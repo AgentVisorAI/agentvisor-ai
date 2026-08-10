@@ -1,0 +1,20 @@
+[package]
+name = "ab-atif"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ATIF v1.7 (Harbor Agent Trajectory Interchange Format) writer, reader, validator"
+
+[dependencies]
+ab-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

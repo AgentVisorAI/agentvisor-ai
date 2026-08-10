@@ -1,0 +1,101 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ab-core",
+    "crates/ab-events",
+    "crates/ab-atif",
+    "crates/ab-receipts",
+    "crates/ab-state",
+    "crates/ab-bridge",
+    "crates/ab-identity",
+    "crates/ab-compress",
+    "crates/ab-loopdetect",
+    "crates/ab-sandbox",
+    "crates/ab-harness",
+    "crates/ab-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/agentbridge/agent-bridge"
+
+[workspace.dependencies]
+ab-core = { path = "crates/ab-core" }
+ab-events = { path = "crates/ab-events" }
+ab-atif = { path = "crates/ab-atif" }
+ab-receipts = { path = "crates/ab-receipts" }
+ab-state = { path = "crates/ab-state" }
+ab-bridge = { path = "crates/ab-bridge" }
+ab-identity = { path = "crates/ab-identity" }
+ab-compress = { path = "crates/ab-compress" }
+ab-loopdetect = { path = "crates/ab-loopdetect" }
+ab-sandbox = { path = "crates/ab-sandbox" }
+ab-harness = { path = "crates/ab-harness" }
+
+tokio = { version = "1.47", features = ["full"] }
+axum = { version = "0.8", features = ["macros"] }
+hyper = { version = "1.7", features = ["full"] }
+tower = { version = "0.5", features = ["util", "limit", "timeout"] }
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+# float_roundtrip is REQUIRED for RFC 8785 correctness: without it serde_json
+# parses floats at reduced precision and canonical hashes differ from other
+# JCS implementations (verified by the RFC Appendix vectors in ab-receipts).
+serde_json = { version = "1.0", features = ["preserve_order", "float_roundtrip"] }
+serde_yaml = "0.9"
+toml = "0.8"
+thiserror = "2.0"
+anyhow = "1.0"
+# Correctly-rounded shortest float digits for RFC 8785 (already in-tree via serde_json).
+ryu = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1.18", features = ["v7", "v4", "serde"] }
+ed25519-dalek = { version = "2.2", features = ["rand_core", "pkcs8", "pem"] }
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+rand = "0.8"
+jsonwebtoken = "9.3"
+jsonschema = "0.26"
+dashmap = "6.1"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+clap = { version = "4.5", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+wasmtime = { version = "27", default-features = false, features = ["runtime", "cranelift", "wat"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1.6"
+tempfile = "3.14"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "warn"
+# Checked arithmetic is enforced by construction in budget/monetary code (ab-state);
+# blanket-warning every u64 counter/time op only produces noise.
+arithmetic_side_effects = "allow"
+cast_possible_truncation = "warn"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+debug = true

@@ -1,0 +1,32 @@
+[package]
+name = "ab-state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Atomic counters, token velocity, rate limits, action budgets (StateStore)"
+
+[dependencies]
+ab-core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+
+[features]
+default = []
+# Redis Cluster backend (brief §8); requires a live server, contract tests gated on AB_REDIS_URL.
+redis = ["dep:redis"]
+
+[dependencies.redis]
+version = "0.27"
+optional = true
+default-features = false
+features = ["script"]
+
+[dev-dependencies]
+proptest = { workspace = true }
+ab-core = { workspace = true }
+
+[lints]
+workspace = true

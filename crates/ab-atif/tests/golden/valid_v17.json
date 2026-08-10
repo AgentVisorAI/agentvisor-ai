@@ -1,0 +1,66 @@
+{
+  "schema_version": "ATIF-v1.7",
+  "session_id": "025B810F-B3A2-4C67-93C0-FE7A142A947A",
+  "trajectory_id": "traj-0001",
+  "agent": {
+    "name": "my-agent",
+    "version": "1.0.0",
+    "model_name": "claude-3-5-sonnet-20241022"
+  },
+  "steps": [
+    {
+      "step_id": 1,
+      "timestamp": "2025-01-15T10:30:00Z",
+      "source": "user",
+      "message": "What is the current trading price of Alphabet (GOOGL)?"
+    },
+    {
+      "step_id": 2,
+      "timestamp": "2025-01-15T10:30:02Z",
+      "source": "agent",
+      "message": "I will search for the current trading price for GOOGL.",
+      "reasoning_content": "The request requires the current stock price. I will execute a tool call to retrieve this information.",
+      "tool_calls": [
+        {
+          "tool_call_id": "call_price_1",
+          "function_name": "financial_search",
+          "arguments": { "ticker": "GOOGL", "metric": "price" }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "source_call_id": "call_price_1",
+            "content": "GOOGL is currently trading at $185.35"
+          }
+        ]
+      },
+      "metrics": {
+        "prompt_tokens": 520,
+        "completion_tokens": 80,
+        "cached_tokens": 200,
+        "cost_usd": 0.00045
+      },
+      "llm_call_count": 1
+    },
+    {
+      "step_id": 3,
+      "timestamp": "2025-01-15T10:30:05Z",
+      "source": "agent",
+      "message": "Alphabet (GOOGL) is trading at $185.35.",
+      "metrics": {
+        "prompt_tokens": 600,
+        "completion_tokens": 44,
+        "cached_tokens": 0,
+        "cost_usd": 0.00033
+      }
+    }
+  ],
+  "final_metrics": {
+    "total_prompt_tokens": 1120,
+    "total_completion_tokens": 124,
+    "total_cached_tokens": 200,
+    "total_cost_usd": 0.00078,
+    "total_steps": 3
+  }
+}
