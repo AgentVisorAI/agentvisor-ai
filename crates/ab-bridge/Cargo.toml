@@ -21,7 +21,7 @@ default = []
 # NATS JetStream connector (edge/single-node alternative, brief Module F).
 nats = ["dep:async-nats", "dep:tokio", "dep:futures"]
 # Kafka-wire connector (works against Redpanda, brief's reference broker).
-kafka = ["dep:rskafka", "dep:tokio"]
+kafka = ["dep:rskafka", "dep:tokio", "dep:chrono"]
 
 [dependencies.async-nats]
 version = "0.38"
@@ -30,6 +30,12 @@ optional = true
 [dependencies.rskafka]
 version = "0.5"
 optional = true
+
+[dependencies.chrono]
+version = "0.4"
+optional = true
+default-features = false
+features = ["clock"]
 
 [dependencies.tokio]
 workspace = true
