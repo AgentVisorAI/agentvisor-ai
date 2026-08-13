@@ -9,9 +9,10 @@
 //! (brief §2 signing rule).
 //!
 //! Silent-error posture: every dropped worker message increments
-//! `ab_events_dropped_total`; ATIF appends spill to disk rather than drop;
-//! client aborts still finalize sessions; worker panics are supervised and
-//! counted.
+//! `ab_events_dropped_total`; audited chat/tool work reserves worker capacity
+//! before quotas mutate, so ATIF-bearing jobs are admission-gated (fail
+//! closed), never dropped mid-flight; client aborts still finalize sessions;
+//! worker panics are supervised and counted.
 
 pub mod config;
 pub(crate) mod journal;
