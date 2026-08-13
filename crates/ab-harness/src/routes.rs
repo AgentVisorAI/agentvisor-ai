@@ -144,7 +144,7 @@ async fn chat_completions(
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     for (name, value) in &upstream_headers {
-        if name != axum::http::header::CONTENT_LENGTH {
+        if is_forwardable_upstream_header(name) {
             response.headers_mut().insert(name.clone(), value.clone());
         }
     }
@@ -159,6 +159,46 @@ async fn chat_completions(
             .insert(crate::pipeline::MIDDLEWARE_US_HEADER, value);
     }
     response
+}
+
+/// Decide whether an upstream response header may be forwarded to the client.
+///
+/// This is a *proxy* trust boundary: the upstream LLM provider is not on the
+/// same trust domain as our client, so blindly forwarding response headers
+/// would let the upstream (or an attacker who influences the upstream)
+/// - set cookies in our domain (`Set-Cookie` — cookie injection),
+/// - open CORS on our origin (`Access-Control-Allow-*`),
+/// - inject invalid or contradictory framing/hop-by-hop metadata
+///   (`Transfer-Encoding`, `Content-Length`, `Connection`, `Keep-Alive`,
+///   `Trailer`, `TE`, `Upgrade`, `Proxy-Authenticate`, `Proxy-Authorization`),
+/// - leak upstream implementation identity (`Server`, `X-Powered-By`,
+///   `Via`, `X-Request-ID`).
+///
+/// Hyper computes framing metadata (`Content-Length`, `Transfer-Encoding`)
+/// itself when we build the response; forwarding the upstream's copies risks
+/// double-encoded or contradictory headers and — with `Transfer-Encoding` —
+/// classical HTTP request smuggling. Hop-by-hop headers are forbidden by
+/// RFC 7230 §6.1 from crossing a proxy.
+fn is_forwardable_upstream_header(name: &axum::http::HeaderName) -> bool {
+    use axum::http::header;
+    let is_denied = *name == header::CONTENT_LENGTH
+        || *name == header::TRANSFER_ENCODING
+        || *name == header::CONNECTION
+        || *name == header::UPGRADE
+        || *name == header::TE
+        || *name == header::TRAILER
+        || *name == header::PROXY_AUTHENTICATE
+        || *name == header::PROXY_AUTHORIZATION
+        || *name == header::SET_COOKIE
+        || *name == header::SERVER
+        || *name == header::VIA
+        || name.as_str().eq_ignore_ascii_case("keep-alive")
+        || name.as_str().eq_ignore_ascii_case("x-powered-by")
+        || name.as_str().eq_ignore_ascii_case("x-request-id")
+        // Never let the upstream open CORS on our origin — if we want CORS
+        // we set it deliberately in our own router.
+        || name.as_str().to_ascii_lowercase().starts_with("access-control-");
+    !is_denied
 }
 
 async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -2858,5 +2898,81 @@ mod tests {
         .await
         .unwrap();
         provider.abort();
+    }
+
+    /// Regression lock for the upstream-response header forwarding
+    /// trust-boundary bug (CWE-346 / CWE-16). Before the fix, every
+    /// upstream response header except `Content-Length` was blindly
+    /// forwarded to the client — letting a hostile or MITM'd upstream
+    ///
+    /// - set cookies on our domain (`Set-Cookie`),
+    /// - open CORS on our origin (`Access-Control-Allow-*`),
+    /// - leak upstream implementation identity (`Server`, `Via`,
+    ///   `X-Powered-By`, `X-Request-ID`),
+    /// - inject conflicting framing/hop-by-hop metadata (`Connection`,
+    ///   `Transfer-Encoding`, `Keep-Alive`, `Upgrade`, `TE`, `Trailer`,
+    ///   `Proxy-Authenticate`, `Proxy-Authorization`).
+    ///
+    /// `is_forwardable_upstream_header` is now the sole gate on which
+    /// upstream headers cross the proxy trust boundary — this test locks
+    /// each dangerous class out and confirms benign headers (`Content-Type`,
+    /// `Cache-Control`, `ETag`) still pass through.
+    #[test]
+    fn upstream_response_headers_do_not_cross_proxy_trust_boundary() {
+        use axum::http::HeaderName;
+        let dangerous = [
+            // Cookie injection on our domain from a hostile upstream.
+            "set-cookie",
+            // CORS bypass — we never let the upstream open our origin.
+            "access-control-allow-origin",
+            "access-control-allow-credentials",
+            "access-control-allow-methods",
+            "access-control-allow-headers",
+            "access-control-expose-headers",
+            "access-control-max-age",
+            // RFC 7230 §6.1 hop-by-hop headers — a proxy must not
+            // forward these; forwarding `Transfer-Encoding` enables
+            // classical HTTP request smuggling.
+            "connection",
+            "keep-alive",
+            "transfer-encoding",
+            "upgrade",
+            "te",
+            "trailer",
+            "proxy-authenticate",
+            "proxy-authorization",
+            // Framing metadata that hyper computes from the response
+            // body; the upstream's value would be wrong.
+            "content-length",
+            // Implementation-identity leaks.
+            "server",
+            "via",
+            "x-powered-by",
+            "x-request-id",
+        ];
+        for name in dangerous {
+            let header = HeaderName::from_static(name);
+            assert!(
+                !is_forwardable_upstream_header(&header),
+                "dangerous header {name:?} must not be forwarded to the client"
+            );
+        }
+
+        let benign = [
+            "content-type",
+            "content-encoding",
+            "cache-control",
+            "etag",
+            "last-modified",
+            "vary",
+            "expires",
+        ];
+        for name in benign {
+            let header = HeaderName::from_static(name);
+            assert!(
+                is_forwardable_upstream_header(&header),
+                "benign header {name:?} must still be forwarded"
+            );
+        }
     }
 }
