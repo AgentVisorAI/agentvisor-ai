@@ -845,9 +845,13 @@ impl AppState {
             .and_then(|value| value.strip_prefix("Bearer "));
         match (bearer, &self.identity) {
             (Some(token), Some(validator)) => {
-                let validated = validator
-                    .validate(token)
-                    .map_err(|error| PipelineError::Unauthorized(error.to_string()))?;
+                let validated = validator.validate(token).map_err(|error| {
+                    tracing::warn!(
+                        error = %error,
+                        "identity validation failed"
+                    );
+                    PipelineError::Unauthorized(classify_identity_error(&error).to_owned())
+                })?;
                 if self.config.enforce_identity_scopes {
                     if let Some(required) = required_scope {
                         if !scope_allows(&validated.claims.scopes, required) {
@@ -922,6 +926,36 @@ fn classify_upstream_error(error: &reqwest::Error) -> &'static str {
         "upstream returned error status"
     } else {
         "upstream forwarding failed"
+    }
+}
+
+/// Map an [`IdentityError`] to a client-safe reason (CWE-209).
+///
+/// The `Display` impl on `IdentityError` embeds attacker-influenced strings
+/// (the presented `kid`, `iss`, and structural detail from the underlying
+/// JWT parser) and distinguishes between at least sixteen distinct failure
+/// modes. Returning that verbatim to the client turns each 401 response
+/// into an *enumeration oracle* for the validator's configured JWKS and
+/// issuer allowlist: an attacker can iterate candidate `kid`s and issuers
+/// and read the response body to discover which values are registered
+/// (`UnknownKid` vs `AlgorithmRejected` vs `Verification` vs `BadIssuer`
+/// all produce distinguishable text).
+///
+/// We collapse every attacker-reachable variant to a single stable string.
+/// The detailed cause is preserved server-side by the caller via
+/// `tracing::warn!` and the failure-job audit chain, so operators keep
+/// full diagnostic detail without exposing it to the network.
+fn classify_identity_error(error: &ab_identity::IdentityError) -> &'static str {
+    match error {
+        // Server-side misconfiguration is not attacker-reachable in the
+        // normal request path (validator construction rejects a bad JWKS
+        // at startup); report it distinctly so operator dashboards can
+        // surface it if it ever appears.
+        ab_identity::IdentityError::Jwks(_) => "identity validator misconfigured",
+        // Every other variant is at least partially attacker-influenced —
+        // collapse to one opaque message. Any finer distinction leaks
+        // configured `kid`s, issuers, or acceptable algorithms.
+        _ => "identity validation failed",
     }
 }
 
@@ -1660,6 +1694,137 @@ mod tests {
         assert!(
             !message.contains("corp.example"),
             "upstream error message {message:?} leaks the configured domain"
+        );
+    }
+
+    /// Regression lock for CWE-209 information exposure. Before the fix,
+    /// `PipelineError::Unauthorized(identity_err.to_string())` embedded the
+    /// specific `IdentityError` variant's `Display` text in the JSON error
+    /// body. Because that text distinguishes at least sixteen distinct
+    /// failure modes — and echoes the attacker-supplied `kid`, `iss`, and
+    /// `alg` values — each response became an enumeration oracle: an
+    /// attacker could iterate candidate `kid`s and read the response body
+    /// to discover which are configured on our validator. The client-facing
+    /// message must now be a single stable string, and must never echo
+    /// attacker-controlled token fields.
+    #[test]
+    fn identity_validation_failure_does_not_leak_kid_or_issuer() {
+        // Every variant that an attacker can reach via a crafted token must
+        // classify to exactly the same client-facing string. Any divergence
+        // is an enumeration oracle for validator configuration.
+        //
+        // Sentinels that would appear in the raw `Display` output are
+        // asserted absent — this catches accidental future variants that
+        // slip through the `_` catch-all with a different classification.
+        let sentinel_kid = "sentinel-attacker-kid";
+        let sentinel_iss = "https://sentinel-attacker-iss.example.invalid";
+        let sentinel_alg = "HS512";
+        let cases: Vec<(&'static str, ab_identity::IdentityError)> = vec![
+            (
+                "Malformed",
+                ab_identity::IdentityError::Malformed("jwt parse".into()),
+            ),
+            ("MissingKid", ab_identity::IdentityError::MissingKid),
+            (
+                "UnknownKid",
+                ab_identity::IdentityError::UnknownKid(sentinel_kid.into()),
+            ),
+            (
+                "AlgorithmRejected",
+                ab_identity::IdentityError::AlgorithmRejected {
+                    alg: sentinel_alg.into(),
+                    kid: sentinel_kid.into(),
+                },
+            ),
+            (
+                "Verification",
+                ab_identity::IdentityError::Verification("bad sig".into()),
+            ),
+            ("TtlTooLong", ab_identity::IdentityError::TtlTooLong(9999)),
+            (
+                "BadTimestamps",
+                ab_identity::IdentityError::BadTimestamps { iat: 10, exp: 5 },
+            ),
+            (
+                "FutureIat",
+                ab_identity::IdentityError::FutureIat {
+                    iat: 999_999_999,
+                    now: 1,
+                },
+            ),
+            ("EmptyField", ab_identity::IdentityError::EmptyField("charter")),
+            (
+                "SpoofingCharacter",
+                ab_identity::IdentityError::SpoofingCharacter("charter"),
+            ),
+            (
+                "BadIssuer",
+                ab_identity::IdentityError::BadIssuer(sentinel_iss.into()),
+            ),
+            (
+                "ScopeEscalation",
+                ab_identity::IdentityError::ScopeEscalation {
+                    scope: "chat:write".into(),
+                },
+            ),
+            (
+                "ExpEscalation",
+                ab_identity::IdentityError::ExpEscalation {
+                    child: 100,
+                    parent: 50,
+                },
+            ),
+            ("ChainTooDeep", ab_identity::IdentityError::ChainTooDeep(5)),
+        ];
+
+        let mut classifications: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+        for (name, error) in &cases {
+            let client_msg = super::classify_identity_error(error);
+            classifications.insert(client_msg);
+            assert!(
+                !client_msg.contains(sentinel_kid),
+                "{name}: client message {client_msg:?} echoes attacker kid"
+            );
+            assert!(
+                !client_msg.contains(sentinel_iss),
+                "{name}: client message {client_msg:?} echoes attacker iss"
+            );
+            assert!(
+                !client_msg.contains(sentinel_alg),
+                "{name}: client message {client_msg:?} echoes attacker alg"
+            );
+            // The full PipelineError as rendered to the client must also
+            // not leak — this is what actually goes on the wire via
+            // `pipeline_error()` -> `Json(json!({"error": err.to_string()}))`.
+            let wire = PipelineError::Unauthorized(client_msg.to_owned()).to_string();
+            assert!(
+                !wire.contains(sentinel_kid),
+                "{name}: wire error {wire:?} echoes attacker kid"
+            );
+            assert!(
+                !wire.contains(sentinel_iss),
+                "{name}: wire error {wire:?} echoes attacker iss"
+            );
+            assert!(
+                !wire.contains(sentinel_alg),
+                "{name}: wire error {wire:?} echoes attacker alg"
+            );
+        }
+        // All attacker-reachable variants collapse to exactly one class —
+        // the `Jwks` variant (server-side misconfig only, not on the
+        // request path) may distinctly classify.
+        assert_eq!(
+            classifications.len(),
+            1,
+            "attacker-reachable IdentityError variants classify to multiple messages {classifications:?}: this is an enumeration oracle"
+        );
+
+        // And Jwks classifies distinctly (server-side, not attacker-reachable).
+        let jwks_msg = super::classify_identity_error(&ab_identity::IdentityError::Jwks("bad jwks".into()));
+        assert_ne!(
+            jwks_msg,
+            *classifications.iter().next().unwrap(),
+            "server-side misconfig should classify distinctly for operator dashboards"
         );
     }
 }
