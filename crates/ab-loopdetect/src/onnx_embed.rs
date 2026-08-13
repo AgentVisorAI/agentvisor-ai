@@ -9,9 +9,10 @@
 
 use crate::embed::Embedder;
 use std::path::Path;
+use std::sync::Arc;
 use tract_onnx::prelude::*;
 
-type RunnableOnnxModel = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+type RunnableOnnxModel = Arc<TypedRunnableModel>;
 
 /// Embedder backed by an ONNX sentence-embedding model.
 pub struct OnnxEmbedder {
@@ -95,7 +96,9 @@ impl OnnxEmbedder {
         let output = outputs
             .first()
             .ok_or_else(|| "ONNX model returned no output".to_owned())?;
-        let view = output.to_array_view::<f32>().map_err(|error| error.to_string())?;
+        let view = output
+            .to_plain_array_view::<f32>()
+            .map_err(|error| error.to_string())?;
         let mut vector = pool_output(view, &mask_values, self.dim)?;
         let norm: f32 = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
         if norm > 0.0 {
