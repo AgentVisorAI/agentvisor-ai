@@ -57,7 +57,8 @@ pub trait StateStore: Send + Sync {
     fn remove(&self, key: &str);
 }
 
-/// Single-node in-memory store on lock-free atomics.
+/// Single-node in-memory store: atomic counters behind a short transaction
+/// mutex that serializes check-and-spend so multi-key spends stay atomic.
 #[derive(Debug, Default)]
 pub struct InMemoryStore {
     counters: DashMap<String, Arc<AtomicI64>>,

@@ -87,7 +87,8 @@ a per-stage histogram; a strict mode (`AB_STRICT_BUDGET`) flags stages > 2.0 ms.
 ### D2. Channel overflow is never silent
 `try_send` failure increments `ab_events_dropped_total{stage}` and logs at WARN with session id. Tests
 force overflow and assert the counter. Drop policy: drop-newest for telemetry events (hot path never
-blocks); ATIF step appends spill to a per-session disk spool before dropping (fidelity criterion).
+blocks); ATIF-bearing work reserves worker capacity before quota mutation, so overflow fails the
+request closed at admission instead of dropping audit steps mid-flight (fidelity criterion).
 
 ### D3. Embedded broker is the reference Bridge backend
 Redpanda requires Docker (daemon down) and NATS is an external binary. To make the Bridge contract
@@ -172,7 +173,8 @@ receipt ≤ 60 s (measured); promotion idempotent (double-promote = one receipt)
 
 ### D13. Silent-error inventory (each with a dedicated test)
 1. Full telemetry channel drops events → counter + WARN asserted under forced overflow.
-2. ATIF steps lost under backpressure → disk spill; fidelity test = 100 % steps present.
+2. ATIF steps lost under backpressure → pre-admission worker reservation fails the request closed;
+   fidelity test = 100 % steps present.
 3. Unknown/missing JSON fields silently ignored → strict validator modes + round-trip property tests.
 4. Integer > 2^53 corrupts JCS hashing → guard rejects; test.
 5. Float `-0.0`/`1e21` canonicalization drift → RFC 8785 vectors.
@@ -300,7 +302,7 @@ re-check RTM, record BENCHMARKS.md, memory notes).
 2. **TCP RST**: raw RST isn't portably expressible at the Axum layer; we implement HTTP 429, corrective
    payload injection, and hard connection abort — the three enforceable equivalents (config-selectable).
 3. **stop_reason_id numeric values**: upstream enum values are not independently relied upon; we ship our
-   authored profile's documented mapping (core 0-4, 99 Other; extension 90-97) in the JSON Schema +
+   authored profile's documented mapping (core 0-4, 99 Other; extension 90-94) in the JSON Schema +
    EVOLUTION.md re-mapping policy.
 4. **Sections 4-7 absent in the source docx** (numbering jumps 3→8); not an omission here.
 

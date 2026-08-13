@@ -18,7 +18,7 @@ test:
 test-all:
 	cargo test --workspace --all-features
 
-# Heavy SLA / perf measurement (writes BENCHMARKS.md numbers; see docs)
+# Heavy SLA / perf measurement (prints the numbers recorded in BENCHMARKS.md; see docs)
 sla:
 	ulimit -n 65536 && RUN_HEAVY_PERF=1 cargo test --workspace --release -- --ignored --nocapture sla_
 

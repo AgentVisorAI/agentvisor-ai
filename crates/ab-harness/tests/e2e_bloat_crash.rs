@@ -45,10 +45,9 @@ fn ring(s: &Ed25519Signer) -> Keyring {
 // 1. Depth bomb: 10 000 levels of nested arrays. JCS canonicalization uses
 //    recursion, which would overflow the default 8 MiB thread stack; the
 //    test runs the canonicalize call on a 64 MiB stack thread so the
-//    ATTACKER'S depth bomb is bounded by their memory, not ours. If the
-//    call completes, brackets match; if it panics on that thread, we
-//    catch the panic here and pass — the point is the MAIN thread
-//    survives.
+//    depth bomb cannot take down the process. The call must finish inside
+//    60 s; a clean `Err` from canonicalize is acceptable, a worker panic
+//    propagates through the join and fails the test.
 // ---------------------------------------------------------------------------
 
 #[test]
