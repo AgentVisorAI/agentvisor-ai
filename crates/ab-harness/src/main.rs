@@ -520,15 +520,35 @@ fn load_or_create_signer(path: &Path) -> Result<Ed25519Signer> {
     }
 }
 
-/// Reject a file whose mode is readable by group or other on Unix. Windows
-/// does not model POSIX modes so this is a no-op there — deployments on
+/// Reject a file whose mode is readable by group or other on Unix, and
+/// refuse to follow a symbolic link at `path` — a pre-planted symlink to
+/// an attacker-owned 0o600 hex file would otherwise fool the mode check
+/// (`std::fs::metadata` follows symlinks and returns the *target*'s mode)
+/// and let `read_to_string` load an attacker-chosen seed. Windows does
+/// not model POSIX modes so this is a no-op there — deployments on
 /// Windows must rely on ACLs set by the operator.
 fn require_owner_only_mode(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        let metadata =
-            std::fs::metadata(path).with_context(|| format!("stat secret file {}", path.display()))?;
+        // `symlink_metadata` does NOT traverse a symbolic link, so the
+        // file-type check below is applied to the link itself, not to
+        // whatever the link happens to point at.
+        let metadata = std::fs::symlink_metadata(path)
+            .with_context(|| format!("stat secret file {}", path.display()))?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            anyhow::bail!(
+                "secret file {} is a symbolic link; refusing to follow (remove the link and store the seed inline at this path)",
+                path.display(),
+            );
+        }
+        if !file_type.is_file() {
+            anyhow::bail!(
+                "secret file {} is not a regular file (type: {file_type:?})",
+                path.display(),
+            );
+        }
         // Bottom 9 bits are rwxrwxrwx; any of the group/other read bits set is a leak.
         let mode = metadata.mode() & 0o777;
         if mode & 0o077 != 0 {
@@ -728,6 +748,63 @@ mod tests {
         config.require_identity = true;
         config.identity_hmac_secret_file = Some(secret.to_string_lossy().into_owned());
         assert!(build_identity(&config).await.is_err());
+    }
+
+    /// Vicious bug regression: `std::fs::metadata` follows symbolic links,
+    /// so the historical `require_owner_only_mode` check returned the
+    /// *target*'s mode. A pre-planted symlink pointing at an attacker-owned
+    /// 0o600 hex file would therefore pass the mode check, and the
+    /// subsequent `read_to_string` (which also follows symlinks) would load
+    /// the attacker's chosen seed — replacing the harness's signing key.
+    /// The fix uses `symlink_metadata` to reject symlinks up front, before
+    /// any secret bytes are read.
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_follow_signing_seed_symlink_to_attacker_owned_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        // Attacker file: an ordinary 0o600 file owned by the same user.
+        // In a shared-tenant deployment this could be any 32-byte hex blob
+        // the attacker chose (e.g., their own keypair).
+        let attacker_file = directory.path().join("attacker.hex");
+        std::fs::write(
+            &attacker_file,
+            "0102030405060708091011121314151617181920212223242526272829303132\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&attacker_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Attacker plants a symlink at the seed path.
+        let seed_path = directory.path().join("signing.seed");
+        std::os::unix::fs::symlink(&attacker_file, &seed_path).unwrap();
+        let err = read_signer(&seed_path).unwrap_err().to_string();
+        assert!(
+            err.contains("symbolic link"),
+            "expected symlink rejection, got: {err}",
+        );
+    }
+
+    /// Same guarantee for the identity HMAC secret file: a pre-planted
+    /// symlink to an attacker-owned 0o600 file must be refused rather
+    /// than followed to load an attacker-chosen HMAC key.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refuses_to_follow_hmac_secret_symlink_to_attacker_owned_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let attacker_file = directory.path().join("attacker.hmac");
+        std::fs::write(&attacker_file, b"attacker-chosen-hmac-key").unwrap();
+        std::fs::set_permissions(&attacker_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let secret = directory.path().join("identity.hmac");
+        std::os::unix::fs::symlink(&attacker_file, &secret).unwrap();
+        let mut config = HarnessConfig::for_tests("http://upstream", "/tmp", "/tmp");
+        config.require_identity = true;
+        config.identity_hmac_secret_file = Some(secret.to_string_lossy().into_owned());
+        let result = build_identity(&config).await;
+        let err = result.err().map(|error| error.to_string()).unwrap_or_default();
+        assert!(
+            err.contains("symbolic link"),
+            "expected symlink rejection, got: {err}",
+        );
     }
 
     #[tokio::test]
