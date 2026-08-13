@@ -114,14 +114,11 @@ identity block (version/charter/instance_uid), tool-call summary, cost, stop rea
 signature over JCS of the payload-minus-signature. Verification is offline given the public key. `Signer`
 is a trait (Ed25519 in-process now; KMS post-MVP per brief).
 
-### D6. Embedder: deterministic default, ONNX behind a feature
-Default `HashEmbedder`: char-n-gram feature hashing → fixed-dim f32 vector, L2-normalized. Deterministic,
-CPU-cheap, catches verbatim and near-paraphrase loops (which are n-gram-dense), fully testable, zero
-model download. `tract-onnx` (`onnx` feature) loads MiniLM-class models from a configured path (pure
-Rust — matches "no PyTorch/Python bloat"; hermetic builds, unlike `ort`'s binary download). The loop SLA
-suite runs on the default embedder. Qdrant (brief's off-path vector engine) is *not needed for the MVP
-algorithm* (Δ between consecutive steps needs only a per-session ring); we ship a `VectorSink` trait as
-the Qdrant integration point — deviation documented in § 8.
+### D6. Embedder: pinned ONNX production path, deterministic fallback
+`tract-onnx` loads the checksum-pinned MiniLM deployment model and tokenizer in the production image
+(pure Rust, no PyTorch/Python runtime). The full loop and false-positive SLA suites run against that real
+model, and its 384-dimensional output passes the live Qdrant contract. `HashEmbedder` remains a
+deterministic, zero-artifact fallback for minimal embedded tests and explicitly configured deployments.
 
 ### D7. WASM policies are real, tests need no external toolchain
 `ab-sandbox` embeds wasmtime; policy modules receive the tool-call JSON + budget state and return
@@ -203,7 +200,7 @@ receipt ≤ 60 s (measured); promotion idempotent (double-promote = one receipt)
 
 ### D14. Dependencies (lean, pinned via committed Cargo.lock)
 tokio, axum, hyper, tower, futures; serde, serde_json; ed25519-dalek 2, sha2, hex, base64, rand;
-jsonwebtoken; jsonschema; uuid (v7); dashmap, parking_lot; crossbeam-channel (worker ring buffers, per
+jsonwebtoken; jsonschema; uuid (v7); dashmap, parking_lot; bounded Tokio mpsc shards (per
 brief); thiserror (libs), anyhow (bins); tracing (+subscriber); serde_yaml (manifest), toml (config);
 clap (CLI); reqwest (CLI/JWKS/loadgen); criterion, proptest, tempfile (dev). Feature-gated: `redis`,
 `async-nats`, `rskafka`, `tract-onnx`, wasmtime (default-on). Metrics registry is hand-rolled in
@@ -219,33 +216,35 @@ Workspace lints: `unsafe_code = "forbid"`, `warnings = "deny"` in CI, clippy `pe
 
 ## 4. Requirements Traceability Matrix (brief → artifact → proof)
 
+This is the implementation traceability record, not a test report. Current measured evidence and environment limits live in `VERIFICATION.md` and `BENCHMARKS.md`.
+
 | # | Brief requirement | Where implemented | Proof (test/bench/doc) |
 |---|---|---|---|
-| R1 | §2 signed hot-path added latency p95 ≤ 5 ms, p99 ≤ 8 ms incl. non-blocking publish | ab-harness pipeline | `sla_hotpath` integration test (proxy-vs-direct differential, mock provider) + criterion stage benches + BENCHMARKS.md |
-| R2 | §2 > 2 ms work must be async via ring buffers | ab-harness workers (crossbeam/tokio bounded) | stage histograms + strict-budget test |
+| R1 | §2 signed hot-path added latency p95 ≤ 5 ms, p99 ≤ 8 ms | ab-harness pipeline | release `sla_core_metrics`; scope and limits in BENCHMARKS.md |
+| R2 | §2 > 2 ms work must be off the async request runtime | blocking-pool middleware + bounded sharded workers | all-feature lint/tests; stage histograms |
 | R3 | §2 receipts batched off hot path, finalized once at session close | ab-harness session close → ab-receipts | test: no signing occurs per-chunk (call-count probe); close issues exactly one |
-| R4 | §2 ATIF path fully async, separate budget | ab-harness unsigned path | hot-path test with ATIF writer artificially stalled → latency unaffected |
+| R4 | §2 ATIF path separate from signed hot path | authenticated journals + snapshot writer | write-failure retry, torn-tail, tamper, and restart tests |
 | R5 | A: loop detect via embeddings, Δ≈0 over 3 steps + N tokens → 429/inject, OCSF event with stop_reason_id | ab-loopdetect + harness enforcement | synthetic loop suite: 100 % catch ≤ 3 cycles; progressing suite: 0 false trips; emitted event schema-validated |
 | R6 | B: MCP JSON-RPC intercept, WASM policies (wasmtime), action budgets (max_db_writes, max_payout_usd), schema-invalid blocked, < 5 ms | ab-sandbox (+ab-state) | block-latency bench < 5 ms; budget stress; WAT policy tests; JSON-schema negative suite; per-call OCSF event w/ budget consumption |
 | R7 | C: parse payloads, prune, 30-50 % reduction on ≥ 50 k-token histories, metrics mirror ATIF fields | ab-compress | 50 k synthetic corpus test asserts ≥ 30 %; invariant property tests; metric name parity test |
 | R8 | D: short-lived JWT/HMAC, IdP-bound, scope inheritance, 15-min TTL, instance_uid+TTL in event identity block | ab-identity + ab-events | adversarial JWT suite; delegation property tests; event identity-block content test |
 | R9 | E: events carry ai_agent.version/charter/instance_uid + stop_reason_id per PR #1; metadata v1.10.0 | ab-events | golden events validated against shipped JSON Schemas; field-presence tests |
-| R10 | E roadmap: Fingerprint observable (tool schemas + sampling params), JCS | ab-events `inventory` (flagged) | chained-fingerprint test behind flag; EVOLUTION.md |
+| R10 | E roadmap: Fingerprint observable (tool schemas + sampling params), JCS | ab-events model/schema only | roadmap shape test; not an MVP gate |
 | R11 | F: broker Redpanda ref + NATS alt; topic per event class; partition by instance_uid; ordered replay | ab-bridge (embedded + `kafka`/`nats` features) | embedded contract suite (ordering, replay, offsets); connector contract tests (live-gated) |
 | R12 | F: portability = single binary + declarative manifest; schema-validated provisioning | ab-bridge manifest + `abctl bridge provision` | provision-from-manifest-alone integration test (fresh dir), events schema-validated, wall-time recorded (≪ 15 min) |
-| R13 | F: retention 30 d default + cold-tier export to customer storage | ab-bridge retention task + `ColdStore` | rotation test with shortened clock; cold-export file test |
+| R13 | F: retention 30 d default + cold-tier export to customer storage | broker retention + `ColdArchive` retry outbox | embedded expiry and object-store contract tests |
 | R14 | G: session-close JCS canonicalization + Ed25519 receipt; offline verify; payload fields per brief | ab-receipts | RFC 8785 vectors; tamper/mutation suite; offline verify (no bridge handle in scope); payload field test; sign latency bench < 2 ms |
 | R15 | G: signing reserved for consequential actions by policy | harness config (`signed` workflow opt-in) | default-unsigned test; per-workflow policy test |
 | R16 | H: ATIF v1.7 capture: root object, agent config, ordered steps, aggregate metrics | ab-atif | golden trajectories; strict validator (Harbor rules: sequential ids, agent-only fields, source_call_id refs, ISO-8601) |
 | R17 | H: cached-token metrics intact → replayable checkpoint | ab-atif metrics | fidelity test: 100 % steps carry prompt/completion/cached counts through export |
 | R18 | H: reconciler promotes → retroactive receipt, never blocking hot path | ab-harness reconciler | promotion ≤ 60 s test (measured); hot-path isolation test; idempotency test |
-| R19 | H: Harbor interop | ab-atif writer | golden files cross-validated against the published field model + version history |
-| R20 | §8 stack: Rust+Axum/Tokio, wasmtime, Redis, ONNX-capable, Ed25519, OTel/Vector | workspace | Cargo.toml + feature matrix + vector.toml + ARCHITECTURE.md |
+| R19 | H: Harbor interop | real HTTP harness ATIF export | CI invokes Harbor's pinned reference validator |
+| R20 | §8 stack: Rust+Axum/Tokio, wasmtime, Redis, ONNX-capable, Ed25519, OTLP/Vector | workspace | all-feature build, live OTLP protocol check, Vector config |
 | R21 | §9 data-flow sequence order | ab-harness pipeline | integration test asserts stage order via tracing span capture |
 | R22 | §10 loop SLA 100 % ≤ 3 cycles | ab-loopdetect | R5 suite |
 | R23 | §10 tool block < 5 ms | ab-sandbox | R6 bench |
 | R24 | §10 context ≥ 30 % @ ≥ 50 k | ab-compress | R7 test |
-| R25 | §10 10 k concurrent connections per node | abctl loadgen | opt-in heavy perf run (`RUN_HEAVY_PERF=1`, documented macOS fd limits); default 500-conn CI-scale run; BENCHMARKS.md |
+| R25 | §10 10 k concurrent connections per node | release socket-level SLA | mandatory CI run at 10,000; BENCHMARKS.md |
 | R26 | §10 publish overhead ≤ 0.5 ms p99 | ab-bridge enqueue | criterion bench + in-test p99 measurement |
 | R27 | §10 receipt sign < 2 ms async | ab-receipts | bench + async-issuance test |
 | R28 | §10 ATIF fidelity 100 % valid v1.7 | ab-atif | R17 + validator pass on every exported file in integration runs |
@@ -290,27 +289,20 @@ re-check RTM, record BENCHMARKS.md, memory notes).
 
 ## 7. Operational notes
 
-- macOS fd limits: heavy loadgen documents `ulimit -n 10240`; Linux figures reported separately when run.
+- macOS fd limits: heavy loadgen requires `ulimit -n 65536`; Linux CI uses the same 10,000 target.
 - Live-broker/Redis/ONNX tests: env-gated, loudly skipped, never silently green.
-- Docker daemon down: images/compose shipped + `docker compose config`-validated; run instructions in README.
+- Docker image construction is a mandatory CI gate. Local Docker API availability is recorded in VERIFICATION.md.
 
 ## 8. Documented deviations from the brief (with rationale)
 
-1. **Qdrant** listed in the stack but unnecessary for the MVP loop algorithm (consecutive-step Δ over a
-   per-session window). Shipped: `VectorSink` trait + in-memory window. Qdrant connector = post-MVP plug-in.
-2. **ONNX default-off**: brief's bge-micro/MiniLM supported via `tract-onnx` feature + model path config;
-   default embedder is the deterministic HashEmbedder so the loop SLA is hermetically provable. Rationale:
-   no model artifact may be assumed present in air-gapped installs; trait boundary makes the swap config-only.
-3. **Redpanda not runnable here** (Docker daemon down): Kafka-wire connector code + compose file shipped;
-   embedded broker is the tested reference backend, NATS live-tested if brew install succeeds.
-4. **TCP RST**: raw RST isn't portably expressible at the Axum layer; we implement HTTP 429, corrective
+1. **Qdrant optional at runtime**: the Qdrant connector, collection provisioning, and Compose service ship,
+   while embedded deployments may select the in-process session window without external vector storage.
+2. **TCP RST**: raw RST isn't portably expressible at the Axum layer; we implement HTTP 429, corrective
    payload injection, and hard connection abort — the three enforceable equivalents (config-selectable).
-5. **OpenTelemetry**: MVP emits Prometheus metrics + structured JSONL logs with a shipped Vector config
-   (brief's telemetry row names OTel/Vector as the pipeline); OTLP push = post-MVP, trait-ready.
-6. **stop_reason_id numeric values**: upstream #1704 enum values not published in the brief; we ship our
+3. **stop_reason_id numeric values**: upstream enum values are not independently relied upon; we ship our
    authored profile's documented mapping (core 0-4, 99 Other; extension 90-97) in the JSON Schema +
-   EVOLUTION.md re-mapping policy. (We hold authorship upstream per the brief, so this is self-consistent.)
-7. **Sections 4-7 absent in the source docx** (numbering jumps 3→8); not an omission here.
+   EVOLUTION.md re-mapping policy.
+4. **Sections 4-7 absent in the source docx** (numbering jumps 3→8); not an omission here.
 
 ---
 
