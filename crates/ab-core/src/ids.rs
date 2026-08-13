@@ -92,9 +92,11 @@ mod tests {
 
     /// Every byte that could be used to escape a log line, terminal control
     /// sequence, or cross-line boundary must be rejected. This locks the
-    /// defense: log injection via a hostile `X-AB-Session` header is
-    /// impossible because the id never reaches `%session_id` in a
-    /// tracing::info_span!() unless it survives `SessionId::parse`.
+    /// defense: any `SessionId` that survives `parse` is safe to interpolate
+    /// into log lines and event chains, so hostile `X-AB-Session` values can
+    /// never ride a *parsed* id into a forged log record. (Middleware that
+    /// logs the raw header string separately relies on the tracing layer's
+    /// own field escaping.)
     #[test]
     fn session_id_rejects_every_log_injection_byte() {
         // Cover: NUL, tab, LF, CR, ESC, DEL, and every high-ASCII byte.

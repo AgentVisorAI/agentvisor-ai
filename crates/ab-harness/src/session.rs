@@ -200,7 +200,9 @@ impl Session {
             .store(ab_core::time::now_ms(), Ordering::Release);
     }
 
-    /// Attempt to transition to closed. Returns `true` exactly once.
+    /// Attempt to claim the close transition. Only one caller can hold the
+    /// claim at a time; a failed finalize resets it (`reset_close`) so the
+    /// close can be retried.
     pub fn try_close(&self) -> bool {
         self.closed
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
@@ -253,14 +255,17 @@ impl Session {
         }
     }
 
-    /// Atomically claim promotion. Returns `true` exactly once.
+    /// Atomically claim promotion. Only one caller can hold the claim at a
+    /// time; failed receipt persistence resets it (`reset_promotion`) so
+    /// promotion can be retried.
     pub fn try_promote(&self) -> bool {
         self.promoted
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
 
-    /// True after promotion has been claimed.
+    /// True after promotion has completed (receipt persisted), not merely
+    /// been claimed.
     pub fn is_promoted(&self) -> bool {
         self.promoted.load(Ordering::Acquire) == 2
     }

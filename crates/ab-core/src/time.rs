@@ -87,17 +87,17 @@ mod tests {
     #[test]
     fn now_is_sane() {
         let now = now_ms();
-        assert!(now > 1_700_000_000_000, "clock reads before 2023: {now}");
+        assert!(now > 1_700_000_000_000, "clock reads before Nov 2023: {now}");
         let iso = now_iso8601();
         assert!(iso.ends_with('Z') && iso.len() == 24, "bad iso format: {iso}");
     }
 
     #[test]
     fn civil_from_days_exercises_month_and_day_arithmetic() {
-        // Feb 29 2024 (leap), Mar 1 2024, Dec 31 2099, Jan 1 2100 (100-year
-        // non-leap boundary), and Feb 29 2000 (400-year leap). Each hits a
-        // different branch of civil_from_days; any `+`/`-` mutation flips
-        // the observable date fields.
+        // Epoch day zero, Mar 1 2024 (day after a leap Feb 29), Dec 31 2099
+        // (last day before the 100-year non-leap boundary), and Feb 29 2000
+        // (400-year leap). Each hits a different branch of civil_from_days;
+        // any `+`/`-` mutation flips the observable date fields.
         let cases: &[(u64, &str)] = &[
             (0, "1970-01-01T00:00:00.000Z"),
             (1_709_251_200_000, "2024-03-01T00:00:00.000Z"),
@@ -178,9 +178,9 @@ mod tests {
 
     /// Wall-clock time must not run backward as observed by consecutive
     /// `now_ms()` calls under normal operation. Two rapid samples might tie,
-    /// but the second is never less than the first. If the underlying kernel
-    /// clock jumps backward the workspace tolerates the anomaly by saturating
-    /// at 0 rather than panicking — verified by this smoke test.
+    /// but the second is never less than the first. (Pre-epoch clocks are a
+    /// separate concern: `now_ms` saturates at 0 rather than panicking, which
+    /// this smoke test cannot induce.)
     #[test]
     fn now_ms_never_panics_and_is_monotonic_under_normal_operation() {
         let mut previous = now_ms();

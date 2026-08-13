@@ -91,7 +91,7 @@ pub struct Step {
     pub source: Source,
     /// Message content (string or content-part array since v1.6).
     pub message: serde_json::Value,
-    /// Qualitative or quantitative reasoning effort.
+    /// Agent-only: qualitative or quantitative reasoning effort.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Agent-only: chain-of-thought / reasoning content.
@@ -112,7 +112,7 @@ pub struct Step {
     /// True when copied from a previous trajectory as context.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_copied_context: Option<bool>,
-    /// Agent-only: number of LLM calls in this step (v1.7).
+    /// Number of LLM calls in this step (v1.7; valid on any step source).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm_call_count: Option<u64>,
     /// Custom metadata.

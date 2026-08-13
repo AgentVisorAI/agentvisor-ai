@@ -7,9 +7,9 @@
 //! link's scopes must be a subset of its parent's, with `child.exp ≤
 //! parent.exp` and bounded chain depth.
 //!
-//! Adversarial coverage (tests): `alg=none`, RS/HS algorithm confusion,
-//! expired / not-yet-valid, oversized TTL, scope escalation at any link,
-//! truncated & tampered tokens, unknown `kid`.
+//! Adversarial coverage (tests): `alg=none`, algorithm confusion (HS256
+//! header against an Ed25519 key), expired / not-yet-valid, oversized TTL,
+//! scope escalation at any link, truncated & tampered tokens, unknown `kid`.
 
 pub mod claims;
 pub mod validator;

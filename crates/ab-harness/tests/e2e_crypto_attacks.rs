@@ -223,10 +223,17 @@ fn verifier_accepts_any_lexical_reordering_of_the_same_receipt() {
     let s = signer();
     let ring = ring(&s);
     let receipt = Receipt::issue(body("sess-lex"), &s).unwrap();
-    // Round-trip through serde_json::Value, which does not preserve object
-    // key order — the verifier re-canonicalizes, so this MUST still verify.
+    // Reverse the top-level key order (this workspace enables serde_json's
+    // preserve_order, so insertion order IS wire order — reversing it
+    // genuinely reorders the serialized bytes). The verifier
+    // re-canonicalizes, so this MUST still verify.
     let as_value: serde_json::Value = serde_json::to_value(&receipt).unwrap();
-    let reserialized = serde_json::to_string(&as_value).unwrap();
+    let object = as_value.as_object().unwrap();
+    let mut reversed = serde_json::Map::new();
+    for (key, value) in object.iter().rev() {
+        reversed.insert(key.clone(), value.clone());
+    }
+    let reserialized = serde_json::to_string(&serde_json::Value::Object(reversed)).unwrap();
     let restored: Receipt = serde_json::from_str(&reserialized).unwrap();
     restored.verify(&ring).expect("lexical reordering broke verify");
 }
@@ -403,9 +410,9 @@ fn small_order_embedded_public_key_cannot_authenticate_a_receipt() {
             p[0] = 1;
             p
         },
-        // order-2 point (0, -1) → encoding: all zeros except sign
+        // order-4 point (y = 0): the all-zero encoding
         [0u8; 32],
-        // 2^255 - 19 - 1 encoding variant with high bit set
+        // order-2 point (0, -1): y = p - 1 = 2^255 - 20, sign bit clear
         {
             let mut p = [0u8; 32];
             p[0] = 0xec;
@@ -490,9 +497,9 @@ fn jcs_key_ordering_uses_utf16_code_units_not_codepoints() {
 
 // ---------------------------------------------------------------------------
 // 16. Trailing garbage after a receipt JSON must be refused. serde_json's
-//     `from_slice` succeeds if the value parses even when garbage follows —
-//     `from_str`/`from_slice` in strict mode should refuse. Confirm both
-//     behaviors so an attacker cannot smuggle a second document.
+//     `from_slice` rejects trailing non-whitespace after a complete value
+//     ("trailing characters") — lock that in so an attacker cannot smuggle
+//     a second document behind a valid receipt.
 // ---------------------------------------------------------------------------
 
 #[test]

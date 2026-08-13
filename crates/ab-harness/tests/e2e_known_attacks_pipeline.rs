@@ -254,10 +254,10 @@ fn cold_store_control_key_derivation_isolates_deployments() {
 }
 
 // ---------------------------------------------------------------------------
-// 9. Broker manifest tampering (attack: an operator ships a partition
-// count that doesn't match the on-disk layout, hoping to redirect writes
-// to a different segment). `EmbeddedBroker::open` compares the on-disk
-// manifest to detect mismatches.
+// 9. Broker re-provision tampering (attack: an operator re-provisions an
+// existing data dir with a different topic/partition layout, hoping to
+// redirect writes to a different segment). `EmbeddedBroker::provision`
+// refuses to provision over an already-provisioned directory.
 // ---------------------------------------------------------------------------
 
 #[test]

@@ -11,10 +11,11 @@
 //!   - line separator + paragraph separator (Cargo::json parsers vs older
 //!     JS parsers disagreed until ES2019)
 //!   - bidi overrides / isolates (CVE-2021-42574 style "Trojan Source")
-//!   - CJK fullwidth ASCII (fullwidth quotes, brackets)
+//!   - CJK fullwidth ASCII (fullwidth letters as confusables)
 //!   - astral-plane / supplementary characters (emoji + math symbols +
 //!     ancient scripts)
-//!   - surrogate half characters (must round-trip cleanly)
+//!   - code points adjacent to the surrogate range (U+D7FF / U+E000 —
+//!     actual surrogate halves cannot exist in valid UTF-8)
 //!   - control characters allowed by JSON (U+0080..U+009F)
 //!   - invalid UTF-8 byte sequences (must be rejected by serde, never
 //!     silently coerced)
@@ -118,8 +119,8 @@ fn session_id_refuses_exotic_control_and_non_ascii_bytes() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Tokenizer never panics on ANY of the exotic classes, and it counts
-//    each non-ASCII grapheme as at least one token so the budget can't be
+// 2. Tokenizer never panics on ANY of the exotic classes, and every one of
+//    these exotic cases yields a non-zero count so the budget can't be
 //    zero-costed by cramming Unicode into a prompt.
 // ---------------------------------------------------------------------------
 
@@ -146,6 +147,7 @@ fn tokenizer_survives_every_exotic_class_and_bills_them() {
     ];
     for s in cases {
         let count = approx_tokens(s);
+        assert!(count >= 1, "exotic case zero-costed: {s:?}");
         assert!(count < 1_000_000, "runaway token count for {s:?}: {count}");
     }
     // Homoglyphs must NOT tokenize identically to their ASCII look-alikes.
@@ -188,10 +190,11 @@ fn jcs_canonicalizes_every_legal_unicode_and_serde_rejects_invalid_utf8() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Unicode normalization confusables — the four canonical forms
-//    (NFC/NFD/NFKC/NFKD) of "café" produce distinct JCS canonical bytes,
-//    so a signature under one form NEVER verifies another. No homoglyph
-//    forgery via normalization.
+// 4. Unicode normalization confusables — NFC and NFD encodings of "café"
+//    plus a fullwidth confusable produce distinct JCS canonical bytes, so
+//    a signature under one form NEVER verifies another. No homoglyph
+//    forgery via normalization. (For "café", NFKC≡NFC and NFKD≡NFD, so
+//    these three variants cover the distinct forms.)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -298,10 +301,10 @@ fn chain_distinguishes_visually_identical_but_bytewise_different_events() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Tokenizer JSON path (`approx_tokens_json`) is monotone on payload
-//    growth and never zeroes out for a non-null value — pathological
-//    inputs (very deep, very wide, exotic-heavy) still produce a positive
-//    token count so budgets can never be silently bypassed.
+// 8. Tokenizer JSON path (`approx_tokens_json`) never zeroes out for a
+//    non-null value — pathological inputs (very deep, very wide,
+//    exotic-heavy) still produce a positive token count so budgets can
+//    never be silently bypassed.
 // ---------------------------------------------------------------------------
 
 #[test]

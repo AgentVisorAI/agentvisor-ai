@@ -15,10 +15,10 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 // ---------------------------------------------------------------------------
-// 1. Concurrent `record_at` with the SAME timestamp: sum of returned totals
-//    is monotonically non-decreasing (each caller sees at least its own
-//    contribution) and the final windowed total equals the total inserted
-//    (nothing lost, nothing double-counted).
+// 1. Concurrent `record_at` with the SAME timestamp: every returned total
+//    covers at least the caller's own contributions so far, and the final
+//    windowed total equals the total inserted (nothing lost, nothing
+//    double-counted).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -33,8 +33,13 @@ fn concurrent_record_at_same_timestamp_never_loses_a_sample() {
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
                 barrier.wait();
-                for _ in 0..K {
-                    v.record_at(42, 1);
+                for k in 0..K {
+                    let total = v.record_at(42, 1);
+                    assert!(
+                        total > k,
+                        "returned total {total} below own contribution {}",
+                        k + 1
+                    );
                 }
             })
         })
@@ -47,10 +52,10 @@ fn concurrent_record_at_same_timestamp_never_loses_a_sample() {
 
 // ---------------------------------------------------------------------------
 // 2. Sliding-window eviction race: writers push samples at advancing
-//    timestamps while a reader concurrently queries `current_at` far ahead
-//    of them. Every reader observation must be ≤ total inserted so far
-//    (no phantom samples), and after quiescing, `current_at` at a distant
-//    future timestamp = 0 (window fully evicted).
+//    timestamps while a reader concurrently queries `current_at(0)` (which
+//    counts everything inserted so far). Every reader observation must be
+//    ≤ total inserted so far (no phantom samples), and after quiescing,
+//    `current_at` at a distant future timestamp = 0 (window fully evicted).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -135,8 +140,8 @@ fn concurrent_record_and_query_yield_consistent_final_total() {
     }
     // After all writers finish, at a large enough `now_ms` every sample
     // inserted at timestamp t ≥ now_ms - window sits inside the window.
-    // With window=10_000 and max t < WRITERS + K = 8 + 1000 = 1008, calling
-    // current_at(1008) includes every sample.
+    // With window=10_000 and max t < WRITERS + K = 8 + 200 = 208, calling
+    // current_at(208) includes every sample.
     let latest = WRITERS as u64 + K;
     assert_eq!(v.current_at(latest), (WRITERS as u64) * K);
 }

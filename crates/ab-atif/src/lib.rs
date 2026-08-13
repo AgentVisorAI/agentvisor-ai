@@ -7,9 +7,10 @@
 //!   (relaxed in v1.7), `trajectory_id` + `subagent_trajectories` (v1.7),
 //!   `agent`, ordered `steps`, `final_metrics`, `extra` (v1.1);
 //! - `Step.step_id` sequential from 1; `source` ∈ {system, user, agent};
-//!   agent-only fields (`reasoning_content`, `model_name`, `tool_calls`,
-//!   `metrics`, `llm_call_count`) rejected on non-agent steps; `observation`
-//!   allowed on agent steps and, since v1.2, system steps;
+//!   agent-only fields (`reasoning_content`, `reasoning_effort`, `model_name`,
+//!   `tool_calls`, `metrics`) rejected on non-agent steps; `observation`
+//!   allowed on agent steps and, since v1.2, system steps; `llm_call_count`
+//!   (v1.7) allowed on any step;
 //! - `Metrics` carries `prompt_tokens` / `completion_tokens` / `cached_tokens`
 //!   / `cost_usd` (+ `logprobs`, `completion_token_ids` v1.3,
 //!   `prompt_token_ids` v1.4) — the cached-token preservation that makes an

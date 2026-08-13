@@ -99,14 +99,14 @@ fn compression_collapse_never_evicts_a_system_role_message() {
 // ---------------------------------------------------------------------------
 // Attack 2. Compression bypass by shape confusion.
 // Attacker sends {"messages": <not-an-array>, "hidden": ...}. The
-// compressor must not crash or leak the hidden field, and must return the
-// payload unchanged.
+// compressor must not crash and must return the payload unchanged — the
+// hidden field neither dropped nor duplicated.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn compression_on_non_chat_shape_returns_payload_unchanged_no_panic() {
     for weird in [
-        json!({"messages": "not an array"}),
+        json!({"messages": "not an array", "hidden": "do-not-touch"}),
         json!({"messages": 42}),
         json!({"messages": null}),
         json!({"messages": [null, true, {"role": "user"}]}),

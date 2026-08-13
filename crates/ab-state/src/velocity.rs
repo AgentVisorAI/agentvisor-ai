@@ -1,6 +1,6 @@
-//! Token-velocity tracking: sliding-window tokens-per-second used for
-//! rate limiting and as the `N+ tokens` arm of the loop-breaker rule
-//! (Module A: Δ≈0 across 3 steps *while consuming N+ tokens*).
+//! Token-velocity tracking: sliding-window tokens-per-second intended for
+//! rate limiting. (The loop-breaker's `N+ tokens` arm uses its own
+//! cumulative per-session counter, not this window.)
 
 use parking_lot::Mutex;
 use std::collections::VecDeque;

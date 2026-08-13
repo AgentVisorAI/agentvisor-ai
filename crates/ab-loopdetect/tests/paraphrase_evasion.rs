@@ -136,10 +136,12 @@ fn hash_breaker_does_not_catch_dissimilar_paraphrase_rotation() {
     let e = HashEmbedder::default();
     let mut trips = 0;
     let pairs = dissimilar_but_same_meaning_pairs();
-    // Cycle 30 steps through the 15 pairs (a, b, a, b, …).
+    // 30 steps: walk the pairs, emitting each pair's two same-meaning
+    // restatements back to back (a0, b0, a1, b1, …) so semantically
+    // equivalent texts really do appear on consecutive steps.
     let session = SessionLoopState::new(cfg);
     for i in 0..30 {
-        let (a, b) = pairs[i % pairs.len()];
+        let (a, b) = pairs[(i / 2) % pairs.len()];
         let step = if i % 2 == 0 { a } else { b };
         if let BreakerVerdict::Tripped { .. } = session.observe(&e, step, 400) {
             trips += 1;

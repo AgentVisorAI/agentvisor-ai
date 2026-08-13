@@ -116,11 +116,19 @@ fn compact_and_pretty_receipt_json_both_verify() {
     via_compact.verify(&ring).unwrap();
     // Interleaved fields (map key reorder in serialization) must also verify
     // because JCS re-canonicalizes.
-    let mut ordered_last: BTreeMap<String, serde_json::Value> = serde_json::from_str(&compact).unwrap();
-    // Move signature_b64 first — client shuffling map order must not matter.
-    let sig = ordered_last.remove("signature_b64").unwrap();
-    ordered_last.insert("signature_b64".to_string(), sig);
-    let shuffled = serde_json::to_string(&ordered_last).unwrap();
+    let parsed: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&compact).unwrap();
+    // Move signature_b64 first — preserve_order is enabled workspace-wide,
+    // so rebuilding the map signature-first genuinely reorders the wire
+    // bytes; client shuffling map order must not matter.
+    let mut shuffled_map = serde_json::Map::new();
+    let sig = parsed.get("signature_b64").unwrap().clone();
+    shuffled_map.insert("signature_b64".to_string(), sig);
+    for (key, value) in parsed {
+        if key != "signature_b64" {
+            shuffled_map.insert(key, value);
+        }
+    }
+    let shuffled = serde_json::to_string(&shuffled_map).unwrap();
     let reshuffled: Receipt = serde_json::from_str(&shuffled).unwrap();
     reshuffled.verify(&ring).unwrap();
 }
@@ -339,6 +347,20 @@ fn broker_fetch_with_max_one_returns_at_most_one_record() {
     }
     let fetched = broker.fetch("agent.tool_call", 0, 0, 1).unwrap();
     assert_eq!(fetched.len(), 1, "max=1 must cap at 1, got {fetched:?}");
+}
+
+#[test]
+fn broker_fetch_with_max_zero_returns_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = EmbeddedBroker::provision(dir.path(), &min_manifest()).unwrap();
+    broker
+        .publish("agent.tool_call", "inst", &json!({"metadata": {"uid": "u-zero"}}))
+        .unwrap();
+    let fetched = broker.fetch("agent.tool_call", 0, 0, 0).unwrap();
+    assert!(
+        fetched.is_empty(),
+        "max=0 must return no records, got {fetched:?}"
+    );
 }
 
 #[test]

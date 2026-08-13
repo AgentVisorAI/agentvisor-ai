@@ -185,8 +185,9 @@ impl WorkerHandle {
         }
     }
 
-    /// Submit without waiting. This is the only submission method used on the
-    /// hot path.
+    /// Submit without waiting. Used by rejection/failure paths; the hot path
+    /// reserves capacity up front via [`WorkerHandle::try_reserve`] and
+    /// submits through [`WorkerPermit::submit`].
     pub fn try_submit(&self, job: WorkerJob) -> Result<(), SubmitError> {
         let capacity_permit = self.try_capacity()?;
         let Some(sender) = self.sender_for(&job.session.id).cloned() else {
@@ -305,7 +306,8 @@ impl WorkerHandle {
     }
 }
 
-/// Start one ordered worker behind a bounded channel.
+/// Start the session-sharded worker pool (up to 16 shards, each behind a
+/// bounded channel). Ordering is per session via hash sharding.
 pub fn spawn_worker(
     capacity: usize,
     bridge: Arc<dyn EventBus>,
@@ -315,7 +317,7 @@ pub fn spawn_worker(
     spawn_worker_with_sink(capacity, bridge, embedder, Arc::new(NoopVectorSink), metrics)
 }
 
-/// Start one ordered worker with an explicit off-path vector sink.
+/// Start the worker pool with an explicit off-path vector sink.
 pub fn spawn_worker_with_sink(
     capacity: usize,
     bridge: Arc<dyn EventBus>,
@@ -326,7 +328,7 @@ pub fn spawn_worker_with_sink(
     spawn_worker_with_spool(capacity, bridge, embedder, vector_sink, None, metrics)
 }
 
-/// Start one ordered worker with vector persistence and optional ATIF journal.
+/// Start the worker pool with vector persistence and optional ATIF journal.
 pub fn spawn_worker_with_spool(
     capacity: usize,
     bridge: Arc<dyn EventBus>,
@@ -346,7 +348,7 @@ pub fn spawn_worker_with_spool(
     )
 }
 
-/// Start one ordered worker with authenticated active-workflow journals.
+/// Start the worker pool with authenticated active-workflow journals.
 pub fn spawn_worker_with_spool_authenticated(
     capacity: usize,
     bridge: Arc<dyn EventBus>,

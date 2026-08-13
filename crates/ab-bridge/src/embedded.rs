@@ -1,10 +1,15 @@
 //! The embedded file-backed broker — the Bridge reference backend.
 //!
-//! Layout: `<data_dir>/manifest.yaml` + `<data_dir>/topics/<topic>/p<N>.jsonl`
-//! (one JSONL segment per partition; offset = record index). Appends are
-//! serialized per partition; a crash can leave at most one torn trailing line,
-//! which recovery detects, truncates, and *counts* (never silently absorbs —
-//! D13.16).
+//! Layout: `<data_dir>/manifest.yaml` + per partition under
+//! `<data_dir>/topics/<topic>/`: `p<N>.jsonl` (the JSONL segment),
+//! `p<N>.next-offset` (durable high-water mark), and `p<N>.event-uids.jsonl`
+//! (idempotency sidecar). Offsets are stable logical positions: retention
+//! rewrites keep surviving records under their original offsets, so after
+//! expiry the first file line can carry an offset > 0. Segment appends are
+//! serialized per partition; a crash can leave at most one torn trailing
+//! line, which recovery detects, truncates, and *counts* (never silently
+//! absorbs — D13.16). A torn sidecar tail is truncated without counting and
+//! rebuilt from the recovered segment.
 //!
 //! Scope: single-process access (the harness embeds the broker or fronts it).
 //! Cross-process multi-writer setups use the NATS/Kafka connectors.
@@ -129,8 +134,10 @@ impl EmbeddedBroker {
         &self.data_dir
     }
 
-    /// Enforce per-topic hot retention at time `now_ms`: expired records are
-    /// appended to the cold file (when `cold_uri` is a directory path) and
+    /// Enforce per-topic hot retention at time `now_ms`: each expired record
+    /// is exported to the cold tier as its own write-once object (via the
+    /// authenticated `ColdArchive` for `scheme://` URIs, or
+    /// `write_cold_event_once` for local directory paths) before being
     /// removed from the hot segment via atomic rewrite. Returns the number of
     /// records expired.
     pub fn enforce_retention(&self, now_ms: u64) -> Result<u64, BusError> {
@@ -548,7 +555,7 @@ impl EventBus for EmbeddedBroker {
         // Hold the partition lock across the entire read so a concurrent
         // enforce_retention rename cannot swap the segment mid-read.
         let part = slot.lock();
-        if !part.path.exists() {
+        if max == 0 || !part.path.exists() {
             return Ok(Vec::new());
         }
         let reader = BufReader::new(fs::File::open(&part.path)?);

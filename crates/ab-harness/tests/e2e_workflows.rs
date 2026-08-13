@@ -289,9 +289,9 @@ async fn signed_close_emits_a_receipt_event_to_the_receipt_topic() {
 }
 
 // ------------------------------------------------------------------
-// 7. Concurrent close + promote race on an unsigned session:
-//    exactly one promote succeeds; the losing side sees a promoted
-//    receipt (idempotency).
+// 7. Promote race on a closed unsigned session: 8 concurrent promotes
+//    all succeed and return the byte-identical receipt (idempotency —
+//    no forked chains).
 // ------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

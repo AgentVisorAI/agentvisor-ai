@@ -14,16 +14,6 @@
 use ab_sandbox::rpc::{self, RpcError};
 use serde_json::{json, Value};
 
-fn well_formed_tool_call() -> Vec<u8> {
-    serde_json::to_vec(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {"name": "t", "arguments": {}}
-    }))
-    .unwrap()
-}
-
 // ---------------------------------------------------------------------------
 // 1. Byte cap: (MAX_PAYLOAD_BYTES + 1) refused with the typed TooLarge
 //    error before any JSON parsing runs.
@@ -43,26 +33,28 @@ fn one_byte_over_cap_is_refused_with_typed_error() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Byte cap boundary: a well-formed request sized to just under the cap
+// 2. Byte cap boundary: a well-formed request sized exactly AT the cap
 //    parses successfully. Proves the check is `>` not `>=` and that no
 //    memory-clamping bug corrupts near-cap payloads.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn payload_just_under_cap_still_parses_successfully() {
-    let base = well_formed_tool_call();
-    // Pad the arguments string field until total is ~MAX-2 KiB (safety
-    // margin for JSON overhead). This proves near-cap inputs work.
-    let target = rpc::MAX_PAYLOAD_BYTES - 2 * 1024;
-    let padding = target.saturating_sub(base.len());
-    let payload = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {"name": "t", "arguments": {"pad": "a".repeat(padding)}}
-    });
-    let raw = serde_json::to_vec(&payload).unwrap();
-    assert!(raw.len() <= rpc::MAX_PAYLOAD_BYTES);
+fn payload_exactly_at_cap_still_parses_successfully() {
+    // Measure the JSON overhead with an empty pad, then pad the arguments
+    // string until the serialized payload is exactly MAX_PAYLOAD_BYTES
+    // ("a" adds one byte per char — no JSON escaping).
+    let build = |padding: usize| {
+        serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "t", "arguments": {"pad": "a".repeat(padding)}}
+        }))
+        .unwrap()
+    };
+    let overhead = build(0).len();
+    let raw = build(rpc::MAX_PAYLOAD_BYTES - overhead);
+    assert_eq!(raw.len(), rpc::MAX_PAYLOAD_BYTES);
     let parsed = rpc::parse_tool_call(&raw).unwrap();
     assert_eq!(parsed.tool, "t");
 }

@@ -352,7 +352,10 @@ fn stringified_payout_amount_does_not_bypass_the_budget_gate() {
     // that would blow the $10 cap silently while still allowing the call.
     if let ToolVerdict::Allowed { .. } = verdict {
         // If allowed, the stored payout must remain within the budget cap.
-        let spent = store.get("budget:sess:payout").unwrap_or(0);
+        // Read the real budget key: budget:{sha256(session)[..32]}:payout.
+        let digest = ab_core::digest::sha256_hex(b"sess");
+        let key = format!("budget:{{{}}}:payout", digest.get(..32).unwrap());
+        let spent = store.get(&key).unwrap_or(0);
         assert!(
             spent <= 10 * 1_000_000,
             "stringified amount slipped past the budget: spent={spent}"
@@ -421,7 +424,8 @@ fn signature_oracle_reveals_nothing_that_would_forge_a_new_receipt() {
     // 200 distinct canonicalized bodies must yield 200 distinct signatures.
     assert_eq!(sigs.lock().len(), 200);
     // Cross-check: try to reuse any one signature under a fresh forged
-    // body — must fail. Picks the first signature deterministically.
+    // body — must fail. HashMap iteration order is arbitrary; any stolen
+    // signature must fail equally.
     let stolen_sig: String = sigs.lock().values().next().unwrap().clone();
     let mut forged_body = ab_receipts::ReceiptBody {
         receipt_version: 1,

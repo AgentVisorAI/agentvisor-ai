@@ -132,8 +132,9 @@ fn concurrent_add_operations_sum_exactly() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Mixed add + try_spend race: at all times spent ≤ added; never a
-//    negative snapshot and never a spend that outran the deposits.
+// 4. Mixed add + try_spend race: adds are exact (final total = ADDERS × K),
+//    concurrent `get` never returns a poisoned value, and the shadow spend
+//    key's final count equals the number of successful spends.
 // ---------------------------------------------------------------------------
 
 #[test]
