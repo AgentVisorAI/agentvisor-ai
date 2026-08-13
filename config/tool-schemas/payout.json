@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["amount_usd", "recipient"],
+  "properties": {
+    "amount_usd": { "type": "number", "exclusiveMinimum": 0, "maximum": 50 },
+    "recipient": { "type": "string", "minLength": 1, "maxLength": 256 }
+  }
+}

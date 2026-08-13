@@ -51,10 +51,16 @@ pub fn parse_tool_call(raw: &[u8]) -> Result<ToolCallRequest, RpcError> {
     if depth_of(&v, 0) > MAX_JSON_DEPTH {
         return Err(RpcError::NotJsonRpc("nesting exceeds depth bound".into()));
     }
-    let obj = v.as_object().ok_or_else(|| RpcError::NotJsonRpc("root is not an object".into()))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| RpcError::NotJsonRpc("root is not an object".into()))?;
     match obj.get("jsonrpc").and_then(Value::as_str) {
         Some("2.0") => {}
-        other => return Err(RpcError::NotJsonRpc(format!("jsonrpc field is {other:?}, need \"2.0\""))),
+        other => {
+            return Err(RpcError::NotJsonRpc(format!(
+                "jsonrpc field is {other:?}, need \"2.0\""
+            )))
+        }
     }
     let method = obj
         .get("method")
@@ -72,11 +78,23 @@ pub fn parse_tool_call(raw: &[u8]) -> Result<ToolCallRequest, RpcError> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| RpcError::BadParams("params.name missing or empty".into()))?;
-    let arguments = params.get("arguments").cloned().unwrap_or_else(|| Value::Object(Default::default()));
+    if ab_core::text::contains_bidi_or_zero_width(tool) {
+        return Err(RpcError::BadParams(
+            "params.name carries a bidi/zero-width spoofing character".into(),
+        ));
+    }
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Default::default()));
     if !arguments.is_object() {
         return Err(RpcError::BadParams("params.arguments must be an object".into()));
     }
-    Ok(ToolCallRequest { id: obj.get("id").cloned(), tool: tool.to_owned(), arguments })
+    Ok(ToolCallRequest {
+        id: obj.get("id").cloned(),
+        tool: tool.to_owned(),
+        arguments,
+    })
 }
 
 fn depth_of(v: &Value, current: usize) -> usize {
@@ -84,12 +102,16 @@ fn depth_of(v: &Value, current: usize) -> usize {
         return current; // early-out: no need to recurse further
     }
     match v {
-        Value::Array(items) => {
-            items.iter().map(|i| depth_of(i, current + 1)).max().unwrap_or(current + 1)
-        }
-        Value::Object(map) => {
-            map.values().map(|i| depth_of(i, current + 1)).max().unwrap_or(current + 1)
-        }
+        Value::Array(items) => items
+            .iter()
+            .map(|i| depth_of(i, current + 1))
+            .max()
+            .unwrap_or(current + 1),
+        Value::Object(map) => map
+            .values()
+            .map(|i| depth_of(i, current + 1))
+            .max()
+            .unwrap_or(current + 1),
         _ => current,
     }
 }
@@ -110,7 +132,12 @@ pub fn authorization_error(id: Option<&Value>, reason: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use proptest::prelude::*;
@@ -146,9 +173,18 @@ mod tests {
     #[test]
     fn rejects_malformed_shapes() {
         assert!(matches!(parse_tool_call(b"not json"), Err(RpcError::Json(_))));
-        assert!(matches!(parse_tool_call(b"[1,2,3]"), Err(RpcError::NotJsonRpc(_))));
-        assert!(matches!(parse_tool_call(br#"{"jsonrpc":"1.0","method":"tools/call"}"#), Err(RpcError::NotJsonRpc(_))));
-        assert!(matches!(parse_tool_call(br#"{"jsonrpc":"2.0"}"#), Err(RpcError::NotJsonRpc(_))));
+        assert!(matches!(
+            parse_tool_call(b"[1,2,3]"),
+            Err(RpcError::NotJsonRpc(_))
+        ));
+        assert!(matches!(
+            parse_tool_call(br#"{"jsonrpc":"1.0","method":"tools/call"}"#),
+            Err(RpcError::NotJsonRpc(_))
+        ));
+        assert!(matches!(
+            parse_tool_call(br#"{"jsonrpc":"2.0"}"#),
+            Err(RpcError::NotJsonRpc(_))
+        ));
         assert!(matches!(
             parse_tool_call(br#"{"jsonrpc":"2.0","method":"resources/read"}"#),
             Err(RpcError::NotToolCall(_))
@@ -173,6 +209,14 @@ mod tests {
     fn oversized_payload_rejected_before_parse() {
         let huge = vec![b'x'; MAX_PAYLOAD_BYTES + 1];
         assert!(matches!(parse_tool_call(&huge), Err(RpcError::TooLarge(..))));
+    }
+
+    #[test]
+    fn max_payload_bytes_is_pinned_at_4_mib() {
+        // The DoS-guard cap is part of the public API. A `*` -> `+` mutation
+        // in `4 * 1024 * 1024` would slip past size-relative asserts because
+        // both sides self-reference the constant; pin the absolute value.
+        assert_eq!(MAX_PAYLOAD_BYTES, 4_194_304);
     }
 
     #[test]
@@ -208,6 +252,31 @@ mod tests {
         #[test]
         fn never_panics_on_arbitrary_json(s in "\\PC{0,500}") {
             let _ = parse_tool_call(s.as_bytes());
+        }
+    }
+
+    /// Tool names carrying a Trojan-Source RLO or any zero-width character
+    /// must be rejected. Otherwise a hostile agent could send a payload
+    /// whose `params.name` renders as `db_write` on an operator's terminal
+    /// while the raw bytes read as a completely different tool identifier,
+    /// spoofing audit chains and receipts.
+    #[test]
+    fn tool_name_carrying_a_bidi_or_zero_width_character_is_rejected() {
+        for spoof in [
+            "db_write\u{202E}etirw_bd",
+            "\u{202E}db_write",
+            "db\u{200B}_write",
+            "db_write\u{200E}",
+            "db_write\u{2066}suffix",
+            "db_write\u{FEFF}",
+        ] {
+            let raw = call(spoof, json!({}));
+            match parse_tool_call(&raw) {
+                Err(RpcError::BadParams(reason)) => {
+                    assert!(reason.contains("spoofing"), "wrong reason: {reason}");
+                }
+                other => panic!("must reject {spoof:?}, got {other:?}"),
+            }
         }
     }
 }

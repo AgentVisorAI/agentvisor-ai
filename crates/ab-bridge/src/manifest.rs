@@ -3,6 +3,9 @@
 //! region or air-gapped enclave from that manifest alone").
 
 use serde::{Deserialize, Serialize};
+#[cfg(any(feature = "nats", feature = "kafka"))]
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 /// Manifest format version (evolution surface).
 pub const MANIFEST_VERSION: u32 = 1;
@@ -19,7 +22,10 @@ pub struct RetentionSpec {
 
 impl Default for RetentionSpec {
     fn default() -> Self {
-        Self { hot_hours: 720, cold_uri: None }
+        Self {
+            hot_hours: 720,
+            cold_uri: None,
+        }
     }
 }
 
@@ -45,8 +51,15 @@ pub struct BridgeManifest {
     pub manifest_version: u32,
     /// Deployment name (region/enclave label).
     pub name: String,
+    /// Broker replication factor for managed Kafka/NATS deployments.
+    #[serde(default = "default_replication_factor")]
+    pub replication_factor: u32,
     /// Topic declarations.
     pub topics: Vec<TopicSpec>,
+}
+
+fn default_replication_factor() -> u32 {
+    1
 }
 
 /// Manifest validation errors.
@@ -70,6 +83,7 @@ impl BridgeManifest {
         Self {
             manifest_version: MANIFEST_VERSION,
             name: name.to_owned(),
+            replication_factor: default_replication_factor(),
             topics: ab_events::EventClass::all()
                 .iter()
                 .map(|c| TopicSpec {
@@ -105,6 +119,11 @@ impl BridgeManifest {
         if self.topics.is_empty() {
             return Err(ManifestError::Invalid("no topics declared".into()));
         }
+        if !(1..=5).contains(&self.replication_factor) {
+            return Err(ManifestError::Invalid(
+                "replication_factor must be between 1 and 5".to_owned(),
+            ));
+        }
         let mut names: Vec<&str> = self.topics.iter().map(|t| t.name.as_str()).collect();
         names.sort_unstable();
         let before = names.len();
@@ -113,23 +132,113 @@ impl BridgeManifest {
             return Err(ManifestError::Invalid("duplicate topic names".into()));
         }
         for t in &self.topics {
-            if t.name.is_empty() {
-                return Err(ManifestError::Invalid("empty topic name".into()));
+            if t.name.is_empty()
+                || !t
+                    .name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+                || t.name == "."
+                || t.name == ".."
+            {
+                return Err(ManifestError::Invalid(format!("unsafe topic name {:?}", t.name)));
             }
             if t.partitions == 0 {
-                return Err(ManifestError::Invalid(format!("topic {:?} has 0 partitions", t.name)));
+                return Err(ManifestError::Invalid(format!(
+                    "topic {:?} has 0 partitions",
+                    t.name
+                )));
             }
             if t.retention.hot_hours == 0 {
-                return Err(ManifestError::Invalid(format!("topic {:?} has 0h retention", t.name)));
+                return Err(ManifestError::Invalid(format!(
+                    "topic {:?} has 0h retention",
+                    t.name
+                )));
+            }
+            if let Some(reference) = &t.schema_ref {
+                let path = Path::new(reference);
+                if path.is_absolute()
+                    || path
+                        .components()
+                        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+                {
+                    return Err(ManifestError::Invalid(format!("unsafe schema_ref {reference:?}")));
+                }
             }
         }
         Ok(())
     }
 }
 
+#[cfg(any(feature = "nats", feature = "kafka"))]
+pub(crate) fn compile_topic_validators(
+    manifest: &BridgeManifest,
+) -> Result<HashMap<String, jsonschema::Validator>, crate::BusError> {
+    let mut validators = HashMap::new();
+    for topic in &manifest.topics {
+        let Some(reference) = &topic.schema_ref else {
+            continue;
+        };
+        let schema = schema_document(reference)?;
+        let validator = jsonschema::validator_for(&schema)
+            .map_err(|error| crate::BusError::Backend(format!("invalid schema {reference:?}: {error}")))?;
+        validators.insert(topic.name.clone(), validator);
+    }
+    Ok(validators)
+}
+
+#[cfg(any(feature = "nats", feature = "kafka"))]
+pub(crate) fn validate_topic_event(
+    validators: &HashMap<String, jsonschema::Validator>,
+    topic: &str,
+    value: &serde_json::Value,
+) -> Result<(), crate::BusError> {
+    let Some(validator) = validators.get(topic) else {
+        return Ok(());
+    };
+    let errors: Vec<String> = validator
+        .iter_errors(value)
+        .take(3)
+        .map(|error| error.to_string())
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(crate::BusError::Backend(format!(
+            "event rejected by schema for topic {topic:?}: {}",
+            errors.join("; ")
+        )))
+    }
+}
+
+pub(crate) fn schema_document(reference: &str) -> Result<serde_json::Value, crate::BusError> {
+    if reference == "schemas/ocsf-agent-event.schema.json" {
+        return serde_json::from_str(include_str!("../../../schemas/ocsf-agent-event.schema.json"))
+            .map_err(crate::BusError::from);
+    }
+    let direct = PathBuf::from(reference);
+    if direct.exists() {
+        return serde_json::from_slice(&std::fs::read(direct)?).map_err(crate::BusError::from);
+    }
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(reference);
+    if workspace.exists() {
+        serde_json::from_slice(&std::fs::read(workspace)?).map_err(crate::BusError::from)
+    } else {
+        Err(crate::BusError::Backend(format!(
+            "schema reference {reference:?} could not be resolved"
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
 
@@ -162,11 +271,24 @@ mod tests {
         assert!(matches!(m.validate(), Err(ManifestError::Invalid(_))));
 
         let mut m = BridgeManifest::default_for("x");
+        m.topics[0].name = "../escape".to_owned();
+        assert!(matches!(m.validate(), Err(ManifestError::Invalid(_))));
+
+        let mut m = BridgeManifest::default_for("x");
+        m.topics[0].schema_ref = Some("../outside.json".to_owned());
+        assert!(matches!(m.validate(), Err(ManifestError::Invalid(_))));
+
+        let mut m = BridgeManifest::default_for("x");
         let dup = m.topics[0].clone();
         m.topics.push(dup);
         assert!(matches!(m.validate(), Err(ManifestError::Invalid(_))));
 
-        let m = BridgeManifest { manifest_version: MANIFEST_VERSION, name: String::new(), topics: vec![] };
+        let m = BridgeManifest {
+            manifest_version: MANIFEST_VERSION,
+            name: String::new(),
+            replication_factor: 1,
+            topics: vec![],
+        };
         assert!(m.validate().is_err());
     }
 
@@ -176,5 +298,15 @@ mod tests {
             BridgeManifest::from_yaml(":\n  - not: [valid"),
             Err(ManifestError::Parse(_))
         ));
+    }
+
+    #[test]
+    fn default_manifest_matches_shipped_json_schema() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/bridge-manifest.schema.json")).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let value = serde_json::to_value(BridgeManifest::default_for("schema-test")).unwrap();
+        let errors: Vec<_> = validator.iter_errors(&value).collect();
+        assert!(errors.is_empty(), "{errors:?}");
     }
 }

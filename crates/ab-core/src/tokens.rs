@@ -35,11 +35,26 @@ pub fn approx_tokens(text: &str) -> u64 {
 }
 
 /// Approximate token count for a serialized JSON value.
+///
+/// Reuses a thread-local byte buffer for JSON serialization, so on repeated
+/// calls no per-call allocation happens (the buffer grows to the peak size
+/// once and then stays). Called on every request through `prepare_chat`.
 pub fn approx_tokens_json(value: &serde_json::Value) -> u64 {
-    match serde_json::to_string(value) {
-        Ok(s) => approx_tokens(&s),
-        Err(_) => 0,
+    use std::cell::RefCell;
+    thread_local! {
+        static BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     }
+    BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        if serde_json::to_writer(&mut *buf, value).is_err() {
+            return 0;
+        }
+        match std::str::from_utf8(&buf) {
+            Ok(s) => approx_tokens(s),
+            Err(_) => 0,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -71,6 +86,23 @@ mod tests {
     #[test]
     fn emoji_do_not_panic() {
         assert!(approx_tokens("🎉🎉🎉") >= 3);
+    }
+
+    #[test]
+    fn approx_tokens_json_reflects_payload_size() {
+        // Catches `approx_tokens_json -> 0 / 1` stubs: a non-empty payload
+        // must produce more tokens than an empty one.
+        let empty = approx_tokens_json(&serde_json::json!({}));
+        let small = approx_tokens_json(&serde_json::json!({"k": "v"}));
+        let bigger = approx_tokens_json(&serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "hello world"},
+                {"role": "assistant", "content": "hi back"},
+            ]
+        }));
+        assert!(small > empty, "small={small} not > empty={empty}");
+        assert!(bigger > small, "bigger={bigger} not > small={small}");
+        assert!(bigger >= 4);
     }
 
     proptest! {

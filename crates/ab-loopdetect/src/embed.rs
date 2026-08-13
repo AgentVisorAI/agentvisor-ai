@@ -7,6 +7,11 @@ pub trait Embedder: Send + Sync {
     /// Embed `text`. Must return an L2-normalized vector of length `dim()`
     /// (the zero vector is allowed for empty/degenerate input).
     fn embed(&self, text: &str) -> Vec<f32>;
+    /// Fallible embedding path used by production workers. Deterministic
+    /// embedders use the infallible default implementation.
+    fn try_embed(&self, text: &str) -> Result<Vec<f32>, String> {
+        Ok(self.embed(text))
+    }
 }
 
 /// Character-n-gram feature-hashing embedder.
@@ -32,18 +37,6 @@ impl HashEmbedder {
     pub fn new(dim: usize) -> Self {
         Self { dim: dim.max(8) }
     }
-}
-
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h = FNV_OFFSET;
-    for b in bytes {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    h
 }
 
 impl Embedder for HashEmbedder {
@@ -103,7 +96,7 @@ impl Embedder for HashEmbedder {
 }
 
 fn bump(v: &mut [f32], gram: &str, dim: usize) {
-    let h = fnv1a(gram.as_bytes());
+    let h = ab_core::hash::fnv1a(gram.as_bytes());
     #[allow(clippy::cast_possible_truncation)]
     let idx = (h % dim as u64) as usize;
     let sign = if (h >> 63) == 0 { 1.0 } else { -1.0 };

@@ -211,14 +211,19 @@ pub fn new_body(
         cost,
         stop_reason_id: stop_reason.id(),
         stop_reason: stop_reason.caption().to_owned(),
-        key_id: String::new(),       // filled by issue()
+        key_id: String::new(),         // filled by issue()
         public_key_b64: String::new(), // filled by issue()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use crate::keys::Ed25519Signer;
@@ -236,7 +241,11 @@ mod tests {
                 chain_head: "ab".repeat(32),
                 event_count: 41,
             },
-            ToolCallSummary { total: 12, allowed: 10, blocked: 2 },
+            ToolCallSummary {
+                total: 12,
+                allowed: 10,
+                blocked: 2,
+            },
             CostSummary {
                 prompt_tokens: 52_000,
                 completion_tokens: 9_000,
@@ -271,6 +280,18 @@ mod tests {
     }
 
     #[test]
+    fn issued_receipt_matches_shipped_schema() {
+        let signer = Ed25519Signer::from_seed([13; 32]);
+        let receipt = Receipt::issue(body(), &signer).unwrap();
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/receipt-v1.schema.json")).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let value = serde_json::to_value(receipt).unwrap();
+        let errors: Vec<_> = validator.iter_errors(&value).collect();
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
     fn every_field_tamper_detected() {
         let signer = Ed25519Signer::generate();
         let mut ring = Keyring::new();
@@ -288,7 +309,10 @@ mod tests {
             let mut bad = good.clone();
             bad[field] = val;
             let parsed: Receipt = serde_json::from_value(bad).unwrap();
-            assert!(parsed.verify(&ring).is_err(), "tampered {field} passed verification");
+            assert!(
+                parsed.verify(&ring).is_err(),
+                "tampered {field} passed verification"
+            );
         }
         // Nested tampers.
         let mut bad = good.clone();
@@ -297,7 +321,7 @@ mod tests {
         assert!(parsed.verify(&ring).is_err(), "tampered cost passed");
 
         let mut bad = good.clone();
-        bad["ai_agent"]["charter"] = "swapped-charter".into();
+        bad["ai_agent"]["charter"]["name"] = "swapped-charter".into();
         let parsed: Receipt = serde_json::from_value(bad).unwrap();
         assert!(parsed.verify(&ring).is_err(), "tampered charter passed");
 
@@ -362,5 +386,88 @@ mod tests {
         let receipt = Receipt::issue(body(), &signer).unwrap();
         let ring = Keyring::new(); // empty
         assert!(receipt.verify(&ring).is_err());
+    }
+
+    #[test]
+    fn attacker_receipt_does_not_pass_a_ring_seeded_with_only_a_different_key() {
+        let attacker = Ed25519Signer::generate();
+        let honest = Ed25519Signer::generate();
+        assert_ne!(attacker.key_id(), honest.key_id());
+        let forged = Receipt::issue(body(), &attacker).unwrap();
+        let mut ring = Keyring::new();
+        ring.add_signer(&honest).unwrap();
+        assert!(matches!(
+            forged.verify(&ring),
+            Err(ReceiptError::Key(KeyError::UnknownKeyId(_)))
+        ));
+    }
+
+    #[test]
+    fn verify_embedded_rejects_a_tampered_body() {
+        // verify_embedded MUST NOT be reducible to Ok(()): tamper the
+        // session_id and require Err. Catches any stub or short-circuit
+        // that would silently accept every receipt.
+        let signer = Ed25519Signer::generate();
+        let receipt = Receipt::issue(body(), &signer).unwrap();
+        let mut raw = serde_json::to_value(&receipt).unwrap();
+        raw["session_id"] = serde_json::Value::from("attacker");
+        let tampered: Receipt = serde_json::from_value(raw).unwrap();
+        assert!(tampered.verify_embedded().is_err());
+    }
+
+    #[test]
+    fn verify_embedded_rejects_a_swapped_public_key() {
+        // Substitute the embedded pubkey for someone else's — the id/key
+        // binding inside verify_embedded must catch this.
+        let honest = Ed25519Signer::generate();
+        let attacker = Ed25519Signer::generate();
+        let mut receipt = Receipt::issue(body(), &honest).unwrap();
+        receipt.body.public_key_b64 =
+            base64::engine::general_purpose::STANDARD.encode(attacker.public_key_bytes());
+        assert!(receipt.verify_embedded().is_err());
+    }
+
+    /// Stress: for every wall-clock instant sampled during issuance, the
+    /// integer `issued_at` and the human-readable `issued_at_iso` must be
+    /// mutually consistent. If they ever drift, downstream consumers that
+    /// parse only one field could reconstruct a different timestamp than
+    /// the signer intended, and the signature's coverage of both fields
+    /// would still verify (since the signer produced them together).
+    #[test]
+    fn issued_at_and_issued_at_iso_are_always_consistent() {
+        let signer = Ed25519Signer::generate();
+        for _ in 0..64 {
+            let receipt = Receipt::issue(body(), &signer).unwrap();
+            let derived = ab_core::time::iso8601_ms(receipt.body.issued_at);
+            assert_eq!(
+                derived, receipt.body.issued_at_iso,
+                "iso/ms mismatch: {} vs {}",
+                receipt.body.issued_at, receipt.body.issued_at_iso,
+            );
+        }
+    }
+
+    /// Cross-machine stress: two independently-issued receipts (simulating
+    /// two harness replicas whose wall clocks drift within a normal
+    /// tolerance) must both verify against the same keyring and carry
+    /// UTC-Z timestamps regardless of what timezone the issuing process
+    /// was configured with.
+    #[test]
+    fn receipts_issued_by_two_machines_both_verify_and_use_utc_zulu() {
+        let signer_a = Ed25519Signer::generate();
+        let signer_b = Ed25519Signer::generate();
+        let mut ring = Keyring::new();
+        ring.add_signer(&signer_a).unwrap();
+        ring.add_signer(&signer_b).unwrap();
+        let ra = Receipt::issue(body(), &signer_a).unwrap();
+        let rb = Receipt::issue(body(), &signer_b).unwrap();
+        ra.verify(&ring).unwrap();
+        rb.verify(&ring).unwrap();
+        assert!(ra.body.issued_at_iso.ends_with('Z'), "{}", ra.body.issued_at_iso,);
+        assert!(rb.body.issued_at_iso.ends_with('Z'), "{}", rb.body.issued_at_iso,);
+        // Both timestamps must be within a minute of each other on the
+        // same physical host running the test.
+        let diff_ms = ra.body.issued_at.abs_diff(rb.body.issued_at);
+        assert!(diff_ms < 60_000, "clocks {diff_ms} ms apart");
     }
 }

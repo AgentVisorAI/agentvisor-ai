@@ -43,7 +43,10 @@ pub struct NhiClaims {
 impl NhiClaims {
     /// True when `candidate`'s scopes are a subset of `self`'s.
     pub fn scopes_cover(&self, candidate: &NhiClaims) -> bool {
-        candidate.scopes.iter().all(|s| self.scopes.iter().any(|p| p == s))
+        candidate
+            .scopes
+            .iter()
+            .all(|s| self.scopes.iter().any(|p| p == s))
     }
 }
 

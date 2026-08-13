@@ -1,0 +1,32 @@
+config_version = 1
+listen = "0.0.0.0:8484"
+upstream_url = "http://host.docker.internal:4000"
+upstream_http2_prior_knowledge = false
+upstream_read_timeout_s = 300
+# tool_upstream_url = "http://host.docker.internal:3000/mcp"
+require_identity = false
+audience = "agent-bridge"
+default_workflow = "unsigned"
+consequential_tools = ["db_write", "payout", "merge", "deploy"]
+session_idle_close_s = 900
+atif_spool_dir = "spool/atif"
+bridge_data_dir = "data/bridge"
+worker_channel_capacity = 32768
+strict_stage_budget = false
+compression_enabled = true
+reconcile_tick_s = 5
+
+[breaker]
+delta_epsilon = 0.30
+window = 3
+min_tokens = 1000
+action = "reject"
+
+[budget]
+max_tokens = 200000
+max_payout_usd_micros = 50000000
+max_total_tool_calls = 100
+
+[budget.max_tool_calls]
+db_write = 3
+payout = 10

@@ -15,7 +15,10 @@ pub struct TokenVelocity {
 impl TokenVelocity {
     /// Create a tracker with the given window size in milliseconds.
     pub fn new(window_ms: u64) -> Self {
-        Self { window_ms: window_ms.max(1), samples: Mutex::new(VecDeque::new()) }
+        Self {
+            window_ms: window_ms.max(1),
+            samples: Mutex::new(VecDeque::new()),
+        }
     }
 
     /// Record `tokens` at time `now_ms` and return the windowed total.
@@ -38,7 +41,11 @@ impl TokenVelocity {
     pub fn current_at(&self, now_ms: u64) -> u64 {
         let samples = self.samples.lock();
         let cutoff = now_ms.saturating_sub(self.window_ms);
-        samples.iter().filter(|(t, _)| *t >= cutoff).map(|(_, n)| *n).sum()
+        samples
+            .iter()
+            .filter(|(t, _)| *t >= cutoff)
+            .map(|(_, n)| *n)
+            .sum()
     }
 }
 
@@ -75,5 +82,19 @@ mod tests {
         // Skewed clock: earlier timestamp after a later one.
         let total = v.record_at(4000, 5);
         assert!(total >= 5, "must count at least the new sample, got {total}");
+    }
+
+    #[test]
+    fn record_returns_the_windowed_total_including_the_new_sample() {
+        // The wall-clock `record` wrapper must not be reducible to a
+        // constant (mutant misses on `record -> 0 / 1`).
+        let v = TokenVelocity::new(60_000);
+        let first = v.record(7);
+        assert_eq!(first, 7, "first record must return the value just written");
+        let second = v.record(3);
+        assert_eq!(
+            second, 10,
+            "second record must reflect both samples inside the window"
+        );
     }
 }

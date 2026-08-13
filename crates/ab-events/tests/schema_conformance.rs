@@ -1,7 +1,12 @@
 //! Cross-validation of emitted events against the shipped JSON Schema
 //! (schemas/ocsf-agent-event.schema.json). Guarantees the Rust model and the
 //! published schema never drift (silent-error class D13.3/17).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 #![allow(clippy::type_complexity)]
 
 use ab_events::{
@@ -92,14 +97,29 @@ fn schema_rejects_tampered_events() {
 
     // Each mutation must be caught by the schema — no silent pass.
     let mutations: Vec<(&str, Box<dyn Fn(&mut serde_json::Value)>)> = vec![
-        ("wrong ocsf version", Box::new(|v| v["metadata"]["version"] = "9.9.9".into())),
-        ("empty instance_uid", Box::new(|v| v["ai_agent"]["instance_uid"] = "".into())),
-        ("unknown class", Box::new(|v| v["class_name"] = "agent.bogus".into())),
-        ("orphan stop_reason_id", Box::new(|v| v["stop_reason_id"] = 90.into())),
+        (
+            "wrong ocsf version",
+            Box::new(|v| v["metadata"]["version"] = "9.9.9".into()),
+        ),
+        (
+            "empty instance_uid",
+            Box::new(|v| v["ai_agent"]["instance_uid"] = "".into()),
+        ),
+        (
+            "unknown class",
+            Box::new(|v| v["class_name"] = "agent.bogus".into()),
+        ),
+        (
+            "orphan stop_reason_id",
+            Box::new(|v| v["stop_reason_id"] = 90.into()),
+        ),
         ("severity 0", Box::new(|v| v["severity_id"] = 0.into())),
         ("status 9", Box::new(|v| v["status_id"] = 9.into())),
         ("zero time", Box::new(|v| v["time"] = 0.into())),
-        ("bad iso format", Box::new(|v| v["time_iso"] = "2026-08-10 17:00:00".into())),
+        (
+            "bad iso format",
+            Box::new(|v| v["time_iso"] = "2026-08-10 17:00:00".into()),
+        ),
         (
             "missing identity block",
             Box::new(|v| {
@@ -110,6 +130,9 @@ fn schema_rejects_tampered_events() {
     for (name, mutate) in mutations {
         let mut bad = good.clone();
         mutate(&mut bad);
-        assert!(!schema.is_valid(&bad), "mutation `{name}` slipped through the schema");
+        assert!(
+            !schema.is_valid(&bad),
+            "mutation `{name}` slipped through the schema"
+        );
     }
 }

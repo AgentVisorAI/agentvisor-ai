@@ -1,4 +1,4 @@
-.PHONY: fmt lint test test-all bench sla ci doc clean
+.PHONY: fmt fmt-check lint lint-all-features test test-all bench sla schema-check compose-check ci doc clean
 
 fmt:
 	cargo fmt --all
@@ -20,15 +20,23 @@ test-all:
 
 # Heavy SLA / perf measurement (writes BENCHMARKS.md numbers; see docs)
 sla:
-	RUN_HEAVY_PERF=1 cargo test --workspace --release -- --ignored --nocapture sla_
+	ulimit -n 65536 && RUN_HEAVY_PERF=1 cargo test --workspace --release -- --ignored --nocapture sla_
 
 bench:
 	cargo bench --workspace
 
 doc:
-	RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" cargo doc --workspace --no-deps
+	RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D warnings" cargo doc --workspace --all-features --no-deps
 
-ci: fmt-check lint test doc
+schema-check:
+	for schema in schemas/*.json; do node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$$schema"; done
+	cargo run -q -p ab-cli -- manifest-validate manifests/bridge.example.yaml
+	cargo run -q -p ab-cli -- config-validate config/harness.example.toml
+
+compose-check:
+	docker compose -f docker/docker-compose.yml config >/dev/null
+
+ci: fmt-check lint-all-features test test-all doc schema-check
 	cargo check --workspace --no-default-features
 	cargo check --workspace --all-features
 

@@ -16,14 +16,18 @@ ab-events = { workspace = true }
 ab-atif = { workspace = true }
 ab-receipts = { workspace = true }
 ab-bridge = { workspace = true }
-ab-identity = { workspace = true }
+ab-harness = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
 reqwest = { workspace = true }
 hex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

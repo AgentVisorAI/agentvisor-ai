@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["repository", "pull_request"],
+  "properties": {
+    "repository": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "pull_request": { "type": "integer", "minimum": 1 }
+  }
+}

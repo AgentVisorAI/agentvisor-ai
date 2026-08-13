@@ -16,13 +16,17 @@ parking_lot = { workspace = true }
 [features]
 default = []
 # Redis Cluster backend (brief §8); requires a live server, contract tests gated on AB_REDIS_URL.
-redis = ["dep:redis"]
+redis = ["dep:redis", "dep:r2d2"]
 
 [dependencies.redis]
 version = "0.27"
 optional = true
 default-features = false
-features = ["script"]
+features = ["script", "r2d2", "cluster"]
+
+[dependencies.r2d2]
+workspace = true
+optional = true
 
 [dev-dependencies]
 proptest = { workspace = true }

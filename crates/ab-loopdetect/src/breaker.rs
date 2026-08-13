@@ -43,7 +43,12 @@ impl Default for BreakerConfig {
         // genuinely progressing steps Δ ≈ 0.88–0.98. 0.30 sits between with
         // wide margins on both sides (semantic ONNX embedders push loop
         // deltas even lower, so the margin only grows with better models).
-        Self { delta_epsilon: 0.30, window: 3, min_tokens: 1_000, action: BreakerAction::Reject }
+        Self {
+            delta_epsilon: 0.30,
+            window: 3,
+            min_tokens: 1_000,
+            action: BreakerAction::Reject,
+        }
     }
 }
 
@@ -118,18 +123,44 @@ impl SessionLoopState {
     pub fn state(&self) -> BreakerState {
         self.inner.lock().state
     }
+    /// Configured enforcement action when the breaker is open.
+    pub fn action(&self) -> BreakerAction {
+        self.cfg.action
+    }
 
     /// Observe one reasoning step (worker thread): embed, compute Δ against
     /// the previous step, update the streak, return the verdict.
     pub fn observe(&self, embedder: &dyn Embedder, text: &str, step_tokens: u64) -> BreakerVerdict {
         let embedding = embedder.embed(text);
+        self.observe_embedding(embedding, step_tokens)
+    }
+
+    /// Observe a precomputed embedding. Workers use this path when the same
+    /// vector is also persisted to an off-path vector sink.
+    pub fn observe_embedding(&self, embedding: Vec<f32>, step_tokens: u64) -> BreakerVerdict {
+        self.observe_embedding_with_similarity(embedding, step_tokens, None)
+    }
+
+    /// Observe an embedding plus an optional nearest prior-session similarity
+    /// supplied by a distributed vector engine.
+    pub fn observe_embedding_with_similarity(
+        &self,
+        embedding: Vec<f32>,
+        step_tokens: u64,
+        nearest_similarity: Option<f32>,
+    ) -> BreakerVerdict {
         let mut inner = self.inner.lock();
         inner.tokens_consumed = inner.tokens_consumed.saturating_add(step_tokens);
 
-        let delta = match &inner.prev_embedding {
+        let adjacent_delta = match &inner.prev_embedding {
             Some(prev) => 1.0 - cosine(prev, &embedding),
             None => 1.0, // first step: maximum novelty by definition
         };
+        let delta = nearest_similarity
+            .filter(|similarity| similarity.is_finite())
+            .map_or(adjacent_delta, |similarity| {
+                adjacent_delta.min(1.0 - similarity.clamp(-1.0, 1.0))
+            });
         inner.prev_embedding = Some(embedding);
         inner.deltas.push_back(delta);
         if inner.deltas.len() > 32 {
@@ -151,21 +182,24 @@ impl SessionLoopState {
                 action: self.cfg.action,
             }
         } else if inner.streak > 0 {
-            BreakerVerdict::Suspicious { delta, streak: inner.streak }
+            BreakerVerdict::Suspicious {
+                delta,
+                streak: inner.streak,
+            }
         } else {
             BreakerVerdict::Progressing { delta }
         }
     }
 
     /// Manually reset (e.g. after a corrective injection gave the agent a new
-    /// direction). Clears the streak and closes the breaker but keeps token
-    /// accounting.
+    /// direction). Clears the streak, the token floor, and closes the breaker.
     pub fn reset(&self) {
         let mut inner = self.inner.lock();
         inner.streak = 0;
         inner.state = BreakerState::Closed;
         inner.prev_embedding = None;
         inner.deltas.clear();
+        inner.tokens_consumed = 0;
     }
 }
 
@@ -177,7 +211,10 @@ mod tests {
     use crate::embed::HashEmbedder;
 
     fn cfg() -> BreakerConfig {
-        BreakerConfig { min_tokens: 1000, ..BreakerConfig::default() }
+        BreakerConfig {
+            min_tokens: 1000,
+            ..BreakerConfig::default()
+        }
     }
 
     #[test]
@@ -186,10 +223,19 @@ mod tests {
         let e = HashEmbedder::default();
         let text = "I should check the database again for the pending orders";
         // Step 1 establishes the baseline (delta = 1.0).
-        assert!(matches!(s.observe(&e, text, 400), BreakerVerdict::Progressing { .. }));
+        assert!(matches!(
+            s.observe(&e, text, 400),
+            BreakerVerdict::Progressing { .. }
+        ));
         // Steps 2-3: identical → streak builds but token gate also applies.
-        assert!(matches!(s.observe(&e, text, 400), BreakerVerdict::Suspicious { streak: 1, .. }));
-        assert!(matches!(s.observe(&e, text, 400), BreakerVerdict::Suspicious { streak: 2, .. }));
+        assert!(matches!(
+            s.observe(&e, text, 400),
+            BreakerVerdict::Suspicious { streak: 1, .. }
+        ));
+        assert!(matches!(
+            s.observe(&e, text, 400),
+            BreakerVerdict::Suspicious { streak: 2, .. }
+        ));
         // Step 4: streak 3 + 1600 tokens ≥ 1000 → tripped (≤ 3 cycles after baseline).
         let v = s.observe(&e, text, 400);
         assert!(matches!(v, BreakerVerdict::Tripped { streak: 3, .. }), "{v:?}");
@@ -243,8 +289,12 @@ mod tests {
         s.observe(&e, looped, 800);
         s.observe(&e, looped, 800); // streak 1
         s.observe(&e, looped, 800); // streak 2
-        // Progress breaks the streak before it reaches 3.
-        let v = s.observe(&e, "completely new direction: escalate to the human operator with log excerpts", 800);
+                                    // Progress breaks the streak before it reaches 3.
+        let v = s.observe(
+            &e,
+            "completely new direction: escalate to the human operator with log excerpts",
+            800,
+        );
         assert!(matches!(v, BreakerVerdict::Progressing { .. }), "{v:?}");
         // Next looped step compares against the *progress* text → still novel
         // (streak 0); only the one after that restarts the streak at 1.
@@ -265,6 +315,30 @@ mod tests {
         assert_eq!(s.state(), BreakerState::Open);
         s.reset();
         assert_eq!(s.state(), BreakerState::Closed);
-        assert!(matches!(s.observe(&e, t, 500), BreakerVerdict::Progressing { .. }));
+        assert!(matches!(
+            s.observe(&e, t, 500),
+            BreakerVerdict::Progressing { .. }
+        ));
+    }
+
+    #[test]
+    fn distributed_similarity_detects_periodic_dag_loop() {
+        let s = SessionLoopState::new(BreakerConfig {
+            window: 2,
+            min_tokens: 0,
+            ..BreakerConfig::default()
+        });
+        assert!(matches!(
+            s.observe_embedding_with_similarity(vec![1.0, 0.0], 10, None),
+            BreakerVerdict::Progressing { .. }
+        ));
+        assert!(matches!(
+            s.observe_embedding_with_similarity(vec![0.0, 1.0], 10, Some(0.99)),
+            BreakerVerdict::Suspicious { streak: 1, .. }
+        ));
+        assert!(matches!(
+            s.observe_embedding_with_similarity(vec![-1.0, 0.0], 10, Some(0.99)),
+            BreakerVerdict::Tripped { streak: 2, .. }
+        ));
     }
 }

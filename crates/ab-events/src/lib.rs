@@ -14,8 +14,8 @@ pub mod stop_reason;
 pub mod validate;
 
 pub use model::{
-    AgentIdentity, EventClass, EventMetrics, Fingerprint, Metadata, OcsfEvent, OcsfEventBuilder,
-    StatusId, OCSF_VERSION, PRODUCT_NAME,
+    AgentIdentity, CharterFile, EventClass, EventMetrics, Fingerprint, Metadata, OcsfEvent, OcsfEventBuilder,
+    Product, StatusId, CATEGORY_UID, OCSF_VERSION, PRODUCT_NAME,
 };
 pub use stop_reason::StopReason;
 pub use validate::{validate_event, ValidationError};

@@ -23,6 +23,12 @@ pub enum ValidationError {
     /// `class_uid` doesn't match the class enum.
     #[error("class_uid {0} does not match class_name")]
     ClassUidMismatch(u32),
+    /// Event is not in the OCSF Application Activity category.
+    #[error("category_uid {0} is not Application Activity (6)")]
+    BadCategory(u8),
+    /// Charter is not represented as an OCSF Regular File.
+    #[error("ai_agent.charter.type_id {0} is not Regular File (1)")]
+    BadCharterType(u8),
     /// Severity outside 1–6.
     #[error("severity_id {0} outside 1..=6")]
     BadSeverity(u8),
@@ -47,20 +53,35 @@ pub fn validate_event(ev: &OcsfEvent) -> Result<(), Vec<ValidationError>> {
     if ev.metadata.version.is_empty() {
         errors.push(ValidationError::EmptyField("metadata.version"));
     }
+    if ev.metadata.product.name.is_empty() {
+        errors.push(ValidationError::EmptyField("metadata.product.name"));
+    }
+    if ev.metadata.product.vendor_name.is_empty() {
+        errors.push(ValidationError::EmptyField("metadata.product.vendor_name"));
+    }
+    if ev.metadata.product.version.is_empty() {
+        errors.push(ValidationError::EmptyField("metadata.product.version"));
+    }
     if ev.session_uid.is_empty() {
         errors.push(ValidationError::EmptyField("session_uid"));
     }
     if ev.ai_agent.version.is_empty() {
         errors.push(ValidationError::EmptyField("ai_agent.version"));
     }
-    if ev.ai_agent.charter.is_empty() {
-        errors.push(ValidationError::EmptyField("ai_agent.charter"));
+    if ev.ai_agent.charter.name.is_empty() {
+        errors.push(ValidationError::EmptyField("ai_agent.charter.name"));
+    }
+    if ev.ai_agent.charter.type_id != 1 {
+        errors.push(ValidationError::BadCharterType(ev.ai_agent.charter.type_id));
     }
     if ev.ai_agent.instance_uid.is_empty() {
         errors.push(ValidationError::EmptyField("ai_agent.instance_uid"));
     }
     if ev.class_uid != ev.class_name.class_uid() {
         errors.push(ValidationError::ClassUidMismatch(ev.class_uid));
+    }
+    if ev.category_uid != crate::model::CATEGORY_UID {
+        errors.push(ValidationError::BadCategory(ev.category_uid));
     }
     let expected_type = u64::from(ev.class_name.class_uid()) * 100 + u64::from(ev.activity_id);
     if ev.type_uid != expected_type {
@@ -91,7 +112,12 @@ pub fn validate_event(ev: &OcsfEvent) -> Result<(), Vec<ValidationError>> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use crate::model::{AgentIdentity, EventClass, OcsfEventBuilder};
@@ -123,7 +149,7 @@ mod tests {
     fn empty_identity_fields_all_reported() {
         let mut ev = valid_event();
         ev.ai_agent.version.clear();
-        ev.ai_agent.charter.clear();
+        ev.ai_agent.charter.name.clear();
         ev.ai_agent.instance_uid.clear();
         let errs = validate_event(&ev).unwrap_err();
         assert_eq!(errs.len(), 3, "collect-all: {errs:?}");
@@ -152,8 +178,31 @@ mod tests {
     fn bad_severity_detected() {
         let mut ev = valid_event();
         ev.severity_id = 0;
-        assert!(validate_event(&ev).unwrap_err().contains(&ValidationError::BadSeverity(0)));
+        assert!(validate_event(&ev)
+            .unwrap_err()
+            .contains(&ValidationError::BadSeverity(0)));
         ev.severity_id = 7;
-        assert!(validate_event(&ev).unwrap_err().contains(&ValidationError::BadSeverity(7)));
+        assert!(validate_event(&ev)
+            .unwrap_err()
+            .contains(&ValidationError::BadSeverity(7)));
+    }
+
+    #[test]
+    fn status_id_boundary_accepts_up_to_2_rejects_3() {
+        // Catches `> 2` vs `== 2` / `>= 2` mutations: status_id=2 (Failure)
+        // is VALID and must not be flagged; 3 is invalid and must be flagged.
+        let mut ev = valid_event();
+        for valid in [0u8, 1, 2] {
+            ev.status_id = valid;
+            let errs = validate_event(&ev).map(|_| Vec::new()).unwrap_or_else(|e| e);
+            assert!(
+                !errs.iter().any(|e| matches!(e, ValidationError::BadStatus(_))),
+                "status_id={valid} incorrectly flagged: {errs:?}"
+            );
+        }
+        ev.status_id = 3;
+        assert!(validate_event(&ev)
+            .unwrap_err()
+            .contains(&ValidationError::BadStatus(3)));
     }
 }

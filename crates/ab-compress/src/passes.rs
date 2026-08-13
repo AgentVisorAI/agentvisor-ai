@@ -18,6 +18,13 @@ pub struct CompressionConfig {
     /// Only bother when the payload exceeds this many approximate tokens
     /// (compressing tiny payloads wastes hot-path time).
     pub min_tokens_to_engage: u64,
+    /// Enable audited middle-history stubbing when other passes cannot reach
+    /// the target on very large histories. Only engages when the payload
+    /// exceeds 50 000 approximate tokens (hardcoded floor; trumps
+    /// `min_tokens_to_engage` for this pass).
+    pub summarize_middle: bool,
+    /// Minimum target reduction ratio times 1000.
+    pub target_reduction_millis: u64,
 }
 
 impl Default for CompressionConfig {
@@ -28,6 +35,8 @@ impl Default for CompressionConfig {
             collapse_duplicates: true,
             normalize_json: true,
             min_tokens_to_engage: 512,
+            summarize_middle: true,
+            target_reduction_millis: 300,
         }
     }
 }
@@ -65,10 +74,20 @@ impl CompressionOutcome {
 pub fn compress(payload: &Value, cfg: &CompressionConfig) -> CompressionOutcome {
     let tokens_before = approx_tokens(&payload.to_string());
     let Some(messages) = payload.get("messages").and_then(Value::as_array) else {
-        return CompressionOutcome { payload: payload.clone(), tokens_before, tokens_after: tokens_before, changed: false };
+        return CompressionOutcome {
+            payload: payload.clone(),
+            tokens_before,
+            tokens_after: tokens_before,
+            changed: false,
+        };
     };
     if tokens_before < cfg.min_tokens_to_engage || messages.is_empty() {
-        return CompressionOutcome { payload: payload.clone(), tokens_before, tokens_after: tokens_before, changed: false };
+        return CompressionOutcome {
+            payload: payload.clone(),
+            tokens_before,
+            tokens_after: tokens_before,
+            changed: false,
+        };
     }
 
     let mut out = messages.clone();
@@ -83,9 +102,23 @@ pub fn compress(payload: &Value, cfg: &CompressionConfig) -> CompressionOutcome 
     if cfg.normalize_json {
         changed |= normalize_json_content(&mut out, tail_start);
     }
+    if cfg.summarize_middle && tokens_before >= 50_000 {
+        changed |= stub_middle_to_target(
+            payload,
+            &mut out,
+            tail_start,
+            tokens_before,
+            cfg.target_reduction_millis,
+        );
+    }
 
     if !changed {
-        return CompressionOutcome { payload: payload.clone(), tokens_before, tokens_after: tokens_before, changed: false };
+        return CompressionOutcome {
+            payload: payload.clone(),
+            tokens_before,
+            tokens_after: tokens_before,
+            changed: false,
+        };
     }
     let mut new_payload = payload.clone();
     if let Some(obj) = new_payload.as_object_mut() {
@@ -94,9 +127,77 @@ pub fn compress(payload: &Value, cfg: &CompressionConfig) -> CompressionOutcome 
     let tokens_after = approx_tokens(&new_payload.to_string());
     // Guard: a pass must never grow the payload; if it somehow did, keep the original.
     if tokens_after > tokens_before {
-        return CompressionOutcome { payload: payload.clone(), tokens_before, tokens_after: tokens_before, changed: false };
+        return CompressionOutcome {
+            payload: payload.clone(),
+            tokens_before,
+            tokens_after: tokens_before,
+            changed: false,
+        };
     }
-    CompressionOutcome { payload: new_payload, tokens_before, tokens_after, changed: true }
+    CompressionOutcome {
+        payload: new_payload,
+        tokens_before,
+        tokens_after,
+        changed: true,
+    }
+}
+
+fn stub_middle_to_target(
+    payload: &Value,
+    messages: &mut [Value],
+    tail_start: usize,
+    tokens_before: u64,
+    target_reduction_millis: u64,
+) -> bool {
+    if messages.iter().any(|message| {
+        msg_content_str(message).is_some_and(|content| content.contains("reason: middle history]"))
+    }) {
+        return false;
+    }
+    let target_tokens =
+        tokens_before.saturating_mul(1000u64.saturating_sub(target_reduction_millis.min(1000))) / 1000;
+    let mut changed = false;
+    for index in 0..tail_start {
+        if payload_tokens_with_messages(payload, messages) <= target_tokens {
+            break;
+        }
+        let Some(message) = messages.get_mut(index) else {
+            continue;
+        };
+        let role = msg_role(message);
+        if role == "system" || role == "tool" || message.get("tool_calls").is_some() {
+            continue;
+        }
+        let Some(content) = msg_content_str(message) else {
+            continue;
+        };
+        if content.starts_with("[pruned:") {
+            continue;
+        }
+        let tokens = approx_tokens(content);
+        if tokens < 32 {
+            continue;
+        }
+        let digest = ab_core::digest::sha256_hex(content.as_bytes());
+        if let Some(object) = message.as_object_mut() {
+            object.insert(
+                "content".to_owned(),
+                Value::String(format!(
+                    "[pruned: {tokens} tokens, sha256:{digest}, reason: middle history]"
+                )),
+            );
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn payload_tokens_with_messages(payload: &Value, messages: &[Value]) -> u64 {
+    let mut value = payload.clone();
+    if let Some(object) = value.as_object_mut() {
+        object.insert("messages".to_owned(), Value::Array(messages.to_vec()));
+    }
+    approx_tokens(&value.to_string())
 }
 
 fn msg_role(m: &Value) -> &str {
@@ -177,7 +278,9 @@ fn stub_stale_tool_outputs(messages: &mut [Value], tail_start: usize, threshold:
         if msg_role(m) != "tool" {
             continue;
         }
-        let Some(content) = msg_content_str(m) else { continue };
+        let Some(content) = msg_content_str(m) else {
+            continue;
+        };
         if content.starts_with("[pruned:") {
             continue; // already stubbed — idempotence
         }
@@ -207,13 +310,19 @@ fn normalize_json_content(messages: &mut [Value], tail_start: usize) -> bool {
         if role != "tool" && role != "assistant" {
             continue;
         }
-        let Some(content) = msg_content_str(m) else { continue };
+        let Some(content) = msg_content_str(m) else {
+            continue;
+        };
         let trimmed = content.trim_start();
         if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
             continue;
         }
-        let Ok(parsed) = serde_json::from_str::<Value>(content) else { continue };
-        let Ok(minified) = serde_json::to_string(&parsed) else { continue };
+        let Ok(parsed) = serde_json::from_str::<Value>(content) else {
+            continue;
+        };
+        let Ok(minified) = serde_json::to_string(&parsed) else {
+            continue;
+        };
         if minified.len() < content.len() {
             if let Some(obj) = m.as_object_mut() {
                 obj.insert("content".to_owned(), Value::String(minified));
@@ -231,12 +340,20 @@ fn audit_stub(reason: &str, tokens: u64, original: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
 
     fn engage_all() -> CompressionConfig {
-        CompressionConfig { min_tokens_to_engage: 0, ..CompressionConfig::default() }
+        CompressionConfig {
+            min_tokens_to_engage: 0,
+            ..CompressionConfig::default()
+        }
     }
 
     fn payload(messages: Vec<Value>) -> Value {
@@ -276,8 +393,7 @@ mod tests {
             .iter()
             .skip(1)
             .filter(|m| {
-                msg_role(m) == "system"
-                    && msg_content_str(m).is_some_and(|c| c.starts_with("[pruned:"))
+                msg_role(m) == "system" && msg_content_str(m).is_some_and(|c| c.starts_with("[pruned:"))
             })
             .count();
         assert!(stubbed > 0, "no duplicate system messages were stubbed");
@@ -302,7 +418,10 @@ mod tests {
         let stub = msg_content_str(first_tool).unwrap();
         assert!(stub.starts_with("[pruned:"), "{stub}");
         let expected_digest = ab_core::digest::sha256_hex(big.as_bytes());
-        assert!(stub.contains(&expected_digest), "audit digest must reference the original");
+        assert!(
+            stub.contains(&expected_digest),
+            "audit digest must reference the original"
+        );
         // tool_call_id linkage preserved.
         assert!(first_tool.get("tool_call_id").is_some());
         // Tail messages byte-identical.
@@ -320,10 +439,17 @@ mod tests {
         let out = compress(&payload(msgs), &engage_all());
         assert!(out.changed);
         let result = out.payload["messages"].as_array().unwrap();
-        let minified = result.iter().skip(1).find(|m| msg_role(m) == "assistant").unwrap();
+        let minified = result
+            .iter()
+            .skip(1)
+            .find(|m| msg_role(m) == "assistant")
+            .unwrap();
         let c = msg_content_str(minified).unwrap();
         assert!(!c.contains('\n'), "not minified: {c}");
-        assert_eq!(serde_json::from_str::<Value>(c).unwrap(), json!({"a": [1,2,3], "b": {"c": "d"}}));
+        assert_eq!(
+            serde_json::from_str::<Value>(c).unwrap(),
+            json!({"a": [1,2,3], "b": {"c": "d"}})
+        );
     }
 
     #[test]
@@ -367,11 +493,45 @@ mod tests {
         }
         let p = payload(msgs);
         let out = compress(&p, &CompressionConfig::default());
-        assert!(out.tokens_before >= 50_000, "corpus too small: {}", out.tokens_before);
+        assert!(
+            out.tokens_before >= 50_000,
+            "corpus too small: {}",
+            out.tokens_before
+        );
         let ratio = out.pruning_ratio_millis();
         assert!(ratio >= 300, "reduction {}.{}% < 30%", ratio / 10, ratio % 10);
         // Metric names mirror ATIF (Module C requirement).
         assert!(out.pruned_tokens() > 0);
+    }
+
+    #[test]
+    fn unique_fifty_k_history_reaches_target_without_touching_tail() {
+        let mut messages = vec![json!({"role": "system", "content": "stable system prompt"})];
+        for index in 0..80 {
+            messages.push(json!({
+                "role": if index % 2 == 0 { "user" } else { "assistant" },
+                "content": format!(
+                    "unique-{index} {}",
+                    (0..900)
+                        .map(|word| format!("token-{index}-{word}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+            }));
+        }
+        let input = payload(messages);
+        let original_tail = input["messages"].as_array().unwrap()[73..].to_vec();
+        let output = compress(&input, &CompressionConfig::default());
+        assert!(output.tokens_before >= 50_000);
+        assert!(output.pruning_ratio_millis() >= 300);
+        assert_eq!(
+            &output.payload["messages"].as_array().unwrap()[73..],
+            original_tail.as_slice()
+        );
+        assert_eq!(
+            compress(&output.payload, &CompressionConfig::default()).payload,
+            output.payload
+        );
     }
 
     #[test]

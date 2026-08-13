@@ -15,11 +15,18 @@ pub struct SandboxConfig {
     /// Argument field carrying a payout amount in USD (e.g. `amount_usd`).
     /// When present on a call, it is charged against `max_payout_usd_micros`.
     pub payout_field: String,
+    /// Reject tools without a configured schema.
+    pub require_schema: bool,
 }
 
 impl Default for SandboxConfig {
     fn default() -> Self {
-        Self { schemas: HashMap::new(), budget: BudgetSpec::default(), payout_field: "amount_usd".into() }
+        Self {
+            schemas: HashMap::new(),
+            budget: BudgetSpec::default(),
+            payout_field: "amount_usd".into(),
+            require_schema: false,
+        }
     }
 }
 
@@ -37,7 +44,7 @@ pub enum ToolVerdict {
     },
     /// Block; respond to the agent with `response`.
     Blocked {
-        /// Tool name ("<unparsed>" when the payload never parsed).
+        /// Tool name (`<unparsed>` when the payload never parsed).
         tool: String,
         /// Which gate blocked: `parse` | `schema` | `policy` | `budget`.
         stage: &'static str,
@@ -82,7 +89,11 @@ impl Sandbox {
                 .map_err(|e| format!("schema for tool {tool:?} does not compile: {e}"))?;
             validators.insert(tool.clone(), v);
         }
-        Ok(Self { validators, policies, config })
+        Ok(Self {
+            validators,
+            policies,
+            config,
+        })
     }
 
     /// Evaluate a raw MCP payload for `session`.
@@ -110,7 +121,13 @@ impl Sandbox {
 
         // Gate 2: schema.
         if let Some(validator) = self.validators.get(&req.tool) {
-            let errors: Vec<String> = validator.iter_errors(&req.arguments).map(|e| e.to_string()).collect();
+            // Bounded work: a hostile client cannot force unbounded String
+            // allocation by sending pathologically-invalid arguments.
+            let errors: Vec<String> = validator
+                .iter_errors(&req.arguments)
+                .take(3)
+                .map(|e| e.to_string())
+                .collect();
             if !errors.is_empty() {
                 let reason = format!("schema validation failed: {}", errors.join("; "));
                 return ToolVerdict::Blocked {
@@ -121,6 +138,15 @@ impl Sandbox {
                     elapsed_us: elapsed(started),
                 };
             }
+        } else if self.config.require_schema {
+            let reason = format!("no argument schema configured for tool {:?}", req.tool);
+            return ToolVerdict::Blocked {
+                tool: req.tool.clone(),
+                stage: "schema",
+                reason: reason.clone(),
+                response: authorization_error(req.id.as_ref(), &reason),
+                elapsed_us: elapsed(started),
+            };
         }
 
         // Gate 3: policy chain (first deny wins).
@@ -180,12 +206,25 @@ impl Sandbox {
             }
         }
     }
+
+    /// Evaluate an arbitrary operation payload against the configured native
+    /// and WASM policy chain. Used for chat sanitization before compression.
+    pub fn sanitize(&self, operation: &str, payload: &Value) -> Result<(), String> {
+        for policy in &self.policies {
+            if let PolicyDecision::Deny { reason } = policy.evaluate(operation, payload) {
+                return Err(format!("policy {:?}: {reason}", policy.name()));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Extract a payout amount (USD float or integer) as micro-USD. Rejects
 /// negatives, NaN/Inf, and absurd magnitudes rather than truncating silently.
 fn extract_payout_micros(arguments: &Value, field: &str) -> Result<u64, String> {
-    let Some(v) = arguments.get(field) else { return Ok(0) };
+    let Some(v) = arguments.get(field) else {
+        return Ok(0);
+    };
     let usd = v.as_f64().ok_or_else(|| format!("{field} must be a number"))?;
     if !usd.is_finite() || usd < 0.0 {
         return Err(format!("{field} must be a finite non-negative number, got {usd}"));
@@ -194,12 +233,17 @@ fn extract_payout_micros(arguments: &Value, field: &str) -> Result<u64, String> 
         return Err(format!("{field} of {usd} exceeds sanity bounds"));
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    Ok((usd * 1_000_000.0).round() as u64)
+    Ok((usd * ab_core::units::USD_MICROS_PER_DOLLAR as f64).round() as u64)
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use crate::policy::NativePolicy;
@@ -235,7 +279,12 @@ mod tests {
             max_tokens: None,
         };
         Sandbox::new(
-            SandboxConfig { schemas, budget, payout_field: "amount_usd".into() },
+            SandboxConfig {
+                schemas,
+                budget,
+                payout_field: "amount_usd".into(),
+                require_schema: false,
+            },
             vec![Box::new(NativePolicy::deny_tools(&["rm_rf"]))],
         )
         .unwrap()
@@ -244,7 +293,11 @@ mod tests {
     #[test]
     fn valid_call_allowed_with_latency() {
         let store = InMemoryStore::new();
-        let v = sandbox().check(&store, "s", &raw_call("db_write", json!({"table": "t", "row": {}})));
+        let v = sandbox().check(
+            &store,
+            "s",
+            &raw_call("db_write", json!({"table": "t", "row": {}})),
+        );
         assert!(v.is_allowed(), "{v:?}");
         // R23: block/allow decision < 5ms = 5000µs.
         assert!(v.elapsed_us() < 5_000, "decision took {}µs", v.elapsed_us());
@@ -264,7 +317,11 @@ mod tests {
             other => panic!("{other:?}"),
         }
         // Type confusion.
-        let v = s.check(&store, "s", &raw_call("db_write", json!({"table": 42, "row": {}})));
+        let v = s.check(
+            &store,
+            "s",
+            &raw_call("db_write", json!({"table": 42, "row": {}})),
+        );
         assert!(!v.is_allowed());
         // Extra field (additionalProperties: false).
         let v = s.check(
@@ -294,7 +351,9 @@ mod tests {
         let s = sandbox();
         let args = json!({"table": "t", "row": {}});
         for _ in 0..3 {
-            assert!(s.check(&store, "sess", &raw_call("db_write", args.clone())).is_allowed());
+            assert!(s
+                .check(&store, "sess", &raw_call("db_write", args.clone()))
+                .is_allowed());
         }
         let v = s.check(&store, "sess", &raw_call("db_write", args));
         match v {
@@ -310,12 +369,18 @@ mod tests {
     fn payout_cap_enforced_and_hostile_amounts_rejected() {
         let store = InMemoryStore::new();
         let s = sandbox();
-        assert!(s.check(&store, "p", &raw_call("payout", json!({"amount_usd": 49.5}))).is_allowed());
+        assert!(s
+            .check(&store, "p", &raw_call("payout", json!({"amount_usd": 49.5})))
+            .is_allowed());
         // Would cross $50 total.
         let v = s.check(&store, "p", &raw_call("payout", json!({"amount_usd": 1.0})));
         assert!(!v.is_allowed(), "{v:?}");
         // Hostile numerics.
-        for bad in [json!({"amount_usd": -5}), json!({"amount_usd": "1e9"}), json!({"amount_usd": 1e15})] {
+        for bad in [
+            json!({"amount_usd": -5}),
+            json!({"amount_usd": "1e9"}),
+            json!({"amount_usd": 1e15}),
+        ] {
             let v = s.check(&store, "p2", &raw_call("payout", bad));
             assert!(!v.is_allowed(), "hostile payout accepted: {v:?}");
         }
@@ -342,13 +407,53 @@ mod tests {
     }
 
     #[test]
+    fn required_schema_mode_blocks_unknown_tools() {
+        let sandbox = Sandbox::new(
+            SandboxConfig {
+                require_schema: true,
+                ..SandboxConfig::default()
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let verdict = sandbox.check(&InMemoryStore::new(), "session", &raw_call("unknown", json!({})));
+        assert!(matches!(verdict, ToolVerdict::Blocked { stage: "schema", .. }));
+    }
+
+    #[test]
     fn bad_boot_schema_is_a_boot_error() {
         let mut schemas = HashMap::new();
         schemas.insert("t".to_owned(), json!({"type": "not-a-type"}));
         let err = Sandbox::new(
-            SandboxConfig { schemas, ..SandboxConfig::default() },
+            SandboxConfig {
+                schemas,
+                ..SandboxConfig::default()
+            },
             vec![],
         );
         assert!(err.is_err(), "invalid schema must fail at boot, not be skipped");
+    }
+
+    #[test]
+    fn chat_payload_uses_the_same_policy_chain() {
+        let sandbox = Sandbox::new(
+            SandboxConfig::default(),
+            vec![Box::new(NativePolicy::new("no-secret", |operation, payload| {
+                if operation == "chat/completions" && payload.to_string().contains("secret") {
+                    PolicyDecision::Deny {
+                        reason: "secret content".into(),
+                    }
+                } else {
+                    PolicyDecision::Allow
+                }
+            }))],
+        )
+        .unwrap();
+        assert!(sandbox
+            .sanitize("chat/completions", &json!({"messages": ["safe"]}))
+            .is_ok());
+        assert!(sandbox
+            .sanitize("chat/completions", &json!({"messages": ["secret"]}))
+            .is_err());
     }
 }

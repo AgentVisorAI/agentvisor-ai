@@ -17,6 +17,8 @@
 //! up an identical bridge from the manifest alone (success criterion R12/R30).
 
 pub mod bus;
+#[cfg(feature = "cold-store")]
+pub(crate) mod cold_store;
 pub mod embedded;
 pub mod manifest;
 
@@ -24,7 +26,7 @@ pub use bus::{BusError, EventBus, PublishAck, StoredEvent};
 pub use embedded::EmbeddedBroker;
 pub use manifest::{BridgeManifest, ManifestError, RetentionSpec, TopicSpec, MANIFEST_VERSION};
 
-#[cfg(feature = "nats")]
-pub mod nats_bus;
 #[cfg(feature = "kafka")]
 pub mod kafka_bus;
+#[cfg(feature = "nats")]
+pub mod nats_bus;

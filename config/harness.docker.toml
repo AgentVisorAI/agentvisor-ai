@@ -1,0 +1,51 @@
+config_version = 1
+listen = "0.0.0.0:8484"
+upstream_url = "http://host.docker.internal:4000"
+upstream_http2_prior_knowledge = false
+upstream_read_timeout_s = 300
+# tool_upstream_url = "http://host.docker.internal:3000/mcp"
+require_identity = true
+audience = "agent-bridge"
+identity_hmac_secret_file = "/run/secrets/identity_hmac"
+identity_hmac_kid = "docker-idp"
+identity_allowed_issuers = ["https://idp.example"]
+enforce_identity_scopes = true
+chat_scope = "chat:write"
+session_close_scope = "session:close"
+session_promote_scope = "session:promote"
+default_workflow = "unsigned"
+consequential_tools = ["db_write", "payout", "merge", "deploy"]
+session_idle_close_s = 900
+atif_spool_dir = "/app/spool/atif"
+bridge_data_dir = "/app/data/bridge"
+bridge_backend = "kafka"
+bridge_manifest_path = "/app/manifests/bridge.example.yaml"
+bridge_endpoint = "redpanda:9092"
+state_backend = "redis"
+state_endpoint = "redis://redis:6379"
+embedder_backend = "onnx"
+onnx_model_path = "/app/models/model.onnx"
+onnx_tokenizer_path = "/app/models/tokenizer.json"
+onnx_dimension = 384
+vector_backend = "qdrant"
+qdrant_url = "http://qdrant:6333"
+qdrant_collection = "agent_steps"
+worker_channel_capacity = 32768
+strict_stage_budget = false
+compression_enabled = true
+reconcile_tick_s = 5
+
+[breaker]
+delta_epsilon = 0.30
+window = 3
+min_tokens = 1000
+action = "reject"
+
+[budget]
+max_tokens = 200000
+max_payout_usd_micros = 50000000
+max_total_tool_calls = 100
+
+[budget.max_tool_calls]
+db_write = 3
+payout = 10

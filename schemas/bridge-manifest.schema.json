@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentbridge.dev/schemas/bridge-manifest-v1.json",
+  "title": "AgentBridge Bridge Manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["manifest_version", "name", "topics"],
+  "properties": {
+    "manifest_version": { "const": 1 },
+    "name": { "type": "string", "minLength": 1 },
+    "replication_factor": { "type": "integer", "minimum": 1, "maximum": 5, "default": 1 },
+    "topics": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "partitions", "retention"],
+        "properties": {
+          "name": { "type": "string", "pattern": "^agent\\.[a-z_]+$" },
+          "partitions": { "type": "integer", "minimum": 1 },
+          "schema_ref": { "type": "string", "minLength": 1 },
+          "retention": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["hot_hours"],
+            "properties": {
+              "hot_hours": { "type": "integer", "minimum": 1, "default": 720 },
+              "cold_uri": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    }
+  }
+}

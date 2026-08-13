@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentbridge.dev/schemas/receipt-v1.json",
+  "title": "AgentBridge Receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["receipt_version", "receipt_id", "session_id", "issued_at", "issued_at_iso", "ai_agent", "subject", "tool_calls", "cost", "stop_reason_id", "stop_reason", "key_id", "public_key_b64", "signature_b64"],
+  "properties": {
+    "receipt_version": { "const": 1 },
+    "receipt_id": { "type": "string", "minLength": 1 },
+    "session_id": { "type": "string", "minLength": 1 },
+    "issued_at": { "type": "integer", "minimum": 0, "maximum": 9007199254740992 },
+    "issued_at_iso": { "type": "string", "format": "date-time" },
+    "ai_agent": {
+      "type": "object",
+      "required": ["version", "charter", "instance_uid"],
+      "properties": {
+        "version": { "type": "string", "minLength": 1 },
+        "charter": {
+          "type": "object",
+          "required": ["name", "type_id"],
+          "properties": {
+            "name": { "type": "string", "minLength": 1 },
+            "type_id": { "const": 1 }
+          }
+        },
+        "instance_uid": { "type": "string", "minLength": 1 },
+        "ttl_remaining_s": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "subject": {
+      "oneOf": [
+        { "type": "object", "required": ["kind", "chain_head", "event_count"], "properties": { "kind": { "const": "event_chain" }, "chain_head": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "event_count": { "type": "integer", "minimum": 0 } } },
+        { "type": "object", "required": ["kind", "trajectory_digest", "step_count", "retroactive"], "properties": { "kind": { "const": "atif_trajectory" }, "trajectory_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "step_count": { "type": "integer", "minimum": 0 }, "retroactive": { "const": true } } }
+      ]
+    },
+    "tool_calls": { "type": "object" },
+    "cost": { "type": "object" },
+    "stop_reason_id": { "type": "integer", "minimum": 0, "maximum": 255 },
+    "stop_reason": { "type": "string" },
+    "key_id": { "type": "string", "minLength": 1 },
+    "public_key_b64": { "type": "string", "minLength": 1 },
+    "signature_b64": { "type": "string", "minLength": 1 }
+  }
+}

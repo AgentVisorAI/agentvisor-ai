@@ -3,7 +3,12 @@
 //! on both sides. Measured on 2026-08-10: paraphrase 0.13–0.18, progressing
 //! 0.88–0.98. If an embedder change erodes this margin, this test fails before
 //! any SLA does.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use ab_loopdetect::{cosine, Embedder, HashEmbedder};
 
@@ -26,7 +31,10 @@ fn delta_separation_margin_holds() {
         "Staging verifies clean; promoting to production and watching error rates",
     ];
     let deltas = |steps: &[&str]| -> Vec<f32> {
-        steps.windows(2).map(|w| 1.0 - cosine(&e.embed(w[0]), &e.embed(w[1]))).collect()
+        steps
+            .windows(2)
+            .map(|w| 1.0 - cosine(&e.embed(w[0]), &e.embed(w[1])))
+            .collect()
     };
     let para = deltas(&paraphrase);
     let prog = deltas(&progressing);

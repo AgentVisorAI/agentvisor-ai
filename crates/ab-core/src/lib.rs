@@ -6,10 +6,14 @@
 
 pub mod digest;
 pub mod error;
+pub mod fsutil;
+pub mod hash;
 pub mod ids;
 pub mod metrics;
+pub mod text;
 pub mod time;
 pub mod tokens;
+pub mod units;
 
 pub use error::CoreError;
 pub use ids::{new_event_uid, new_session_id, InstanceUid, SessionId};

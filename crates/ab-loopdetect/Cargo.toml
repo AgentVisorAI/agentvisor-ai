@@ -9,20 +9,31 @@ description = "Semantic loop detection: embeddings, delta window, circuit breake
 [dependencies]
 ab-core = { workspace = true }
 serde = { workspace = true }
-thiserror = { workspace = true }
 parking_lot = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
 
 [features]
 default = []
 # ONNX embedding models (MiniLM-class) via pure-Rust tract; model path supplied at runtime.
-onnx = ["dep:tract-onnx"]
+onnx = ["dep:tract-onnx", "dep:tokenizers"]
+qdrant = ["dep:reqwest"]
 
 [dependencies.tract-onnx]
 version = "0.21"
 optional = true
 
+[dependencies.tokenizers]
+version = "0.21"
+optional = true
+
+[dependencies.reqwest]
+workspace = true
+optional = true
+
 [dev-dependencies]
 proptest = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

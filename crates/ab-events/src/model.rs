@@ -10,6 +10,9 @@ pub const OCSF_VERSION: &str = "1.10.0";
 /// Product name stamped in metadata.
 pub const PRODUCT_NAME: &str = "agent-bridge";
 
+/// OCSF Application Activity category uid.
+pub const CATEGORY_UID: u8 = 6;
+
 /// Event classes. One Bridge topic exists per class (Module F topic layout).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -99,11 +102,43 @@ impl StatusId {
 /// The agent config-state identity block bound into every event (Module E,
 /// PR #1 pattern: version + charter + instance_uid).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CharterFile {
+    /// Charter document file name.
+    pub name: String,
+    /// OCSF File type id 1, Regular File.
+    pub type_id: u8,
+}
+
+impl From<String> for CharterFile {
+    fn from(name: String) -> Self {
+        Self { name, type_id: 1 }
+    }
+}
+
+impl From<&str> for CharterFile {
+    fn from(name: &str) -> Self {
+        Self::from(name.to_owned())
+    }
+}
+
+/// OCSF Product object embedded in event metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Product {
+    /// Product name.
+    pub name: String,
+    /// Product vendor.
+    pub vendor_name: String,
+    /// Product version.
+    pub version: String,
+}
+
+/// Agent configuration state bound into every emitted event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentIdentity {
     /// Deployed agent version (changes on deploy).
     pub version: String,
     /// Agent charter — the operating mandate/config name (changes on deploy).
-    pub charter: String,
+    pub charter: CharterFile,
     /// Unique id of this running instance.
     pub instance_uid: String,
     /// Remaining identity-token TTL at emission time, seconds (Module D binds
@@ -170,10 +205,10 @@ pub struct Metadata {
     /// Unique event uid (UUIDv7).
     pub uid: String,
     /// Emitting product.
-    pub product: String,
+    pub product: Product,
     /// Per-session sequence number — the authoritative intra-session order
     /// (wall clocks are never trusted for ordering).
-    pub seq: u64,
+    pub sequence: u64,
 }
 
 /// A schema-conformant agent event.
@@ -188,6 +223,8 @@ pub struct OcsfEvent {
     pub class_name: EventClass,
     /// Numeric class uid.
     pub class_uid: u32,
+    /// OCSF Application Activity category uid.
+    pub category_uid: u8,
     /// Activity within the class (1 = default activity).
     pub activity_id: u8,
     /// `class_uid * 100 + activity_id` per OCSF convention.
@@ -237,6 +274,7 @@ pub struct OcsfEventBuilder {
     severity_id: u8,
     status: StatusId,
     stop_reason: Option<crate::StopReason>,
+    native_stop_reason: Option<String>,
     payload: serde_json::Value,
     metrics: Option<EventMetrics>,
     inventory: Option<Fingerprint>,
@@ -255,17 +293,12 @@ impl OcsfEventBuilder {
             severity_id: 1,
             status: StatusId::Success,
             stop_reason: None,
+            native_stop_reason: None,
             payload: serde_json::Value::Null,
             metrics: None,
             inventory: None,
             prev_inventory: None,
         }
-    }
-
-    /// Set the activity id (default 1).
-    pub fn activity(mut self, id: u8) -> Self {
-        self.activity_id = id;
-        self
     }
 
     /// Set severity (default 1 = informational).
@@ -283,6 +316,13 @@ impl OcsfEventBuilder {
     /// Attach a stop reason.
     pub fn stop_reason(mut self, r: crate::StopReason) -> Self {
         self.stop_reason = Some(r);
+        self
+    }
+
+    /// Attach a normalized reason and the provider's source-native value.
+    pub fn stop_reason_native(mut self, reason: crate::StopReason, native: impl Into<String>) -> Self {
+        self.stop_reason = Some(reason);
+        self.native_stop_reason = Some(native.into());
         self
     }
 
@@ -329,11 +369,16 @@ impl OcsfEventBuilder {
             metadata: Metadata {
                 version: OCSF_VERSION.to_owned(),
                 uid: ab_core::new_event_uid(),
-                product: PRODUCT_NAME.to_owned(),
-                seq: self.seq,
+                product: Product {
+                    name: PRODUCT_NAME.to_owned(),
+                    vendor_name: "AgentBridge".to_owned(),
+                    version: env!("CARGO_PKG_VERSION").to_owned(),
+                },
+                sequence: self.seq,
             },
             class_name: self.class,
             class_uid,
+            category_uid: CATEGORY_UID,
             activity_id: self.activity_id,
             type_uid: u64::from(class_uid) * 100 + u64::from(self.activity_id),
             time: now,
@@ -343,7 +388,9 @@ impl OcsfEventBuilder {
             session_uid: self.session_uid,
             ai_agent: self.ai_agent,
             stop_reason_id: self.stop_reason.map(crate::StopReason::id),
-            stop_reason: self.stop_reason.map(|r| r.caption().to_owned()),
+            stop_reason: self
+                .native_stop_reason
+                .or_else(|| self.stop_reason.map(|reason| reason.caption().to_owned())),
             payload: self.payload,
             metrics: self.metrics,
             inventory: self.inventory,
@@ -355,7 +402,12 @@ impl OcsfEventBuilder {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use crate::StopReason;
@@ -377,13 +429,15 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(ev.ai_agent.version, "2.1.0");
-        assert_eq!(ev.ai_agent.charter, "billing-support");
+        assert_eq!(ev.ai_agent.charter.name, "billing-support");
         assert_eq!(ev.ai_agent.instance_uid, "agent-inst-42");
-        assert_eq!(ev.stop_reason_id, Some(90));
+        assert_eq!(ev.stop_reason_id, Some(91));
         assert_eq!(ev.stop_reason.as_deref(), Some("Loop Detected"));
         assert_eq!(ev.class_uid, 9902);
         assert_eq!(ev.type_uid, 990_201);
-        assert_eq!(ev.metadata.seq, 7);
+        assert_eq!(ev.metadata.sequence, 7);
+        assert_eq!(ev.category_uid, CATEGORY_UID);
+        assert_eq!(ev.metadata.product.name, PRODUCT_NAME);
         assert_eq!(ev.metadata.version, OCSF_VERSION);
     }
 
@@ -462,6 +516,12 @@ mod tests {
     #[test]
     fn all_classes_have_unique_uids_and_topics() {
         let classes = EventClass::all();
+        // Concrete lower bound catches an `all() -> empty slice` stub.
+        assert!(
+            classes.len() >= 6,
+            "EventClass::all shrank unexpectedly: {}",
+            classes.len()
+        );
         let mut uids: Vec<u32> = classes.iter().map(|c| c.class_uid()).collect();
         let mut topics: Vec<&str> = classes.iter().map(|c| c.topic()).collect();
         uids.sort_unstable();
@@ -470,5 +530,14 @@ mod tests {
         topics.dedup();
         assert_eq!(uids.len(), classes.len());
         assert_eq!(topics.len(), classes.len());
+    }
+
+    #[test]
+    fn status_id_wire_values_are_ocsf_conformant() {
+        // OCSF: 0 unknown, 1 success, 2 failure. Concrete numeric asserts
+        // detect any `id() -> constant` stub of the mapping.
+        assert_eq!(StatusId::Unknown.id(), 0);
+        assert_eq!(StatusId::Success.id(), 1);
+        assert_eq!(StatusId::Failure.id(), 2);
     }
 }

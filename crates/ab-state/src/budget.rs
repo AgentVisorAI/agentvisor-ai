@@ -4,7 +4,7 @@
 //! Money is tracked in integer micro-USD; a payout of $12.34 spends
 //! 12_340_000. Fractional-cent dust can therefore never accumulate invisibly.
 
-use crate::store::{StateError, StateStore};
+use crate::store::{Spend, StateError, StateStore};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -63,7 +63,9 @@ impl<'a> ActionBudget<'a> {
     }
 
     fn key(&self, dim: &str) -> String {
-        format!("budget:{}:{dim}", self.session)
+        let digest = ab_core::digest::sha256_hex(self.session.as_bytes());
+        // 32 hex chars = 128 bits: collision-safe well beyond realistic session counts.
+        format!("budget:{{{}}}:{dim}", digest.get(..32).unwrap_or(&digest))
     }
 
     /// Check-and-spend one invocation of `tool`, with an optional payout
@@ -75,40 +77,58 @@ impl<'a> ActionBudget<'a> {
     /// enforced by compensation, which is exact because refusals record
     /// nothing and grants are integers).
     pub fn try_tool_call(&self, tool: &str, payout_usd_micros: u64) -> Result<BudgetDecision, StateError> {
-        let mut spent: Vec<(String, u64)> = Vec::new();
+        // Parallel arrays keep spends and limit-names together without paying
+        // for a joined-tuple clone before hitting the state store. There are
+        // at most three dimensions (total, per-tool, payout).
+        let mut spends: Vec<Spend> = Vec::with_capacity(3);
+        let mut limit_names: Vec<String> = Vec::with_capacity(3);
 
         if let Some(cap) = self.spec.max_total_tool_calls {
-            let key = self.key("total_calls");
-            if !self.store.try_spend(&key, 1, cap)? {
-                return Ok(BudgetDecision::Refused { limit: "max_total_tool_calls".into(), cap });
-            }
-            spent.push((key, 1));
+            spends.push(Spend {
+                key: self.key("total_calls"),
+                amount: 1,
+                limit: cap,
+            });
+            limit_names.push("max_total_tool_calls".into());
         }
         if let Some(cap) = self.spec.max_tool_calls.get(tool).copied() {
-            let key = self.key(&format!("tool:{tool}"));
-            if !self.store.try_spend(&key, 1, cap)? {
-                self.rollback(&spent);
-                return Ok(BudgetDecision::Refused { limit: format!("max_tool_calls.{tool}"), cap });
-            }
-            spent.push((key, 1));
+            spends.push(Spend {
+                key: self.key(&format!("tool:{tool}")),
+                amount: 1,
+                limit: cap,
+            });
+            limit_names.push(format!("max_tool_calls.{tool}"));
         }
         if payout_usd_micros > 0 {
             match self.spec.max_payout_usd_micros {
                 Some(cap) => {
-                    let key = self.key("payout");
-                    if !self.store.try_spend(&key, payout_usd_micros, cap)? {
-                        self.rollback(&spent);
-                        return Ok(BudgetDecision::Refused { limit: "max_payout_usd_micros".into(), cap });
-                    }
-                    spent.push((key, payout_usd_micros));
+                    spends.push(Spend {
+                        key: self.key("payout"),
+                        amount: payout_usd_micros,
+                        limit: cap,
+                    });
+                    limit_names.push("max_payout_usd_micros".into());
                 }
-                // A payout with no configured payout cap is refused outright:
-                // fail-closed beats a silent unlimited-money path.
                 None => {
-                    self.rollback(&spent);
-                    return Ok(BudgetDecision::Refused { limit: "max_payout_usd_micros(unset)".into(), cap: 0 });
+                    return Ok(BudgetDecision::Refused {
+                        limit: "max_payout_usd_micros(unset)".into(),
+                        cap: 0,
+                    });
                 }
             }
+        }
+
+        if let Some(index) = self.store.try_spend_many(&spends)? {
+            let spend = spends
+                .get(index)
+                .ok_or_else(|| StateError::Backend(format!("invalid failed spend index {index}")))?;
+            let limit = limit_names
+                .get(index)
+                .ok_or_else(|| StateError::Backend(format!("invalid failed spend index {index}")))?;
+            return Ok(BudgetDecision::Refused {
+                limit: limit.clone(),
+                cap: spend.limit,
+            });
         }
 
         let remaining = self.remaining_min(tool)?;
@@ -122,24 +142,17 @@ impl<'a> ActionBudget<'a> {
                 let key = self.key("tokens");
                 if self.store.try_spend(&key, tokens, cap)? {
                     let used = self.store.get(&key)?;
-                    Ok(BudgetDecision::Allowed { remaining: cap.saturating_sub(used) })
+                    Ok(BudgetDecision::Allowed {
+                        remaining: cap.saturating_sub(used),
+                    })
                 } else {
-                    Ok(BudgetDecision::Refused { limit: "max_tokens".into(), cap })
+                    Ok(BudgetDecision::Refused {
+                        limit: "max_tokens".into(),
+                        cap,
+                    })
                 }
             }
             None => Ok(BudgetDecision::Allowed { remaining: u64::MAX }),
-        }
-    }
-
-    fn rollback(&self, spent: &[(String, u64)]) {
-        for (key, amount) in spent {
-            // Compensating subtraction: refused multi-dimension spends must
-            // not leak partial consumption.
-            let _ = self.store.get(key).map(|current| {
-                let target = current.saturating_sub(*amount);
-                self.store.remove(key);
-                let _ = self.store.add(key, target);
-            });
         }
     }
 
@@ -188,7 +201,10 @@ mod tests {
         let refused = b.try_tool_call("db_write", 0).unwrap();
         assert_eq!(
             refused,
-            BudgetDecision::Refused { limit: "max_tool_calls.db_write".into(), cap: 3 }
+            BudgetDecision::Refused {
+                limit: "max_tool_calls.db_write".into(),
+                cap: 3
+            }
         );
         // Other tools still work (total budget has room).
         assert!(b.try_tool_call("search", 0).unwrap().is_allowed());
@@ -213,7 +229,10 @@ mod tests {
         let s = BudgetSpec::default();
         let b = ActionBudget::new(&store, "sess", &s);
         let d = b.try_tool_call("payout", 1).unwrap();
-        assert!(!d.is_allowed(), "uncapped payout must be refused, not silently allowed");
+        assert!(
+            !d.is_allowed(),
+            "uncapped payout must be refused, not silently allowed"
+        );
     }
 
     #[test]
@@ -231,7 +250,10 @@ mod tests {
         for _ in 0..7 {
             assert!(b.try_tool_call("other", 0).unwrap().is_allowed());
         }
-        assert!(!b.try_tool_call("other", 0).unwrap().is_allowed(), "total cap must bind at 10");
+        assert!(
+            !b.try_tool_call("other", 0).unwrap().is_allowed(),
+            "total cap must bind at 10"
+        );
     }
 
     #[test]
@@ -254,7 +276,36 @@ mod tests {
             assert!(a.try_tool_call("db_write", 0).unwrap().is_allowed());
         }
         assert!(!a.try_tool_call("db_write", 0).unwrap().is_allowed());
-        assert!(b.try_tool_call("db_write", 0).unwrap().is_allowed(), "session b unaffected");
+        assert!(
+            b.try_tool_call("db_write", 0).unwrap().is_allowed(),
+            "session b unaffected"
+        );
+    }
+
+    #[test]
+    fn concurrent_multi_dimension_spends_commit_all_or_none() {
+        let store = std::sync::Arc::new(InMemoryStore::new());
+        let spec = std::sync::Arc::new(BudgetSpec {
+            max_tool_calls: BTreeMap::from([("db_write".to_owned(), 100)]),
+            max_total_tool_calls: Some(100),
+            ..BudgetSpec::default()
+        });
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let store = std::sync::Arc::clone(&store);
+            let spec = std::sync::Arc::clone(&spec);
+            handles.push(std::thread::spawn(move || {
+                let budget = ActionBudget::new(store.as_ref(), "atomic", spec.as_ref());
+                (0..20)
+                    .filter(|_| budget.try_tool_call("db_write", 0).unwrap().is_allowed())
+                    .count()
+            }));
+        }
+        let allowed: usize = handles.into_iter().map(|handle| handle.join().unwrap()).sum();
+        assert_eq!(allowed, 100);
+        let budget = ActionBudget::new(store.as_ref(), "atomic", spec.as_ref());
+        assert_eq!(store.get(&budget.key("total_calls")).unwrap(), 100);
+        assert_eq!(store.get(&budget.key("tool:db_write")).unwrap(), 100);
     }
 
     #[test]
@@ -266,5 +317,24 @@ mod tests {
             assert!(b.try_tool_call("anything", 0).unwrap().is_allowed());
         }
         assert!(b.try_tokens(u64::MAX / 4).unwrap().is_allowed());
+    }
+
+    #[test]
+    fn allowed_decision_reports_true_remaining_headroom() {
+        // Catches any stub of `remaining_min` (e.g. → Ok(0) / Ok(1)): with a
+        // cap of 10 and 3 prior spends, `remaining` must be exactly 7.
+        let store = InMemoryStore::new();
+        let s = BudgetSpec {
+            max_total_tool_calls: Some(10),
+            ..BudgetSpec::default()
+        };
+        let b = ActionBudget::new(&store, "sess-rem", &s);
+        for _ in 0..3 {
+            assert!(b.try_tool_call("t", 0).unwrap().is_allowed());
+        }
+        match b.try_tool_call("t", 0).unwrap() {
+            BudgetDecision::Allowed { remaining } => assert_eq!(remaining, 6),
+            other => panic!("expected Allowed with real remaining, got {other:?}"),
+        }
     }
 }

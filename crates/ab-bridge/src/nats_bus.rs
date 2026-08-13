@@ -12,9 +12,11 @@ use std::collections::HashMap;
 
 /// NATS JetStream bus.
 pub struct NatsBus {
-    rt: tokio::runtime::Runtime,
+    cold_archive: Option<crate::cold_store::ColdArchive>,
     js: async_nats::jetstream::Context,
+    executor: crate::bus::ConnectorExecutor,
     topics: HashMap<String, u32>,
+    validators: HashMap<String, jsonschema::Validator>,
 }
 
 fn stream_name(topic: &str) -> String {
@@ -24,53 +26,172 @@ fn stream_name(topic: &str) -> String {
 impl NatsBus {
     /// Connect and provision streams per the manifest.
     pub fn provision(url: &str, manifest: &BridgeManifest) -> Result<Self, BusError> {
-        manifest.validate().map_err(|e| BusError::Backend(e.to_string()))?;
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
+        manifest
+            .validate()
             .map_err(|e| BusError::Backend(e.to_string()))?;
-        let client = rt
-            .block_on(async_nats::connect(url))
+        let validators = crate::manifest::compile_topic_validators(manifest)?;
+        let cold_archive = crate::cold_store::ColdArchive::from_manifest(manifest)?;
+        let executor = crate::bus::ConnectorExecutor::new("agent-bridge-nats")?;
+        let url = url.to_owned();
+        let client = executor
+            .run(move || async move { async_nats::connect(url).await })?
             .map_err(|e| BusError::Backend(e.to_string()))?;
         let js = async_nats::jetstream::new(client);
         let mut topics = HashMap::new();
         for t in &manifest.topics {
             let subjects: Vec<String> = (0..t.partitions).map(|p| format!("{}.p{p}", t.name)).collect();
-            rt.block_on(js.get_or_create_stream(async_nats::jetstream::stream::Config {
+            let context = js.clone();
+            let retention = std::time::Duration::from_secs(u64::from(t.retention.hot_hours) * 3600);
+            let config = async_nats::jetstream::stream::Config {
                 name: stream_name(&t.name),
-                subjects,
-                max_age: std::time::Duration::from_secs(u64::from(t.retention.hot_hours) * 3600),
+                subjects: subjects.clone(),
+                max_age: retention,
+                duplicate_window: retention,
+                num_replicas: usize::try_from(manifest.replication_factor)
+                    .map_err(|_| BusError::Backend("NATS replication factor exceeds usize".to_owned()))?,
                 ..Default::default()
-            }))
-            .map_err(|e| BusError::Backend(e.to_string()))?;
+            };
+            executor
+                .run(move || async move {
+                    context
+                        .get_or_create_stream(config.clone())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    context
+                        .update_stream(config.clone())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let mut stream = context
+                        .get_stream(&config.name)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let actual = stream
+                        .info()
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .config
+                        .clone();
+                    if actual.subjects != subjects
+                        || actual.max_age != retention
+                        || actual.duplicate_window != retention
+                        || actual.num_replicas != config.num_replicas
+                    {
+                        return Err("JetStream stream does not match Bridge manifest".to_owned());
+                    }
+                    Ok::<_, String>(())
+                })?
+                .map_err(BusError::Backend)?;
             topics.insert(t.name.clone(), t.partitions);
         }
-        Ok(Self { rt, js, topics })
+        Ok(Self {
+            cold_archive,
+            js,
+            executor,
+            topics,
+            validators,
+        })
+    }
+
+    fn publish_with_uid(
+        &self,
+        topic: &str,
+        key: &str,
+        value: &serde_json::Value,
+        event_uid: Option<&str>,
+    ) -> Result<PublishAck, BusError> {
+        crate::manifest::validate_topic_event(&self.validators, topic, value)?;
+        let partitions = *self
+            .topics
+            .get(topic)
+            .ok_or_else(|| BusError::UnknownTopic(topic.to_owned()))?;
+        let partition = partition_for(key, partitions);
+        let event_uid = event_uid.map_or_else(ab_core::new_event_uid, str::to_owned);
+        let stored_at = ab_core::time::now_ms();
+        let record = StoredEvent {
+            partition,
+            offset: 0,
+            key: key.to_owned(),
+            value: value.clone(),
+            stored_at,
+        };
+        if let Some(archive) = &self.cold_archive {
+            archive.stage(topic, &record, &event_uid)?;
+        }
+        let ack = self.publish_broker_only(topic, key, value, stored_at, &event_uid)?;
+        if let Some(archive) = &self.cold_archive {
+            archive.commit(topic, &event_uid, ack.offset)?;
+        }
+        Ok(ack)
+    }
+
+    fn publish_broker_only(
+        &self,
+        topic: &str,
+        key: &str,
+        value: &serde_json::Value,
+        stored_at: u64,
+        event_uid: &str,
+    ) -> Result<PublishAck, BusError> {
+        crate::manifest::validate_topic_event(&self.validators, topic, value)?;
+        let partitions = *self
+            .topics
+            .get(topic)
+            .ok_or_else(|| BusError::UnknownTopic(topic.to_owned()))?;
+        let partition = partition_for(key, partitions);
+        let record = StoredEvent {
+            partition,
+            offset: 0,
+            key: key.to_owned(),
+            value: value.clone(),
+            stored_at,
+        };
+        let payload = serde_json::to_vec(&record)?;
+        let subject = format!("{topic}.p{partition}");
+        let context = self.js.clone();
+        let event_uid = event_uid.to_owned();
+        let ack = self
+            .executor
+            .run(move || async move {
+                let mut headers = async_nats::HeaderMap::new();
+                headers.insert("Nats-Msg-Id", event_uid);
+                context
+                    .publish_with_headers(subject, headers, payload.into())
+                    .await?
+                    .await
+            })?
+            .map_err(|e| BusError::Backend(e.to_string()))?;
+        Ok(PublishAck {
+            topic: topic.to_owned(),
+            partition,
+            offset: ack.sequence,
+        })
     }
 }
 
 impl EventBus for NatsBus {
+    fn set_control_key(&self, key: [u8; 32]) -> Result<(), BusError> {
+        if let Some(archive) = &self.cold_archive {
+            archive.set_control_key(key);
+        }
+        Ok(())
+    }
+
     fn publish(&self, topic: &str, key: &str, value: &serde_json::Value) -> Result<PublishAck, BusError> {
-        let partitions =
-            *self.topics.get(topic).ok_or_else(|| BusError::UnknownTopic(topic.to_owned()))?;
-        let partition = partition_for(key, partitions);
-        let record = StoredEvent {
-            partition,
-            offset: 0, // assigned below from the JetStream sequence
-            key: key.to_owned(),
-            value: value.clone(),
-            stored_at: ab_core::time::now_ms(),
-        };
-        let payload = serde_json::to_vec(&record)?;
-        let subject = format!("{topic}.p{partition}");
-        let ack = self
-            .rt
-            .block_on(async {
-                self.js.publish(subject, payload.into()).await?.await
-            })
-            .map_err(|e| BusError::Backend(e.to_string()))?;
-        Ok(PublishAck { topic: topic.to_owned(), partition, offset: ack.sequence })
+        let event_uid = value
+            .get("metadata")
+            .and_then(|metadata| metadata.get("uid"))
+            .and_then(serde_json::Value::as_str);
+        self.publish_with_uid(topic, key, value, event_uid)
+    }
+
+    fn publish_idempotent(
+        &self,
+        topic: &str,
+        key: &str,
+        value: &serde_json::Value,
+        event_uid: &str,
+    ) -> Result<PublishAck, BusError> {
+        self.publish_with_uid(topic, key, value, Some(event_uid))
     }
 
     fn fetch(
@@ -85,9 +206,10 @@ impl EventBus for NatsBus {
         }
         let stream_name = stream_name(topic);
         let subject = format!("{topic}.p{partition}");
-        self.rt
-            .block_on(async {
-                let stream = self.js.get_stream(&stream_name).await?;
+        let context = self.js.clone();
+        self.executor
+            .run(move || async move {
+                let stream = context.get_stream(&stream_name).await?;
                 let consumer = stream
                     .create_consumer(async_nats::jetstream::consumer::pull::Config {
                         deliver_policy: async_nats::jetstream::consumer::DeliverPolicy::ByStartSequence {
@@ -117,17 +239,34 @@ impl EventBus for NatsBus {
                     }
                 }
                 Ok::<_, async_nats::Error>(out)
-            })
+            })?
             .map_err(|e| BusError::Backend(e.to_string()))
     }
 
     fn partitions(&self, topic: &str) -> Result<u32, BusError> {
-        self.topics.get(topic).copied().ok_or_else(|| BusError::UnknownTopic(topic.to_owned()))
+        self.topics
+            .get(topic)
+            .copied()
+            .ok_or_else(|| BusError::UnknownTopic(topic.to_owned()))
     }
 
     fn topics(&self) -> Vec<String> {
         let mut t: Vec<String> = self.topics.keys().cloned().collect();
         t.sort();
         t
+    }
+
+    fn maintenance(&self, _now_ms: u64) -> Result<u64, BusError> {
+        self.cold_archive.as_ref().map_or(Ok(0), |archive| {
+            archive.retry_pending_with(|pending| {
+                self.publish_broker_only(
+                    &pending.topic,
+                    &pending.key,
+                    &pending.value,
+                    pending.stored_at,
+                    &pending.event_uid,
+                )
+            })
+        })
     }
 }

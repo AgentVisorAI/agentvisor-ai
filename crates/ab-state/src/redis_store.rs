@@ -5,68 +5,230 @@
 //! Contract tests live in `tests/redis_contract.rs`, gated on `AB_REDIS_URL`
 //! (skipped loudly when unset — a skipped gate prints, never silently passes).
 
-use crate::store::{StateError, StateStore};
+use crate::store::{Spend, StateError, StateStore};
 use redis::Commands;
 
-/// Atomic check-and-spend: spends `amount` only if `current + amount <= limit`.
+/// Atomic check-and-spend using subtraction so `current + amount` never rounds.
 const TRY_SPEND_LUA: &str = r"
+for i, key in ipairs(KEYS) do
+    local current = tonumber(redis.call('GET', key) or '0')
+    local amount = tonumber(ARGV[(i - 1) * 2 + 1])
+    local limit = tonumber(ARGV[(i - 1) * 2 + 2])
+    if current > limit or amount > limit - current then
+        return i
+    end
+end
+for i, key in ipairs(KEYS) do
+    redis.call('INCRBY', key, ARGV[(i - 1) * 2 + 1])
+    redis.call('EXPIRE', key, 86400)
+end
+return 0
+";
+
+const ADD_LUA: &str = r"
 local current = tonumber(redis.call('GET', KEYS[1]) or '0')
 local amount = tonumber(ARGV[1])
 local limit = tonumber(ARGV[2])
-if current + amount <= limit then
-  redis.call('INCRBY', KEYS[1], amount)
-  return 1
-else
-  return 0
+if current > limit or amount > limit - current then
+    return -1
 end
+return redis.call('INCRBY', KEYS[1], ARGV[1])
 ";
 
 /// Redis-backed store. Cheap to clone via internal client pooling.
 pub struct RedisStore {
+    backend: RedisBackend,
+}
+
+enum RedisBackend {
+    Single(r2d2::Pool<RedisConnectionManager>),
+    Cluster(Box<parking_lot::Mutex<redis::cluster::ClusterConnection>>),
+}
+
+struct RedisConnectionManager {
     client: redis::Client,
+    timeout: std::time::Duration,
+}
+
+impl r2d2::ManageConnection for RedisConnectionManager {
+    type Connection = redis::Connection;
+    type Error = redis::RedisError;
+
+    fn connect(&self) -> Result<Self::Connection, Self::Error> {
+        let connection = self.client.get_connection_with_timeout(self.timeout)?;
+        connection.set_read_timeout(Some(self.timeout))?;
+        connection.set_write_timeout(Some(self.timeout))?;
+        Ok(connection)
+    }
+
+    fn is_valid(&self, connection: &mut Self::Connection) -> Result<(), Self::Error> {
+        redis::cmd("PING").query(connection)
+    }
+
+    fn has_broken(&self, _connection: &mut Self::Connection) -> bool {
+        false
+    }
 }
 
 impl RedisStore {
     /// Connect to `url` (e.g. `redis://127.0.0.1:6379`).
+    /// Comma-separated URLs select Redis Cluster mode.
     pub fn connect(url: &str) -> Result<Self, StateError> {
+        let nodes: Vec<String> = url
+            .split(',')
+            .map(str::trim)
+            .filter(|node| !node.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if nodes.len() > 1 {
+            let client = redis::cluster::ClusterClientBuilder::new(nodes)
+                .connection_timeout(std::time::Duration::from_secs(2))
+                .response_timeout(std::time::Duration::from_secs(2))
+                .build()
+                .map_err(|e| StateError::Backend(e.to_string()))?;
+            let connection = client
+                .get_connection()
+                .map_err(|e| StateError::Backend(e.to_string()))?;
+            return Ok(Self {
+                backend: RedisBackend::Cluster(Box::new(parking_lot::Mutex::new(connection))),
+            });
+        }
         let client = redis::Client::open(url).map_err(|e| StateError::Backend(e.to_string()))?;
-        Ok(Self { client })
+        let manager = RedisConnectionManager {
+            client,
+            timeout: std::time::Duration::from_secs(2),
+        };
+        let pool = r2d2::Pool::builder()
+            .max_size(32)
+            .connection_timeout(std::time::Duration::from_secs(2))
+            .build(manager)
+            .map_err(|e| StateError::Backend(e.to_string()))?;
+        Ok(Self {
+            backend: RedisBackend::Single(pool),
+        })
     }
+}
 
-    fn conn(&self) -> Result<redis::Connection, StateError> {
-        self.client.get_connection().map_err(|e| StateError::Backend(e.to_string()))
+fn add_on<C: redis::ConnectionLike>(conn: &mut C, key: &str, delta: u64) -> Result<u64, StateError> {
+    if delta > ab_core::error::JCS_SAFE_MAX {
+        return Err(StateError::Overflow(key.to_owned()));
+    }
+    let value: i64 = redis::Script::new(ADD_LUA)
+        .key(key)
+        .arg(delta)
+        .arg(ab_core::error::JCS_SAFE_MAX)
+        .invoke(conn)
+        .map_err(|e| StateError::Backend(e.to_string()))?;
+    if value < 0 {
+        return Err(StateError::Overflow(key.to_owned()));
+    }
+    u64::try_from(value).map_err(|_| StateError::Overflow(key.to_owned()))
+}
+
+fn get_on<C: redis::ConnectionLike>(conn: &mut C, key: &str) -> Result<u64, StateError> {
+    let value: Option<i64> = conn.get(key).map_err(|e| StateError::Backend(e.to_string()))?;
+    let value = match value {
+        None => 0,
+        Some(v) if v < 0 => return Err(StateError::Overflow(key.to_owned())),
+        Some(v) => u64::try_from(v).map_err(|_| StateError::Overflow(key.to_owned()))?,
+    };
+    if value > ab_core::error::JCS_SAFE_MAX {
+        return Err(StateError::Overflow(key.to_owned()));
+    }
+    Ok(value)
+}
+
+fn spend_many_on<C: redis::ConnectionLike>(
+    conn: &mut C,
+    spends: &[Spend],
+) -> Result<Option<usize>, StateError> {
+    // Same duplicate-key guard as `InMemoryStore::try_spend_many`: the Lua
+    // script reads GET(key) once per iteration in the check phase, so two
+    // spends on the same key each see the pre-commit value and pass their
+    // independent limit checks, then the commit phase INCRBYs both.
+    let mut seen = std::collections::HashSet::with_capacity(spends.len());
+    for spend in spends {
+        if !seen.insert(spend.key.as_str()) {
+            return Err(StateError::Backend(format!(
+                "try_spend_many received duplicate key {:?}",
+                spend.key,
+            )));
+        }
+    }
+    for spend in spends {
+        if spend.amount > ab_core::error::JCS_SAFE_MAX || spend.limit > ab_core::error::JCS_SAFE_MAX {
+            return Err(StateError::Overflow(spend.key.clone()));
+        }
+    }
+    let script = redis::Script::new(TRY_SPEND_LUA);
+    let mut invocation = script.prepare_invoke();
+    for spend in spends {
+        invocation.key(&spend.key).arg(spend.amount).arg(spend.limit);
+    }
+    let failed: i64 = invocation
+        .invoke(conn)
+        .map_err(|e| StateError::Backend(e.to_string()))?;
+    if failed == 0 {
+        Ok(None)
+    } else {
+        usize::try_from(failed - 1)
+            .map(Some)
+            .map_err(|_| StateError::Backend(format!("invalid Lua failure index {failed}")))
     }
 }
 
 impl StateStore for RedisStore {
     fn add(&self, key: &str, delta: u64) -> Result<u64, StateError> {
-        let mut conn = self.conn()?;
-        let v: i64 = conn
-            .incr(key, i64::try_from(delta).map_err(|_| StateError::Overflow(key.to_owned()))?)
-            .map_err(|e| StateError::Backend(e.to_string()))?;
-        u64::try_from(v).map_err(|_| StateError::Overflow(key.to_owned()))
+        match &self.backend {
+            RedisBackend::Single(pool) => add_on(
+                &mut pool.get().map_err(|e| StateError::Backend(e.to_string()))?,
+                key,
+                delta,
+            ),
+            RedisBackend::Cluster(connection) => add_on(&mut *connection.lock(), key, delta),
+        }
     }
 
     fn get(&self, key: &str) -> Result<u64, StateError> {
-        let mut conn = self.conn()?;
-        let v: Option<i64> = conn.get(key).map_err(|e| StateError::Backend(e.to_string()))?;
-        Ok(v.and_then(|x| u64::try_from(x).ok()).unwrap_or(0))
+        match &self.backend {
+            RedisBackend::Single(pool) => get_on(
+                &mut pool.get().map_err(|e| StateError::Backend(e.to_string()))?,
+                key,
+            ),
+            RedisBackend::Cluster(connection) => get_on(&mut *connection.lock(), key),
+        }
     }
 
     fn try_spend(&self, key: &str, amount: u64, limit: u64) -> Result<bool, StateError> {
-        let mut conn = self.conn()?;
-        let granted: i64 = redis::Script::new(TRY_SPEND_LUA)
-            .key(key)
-            .arg(amount)
-            .arg(limit)
-            .invoke(&mut conn)
-            .map_err(|e| StateError::Backend(e.to_string()))?;
-        Ok(granted == 1)
+        Ok(self
+            .try_spend_many(&[Spend {
+                key: key.to_owned(),
+                amount,
+                limit,
+            }])?
+            .is_none())
+    }
+
+    fn try_spend_many(&self, spends: &[Spend]) -> Result<Option<usize>, StateError> {
+        match &self.backend {
+            RedisBackend::Single(pool) => spend_many_on(
+                &mut pool.get().map_err(|e| StateError::Backend(e.to_string()))?,
+                spends,
+            ),
+            RedisBackend::Cluster(connection) => spend_many_on(&mut *connection.lock(), spends),
+        }
     }
 
     fn remove(&self, key: &str) {
-        if let Ok(mut conn) = self.conn() {
-            let _: Result<(), _> = conn.del(key);
+        match &self.backend {
+            RedisBackend::Single(pool) => {
+                if let Ok(mut connection) = pool.get() {
+                    let _: Result<(), _> = connection.del(key);
+                }
+            }
+            RedisBackend::Cluster(connection) => {
+                let _: Result<(), _> = connection.lock().del(key);
+            }
         }
     }
 }

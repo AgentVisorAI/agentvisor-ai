@@ -1,6 +1,7 @@
 //! The `StateStore` trait and the in-memory reference implementation.
 
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
@@ -14,6 +15,17 @@ pub enum StateError {
     /// Backend unavailable (network stores).
     #[error("state backend unavailable: {0}")]
     Backend(String),
+}
+
+/// One key/amount/limit entry in an atomic multi-dimensional spend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Spend {
+    /// Counter key.
+    pub key: String,
+    /// Amount to add.
+    pub amount: u64,
+    /// Maximum resulting counter value.
+    pub limit: u64,
 }
 
 /// Atomic counter operations. Every mutation is atomic with respect to
@@ -31,6 +43,16 @@ pub trait StateStore: Send + Sync {
     /// `Ok(false)` (recording nothing) otherwise.
     fn try_spend(&self, key: &str, amount: u64, limit: u64) -> Result<bool, StateError>;
 
+    /// Atomically validate and commit every spend, or commit none. Returns the
+    /// index of the first dimension that would exceed its limit.
+    ///
+    /// Every `Spend` in `spends` must carry a distinct `key`; two entries for
+    /// the same key would each observe the pre-commit value in the check
+    /// phase and pass their independent limit checks, then the commit phase
+    /// would sum them and blow through the cap. Duplicate keys return
+    /// `StateError::Backend` (not `Overflow`), matching the API-misuse class.
+    fn try_spend_many(&self, spends: &[Spend]) -> Result<Option<usize>, StateError>;
+
     /// Remove a key (session cleanup).
     fn remove(&self, key: &str);
 }
@@ -39,6 +61,7 @@ pub trait StateStore: Send + Sync {
 #[derive(Debug, Default)]
 pub struct InMemoryStore {
     counters: DashMap<String, Arc<AtomicI64>>,
+    transaction_lock: Mutex<()>,
 }
 
 impl InMemoryStore {
@@ -59,52 +82,80 @@ const MAX: i64 = i64::MAX / 2; // headroom so races can't reach the wrap point
 
 impl StateStore for InMemoryStore {
     fn add(&self, key: &str, delta: u64) -> Result<u64, StateError> {
+        let _transaction = self.transaction_lock.lock();
         let delta = i64::try_from(delta).map_err(|_| StateError::Overflow(key.to_owned()))?;
         let cell = self.cell(key);
-        let prev = cell.fetch_add(delta, Ordering::AcqRel);
-        let new = prev.checked_add(delta).filter(|v| *v <= MAX);
-        match new {
-            Some(v) => Ok(u64::try_from(v).unwrap_or(0)),
-            None => {
-                // Roll back the poisoned add and fail loudly.
-                cell.fetch_sub(delta, Ordering::AcqRel);
-                Err(StateError::Overflow(key.to_owned()))
-            }
-        }
+        let prev = cell.load(Ordering::Acquire);
+        let new = prev
+            .checked_add(delta)
+            .filter(|v| *v <= MAX)
+            .ok_or_else(|| StateError::Overflow(key.to_owned()))?;
+        // Only write after confirming no overflow — no transient negative visible to readers.
+        cell.store(new, Ordering::Release);
+        Ok(u64::try_from(new).unwrap_or(0))
     }
 
     fn get(&self, key: &str) -> Result<u64, StateError> {
-        Ok(self
-            .counters
-            .get(key)
-            .map(|c| c.load(Ordering::Acquire))
-            .map(|v| u64::try_from(v).unwrap_or(0))
-            .unwrap_or(0))
-    }
-
-    fn try_spend(&self, key: &str, amount: u64, limit: u64) -> Result<bool, StateError> {
-        let amount_i = i64::try_from(amount).map_err(|_| StateError::Overflow(key.to_owned()))?;
-        let limit_i = i64::try_from(limit.min(u64::try_from(MAX).unwrap_or(u64::MAX)))
-            .map_err(|_| StateError::Overflow(key.to_owned()))?;
-        let cell = self.cell(key);
-        // Compare-and-swap loop: the only race-safe check-and-spend.
-        let mut current = cell.load(Ordering::Acquire);
-        loop {
-            let next = match current.checked_add(amount_i) {
-                Some(v) => v,
-                None => return Err(StateError::Overflow(key.to_owned())),
-            };
-            if next > limit_i {
-                return Ok(false);
-            }
-            match cell.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return Ok(true),
-                Err(observed) => current = observed,
+        match self.counters.get(key) {
+            None => Ok(0),
+            Some(cell) => {
+                let raw = cell.load(Ordering::Acquire);
+                if raw < 0 {
+                    return Err(StateError::Overflow(key.to_owned()));
+                }
+                u64::try_from(raw).map_err(|_| StateError::Overflow(key.to_owned()))
             }
         }
     }
 
+    fn try_spend(&self, key: &str, amount: u64, limit: u64) -> Result<bool, StateError> {
+        Ok(self
+            .try_spend_many(&[Spend {
+                key: key.to_owned(),
+                amount,
+                limit,
+            }])?
+            .is_none())
+    }
+
+    fn try_spend_many(&self, spends: &[Spend]) -> Result<Option<usize>, StateError> {
+        let _transaction = self.transaction_lock.lock();
+        // Reject duplicate keys: check phase reads current + adds amount per entry.
+        // Two spends on the same key would each see the pre-commit value and pass
+        // their independent limit checks, then the commit phase would sum them
+        // and silently blow through the cap.
+        let mut seen = std::collections::HashSet::with_capacity(spends.len());
+        for spend in spends {
+            if !seen.insert(spend.key.as_str()) {
+                return Err(StateError::Backend(format!(
+                    "try_spend_many received duplicate key {:?}",
+                    spend.key,
+                )));
+            }
+        }
+        let mut prepared = Vec::with_capacity(spends.len());
+        for (index, spend) in spends.iter().enumerate() {
+            let amount = i64::try_from(spend.amount).map_err(|_| StateError::Overflow(spend.key.clone()))?;
+            let limit = i64::try_from(spend.limit.min(u64::try_from(MAX).unwrap_or(u64::MAX)))
+                .map_err(|_| StateError::Overflow(spend.key.clone()))?;
+            let cell = self.cell(&spend.key);
+            let current = cell.load(Ordering::Acquire);
+            let next = current
+                .checked_add(amount)
+                .ok_or_else(|| StateError::Overflow(spend.key.clone()))?;
+            if next > limit {
+                return Ok(Some(index));
+            }
+            prepared.push((cell, amount));
+        }
+        for (cell, amount) in prepared {
+            cell.fetch_add(amount, Ordering::AcqRel);
+        }
+        Ok(None)
+    }
+
     fn remove(&self, key: &str) {
+        let _transaction = self.transaction_lock.lock();
         self.counters.remove(key);
     }
 }
@@ -114,6 +165,71 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+
+    #[test]
+    fn add_overflow_rollback_is_never_visible_to_concurrent_get() {
+        // Before the fix, add() did fetch_add + fetch_sub to roll back, and
+        // get() held no lock — so a concurrent get() could see a transiently
+        // negative counter and return Err(Overflow) spuriously.
+        // The fix uses store() only after confirming no overflow, so no
+        // negative value ever hits the cell.
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let store = Arc::new(InMemoryStore::new());
+        store.add("k", 5).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+
+        // Writer: push add() to overflow (delta = i64::MAX triggers Overflow).
+        let s1 = Arc::clone(&store);
+        let b1 = Arc::clone(&barrier);
+        let writer = thread::spawn(move || {
+            b1.wait();
+            for _ in 0..500 {
+                let _ = s1.add("k", u64::MAX / 2); // will overflow
+            }
+        });
+
+        // Reader: must never see Err(Overflow) from a spurious negative.
+        let s2 = Arc::clone(&store);
+        let b2 = Arc::clone(&barrier);
+        let reader1 = thread::spawn(move || {
+            b2.wait();
+            for _ in 0..2_000 {
+                let v = s2.get("k");
+                assert!(v.is_ok(), "spurious Overflow from concurrent get: {v:?}");
+            }
+        });
+
+        let s3 = Arc::clone(&store);
+        let b3 = Arc::clone(&barrier);
+        let reader2 = thread::spawn(move || {
+            b3.wait();
+            for _ in 0..2_000 {
+                let v = s3.get("k");
+                assert!(v.is_ok(), "spurious Overflow from concurrent get: {v:?}");
+            }
+        });
+
+        writer.join().unwrap();
+        reader1.join().unwrap();
+        reader2.join().unwrap();
+    }
+
+    #[test]
+    fn poisoned_negative_value_surfaces_as_overflow_not_silent_zero() {
+        // Direct cell manipulation simulates a wire-format corruption or a bug
+        // that leaves the counter negative. `get` must surface an Overflow
+        // error, not silently zero — the previous behavior would let a
+        // corrupted account get a free reset.
+        let s = InMemoryStore::new();
+        let cell = s.cell("k");
+        cell.store(-1, Ordering::Release);
+        match s.get("k") {
+            Err(StateError::Overflow(_)) => (),
+            other => panic!("expected Overflow on negative counter, got {other:?}"),
+        }
+    }
 
     #[test]
     fn add_and_get() {
@@ -193,5 +309,64 @@ mod tests {
         let total: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
         assert!(total <= limit, "over-spend: {total} > {limit}");
         assert_eq!(s.get("cap").unwrap(), total);
+    }
+
+    /// Vicious bug caught in review round 16: `try_spend_many` used to
+    /// validate each Spend against the pre-commit cell value and then commit
+    /// them all sequentially. When two Spends referenced the same key, both
+    /// passed their independent limit checks (each saw `current = 0`), then
+    /// the commit phase INCRBY'd both — silently blowing through the cap.
+    /// Duplicate keys must fail loudly with `Backend`, not silently double-spend.
+    #[test]
+    fn try_spend_many_refuses_duplicate_keys() {
+        let s = InMemoryStore::new();
+        let outcome = s.try_spend_many(&[
+            Spend {
+                key: "budget".to_owned(),
+                amount: 60,
+                limit: 100,
+            },
+            Spend {
+                key: "budget".to_owned(),
+                amount: 60,
+                limit: 100,
+            },
+        ]);
+        match outcome {
+            Err(StateError::Backend(reason)) => {
+                assert!(reason.contains("duplicate key"), "wrong reason: {reason}");
+            }
+            other => panic!("must reject duplicate keys, got {other:?}"),
+        }
+        assert_eq!(
+            s.get("budget").unwrap(),
+            0,
+            "no partial spend must have been committed",
+        );
+    }
+
+    /// Symmetric locking of the fix: legitimate distinct-key multi-spends must
+    /// still succeed exactly as before.
+    #[test]
+    fn try_spend_many_distinct_keys_still_commits_atomically() {
+        let s = InMemoryStore::new();
+        assert_eq!(
+            s.try_spend_many(&[
+                Spend {
+                    key: "a".to_owned(),
+                    amount: 3,
+                    limit: 10,
+                },
+                Spend {
+                    key: "b".to_owned(),
+                    amount: 4,
+                    limit: 10,
+                },
+            ])
+            .unwrap(),
+            None,
+        );
+        assert_eq!(s.get("a").unwrap(), 3);
+        assert_eq!(s.get("b").unwrap(), 4);
     }
 }

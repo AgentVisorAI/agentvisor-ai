@@ -1,91 +1,326 @@
 //! Kafka-wire connector (feature `kafka`), targeting Redpanda as the reference
-//! self-hosted broker (brief Module F). Uses rskafka (pure Rust, no librdkafka
-//! system dependency). Contract tests gate on `AB_KAFKA_BROKER`.
+//! self-hosted broker (brief Module F). The event path uses rskafka; a statically
+//! linked librdkafka admin client provisions and verifies topic retention.
 
 use crate::bus::{partition_for, BusError, EventBus, PublishAck, StoredEvent};
 use crate::manifest::BridgeManifest;
-use rskafka::client::partition::{Compression, UnknownTopicHandling};
+use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, ResourceSpecifier, TopicReplication};
+use rdkafka::client::DefaultClientContext;
+use rdkafka::config::ClientConfig;
+use rdkafka::types::RDKafkaErrorCode;
+use rskafka::client::partition::{Compression, OffsetAt, UnknownTopicHandling};
 use rskafka::client::{Client, ClientBuilder};
 use rskafka::record::Record;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Kafka/Redpanda bus.
 pub struct KafkaBus {
-    rt: tokio::runtime::Runtime,
-    client: Client,
+    cold_archive: Option<crate::cold_store::ColdArchive>,
+    client: Arc<Client>,
+    executor: crate::bus::ConnectorExecutor,
     topics: HashMap<String, u32>,
+    validators: HashMap<String, jsonschema::Validator>,
 }
 
 impl KafkaBus {
     /// Connect to `broker` (host:port) and provision topics per the manifest.
     pub fn provision(broker: &str, manifest: &BridgeManifest) -> Result<Self, BusError> {
-        manifest.validate().map_err(|e| BusError::Backend(e.to_string()))?;
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
+        manifest
+            .validate()
             .map_err(|e| BusError::Backend(e.to_string()))?;
-        let client = rt
-            .block_on(ClientBuilder::new(vec![broker.to_owned()]).build())
+        let validators = crate::manifest::compile_topic_validators(manifest)?;
+        let cold_archive = crate::cold_store::ColdArchive::from_manifest(manifest)?;
+        let executor = crate::bus::ConnectorExecutor::new("agent-bridge-kafka")?;
+        let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+            .set("bootstrap.servers", broker)
+            .set("socket.timeout.ms", "10000")
+            .create()
+            .map_err(|error| BusError::Backend(error.to_string()))?;
+        let admin = Arc::new(admin);
+        for topic in &manifest.topics {
+            let admin = Arc::clone(&admin);
+            let name = topic.name.clone();
+            let partitions = topic.partitions;
+            let replication_factor = manifest.replication_factor;
+            let retention_ms = u64::from(topic.retention.hot_hours)
+                .checked_mul(ab_core::units::MS_PER_HOUR)
+                .ok_or_else(|| BusError::Backend("Kafka retention overflow".to_owned()))?
+                .to_string();
+            executor
+                .run(move || provision_topic(admin, name, partitions, replication_factor, retention_ms))?
+                .map_err(BusError::Backend)?;
+        }
+        drop(admin);
+        let brokers = vec![broker.to_owned()];
+        let client = executor
+            .run(move || async move { ClientBuilder::new(brokers).build().await })?
             .map_err(|e| BusError::Backend(e.to_string()))?;
+        let client = Arc::new(client);
         let mut topics = HashMap::new();
         for t in &manifest.topics {
-            let controller = client.controller_client().map_err(|e| BusError::Backend(e.to_string()))?;
-            // Idempotent create: "already exists" is fine.
-            let created = rt.block_on(controller.create_topic(
-                t.name.clone(),
-                t.partitions as i32,
-                1, // replication factor: single-node reference deployment
-                5_000,
-            ));
-            if let Err(e) = created {
-                let msg = e.to_string();
-                if !msg.contains("already exists") && !msg.contains("TopicAlreadyExists") {
-                    return Err(BusError::Backend(msg));
-                }
-            }
             topics.insert(t.name.clone(), t.partitions);
         }
-        Ok(Self { rt, client, topics })
+        let metadata_client = Arc::clone(&client);
+        let metadata = executor
+            .run(move || async move { metadata_client.list_topics().await })?
+            .map_err(|error| BusError::Backend(error.to_string()))?;
+        for expected in &manifest.topics {
+            let actual = metadata
+                .iter()
+                .find(|topic| topic.name == expected.name)
+                .ok_or_else(|| BusError::Backend(format!("Kafka topic {:?} is missing", expected.name)))?;
+            if actual.partitions.len() != expected.partitions as usize {
+                return Err(BusError::Backend(format!(
+                    "Kafka topic {:?} has {} partitions, manifest requires {}",
+                    expected.name,
+                    actual.partitions.len(),
+                    expected.partitions
+                )));
+            }
+        }
+        Ok(Self {
+            cold_archive,
+            client,
+            executor,
+            topics,
+            validators,
+        })
     }
-}
 
-impl EventBus for KafkaBus {
-    fn publish(&self, topic: &str, key: &str, value: &serde_json::Value) -> Result<PublishAck, BusError> {
-        let partitions =
-            *self.topics.get(topic).ok_or_else(|| BusError::UnknownTopic(topic.to_owned()))?;
+    fn publish_with_uid(
+        &self,
+        topic: &str,
+        key: &str,
+        value: &serde_json::Value,
+        event_uid: Option<&str>,
+    ) -> Result<PublishAck, BusError> {
+        crate::manifest::validate_topic_event(&self.validators, topic, value)?;
+        let partitions = *self
+            .topics
+            .get(topic)
+            .ok_or_else(|| BusError::UnknownTopic(topic.to_owned()))?;
+        let partition = partition_for(key, partitions);
+        let event_uid = event_uid.map_or_else(ab_core::new_event_uid, str::to_owned);
+        let stored_at = ab_core::time::now_ms();
+        let record = StoredEvent {
+            partition,
+            offset: 0,
+            key: key.to_owned(),
+            value: value.clone(),
+            stored_at,
+        };
+        if let Some(archive) = &self.cold_archive {
+            archive.stage(topic, &record, &event_uid)?;
+        }
+        let ack = self.publish_broker_only(topic, key, value, stored_at, &event_uid)?;
+        if let Some(archive) = &self.cold_archive {
+            archive.commit(topic, &event_uid, ack.offset)?;
+        }
+        Ok(ack)
+    }
+
+    fn publish_broker_only(
+        &self,
+        topic: &str,
+        key: &str,
+        value: &serde_json::Value,
+        stored_at: u64,
+        event_uid: &str,
+    ) -> Result<PublishAck, BusError> {
+        crate::manifest::validate_topic_event(&self.validators, topic, value)?;
+        let partitions = *self
+            .topics
+            .get(topic)
+            .ok_or_else(|| BusError::UnknownTopic(topic.to_owned()))?;
         let partition = partition_for(key, partitions);
         let record = StoredEvent {
             partition,
             offset: 0,
             key: key.to_owned(),
             value: value.clone(),
-            stored_at: ab_core::time::now_ms(),
+            stored_at,
         };
         let payload = serde_json::to_vec(&record)?;
+        let client = Arc::clone(&self.client);
+        let topic_name = topic.to_owned();
+        let key_bytes = event_uid.as_bytes().to_vec();
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert("agentbridge-event-uid".to_owned(), event_uid.as_bytes().to_vec());
         let offset = self
-            .rt
-            .block_on(async {
-                let pc = self
-                    .client
-                    .partition_client(topic, partition as i32, UnknownTopicHandling::Error)
+            .executor
+            .run(move || async move {
+                let pc = client
+                    .partition_client(topic_name, partition as i32, UnknownTopicHandling::Error)
                     .await?;
                 let offsets = pc
                     .produce(
                         vec![Record {
-                            key: Some(key.as_bytes().to_vec()),
+                            key: Some(key_bytes),
                             value: Some(payload),
-                            headers: Default::default(),
+                            headers,
                             timestamp: chrono_now(),
                         }],
                         Compression::NoCompression,
                     )
                     .await?;
                 Ok::<_, rskafka::client::error::Error>(offsets.first().copied().unwrap_or(0))
-            })
+            })?
             .map_err(|e| BusError::Backend(e.to_string()))?;
-        #[allow(clippy::cast_sign_loss)]
-        Ok(PublishAck { topic: topic.to_owned(), partition, offset: offset as u64 })
+        let offset = u64::try_from(offset)
+            .map_err(|_| BusError::Backend(format!("Kafka returned negative offset {offset}")))?;
+        Ok(PublishAck {
+            topic: topic.to_owned(),
+            partition,
+            offset,
+        })
+    }
+}
+
+async fn provision_topic(
+    admin: Arc<AdminClient<DefaultClientContext>>,
+    name: String,
+    partitions: u32,
+    replication_factor: u32,
+    retention_ms: String,
+) -> Result<(), String> {
+    let partitions = i32::try_from(partitions)
+        .map_err(|_| format!("partition count for Kafka topic {name:?} exceeds i32"))?;
+    let replication_factor = i32::try_from(replication_factor)
+        .map_err(|_| format!("replication factor for Kafka topic {name:?} exceeds i32"))?;
+    let topic = NewTopic::new(&name, partitions, TopicReplication::Fixed(replication_factor))
+        .set("retention.ms", &retention_ms);
+    let results = admin
+        .create_topics(
+            [&topic],
+            &AdminOptions::new().operation_timeout(Some(std::time::Duration::from_secs(5))),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    match results.into_iter().next() {
+        Some(Ok(_)) | Some(Err((_, RDKafkaErrorCode::TopicAlreadyExists))) => {}
+        Some(Err((_, error))) => return Err(format!("create Kafka topic {name:?}: {error}")),
+        None => return Err(format!("create Kafka topic {name:?} returned no result")),
+    }
+
+    let resource = ResourceSpecifier::Topic(&name);
+    let results = admin
+        .describe_configs([&resource], &AdminOptions::new())
+        .await
+        .map_err(|error| error.to_string())?;
+    let configuration = results
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("describe Kafka topic {name:?} returned no result"))?
+        .map_err(|error| format!("describe Kafka topic {name:?}: {error}"))?;
+    let actual = configuration
+        .get("retention.ms")
+        .and_then(|entry| entry.value.as_deref());
+    if actual != Some(retention_ms.as_str()) {
+        return Err(format!(
+            "Kafka topic {name:?} retention.ms is {actual:?}, manifest requires {retention_ms:?}"
+        ));
+    }
+    Ok(())
+}
+
+impl EventBus for KafkaBus {
+    fn set_control_key(&self, key: [u8; 32]) -> Result<(), BusError> {
+        if let Some(archive) = &self.cold_archive {
+            archive.set_control_key(key);
+        }
+        Ok(())
+    }
+
+    fn publish(&self, topic: &str, key: &str, value: &serde_json::Value) -> Result<PublishAck, BusError> {
+        let event_uid = value
+            .get("metadata")
+            .and_then(|metadata| metadata.get("uid"))
+            .and_then(serde_json::Value::as_str);
+        self.publish_with_uid(topic, key, value, event_uid)
+    }
+
+    fn publish_idempotent(
+        &self,
+        topic: &str,
+        key: &str,
+        value: &serde_json::Value,
+        event_uid: &str,
+    ) -> Result<PublishAck, BusError> {
+        self.publish_with_uid(topic, key, value, Some(event_uid))
+    }
+
+    fn find_event_by_uid(
+        &self,
+        topic: &str,
+        key: &str,
+        event_uid: &str,
+    ) -> Result<Option<PublishAck>, BusError> {
+        let partitions = *self
+            .topics
+            .get(topic)
+            .ok_or_else(|| BusError::UnknownTopic(topic.to_owned()))?;
+        let partition = partition_for(key, partitions);
+        let client = Arc::clone(&self.client);
+        let topic_name = topic.to_owned();
+        let event_uid = event_uid.to_owned();
+        let found = self
+            .executor
+            .run(move || async move {
+                let partition_client = client
+                    .partition_client(topic_name, partition as i32, UnknownTopicHandling::Error)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let mut offset = partition_client
+                    .get_offset(OffsetAt::Earliest)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let latest = partition_client
+                    .get_offset(OffsetAt::Latest)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                while offset < latest {
+                    let (records, _) = partition_client
+                        .fetch_records(offset, 1..(16 * 1024 * 1024), 500)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if records.is_empty() {
+                        break;
+                    }
+                    for record in &records {
+                        if let Some(payload) = record.record.value.as_deref() {
+                            let stored: StoredEvent =
+                                serde_json::from_slice(payload).map_err(|error| error.to_string())?;
+                            if stored
+                                .value
+                                .get("metadata")
+                                .and_then(|metadata| metadata.get("uid"))
+                                .and_then(serde_json::Value::as_str)
+                                == Some(event_uid.as_str())
+                            {
+                                return Ok::<_, String>(Some(record.offset));
+                            }
+                        }
+                    }
+                    offset = records
+                        .last()
+                        .and_then(|record| record.offset.checked_add(1))
+                        .ok_or_else(|| "Kafka event lookup offset overflow".to_owned())?;
+                }
+                Ok::<_, String>(None)
+            })?
+            .map_err(BusError::Backend)?;
+        found
+            .map(|offset| {
+                u64::try_from(offset)
+                    .map(|offset| PublishAck {
+                        topic: topic.to_owned(),
+                        partition,
+                        offset,
+                    })
+                    .map_err(|_| BusError::Backend(format!("Kafka returned negative offset {offset}")))
+            })
+            .transpose()
     }
 
     fn fetch(
@@ -98,15 +333,17 @@ impl EventBus for KafkaBus {
         if !self.topics.contains_key(topic) {
             return Err(BusError::UnknownTopic(topic.to_owned()));
         }
-        self.rt
-            .block_on(async {
-                let pc = self
-                    .client
+        let client = Arc::clone(&self.client);
+        let topic = topic.to_owned();
+        self.executor
+            .run(move || async move {
+                let pc = client
                     .partition_client(topic, partition as i32, UnknownTopicHandling::Error)
                     .await?;
                 #[allow(clippy::cast_possible_wrap)]
-                let (records, _high_watermark) =
-                    pc.fetch_records(offset as i64, 1..(16 * 1024 * 1024), 500).await?;
+                let (records, _high_watermark) = pc
+                    .fetch_records(offset as i64, 1..(16 * 1024 * 1024), 500)
+                    .await?;
                 let mut out = Vec::new();
                 for r in records {
                     if let Some(value) = r.record.value {
@@ -123,18 +360,35 @@ impl EventBus for KafkaBus {
                     }
                 }
                 Ok::<_, rskafka::client::error::Error>(out)
-            })
+            })?
             .map_err(|e| BusError::Backend(e.to_string()))
     }
 
     fn partitions(&self, topic: &str) -> Result<u32, BusError> {
-        self.topics.get(topic).copied().ok_or_else(|| BusError::UnknownTopic(topic.to_owned()))
+        self.topics
+            .get(topic)
+            .copied()
+            .ok_or_else(|| BusError::UnknownTopic(topic.to_owned()))
     }
 
     fn topics(&self) -> Vec<String> {
         let mut t: Vec<String> = self.topics.keys().cloned().collect();
         t.sort();
         t
+    }
+
+    fn maintenance(&self, _now_ms: u64) -> Result<u64, BusError> {
+        self.cold_archive.as_ref().map_or(Ok(0), |archive| {
+            archive.retry_pending_with(|pending| {
+                self.publish_broker_only(
+                    &pending.topic,
+                    &pending.key,
+                    &pending.value,
+                    pending.stored_at,
+                    &pending.event_uid,
+                )
+            })
+        })
     }
 }
 

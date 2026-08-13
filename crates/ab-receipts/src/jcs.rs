@@ -31,7 +31,9 @@ pub enum JcsError {
 
 /// Canonicalize a JSON value per RFC 8785. Returns the canonical UTF-8 string.
 pub fn canonicalize(value: &Value) -> Result<String, JcsError> {
-    let mut out = String::new();
+    // Typical receipt canonicalizes to a few hundred bytes; pre-allocate to
+    // avoid the growth-doubling churn on the first few pushes.
+    let mut out = String::with_capacity(512);
     write_value(value, &mut out)?;
     Ok(out)
 }
@@ -99,18 +101,18 @@ fn write_string(s: &str, out: &mut String) {
     out.push('"');
 }
 
-const SAFE_MAX: u64 = 1 << 53;
+use ab_core::error::JCS_SAFE_MAX;
 
 fn write_number(n: &serde_json::Number, out: &mut String) -> Result<(), JcsError> {
     if let Some(u) = n.as_u64() {
-        if u > SAFE_MAX {
+        if u > JCS_SAFE_MAX {
             return Err(JcsError::UnsafeInteger(u.to_string()));
         }
         let _ = write!(out, "{u}");
         return Ok(());
     }
     if let Some(i) = n.as_i64() {
-        if i < -(SAFE_MAX as i64) {
+        if i < -(JCS_SAFE_MAX as i64) {
             return Err(JcsError::UnsafeInteger(i.to_string()));
         }
         let _ = write!(out, "{i}");
@@ -194,9 +196,15 @@ fn digits_and_k(printed: &str) -> (String, i64) {
     let int_stripped = int_part.trim_start_matches('0');
     let (raw, k) = if int_stripped.is_empty() {
         let lead_zeros = frac_part.len() - frac_part.trim_start_matches('0').len();
-        (frac_part.trim_start_matches('0').to_owned(), e - lead_zeros as i64)
+        (
+            frac_part.trim_start_matches('0').to_owned(),
+            e - lead_zeros as i64,
+        )
     } else {
-        (format!("{int_stripped}{frac_part}"), int_stripped.len() as i64 + e)
+        (
+            format!("{int_stripped}{frac_part}"),
+            int_stripped.len() as i64 + e,
+        )
     };
     let digits = raw.trim_end_matches('0');
     if digits.is_empty() {
@@ -268,8 +276,7 @@ mod tests {
         // \u20AC €, \uD83D\uDE02 😂 (U+1F602), \uFB33 דּ (precomposed).
         // UTF-16 code-unit order: 20AC < D83D < FB33 — differs from code-point
         // order, where 1F602 would sort last.
-        let v: Value =
-            serde_json::from_str(r#"{"\uFB33": 3, "\uD83D\uDE02": 2, "\u20AC": 1}"#).unwrap();
+        let v: Value = serde_json::from_str(r#"{"\uFB33": 3, "\uD83D\uDE02": 2, "\u20AC": 1}"#).unwrap();
         let c = canonicalize(&v).unwrap();
         assert_eq!(c, "{\"\u{20ac}\":1,\"\u{1f602}\":2,\"\u{fb33}\":3}");
     }
@@ -299,7 +306,10 @@ mod tests {
     fn unsafe_integers_rejected() {
         let over = serde_json::Number::from((1u64 << 53) + 1);
         let v = Value::Number(over);
-        assert_eq!(canonicalize(&v), Err(JcsError::UnsafeInteger(((1u64 << 53) + 1).to_string())));
+        assert_eq!(
+            canonicalize(&v),
+            Err(JcsError::UnsafeInteger(((1u64 << 53) + 1).to_string()))
+        );
         let under = serde_json::Number::from(-(1i64 << 53) - 1);
         assert!(canonicalize(&Value::Number(under)).is_err());
         // Exactly ±2^53 is fine.
@@ -330,5 +340,25 @@ mod tests {
         assert_eq!(canonicalize(&json!({})).unwrap(), "{}");
         assert_eq!(canonicalize(&json!([])).unwrap(), "[]");
         assert_eq!(canonicalize(&json!("")).unwrap(), "\"\"");
+    }
+
+    #[test]
+    fn space_at_boundary_u0020_is_not_escaped() {
+        // The escape guard is `< 0x20`: space (U+0020) sits at the boundary
+        // and must stay literal, not become "\u0020". This detects the
+        // <-vs-<= off-by-one silently corrupting canonical output.
+        let v = json!({"a": "a b"});
+        assert_eq!(canonicalize(&v).unwrap(), "{\"a\":\"a b\"}");
+        // And U+001F just below the boundary DOES get escaped.
+        let v2 = json!({"a": "a\u{001f}b"});
+        assert_eq!(canonicalize(&v2).unwrap(), "{\"a\":\"a\\u001fb\"}");
+    }
+
+    #[test]
+    fn positive_zero_never_prints_with_a_minus_sign() {
+        // The negation short-circuit is `if f < 0.0`. A `<=` off-by-one would
+        // recurse on +0.0 with a `-` prefix and yield "-0".
+        assert_eq!(ecma_number(0.0), "0");
+        assert_eq!(ecma_number(-0.0), "0");
     }
 }
