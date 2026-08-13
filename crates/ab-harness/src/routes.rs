@@ -351,7 +351,20 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                             Err(error) => lifecycle_error(format!("read tool response: {error}")),
                         }
                     }
-                    Err(error) => lifecycle_error(format!("forward tool call: {error}")),
+                    Err(error) => {
+                        // CWE-209: `reqwest::Error::Display` embeds the request URL —
+                        // returning it verbatim would leak the operator-configured
+                        // tool-upstream URL (potentially an internal hostname) to
+                        // whichever client called `/mcp`. Report a stable category
+                        // and preserve the raw detail server-side for operators.
+                        let category = crate::pipeline::classify_upstream_error(&error);
+                        tracing::warn!(
+                            error = %error,
+                            category = category,
+                            "tool upstream forwarding failed"
+                        );
+                        lifecycle_error(format!("forward tool call: {category}"))
+                    }
                 }
             } else {
                 (
@@ -377,7 +390,19 @@ async fn read_limited_tool_response(response: reqwest::Response) -> Result<Bytes
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| error.to_string())?;
+        // CWE-209: `reqwest::Error::Display` embeds the request URL — leaking
+        // the operator-configured tool-upstream URL to the client if we
+        // returned it verbatim. Use the stable classifier and log the raw
+        // detail for operators.
+        let chunk = chunk.map_err(|error| {
+            let category = crate::pipeline::classify_upstream_error(&error);
+            tracing::warn!(
+                error = %error,
+                category = category,
+                "tool upstream stream chunk failed"
+            );
+            category.to_owned()
+        })?;
         let next = body
             .len()
             .checked_add(chunk.len())
@@ -2974,5 +2999,58 @@ mod tests {
                 "benign header {name:?} must still be forwarded"
             );
         }
+    }
+
+    /// Regression lock for CWE-209 information exposure on the MCP
+    /// tool-call path — the second occurrence of pass 17's chat/completion
+    /// leak. Before this fix, when the tool-upstream request failed
+    /// (unroutable host, timeout, TLS error, …) `mcp_call` returned
+    /// `lifecycle_error(format!("forward tool call: {reqwest_err}"))`
+    /// which — because `reqwest::Error::Display` embeds the request URL —
+    /// leaked the operator-configured tool-upstream URL (potentially an
+    /// internal hostname) to any client that could hit `/mcp`. The
+    /// `read_limited_tool_response` mid-stream error path had the same
+    /// bug. The client-facing message must now be a stable, non-identifying
+    /// category (e.g. `"upstream unreachable"`), matching pass 17's
+    /// classifier categories.
+    #[tokio::test]
+    async fn mcp_tool_upstream_failure_does_not_leak_configured_url() {
+        // Distinctive sentinel host so any regression is unmissable.
+        let sentinel_host = "internal-mcp-sentinel-host.corp.example";
+        let sentinel_url = format!("http://{sentinel_host}:65002/mcp");
+        let directory = tempfile::tempdir().unwrap();
+        let (mut state, provider) = test_state(directory.path()).await;
+        Arc::get_mut(&mut state.config).unwrap().tool_upstream_url = Some(sentinel_url);
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/mcp")
+                    .header("x-ab-session", "mcp-cwe-209-check")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":"leak","method":"tools/call","params":{"name":"read","arguments":{}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            !body.contains(sentinel_host),
+            "MCP forward-tool error body {body:?} leaks the configured tool-upstream host"
+        );
+        assert!(
+            !body.contains("65002"),
+            "MCP forward-tool error body {body:?} leaks the configured tool-upstream port"
+        );
+        assert!(
+            !body.contains("corp.example"),
+            "MCP forward-tool error body {body:?} leaks the configured tool-upstream domain"
+        );
+        provider.abort();
     }
 }

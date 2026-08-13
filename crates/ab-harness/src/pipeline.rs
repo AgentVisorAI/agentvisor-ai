@@ -913,7 +913,7 @@ fn truthy_env(name: &str) -> bool {
 /// upstream URL — potentially an internal hostname — to the caller. Return a
 /// stable, non-identifying category instead; the detailed message is logged
 /// server-side by the caller.
-fn classify_upstream_error(error: &reqwest::Error) -> &'static str {
+pub(crate) fn classify_upstream_error(error: &reqwest::Error) -> &'static str {
     if error.is_timeout() {
         "upstream timed out"
     } else if error.is_connect() {
