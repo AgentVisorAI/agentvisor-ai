@@ -356,8 +356,10 @@ mod tests {
 
     #[test]
     fn positive_zero_never_prints_with_a_minus_sign() {
-        // The negation short-circuit is `if f < 0.0`. A `<=` off-by-one would
-        // recurse on +0.0 with a `-` prefix and yield "-0".
+        // ES semantics: both zeros print "0". The `f == 0.0` early return
+        // covers -0.0 too (IEEE: -0.0 == 0.0), and it must stay ahead of the
+        // sign-handling branch — dropping or reordering it would send -0.0
+        // through ryu and emit "-0".
         assert_eq!(ecma_number(0.0), "0");
         assert_eq!(ecma_number(-0.0), "0");
     }

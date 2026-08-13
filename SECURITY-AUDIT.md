@@ -38,7 +38,7 @@ in the root `Cargo.toml`. Advisories filtered out on this basis:
 
 **wasmtime 27 RUSTSEC-2026-0096 (critical, aarch64 Cranelift heap escape) is
 NOT reachable.** Guest bytecode is loaded only from operator-signed policy
-paths (`config.wasm_policy_paths`, see `crates/ab-harness/src/main.rs:257`).
+paths (`config.wasm_policy_paths`, loaded in `crates/ab-harness/src/main.rs`).
 Attackers cannot deliver Wasm bytes to `Module::new`. Regressions locking
 this containment invariant:
 
@@ -68,6 +68,8 @@ attacker cannot substitute a hostile model.
   URI is an operator secret). Upgrade path (`async-nats 0.42+`) is straightforward
   once the workspace's `nats`/`kafka` feature declarations are corrected
   (see "Known pre-existing workspace issue" below).
+  *Resolved after this audit:* the workspace now pins `async-nats 0.50`
+  with `rustls-webpki 0.103.13` in `Cargo.lock`.
 
 ### Informational (no CVE)
 
@@ -100,17 +102,18 @@ Wasm sandbox (crates/ab-sandbox/src/wasm_policy.rs):
 
 ## Known pre-existing workspace issue (not this session's scope)
 
-`crates/ab-bridge/Cargo.toml` declares only `nats` and `kafka` features but
-`crates/ab-bridge/src/embedded.rs` and neighbors reference `feature = "cold-store"`,
-crate `rdkafka`, and module `cold_store`. `cargo clippy --all-features` fails
-because the referenced feature/crate names are not declared. Default builds
-(`cargo build --workspace`, `cargo test --workspace`) succeed because the
-missing features aren't activated. This is a pre-existing declaration drift
-that also blocks upgrading the vulnerable transitive `rustls-webpki` chain
-(the `async-nats` upgrade path). Recommended follow-up: reconcile
-`crates/ab-bridge/Cargo.toml` with the source tree by declaring `cold-store`,
-`rdkafka`, `object_store`, `url`, `hmac`, `sha2`, `hex` — then bump
-`async-nats` to `0.42+` and re-run `cargo audit`.
+*Resolved after this audit; kept for the record.*
+
+At audit time, `crates/ab-bridge/Cargo.toml` declared only `nats` and `kafka`
+features while `crates/ab-bridge/src/embedded.rs` and neighbors referenced
+`feature = "cold-store"`, crate `rdkafka`, and module `cold_store`, so
+`cargo clippy --all-features` failed. Default builds succeeded because the
+missing features weren't activated. This drift also blocked upgrading the
+vulnerable transitive `rustls-webpki` chain (the `async-nats` upgrade path).
+The recommended follow-up has since been completed: `ab-bridge/Cargo.toml`
+now declares `cold-store` (with `object_store`, `url`, `hmac`, `sha2`, `hex`,
+`ab-receipts`) plus `rdkafka` under `kafka`, `async-nats` is at 0.50, and the
+all-feature clippy/test gates pass.
 
 ## Verification
 

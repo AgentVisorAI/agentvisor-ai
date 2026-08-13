@@ -88,8 +88,8 @@ fn payload_with_prompt_size(bytes: usize) -> Value {
 
 // ---------------------------------------------------------------------------
 // 1. Very large prompt through `prepare_chat` accepted when no token cap
-//    is set. The recorded session must show a non-zero prompt token cost
-//    and the seq must have advanced by exactly one.
+//    is set. The session must exist in the registry afterwards (the prep
+//    was admitted and recorded).
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -117,7 +117,7 @@ async fn prepare_chat_refuses_a_massive_prompt_that_blows_the_token_budget() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Many medium requests on ONE session: N × 128 KiB preps close into a
+// 3. Many medium requests on ONE session: N × 16 KiB preps close into a
 //    single receipt whose event_count = N. Proves per-request memory does
 //    not grow the aggregate cost non-linearly.
 // ---------------------------------------------------------------------------

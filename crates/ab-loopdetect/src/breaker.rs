@@ -89,8 +89,10 @@ pub enum BreakerState {
     Open,
 }
 
-/// Per-session loop-detection state. All mutation happens on worker threads;
-/// the hot path only reads [`SessionLoopState::state`].
+/// Per-session loop-detection state. Embedding/delta mutation happens on
+/// worker threads; the hot path reads [`SessionLoopState::state`] and
+/// [`SessionLoopState::action`], and calls [`SessionLoopState::reset`] when
+/// an Inject verdict fires.
 pub struct SessionLoopState {
     cfg: BreakerConfig,
     inner: Mutex<Inner>,
@@ -141,8 +143,8 @@ impl SessionLoopState {
         self.observe_embedding_with_similarity(embedding, step_tokens, None)
     }
 
-    /// Observe an embedding plus an optional nearest prior-session similarity
-    /// supplied by a distributed vector engine.
+    /// Observe an embedding plus an optional nearest prior-step similarity
+    /// (scoped to the same session) supplied by a distributed vector engine.
     pub fn observe_embedding_with_similarity(
         &self,
         embedding: Vec<f32>,

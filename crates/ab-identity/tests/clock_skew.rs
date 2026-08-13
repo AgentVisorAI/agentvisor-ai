@@ -296,7 +296,7 @@ fn iat_close_to_now_never_underflows_ttl_computation() {
 }
 
 /// Rapid successive validations must produce non-increasing `ttl_remaining_s`
-/// under a monotone wall clock — a decrease detected across two same-token
+/// under a monotone wall clock — an *increase* detected across two same-token
 /// validations would signal that `now_ms()` ran backward, which the workspace
 /// guarantees does not happen under normal operation.
 #[test]

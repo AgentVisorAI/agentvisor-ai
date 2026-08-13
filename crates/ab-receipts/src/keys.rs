@@ -31,7 +31,7 @@ impl std::fmt::Debug for Ed25519Signer {
 
 impl Ed25519Signer {
     /// Generate a fresh keypair. The key id is derived from the public key
-    /// (first 16 hex chars of its SHA-256) so ids are collision-resistant and
+    /// (first 32 hex chars of its SHA-256) so ids are collision-resistant and
     /// never chosen by an attacker.
     pub fn generate() -> Self {
         let key = SigningKey::generate(&mut rand::rngs::OsRng);
@@ -268,23 +268,13 @@ mod tests {
         let mut ring = Keyring::new();
         let honest = Ed25519Signer::generate();
         let id = ring.add_signer(&honest).unwrap();
-        // Simulate a colliding attacker key by forcing a distinct verifying key
-        // into the same slot the honest key occupies.
         let attacker = Ed25519Signer::generate();
         assert_ne!(honest.public_key_bytes(), attacker.public_key_bytes());
-        ring.keys.insert(
-            id.clone(),
-            VerifyingKey::from_bytes(&honest.public_key_bytes()).unwrap(),
-        );
-        // Now try to add the attacker's bytes under the colliding id (rewrite id).
-        // We can't manufacture an SHA-256 collision, so we invoke the low-level
-        // path directly: the ring's guard MUST refuse the different bytes.
-        let mut hostile = ring.clone();
-        // Manually place the attacker's key under the honest id.
+        // We can't manufacture a real SHA-256 collision, so simulate one at
+        // the low-level map: a ring already holding the ATTACKER's key under
+        // the honest key's id. Adding the honest key (whose derived id now
+        // collides with different bytes) must be refused, not overwritten.
         let attacker_vk = VerifyingKey::from_bytes(&attacker.public_key_bytes()).unwrap();
-        hostile.keys.insert(id.clone(), attacker_vk);
-        // A subsequent add of the honest key under the (now-hostile) id must fail.
-        // Reproduce the collision by rewriting the id-derivation for the test.
         let mut fresh = Keyring::new();
         fresh.keys.insert(id.clone(), attacker_vk);
         let err = fresh

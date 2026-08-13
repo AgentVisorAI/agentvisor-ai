@@ -1531,9 +1531,9 @@ impl Drop for AbortFinalizingStream {
         // stream via `wait_for_streams`, the finalize path is imminent and
         // we must not `mark_capture_failed` on the last budget check /
         // trailing frame — otherwise `close_session_locked`'s post-drain
-        // `capture_failed` guard returns `CaptureIncomplete`, `CloseClaim`
-        // resets the close, and the session sticks with `closed=0,
-        // capture_failed=1, artifact_committed=0` (unfinalizable forever).
+        // `capture_failed` guard seals the session (`mark_artifact_committed`
+        // + committed claim) and returns `CaptureIncomplete`: the close is
+        // never retried and the session finalizes with no artifact at all.
         // On a normal abort (no concurrent close) the fail-closed marks
         // still fire, so a mid-flight budget verdict or garbled trailing
         // frame still refuses the capture on the client's next request.
@@ -2120,11 +2120,10 @@ mod tests {
     /// internally regardless of whether we would have emitted them to the
     /// client). The resulting `capture_failed = 1` then makes the concurrent
     /// close's post-`wait_for_worker_jobs` `if session.capture_failed()` guard
-    /// return `Err(FinalizeError::CaptureIncomplete)`, which drops
-    /// `CloseClaim` unarmed → `reset_close()` sets `closed = 0`, and the
-    /// session is permanently stuck (`closed = 0`, `capture_failed = 1`,
-    /// `artifact_committed = 0`). Any future close attempt hits the same
-    /// guard and fails identically. The fix: gate the pending-budget mark
+    /// seal the session (`mark_artifact_committed` + committed claim) and
+    /// return `Err(FinalizeError::CaptureIncomplete)`: the close is not
+    /// retried, and the session finalizes without any artifact — the
+    /// capture is silently lost. The fix: gate the pending-budget mark
     /// (and the budget-delta > 0 mark and the flush-error mark) on
     /// `!is_closed`, so during a concurrent close the drop submits the
     /// response capture without fail-closing the session.
@@ -2208,7 +2207,7 @@ mod tests {
 
         assert!(
             !session.capture_failed(),
-            "AbortFinalizingStream::drop must not fail the capture just because a completion-token budget check was still in flight while a concurrent close is already draining this stream via wait_for_streams — otherwise close_session_locked returns CaptureIncomplete, CloseClaim resets the close, and the session becomes permanently stuck (closed=0, capture_failed=1, artifact_committed=0)",
+            "AbortFinalizingStream::drop must not fail the capture just because a completion-token budget check was still in flight while a concurrent close is already draining this stream via wait_for_streams — otherwise close_session_locked's capture_failed guard seals the session and returns CaptureIncomplete: the receipt is never signed and the capture is lost",
         );
 
         // Now run the concurrent close to completion. It must succeed —
@@ -2225,7 +2224,7 @@ mod tests {
         .await
         .expect("close_session hung after drop released the stream");
         outcome.expect(
-            "close_session must succeed after AbortFinalizingStream::drop submits the response capture — a stuck session is worse than a marginally-over-budget response record, because the session cannot be finalized at all",
+            "close_session must succeed after AbortFinalizingStream::drop submits the response capture — a session sealed without its artifact is worse than a marginally-over-budget response record, because the receipt is lost entirely",
         );
 
         provider.abort();

@@ -93,8 +93,9 @@ fn key_material_debug_hides_pem_and_jwk_bodies_too() {
 }
 
 /// End-to-end: a validator holding an HMAC secret can still authenticate
-/// tokens (proves the secret is used internally), while nothing the caller
-/// can observe about the validator's `Debug` reveals the secret bytes.
+/// tokens (proves the secret is used internally), while the `Debug` output of
+/// the `KeyMaterial` handle — the only debug-formattable secret-bearing
+/// surface a caller can reach — never reveals the secret bytes.
 #[test]
 fn validator_debug_holding_hmac_secret_does_not_leak_it() {
     let secret = b"another-tightly-held-hmac-secret-42-abcdef".to_vec();

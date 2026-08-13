@@ -63,10 +63,8 @@ fn body(session: &str, count: u64) -> ReceiptBody {
 
 // ---------------------------------------------------------------------------
 // 1. Chain append serialization: N threads racing to append distinct events
-//    through a shared Mutex must not lose or reorder appends; the final
-//    count equals the total appends, and the head is deterministic for the
-//    sorted event set (we sort our appends server-side by seq before
-//    comparing to an offline reference).
+//    through a shared Mutex must not lose appends; the final count equals
+//    the total appends (N × K).
 // ---------------------------------------------------------------------------
 
 #[test]

@@ -42,7 +42,8 @@ pub struct AppState {
     pub store: Arc<dyn StateStore>,
     /// MCP schema, policy, and action-budget sandbox.
     pub sandbox: Arc<Sandbox>,
-    /// Event Bridge backend used only by asynchronous workers.
+    /// Event Bridge backend used by asynchronous workers and by lifecycle
+    /// finalization (close/promote publish through it inline).
     pub bridge: Arc<dyn EventBus>,
     /// Live session registry.
     pub sessions: Arc<SessionRegistry>,
@@ -430,8 +431,10 @@ impl AppState {
         })
     }
 
-    /// Run synchronous local gates on the blocking pool without waiting for
-    /// off-path journal, embedding, or broker work.
+    /// Run synchronous local gates without waiting for off-path journal,
+    /// embedding, or broker work. When a completion-token budget is
+    /// configured (`budget.max_tokens`) the gates run on the blocking pool;
+    /// otherwise they are cheap enough to run inline.
     pub async fn prepare_chat_nonblocking(
         &self,
         headers: &HeaderMap,

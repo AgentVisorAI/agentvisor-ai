@@ -15,12 +15,12 @@ pub struct CompressionConfig {
     pub collapse_duplicates: bool,
     /// Normalize whitespace inside JSON-looking tool content.
     pub normalize_json: bool,
-    /// Only bother when the payload exceeds this many approximate tokens
-    /// (compressing tiny payloads wastes hot-path time).
+    /// Only bother when the payload reaches at least this many approximate
+    /// tokens (compressing tiny payloads wastes hot-path time).
     pub min_tokens_to_engage: u64,
     /// Enable audited middle-history stubbing when other passes cannot reach
     /// the target on very large histories. Only engages when the payload
-    /// exceeds 50 000 approximate tokens (hardcoded floor; trumps
+    /// reaches at least 50 000 approximate tokens (hardcoded floor; trumps
     /// `min_tokens_to_engage` for this pass).
     pub summarize_middle: bool,
     /// Minimum target reduction ratio times 1000.

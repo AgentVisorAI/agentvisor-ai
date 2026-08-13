@@ -72,10 +72,9 @@ impl<'a> ActionBudget<'a> {
     /// amount in micro-USD carried by this call.
     ///
     /// Dimensions are checked in a fixed order (total calls → per-tool →
-    /// payout); on refusal, earlier-dimension spends are rolled back so a
-    /// refused call consumes nothing (atomicity across dimensions is
-    /// enforced by compensation, which is exact because refusals record
-    /// nothing and grants are integers).
+    /// payout) and committed atomically via `try_spend_many`: every
+    /// dimension is validated first and either all spends commit or none
+    /// do, so a refused call consumes nothing.
     pub fn try_tool_call(&self, tool: &str, payout_usd_micros: u64) -> Result<BudgetDecision, StateError> {
         // Parallel arrays keep spends and limit-names together without paying
         // for a joined-tuple clone before hitting the state store. There are
@@ -322,7 +321,8 @@ mod tests {
     #[test]
     fn allowed_decision_reports_true_remaining_headroom() {
         // Catches any stub of `remaining_min` (e.g. → Ok(0) / Ok(1)): with a
-        // cap of 10 and 3 prior spends, `remaining` must be exactly 7.
+        // cap of 10, 3 prior spends, and the measured 4th call spending one
+        // itself, `remaining` must be exactly 6.
         let store = InMemoryStore::new();
         let s = BudgetSpec {
             max_total_tool_calls: Some(10),

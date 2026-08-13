@@ -346,9 +346,11 @@ async fn tampered_atif_trajectory_is_rejected_on_promotion() {
 }
 
 // ---------------------------------------------------------------------------
-// MCP-T9 / Confused deputy: a request that reuses session A's id but with a
-// different identity_uid must be refused, even if the workflow matches.
-// (Documented invariant — locking it in as an adversarial regression.)
+// MCP-T9 / Confused deputy: reusing session A's id with spoofed identity
+// headers must NOT escalate identity. The harness ignores custom identity
+// headers (only a real JWT can change identity), so the request succeeds
+// under the same anonymous identity — locking in the negative: header
+// spoofing cannot swap the identity attached to a live session.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

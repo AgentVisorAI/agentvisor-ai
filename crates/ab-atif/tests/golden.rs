@@ -102,21 +102,25 @@ fn collects_all_errors_not_just_first() {
 
 #[test]
 fn agent_only_fields_rejected_on_user_and_system_steps() {
-    for field in ["reasoning_content", "model_name", "metrics", "tool_calls"] {
-        let mut v = golden();
-        let val = match field {
-            "metrics" => json!({"prompt_tokens": 1}),
-            "tool_calls" => json!([{"tool_call_id": "c1", "function_name": "f", "arguments": {}}]),
-            _ => json!("x"),
-        };
-        v["steps"][0][field] = val;
-        let issues = validate_value(&v, Mode::Strict);
-        assert!(
-            issues
-                .iter()
-                .any(|i| i.path == format!("trajectory.steps.0.{field}") && i.message.contains("agent-only")),
-            "field {field} not flagged: {issues:#?}"
-        );
+    for source in ["user", "system"] {
+        for field in ["reasoning_content", "model_name", "metrics", "tool_calls"] {
+            let mut v = golden();
+            v["steps"][0]["source"] = json!(source);
+            let val = match field {
+                "metrics" => json!({"prompt_tokens": 1}),
+                "tool_calls" => json!([{"tool_call_id": "c1", "function_name": "f", "arguments": {}}]),
+                _ => json!("x"),
+            };
+            v["steps"][0][field] = val;
+            let issues = validate_value(&v, Mode::Strict);
+            assert!(
+                issues
+                    .iter()
+                    .any(|i| i.path == format!("trajectory.steps.0.{field}")
+                        && i.message.contains("agent-only")),
+                "field {field} not flagged on {source} step: {issues:#?}"
+            );
+        }
     }
 }
 

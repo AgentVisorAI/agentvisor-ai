@@ -442,7 +442,11 @@ impl Finalizer {
         Ok(receipt)
     }
 
-    /// Recover closed unsigned sessions by scanning strict ATIF artifacts.
+    /// Recover interrupted sessions from the spool: quarantine sessions with
+    /// incomplete effects, replay lifecycle outboxes, recover signed journal
+    /// sessions, consolidate unsigned step journals, then scan strict ATIF
+    /// artifacts for closed unsigned sessions. Returns the total count of
+    /// recovered sessions (unsigned + signed).
     #[tracing::instrument(name = "agentbridge.recovery", skip_all)]
     pub async fn recover_spooled_sessions(
         &self,

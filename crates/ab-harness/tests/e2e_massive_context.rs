@@ -1,8 +1,7 @@
 //! Robustness under massive / extremely large prompts and contexts.
 //!
 //! Guarantees exercised here:
-//!   - JCS canonicalization never blows the stack on deep/wide trees and
-//!     produces monotonically-larger output for monotonically-larger input;
+//!   - JCS canonicalization never blows the stack on deep/wide trees;
 //!   - the event chain hashes very long streams in linear time and never
 //!     drops or double-counts events;
 //!   - `Receipt::verify` still passes over a `stop_reason` that carries
@@ -173,7 +172,7 @@ fn tokenizer_is_monotone_and_finite_on_4mib_unicode() {
     let n1 = approx_tokens(&big);
     let n2 = approx_tokens(&(big.clone() + unit));
     assert!(n2 >= n1, "tokenizer non-monotone");
-    // Approximate but sane: >= 1 token per unit repetition.
+    // Approximate but sane: at least 1 token per eight unit repetitions.
     let repeats = big.len() / unit.len();
     assert!(u64::try_from(repeats).unwrap() <= n1 * 8);
     // JSON path also survives.
@@ -183,13 +182,13 @@ fn tokenizer_is_monotone_and_finite_on_4mib_unicode() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Deep nested object (1000 levels) inside a signed receipt subject:
+// 7. Deep nested object (500 levels) inside a signed receipt subject:
 //    verify still passes end-to-end.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn receipt_verify_survives_deeply_nested_charter_metadata_in_stop_reason() {
-    // Encode 1000-level structure as a text payload inside stop_reason —
+    // Encode a 500-level structure as a text payload inside stop_reason —
     // the receipt schema doesn't accept nested JSON in typed fields, but
     // stop_reason is String and must round-trip an arbitrarily-nested
     // JSON string safely.

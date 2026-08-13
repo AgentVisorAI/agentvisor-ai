@@ -4,8 +4,8 @@
 //! the CLI honors its documented contract in every detail an operator can see:
 //! stdout shape (JSON for `keygen`, `verified <id>` for `receipt-verify`),
 //! stderr on failure, discoverability (`--help` mentions every subcommand),
-//! version tag, argument validation edge cases (empty strings, unicode, very
-//! long paths, symlink parents, tab/newline/space payloads), and cross-command
+//! version tag, argument validation edge cases (empty strings, unicode and
+//! space paths, newline payloads), and cross-command
 //! consistency (the pubkey printed by `keygen` verifies a receipt signed by
 //! that seed).
 
@@ -390,7 +390,7 @@ fn cli_rejects_missing_required_arguments() {
 }
 
 #[test]
-fn cli_handles_paths_with_spaces_unicode_and_trailing_slash() {
+fn cli_handles_paths_with_spaces_and_unicode() {
     let dir = tempfile::tempdir().unwrap();
     // Path containing a space.
     let sub = dir.path().join("with spaces");

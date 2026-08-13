@@ -74,9 +74,9 @@ fn deep_nested_arrays_do_not_stack_overflow_jcs() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. RPC depth-cap enforcement: feed an input exactly at the cap and one
-//    over. Cap is `MAX_JSON_DEPTH = 64`; the parse must accept at the
-//    boundary and reject just over.
+// 2. RPC depth-cap enforcement: feed an input exactly at the cap and well
+//    over it. Cap is `MAX_JSON_DEPTH = 64`; the parse must accept at the
+//    boundary and reject beyond it.
 // ---------------------------------------------------------------------------
 
 #[test]

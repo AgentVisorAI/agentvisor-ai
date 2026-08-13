@@ -207,7 +207,8 @@ async fn noop_vector_sink_satisfies_the_contract() {
 
 // ---------------------------------------------------------------------------
 // 6. Statistical delta distribution: 50 paraphrase-loop steps must have
-//    mean delta < epsilon; 50 progressing steps must have mean delta > epsilon.
+//    mean delta < epsilon; 15 genuinely progressing steps must have mean
+//    delta > epsilon.
 // ---------------------------------------------------------------------------
 
 #[test]

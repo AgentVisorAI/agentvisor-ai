@@ -35,7 +35,8 @@ end
 return redis.call('INCRBY', KEYS[1], ARGV[1])
 ";
 
-/// Redis-backed store. Cheap to clone via internal client pooling.
+/// Redis-backed store. Connections are pooled internally (r2d2 for
+/// single-node; cluster connections are serialized behind a mutex).
 pub struct RedisStore {
     backend: RedisBackend,
 }

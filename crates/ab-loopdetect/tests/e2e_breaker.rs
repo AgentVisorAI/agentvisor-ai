@@ -83,7 +83,7 @@ fn verbatim_loop_trips_within_configured_window() {
 //    embedder (documented design: n-gram overlap drops when surface forms
 //    differ, so δ stays high). This test proves the hash embedder behaves
 //    correctly per spec, and that detection of semantic paraphrases requires
-//    an ONNX embedder (exercised in the onnx_contract suite).
+//    an ONNX embedder (exercised by `sla::production_onnx_model_meets_loop_sla`).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -99,7 +99,8 @@ fn paraphrase_rotation_is_correctly_not_detected_by_the_hash_embedder() {
         "try the DB query one more time for unresolved items",
     ];
     // The hash embedder sees distinct n-grams across these 6 variants; they
-    // should all register as Progressing or at most Suspicious (never Tripped).
+    // should all register as Progressing or at most Suspicious (a trip or
+    // two from n-gram coincidence is tolerated by the bound below).
     let mut trips = 0;
     for t in paraphrases.iter().cycle().take(20) {
         if let BreakerVerdict::Tripped { .. } = s.observe(&e, t, 600) {
@@ -387,7 +388,7 @@ fn alternating_languages_for_same_concept_is_not_a_false_positive() {
 }
 
 // ---------------------------------------------------------------------------
-// 14. tokens_consumed arithmetic never overflows even at u64::MAX / 2.
+// 14. tokens_consumed arithmetic never overflows even near u64::MAX.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -396,9 +397,10 @@ fn tokens_consumed_uses_saturating_add_not_wrapping() {
     let e = embedder();
     let v = s.observe(&e, "step one", u64::MAX / 2);
     assert!(matches!(v, BreakerVerdict::Progressing { .. }), "{v:?}");
-    // Saturating add: (MAX/2) + (MAX/2 + 1) would wrap — saturating gives
-    // MAX, so the token floor is met and a streak trip is possible.
-    let v = s.observe(&e, "step one", u64::MAX / 2 + 1);
+    // Saturating add: (MAX/2) + MAX would wrap to MAX/2 - 1, dropping below
+    // the MAX/2 token floor — saturating gives MAX, so the floor is met and
+    // a streak trip is possible.
+    let v = s.observe(&e, "step one", u64::MAX);
     // (streak would be 1 from repeated text, and tokens >= floor) → Tripped.
     assert!(matches!(v, BreakerVerdict::Tripped { .. }), "{v:?}");
     // No panic — that's the key invariant.
@@ -441,23 +443,24 @@ fn concurrent_observe_from_many_threads_never_panics() {
 }
 
 // ---------------------------------------------------------------------------
-// 16. Distributed nearest-similarity path: a periodic multi-session DAG
-//     loop is detected even when adjacent embeddings differ significantly,
-//     because the nearest_similarity signal from the vector DB is high.
+// 16. Distributed nearest-similarity path: a periodic loop within a session
+//     is detected even when adjacent embeddings differ significantly,
+//     because the nearest_similarity signal from the vector DB (which
+//     production scopes to the same session_id) is high.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn vector_db_similarity_catches_cross_session_periodic_loop() {
+fn vector_db_similarity_catches_periodic_loop_within_session() {
     let s = SessionLoopState::new(cfg_with(2, 0, EPSILON));
     // Step 1: fresh start.
     let v = s.observe_embedding_with_similarity(vec![1.0, 0.0, 0.0], 100, None);
     assert!(matches!(v, BreakerVerdict::Progressing { .. }), "{v:?}");
-    // Step 2: adjacent delta high (new vector), but vector DB says this
-    // session's pattern matches a prior identical session (similarity 0.98).
+    // Step 2: adjacent delta high (new vector), but the vector DB says this
+    // step matches an earlier step of the same session (similarity 0.98).
     // min(high_adj_delta, 1-0.98) = 0.02 < epsilon → Suspicious.
     let v = s.observe_embedding_with_similarity(vec![0.0, 1.0, 0.0], 100, Some(0.98));
     assert!(matches!(v, BreakerVerdict::Suspicious { streak: 1, .. }), "{v:?}");
-    // Step 3: same cross-session hit → Tripped.
+    // Step 3: same nearest-neighbor hit → Tripped.
     let v = s.observe_embedding_with_similarity(vec![0.0, 0.0, 1.0], 100, Some(0.97));
     assert!(matches!(v, BreakerVerdict::Tripped { streak: 2, .. }), "{v:?}");
 }
@@ -765,8 +768,9 @@ fn multiple_rapid_resets_leave_the_breaker_functional() {
 }
 
 // ---------------------------------------------------------------------------
-// 30. Very large step text (100 KiB): embedder must complete without OOM,
-//     panic, or silent truncation.
+// 30. Very large step text (100 KiB): embedder must complete without OOM or
+//     panic, and a repeated identical large step must still register as a
+//     near-duplicate (streak accumulates).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -820,7 +824,9 @@ fn embedder_delta_separation_paraphrase_below_epsilon_progressing_above() {
     let e = embedder();
     let epsilon = EPSILON;
     let paraphrase_pairs = [
-        // Pairs verified by calibrate.rs to score δ < 0.25.
+        // Drawn from the calibrate.rs paraphrase corpus (its windows(2)
+        // check verifies consecutive variants, covering the first pair);
+        // this test asserts δ < ε for both pairs directly.
         (
             "I should check the inventory service for stock level of SKU 12345",
             "Let me check the inventory service for stock level of SKU 12345",

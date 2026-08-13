@@ -154,9 +154,10 @@ impl IdentityValidator {
         self.keys.write().insert(kid.into(), key);
     }
 
-    /// Add all supported Ed25519 keys from a standard JWKS document. Existing
-    /// keys remain available so receipts and in-flight delegation chains can
-    /// survive IdP rotation.
+    /// Add all supported Ed25519 keys from a standard JWKS document. Keys
+    /// loaded by a *previous* `add_jwks` call are retired (replace
+    /// semantics, so IdP rotation drops superseded JWKS keys); keys
+    /// registered manually via `add_key` are left untouched.
     pub fn add_jwks(&self, document: &serde_json::Value) -> Result<usize, IdentityError> {
         let keys = document
             .get("keys")
@@ -252,7 +253,8 @@ impl IdentityValidator {
     }
 
     /// Validate one JWT: header sanity, kid lookup, alg/key-type match,
-    /// signature, exp/nbf/aud, TTL cap, issuer allowlist, field presence.
+    /// signature, exp/nbf/aud, future-iat, TTL cap, field presence,
+    /// bidi/zero-width spoofing guard, issuer allowlist.
     fn validate_single(&self, token: &str) -> Result<NhiClaims, IdentityError> {
         let header =
             jsonwebtoken::decode_header(token).map_err(|e| IdentityError::Malformed(e.to_string()))?;
