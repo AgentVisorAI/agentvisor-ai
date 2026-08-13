@@ -2,12 +2,16 @@
 
 use crate::claims::{NhiClaims, MAX_TTL_SECS};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
-use std::collections::HashMap;
+use parking_lot::RwLock;
+use std::collections::{HashMap, HashSet};
 
 /// Verification key material, bound to a `kid`.
+#[derive(Clone)]
 pub enum KeyMaterial {
     /// Ed25519 public key, SPKI PEM (`-----BEGIN PUBLIC KEY-----`). EdDSA.
     Ed25519Pem(String),
+    /// Ed25519 JWK `x` coordinate, base64url without padding.
+    Ed25519Jwk(String),
     /// HMAC shared secret. HS256 (dev / shared-secret IdP integrations).
     HmacSecret(Vec<u8>),
 }
@@ -16,6 +20,7 @@ impl std::fmt::Debug for KeyMaterial {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Ed25519Pem(_) => f.write_str("KeyMaterial::Ed25519Pem(..)"),
+            Self::Ed25519Jwk(_) => f.write_str("KeyMaterial::Ed25519Jwk(..)"),
             Self::HmacSecret(_) => f.write_str("KeyMaterial::HmacSecret(..)"), // never print secrets
         }
     }
@@ -58,12 +63,27 @@ pub enum IdentityError {
         /// Expiry.
         exp: u64,
     },
+    /// `iat` is unreasonably far in the future.
+    #[error("issued-at timestamp {iat} is in the future (now {now})")]
+    FutureIat {
+        /// Issued-at claim.
+        iat: u64,
+        /// Validator wall clock.
+        now: u64,
+    },
     /// Required identity field empty.
     #[error("empty identity field {0}")]
     EmptyField(&'static str),
+    /// Field carries a bidi override or zero-width character that would
+    /// spoof how the identity renders in a log or audit view.
+    #[error("identity field {0} carries a bidi/zero-width spoofing character")]
+    SpoofingCharacter(&'static str),
     /// Issuer not in the allowlist.
     #[error("issuer {0:?} not allowed")]
     BadIssuer(String),
+    /// JWKS document was malformed or contained no supported signing keys.
+    #[error("invalid JWKS: {0}")]
+    Jwks(String),
     /// Child scopes exceed parent scopes.
     #[error("scope escalation: {scope:?} not granted by parent")]
     ScopeEscalation {
@@ -99,7 +119,7 @@ impl ValidatedIdentity {
     pub fn agent_identity(&self) -> ab_events::AgentIdentity {
         ab_events::AgentIdentity {
             version: self.claims.version.clone(),
-            charter: self.claims.charter.clone(),
+            charter: self.claims.charter.clone().into(),
             instance_uid: self.claims.instance_uid.clone(),
             ttl_remaining_s: Some(self.ttl_remaining_s),
         }
@@ -108,7 +128,8 @@ impl ValidatedIdentity {
 
 /// The validator: keyed by `kid`, audience-bound, issuer-allowlisted.
 pub struct IdentityValidator {
-    keys: HashMap<String, KeyMaterial>,
+    keys: RwLock<HashMap<String, KeyMaterial>>,
+    jwks_kids: RwLock<HashSet<String>>,
     audience: String,
     allowed_issuers: Option<Vec<String>>,
     max_chain_depth: usize,
@@ -119,7 +140,8 @@ impl IdentityValidator {
     /// Create a validator for `audience`.
     pub fn new(audience: impl Into<String>) -> Self {
         Self {
-            keys: HashMap::new(),
+            keys: RwLock::new(HashMap::new()),
+            jwks_kids: RwLock::new(HashSet::new()),
             audience: audience.into(),
             allowed_issuers: None,
             max_chain_depth: 4,
@@ -128,8 +150,55 @@ impl IdentityValidator {
     }
 
     /// Register key material under a `kid`.
-    pub fn add_key(&mut self, kid: impl Into<String>, key: KeyMaterial) {
-        self.keys.insert(kid.into(), key);
+    pub fn add_key(&self, kid: impl Into<String>, key: KeyMaterial) {
+        self.keys.write().insert(kid.into(), key);
+    }
+
+    /// Add all supported Ed25519 keys from a standard JWKS document. Existing
+    /// keys remain available so receipts and in-flight delegation chains can
+    /// survive IdP rotation.
+    pub fn add_jwks(&self, document: &serde_json::Value) -> Result<usize, IdentityError> {
+        let keys = document
+            .get("keys")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| IdentityError::Jwks("missing keys array".to_owned()))?;
+        let mut parsed = Vec::new();
+        for key in keys {
+            if key.get("kty").and_then(serde_json::Value::as_str) != Some("OKP")
+                || key.get("crv").and_then(serde_json::Value::as_str) != Some("Ed25519")
+            {
+                continue;
+            }
+            let kid = key
+                .get("kid")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| IdentityError::Jwks("Ed25519 key missing kid".to_owned()))?;
+            let x = key
+                .get("x")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| IdentityError::Jwks(format!("key {kid:?} missing x")))?;
+            parsed.push((kid.to_owned(), KeyMaterial::Ed25519Jwk(x.to_owned())));
+        }
+        if parsed.is_empty() {
+            return Err(IdentityError::Jwks("no Ed25519 OKP keys found".to_owned()));
+        }
+        let mut loaded = self.keys.write();
+        let mut prior = self.jwks_kids.write();
+        for kid in prior.drain() {
+            loaded.remove(&kid);
+        }
+        for (kid, material) in &parsed {
+            loaded.insert(kid.clone(), material.clone());
+            prior.insert(kid.clone());
+        }
+        Ok(parsed.len())
+    }
+
+    /// Number of verification keys currently loaded.
+    pub fn key_count(&self) -> usize {
+        self.keys.read().len()
     }
 
     /// Restrict accepted issuers.
@@ -155,19 +224,26 @@ impl IdentityValidator {
             }
             let parent = self.validate_single(&pt)?;
             // Scope inheritance: child ⊆ parent.
-            if let Some(escalated) =
-                child.scopes.iter().find(|s| !parent.scopes.iter().any(|p| p == *s))
+            if let Some(escalated) = child
+                .scopes
+                .iter()
+                .find(|s| !parent.scopes.iter().any(|p| p == *s))
             {
-                return Err(IdentityError::ScopeEscalation { scope: escalated.clone() });
+                return Err(IdentityError::ScopeEscalation {
+                    scope: escalated.clone(),
+                });
             }
             // Child must not outlive parent.
             if child.exp > parent.exp {
-                return Err(IdentityError::ExpEscalation { child: child.exp, parent: parent.exp });
+                return Err(IdentityError::ExpEscalation {
+                    child: child.exp,
+                    parent: parent.exp,
+                });
             }
             parent_token = parent.parent_token.clone();
             child = parent;
         }
-        let now_s = ab_core::time::now_ms() / 1000;
+        let now_s = ab_core::time::now_ms() / ab_core::units::MS_PER_SEC;
         Ok(ValidatedIdentity {
             ttl_remaining_s: leaf.exp.saturating_sub(now_s),
             chain_depth: depth,
@@ -181,7 +257,10 @@ impl IdentityValidator {
         let header =
             jsonwebtoken::decode_header(token).map_err(|e| IdentityError::Malformed(e.to_string()))?;
         let kid = header.kid.ok_or(IdentityError::MissingKid)?;
-        let key = self.keys.get(&kid).ok_or_else(|| IdentityError::UnknownKid(kid.clone()))?;
+        let keys = self.keys.read();
+        let key = keys
+            .get(&kid)
+            .ok_or_else(|| IdentityError::UnknownKid(kid.clone()))?;
 
         // Algorithm-confusion defense: the key's type dictates the only
         // acceptable alg; the token's stated alg must equal it exactly.
@@ -191,10 +270,18 @@ impl IdentityValidator {
                 DecodingKey::from_ed_pem(pem.as_bytes())
                     .map_err(|e| IdentityError::Malformed(format!("bad key for kid {kid}: {e}")))?,
             ),
+            KeyMaterial::Ed25519Jwk(x) => (
+                Algorithm::EdDSA,
+                DecodingKey::from_ed_components(x)
+                    .map_err(|e| IdentityError::Malformed(format!("bad JWK for kid {kid}: {e}")))?,
+            ),
             KeyMaterial::HmacSecret(secret) => (Algorithm::HS256, DecodingKey::from_secret(secret)),
         };
         if header.alg != expected_alg {
-            return Err(IdentityError::AlgorithmRejected { alg: format!("{:?}", header.alg), kid });
+            return Err(IdentityError::AlgorithmRejected {
+                alg: format!("{:?}", header.alg),
+                kid,
+            });
         }
 
         let mut validation = Validation::new(expected_alg);
@@ -208,7 +295,17 @@ impl IdentityValidator {
         let claims = data.claims;
 
         if claims.exp <= claims.iat {
-            return Err(IdentityError::BadTimestamps { iat: claims.iat, exp: claims.exp });
+            return Err(IdentityError::BadTimestamps {
+                iat: claims.iat,
+                exp: claims.exp,
+            });
+        }
+        let now_s = ab_core::time::now_ms() / ab_core::units::MS_PER_SEC;
+        if claims.iat > now_s.saturating_add(self.leeway_secs) {
+            return Err(IdentityError::FutureIat {
+                iat: claims.iat,
+                now: now_s,
+            });
         }
         let ttl = claims.exp - claims.iat;
         if ttl > MAX_TTL_SECS {
@@ -222,6 +319,22 @@ impl IdentityValidator {
         }
         if claims.version.is_empty() {
             return Err(IdentityError::EmptyField("version"));
+        }
+        // Trojan-Source guard: any bidi override or zero-width character in
+        // a rendered identity field would spoof how it looks in operator
+        // logs, receipts, and event chains while remaining part of the raw
+        // bytes on the wire.
+        for (name, value) in [
+            ("instance_uid", claims.instance_uid.as_str()),
+            ("charter", claims.charter.as_str()),
+            ("version", claims.version.as_str()),
+            ("sub", claims.sub.as_str()),
+            ("iss", claims.iss.as_str()),
+            ("jti", claims.jti.as_str()),
+        ] {
+            if ab_core::text::contains_bidi_or_zero_width(value) {
+                return Err(IdentityError::SpoofingCharacter(name));
+            }
         }
         if let Some(allowed) = &self.allowed_issuers {
             if !allowed.contains(&claims.iss) {

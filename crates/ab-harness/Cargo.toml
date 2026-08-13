@@ -6,6 +6,20 @@ rust-version.workspace = true
 license.workspace = true
 description = "The drop-in agent harness: inline proxy, hot path pipeline, workers, reconciler"
 
+[[bin]]
+name = "agent-bridge"
+path = "src/main.rs"
+
+[features]
+default = []
+redis = ["ab-state/redis"]
+nats = ["ab-bridge/nats"]
+kafka = ["ab-bridge/kafka"]
+onnx = ["ab-loopdetect/onnx"]
+qdrant = ["ab-loopdetect/qdrant"]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+full = ["redis", "nats", "kafka", "onnx", "qdrant", "otel"]
+
 [dependencies]
 ab-core = { workspace = true }
 ab-events = { workspace = true }
@@ -20,6 +34,7 @@ ab-sandbox = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 hyper = { workspace = true }
+hyper-util = { workspace = true }
 tower = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
@@ -32,9 +47,42 @@ tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+
+[dependencies.opentelemetry]
+version = "0.32"
+optional = true
+default-features = false
+features = ["trace"]
+
+[dependencies.opentelemetry_sdk]
+version = "0.32"
+optional = true
+default-features = false
+features = ["trace"]
+
+[dependencies.opentelemetry-otlp]
+version = "0.32"
+optional = true
+default-features = false
+features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls"]
+
+[dependencies.tracing-opentelemetry]
+version = "0.33"
+optional = true
+default-features = false
 
 [dev-dependencies]
 tempfile = { workspace = true }
+criterion = { workspace = true }
+jsonwebtoken = { workspace = true }
+base64 = { workspace = true }
+
+[[bench]]
+name = "hot_path"
+harness = false
 
 [lints]
 workspace = true

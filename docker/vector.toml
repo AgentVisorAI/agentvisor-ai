@@ -1,0 +1,23 @@
+[sources.agent_bridge]
+type = "docker_logs"
+include_containers = ["agent-bridge"]
+
+[sources.otlp]
+type = "opentelemetry"
+grpc.address = "0.0.0.0:4317"
+http.address = "0.0.0.0:4318"
+
+[transforms.structured]
+type = "remap"
+inputs = ["agent_bridge"]
+source = '''
+. = merge(., parse_json(.message) ?? {})
+.service = "agent-bridge"
+'''
+
+[sinks.console]
+type = "console"
+inputs = ["structured", "otlp.logs", "otlp.metrics", "otlp.traces"]
+encoding.codec = "json"
+
+# Replace this sink with the customer-owned Datadog, Splunk, or OTLP endpoint.

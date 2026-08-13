@@ -24,7 +24,7 @@ pub enum WriterError {
 /// Steps receive sequential ids automatically; aggregate metrics accumulate as
 /// steps are appended (checked arithmetic — a corrupt aggregate must fail
 /// loudly, not wrap).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TrajectoryBuilder {
     session_id: Option<String>,
     trajectory_id: Option<String>,
@@ -66,22 +66,47 @@ impl TrajectoryBuilder {
     /// aggregate metrics.
     pub fn push_step(&mut self, mut step: Step) -> Result<(), ab_core::CoreError> {
         step.step_id = self.steps.len() as u64 + 1;
-        if let Some(m) = &step.metrics {
-            self.total_prompt = self
+        // Compute the proposed totals into locals so an overflow on the
+        // second/third field cannot leave the builder with partially-updated
+        // totals ahead of a step that never got pushed.
+        let (next_prompt, next_completion, next_cached, next_cost) = if let Some(m) = &step.metrics {
+            let next_prompt = self
                 .total_prompt
                 .checked_add(m.prompt_tokens.unwrap_or(0))
-                .ok_or(ab_core::CoreError::Overflow { context: "total_prompt_tokens" })?;
-            self.total_completion = self
+                .ok_or(ab_core::CoreError::Overflow {
+                    context: "total_prompt_tokens",
+                })?;
+            let next_completion = self
                 .total_completion
                 .checked_add(m.completion_tokens.unwrap_or(0))
-                .ok_or(ab_core::CoreError::Overflow { context: "total_completion_tokens" })?;
-            self.total_cached = self
+                .ok_or(ab_core::CoreError::Overflow {
+                    context: "total_completion_tokens",
+                })?;
+            let next_cached = self
                 .total_cached
                 .checked_add(m.cached_tokens.unwrap_or(0))
-                .ok_or(ab_core::CoreError::Overflow { context: "total_cached_tokens" })?;
-            self.total_cost += m.cost_usd.unwrap_or(0.0);
-        }
+                .ok_or(ab_core::CoreError::Overflow {
+                    context: "total_cached_tokens",
+                })?;
+            (
+                next_prompt,
+                next_completion,
+                next_cached,
+                self.total_cost + m.cost_usd.unwrap_or(0.0),
+            )
+        } else {
+            (
+                self.total_prompt,
+                self.total_completion,
+                self.total_cached,
+                self.total_cost,
+            )
+        };
         self.steps.push(step);
+        self.total_prompt = next_prompt;
+        self.total_completion = next_completion;
+        self.total_cached = next_cached;
+        self.total_cost = next_cost;
         Ok(())
     }
 
@@ -94,13 +119,16 @@ impl TrajectoryBuilder {
             trajectory_id: self.trajectory_id,
             agent: self.agent,
             steps: self.steps,
+            notes: None,
             final_metrics: Some(FinalMetrics {
                 total_prompt_tokens: Some(self.total_prompt),
                 total_completion_tokens: Some(self.total_completion),
                 total_cached_tokens: Some(self.total_cached),
                 total_cost_usd: Some(self.total_cost),
                 total_steps: Some(total_steps),
+                extra: None,
             }),
+            continued_trajectory_ref: None,
             subagent_trajectories: None,
             extra: None,
         }
@@ -118,6 +146,7 @@ pub fn metrics(prompt: u64, completion: u64, cached: u64, cost_usd: f64) -> Metr
         logprobs: None,
         completion_token_ids: None,
         prompt_token_ids: None,
+        extra: None,
     }
 }
 
@@ -139,6 +168,7 @@ pub fn write_atomic(trajectory: &Trajectory, path: &Path) -> Result<(), WriterEr
     tmp.flush()?;
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| WriterError::Io(e.error))?;
+    ab_core::fsutil::sync_directory(dir)?;
     Ok(())
 }
 
@@ -162,14 +192,16 @@ mod tests {
     fn step(source: Source) -> Step {
         Step {
             step_id: 999, // deliberately wrong; builder must overwrite
-            timestamp: ab_core::time::now_iso8601(),
+            timestamp: Some(ab_core::time::now_iso8601()),
             source,
-            message: Some(serde_json::json!("hello")),
+            message: serde_json::json!("hello"),
+            reasoning_effort: None,
             reasoning_content: None,
             model_name: None,
             tool_calls: None,
             observation: None,
             metrics: matches!(source, Source::Agent).then(|| metrics(100, 20, 60, 0.001)),
+            is_copied_context: None,
             llm_call_count: None,
             extra: None,
         }
@@ -182,7 +214,10 @@ mod tests {
         b.push_step(step(Source::Agent)).unwrap();
         b.push_step(step(Source::Agent)).unwrap();
         let t = b.finish();
-        assert_eq!(t.steps.iter().map(|s| s.step_id).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(
+            t.steps.iter().map(|s| s.step_id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
         let fm = t.final_metrics.unwrap();
         assert_eq!(fm.total_prompt_tokens, Some(200));
         assert_eq!(fm.total_completion_tokens, Some(40));
@@ -238,5 +273,39 @@ mod tests {
         let err = write_atomic(&t, &path);
         assert!(matches!(err, Err(WriterError::Invalid(_))));
         assert!(!path.exists(), "invalid file must not be created");
+    }
+
+    /// Vicious bug caught in review round 17: `push_step` used to mutate
+    /// `total_prompt` before checking `total_completion` for overflow, so an
+    /// overflow on a later field would leave the builder with totals ahead
+    /// of a step that was never pushed. Locks the atomic-commit invariant:
+    /// on any overflow, every accumulator + `steps` stays exactly as it was
+    /// before the call.
+    #[test]
+    fn push_step_overflow_leaves_builder_state_unchanged() {
+        let mut b = TrajectoryBuilder::new(agent(), None);
+        // First a legitimate step to establish nonzero totals.
+        b.push_step(step(Source::Agent)).unwrap();
+        let before_prompt = b.total_prompt;
+        let before_completion = b.total_completion;
+        let before_cached = b.total_cached;
+        let before_len = b.steps.len();
+
+        // Craft a step whose `completion_tokens` overflows the running total
+        // while `prompt_tokens` does not. Without the atomic-commit fix,
+        // total_prompt would be updated but the step would not be pushed,
+        // leaving total_prompt out of sync with sum(steps.prompt).
+        let mut hostile = step(Source::Agent);
+        hostile.metrics = Some(metrics(1, u64::MAX, 0, 0.0));
+        let err = b.push_step(hostile).expect_err("must refuse overflowing totals");
+        assert!(
+            matches!(err, ab_core::CoreError::Overflow { .. }),
+            "wrong error variant: {err:?}",
+        );
+
+        assert_eq!(b.total_prompt, before_prompt, "total_prompt leaked");
+        assert_eq!(b.total_completion, before_completion, "total_completion leaked");
+        assert_eq!(b.total_cached, before_cached, "total_cached leaked");
+        assert_eq!(b.steps.len(), before_len, "steps len leaked");
     }
 }

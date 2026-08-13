@@ -16,7 +16,7 @@ pub mod store;
 pub mod velocity;
 
 pub use budget::{ActionBudget, BudgetDecision, BudgetSpec};
-pub use store::{InMemoryStore, StateError, StateStore};
+pub use store::{InMemoryStore, Spend, StateError, StateStore};
 pub use velocity::TokenVelocity;
 
 #[cfg(feature = "redis")]

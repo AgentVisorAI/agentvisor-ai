@@ -15,9 +15,16 @@
 
 pub mod breaker;
 pub mod embed;
+pub mod vector_sink;
 
-pub use breaker::{BreakerConfig, BreakerState, BreakerVerdict, SessionLoopState};
+pub use breaker::{BreakerAction, BreakerConfig, BreakerState, BreakerVerdict, SessionLoopState};
 pub use embed::{cosine, Embedder, HashEmbedder};
+pub use vector_sink::{NoopVectorSink, VectorSearchFuture, VectorSink, VectorSinkFuture};
+
+#[cfg(feature = "qdrant")]
+pub use vector_sink::QdrantVectorSink;
 
 #[cfg(feature = "onnx")]
 pub mod onnx_embed;
+#[cfg(feature = "onnx")]
+pub use onnx_embed::OnnxEmbedder;

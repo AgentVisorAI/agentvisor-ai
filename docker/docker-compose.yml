@@ -1,0 +1,110 @@
+services:
+  agent-bridge:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: agent-bridge:local
+    container_name: agent-bridge
+    ports:
+      - "8484:8484"
+    environment:
+      RUST_LOG: info
+      AB_CONFIG: /app/config/harness.docker.toml
+      AB_SIGNING_SEED_FILE: /app/data/signing.seed
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://vector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+    volumes:
+      - bridge-data:/app/data
+      - atif-spool:/app/spool
+    secrets:
+      - identity_hmac
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "abctl", "config-validate", "/app/config/harness.docker.toml"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+
+  redpanda:
+    image: redpandadata/redpanda:v25.2.5
+    ports:
+      - "19092:19092"
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://127.0.0.1:19092
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -Eq 'Healthy:[[:space:]]+true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:8.2.1-alpine
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  qdrant:
+    image: qdrant/qdrant:v1.15.4
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333'"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  nats:
+    image: nats:2.11-alpine
+    ports:
+      - "4222:4222"
+    command: ["-js", "-m", "8222"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  vector:
+    image: timberio/vector:0.48.0-debian
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      - ./vector.toml:/etc/vector/vector.toml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+volumes:
+  bridge-data:
+  atif-spool:
+  qdrant-data:
+  redis-data:
+
+secrets:
+  identity_hmac:
+    external: true

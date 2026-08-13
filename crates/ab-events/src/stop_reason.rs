@@ -1,10 +1,8 @@
 //! Stop-reason identifiers.
 //!
-//! Values 0–4 and 99 track conventional completion semantics; 90–97 are the
-//! AgentBridge extension range for enforcement verdicts. The numeric mapping is
-//! part of our authored profile (the brief's upstream PR does not publish enum
-//! values); EVOLUTION.md documents the re-mapping policy should upstream
-//! ocsf#1704 land different numbers.
+//! Values 0–4 follow upstream OCSF PR #1704. 90 = provider content filter
+//! (provider-native, not enforcement). 91–94 are AgentBridge enforcement
+//! extensions. 99 = Other (catch-all; forward-compatible).
 
 use serde::{Deserialize, Serialize};
 
@@ -44,12 +42,12 @@ impl StopReason {
             Self::Stop => 1,
             Self::MaxTokens => 2,
             Self::ToolUse => 3,
-            Self::ContentFilter => 4,
-            Self::LoopDetected => 90,
-            Self::BudgetExceeded => 91,
-            Self::PolicyBlocked => 92,
-            Self::IdentityRejected => 93,
-            Self::SessionClosed => 94,
+            Self::SessionClosed => 4,
+            Self::ContentFilter => 90,
+            Self::LoopDetected => 91,
+            Self::BudgetExceeded => 92,
+            Self::PolicyBlocked => 93,
+            Self::IdentityRejected => 94,
             Self::Other => 99,
         }
     }
@@ -59,7 +57,7 @@ impl StopReason {
         match self {
             Self::Unknown => "Unknown",
             Self::Stop => "Stop",
-            Self::MaxTokens => "Max Tokens",
+            Self::MaxTokens => "Length",
             Self::ToolUse => "Tool Use",
             Self::ContentFilter => "Content Filter",
             Self::LoopDetected => "Loop Detected",
@@ -75,15 +73,16 @@ impl StopReason {
     /// map to `Unknown`, never an error — forward compatibility).
     pub fn from_id(id: u8) -> Self {
         match id {
+            0 => Self::Unknown,
             1 => Self::Stop,
             2 => Self::MaxTokens,
             3 => Self::ToolUse,
-            4 => Self::ContentFilter,
-            90 => Self::LoopDetected,
-            91 => Self::BudgetExceeded,
-            92 => Self::PolicyBlocked,
-            93 => Self::IdentityRejected,
-            94 => Self::SessionClosed,
+            4 => Self::SessionClosed,
+            90 => Self::ContentFilter,
+            91 => Self::LoopDetected,
+            92 => Self::BudgetExceeded,
+            93 => Self::PolicyBlocked,
+            94 => Self::IdentityRejected,
             99 => Self::Other,
             _ => Self::Unknown,
         }

@@ -42,8 +42,9 @@ pub struct Histogram {
 }
 
 /// Default latency bucket upper bounds in microseconds: 50µs … 10s.
-pub const DEFAULT_LATENCY_BOUNDS_US: &[u64] =
-    &[50, 100, 250, 500, 1_000, 2_000, 5_000, 8_000, 10_000, 25_000, 50_000, 100_000, 1_000_000, 10_000_000];
+pub const DEFAULT_LATENCY_BOUNDS_US: &[u64] = &[
+    50, 100, 250, 500, 1_000, 2_000, 5_000, 8_000, 10_000, 25_000, 50_000, 100_000, 1_000_000, 10_000_000,
+];
 
 impl Histogram {
     /// Create a histogram with the given bucket upper bounds (µs, ascending).
@@ -83,7 +84,11 @@ impl Histogram {
         if total == 0 {
             return 0;
         }
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
         let target = ((total as f64) * q.clamp(0.0, 1.0)).ceil() as u64;
         let mut cum = 0u64;
         for (i, b) in self.bounds_us.iter().enumerate() {
@@ -115,11 +120,20 @@ impl Registry {
 
     /// Register (or fetch) a counter. `key` must be a valid Prometheus series
     /// name with optional `{label="v"}` suffix.
+    ///
+    /// Panics if `key` is already registered as a histogram; a silent
+    /// overwrite would detach the existing metric from the registry and
+    /// lose every observation collected against it.
+    #[allow(clippy::panic)]
     pub fn counter(&self, key: &str, help: &str) -> Arc<Counter> {
         let mut m = self.metrics.lock();
         match m.get(key) {
             Some((_, Metric::Counter(c))) => Arc::clone(c),
-            _ => {
+            Some((_, Metric::Histogram(_))) => panic!(
+                "metric name conflict: {key:?} is already registered as a histogram, \
+                 cannot register as a counter",
+            ),
+            None => {
                 let c = Arc::new(Counter::default());
                 m.insert(key.to_owned(), (help.to_owned(), Metric::Counter(Arc::clone(&c))));
                 c
@@ -128,13 +142,25 @@ impl Registry {
     }
 
     /// Register (or fetch) a histogram with default latency buckets.
+    ///
+    /// Panics if `key` is already registered as a counter; a silent overwrite
+    /// would detach the existing metric from the registry and lose every
+    /// observation collected against it.
+    #[allow(clippy::panic)]
     pub fn histogram(&self, key: &str, help: &str) -> Arc<Histogram> {
         let mut m = self.metrics.lock();
         match m.get(key) {
             Some((_, Metric::Histogram(h))) => Arc::clone(h),
-            _ => {
+            Some((_, Metric::Counter(_))) => panic!(
+                "metric name conflict: {key:?} is already registered as a counter, \
+                 cannot register as a histogram",
+            ),
+            None => {
                 let h = Arc::new(Histogram::new(DEFAULT_LATENCY_BOUNDS_US));
-                m.insert(key.to_owned(), (help.to_owned(), Metric::Histogram(Arc::clone(&h))));
+                m.insert(
+                    key.to_owned(),
+                    (help.to_owned(), Metric::Histogram(Arc::clone(&h))),
+                );
                 h
             }
         }
@@ -144,15 +170,20 @@ impl Registry {
     pub fn render(&self) -> String {
         let m = self.metrics.lock();
         let mut out = String::new();
+        let mut declared = std::collections::BTreeSet::new();
         for (key, (help, metric)) in m.iter() {
             let (base, labels) = split_key(key);
             match metric {
                 Metric::Counter(c) => {
-                    out.push_str(&format!("# HELP {base} {help}\n# TYPE {base} counter\n"));
+                    if declared.insert(base.to_owned()) {
+                        out.push_str(&format!("# HELP {base} {help}\n# TYPE {base} counter\n"));
+                    }
                     out.push_str(&format!("{key} {}\n", c.get()));
                 }
                 Metric::Histogram(h) => {
-                    out.push_str(&format!("# HELP {base} {help}\n# TYPE {base} histogram\n"));
+                    if declared.insert(base.to_owned()) {
+                        out.push_str(&format!("# HELP {base} {help}\n# TYPE {base} histogram\n"));
+                    }
                     let mut cum = 0u64;
                     for (i, b) in h.bounds_us.iter().enumerate() {
                         cum += h.buckets.get(i).map_or(0, |x| x.load(Ordering::Relaxed));
@@ -168,8 +199,15 @@ impl Registry {
                         h.count()
                     ));
                     let sum_s = (h.sum_us.load(Ordering::Relaxed) as f64) / 1_000_000.0;
-                    out.push_str(&format!("{base}_sum{labels_block} {sum_s}\n", labels_block = labels_suffix(labels)));
-                    out.push_str(&format!("{base}_count{labels_block} {}\n", h.count(), labels_block = labels_suffix(labels)));
+                    out.push_str(&format!(
+                        "{base}_sum{labels_block} {sum_s}\n",
+                        labels_block = labels_suffix(labels)
+                    ));
+                    out.push_str(&format!(
+                        "{base}_count{labels_block} {}\n",
+                        h.count(),
+                        labels_block = labels_suffix(labels)
+                    ));
                 }
             }
         }
@@ -232,6 +270,20 @@ mod tests {
     }
 
     #[test]
+    fn labeled_family_is_declared_once() {
+        let r = Registry::new();
+        r.histogram("ab_stage_duration_us{stage=\"identity\"}", "stage latency");
+        r.histogram("ab_stage_duration_us{stage=\"quota\"}", "stage latency");
+        let text = r.render();
+        assert_eq!(text.matches("# HELP ab_stage_duration_us ").count(), 1, "{text}");
+        assert_eq!(
+            text.matches("# TYPE ab_stage_duration_us histogram").count(),
+            1,
+            "{text}"
+        );
+    }
+
+    #[test]
     fn histogram_quantiles() {
         let h = Histogram::new(DEFAULT_LATENCY_BOUNDS_US);
         for _ in 0..99 {
@@ -266,5 +318,66 @@ mod tests {
         let b = r.counter("x_total", "x");
         a.inc();
         assert_eq!(b.get(), 1);
+    }
+
+    #[test]
+    fn labeled_histogram_renders_labels_on_every_series_line() {
+        // Catches `split_key`, `join_labels`, and `labels_suffix` stubs.
+        // A labeled histogram must emit label pairs on _bucket, _sum, and
+        // _count — the label prefix must land BEFORE the `le=` in buckets
+        // and the entire `{labels}` block must land after _sum/_count.
+        let r = Registry::new();
+        let h = r.histogram("ab_lat{route=\"chat\"}", "lat");
+        h.observe_us(60);
+        let text = r.render();
+        assert!(
+            text.contains("ab_lat_bucket{route=\"chat\",le=\"0.0001\"} 1"),
+            "join_labels lost the route label: {text}"
+        );
+        assert!(
+            text.contains("ab_lat_sum{route=\"chat\"} "),
+            "labels_suffix lost the route label on _sum: {text}"
+        );
+        assert!(
+            text.contains("ab_lat_count{route=\"chat\"} 1"),
+            "labels_suffix lost the route label on _count: {text}"
+        );
+    }
+
+    /// Vicious bug caught in review round 18: `counter()` used to silently
+    /// insert a fresh Counter over an existing Histogram at the same key,
+    /// detaching the histogram from the registry and losing every prior
+    /// observation. A metric name registered as one type must never be
+    /// silently repurposed as the other — panic loudly instead.
+    #[test]
+    #[should_panic(expected = "already registered as a histogram")]
+    fn counter_over_existing_histogram_panics_instead_of_overwriting() {
+        let r = Registry::new();
+        r.histogram("ab_metric", "help");
+        r.counter("ab_metric", "help");
+    }
+
+    #[test]
+    #[should_panic(expected = "already registered as a counter")]
+    fn histogram_over_existing_counter_panics_instead_of_overwriting() {
+        let r = Registry::new();
+        r.counter("ab_metric", "help");
+        r.histogram("ab_metric", "help");
+    }
+
+    /// Same-type re-registration must still work (idempotent) — the panic
+    /// guard only fires on genuine type conflicts.
+    #[test]
+    fn same_type_re_registration_returns_existing_arc() {
+        let r = Registry::new();
+        let c1 = r.counter("ab_metric", "help");
+        let c2 = r.counter("ab_metric", "help");
+        c1.inc();
+        assert_eq!(c2.get(), 1, "must return the same underlying counter");
+
+        let h1 = r.histogram("ab_other", "help");
+        let h2 = r.histogram("ab_other", "help");
+        h1.observe_us(50);
+        assert_eq!(h2.count(), 1, "must return the same underlying histogram");
     }
 }

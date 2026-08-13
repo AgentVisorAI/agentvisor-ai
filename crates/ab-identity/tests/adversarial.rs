@@ -1,6 +1,11 @@
 //! Adversarial NHI validation suite (plan D8/D13.8): forged algs, confusion
 //! attacks, TTL abuse, scope escalation, chain-depth abuse, tampering.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use ab_identity::{IdentityError, IdentityValidator, KeyMaterial, NhiClaims, MAX_TTL_SECS};
 use base64::Engine as _;
@@ -11,21 +16,28 @@ struct TestKeys {
     kid: String,
     encoding: EncodingKey,
     public_pem: String,
+    public_x: String,
 }
 
 fn ed25519_keys(kid: &str) -> TestKeys {
     let signing = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let private_pem = signing.to_pkcs8_pem(LineEnding::LF).unwrap().to_string();
     let public_pem = signing.verifying_key().to_public_key_pem(LineEnding::LF).unwrap();
+    let public_x =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signing.verifying_key().as_bytes());
     TestKeys {
         kid: kid.to_owned(),
         encoding: EncodingKey::from_ed_pem(private_pem.as_bytes()).unwrap(),
         public_pem,
+        public_x,
     }
 }
 
 fn now_s() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 fn claims(scopes: &[&str], ttl: u64, parent_token: Option<String>) -> NhiClaims {
@@ -53,7 +65,7 @@ fn mint(keys: &TestKeys, claims: &NhiClaims) -> String {
 }
 
 fn validator(keys: &TestKeys) -> IdentityValidator {
-    let mut v = IdentityValidator::new("harness-prod");
+    let v = IdentityValidator::new("harness-prod");
     v.add_key(keys.kid.clone(), KeyMaterial::Ed25519Pem(keys.public_pem.clone()));
     v
 }
@@ -68,7 +80,7 @@ fn valid_token_accepted_with_identity_block() {
     assert!(id.ttl_remaining_s > 500 && id.ttl_remaining_s <= 600);
     let block = id.agent_identity();
     assert_eq!(block.instance_uid, "inst-1");
-    assert_eq!(block.charter, "support");
+    assert_eq!(block.charter.name, "support");
     assert_eq!(block.version, "1.2.3");
     assert!(block.ttl_remaining_s.is_some());
 }
@@ -106,6 +118,19 @@ fn future_nbf_rejected() {
 }
 
 #[test]
+fn future_iat_cannot_extend_effective_ttl() {
+    let keys = ed25519_keys("k1");
+    let validator = validator(&keys);
+    let mut claims = claims(&["tool:read"], 600, None);
+    claims.iat = now_s() + 120;
+    claims.exp = claims.iat + 600;
+    assert!(matches!(
+        validator.validate(&mint(&keys, &claims)),
+        Err(IdentityError::FutureIat { .. })
+    ));
+}
+
+#[test]
 fn wrong_audience_rejected() {
     let keys = ed25519_keys("k1");
     let v = validator(&keys);
@@ -131,7 +156,9 @@ fn alg_none_rejected() {
     // Hand-forge an alg=none token with our kid.
     let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
     let header = b64(br#"{"alg":"none","typ":"JWT","kid":"k1"}"#);
-    let payload = b64(serde_json::to_vec(&claims(&["tool:admin"], 600, None)).unwrap().as_slice());
+    let payload = b64(serde_json::to_vec(&claims(&["tool:admin"], 600, None))
+        .unwrap()
+        .as_slice());
     for forged in [format!("{header}.{payload}."), format!("{header}.{payload}")] {
         let err = v.validate(&forged);
         assert!(err.is_err(), "alg=none accepted: {forged}");
@@ -153,7 +180,10 @@ fn algorithm_confusion_hs256_signed_with_public_pem_rejected() {
         &EncodingKey::from_secret(keys.public_pem.as_bytes()),
     )
     .unwrap();
-    assert!(matches!(v.validate(&forged), Err(IdentityError::AlgorithmRejected { .. })));
+    assert!(matches!(
+        v.validate(&forged),
+        Err(IdentityError::AlgorithmRejected { .. })
+    ));
 }
 
 #[test]
@@ -172,7 +202,9 @@ fn tampered_payload_rejected() {
     let token = mint(&keys, &claims(&["tool:read"], 600, None));
     let mut parts: Vec<String> = token.split('.').map(str::to_owned).collect();
     // Bit-flip inside the payload.
-    let mut payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&parts[1]).unwrap();
+    let mut payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&parts[1])
+        .unwrap();
     payload[10] ^= 1;
     parts[1] = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload);
     let tampered = parts.join(".");
@@ -278,7 +310,10 @@ fn child_outliving_parent_rejected() {
     let parent_token = mint(&keys, &parent);
     let mut child = claims(&["tool:read"], 600, Some(parent_token)); // exp beyond parent
     child.exp = parent.exp + 100;
-    assert!(matches!(v.validate(&mint(&keys, &child)), Err(IdentityError::ExpEscalation { .. })));
+    assert!(matches!(
+        v.validate(&mint(&keys, &child)),
+        Err(IdentityError::ExpEscalation { .. })
+    ));
 }
 
 #[test]
@@ -313,8 +348,11 @@ fn expired_parent_invalidates_child() {
 
 #[test]
 fn hs256_with_shared_secret_works_and_is_isolated() {
-    let mut v = IdentityValidator::new("harness-prod");
-    v.add_key("hmac-1", KeyMaterial::HmacSecret(b"super-secret-dev-key".to_vec()));
+    let v = IdentityValidator::new("harness-prod");
+    v.add_key(
+        "hmac-1",
+        KeyMaterial::HmacSecret(b"super-secret-dev-key".to_vec()),
+    );
     let mut header = Header::new(Algorithm::HS256);
     header.kid = Some("hmac-1".into());
     let token = jsonwebtoken::encode(
@@ -328,5 +366,51 @@ fn hs256_with_shared_secret_works_and_is_isolated() {
     // EdDSA-labeled token pointing at the HMAC kid must be refused (confusion, reverse direction).
     let ed = ed25519_keys("hmac-1");
     let forged = mint(&ed, &claims(&["tool:admin"], 600, None));
-    assert!(matches!(v.validate(&forged), Err(IdentityError::AlgorithmRejected { .. })));
+    assert!(matches!(
+        v.validate(&forged),
+        Err(IdentityError::AlgorithmRejected { .. })
+    ));
+}
+
+#[test]
+fn standard_ed25519_jwks_is_accepted_and_refreshable() {
+    let keys = ed25519_keys("jwks-1");
+    let validator = IdentityValidator::new("harness-prod");
+    let added = validator
+        .add_jwks(&serde_json::json!({
+            "keys": [{
+                "kid": keys.kid,
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "alg": "EdDSA",
+                "use": "sig",
+                "x": keys.public_x,
+            }]
+        }))
+        .unwrap();
+    assert_eq!(added, 1);
+    assert_eq!(validator.key_count(), 1);
+    validator
+        .validate(&mint(&keys, &claims(&["tool:read"], 600, None)))
+        .unwrap();
+
+    let replacement = ed25519_keys("jwks-2");
+    validator
+        .add_jwks(&serde_json::json!({
+            "keys": [{
+                "kid": replacement.kid,
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": replacement.public_x,
+            }]
+        }))
+        .unwrap();
+    assert!(matches!(
+        validator.validate(&mint(&keys, &claims(&["tool:read"], 600, None))),
+        Err(IdentityError::UnknownKid(_))
+    ));
+    validator
+        .validate(&mint(&replacement, &claims(&["tool:read"], 600, None)))
+        .unwrap();
+    assert_eq!(validator.key_count(), 1);
 }

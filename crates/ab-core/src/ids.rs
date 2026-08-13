@@ -68,13 +68,10 @@ pub fn new_event_uid() -> String {
     uuid::Uuid::now_v7().to_string()
 }
 
-/// Generate a fresh instance uid (UUIDv7).
-pub fn new_instance_uid() -> InstanceUid {
-    InstanceUid(uuid::Uuid::now_v7().to_string())
-}
-
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
     use super::*;
 
     #[test]
@@ -93,10 +90,68 @@ mod tests {
         assert!(SessionId::parse("ok-id_123").is_ok());
     }
 
+    /// Every byte that could be used to escape a log line, terminal control
+    /// sequence, or cross-line boundary must be rejected. This locks the
+    /// defense: log injection via a hostile `X-AB-Session` header is
+    /// impossible because the id never reaches `%session_id` in a
+    /// tracing::info_span!() unless it survives `SessionId::parse`.
+    #[test]
+    fn session_id_rejects_every_log_injection_byte() {
+        // Cover: NUL, tab, LF, CR, ESC, DEL, and every high-ASCII byte.
+        let mut hostile_bytes: Vec<u8> = (0..=0x20).collect();
+        hostile_bytes.push(0x7f);
+        hostile_bytes.extend(0x80u8..=0xff);
+        for b in hostile_bytes {
+            let s = format!("legit{}injected", b as char);
+            assert!(
+                SessionId::parse(&s).is_err(),
+                "byte 0x{b:02x} must not be allowed in a session id",
+            );
+            // Also test with the byte as the leading character.
+            let leading = format!("{}suffix", b as char);
+            assert!(
+                SessionId::parse(&leading).is_err(),
+                "leading byte 0x{b:02x} must not be allowed",
+            );
+        }
+    }
+
     #[test]
     fn instance_uid_rejects_bad_input() {
         assert!(InstanceUid::parse("").is_err());
         assert!(InstanceUid::parse("é").is_err());
         assert!(InstanceUid::parse("agent-7").is_ok());
+    }
+
+    #[test]
+    fn length_boundary_128_is_accepted_129_is_rejected() {
+        // Catches `> 128` vs `== 128` / `>= 128` mutations on both types.
+        for parser in [
+            SessionId::parse("x".repeat(128).as_str()).is_ok(),
+            InstanceUid::parse("x".repeat(128).as_str()).is_ok(),
+        ] {
+            assert!(parser, "128-char id must be accepted");
+        }
+        assert!(SessionId::parse(&"x".repeat(129)).is_err());
+        assert!(InstanceUid::parse(&"x".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn as_str_and_display_return_the_wrapped_string() {
+        // Catches `as_str -> "xyzzy"` / `-> ""` and Display default-return.
+        let sid = SessionId::parse("sess-abc-123").unwrap();
+        assert_eq!(sid.as_str(), "sess-abc-123");
+        assert_eq!(format!("{sid}"), "sess-abc-123");
+        let iid = InstanceUid::parse("inst-42").unwrap();
+        assert_eq!(iid.as_str(), "inst-42");
+        assert_eq!(format!("{iid}"), "inst-42");
+    }
+
+    #[test]
+    fn new_event_uid_returns_a_uuid_shaped_string() {
+        // Catches `new_event_uid -> String::new()` and `-> "xyzzy".into()`.
+        let uid = new_event_uid();
+        assert_eq!(uid.len(), 36, "UUID text is 36 chars: {uid:?}");
+        assert_eq!(uid.matches('-').count(), 4, "UUID has 4 hyphens: {uid:?}");
     }
 }

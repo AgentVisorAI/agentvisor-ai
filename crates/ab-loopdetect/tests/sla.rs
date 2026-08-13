@@ -4,10 +4,15 @@
 //! false trips on genuinely progressing sessions.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[cfg(feature = "onnx")]
+use ab_loopdetect::OnnxEmbedder;
 use ab_loopdetect::{BreakerConfig, BreakerVerdict, HashEmbedder, SessionLoopState};
 
 fn cfg() -> BreakerConfig {
-    BreakerConfig { min_tokens: 500, ..BreakerConfig::default() }
+    BreakerConfig {
+        min_tokens: 500,
+        ..BreakerConfig::default()
+    }
 }
 
 /// 20 synthetic loop families: verbatim repeats and light paraphrase cycles
@@ -151,7 +156,11 @@ fn sla_catches_100_percent_of_loops_within_3_cycles() {
         }
         let at = tripped_at.unwrap_or_else(|| panic!("corpus {ci} never tripped: {:?}", corpus.first()));
         // Step 0 is the baseline; trip must come within 3 further cycles.
-        assert!(at <= 3, "corpus {ci} tripped at step {at} (> 3 cycles): {:?}", corpus.first());
+        assert!(
+            at <= 3,
+            "corpus {ci} tripped at step {at} (> 3 cycles): {:?}",
+            corpus.first()
+        );
     }
 }
 
@@ -166,6 +175,49 @@ fn sla_zero_false_positives_on_progressing_sessions() {
             assert!(
                 !matches!(v, BreakerVerdict::Tripped { .. }),
                 "false positive in progressing corpus {ci} at step {si}: {v:?}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn production_onnx_model_meets_loop_sla() {
+    let Ok(model) = std::env::var("AB_ONNX_MODEL_PATH") else {
+        eprintln!("SKIPPED (AB_ONNX_MODEL_PATH unset): ONNX loop SLA requires a model");
+        return;
+    };
+    let tokenizer = std::env::var("AB_ONNX_TOKENIZER_PATH").unwrap();
+    let embedder = OnnxEmbedder::load(
+        std::path::Path::new(&model),
+        std::path::Path::new(&tokenizer),
+        384,
+    )
+    .unwrap();
+    for (corpus_index, corpus) in loop_corpora().iter().enumerate() {
+        let session = SessionLoopState::new(cfg());
+        let mut tripped_at = None;
+        for (step_index, step) in corpus.iter().enumerate() {
+            if matches!(
+                session.observe(&embedder, step, 400),
+                BreakerVerdict::Tripped { .. }
+            ) {
+                tripped_at = Some(step_index);
+                break;
+            }
+        }
+        assert!(
+            tripped_at.is_some_and(|step| step <= 3),
+            "ONNX loop corpus {corpus_index} did not trip within 3 cycles"
+        );
+    }
+    for (corpus_index, corpus) in progressing_corpora().iter().enumerate() {
+        let session = SessionLoopState::new(cfg());
+        for (step_index, step) in corpus.iter().enumerate() {
+            let verdict = session.observe(&embedder, step, 5_000);
+            assert!(
+                !matches!(verdict, BreakerVerdict::Tripped { .. }),
+                "ONNX false positive in corpus {corpus_index} at step {step_index}"
             );
         }
     }

@@ -44,9 +44,15 @@ pub struct Trajectory {
     pub agent: Agent,
     /// Ordered interaction steps (`step_id` sequential from 1).
     pub steps: Vec<Step>,
+    /// Custom information, design notes, or explanations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
     /// Aggregate metrics.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub final_metrics: Option<FinalMetrics>,
+    /// Reference to a continuation trajectory file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continued_trajectory_ref: Option<String>,
     /// Embedded subagent trajectories (v1.7).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_trajectories: Option<Vec<Trajectory>>,
@@ -67,7 +73,7 @@ pub struct Agent {
     pub model_name: Option<String>,
     /// Tool/function definitions in scope (v1.5, for SFT pipelines).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_definitions: Option<serde_json::Value>,
+    pub tool_definitions: Option<Vec<serde_json::Map<String, serde_json::Value>>>,
     /// Custom metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra: Option<serde_json::Value>,
@@ -79,12 +85,15 @@ pub struct Step {
     /// Sequential id starting at 1.
     pub step_id: u64,
     /// ISO-8601 timestamp.
-    pub timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
     /// Who produced the step.
     pub source: Source,
     /// Message content (string or content-part array since v1.6).
+    pub message: serde_json::Value,
+    /// Qualitative or quantitative reasoning effort.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<serde_json::Value>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Agent-only: chain-of-thought / reasoning content.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
@@ -100,12 +109,25 @@ pub struct Step {
     /// Agent-only: per-step LLM metrics.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
+    /// True when copied from a previous trajectory as context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_copied_context: Option<bool>,
     /// Agent-only: number of LLM calls in this step (v1.7).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm_call_count: Option<u64>,
     /// Custom metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra: Option<serde_json::Value>,
+}
+
+/// String or numeric ATIF reasoning effort.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ReasoningEffort {
+    /// Qualitative effort label.
+    Text(String),
+    /// Numeric effort measure.
+    Numeric(f64),
 }
 
 /// A tool/function invocation.
@@ -137,8 +159,29 @@ pub struct ObservationResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_call_id: Option<String>,
     /// Result content (string or content-part array since v1.6).
-    pub content: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<serde_json::Value>,
+    /// References to delegated subagent trajectories.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_trajectory_ref: Option<Vec<SubagentTrajectoryRef>>,
     /// Custom metadata (v1.7).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra: Option<serde_json::Value>,
+}
+
+/// Resolvable reference to an embedded or external subagent trajectory.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubagentTrajectoryRef {
+    /// Embedded trajectory document identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trajectory_id: Option<String>,
+    /// Informational run-scoped session identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// External trajectory file or object-store path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trajectory_path: Option<String>,
+    /// Custom reference metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra: Option<serde_json::Value>,
 }
@@ -168,6 +211,9 @@ pub struct Metrics {
     /// Prompt token ids (v1.4).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_token_ids: Option<Vec<u64>>,
+    /// Additional operational metrics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra: Option<serde_json::Value>,
 }
 
 /// Trajectory-level aggregates.
@@ -188,4 +234,7 @@ pub struct FinalMetrics {
     /// Number of steps.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_steps: Option<u64>,
+    /// Additional aggregate metrics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra: Option<serde_json::Value>,
 }

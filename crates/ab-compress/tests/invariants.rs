@@ -1,7 +1,12 @@
 //! Property tests for compression invariants (plan D9): first-system and tail
 //! preservation, parseability, idempotence, monotone size — over arbitrary
 //! generated conversations including unicode content.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use ab_compress::{compress, CompressionConfig};
 use proptest::prelude::*;
@@ -11,7 +16,11 @@ fn arb_message() -> impl Strategy<Value = Value> {
     let role = prop_oneof![Just("system"), Just("user"), Just("assistant"), Just("tool")];
     (role, "\\PC{0,300}", 0u32..4).prop_map(|(role, content, dup_seed)| {
         // dup_seed biases toward duplicate content so collapse passes engage.
-        let content = if dup_seed == 0 { "repeated content block ".repeat(20) } else { content };
+        let content = if dup_seed == 0 {
+            "repeated content block ".repeat(20)
+        } else {
+            content
+        };
         if role == "tool" {
             json!({"role": "tool", "tool_call_id": format!("c{dup_seed}"), "content": content})
         } else {
@@ -21,7 +30,10 @@ fn arb_message() -> impl Strategy<Value = Value> {
 }
 
 fn cfg() -> CompressionConfig {
-    CompressionConfig { min_tokens_to_engage: 0, ..CompressionConfig::default() }
+    CompressionConfig {
+        min_tokens_to_engage: 0,
+        ..CompressionConfig::default()
+    }
 }
 
 proptest! {

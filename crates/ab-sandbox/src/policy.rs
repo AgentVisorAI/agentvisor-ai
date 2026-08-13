@@ -36,7 +36,10 @@ impl NativePolicy {
         name: impl Into<String>,
         rule: impl Fn(&str, &Value) -> PolicyDecision + Send + Sync + 'static,
     ) -> Self {
-        Self { name: name.into(), rule: Box::new(rule) }
+        Self {
+            name: name.into(),
+            rule: Box::new(rule),
+        }
     }
 
     /// Deny-list policy: block the named tools outright.
@@ -44,7 +47,9 @@ impl NativePolicy {
         let denied: Vec<String> = tools.iter().map(|s| (*s).to_owned()).collect();
         Self::new("deny_tools", move |tool, _| {
             if denied.iter().any(|d| d == tool) {
-                PolicyDecision::Deny { reason: format!("tool {tool:?} is deny-listed") }
+                PolicyDecision::Deny {
+                    reason: format!("tool {tool:?} is deny-listed"),
+                }
             } else {
                 PolicyDecision::Allow
             }
@@ -58,7 +63,9 @@ impl NativePolicy {
             if allowed.iter().any(|a| a == tool) {
                 PolicyDecision::Allow
             } else {
-                PolicyDecision::Deny { reason: format!("tool {tool:?} is not allow-listed") }
+                PolicyDecision::Deny {
+                    reason: format!("tool {tool:?} is not allow-listed"),
+                }
             }
         })
     }
@@ -85,26 +92,52 @@ mod tests {
     fn deny_list() {
         let p = NativePolicy::deny_tools(&["drop_database", "send_wire"]);
         assert_eq!(p.evaluate("search", &json!({})), PolicyDecision::Allow);
-        assert!(matches!(p.evaluate("drop_database", &json!({})), PolicyDecision::Deny { .. }));
+        assert!(matches!(
+            p.evaluate("drop_database", &json!({})),
+            PolicyDecision::Deny { .. }
+        ));
     }
 
     #[test]
     fn allow_list() {
         let p = NativePolicy::allow_only(&["search", "read_file"]);
         assert_eq!(p.evaluate("search", &json!({})), PolicyDecision::Allow);
-        assert!(matches!(p.evaluate("db_write", &json!({})), PolicyDecision::Deny { .. }));
+        assert!(matches!(
+            p.evaluate("db_write", &json!({})),
+            PolicyDecision::Deny { .. }
+        ));
     }
 
     #[test]
     fn custom_argument_rule() {
         let p = NativePolicy::new("payout_ceiling", |tool, args| {
             if tool == "payout" && args.get("amount_usd").and_then(Value::as_f64).unwrap_or(0.0) > 50.0 {
-                PolicyDecision::Deny { reason: "single payout above $50".into() }
+                PolicyDecision::Deny {
+                    reason: "single payout above $50".into(),
+                }
             } else {
                 PolicyDecision::Allow
             }
         });
-        assert_eq!(p.evaluate("payout", &json!({"amount_usd": 49.0})), PolicyDecision::Allow);
-        assert!(matches!(p.evaluate("payout", &json!({"amount_usd": 51.0})), PolicyDecision::Deny { .. }));
+        assert_eq!(
+            p.evaluate("payout", &json!({"amount_usd": 49.0})),
+            PolicyDecision::Allow
+        );
+        assert!(matches!(
+            p.evaluate("payout", &json!({"amount_usd": 51.0})),
+            PolicyDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn native_policy_name_returns_the_registered_string() {
+        // Catches `name -> ""` and `name -> "xyzzy"` stubs: the returned
+        // string must match what the constructor was given.
+        let a = NativePolicy::deny_tools(&["x"]);
+        assert_eq!(a.name(), "deny_tools");
+        let b = NativePolicy::allow_only(&["x"]);
+        assert_eq!(b.name(), "allow_only");
+        let c = NativePolicy::new("payout_ceiling", |_, _| PolicyDecision::Allow);
+        assert_eq!(c.name(), "payout_ceiling");
     }
 }

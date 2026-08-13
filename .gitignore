@@ -6,3 +6,70 @@ target/
 /data/
 *.profraw
 criterion/
+/config/*.seed
+*.key
+*.pem
+
+# Rust workspace scratch that lives inside target/ but bleeds via IDE tools
+target/tmp/
+target/flycheck*/
+perf.data*
+flamegraph.svg
+*.iml
+
+# cargo-mutants output (regenerated per run)
+mutants.out/
+mutants.out.old/
+
+# Coverage
+*.lcov
+lcov.info
+cobertura.xml
+tarpaulin-report.html
+.coverage
+coverage/
+
+# Editors & IDEs
+.vscode/
+.idea/
+.zed/
+*.swp
+*.swo
+*~
+.#*
+\#*\#
+
+# OS cruft
+._*
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
+
+# Local backups and merge leftovers
+*.bak
+*.orig
+*.rej
+
+# Environment / secrets never committed
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Python tooling (companion scripts, .venv already covered)
+.venv/
+__pycache__/
+*.pyc
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Node tooling (if a JS/TS helper ever lands)
+node_modules/
+
+# Log files
+*.log

@@ -16,18 +16,64 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.90.0
+          toolchain: 1.97.1
           components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Start live contract services
+        run: docker compose -f docker/docker-compose.yml up -d --wait redpanda redis qdrant nats
+      - name: Fetch pinned MiniLM artifacts
+        run: |
+          mkdir -p /tmp/agentbridge-minilm
+          curl -fL --retry 3 -o /tmp/agentbridge-minilm/model.onnx https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/onnx/model.onnx
+          curl -fL --retry 3 -o /tmp/agentbridge-minilm/tokenizer.json https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/tokenizer.json
+          echo "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452  /tmp/agentbridge-minilm/model.onnx" | sha256sum -c -
+          echo "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037  /tmp/agentbridge-minilm/tokenizer.json" | sha256sum -c -
       - name: Test
-        run: cargo test --workspace
+        env:
+          AB_REDIS_URL: redis://127.0.0.1:6379
+          AB_KAFKA_BROKER: 127.0.0.1:19092
+          AB_NATS_URL: nats://127.0.0.1:4222
+          AB_QDRANT_URL: http://127.0.0.1:6333
+          AB_ONNX_MODEL_PATH: /tmp/agentbridge-minilm/model.onnx
+          AB_ONNX_TOKENIZER_PATH: /tmp/agentbridge-minilm/tokenizer.json
+        run: |
+          cargo test --workspace
+          cargo test --workspace --all-features
+      - name: Release SLA
+        env:
+          AB_REDIS_URL: redis://127.0.0.1:6379
+          AB_KAFKA_BROKER: 127.0.0.1:19092
+        run: |
+          cargo test -p ab-harness --release --features full --test sla sla_core_metrics -- --ignored --nocapture
+          ulimit -n 65536
+          RUN_HEAVY_PERF=1 AB_SLA_CONNECTIONS=10000 cargo test -p ab-harness --release --features full --test sla sla_10k_streaming_connections -- --ignored --nocapture
       - name: Feature matrix
         run: |
           cargo check --workspace --no-default-features
           cargo check --workspace --all-features
       - name: Docs
-        run: RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" cargo doc --workspace --no-deps
+        run: RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D warnings" cargo doc --workspace --all-features --no-deps
+      - name: Schemas and examples
+        run: make schema-check
+      - name: Harbor ATIF interoperability
+        env:
+          HARBOR_TELEMETRY: "off"
+        run: |
+          python -m pip install --disable-pip-version-check "pydantic>=2.11.7" "shortuuid>=1.0.13"
+          python -m pip install --disable-pip-version-check --no-deps "git+https://github.com/harbor-framework/harbor.git@e5e46809a973c91d90a207fcaa232ab8ff89acaf"
+          AB_HARBOR_INTEROP_OUT=/tmp/agentbridge-atif.json cargo test -p ab-harness full_chat_close_and_promotion_flow
+          python -m harbor.utils.trajectory_validator /tmp/agentbridge-atif.json --no-validate-images
+      - name: Compose
+        run: docker compose -f docker/docker-compose.yml config >/dev/null
+      - name: Container build
+        run: docker compose -f docker/docker-compose.yml build agent-bridge
+      - name: Stop live contract services
+        if: always()
+        run: docker compose -f docker/docker-compose.yml down -v

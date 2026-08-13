@@ -23,7 +23,10 @@ impl EventChain {
         let mut h = Sha256::new();
         h.update(b"ab-genesis");
         h.update(session_id.as_bytes());
-        Self { head: h.finalize().into(), count: 0 }
+        Self {
+            head: h.finalize().into(),
+            count: 0,
+        }
     }
 
     /// Append an event (as JSON) to the chain.
@@ -59,13 +62,20 @@ impl EventChain {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use serde_json::json;
 
     fn events() -> Vec<serde_json::Value> {
-        (0..5).map(|i| json!({"seq": i, "payload": format!("event-{i}")})).collect()
+        (0..5)
+            .map(|i| json!({"seq": i, "payload": format!("event-{i}")}))
+            .collect()
     }
 
     #[test]

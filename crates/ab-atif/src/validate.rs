@@ -66,7 +66,9 @@ const TRAJECTORY_FIELDS: &[&str] = &[
     "trajectory_id",
     "agent",
     "steps",
+    "notes",
     "final_metrics",
+    "continued_trajectory_ref",
     "subagent_trajectories",
     "extra",
 ];
@@ -76,18 +78,26 @@ const STEP_FIELDS: &[&str] = &[
     "timestamp",
     "source",
     "message",
+    "reasoning_effort",
     "reasoning_content",
     "model_name",
     "tool_calls",
     "observation",
     "metrics",
+    "is_copied_context",
     "llm_call_count",
     "extra",
 ];
-const AGENT_ONLY_STEP_FIELDS: &[&str] =
-    &["reasoning_content", "model_name", "tool_calls", "metrics", "llm_call_count"];
+const AGENT_ONLY_STEP_FIELDS: &[&str] = &[
+    "reasoning_content",
+    "reasoning_effort",
+    "model_name",
+    "tool_calls",
+    "metrics",
+];
 const TOOL_CALL_FIELDS: &[&str] = &["tool_call_id", "function_name", "arguments", "extra"];
-const OBS_RESULT_FIELDS: &[&str] = &["source_call_id", "content", "extra"];
+const OBS_RESULT_FIELDS: &[&str] = &["source_call_id", "content", "subagent_trajectory_ref", "extra"];
+const SUBAGENT_REF_FIELDS: &[&str] = &["trajectory_id", "session_id", "trajectory_path", "extra"];
 const METRICS_FIELDS: &[&str] = &[
     "prompt_tokens",
     "completion_tokens",
@@ -96,6 +106,7 @@ const METRICS_FIELDS: &[&str] = &[
     "logprobs",
     "completion_token_ids",
     "prompt_token_ids",
+    "extra",
 ];
 const FINAL_METRICS_FIELDS: &[&str] = &[
     "total_prompt_tokens",
@@ -103,6 +114,7 @@ const FINAL_METRICS_FIELDS: &[&str] = &[
     "total_cached_tokens",
     "total_cost_usd",
     "total_steps",
+    "extra",
 ];
 
 /// Validate a raw JSON value as an ATIF trajectory.
@@ -154,7 +166,11 @@ fn validate_trajectory_obj(
             None
         }
         None => {
-            issue!(issues, format!("{path}.schema_version"), "required field is missing");
+            issue!(
+                issues,
+                format!("{path}.schema_version"),
+                "required field is missing"
+            );
             None
         }
     };
@@ -162,16 +178,32 @@ fn validate_trajectory_obj(
 
     // Version gates on root fields.
     if obj.contains_key("extra") && ver < (1, 1) {
-        issue!(issues, format!("{path}.extra"), "field requires ATIF-v1.1+, file is v{}.{}", ver.0, ver.1);
+        issue!(
+            issues,
+            format!("{path}.extra"),
+            "field requires ATIF-v1.1+, file is v{}.{}",
+            ver.0,
+            ver.1
+        );
     }
     for f in ["trajectory_id", "subagent_trajectories"] {
         if obj.contains_key(f) && ver < (1, 7) {
-            issue!(issues, format!("{path}.{f}"), "field requires ATIF-v1.7+, file is v{}.{}", ver.0, ver.1);
+            issue!(
+                issues,
+                format!("{path}.{f}"),
+                "field requires ATIF-v1.7+, file is v{}.{}",
+                ver.0,
+                ver.1
+            );
         }
     }
     // session_id optionality was relaxed in v1.7; older files must carry it.
     if top_level && ver < (1, 7) && obj.get("session_id").and_then(Value::as_str).is_none() {
-        issue!(issues, format!("{path}.session_id"), "required field is missing (optional only since v1.7)");
+        issue!(
+            issues,
+            format!("{path}.session_id"),
+            "required field is missing (optional only since v1.7)"
+        );
     }
 
     // agent
@@ -202,6 +234,9 @@ fn validate_trajectory_obj(
     // steps
     match obj.get("steps") {
         Some(Value::Array(steps)) => {
+            if steps.is_empty() {
+                issue!(issues, format!("{path}.steps"), "must contain at least one step");
+            }
             for (i, step) in steps.iter().enumerate() {
                 validate_step(step, &format!("{path}.steps.{i}"), i, ver, mode, issues);
             }
@@ -214,7 +249,13 @@ fn validate_trajectory_obj(
     if let Some(fm) = obj.get("final_metrics") {
         match fm.as_object() {
             Some(m) => {
-                check_unknown_fields(m, FINAL_METRICS_FIELDS, &format!("{path}.final_metrics"), mode, issues);
+                check_unknown_fields(
+                    m,
+                    FINAL_METRICS_FIELDS,
+                    &format!("{path}.final_metrics"),
+                    mode,
+                    issues,
+                );
                 for f in [
                     "total_prompt_tokens",
                     "total_completion_tokens",
@@ -223,13 +264,21 @@ fn validate_trajectory_obj(
                 ] {
                     if let Some(v) = m.get(f) {
                         if !v.is_u64() {
-                            issue!(issues, format!("{path}.final_metrics.{f}"), "must be a non-negative integer");
+                            issue!(
+                                issues,
+                                format!("{path}.final_metrics.{f}"),
+                                "must be a non-negative integer"
+                            );
                         }
                     }
                 }
                 if let Some(v) = m.get("total_cost_usd") {
                     if !v.is_number() {
-                        issue!(issues, format!("{path}.final_metrics.total_cost_usd"), "must be a number");
+                        issue!(
+                            issues,
+                            format!("{path}.final_metrics.total_cost_usd"),
+                            "must be a number"
+                        );
                     }
                 }
             }
@@ -239,8 +288,32 @@ fn validate_trajectory_obj(
 
     // subagent trajectories recurse with the same rules.
     if let Some(Value::Array(subs)) = obj.get("subagent_trajectories") {
+        let mut trajectory_ids = std::collections::HashSet::new();
         for (i, sub) in subs.iter().enumerate() {
-            validate_trajectory_obj(sub, &format!("{path}.subagent_trajectories.{i}"), mode, issues, false);
+            let id = sub
+                .get("trajectory_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty());
+            match id {
+                Some(id) if trajectory_ids.insert(id.to_owned()) => {}
+                Some(id) => issue!(
+                    issues,
+                    format!("{path}.subagent_trajectories.{i}.trajectory_id"),
+                    "duplicate embedded trajectory_id {id:?}"
+                ),
+                None => issue!(
+                    issues,
+                    format!("{path}.subagent_trajectories.{i}.trajectory_id"),
+                    "required for embedded subagent trajectories"
+                ),
+            }
+            validate_trajectory_obj(
+                sub,
+                &format!("{path}.subagent_trajectories.{i}"),
+                mode,
+                issues,
+                false,
+            );
         }
     }
 }
@@ -264,24 +337,63 @@ fn validate_step(
     match obj.get("step_id").and_then(Value::as_u64) {
         Some(id) if id == expected => {}
         Some(id) => {
-            issue!(issues, format!("{path}.step_id"), "expected {expected} (sequential from 1), got {id}");
+            issue!(
+                issues,
+                format!("{path}.step_id"),
+                "expected {expected} (sequential from 1), got {id}"
+            );
         }
-        None => issue!(issues, format!("{path}.step_id"), "required field is missing or not an integer"),
+        None => issue!(
+            issues,
+            format!("{path}.step_id"),
+            "required field is missing or not an integer"
+        ),
     }
 
-    // timestamp: ISO 8601.
-    match obj.get("timestamp").and_then(Value::as_str) {
-        Some(ts) if is_iso8601(ts) => {}
-        Some(ts) => issue!(issues, format!("{path}.timestamp"), "invalid ISO-8601 timestamp {ts:?}"),
-        None => issue!(issues, format!("{path}.timestamp"), "required field is missing"),
+    // timestamp: optional ISO 8601.
+    if let Some(timestamp) = obj.get("timestamp") {
+        match timestamp.as_str() {
+            Some(ts) if is_iso8601(ts) => {}
+            Some(ts) => issue!(
+                issues,
+                format!("{path}.timestamp"),
+                "invalid ISO-8601 timestamp {ts:?}"
+            ),
+            None => issue!(issues, format!("{path}.timestamp"), "must be a string"),
+        }
     }
 
     // source.
     let source = obj.get("source").and_then(Value::as_str);
     match source {
         Some("system" | "user" | "agent") => {}
-        Some(s) => issue!(issues, format!("{path}.source"), "invalid source {s:?} (system|user|agent)"),
+        Some(s) => issue!(
+            issues,
+            format!("{path}.source"),
+            "invalid source {s:?} (system|user|agent)"
+        ),
         None => issue!(issues, format!("{path}.source"), "required field is missing"),
+    }
+
+    match obj.get("message") {
+        Some(Value::String(_) | Value::Array(_)) => {}
+        Some(_) => issue!(
+            issues,
+            format!("{path}.message"),
+            "must be a string or content-part array"
+        ),
+        None => issue!(issues, format!("{path}.message"), "required field is missing"),
+    }
+
+    if obj
+        .get("reasoning_effort")
+        .is_some_and(|value| !value.is_string() && !value.is_number())
+    {
+        issue!(
+            issues,
+            format!("{path}.reasoning_effort"),
+            "must be a string or number"
+        );
     }
 
     // Agent-only fields.
@@ -289,7 +401,11 @@ fn validate_step(
         if src != "agent" {
             for f in AGENT_ONLY_STEP_FIELDS {
                 if obj.contains_key(*f) {
-                    issue!(issues, format!("{path}.{f}"), "agent-only field present on {src} step");
+                    issue!(
+                        issues,
+                        format!("{path}.{f}"),
+                        "agent-only field present on {src} step"
+                    );
                 }
             }
             // observation: agent always; system since v1.2; never user.
@@ -307,13 +423,32 @@ fn validate_step(
     }
 
     if obj.contains_key("llm_call_count") && ver < (1, 7) {
-        issue!(issues, format!("{path}.llm_call_count"), "field requires ATIF-v1.7+");
+        issue!(
+            issues,
+            format!("{path}.llm_call_count"),
+            "field requires ATIF-v1.7+"
+        );
+    }
+    if source == Some("agent") && obj.get("llm_call_count").and_then(Value::as_u64) == Some(0) {
+        for field in ["metrics", "reasoning_content"] {
+            if obj.contains_key(field) {
+                issue!(
+                    issues,
+                    format!("{path}.{field}"),
+                    "must be absent when llm_call_count is 0"
+                );
+            }
+        }
     }
 
     // Multimodal content-part arrays require v1.6+.
     if ver < (1, 6) {
         if let Some(Value::Array(_)) = obj.get("message") {
-            issue!(issues, format!("{path}.message"), "content-part arrays require ATIF-v1.6+");
+            issue!(
+                issues,
+                format!("{path}.message"),
+                "content-part arrays require ATIF-v1.6+"
+            );
         }
     }
 
@@ -339,13 +474,26 @@ fn validate_step(
                             }
                             call_ids.push(id.to_owned());
                         }
-                        _ => issue!(issues, format!("{cpath}.tool_call_id"), "required field is missing"),
+                        _ => issue!(
+                            issues,
+                            format!("{cpath}.tool_call_id"),
+                            "required field is missing"
+                        ),
                     }
-                    if c.get("function_name").and_then(Value::as_str).is_none_or(str::is_empty) {
-                        issue!(issues, format!("{cpath}.function_name"), "required field is missing");
+                    if c.get("function_name")
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty)
+                    {
+                        issue!(
+                            issues,
+                            format!("{cpath}.function_name"),
+                            "required field is missing"
+                        );
                     }
-                    if c.get("arguments").is_none() {
-                        issue!(issues, format!("{cpath}.arguments"), "required field is missing");
+                    match c.get("arguments") {
+                        Some(Value::Object(_)) => {}
+                        Some(_) => issue!(issues, format!("{cpath}.arguments"), "must be an object"),
+                        None => issue!(issues, format!("{cpath}.arguments"), "required field is missing"),
                     }
                 }
             }
@@ -370,15 +518,48 @@ fn validate_step(
                             if res.contains_key("extra") && ver < (1, 7) {
                                 issue!(issues, format!("{rpath}.extra"), "field requires ATIF-v1.7+");
                             }
-                            if res.get("content").is_none() {
-                                issue!(issues, format!("{rpath}.content"), "required field is missing");
-                            } else if ver < (1, 6) {
-                                if let Some(Value::Array(_)) = res.get("content") {
+                            if let Some(content) = res.get("content") {
+                                if !content.is_string() && !content.is_array() {
+                                    issue!(
+                                        issues,
+                                        format!("{rpath}.content"),
+                                        "must be a string or content-part array"
+                                    );
+                                } else if ver < (1, 6) && content.is_array() {
                                     issue!(
                                         issues,
                                         format!("{rpath}.content"),
                                         "content-part arrays require ATIF-v1.6+"
                                     );
+                                }
+                            }
+                            if let Some(references) =
+                                res.get("subagent_trajectory_ref").and_then(Value::as_array)
+                            {
+                                for (k, reference) in references.iter().enumerate() {
+                                    let ref_path = format!("{rpath}.subagent_trajectory_ref.{k}");
+                                    let Some(reference) = reference.as_object() else {
+                                        issue!(issues, ref_path, "must be an object");
+                                        continue;
+                                    };
+                                    check_unknown_fields(
+                                        reference,
+                                        SUBAGENT_REF_FIELDS,
+                                        &ref_path,
+                                        mode,
+                                        issues,
+                                    );
+                                    let has_id = reference
+                                        .get("trajectory_id")
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|value| !value.is_empty());
+                                    let has_path = reference
+                                        .get("trajectory_path")
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|value| !value.is_empty());
+                                    if !has_id && !has_path {
+                                        issue!(issues, ref_path, "must set trajectory_id or trajectory_path");
+                                    }
                                 }
                             }
                             if let Some(src_id) = res.get("source_call_id").and_then(Value::as_str) {
@@ -392,10 +573,39 @@ fn validate_step(
                             }
                         }
                     }
-                    None => issue!(issues, format!("{opath}.results"), "required field is missing or not an array"),
+                    None => issue!(
+                        issues,
+                        format!("{opath}.results"),
+                        "required field is missing or not an array"
+                    ),
                 }
             }
             None => issue!(issues, opath, "must be an object"),
+        }
+    }
+
+    if mode == Mode::Strict
+        && ver >= (1, 7)
+        && source == Some("agent")
+        && obj.get("llm_call_count").and_then(Value::as_u64) != Some(0)
+    {
+        match obj.get("metrics").and_then(Value::as_object) {
+            Some(metrics) => {
+                for field in ["prompt_tokens", "completion_tokens", "cached_tokens"] {
+                    if !metrics.contains_key(field) {
+                        issue!(
+                            issues,
+                            format!("{path}.metrics.{field}"),
+                            "required for strict ATIF-v1.7 agent-step fidelity"
+                        );
+                    }
+                }
+            }
+            None => issue!(
+                issues,
+                format!("{path}.metrics"),
+                "required for strict ATIF-v1.7 agent-step fidelity"
+            ),
         }
     }
 
@@ -416,10 +626,18 @@ fn validate_step(
                     issue!(issues, format!("{mpath}.cost_usd"), "must be a number");
                 }
                 if m.contains_key("completion_token_ids") && ver < (1, 3) {
-                    issue!(issues, format!("{mpath}.completion_token_ids"), "field requires ATIF-v1.3+");
+                    issue!(
+                        issues,
+                        format!("{mpath}.completion_token_ids"),
+                        "field requires ATIF-v1.3+"
+                    );
                 }
                 if m.contains_key("prompt_token_ids") && ver < (1, 4) {
-                    issue!(issues, format!("{mpath}.prompt_token_ids"), "field requires ATIF-v1.4+");
+                    issue!(
+                        issues,
+                        format!("{mpath}.prompt_token_ids"),
+                        "field requires ATIF-v1.4+"
+                    );
                 }
             }
             None => issue!(issues, mpath, "must be an object"),
@@ -502,7 +720,12 @@ fn is_iso8601(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
 
