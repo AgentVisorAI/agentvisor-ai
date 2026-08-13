@@ -110,7 +110,7 @@ fn rpc_parse_rejects_just_over_the_depth_cap_and_accepts_at_it() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Wide-flat bomb: an object with 1 million keys. JCS must not panic;
+// 3. Wide-flat bomb: an object with 500k keys. JCS must not panic;
 //    must complete or error in bounded time. This exercises the sort +
 //    write path on a pathological input.
 // ---------------------------------------------------------------------------
@@ -189,7 +189,7 @@ fn half_a_million_event_chain_computes_and_still_detects_tamper() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Store bomb: 100k keys × 100 add operations, then bulk get. Never
+// 6. Store bomb: 100k keys × 3 add operations, then bulk get. Never
 //    negative, never Overflow, memory bounded.
 // ---------------------------------------------------------------------------
 

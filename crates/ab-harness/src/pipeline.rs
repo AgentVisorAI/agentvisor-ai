@@ -246,8 +246,8 @@ impl AppState {
         })
     }
 
-    /// Run identity, breaker, quota, compression, and asynchronous dispatch in
-    /// the mandated order without awaiting worker or upstream I/O.
+    /// Run identity, breaker, quota, sanitize, compression, and asynchronous
+    /// dispatch in the mandated order without awaiting worker or upstream I/O.
     pub fn prepare_chat(
         &self,
         headers: &HeaderMap,
