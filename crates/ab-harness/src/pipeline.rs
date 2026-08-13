@@ -528,9 +528,16 @@ impl AppState {
                 response_attempt_id,
             }),
             Err(error) => {
-                let error = PipelineError::Upstream(error.to_string());
+                let internal_detail = error.to_string();
+                tracing::warn!(
+                    session = %session.id,
+                    error = %internal_detail,
+                    "upstream forwarding failed"
+                );
+                let client_reason = classify_upstream_error(&error);
+                let client_error = PipelineError::Upstream(client_reason.to_owned());
                 if let Some(permit) = response_permit {
-                    let mut job = self.failure_job(session, identity, StopReason::Other, error.to_string());
+                    let mut job = self.failure_job(session, identity, StopReason::Other, internal_detail);
                     job.response_marker = response_marker;
                     job.response_attempt = Some(crate::worker::ResponseAttempt {
                         id: response_attempt_id,
@@ -540,7 +547,7 @@ impl AppState {
                 } else {
                     self.enqueue_failure(session, identity, StopReason::Other, error.to_string())?;
                 }
-                Err(error)
+                Err(client_error)
             }
         }
     }
@@ -894,6 +901,27 @@ fn truthy_env(name: &str) -> bool {
             "1" | "true" | "yes" | "on"
         ),
         Err(_) => false,
+    }
+}
+
+/// Map a `reqwest::Error` to a client-safe reason (CWE-209): the raw
+/// `Display` includes the request URL, which leaks the operator-configured
+/// upstream URL — potentially an internal hostname — to the caller. Return a
+/// stable, non-identifying category instead; the detailed message is logged
+/// server-side by the caller.
+fn classify_upstream_error(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "upstream timed out"
+    } else if error.is_connect() {
+        "upstream unreachable"
+    } else if error.is_request() {
+        "upstream request rejected"
+    } else if error.is_body() || error.is_decode() {
+        "upstream response malformed"
+    } else if error.is_status() {
+        "upstream returned error status"
+    } else {
+        "upstream forwarding failed"
     }
 }
 
@@ -1596,5 +1624,42 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// Regression lock for CWE-209 information exposure. Before the fix,
+    /// `PipelineError::Upstream(reqwest_err.to_string())` embedded the
+    /// operator-configured upstream URL in the JSON error body — any client
+    /// that triggered an upstream failure could discover the URL, potentially
+    /// leaking an internal hostname. The client-facing message must now be a
+    /// stable category ("upstream unreachable", "upstream timed out", …) that
+    /// does not depend on the URL.
+    #[tokio::test]
+    async fn upstream_failure_message_does_not_leak_configured_url() {
+        // Use a distinctive private-network host so a regression is unmissable
+        // in the assertion below.
+        let sentinel_url = "http://internal-sentinel-host.corp.example:65001";
+        let config = HarnessConfig::for_tests(sentinel_url, "/tmp", "/tmp");
+        let state = state(config);
+        let mut headers = HeaderMap::new();
+        headers.insert(SESSION_HEADER, HeaderValue::from_static("cwe-209-check"));
+        headers.insert(WORKFLOW_HEADER, HeaderValue::from_static("signed"));
+        let prepared = state.prepare_chat(&headers, payload()).unwrap();
+        let error = match state.forward_chat(prepared).await {
+            Ok(_) => panic!("connect to unroutable host must fail"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            !message.contains("internal-sentinel-host"),
+            "upstream error message {message:?} leaks the configured URL"
+        );
+        assert!(
+            !message.contains("65001"),
+            "upstream error message {message:?} leaks the configured port"
+        );
+        assert!(
+            !message.contains("corp.example"),
+            "upstream error message {message:?} leaks the configured domain"
+        );
     }
 }
