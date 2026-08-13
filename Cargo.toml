@@ -68,7 +68,7 @@ parking_lot = "0.12"
 r2d2 = "0.8"
 clap = { version = "4.5", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "http2"] }
-wasmtime = { version = "27", default-features = false, features = ["runtime", "cranelift", "wat"] }
+wasmtime = { version = "47", default-features = false, features = ["runtime", "cranelift", "wat"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.6"
 tempfile = "3.14"

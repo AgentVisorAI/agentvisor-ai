@@ -20,7 +20,7 @@ onnx = ["dep:tract-onnx", "dep:tokenizers"]
 qdrant = ["dep:reqwest"]
 
 [dependencies.tract-onnx]
-version = "0.21"
+version = "0.23"
 optional = true
 
 [dependencies.tokenizers]
