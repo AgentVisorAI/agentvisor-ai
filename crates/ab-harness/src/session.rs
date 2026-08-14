@@ -859,12 +859,22 @@ mod tests {
         // Artifact committed but the close never completed (bridge emit or
         // journal removal failed): the journal may still be on disk, so a
         // reused id must find this sealed session, not a fresh one.
-        let incomplete = r.get_or_open("keep-incomplete", Workflow::Signed, &identity(), &Default::default());
+        let incomplete = r.get_or_open(
+            "keep-incomplete",
+            Workflow::Signed,
+            &identity(),
+            &Default::default(),
+        );
         incomplete.try_close();
         incomplete.mark_artifact_committed();
         incomplete.last_activity_ms.store(stale, Ordering::Release);
 
-        let unsigned = r.get_or_open("keep-unsigned", Workflow::Unsigned, &identity(), &Default::default());
+        let unsigned = r.get_or_open(
+            "keep-unsigned",
+            Workflow::Unsigned,
+            &identity(),
+            &Default::default(),
+        );
         unsigned.try_close();
         unsigned.mark_artifact_committed();
         unsigned.mark_close_complete();
@@ -877,7 +887,12 @@ mod tests {
         failed.mark_capture_failed();
         failed.last_activity_ms.store(stale, Ordering::Release);
 
-        let streaming = r.get_or_open("keep-streaming", Workflow::Signed, &identity(), &Default::default());
+        let streaming = r.get_or_open(
+            "keep-streaming",
+            Workflow::Signed,
+            &identity(),
+            &Default::default(),
+        );
         streaming.try_close();
         streaming.mark_artifact_committed();
         streaming.mark_close_complete();

@@ -656,9 +656,9 @@ impl AppState {
         }
         if prepared.session.loop_state.state() == BreakerState::Open {
             let error = match prepared.session.loop_state.action() {
-                BreakerAction::Abort => PipelineError::Abort(
-                    "semantic loop circuit breaker opened during audit".to_owned(),
-                ),
+                BreakerAction::Abort => {
+                    PipelineError::Abort("semantic loop circuit breaker opened during audit".to_owned())
+                }
                 _ => PipelineError::Blocked(
                     "semantic loop circuit breaker opened during audit; retry required".to_owned(),
                 ),
@@ -1694,7 +1694,10 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(SESSION_HEADER, HeaderValue::from_static("budget-cleanup"));
         state.prepare_chat(&headers, payload()).unwrap();
-        let tokens_key = format!("{}tokens", ab_state::ActionBudget::session_prefix("budget-cleanup"));
+        let tokens_key = format!(
+            "{}tokens",
+            ab_state::ActionBudget::session_prefix("budget-cleanup")
+        );
         assert!(
             store.get(&tokens_key).unwrap() > 0,
             "precondition: admission must have spent from the token budget",
@@ -1754,7 +1757,10 @@ mod tests {
             "params": {"name": "safe_tool", "arguments": {}}
         }))
         .unwrap();
-        let verdict = state.intercept_tool_durable(&HeaderMap::new(), &raw).await.unwrap();
+        let verdict = state
+            .intercept_tool_durable(&HeaderMap::new(), &raw)
+            .await
+            .unwrap();
         assert!(
             verdict.is_allowed(),
             "durable interception must await the verdict's own session, not a re-derived id",
@@ -1801,7 +1807,10 @@ mod tests {
             matches!(refusal, Some(PipelineError::Blocked(_))),
             "the breaker must refuse during the audit wait, got {refusal:?}",
         );
-        assert!(!abandoned_by_test.is_empty(), "at least one prepare must succeed first");
+        assert!(
+            !abandoned_by_test.is_empty(),
+            "at least one prepare must succeed first"
+        );
         let session = state.sessions.get("durable-loop").unwrap();
         session.wait_for_worker_jobs().await;
 
