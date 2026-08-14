@@ -63,6 +63,9 @@ pub struct Finalizer {
     recovery_lock: Arc<tokio::sync::Mutex<()>>,
     lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
     quarantined_sessions: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    /// Artifacts already warned about during recovery scans, so a corrupt
+    /// file left on disk as evidence does not repeat its warning every tick.
+    warned_artifacts: Arc<parking_lot::Mutex<std::collections::HashSet<PathBuf>>>,
     journal_key: [u8; 32],
 }
 
@@ -113,6 +116,7 @@ impl Finalizer {
             recovery_lock: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
             quarantined_sessions: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            warned_artifacts: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             journal_key,
         }
     }
@@ -133,6 +137,7 @@ impl Finalizer {
             recovery_lock: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
             quarantined_sessions: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            warned_artifacts: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             journal_key,
         }
     }
@@ -208,7 +213,7 @@ impl Finalizer {
                     let receipt = Receipt::issue(body, self.signer.as_ref())
                         .map_err(|error| FinalizeError::Receipt(error.to_string()))?;
                     self.metrics
-                        .histogram("ab_receipt_sign_duration_us", "Receipt signing latency")
+                        .histogram("ab_receipt_sign_duration_seconds", "Receipt signing latency")
                         .observe_us(elapsed_us(sign_started));
                     self.persist_receipt(&session.id, &receipt).await?;
                     *session.receipt.lock() = Some(receipt.clone());
@@ -308,7 +313,10 @@ impl Finalizer {
         self.remove_lifecycle_outbox(&session.id, crate::journal::SESSION_CLOSE_OUTBOX_KIND)
             .await?;
         self.metrics
-            .histogram("ab_session_finalize_duration_us", "Session finalization latency")
+            .histogram(
+                "ab_session_finalize_duration_seconds",
+                "Session finalization latency",
+            )
             .observe_us(elapsed_us(started));
         self.metrics
             .counter("ab_sessions_finalized_total", "Sessions finalized")
@@ -542,13 +550,41 @@ impl Finalizer {
             let Some(session_id) = trajectory.session_id.clone() else {
                 continue;
             };
+            // Integrity failures must not abort the scan: one tampered or
+            // orphaned artifact would otherwise starve recovery of every
+            // other session on every tick. The file stays on disk as
+            // evidence; warn once and keep going.
             if !path.with_extension("atif-auth").exists() {
-                return Err(FinalizeError::Atif(format!(
-                    "ATIF artifact {} has no authenticated provenance",
-                    path.display()
-                )));
+                self.metrics
+                    .counter(
+                        "ab_atif_recovery_skipped_total{reason=\"unauthenticated\"}",
+                        "ATIF spool files skipped during recovery",
+                    )
+                    .inc();
+                if self.warned_artifacts.lock().insert(path.clone()) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "ignoring ATIF spool file with no authenticated provenance"
+                    );
+                }
+                continue;
             }
-            self.ensure_atif_provenance(&path, &session_id).await?;
+            if let Err(error) = self.ensure_atif_provenance(&path, &session_id).await {
+                self.metrics
+                    .counter(
+                        "ab_atif_recovery_skipped_total{reason=\"provenance\"}",
+                        "ATIF spool files skipped during recovery",
+                    )
+                    .inc();
+                if self.warned_artifacts.lock().insert(path.clone()) {
+                    tracing::warn!(
+                        %error,
+                        path = %path.display(),
+                        "ignoring ATIF spool file whose provenance does not verify"
+                    );
+                }
+                continue;
+            }
             if sessions.get(&session_id).is_some() {
                 continue;
             }
@@ -1607,7 +1643,7 @@ pub fn spawn_reconciler(
                 }
             }
             metrics
-                .histogram("ab_reconcile_duration_us", "Idle reconciliation duration")
+                .histogram("ab_reconcile_duration_seconds", "Idle reconciliation duration")
                 .observe_us(elapsed_us(started));
         }
     })
@@ -2588,6 +2624,105 @@ mod tests {
             "live session's atif_path must not be reassigned to the stale artifact",
         );
         assert_eq!(registry.len(), 1, "recovery must not add a duplicate entry");
+    }
+
+    /// A tampered (or unauthenticated) artifact left in the spool must not
+    /// abort the recovery scan: before this fix, `recover_spooled_sessions`
+    /// returned `Err` at the first provenance failure, so one corrupt file
+    /// starved recovery of every *other* session on every tick — and the
+    /// warn (with no path) repeated forever. Integrity failures now skip
+    /// the file (it stays on disk as evidence), count a skip metric, and
+    /// let the rest of the spool recover.
+    #[tokio::test]
+    async fn recovery_skips_tampered_artifact_and_still_recovers_the_rest() {
+        let directory = tempfile::tempdir().unwrap();
+        let metrics = Arc::new(Registry::new());
+        let finalizer = Finalizer::new(
+            Arc::new(Ed25519Signer::from_seed([7; 32])),
+            directory.path().to_path_buf(),
+            Arc::clone(&metrics),
+        );
+        let step = ab_atif::Step {
+            step_id: 0,
+            timestamp: None,
+            source: ab_atif::Source::Agent,
+            message: serde_json::json!("archived response"),
+            reasoning_effort: None,
+            reasoning_content: None,
+            model_name: Some("test-model".into()),
+            tool_calls: None,
+            observation: None,
+            metrics: Some(ab_atif::Metrics {
+                prompt_tokens: Some(1),
+                completion_tokens: Some(1),
+                cached_tokens: Some(0),
+                cost_usd: Some(0.0),
+                logprobs: None,
+                completion_token_ids: None,
+                prompt_token_ids: None,
+                extra: None,
+            }),
+            is_copied_context: None,
+            llm_call_count: Some(1),
+            extra: None,
+        };
+        let identity = AgentIdentity {
+            version: "1".to_owned(),
+            charter: "test".into(),
+            instance_uid: "instance-1".to_owned(),
+            ttl_remaining_s: Some(600),
+        };
+        let mut artifact_paths = Vec::new();
+        for id in ["tampered-session", "healthy-session"] {
+            let session = Arc::new(Session::new(
+                id.to_owned(),
+                Workflow::Unsigned,
+                identity.clone(),
+                Default::default(),
+            ));
+            session.atif.lock().push_step(step.clone()).unwrap();
+            let outcome = finalizer
+                .close_session(Arc::clone(&session), StopReason::SessionClosed)
+                .await
+                .unwrap();
+            match outcome {
+                FinalizeOutcome::Atif { path } => artifact_paths.push(path),
+                other => panic!("expected FinalizeOutcome::Atif, got {other:?}"),
+            }
+        }
+        // Corrupt the first artifact's bytes so its .atif-auth digest no
+        // longer matches.
+        let tampered = &artifact_paths[0];
+        let mut bytes = std::fs::read(tampered).unwrap();
+        let position = bytes
+            .windows("archived".len())
+            .position(|window| window == b"archived")
+            .expect("artifact must contain the step message");
+        bytes[position] = b'X';
+        std::fs::write(tampered, &bytes).unwrap();
+
+        let registry = SessionRegistry::new();
+        finalizer
+            .recover_spooled_sessions(&registry, &Default::default())
+            .await
+            .expect("one tampered artifact must not abort the recovery scan");
+        assert!(
+            registry.get("healthy-session").is_some(),
+            "the healthy artifact must still recover when a sibling is tampered",
+        );
+        assert!(
+            registry.get("tampered-session").is_none(),
+            "the tampered artifact must not recover a session",
+        );
+        assert!(
+            tampered.exists(),
+            "the tampered artifact must stay on disk as evidence",
+        );
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains("ab_atif_recovery_skipped_total{reason=\"provenance\"}"),
+            "skips must be visible to operators via metrics; got: {rendered}",
+        );
     }
 
     /// A background promotion retry must never force-close a session that is

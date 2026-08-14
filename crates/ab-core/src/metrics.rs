@@ -167,6 +167,10 @@ impl Registry {
     }
 
     /// Render the registry in Prometheus text exposition format.
+    ///
+    /// Histogram observations are stored internally in microseconds but
+    /// rendered in seconds (`le` bounds and `_sum`), per Prometheus base-unit
+    /// convention. Histogram metric names should therefore end in `_seconds`.
     pub fn render(&self) -> String {
         let m = self.metrics.lock();
         let mut out = String::new();
@@ -272,12 +276,16 @@ mod tests {
     #[test]
     fn labeled_family_is_declared_once() {
         let r = Registry::new();
-        r.histogram("ab_stage_duration_us{stage=\"identity\"}", "stage latency");
-        r.histogram("ab_stage_duration_us{stage=\"quota\"}", "stage latency");
+        r.histogram("ab_stage_duration_seconds{stage=\"identity\"}", "stage latency");
+        r.histogram("ab_stage_duration_seconds{stage=\"quota\"}", "stage latency");
         let text = r.render();
-        assert_eq!(text.matches("# HELP ab_stage_duration_us ").count(), 1, "{text}");
         assert_eq!(
-            text.matches("# TYPE ab_stage_duration_us histogram").count(),
+            text.matches("# HELP ab_stage_duration_seconds ").count(),
+            1,
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("# TYPE ab_stage_duration_seconds histogram").count(),
             1,
             "{text}"
         );
