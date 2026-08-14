@@ -477,11 +477,25 @@ fn path_for_config(label: &str, path: &Path) -> Result<String> {
     Ok(text.to_owned())
 }
 
+/// A relative home (odd `$HOME`) would bake relative key/data paths into
+/// the config, which silently break as soon as the server runs from a
+/// different directory. Anchor everything to an absolute path up front.
+fn absolute_home(home: &Path) -> Result<PathBuf> {
+    if home.is_absolute() {
+        return Ok(home.to_path_buf());
+    }
+    Ok(std::env::current_dir()
+        .context("resolve current directory")?
+        .join(home))
+}
+
 /// The guided setup: two questions (provider, key), everything stored
 /// under `home/.agentbridge/` so no environment variables, exports, or
 /// file editing are ever needed. Drive `input` with scripted answers and
 /// `SecretInput::Plain` in tests.
 pub fn wizard(home: &Path, input: &mut dyn std::io::BufRead, secrets: &SecretInput) -> Result<WizardOutcome> {
+    let home = absolute_home(home)?;
+    let home = home.as_path();
     println!("Welcome to AgentBridge! Two quick questions and you're done.");
     println!();
     println!("Where do your AI models come from?");
@@ -602,7 +616,12 @@ pub fn wizard(home: &Path, input: &mut dyn std::io::BufRead, secrets: &SecretInp
         std::fs::copy(&config_path, &backup).with_context(|| format!("back up {}", config_path.display()))?;
         println!("\n(Your previous settings were saved to {})", backup.display());
     }
-    std::fs::write(&config_path, &rendered).with_context(|| format!("write {}", config_path.display()))?;
+    // Write-then-rename so a crash mid-write can't leave a truncated
+    // config, and a symlink planted at the config path gets replaced by
+    // a real file instead of silently redirecting the write elsewhere.
+    let staging = config_path.with_extension("toml.tmp");
+    std::fs::write(&staging, &rendered).with_context(|| format!("write {}", staging.display()))?;
+    std::fs::rename(&staging, &config_path).with_context(|| format!("install {}", config_path.display()))?;
 
     println!("\nAll set!");
     println!();
@@ -616,7 +635,10 @@ pub fn wizard(home: &Path, input: &mut dyn std::io::BufRead, secrets: &SecretInp
             friendly_name(preset)
         );
     }
-    let start_now = ask_yes_no("\nStart AgentBridge now? [Y/n]: ", input, true)?;
+    // Setup already succeeded and the config is on disk, so a closed
+    // stdin here (e.g. `printf '11\n' | abctl`) must not turn into a
+    // scary error — it just means "don't start now".
+    let start_now = ask_yes_no("\nStart AgentBridge now? [Y/n]: ", input, true).unwrap_or(false);
     Ok(WizardOutcome {
         config_path,
         start_now,
@@ -742,9 +764,18 @@ pub async fn start() -> Result<()> {
             }
         }
     }
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("could not run {}", binary.display()))?;
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            anyhow::anyhow!(
+                "could not find the AgentBridge server program ({}).\n\
+                 It normally lives next to abctl. To install it:\n\
+                 cargo install --path crates/ab-harness --bin agent-bridge",
+                binary.display()
+            )
+        } else {
+            anyhow::Error::new(error).context(format!("could not run {}", binary.display()))
+        }
+    })?;
 
     // Wait until healthy — or explain why it died.
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -1361,5 +1392,51 @@ mod tests {
             !ab_harness::config::user_config_path_from(home.path()).exists(),
             "no partial config on abort"
         );
+    }
+
+    #[test]
+    fn wizard_eof_after_config_written_means_do_not_start() {
+        let home = tempfile::tempdir().unwrap();
+        // Input ends right after setup finishes — the config is saved, so
+        // this must succeed with start_now == false, not error out.
+        let outcome = drive_wizard(home.path(), "11\n").unwrap();
+        assert!(!outcome.start_now);
+        assert!(outcome.config_path.exists());
+    }
+
+    #[test]
+    fn relative_home_is_anchored_to_an_absolute_path() {
+        // A relative $HOME must not leak relative paths into the config —
+        // they would break the moment the server runs from another cwd.
+        let anchored = absolute_home(Path::new("odd-home")).unwrap();
+        assert!(anchored.is_absolute());
+        assert!(anchored.ends_with("odd-home"));
+        let already = absolute_home(Path::new("/etc/xdg-home")).unwrap();
+        assert_eq!(already, Path::new("/etc/xdg-home"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wizard_replaces_config_symlink_instead_of_following_it() {
+        let home = tempfile::tempdir().unwrap();
+        let victim = home.path().join("victim.toml");
+        std::fs::write(&victim, "untouched").unwrap();
+        let config_path = ab_harness::config::user_config_path_from(home.path());
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&victim, &config_path).unwrap();
+
+        drive_wizard(home.path(), "11\nn\n").unwrap();
+
+        assert!(
+            !std::fs::symlink_metadata(&config_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "config must become a real file"
+        );
+        // The backup step reads through the symlink, so the pre-existing
+        // "config" is preserved; the victim itself must not gain our TOML.
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+        assert!(std::fs::read_to_string(&config_path).unwrap().contains("11434"));
     }
 }
