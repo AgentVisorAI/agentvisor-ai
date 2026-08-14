@@ -1,6 +1,15 @@
 # AgentBridge
 
+[![CI](https://github.com/debugmode0/agent-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/debugmode0/agent-bridge/actions/workflows/ci.yml)
+[![Supply chain](https://github.com/debugmode0/agent-bridge/actions/workflows/deny.yml/badge.svg)](https://github.com/debugmode0/agent-bridge/actions/workflows/deny.yml)
+[![Docs](https://github.com/debugmode0/agent-bridge/actions/workflows/pages.yml/badge.svg)](https://debugmode0.github.io/agent-bridge/)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 AgentBridge is an inline Rust proxy for OpenAI-compatible agent traffic and MCP tool calls. It applies identity, quota, policy, compression, and loop controls; emits OCSF-shaped events; writes ATIF v1.7 trajectories; and issues offline-verifiable Ed25519 receipts.
+
+- **API docs:** <https://debugmode0.github.io/agent-bridge/>
+- **Releases:** <https://github.com/debugmode0/agent-bridge/releases>
+- **Security:** see [`SECURITY.md`](SECURITY.md) — report vulnerabilities privately.
 
 ## Easiest start (no config, no exports)
 

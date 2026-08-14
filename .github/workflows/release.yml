@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+permissions:
+  contents: write
+
+concurrency:
+  # A pushed tag is immutable, but keep the group so re-runs do not race.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build binaries
+        # Default features only: no live backends, no ONNX, no cross-compile
+        # tooling required. Users who need kafka/nats/redis/onnx/qdrant/otel
+        # can build from source with `--features full`.
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            -p ab-harness --bin agent-bridge \
+            -p ab-cli --bin abctl
+      - name: Package archive
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          stage="agent-bridge-${version}-${{ matrix.target }}"
+          mkdir -p "$stage"
+          cp target/${{ matrix.target }}/release/agent-bridge "$stage/"
+          cp target/${{ matrix.target }}/release/abctl "$stage/"
+          cp LICENSE README.md CHANGELOG.md SECURITY.md "$stage/"
+          tar -czf "$stage.tar.gz" "$stage"
+          shasum -a 256 "$stage.tar.gz" > "$stage.tar.gz.sha256"
+          echo "archive=$stage.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=$stage.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+      - name: Aggregate SHA-256 checksums
+        working-directory: dist
+        run: |
+          cat ./*.sha256 > SHA256SUMS
+          shasum -a 256 -c SHA256SUMS
+      - name: Extract changelog for ${{ github.ref_name }}
+        id: notes
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          # Slice CHANGELOG.md from `## <version>` to the next `## `.
+          awk -v v="$version" '
+            index($0, "## " v " ") == 1 || $0 == "## " v { in_section = 1; next }
+            in_section && /^## / { exit }
+            in_section { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            printf 'Release %s.\n\nSee [CHANGELOG.md](CHANGELOG.md).\n' "$version" > notes.md
+          fi
+          {
+            echo "notes<<EOF"
+            cat notes.md
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          prerelease_flag=""
+          case "${GITHUB_REF_NAME}" in
+            *-*) prerelease_flag="--prerelease" ;;
+          esac
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file notes.md \
+            $prerelease_flag \
+            dist/*.tar.gz dist/*.tar.gz.sha256 dist/SHA256SUMS

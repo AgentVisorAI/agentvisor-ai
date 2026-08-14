@@ -4,8 +4,11 @@ yanked = "deny"
 
 [licenses]
 version = 2
+# All entries are OSI-approved or SPDX-recognised permissive licenses used by
+# transitive dependencies. Add new licenses only after review.
 allow = [
     "MIT",
+    "MIT-0",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
@@ -15,13 +18,17 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "MPL-2.0",
-    "OpenSSL",
     "Unlicense",
+    # webpki-roots (Mozilla CA bundle) publishes under CDLA-Permissive-2.0.
+    "CDLA-Permissive-2.0",
 ]
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# The workspace uses internal `path = "..."` dependencies which cargo-deny
+# reports as wildcard versions. External wildcard dependencies remain denied.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
