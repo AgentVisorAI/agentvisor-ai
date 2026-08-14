@@ -349,6 +349,9 @@ impl Finalizer {
             .counter("ab_sessions_finalized_total", "Sessions finalized")
             .inc();
         claim.committed = true;
+        // Only now — with lifecycle events published and the on-disk journal
+        // removed — may the registry evict this session.
+        session.mark_close_complete();
         self.clear_budget_state(&session.id);
         Ok(outcome)
     }

@@ -66,6 +66,12 @@ pub struct Session {
     pub closed: AtomicU64,
     /// Set once a receipt or ATIF artifact is durably committed.
     artifact_committed: AtomicU64,
+    /// Set only when a close ran to full completion: artifact committed,
+    /// lifecycle events published, and the on-disk journal removed. Gates
+    /// registry eviction — `artifact_committed` alone is set *before* the
+    /// fallible bridge emits and journal removal, so a failed or in-flight
+    /// close must not look evictable.
+    close_complete: AtomicU64,
     /// Serializes close against request admission.
     admission: RwLock<()>,
     /// Forwarded chat responses that have not completed or aborted.
@@ -139,6 +145,7 @@ impl Session {
             last_stop_reason_id: AtomicU64::new(0),
             closed: AtomicU64::new(0),
             artifact_committed: AtomicU64::new(0),
+            close_complete: AtomicU64::new(0),
             admission: RwLock::new(()),
             active_streams: AtomicU64::new(0),
             streams_drained: tokio::sync::Notify::new(),
@@ -238,6 +245,12 @@ impl Session {
 
     pub(crate) fn mark_artifact_committed(&self) {
         self.artifact_committed.store(1, Ordering::Release);
+    }
+
+    /// Record that a close ran to full completion (journal and outboxes
+    /// removed). Only such sessions may be evicted from the registry.
+    pub(crate) fn mark_close_complete(&self) {
+        self.close_complete.store(1, Ordering::Release);
     }
 
     pub(crate) async fn wait_for_streams(&self) {
@@ -572,12 +585,17 @@ impl SessionRegistry {
         self.sessions.remove(id);
     }
 
-    /// Evict signed sessions whose finalization is fully committed and that
+    /// Evict signed sessions whose close ran to full completion and that
     /// have been idle longer than `idle_s`, returning the evicted sessions.
     ///
-    /// Only signed sessions are eligible: their close removes the on-disk
-    /// journal, so nothing re-inserts them, and a later request or lifecycle
-    /// call for the id behaves exactly as it would after a process restart.
+    /// Only signed sessions whose close *fully completed* are eligible: a
+    /// completed close removed the on-disk journal, so nothing re-inserts
+    /// them, and a later request or lifecycle call for the id behaves
+    /// exactly as it would after a process restart. `close_complete` (not
+    /// `artifact_committed`, which is set before the fallible bridge emits
+    /// and journal removal) is the gate — a failed or in-flight close must
+    /// stay resident, or a client reusing the id could open a fresh session
+    /// whose journal appends collide with the still-on-disk records.
     /// Unsigned sessions must stay resident — the recovery scan re-inserts
     /// them from their spool artifact on the next tick anyway, and evicting
     /// one lets a client reuse its id against the still-present artifact and
@@ -592,7 +610,7 @@ impl SessionRegistry {
         let mut evicted = Vec::new();
         self.sessions.retain(|_, session| {
             let evict = session.workflow == Workflow::Signed
-                && session.artifact_committed.load(Ordering::Acquire) != 0
+                && session.close_complete.load(Ordering::Acquire) != 0
                 && !session.capture_failed()
                 && session.active_streams.load(Ordering::Acquire) == 0
                 && session.pending_jobs.load(Ordering::Acquire) == 0
@@ -835,28 +853,41 @@ mod tests {
         let eligible = r.get_or_open("evict-me", Workflow::Signed, &identity(), &Default::default());
         eligible.try_close();
         eligible.mark_artifact_committed();
+        eligible.mark_close_complete();
         eligible.last_activity_ms.store(stale, Ordering::Release);
+
+        // Artifact committed but the close never completed (bridge emit or
+        // journal removal failed): the journal may still be on disk, so a
+        // reused id must find this sealed session, not a fresh one.
+        let incomplete = r.get_or_open("keep-incomplete", Workflow::Signed, &identity(), &Default::default());
+        incomplete.try_close();
+        incomplete.mark_artifact_committed();
+        incomplete.last_activity_ms.store(stale, Ordering::Release);
 
         let unsigned = r.get_or_open("keep-unsigned", Workflow::Unsigned, &identity(), &Default::default());
         unsigned.try_close();
         unsigned.mark_artifact_committed();
+        unsigned.mark_close_complete();
         unsigned.last_activity_ms.store(stale, Ordering::Release);
 
         let failed = r.get_or_open("keep-failed", Workflow::Signed, &identity(), &Default::default());
         failed.try_close();
         failed.mark_artifact_committed();
+        failed.mark_close_complete();
         failed.mark_capture_failed();
         failed.last_activity_ms.store(stale, Ordering::Release);
 
         let streaming = r.get_or_open("keep-streaming", Workflow::Signed, &identity(), &Default::default());
         streaming.try_close();
         streaming.mark_artifact_committed();
+        streaming.mark_close_complete();
         streaming.last_activity_ms.store(stale, Ordering::Release);
         let lease = SessionLease::new(Arc::clone(&streaming));
 
         let fresh = r.get_or_open("keep-fresh", Workflow::Signed, &identity(), &Default::default());
         fresh.try_close();
         fresh.mark_artifact_committed();
+        fresh.mark_close_complete();
 
         let open = r.get_or_open("keep-open", Workflow::Signed, &identity(), &Default::default());
         open.last_activity_ms.store(stale, Ordering::Release);
@@ -868,7 +899,14 @@ mod tests {
             "only the committed, quiescent, idle signed session may be evicted",
         );
         assert!(r.get("evict-me").is_none());
-        for id in ["keep-unsigned", "keep-failed", "keep-streaming", "keep-fresh", "keep-open"] {
+        for id in [
+            "keep-incomplete",
+            "keep-unsigned",
+            "keep-failed",
+            "keep-streaming",
+            "keep-fresh",
+            "keep-open",
+        ] {
             assert!(r.get(id).is_some(), "{id} must stay resident");
         }
         drop(lease);
