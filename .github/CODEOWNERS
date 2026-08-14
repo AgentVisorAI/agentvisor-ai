@@ -1,0 +1,16 @@
+# Every change requires review from a listed owner.
+# Order matters: the last matching pattern wins.
+
+*                       @debugmode0
+
+/.github/               @debugmode0
+/deploy/                @debugmode0
+/docker/                @debugmode0
+
+# Security-critical: request an extra pair of eyes on any change here.
+/crates/ab-receipts/    @debugmode0
+/crates/ab-identity/    @debugmode0
+/crates/ab-sandbox/     @debugmode0
+/crates/ab-state/       @debugmode0
+/SECURITY.md            @debugmode0
+/SECURITY-AUDIT.md      @debugmode0

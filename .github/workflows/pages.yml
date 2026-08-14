@@ -1,0 +1,70 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build API docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # Pinned in rust-toolchain.toml; this ensures the rustdoc lints
+          # match the CI build.
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Build rustdoc
+        env:
+          # Match the CI `Docs` job in ci.yml so broken intra-doc links are hard errors.
+          RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D warnings"
+        run: cargo doc --workspace --no-deps
+      - name: Write landing page
+        # `cargo doc` without `--enable-index-page` (nightly) leaves target/doc
+        # with no index.html. A tiny meta-refresh to the top-level harness crate
+        # keeps the Pages root URL from being a directory listing.
+        run: |
+          printf '%s\n' \
+            '<!DOCTYPE html>' \
+            '<meta charset="utf-8">' \
+            '<title>AgentBridge — API documentation</title>' \
+            '<meta http-equiv="refresh" content="0; url=ab_harness/index.html">' \
+            '<link rel="canonical" href="ab_harness/index.html">' \
+            '<p><a href="ab_harness/index.html">Continue to <code>ab_harness</code></a></p>' \
+            > target/doc/index.html
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/doc
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

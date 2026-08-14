@@ -1,0 +1,34 @@
+name: Feature request
+description: Propose a change that adds capability.
+title: "feature: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What real-world situation are you trying to solve? Concrete beats abstract.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: The interface or behaviour you want. Include the shape of any new config/CLI/HTTP surface.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What did you consider and reject, and why?
+    validations:
+      required: false
+  - type: textarea
+    id: impact
+    attributes:
+      label: Audit-trail / compatibility impact
+      description: Would this change wire formats, receipts, journals, or existing config keys? If yes, describe the migration path.
+    validations:
+      required: false
