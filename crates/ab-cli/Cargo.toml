@@ -18,6 +18,7 @@ ab-receipts = { workspace = true }
 ab-bridge = { workspace = true }
 ab-harness = { workspace = true }
 clap = { workspace = true }
+rpassword = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }

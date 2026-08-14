@@ -287,17 +287,32 @@ impl std::fmt::Display for ConfigSource {
 }
 
 /// Well-known config locations probed in order when `AB_CONFIG` is unset.
+/// Project-local files (current directory) beat the per-user file the
+/// `abctl` setup wizard writes (see [`user_config_path`]).
 pub const CONFIG_SEARCH_PATHS: [&str; 3] = [
     "agentbridge.toml",
     "config/harness.toml",
     "config/harness.example.toml",
 ];
 
+/// Per-user config file inside `home`, as written by the `abctl` wizard.
+pub fn user_config_path_from(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".agentbridge").join("agentbridge.toml")
+}
+
+/// Per-user config file (`~/.agentbridge/agentbridge.toml`), if the home
+/// directory is known.
+pub fn user_config_path() -> Option<std::path::PathBuf> {
+    #[allow(deprecated)] // undeprecated in Rust 1.86; MSRV is 1.88
+    std::env::home_dir().map(|home| user_config_path_from(&home))
+}
+
 /// Resolve the configuration source without reading it.
 ///
 /// Order: `AB_CONFIG` (must exist — a typo must never silently fall
-/// through to another file), then [`CONFIG_SEARCH_PATHS`], then built-in
-/// defaults driven by `AB_UPSTREAM_URL`.
+/// through to another file), then [`CONFIG_SEARCH_PATHS`], then the
+/// per-user wizard file, then built-in defaults driven by
+/// `AB_UPSTREAM_URL`.
 pub fn resolve_config_source() -> Result<ConfigSource, String> {
     if let Some(path) = std::env::var_os("AB_CONFIG") {
         // Empty means unset: compose files commonly render
@@ -317,6 +332,11 @@ pub fn resolve_config_source() -> Result<ConfigSource, String> {
         let path = std::path::Path::new(candidate);
         if path.is_file() {
             return Ok(ConfigSource::File(path.to_path_buf()));
+        }
+    }
+    if let Some(path) = user_config_path() {
+        if path.is_file() {
+            return Ok(ConfigSource::File(path));
         }
     }
     Ok(ConfigSource::BuiltIn)
@@ -339,9 +359,10 @@ pub fn load_config() -> Result<(HarnessConfig, ConfigSource), String> {
         return Err(format!(
             "no configuration found and AB_UPSTREAM_URL is not set.\n\
              Quick start (pick one):\n\
+             \x20 abctl                              # guided setup, two questions\n\
              \x20 abctl init --preset openai        # write an annotated agentbridge.toml\n\
              \x20 AB_UPSTREAM_URL=http://127.0.0.1:11434 agent-bridge   # zero-config\n\
-             Searched: $AB_CONFIG, {}",
+             Searched: $AB_CONFIG, {}, ~/.agentbridge/agentbridge.toml",
             CONFIG_SEARCH_PATHS.join(", ")
         ));
     }
@@ -835,6 +856,15 @@ mod tests {
         assert_eq!(cfg.state_backend, "memory");
         assert_eq!(cfg.embedder_backend, "hash");
         assert_eq!(cfg.vector_backend, "memory");
+    }
+
+    #[test]
+    fn user_config_path_is_stable() {
+        let path = user_config_path_from(std::path::Path::new("/home/pat"));
+        assert_eq!(
+            path,
+            std::path::Path::new("/home/pat/.agentbridge/agentbridge.toml")
+        );
     }
 
     /// The `/v1` suffix footgun must be detected exactly: flagged when the
