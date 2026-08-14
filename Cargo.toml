@@ -20,20 +20,20 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
-repository = "https://github.com/agentbridge/agent-bridge"
+repository = "https://github.com/AgentVisorAI/agent-bridge"
 
 [workspace.dependencies]
-ab-core = { path = "crates/ab-core" }
-ab-events = { path = "crates/ab-events" }
-ab-atif = { path = "crates/ab-atif" }
-ab-receipts = { path = "crates/ab-receipts" }
-ab-state = { path = "crates/ab-state" }
-ab-bridge = { path = "crates/ab-bridge" }
-ab-identity = { path = "crates/ab-identity" }
-ab-compress = { path = "crates/ab-compress" }
-ab-loopdetect = { path = "crates/ab-loopdetect" }
-ab-sandbox = { path = "crates/ab-sandbox" }
-ab-harness = { path = "crates/ab-harness" }
+ab-core = { path = "crates/ab-core", version = "0.1.0" }
+ab-events = { path = "crates/ab-events", version = "0.1.0" }
+ab-atif = { path = "crates/ab-atif", version = "0.1.0" }
+ab-receipts = { path = "crates/ab-receipts", version = "0.1.0" }
+ab-state = { path = "crates/ab-state", version = "0.1.0" }
+ab-bridge = { path = "crates/ab-bridge", version = "0.1.0" }
+ab-identity = { path = "crates/ab-identity", version = "0.1.0" }
+ab-compress = { path = "crates/ab-compress", version = "0.1.0" }
+ab-loopdetect = { path = "crates/ab-loopdetect", version = "0.1.0" }
+ab-sandbox = { path = "crates/ab-sandbox", version = "0.1.0" }
+ab-harness = { path = "crates/ab-harness", version = "0.1.0" }
 
 tokio = { version = "1.47", features = ["full"] }
 axum = { version = "0.8", features = ["macros"] }
