@@ -1598,8 +1598,9 @@ pub fn spawn_reconciler(
                     .inc();
             }
             for session in sessions.idle_sessions(idle_s) {
+                let session_id = session.id.clone();
                 if let Err(error) = finalizer.close_session(session, StopReason::SessionClosed).await {
-                    tracing::warn!(%error, "idle session finalization failed");
+                    tracing::warn!(session = %session_id, %error, "idle session finalization failed");
                     metrics
                         .counter("ab_reconcile_errors_total", "Reconciliation errors")
                         .inc();

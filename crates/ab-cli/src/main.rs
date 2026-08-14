@@ -399,6 +399,10 @@ async fn loadgen(
         .context("build loadgen client")?;
     let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
     let token = bearer_token(token_file)?.map(Arc::<str>::from);
+    // Unique per run: reusing ids like `load-0` across runs would bind to
+    // sessions a previous run left behind — sealed ones refuse reuse with
+    // 400 "session is already closed".
+    let run_id = ab_core::new_event_uid();
     let started = Instant::now();
     let results: Vec<Result<u64, String>> = stream::iter(0..connections)
         .map(|index| {
@@ -406,11 +410,12 @@ async fn loadgen(
             let url = url.clone();
             let workflow = workflow.to_owned();
             let token = token.clone();
+            let run_id = run_id.clone();
             async move {
                 let request_started = Instant::now();
                 let mut request = client
                     .post(url)
-                    .header("x-ab-session", format!("load-{index}"))
+                    .header("x-ab-session", format!("load-{run_id}-{index}"))
                     .header("x-ab-workflow", workflow)
                     .json(&serde_json::json!({
                         "model": "loadgen",
