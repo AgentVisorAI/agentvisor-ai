@@ -581,6 +581,21 @@ pub fn wizard(home: &Path, input: &mut dyn std::io::BufRead, secrets: &SecretInp
                 println!("That key contains characters that don't belong — please try again.");
                 continue;
             }
+            // Real API keys are plain ASCII; anything else (emoji, accents,
+            // smart quotes from a rich-text paste) would only fail later
+            // with a cryptic HTTP-header error, so catch it here.
+            if !pasted.is_ascii() {
+                println!(
+                    "That key contains non-ASCII characters (accents, emoji, or smart quotes) — API keys never do. Please paste it again."
+                );
+                continue;
+            }
+            if pasted.len() > 8192 {
+                println!(
+                    "That looks far too long to be an API key — it may be the wrong clipboard content. Please paste just the key."
+                );
+                continue;
+            }
             key = Some(pasted.to_owned());
             break;
         }
@@ -645,7 +660,11 @@ pub fn wizard(home: &Path, input: &mut dyn std::io::BufRead, secrets: &SecretInp
     })
 }
 
-/// Is a harness answering at `base` right now?
+/// Is an actual AgentBridge answering at `base` right now? Requires the
+/// `/health` body to self-identify (`"service": "agentbridge"`) so an
+/// unrelated app that happens to answer 200 on the port is not mistaken
+/// for a running AgentBridge — that would silently point the user's
+/// tools at the wrong service.
 async fn health_ok(base: &str) -> bool {
     let Ok(client) = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -654,9 +673,15 @@ async fn health_ok(base: &str) -> bool {
     else {
         return false;
     };
+    let Ok(response) = client.get(format!("{base}/health")).send().await else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
     matches!(
-        client.get(format!("{base}/health")).send().await,
-        Ok(response) if response.status().is_success()
+        response.json::<serde_json::Value>().await,
+        Ok(body) if body.get("service").and_then(serde_json::Value::as_str) == Some("agentbridge")
     )
 }
 
@@ -777,7 +802,12 @@ pub async fn start() -> Result<()> {
         }
     })?;
 
-    // Wait until healthy — or explain why it died.
+    // Wait until healthy — or explain why it died. Stop requests during
+    // startup must reach the child too: without polling the signal
+    // streams here, a SIGTERM/SIGINT in this window would kill abctl at
+    // the default disposition and orphan the server mid-boot.
+    let mut interrupt = std::pin::pin!(tokio::signal::ctrl_c());
+    let mut terminate = std::pin::pin!(terminate_signal());
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         if let Some(status) = child.try_wait().context("check server status")? {
@@ -794,7 +824,21 @@ pub async fn start() -> Result<()> {
             print_log_tail(&log_path, 12);
             anyhow::bail!("the server did not become ready within 20 seconds");
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_millis(250)) => {}
+            _ = &mut interrupt => {
+                println!("\nStopping AgentBridge...");
+                forward_signal(&child, "-INT");
+                wait_for_graceful_exit(&mut child).await;
+                return Ok(());
+            }
+            () = &mut terminate => {
+                println!("\nStopping AgentBridge...");
+                forward_signal(&child, "-TERM");
+                wait_for_graceful_exit(&mut child).await;
+                return Ok(());
+            }
+        }
     }
 
     println!("✓ AgentBridge is running at {base}");
@@ -813,21 +857,73 @@ pub async fn start() -> Result<()> {
                 anyhow::bail!("server exited unexpectedly");
             }
         }
-        _ = tokio::signal::ctrl_c() => {
+        _ = &mut interrupt => {
             println!("\nStopping AgentBridge...");
-            // The server received the same Ctrl-C (same terminal group)
-            // and shuts down gracefully; force only if it hangs.
-            match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
-                Ok(_) => println!("Stopped. Your data is saved."),
-                Err(_) => {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    println!("Stopped (forced).");
-                }
-            }
+            // Terminal Ctrl-C reaches the child through the foreground
+            // process group, but a direct `kill -INT <abctl>` does not —
+            // forward to be sure. A duplicate SIGINT is harmless: the
+            // server's signal stream is already registered, so it can't
+            // fall back to the abrupt default disposition.
+            forward_signal(&child, "-INT");
+            wait_for_graceful_exit(&mut child).await;
+        }
+        () = &mut terminate => {
+            // SIGTERM (Activity Monitor "Quit", plain `kill`, service
+            // managers) only reaches abctl — without forwarding it the
+            // server would keep running unsupervised as an orphan.
+            println!("\nStopping AgentBridge...");
+            forward_signal(&child, "-TERM");
+            wait_for_graceful_exit(&mut child).await;
         }
     }
     Ok(())
+}
+
+/// Resolves when the process receives SIGTERM; never resolves where
+/// SIGTERM does not exist (or the handler cannot be installed) so the
+/// other `select!` arms keep working.
+#[cfg(unix)]
+async fn terminate_signal() {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut stream) => {
+            stream.recv().await;
+        }
+        Err(_) => std::future::pending().await,
+    }
+}
+
+#[cfg(not(unix))]
+async fn terminate_signal() {
+    std::future::pending::<()>().await;
+}
+
+/// Forward `signal` (e.g. "-INT") to the server child so it shuts down
+/// gracefully even when only abctl was signalled. Uses the `kill`
+/// program because the workspace forbids unsafe code (no raw libc).
+#[cfg(unix)]
+fn forward_signal(child: &tokio::process::Child, signal: &str) {
+    if let Some(pid) = child.id() {
+        let _ = std::process::Command::new("kill")
+            .arg(signal)
+            .arg(pid.to_string())
+            .status();
+    }
+}
+
+#[cfg(not(unix))]
+fn forward_signal(_child: &tokio::process::Child, _signal: &str) {}
+
+/// Give the server ten seconds to flush trajectories and exit; only
+/// force-kill if it hangs.
+async fn wait_for_graceful_exit(child: &mut tokio::process::Child) {
+    match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+        Ok(_) => println!("Stopped. Your data is saved."),
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            println!("Stopped (forced).");
+        }
+    }
 }
 
 /// One diagnostic line: pass/warn/fail plus a short explanation.
@@ -1343,6 +1439,19 @@ mod tests {
         assert_eq!(config.upstream_url, "https://api.anthropic.com");
         let key_path = config.upstream_api_key_file.unwrap();
         assert_eq!(std::fs::read_to_string(key_path).unwrap(), "sk-ant");
+    }
+
+    #[test]
+    fn wizard_reasks_on_non_ascii_and_oversized_key() {
+        let home = tempfile::tempdir().unwrap();
+        // Emoji key re-asked (would break the HTTP auth header later),
+        // then a >8 KiB paste re-asked, then a real key accepted.
+        let huge = "k".repeat(9000);
+        let outcome = drive_wizard(home.path(), &format!("1\nsk-🔑-emoji\n{huge}\nsk-real\nn\n")).unwrap();
+        let config_text = std::fs::read_to_string(&outcome.config_path).unwrap();
+        let config = ab_harness::HarnessConfig::from_toml(&config_text).unwrap();
+        let key_path = config.upstream_api_key_file.unwrap();
+        assert_eq!(std::fs::read_to_string(key_path).unwrap(), "sk-real");
     }
 
     #[test]

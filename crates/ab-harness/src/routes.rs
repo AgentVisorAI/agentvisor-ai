@@ -57,7 +57,13 @@ async fn trace_request(request: Request<Body>, next: Next) -> Response {
 }
 
 async fn health() -> impl IntoResponse {
-    Json(json!({"status": "ok", "version": env!("CARGO_PKG_VERSION")}))
+    Json(json!({
+        "status": "ok",
+        // Product identifier so callers (abctl start) can tell a real
+        // AgentBridge apart from an unrelated service squatting the port.
+        "service": "agentbridge",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
 }
 
 async fn metrics(State(state): State<AppState>) -> Response {
