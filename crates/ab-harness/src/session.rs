@@ -578,7 +578,18 @@ impl SessionRegistry {
             ab_core::time::now_ms().saturating_sub(idle_s.saturating_mul(ab_core::units::MS_PER_SEC));
         self.sessions
             .iter()
-            .filter(|e| e.last_activity_ms.load(Ordering::Acquire) < cutoff && !e.is_closed())
+            .filter(|e| {
+                e.last_activity_ms.load(Ordering::Acquire) < cutoff
+                    && !e.is_closed()
+                    // A session with a live forwarded response is not idle even
+                    // when its admission clock is stale: `last_activity_ms` is
+                    // refreshed only at request admission, so a stream that
+                    // outlives the idle window would otherwise let the sweeper
+                    // claim the close (sealing the session mid-conversation)
+                    // and then park inside `wait_for_streams` while holding
+                    // the shared lifecycle lock until the client's stream ends.
+                    && e.active_streams.load(Ordering::Acquire) == 0
+            })
             .map(|e| e.clone())
             .collect()
     }
@@ -707,6 +718,32 @@ mod tests {
         assert!(
             r.idle_sessions(5).is_empty(),
             "closed sessions are not idle candidates"
+        );
+    }
+
+    /// `last_activity_ms` is refreshed only at request admission, so a chat
+    /// stream that outlives the idle window makes its session *look* idle
+    /// while a response is actively relaying. The sweeper must skip it:
+    /// otherwise `try_close` seals the session mid-conversation (every new
+    /// request gets "session is already closed") and `close_session_locked`
+    /// then parks inside `wait_for_streams` while holding the shared
+    /// lifecycle lock until the client's stream ends.
+    #[test]
+    fn idle_sweep_skips_sessions_with_active_streams() {
+        let r = SessionRegistry::new();
+        let s = r.get_or_open("streaming", Workflow::Unsigned, &identity(), &Default::default());
+        s.last_activity_ms
+            .store(ab_core::time::now_ms() - 10_000, Ordering::Release);
+        let lease = SessionLease::new(Arc::clone(&s));
+        assert!(
+            r.idle_sessions(5).is_empty(),
+            "a session with an active response stream must not be reaped as idle",
+        );
+        drop(lease);
+        assert_eq!(
+            r.idle_sessions(5).len(),
+            1,
+            "once the stream lease drops, the stale session becomes an idle candidate again",
         );
     }
 
