@@ -66,9 +66,17 @@ impl<'a> ActionBudget<'a> {
     }
 
     fn key(&self, dim: &str) -> String {
-        let digest = ab_core::digest::sha256_hex(self.session.as_bytes());
+        format!("{}{dim}", Self::session_prefix(self.session))
+    }
+
+    /// Common key prefix for every budget counter of `session`. Callers use
+    /// this with [`StateStore::remove_prefix`] to drop a finalized session's
+    /// counters (per-tool keys are dynamic, so single-key removal cannot
+    /// enumerate them).
+    pub fn session_prefix(session: &str) -> String {
+        let digest = ab_core::digest::sha256_hex(session.as_bytes());
         // 32 hex chars = 128 bits: collision-safe well beyond realistic session counts.
-        format!("budget:{{{}}}:{dim}", digest.get(..32).unwrap_or(&digest))
+        format!("budget:{{{}}}:", digest.get(..32).unwrap_or(&digest))
     }
 
     /// Check-and-spend one invocation of `tool`, with an optional payout

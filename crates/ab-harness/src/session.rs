@@ -572,6 +572,39 @@ impl SessionRegistry {
         self.sessions.remove(id);
     }
 
+    /// Evict signed sessions whose finalization is fully committed and that
+    /// have been idle longer than `idle_s`, returning the evicted sessions.
+    ///
+    /// Only signed sessions are eligible: their close removes the on-disk
+    /// journal, so nothing re-inserts them, and a later request or lifecycle
+    /// call for the id behaves exactly as it would after a process restart.
+    /// Unsigned sessions must stay resident — the recovery scan re-inserts
+    /// them from their spool artifact on the next tick anyway, and evicting
+    /// one lets a client reuse its id against the still-present artifact and
+    /// provenance files, poisoning the new incarnation's close. Capture-failed
+    /// (quarantined) sessions also stay: they are bounded by real crash
+    /// events and their in-registry seal is what keeps the fail-closed
+    /// refusal cheap. Without eviction the registry grows by one entry per
+    /// client-chosen session id for the process lifetime.
+    pub fn evict_finalized(&self, idle_s: u64) -> Vec<Arc<Session>> {
+        let cutoff =
+            ab_core::time::now_ms().saturating_sub(idle_s.saturating_mul(ab_core::units::MS_PER_SEC));
+        let mut evicted = Vec::new();
+        self.sessions.retain(|_, session| {
+            let evict = session.workflow == Workflow::Signed
+                && session.artifact_committed.load(Ordering::Acquire) != 0
+                && !session.capture_failed()
+                && session.active_streams.load(Ordering::Acquire) == 0
+                && session.pending_jobs.load(Ordering::Acquire) == 0
+                && session.last_activity_ms.load(Ordering::Acquire) < cutoff;
+            if evict {
+                evicted.push(Arc::clone(session));
+            }
+            !evict
+        });
+        evicted
+    }
+
     /// Sessions idle longer than `idle_s` (for the sweeper).
     pub fn idle_sessions(&self, idle_s: u64) -> Vec<Arc<Session>> {
         let cutoff =
@@ -789,6 +822,56 @@ mod tests {
         // Something halfway through the multiplication path still triggers
         // saturation because `idle_s * 1000` overflows.
         assert!(r.idle_sessions(u64::MAX / 500).is_empty());
+    }
+
+    /// `evict_finalized` removes only signed, fully committed, quiescent,
+    /// idle sessions — and leaves unsigned, capture-failed, active-stream,
+    /// and recently-active sessions resident.
+    #[test]
+    fn evict_finalized_removes_only_quiescent_committed_signed_sessions() {
+        let r = SessionRegistry::new();
+        let stale = ab_core::time::now_ms() - 10_000;
+
+        let eligible = r.get_or_open("evict-me", Workflow::Signed, &identity(), &Default::default());
+        eligible.try_close();
+        eligible.mark_artifact_committed();
+        eligible.last_activity_ms.store(stale, Ordering::Release);
+
+        let unsigned = r.get_or_open("keep-unsigned", Workflow::Unsigned, &identity(), &Default::default());
+        unsigned.try_close();
+        unsigned.mark_artifact_committed();
+        unsigned.last_activity_ms.store(stale, Ordering::Release);
+
+        let failed = r.get_or_open("keep-failed", Workflow::Signed, &identity(), &Default::default());
+        failed.try_close();
+        failed.mark_artifact_committed();
+        failed.mark_capture_failed();
+        failed.last_activity_ms.store(stale, Ordering::Release);
+
+        let streaming = r.get_or_open("keep-streaming", Workflow::Signed, &identity(), &Default::default());
+        streaming.try_close();
+        streaming.mark_artifact_committed();
+        streaming.last_activity_ms.store(stale, Ordering::Release);
+        let lease = SessionLease::new(Arc::clone(&streaming));
+
+        let fresh = r.get_or_open("keep-fresh", Workflow::Signed, &identity(), &Default::default());
+        fresh.try_close();
+        fresh.mark_artifact_committed();
+
+        let open = r.get_or_open("keep-open", Workflow::Signed, &identity(), &Default::default());
+        open.last_activity_ms.store(stale, Ordering::Release);
+
+        let evicted = r.evict_finalized(5);
+        assert_eq!(
+            evicted.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["evict-me"],
+            "only the committed, quiescent, idle signed session may be evicted",
+        );
+        assert!(r.get("evict-me").is_none());
+        for id in ["keep-unsigned", "keep-failed", "keep-streaming", "keep-fresh", "keep-open"] {
+            assert!(r.get(id).is_some(), "{id} must stay resident");
+        }
+        drop(lease);
     }
 
     /// A session touched millions of times a second under normal operation

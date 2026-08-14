@@ -382,7 +382,8 @@ impl AppState {
             std::path::PathBuf::from(&config.atif_spool_dir),
             Arc::clone(&metrics),
             Arc::clone(&bridge),
-        );
+        )
+        .with_state_store(Arc::clone(&store));
         let mut client_builder = reqwest::Client::builder()
             .connect_timeout(HTTP_CONNECT_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none());
@@ -1603,6 +1604,113 @@ mod tests {
             state.prepare_chat(&headers, repeated),
             Err(PipelineError::Abort(_))
         ));
+    }
+
+    /// A breaker trip used to replace the job's Compression class with
+    /// StopReason *before* the accounting decisions ran, so the tripped
+    /// admission's prompt tokens vanished from the session totals (and the
+    /// journal record) — receipts undercounted exactly the runaway sessions
+    /// the breaker exists to attest. Accounting must key on the submitted
+    /// class, not the swapped one.
+    #[tokio::test]
+    async fn breaker_trip_does_not_drop_the_admissions_prompt_token_accounting() {
+        let mut config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        config.breaker.min_tokens = 0;
+        let state = state(config);
+        let mut headers = HeaderMap::new();
+        headers.insert(SESSION_HEADER, HeaderValue::from_static("loop-session"));
+        headers.insert(WORKFLOW_HEADER, HeaderValue::from_static("signed"));
+        let repeated = serde_json::json!({
+            "model": "test",
+            "messages": [{
+                "role": "assistant",
+                "content": "I should check the database again for pending orders"
+            }]
+        });
+        // Four identical admissions, tracking chain growth like `trip_loop`;
+        // the breaker trips on one of the later worker jobs. Capture the
+        // per-admission token amount after the first job lands.
+        let mut per_request = 0u64;
+        for expected in 1..=4u64 {
+            state.prepare_chat(&headers, repeated.clone()).unwrap();
+            let session = state.sessions.get("loop-session").unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while session.chain.lock().count() < expected {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if expected == 1 {
+                tokio::time::timeout(std::time::Duration::from_secs(10), session.wait_for_worker_jobs())
+                    .await
+                    .unwrap();
+                per_request = session
+                    .totals
+                    .prompt_tokens
+                    .load(std::sync::atomic::Ordering::Acquire);
+                assert!(per_request > 0, "admission must account prompt tokens");
+            }
+        }
+        let session = state.sessions.get("loop-session").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), session.wait_for_worker_jobs())
+            .await
+            .unwrap();
+        assert_eq!(
+            session.loop_state.state(),
+            BreakerState::Open,
+            "precondition: the breaker must have tripped during the four admissions",
+        );
+        assert_eq!(
+            session
+                .totals
+                .prompt_tokens
+                .load(std::sync::atomic::Ordering::Acquire),
+            per_request * 4,
+            "every admission's prompt tokens must be accounted, including the one whose \
+             worker job carried the breaker trip",
+        );
+    }
+
+    /// Budget counters are dead weight once a session is sealed (admission
+    /// rejects closed sessions before any quota check); finalization must
+    /// clear them or the in-memory state store grows by a few cells per
+    /// client-chosen session id forever.
+    #[tokio::test]
+    async fn finalization_clears_the_sessions_budget_counters() {
+        let store: Arc<dyn StateStore> = Arc::new(InMemoryStore::new());
+        let mut config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        config.budget.max_tokens = Some(1_000_000);
+        config.atif_spool_dir = tempfile::tempdir().unwrap().keep().to_string_lossy().into_owned();
+        let state = AppState::new(
+            config,
+            Arc::clone(&store),
+            Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
+            Arc::new(NullBus),
+            None,
+            Arc::new(Ed25519Signer::from_seed([9; 32])),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(SESSION_HEADER, HeaderValue::from_static("budget-cleanup"));
+        state.prepare_chat(&headers, payload()).unwrap();
+        let tokens_key = format!("{}tokens", ab_state::ActionBudget::session_prefix("budget-cleanup"));
+        assert!(
+            store.get(&tokens_key).unwrap() > 0,
+            "precondition: admission must have spent from the token budget",
+        );
+        let session = state.sessions.get("budget-cleanup").unwrap();
+        session.wait_for_worker_jobs().await;
+        state
+            .finalizer
+            .close_session(session, StopReason::SessionClosed)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(&tokens_key).unwrap(),
+            0,
+            "finalization must remove the sealed session's budget counters",
+        );
     }
 
     #[tokio::test]

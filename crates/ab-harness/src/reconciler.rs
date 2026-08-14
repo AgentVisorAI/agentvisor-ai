@@ -60,6 +60,10 @@ pub struct Finalizer {
     spool_dir: PathBuf,
     metrics: Arc<Registry>,
     bridge: Option<Arc<dyn EventBus>>,
+    /// Quota/budget state to clear once a session is sealed (closed sessions
+    /// refuse admission, so their budget counters are dead weight). Optional
+    /// because lifecycle tests construct a Finalizer without one.
+    state_store: Option<Arc<dyn ab_state::StateStore>>,
     recovery_lock: Arc<tokio::sync::Mutex<()>>,
     lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
     quarantined_sessions: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
@@ -113,6 +117,7 @@ impl Finalizer {
             spool_dir,
             metrics,
             bridge: None,
+            state_store: None,
             recovery_lock: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
             quarantined_sessions: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
@@ -134,11 +139,31 @@ impl Finalizer {
             spool_dir,
             metrics,
             bridge: Some(bridge),
+            state_store: None,
             recovery_lock: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
             quarantined_sessions: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             warned_artifacts: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             journal_key,
+        }
+    }
+
+    /// Attach the quota/budget state store whose per-session counters are
+    /// cleared when a session is sealed.
+    #[must_use]
+    pub fn with_state_store(mut self, store: Arc<dyn ab_state::StateStore>) -> Self {
+        self.state_store = Some(store);
+        self
+    }
+
+    /// Drop a sealed session's budget counters. Admission gates reject
+    /// closed and capture-failed sessions before any quota check, so the
+    /// counters can never be consulted again; leaving them would grow the
+    /// in-memory state store by a few cells per session forever
+    /// (attacker-chosen session ids make that unbounded).
+    fn clear_budget_state(&self, session_id: &str) {
+        if let Some(store) = self.state_store.as_deref() {
+            store.remove_prefix(&ab_state::ActionBudget::session_prefix(session_id));
         }
     }
 
@@ -186,6 +211,7 @@ impl Finalizer {
             // this branch retries on every idle tick forever.
             session.mark_artifact_committed();
             claim.committed = true;
+            self.clear_budget_state(&session.id);
             return Err(FinalizeError::CaptureIncomplete);
         }
         let started = Instant::now();
@@ -236,6 +262,7 @@ impl Finalizer {
                     if trajectory.steps.is_empty() {
                         session.mark_artifact_committed();
                         claim.committed = true;
+                        self.clear_budget_state(&session.id);
                         return Err(FinalizeError::Atif(
                             "cannot finalize an unsigned session with no captured steps".to_owned(),
                         ));
@@ -322,6 +349,7 @@ impl Finalizer {
             .counter("ab_sessions_finalized_total", "Sessions finalized")
             .inc();
         claim.committed = true;
+        self.clear_budget_state(&session.id);
         Ok(outcome)
     }
 
@@ -1641,6 +1669,10 @@ pub fn spawn_reconciler(
                         .counter("ab_reconcile_errors_total", "Reconciliation errors")
                         .inc();
                 }
+            }
+            let evicted = sessions.evict_finalized(idle_s);
+            if !evicted.is_empty() {
+                tracing::debug!(count = evicted.len(), "evicted finalized signed sessions");
             }
             metrics
                 .histogram("ab_reconcile_duration_seconds", "Idle reconciliation duration")

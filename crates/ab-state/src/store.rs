@@ -55,6 +55,14 @@ pub trait StateStore: Send + Sync {
 
     /// Remove a key (session cleanup).
     fn remove(&self, key: &str);
+
+    /// Remove every key beginning with `prefix` (whole-session cleanup at
+    /// finalization). Backends with native expiry (e.g. Redis TTLs) may
+    /// leave this as the default no-op; in-process backends must implement
+    /// it or session-keyed counters accumulate for the process lifetime.
+    fn remove_prefix(&self, prefix: &str) {
+        let _ = prefix;
+    }
 }
 
 /// Single-node in-memory store: atomic counters behind a short transaction
@@ -159,6 +167,11 @@ impl StateStore for InMemoryStore {
         let _transaction = self.transaction_lock.lock();
         self.counters.remove(key);
     }
+
+    fn remove_prefix(&self, prefix: &str) {
+        let _transaction = self.transaction_lock.lock();
+        self.counters.retain(|key, _| !key.starts_with(prefix));
+    }
 }
 
 #[cfg(test)]
@@ -166,6 +179,23 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+
+    #[test]
+    fn remove_prefix_drops_only_matching_keys() {
+        let store = InMemoryStore::new();
+        store.add("budget:{aaaa}:tokens", 5).unwrap();
+        store.add("budget:{aaaa}:tool:db_write", 1).unwrap();
+        store.add("budget:{bbbb}:tokens", 7).unwrap();
+        store.remove_prefix("budget:{aaaa}:");
+        assert_eq!(store.get("budget:{aaaa}:tokens").unwrap(), 0);
+        assert_eq!(store.get("budget:{aaaa}:tool:db_write").unwrap(), 0);
+        assert_eq!(
+            store.get("budget:{bbbb}:tokens").unwrap(),
+            7,
+            "other sessions' counters must survive a prefix removal",
+        );
+        assert_eq!(store.counters.len(), 1, "removed cells must actually be freed");
+    }
 
     #[test]
     fn add_overflow_rollback_is_never_visible_to_concurrent_get() {

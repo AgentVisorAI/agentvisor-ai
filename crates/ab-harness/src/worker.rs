@@ -523,6 +523,13 @@ async fn process_job(
     } else {
         None
     };
+    // Accounting must key on the class the job was *submitted* with: a
+    // breaker trip replaces `class` with StopReason below, and deciding the
+    // prompt/completion buckets from the replaced class silently dropped a
+    // tripped chat admission's prompt tokens from the journal record and the
+    // receipt totals — undercounting exactly the runaway sessions the
+    // breaker exists to attest.
+    let submitted_class = job.class;
     let (class, status, stop_reason, payload) = match breaker {
         Some(BreakerVerdict::Tripped {
             delta,
@@ -612,8 +619,8 @@ async fn process_job(
     } else {
         None
     };
-    let is_tool_call = class == EventClass::ToolCall;
-    let is_response_accounting = is_llm_agent_response && class != EventClass::Compression;
+    let is_tool_call = submitted_class == EventClass::ToolCall;
+    let is_response_accounting = is_llm_agent_response && submitted_class != EventClass::Compression;
     let record = ActiveJournalRecord {
         event: value.clone(),
         identity: job.identity.clone(),
@@ -621,7 +628,7 @@ async fn process_job(
         tool_calls: u64::from(is_tool_call),
         tool_allowed: u64::from(is_tool_call && status == StatusId::Success),
         tool_blocked: u64::from(is_tool_call && status == StatusId::Failure),
-        prompt_tokens: if class == EventClass::Compression {
+        prompt_tokens: if submitted_class == EventClass::Compression {
             job.metrics.prompt_tokens.unwrap_or(0)
         } else {
             0
@@ -678,7 +685,7 @@ async fn process_job(
     if let Some(directory) = spool_dir.as_deref() {
         persist_broker_ack(directory, &job.session.id, &event_uid, &ack, &journal_key).await?;
     }
-    if class == EventClass::ToolCall {
+    if is_tool_call {
         checked_atomic_add(&job.session.totals.tool_calls, 1, "tool calls")?;
         match status {
             StatusId::Success => {
@@ -691,7 +698,7 @@ async fn process_job(
             _ => {}
         }
     }
-    if class == EventClass::Compression {
+    if submitted_class == EventClass::Compression {
         checked_atomic_add(
             &job.session.totals.prompt_tokens,
             job.metrics.prompt_tokens.unwrap_or(0),
