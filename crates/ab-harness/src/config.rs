@@ -442,6 +442,16 @@ impl HarnessConfig {
     /// produces `/v1/v1/...` and a confusing provider 404). Returns the
     /// duplicated segment for warning messages.
     pub fn duplicated_chat_path_segment(&self) -> Option<&str> {
+        // The worst variant first: the base URL embeds the entire chat path
+        // (a pasted full endpoint URL), so the join repeats all of it.
+        if !self.upstream_chat_path.is_empty()
+            && self
+                .upstream_url
+                .trim_end_matches('/')
+                .ends_with(&self.upstream_chat_path)
+        {
+            return Some(self.upstream_chat_path.trim_start_matches('/'));
+        }
         let first_segment = self
             .upstream_chat_path
             .trim_start_matches('/')
@@ -528,6 +538,30 @@ impl HarnessConfig {
                 "unsupported config_version {} (this build supports {CONFIG_VERSION})",
                 self.config_version
             ));
+        }
+        if self.listen.is_empty() {
+            return Err("listen is required (host:port, e.g. 127.0.0.1:8484)".into());
+        }
+        // Shape-only check: hostnames are resolved at bind time, but a missing
+        // or non-numeric port would otherwise pass validation and only fail at
+        // server startup, defeating pre-flight `abctl config-validate`/doctor.
+        match self.listen.rsplit_once(':') {
+            Some((host, port)) if !host.is_empty() && port.parse::<u16>().is_ok() => {}
+            _ => {
+                return Err(format!(
+                    "listen {:?} must be host:port with a port in 0-65535",
+                    self.listen
+                ));
+            }
+        }
+        if self.reconcile_tick_s == 0 {
+            return Err("reconcile_tick_s must be greater than zero".into());
+        }
+        if self.session_idle_close_s == 0 {
+            return Err(
+                "session_idle_close_s must be greater than zero (0 would close every open session at each reconcile tick)"
+                    .into(),
+            );
         }
         if self.upstream_url.is_empty() {
             return Err("upstream_url is required".into());
@@ -661,6 +695,18 @@ impl HarnessConfig {
         }
         if self.qdrant_collection.is_empty() {
             return Err("qdrant_collection must not be empty".into());
+        }
+        if self.breaker.window == 0 {
+            return Err(
+                "breaker.window must be greater than zero (0 trips on token count alone, ignoring semantic similarity)"
+                    .into(),
+            );
+        }
+        if !self.breaker.delta_epsilon.is_finite() || self.breaker.delta_epsilon <= 0.0 {
+            return Err(format!(
+                "breaker.delta_epsilon must be a finite number greater than zero, got {}",
+                self.breaker.delta_epsilon
+            ));
         }
         Ok(())
     }
@@ -896,6 +942,48 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_unbindable_listen_and_zero_intervals() {
+        let base = || HarnessConfig::for_tests("http://u", "spool", "bridge");
+
+        let mut cfg = base();
+        cfg.listen = String::new();
+        assert!(cfg.validate().unwrap_err().contains("listen is required"));
+
+        cfg = base();
+        cfg.listen = "no-port-here".into();
+        assert!(cfg.validate().unwrap_err().contains("host:port"));
+
+        cfg = base();
+        cfg.listen = "127.0.0.1:70000".into();
+        assert!(cfg.validate().unwrap_err().contains("host:port"));
+
+        // Hostnames and OS-assigned port 0 stay legal (bind resolves them).
+        cfg = base();
+        cfg.listen = "localhost:8484".into();
+        cfg.validate().unwrap();
+        cfg.listen = "[::1]:0".into();
+        cfg.validate().unwrap();
+
+        cfg = base();
+        cfg.reconcile_tick_s = 0;
+        assert!(cfg.validate().unwrap_err().contains("reconcile_tick_s"));
+
+        cfg = base();
+        cfg.session_idle_close_s = 0;
+        assert!(cfg.validate().unwrap_err().contains("session_idle_close_s"));
+
+        cfg = base();
+        cfg.breaker.window = 0;
+        assert!(cfg.validate().unwrap_err().contains("breaker.window"));
+
+        cfg = base();
+        cfg.breaker.delta_epsilon = f32::NAN;
+        assert!(cfg.validate().unwrap_err().contains("delta_epsilon"));
+        cfg.breaker.delta_epsilon = -0.5;
+        assert!(cfg.validate().unwrap_err().contains("delta_epsilon"));
+    }
+
+    #[test]
     fn user_config_path_is_stable() {
         let path = user_config_path_from(std::path::Path::new("/home/pat"));
         assert_eq!(
@@ -932,6 +1020,15 @@ mod tests {
         let mut azure = cfg("https://r.openai.azure.com/openai");
         azure.upstream_chat_path = "/openai/deployments/d/chat/completions".into();
         assert_eq!(azure.duplicated_chat_path_segment(), Some("openai"));
+        // A pasted full endpoint URL embeds the entire chat path.
+        assert_eq!(
+            cfg("http://10.0.0.5:8000/v1/chat/completions").duplicated_chat_path_segment(),
+            Some("v1/chat/completions")
+        );
+        assert_eq!(
+            cfg("http://10.0.0.5:8000/v1/chat/completions/").duplicated_chat_path_segment(),
+            Some("v1/chat/completions")
+        );
     }
 
     #[test]

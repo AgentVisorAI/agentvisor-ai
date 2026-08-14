@@ -158,6 +158,35 @@ fn assert_toml_safe(label: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Split a pasted upstream URL that already embeds a chat-completions path.
+///
+/// The harness joins `upstream_url` + `upstream_chat_path`, so storing a full
+/// endpoint URL (which "paste your endpoint" naturally invites) would produce
+/// `/v1/chat/completions/v1/chat/completions` and a confusing provider 404.
+/// Returns `(base_url, chat_path_override)`; the override is `None` when the
+/// embedded path is exactly the default that the harness appends anyway.
+fn split_embedded_chat_path(url: String) -> (String, Option<String>) {
+    const DEFAULT_CHAT_PATH: &str = "/v1/chat/completions";
+    let path_start = match url.find("://").and_then(|scheme| {
+        let host = scheme + 3;
+        url[host..].find('/').map(|slash| host + slash)
+    }) {
+        Some(index) => index,
+        None => return (url, None),
+    };
+    let path = &url[path_start..];
+    let embeds_chat = path.ends_with("/chat/completions") || path.contains("/chat/completions?");
+    if !embeds_chat {
+        return (url, None);
+    }
+    let base = url[..path_start].to_owned();
+    if path == DEFAULT_CHAT_PATH {
+        return (base, None);
+    }
+    let path = path.to_owned();
+    (base, Some(path))
+}
+
 /// Render the annotated TOML for a plan.
 fn render_config(plan: &ConfigPlan) -> String {
     let spec = spec(plan.preset);
@@ -253,6 +282,14 @@ pub fn init(
             None => KeySpec::NoKey,
         },
         data_root: None,
+    };
+    // Same footgun as the wizard: a full endpoint URL passed via
+    // --upstream-url would double the chat path once the harness joins them.
+    let (upstream_url, chat_path) = split_embedded_chat_path(plan.upstream_url);
+    let plan = ConfigPlan {
+        upstream_url,
+        chat_path: chat_path.or(plan.chat_path),
+        ..plan
     };
     let rendered = render_config(&plan);
     // Refuse to write anything the harness itself would reject.
@@ -543,7 +580,11 @@ pub fn wizard(home: &Path, input: &mut dyn std::io::BufRead, secrets: &SecretInp
                 |value| upstream_url_error(value).map(|reason| format!("That URL {reason}.")),
             )?;
             let needs_key = ask_yes_no("Does it need an API key? [y/N]: ", input, false)?;
-            (url, None, needs_key)
+            // Pasting the complete endpoint URL must work: split any embedded
+            // chat path so base + upstream_chat_path join back to what was
+            // pasted instead of doubling the path.
+            let (url, chat_path) = split_embedded_chat_path(url);
+            (url, chat_path, needs_key)
         }
         other => {
             let spec = spec(other);
@@ -1225,7 +1266,12 @@ async fn probe_endpoint(endpoint: &str) -> Result<()> {
 
 /// `abctl health` — probe a running harness; exit 0 only on HTTP 200.
 pub async fn health(base_url: &str) -> Result<()> {
-    let url = format!("{}/health", base_url.trim_end_matches('/'));
+    // Accept both the base URL (documented) and a pasted full /health URL:
+    // silently appending a second /health would probe a nonexistent path and
+    // report a healthy harness as unhealthy.
+    let base = base_url.trim_end_matches('/');
+    let base = base.strip_suffix("/health").unwrap_or(base);
+    let url = format!("{base}/health");
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(3))
@@ -1248,6 +1294,43 @@ mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn split_embedded_chat_path_covers_pasted_endpoint_urls() {
+        // Default chat path collapses to the base URL alone.
+        assert_eq!(
+            split_embedded_chat_path("http://10.0.0.5:8000/v1/chat/completions".into()),
+            ("http://10.0.0.5:8000".into(), None)
+        );
+        // Non-default embedded paths are preserved verbatim as overrides.
+        assert_eq!(
+            split_embedded_chat_path("http://gw.corp/llm/v1/chat/completions".into()),
+            ("http://gw.corp".into(), Some("/llm/v1/chat/completions".into()))
+        );
+        assert_eq!(
+            split_embedded_chat_path(
+                "https://r.openai.azure.com/openai/deployments/d/chat/completions?api-version=1".into()
+            ),
+            (
+                "https://r.openai.azure.com".into(),
+                Some("/openai/deployments/d/chat/completions?api-version=1".into())
+            )
+        );
+        // Base URLs pass through untouched.
+        assert_eq!(
+            split_embedded_chat_path("http://10.0.0.5:8000".into()),
+            ("http://10.0.0.5:8000".into(), None)
+        );
+        assert_eq!(
+            split_embedded_chat_path("http://10.0.0.5:8000/v1".into()),
+            ("http://10.0.0.5:8000/v1".into(), None)
+        );
+        // A path that merely mentions the words is not a chat endpoint.
+        assert_eq!(
+            split_embedded_chat_path("http://h/x/chat/completionsfoo".into()),
+            ("http://h/x/chat/completionsfoo".into(), None)
+        );
+    }
 
     fn plan_for(preset: Preset, upstream_url: &str, key_env: Option<&str>) -> ConfigPlan {
         ConfigPlan {

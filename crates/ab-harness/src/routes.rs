@@ -295,9 +295,7 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                         }
                         return (
                             StatusCode::CONFLICT,
-                            Json(json!({
-                                "error": "tool execution outcome is uncertain; refusing duplicate execution"
-                            })),
+                            Json(json!({"error": TOOL_OUTCOME_UNCERTAIN})),
                         )
                             .into_response();
                     }
@@ -357,7 +355,19 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                     }
                 };
                 if let Err(error) = execution.claim().await {
-                    return (StatusCode::CONFLICT, Json(json!({"error": error}))).into_response();
+                    // A lost claim race means another in-flight request owns
+                    // this execution; answer exactly like the Pending state
+                    // and keep the underlying io detail out of the wire.
+                    tracing::warn!(
+                        session = %execution.session_id,
+                        error = %error,
+                        "concurrent tool execution claim lost"
+                    );
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({"error": TOOL_OUTCOME_UNCERTAIN})),
+                    )
+                        .into_response();
                 }
                 let mut tool_request = state
                     .client
@@ -538,6 +548,10 @@ enum ToolExecutionState {
 }
 
 const TOOL_REQUEST_MISMATCH: &str = "JSON-RPC id is already bound to a different tool request or principal";
+/// Canonical duplicate-execution refusal, shared by the pre-flight Pending
+/// state and a lost concurrent claim race so neither reveals more than the
+/// other (a raw claim error would leak filesystem detail, CWE-209).
+const TOOL_OUTCOME_UNCERTAIN: &str = "tool execution outcome is uncertain; refusing duplicate execution";
 
 #[derive(PartialEq, serde::Serialize, serde::Deserialize)]
 struct ToolIntent {
@@ -2714,6 +2728,59 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
         assert_eq!(calls.load(std::sync::atomic::Ordering::Acquire), 1);
+        tool_server.abort();
+        provider.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_tool_claims_conflict_without_leaking_io_detail() {
+        let tool_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tool_address = tool_listener.local_addr().unwrap();
+        let held = Arc::new(HeldToolState {
+            arrived: std::sync::atomic::AtomicBool::new(false),
+            release: tokio::sync::Notify::new(),
+        });
+        let tool_router = Router::new()
+            .route("/mcp", post(held_tool))
+            .with_state(Arc::clone(&held));
+        let tool_server = tokio::spawn(async move {
+            axum::serve(tool_listener, tool_router).await.unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let (mut state, provider) = test_state(directory.path()).await;
+        Arc::get_mut(&mut state.config).unwrap().tool_upstream_url =
+            Some(format!("http://{tool_address}/mcp"));
+        let app = build_router(state);
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/mcp")
+                .header("x-ab-session", "claim-race")
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"read","arguments":{}}}"#,
+                ))
+                .unwrap()
+        };
+        let winner_app = app.clone();
+        let winner = tokio::spawn(async move { winner_app.oneshot(request()).await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !held.arrived.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // The winner holds the claim while its upstream call is in flight;
+        // an identical duplicate must lose the race with the canonical
+        // uncertainty message and no io/filesystem detail.
+        let loser = app.oneshot(request()).await.unwrap();
+        assert_eq!(loser.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(loser.into_body(), 64 * 1024).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains(TOOL_OUTCOME_UNCERTAIN), "{text}");
+        assert!(!text.contains("os error"), "leaked io detail: {text}");
+        held.release.notify_one();
+        assert_eq!(winner.await.unwrap().status(), StatusCode::OK);
         tool_server.abort();
         provider.abort();
     }
