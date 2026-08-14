@@ -13,14 +13,22 @@ use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Debug, Parser)]
-#[command(name = "abctl", version, about = "AgentBridge operations CLI")]
+#[command(
+    name = "abctl",
+    version,
+    about = "AgentBridge operations CLI. Run with no arguments for guided setup."
+)]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Guided setup: answer two questions, get a working proxy (default).
+    Setup,
+    /// Start AgentBridge and print where to point your AI app.
+    Start,
     /// Create a provider-specific agentbridge.toml (start here).
     Init {
         /// Provider preset.
@@ -150,7 +158,12 @@ async fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    match cli.command {
+    let Some(command) = cli.command else {
+        return wizard_then_maybe_start().await;
+    };
+    match command {
+        Command::Setup => wizard_then_maybe_start().await,
+        Command::Start => setup::start().await,
         Command::Init {
             preset,
             output,
@@ -190,6 +203,32 @@ async fn run(cli: Cli) -> Result<()> {
             workflow,
             bearer_token_file,
         } => loadgen(&url, connections, &workflow, bearer_token_file.as_deref()).await,
+    }
+}
+
+/// The wizard reads answers from stdin; secrets come from the terminal
+/// with echo off when interactive, or from the same stream when piped
+/// (scripts and tests).
+async fn wizard_then_maybe_start() -> Result<()> {
+    let outcome = {
+        use std::io::IsTerminal as _;
+        #[allow(deprecated)] // undeprecated in Rust 1.86; MSRV is 1.88
+        let home = std::env::home_dir().context("could not find your home folder")?;
+        let stdin = std::io::stdin();
+        let secrets = if stdin.is_terminal() {
+            setup::SecretInput::Hidden
+        } else {
+            setup::SecretInput::Plain
+        };
+        let mut input = stdin.lock();
+        setup::wizard(&home, &mut input, &secrets)?
+    };
+    if outcome.start_now {
+        setup::start().await
+    } else {
+        println!("\nYour settings are saved at {}.", outcome.config_path.display());
+        println!("When you're ready: abctl start");
+        Ok(())
     }
 }
 

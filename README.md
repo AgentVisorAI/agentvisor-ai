@@ -2,6 +2,23 @@
 
 AgentBridge is an inline Rust proxy for OpenAI-compatible agent traffic and MCP tool calls. It applies identity, quota, policy, compression, and loop controls; emits OCSF-shaped events; writes ATIF v1.7 trajectories; and issues offline-verifiable Ed25519 receipts.
 
+## Easiest start (no config, no exports)
+
+```bash
+cargo install --path crates/ab-harness --bin agent-bridge
+cargo install --path crates/ab-cli --bin abctl
+abctl
+```
+
+Bare `abctl` launches a guided setup: pick your AI provider from a
+numbered list, paste your API key once (typed hidden, stored
+owner-only under `~/.agentbridge/keys/`), and it writes
+`~/.agentbridge/agentbridge.toml` for you. Answer "yes" at the end —
+or run `abctl start` later — and AgentBridge is running with a
+friendly banner telling you exactly what URL to paste into your app.
+`Ctrl-C` stops it cleanly. No files to edit, no environment
+variables, no terminal knowledge beyond typing a number.
+
 ## 60-second start
 
 Pick the row that matches your provider, then run two commands.
@@ -46,7 +63,7 @@ AB_UPSTREAM_URL=http://127.0.0.1:11434 agent-bridge   # e.g. Ollama
 | `litellm` | 127.0.0.1:4000 | `LITELLM_MASTER_KEY` |
 | `custom` | `--upstream-url ...` | `--key-env NAME` |
 
-`abctl doctor` diagnoses the environment (config resolution, key presence, upstream reachability, data dirs, backends) without printing secrets. `abctl health` probes a running instance.
+`abctl doctor` diagnoses the environment (config resolution, key presence, upstream reachability, data dirs, backends) without printing secrets. `abctl health` probes a running instance. `abctl start` launches the server for you (logs to `~/.agentbridge/agent-bridge.log`) and waits until it answers.
 
 ### Configuration resolution
 
@@ -54,7 +71,8 @@ AB_UPSTREAM_URL=http://127.0.0.1:11434 agent-bridge   # e.g. Ollama
 2. `./agentbridge.toml`
 3. `./config/harness.toml`
 4. `./config/harness.example.toml`
-5. built-in defaults (requires `AB_UPSTREAM_URL`)
+5. `~/.agentbridge/agentbridge.toml` (written by the `abctl` guided setup)
+6. built-in defaults (requires `AB_UPSTREAM_URL`)
 
 Environment overrides beat file values: `AB_LISTEN`, `AB_UPSTREAM_URL`, `AB_UPSTREAM_CHAT_PATH`, `AB_UPSTREAM_AUTH_HEADER`, `AB_UPSTREAM_AUTH_SCHEME`, `AB_STATE_ENDPOINT`, `AB_BRIDGE_ENDPOINT`, `AB_QDRANT_URL`. Exporting `AB_UPSTREAM_API_KEY` selects itself as the key source when the file doesn't name one; `AB_UPSTREAM_KEY_FILE=/run/secrets/api_key` points at a mounted secret file (Docker/Kubernetes secrets) instead. Key *values* are only ever read from the environment or `0600` files — never from the command line.
 

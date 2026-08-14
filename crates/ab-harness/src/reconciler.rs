@@ -488,6 +488,17 @@ impl Finalizer {
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
                 continue;
             }
+            // Live session journals ({hash}.session.json) are handled by
+            // consolidate_step_journals above; they are not ATIF documents,
+            // so parsing them here would only spam misleading warnings
+            // every tick while a session is open.
+            if path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| name.ends_with(".session.json"))
+            {
+                continue;
+            }
             let bytes = tokio::fs::read(&path)
                 .await
                 .map_err(|error| FinalizeError::Atif(error.to_string()))?;
@@ -2734,6 +2745,65 @@ mod tests {
         assert!(
             recovered.is_closed(),
             "the quarantined-unsigned recovery branch (consolidate_step_journals) must also mark the session finalized (artifact_committed) so the idle sweeper's `!is_closed()` filter skips it — otherwise every idle tick calls close_session_locked which returns CaptureIncomplete, CloseClaim resets the close, and the session churns forever burning CPU, log noise, and metrics without ever leaving the registry",
+        );
+    }
+
+    /// A live session's `{stem}.session.json` journal metadata must be
+    /// invisible to the ATIF spool scan. Both journal consumers skip a
+    /// session that is still in the registry, so without the scan-side
+    /// guard, every reconciler tick re-parsed the metadata file as an
+    /// ATIF document, failed, warned "ignoring invalid ATIF spool file",
+    /// and inflated the invalid_json skip counter — pure noise while a
+    /// session was merely open.
+    #[tokio::test]
+    async fn atif_scan_ignores_live_session_journal_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let metrics = Arc::new(Registry::new());
+        let finalizer = Finalizer::new(
+            Arc::new(Ed25519Signer::from_seed([7; 32])),
+            directory.path().to_path_buf(),
+            Arc::clone(&metrics),
+        );
+        let session_id = "still-open-session";
+        let identity = AgentIdentity {
+            version: "1".into(),
+            charter: "test".into(),
+            instance_uid: "instance-1".into(),
+            ttl_remaining_s: Some(600),
+        };
+        let digest = ab_core::digest::sha256_hex(session_id.as_bytes());
+        let stem = &digest[..32];
+        let metadata_payload = serde_json::json!({
+            "journal_version": 2,
+            "session_id": session_id,
+            "identity": identity,
+            "workflow": "unsigned",
+        });
+        let metadata_sealed =
+            crate::journal::seal(&finalizer.journal_key, "metadata", 0, &metadata_payload).unwrap();
+        std::fs::write(
+            directory.path().join(format!("{stem}.session.json")),
+            &metadata_sealed,
+        )
+        .unwrap();
+
+        // The session is live, so consolidate/recover leave its journal alone.
+        let registry = SessionRegistry::new();
+        let live = registry.get_or_open(session_id, Workflow::Unsigned, &identity, &Default::default());
+        assert!(!live.is_closed(), "precondition: session is open");
+
+        finalizer
+            .recover_spooled_sessions(&registry, &Default::default())
+            .await
+            .unwrap();
+
+        assert!(
+            !metrics.render().contains("ab_atif_recovery_skipped_total"),
+            "the ATIF scan must skip *.session.json instead of counting it as an invalid spool file",
+        );
+        assert!(
+            directory.path().join(format!("{stem}.session.json")).exists(),
+            "the live session's journal metadata must survive the pass",
         );
     }
 
