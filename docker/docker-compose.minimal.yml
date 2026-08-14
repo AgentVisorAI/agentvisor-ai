@@ -1,0 +1,43 @@
+# AgentBridge minimal deployment: one container, zero external services.
+#
+#   docker compose -f docker/docker-compose.minimal.yml up
+#
+# Default upstream is Ollama on the Docker host. For a cloud provider:
+#
+#   AB_UPSTREAM_URL=https://api.openai.com \
+#   AB_UPSTREAM_API_KEY=sk-... \
+#   docker compose -f docker/docker-compose.minimal.yml up
+#
+# The full observability stack (Redpanda, Redis, Qdrant, Vector) lives in
+# docker-compose.yml next to this file.
+
+services:
+  agent-bridge:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: agent-bridge:local
+    container_name: agent-bridge
+    ports:
+      - "8484:8484"
+    environment:
+      RUST_LOG: info
+      AB_CONFIG: /app/config/harness.container.toml
+      AB_SIGNING_SEED_FILE: /app/data/signing.seed
+      # Uncomment (or pass via the shell) to target a cloud provider:
+      # AB_UPSTREAM_URL: https://api.openai.com
+      # AB_UPSTREAM_API_KEY: ${AB_UPSTREAM_API_KEY}
+    volumes:
+      - bridge-data:/app/data
+      - atif-spool:/app/spool
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "abctl", "health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  bridge-data:
+  atif-spool:

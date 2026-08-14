@@ -1,0 +1,56 @@
+# AgentBridge systemd unit.
+#
+# Install:
+#   sudo useradd --system --home /var/lib/agent-bridge --shell /usr/sbin/nologin agent-bridge
+#   sudo mkdir -p /var/lib/agent-bridge /etc/agent-bridge
+#   sudo cp target/release/agent-bridge /usr/local/bin/
+#   sudo cp target/release/abctl /usr/local/bin/
+#   cd /etc/agent-bridge && sudo abctl init --preset openai --output agentbridge.toml
+#   echo 'AB_UPSTREAM_API_KEY=sk-...' | sudo tee /etc/agent-bridge/secrets.env
+#   sudo chmod 600 /etc/agent-bridge/secrets.env
+#   sudo chown -R agent-bridge:agent-bridge /var/lib/agent-bridge /etc/agent-bridge
+#   sudo cp deploy/systemd/agent-bridge.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now agent-bridge
+#
+# Check: abctl health --url http://127.0.0.1:8484
+
+[Unit]
+Description=AgentBridge LLM proxy with signed receipts
+Documentation=https://github.com/agentbridge/agentbridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agent-bridge
+Group=agent-bridge
+WorkingDirectory=/var/lib/agent-bridge
+Environment=RUST_LOG=info
+Environment=AB_CONFIG=/etc/agent-bridge/agentbridge.toml
+Environment=AB_SIGNING_SEED_FILE=/var/lib/agent-bridge/signing.seed
+# API keys live here, mode 0600, never in the unit file:
+EnvironmentFile=-/etc/agent-bridge/secrets.env
+ExecStart=/usr/local/bin/agent-bridge
+Restart=on-failure
+RestartSec=2
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/agent-bridge
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+RestrictRealtime=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

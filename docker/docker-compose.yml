@@ -21,7 +21,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
-      test: ["CMD", "abctl", "config-validate", "/app/config/harness.docker.toml"]
+      test: ["CMD", "abctl", "health"]
       interval: 10s
       timeout: 3s
       retries: 5

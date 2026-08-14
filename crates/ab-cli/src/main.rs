@@ -1,5 +1,7 @@
 //! `abctl` operations for keys, receipts, ATIF, Bridge, sessions, and load.
 
+mod setup;
+
 use ab_bridge::{BridgeManifest, EmbeddedBroker, EventBus};
 use ab_receipts::{Ed25519Signer, Keyring, Receipt, Signer};
 use anyhow::{Context, Result};
@@ -19,6 +21,36 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Create a provider-specific agentbridge.toml (start here).
+    Init {
+        /// Provider preset.
+        #[arg(long, value_enum, default_value_t = setup::Preset::Openai)]
+        preset: setup::Preset,
+        /// Destination file (the harness finds agentbridge.toml automatically).
+        #[arg(long, default_value = "agentbridge.toml")]
+        output: PathBuf,
+        /// Overwrite an existing file.
+        #[arg(long)]
+        force: bool,
+        /// Override the preset's upstream base URL (required for --preset custom).
+        #[arg(long)]
+        upstream_url: Option<String>,
+        /// Override the environment variable the API key is read from.
+        #[arg(long)]
+        key_env: Option<String>,
+    },
+    /// Diagnose the environment: config, keys, upstream, backends.
+    Doctor {
+        /// Skip network reachability probes.
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Probe a running harness /health endpoint (for container healthchecks).
+    Health {
+        /// Harness base URL.
+        #[arg(long, default_value = "http://127.0.0.1:8484")]
+        url: String,
+    },
     /// Generate and persist an Ed25519 signing seed.
     Keygen {
         /// Destination seed file.
@@ -119,6 +151,21 @@ async fn main() -> Result<()> {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Init {
+            preset,
+            output,
+            force,
+            upstream_url,
+            key_env,
+        } => setup::init(
+            preset,
+            &output,
+            force,
+            upstream_url.as_deref(),
+            key_env.as_deref(),
+        ),
+        Command::Doctor { offline } => setup::doctor(offline).await,
+        Command::Health { url } => setup::health(&url).await,
         Command::Keygen { output } => keygen(&output),
         Command::ReceiptVerify { path, public_key_hex } => receipt_verify(&path, &public_key_hex),
         Command::AtifValidate { path, mode } => atif_validate(&path, mode),
@@ -413,6 +460,9 @@ mod tests {
     #[test]
     fn cli_covers_required_commands() {
         for args in [
+            vec!["abctl", "init", "--preset", "ollama"],
+            vec!["abctl", "doctor", "--offline"],
+            vec!["abctl", "health"],
             vec!["abctl", "keygen", "--output", "key.seed"],
             vec![
                 "abctl",

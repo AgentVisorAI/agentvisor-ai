@@ -1,0 +1,155 @@
+# AgentBridge on Kubernetes — single-replica starter manifest.
+#
+#   kubectl create namespace agent-bridge
+#   kubectl -n agent-bridge create secret generic agent-bridge-upstream \
+#       --from-literal=api-key=sk-...
+#   kubectl -n agent-bridge apply -f agent-bridge.yaml
+#
+# Notes:
+# - The embedded event bridge stores receipts/events on the PVC, which pins
+#   the Deployment to one replica. For horizontal scale switch
+#   bridge_backend to kafka/nats and state_backend to redis (see
+#   config/harness.docker.toml in the repository) — then replicas can grow.
+# - Replace the image with your registry copy; build it from docker/Dockerfile.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-bridge-config
+data:
+  agentbridge.toml: |
+    config_version = 1
+    listen = "0.0.0.0:8484"
+
+    # Override per environment. AB_UPSTREAM_URL beats this value if set.
+    upstream_url = "https://api.openai.com"
+
+    # The API key is mounted as an env var from the Secret below.
+    upstream_api_key_env = "AB_UPSTREAM_API_KEY"
+
+    # Dev posture. In production configure identity_jwks_url and set
+    # require_identity = true.
+    require_identity = false
+
+    atif_spool_dir = "/app/spool/atif"
+    bridge_data_dir = "/app/data/bridge"
+    bridge_backend = "embedded"
+    bridge_manifest_path = "/app/manifests/bridge.example.yaml"
+    tool_schema_dir = "/app/config/tool-schemas"
+    wasm_policy_paths = ["/app/config/policies/payload_limit.wat"]
+    state_backend = "memory"
+    embedder_backend = "hash"
+    vector_backend = "memory"
+
+    [breaker]
+    delta_epsilon = 0.30
+    window = 3
+    min_tokens = 1000
+    action = "reject"
+
+    [budget]
+    max_tokens = 200000
+    max_payout_usd_micros = 50000000
+    max_total_tool_calls = 100
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agent-bridge-data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-bridge
+  labels:
+    app: agent-bridge
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # the PVC is ReadWriteOnce
+  selector:
+    matchLabels:
+      app: agent-bridge
+  template:
+    metadata:
+      labels:
+        app: agent-bridge
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+      containers:
+        - name: agent-bridge
+          image: agent-bridge:local # replace with your registry image
+          ports:
+            - containerPort: 8484
+              name: http
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: AB_CONFIG
+              value: /etc/agent-bridge/agentbridge.toml
+            - name: AB_SIGNING_SEED_FILE
+              value: /app/data/signing.seed
+            - name: AB_UPSTREAM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: agent-bridge-upstream
+                  key: api-key
+          volumeMounts:
+            - name: config
+              mountPath: /etc/agent-bridge
+              readOnly: true
+            - name: data
+              mountPath: /app/data
+            - name: spool
+              mountPath: /app/spool
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false # /app/data and /app/spool are writable mounts
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          configMap:
+            name: agent-bridge-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: agent-bridge-data
+        - name: spool
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-bridge
+spec:
+  selector:
+    app: agent-bridge
+  ports:
+    - name: http
+      port: 8484
+      targetPort: http
