@@ -164,9 +164,29 @@ pub fn init(
         (None, "") => anyhow::bail!("--preset custom requires --upstream-url"),
         (None, default) => default.to_owned(),
     };
+    // The values are interpolated into TOML below: reject anything that
+    // could escape the string literal (quote, backslash, control bytes)
+    // instead of silently writing a config that means something else.
+    if !upstream_url.starts_with("http://") && !upstream_url.starts_with("https://") {
+        anyhow::bail!("--upstream-url must start with http:// or https://");
+    }
+    if upstream_url
+        .chars()
+        .any(|c| c == '"' || c == '\\' || c.is_control() || c == ' ')
+    {
+        anyhow::bail!("--upstream-url contains characters not allowed in a URL");
+    }
     let key_env = key_env
         .map(str::to_owned)
         .or_else(|| spec_defaults.key_env.map(str::to_owned));
+    if let Some(env) = &key_env {
+        let valid = !env.is_empty()
+            && !env.starts_with(|c: char| c.is_ascii_digit())
+            && env.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            anyhow::bail!("--key-env must be a valid environment variable name, got {env:?}");
+        }
+    }
     let rendered = render_config(preset, &upstream_url, key_env.as_deref());
     // Refuse to write anything the harness itself would reject.
     ab_harness::HarnessConfig::from_toml(&rendered)
@@ -249,7 +269,16 @@ pub async fn doctor(offline: bool) -> Result<()> {
     };
 
     if let Some(config) = &config {
-        // 2. Upstream auth source (names only, never values).
+        // 2. Common URL footgun: base URL already contains the chat path
+        // prefix (e.g. ".../v1" + "/v1/chat/completions").
+        if let Some(segment) = config.duplicated_chat_path_segment() {
+            checks.push(Check::Warn(format!(
+                "upstream_url ends with \"/{segment}\" and upstream_chat_path repeats it; \
+                 the joined URL will contain \"/{segment}/{segment}/\" — drop the suffix from upstream_url"
+            )));
+        }
+
+        // 3. Upstream auth source (names only, never values).
         let auth = ab_harness::pipeline::describe_upstream_auth(config);
         if let Some(env) = &config.upstream_api_key_env {
             match std::env::var(env) {
@@ -271,7 +300,7 @@ pub async fn doctor(offline: bool) -> Result<()> {
             checks.push(Check::Pass(format!("upstream auth: {auth}")));
         }
 
-        // 3. Upstream reachability (TCP + HTTP; any HTTP status counts).
+        // 4. Upstream reachability (TCP + HTTP; any HTTP status counts).
         if offline {
             checks.push(Check::Warn("upstream: skipped (--offline)".to_owned()));
         } else {
@@ -293,7 +322,7 @@ pub async fn doctor(offline: bool) -> Result<()> {
             }
         }
 
-        // 4. Bridge manifest.
+        // 5. Bridge manifest.
         match std::fs::read_to_string(&config.bridge_manifest_path) {
             Ok(text) => match ab_bridge::BridgeManifest::from_yaml(&text) {
                 Ok(manifest) => checks.push(Check::Pass(format!(
@@ -315,7 +344,7 @@ pub async fn doctor(offline: bool) -> Result<()> {
             ))),
         }
 
-        // 5. WASM policies.
+        // 6. WASM policies.
         for path in &config.wasm_policy_paths {
             if Path::new(path).is_file() {
                 checks.push(Check::Pass(format!("policy: {path}")));
@@ -326,7 +355,7 @@ pub async fn doctor(offline: bool) -> Result<()> {
             }
         }
 
-        // 6. Tool schemas.
+        // 7. Tool schemas.
         match config.tool_schema_dir.as_deref() {
             Some(dir) => match std::fs::read_dir(dir) {
                 Ok(entries) => {
@@ -356,7 +385,7 @@ pub async fn doctor(offline: bool) -> Result<()> {
             )),
         }
 
-        // 7. Signing seed (created on first run if absent).
+        // 8. Signing seed (created on first run if absent).
         let seed_path = std::env::var_os("AB_SIGNING_SEED_FILE")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("config/signing.seed"));
@@ -391,7 +420,7 @@ pub async fn doctor(offline: bool) -> Result<()> {
             )));
         }
 
-        // 8. Data directories writable (created on demand by the server).
+        // 9. Data directories writable (created on demand by the server).
         for (label, dir) in [
             ("spool dir", config.atif_spool_dir.as_str()),
             ("bridge dir", config.bridge_data_dir.as_str()),
@@ -415,18 +444,26 @@ pub async fn doctor(offline: bool) -> Result<()> {
                 }
                 ancestor
             };
-            let writable = !probe_parent
-                .metadata()
-                .map(|m| m.permissions().readonly())
-                .unwrap_or(true);
-            if writable {
-                checks.push(Check::Pass(format!("{label}: {dir}")));
-            } else {
-                checks.push(Check::Fail(format!("{label}: {dir} is not writable")));
+            // A real create+delete probe: permission bits alone lie about
+            // ownership, ACLs, and read-only mounts.
+            let probe = probe_parent.join(format!(".abctl-doctor-{}", std::process::id()));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&probe)
+            {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&probe);
+                    checks.push(Check::Pass(format!("{label}: {dir}")));
+                }
+                Err(error) => checks.push(Check::Fail(format!(
+                    "{label}: cannot write in {} ({error})",
+                    probe_parent.display()
+                ))),
             }
         }
 
-        // 9. Backend endpoints (TCP probe only; skipped offline).
+        // 10. Backend endpoints (TCP probe only; skipped offline).
         if !offline {
             for (label, endpoint) in [
                 ("state (redis)", config.state_endpoint.as_deref()),
@@ -445,7 +482,7 @@ pub async fn doctor(offline: bool) -> Result<()> {
             }
         }
 
-        // 10. Identity posture.
+        // 11. Identity posture.
         if config.require_identity {
             checks.push(Check::Pass("identity: required (production posture)".to_owned()));
         } else {
@@ -585,5 +622,45 @@ mod tests {
         let path = dir.path().join("agentbridge.toml");
         let error = init(Preset::Custom, &path, false, None, None).unwrap_err();
         assert!(error.to_string().contains("--upstream-url"), "{error}");
+    }
+
+    /// User-supplied values are interpolated into TOML: anything that could
+    /// escape the string literal must be rejected, not written.
+    #[test]
+    fn init_rejects_toml_injection_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agentbridge.toml");
+        for url in [
+            "http://x\"\nrequire_identity = false #", // quote escape
+            "http://x\\y",                            // backslash escape
+            "ftp://host",                             // wrong scheme
+            "api.openai.com",                         // missing scheme
+            "http://x y",                             // embedded space
+        ] {
+            let error = init(Preset::Custom, &path, true, Some(url), None).unwrap_err();
+            assert!(!path.exists(), "{url:?} must not produce a file: {error}");
+        }
+        for env in ["MY KEY", "1KEY", "KEY\"X", "", "KEY-NAME"] {
+            let error = init(
+                Preset::Custom,
+                &path,
+                true,
+                Some("http://127.0.0.1:9000"),
+                Some(env),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("--key-env"), "{env:?}: {error}");
+            assert!(!path.exists(), "{env:?} must not produce a file");
+        }
+        // Sane values still pass.
+        init(
+            Preset::Custom,
+            &path,
+            true,
+            Some("http://127.0.0.1:9000"),
+            Some("MY_KEY_9"),
+        )
+        .unwrap();
+        assert!(path.exists());
     }
 }

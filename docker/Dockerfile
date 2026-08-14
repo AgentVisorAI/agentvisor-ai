@@ -25,5 +25,7 @@ COPY --chown=65532:65532 config/tool-schemas ./config/tool-schemas
 COPY --chown=65532:65532 manifests ./manifests
 USER 65532
 EXPOSE 8484
-ENV AB_CONFIG=/app/config/harness.docker.toml
+# Standalone single-container defaults (embedded bridge, in-memory state).
+# The full-stack compose file overrides this with harness.docker.toml.
+ENV AB_CONFIG=/app/config/harness.container.toml
 ENTRYPOINT ["agent-bridge"]
