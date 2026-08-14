@@ -1,6 +1,12 @@
 [advisories]
 version = 2
 yanked = "deny"
+# `unmaintained = "workspace"` still surfaces unmaintained *direct*
+# dependencies as errors but tolerates transitive maintenance debt that our
+# own upgrades cannot resolve (e.g. `paste` reached via wasmtime and
+# `number_prefix` reached via tokenizers -> indicatif). Real security
+# advisories still fail the check.
+unmaintained = "workspace"
 
 [licenses]
 version = 2
