@@ -147,7 +147,37 @@ async fn chat_completions(
         captured_bytes: 0,
         completed: false,
     };
-    let mut response = Response::new(Body::from_stream(stream));
+    let mut response = if is_sse {
+        Response::new(Body::from_stream(stream))
+    } else {
+        // A non-SSE body is fully buffered inside the relay before any byte
+        // is released: worker capture and the completion-token budget gate
+        // run on the complete body. Handing axum a stream here would commit
+        // the upstream status line before those gates run, so a budget
+        // refusal degraded into a 200 head followed by an empty body with
+        // no explanation. Drain the relay first (no extra buffering beyond
+        // what the relay already does) and surface refusals as real errors.
+        let mut relay = Box::pin(stream);
+        let mut buffered: Vec<u8> = Vec::new();
+        loop {
+            match relay.next().await {
+                Some(Ok(bytes)) => buffered.extend_from_slice(&bytes),
+                Some(Err(error)) => {
+                    let refusal_status = if error.kind() == std::io::ErrorKind::QuotaExceeded {
+                        StatusCode::TOO_MANY_REQUESTS
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    };
+                    // Dropping the relay here runs its finalization Drop
+                    // (evidence capture + session seal), same as when a
+                    // client observed the severed stream.
+                    return (refusal_status, Json(json!({"error": error.to_string()}))).into_response();
+                }
+                None => break,
+            }
+        }
+        Response::new(Body::from(buffered))
+    };
     *response.status_mut() = status;
     for (name, value) in &upstream_headers {
         if is_forwardable_upstream_header(name) {
@@ -355,7 +385,9 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                                 };
                                 complete_tool_audit(&execution, outcome, completion_permit, session).await
                             }
-                            Err(error) => lifecycle_error(format!("read tool response: {error}")),
+                            Err(error) => pipeline_error(crate::pipeline::PipelineError::Upstream(format!(
+                                "read tool response: {error}"
+                            ))),
                         }
                     }
                     Err(error) => {
@@ -370,7 +402,12 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                             category = category,
                             "tool upstream forwarding failed"
                         );
-                        lifecycle_error(format!("forward tool call: {category}"))
+                        // Upstream faults must surface as 502 (as the chat
+                        // relay does), not 500: a 500 blames the harness and
+                        // misroutes operator alerting/retry policy.
+                        pipeline_error(crate::pipeline::PipelineError::Upstream(format!(
+                            "forward tool call: {category}"
+                        )))
                     }
                 }
             } else {
@@ -1291,9 +1328,13 @@ impl Stream for AbortFinalizingStream {
                     )))));
                 }
                 self.pending_output.clear();
-                return Poll::Ready(Some(Err(std::io::Error::other(format!(
-                    "response blocked by token budget: {reason}"
-                )))));
+                // QuotaExceeded is an in-process marker: the non-SSE drain in
+                // `chat_completions` maps it to HTTP 429 so budget refusals
+                // reach the client as a real error instead of a severed body.
+                return Poll::Ready(Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::QuotaExceeded,
+                    format!("response blocked by token budget: {reason}"),
+                ))));
             }
             match pending.continuation {
                 BudgetContinuation::Emit(bytes) => return Poll::Ready(Some(Ok(bytes))),
@@ -2117,7 +2158,7 @@ mod tests {
                 .unwrap(),
         )
         .into_owned();
-        assert!(metrics.contains("ab_stage_duration_us") || metrics.contains("ab_sessions"));
+        assert!(metrics.contains("ab_stage_duration_seconds") || metrics.contains("ab_sessions"));
 
         let aborted = app.clone().oneshot(chat_request("abort-flow")).await.unwrap();
         drop(aborted);
@@ -2883,9 +2924,14 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert!(axum::body::to_bytes(response.into_body(), 64 * 1024)
+        // The non-SSE path drains the relay server-side, so a capture
+        // failure surfaces as a clean 502 + JSON error instead of a
+        // committed 200 with a severed body.
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
-            .is_err());
+            .unwrap();
+        assert!(serde_json::from_slice::<Value>(&body).unwrap()["error"].is_string());
         let session = state.sessions.get("malformed-json").unwrap();
         assert!(session.capture_failed());
         provider.abort();
@@ -2998,9 +3044,13 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert!(axum::body::to_bytes(response.into_body(), 64 * 1024)
+        // Missing choices fails capture; the server-side drain converts
+        // the refusal into a 502 + JSON error rather than a severed body.
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
-            .is_err());
+            .unwrap();
+        assert!(serde_json::from_slice::<Value>(&body).unwrap()["error"].is_string());
         assert!(state.sessions.get("empty-success").unwrap().capture_failed());
         provider.abort();
     }
@@ -3243,7 +3293,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "tool-upstream faults must surface as 502 like the chat relay, not 500"
+        );
         let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
             .unwrap();

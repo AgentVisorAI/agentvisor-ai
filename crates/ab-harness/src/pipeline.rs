@@ -344,7 +344,7 @@ impl AppState {
         let metrics = Arc::new(Registry::new());
         for stage in ["identity", "quota", "sanitize", "compression", "dispatch"] {
             metrics.histogram(
-                &format!("ab_stage_duration_us{{stage=\"{stage}\"}}"),
+                &format!("ab_stage_duration_seconds{{stage=\"{stage}\"}}"),
                 "Harness stage latency",
             );
         }
@@ -360,9 +360,12 @@ impl AppState {
         metrics.counter("ab_sessions_finalized_total", "Sessions finalized");
         metrics.counter("ab_sessions_promoted_total", "Unsigned sessions promoted");
         metrics.counter("ab_reconcile_errors_total", "Reconciliation errors");
-        metrics.histogram("ab_receipt_sign_duration_us", "Receipt signing latency");
-        metrics.histogram("ab_reconcile_duration_us", "Idle reconciliation duration");
-        metrics.histogram("ab_session_finalize_duration_us", "Session finalization latency");
+        metrics.histogram("ab_receipt_sign_duration_seconds", "Receipt signing latency");
+        metrics.histogram("ab_reconcile_duration_seconds", "Idle reconciliation duration");
+        metrics.histogram(
+            "ab_session_finalize_duration_seconds",
+            "Session finalization latency",
+        );
         let sessions = Arc::new(SessionRegistry::new());
         let journal_key = crate::journal::key_from_signer(signer.as_ref());
         let worker = crate::worker::spawn_worker_with_spool_authenticated(
@@ -1062,7 +1065,7 @@ impl AppState {
         let elapsed = elapsed_us(started);
         self.metrics
             .histogram(
-                &format!("ab_stage_duration_us{{stage=\"{stage}\"}}"),
+                &format!("ab_stage_duration_seconds{{stage=\"{stage}\"}}"),
                 "Harness stage latency",
             )
             .observe_us(elapsed);
@@ -1429,7 +1432,7 @@ mod tests {
             "middleware took {}us",
             prepared.middleware_us
         );
-        assert!(state.metrics.render().contains("ab_stage_duration_us"));
+        assert!(state.metrics.render().contains("ab_stage_duration_seconds"));
     }
 
     #[tokio::test]

@@ -415,8 +415,22 @@ fn spawn_worker_shard(
             let spool_dir = spool_dir.clone();
             let session = Arc::clone(&job.session);
             let result = tokio::spawn(
-                async move { process_job(job, bridge, embedder, vector_sink, spool_dir, journal_key).await }
-                    .instrument(span),
+                {
+                    let job_metrics = Arc::clone(&worker_metrics);
+                    async move {
+                        process_job(
+                            job,
+                            bridge,
+                            embedder,
+                            vector_sink,
+                            spool_dir,
+                            journal_key,
+                            job_metrics,
+                        )
+                        .await
+                    }
+                }
+                .instrument(span),
             )
             .await;
             let outcome = match result {
@@ -463,6 +477,7 @@ fn worker_span(job: &WorkerJob) -> tracing::Span {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_job(
     mut job: WorkerJob,
     bridge: Arc<dyn EventBus>,
@@ -470,6 +485,7 @@ async fn process_job(
     vector_sink: Arc<dyn VectorSink>,
     spool_dir: Option<std::path::PathBuf>,
     journal_key: [u8; 32],
+    metrics: Arc<Registry>,
 ) -> Result<(), String> {
     // A queued envelope for a session that has already been poisoned must not
     // consume a sequence number or write to the journal — otherwise the seq
@@ -513,17 +529,33 @@ async fn process_job(
             streak,
             tokens_consumed,
             action,
-        }) => (
-            EventClass::StopReason,
-            StatusId::Failure,
-            Some(StopReason::LoopDetected),
-            serde_json::json!({
-                "delta": delta,
-                "streak": streak,
-                "tokens_consumed": tokens_consumed,
-                "action": action,
-            }),
-        ),
+        }) => {
+            // The trip is recorded in the trajectory, but operators watching
+            // logs/metrics must also see why this session's next request
+            // will be rejected/aborted/injected.
+            tracing::warn!(
+                session = %job.session.id,
+                delta,
+                streak,
+                tokens_consumed,
+                action = ?action,
+                "semantic loop circuit breaker tripped"
+            );
+            metrics
+                .counter("ab_breaker_trips_total", "Semantic loop breaker trips")
+                .inc();
+            (
+                EventClass::StopReason,
+                StatusId::Failure,
+                Some(StopReason::LoopDetected),
+                serde_json::json!({
+                    "delta": delta,
+                    "streak": streak,
+                    "tokens_consumed": tokens_consumed,
+                    "action": action,
+                }),
+            )
+        }
         _ => (job.class, job.status, job.stop_reason, job.payload),
     };
 

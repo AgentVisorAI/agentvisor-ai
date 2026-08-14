@@ -263,7 +263,7 @@ async fn sla_core_metrics() {
             .unwrap();
     }
     let sign_p99 = metrics
-        .histogram("ab_receipt_sign_duration_us", "Receipt signing latency")
+        .histogram("ab_receipt_sign_duration_seconds", "Receipt signing latency")
         .quantile_us(0.99);
     assert!(sign_p99 < 2_000, "receipt sign p99 {sign_p99}us exceeds 2000us");
 
