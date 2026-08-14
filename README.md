@@ -56,7 +56,7 @@ AB_UPSTREAM_URL=http://127.0.0.1:11434 agent-bridge   # e.g. Ollama
 4. `./config/harness.example.toml`
 5. built-in defaults (requires `AB_UPSTREAM_URL`)
 
-Environment overrides beat file values: `AB_LISTEN`, `AB_UPSTREAM_URL`, `AB_UPSTREAM_CHAT_PATH`, `AB_UPSTREAM_AUTH_HEADER`, `AB_UPSTREAM_AUTH_SCHEME`, `AB_STATE_ENDPOINT`, `AB_BRIDGE_ENDPOINT`, `AB_QDRANT_URL`. Exporting `AB_UPSTREAM_API_KEY` selects itself as the key source when the file doesn't name one. Key *values* are only ever read from the environment or `0600` files — never from the command line.
+Environment overrides beat file values: `AB_LISTEN`, `AB_UPSTREAM_URL`, `AB_UPSTREAM_CHAT_PATH`, `AB_UPSTREAM_AUTH_HEADER`, `AB_UPSTREAM_AUTH_SCHEME`, `AB_STATE_ENDPOINT`, `AB_BRIDGE_ENDPOINT`, `AB_QDRANT_URL`. Exporting `AB_UPSTREAM_API_KEY` selects itself as the key source when the file doesn't name one; `AB_UPSTREAM_KEY_FILE=/run/secrets/api_key` points at a mounted secret file (Docker/Kubernetes secrets) instead. Key *values* are only ever read from the environment or `0600` files — never from the command line.
 
 ### Upstream authentication
 

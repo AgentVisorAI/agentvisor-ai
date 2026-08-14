@@ -69,6 +69,15 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("bind {}", config.listen))?;
+    if let Some(segment) = config.duplicated_chat_path_segment() {
+        tracing::warn!(
+            upstream_url = %config.upstream_url,
+            upstream_chat_path = %config.upstream_chat_path,
+            "upstream_url already ends with \"/{segment}\" and upstream_chat_path repeats it; \
+             the joined URL will contain \"/{segment}/{segment}/\" — most providers expect the \
+             base URL without the \"/{segment}\" suffix"
+        );
+    }
     tracing::info!(
         listen = %config.listen,
         config = %config_source,

@@ -300,14 +300,18 @@ pub const CONFIG_SEARCH_PATHS: [&str; 3] = [
 /// defaults driven by `AB_UPSTREAM_URL`.
 pub fn resolve_config_source() -> Result<ConfigSource, String> {
     if let Some(path) = std::env::var_os("AB_CONFIG") {
-        let path = std::path::PathBuf::from(path);
-        if !path.is_file() {
-            return Err(format!(
-                "AB_CONFIG points to {} which does not exist or is not a file",
-                path.display()
-            ));
+        // Empty means unset: compose files commonly render
+        // `AB_CONFIG: ${AB_CONFIG:-}` which must not become a hard error.
+        if !path.is_empty() {
+            let path = std::path::PathBuf::from(path);
+            if !path.is_file() {
+                return Err(format!(
+                    "AB_CONFIG points to {} which does not exist or is not a file",
+                    path.display()
+                ));
+            }
+            return Ok(ConfigSource::File(path));
         }
-        return Ok(ConfigSource::File(path));
     }
     for candidate in CONFIG_SEARCH_PATHS {
         let path = std::path::Path::new(candidate);
@@ -386,6 +390,29 @@ impl HarnessConfig {
         default_wasm_policies().iter().any(|entry| entry == path)
     }
 
+    /// Detect the classic footgun of `upstream_url` already ending with the
+    /// first segment of `upstream_chat_path` (for example a base URL of
+    /// `https://api.openai.com/v1` joined with `/v1/chat/completions`
+    /// produces `/v1/v1/...` and a confusing provider 404). Returns the
+    /// duplicated segment for warning messages.
+    pub fn duplicated_chat_path_segment(&self) -> Option<&str> {
+        let first_segment = self
+            .upstream_chat_path
+            .trim_start_matches('/')
+            .split('/')
+            .next()?;
+        if first_segment.is_empty() {
+            return None;
+        }
+        let base = self.upstream_url.trim_end_matches('/');
+        let last_segment = base.rsplit('/').next()?;
+        // A bare scheme+host has no path segments; ignore the host itself.
+        if last_segment.contains('.') || last_segment.contains(':') || base.ends_with("//") {
+            return None;
+        }
+        (last_segment == first_segment).then_some(first_segment)
+    }
+
     /// Apply `AB_*` environment overrides from the process environment.
     /// Environment beats file for these scalars (12-factor container
     /// deployments override without editing mounted files). Key *values*
@@ -422,6 +449,18 @@ impl HarnessConfig {
         }
         if let Some(url) = get("AB_QDRANT_URL").and_then(non_empty) {
             self.qdrant_url = Some(url);
+        }
+        // Docker/Kubernetes secrets arrive as mounted files; let those
+        // deployments point at one without editing config. File beats the
+        // AB_UPSTREAM_API_KEY convenience below but never a config-file
+        // key source (validate() rejects env+file ambiguity anyway).
+        if self.upstream_api_key_env.is_none()
+            && self.upstream_api_key_file.is_none()
+            && !self.upstream_authorization_passthrough
+        {
+            if let Some(path) = get("AB_UPSTREAM_KEY_FILE").and_then(non_empty) {
+                self.upstream_api_key_file = Some(path);
+            }
         }
         // Convenience: exporting AB_UPSTREAM_API_KEY selects itself as the
         // key source unless the file already chose one (file wins so a
@@ -754,6 +793,37 @@ mod tests {
     }
 
     #[test]
+    fn env_key_file_override_precedence() {
+        // AB_UPSTREAM_KEY_FILE selects the mounted-secret file...
+        let env = |name: &str| -> Option<String> {
+            match name {
+                "AB_UPSTREAM_KEY_FILE" => Some("/run/secrets/api_key".into()),
+                "AB_UPSTREAM_API_KEY" => Some("sk-secret".into()),
+                _ => None,
+            }
+        };
+        let mut cfg = HarnessConfig::for_tests("http://u", "spool", "bridge");
+        cfg.apply_env_overrides_from(env);
+        assert_eq!(cfg.upstream_api_key_file.as_deref(), Some("/run/secrets/api_key"));
+        // ...and beats the AB_UPSTREAM_API_KEY self-selection (no ambiguity).
+        assert_eq!(cfg.upstream_api_key_env, None);
+
+        // But never displaces a config-file key source.
+        let mut cfg = HarnessConfig::for_tests("http://u", "spool", "bridge");
+        cfg.upstream_api_key_env = Some("OPENAI_API_KEY".into());
+        cfg.apply_env_overrides_from(env);
+        assert_eq!(cfg.upstream_api_key_env.as_deref(), Some("OPENAI_API_KEY"));
+        assert_eq!(cfg.upstream_api_key_file, None);
+
+        // And is ignored entirely in passthrough mode.
+        let mut cfg = HarnessConfig::for_tests("http://u", "spool", "bridge");
+        cfg.upstream_authorization_passthrough = true;
+        cfg.apply_env_overrides_from(env);
+        assert_eq!(cfg.upstream_api_key_file, None);
+        assert_eq!(cfg.upstream_api_key_env, None);
+    }
+
+    #[test]
     fn builtin_config_validates_once_upstream_is_set() {
         let mut cfg = HarnessConfig::builtin().unwrap();
         assert!(cfg.validate().is_err(), "must not pass without an upstream");
@@ -765,6 +835,36 @@ mod tests {
         assert_eq!(cfg.state_backend, "memory");
         assert_eq!(cfg.embedder_backend, "hash");
         assert_eq!(cfg.vector_backend, "memory");
+    }
+
+    /// The `/v1` suffix footgun must be detected exactly: flagged when the
+    /// base URL already ends with the first chat-path segment, silent for
+    /// bare hosts, ports, and provider paths that do not overlap.
+    #[test]
+    fn duplicated_chat_path_segment_detection() {
+        let cfg = |url: &str| HarnessConfig::for_tests(url, "spool", "bridge");
+        assert_eq!(
+            cfg("https://api.openai.com/v1").duplicated_chat_path_segment(),
+            Some("v1")
+        );
+        assert_eq!(
+            cfg("https://api.openai.com/v1/").duplicated_chat_path_segment(),
+            Some("v1")
+        );
+        assert_eq!(
+            cfg("http://localhost:8080/v1").duplicated_chat_path_segment(),
+            Some("v1")
+        );
+        assert_eq!(cfg("https://api.openai.com").duplicated_chat_path_segment(), None);
+        assert_eq!(cfg("http://127.0.0.1:11434").duplicated_chat_path_segment(), None);
+        // Gemini-style base path that does not repeat the chat path.
+        let mut gemini = cfg("https://generativelanguage.googleapis.com/v1beta/openai");
+        gemini.upstream_chat_path = "/chat/completions".into();
+        assert_eq!(gemini.duplicated_chat_path_segment(), None);
+        // Azure-style custom path with a matching base suffix still flags.
+        let mut azure = cfg("https://r.openai.azure.com/openai");
+        azure.upstream_chat_path = "/openai/deployments/d/chat/completions".into();
+        assert_eq!(azure.duplicated_chat_path_segment(), Some("openai"));
     }
 
     #[test]

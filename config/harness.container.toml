@@ -7,6 +7,8 @@
 # Environment overrides (set with `docker run -e ...`):
 #   AB_UPSTREAM_URL       provider base URL (default below: Ollama on the host)
 #   AB_UPSTREAM_API_KEY   API key value; presence selects it as the key source
+#   AB_UPSTREAM_KEY_FILE  path to a mounted secret file holding the key
+#                         (Docker/Kubernetes secrets; must be mode 0600)
 #   AB_UPSTREAM_CHAT_PATH provider chat path when not /v1/chat/completions
 #   AB_LISTEN             listen address
 
