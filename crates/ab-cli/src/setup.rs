@@ -502,6 +502,15 @@ fn write_private_key_file(path: &Path, key: &str) -> Result<()> {
         .with_context(|| format!("create key file {}", path.display()))?;
     file.write_all(key.as_bytes())
         .with_context(|| format!("write key file {}", path.display()))?;
+    // Same durability posture as the server's signing-seed install: a crash
+    // right after setup must not leave the key file empty or truncated.
+    file.sync_all()
+        .with_context(|| format!("sync key file {}", path.display()))?;
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("sync key directory {}", parent.display()))?;
+    }
     Ok(())
 }
 

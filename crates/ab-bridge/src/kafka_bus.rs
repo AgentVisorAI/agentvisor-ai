@@ -164,9 +164,15 @@ impl KafkaBus {
                         Compression::NoCompression,
                     )
                     .await?;
-                Ok::<_, rskafka::client::error::Error>(offsets.first().copied().unwrap_or(0))
+                // One record in => exactly one offset out. An empty response
+                // is a broker anomaly; fabricating offset 0 here would persist
+                // a legitimate-looking ack that dedupe/recovery then trusts.
+                Ok::<_, rskafka::client::error::Error>(offsets.first().copied())
             })?
             .map_err(|e| BusError::Backend(e.to_string()))?;
+        let offset = offset.ok_or_else(|| {
+            BusError::Backend("Kafka produce succeeded but returned no offset for the record".to_owned())
+        })?;
         let offset = u64::try_from(offset)
             .map_err(|_| BusError::Backend(format!("Kafka returned negative offset {offset}")))?;
         Ok(PublishAck {
