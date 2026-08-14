@@ -1229,6 +1229,22 @@ fn sse_frame_end(buffer: &[u8]) -> Option<usize> {
     None
 }
 
+impl AbortFinalizingStream {
+    /// Fail-closed relay abort: the client connection is severed (the
+    /// status line already went out, so a clean error response is no
+    /// longer possible). Without this log the reason would vanish into
+    /// an io::Error that hyper discards — leaving "empty reply from
+    /// server" as the only symptom of e.g. an upstream returning HTML.
+    fn abort_error(&self, reason: String) -> std::io::Error {
+        tracing::warn!(
+            session = %self.session.id,
+            %reason,
+            "aborting client response; upstream reply could not be captured"
+        );
+        std::io::Error::other(reason)
+    }
+}
+
 impl Stream for AbortFinalizingStream {
     type Item = Result<Bytes, std::io::Error>;
 
@@ -1318,7 +1334,8 @@ impl Stream for AbortFinalizingStream {
                             Err(error) => {
                                 self.session.mark_capture_failed();
                                 self.pending_output.clear();
-                                return Poll::Ready(Some(Err(std::io::Error::other(error))));
+                                let error = self.abort_error(error);
+                                return Poll::Ready(Some(Err(error)));
                             }
                         };
                         self.pending_output.push_back(bytes);
@@ -1331,6 +1348,7 @@ impl Stream for AbortFinalizingStream {
                     Poll::Ready(Some(Err(error))) => {
                         self.session.mark_capture_failed();
                         self.pending_output.clear();
+                        let error = self.abort_error(error.to_string());
                         return Poll::Ready(Some(Err(error)));
                     }
                     Poll::Pending => return Poll::Pending,
@@ -1340,7 +1358,8 @@ impl Stream for AbortFinalizingStream {
                             Err(error) => {
                                 self.session.mark_capture_failed();
                                 self.pending_output.clear();
-                                return Poll::Ready(Some(Err(std::io::Error::other(error))));
+                                let error = self.abort_error(error);
+                                return Poll::Ready(Some(Err(error)));
                             }
                         };
                         if delta > 0 {
@@ -1372,11 +1391,13 @@ impl Stream for AbortFinalizingStream {
                 }
                 Err(error) => {
                     self.session.mark_capture_failed();
-                    Poll::Ready(Some(Err(std::io::Error::other(error))))
+                    let error = self.abort_error(error);
+                    Poll::Ready(Some(Err(error)))
                 }
             },
             Poll::Ready(Some(Err(error))) => {
                 self.session.mark_capture_failed();
+                let error = self.abort_error(error.to_string());
                 Poll::Ready(Some(Err(error)))
             }
             Poll::Pending => Poll::Pending,
@@ -1385,7 +1406,8 @@ impl Stream for AbortFinalizingStream {
                     Ok(delta) => delta,
                     Err(error) => {
                         self.session.mark_capture_failed();
-                        return Poll::Ready(Some(Err(std::io::Error::other(error))));
+                        let error = self.abort_error(error);
+                        return Poll::Ready(Some(Err(error)));
                     }
                 };
                 if delta > 0 {

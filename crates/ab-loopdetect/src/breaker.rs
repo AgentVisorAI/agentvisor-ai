@@ -7,7 +7,10 @@ use std::collections::VecDeque;
 
 /// Breaker tuning (config-file surface). Defaults implement the brief's rule:
 /// Δ≈0 across 3 consecutive steps while consuming N+ tokens.
+///
+/// Unknown keys are rejected so `[breaker]` typos fail loudly at startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BreakerConfig {
     /// Δ threshold: a step with `1 - cosine < delta_epsilon` counts as
     /// near-zero semantic progress.

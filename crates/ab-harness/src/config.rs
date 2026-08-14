@@ -6,7 +6,13 @@ use serde::{Deserialize, Serialize};
 pub const CONFIG_VERSION: u32 = 1;
 
 /// Top-level harness configuration.
+///
+/// Unknown keys are rejected (`deny_unknown_fields`) so a typo like
+/// `idel_timeout_s` fails loudly at startup instead of being silently
+/// ignored. Forward compatibility is handled by `config_version` gating,
+/// not by tolerating unrecognized keys.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HarnessConfig {
     /// Config format version.
     #[serde(default = "default_config_version")]
@@ -373,6 +379,7 @@ pub fn load_config() -> Result<(HarnessConfig, ConfigSource), String> {
 impl HarnessConfig {
     /// Parse from TOML, validating the version and structural sanity.
     pub fn from_toml(s: &str) -> Result<Self, String> {
+        Self::check_declared_version(s)?;
         let cfg: Self = toml::from_str(s).map_err(|e| format!("config parse: {e}"))?;
         cfg.validate()?;
         Ok(cfg)
@@ -381,7 +388,25 @@ impl HarnessConfig {
     /// Parse from TOML without validating, so environment overrides can be
     /// applied first (`main` validates after [`Self::apply_env_overrides`]).
     pub fn from_toml_unvalidated(s: &str) -> Result<Self, String> {
+        Self::check_declared_version(s)?;
         toml::from_str(s).map_err(|e| format!("config parse: {e}"))
+    }
+
+    /// Pre-pass on the loosely-parsed document so a config written for a
+    /// newer format version reports "unsupported config_version N" instead
+    /// of tripping the strict unknown-field rejection on whatever new key
+    /// appears first.
+    fn check_declared_version(s: &str) -> Result<(), String> {
+        let loose: toml::Value = toml::from_str(s).map_err(|e| format!("config parse: {e}"))?;
+        if let Some(version) = loose.get("config_version") {
+            let declared = version.as_integer().unwrap_or(-1);
+            if declared != i64::from(CONFIG_VERSION) {
+                return Err(format!(
+                    "unsupported config_version {version} (this build supports {CONFIG_VERSION})",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// A config of pure built-in defaults for zero-config startup. The
@@ -718,6 +743,18 @@ mod tests {
         assert!(!cfg.upstream_authorization_passthrough);
     }
 
+    /// A typo'd key must fail loudly (naming the offender) instead of being
+    /// silently ignored; `config_version` handles forward compatibility.
+    #[test]
+    fn unknown_config_key_is_rejected_with_its_name() {
+        let err = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api.openai.com"
+               idel_timeout_s = 10"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("idel_timeout_s"), "error must name the key: {err}");
+    }
+
     /// The auth surface must reject every ambiguous or unsafe combination
     /// loudly at startup instead of picking one silently.
     #[test]
@@ -917,14 +954,18 @@ mod tests {
         .is_err());
     }
 
+    /// A config from a newer format version must be refused by its declared
+    /// `config_version` — not by whichever unknown key the strict parser
+    /// happens to trip on first.
     #[test]
-    fn unknown_fields_tolerated_inbound() {
-        // Older harnesses must boot with configs written for newer versions
-        // that only add fields.
-        let cfg = HarnessConfig::from_toml(
-            r#"upstream_url = "https://api"
+    fn future_version_config_reports_version_not_unknown_field() {
+        let err = HarnessConfig::from_toml(
+            r#"config_version = 2
+               upstream_url = "https://api"
                future_option_from_v2 = true"#,
-        );
-        assert!(cfg.is_ok(), "{cfg:?}");
+        )
+        .unwrap_err();
+        assert!(err.contains("unsupported config_version 2"), "{err}");
+        assert!(!err.contains("future_option_from_v2"), "{err}");
     }
 }

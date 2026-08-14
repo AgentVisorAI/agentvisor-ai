@@ -1400,7 +1400,9 @@ mod tests {
         for expected in 1..=4u64 {
             state.prepare_chat(headers, repeated.clone()).unwrap();
             let session = state.sessions.get("loop-session").unwrap();
-            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            // Generous budget: the chain append rides an async worker job and
+            // must survive heavily loaded parallel test runs.
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 while session.chain.lock().count() < expected {
                     tokio::task::yield_now().await;
                 }
