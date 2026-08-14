@@ -538,6 +538,7 @@ impl AppState {
         };
         self.observe_stage("compression", stage);
 
+        let stage = Instant::now();
         let text = last_message_text(&compression.payload);
         let atif = match atif_capture_from_request(&compression.payload) {
             Ok(atif) => atif,
@@ -583,7 +584,7 @@ impl AppState {
             }),
         };
         worker_permit.submit(job);
-        self.observe_stage("dispatch", total_started);
+        self.observe_stage("dispatch", stage);
         let lease = SessionLease::new(Arc::clone(&session));
         drop(admission);
 
@@ -641,26 +642,56 @@ impl AppState {
         }
         let state = self.clone();
         let headers = headers.clone();
-        let prepared = tokio::task::spawn_blocking(move || state.prepare_chat(&headers, payload))
+        let mut prepared = tokio::task::spawn_blocking(move || state.prepare_chat(&headers, payload))
             .await
             .map_err(|error| PipelineError::Unavailable(error.to_string()))??;
         prepared.session.wait_for_worker_jobs().await;
         if prepared.session.capture_failed() {
-            return Err(PipelineError::Unavailable(
+            let error = PipelineError::Unavailable(
                 "request audit capture failed before provider dispatch".to_owned(),
-            ));
+            );
+            self.abandon_prepared(&mut prepared, StopReason::Other, &error.to_string());
+            return Err(error);
         }
         if prepared.session.loop_state.state() == BreakerState::Open {
-            return match prepared.session.loop_state.action() {
-                BreakerAction::Abort => Err(PipelineError::Abort(
+            let error = match prepared.session.loop_state.action() {
+                BreakerAction::Abort => PipelineError::Abort(
                     "semantic loop circuit breaker opened during audit".to_owned(),
-                )),
-                _ => Err(PipelineError::Blocked(
+                ),
+                _ => PipelineError::Blocked(
                     "semantic loop circuit breaker opened during audit; retry required".to_owned(),
-                )),
+                ),
             };
+            self.abandon_prepared(&mut prepared, StopReason::LoopDetected, &error.to_string());
+            return Err(error);
         }
         Ok(prepared)
+    }
+
+    /// Close out a prepared request that will never reach `forward_chat`.
+    ///
+    /// `prepare_chat` journals a non-terminal [`crate::worker::ResponseAttempt`]
+    /// with its admission record; the matching terminal record normally comes
+    /// from `forward_chat`'s failure path or the response relay. A caller that
+    /// abandons the request after admission must submit the terminal failure
+    /// record itself — otherwise the journal ends with a dangling non-terminal
+    /// attempt and a later crash-recovery scan quarantines the whole session
+    /// over a request the client already saw fail.
+    fn abandon_prepared(&self, prepared: &mut PreparedRequest, stop_reason: StopReason, reason: &str) {
+        let Some(permit) = prepared.response_permit.take() else {
+            return;
+        };
+        let mut job = self.failure_job(
+            Arc::clone(&prepared.session),
+            prepared.identity.clone(),
+            stop_reason,
+            reason.to_owned(),
+        );
+        job.response_attempt = Some(crate::worker::ResponseAttempt {
+            id: prepared.response_attempt_id.clone(),
+            terminal: true,
+        });
+        permit.submit(job);
     }
 
     /// Forward a prepared OpenAI-compatible request to the configured provider.
@@ -738,6 +769,21 @@ impl AppState {
     /// Intercept one MCP JSON-RPC tool call, emit its OCSF verdict
     /// asynchronously, and return the immediate authorization decision.
     pub fn intercept_tool(&self, headers: &HeaderMap, raw: &[u8]) -> Result<ToolVerdict, PipelineError> {
+        self.intercept_tool_with_session(headers, raw)
+            .map(|(verdict, _session)| verdict)
+    }
+
+    /// Core of [`Self::intercept_tool`] that also returns the bound session.
+    ///
+    /// Callers that must await audit durability need the same session the
+    /// verdict was recorded under: re-deriving it from headers would mint a
+    /// fresh random id for a header-less request (see [`session_id`]) and
+    /// look up a session that does not exist.
+    fn intercept_tool_with_session(
+        &self,
+        headers: &HeaderMap,
+        raw: &[u8],
+    ) -> Result<(ToolVerdict, Arc<Session>), PipelineError> {
         let session_id = session_id(headers)?;
         let workflow = workflow(headers, &self.config.default_workflow)?;
         let parsed_call = ab_sandbox::parse_tool_call(raw).ok();
@@ -877,7 +923,7 @@ impl AppState {
             response_attempt: None,
         });
         drop(admission);
-        Ok(verdict)
+        Ok((verdict, session))
     }
 
     /// Authorize a tool call and wait for its verdict event to become durable.
@@ -889,14 +935,10 @@ impl AppState {
         let state = self.clone();
         let owned_headers = headers.clone();
         let raw = raw.to_vec();
-        let verdict = tokio::task::spawn_blocking(move || state.intercept_tool(&owned_headers, &raw))
-            .await
-            .map_err(|error| PipelineError::Unavailable(error.to_string()))??;
-        let id = session_id(headers)?;
-        let session = self
-            .sessions
-            .get(&id)
-            .ok_or_else(|| PipelineError::Unavailable("tool session disappeared".to_owned()))?;
+        let (verdict, session) =
+            tokio::task::spawn_blocking(move || state.intercept_tool_with_session(&owned_headers, &raw))
+                .await
+                .map_err(|error| PipelineError::Unavailable(error.to_string()))??;
         session.wait_for_worker_jobs().await;
         if session.capture_failed() {
             return Err(PipelineError::Unavailable(
@@ -1585,6 +1627,107 @@ mod tests {
         signed.insert(SESSION_HEADER, HeaderValue::from_static("signed-write"));
         signed.insert(WORKFLOW_HEADER, HeaderValue::from_static("signed"));
         assert!(state.intercept_tool(&signed, &raw).unwrap().is_allowed());
+    }
+
+    /// `intercept_tool_durable` used to re-derive the session id from headers
+    /// AFTER the verdict. For a header-less request `session_id()` mints a
+    /// fresh random id on every call, so the post-verdict lookup targeted a
+    /// session that never existed and the call always failed with "tool
+    /// session disappeared" — after the verdict had already been computed and
+    /// audited under the real (generated) session.
+    #[tokio::test]
+    async fn intercept_tool_durable_works_without_a_session_header() {
+        let config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        let state = state(config);
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "safe_tool", "arguments": {}}
+        }))
+        .unwrap();
+        let verdict = state.intercept_tool_durable(&HeaderMap::new(), &raw).await.unwrap();
+        assert!(
+            verdict.is_allowed(),
+            "durable interception must await the verdict's own session, not a re-derived id",
+        );
+    }
+
+    /// When `prepare_chat_durable` refuses a request AFTER admission (the
+    /// request's own loop analysis opened the breaker during the audit wait),
+    /// it must submit the terminal failure record for the response attempt
+    /// journaled at admission. Otherwise the active journal ends with a
+    /// dangling non-terminal attempt and a later crash-recovery scan
+    /// quarantines the session over a request the client already saw fail.
+    #[tokio::test]
+    async fn durable_breaker_refusal_journals_a_terminal_response_attempt() {
+        let mut config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        config.breaker.min_tokens = 0;
+        let state = state(config);
+        let mut headers = HeaderMap::new();
+        headers.insert(SESSION_HEADER, HeaderValue::from_static("durable-loop"));
+        headers.insert(WORKFLOW_HEADER, HeaderValue::from_static("signed"));
+        let repeated = serde_json::json!({
+            "model": "test",
+            "messages": [{
+                "role": "assistant",
+                "content": "I should check the database again for pending orders"
+            }],
+        });
+        // Attempts the test itself abandons after a successful prepare: they
+        // are expected to stay non-terminal because no forward happens here.
+        let mut abandoned_by_test = std::collections::HashSet::new();
+        let mut refusal = None;
+        for _ in 0..8 {
+            match state.prepare_chat_durable(&headers, repeated.clone()).await {
+                Ok(prepared) => {
+                    abandoned_by_test.insert(prepared.response_attempt_id.clone());
+                }
+                Err(error) => {
+                    refusal = Some(error);
+                    break;
+                }
+            }
+        }
+        assert!(
+            matches!(refusal, Some(PipelineError::Blocked(_))),
+            "the breaker must refuse during the audit wait, got {refusal:?}",
+        );
+        assert!(!abandoned_by_test.is_empty(), "at least one prepare must succeed first");
+        let session = state.sessions.get("durable-loop").unwrap();
+        session.wait_for_worker_jobs().await;
+
+        let digest = ab_core::digest::sha256_hex("durable-loop".as_bytes());
+        let stem = digest.get(..32).unwrap();
+        let journal_path =
+            std::path::Path::new(&state.config.atif_spool_dir).join(format!("{stem}.events.ndjson"));
+        let journal = std::fs::read_to_string(&journal_path).unwrap();
+        let mut dangling = std::collections::HashSet::new();
+        for (index, line) in journal.lines().enumerate() {
+            let record: crate::worker::ActiveJournalRecord = crate::journal::open(
+                &state.journal_key,
+                "durable-loop:active",
+                index as u64,
+                line.as_bytes(),
+            )
+            .unwrap();
+            if let Some(attempt) = record.response_attempt {
+                if attempt.terminal {
+                    assert!(
+                        dangling.remove(&attempt.id),
+                        "terminal record for attempt {} has no admission record",
+                        attempt.id,
+                    );
+                } else {
+                    dangling.insert(attempt.id);
+                }
+            }
+        }
+        assert_eq!(
+            dangling, abandoned_by_test,
+            "the refused request's response attempt must be terminated in the journal; \
+             only attempts the test itself dropped may remain open",
+        );
     }
 
     /// A session that only routes MCP tool calls (no chat completions) must

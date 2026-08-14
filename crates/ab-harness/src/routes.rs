@@ -181,7 +181,10 @@ async fn chat_completions(
     *response.status_mut() = status;
     for (name, value) in &upstream_headers {
         if is_forwardable_upstream_header(name) {
-            response.headers_mut().insert(name.clone(), value.clone());
+            // `append`, not `insert`: iterating a HeaderMap repeats the name
+            // for each value of a multi-valued header, and `insert` would
+            // keep only the last one.
+            response.headers_mut().append(name.clone(), value.clone());
         }
     }
     if let Ok(value) = HeaderValue::from_str(&session_id) {
@@ -672,8 +675,12 @@ impl ToolExecution {
         let session_id = headers
             .get(crate::pipeline::SESSION_HEADER)
             .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| crate::pipeline::PipelineError::BadRequest("missing x-ab-session".to_owned()))?
-            .to_owned();
+            .ok_or_else(|| crate::pipeline::PipelineError::BadRequest("missing x-ab-session".to_owned()))?;
+        // Same validation as the pipeline's `session_id`: an id the intercept
+        // path would reject must not key a tool-execution intent either.
+        let session_id = ab_core::SessionId::parse(session_id)
+            .map(|id| id.to_string())
+            .map_err(|error| crate::pipeline::PipelineError::BadRequest(error.to_string()))?;
         let call = ab_sandbox::parse_tool_call(body)
             .map_err(|error| crate::pipeline::PipelineError::BadRequest(error.to_string()))?;
         let id = call.id.ok_or_else(|| {
