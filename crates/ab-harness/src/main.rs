@@ -20,15 +20,8 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "otel"))]
     init_tracing()?;
 
-    let config_path = std::env::var_os("AB_CONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("config/harness.example.toml"));
-    let config_text = std::fs::read_to_string(&config_path)
-        .with_context(|| format!("read harness config {}", config_path.display()))?;
-    let config = HarnessConfig::from_toml(&config_text).map_err(anyhow::Error::msg)?;
-    let manifest_text = std::fs::read_to_string(&config.bridge_manifest_path)
-        .with_context(|| format!("read Bridge manifest {}", config.bridge_manifest_path))?;
-    let manifest = BridgeManifest::from_yaml(&manifest_text).map_err(anyhow::Error::new)?;
+    let (config, config_source) = ab_harness::config::load_config().map_err(anyhow::Error::msg)?;
+    let manifest = load_manifest(&config)?;
     let bridge = build_bridge(&config, &manifest)?;
 
     let sandbox = load_sandbox(&config)?;
@@ -76,7 +69,16 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("bind {}", config.listen))?;
-    tracing::info!(listen = %config.listen, "AgentBridge started");
+    tracing::info!(
+        listen = %config.listen,
+        config = %config_source,
+        upstream = %format!("{}{}", config.upstream_url.trim_end_matches('/'), config.upstream_chat_path),
+        upstream_auth = %ab_harness::pipeline::describe_upstream_auth(&config),
+        bridge = %config.bridge_backend,
+        state = %config.state_backend,
+        identity = if config.require_identity { "required" } else { "optional" },
+        "AgentBridge started"
+    );
     let (shutdown_started_tx, shutdown_started_rx) = tokio::sync::oneshot::channel();
     let server = std::future::IntoFuture::into_future(
         axum::serve(listener, build_router(state.clone())).with_graceful_shutdown(async {
@@ -245,31 +247,69 @@ fn init_tracing() -> Result<Option<opentelemetry_sdk::trace::SdkTracerProvider>>
 fn load_sandbox(config: &HarnessConfig) -> Result<Sandbox> {
     let mut schemas = std::collections::HashMap::new();
     if let Some(directory) = config.tool_schema_dir.as_deref() {
-        let entries = std::fs::read_dir(directory)
-            .with_context(|| format!("read tool schema directory {directory}"))?;
-        for entry in entries {
-            let path = entry?.path();
-            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
-                continue;
+        // Zero-config: the *default* schema directory may simply not exist
+        // (fresh install, empty working dir). That is fine — the sandbox
+        // stays fail-closed and rejects tool calls until schemas are added.
+        // An explicitly configured directory must exist: a typo silently
+        // disabling every schema would be a policy bypass.
+        let is_default_dir = config.uses_default_tool_schema_dir();
+        match std::fs::read_dir(directory) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && is_default_dir => {
+                tracing::warn!(
+                    directory,
+                    "default tool schema directory not found; tool calls will be rejected until schemas are added"
+                );
             }
-            let tool = path
-                .file_stem()
-                .and_then(std::ffi::OsStr::to_str)
-                .filter(|name| !name.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("invalid tool schema filename {}", path.display()))?;
-            let schema: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(&path).with_context(|| format!("read tool schema {}", path.display()))?,
-            )
-            .with_context(|| format!("parse tool schema {}", path.display()))?;
-            schemas.insert(tool.to_owned(), schema);
+            Err(error) => {
+                return Err(error).with_context(|| format!("read tool schema directory {directory}"));
+            }
+            Ok(entries) => {
+                for entry in entries {
+                    let path = entry?.path();
+                    if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
+                        continue;
+                    }
+                    let tool = path
+                        .file_stem()
+                        .and_then(std::ffi::OsStr::to_str)
+                        .filter(|name| !name.is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("invalid tool schema filename {}", path.display()))?;
+                    let schema: serde_json::Value = serde_json::from_slice(
+                        &std::fs::read(&path)
+                            .with_context(|| format!("read tool schema {}", path.display()))?,
+                    )
+                    .with_context(|| format!("parse tool schema {}", path.display()))?;
+                    schemas.insert(tool.to_owned(), schema);
+                }
+            }
         }
     }
     if config.require_tool_schema && schemas.is_empty() {
-        anyhow::bail!("require_tool_schema=true but no tool schemas were loaded");
+        // Only a hard error when tool forwarding is actually in use:
+        // without a tool upstream no /v1/mcp call can be forwarded anyway,
+        // and the sandbox rejects everything unmatched (fail-closed).
+        if config.tool_upstream_url.is_some() {
+            anyhow::bail!(
+                "require_tool_schema=true and tool_upstream_url is set, but no tool schemas were loaded from {:?}",
+                config.tool_schema_dir
+            );
+        }
+        tracing::warn!("no tool schemas loaded; every tool call will be rejected (fail-closed)");
     }
     let mut policies: Vec<Box<dyn PolicyEngine>> = Vec::new();
     for path in &config.wasm_policy_paths {
-        let bytes = std::fs::read(path).with_context(|| format!("read WASM policy {path}"))?;
+        // Zero-config: fall back to the embedded copy of the default
+        // payload-limit policy when the default path is absent on disk.
+        // Explicitly configured paths must exist (typo = hard error).
+        let is_default_policy = HarnessConfig::is_default_policy_path(path);
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && is_default_policy => {
+                tracing::info!(path, "policy file not found; using embedded built-in copy");
+                BUILTIN_POLICY_WAT.as_bytes().to_vec()
+            }
+            Err(error) => return Err(error).with_context(|| format!("read WASM policy {path}")),
+        };
         policies.push(Box::new(
             WasmPolicy::from_bytes(path, &bytes).map_err(anyhow::Error::msg)?,
         ));
@@ -284,6 +324,66 @@ fn load_sandbox(config: &HarnessConfig) -> Result<Sandbox> {
         policies,
     )
     .map_err(anyhow::Error::msg)
+}
+
+/// Embedded copy of the default payload-limit policy, compiled into the
+/// binary so `cargo install agent-bridge && agent-bridge` works from an
+/// empty directory. Kept in sync with the repo file by `include_str!`.
+const BUILTIN_POLICY_WAT: &str = include_str!("../../../config/policies/payload_limit.wat");
+
+/// Built-in Bridge manifest for zero-config startup. Hot-only retention
+/// (no `cold_uri`: cold export needs the `cold-store` feature and an
+/// operator-chosen destination) and single-partition topics suitable for
+/// a local trial. The OCSF schema reference resolves to the copy embedded
+/// in `ab-bridge`, so no file is needed on disk.
+const BUILTIN_MANIFEST_YAML: &str = r#"
+manifest_version: 1
+name: agent-bridge-builtin
+replication_factor: 1
+topics:
+  - name: agent.tool_call
+    partitions: 1
+    retention: { hot_hours: 168 }
+    schema_ref: schemas/ocsf-agent-event.schema.json
+  - name: agent.stop_reason
+    partitions: 1
+    retention: { hot_hours: 168 }
+    schema_ref: schemas/ocsf-agent-event.schema.json
+  - name: agent.receipt
+    partitions: 1
+    retention: { hot_hours: 168 }
+    schema_ref: schemas/ocsf-agent-event.schema.json
+  - name: agent.compression
+    partitions: 1
+    retention: { hot_hours: 168 }
+    schema_ref: schemas/ocsf-agent-event.schema.json
+  - name: agent.identity
+    partitions: 1
+    retention: { hot_hours: 168 }
+    schema_ref: schemas/ocsf-agent-event.schema.json
+  - name: agent.session
+    partitions: 1
+    retention: { hot_hours: 168 }
+    schema_ref: schemas/ocsf-agent-event.schema.json
+"#;
+
+/// Load the Bridge manifest, falling back to the embedded built-in when
+/// the *default* path is absent (zero-config). An explicitly configured
+/// path that is missing stays a hard error.
+fn load_manifest(config: &HarnessConfig) -> Result<BridgeManifest> {
+    match std::fs::read_to_string(&config.bridge_manifest_path) {
+        Ok(text) => BridgeManifest::from_yaml(&text).map_err(anyhow::Error::new),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && config.uses_default_manifest_path() => {
+            tracing::info!(
+                path = %config.bridge_manifest_path,
+                "Bridge manifest not found; using embedded built-in manifest"
+            );
+            BridgeManifest::from_yaml(BUILTIN_MANIFEST_YAML).map_err(anyhow::Error::new)
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("read Bridge manifest {}", config.bridge_manifest_path))
+        }
+    }
 }
 
 fn spawn_bridge_maintenance(

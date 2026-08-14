@@ -13,7 +13,7 @@ use ab_loopdetect::{BreakerAction, BreakerState, Embedder, HashEmbedder, NoopVec
 use ab_receipts::Signer;
 use ab_sandbox::{Sandbox, ToolVerdict};
 use ab_state::{ActionBudget, BudgetDecision, StateStore};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Instant;
@@ -55,9 +55,167 @@ pub struct AppState {
     pub metrics: Arc<Registry>,
     /// Reused upstream HTTP client.
     pub client: reqwest::Client,
+    /// Static credential injected into every chat-completions forward
+    /// (resolved once at startup; value is marked sensitive).
+    pub(crate) upstream_auth: Option<(HeaderName, HeaderValue)>,
+    /// Bearer credential injected into every tool-upstream forward.
+    pub(crate) tool_auth: Option<HeaderValue>,
     /// Asynchronous session close and promotion service.
     pub finalizer: Finalizer,
     pub(crate) journal_key: [u8; 32],
+}
+
+/// How the harness authenticates to the chat upstream, for startup logs
+/// and `abctl doctor` — never contains key material.
+pub fn describe_upstream_auth(config: &HarnessConfig) -> String {
+    if config.upstream_authorization_passthrough {
+        "passthrough(client Authorization)".to_owned()
+    } else if let Some(env) = config.upstream_api_key_env.as_deref() {
+        format!("api-key from ${env} in header {:?}", config.upstream_auth_header)
+    } else if let Some(file) = config.upstream_api_key_file.as_deref() {
+        format!(
+            "api-key from file {file} in header {:?}",
+            config.upstream_auth_header
+        )
+    } else {
+        "none".to_owned()
+    }
+}
+
+/// Resolve the configured upstream credential into a ready header pair.
+///
+/// Key material is accepted only from an environment variable or an
+/// owner-only file — never from TOML or argv — and the resulting header
+/// value is marked sensitive so `Debug` output redacts it.
+pub(crate) fn resolve_upstream_auth(
+    config: &HarnessConfig,
+) -> Result<Option<(HeaderName, HeaderValue)>, PipelineError> {
+    let key = match read_secret(
+        config.upstream_api_key_env.as_deref(),
+        config.upstream_api_key_file.as_deref(),
+        "upstream API key",
+    )? {
+        Some(key) => key,
+        None => return Ok(None),
+    };
+    let name = HeaderName::try_from(config.upstream_auth_header.as_str()).map_err(|_| {
+        PipelineError::Upstream(format!(
+            "upstream_auth_header {:?} is not a valid header name",
+            config.upstream_auth_header
+        ))
+    })?;
+    let rendered = if config.upstream_auth_scheme.is_empty() {
+        key
+    } else {
+        format!("{} {key}", config.upstream_auth_scheme)
+    };
+    let mut value = HeaderValue::from_str(&rendered).map_err(|_| {
+        PipelineError::Upstream(
+            "upstream API key contains bytes that cannot appear in an HTTP header".to_owned(),
+        )
+    })?;
+    value.set_sensitive(true);
+    Ok(Some((name, value)))
+}
+
+/// Resolve the optional tool-upstream bearer token.
+pub(crate) fn resolve_tool_auth(config: &HarnessConfig) -> Result<Option<HeaderValue>, PipelineError> {
+    let token = match read_secret(
+        config.tool_upstream_bearer_env.as_deref(),
+        config.tool_upstream_bearer_file.as_deref(),
+        "tool upstream bearer token",
+    )? {
+        Some(token) => token,
+        None => return Ok(None),
+    };
+    let mut value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
+        PipelineError::Upstream(
+            "tool upstream bearer token contains bytes that cannot appear in an HTTP header".to_owned(),
+        )
+    })?;
+    value.set_sensitive(true);
+    Ok(Some(value))
+}
+
+/// Read a secret from an env var or an owner-only file, trimming trailing
+/// whitespace. A configured-but-missing source is a loud startup error:
+/// silently proxying unauthenticated would produce baffling upstream 401s.
+fn read_secret(
+    env_name: Option<&str>,
+    file_path: Option<&str>,
+    what: &str,
+) -> Result<Option<String>, PipelineError> {
+    read_secret_from(|name| std::env::var(name).ok(), env_name, file_path, what)
+}
+
+/// Testable core of [`read_secret`] with an injected environment.
+fn read_secret_from(
+    get_env: impl Fn(&str) -> Option<String>,
+    env_name: Option<&str>,
+    file_path: Option<&str>,
+    what: &str,
+) -> Result<Option<String>, PipelineError> {
+    if let Some(name) = env_name {
+        let value = get_env(name).ok_or_else(|| {
+            PipelineError::Upstream(format!(
+                "{what}: environment variable {name} is not set (export it or update the config)"
+            ))
+        })?;
+        let value = value.trim().to_owned();
+        if value.is_empty() {
+            return Err(PipelineError::Upstream(format!(
+                "{what}: environment variable {name} is set but empty"
+            )));
+        }
+        return Ok(Some(value));
+    }
+    if let Some(path) = file_path {
+        require_owner_only_secret(std::path::Path::new(path))
+            .map_err(|error| PipelineError::Upstream(format!("{what}: {error}")))?;
+        let value = std::fs::read_to_string(path)
+            .map_err(|error| PipelineError::Upstream(format!("{what}: read {path}: {error}")))?;
+        let value = value.trim().to_owned();
+        if value.is_empty() {
+            return Err(PipelineError::Upstream(format!("{what}: file {path} is empty")));
+        }
+        return Ok(Some(value));
+    }
+    Ok(None)
+}
+
+/// Same posture as the signing-seed loader: refuse symlinks (a pre-planted
+/// link would fool the mode check, CWE-59) and group/other-readable modes
+/// on Unix. Windows deployments rely on operator-set ACLs.
+fn require_owner_only_secret(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("stat secret file {}: {error}", path.display()))?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            return Err(format!(
+                "secret file {} is a symbolic link; refusing to follow",
+                path.display()
+            ));
+        }
+        if !file_type.is_file() {
+            return Err(format!("secret file {} is not a regular file", path.display()));
+        }
+        let mode = metadata.mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "secret file {} has mode 0o{mode:03o}; must be owner-only (chmod 600 {})",
+                path.display(),
+                path.display()
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 /// A request after all local hot-path gates have passed.
@@ -73,6 +231,8 @@ pub struct PreparedRequest {
     lease: SessionLease,
     response_permit: Option<WorkerPermit>,
     response_attempt_id: String,
+    /// Client `Authorization` header captured for passthrough mode only.
+    client_authorization: Option<HeaderValue>,
 }
 
 /// Provider response paired with its active session lease.
@@ -232,6 +392,8 @@ impl AppState {
         let client = client_builder
             .build()
             .map_err(|error| PipelineError::Upstream(error.to_string()))?;
+        let upstream_auth = resolve_upstream_auth(&config)?;
+        let tool_auth = resolve_tool_auth(&config)?;
         Ok(Self {
             config,
             store,
@@ -242,6 +404,8 @@ impl AppState {
             identity,
             metrics,
             client,
+            upstream_auth,
+            tool_auth,
             finalizer,
             journal_key,
         })
@@ -428,6 +592,11 @@ impl AppState {
             lease,
             response_permit: Some(response_permit),
             response_attempt_id,
+            client_authorization: if self.config.upstream_authorization_passthrough {
+                headers.get(axum::http::header::AUTHORIZATION).cloned()
+            } else {
+                None
+            },
         })
     }
 
@@ -500,11 +669,13 @@ impl AppState {
             lease,
             response_permit,
             response_attempt_id,
+            client_authorization,
             ..
         } = request;
         let url = format!(
-            "{}/v1/chat/completions",
-            self.config.upstream_url.trim_end_matches('/')
+            "{}{}",
+            self.config.upstream_url.trim_end_matches('/'),
+            self.config.upstream_chat_path
         );
         let request_digest =
             ab_core::digest::sha256_hex(serde_json::to_vec(&payload).unwrap_or_default().as_slice());
@@ -519,7 +690,16 @@ impl AppState {
             tracing::warn!(%error, session = %session.id, "could not write in-flight response marker");
         })
         .ok();
-        match self.client.post(url).json(&payload).send().await {
+        let mut upstream_request = self.client.post(url).json(&payload);
+        if let Some((name, value)) = &self.upstream_auth {
+            upstream_request = upstream_request.header(name.clone(), value.clone());
+        } else if let Some(authorization) = client_authorization {
+            // Passthrough mode: the client's own credential travels to the
+            // upstream. `validate()` guarantees this is mutually exclusive
+            // with static keys and with NHI identity enforcement.
+            upstream_request = upstream_request.header(reqwest::header::AUTHORIZATION, authorization);
+        }
+        match upstream_request.send().await {
             Ok(response) => Ok(ForwardedResponse {
                 response,
                 lease,
@@ -1826,5 +2006,102 @@ mod tests {
             *classifications.iter().next().unwrap(),
             "server-side misconfig should classify distinctly for operator dashboards"
         );
+    }
+
+    /// The secret reader must fail loudly on missing/empty sources and
+    /// trim whitespace — silent unauthenticated proxying is the worst
+    /// failure mode because the operator sees only upstream 401s.
+    #[test]
+    fn read_secret_source_handling() {
+        let env = |name: &str| -> Option<String> {
+            match name {
+                "GOOD_KEY" => Some("sk-live-123\n".into()),
+                "EMPTY_KEY" => Some("   ".into()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            super::read_secret_from(env, Some("GOOD_KEY"), None, "upstream API key")
+                .unwrap()
+                .as_deref(),
+            Some("sk-live-123"),
+            "value must be trimmed"
+        );
+        assert!(super::read_secret_from(env, Some("MISSING_KEY"), None, "upstream API key").is_err());
+        assert!(super::read_secret_from(env, Some("EMPTY_KEY"), None, "upstream API key").is_err());
+        assert!(super::read_secret_from(env, None, None, "upstream API key")
+            .unwrap()
+            .is_none());
+
+        // File source: owner-only accepted (with trim), world-readable refused.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        std::fs::write(&path, "sk-file-456\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let error = super::read_secret_from(env, None, path.to_str(), "upstream API key").unwrap_err();
+            assert!(error.to_string().contains("must be owner-only"), "{error}");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(
+            super::read_secret_from(env, None, path.to_str(), "upstream API key")
+                .unwrap()
+                .as_deref(),
+            Some("sk-file-456")
+        );
+        // Missing file is a hard error, not silent None.
+        assert!(
+            super::read_secret_from(env, None, dir.path().join("absent").to_str(), "upstream API key")
+                .is_err()
+        );
+    }
+
+    /// Auth resolution renders scheme-prefixed and raw header values,
+    /// marks them sensitive, and never leaks the key through `describe`.
+    #[test]
+    fn upstream_auth_resolution_and_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("azure.key");
+        std::fs::write(&key_path, "azure-raw-key").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        // Bearer scheme.
+        let mut config = HarnessConfig::for_tests("http://up", "spool", "bridge");
+        config.upstream_api_key_file = Some(key_path.to_string_lossy().into_owned());
+        let (name, value) = super::resolve_upstream_auth(&config).unwrap().unwrap();
+        assert_eq!(name.as_str(), "authorization");
+        assert_eq!(value.to_str().unwrap(), "Bearer azure-raw-key");
+        assert!(value.is_sensitive(), "credential must redact in Debug output");
+
+        // Raw scheme (Azure api-key style).
+        config.upstream_auth_header = "api-key".into();
+        config.upstream_auth_scheme = String::new();
+        let (name, value) = super::resolve_upstream_auth(&config).unwrap().unwrap();
+        assert_eq!(name.as_str(), "api-key");
+        assert_eq!(value.to_str().unwrap(), "azure-raw-key");
+
+        // Description names the source but never the value.
+        let described = super::describe_upstream_auth(&config);
+        assert!(described.contains("api-key from file"), "{described}");
+        assert!(!described.contains("azure-raw-key"), "{described}");
+
+        // No auth configured resolves to None and describes as none.
+        let bare = HarnessConfig::for_tests("http://up", "spool", "bridge");
+        assert!(super::resolve_upstream_auth(&bare).unwrap().is_none());
+        assert_eq!(super::describe_upstream_auth(&bare), "none");
+
+        // Tool bearer renders Bearer form from a file source.
+        let mut tooling = HarnessConfig::for_tests("http://up", "spool", "bridge");
+        tooling.tool_upstream_url = Some("http://tools/mcp".into());
+        tooling.tool_upstream_bearer_file = Some(key_path.to_string_lossy().into_owned());
+        let bearer = super::resolve_tool_auth(&tooling).unwrap().unwrap();
+        assert_eq!(bearer.to_str().unwrap(), "Bearer azure-raw-key");
+        assert!(bearer.is_sensitive());
     }
 }

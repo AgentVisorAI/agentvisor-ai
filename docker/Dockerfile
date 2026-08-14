@@ -19,6 +19,7 @@ COPY --from=build --chown=65532:65532 /tmp/models /app/models
 COPY --from=build --chown=65532:65532 /tmp/runtime-root/ /app/
 COPY --chown=65532:65532 schemas ./schemas
 COPY --chown=65532:65532 config/harness.docker.toml ./config/harness.docker.toml
+COPY --chown=65532:65532 config/harness.container.toml ./config/harness.container.toml
 COPY --chown=65532:65532 config/policies ./config/policies
 COPY --chown=65532:65532 config/tool-schemas ./config/tool-schemas
 COPY --chown=65532:65532 manifests ./manifests

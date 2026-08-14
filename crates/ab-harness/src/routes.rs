@@ -323,14 +323,15 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                 if let Err(error) = execution.claim().await {
                     return (StatusCode::CONFLICT, Json(json!({"error": error}))).into_response();
                 }
-                match state
+                let mut tool_request = state
                     .client
                     .post(url)
                     .header(axum::http::header::CONTENT_TYPE, "application/json")
-                    .body(body)
-                    .send()
-                    .await
-                {
+                    .body(body);
+                if let Some(bearer) = &state.tool_auth {
+                    tool_request = tool_request.header(axum::http::header::AUTHORIZATION, bearer.clone());
+                }
+                match tool_request.send().await {
                     Ok(upstream) => {
                         let status = upstream.status();
                         match read_limited_tool_response(upstream).await {
@@ -2387,6 +2388,186 @@ mod tests {
             .unwrap();
         assert_eq!(changed_request.status(), StatusCode::CONFLICT);
         assert_eq!(calls.load(std::sync::atomic::Ordering::Acquire), 1);
+        tool_server.abort();
+        provider.abort();
+    }
+
+    /// End-to-end proof that a configured upstream API key is injected on
+    /// the upstream wire: a capturing mock provider records the header the
+    /// harness actually sent for both Bearer and Azure raw-key styles, and
+    /// the passthrough mode relays the client's own Authorization header.
+    #[tokio::test]
+    async fn upstream_auth_header_reaches_provider_wire() {
+        type Captured = Arc<parking_lot::Mutex<Vec<(Option<String>, Option<String>)>>>;
+        async fn capture_chat(
+            State(captured): State<Captured>,
+            headers: HeaderMap,
+            Json(_): Json<Value>,
+        ) -> Response {
+            captured.lock().push((
+                headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned),
+                headers
+                    .get("api-key")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned),
+            ));
+            Json(json!({"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1}}))
+                .into_response()
+        }
+        let captured: Captured = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider_router = Router::new()
+            .route("/v1/chat/completions", post(capture_chat))
+            .route("/openai/deployments/d1/chat/completions", post(capture_chat))
+            .with_state(Arc::clone(&captured));
+        let provider = tokio::spawn(async move {
+            axum::serve(listener, provider_router).await.unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let key_path = directory.path().join("upstream.key");
+        std::fs::write(&key_path, "sk-wire-test\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let spool = directory.path().to_string_lossy();
+        let build_state = |config: crate::config::HarnessConfig| {
+            AppState::new(
+                config,
+                Arc::new(InMemoryStore::new()),
+                Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
+                Arc::new(NullBus),
+                None,
+                Arc::new(Ed25519Signer::from_seed([12; 32])),
+            )
+            .unwrap()
+        };
+        let send_chat = |state: AppState, authorization: Option<&'static str>| async move {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header("x-ab-session", "auth-wire");
+            if let Some(value) = authorization {
+                request = request.header(axum::http::header::AUTHORIZATION, value);
+            }
+            let response = build_router(state)
+                .oneshot(request.body(Body::from(chat_payload().to_string())).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        };
+
+        // 1) Bearer key from an owner-only file.
+        let mut config =
+            crate::config::HarnessConfig::for_tests(&format!("http://{address}"), &spool, &spool);
+        config.upstream_api_key_file = Some(key_path.to_string_lossy().into_owned());
+        send_chat(build_state(config), None).await;
+        assert_eq!(
+            captured.lock().pop().unwrap(),
+            (Some("Bearer sk-wire-test".to_owned()), None),
+            "Bearer credential must reach the provider"
+        );
+
+        // 2) Azure style: raw key in a custom header on a custom path.
+        let mut config =
+            crate::config::HarnessConfig::for_tests(&format!("http://{address}"), &spool, &spool);
+        config.upstream_api_key_file = Some(key_path.to_string_lossy().into_owned());
+        config.upstream_auth_header = "api-key".into();
+        config.upstream_auth_scheme = String::new();
+        config.upstream_chat_path = "/openai/deployments/d1/chat/completions".into();
+        send_chat(build_state(config), None).await;
+        assert_eq!(
+            captured.lock().pop().unwrap(),
+            (None, Some("sk-wire-test".to_owned())),
+            "raw key must reach the provider on the configured path and header"
+        );
+
+        // 3) Passthrough: the client's own Authorization header is relayed.
+        let mut config =
+            crate::config::HarnessConfig::for_tests(&format!("http://{address}"), &spool, &spool);
+        config.upstream_authorization_passthrough = true;
+        send_chat(build_state(config), Some("Bearer client-owned-key")).await;
+        assert_eq!(
+            captured.lock().pop().unwrap(),
+            (Some("Bearer client-owned-key".to_owned()), None),
+            "passthrough must relay the client credential"
+        );
+
+        // 4) No auth configured: no Authorization header appears upstream.
+        let config = crate::config::HarnessConfig::for_tests(&format!("http://{address}"), &spool, &spool);
+        send_chat(build_state(config), Some("Bearer client-owned-key")).await;
+        assert_eq!(
+            captured.lock().pop().unwrap(),
+            (None, None),
+            "without passthrough the client credential must NOT leak upstream"
+        );
+        provider.abort();
+    }
+
+    /// The tool-upstream bearer token must be injected on forwarded MCP
+    /// calls (and must not depend on the caller's own headers).
+    #[tokio::test]
+    async fn tool_upstream_bearer_reaches_tool_server() {
+        type Captured = Arc<parking_lot::Mutex<Vec<Option<String>>>>;
+        async fn capture_tool(State(captured): State<Captured>, headers: HeaderMap, body: Bytes) -> Response {
+            captured.lock().push(
+                headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned),
+            );
+            (StatusCode::OK, body).into_response()
+        }
+        let captured: Captured = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let tool_router = Router::new()
+            .route("/mcp", post(capture_tool))
+            .with_state(Arc::clone(&captured));
+        let tool_server = tokio::spawn(async move {
+            axum::serve(listener, tool_router).await.unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let token_path = directory.path().join("mcp.token");
+        std::fs::write(&token_path, "tool-secret\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let (mut state, provider) = test_state(directory.path()).await;
+        {
+            let config = Arc::get_mut(&mut state.config).unwrap();
+            config.tool_upstream_url = Some(format!("http://{address}/mcp"));
+            config.tool_upstream_bearer_file = Some(token_path.to_string_lossy().into_owned());
+        }
+        // test_state resolved auth from the pre-mutation config; re-resolve.
+        state.tool_auth = crate::pipeline::resolve_tool_auth(&state.config).unwrap();
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/mcp")
+                    .header("x-ab-session", "tool-auth")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":"t1","method":"tools/call","params":{"name":"read","arguments":{}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            captured.lock().pop().unwrap().as_deref(),
+            Some("Bearer tool-secret"),
+            "tool bearer must reach the tool server"
+        );
         tool_server.abort();
         provider.abort();
     }

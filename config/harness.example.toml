@@ -3,7 +3,25 @@ listen = "0.0.0.0:8484"
 upstream_url = "http://host.docker.internal:4000"
 upstream_http2_prior_knowledge = false
 upstream_read_timeout_s = 300
+
+# --- Upstream authentication (see README "Upstream authentication") ---
+# Provider chat endpoint path; Azure/Gemini use non-default paths.
+# upstream_chat_path = "/v1/chat/completions"
+# API key source: an environment variable name OR a 0600 file (not both).
+# upstream_api_key_env = "OPENAI_API_KEY"
+# upstream_api_key_file = "/run/secrets/upstream_api_key"
+# Header + scheme the key is sent with. Azure: "api-key" + "" (raw).
+# upstream_auth_header = "authorization"
+# upstream_auth_scheme = "Bearer"
+# Relay each client's own Authorization header instead of a static key
+# (mutually exclusive with the static key and require_identity):
+# upstream_authorization_passthrough = true
+
 # tool_upstream_url = "http://host.docker.internal:3000/mcp"
+# Bearer token injected on forwarded MCP tool calls:
+# tool_upstream_bearer_env = "MCP_TOKEN"
+# tool_upstream_bearer_file = "/run/secrets/mcp_token"
+
 require_identity = false
 audience = "agent-bridge"
 default_workflow = "unsigned"
