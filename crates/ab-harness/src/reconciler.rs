@@ -463,12 +463,26 @@ impl Finalizer {
                 .await
                 .map_err(FinalizeError::Atif)?,
         );
+        // A marker only proves an *abandoned* effect when its session is
+        // not currently active: live sessions legitimately hold markers
+        // for the duration of an upstream call, and a request that merely
+        // straddles a periodic tick must not poison its session as
+        // capture-failed forever.
+        quarantined.retain(|id| sessions.get(id).is_none());
         if !quarantined.is_empty() {
-            tracing::warn!(
-                sessions = quarantined.len(),
-                "quarantining sessions with incomplete effects"
-            );
-            self.quarantined_sessions.lock().extend(quarantined);
+            // The markers stay on disk as evidence, so every periodic tick
+            // rediscovers the same set. Warn only about ids not already in
+            // the quarantine — otherwise a single crash would repeat this
+            // warning every tick forever.
+            let mut known = self.quarantined_sessions.lock();
+            let new: Vec<&String> = quarantined.iter().filter(|id| !known.contains(*id)).collect();
+            if !new.is_empty() {
+                tracing::warn!(
+                    sessions = new.len(),
+                    "quarantining sessions with incomplete effects"
+                );
+            }
+            known.extend(quarantined.iter().cloned());
         }
         self.replay_lifecycle_outboxes().await?;
         let signed_recovered = self.recover_signed_journals(sessions, breaker).await?;
@@ -2395,6 +2409,42 @@ mod tests {
         assert!(
             session.atif_path.lock().is_none(),
             "no ATIF file was ever produced for the empty session",
+        );
+    }
+
+    /// An in-flight response marker belonging to a *currently active*
+    /// session is normal operation (the marker lives for the duration of
+    /// the upstream call), not evidence of an abandoned effect. A periodic
+    /// recovery tick that runs while such a request is in flight must not
+    /// quarantine the session — otherwise any LLM call slower than one
+    /// reconcile tick would poison its own session as capture-failed and
+    /// wrongly quarantine the final trajectory at close.
+    #[tokio::test]
+    async fn recovery_tick_does_not_quarantine_live_sessions_with_inflight_markers() {
+        let directory = tempfile::tempdir().unwrap();
+        let finalizer = finalizer(directory.path());
+        let live = session(Workflow::Unsigned);
+        let registry = crate::session::SessionRegistry::new();
+        let live = registry.insert_recovered(Arc::try_unwrap(live).map_err(|_| ()).unwrap());
+        crate::worker::create_response_marker(
+            directory.path(),
+            &finalizer.journal_key,
+            &live.id,
+            "digest".to_owned(),
+        )
+        .await
+        .unwrap();
+        finalizer
+            .recover_spooled_sessions(&registry, &Default::default())
+            .await
+            .unwrap();
+        assert!(
+            !finalizer.quarantined_sessions.lock().contains(&live.id),
+            "a live session's in-flight marker must not put it in quarantine",
+        );
+        assert!(
+            !live.capture_failed(),
+            "a recovery tick must not poison a live session mid-request",
         );
     }
 

@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Declarative budget for one session/agent (config-file surface).
+///
+/// Unknown keys are rejected so `[budget]` typos fail loudly at startup.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct BudgetSpec {
     /// Max total tokens (prompt+completion) per session. `None` = unlimited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
