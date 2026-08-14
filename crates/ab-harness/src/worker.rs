@@ -431,7 +431,12 @@ fn spawn_worker_shard(
                     Err(format!("worker job panicked: {error}"))
                 }
             };
-            if outcome.is_err() {
+            if let Err(error) = &outcome {
+                // The session flips fail-closed silently otherwise: name the
+                // session and the root cause (e.g. EACCES on the journal
+                // file) so operators can trace "capture is incomplete"
+                // refusals back to this event.
+                tracing::warn!(session = %session.id, %error, "capture job failed; session is fail-closed");
                 session.mark_capture_failed();
                 worker_metrics
                     .counter("ab_worker_errors_total", "Worker jobs that failed")
@@ -847,7 +852,8 @@ async fn append_journal(
         if !metadata_path.exists() {
             let metadata = crate::journal::seal(&journal_key, "metadata", 0, &metadata_payload)?;
             let temporary = directory.join(format!("{stem}.{}.tmp", ab_core::new_event_uid()));
-            let mut file = std::fs::File::create(&temporary).map_err(|error| error.to_string())?;
+            let mut file = std::fs::File::create(&temporary)
+                .map_err(|error| format!("create journal metadata {}: {error}", temporary.display()))?;
             file.write_all(&metadata).map_err(|error| error.to_string())?;
             file.sync_all().map_err(|error| error.to_string())?;
             std::fs::rename(temporary, &metadata_path).map_err(|error| error.to_string())?;
@@ -869,8 +875,8 @@ async fn append_journal(
         let mut journal = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(journal_path)
-            .map_err(|error| error.to_string())?;
+            .open(&journal_path)
+            .map_err(|error| format!("open event journal {}: {error}", journal_path.display()))?;
         journal.write_all(&line).map_err(|error| error.to_string())?;
         journal.write_all(b"\n").map_err(|error| error.to_string())?;
         journal.sync_data().map_err(|error| error.to_string())?;
