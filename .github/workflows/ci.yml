@@ -22,6 +22,13 @@ jobs:
         with:
           python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
+      - name: Install native build dependencies
+        # rdkafka-sys (via the `kafka` feature) builds librdkafka from source
+        # and requires libcurl headers; wasmtime with cranelift is otherwise
+        # self-contained but its assembler paths appreciate a modern cmake.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
