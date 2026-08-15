@@ -270,6 +270,20 @@ impl IdentityValidator {
     /// signature, exp/nbf/aud, future-iat, TTL cap, field presence,
     /// bidi/zero-width spoofing guard, issuer allowlist.
     fn validate_single(&self, token: &str) -> Result<NhiClaims, IdentityError> {
+        // Reject oversized tokens up front so an unauthenticated caller
+        // cannot amplify their pre-auth memory footprint through
+        // `jsonwebtoken::decode_header`, which base64-decodes the
+        // header segment before signature verification. RFC-realistic
+        // NHI JWTs are at most a few KiB; 8 KiB is a comfortable
+        // ceiling that blocks the amplification while accepting real
+        // tokens with generous claim sets.
+        const MAX_JWT_BYTES: usize = 8 * 1024;
+        if token.len() > MAX_JWT_BYTES {
+            return Err(IdentityError::Malformed(format!(
+                "token is {} bytes, exceeds pre-auth cap of {MAX_JWT_BYTES}",
+                token.len()
+            )));
+        }
         let header =
             jsonwebtoken::decode_header(token).map_err(|e| IdentityError::Malformed(e.to_string()))?;
         let kid = header.kid.ok_or(IdentityError::MissingKid)?;

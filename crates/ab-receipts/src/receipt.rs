@@ -148,26 +148,57 @@ const ALLOWED_RECEIPT_TOP_LEVEL_KEYS: &[&str] = &[
 
 impl<'de> Deserialize<'de> for Receipt {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        use serde::de::Error as _;
-        let mut raw = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
-        for key in raw.keys() {
-            if !ALLOWED_RECEIPT_TOP_LEVEL_KEYS.contains(&key.as_str()) {
-                return Err(D::Error::custom(format!(
-                    "unknown field `{key}` in Receipt; a signed receipt \
-                     may only carry the fields declared in ReceiptBody + \
-                     signature_b64. Extra fields would be visible to a raw \
-                     JSON reader but not covered by the signature — treat \
-                     as tampering."
-                )));
+        use serde::de::{Error as _, MapAccess, Visitor};
+        // Custom visitor so we can reject duplicate keys explicitly.
+        // `serde_json::Map::deserialize` silently collapses duplicate
+        // keys (last-wins) — RFC 8259 leaves the behaviour undefined
+        // and other JSON parsers (jq's `--sort-keys`, some strict
+        // Python configs, several audit tools) pick first-wins.
+        // A hostile issuer could sign under the last-wins interpretation
+        // while an auditor reading with a first-wins parser saw the
+        // friendly value; the signature would verify but the audit
+        // would show a different receipt.
+        struct ReceiptVisitor;
+        impl<'de> Visitor<'de> for ReceiptVisitor {
+            type Value = Receipt;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an AgentBridge Receipt JSON object")
+            }
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Receipt, M::Error> {
+                let mut raw = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if !ALLOWED_RECEIPT_TOP_LEVEL_KEYS.contains(&key.as_str()) {
+                        return Err(M::Error::custom(format!(
+                            "unknown field `{key}` in Receipt; a signed receipt \
+                             may only carry the fields declared in ReceiptBody + \
+                             signature_b64. Extra fields would be visible to a raw \
+                             JSON reader but not covered by the signature — treat \
+                             as tampering."
+                        )));
+                    }
+                    if raw.contains_key(&key) {
+                        return Err(M::Error::custom(format!(
+                            "duplicate field `{key}` in Receipt; JSON parsers \
+                             disagree on duplicate-key semantics (last-wins vs \
+                             first-wins), so accepting duplicates would let a \
+                             hostile issuer sign under one interpretation while an \
+                             auditor's parser reports the other"
+                        )));
+                    }
+                    let value: serde_json::Value = map.next_value()?;
+                    raw.insert(key, value);
+                }
+                let signature_value = raw
+                    .remove("signature_b64")
+                    .ok_or_else(|| M::Error::missing_field("signature_b64"))?;
+                let signature_b64: String =
+                    serde_json::from_value(signature_value).map_err(M::Error::custom)?;
+                let body: ReceiptBody =
+                    serde_json::from_value(serde_json::Value::Object(raw)).map_err(M::Error::custom)?;
+                Ok(Receipt { body, signature_b64 })
             }
         }
-        let signature_value = raw
-            .remove("signature_b64")
-            .ok_or_else(|| D::Error::missing_field("signature_b64"))?;
-        let signature_b64: String = serde_json::from_value(signature_value).map_err(D::Error::custom)?;
-        let body: ReceiptBody =
-            serde_json::from_value(serde_json::Value::Object(raw)).map_err(D::Error::custom)?;
-        Ok(Self { body, signature_b64 })
+        deserializer.deserialize_map(ReceiptVisitor)
     }
 }
 
@@ -580,6 +611,37 @@ mod tests {
         assert_eq!(
             body_keys, allowed,
             "ALLOWED_RECEIPT_TOP_LEVEL_KEYS drift vs ReceiptBody serialization"
+        );
+    }
+
+    /// A hostile issuer could sign under one JSON parser's
+    /// duplicate-key semantics (usually last-wins) while an auditor
+    /// reads the same wire bytes under a different parser
+    /// (first-wins). Both parses "succeed" but see different receipt
+    /// contents. Our custom Deserialize now rejects duplicates
+    /// outright, closing the parser-disagreement audit-spoofing gap.
+    #[test]
+    fn receipt_with_duplicate_top_level_key_is_rejected_on_parse() {
+        // Hand-craft the JSON so both `session_id` entries land at the
+        // top level and are seen in order by the map visitor. Rust's
+        // `format!` guarantees a fixed byte sequence.
+        let signer = Ed25519Signer::generate();
+        let receipt = Receipt::issue(body(), &signer).unwrap();
+        let good = serde_json::to_string(&receipt).unwrap();
+        // Inject a second `session_id` right before the closing `}`.
+        assert!(good.ends_with('}'));
+        let tampered = format!(
+            "{},\"session_id\":\"forged-second-copy\"}}",
+            &good[..good.len() - 1]
+        );
+        let error = serde_json::from_str::<Receipt>(&tampered).unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate field"),
+            "expected duplicate-key rejection, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("session_id"),
+            "error should name the offending field, got: {error}"
         );
     }
 }
