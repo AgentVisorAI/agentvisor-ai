@@ -707,6 +707,29 @@ impl SessionRegistry {
         evicted
     }
 
+    /// Round-43 F1: sessions where `close_session_locked` marked
+    /// `artifact_committed = 1` but crashed / failed before running
+    /// the finalization tail (`emit_bridge_event(SESSION_CLOSE)` +
+    /// `remove_step_journal` + `remove_lifecycle_outbox` +
+    /// `mark_close_complete`). Without this recovery hook such
+    /// sessions accumulate in the registry forever: `is_closed()` is
+    /// true so the idle sweeper skips them; `close_complete = 0` so
+    /// `evict_finalized` refuses them; recovery scans skip them via
+    /// the "already in registry" short-circuit. Capture-failed and
+    /// empty-unsigned quarantines are excluded — they intentionally
+    /// stay in the registry as evidence of the incident.
+    pub fn pending_close_sessions(&self) -> Vec<Arc<Session>> {
+        self.sessions
+            .iter()
+            .filter(|entry| {
+                entry.artifact_committed.load(Ordering::Acquire) != 0
+                    && entry.close_complete.load(Ordering::Acquire) == 0
+                    && !entry.capture_failed()
+            })
+            .map(|entry| entry.clone())
+            .collect()
+    }
+
     /// Sessions idle longer than `idle_s` (for the sweeper).
     pub fn idle_sessions(&self, idle_s: u64) -> Vec<Arc<Session>> {
         let cutoff =
