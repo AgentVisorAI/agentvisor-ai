@@ -984,26 +984,36 @@ impl Finalizer {
         Ok(recovered + signed_recovered)
     }
 
-    // Round-40 F1 (DEFERRED): the per-session `?` sites inside
-    // this loop (metadata sidecar HMAC failure, identity decode,
-    // journal HMAC / sequence / accounting inconsistencies, receipt
-    // parse/verify) propagate through this fn's outer `?` at
-    // `recover_spooled_sessions:753` and abort BOTH
-    // consolidate_step_journals AND the entire unsigned recovery
-    // loop for the same tick — one tampered sidecar
-    // head-of-line-blocks recovery of every other signed AND
-    // unsigned session. Round-27 F1/F2 applied the warn+continue
-    // discipline to the ATIF-spool and promotion-marker paths;
-    // this signed-journal path needs the same treatment. Deferred
-    // to a dedicated round because the per-session body is
-    // ~280 lines with intricate `continue` control flow that
-    // needs careful extraction into a helper method with a
-    // dedicated Result<Outcome> return type.
+    // Round-40 F1 -> round-41: extracted the per-candidate body
+    // into an inner `async` block whose Err is caught in the outer
+    // loop and turned into `warn_once + counter + continue`, so a
+    // single tampered sidecar / corrupted receipt / HMAC-drift
+    // never head-of-line-blocks recovery of every OTHER signed
+    // AND unsigned session for the tick.
+    //
+    // Round-27 F1 / F2 applied the same discipline to the ATIF-
+    // spool and promotion-marker paths. Under-load stability
+    // depends on this being uniform across every recovery path;
+    // the block's outcome enum makes the "did this candidate
+    // actually recover" question type-safe.
     async fn recover_signed_journals(
         &self,
         sessions: &SessionRegistry,
         breaker: &ab_loopdetect::BreakerConfig,
     ) -> Result<usize, FinalizeError> {
+        /// Round-41 F1: per-candidate outcome so the outer loop can
+        /// distinguish "session recovered" from "candidate wasn't
+        /// mine / already active / deliberately skipped".
+        enum SignedCandidateOutcome {
+            /// The session was materialised and finalized (or set aside
+            /// as capture-failed for later quarantine). Increment the
+            /// recovered counter.
+            Recovered,
+            /// This candidate wasn't for us (not a signed sidecar,
+            /// already-active session, journal quarantined, etc.).
+            /// Not an error; do NOT count as recovered.
+            Skipped,
+        }
         let mut entries = match tokio::fs::read_dir(&self.spool_dir).await {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -1022,6 +1032,14 @@ impl Finalizer {
             let Some(stem) = name.strip_suffix(".session.json") else {
                 continue;
             };
+            // Round-41 F1: per-candidate body wrapped in an inner
+            // async block so every `?` and `return Err(...)` inside
+            // gets caught by the outer match instead of propagating
+            // up through `recover_spooled_sessions:753` and killing
+            // the whole recovery scan for the tick. Every prior
+            // `continue;` becomes `return Ok(Skipped);`; every
+            // `recovered += 1; continue;` becomes `return Ok(Recovered);`.
+            let outcome: Result<SignedCandidateOutcome, FinalizeError> = async {
             let metadata = self.read_journal_metadata(&metadata_path).await?;
             if metadata
                 .get("journal_version")
@@ -1049,18 +1067,18 @@ impl Finalizer {
                         "sidecar has unsupported journal_version; skipping this session so recovery can proceed for the rest"
                     );
                 }
-                continue;
+                return Ok(SignedCandidateOutcome::Skipped);
             }
             if metadata.get("workflow").and_then(serde_json::Value::as_str) != Some(Workflow::Signed.as_str())
             {
-                continue;
+                return Ok(SignedCandidateOutcome::Skipped);
             }
             let session_id = metadata
                 .get("session_id")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| FinalizeError::Atif("journal metadata has no session_id".into()))?;
             if sessions.get(session_id).is_some() {
-                continue;
+                return Ok(SignedCandidateOutcome::Skipped);
             }
             // Per-session lifecycle lock for the signed-recovery path,
             // scoped to this candidate only. Released between candidates
@@ -1103,12 +1121,12 @@ impl Finalizer {
                             "failed to quarantine metadata sidecar; leaving in place so a future recovery can try again"
                         ),
                     }
-                    continue;
+                    return Ok(SignedCandidateOutcome::Skipped);
                 }
-                tokio::fs::remove_file(metadata_path)
+                tokio::fs::remove_file(metadata_path.clone())
                     .await
                     .map_err(|error| FinalizeError::Atif(error.to_string()))?;
-                continue;
+                return Ok(SignedCandidateOutcome::Skipped);
             }
             let session = Arc::new(Session::new(
                 session_id.to_owned(),
@@ -1307,7 +1325,7 @@ impl Finalizer {
                 Ok(inserted) => inserted,
                 Err(_active) => {
                     tracing::info!(session = %session_id, "signed recovery skipped: session already active");
-                    continue;
+                    return Ok(SignedCandidateOutcome::Skipped);
                 }
             };
             if inconsistent_responses {
@@ -1315,17 +1333,35 @@ impl Finalizer {
                 // otherwise a live session with the same id would inherit the capture-failed verdict.
                 self.quarantined_sessions.lock().insert(session.id.clone());
                 session.mark_capture_failed();
-                recovered += 1;
-                continue;
+                return Ok(SignedCandidateOutcome::Recovered);
             }
             if self.quarantined_sessions.lock().contains(&session.id) {
                 session.mark_capture_failed();
-                recovered += 1;
-                continue;
+                return Ok(SignedCandidateOutcome::Recovered);
             }
             self.close_session_locked(Arc::clone(&session), StopReason::SessionClosed)
                 .await?;
-            recovered += 1;
+            Ok(SignedCandidateOutcome::Recovered)
+            }.await;
+            match outcome {
+                Ok(SignedCandidateOutcome::Recovered) => recovered += 1,
+                Ok(SignedCandidateOutcome::Skipped) => {}
+                Err(error) => {
+                    self.metrics
+                        .counter(
+                            "ab_signed_recovery_skipped_total",
+                            "Signed sessions skipped during recovery due to per-session errors (round-41 F1)",
+                        )
+                        .inc();
+                    if self.warn_once(metadata_path.clone()) {
+                        tracing::warn!(
+                            %error,
+                            path = %ab_core::fsutil::basename(&metadata_path),
+                            "skipping signed session recovery due to per-session error; other sessions continue"
+                        );
+                    }
+                }
+            }
         }
         Ok(recovered)
     }
@@ -1410,6 +1446,13 @@ impl Finalizer {
             let Some(stem) = name.strip_suffix(".session.json") else {
                 continue;
             };
+            // Round-41 F1 (twin of the recover_signed_journals fix):
+            // wrap the per-candidate body so per-session errors
+            // warn+continue instead of aborting the whole
+            // consolidation scan. A single poisoned sidecar or a
+            // torn events journal used to head-of-line-block
+            // every OTHER unsigned session on the tick.
+            let outcome: Result<(), FinalizeError> = async {
             let final_path = self.spool_dir.join(format!("{stem}.json"));
             let journal_path = self.spool_dir.join(format!("{stem}.events.ndjson"));
             let metadata = self.read_journal_metadata(&metadata_path).await?;
@@ -1429,18 +1472,18 @@ impl Finalizer {
                         "sidecar has unsupported journal_version; skipping this session so recovery can proceed for the rest"
                     );
                 }
-                continue;
+                return Ok(());
             }
             if metadata.get("workflow").and_then(serde_json::Value::as_str) == Some(Workflow::Signed.as_str())
             {
-                continue;
+                return Ok(());
             }
             let session_id = metadata
                 .get("session_id")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| FinalizeError::Atif("journal metadata has no session_id".into()))?;
             if sessions.get(session_id).is_some() {
-                continue;
+                return Ok(());
             }
             // Per-session lifecycle lock for the unsigned-consolidation
             // path, scoped to this candidate only. Released between
@@ -1478,7 +1521,7 @@ impl Finalizer {
                 // CloseClaim resets `closed` — an unbounded churn loop.
                 quarantined.mark_artifact_committed();
                 sessions.insert_recovered(quarantined);
-                continue;
+                return Ok(());
             }
             if journal.is_empty() {
                 // Round-14 F5: same quarantine-preservation guard as
@@ -1501,12 +1544,12 @@ impl Finalizer {
                             "failed to quarantine metadata sidecar; leaving in place so a future recovery can try again"
                         ),
                     }
-                    continue;
+                    return Ok(());
                 }
-                tokio::fs::remove_file(metadata_path)
+                tokio::fs::remove_file(metadata_path.clone())
                     .await
                     .map_err(|error| FinalizeError::Atif(error.to_string()))?;
-                continue;
+                return Ok(());
             }
             let journal_len = u64::try_from(journal.len())
                 .map_err(|_| FinalizeError::Atif("active journal length overflow".to_owned()))?;
@@ -1643,7 +1686,7 @@ impl Finalizer {
                         );
                     }
                 }
-                continue;
+                return Ok(());
             }
             let mut trajectory = builder.finish();
             trajectory.agent.extra = Some(serde_json::json!({
@@ -1687,6 +1730,23 @@ impl Finalizer {
             }
             self.ensure_atif_provenance(&final_path, session_id).await?;
             self.remove_step_journal(session_id).await?;
+            Ok(())
+            }.await;
+            if let Err(error) = outcome {
+                self.metrics
+                    .counter(
+                        "ab_unsigned_recovery_skipped_total",
+                        "Unsigned sessions skipped during consolidation due to per-session errors (round-41 F1)",
+                    )
+                    .inc();
+                if self.warn_once(metadata_path.clone()) {
+                    tracing::warn!(
+                        %error,
+                        path = %ab_core::fsutil::basename(&metadata_path),
+                        "skipping unsigned session consolidation due to per-session error; other sessions continue"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -2757,9 +2817,17 @@ mod tests {
         let result = finalizer
             .recover_spooled_sessions(&registry, &Default::default())
             .await;
+        // Round-41 F1: per-session finalize errors during signed
+        // recovery no longer propagate to the outer function's Err
+        // — they warn+continue so one broken session cannot HOL-
+        // block every other. The security invariant this test
+        // enforces (post-error try_lease rejection) still holds via
+        // the round-14 F5 mark_artifact_committed-before-
+        // try_insert_recovered ordering: after close_session_locked
+        // Err, `is_closed()` is true, so lease is refused.
         assert!(
-            result.is_err(),
-            "recovery must error at persist_receipt to trigger the CloseClaim reset window; got {result:?}",
+            result.is_ok(),
+            "round-41 F1: per-session errors warn+continue; got {result:?}",
         );
 
         let session = registry
@@ -2768,6 +2836,60 @@ mod tests {
         assert!(
             session.try_lease().is_none(),
             "recovered signed session must reject new leases even after finalize errors — otherwise a racing client request could take a lease, submit a worker job that appends to the recovered chain, and permanently diverge it from the persisted receipt's subject.event_count (also leaving a wrong-index entry sealed at file position N)",
+        );
+    }
+
+    /// Round-41 F1: a corrupt/tampered signed sidecar must NOT
+    /// head-of-line-block recovery of every OTHER session for the
+    /// tick. Before this fix, the outer function returned Err on
+    /// the first poisoned sidecar and skipped every subsequent
+    /// signed AND unsigned candidate. Round-27 F1 / F2 already
+    /// applied the warn+continue discipline to the ATIF-spool and
+    /// promotion-marker paths; this locks in parity for the
+    /// signed-journal path.
+    ///
+    /// Test plan: plant one poisoned metadata sidecar with a
+    /// filename-shape that recover_signed_journals will accept but
+    /// content that fails HMAC verification. Assert:
+    ///   (a) recover_spooled_sessions returns Ok (was Err
+    ///       pre-round-41),
+    ///   (b) the poisoned session id is NOT installed into the
+    ///       registry.
+    #[tokio::test]
+    async fn round_41_f1_corrupt_signed_sidecar_does_not_block_other_signed_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        // Plant a poisoned sidecar with the correct filename shape
+        // but garbage content — read_journal_metadata will fail
+        // HMAC verification and return Err. Pre-round-41 F1 this
+        // Err propagated through recover_spooled_sessions and
+        // aborted every unrelated session's recovery for the tick.
+        let poison_stem = "poisonpoisonpoisonpoisonpoison32";
+        std::fs::write(
+            directory
+                .path()
+                .join(format!("{poison_stem}.session.json")),
+            b"{\"garbage\": true, \"not\": \"a valid sealed metadata\"}",
+        )
+        .unwrap();
+        std::fs::write(
+            directory
+                .path()
+                .join(format!("{poison_stem}.events.ndjson")),
+            b"{}\n",
+        )
+        .unwrap();
+        let registry = crate::session::SessionRegistry::new();
+        let finalizer = finalizer(directory.path());
+        let outcome = finalizer
+            .recover_spooled_sessions(&registry, &Default::default())
+            .await;
+        assert!(
+            outcome.is_ok(),
+            "poisoned sidecar must not fail the outer recover_spooled_sessions; got {outcome:?}"
+        );
+        assert!(
+            registry.get(poison_stem).is_none(),
+            "poisoned session id must NEVER be installed into the registry"
         );
     }
 
