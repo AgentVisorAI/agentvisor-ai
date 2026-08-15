@@ -410,6 +410,37 @@ impl AppState {
         metrics.counter("ab_sessions_finalized_total", "Sessions finalized");
         metrics.counter("ab_sessions_promoted_total", "Unsigned sessions promoted");
         metrics.counter("ab_reconcile_errors_total", "Reconciliation errors");
+        // Round-42 F2: pre-register recovery-skipped counters so
+        // Prometheus `absent()` alerts do not fire on healthy nodes
+        // that have never hit a per-session recovery error, and so
+        // dashboards render flat-zero instead of "No data". Each
+        // series must exist on `/metrics` from boot; `Registry::counter`
+        // is otherwise lazy and only inserts on first `.inc()`.
+        metrics.counter(
+            "ab_signed_recovery_skipped_total",
+            "Signed sessions skipped during recovery due to per-session errors (round-41 F1)",
+        );
+        metrics.counter(
+            "ab_unsigned_recovery_skipped_total",
+            "Unsigned step-journal consolidations skipped during recovery due to per-session errors (round-41 F1)",
+        );
+        metrics.counter(
+            "ab_atif_trajectory_recovery_skipped_total",
+            "ATIF trajectories skipped during recovery due to per-session errors (round-42 F1)",
+        );
+        for reason in [
+            "too_large",
+            "read_error",
+            "invalid_json",
+            "nonconformant",
+            "unauthenticated",
+            "provenance",
+        ] {
+            metrics.counter(
+                &format!("ab_atif_recovery_skipped_total{{reason=\"{reason}\"}}"),
+                "ATIF spool files skipped during recovery",
+            );
+        }
         metrics.histogram("ab_receipt_sign_duration_seconds", "Receipt signing latency");
         // Reconciler ticks scan the ATIF spool dir, which can be large;
         // finalisation waits for worker drain + broker publish. Wide
