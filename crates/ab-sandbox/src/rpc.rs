@@ -370,7 +370,12 @@ mod tests {
     /// a structured id.
     #[test]
     fn tools_call_with_structured_id_is_rejected() {
-        for hostile_id in [json!({"nested": true}), json!([1, 2, 3]), json!(true), json!(false)] {
+        for hostile_id in [
+            json!({"nested": true}),
+            json!([1, 2, 3]),
+            json!(true),
+            json!(false),
+        ] {
             let raw = serde_json::to_vec(&json!({
                 "jsonrpc": "2.0",
                 "id": hostile_id,
