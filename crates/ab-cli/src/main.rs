@@ -289,37 +289,30 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
     }
 }
 
-/// Round-16 F5: cap file reads that feed the JSON parser so a
-/// hostile file (or a symlink pointing at `/dev/zero`) cannot OOM
-/// the CLI before the parser can reject it. `read_capped` performs
-/// the size check against `metadata.len()` before reading a byte,
-/// and refuses non-regular files up front.
+/// Round-16 F5 → round-17 F3: read caps now live in `ab_core::fsutil`
+/// so both the CLI and the harness reconciler enforce identical
+/// bounds. Kept as thin wrappers here for clearer local error text.
 fn read_capped(path: &Path, max_bytes: u64, label: &str) -> Result<Vec<u8>> {
-    let metadata = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
-    if !metadata.is_file() {
-        anyhow::bail!(
-            "{label} at {} is not a regular file (type: {:?})",
-            path.display(),
-            metadata.file_type()
-        );
-    }
-    if metadata.len() > max_bytes {
-        anyhow::bail!(
-            "{label} at {} is {} bytes; refusing to load more than {max_bytes}",
-            path.display(),
-            metadata.len()
-        );
-    }
-    std::fs::read(path).with_context(|| format!("read {}", path.display()))
+    ab_core::fsutil::read_capped(path, max_bytes)
+        .with_context(|| format!("{label} at {}", path.display()))
+}
+
+fn read_capped_str(path: &Path, max_bytes: u64, label: &str) -> Result<String> {
+    ab_core::fsutil::read_capped_string(path, max_bytes)
+        .with_context(|| format!("{label} at {}", path.display()))
 }
 
 /// Receipts JCS-canonicalize to a few hundred bytes; even a huge
 /// tool-call summary stays well under 16 MiB.
-const MAX_RECEIPT_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_RECEIPT_BYTES: u64 = ab_core::fsutil::MAX_RECEIPT_BYTES;
 
 /// ATIF trajectories can carry long transcripts; 64 MiB is generous
 /// (a 200k-token GPT-4 context in ASCII fits in ~800 KiB).
-const MAX_ATIF_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ATIF_BYTES: u64 = ab_core::fsutil::MAX_ATIF_BYTES;
+
+/// Small-file cap for operator-supplied config / manifest / bearer
+/// token files.
+const MAX_CONFIG_BYTES: u64 = ab_core::fsutil::MAX_CONTROL_BYTES;
 
 fn receipt_verify(path: &Path, public_key_hex: &str) -> Result<()> {
     // Round-16: use the strict deserializer that refuses duplicate
@@ -364,15 +357,14 @@ fn atif_validate(path: &Path, mode: ValidationMode) -> Result<()> {
 }
 
 fn manifest_validate(path: &Path) -> Result<()> {
-    let yaml = std::fs::read_to_string(path).with_context(|| format!("read manifest {}", path.display()))?;
+    let yaml = read_capped_str(path, MAX_CONFIG_BYTES, "manifest")?;
     let manifest = BridgeManifest::from_yaml(&yaml).map_err(anyhow::Error::new)?;
     println!("valid {} topics={}", manifest.name, manifest.topics.len());
     Ok(())
 }
 
 fn bridge_provision(manifest_path: &Path, data_dir: &Path) -> Result<()> {
-    let yaml = std::fs::read_to_string(manifest_path)
-        .with_context(|| format!("read manifest {}", manifest_path.display()))?;
+    let yaml = read_capped_str(manifest_path, MAX_CONFIG_BYTES, "manifest")?;
     let manifest = BridgeManifest::from_yaml(&yaml).map_err(anyhow::Error::new)?;
     let started = Instant::now();
     EmbeddedBroker::provision(data_dir, &manifest).context("provision Bridge")?;
@@ -422,7 +414,7 @@ async fn session_promote(base_url: &str, id: &str, token_file: Option<&Path>) ->
 }
 
 fn config_validate(path: &Path) -> Result<()> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
+    let text = read_capped_str(path, MAX_CONFIG_BYTES, "config")?;
     let config = ab_harness::HarnessConfig::from_toml(&text).map_err(anyhow::Error::msg)?;
     println!(
         "valid config_version={} listen={}",
@@ -573,8 +565,7 @@ fn bearer_token(path: Option<&Path>) -> Result<Option<String>> {
                 );
             }
         }
-        let token = std::fs::read_to_string(&path)
-            .with_context(|| format!("read bearer token {}", path.display()))?;
+        let token = read_capped_str(&path, MAX_CONFIG_BYTES, "bearer token")?;
         let token = token.trim().to_owned();
         if token.is_empty() {
             anyhow::bail!("bearer token file {} is empty", path.display());

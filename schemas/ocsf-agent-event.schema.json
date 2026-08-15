@@ -23,12 +23,14 @@
   "properties": {
     "metadata": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["version", "uid", "product", "sequence"],
       "properties": {
         "version": { "const": "1.10.0" },
         "uid": { "type": "string", "minLength": 1 },
         "product": {
           "type": "object",
+          "additionalProperties": false,
           "required": ["name", "vendor_name", "version"],
           "properties": {
             "name": { "type": "string", "minLength": 1 },
@@ -63,11 +65,13 @@
     "session_uid": { "type": "string", "minLength": 1 },
     "ai_agent": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["version", "charter", "instance_uid"],
       "properties": {
         "version": { "type": "string", "minLength": 1 },
         "charter": {
           "type": "object",
+          "additionalProperties": false,
           "required": ["name", "type_id"],
           "properties": {
             "name": { "type": "string", "minLength": 1 },
@@ -83,6 +87,7 @@
     "payload": {},
     "metrics": {
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "prompt_tokens": { "type": "integer", "minimum": 0, "maximum": 9007199254740992 },
         "completion_tokens": { "type": "integer", "minimum": 0, "maximum": 9007199254740992 },
@@ -101,6 +106,7 @@
   "$defs": {
     "fingerprint": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["algorithm_id", "algorithm", "serialization_id", "serialization", "value"],
       "properties": {
         "algorithm_id": { "const": 3 },
