@@ -84,7 +84,10 @@
     },
     "stop_reason_id": { "type": "integer", "enum": [0, 1, 2, 3, 4, 90, 91, 92, 93, 94, 99] },
     "stop_reason": { "type": "string", "minLength": 1 },
-    "payload": {},
+    "payload": {
+      "type": ["object", "array", "string", "number", "boolean", "null"],
+      "maxProperties": 512
+    },
     "metrics": {
       "type": "object",
       "additionalProperties": false,
