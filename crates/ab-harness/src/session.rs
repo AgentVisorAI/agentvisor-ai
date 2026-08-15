@@ -449,6 +449,26 @@ impl Session {
         self.pending_jobs.load(Ordering::Acquire)
     }
 
+    /// Round-44 F2: distinguish the "empty unsigned session close
+    /// was rejected" quarantine (reconciler.rs:442-449) from a
+    /// successfully-persisted unsigned session. The reject path sets
+    /// `artifact_committed = 1` (so `is_closed()` stays true) but
+    /// never writes an ATIF file, never sets `atif_path`, and never
+    /// calls `mark_capture_failed`. Without this predicate the
+    /// round-43 F1 `pending_close_sessions()` filter picks it up and
+    /// drives the finalization tail — which emits a spurious
+    /// SESSION_CLOSE bridge event for a session that has no receipt
+    /// and no ATIF, breaking downstream OCSF consumers' invariant
+    /// that a close event follows an artifact event. It also marks
+    /// `close_complete = 1`, which lets `get_or_open` (reopen=true)
+    /// silently replace the quarantined Session with a fresh one on
+    /// the next chat request, losing the incident evidence.
+    pub(crate) fn is_empty_unsigned_quarantine(&self) -> bool {
+        self.workflow == Workflow::Unsigned
+            && self.artifact_committed.load(Ordering::Acquire) != 0
+            && self.atif_path.lock().is_none()
+    }
+
     pub(crate) fn mark_capture_failed(&self) {
         self.capture_failed.store(1, Ordering::Release);
     }
@@ -718,6 +738,14 @@ impl SessionRegistry {
     /// the "already in registry" short-circuit. Capture-failed and
     /// empty-unsigned quarantines are excluded — they intentionally
     /// stay in the registry as evidence of the incident.
+    ///
+    /// Round-44 F2: the empty-unsigned quarantine at
+    /// reconciler.rs:442-449 does NOT set `capture_failed = 1` (it
+    /// is a distinct semantic — "no work was captured" rather than
+    /// "capture was lost mid-flight"), so `!capture_failed()` alone
+    /// let the sweep pick it up and emit a spurious SESSION_CLOSE
+    /// bridge event for a session that had no other events on the
+    /// wire. `is_empty_unsigned_quarantine()` closes that gap.
     pub fn pending_close_sessions(&self) -> Vec<Arc<Session>> {
         self.sessions
             .iter()
@@ -725,6 +753,7 @@ impl SessionRegistry {
                 entry.artifact_committed.load(Ordering::Acquire) != 0
                     && entry.close_complete.load(Ordering::Acquire) == 0
                     && !entry.capture_failed()
+                    && !entry.is_empty_unsigned_quarantine()
             })
             .map(|entry| entry.clone())
             .collect()
