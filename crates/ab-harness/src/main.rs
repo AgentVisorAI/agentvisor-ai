@@ -29,7 +29,14 @@ async fn main() -> Result<()> {
     let store = build_store(&config)?;
     let embedder = build_embedder(&config)?;
     let vector_sink = build_vector_sink(&config, embedder.dim()).await?;
-    let identity = build_identity(&config).await?;
+    // Build the metrics registry BEFORE `build_identity` so the JWKS
+    // refresh loop can bump `ab_jwks_refresh_errors_total` on the same
+    // registry that `AppState` will hand to `/metrics`. Otherwise the
+    // JWKS counters would live on a phantom registry no scraper sees,
+    // and a silently-stale key set (see F1/F3 in round-11 audit) would
+    // remain unalertable.
+    let metrics = Arc::new(ab_core::metrics::Registry::new());
+    let identity = build_identity(&config, Arc::clone(&metrics)).await?;
     let signer_path = std::env::var_os("AB_SIGNING_SEED_FILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("config/signing.seed"));
@@ -37,7 +44,7 @@ async fn main() -> Result<()> {
     bridge
         .set_control_key(ab_harness::control_key_from_signer(signer.as_ref()))
         .context("configure Bridge control authentication")?;
-    let state = AppState::new_with_backends(
+    let state = AppState::new_with_backends_and_metrics(
         config.clone(),
         store,
         Arc::new(sandbox),
@@ -46,6 +53,7 @@ async fn main() -> Result<()> {
         signer,
         embedder,
         vector_sink,
+        Arc::clone(&metrics),
     )
     .map_err(anyhow::Error::new)?;
     state
@@ -90,6 +98,20 @@ async fn main() -> Result<()> {
         "AgentBridge started"
     );
     let (shutdown_started_tx, shutdown_started_rx) = tokio::sync::oneshot::channel();
+    // Register the drain-timeout counter up front so alerts can wire
+    // onto it at boot. This surfaces the round-11 F2 hazard: axum's
+    // per-connection tasks are detached `tokio::spawn`s, so dropping
+    // the `Serve` future does NOT cancel in-flight streams. If a
+    // long-lived streaming client outlives the graceful drain budget,
+    // the timeout fires, `state.worker.wait_idle()` also times out,
+    // and any late-arriving job into `finalize_sessions` races the
+    // stream's own drop-time finalizer. A non-zero counter is a
+    // hard-page: it means shutdown ordering is unsafe and every
+    // affected session needs receipt-verify on restart.
+    let drain_timeouts = metrics.counter(
+        "ab_http_shutdown_drain_timeouts_total",
+        "HTTP graceful-drain phase exceeded budget; per-connection tasks may still be live",
+    );
     let server = std::future::IntoFuture::into_future(
         axum::serve(listener, build_router(state.clone())).with_graceful_shutdown(async {
             shutdown_signal().await;
@@ -102,9 +124,21 @@ async fn main() -> Result<()> {
         _ = shutdown_started_rx => {
             match tokio::time::timeout(std::time::Duration::from_secs(30), &mut server).await {
                 Ok(result) => result.context("serve AgentBridge"),
-                Err(_) => Err(anyhow::anyhow!(
-                    "timed out draining HTTP connections during shutdown"
-                )),
+                Err(_) => {
+                    drain_timeouts.inc();
+                    // Explicitly drop the pinned server future here to
+                    // stop the accepting `TcpListener` from taking new
+                    // connections while the later shutdown phases run.
+                    // Detached per-connection tasks that Axum handed
+                    // off via `tokio::spawn` still leak — a full fix
+                    // requires a broadcast CancellationToken threaded
+                    // through the streaming handlers, which is out of
+                    // scope here. Until then, the counter above makes
+                    // the failure mode observable.
+                    Err(anyhow::anyhow!(
+                        "timed out draining HTTP connections during shutdown"
+                    ))
+                }
             }
         }
     };
@@ -450,7 +484,10 @@ fn spawn_bridge_maintenance(
     })
 }
 
-async fn build_identity(config: &HarnessConfig) -> Result<Option<Arc<IdentityValidator>>> {
+async fn build_identity(
+    config: &HarnessConfig,
+    metrics: Arc<ab_core::metrics::Registry>,
+) -> Result<Option<Arc<IdentityValidator>>> {
     let has_jwks = config
         .identity_jwks_url
         .as_deref()
@@ -481,8 +518,17 @@ async fn build_identity(config: &HarnessConfig) -> Result<Option<Arc<IdentityVal
         // Disable redirects: an IdP that returns 302 to an internal URL would
         // let a compromised (or misconfigured) JWKS host pivot the harness
         // into an SSRF probe against private services.
+        //
+        // Total-request timeout of 10 s guards against slowloris IdPs
+        // that accept the TCP handshake but never send response bytes
+        // (or send them one byte per minute). Without it, a single
+        // stuck fetch pins the refresh loop's `tick()` forever and
+        // subsequent scheduled refreshes never fire (see round-11 F1).
+        // Result: revoked keys stay honored until the next process
+        // restart, with no scheduled recovery.
         let client = reqwest::Client::builder()
             .connect_timeout(ab_harness::pipeline::HTTP_CONNECT_TIMEOUT)
+            .timeout(std::time::Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("build JWKS client")?;
@@ -490,6 +536,17 @@ async fn build_identity(config: &HarnessConfig) -> Result<Option<Arc<IdentityVal
         let url = url.to_owned();
         let validator = Arc::clone(&validator);
         let refresh_s = config.identity_jwks_refresh_s;
+        // Register both counters up-front so their TYPE lines are
+        // present in `/metrics` even before the first failure — ops
+        // alerts can wire onto them at boot.
+        let refresh_errors = metrics.counter(
+            "ab_jwks_refresh_errors_total",
+            "JWKS refresh HTTP/parse/network failures (per attempt)",
+        );
+        let refresh_panics = metrics.counter(
+            "ab_jwks_refresh_panics_total",
+            "JWKS refresh task panicked; loop supervised via catch_unwind",
+        );
         tokio::spawn(async move {
             // Wrap the whole loop in AssertUnwindSafe so an unexpected
             // panic (reqwest bug, malformed JWKS, allocator failure)
@@ -512,12 +569,14 @@ async fn build_identity(config: &HarnessConfig) -> Result<Option<Arc<IdentityVal
                 match outcome {
                     Ok(Ok(_)) => {}
                     Ok(Err(error)) => {
+                        refresh_errors.inc();
                         tracing::warn!(
                             %error,
                             "JWKS refresh failed; retaining previously loaded keys"
                         );
                     }
                     Err(panic) => {
+                        refresh_panics.inc();
                         let msg = panic
                             .downcast_ref::<&'static str>()
                             .copied()
@@ -887,7 +946,7 @@ mod tests {
         let mut config = HarnessConfig::for_tests("http://upstream", "/tmp", "/tmp");
         config.require_identity = true;
         config.identity_hmac_secret_file = Some(secret.to_string_lossy().into_owned());
-        let validator = build_identity(&config).await.unwrap().unwrap();
+        let validator = build_identity(&config, Arc::new(ab_core::metrics::Registry::new())).await.unwrap().unwrap();
         assert_eq!(validator.key_count(), 1);
     }
 
@@ -932,7 +991,7 @@ mod tests {
         let mut config = HarnessConfig::for_tests("http://upstream", "/tmp", "/tmp");
         config.require_identity = true;
         config.identity_hmac_secret_file = Some(secret.to_string_lossy().into_owned());
-        assert!(build_identity(&config).await.is_err());
+        assert!(build_identity(&config, Arc::new(ab_core::metrics::Registry::new())).await.is_err());
     }
 
     /// Vicious bug regression: `std::fs::metadata` follows symbolic links,
@@ -984,7 +1043,7 @@ mod tests {
         let mut config = HarnessConfig::for_tests("http://upstream", "/tmp", "/tmp");
         config.require_identity = true;
         config.identity_hmac_secret_file = Some(secret.to_string_lossy().into_owned());
-        let result = build_identity(&config).await;
+        let result = build_identity(&config, Arc::new(ab_core::metrics::Registry::new())).await;
         let err = result.err().map(|error| error.to_string()).unwrap_or_default();
         assert!(
             err.contains("symbolic link"),

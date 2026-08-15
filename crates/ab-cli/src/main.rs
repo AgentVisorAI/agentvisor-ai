@@ -401,9 +401,14 @@ async fn loadgen(
     // Cap the requested concurrency: at multi-hundred-thousand
     // connections the loadgen exhausts source ports / FDs / RAM on the
     // operator's own host before any latency numbers land, and the load
-    // *test* becomes the very thing it was supposed to measure. 100k is
-    // enough to comfortably cover the 10k SLA gate.
-    const MAX_CONNECTIONS: usize = 100_000;
+    // *test* becomes the very thing it was supposed to measure. 10k is
+    // the stated SLA gate (round-11 F6) — the previous 100k cap
+    // encouraged runs that a single host cannot sustain: default Linux
+    // `net.ipv4.ip_local_port_range` (~28k) exhausts before hyper can
+    // dial, and `RLIMIT_NOFILE` (1024–65536) trips producing thousands
+    // of `Address not available` failures that look like the harness
+    // is broken.
+    const MAX_CONNECTIONS: usize = 10_000;
     if connections > MAX_CONNECTIONS {
         anyhow::bail!(
             "connections must be <= {MAX_CONNECTIONS} — larger values \

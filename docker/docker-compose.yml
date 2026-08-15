@@ -8,10 +8,11 @@ services:
     ports:
       - "8484:8484"
     # Docker's default stop_grace_period is 10 s — far shorter than the
-    # harness's shutdown budget (up to 30 s per phase for HTTP drain,
-    # worker wait_idle, and finalize_sessions). Without this override,
-    # docker stop / docker compose down sends SIGKILL mid-finalise,
-    # dropping receipts and truncating ATIF trajectories.
+    # harness's four shutdown phases (HTTP drain, worker wait_idle,
+    # finalize_sessions, telemetry flush; up to 30 s each for the first
+    # three plus 5 s for OTel). Without this override, docker stop /
+    # docker compose down sends SIGKILL mid-finalise, dropping receipts
+    # and truncating ATIF trajectories.
     stop_grace_period: 120s
     # Match the Kubernetes securityContext: no fresh privileges after fork,
     # drop every Linux capability, and cap process/memory footprint so a
@@ -43,7 +44,14 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
-      test: ["CMD", "abctl", "health"]
+      # Hardcode the URL rather than relying on `abctl health`'s default
+      # matching whatever `listen` is in `config/harness.docker.toml`.
+      # A silent drift between the two used to make the healthcheck
+      # report *green* against the wrong endpoint (round-11 F8) — the
+      # `listen` port changing without the CLI default updating still
+      # returned 200 from a stale sidecar or an unrelated in-container
+      # service.
+      test: ["CMD", "abctl", "health", "--url", "http://127.0.0.1:8484"]
       interval: 10s
       timeout: 3s
       retries: 5
