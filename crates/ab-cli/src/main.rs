@@ -437,6 +437,19 @@ fn bridge_provision(manifest_path: &Path, data_dir: &Path) -> Result<()> {
 }
 
 fn event_tail(data_dir: &Path, topic: &str, partition: u32, offset: u64, max: usize) -> Result<()> {
+    // Round-24 F7: cap `--max`. Every neighbouring CLI flag has a
+    // documented cap (loadgen --connections <= 10_000, dashboard
+    // limit <= 500, receipt/atif/config file caps); event-tail did
+    // not, so `abctl event-tail --max 4000000000` allocates a Vec
+    // large enough to OOM the CLI on a 64-bit host. 100_000 is
+    // three orders of magnitude above any operator-friendly page
+    // size — a real drain use case should page with --offset.
+    const MAX_EVENT_TAIL: usize = 100_000;
+    if max > MAX_EVENT_TAIL {
+        anyhow::bail!(
+            "--max {max} exceeds the safety cap of {MAX_EVENT_TAIL}; page with --offset instead"
+        );
+    }
     let bridge = EmbeddedBroker::open(data_dir).context("open Bridge")?;
     for event in bridge
         .fetch(topic, partition, offset, max)
@@ -713,5 +726,21 @@ mod tests {
         );
         // The original pre-existing seed file is untouched.
         assert_eq!(std::fs::read(&seed_path).unwrap(), b"pre-existing");
+    }
+
+    /// Round-24 F7: `event_tail` refuses --max above the safety cap
+    /// so a typo (`--max 999999999`) cannot OOM the CLI by
+    /// preallocating a proportional Vec inside bridge.fetch. The
+    /// tempdir passed in doesn't need a real manifest — the cap
+    /// check fires before EmbeddedBroker::open.
+    #[test]
+    fn event_tail_refuses_max_above_safety_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = event_tail(dir.path(), "any-topic", 0, 0, 100_001).unwrap_err();
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("safety cap"),
+            "expected safety-cap rejection, got {text}"
+        );
     }
 }

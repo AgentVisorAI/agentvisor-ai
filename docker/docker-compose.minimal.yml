@@ -18,6 +18,19 @@ services:
       dockerfile: docker/Dockerfile
     image: agent-bridge:local
     container_name: agent-bridge
+    # Round-24 F6: parity with docker-compose.yml. The minimal
+    # template is advertised as the on-ramp for evaluators; without
+    # these knobs the same agent-bridge binary ships with a
+    # materially less-hardened surface than the full stack (default
+    # capabilities include NET_RAW / CHOWN / DAC_OVERRIDE, no
+    # process-cap, no grace budget for the four-phase shutdown).
+    stop_grace_period: 120s
+    restart: unless-stopped
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    pids_limit: 4096
     ports:
       # Round-16 F2: bind to 127.0.0.1 explicitly. Docker's default
       # (`"8484:8484"`) means `0.0.0.0:8484` — reachable from any
