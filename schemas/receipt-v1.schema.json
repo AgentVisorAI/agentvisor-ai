@@ -13,11 +13,13 @@
     "issued_at_iso": { "type": "string", "format": "date-time" },
     "ai_agent": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["version", "charter", "instance_uid"],
       "properties": {
         "version": { "type": "string", "minLength": 1 },
         "charter": {
           "type": "object",
+          "additionalProperties": false,
           "required": ["name", "type_id"],
           "properties": {
             "name": { "type": "string", "minLength": 1 },
@@ -30,12 +32,31 @@
     },
     "subject": {
       "oneOf": [
-        { "type": "object", "required": ["kind", "chain_head", "event_count"], "properties": { "kind": { "const": "event_chain" }, "chain_head": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "event_count": { "type": "integer", "minimum": 0 } } },
-        { "type": "object", "required": ["kind", "trajectory_digest", "step_count", "retroactive"], "properties": { "kind": { "const": "atif_trajectory" }, "trajectory_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "step_count": { "type": "integer", "minimum": 0 }, "retroactive": { "const": true } } }
+        { "type": "object", "additionalProperties": false, "required": ["kind", "chain_head", "event_count"], "properties": { "kind": { "const": "event_chain" }, "chain_head": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "event_count": { "type": "integer", "minimum": 0 } } },
+        { "type": "object", "additionalProperties": false, "required": ["kind", "trajectory_digest", "step_count", "retroactive"], "properties": { "kind": { "const": "atif_trajectory" }, "trajectory_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "step_count": { "type": "integer", "minimum": 0 }, "retroactive": { "const": true } } }
       ]
     },
-    "tool_calls": { "type": "object" },
-    "cost": { "type": "object" },
+    "tool_calls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "allowed", "blocked"],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "allowed": { "type": "integer", "minimum": 0 },
+        "blocked": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "cost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prompt_tokens", "completion_tokens", "cached_tokens", "cost_usd_micros"],
+      "properties": {
+        "prompt_tokens": { "type": "integer", "minimum": 0 },
+        "completion_tokens": { "type": "integer", "minimum": 0 },
+        "cached_tokens": { "type": "integer", "minimum": 0 },
+        "cost_usd_micros": { "type": "integer", "minimum": 0 }
+      }
+    },
     "stop_reason_id": { "type": "integer", "minimum": 0, "maximum": 255 },
     "stop_reason": { "type": "string" },
     "key_id": { "type": "string", "minLength": 1 },
