@@ -166,6 +166,33 @@ fn static_asset(body: &'static str, content_type: &'static str) -> Response {
         HeaderName::from_static("x-content-type-options"),
         HeaderValue::from_static("nosniff"),
     );
+    // Round-28 F2: defense-in-depth against a future XSS regression
+    // in `highlightJson` or any innerHTML-writing dashboard code.
+    // The dashboard is a same-origin single-page app that only
+    // needs its own JS/CSS/img and its own /api/v1/dashboard/*
+    // fetches; a strict CSP shrinks the blast radius to zero even
+    // if attacker-controlled text ever reaches innerHTML.
+    // `frame-ancestors 'none'` + `X-Frame-Options: DENY` block
+    // clickjacking / iframe embed for the day the dashboard grows
+    // an identity gate. `Referrer-Policy: no-referrer` prevents
+    // session ids from leaking through an outbound link.
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; script-src 'self'; style-src 'self'; \
+             img-src 'self' data:; font-src 'self'; \
+             connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; \
+             form-action 'none'",
+        ),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
+    response.headers_mut().insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
     response
 }
 
@@ -191,6 +218,24 @@ fn no_store_json_response(value: impl serde::Serialize) -> Response {
     response.headers_mut().insert(
         HeaderName::from_static("x-content-type-options"),
         HeaderValue::from_static("nosniff"),
+    );
+    // Round-28 F2: mirror the same anti-XSS / anti-clickjacking /
+    // anti-referrer-leak headers on JSON responses. A future
+    // dashboard client that navigates directly to
+    // /api/v1/dashboard/sessions/{id} in a top-level window must
+    // not become a referrer source for session-id leakage, and
+    // must not be framable.
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'; base-uri 'none'"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
+    response.headers_mut().insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
     );
     response
 }

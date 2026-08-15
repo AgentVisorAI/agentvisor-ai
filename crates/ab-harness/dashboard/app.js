@@ -274,7 +274,11 @@ function highlightJson(value) {
     (match, _g1, colon) => {
       if (colon) return `<span class="k">${match}</span>`;
       if (/^"/.test(match)) return `<span class="s">${match}</span>`;
-      if (/true|false|null/.test(match)) return `<span class="n">${match}</span>`;
+      // Round-28 F6: booleans/null get a distinct class from numbers
+      // so the receipt drawer visually differentiates them. Previously
+      // the boolean/null branch and the numeric else-branch both
+      // emitted class="n" (copy-paste from the numeric case).
+      if (/^(true|false|null)$/.test(match)) return `<span class="b">${match}</span>`;
       return `<span class="n">${match}</span>`;
     },
   );
