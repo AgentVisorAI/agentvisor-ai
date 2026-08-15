@@ -29,7 +29,17 @@ impl TokenVelocity {
         while samples.front().is_some_and(|(t, _)| *t < cutoff) {
             samples.pop_front();
         }
-        samples.iter().map(|(_, n)| *n).sum()
+        // Round-26 F5: `Iterator::sum` on `u64` panics in debug and
+        // silently wraps in release on overflow. Every other counter
+        // and spend site in ab_state uses `checked_add` or
+        // `saturating_add` — velocity was the last inconsistent
+        // site. Realistically requires ~2^64 windowed tokens, but
+        // the discipline gap means a future refactor that turns
+        // `window_ms` into a `Duration::MAX` sentinel could reach
+        // it. Cheap to fix.
+        samples
+            .iter()
+            .fold(0u64, |acc, (_, n)| acc.saturating_add(*n))
     }
 
     /// Record at the current wall clock.
@@ -41,11 +51,11 @@ impl TokenVelocity {
     pub fn current_at(&self, now_ms: u64) -> u64 {
         let samples = self.samples.lock();
         let cutoff = now_ms.saturating_sub(self.window_ms);
+        // Round-26 F5: mirror record_at's saturating_add discipline.
         samples
             .iter()
             .filter(|(t, _)| *t >= cutoff)
-            .map(|(_, n)| *n)
-            .sum()
+            .fold(0u64, |acc, (_, n)| acc.saturating_add(*n))
     }
 }
 
@@ -95,6 +105,30 @@ mod tests {
         assert_eq!(
             second, 10,
             "second record must reflect both samples inside the window"
+        );
+    }
+
+    /// Round-26 F5: `Iterator::sum` on `u64` panics in debug and
+    /// wraps in release on overflow. Every other counter/spend
+    /// site in ab_state uses checked/saturating arithmetic;
+    /// velocity now does too. Two u64::MAX samples inside the
+    /// window must return u64::MAX (saturated), not panic and not
+    /// wrap to a small number.
+    #[test]
+    fn windowed_sum_saturates_instead_of_wrapping_or_panicking() {
+        let v = TokenVelocity::new(60_000);
+        v.record_at(1_000, u64::MAX);
+        let total = v.record_at(2_000, u64::MAX);
+        assert_eq!(
+            total,
+            u64::MAX,
+            "windowed sum must saturate at u64::MAX, got {total}"
+        );
+        // current_at path also.
+        let peek = v.current_at(3_000);
+        assert_eq!(
+            peek, u64::MAX,
+            "current_at must saturate at u64::MAX, got {peek}"
         );
     }
 }
