@@ -826,7 +826,14 @@ fn load_or_create_signer(path: &Path) -> Result<Ed25519Signer> {
         Err(error) => return Err(error),
     }
     let signer = Ed25519Signer::generate();
-    if install_seed_exclusive(path, &hex::encode(signer.seed()))? {
+    // Round-18 F5: wrap the hex-encoded seed in Zeroizing so
+    // install_seed_exclusive receives it via a zeroize-on-drop
+    // holder. The `seed()` return itself is a bare `[u8; 32]`
+    // but `signer` (an Ed25519Signer with the zeroize feature
+    // enabled on ed25519-dalek) zeroes its inner SigningKey on
+    // drop; we handle the outbound hex intermediate here.
+    let encoded_seed = zeroize::Zeroizing::new(hex::encode(signer.seed()));
+    if install_seed_exclusive(path, &encoded_seed)? {
         Ok(signer)
     } else {
         read_signer(path).context("load signing seed installed by another process")
@@ -881,12 +888,32 @@ fn require_owner_only_mode(path: &Path) -> Result<()> {
 
 fn read_signer(path: &Path) -> Result<Ed25519Signer> {
     require_owner_only_mode(path)?;
-    let encoded =
-        std::fs::read_to_string(path).with_context(|| format!("read signing seed {}", path.display()))?;
-    let bytes = hex::decode(encoded.trim()).context("decode signing seed as hex")?;
-    let seed: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("signing seed must contain exactly 32 bytes"))?;
+    // Round-18 F4: consistent posture with the CLI's round-17 F6
+    // read_capped_str — the harness should not use uncapped
+    // read_to_string on a security-sensitive file just because
+    // require_owner_only_mode already refused the group/other-
+    // readable case. A hex-encoded 32-byte seed is 65 bytes with
+    // newline; MAX_CONTROL_BYTES (1 MiB) is a generous ceiling.
+    // Round-18 F5: wrap the seed intermediates in `Zeroizing<...>`
+    // so their memory is zeroed on drop rather than leaking a
+    // recoverable copy in freed heap / stack slots (visible to a
+    // core dump, minidump upload, or kdump crashkernel image).
+    // ed25519-dalek 2.2+ with the `zeroize` feature also zeroes
+    // SigningKey's internal buffer on drop.
+    use zeroize::Zeroizing;
+    let encoded = Zeroizing::new(
+        ab_core::fsutil::read_capped_string(path, ab_core::fsutil::MAX_CONTROL_BYTES)
+            .with_context(|| format!("read signing seed {}", path.display()))?,
+    );
+    let bytes = Zeroizing::new(
+        hex::decode(encoded.trim()).context("decode signing seed as hex")?,
+    );
+    let seed: Zeroizing<[u8; 32]> = Zeroizing::new(
+        (*bytes)
+            .clone()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("signing seed must contain exactly 32 bytes"))?,
+    );
     // Round-14: refuse known-weak Ed25519 seeds. An all-zero seed
     // produces a valid keypair with a globally-known public key — any
     // attacker who knows we accepted `[0; 32]` can forge receipts
@@ -894,19 +921,19 @@ fn read_signer(path: &Path) -> Result<Ed25519Signer> {
     // (both are the "textbook wrong" values operators sometimes
     // paste in when troubleshooting). Fail fast at startup so the
     // hazard cannot ship silently.
-    if seed == [0u8; 32] {
+    if *seed == [0u8; 32] {
         anyhow::bail!(
             "signing seed at {} is all zeros; refusing (this is a known-weak seed with a globally predictable public key)",
             path.display()
         );
     }
-    if seed == [0xFFu8; 32] {
+    if *seed == [0xFFu8; 32] {
         anyhow::bail!(
             "signing seed at {} is all 0xFF bytes; refusing (this is a known-weak seed with a globally predictable public key)",
             path.display()
         );
     }
-    Ok(Ed25519Signer::from_seed(seed))
+    Ok(Ed25519Signer::from_seed(*seed))
 }
 
 fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {

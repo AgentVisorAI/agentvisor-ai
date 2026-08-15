@@ -50,6 +50,7 @@ dashmap = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
+zeroize = { workspace = true }
 
 [dependencies.opentelemetry]
 version = "0.32"
