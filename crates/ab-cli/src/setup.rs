@@ -440,24 +440,60 @@ fn ask_line(prompt: &str, input: &mut dyn std::io::BufRead) -> Result<String> {
     Ok(line.trim().to_owned())
 }
 
-/// Round-38 F2: `Zeroizing<String>` so every intermediate copy of
-/// the pasted secret zeroes its heap allocation on drop. Both
-/// branches return plain `String` from their underlying reader; we
-/// wrap immediately at the boundary so the un-zeroized `String`
-/// never outlives this function. Rejected retries in the caller's
-/// loop then drop-zero the previous attempt's buffer as well.
+/// Round-39 F1: read one line into a `Zeroizing<String>` from the
+/// very first allocation, so the pasted secret + trailing `\n` are
+/// zeroed on drop. `ask_line` above stores the line in a plain
+/// `String` and returns a fresh `.trim().to_owned()` — both the
+/// original buffer and the trimmed copy sit un-zeroed in the
+/// allocator when the piped-stdin (non-TTY) Plain path fed the
+/// wizard a real API key. Round-38 F2 wrapped only the outer
+/// return; this closes the intermediate copies. The caller trims
+/// via `line.trim()` (a `&str` borrow into the Zeroizing buffer),
+/// so no additional un-zeroed intermediate is created.
+fn ask_secret_line(
+    prompt: &str,
+    input: &mut dyn std::io::BufRead,
+) -> Result<zeroize::Zeroizing<String>> {
+    use std::io::Write as _;
+    print!("{prompt}");
+    std::io::stdout().flush().context("flush prompt")?;
+    let mut line = zeroize::Zeroizing::new(String::new());
+    if input.read_line(&mut line).context("read answer")? == 0 {
+        anyhow::bail!("setup input ended unexpectedly");
+    }
+    Ok(line)
+}
+
+/// Round-38 F2 + round-39 F1: `Zeroizing<String>` end-to-end so
+/// every intermediate copy of the pasted secret zeroes its heap
+/// allocation on drop.
+///
+/// * Hidden (TTY) branch: `rpassword::prompt_password` returns a
+///   plain `String`; wrap it immediately at the boundary so the
+///   raw allocation never outlives this function.
+/// * Plain (non-TTY / piped stdin) branch: use `ask_secret_line`
+///   which allocates the line buffer INSIDE `Zeroizing` from the
+///   start. `ask_line` (used for non-secret prompts) still returns
+///   plain `String` — cheaper, but MUST NOT be reached from
+///   secret-carrying paths. Rejected retries in the caller's loop
+///   then drop-zero the previous attempt's buffer as well.
+///
+/// Residual: `StdinLock`'s internal `BufReader` buffer is outside
+/// our control (std/kernel-owned); we cannot zero that copy. All
+/// intermediates we ourselves allocate are zeroed.
 fn ask_secret(
     prompt: &str,
     input: &mut dyn std::io::BufRead,
     mode: &SecretInput,
 ) -> Result<zeroize::Zeroizing<String>> {
-    let raw = match mode {
+    match mode {
         SecretInput::Hidden => {
-            rpassword::prompt_password(format!("{prompt} (typing is hidden): ")).context("read key")?
+            let raw = rpassword::prompt_password(format!("{prompt} (typing is hidden): "))
+                .context("read key")?;
+            Ok(zeroize::Zeroizing::new(raw))
         }
-        SecretInput::Plain => ask_line(&format!("{prompt}: "), input)?,
-    };
-    Ok(zeroize::Zeroizing::new(raw))
+        SecretInput::Plain => ask_secret_line(&format!("{prompt}: "), input),
+    }
 }
 
 fn ask_yes_no(prompt: &str, input: &mut dyn std::io::BufRead, default: bool) -> Result<bool> {
@@ -1435,6 +1471,32 @@ mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
 
     use super::*;
+
+    /// Round-39 F1: the piped-stdin (Plain) secret-reading path uses
+    /// a `Zeroizing<String>` buffer from the first allocation.
+    /// A compile-time type check on the return type is the tightest
+    /// property test — if a future refactor accidentally unwraps
+    /// the Zeroizing wrapper somewhere in ask_secret_line's chain,
+    /// this fails to type-check. Also assert a runtime behaviour
+    /// property: the returned buffer's Deref exposes the exact bytes
+    /// read (secret + trailing newline) so the caller sees the raw
+    /// content and can trim() to a &str borrow into the Zeroizing
+    /// buffer without creating a fresh un-zeroed allocation.
+    #[test]
+    fn ask_secret_line_returns_zeroizing_string() {
+        let mut cursor = std::io::Cursor::new(b"sk-test-key\n".to_vec());
+        let line = ask_secret_line("prompt: ", &mut cursor).unwrap();
+        // Type is Zeroizing<String>.
+        let _explicit: zeroize::Zeroizing<String> = line;
+        // Content is exactly what stdin fed us — the trailing '\n'
+        // is preserved so the caller (round-38 F2 flow) trims via
+        // `.trim()` (a &str borrow into the Zeroizing buffer)
+        // instead of `.trim().to_owned()` which would spawn a fresh
+        // un-zeroed allocation.
+        let mut cursor = std::io::Cursor::new(b"sk-abc-123\n".to_vec());
+        let line = ask_secret_line("prompt: ", &mut cursor).unwrap();
+        assert_eq!(&*line, "sk-abc-123\n");
+    }
 
     #[test]
     fn split_embedded_chat_path_covers_pasted_endpoint_urls() {
