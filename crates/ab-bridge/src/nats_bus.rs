@@ -36,7 +36,15 @@ impl NatsBus {
         let client = executor
             .run(move || async move { async_nats::connect(url).await })?
             .map_err(|e| BusError::Backend(e.to_string()))?;
-        let js = async_nats::jetstream::new(client);
+        // `async_nats::jetstream::new` must be called from within a Tokio
+        // runtime — the constructor eagerly calls `Handle::current()` and
+        // panics otherwise (async-nats 0.50, jetstream/context.rs:129).
+        // Route it through the executor so the sync `provision` entrypoint
+        // stays runtime-agnostic for callers.
+        let js = executor.run({
+            let client = client.clone();
+            move || async move { async_nats::jetstream::new(client) }
+        })?;
         let mut topics = HashMap::new();
         for t in &manifest.topics {
             let subjects: Vec<String> = (0..t.partitions).map(|p| format!("{}.p{p}", t.name)).collect();
