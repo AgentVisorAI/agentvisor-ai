@@ -59,9 +59,7 @@ impl TokenVelocity {
         // the discipline gap means a future refactor that turns
         // `window_ms` into a `Duration::MAX` sentinel could reach
         // it. Cheap to fix.
-        samples
-            .iter()
-            .fold(0u64, |acc, (_, n)| acc.saturating_add(*n))
+        samples.iter().fold(0u64, |acc, (_, n)| acc.saturating_add(*n))
     }
 
     /// Record at the current wall clock.
@@ -148,9 +146,6 @@ mod tests {
         );
         // current_at path also.
         let peek = v.current_at(3_000);
-        assert_eq!(
-            peek, u64::MAX,
-            "current_at must saturate at u64::MAX, got {peek}"
-        );
+        assert_eq!(peek, u64::MAX, "current_at must saturate at u64::MAX, got {peek}");
     }
 }

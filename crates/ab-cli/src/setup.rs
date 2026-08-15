@@ -310,9 +310,8 @@ pub fn init(
     // `output`.
     if let Ok(metadata) = std::fs::symlink_metadata(output) {
         if metadata.file_type().is_symlink() {
-            std::fs::remove_file(output).with_context(|| {
-                format!("remove pre-existing symlink at {}", output.display())
-            })?;
+            std::fs::remove_file(output)
+                .with_context(|| format!("remove pre-existing symlink at {}", output.display()))?;
         }
     }
     if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -329,8 +328,7 @@ pub fn init(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        if let Err(error) = std::fs::set_permissions(output, std::fs::Permissions::from_mode(0o600))
-        {
+        if let Err(error) = std::fs::set_permissions(output, std::fs::Permissions::from_mode(0o600)) {
             eprintln!(
                 "warning: failed to chmod 0600 on {}: {error}; contents may be world-readable",
                 output.display(),
@@ -468,10 +466,7 @@ fn ask_line(prompt: &str, input: &mut dyn std::io::BufRead) -> Result<String> {
 /// return; this closes the intermediate copies. The caller trims
 /// via `line.trim()` (a `&str` borrow into the Zeroizing buffer),
 /// so no additional un-zeroed intermediate is created.
-fn ask_secret_line(
-    prompt: &str,
-    input: &mut dyn std::io::BufRead,
-) -> Result<zeroize::Zeroizing<String>> {
+fn ask_secret_line(prompt: &str, input: &mut dyn std::io::BufRead) -> Result<zeroize::Zeroizing<String>> {
     use std::io::Write as _;
     print!("{prompt}");
     std::io::stdout().flush().context("flush prompt")?;
@@ -506,8 +501,8 @@ fn ask_secret(
 ) -> Result<zeroize::Zeroizing<String>> {
     match mode {
         SecretInput::Hidden => {
-            let raw = rpassword::prompt_password(format!("{prompt} (typing is hidden): "))
-                .context("read key")?;
+            let raw =
+                rpassword::prompt_password(format!("{prompt} (typing is hidden): ")).context("read key")?;
             Ok(zeroize::Zeroizing::new(raw))
         }
         SecretInput::Plain => ask_secret_line(&format!("{prompt}: "), input),
@@ -829,9 +824,7 @@ pub fn wizard(home: &Path, input: &mut dyn std::io::BufRead, secrets: &SecretInp
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        if let Err(error) =
-            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
-        {
+        if let Err(error) = std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)) {
             eprintln!(
                 "warning: failed to chmod 0600 on {}: {error}; contents may be world-readable",
                 config_path.display(),
@@ -1452,10 +1445,7 @@ fn probe_target(endpoint: &str) -> Result<String> {
     // Strip userinfo (`user:pass@`).
     let hostpart = rest.rsplit_once('@').map_or(rest, |(_userinfo, host)| host);
     // Trim path/query/fragment.
-    let host_and_port = hostpart
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(hostpart);
+    let host_and_port = hostpart.split(['/', '?', '#']).next().unwrap_or(hostpart);
     let (host, port_opt) = if let Some(stripped) = host_and_port.strip_prefix('[') {
         match stripped.split_once(']') {
             Some((h, tail)) => {
@@ -1466,9 +1456,7 @@ fn probe_target(endpoint: &str) -> Result<String> {
         }
     } else {
         match host_and_port.rsplit_once(':') {
-            Some((h, p)) if p.parse::<u16>().is_ok() => {
-                (h.to_owned(), p.parse::<u16>().ok())
-            }
+            Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_owned(), p.parse::<u16>().ok()),
             _ => (host_and_port.to_owned(), None),
         }
     };
@@ -1525,9 +1513,7 @@ fn build_probe_base(listen: &str) -> String {
         // rejects zone ids on stable Rust; drop the zone id via a
         // second replace so at least the loopback rewrite still
         // runs.
-        let rewritten = listen
-            .replace("0.0.0.0", "127.0.0.1")
-            .replace("[::]", "[::1]");
+        let rewritten = listen.replace("0.0.0.0", "127.0.0.1").replace("[::]", "[::1]");
         // Strip an IPv6 zone identifier if present: `[fe80::1%eth0]`
         // -> `[fe80::1]`. Loopback connects don't need it, and the
         // raw `%` breaks URL parsing downstream.
@@ -1949,13 +1935,31 @@ mod tests {
     #[test]
     fn round_28_probe_target_parses_urls_correctly() {
         // F1: scheme-driven defaults, not the old hardcoded :80.
-        assert_eq!(probe_target("https://api.example.com").unwrap(), "api.example.com:443");
-        assert_eq!(probe_target("redis://cache.example.com").unwrap(), "cache.example.com:6379");
-        assert_eq!(probe_target("rediss://cache.example.com").unwrap(), "cache.example.com:443");
-        assert_eq!(probe_target("nats://bus.example.com").unwrap(), "bus.example.com:4222");
+        assert_eq!(
+            probe_target("https://api.example.com").unwrap(),
+            "api.example.com:443"
+        );
+        assert_eq!(
+            probe_target("redis://cache.example.com").unwrap(),
+            "cache.example.com:6379"
+        );
+        assert_eq!(
+            probe_target("rediss://cache.example.com").unwrap(),
+            "cache.example.com:443"
+        );
+        assert_eq!(
+            probe_target("nats://bus.example.com").unwrap(),
+            "bus.example.com:4222"
+        );
         // Explicit port always wins over scheme default.
-        assert_eq!(probe_target("https://api.example.com:6333").unwrap(), "api.example.com:6333");
-        assert_eq!(probe_target("http://api.example.com:8080/path?q=1").unwrap(), "api.example.com:8080");
+        assert_eq!(
+            probe_target("https://api.example.com:6333").unwrap(),
+            "api.example.com:6333"
+        );
+        assert_eq!(
+            probe_target("http://api.example.com:8080/path?q=1").unwrap(),
+            "api.example.com:8080"
+        );
         // Bare host without scheme defaults to :80.
         assert_eq!(probe_target("localhost").unwrap(), "localhost:80");
         assert_eq!(probe_target("localhost:6379").unwrap(), "localhost:6379");
@@ -1968,7 +1972,10 @@ mod tests {
         assert!(!target.contains("pass"), "userinfo leaked into target: {target}");
         // IPv6 literals stay bracketed and preserve default port.
         assert_eq!(probe_target("http://[::1]").unwrap(), "[::1]:80");
-        assert_eq!(probe_target("https://[2001:db8::1]:8443").unwrap(), "[2001:db8::1]:8443");
+        assert_eq!(
+            probe_target("https://[2001:db8::1]:8443").unwrap(),
+            "[2001:db8::1]:8443"
+        );
     }
 
     /// Round-40 F2: `build_probe_base` handles the four listen-form
@@ -1978,23 +1985,14 @@ mod tests {
     #[test]
     fn build_probe_base_covers_ipv6_zones_and_family_dispatch() {
         // IPv4 unspecified -> IPv4 loopback.
-        assert_eq!(
-            build_probe_base("0.0.0.0:8484"),
-            "http://127.0.0.1:8484"
-        );
+        assert_eq!(build_probe_base("0.0.0.0:8484"), "http://127.0.0.1:8484");
         // IPv6 unspecified -> IPv6 loopback (bracketed).
         assert_eq!(build_probe_base("[::]:8484"), "http://[::1]:8484");
         // IPv6 unspecified expanded form — SocketAddr parse
         // normalises to `::` so we still get [::1].
-        assert_eq!(
-            build_probe_base("[0:0:0:0:0:0:0:0]:8484"),
-            "http://[::1]:8484"
-        );
+        assert_eq!(build_probe_base("[0:0:0:0:0:0:0:0]:8484"), "http://[::1]:8484");
         // Concrete IPv4/IPv6 interface bindings are preserved.
-        assert_eq!(
-            build_probe_base("127.0.0.1:8484"),
-            "http://127.0.0.1:8484"
-        );
+        assert_eq!(build_probe_base("127.0.0.1:8484"), "http://127.0.0.1:8484");
         assert_eq!(
             build_probe_base("[2001:db8::1]:8484"),
             "http://[2001:db8::1]:8484"

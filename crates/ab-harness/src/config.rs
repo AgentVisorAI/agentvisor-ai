@@ -945,27 +945,15 @@ impl HarnessConfig {
             }
         }
         if self.vector_backend == "qdrant" {
-            if let Some(url) = self
-                .qdrant_url
-                .as_deref()
-                .filter(|value| !value.is_empty())
-            {
+            if let Some(url) = self.qdrant_url.as_deref().filter(|value| !value.is_empty()) {
                 if !(url.starts_with("http://") || url.starts_with("https://")) {
-                    return Err(format!(
-                        "qdrant_url must be http:// or https://, got {url:?}"
-                    ));
+                    return Err(format!("qdrant_url must be http:// or https://, got {url:?}"));
                 }
             }
         }
         if self.state_backend == "redis" {
-            if let Some(url) = self
-                .state_endpoint
-                .as_deref()
-                .filter(|value| !value.is_empty())
-            {
-                if !(url.starts_with("redis://")
-                    || url.starts_with("rediss://")
-                    || url.starts_with("unix:"))
+            if let Some(url) = self.state_endpoint.as_deref().filter(|value| !value.is_empty()) {
+                if !(url.starts_with("redis://") || url.starts_with("rediss://") || url.starts_with("unix:"))
                 {
                     return Err(format!(
                         "state_endpoint (redis backend) must be redis://, rediss:// or unix:, got {url:?}"
@@ -974,11 +962,7 @@ impl HarnessConfig {
             }
         }
         if self.bridge_backend == "nats" {
-            if let Some(url) = self
-                .bridge_endpoint
-                .as_deref()
-                .filter(|value| !value.is_empty())
-            {
+            if let Some(url) = self.bridge_endpoint.as_deref().filter(|value| !value.is_empty()) {
                 if !(url.starts_with("nats://") || url.starts_with("tls://")) {
                     return Err(format!(
                         "bridge_endpoint (nats backend) must be nats:// or tls://, got {url:?}"
@@ -1398,8 +1382,7 @@ mod tests {
     /// at `file:///etc/passwd`. `abctl config-validate` now refuses.
     #[test]
     fn upstream_url_non_http_scheme_is_rejected() {
-        let err =
-            HarnessConfig::from_toml(r#"upstream_url = "file:///etc/passwd""#).unwrap_err();
+        let err = HarnessConfig::from_toml(r#"upstream_url = "file:///etc/passwd""#).unwrap_err();
         assert!(err.contains("upstream_url"), "{err}");
         let err = HarnessConfig::from_toml(r#"upstream_url = "gopher://x""#).unwrap_err();
         assert!(err.contains("upstream_url"), "{err}");

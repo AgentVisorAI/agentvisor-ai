@@ -163,8 +163,7 @@ impl<'a> ActionBudget<'a> {
             self.store.refund(&self.key(&format!("tool:{tool}")), 1);
         }
         if payout_usd_micros > 0 && self.spec.max_payout_usd_micros.is_some() {
-            self.store
-                .refund(&self.key("payout"), payout_usd_micros);
+            self.store.refund(&self.key("payout"), payout_usd_micros);
         }
     }
 
