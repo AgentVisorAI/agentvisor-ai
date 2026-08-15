@@ -39,6 +39,11 @@ pub struct Histogram {
     buckets: Vec<AtomicU64>,
     count: AtomicU64,
     sum_us: AtomicU64,
+    /// Samples above every declared bucket. Represents the implicit
+    /// `le="+Inf"` bucket in Prometheus terms and lets `quantile_us`
+    /// distinguish "quantile equals the top bound" from "quantile lies
+    /// beyond the top bound".
+    overflow: AtomicU64,
 }
 
 /// Default latency bucket upper bounds in microseconds: 50µs … 10s.
@@ -54,6 +59,7 @@ impl Histogram {
             buckets: bounds_us.iter().map(|_| AtomicU64::new(0)).collect(),
             count: AtomicU64::new(0),
             sum_us: AtomicU64::new(0),
+            overflow: AtomicU64::new(0),
         }
     }
 
@@ -66,9 +72,15 @@ impl Histogram {
                 if let Some(bucket) = self.buckets.get(i) {
                     bucket.fetch_add(1, Ordering::Relaxed);
                 }
-                break;
+                return;
             }
         }
+        // Sample landed above every declared bucket. Track it so the
+        // renderer can emit the standard Prometheus `le="+Inf"` bucket
+        // (bounded-bucket sum otherwise equals `count` minus the tail,
+        // which is invalid Prometheus text) and so operators can spot a
+        // regime where the true P99 is beyond the top bound.
+        self.overflow.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Total number of samples.
@@ -79,6 +91,10 @@ impl Histogram {
     /// Approximate quantile (µs) from bucket boundaries. Returns the upper
     /// bound of the bucket containing quantile `q` (0.0–1.0), or the max bound
     /// if the sample landed above every bucket.
+    ///
+    /// A `q` whose target is served only by samples in the implicit +Inf
+    /// bucket returns `u64::MAX` as a sentinel: this signals "beyond top
+    /// bucket" instead of silently under-reporting `bounds_us.last()`.
     pub fn quantile_us(&self, q: f64) -> u64 {
         let total = self.count();
         if total == 0 {
@@ -96,6 +112,12 @@ impl Histogram {
             if cum >= target {
                 return *b;
             }
+        }
+        // Bounded buckets could not reach the target: the target must sit in
+        // the +Inf overflow bucket. Surface that with u64::MAX rather than
+        // returning bounds_us.last() and silently under-reporting.
+        if self.overflow.load(Ordering::Relaxed) > 0 {
+            return u64::MAX;
         }
         self.bounds_us.last().copied().unwrap_or(0)
     }
@@ -123,9 +145,14 @@ impl Registry {
     ///
     /// Panics if `key` is already registered as a histogram; a silent
     /// overwrite would detach the existing metric from the registry and
-    /// lose every observation collected against it.
+    /// lose every observation collected against it. Also panics if `key`
+    /// contains a byte that would corrupt Prometheus text exposition
+    /// (`"`, `\n`, `\\`) — this catches accidental interpolation of
+    /// attacker-controlled strings into a metric key at registration
+    /// rather than surfacing corrupt scrape output later.
     #[allow(clippy::panic)]
     pub fn counter(&self, key: &str, help: &str) -> Arc<Counter> {
+        validate_metric_key(key);
         let mut m = self.metrics.lock();
         match m.get(key) {
             Some((_, Metric::Counter(c))) => Arc::clone(c),
@@ -145,9 +172,11 @@ impl Registry {
     ///
     /// Panics if `key` is already registered as a counter; a silent overwrite
     /// would detach the existing metric from the registry and lose every
-    /// observation collected against it.
+    /// observation collected against it. Same key-byte guard as
+    /// [`Self::counter`].
     #[allow(clippy::panic)]
     pub fn histogram(&self, key: &str, help: &str) -> Arc<Histogram> {
+        validate_metric_key(key);
         let mut m = self.metrics.lock();
         match m.get(key) {
             Some((_, Metric::Histogram(h))) => Arc::clone(h),
@@ -216,6 +245,26 @@ impl Registry {
             }
         }
         out
+    }
+}
+
+/// Reject metric keys that would corrupt the Prometheus text exposition
+/// format. Legitimate keys carry label values like `{stage="identity"}` and
+/// must be allowed to contain double quotes and `=`, but a newline,
+/// carriage return, backslash, or NUL byte inside a key would split the
+/// scrape line and produce invalid text. These bytes arrive only from
+/// callers accidentally interpolating attacker-influenced strings into a
+/// series name; catch that at registration.
+#[allow(clippy::panic)]
+fn validate_metric_key(key: &str) {
+    for byte in key.bytes() {
+        if matches!(byte, b'\n' | b'\r' | b'\\' | 0x00) {
+            panic!(
+                "metric key {key:?} contains a byte (0x{byte:02x}) that would corrupt \
+                 Prometheus text exposition; interpolating attacker-controlled strings \
+                 into metric keys is unsafe",
+            );
+        }
     }
 }
 
