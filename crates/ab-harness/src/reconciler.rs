@@ -96,18 +96,32 @@ pub struct Finalizer {
 /// attacker who forces one eviction per tick cannot cause every
 /// legitimate recurring artifact to re-warn together — only ONE
 /// entry evicts per insert-past-cap.
-#[derive(Default)]
+///
+/// Round-19 F5: the cap is stored on the struct rather than passed
+/// per-insert. Previously callers had to agree on the cap for
+/// every call; a future caller who passed a smaller value would
+/// have shrunk the deque without evicting matching set entries,
+/// silently desyncing the two collections.
 pub(crate) struct WarnedArtifacts {
     order: std::collections::VecDeque<PathBuf>,
     set: std::collections::HashSet<PathBuf>,
+    cap: usize,
 }
 
 impl WarnedArtifacts {
-    fn insert(&mut self, path: PathBuf, cap: usize) -> bool {
+    fn new(cap: usize) -> Self {
+        Self {
+            order: std::collections::VecDeque::new(),
+            set: std::collections::HashSet::new(),
+            cap,
+        }
+    }
+
+    fn insert(&mut self, path: PathBuf) -> bool {
         if self.set.contains(&path) {
             return false;
         }
-        if self.order.len() >= cap {
+        if self.order.len() >= self.cap {
             if let Some(evicted) = self.order.pop_front() {
                 self.set.remove(&evicted);
             }
@@ -245,7 +259,7 @@ impl Finalizer {
             recovery_lock: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle_locks: Arc::new(SessionLockTable::default()),
             quarantined_sessions: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
-            warned_artifacts: Arc::new(parking_lot::Mutex::new(WarnedArtifacts::default())),
+            warned_artifacts: Arc::new(parking_lot::Mutex::new(WarnedArtifacts::new(WARNED_ARTIFACTS_CAP))),
             journal_key,
         }
     }
@@ -267,7 +281,7 @@ impl Finalizer {
             recovery_lock: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle_locks: Arc::new(SessionLockTable::default()),
             quarantined_sessions: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
-            warned_artifacts: Arc::new(parking_lot::Mutex::new(WarnedArtifacts::default())),
+            warned_artifacts: Arc::new(parking_lot::Mutex::new(WarnedArtifacts::new(WARNED_ARTIFACTS_CAP))),
             journal_key,
         }
     }
@@ -302,9 +316,7 @@ impl Finalizer {
     /// is O(1). Returns true if this is the first warn for `path`
     /// in the current window (caller emits the warn only then).
     fn warn_once(&self, path: PathBuf) -> bool {
-        self.warned_artifacts
-            .lock()
-            .insert(path, WARNED_ARTIFACTS_CAP)
+        self.warned_artifacts.lock().insert(path)
     }
 
     /// Attach the quota/budget state store whose per-session counters are
@@ -558,8 +570,18 @@ impl Finalizer {
             serde_json::from_slice(&bytes).map_err(|error| FinalizeError::Atif(error.to_string()))?;
         let issues = ab_atif::validate_trajectory(&trajectory, ab_atif::Mode::Strict);
         if !issues.is_empty() {
+            // Round-19 F6: cap the rendered head. An attacker-planted
+            // trajectory can legitimately fit millions of issues
+            // inside MAX_ATIF_BYTES; Debug-formatting all of them
+            // into a `FinalizeError::Atif(String)` amplified
+            // attacker input through every downstream log sink
+            // (tracing::warn → Vector → OTLP → …).
+            const RENDER_ISSUE_HEAD: usize = 16;
+            let total = issues.len();
+            let head: Vec<_> = issues.iter().take(RENDER_ISSUE_HEAD).collect();
             return Err(FinalizeError::Atif(format!(
-                "strict validation failed: {issues:?}"
+                "strict validation failed ({total} issues, showing first {}): {head:?}",
+                head.len()
             )));
         }
         let trajectory_digest = ab_core::digest::sha256_hex(&bytes);
@@ -2329,7 +2351,7 @@ mod tests {
 
     fn finalizer(directory: &std::path::Path) -> Finalizer {
         Finalizer::new(
-            Arc::new(Ed25519Signer::from_seed([7; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[7; 32])),
             directory.to_path_buf(),
             Arc::new(Registry::new()),
         )
@@ -2353,7 +2375,7 @@ mod tests {
             attempts: parking_lot::Mutex::new(Vec::new()),
         });
         let finalizer = Finalizer::with_bridge(
-            Arc::new(Ed25519Signer::from_seed([7; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[7; 32])),
             directory.path().to_path_buf(),
             Arc::new(Registry::new()),
             bus,
@@ -2392,7 +2414,7 @@ mod tests {
             attempts: parking_lot::Mutex::new(Vec::new()),
         });
         let finalizer = Finalizer::with_bridge(
-            Arc::new(Ed25519Signer::from_seed([7; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[7; 32])),
             directory.path().to_path_buf(),
             Arc::new(Registry::new()),
             bus.clone(),
@@ -2468,7 +2490,7 @@ mod tests {
         use std::io::Write as _;
 
         let directory = tempfile::tempdir().unwrap();
-        let signer: Arc<dyn Signer> = Arc::new(Ed25519Signer::from_seed([29; 32]));
+        let signer: Arc<dyn Signer> = Arc::new(Ed25519Signer::from_seed(&[29; 32]));
         let journal_key = crate::journal::key_from_signer(signer.as_ref());
         let session_id = "signed-recovery-lease-guard";
         let identity = AgentIdentity {
@@ -2614,7 +2636,7 @@ mod tests {
             attempts: parking_lot::Mutex::new(Vec::new()),
         });
         let finalizer = Finalizer::with_bridge(
-            Arc::new(Ed25519Signer::from_seed([17; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[17; 32])),
             directory.path().to_path_buf(),
             Arc::new(Registry::new()),
             bus.clone(),
@@ -2661,7 +2683,7 @@ mod tests {
             attempts: parking_lot::Mutex::new(Vec::new()),
         });
         let finalizer = Finalizer::with_bridge(
-            Arc::new(Ed25519Signer::from_seed([23; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[23; 32])),
             directory.path().to_path_buf(),
             Arc::new(Registry::new()),
             bus,
@@ -2689,7 +2711,7 @@ mod tests {
             attempts: parking_lot::Mutex::new(Vec::new()),
         });
         let finalizer = Finalizer::with_bridge(
-            Arc::new(Ed25519Signer::from_seed([19; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[19; 32])),
             directory.path().to_path_buf(),
             Arc::new(Registry::new()),
             bus.clone(),
@@ -3145,7 +3167,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let metrics = Arc::new(Registry::new());
         let finalizer = Finalizer::new(
-            Arc::new(Ed25519Signer::from_seed([7; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[7; 32])),
             directory.path().to_path_buf(),
             Arc::clone(&metrics),
         );
@@ -3453,7 +3475,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let metrics = Arc::new(Registry::new());
         let finalizer = Finalizer::new(
-            Arc::new(Ed25519Signer::from_seed([7; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[7; 32])),
             directory.path().to_path_buf(),
             Arc::clone(&metrics),
         );
@@ -3660,31 +3682,30 @@ mod tests {
     /// tick when a rotating-timestamp attacker fills the cap.
     #[test]
     fn warned_artifacts_evicts_one_at_a_time_not_all_at_once() {
-        let mut warned = WarnedArtifacts::default();
-        let cap = 3;
-        assert!(warned.insert(PathBuf::from("a"), cap));
-        assert!(warned.insert(PathBuf::from("b"), cap));
-        assert!(warned.insert(PathBuf::from("c"), cap));
-        assert_eq!(warned.len(), cap);
+        let mut warned = WarnedArtifacts::new(3);
+        assert!(warned.insert(PathBuf::from("a")));
+        assert!(warned.insert(PathBuf::from("b")));
+        assert!(warned.insert(PathBuf::from("c")));
+        assert_eq!(warned.len(), 3);
         // Reinserting an existing entry is a no-op — still in-set,
         // no warn.
-        assert!(!warned.insert(PathBuf::from("b"), cap));
+        assert!(!warned.insert(PathBuf::from("b")));
         // Fourth distinct entry evicts the OLDEST ("a"), NOT all.
         // Other legitimate entries (b, c) still tracked.
-        assert!(warned.insert(PathBuf::from("d"), cap));
-        assert_eq!(warned.len(), cap);
-        assert!(!warned.insert(PathBuf::from("b"), cap));
-        assert!(!warned.insert(PathBuf::from("c"), cap));
-        assert!(!warned.insert(PathBuf::from("d"), cap));
+        assert!(warned.insert(PathBuf::from("d")));
+        assert_eq!(warned.len(), 3);
+        assert!(!warned.insert(PathBuf::from("b")));
+        assert!(!warned.insert(PathBuf::from("c")));
+        assert!(!warned.insert(PathBuf::from("d")));
         // "a" was evicted, so a re-warn on "a" returns true.
         // This new insert evicts b (now the oldest) — but c and d
         // survive. That's the FIFO contract: ONE eviction per
         // insert, not a full flush.
-        assert!(warned.insert(PathBuf::from("a"), cap));
-        assert_eq!(warned.len(), cap);
-        assert!(!warned.insert(PathBuf::from("c"), cap));
-        assert!(!warned.insert(PathBuf::from("d"), cap));
-        assert!(!warned.insert(PathBuf::from("a"), cap));
+        assert!(warned.insert(PathBuf::from("a")));
+        assert_eq!(warned.len(), 3);
+        assert!(!warned.insert(PathBuf::from("c")));
+        assert!(!warned.insert(PathBuf::from("d")));
+        assert!(!warned.insert(PathBuf::from("a")));
     }
 
     #[tokio::test]

@@ -83,7 +83,7 @@ fn make_state(sandbox: Sandbox, budget: BudgetSpec, bus: Arc<RecordingBus>) -> A
             Arc::new(sandbox),
             bus,
             None,
-            Arc::new(Ed25519Signer::from_seed([42; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[42; 32])),
         )
         .unwrap(),
     )

@@ -33,7 +33,7 @@ use std::thread;
 use std::time::Instant;
 
 fn signer() -> Ed25519Signer {
-    Ed25519Signer::from_seed([99; 32])
+    Ed25519Signer::from_seed(&[99; 32])
 }
 fn ring(s: &Ed25519Signer) -> Keyring {
     let mut r = Keyring::new();

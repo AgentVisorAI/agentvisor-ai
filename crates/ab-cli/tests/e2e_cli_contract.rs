@@ -152,7 +152,7 @@ fn receipt_verify_stdout_matches_receipt_id_on_success() {
         CostSummary, Ed25519Signer, Receipt, ReceiptBody, ReceiptSubject, Signer, ToolCallSummary,
     };
     let dir = tempfile::tempdir().unwrap();
-    let signer = Ed25519Signer::from_seed([13; 32]);
+    let signer = Ed25519Signer::from_seed(&[13; 32]);
     let body = ReceiptBody {
         receipt_version: 1,
         receipt_id: "receipt-01".to_owned(),
@@ -199,7 +199,7 @@ fn receipt_verify_wrong_key_writes_reason_to_stderr() {
     use ab_events::{AgentIdentity, CharterFile};
     use ab_receipts::{CostSummary, Ed25519Signer, Receipt, ReceiptBody, ReceiptSubject, ToolCallSummary};
     let dir = tempfile::tempdir().unwrap();
-    let signer = Ed25519Signer::from_seed([17; 32]);
+    let signer = Ed25519Signer::from_seed(&[17; 32]);
     let body = ReceiptBody {
         receipt_version: 1,
         receipt_id: "r".to_owned(),
@@ -260,7 +260,7 @@ fn keygen_public_key_verifies_a_receipt_signed_by_the_same_seed_when_reloaded() 
     // Reload the seed and produce a receipt with the same signer.
     let raw = std::fs::read_to_string(&seed).unwrap();
     let seed_bytes: [u8; 32] = hex::decode(raw.trim()).unwrap().try_into().unwrap();
-    let signer = Ed25519Signer::from_seed(seed_bytes);
+    let signer = Ed25519Signer::from_seed(&seed_bytes);
     let body = ReceiptBody {
         receipt_version: 1,
         receipt_id: "roundtrip".to_owned(),

@@ -70,7 +70,7 @@ async fn sixty_four_agents_preserve_all_signed_steps_under_contention() {
             Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
             bus.clone(),
             None,
-            Arc::new(Ed25519Signer::from_seed([41; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[41; 32])),
         )
         .unwrap(),
     );

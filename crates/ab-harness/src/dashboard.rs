@@ -407,7 +407,7 @@ mod tests {
             Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
             Arc::new(NullBus),
             None,
-            Arc::new(Ed25519Signer::from_seed([9; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[9; 32])),
         )
         .unwrap()
     }
@@ -622,7 +622,7 @@ mod tests {
         let state = build_state(config);
         open_a_session(&state, "sess-with-receipt");
         let session = state.sessions.get("sess-with-receipt").unwrap();
-        let signer = Ed25519Signer::from_seed([7; 32]);
+        let signer = Ed25519Signer::from_seed(&[7; 32]);
         let key_id = signer.key_id().to_owned();
         let public_key_b64 = base64::engine::general_purpose::STANDARD.encode(signer.public_key_bytes());
         let body = ReceiptBody {
