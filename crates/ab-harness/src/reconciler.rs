@@ -871,6 +871,30 @@ impl Finalizer {
                 Vec::new()
             };
             if journal.is_empty() {
+                // Round-14 F5: preserve the sealed metadata sidecar
+                // when a torn-write journal has been quarantined in
+                // a prior tick (see `read_complete_journal` at
+                // ~:1980). Without this, we'd delete the sidecar the
+                // very next tick, orphaning the `.corrupt-<uid>`
+                // bytes with no linkage back to session identity.
+                if quarantine_sibling_exists(&self.spool_dir, stem).await? {
+                    let quarantine_metadata = self
+                        .spool_dir
+                        .join(format!("{stem}.session.json.corrupt-{}", ab_core::new_event_uid()));
+                    match tokio::fs::rename(&metadata_path, &quarantine_metadata).await {
+                        Ok(()) => tracing::warn!(
+                            metadata = %metadata_path.display(),
+                            quarantine = %quarantine_metadata.display(),
+                            "sealed metadata sidecar quarantined alongside its torn signed journal (round-14 F5)"
+                        ),
+                        Err(error) => tracing::error!(
+                            metadata = %metadata_path.display(),
+                            %error,
+                            "failed to quarantine metadata sidecar; leaving in place so a future recovery can try again"
+                        ),
+                    }
+                    continue;
+                }
                 tokio::fs::remove_file(metadata_path)
                     .await
                     .map_err(|error| FinalizeError::Atif(error.to_string()))?;
@@ -1195,6 +1219,28 @@ impl Finalizer {
                 continue;
             }
             if journal.is_empty() {
+                // Round-14 F5: same quarantine-preservation guard as
+                // the signed branch — don't delete the sealed
+                // metadata when a torn journal has been quarantined
+                // in a prior tick.
+                if quarantine_sibling_exists(&self.spool_dir, stem).await? {
+                    let quarantine_metadata = self
+                        .spool_dir
+                        .join(format!("{stem}.session.json.corrupt-{}", ab_core::new_event_uid()));
+                    match tokio::fs::rename(&metadata_path, &quarantine_metadata).await {
+                        Ok(()) => tracing::warn!(
+                            metadata = %metadata_path.display(),
+                            quarantine = %quarantine_metadata.display(),
+                            "sealed metadata sidecar quarantined alongside its torn unsigned journal (round-14 F5)"
+                        ),
+                        Err(error) => tracing::error!(
+                            metadata = %metadata_path.display(),
+                            %error,
+                            "failed to quarantine metadata sidecar; leaving in place so a future recovery can try again"
+                        ),
+                    }
+                    continue;
+                }
                 tokio::fs::remove_file(metadata_path)
                     .await
                     .map_err(|error| FinalizeError::Atif(error.to_string()))?;
@@ -1944,6 +1990,41 @@ async fn resolve_lifecycle_ack(
         .map_err(|error| FinalizeError::Bridge(error.to_string()))
 }
 
+/// Round-14 F5: check whether `read_complete_journal` has previously
+/// quarantined this stem's events journal to
+/// `<stem>.events.ndjson.corrupt-*`. Callers use this to decide
+/// whether to delete the sealed metadata sidecar when the events
+/// journal appears empty — if there's a sibling `.corrupt-*` file,
+/// the "empty" is actually "torn and moved out for post-mortem" and
+/// the metadata must be preserved (or quarantined itself) rather
+/// than removed.
+async fn quarantine_sibling_exists(
+    spool_dir: &std::path::Path,
+    stem: &str,
+) -> Result<bool, FinalizeError> {
+    let prefix = format!("{stem}.events.ndjson.corrupt-");
+    let spool_dir = spool_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<bool, FinalizeError> {
+        let entries = match std::fs::read_dir(&spool_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| FinalizeError::Atif(error.to_string()))?;
+            let name = entry.file_name();
+            if let Some(name) = name.to_str() {
+                if name.starts_with(&prefix) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    })
+    .await
+    .map_err(|error| FinalizeError::Task(error.to_string()))?
+}
+
 async fn read_complete_journal(path: &std::path::Path) -> Result<Vec<String>, FinalizeError> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<Vec<String>, FinalizeError> {
@@ -1976,7 +2057,7 @@ async fn read_complete_journal(path: &std::path::Path) -> Result<Vec<String>, Fi
                 .unwrap_or("journal");
             let new_name = format!("{stem}.corrupt-{}", ab_core::new_event_uid());
             quarantine.set_file_name(new_name);
-            match std::fs::rename(&path, &quarantine) {
+            let rename_error_message = match std::fs::rename(&path, &quarantine) {
                 Ok(()) => {
                     tracing::error!(
                         original = %path.display(),
@@ -1984,6 +2065,7 @@ async fn read_complete_journal(path: &std::path::Path) -> Result<Vec<String>, Fi
                         bytes = bytes.len(),
                         "journal has no complete lines; quarantined for post-mortem instead of silent 0-truncate"
                     );
+                    None
                 }
                 Err(rename_error) => {
                     tracing::error!(
@@ -1992,14 +2074,30 @@ async fn read_complete_journal(path: &std::path::Path) -> Result<Vec<String>, Fi
                         error = %rename_error,
                         "journal has no complete lines and quarantine rename failed; refusing to truncate"
                     );
+                    Some(rename_error.to_string())
                 }
-            }
-            return Err(FinalizeError::Atif(format!(
-                "journal {} contained no complete lines ({} bytes); quarantined at {}",
-                path.display(),
-                bytes.len(),
-                quarantine.display()
-            )));
+            };
+            // Round-14 F6: don't claim the file was quarantined if
+            // the rename itself failed. Otherwise the operator
+            // chases a phantom `.corrupt-<uid>` path while the real
+            // failure (ENOSPC / EACCES / cross-fs rename) sits
+            // buried in the tracing log.
+            return Err(FinalizeError::Atif(match rename_error_message {
+                None => format!(
+                    "journal {} contained no complete lines ({} bytes); quarantined at {}",
+                    path.display(),
+                    bytes.len(),
+                    quarantine.display()
+                ),
+                Some(rename_error) => format!(
+                    "journal {} contained no complete lines ({} bytes); quarantine rename to {} failed: {}; bytes remain at {}",
+                    path.display(),
+                    bytes.len(),
+                    quarantine.display(),
+                    rename_error,
+                    path.display()
+                ),
+            }));
         }
         if complete_len < bytes.len() {
             tracing::warn!(
