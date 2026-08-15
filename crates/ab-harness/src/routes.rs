@@ -1741,10 +1741,39 @@ impl Drop for AbortFinalizingStream {
         if !is_closed {
             let session = Arc::clone(&self.session);
             let finalizer = self.finalizer.clone();
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                runtime.spawn(async move {
-                    let _ = finalizer.close_session(session, StopReason::Other).await;
-                });
+            let session_id = session.id.clone();
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => {
+                    // Detach: the drop is sync and cannot await. The
+                    // spawn is supervised only by the runtime's panic
+                    // hook, so mirror the outcome to tracing + a metric
+                    // instead of silently discarding the Result — a
+                    // failed close would otherwise leave the session
+                    // "open" until the idle sweeper reaps it, with zero
+                    // operator signal.
+                    runtime.spawn(async move {
+                        if let Err(error) = finalizer.close_session(session, StopReason::Other).await {
+                            tracing::warn!(
+                                %error,
+                                %session_id,
+                                "background close on stream abort failed"
+                            );
+                        }
+                    });
+                }
+                Err(error) => {
+                    // Runtime is gone (shutdown, drop from a blocking
+                    // thread) — there is no place to await the close.
+                    // Mark capture failed so the reconciler retries on
+                    // the next tick instead of finalising a session
+                    // that never ran to completion.
+                    tracing::warn!(
+                        %error,
+                        %session_id,
+                        "no tokio runtime available for stream-abort close; marking capture failed for reconciler retry"
+                    );
+                    self.session.mark_capture_failed();
+                }
             }
         }
     }

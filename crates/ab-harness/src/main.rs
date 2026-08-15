@@ -9,6 +9,7 @@ use ab_receipts::{Ed25519Signer, Signer};
 use ab_sandbox::{PolicyEngine, Sandbox, SandboxConfig, WasmPolicy};
 use ab_state::{InMemoryStore, StateStore};
 use anyhow::{Context, Result};
+use futures::future::FutureExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing_subscriber::prelude::*;
@@ -462,12 +463,37 @@ async fn build_identity(config: &HarnessConfig) -> Result<Option<Arc<IdentityVal
         let validator = Arc::clone(&validator);
         let refresh_s = config.identity_jwks_refresh_s;
         tokio::spawn(async move {
+            // Wrap the whole loop in AssertUnwindSafe so an unexpected
+            // panic (reqwest bug, malformed JWKS, allocator failure)
+            // does not silently kill the refresher and leave the harness
+            // running with a stale key set. If the loop *does* panic, we
+            // log + count + rebuild the loop.
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(refresh_s));
             interval.tick().await;
             loop {
                 interval.tick().await;
-                if let Err(error) = refresh_jwks(&client, &url, validator.as_ref()).await {
-                    tracing::warn!(%error, "JWKS refresh failed; retaining previously loaded keys");
+                let outcome = std::panic::AssertUnwindSafe(refresh_jwks(&client, &url, validator.as_ref()))
+                    .catch_unwind()
+                    .await;
+                match outcome {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            %error,
+                            "JWKS refresh failed; retaining previously loaded keys"
+                        );
+                    }
+                    Err(panic) => {
+                        let msg = panic
+                            .downcast_ref::<&'static str>()
+                            .copied()
+                            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                            .unwrap_or("panic payload was not a string");
+                        tracing::error!(
+                            panic = %msg,
+                            "JWKS refresh task panicked; retaining previously loaded keys and continuing"
+                        );
+                    }
                 }
             }
         });
