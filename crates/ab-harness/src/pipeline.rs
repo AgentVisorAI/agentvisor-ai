@@ -875,16 +875,45 @@ impl AppState {
                 response_attempt_id,
             }),
             Err(error) => {
-                let internal_detail = error.to_string();
+                // Round-35 F1: `reqwest::Error::Display` embeds the
+                // request URL (see the round-34 F4 rule at
+                // routes.rs::read_limited_tool_response — the same
+                // rule applies here). `%error` on `reqwest::Error`
+                // would render `error sending request for url
+                // (https://api.openai.com/v1/chat/completions): dns
+                // error: ...` into every OTLP sink. In multi-tenant
+                // / air-gapped deployments the upstream URL is not
+                // something the operator wants leaked to the
+                // customer's SIEM (it may be an internal LiteLLM
+                // router, an on-prem Azure resource name, a
+                // per-tenant model deployment path). Log the
+                // stable classifier + reqwest's structured
+                // predicates only.
+                //
+                // Also propagate the classifier — NOT
+                // `error.to_string()` — into the persisted failure
+                // event so the URL doesn't land in the on-disk
+                // journal or in the Bridge-published failure
+                // record either.
+                let client_reason = classify_upstream_error(&error);
                 tracing::warn!(
                     session = %session.id,
-                    error = %internal_detail,
+                    category = client_reason,
+                    error.status = ?error.status(),
+                    error.is_timeout = error.is_timeout(),
+                    error.is_connect = error.is_connect(),
+                    error.is_body = error.is_body(),
                     "upstream forwarding failed"
                 );
-                let client_reason = classify_upstream_error(&error);
                 let client_error = PipelineError::Upstream(client_reason.to_owned());
+                let persisted_reason = format!("upstream_{client_reason}");
                 if let Some(permit) = response_permit {
-                    let mut job = self.failure_job(session, identity, StopReason::Other, internal_detail);
+                    let mut job = self.failure_job(
+                        session,
+                        identity,
+                        StopReason::Other,
+                        persisted_reason.clone(),
+                    );
                     job.response_marker = response_marker;
                     job.response_attempt = Some(crate::worker::ResponseAttempt {
                         id: response_attempt_id,
@@ -896,7 +925,7 @@ impl AppState {
                     // enqueue_failure path below on the next tick.
                     let _ = permit.submit(&self.worker, job);
                 } else {
-                    self.enqueue_failure(session, identity, StopReason::Other, error.to_string())?;
+                    self.enqueue_failure(session, identity, StopReason::Other, persisted_reason)?;
                 }
                 Err(client_error)
             }
