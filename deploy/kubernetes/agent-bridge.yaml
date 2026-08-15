@@ -104,7 +104,20 @@ spec:
             - name: AB_CONFIG
               value: /etc/agent-bridge/agentbridge.toml
             - name: AB_SIGNING_SEED_FILE
-              value: /app/data/signing.seed
+              # Round-15 F8: the signing seed IS the receipt trust
+              # anchor. Previously it lived at /app/data/signing.seed
+              # inside the ReadWriteOnce PVC, which meant any future
+              # workload (debug pod, kubectl exec, migration Job) that
+              # mounted the same claim could read the seed — no mode
+              # enforcement, no Secret gating, no ownership. Move it
+              # to a dedicated k8s Secret mounted read-only with mode
+              # 0400 so a leak requires explicit RBAC on the Secret
+              # rather than incidental access to the data volume.
+              # First-boot auto-generation is still supported by
+              # abctl keygen writing to this Secret out-of-band (see
+              # docker-compose.yml's secret{} block for the sibling
+              # pattern).
+              value: /etc/agent-bridge/signing.seed
             - name: AB_UPSTREAM_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -112,7 +125,12 @@ spec:
                   key: api-key
           volumeMounts:
             - name: config
-              mountPath: /etc/agent-bridge
+              mountPath: /etc/agent-bridge/agentbridge.toml
+              subPath: agentbridge.toml
+              readOnly: true
+            - name: signing-seed
+              mountPath: /etc/agent-bridge/signing.seed
+              subPath: signing.seed
               readOnly: true
             - name: data
               mountPath: /app/data
@@ -159,6 +177,22 @@ spec:
         - name: config
           configMap:
             name: agent-bridge-config
+        - name: signing-seed
+          # Round-15 F8: mount the signing seed from a k8s Secret
+          # with mode 0400 so only the container's UID can read it.
+          # Populate this Secret out-of-band before rolling out the
+          # Deployment: `kubectl create secret generic agent-bridge-
+          # signing-seed --from-file=signing.seed=./signing.seed`.
+          # An initContainer that writes into an
+          # `emptyDir { medium: Memory }` is a fine alternative if
+          # you want first-boot auto-generation without a shared
+          # Secret, but do not put the seed on the RWO data PVC.
+          secret:
+            secretName: agent-bridge-signing-seed
+            defaultMode: 0400
+            items:
+              - key: signing.seed
+                path: signing.seed
         - name: data
           persistentVolumeClaim:
             claimName: agent-bridge-data

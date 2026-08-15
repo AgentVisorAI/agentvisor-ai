@@ -1218,9 +1218,20 @@ impl AppState {
         // exporters attribute the request to B. Refuse the multi-
         // value case at ingress, symmetric with the X-AB-Session /
         // X-AB-Workflow guards.
+        // Round-15 F3: RFC 7235 §2.1 declares the auth-scheme token
+        // case-insensitive. Historically `strip_prefix("Bearer ")`
+        // silently dropped `bearer eyJ...` / `BEARER eyJ...` /
+        // `Bearer\teyJ...` to `None`, then the outer match arm
+        // returned anonymous (when require_identity=false, the
+        // shipped default) — the caller believed they had
+        // authenticated while the audit trail attributed the
+        // request to `anonymous`. That's the exact repudiation
+        // vector the surrounding refuse-anonymous-with-token
+        // guard was written to close. Now strip the scheme
+        // case-insensitively.
         let bearer = single_header(headers, "authorization")?
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "));
+            .and_then(strip_bearer_scheme);
         match (bearer, &self.identity) {
             (Some(token), Some(validator)) => {
                 let validated = validator.validate(token).map_err(|error| {
@@ -1401,6 +1412,36 @@ pub(crate) fn single_header<'a>(
         )));
     }
     Ok(first)
+}
+
+/// Strip the RFC 7235 §2.1 `Bearer` scheme from an Authorization header
+/// value, case-insensitively (per the RFC), and allow one or more
+/// whitespace characters (`SP` / `HTAB`) between the scheme token and
+/// the credential (per `token1` production in §2.1).
+///
+/// Round-15 F3: `str::strip_prefix("Bearer ")` used to be the sole
+/// parser. It missed `bearer`, `BEARER`, and (per the RFC's own
+/// grammar) `Bearer\t...`, silently dropping to `None` and — when
+/// `require_identity = false` — letting the request execute as
+/// anonymous while the caller believed they had authenticated.
+pub(crate) fn strip_bearer_scheme(value: &str) -> Option<&str> {
+    let (scheme, rest) = value.split_at_checked(6)?;
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
+    let rest = rest.trim_start_matches([' ', '\t']);
+    if rest.len() == value.len() - scheme.len() {
+        // No whitespace at all after `Bearer` — the credential MUST
+        // be separated per the ABNF (`token1 = 1*( SP / HTAB )
+        // token`). Refuse `BearerXYZ` — that's a scheme other than
+        // Bearer's credential, not a Bearer credential.
+        return None;
+    }
+    if rest.is_empty() {
+        // Empty credential.
+        return None;
+    }
+    Some(rest)
 }
 
 fn session_id(headers: &HeaderMap) -> Result<String, PipelineError> {
@@ -2388,6 +2429,34 @@ mod tests {
             !matches!(&outcome, Err(PipelineError::BadRequest(msg)) if msg.contains("more than one")),
             "single Authorization header must not be refused as duplicate; got {outcome:?}"
         );
+    }
+
+    /// Round-15 F3: RFC 7235 §2.1 auth-scheme is case-insensitive.
+    /// A caller sending `Authorization: bearer eyJ...` or `BEARER`
+    /// used to be silently downgraded to anonymous (when
+    /// require_identity=false, the shipped default) — repudiation
+    /// class. Verify each case now parses to the same credential.
+    #[test]
+    fn strip_bearer_scheme_matches_case_insensitively() {
+        for scheme in ["Bearer aaaa", "bearer aaaa", "BEARER aaaa", "BeArEr aaaa"] {
+            assert_eq!(
+                strip_bearer_scheme(scheme),
+                Some("aaaa"),
+                "scheme {scheme:?} did not parse to `aaaa`"
+            );
+        }
+        // Tab between scheme and credential (per the RFC's `SP / HTAB` grammar).
+        assert_eq!(strip_bearer_scheme("Bearer\taaaa"), Some("aaaa"));
+        // Multiple spaces are allowed.
+        assert_eq!(strip_bearer_scheme("Bearer   aaaa"), Some("aaaa"));
+        // Missing whitespace or empty credential — refused.
+        assert_eq!(strip_bearer_scheme("BearerXYZ"), None);
+        assert_eq!(strip_bearer_scheme("Bearer "), None);
+        assert_eq!(strip_bearer_scheme("Bearer"), None);
+        // Different scheme — refused.
+        assert_eq!(strip_bearer_scheme("Basic ZmY6bGFyZQ=="), None);
+        // Too short to hold the scheme name — refused.
+        assert_eq!(strip_bearer_scheme(""), None);
     }
 
     fn null_state() -> AppState {

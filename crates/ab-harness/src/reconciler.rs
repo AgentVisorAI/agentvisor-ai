@@ -837,9 +837,20 @@ impl Finalizer {
                 .and_then(serde_json::Value::as_u64)
                 != Some(2)
             {
-                return Err(FinalizeError::Atif(
-                    "unsupported active journal version".to_owned(),
-                ));
+                // Round-15 F1: previously returned Err, which
+                // aborted the whole spool scan via the caller's `?`
+                // — a single drifted or corrupted sidecar (upgrade
+                // migration in progress, hostile plant, disk
+                // bit-rot) blocked recovery of every OTHER session
+                // on this instance. Warn + skip so unrelated
+                // sessions still recover; an operator inspecting
+                // the log can quarantine the specific sidecar.
+                tracing::warn!(
+                    path = %metadata_path.display(),
+                    version = ?metadata.get("journal_version"),
+                    "sidecar has unsupported journal_version; skipping this session so recovery can proceed for the rest"
+                );
+                continue;
             }
             if metadata.get("workflow").and_then(serde_json::Value::as_str) != Some(Workflow::Signed.as_str())
             {
@@ -1165,9 +1176,15 @@ impl Finalizer {
                 .and_then(serde_json::Value::as_u64)
                 != Some(2)
             {
-                return Err(FinalizeError::Atif(
-                    "unsupported active journal version".to_owned(),
-                ));
+                // Round-15 F1: same HOL-block fix as the signed
+                // branch above — one drifted sidecar must not deny
+                // recovery to unrelated sessions.
+                tracing::warn!(
+                    path = %metadata_path.display(),
+                    version = ?metadata.get("journal_version"),
+                    "sidecar has unsupported journal_version; skipping this session so recovery can proceed for the rest"
+                );
+                continue;
             }
             if metadata.get("workflow").and_then(serde_json::Value::as_str) == Some(Workflow::Signed.as_str())
             {
