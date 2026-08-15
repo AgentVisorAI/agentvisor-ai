@@ -1008,11 +1008,24 @@ impl AppState {
             identity.clone(),
             self.config.breaker.clone(),
         ));
+        // Cap the attacker-controlled `session_id` echo so a
+        // maliciously long header cannot bloat every audit record.
+        // 64 bytes is enough to keep well-formed UUIDs and legitimate
+        // client-chosen ids intact; anything larger is truncated with
+        // a marker so operators can still tell what the caller sent.
+        const MAX_ECHO: usize = 64;
+        let mut boundary = MAX_ECHO.min(session_id.len());
+        while boundary < session_id.len() && !session_id.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        let truncated = boundary < session_id.len();
+        let echo = &session_id[..boundary];
+        let echo_marker = if truncated { "…(truncated)" } else { "" };
         self.enqueue_failure(
             session,
             identity,
             stop_reason,
-            format!("requested session {session_id:?}: {reason}"),
+            format!("requested session {echo:?}{echo_marker}: {reason}"),
         )
     }
 
