@@ -173,7 +173,15 @@ const MAX_COST_USD: f64 = 1e12;
 /// trailing synthetic entry noting truncation when the cap fires.
 pub fn validate_value(root: &Value, mode: Mode) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
-    validate_trajectory_obj(root, "trajectory", mode, &mut issues, true, 0);
+    // Round-40 F3: track the ancestor `trajectory_id` chain across
+    // recursion frames so a cycle A -> B -> A can be detected even
+    // when B is a great-grandchild of A. The prior per-frame
+    // HashSet only caught duplicates among direct siblings; a
+    // trajectory can claim to be a re-invocation of any ancestor
+    // and downstream analysis would treat the tree as a genuine
+    // recursive call.
+    let mut ancestors: std::collections::HashSet<String> = std::collections::HashSet::new();
+    validate_trajectory_obj(root, "trajectory", mode, &mut issues, true, 0, &mut ancestors);
     truncate_issues_with_marker(issues)
 }
 
@@ -211,7 +219,7 @@ fn check_unknown_fields(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn validate_trajectory_obj(
     root: &Value,
     path: &str,
@@ -219,6 +227,7 @@ fn validate_trajectory_obj(
     issues: &mut Vec<ValidationIssue>,
     top_level: bool,
     depth: usize,
+    ancestors: &mut std::collections::HashSet<String>,
 ) {
     // Round-25 F4: cap recursion depth. `subagent_trajectories`
     // recurses; adversarial nesting could otherwise stack-overflow
@@ -237,6 +246,32 @@ fn validate_trajectory_obj(
         return;
     };
     check_unknown_fields(obj, TRAJECTORY_FIELDS, path, mode, issues);
+
+    // Round-40 F3: ancestor-cycle detection. Insert this frame's
+    // trajectory_id (if any) into the shared ancestor set BEFORE
+    // recursing into `subagent_trajectories`. If the id is already
+    // in the set, an ancestor already claimed it — the tree encodes
+    // a false recursive self-call. On the way out, we remove the id
+    // so a subtree A -> B -> C at one branch does not also flag
+    // A -> D -> C at a sibling branch. `inserted_id` records
+    // whether we actually added an id (empty / missing ids are
+    // ignored so they don't accidentally clash).
+    let inserted_id: Option<String> = obj
+        .get("trajectory_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .and_then(|id| {
+            if ancestors.insert(id.to_owned()) {
+                Some(id.to_owned())
+            } else {
+                issue!(
+                    issues,
+                    format!("{path}.trajectory_id"),
+                    "trajectory_id {id:?} appears as one of its own ancestors (cycle)"
+                );
+                None
+            }
+        });
 
     // schema_version
     let version = match obj.get("schema_version").and_then(Value::as_str) {
@@ -404,8 +439,16 @@ fn validate_trajectory_obj(
                 issues,
                 false,
                 depth + 1,
+                ancestors,
             );
         }
+    }
+
+    // Round-40 F3: remove this frame's id so sibling branches (a
+    // different subtree at the same ancestor) can legitimately
+    // reuse the id without triggering a false-positive cycle.
+    if let Some(id) = inserted_id {
+        ancestors.remove(&id);
     }
 }
 

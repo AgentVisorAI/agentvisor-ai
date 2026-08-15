@@ -932,24 +932,50 @@ impl Finalizer {
                 }
             };
             let receipt_path = self.receipt_path(&recovered_session.id);
-            if let Ok(bytes) = read_capped_async(receipt_path.clone(), ab_core::fsutil::MAX_RECEIPT_BYTES).await {
-                // Round-16: use the strict deserializer that
-                // refuses duplicate keys at any nesting level. A
-                // post-compromise attacker who overwrote the
-                // on-disk receipt bytes could otherwise smuggle a
-                // duplicate `instance_uid` past round-15 F4's
-                // top-level guard — the round-15 walker closes
-                // that gap uniformly.
-                // Round-17 F3: read is bounded by MAX_RECEIPT_BYTES
-                // so a hostile plant can no longer OOM the
-                // recovery scan on this session.
-                let receipt = Receipt::from_json_slice(&bytes)
-                    .map_err(|error| FinalizeError::Receipt(error.to_string()))?;
-                self.verify_configured_receipt(&receipt)?;
-                if path.with_extension("promote").exists() {
-                    recovered_session.restore_pending_receipt(receipt);
-                } else {
-                    recovered_session.restore_receipt(receipt);
+            // Round-40 F4: distinguish ENOENT from other read
+            // failures (see the twin in recover_signed_journals
+            // for full rationale). An oversize/EACCES/EIO would
+            // previously fold into "no prior receipt" and mint a
+            // fresh one — silently erasing evidence of the
+            // original.
+            match tokio::fs::metadata(&receipt_path).await {
+                Ok(_) => {
+                    let bytes = read_capped_async(
+                        receipt_path.clone(),
+                        ab_core::fsutil::MAX_RECEIPT_BYTES,
+                    )
+                    .await
+                    .map_err(|error| {
+                        FinalizeError::Receipt(format!("existing receipt unreadable: {error}"))
+                    })?;
+                    // Round-16: use the strict deserializer that
+                    // refuses duplicate keys at any nesting level. A
+                    // post-compromise attacker who overwrote the
+                    // on-disk receipt bytes could otherwise smuggle a
+                    // duplicate `instance_uid` past round-15 F4's
+                    // top-level guard — the round-15 walker closes
+                    // that gap uniformly.
+                    // Round-17 F3: read is bounded by MAX_RECEIPT_BYTES
+                    // so a hostile plant can no longer OOM the
+                    // recovery scan on this session.
+                    let receipt = Receipt::from_json_slice(&bytes)
+                        .map_err(|error| FinalizeError::Receipt(error.to_string()))?;
+                    self.verify_configured_receipt(&receipt)?;
+                    if path.with_extension("promote").exists() {
+                        recovered_session.restore_pending_receipt(receipt);
+                    } else {
+                        recovered_session.restore_receipt(receipt);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                    || error.kind() == std::io::ErrorKind::NotADirectory =>
+                {
+                    // Fresh recovery — no prior receipt.
+                }
+                Err(error) => {
+                    return Err(FinalizeError::Receipt(format!(
+                        "existing receipt stat failed: {error}"
+                    )));
                 }
             }
             recovered += 1;
@@ -958,6 +984,21 @@ impl Finalizer {
         Ok(recovered + signed_recovered)
     }
 
+    // Round-40 F1 (DEFERRED): the per-session `?` sites inside
+    // this loop (metadata sidecar HMAC failure, identity decode,
+    // journal HMAC / sequence / accounting inconsistencies, receipt
+    // parse/verify) propagate through this fn's outer `?` at
+    // `recover_spooled_sessions:753` and abort BOTH
+    // consolidate_step_journals AND the entire unsigned recovery
+    // loop for the same tick — one tampered sidecar
+    // head-of-line-blocks recovery of every other signed AND
+    // unsigned session. Round-27 F1/F2 applied the warn+continue
+    // discipline to the ATIF-spool and promotion-marker paths;
+    // this signed-journal path needs the same treatment. Deferred
+    // to a dedicated round because the per-session body is
+    // ~280 lines with intricate `continue` control flow that
+    // needs careful extraction into a helper method with a
+    // dedicated Result<Outcome> return type.
     async fn recover_signed_journals(
         &self,
         sessions: &SessionRegistry,
@@ -1190,19 +1231,59 @@ impl Finalizer {
                 }
             };
             let receipt_path = self.receipt_path(&session.id);
-            if let Ok(bytes) = read_capped_async(receipt_path, ab_core::fsutil::MAX_RECEIPT_BYTES).await {
-                // Round-16: strict deserializer (see the twin call
-                // in the unsigned recovery path above).
-                // Round-17 F3: bounded read.
-                let receipt = Receipt::from_json_slice(&bytes)
-                    .map_err(|error| FinalizeError::Receipt(error.to_string()))?;
-                self.verify_configured_receipt(&receipt)?;
-                if receipt.body.subject != expected_subject {
-                    return Err(FinalizeError::Receipt(
-                        "persisted receipt does not attest the recovered signed journal".to_owned(),
-                    ));
+            // Round-40 F4: distinguish `ENOENT` (fresh recovery, no
+            // prior receipt to reload) from every other read
+            // failure (EACCES, EIO, or the round-19 F10 read cap
+            // firing on a file that grew past MAX_RECEIPT_BYTES).
+            // The prior `if let Ok(bytes) = ...` folded all
+            // failures into "no prior receipt" and re-issued a
+            // fresh receipt over the recovered chain — silently
+            // destroying evidence that a legitimate receipt had
+            // already been issued. Under the oversize case, a
+            // hostile local process could grow receipt.json past
+            // the cap to erase the operator's receipt on the next
+            // recovery tick. Now: a genuine ENOENT is a proper
+            // recovery no-op; any other error is a per-session
+            // failure that surfaces to the reconciler tick.
+            match tokio::fs::metadata(&receipt_path).await {
+                Ok(_) => {
+                    let bytes = read_capped_async(
+                        receipt_path.clone(),
+                        ab_core::fsutil::MAX_RECEIPT_BYTES,
+                    )
+                    .await
+                    .map_err(|error| {
+                        FinalizeError::Receipt(format!(
+                            "existing receipt unreadable: {error}"
+                        ))
+                    })?;
+                    // Round-16: strict deserializer (see the twin call
+                    // in the unsigned recovery path above).
+                    // Round-17 F3: bounded read.
+                    let receipt = Receipt::from_json_slice(&bytes)
+                        .map_err(|error| FinalizeError::Receipt(error.to_string()))?;
+                    self.verify_configured_receipt(&receipt)?;
+                    if receipt.body.subject != expected_subject {
+                        return Err(FinalizeError::Receipt(
+                            "persisted receipt does not attest the recovered signed journal".to_owned(),
+                        ));
+                    }
+                    *session.receipt.lock() = Some(receipt);
                 }
-                *session.receipt.lock() = Some(receipt);
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                    || error.kind() == std::io::ErrorKind::NotADirectory =>
+                {
+                    // Fresh recovery — no prior receipt.
+                    // `NotADirectory` covers the case where a
+                    // parent component of the receipt path is a
+                    // file (equivalent to "no receipt at that
+                    // path" from the receipt's point of view).
+                }
+                Err(error) => {
+                    return Err(FinalizeError::Receipt(format!(
+                        "existing receipt stat failed: {error}"
+                    )));
+                }
             }
             let unwrapped = Arc::try_unwrap(session)
                 .map_err(|_| FinalizeError::Task("signed recovery retained session".to_owned()))?;
