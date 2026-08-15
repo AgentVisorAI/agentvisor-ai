@@ -23,8 +23,8 @@
 use ab_core::tokens::{approx_tokens, approx_tokens_json};
 use ab_events::{AgentIdentity, CharterFile};
 use ab_receipts::{
-    canonicalize, CostSummary, Ed25519Signer, EventChain, Keyring, Receipt, ReceiptBody, ReceiptSubject,
-    Signer, ToolCallSummary,
+    canonicalize, CostSummary, Ed25519Signer, EventChain, JcsError, Keyring, Receipt, ReceiptBody,
+    ReceiptSubject, Signer, ToolCallSummary,
 };
 use serde_json::{json, Value};
 use std::time::Instant;
@@ -88,19 +88,34 @@ fn jcs_handles_wide_object_with_100k_keys() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Deep nested array (1000 levels): stack-safe canonicalization. The
-//    canonical form must contain a matching count of open/close brackets.
+// 2. Deep nested array: stack-safe canonicalization within the JCS depth cap
+//    (round-40 F5: `MAX_NESTED_DEPTH = 128`), and graceful `TooDeep` refusal
+//    beyond it — no stack overflow either way.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn jcs_handles_1000_level_nested_arrays_without_stack_overflow() {
+fn jcs_handles_deep_nested_arrays_without_stack_overflow() {
+    // Within the cap: canonicalize succeeds cleanly (depth 100 is below the
+    // JCS `MAX_NESTED_DEPTH = 128` guard added in round-40 F5).
     let mut v = Value::from(42);
-    for _ in 0..1_000 {
+    for _ in 0..100 {
         v = Value::Array(vec![v]);
     }
     let canon = canonicalize(&v).unwrap();
-    assert_eq!(canon.matches('[').count(), 1_000);
-    assert_eq!(canon.matches(']').count(), 1_000);
+    assert_eq!(canon.matches('[').count(), 100);
+    assert_eq!(canon.matches(']').count(), 100);
+
+    // Beyond the cap: canonicalize refuses with `TooDeep` rather than
+    // recursing into a stack overflow. 1_000 levels was the pre-round-40
+    // stack-safety target; post-cap it must return the guarded error.
+    let mut deep = Value::from(42);
+    for _ in 0..1_000 {
+        deep = Value::Array(vec![deep]);
+    }
+    match canonicalize(&deep) {
+        Err(JcsError::TooDeep(_)) => {}
+        other => panic!("expected JcsError::TooDeep, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

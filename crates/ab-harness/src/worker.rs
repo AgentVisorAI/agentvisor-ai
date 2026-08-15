@@ -1867,12 +1867,26 @@ mod tests {
             directory.path().to_path_buf(),
             Arc::new(Registry::new()),
         );
-        assert!(matches!(
-            finalizer
-                .recover_spooled_sessions(&registry, &Default::default())
-                .await,
-            Err(crate::reconciler::FinalizeError::Atif(_))
-        ));
+        // Round-41 F1: per-session errors during signed recovery no
+        // longer propagate to the outer `recover_spooled_sessions`
+        // Err (which used to head-of-line-block every other session
+        // for the reconciler tick). They now warn+continue. The
+        // security invariant this test locks in is unchanged: the
+        // tampered journal MUST NOT be turned into a receipt AND
+        // the corrupted session MUST NOT be installed into the
+        // registry (both were previously ensured by the outer Err
+        // short-circuit). Now they're ensured by the async block
+        // returning Err BEFORE `try_insert_recovered` runs.
+        let outcome = finalizer
+            .recover_spooled_sessions(&registry, &Default::default())
+            .await;
+        assert!(
+            outcome.is_ok(),
+            "round-41 F1: per-session HMAC failures warn+continue instead of propagating, got {outcome:?}"
+        );
+        // The corrupted session must NOT be installed into the
+        // registry — the security property this test was written to
+        // enforce.
         assert!(registry.get(&active.id).is_none());
     }
 
