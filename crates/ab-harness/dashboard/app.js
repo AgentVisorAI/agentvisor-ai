@@ -7,6 +7,7 @@
 'use strict';
 
 const REFRESH_MS = 5000;
+const FETCH_TIMEOUT_MS = 10000;
 const STATS_URL = '/api/v1/dashboard/stats';
 const LIST_URL = '/api/v1/dashboard/sessions';
 const DETAIL_URL = (id) => `/api/v1/dashboard/sessions/${encodeURIComponent(id)}`;
@@ -18,6 +19,15 @@ const state = {
   timer: null,
   activeSession: null,
   lastRefreshMs: 0,
+  // Monotonic id incremented on every refresh trigger. Late fetches whose
+  // generation does not match the latest gen are discarded — this stops
+  // a slow stats/list response from overwriting a fresher one issued
+  // after a filter change or a rapid pause/resume.
+  refreshGen: 0,
+  // AbortController for the drawer's in-flight detail fetch, so a filter
+  // click or drawer close does not leak an old response into a newly
+  // opened session.
+  drawerAbort: null,
 };
 
 // ---- Utilities ------------------------------------------------------
@@ -87,15 +97,25 @@ function shortId(id) {
   return `${id.slice(0, 12)}…${id.slice(-6)}`;
 }
 
-async function fetchJson(url) {
-  const response = await fetch(url, {
-    headers: { accept: 'application/json' },
-    credentials: 'same-origin',
-  });
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status} on ${url}`);
+async function fetchJson(url, { signal } = {}) {
+  const controller = signal ? null : new AbortController();
+  const timeout = window.setTimeout(
+    () => (signal ? null : controller.abort(new Error('timeout'))),
+    FETCH_TIMEOUT_MS,
+  );
+  try {
+    const response = await fetch(url, {
+      headers: { accept: 'application/json' },
+      credentials: 'same-origin',
+      signal: signal ?? controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} on ${url}`);
+    }
+    return await response.json();
+  } finally {
+    window.clearTimeout(timeout);
   }
-  return response.json();
 }
 
 // ---- Stats strip ----------------------------------------------------
@@ -139,6 +159,9 @@ function statusOf(s) {
   if (s.capture_failed) return { label: 'Capture failed', className: 'failed' };
   if (s.close_complete) return { label: 'Sealed', className: 'closed' };
   if (s.closed) return { label: 'Closing', className: 'closed' };
+  // Recovered ATIF sessions have `artifact_committed=1` but `closed=0`
+  // — `open=false` catches that; treat as sealed for the UI.
+  if (!s.open) return { label: 'Sealed', className: 'closed' };
   return { label: 'Live', className: 'open' };
 }
 
@@ -248,14 +271,26 @@ async function openSession(id) {
   const drawer = document.getElementById('session-drawer');
   const body = document.getElementById('drawer-body');
   const titleEl = document.getElementById('drawer-title');
+  // Cancel any in-flight detail fetch from a previous session so a slow
+  // response cannot bleed into the freshly-opened drawer.
+  if (state.drawerAbort) {
+    state.drawerAbort.abort();
+  }
+  const controller = new AbortController();
+  state.drawerAbort = controller;
   state.activeSession = id;
   drawer.hidden = false;
   titleEl.textContent = id;
   body.innerHTML = '<p class="muted">Loading…</p>';
   try {
-    const detail = await fetchJson(DETAIL_URL(id));
+    const detail = await fetchJson(DETAIL_URL(id), { signal: controller.signal });
+    // Guard against the user opening a different session before this
+    // completed — the drawer already moved on and rendering a stale
+    // detail would corrupt the view.
+    if (state.activeSession !== id) return;
     renderSessionDetail(detail);
   } catch (err) {
+    if (state.activeSession !== id || controller.signal.aborted) return;
     body.innerHTML = '';
     body.appendChild(
       el('p', { class: 'muted' }, `Could not load session detail: ${err.message}`),
@@ -267,6 +302,10 @@ function closeDrawer() {
   const drawer = document.getElementById('session-drawer');
   drawer.hidden = true;
   state.activeSession = null;
+  if (state.drawerAbort) {
+    state.drawerAbort.abort();
+    state.drawerAbort = null;
+  }
 }
 
 function renderSessionDetail(detail) {
@@ -380,24 +419,32 @@ function currentListUrl() {
 
 async function refresh() {
   if (state.paused) return;
+  const gen = ++state.refreshGen;
   try {
     const [stats, list] = await Promise.all([
       fetchJson(STATS_URL),
       fetchJson(currentListUrl()),
     ]);
+    // A newer refresh has already started (or a filter change bumped
+    // the generation) — this response is stale and would clobber the
+    // fresher one, so drop it silently.
+    if (gen !== state.refreshGen) return;
     renderStats(stats);
     renderSessions(list.sessions || []);
     setLive({ ok: true });
     if (state.activeSession) {
-      // Silently refresh the drawer for the open session.
+      const sid = state.activeSession;
       try {
-        const detail = await fetchJson(DETAIL_URL(state.activeSession));
+        const detail = await fetchJson(DETAIL_URL(sid));
+        if (state.activeSession !== sid || gen !== state.refreshGen) return;
         renderSessionDetail(detail);
       } catch (_err) {
-        // Session likely evicted; leave the drawer as-is until user closes it.
+        // Session likely evicted or the user closed the drawer while
+        // the fetch was in flight; leave the drawer as-is.
       }
     }
   } catch (err) {
+    if (gen !== state.refreshGen) return;
     setLive({ error: err.message });
   }
   state.lastRefreshMs = Date.now();

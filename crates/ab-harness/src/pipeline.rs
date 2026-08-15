@@ -366,6 +366,20 @@ impl AppState {
             "ab_session_finalize_duration_seconds",
             "Session finalization latency",
         );
+        for endpoint in ["stats", "list", "detail"] {
+            metrics.histogram(
+                &format!("ab_dashboard_request_duration_seconds{{endpoint=\"{endpoint}\"}}"),
+                "Dashboard endpoint latency",
+            );
+            metrics.counter(
+                &format!("ab_dashboard_requests_total{{endpoint=\"{endpoint}\",status=\"ok\"}}"),
+                "Dashboard endpoint requests served",
+            );
+            metrics.counter(
+                &format!("ab_dashboard_requests_total{{endpoint=\"{endpoint}\",status=\"not_found\"}}"),
+                "Dashboard endpoint requests that could not be served",
+            );
+        }
         let sessions = Arc::new(SessionRegistry::new());
         let journal_key = crate::journal::key_from_signer(signer.as_ref());
         let worker = crate::worker::spawn_worker_with_spool_authenticated(
