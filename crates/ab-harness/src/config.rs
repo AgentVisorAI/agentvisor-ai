@@ -980,6 +980,21 @@ impl HarnessConfig {
     }
 
     /// A config suitable for tests (temp dirs supplied by the caller).
+    ///
+    /// # Round-35 F3 — TESTS AND BENCHES ONLY
+    ///
+    /// The defaults here are DELIBERATELY permissive: `require_identity
+    /// = false`, `require_tool_schema = false`, `enforce_identity_
+    /// scopes = false`, `strict_stage_budget = false`. That posture is
+    /// safe for a test harness but MUST NOT be shipped into a
+    /// production boot path. This function is `#[doc(hidden)]` so it
+    /// does not appear in the public API surface (rustdoc, editor
+    /// completion) and cannot be discovered by a future "smoke boot"
+    /// helper looking for a quick config constructor. Any production
+    /// caller must build a `HarnessConfig` explicitly from
+    /// [`Self::from_toml`] so the deliberate posture flags are
+    /// operator-visible in the config file.
+    #[doc(hidden)]
     pub fn for_tests(upstream_url: &str, spool: &str, bridge: &str) -> Self {
         Self {
             config_version: CONFIG_VERSION,
