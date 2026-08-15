@@ -4,7 +4,7 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
-Post-0.1.0 hardening across rounds 11–19 of a systematic bug audit.
+Post-0.1.0 hardening across rounds 11–32 of a systematic bug audit.
 Highlights, grouped by class:
 
 ### Security
@@ -100,6 +100,103 @@ Highlights, grouped by class:
   generic agent-bridge-signing-seed`; docker-compose.minimal.yml
   banner explains that its tmpfs seed regenerates on every
   restart (rounds 17, 18).
+
+### Rounds 20–32 (highlights)
+
+- **Cross-backend consistency** — `try_spend_many` (round-21 F1)
+  and `COUNTER_MAX` (round-20 F1/F7) share a `JCS_SAFE_MAX`
+  ceiling across `InMemoryStore` and `RedisStore` so a config
+  typo cannot succeed in dev and fail in prod.
+- **Cold outbox integrity** — `ColdArchive::set_control_key`
+  refuses `[0; 32]` / `[0xFF; 32]` (round-21 F3) and
+  `pending_mac` / `verify_pending_mac` refuse those patterns at
+  sign/verify time so the constructor's default-init window
+  cannot produce a forgeable envelope (round-22 F2). All
+  cold-outbox rewrites now use `TempPathGuard` so a transient
+  ENOSPC/EIO cannot leave a `.tmp` orphan with signed material
+  on disk (round-22 F3, round-23 F1, round-27 F3).
+- **Kafka fetch surfaces decode errors** — parity with NatsBus /
+  EmbeddedBroker; a corrupt record no longer creates a silent
+  offset gap in the audit trail (round-22 F1).
+- **Deploy hardening** — `docker-compose.yml` `vector` service
+  no longer mounts `/var/run/docker.sock`; all services now
+  carry `restart: unless-stopped`; redpanda/nats moved to
+  persistent named volumes; docker-compose.minimal.yml gained
+  `cap_drop: [ALL]` / `pids_limit` / `security_opt`; the k8s
+  ATIF spool moved from `emptyDir` to a `subPath` on the
+  durable PVC and the initContainer gained
+  `seccompProfile: RuntimeDefault` (rounds 24, 26).
+- **Bridge maintenance shutdown** — cooperative
+  `tokio::sync::Notify` replaces `JoinHandle::abort()` so the
+  `spawn_blocking` closure quiesces before process exit
+  (round-24 F5).
+- **JWKS strictness** — refuses `use=enc` and non-EdDSA `alg` on
+  OKP/Ed25519 (round-25 F1); `add_key` refuses to shadow
+  JWKS-tracked kids (round-25 F2).
+- **SSE detection is case-insensitive + parameter-tolerant**
+  (round-25 F3); ATIF validator bounded by
+  `MAX_NESTED_DEPTH = 128` (round-25 F4).
+- **ATIF schema strictness** — `additionalProperties: false` on
+  `metrics` and `agent` closes a smuggle path into the signed
+  digest (round-26 F1, F2). Journal `open` verifies MAC before
+  comparing positions to close the position oracle
+  (round-26 F3). Prometheus HELP escaper now scrubs DEL and C1
+  controls (round-26 F4). `TokenVelocity` uses
+  `saturating_add` (round-26 F5).
+- **Recovery robustness** — `recover_spooled_sessions` and
+  `retry_marked_promotions` no longer abort the whole scan on
+  one bad file; orphan `.promote` markers are cleaned up on
+  the `is_promoted()` early-return; `promote_session` on a
+  still-open session additionally requires `session_close_scope`
+  (round-27 F1, F2, F3, F4). `BridgeManifest` /
+  `TopicSpec` / `RetentionSpec` gained `deny_unknown_fields` +
+  numeric caps (partitions ≤ 1024, hot_hours ≤ 10 years); the
+  dashboard `session_detail` returns `atif_filename` instead
+  of the absolute path (round-27 F5, F6).
+- **CLI + Dashboard** — `probe_endpoint` uses scheme-driven
+  default ports and strips userinfo (round-28 F1, F5);
+  dashboard responses now carry a strict CSP + `X-Frame-
+  Options: DENY` + `Referrer-Policy: no-referrer`
+  (round-28 F2); attacker-influencable strings run through
+  `sanitize_for_terminal` before println (round-28 F3);
+  `session_promote` and `loadgen` stream response bodies with
+  hard caps (round-28 F4); `abctl event-tail --max` capped at
+  100 000 (round-24 F7).
+- **Upstream relay** — non-JSON upstream error bodies no longer
+  collapse to 502; the true status + `Retry-After` propagate to
+  the client so SDK backoff works (round-29 F1). Every
+  upstream-relayed response now carries
+  `X-Content-Type-Options: nosniff` (round-29 F4). `/health`
+  no longer discloses `CARGO_PKG_VERSION` to unauthenticated
+  callers (round-29 F6). `StopReason` gained
+  `#[serde(other)]` fallback for forward-compat during
+  heterogeneous cluster upgrades (round-29 F7).
+- **CI supply chain** — every third-party action pinned to a
+  commit SHA; pydantic/shortuuid pinned to exact versions with
+  transitive closure (round-29 F2, F3).
+- **Config validate** — refuses
+  `enforce_identity_scopes = true && require_identity = false`
+  (round-30 F1); per-backend URL scheme allowlist on
+  `identity_jwks_url` / `qdrant_url` / `state_endpoint` /
+  `bridge_endpoint` (round-30 F2); `atif_spool_dir` /
+  `bridge_data_dir` reject empty strings; scope names require
+  non-empty visible-ASCII (round-31 F1, F2).
+- **CORS deny** — explicit `cors_deny` OPTIONS handler on every
+  mutating route: `204 No Content` with NO
+  `Access-Control-Allow-*` headers; browsers correctly refuse
+  cross-origin requests. Test guards against a future
+  `CorsLayer::permissive()` regression (round-31 F5).
+- **MCP tool-call Content-Type preserved** — the upstream tool
+  response's `Content-Type` now round-trips through the on-
+  disk `ToolOutcome` journal and re-emits on cached-outcome
+  replay, so strict JSON-RPC 2.0 clients see
+  `application/json` instead of the axum default
+  `application/octet-stream` (round-32 F2).
+- **Upstream read-timeout floor** — a 60 s read timeout is now
+  applied to the shared reqwest client unconditionally (was
+  opt-in), so a hung tool upstream cannot pin a session lease
+  + WorkerPermit + tool-intent claim indefinitely
+  (round-32 F4).
 
 ## 0.1.0 - 2026-08-10
 
