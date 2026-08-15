@@ -56,7 +56,14 @@ pub fn validate_trajectory(t: &crate::model::Trajectory, mode: Mode) -> Vec<Vali
 
 macro_rules! issue {
     ($issues:expr, $path:expr, $($msg:tt)*) => {
-        $issues.push(ValidationIssue { path: $path.to_string(), message: format!($($msg)*) })
+        // Round-20: cap issue collection so a pathological
+        // trajectory cannot allocate millions of ValidationIssue
+        // structs. We allow ONE extra slot past MAX so
+        // `truncate_issues_with_marker` can detect the overflow
+        // and emit a synthetic truncation notice.
+        if $issues.len() <= MAX_VALIDATION_ISSUES {
+            $issues.push(ValidationIssue { path: $path.to_string(), message: format!($($msg)*) })
+        }
     };
 }
 
@@ -117,10 +124,46 @@ const FINAL_METRICS_FIELDS: &[&str] = &[
     "extra",
 ];
 
+/// Cap on the number of issues collected by `validate_value`.
+///
+/// Round-20: a maliciously crafted trajectory sitting inside
+/// MAX_ATIF_BYTES (64 MiB) can legitimately trigger millions of
+/// validation issues. Each `ValidationIssue` allocates two owned
+/// Strings (path + message); five million entries → ~500 MiB
+/// Vec, hitting OOM before the caller ever renders a bounded
+/// error message (see reconciler round-19 F6). Cap the collection
+/// so the memory bound is O(cap), independent of the input's
+/// pathological branching.
+///
+/// When the cap fires, a synthetic tail issue is emitted so
+/// downstream consumers know the truncation happened.
+pub const MAX_VALIDATION_ISSUES: usize = 4096;
+
 /// Validate a raw JSON value as an ATIF trajectory.
+///
+/// Returns at most [`MAX_VALIDATION_ISSUES`] issues plus a
+/// trailing synthetic entry noting truncation when the cap fires.
 pub fn validate_value(root: &Value, mode: Mode) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
     validate_trajectory_obj(root, "trajectory", mode, &mut issues, true);
+    truncate_issues_with_marker(issues)
+}
+
+/// Round-20: after a validation pass, cap the number of issues
+/// returned so downstream consumers never see a >>bounded Vec.
+/// The `issue!` macro allows ONE slot past MAX so this function
+/// can detect the overflow and swap in a synthetic truncation
+/// notice.
+fn truncate_issues_with_marker(mut issues: Vec<ValidationIssue>) -> Vec<ValidationIssue> {
+    if issues.len() > MAX_VALIDATION_ISSUES {
+        issues.truncate(MAX_VALIDATION_ISSUES);
+        issues.push(ValidationIssue {
+            path: "trajectory".into(),
+            message: format!(
+                "validator hit the {MAX_VALIDATION_ISSUES}-issue cap; additional issues suppressed"
+            ),
+        });
+    }
     issues
 }
 
@@ -748,6 +791,49 @@ mod tests {
     )]
 
     use super::*;
+
+    /// Round-20: a maliciously crafted trajectory containing tens of
+    /// thousands of unknown fields must NOT allocate an unbounded
+    /// Vec<ValidationIssue>. The cap fires and a synthetic
+    /// truncation marker signals the tail.
+    #[test]
+    fn issue_collection_is_bounded_and_marks_truncation() {
+        // Build a trajectory-shaped Value with thousands of unknown
+        // fields at the top level. Each triggers one issue in strict
+        // mode. Well past the MAX_VALIDATION_ISSUES cap.
+        let mut map = serde_json::Map::new();
+        map.insert("schema_version".into(), Value::String("1.7".into()));
+        map.insert("session_id".into(), Value::String("s".into()));
+        map.insert(
+            "agent".into(),
+            serde_json::json!({"name": "a", "version": "1"}),
+        );
+        map.insert(
+            "steps".into(),
+            serde_json::json!([{
+                "step_id": 1,
+                "source": "user",
+                "message": "hi",
+            }]),
+        );
+        for i in 0..(MAX_VALIDATION_ISSUES + 500) {
+            map.insert(format!("unknown_{i}"), Value::Null);
+        }
+        let value = Value::Object(map);
+        let issues = validate_value(&value, Mode::Strict);
+        assert!(
+            issues.len() <= MAX_VALIDATION_ISSUES + 1,
+            "issue Vec is unbounded: {}",
+            issues.len()
+        );
+        // Last entry must be the synthetic truncation marker.
+        let last = issues.last().expect("at least one issue");
+        assert!(
+            last.message.contains("hit the ") && last.message.contains("issue cap"),
+            "expected truncation marker, got: {:?}",
+            last.message
+        );
+    }
 
     #[test]
     fn iso8601_accepts_valid_forms() {

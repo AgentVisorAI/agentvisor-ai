@@ -87,7 +87,15 @@ impl InMemoryStore {
     }
 }
 
-const MAX: i64 = i64::MAX / 2; // headroom so races can't reach the wrap point
+/// Shared counter ceiling. Round-20 F1/F7: both `InMemoryStore` and
+/// `RedisStore::add_on` MUST use this exact value, otherwise the
+/// same trait call succeeds on the in-memory dev/test backend and
+/// silently fails with `StateError::Overflow` in production against
+/// Redis. `ab_core::error::JCS_SAFE_MAX = 2^53` is the tightest
+/// bound (imposed by JCS canonicalization — integers past that
+/// point lose precision in receipt bodies), so both backends align
+/// with the eventually-signed representation.
+pub(crate) const COUNTER_MAX: i64 = ab_core::error::JCS_SAFE_MAX as i64;
 
 impl StateStore for InMemoryStore {
     fn add(&self, key: &str, delta: u64) -> Result<u64, StateError> {
@@ -97,7 +105,7 @@ impl StateStore for InMemoryStore {
         let prev = cell.load(Ordering::Acquire);
         let new = prev
             .checked_add(delta)
-            .filter(|v| *v <= MAX)
+            .filter(|v| *v <= COUNTER_MAX)
             .ok_or_else(|| StateError::Overflow(key.to_owned()))?;
         // Only write after confirming no overflow — no transient negative visible to readers.
         cell.store(new, Ordering::Release);
@@ -145,7 +153,7 @@ impl StateStore for InMemoryStore {
         let mut prepared = Vec::with_capacity(spends.len());
         for (index, spend) in spends.iter().enumerate() {
             let amount = i64::try_from(spend.amount).map_err(|_| StateError::Overflow(spend.key.clone()))?;
-            let limit = i64::try_from(spend.limit.min(u64::try_from(MAX).unwrap_or(u64::MAX)))
+            let limit = i64::try_from(spend.limit.min(u64::try_from(COUNTER_MAX).unwrap_or(u64::MAX)))
                 .map_err(|_| StateError::Overflow(spend.key.clone()))?;
             let cell = self.cell(&spend.key);
             let current = cell.load(Ordering::Acquire);
