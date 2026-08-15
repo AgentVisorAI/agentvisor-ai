@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use std::time::Instant;
 
 fn signer() -> Ed25519Signer {
-    Ed25519Signer::from_seed([17; 32])
+    Ed25519Signer::from_seed(&[17; 32])
 }
 fn ring(s: &Ed25519Signer) -> Keyring {
     let mut r = Keyring::new();

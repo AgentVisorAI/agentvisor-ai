@@ -2220,7 +2220,7 @@ mod tests {
             Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
             Arc::new(NullBus),
             None,
-            Arc::new(Ed25519Signer::from_seed([11; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[11; 32])),
         )
         .unwrap();
         (state, server)
@@ -2779,7 +2779,7 @@ mod tests {
                 Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
                 Arc::new(NullBus),
                 None,
-                Arc::new(Ed25519Signer::from_seed([12; 32])),
+                Arc::new(Ed25519Signer::from_seed(&[12; 32])),
             )
             .unwrap()
         };

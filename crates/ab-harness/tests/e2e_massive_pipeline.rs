@@ -66,7 +66,7 @@ fn app_state(max_tokens: Option<u64>) -> Arc<AppState> {
             Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
             Arc::new(CountingBus::default()),
             None,
-            Arc::new(Ed25519Signer::from_seed([13; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[13; 32])),
         )
         .unwrap(),
     )

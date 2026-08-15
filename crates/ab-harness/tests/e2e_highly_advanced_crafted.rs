@@ -23,10 +23,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 fn signer_a() -> Ed25519Signer {
-    Ed25519Signer::from_seed([21; 32])
+    Ed25519Signer::from_seed(&[21; 32])
 }
 fn signer_b() -> Ed25519Signer {
-    Ed25519Signer::from_seed([22; 32])
+    Ed25519Signer::from_seed(&[22; 32])
 }
 fn ring(signers: &[&Ed25519Signer]) -> Keyring {
     let mut r = Keyring::new();

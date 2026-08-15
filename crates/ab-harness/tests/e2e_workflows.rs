@@ -79,7 +79,7 @@ fn state_with_bus(bus: Arc<RecordingBus>) -> Arc<AppState> {
             Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
             bus,
             None,
-            Arc::new(Ed25519Signer::from_seed([5; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[5; 32])),
         )
         .unwrap(),
     )

@@ -690,7 +690,7 @@ mod tests {
 
     #[test]
     fn issued_receipt_matches_shipped_schema() {
-        let signer = Ed25519Signer::from_seed([13; 32]);
+        let signer = Ed25519Signer::from_seed(&[13; 32]);
         let receipt = Receipt::issue(body(), &signer).unwrap();
         let schema: serde_json::Value =
             serde_json::from_str(include_str!("../../../schemas/receipt-v1.schema.json")).unwrap();

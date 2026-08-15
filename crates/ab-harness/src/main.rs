@@ -826,13 +826,18 @@ fn load_or_create_signer(path: &Path) -> Result<Ed25519Signer> {
         Err(error) => return Err(error),
     }
     let signer = Ed25519Signer::generate();
-    // Round-18 F5: wrap the hex-encoded seed in Zeroizing so
-    // install_seed_exclusive receives it via a zeroize-on-drop
-    // holder. The `seed()` return itself is a bare `[u8; 32]`
-    // but `signer` (an Ed25519Signer with the zeroize feature
-    // enabled on ed25519-dalek) zeroes its inner SigningKey on
-    // drop; we handle the outbound hex intermediate here.
-    let encoded_seed = zeroize::Zeroizing::new(hex::encode(signer.seed()));
+    // Round-18 F5 + round-19 F2/F3: `signer.seed()` now returns
+    // `Zeroizing<[u8; 32]>` directly, so no temp slot lingers on
+    // the caller's stack. The hex encoding is separately wrapped
+    // in Zeroizing so its heap buffer is zeroed on drop too.
+    let seed = signer.seed();
+    // Round-19 F3: `&*seed` (not `*seed`) is required to avoid
+    // copying the seed bytes onto a fresh un-zeroized temp slot
+    // for hex::encode. clippy's `needless_borrows_for_generic_args`
+    // lint is a false positive here — it would suggest `*seed`,
+    // moving 32 bytes out of the Zeroizing wrapper.
+    #[allow(clippy::needless_borrows_for_generic_args)]
+    let encoded_seed = zeroize::Zeroizing::new(hex::encode(&*seed));
     if install_seed_exclusive(path, &encoded_seed)? {
         Ok(signer)
     } else {
@@ -908,10 +913,16 @@ fn read_signer(path: &Path) -> Result<Ed25519Signer> {
     let bytes = Zeroizing::new(
         hex::decode(encoded.trim()).context("decode signing seed as hex")?,
     );
+    // Round-19 F1: copy directly from the Zeroizing<Vec<u8>> slice
+    // into a fresh Zeroizing<[u8; 32]>. Historically we did
+    // `(*bytes).clone().try_into()` which materialized a bare
+    // `Vec<u8>` intermediate and (on `try_into` failure) an
+    // `Err(Vec<u8>)` — both unzeroed. `<[u8;32]>::try_from(&[u8])`
+    // takes only a slice reference and copies bytes straight into
+    // the caller-supplied slot, so the intermediate is scoped to
+    // the Zeroizing wrapper for its entire lifetime.
     let seed: Zeroizing<[u8; 32]> = Zeroizing::new(
-        (*bytes)
-            .clone()
-            .try_into()
+        <[u8; 32]>::try_from(bytes.as_slice())
             .map_err(|_| anyhow::anyhow!("signing seed must contain exactly 32 bytes"))?,
     );
     // Round-14: refuse known-weak Ed25519 seeds. An all-zero seed
@@ -933,7 +944,7 @@ fn read_signer(path: &Path) -> Result<Ed25519Signer> {
             path.display()
         );
     }
-    Ok(Ed25519Signer::from_seed(*seed))
+    Ok(Ed25519Signer::from_seed(&seed))
 }
 
 fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {

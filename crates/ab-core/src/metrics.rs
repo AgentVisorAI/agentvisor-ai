@@ -289,12 +289,19 @@ impl Registry {
     /// Histogram observations are stored internally in microseconds but
     /// rendered in seconds (`le` bounds and `_sum`), per Prometheus base-unit
     /// convention. Histogram metric names should therefore end in `_seconds`.
+    ///
+    /// Round-19: HELP text is escaped per the Prometheus text format
+    /// spec (`\` → `\\`, LF → `\n`). A future counter/histogram
+    /// registration whose HELP contained a newline would otherwise
+    /// silently corrupt the scrape response — Prometheus would parse
+    /// the remainder of the HELP text as metric samples and fail.
     pub fn render(&self) -> String {
         let m = self.metrics.lock();
         let mut out = String::new();
         let mut declared = std::collections::BTreeSet::new();
         for (key, (help, metric)) in m.iter() {
             let (base, labels) = split_key(key);
+            let help = escape_prom_help(help);
             match metric {
                 Metric::Counter(c) => {
                     if declared.insert(base.to_owned()) {
@@ -335,6 +342,24 @@ impl Registry {
         }
         out
     }
+}
+
+/// Round-19: escape a HELP text per the Prometheus text exposition
+/// format spec. Backslash and line-feed are the only two chars the
+/// format reserves in HELP lines. A future counter/histogram
+/// registration whose HELP contained a newline would otherwise
+/// silently corrupt the scrape response — Prometheus would parse
+/// the remainder of the HELP text as metric samples and fail.
+fn escape_prom_help(help: &str) -> String {
+    let mut out = String::with_capacity(help.len());
+    for c in help.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Reject metric keys that would corrupt the Prometheus text exposition
@@ -399,6 +424,31 @@ mod tests {
         let text = r.render();
         assert!(text.contains("# TYPE ab_test_total counter"), "{text}");
         assert!(text.contains("ab_test_total 5"), "{text}");
+    }
+
+    /// Round-19: HELP text with an embedded newline must be escaped
+    /// so the Prometheus text-format scraper does not interpret the
+    /// second half as a metric sample. Backslash must also be
+    /// escaped per the spec.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn render_escapes_newlines_and_backslashes_in_help_text() {
+        let r = Registry::new();
+        r.counter("ab_dangerous_total", "line1\nline2\\path");
+        let text = r.render();
+        // A rendered HELP line must not contain the raw newline —
+        // any newline in the HELP must appear as literal `\n`.
+        let help_line = text
+            .lines()
+            .find(|line| line.starts_with("# HELP ab_dangerous_total"))
+            .expect("HELP line present");
+        assert!(help_line.contains(r"\n"), "help was not escaped: {help_line:?}");
+        assert!(help_line.contains(r"\\"), "backslash was not escaped: {help_line:?}");
+        // And the "line2" fragment must not be on its own line.
+        assert!(
+            !text.contains("\nline2\\path"),
+            "unescaped fragment leaked into scrape: {text}"
+        );
     }
 
     #[test]

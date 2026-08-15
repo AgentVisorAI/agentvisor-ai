@@ -25,6 +25,16 @@ Description=AgentBridge LLM proxy with signed receipts
 Documentation=https://github.com/debugmode0/agent-bridge
 After=network-online.target
 Wants=network-online.target
+# Round-19 F7: bound the restart-loop budget. Without these, a
+# misconfigured AB_CONFIG (bad TOML, port bind conflict) causes
+# exit-nonzero → RestartSec=2 → retry, forever. That floods
+# journald (systemd-journald throttles a unit at ~1000 msg/30s and
+# starts DROPPING messages from unrelated services on the same
+# host). StartLimitBurst=5 with StartLimitIntervalSec=60s means
+# systemd holds the unit in "failed" after 5 crashes in 1 minute,
+# preserving journald capacity for whatever comes next.
+StartLimitBurst=5
+StartLimitIntervalSec=60s
 
 [Service]
 Type=simple

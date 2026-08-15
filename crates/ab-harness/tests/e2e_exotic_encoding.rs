@@ -42,7 +42,7 @@ use ab_receipts::{
 use serde_json::{json, Value};
 
 fn signer() -> Ed25519Signer {
-    Ed25519Signer::from_seed([171; 32])
+    Ed25519Signer::from_seed(&[171; 32])
 }
 fn ring(s: &Ed25519Signer) -> Keyring {
     let mut r = Keyring::new();
