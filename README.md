@@ -5,23 +5,34 @@
 [![Docs](https://github.com/AgentVisorAI/agent-bridge/actions/workflows/pages.yml/badge.svg)](https://agentvisorai.github.io/agent-bridge/)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Put AgentBridge between your app and its model or tools. It records every
-request, tool call, and response, enforces the limits you set, and hands
-you a signed receipt at the end of every session — one anyone can verify
-offline with just a public key. No vendor lock-in, no trust in us.**
+**AI agents you can hand to an auditor.**
 
-- **[The 60-second overview →](https://agentvisorai.github.io/agent-bridge/)** (plain English, for anyone)
-- **[Releases](https://github.com/AgentVisorAI/agent-bridge/releases)** — pre-built binaries with SHA-256 checksums
-- **[Security](SECURITY.md)** — trust boundaries and how to deploy safely (report vulnerabilities privately)
-- **[Architecture](ARCHITECTURE.md)**, **[Benchmarks](BENCHMARKS.md)**, **[Verification protocol](VERIFICATION.md)** — for readers going deeper
-- **[API docs](https://agentvisorai.github.io/agent-bridge/api/)** — Rust crate reference for library authors
+AgentBridge is a small Rust server you drop in front of your agent's
+LLM and tool calls. Every request is recorded, every limit you set is
+enforced before the call goes out, and every session ends with a signed
+receipt anyone can verify offline with just a public key. Change one
+line in your OpenAI client. Nothing else in your app moves.
+
+```python
+client = OpenAI(
+    api_key=os.environ["OPENAI_API_KEY"],
+    base_url="http://127.0.0.1:8484/v1",   # <-- the only change
+)
+```
+
+- **[Landing page](https://agentvisorai.github.io/agent-bridge/)** — the story, in
+  three concrete examples.
+- **[Releases](https://github.com/AgentVisorAI/agent-bridge/releases)** —
+  pre-built binaries with SHA-256 checksums.
+- **[Security model](SECURITY.md)** — trust boundaries, controls, and how
+  to deploy safely. Report vulnerabilities privately via the
+  [advisory form](https://github.com/AgentVisorAI/agent-bridge/security/advisories/new).
+- **[Architecture](ARCHITECTURE.md)** · **[Benchmarks](BENCHMARKS.md)** ·
+  **[Verification protocol](VERIFICATION.md)** — going deeper.
+- **[API docs](https://agentvisorai.github.io/agent-bridge/api/)** — Rust crate
+  reference. Skip unless you're embedding AgentBridge as a library.
 
 ---
-
-Under the hood: an inline Rust proxy for OpenAI-compatible agent traffic
-and MCP tool calls. It applies identity, quota, policy, compression, and
-loop controls; emits OCSF-shaped events; writes ATIF v1.7 trajectories;
-and issues offline-verifiable Ed25519 receipts.
 
 ## Easiest start (no config, no exports)
 
