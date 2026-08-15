@@ -531,8 +531,22 @@ fn write_private_key_file(path: &Path, key: &str) -> Result<()> {
     let _ = std::fs::remove_file(&temporary);
     guard.disarm();
     result?;
-    ab_core::fsutil::sync_directory(parent)
-        .with_context(|| format!("sync key directory {}", parent.display()))?;
+    // Round-14 F4: mirror of round-13 F4 (harness install_seed_
+    // exclusive) and round-12 F5 (fsutil::write_atomic). Once
+    // hard_link commits, the key IS at `path` — a subsequent
+    // sync_directory failure means the dirent may not survive an
+    // immediate power loss, but every observer running now sees the
+    // key. Returning Err here made `abctl init` report failure; the
+    // operator re-runs, line 500 unlinks the good key, and the
+    // whole install cycle retries. Downgrade to warn+Ok so this
+    // last-stanza fsync is best-effort.
+    if let Err(error) = ab_core::fsutil::sync_directory(parent) {
+        eprintln!(
+            "warning: key installed at {}, but parent directory fsync failed: {error}; \
+             dirent may not survive an immediate power loss",
+            parent.display()
+        );
+    }
     Ok(())
 }
 

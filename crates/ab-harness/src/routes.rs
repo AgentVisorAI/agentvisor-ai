@@ -72,6 +72,11 @@ async fn trace_request(request: Request<Body>, next: Next) -> Response {
     // `SessionId::parse` (too long, control chars in disguise). Use
     // `single_header` + `SessionId::parse` to bind ONE consistent
     // value or the sentinel `"invalid"`.
+    // Round-14 F7: use a sentinel that CANNOT pass `SessionId::parse`
+    // (0x21..=0x7e visible-ASCII only), so a client cannot legitimately
+    // send `X-AB-Session: invalid` and share a trace label with a
+    // rejected request. The leading space (0x20) is outside the
+    // allowed range → collision-free.
     let headers = request.headers();
     let session_id = match crate::pipeline::single_header(headers, crate::pipeline::SESSION_HEADER) {
         Ok(Some(value)) => value
@@ -79,9 +84,9 @@ async fn trace_request(request: Request<Body>, next: Next) -> Response {
             .ok()
             .and_then(|v| ab_core::SessionId::parse(v).ok())
             .map(|id| id.to_string())
-            .unwrap_or_else(|| "invalid".to_owned()),
+            .unwrap_or_else(|| " rejected".to_owned()),
         Ok(None) => "unbound".to_owned(),
-        Err(_) => "invalid".to_owned(),
+        Err(_) => " duplicate-header".to_owned(),
     };
     let span = tracing::info_span!(
         "agentbridge.request",

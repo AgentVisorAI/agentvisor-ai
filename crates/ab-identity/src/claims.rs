@@ -79,6 +79,20 @@ impl<'de> serde::Deserialize<'de> for Audience {
                         "aud claim must not be an empty array; provide the audience or omit the claim",
                     ));
                 }
+                // Round-14 F3: incomplete symmetry with round-13 F3
+                // (empty-string reject in visit_str). Without this, an
+                // `aud: [""]` would deserialize as
+                // `Multi(vec!["".to_owned()])` and pass the "not
+                // empty array" gate while still carrying zero
+                // meaningful audience entries. Any code path that
+                // treats `contains("expected")` returning false as
+                // "audience is present but doesn't match" (vs
+                // "audience is unspecified") is misled.
+                if values.iter().any(|v| v.is_empty()) {
+                    return Err(serde::de::Error::custom(
+                        "aud claim array must not contain empty strings",
+                    ));
+                }
                 Ok(Audience::Multi(values))
             }
         }
@@ -228,6 +242,26 @@ mod tests {
         assert!(value.aud.contains("agentbridge"));
         assert!(value.aud.contains("other"));
         assert!(!value.aud.contains("nope"));
+    }
+
+    /// Round-14 F3: incomplete symmetry with round-13 F3
+    /// (empty-string reject in visit_str). An `aud: [""]` would
+    /// otherwise deserialize as `Multi(vec!["".to_owned()])` and
+    /// pass the "not empty array" gate while still carrying zero
+    /// meaningful audience entries.
+    #[test]
+    fn audience_array_with_empty_string_element_is_rejected() {
+        let json = r#"{"aud":["real","",""]}"#;
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        struct Just {
+            aud: Audience,
+        }
+        let err = serde_json::from_str::<Just>(json).unwrap_err().to_string();
+        assert!(
+            err.contains("empty strings"),
+            "expected empty-string-in-array rejection, got: {err}",
+        );
     }
 
     /// Round-13 F3: mirror of F10 for the string half. The docstring
