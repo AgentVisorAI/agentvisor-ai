@@ -289,8 +289,48 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
     }
 }
 
+/// Round-16 F5: cap file reads that feed the JSON parser so a
+/// hostile file (or a symlink pointing at `/dev/zero`) cannot OOM
+/// the CLI before the parser can reject it. `read_capped` performs
+/// the size check against `metadata.len()` before reading a byte,
+/// and refuses non-regular files up front.
+fn read_capped(path: &Path, max_bytes: u64, label: &str) -> Result<Vec<u8>> {
+    let metadata = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "{label} at {} is not a regular file (type: {:?})",
+            path.display(),
+            metadata.file_type()
+        );
+    }
+    if metadata.len() > max_bytes {
+        anyhow::bail!(
+            "{label} at {} is {} bytes; refusing to load more than {max_bytes}",
+            path.display(),
+            metadata.len()
+        );
+    }
+    std::fs::read(path).with_context(|| format!("read {}", path.display()))
+}
+
+/// Receipts JCS-canonicalize to a few hundred bytes; even a huge
+/// tool-call summary stays well under 16 MiB.
+const MAX_RECEIPT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// ATIF trajectories can carry long transcripts; 64 MiB is generous
+/// (a 200k-token GPT-4 context in ASCII fits in ~800 KiB).
+const MAX_ATIF_BYTES: u64 = 64 * 1024 * 1024;
+
 fn receipt_verify(path: &Path, public_key_hex: &str) -> Result<()> {
-    let receipt: Receipt = read_json(path)?;
+    // Round-16: use the strict deserializer that refuses duplicate
+    // JSON keys at any nesting level. `abctl receipt-verify` is the
+    // primary offline audit tool — a receipt that verified here but
+    // showed different content in `jq` (first-wins) would defeat
+    // the whole audit posture. `Receipt::from_json_slice` closes
+    // that split-brain uniformly.
+    let bytes = read_capped(path, MAX_RECEIPT_BYTES, "receipt")?;
+    let receipt = Receipt::from_json_slice(&bytes)
+        .with_context(|| format!("parse receipt {}", path.display()))?;
     let public_key: [u8; 32] = hex::decode(public_key_hex)
         .context("trusted public key is not hexadecimal")?
         .try_into()
@@ -305,7 +345,9 @@ fn receipt_verify(path: &Path, public_key_hex: &str) -> Result<()> {
 }
 
 fn atif_validate(path: &Path, mode: ValidationMode) -> Result<()> {
-    let value: Value = read_json(path)?;
+    let bytes = read_capped(path, MAX_ATIF_BYTES, "trajectory")?;
+    let value: Value =
+        serde_json::from_slice(&bytes).with_context(|| format!("parse JSON {}", path.display()))?;
     let mode = match mode {
         ValidationMode::Strict => ab_atif::Mode::Strict,
         ValidationMode::Compat => ab_atif::Mode::Compat,
@@ -548,11 +590,6 @@ fn percentile(sorted: &[u64], percentile: usize) -> u64 {
     }
     let index = sorted.len().saturating_mul(percentile).saturating_add(99) / 100;
     sorted.get(index.saturating_sub(1)).copied().unwrap_or(0)
-}
-
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
-    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("parse JSON {}", path.display()))
 }
 
 #[cfg(test)]

@@ -19,21 +19,44 @@ services:
     image: agent-bridge:local
     container_name: agent-bridge
     ports:
-      - "8484:8484"
+      # Round-16 F2: bind to 127.0.0.1 explicitly. Docker's default
+      # (`"8484:8484"`) means `0.0.0.0:8484` — reachable from any
+      # network interface. Combined with the shipped default
+      # `require_identity = false`, a LAN peer could otherwise
+      # exercise `/v1/chat/completions` against the operator's
+      # upstream credentials. Change this AND set
+      # `require_identity = true` if you actually want remote
+      # access.
+      - "127.0.0.1:8484:8484"
     environment:
       RUST_LOG: info
       AB_CONFIG: /app/config/harness.container.toml
-      AB_SIGNING_SEED_FILE: /app/data/signing.seed
+      # Round-16 F3: keep the signing seed OFF the shared
+      # `bridge-data` volume so a co-scheduled container mounting
+      # `-v bridge-data:/x` cannot read the receipt trust anchor.
+      # The seed lives in an in-container `emptyDir`-style path
+      # populated by an init step or by the operator running
+      # `abctl keygen -o /run/signing.seed` inside the container.
+      AB_SIGNING_SEED_FILE: /run/signing.seed
       # Uncomment (or pass via the shell) to target a cloud provider:
       # AB_UPSTREAM_URL: https://api.openai.com
       # AB_UPSTREAM_API_KEY: ${AB_UPSTREAM_API_KEY}
     volumes:
       - bridge-data:/app/data
       - atif-spool:/app/spool
+      # Round-16 F3: dedicated tmpfs for the signing seed so no
+      # named volume (which could be re-attached to any other
+      # container) ever carries the receipt trust anchor.
+      - type: tmpfs
+        target: /run
+        tmpfs:
+          mode: 0700
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
-      test: ["CMD", "abctl", "health"]
+      # Round-15 F8-mirror: hardcode the URL rather than relying on
+      # `abctl health`'s default matching whatever `listen` says.
+      test: ["CMD", "abctl", "health", "--url", "http://127.0.0.1:8484"]
       interval: 10s
       timeout: 3s
       retries: 5

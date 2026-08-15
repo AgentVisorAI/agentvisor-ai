@@ -212,6 +212,17 @@ impl IdentityValidator {
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| IdentityError::Jwks(format!("key {kid:?} missing x")))?;
             parsed.push((kid.to_owned(), KeyMaterial::Ed25519Jwk(x.to_owned())));
+            // Round-16 F9: the outer `keys.len() > MAX_JWKS_KEYS`
+            // guard at the top of the function already bounds
+            // `parsed.len()` (parsed is a subset of the outer
+            // array). This inner check is therefore unreachable in
+            // practice — kept as defense-in-depth so a future
+            // refactor that drops the outer guard cannot silently
+            // reopen the write-lock stall vector.
+            debug_assert!(
+                parsed.len() <= MAX_JWKS_KEYS,
+                "outer keys.len() cap should have already refused this document"
+            );
             if parsed.len() > MAX_JWKS_KEYS {
                 return Err(IdentityError::Jwks(format!(
                     "JWKS declares more than {MAX_JWKS_KEYS} Ed25519 OKP keys; refusing to install"
