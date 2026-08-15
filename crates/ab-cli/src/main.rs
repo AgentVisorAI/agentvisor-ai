@@ -334,6 +334,37 @@ fn read_capped_str(path: &Path, max_bytes: u64, label: &str) -> Result<String> {
         .with_context(|| format!("{label} at {}", path.display()))
 }
 
+/// Round-28 F3: neutralise terminal-escape injection when printing
+/// attacker-influenced strings.
+///
+/// Anything reachable through a trusted third party — a signed receipt
+/// whose `receipt_id` was minted by a rotated/compromised signer, an
+/// ATIF file that a peer produced, an HTTP body from an upstream —
+/// can carry ESC / CSI / DEL / C1 bytes that reprogram the operator's
+/// terminal (clear screen, spoof a green "OK" line, rewrite the
+/// window title, or poison paste buffers on vulnerable emulators —
+/// CVE-2003-0063 class). Replace every control byte (C0 except TAB,
+/// DEL, and every C1) with U+FFFD before it flows into
+/// println!/eprintln!.
+fn sanitize_for_terminal(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| {
+            let cp = c as u32;
+            // Preserve TAB (0x09) as the one C0 whitespace we allow;
+            // callers that need line-based output use format! + '\n'
+            // themselves before this function sees the string.
+            if cp == 0x09 {
+                c
+            } else if cp < 0x20 || cp == 0x7f || (0x80..=0x9f).contains(&cp) {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// Receipts JCS-canonicalize to a few hundred bytes; even a huge
 /// tool-call summary stays well under 16 MiB.
 const MAX_RECEIPT_BYTES: u64 = ab_core::fsutil::MAX_RECEIPT_BYTES;
@@ -365,7 +396,11 @@ fn receipt_verify(path: &Path, public_key_hex: &str) -> Result<()> {
         .add_key_bytes(&public_key)
         .context("trusted public key is invalid")?;
     receipt.verify(&keyring).context("receipt verification failed")?;
-    println!("verified {}", receipt.body.receipt_id);
+    // Round-28 F3: sanitise the receipt_id before printing. A signer
+    // trusted by the operator could otherwise mint a receipt whose
+    // receipt_id contains ESC/CSI bytes, reprogramming the auditor's
+    // terminal after the "verified" line.
+    println!("verified {}", sanitize_for_terminal(&receipt.body.receipt_id));
     Ok(())
 }
 
@@ -395,7 +430,15 @@ fn atif_validate(path: &Path, mode: ValidationMode) -> Result<()> {
         let real_total = if truncated { issues.len() - 1 } else { issues.len() };
         let shown = issues.iter().take(ATIF_HEAD);
         for issue in shown {
-            eprintln!("{}: {}", issue.path, issue.message);
+            // Round-28 F3: sanitise every field of the issue since
+            // both `path` (a JSON pointer built from user JSON keys)
+            // and `message` (may embed a value snippet) come from
+            // attacker-supplied ATIF content.
+            eprintln!(
+                "{}: {}",
+                sanitize_for_terminal(&issue.path),
+                sanitize_for_terminal(&issue.message)
+            );
         }
         if real_total > ATIF_HEAD {
             let suppressed = real_total - ATIF_HEAD;
@@ -477,12 +520,46 @@ async fn session_promote(base_url: &str, id: &str, token_file: Option<&Path>) ->
     }
     let response = request.send().await.context("promote session")?;
     let status = response.status();
-    let body = response.text().await.context("read promotion response")?;
+    // Round-28 F4: cap the response body read. reqwest's
+    // `response.text()` buffers the whole body with no built-in
+    // limit; a misbehaving harness (or a stalled proxy) could keep
+    // the CLI holding unbounded RAM waiting for EOF. Stream chunks
+    // and refuse past MAX_CONTROL_BYTES (1 MiB — a promotion
+    // receipt is a few hundred bytes).
+    let body = read_capped_response(response, ab_core::fsutil::MAX_CONTROL_BYTES).await?;
     if !status.is_success() {
-        anyhow::bail!("promotion failed ({status}): {body}");
+        // Round-28 F3: harness error body is attacker-influencable
+        // via header echoing / error messages — sanitise before
+        // it lands on the operator's terminal.
+        anyhow::bail!(
+            "promotion failed ({status}): {}",
+            sanitize_for_terminal(&body)
+        );
     }
-    println!("{body}");
+    // Round-28 F3: the promoted receipt is JSON — printing it
+    // through serde_json::to_string is not attacker-controllable at
+    // this layer, but the raw body could carry stray control bytes
+    // if a proxy adulterates the response. Sanitise to be safe.
+    println!("{}", sanitize_for_terminal(&body));
     Ok(())
+}
+
+/// Round-28 F4: capped, streaming replacement for
+/// `response.text().await`. Refuses to buffer more than `max_bytes`
+/// before an EOF and surfaces the cap in the error text.
+async fn read_capped_response(response: reqwest::Response, max_bytes: u64) -> Result<String> {
+    use futures::StreamExt as _;
+    let mut stream = response.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    let cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("read response chunk")?;
+        if buf.len().saturating_add(chunk.len()) > cap {
+            anyhow::bail!("response exceeded {max_bytes} bytes; refusing to buffer");
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    String::from_utf8(buf).context("response body was not valid UTF-8")
 }
 
 fn config_validate(path: &Path) -> Result<()> {
@@ -567,7 +644,25 @@ async fn loadgen(
                 }
                 let response = request.send().await.map_err(|error| error.to_string())?;
                 let status = response.status();
-                let _ = response.bytes().await.map_err(|error| error.to_string())?;
+                // Round-28 F4: cap loadgen response body reads. With
+                // `stream: true`, an SSE response accumulates whole
+                // via `.bytes()` — a stalled server could pin each
+                // of `--connections 10_000` tasks to unbounded RAM,
+                // turning the load test into the fault it was meant
+                // to expose. Refuse past 4 MiB per response.
+                use futures::StreamExt as _;
+                let mut stream = response.bytes_stream();
+                let mut total = 0usize;
+                const LOADGEN_MAX_RESPONSE: usize = 4 * 1024 * 1024;
+                while let Some(chunk) = stream.next().await {
+                    let bytes = chunk.map_err(|error| error.to_string())?;
+                    total = total.saturating_add(bytes.len());
+                    if total > LOADGEN_MAX_RESPONSE {
+                        return Err(format!(
+                            "response exceeded {LOADGEN_MAX_RESPONSE} bytes"
+                        ));
+                    }
+                }
                 if !status.is_success() {
                     return Err(format!("HTTP {status}"));
                 }
@@ -742,5 +837,29 @@ mod tests {
             text.contains("safety cap"),
             "expected safety-cap rejection, got {text}"
         );
+    }
+
+    /// Round-28 F3: `sanitize_for_terminal` neutralises every control
+    /// byte that could reprogram the operator's terminal. A signer
+    /// trusted by the operator could otherwise mint a receipt whose
+    /// receipt_id contains ESC/CSI/DEL/C1 bytes and hijack the
+    /// output of `abctl receipt-verify`.
+    #[test]
+    fn sanitize_for_terminal_neutralises_ansi_escapes() {
+        // ESC (0x1b) — the C0 prefix for ANSI CSI sequences.
+        let evil = "OK\u{1b}[2J\u{1b}[Hspoofed";
+        let cleaned = sanitize_for_terminal(evil);
+        assert!(!cleaned.contains('\u{1b}'), "ESC survived: {cleaned:?}");
+        // CSI (0x9b) — the single-byte 8-bit-terminal equivalent.
+        let evil2 = "line\u{9b}2J";
+        assert!(!sanitize_for_terminal(evil2).contains('\u{9b}'));
+        // DEL (0x7f).
+        assert!(!sanitize_for_terminal("a\u{7f}b").contains('\u{7f}'));
+        // NUL and other C0 (except TAB which we preserve).
+        assert!(!sanitize_for_terminal("a\u{00}b").contains('\u{00}'));
+        assert!(!sanitize_for_terminal("a\nb").contains('\n'));
+        assert_eq!(sanitize_for_terminal("safe\tstring"), "safe\tstring");
+        // Regular UTF-8 characters (multi-byte) survive.
+        assert_eq!(sanitize_for_terminal("héllo"), "héllo");
     }
 }
