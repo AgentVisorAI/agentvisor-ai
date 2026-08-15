@@ -82,9 +82,17 @@ pub struct Finalizer {
     quarantined_sessions: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     /// Artifacts already warned about during recovery scans, so a corrupt
     /// file left on disk as evidence does not repeat its warning every tick.
+    /// Round-17 F8: capped via `warn_once`; not raw `HashSet::insert`.
     warned_artifacts: Arc<parking_lot::Mutex<std::collections::HashSet<PathBuf>>>,
     journal_key: [u8; 32],
 }
+
+/// Cap on `warned_artifacts` so a rotating-timestamp attacker (or
+/// unbounded orphan churn) cannot leak memory forever. When the set
+/// exceeds this cap it is fully cleared — this "forgets" prior warns
+/// so recurring artifacts might re-warn once, but the alternative
+/// (unbounded growth over months of uptime) is worse.
+const WARNED_ARTIFACTS_CAP: usize = 4096;
 
 /// Per-session lifecycle mutex table.
 ///
@@ -245,6 +253,20 @@ impl Finalizer {
     #[cfg(test)]
     pub(crate) fn lifecycle_locks(&self) -> Arc<SessionLockTable> {
         Arc::clone(&self.lifecycle_locks)
+    }
+
+    /// Round-17 F8: bounded insert-if-absent for `warned_artifacts`.
+    /// When the tracked set is about to exceed `WARNED_ARTIFACTS_CAP`,
+    /// clear it first so a rotating-timestamp attacker (or long
+    /// uptime with orphan churn) cannot leak PathBuf entries
+    /// forever. Returns true if this is the first warn for `path`
+    /// in the current cycle (caller emits the warn only then).
+    fn warn_once(&self, path: PathBuf) -> bool {
+        let mut set = self.warned_artifacts.lock();
+        if set.len() >= WARNED_ARTIFACTS_CAP {
+            set.clear();
+        }
+        set.insert(path)
     }
 
     /// Attach the quota/budget state store whose per-session counters are
@@ -491,7 +513,7 @@ impl Finalizer {
             ));
         }
         self.ensure_atif_provenance(&path, &session.id).await?;
-        let bytes = tokio::fs::read(&path)
+        let bytes = read_capped_async(path.clone(), ab_core::fsutil::MAX_ATIF_BYTES)
             .await
             .map_err(|error| FinalizeError::Atif(error.to_string()))?;
         let trajectory: ab_atif::Trajectory =
@@ -682,7 +704,7 @@ impl Finalizer {
                 );
                 continue;
             }
-            let bytes = tokio::fs::read(&path)
+            let bytes = read_capped_async(path.clone(), ab_core::fsutil::MAX_ATIF_BYTES)
                 .await
                 .map_err(|error| FinalizeError::Atif(error.to_string()))?;
             let trajectory: ab_atif::Trajectory = match serde_json::from_slice(&bytes) {
@@ -722,7 +744,7 @@ impl Finalizer {
                         "ATIF spool files skipped during recovery",
                     )
                     .inc();
-                if self.warned_artifacts.lock().insert(path.clone()) {
+                if self.warn_once(path.clone()) {
                     tracing::warn!(
                         path = %path.display(),
                         "ignoring ATIF spool file with no authenticated provenance"
@@ -737,7 +759,7 @@ impl Finalizer {
                         "ATIF spool files skipped during recovery",
                     )
                     .inc();
-                if self.warned_artifacts.lock().insert(path.clone()) {
+                if self.warn_once(path.clone()) {
                     tracing::warn!(
                         %error,
                         path = %path.display(),
@@ -792,7 +814,7 @@ impl Finalizer {
                 }
             };
             let receipt_path = self.receipt_path(&recovered_session.id);
-            if let Ok(bytes) = tokio::fs::read(&receipt_path).await {
+            if let Ok(bytes) = read_capped_async(receipt_path.clone(), ab_core::fsutil::MAX_RECEIPT_BYTES).await {
                 // Round-16: use the strict deserializer that
                 // refuses duplicate keys at any nesting level. A
                 // post-compromise attacker who overwrote the
@@ -800,6 +822,9 @@ impl Finalizer {
                 // duplicate `instance_uid` past round-15 F4's
                 // top-level guard — the round-15 walker closes
                 // that gap uniformly.
+                // Round-17 F3: read is bounded by MAX_RECEIPT_BYTES
+                // so a hostile plant can no longer OOM the
+                // recovery scan on this session.
                 let receipt = Receipt::from_json_slice(&bytes)
                     .map_err(|error| FinalizeError::Receipt(error.to_string()))?;
                 self.verify_configured_receipt(&receipt)?;
@@ -858,7 +883,7 @@ impl Finalizer {
                 // `warned_artifacts` so a persistent hostile plant
                 // does not produce N warn lines every tick until
                 // process restart, drowning real signal.
-                if self.warned_artifacts.lock().insert(metadata_path.clone()) {
+                if self.warn_once(metadata_path.clone()) {
                     tracing::warn!(
                         path = %metadata_path.display(),
                         version = ?metadata.get("journal_version"),
@@ -1047,9 +1072,10 @@ impl Finalizer {
                 }
             };
             let receipt_path = self.receipt_path(&session.id);
-            if let Ok(bytes) = tokio::fs::read(receipt_path).await {
+            if let Ok(bytes) = read_capped_async(receipt_path, ab_core::fsutil::MAX_RECEIPT_BYTES).await {
                 // Round-16: strict deserializer (see the twin call
                 // in the unsigned recovery path above).
+                // Round-17 F3: bounded read.
                 let receipt = Receipt::from_json_slice(&bytes)
                     .map_err(|error| FinalizeError::Receipt(error.to_string()))?;
                 self.verify_configured_receipt(&receipt)?;
@@ -1197,7 +1223,7 @@ impl Finalizer {
                 // branch above — one drifted sidecar must not deny
                 // recovery to unrelated sessions.
                 // Round-16 F4: dedup via `warned_artifacts`.
-                if self.warned_artifacts.lock().insert(metadata_path.clone()) {
+                if self.warn_once(metadata_path.clone()) {
                     tracing::warn!(
                         path = %metadata_path.display(),
                         version = ?metadata.get("journal_version"),
@@ -2060,6 +2086,22 @@ async fn quarantine_sibling_exists(
     })
     .await
     .map_err(|error| FinalizeError::Task(error.to_string()))?
+}
+
+/// Round-17 F3: async wrapper around `ab_core::fsutil::read_capped`
+/// for the reconciler's hot-path reads. A fs-tamper attacker
+/// (co-scheduled workload, backup restore gone wrong, malicious
+/// sidecar) can otherwise plant a multi-GB receipt/trajectory and
+/// OOM the harness on every recovery tick. `spawn_blocking` keeps
+/// the tokio runtime healthy while `File::open` + `metadata` +
+/// bounded `read_to_end` run on the blocking pool.
+async fn read_capped_async(
+    path: std::path::PathBuf,
+    max_bytes: u64,
+) -> Result<Vec<u8>, std::io::Error> {
+    tokio::task::spawn_blocking(move || ab_core::fsutil::read_capped(&path, max_bytes))
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?
 }
 
 async fn read_complete_journal(path: &std::path::Path) -> Result<Vec<String>, FinalizeError> {

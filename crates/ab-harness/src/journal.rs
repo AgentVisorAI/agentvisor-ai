@@ -63,6 +63,17 @@ pub(crate) fn open<T: DeserializeOwned>(
             envelope.index
         ));
     }
+    // Round-17 F9: HMAC-SHA256 renders as exactly 64 hex chars. A
+    // fs-tamper attacker with a multi-MB mac field would otherwise
+    // force `hex::decode` to allocate half the string length on
+    // every recovery-scan tick. Cap at 128 (twice the legitimate
+    // length to allow one round of format experimentation).
+    if envelope.mac.len() > 128 {
+        return Err(format!(
+            "journal mac field is {} chars; refusing (HMAC-SHA256 is 64 hex chars)",
+            envelope.mac.len()
+        ));
+    }
     let claimed = hex::decode(&envelope.mac).map_err(|error| error.to_string())?;
     let verifier = build_mac(key, domain, envelope.index, &envelope.payload)?;
     verifier

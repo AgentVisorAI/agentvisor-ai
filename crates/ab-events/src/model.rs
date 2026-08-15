@@ -204,6 +204,7 @@ impl Fingerprint {
 
 /// Event metadata (OCSF `metadata` object).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Metadata {
     /// OCSF schema version.
     pub version: String,

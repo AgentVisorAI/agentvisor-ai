@@ -323,6 +323,15 @@ fn verify_pending_mac(
         Hmac::<Sha256>::new_from_slice(control_key).map_err(|error| BusError::Backend(error.to_string()))?;
     mac.update(b"agentbridge-cold-outbox-v1\0");
     mac.update(canonical.as_bytes());
+    // Round-17 F9: same 128-char cap as journal.rs — HMAC-SHA256 is
+    // 64 hex chars; refuse a giant `presented_hex` so a fs-tamper
+    // attacker cannot force a huge hex::decode allocation before
+    // verify_slice fails.
+    if presented_hex.len() > 128 {
+        return Err(BusError::Backend(
+            "cold outbox authentication failed".to_owned(),
+        ));
+    }
     let presented_bytes = hex::decode(presented_hex)
         .map_err(|_| BusError::Backend("cold outbox authentication failed".to_owned()))?;
     mac.verify_slice(&presented_bytes)

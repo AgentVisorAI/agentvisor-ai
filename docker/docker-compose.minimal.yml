@@ -31,12 +31,23 @@ services:
     environment:
       RUST_LOG: info
       AB_CONFIG: /app/config/harness.container.toml
+      # ⚠️  ROUND-17 F2 WARNING — MINIMAL / DEMO TEMPLATE ⚠️
+      # This file uses a tmpfs /run mount for the signing seed. Every
+      # container restart REGENERATES the receipt trust anchor:
+      #   * receipts signed before a restart will not verify against
+      #     the new pubkey (key_id changes with the fresh seed);
+      #   * external auditors following your `pubkey` will silently
+      #     start failing every verify call after each redeploy.
+      # THIS TEMPLATE IS FOR LOCAL DEV / EVAL ONLY. For anything
+      # customer-facing, use `docker-compose.yml` (which mounts the
+      # seed from a docker secret with mode:0400), or wire your own
+      # persistent secret volume.
+      #
       # Round-16 F3: keep the signing seed OFF the shared
       # `bridge-data` volume so a co-scheduled container mounting
       # `-v bridge-data:/x` cannot read the receipt trust anchor.
-      # The seed lives in an in-container `emptyDir`-style path
-      # populated by an init step or by the operator running
-      # `abctl keygen -o /run/signing.seed` inside the container.
+      # The seed lives in the tmpfs /run path below; auto-generated
+      # by the harness on first boot via load_or_create_signer.
       AB_SIGNING_SEED_FILE: /run/signing.seed
       # Uncomment (or pass via the shell) to target a cloud provider:
       # AB_UPSTREAM_URL: https://api.openai.com
