@@ -557,9 +557,41 @@ impl Finalizer {
         }
         let persisted_receipt = { session.receipt.lock().clone() };
         if session.is_promoted() {
-            return persisted_receipt.ok_or_else(|| {
+            let receipt = persisted_receipt.ok_or_else(|| {
                 FinalizeError::Promotion("promoted session has no persisted receipt".to_owned())
-            });
+            })?;
+            // Round-27 F3: opportunistically clean up an orphan
+            // `.promote` marker for an already-promoted session. Two
+            // windows used to leak markers indefinitely: (a) a crash
+            // between `finish_promotion()` and `remove_outbox(&marker)`
+            // below, and (b) any recovery-time `promote()` call that
+            // hits the early-return here without ever touching the
+            // marker. `retry_marked_promotions` would then re-read,
+            // re-verify, and re-early-return the same orphan on every
+            // idle tick forever. Best-effort cleanup: any I/O failure
+            // is warned but does not fail the promotion — the caller
+            // still gets its receipt.
+            //
+            // Extract the atif path with an inner scope so the
+            // parking_lot MutexGuard drops before `.await` (an
+            // `atif_path.lock()` temporary living across the await
+            // makes the future !Send).
+            let atif_path_opt: Option<std::path::PathBuf> = {
+                session.atif_path.lock().clone()
+            };
+            if let Some(atif_path) = atif_path_opt {
+                let marker = atif_path.with_extension("promote");
+                if marker.exists() {
+                    if let Err(error) = remove_outbox(&marker).await {
+                        tracing::warn!(
+                            %error,
+                            path = %marker.display(),
+                            "failed to clean up orphan promotion marker (promotion still succeeded)"
+                        );
+                    }
+                }
+            }
+            return Ok(receipt);
         }
         let path =
             session.atif_path.lock().clone().ok_or_else(|| {
@@ -773,9 +805,26 @@ impl Finalizer {
                 );
                 continue;
             }
-            let bytes = read_capped_async(path.clone(), ab_core::fsutil::MAX_ATIF_BYTES)
-                .await
-                .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+            // Round-27 F1: previously any read failure aborted the entire
+            // recovery scan via `?`. One EIO / EACCES on a single spool
+            // file (root-owned test artifact, chattr +i, transient NFS
+            // blip) would head-of-line-block every other session on
+            // every subsequent restart tick. Mirror the warn+continue
+            // discipline used at 792/809/824 so recovery is per-file.
+            let bytes = match read_capped_async(path.clone(), ab_core::fsutil::MAX_ATIF_BYTES).await
+            {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.metrics
+                        .counter(
+                            "ab_atif_recovery_skipped_total{reason=\"read_error\"}",
+                            "ATIF spool files skipped during recovery",
+                        )
+                        .inc();
+                    tracing::warn!(%error, path = %path.display(), "skipping unreadable ATIF spool file");
+                    continue;
+                }
+            };
             let trajectory: ab_atif::Trajectory = match serde_json::from_slice(&bytes) {
                 Ok(trajectory) => trajectory,
                 Err(error) => {
@@ -1610,12 +1659,37 @@ impl Finalizer {
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("promote") {
                 continue;
             }
-            let sealed = read_capped_async(path.clone(), ab_core::fsutil::MAX_CONTROL_BYTES)
-                .await
-                .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+            // Round-27 F2: previously any read failure or MAC-verify
+            // failure aborted the entire retry pass via `?`. One
+            // unreadable or corrupt `.promote` marker would prevent
+            // retry of every other pending promotion after a crash.
+            // Mirror `replay_lifecycle_outboxes`'s warn+continue on
+            // the same two failure modes; leave the bad marker on
+            // disk as forensic evidence.
+            let sealed = match read_capped_async(path.clone(), ab_core::fsutil::MAX_CONTROL_BYTES).await
+            {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        path = %path.display(),
+                        "skipping unreadable promotion marker"
+                    );
+                    continue;
+                }
+            };
             let marker: PromotionMarker =
-                crate::journal::open(&self.journal_key, "promotion-marker", 0, &sealed)
-                    .map_err(FinalizeError::Atif)?;
+                match crate::journal::open(&self.journal_key, "promotion-marker", 0, &sealed) {
+                    Ok(m) => m,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            path = %path.display(),
+                            "skipping unauthenticated promotion marker"
+                        );
+                        continue;
+                    }
+                };
             let Some(session) = sessions.get(&marker.session_id) else {
                 continue;
             };

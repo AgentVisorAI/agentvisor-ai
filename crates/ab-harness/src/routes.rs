@@ -1013,6 +1013,21 @@ async fn promote_session(
     if let Err(error) = state.authorize_session(&headers, &session, &state.config.session_promote_scope) {
         return pipeline_error(error);
     }
+    // Round-27 F4: `promote()` silently drives `close_session_locked`
+    // on any still-open session. If an operator split the two scopes
+    // (compliance auditor gets `session:promote`, on-call gets
+    // `session:close`), a `session:promote`-only bearer could
+    // otherwise force-close any live agent session by promoting it —
+    // bypassing `session:close` entirely. When the session is still
+    // open, additionally require the close scope so promote ⊇ close
+    // in the scope authority sense.
+    if !session.is_closed() {
+        if let Err(error) =
+            state.authorize_session(&headers, &session, &state.config.session_close_scope)
+        {
+            return pipeline_error(error);
+        }
+    }
     match state.finalizer.promote(session).await {
         Ok(receipt) => Json(receipt).into_response(),
         Err(error) => lifecycle_error(error.to_string()),
