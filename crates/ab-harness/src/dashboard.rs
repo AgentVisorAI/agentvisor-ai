@@ -14,6 +14,7 @@
 
 use crate::pipeline::AppState;
 use crate::session::Workflow;
+use ab_core::time::elapsed_us;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -21,6 +22,7 @@ use axum::Json;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 const INDEX_HTML: &str = include_str!("../dashboard/index.html");
 const STYLE_CSS: &str = include_str!("../dashboard/style.css");
@@ -31,6 +33,23 @@ const APP_JS: &str = include_str!("../dashboard/app.js");
 pub const DEFAULT_LIST_LIMIT: usize = 50;
 /// Upper bound on the `?limit=N` query parameter for the sessions list.
 pub const MAX_LIST_LIMIT: usize = 500;
+
+/// Record latency + outcome for a dashboard request. Kept next to the
+/// handlers so a new endpoint cannot silently forget to register a
+/// counter or histogram — the render() call in ab-core/metrics will
+/// panic on a missing key, catching that regression in tests.
+fn record(state: &AppState, endpoint: &'static str, status: &'static str, started: Instant) {
+    let latency_key = format!("ab_dashboard_request_duration_seconds{{endpoint=\"{endpoint}\"}}");
+    let counter_key = format!("ab_dashboard_requests_total{{endpoint=\"{endpoint}\",status=\"{status}\"}}");
+    state
+        .metrics
+        .histogram(&latency_key, "Dashboard endpoint latency")
+        .observe_us(elapsed_us(started));
+    state
+        .metrics
+        .counter(&counter_key, "Dashboard endpoint requests")
+        .inc();
+}
 
 #[derive(Serialize)]
 pub(crate) struct SessionSummary {
@@ -155,10 +174,11 @@ pub async fn list_sessions(
     State(state): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<ListQuery>,
 ) -> Response {
+    let started = Instant::now();
     let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT).min(MAX_LIST_LIMIT);
-    let mut summaries: Vec<SessionSummary> = state
-        .sessions
-        .open_sessions_including_closed()
+    let snapshot = state.sessions.open_sessions_including_closed();
+    let total_before_truncate = snapshot.len();
+    let mut summaries: Vec<SessionSummary> = snapshot
         .iter()
         .filter(|session| match query.status.as_deref() {
             Some("open") => !session.is_closed(),
@@ -173,20 +193,29 @@ pub async fn list_sessions(
         })
         .map(|session| SessionSummary::from_session(session))
         .collect();
+    let matched = summaries.len();
     summaries.sort_by_key(|s| std::cmp::Reverse(s.last_activity_ms));
     summaries.truncate(limit);
-    let total = state.sessions.len();
-    Json(json!({
+    let response = Json(json!({
         "sessions": summaries,
         "generated_at_ms": ab_core::time::now_ms(),
-        "total_before_truncate": total,
+        // Total number of sessions currently in the registry (before any
+        // filter is applied). This is what /stats also sees.
+        "total_before_truncate": total_before_truncate,
+        // Number of sessions that matched the requested filter (before the
+        // `limit` cap). Useful for pagination hints and diagnostics.
+        "matched": matched,
     }))
-    .into_response()
+    .into_response();
+    record(&state, "list", "ok", started);
+    response
 }
 
 /// GET /api/v1/dashboard/sessions/{id}
 pub async fn session_detail(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let started = Instant::now();
     let Some(session) = state.sessions.get(&id) else {
+        record(&state, "detail", "not_found", started);
         return (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "session not found in registry"})),
@@ -194,11 +223,9 @@ pub async fn session_detail(State(state): State<AppState>, Path(id): Path<String
             .into_response();
     };
     let summary = SessionSummary::from_session(&session);
-    let receipt: Option<Value> = session
-        .receipt
-        .lock()
-        .as_ref()
-        .and_then(|r| serde_json::to_value(r).ok());
+    // Clone out under the lock and drop it before serialization so the
+    // reconciler / worker never blocks on a slow serde_json step.
+    let receipt_clone: Option<ab_receipts::Receipt> = session.receipt.lock().clone();
     let atif_path: Option<String> = session
         .atif_path
         .lock()
@@ -207,24 +234,28 @@ pub async fn session_detail(State(state): State<AppState>, Path(id): Path<String
     // Chain head/count are exposed as a small provenance stub so the UI can
     // show "47 events, head=b2b7…". The full chain lives in the journal on
     // disk; we don't stream it through the dashboard.
-    let chain = {
+    let (chain_head_hex, chain_count) = {
         let chain = session.chain.lock();
-        json!({
-            "head_hex": chain.head_hex(),
-            "count": chain.count(),
-        })
+        (chain.head_hex(), chain.count())
     };
-    Json(json!({
+    let receipt: Option<Value> = receipt_clone.and_then(|r| serde_json::to_value(&r).ok());
+    let response = Json(json!({
         "summary": summary,
-        "chain": chain,
+        "chain": {
+            "head_hex": chain_head_hex,
+            "count": chain_count,
+        },
         "receipt": receipt,
         "atif_path": atif_path,
     }))
-    .into_response()
+    .into_response();
+    record(&state, "detail", "ok", started);
+    response
 }
 
 /// GET /api/v1/dashboard/stats
 pub async fn stats(State(state): State<AppState>) -> Response {
+    let started = Instant::now();
     let sessions = state.sessions.open_sessions_including_closed();
     let mut totals = Stats {
         generated_at_ms: ab_core::time::now_ms(),
@@ -277,7 +308,9 @@ pub async fn stats(State(state): State<AppState>) -> Response {
             .total_tool_blocked
             .saturating_add(session.totals.tool_blocked.load(Ordering::Acquire));
     }
-    Json(totals).into_response()
+    let response = Json(totals).into_response();
+    record(&state, "stats", "ok", started);
+    response
 }
 
 /// Query parameters for `GET /api/v1/dashboard/sessions`.
@@ -499,5 +532,217 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn list_endpoint_reports_matched_count_and_registry_total() {
+        let config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        let state = build_state(config);
+        open_a_session(&state, "sess-open-1");
+        open_a_session(&state, "sess-open-2");
+        let router = build_router(state);
+
+        let (_, all) = get_json(&router, "/api/v1/dashboard/sessions").await;
+        assert_eq!(all["total_before_truncate"], 2);
+        assert_eq!(all["matched"], 2);
+
+        let (_, closed_only) = get_json(&router, "/api/v1/dashboard/sessions?status=closed").await;
+        // total_before_truncate reflects the registry size (2), matched
+        // only counts sessions passing the filter (0 closed).
+        assert_eq!(closed_only["total_before_truncate"], 2);
+        assert_eq!(closed_only["matched"], 0);
+        assert_eq!(closed_only["sessions"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_endpoint_limit_clamps_at_max() {
+        let config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        let state = build_state(config);
+        for i in 0..3 {
+            open_a_session(&state, &format!("sess-{i}"));
+        }
+        let router = build_router(state);
+        let (_, over) = get_json(&router, "/api/v1/dashboard/sessions?limit=99999").await;
+        // 3 sessions, cap is MAX_LIST_LIMIT — should return the 3 we have.
+        assert_eq!(over["sessions"].as_array().unwrap().len(), 3);
+
+        let (_, zero) = get_json(&router, "/api/v1/dashboard/sessions?limit=0").await;
+        assert_eq!(zero["sessions"].as_array().unwrap().len(), 0);
+        assert_eq!(zero["matched"], 3, "limit does not hide the matched total");
+    }
+
+    #[tokio::test]
+    async fn list_endpoint_returns_400_on_invalid_limit() {
+        let config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        let router = build_router(build_state(config));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/dashboard/sessions?limit=abc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn detail_endpoint_returns_receipt_when_present() {
+        // Round-trip a signed receipt into a Session and confirm the
+        // dashboard surfaces it as JSON with the signature intact —
+        // catching any regression that would silently drop cryptographic
+        // material from the operator view.
+        use ab_receipts::{CostSummary, Receipt, ReceiptBody, ReceiptSubject, Signer as _, ToolCallSummary};
+        use base64::Engine as _;
+        let config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        let state = build_state(config);
+        open_a_session(&state, "sess-with-receipt");
+        let session = state.sessions.get("sess-with-receipt").unwrap();
+        let signer = Ed25519Signer::from_seed([7; 32]);
+        let key_id = signer.key_id().to_owned();
+        let public_key_b64 = base64::engine::general_purpose::STANDARD.encode(signer.public_key_bytes());
+        let body = ReceiptBody {
+            receipt_version: 1,
+            receipt_id: "test-receipt".to_owned(),
+            session_id: session.id.clone(),
+            issued_at: 1_700_000_000_000,
+            issued_at_iso: "2023-11-14T22:13:20Z".to_owned(),
+            ai_agent: session.identity.clone(),
+            subject: ReceiptSubject::EventChain {
+                chain_head: "abc123".to_owned(),
+                event_count: 1,
+            },
+            tool_calls: ToolCallSummary::default(),
+            cost: CostSummary::default(),
+            stop_reason_id: 1,
+            stop_reason: "Stop".to_owned(),
+            key_id,
+            public_key_b64,
+        };
+        let receipt = Receipt::issue(body, &signer).expect("sign");
+        session.restore_receipt(receipt.clone());
+        let router = build_router(state.clone());
+        let (status, body) = get_json(&router, "/api/v1/dashboard/sessions/sess-with-receipt").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["summary"]["has_receipt"], true);
+        assert_eq!(body["receipt"]["receipt_id"], "test-receipt");
+        assert!(
+            !body["receipt"]["signature_b64"].as_str().unwrap().is_empty(),
+            "signature must round-trip",
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_endpoint_aggregates_totals_across_sessions() {
+        let config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        let state = build_state(config);
+        open_a_session(&state, "sess-a");
+        open_a_session(&state, "sess-b");
+        let sess_a = state.sessions.get("sess-a").unwrap();
+        let sess_b = state.sessions.get("sess-b").unwrap();
+        sess_a
+            .totals
+            .cost_usd_micros
+            .store(1_000_000, std::sync::atomic::Ordering::Release);
+        sess_a
+            .totals
+            .tool_calls
+            .store(5, std::sync::atomic::Ordering::Release);
+        sess_a
+            .totals
+            .tool_blocked
+            .store(1, std::sync::atomic::Ordering::Release);
+        sess_b
+            .totals
+            .cost_usd_micros
+            .store(500_000, std::sync::atomic::Ordering::Release);
+        sess_b
+            .totals
+            .tool_calls
+            .store(2, std::sync::atomic::Ordering::Release);
+        let router = build_router(state.clone());
+        let (status, body) = get_json(&router, "/api/v1/dashboard/stats").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["session_count"], 2);
+        assert_eq!(body["total_cost_usd_micros"], 1_500_000);
+        assert_eq!(body["total_tool_calls"], 7);
+        assert_eq!(body["total_tool_blocked"], 1);
+    }
+
+    #[tokio::test]
+    async fn dashboard_endpoints_register_prometheus_metrics() {
+        let config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        let state = build_state(config);
+        open_a_session(&state, "sess-metrics");
+        let metrics_registry = std::sync::Arc::clone(&state.metrics);
+        let router = build_router(state.clone());
+        let (_, _) = get_json(&router, "/api/v1/dashboard/stats").await;
+        let (_, _) = get_json(&router, "/api/v1/dashboard/sessions").await;
+        let (_, _) = get_json(&router, "/api/v1/dashboard/sessions/sess-metrics").await;
+        let (_, _) = get_json(&router, "/api/v1/dashboard/sessions/does-not-exist").await;
+        let rendered = metrics_registry.render();
+        for line in [
+            "ab_dashboard_requests_total{endpoint=\"stats\",status=\"ok\"} 1",
+            "ab_dashboard_requests_total{endpoint=\"list\",status=\"ok\"} 1",
+            "ab_dashboard_requests_total{endpoint=\"detail\",status=\"ok\"} 1",
+            "ab_dashboard_requests_total{endpoint=\"detail\",status=\"not_found\"} 1",
+            "ab_dashboard_request_duration_seconds_count{endpoint=\"stats\"} 1",
+        ] {
+            assert!(
+                rendered.contains(line),
+                "expected `{line}` in metrics output:\n{rendered}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dashboard_survives_concurrent_reads_under_hot_path_writes() {
+        // 128 parallel dashboard reads while the hot path is admitting
+        // more sessions — verifies the observability code does not
+        // deadlock, crash on shard lock contention, or panic on a
+        // registry that grows mid-scan.
+        let config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        let state = build_state(config);
+        // Seed enough sessions that iteration touches every DashMap
+        // shard and shows non-trivial payloads to the readers.
+        for i in 0..64 {
+            open_a_session(&state, &format!("seed-{i}"));
+        }
+        let router = build_router(state.clone());
+
+        let mut readers = Vec::new();
+        for _ in 0..128 {
+            let router = router.clone();
+            readers.push(tokio::spawn(async move {
+                let (status, body) = get_json(&router, "/api/v1/dashboard/stats").await;
+                assert_eq!(status, StatusCode::OK);
+                assert!(body["session_count"].as_u64().unwrap() >= 64);
+            }));
+        }
+        // Simultaneously open more sessions on the hot path.
+        let mut writers = Vec::new();
+        for i in 64..96 {
+            let state = state.clone();
+            writers.push(tokio::spawn(async move {
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert(
+                    SESSION_HEADER,
+                    HeaderValue::from_str(&format!("hot-{i}")).unwrap(),
+                );
+                let payload = serde_json::json!({
+                    "model": "test",
+                    "messages": [{"role":"user","content":"go"}],
+                });
+                state.prepare_chat(&headers, payload).unwrap();
+            }));
+        }
+        for reader in readers {
+            reader.await.unwrap();
+        }
+        for writer in writers {
+            writer.await.unwrap();
+        }
     }
 }
