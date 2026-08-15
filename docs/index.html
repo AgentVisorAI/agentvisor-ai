@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AgentBridge — the audit trail for AI agents</title>
+  <meta name="description" content="AgentBridge records every request, tool call, and response an AI agent makes, enforces cost and policy limits, and issues signed receipts anyone can verify offline.">
+  <link rel="stylesheet" href="style.css">
+  <link rel="canonical" href="https://debugmode0.github.io/agent-bridge/">
+</head>
+<body>
+  <header class="hero">
+    <div class="wrap">
+      <p class="eyebrow">AgentBridge <span class="pill">v0.1.0</span></p>
+      <h1>The audit trail for AI agents.</h1>
+      <p class="lede">
+        You put AgentBridge between your app and its model or tools.
+        It records everything the agent does, enforces the limits you set,
+        and hands you a signed receipt at the end of every session that
+        anyone can verify offline &mdash; no vendor lock-in, no trust in us.
+      </p>
+      <p class="cta-row">
+        <a class="cta primary" href="#try-it">See it in 60 seconds</a>
+        <a class="cta" href="https://github.com/debugmode0/agent-bridge">View on GitHub</a>
+      </p>
+    </div>
+  </header>
+
+  <main class="wrap">
+
+    <section id="what-it-does" aria-labelledby="what-it-does-h">
+      <h2 id="what-it-does-h">What it does</h2>
+      <div class="tiles">
+        <article class="tile">
+          <h3>Records what the agent did</h3>
+          <p>
+            Every prompt, tool call, and provider response passes through
+            AgentBridge and lands in an append-only log with timestamps and
+            the caller&rsquo;s identity. Nothing is inferred or summarised;
+            the log is the raw evidence.
+          </p>
+        </article>
+        <article class="tile">
+          <h3>Stops runaways</h3>
+          <p>
+            Set caps on total calls, per-tool calls, spend, and prompt
+            tokens. Detect and cut off loops where the agent keeps trying
+            the same thing. Refusals happen at the gateway, before the
+            model or tool sees the request.
+          </p>
+        </article>
+        <article class="tile">
+          <h3>Proves the session stayed in bounds</h3>
+          <p>
+            When a session ends, AgentBridge signs a compact receipt with
+            an Ed25519 key you own. Anyone with the matching public key
+            can verify the receipt offline &mdash; the vendor, the customer,
+            an auditor, a subpoena.
+          </p>
+        </article>
+      </div>
+    </section>
+
+    <section id="who" aria-labelledby="who-h">
+      <h2 id="who-h">Who runs it</h2>
+      <ul class="prose-list">
+        <li>
+          <strong>Security teams</strong> that need to know what their AI copilots touched
+          and are tired of relying on the model vendor&rsquo;s dashboard.
+        </li>
+        <li>
+          <strong>Platform / SRE teams</strong> who got burned by an agent leaving a database
+          connection open at 3 AM or generating a $4,000 bill on a Sunday.
+        </li>
+        <li>
+          <strong>Compliance and legal</strong> who need offline-verifiable evidence a customer or
+          regulator can accept without trusting the model vendor&rsquo;s word.
+        </li>
+        <li>
+          <strong>Product teams shipping agents</strong> that want to give customers a receipt
+          for each session &mdash; a real one, cryptographically signed.
+        </li>
+      </ul>
+    </section>
+
+    <section id="try-it" aria-labelledby="try-it-h">
+      <h2 id="try-it-h">Try it in 60 seconds</h2>
+      <p>
+        Requires <a href="https://rustup.rs/">Rust</a> (or grab a pre-built binary from the
+        <a href="https://github.com/debugmode0/agent-bridge/releases">releases page</a>).
+        You&rsquo;ll be asked one question at a time; a config file is written for you.
+      </p>
+<pre><code>cargo install --path crates/ab-cli --bin abctl
+abctl</code></pre>
+      <p class="hint">
+        After the setup wizard finishes, AgentBridge starts on <code>http://127.0.0.1:8484</code>.
+        Point any OpenAI-compatible SDK at that URL as if it were the provider &mdash;
+        no code changes. Receipts, events, and trajectories appear under <code>data/</code>.
+      </p>
+    </section>
+
+    <section id="not-included" aria-labelledby="not-included-h">
+      <h2 id="not-included-h">What it is <em>not</em></h2>
+      <p>
+        AgentBridge is not an observability dashboard, an analytics tool,
+        or a service you sign up for. It is a small piece of software that
+        runs next to your agent. It writes files to disk. You keep the
+        signing key. If AgentBridge disappeared tomorrow the receipts you
+        already issued would still verify against your key.
+      </p>
+    </section>
+
+    <section id="read-more" aria-labelledby="read-more-h">
+      <h2 id="read-more-h">Read more</h2>
+      <ul class="link-list">
+        <li>
+          <a href="https://github.com/debugmode0/agent-bridge#readme">README</a>
+          &mdash; full setup, configuration, and the CLI.
+        </li>
+        <li>
+          <a href="https://github.com/debugmode0/agent-bridge/blob/main/ARCHITECTURE.md">Architecture</a>
+          &mdash; how the pipeline fits together.
+        </li>
+        <li>
+          <a href="https://github.com/debugmode0/agent-bridge/blob/main/SECURITY.md">Security model</a>
+          &mdash; trust boundaries, controls, and how to deploy safely.
+        </li>
+        <li>
+          <a href="https://github.com/debugmode0/agent-bridge/blob/main/VERIFICATION.md">Verification protocol</a>
+          &mdash; how a third party checks a receipt without contacting us.
+        </li>
+        <li>
+          <a href="https://github.com/debugmode0/agent-bridge/releases">Releases</a>
+          &mdash; pre-built binaries with SHA-256 checksums.
+        </li>
+        <li>
+          <a href="api/">API documentation</a>
+          &mdash; Rust crate docs for library authors. If you don&rsquo;t know what that
+          means, you don&rsquo;t need it.
+        </li>
+      </ul>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <p>
+        AgentBridge is open source under the
+        <a href="https://github.com/debugmode0/agent-bridge/blob/main/LICENSE">Apache&nbsp;License&nbsp;2.0</a>.
+        Report vulnerabilities privately via the
+        <a href="https://github.com/debugmode0/agent-bridge/security/advisories/new">security&nbsp;advisory&nbsp;form</a>,
+        never in a public issue.
+      </p>
+    </div>
+  </footer>
+</body>
+</html>

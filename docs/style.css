@@ -1,0 +1,238 @@
+/*
+ * Minimal, self-contained landing styles.
+ * No JavaScript, no web fonts, no external assets.
+ * Colour: neutral. Dark mode via prefers-color-scheme.
+ */
+
+:root {
+  color-scheme: light dark;
+  --bg: #fafaf7;
+  --bg-hero: #f0efe8;
+  --fg: #14161a;
+  --fg-muted: #565b64;
+  --accent: #1a4d9c;
+  --accent-fg: #ffffff;
+  --border: #d8d6cd;
+  --code-bg: #1d1f24;
+  --code-fg: #f2f2ef;
+  --pill-bg: #1a4d9c;
+  --pill-fg: #ffffff;
+  --max: 68rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1013;
+    --bg-hero: #16181d;
+    --fg: #eceef2;
+    --fg-muted: #9098a4;
+    --accent: #7ea3d9;
+    --accent-fg: #0f1013;
+    --border: #2a2d34;
+    --code-bg: #0a0b0e;
+    --code-fg: #eceef2;
+    --pill-bg: #2a3e5f;
+    --pill-fg: #eceef2;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.wrap {
+  max-width: var(--max);
+  margin: 0 auto;
+  padding: 0 1.25rem;
+}
+
+/* --- Hero ---------------------------------------------------------- */
+
+.hero {
+  background: var(--bg-hero);
+  border-bottom: 1px solid var(--border);
+  padding: 3.5rem 0 3rem;
+}
+
+.eyebrow {
+  margin: 0 0 0.5rem;
+  color: var(--fg-muted);
+  font-size: 0.9rem;
+  letter-spacing: 0.02em;
+}
+
+.pill {
+  display: inline-block;
+  background: var(--pill-bg);
+  color: var(--pill-fg);
+  padding: 0.05rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  vertical-align: 0.05em;
+  letter-spacing: 0.02em;
+}
+
+.hero h1 {
+  margin: 0 0 1rem;
+  font-size: clamp(1.9rem, 4.5vw, 3rem);
+  line-height: 1.15;
+  letter-spacing: -0.01em;
+}
+
+.lede {
+  max-width: 46rem;
+  margin: 0 0 1.75rem;
+  font-size: clamp(1.05rem, 2vw, 1.2rem);
+  color: var(--fg);
+}
+
+.cta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin: 0;
+}
+
+.cta {
+  display: inline-block;
+  padding: 0.65rem 1.15rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg);
+  text-decoration: none;
+  font-weight: 500;
+  transition: background 120ms, border-color 120ms;
+}
+
+.cta:hover, .cta:focus-visible {
+  background: rgba(0, 0, 0, 0.04);
+  outline: none;
+}
+
+@media (prefers-color-scheme: dark) {
+  .cta:hover, .cta:focus-visible { background: rgba(255, 255, 255, 0.04); }
+}
+
+.cta.primary {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-color: var(--accent);
+}
+
+.cta.primary:hover, .cta.primary:focus-visible {
+  filter: brightness(1.05);
+  background: var(--accent);
+}
+
+/* --- Sections ------------------------------------------------------ */
+
+main section {
+  padding: 3rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+main section:last-of-type { border-bottom: 0; }
+
+h2 {
+  margin: 0 0 1.25rem;
+  font-size: clamp(1.4rem, 2.5vw, 1.75rem);
+  letter-spacing: -0.005em;
+}
+
+h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1.1rem;
+  letter-spacing: -0.005em;
+}
+
+p, li {
+  margin: 0 0 0.9rem;
+  color: var(--fg);
+}
+
+section p:last-child, section li:last-child { margin-bottom: 0; }
+
+/* --- Tiles --------------------------------------------------------- */
+
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15.5rem, 1fr));
+  gap: 1rem;
+}
+
+.tile {
+  padding: 1.25rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-hero);
+}
+
+/* --- Prose list & link list --------------------------------------- */
+
+.prose-list, .link-list {
+  padding-left: 1.15rem;
+  margin: 0;
+}
+
+.link-list a { color: var(--accent); }
+
+/* --- Try-it code block -------------------------------------------- */
+
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1rem 1.15rem;
+  border-radius: 8px;
+  overflow-x: auto;
+  font: 0.95rem/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace;
+}
+
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace; }
+
+p code {
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+  font-size: 0.92em;
+}
+
+.hint {
+  color: var(--fg-muted);
+  font-size: 0.95rem;
+  margin-top: 0.9rem;
+}
+
+/* --- Footer -------------------------------------------------------- */
+
+footer {
+  padding: 2rem 0 3rem;
+  color: var(--fg-muted);
+  font-size: 0.9rem;
+}
+
+footer a { color: var(--fg-muted); }
+footer a:hover { color: var(--fg); }
+
+/* --- General link styles ------------------------------------------ */
+
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 0.2em; }
+a:hover { text-decoration-thickness: 2px; }
+
+/* --- Focus-visible for keyboard nav ------------------------------- */
+
+a:focus-visible, .cta:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
