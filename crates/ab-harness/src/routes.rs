@@ -625,12 +625,38 @@ pub(crate) async fn unresolved_tool_sessions(
                 continue;
             };
             intent_keys.insert(key.to_owned());
-            let intent: ToolIntent = crate::journal::open(
+            // A torn intent (crash between create_new and sync_all in
+            // claim_sync) leaves a 0-byte or partial file at the final
+            // intent_path. If we bubble the journal::open error via `?`
+            // the recovery loop aborts on the first torn intent and
+            // every subsequent tool session stays unrecovered
+            // indefinitely. Quarantine the file so the reconciler makes
+            // progress on the rest of the spool; the tool execution
+            // itself is still uncertain — a subsequent retry by the
+            // client will get TOOL_OUTCOME_UNCERTAIN and can decide.
+            let intent_bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+            let intent: ToolIntent = match crate::journal::open(
                 &control_key,
                 &format!("{}:{key}", crate::journal::TOOL_INTENT_DOMAIN),
                 0,
-                &std::fs::read(&path).map_err(|error| error.to_string())?,
-            )?;
+                &intent_bytes,
+            ) {
+                Ok(intent) => intent,
+                Err(error) => {
+                    let quarantine = path.with_extension("intent.torn");
+                    tracing::warn!(
+                        %error,
+                        original = %path.display(),
+                        quarantine = %quarantine.display(),
+                        "torn tool-execution intent quarantined so recovery can proceed"
+                    );
+                    if let Err(rename_err) = std::fs::rename(&path, &quarantine) {
+                        tracing::warn!(%rename_err, "failed to quarantine torn intent — leaving in place");
+                    }
+                    intent_keys.remove(key);
+                    continue;
+                }
+            };
             if intent.execution_key != key {
                 return Err("tool intent path does not match authenticated execution key".to_owned());
             }
@@ -910,12 +936,37 @@ async fn promote_session(
 }
 
 fn pipeline_error(error: crate::pipeline::PipelineError) -> Response {
-    let close = matches!(error, crate::pipeline::PipelineError::Abort(_));
+    use crate::pipeline::PipelineError;
+    let close = matches!(error, PipelineError::Abort(_));
+    // Capture the classifications BEFORE the error is moved into the
+    // response body so we can attach the right advisory headers.
+    let unavailable = matches!(error, PipelineError::Unavailable(_));
+    let upstream = matches!(error, PipelineError::Upstream(_));
+    let unauthorized = matches!(error, PipelineError::Unauthorized(_));
     let mut response = (error.status(), Json(json!({"error": error.to_string()}))).into_response();
     if close {
         response
             .headers_mut()
             .insert(axum::http::header::CONNECTION, HeaderValue::from_static("close"));
+    }
+    if unavailable || upstream {
+        // RFC 7231 §7.1.3: a 503/502 SHOULD carry Retry-After so
+        // intermediaries and mainstream SDKs back off in bounded
+        // fashion. Value chosen to be short enough that recovery is
+        // fast under transient failures, long enough that clients do
+        // not hammer during audit-capture unavailability.
+        response
+            .headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("5"));
+    }
+    if unauthorized {
+        // RFC 7235 §3.1: 401 MUST carry WWW-Authenticate. RFC 6750 §3
+        // gives the Bearer challenge shape for OAuth-style bearer
+        // tokens, which matches AgentBridge's NHI JWT identity model.
+        response.headers_mut().insert(
+            axum::http::header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"agentbridge\", error=\"invalid_token\""),
+        );
     }
     response
 }
@@ -3084,7 +3135,11 @@ mod tests {
                 .await;
         }
         let blocked = app.oneshot(chat_request("response-loop")).await.unwrap();
-        assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+        // Loop-breaker verdicts are permanent for the current session:
+        // 403 stops mainstream LLM-SDK auto-retry loops that would
+        // otherwise burn budget re-hitting the same breaker (see
+        // pipeline.rs::PipelineError::status).
+        assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
         provider.abort();
     }
 
@@ -3440,5 +3495,51 @@ mod tests {
             "MCP forward-tool error body {body:?} leaks the configured tool-upstream domain"
         );
         provider.abort();
+    }
+
+    #[tokio::test]
+    async fn pipeline_error_carries_retry_after_and_www_authenticate() {
+        // Contract: 503 SHOULD carry Retry-After (RFC 7231 §7.1.3);
+        // 401 MUST carry WWW-Authenticate (RFC 7235 §3.1). These
+        // headers are the mechanism by which intermediaries and SDKs
+        // decide to back off / prompt for credentials — without them,
+        // mainstream LLM SDKs interpret 503 as "retry immediately"
+        // and 401 as "broken proxy".
+        use crate::pipeline::PipelineError;
+
+        let unavailable = pipeline_error(PipelineError::Unavailable("worker queue full".into()));
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            unavailable
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("5")
+        );
+
+        let upstream = pipeline_error(PipelineError::Upstream("bad gateway".into()));
+        assert_eq!(upstream.status(), StatusCode::BAD_GATEWAY);
+        assert!(upstream.headers().get(axum::http::header::RETRY_AFTER).is_some());
+
+        let unauthorized = pipeline_error(PipelineError::Unauthorized("bad token".into()));
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let auth = unauthorized
+            .headers()
+            .get(axum::http::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            auth.starts_with("Bearer"),
+            "WWW-Authenticate must be a Bearer challenge, got {auth:?}"
+        );
+
+        // Permanent verdicts must NOT carry Retry-After — that would
+        // encourage the very retry loop we're trying to stop.
+        let blocked = pipeline_error(PipelineError::Blocked("loop breaker".into()));
+        assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+        assert!(blocked.headers().get(axum::http::header::RETRY_AFTER).is_none());
+        let abort = pipeline_error(PipelineError::Abort("stop retrying".into()));
+        assert_eq!(abort.status(), StatusCode::CONFLICT);
+        assert!(abort.headers().get(axum::http::header::RETRY_AFTER).is_none());
     }
 }

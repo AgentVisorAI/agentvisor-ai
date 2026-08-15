@@ -926,6 +926,16 @@ async fn append_journal(
             }
         }
         let journal_path = directory.join(format!("{stem}.events.ndjson"));
+        // Track whether the journal is being created by *this* append so
+        // we can fsync the containing directory once the file exists —
+        // the metadata fsync above only durably named the metadata
+        // file, not this new journal file. Without the dirent fsync,
+        // a power loss on POSIX-conformant filesystems (xfs, btrfs)
+        // can lose the entry entirely — the file appears not to exist
+        // on restart, `recover_signed_journals` treats the journal as
+        // empty, deletes the metadata, and every already-acked event
+        // becomes orphaned on the broker.
+        let journal_created = !journal_path.exists();
         let mut journal = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -934,6 +944,11 @@ async fn append_journal(
         journal.write_all(&line).map_err(|error| error.to_string())?;
         journal.write_all(b"\n").map_err(|error| error.to_string())?;
         journal.sync_data().map_err(|error| error.to_string())?;
+        if journal_created {
+            std::fs::File::open(&directory)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|error| format!("fsync journal directory {}: {error}", directory.display()))?;
+        }
         Ok(())
     })
     .await

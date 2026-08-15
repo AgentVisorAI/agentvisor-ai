@@ -757,12 +757,28 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
+        // Install SIGTERM first: docker stop / kubectl delete pod send
+        // SIGTERM (not SIGINT) and expect the process to shut down
+        // cleanly within its grace period. If we cannot install a
+        // SIGTERM handler, no orchestrator signal will trigger the
+        // finalizer — the container silently ignores shutdown until
+        // it gets SIGKILL, dropping in-flight receipts.
+        //
+        // This is a fatal environment misconfiguration (typically
+        // over-restrictive seccomp), not something to paper over with
+        // SIGINT-only fallback. Panic so the runtime exits with a
+        // non-zero status the orchestrator can log.
         let mut terminate = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
             Ok(signal) => signal,
             Err(error) => {
-                tracing::error!(%error, "failed to install SIGTERM handler");
-                let _ = tokio::signal::ctrl_c().await;
-                return;
+                tracing::error!(
+                    %error,
+                    "failed to install SIGTERM handler — orchestrator shutdowns will not be observed. \
+                     This is a fatal environment misconfiguration (over-restrictive seccomp, missing \
+                     signal syscalls). Aborting so the container is not silently unresponsive to \
+                     `docker stop` / `kubectl delete pod`."
+                );
+                std::process::exit(2);
             }
         };
         tokio::select! {
