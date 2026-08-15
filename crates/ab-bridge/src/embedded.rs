@@ -58,19 +58,41 @@ impl EmbeddedBroker {
             .validate()
             .map_err(|e| BusError::Backend(e.to_string()))?;
         let manifest_path = data_dir.join("manifest.yaml");
-        if manifest_path.exists() {
-            return Err(BusError::Backend(format!(
-                "bridge already provisioned at {}",
-                data_dir.display()
-            )));
-        }
         fs::create_dir_all(data_dir)?;
         copy_referenced_schemas(data_dir, manifest)?;
         let yaml = manifest.to_yaml().map_err(|e| BusError::Backend(e.to_string()))?;
-        // Manifest write is atomic: tmp + rename.
-        let tmp = data_dir.join("manifest.yaml.tmp");
-        fs::write(&tmp, &yaml)?;
-        fs::rename(&tmp, &manifest_path)?;
+        // Atomic single-winner claim on a fresh provision: `create_new`
+        // refuses to overwrite an existing file with an OS-level
+        // exclusion primitive (O_EXCL), so 8 concurrent provisions race
+        // on the same directory and exactly one wins. The old shape
+        // (`exists()` check → separate write) had a TOCTOU: two racers
+        // could both see "does not exist", both write, both succeed.
+        use std::io::Write as _;
+        let tmp = data_dir.join(format!("manifest.yaml.{}.tmp", ab_core::new_event_uid()));
+        {
+            let mut file = fs::File::create(&tmp)?;
+            file.write_all(yaml.as_bytes())?;
+            file.sync_all()?;
+        }
+        // hard_link refuses to overwrite, so exactly one racer's
+        // hard_link call succeeds. The losers' link fails with
+        // AlreadyExists and their tmp is cleaned up in the Err arm.
+        match fs::hard_link(&tmp, &manifest_path) {
+            Ok(_) => {
+                let _ = fs::remove_file(&tmp);
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&tmp);
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    return Err(BusError::Backend(format!(
+                        "bridge already provisioned at {}",
+                        data_dir.display()
+                    )));
+                }
+                return Err(BusError::Io(error));
+            }
+        }
+        ab_core::fsutil::sync_directory(data_dir).map_err(BusError::Io)?;
         for t in &manifest.topics {
             fs::create_dir_all(data_dir.join("topics").join(&t.name))?;
         }
@@ -97,6 +119,45 @@ impl EmbeddedBroker {
                 let persisted_offset = read_high_water(&watermark_path)?;
                 let mut seen_event_uids = recover_event_uids(&idempotency_path)?;
                 recover_segment_event_uids(&path, &mut seen_event_uids)?;
+                // Post-reconciliation drop: any UID whose offset does
+                // not correspond to a record still present in the
+                // segment (e.g., record purged by retention but the
+                // sidecar rewrite lost the corresponding delete in a
+                // crash between segment rename and sidecar rewrite)
+                // must be evicted. Otherwise `publish_idempotent`
+                // short-circuits to a stale offset and callers fetch
+                // whatever event lives at that offset today, silently
+                // returning the wrong record.
+                if !seen_event_uids.is_empty() {
+                    let mut live_uids =
+                        std::collections::HashSet::<String>::with_capacity(seen_event_uids.len());
+                    if path.exists() {
+                        for line in BufReader::new(fs::File::open(&path)?).lines() {
+                            let Ok(line) = line else {
+                                continue;
+                            };
+                            if line.is_empty() {
+                                continue;
+                            }
+                            if let Ok(event) = serde_json::from_str::<StoredEvent>(&line) {
+                                if let Some(uid) = event_uid_from_value(&event.value) {
+                                    live_uids.insert(uid.to_owned());
+                                }
+                            }
+                        }
+                    }
+                    let before = seen_event_uids.len();
+                    seen_event_uids.retain(|uid, _| live_uids.contains(uid));
+                    if seen_event_uids.len() != before {
+                        tracing::warn!(
+                            topic = %t.name,
+                            partition = p,
+                            dropped = before - seen_event_uids.len(),
+                            "sidecar UID→offset entries dropped: corresponding segment records \
+                             absent (likely retention crash between segment rewrite and sidecar rewrite)"
+                        );
+                    }
+                }
                 torn_total += torn;
                 // Track first-time creation so we can fsync the directory
                 // after the file is materialised — `sync_data()` on the
@@ -204,8 +265,13 @@ impl EmbeddedBroker {
                     }
                 }
                 persist_high_water(&part.watermark_path, part.next_offset)?;
-                // Atomic hot rewrite.
-                let tmp = part.path.with_extension("jsonl.tmp");
+                // Atomic hot rewrite. Use a UUID-suffixed tmp name so a
+                // stale tmp from a prior crashed pass isn't reused (and
+                // an external backup/rsync tool can't grab an
+                // in-progress file thinking it's stable data).
+                let tmp = part
+                    .path
+                    .with_extension(format!("jsonl.{}.tmp", ab_core::new_event_uid()));
                 {
                     let mut f = fs::File::create(&tmp)?;
                     for line in &kept {
@@ -222,17 +288,41 @@ impl EmbeddedBroker {
                 // was expired: without this, a subsequent `publish_idempotent`
                 // with a still-cached UID returns an ack pointing at data that
                 // no longer exists, and the caller's follow-up `fetch(offset)`
-                // silently returns the wrong event or nothing. Compute the
-                // surviving offsets from the retained records and drop
-                // everything else.
+                // silently returns the wrong event or nothing.
+                //
+                // We compute survivors from parseable lines, but ALSO keep
+                // the range [min_kept_offset, max_kept_offset]: any UID
+                // whose offset falls in that range is potentially attached
+                // to an unparseable-but-kept line, and dropping it would
+                // let the next publish_idempotent re-append a duplicate
+                // record (which retention would then choke on next pass).
                 let survivors: std::collections::HashSet<u64> = kept
                     .iter()
                     .filter_map(|line| serde_json::from_str::<StoredEvent>(line).ok())
                     .map(|event| event.offset)
                     .collect();
+                let range = if survivors.is_empty() {
+                    None
+                } else {
+                    // Fold gives min/max in one pass and avoids
+                    // expect() on the guaranteed-non-empty iterator.
+                    let (mut lo, mut hi) = (u64::MAX, 0u64);
+                    for offset in &survivors {
+                        lo = lo.min(*offset);
+                        hi = hi.max(*offset);
+                    }
+                    Some((lo, hi))
+                };
                 let before = part.seen_event_uids.len();
-                part.seen_event_uids
-                    .retain(|_, offset| survivors.contains(offset));
+                part.seen_event_uids.retain(|_, offset| {
+                    if survivors.contains(offset) {
+                        return true;
+                    }
+                    match range {
+                        Some((lo, hi)) => *offset >= lo && *offset <= hi,
+                        None => false,
+                    }
+                });
                 if part.seen_event_uids.len() != before {
                     // Sidecar is now stale — rewrite it atomically with only
                     // the surviving mappings so recovery cannot resurrect a
@@ -399,14 +489,22 @@ fn recover_event_uids(path: &Path) -> Result<HashMap<String, u64>, BusError> {
                 continue;
             }
         };
-        if seen
-            .insert(mapping.event_uid.clone(), mapping.offset)
-            .is_some_and(|existing| existing != mapping.offset)
-        {
-            return Err(BusError::Backend(format!(
-                "event UID {:?} maps to multiple offsets",
-                mapping.event_uid
-            )));
+        if let Some(existing) = seen.insert(mapping.event_uid.clone(), mapping.offset) {
+            if existing != mapping.offset {
+                // Sidecar (idempotency journal) can legitimately hold
+                // stale UID→offset pairs after a partial retention
+                // (segment rewritten atomically, sidecar rewrite lost
+                // in a crash). The segment on disk is the source of
+                // truth; log and let `recover_segment_event_uids` fix
+                // the mapping. Refusing to open the broker here would
+                // brick the whole tier over a benign inconsistency.
+                tracing::warn!(
+                    event_uid = %mapping.event_uid,
+                    prior_offset = existing,
+                    current_offset = mapping.offset,
+                    "sidecar has duplicate UID entry; segment offset will win after full recovery"
+                );
+            }
         }
     }
     Ok(seen)
@@ -438,13 +536,20 @@ fn recover_segment_event_uids(path: &Path, seen: &mut HashMap<String, u64>) -> R
         let Some(uid) = event_uid_from_value(&event.value) else {
             continue;
         };
-        if seen
-            .insert(uid.to_owned(), event.offset)
-            .is_some_and(|existing| existing != event.offset)
-        {
-            return Err(BusError::Backend(format!(
-                "event UID {uid:?} maps to multiple offsets"
-            )));
+        if let Some(existing) = seen.insert(uid.to_owned(), event.offset) {
+            if existing != event.offset {
+                // Segment is authoritative — the sidecar was stale
+                // (see recover_event_uids for the crash mode). Log
+                // and keep the segment offset (the last write wins
+                // via insert). Refusing to open would leave the
+                // broker un-openable on a benign inconsistency.
+                tracing::warn!(
+                    event_uid = uid,
+                    prior_offset = existing,
+                    current_offset = event.offset,
+                    "duplicate UID between sidecar and segment; segment offset wins"
+                );
+            }
         }
     }
     Ok(())

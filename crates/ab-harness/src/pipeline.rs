@@ -271,13 +271,23 @@ pub enum PipelineError {
 
 impl PipelineError {
     /// HTTP status code corresponding to this failure.
+    ///
+    /// * `Blocked` / `Abort` are permanent policy verdicts for the current
+    ///   session: 403 / 409 stop mainstream SDK auto-retry loops that
+    ///   would otherwise interpret 429 as transient rate limiting and
+    ///   burn budget re-hitting the same breaker.
+    /// * `Unavailable` is transient: 503 is paired with `Retry-After` at
+    ///   the response layer so intermediaries and clients back off in
+    ///   bounded fashion (RFC 7231 §7.1.3).
+    /// * `Unauthorized` is paired with `WWW-Authenticate` at the
+    ///   response layer (RFC 7235 §3.1).
     pub fn status(&self) -> axum::http::StatusCode {
         match self {
             Self::BadRequest(_) => axum::http::StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => axum::http::StatusCode::UNAUTHORIZED,
-            Self::Blocked(_) => axum::http::StatusCode::TOO_MANY_REQUESTS,
+            Self::Blocked(_) => axum::http::StatusCode::FORBIDDEN,
             Self::Upstream(_) => axum::http::StatusCode::BAD_GATEWAY,
-            Self::Abort(_) => axum::http::StatusCode::TOO_MANY_REQUESTS,
+            Self::Abort(_) => axum::http::StatusCode::CONFLICT,
             Self::Unavailable(_) => axum::http::StatusCode::SERVICE_UNAVAILABLE,
         }
     }
@@ -342,12 +352,21 @@ impl AppState {
     ) -> Result<Self, PipelineError> {
         let config = Arc::new(config);
         let metrics = Arc::new(Registry::new());
-        for stage in ["identity", "quota", "sanitize", "compression", "dispatch"] {
+        for stage in ["identity", "quota", "sanitize", "compression"] {
             metrics.histogram(
                 &format!("ab_stage_duration_seconds{{stage=\"{stage}\"}}"),
                 "Harness stage latency",
             );
         }
+        // `dispatch` measures the upstream provider call including
+        // streaming — routinely 15-90 s for chat completions. Using the
+        // default 10 s ceiling would saturate every observation into
+        // the +Inf bucket, rendering p95/p99 as u64::MAX.
+        metrics.histogram_with_bounds(
+            "ab_stage_duration_seconds{stage=\"dispatch\"}",
+            "Harness stage latency (upstream provider call)",
+            ab_core::metrics::WIDE_LATENCY_BOUNDS_US,
+        );
         metrics.counter(
             "ab_events_dropped_total{stage=\"worker_queue\"}",
             "Worker jobs dropped",
@@ -361,10 +380,18 @@ impl AppState {
         metrics.counter("ab_sessions_promoted_total", "Unsigned sessions promoted");
         metrics.counter("ab_reconcile_errors_total", "Reconciliation errors");
         metrics.histogram("ab_receipt_sign_duration_seconds", "Receipt signing latency");
-        metrics.histogram("ab_reconcile_duration_seconds", "Idle reconciliation duration");
-        metrics.histogram(
+        // Reconciler ticks scan the ATIF spool dir, which can be large;
+        // finalisation waits for worker drain + broker publish. Wide
+        // bounds keep long-tail p99 useful under load.
+        metrics.histogram_with_bounds(
+            "ab_reconcile_duration_seconds",
+            "Idle reconciliation duration",
+            ab_core::metrics::WIDE_LATENCY_BOUNDS_US,
+        );
+        metrics.histogram_with_bounds(
             "ab_session_finalize_duration_seconds",
             "Session finalization latency",
+            ab_core::metrics::WIDE_LATENCY_BOUNDS_US,
         );
         for endpoint in ["stats", "list", "detail"] {
             metrics.histogram(
@@ -813,9 +840,16 @@ impl AppState {
                 return Err(error);
             }
         };
-        let session = self
-            .sessions
-            .get_or_open(&session_id, workflow, &identity, &self.config.breaker);
+        // Tool interception must NOT resurrect a closed session: a
+        // tool call extends an in-progress conversation, so silently
+        // opening a fresh session under the same id would let the
+        // client accumulate tool calls past a signed receipt boundary
+        // (chain-of-custody split). Chat requests use `get_or_open`
+        // (recycles closed ids); the strict `_no_reopen` variant here
+        // makes the `is_closed()` check below fire.
+        let session =
+            self.sessions
+                .get_or_open_no_reopen(&session_id, workflow, &identity, &self.config.breaker);
         let admission = session.admission_guard();
         validate_session_binding(&session, workflow, &identity)?;
         session.refresh_identity(&identity);
