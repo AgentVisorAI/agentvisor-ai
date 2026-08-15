@@ -1717,7 +1717,7 @@ mod tests {
             Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
             Arc::new(NullBus),
             None,
-            Arc::new(Ed25519Signer::from_seed([9; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[9; 32])),
         )
         .unwrap()
     }
@@ -1975,7 +1975,7 @@ mod tests {
             Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
             Arc::new(NullBus),
             None,
-            Arc::new(Ed25519Signer::from_seed([9; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[9; 32])),
         )
         .unwrap();
         let mut headers = HeaderMap::new();
@@ -2201,7 +2201,7 @@ mod tests {
             sandbox,
             Arc::new(NullBus),
             None,
-            Arc::new(Ed25519Signer::from_seed([9; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[9; 32])),
         )
         .unwrap();
 
@@ -2256,7 +2256,7 @@ mod tests {
             Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
             Arc::new(NullBus),
             None,
-            Arc::new(Ed25519Signer::from_seed([10; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[10; 32])),
             Arc::new(HashEmbedder::default()),
             sink.clone(),
         )
@@ -2522,7 +2522,7 @@ mod tests {
             Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
             Arc::new(NullBus),
             Some(Arc::new(validator)),
-            Arc::new(Ed25519Signer::from_seed([12; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[12; 32])),
         )
         .unwrap()
     }

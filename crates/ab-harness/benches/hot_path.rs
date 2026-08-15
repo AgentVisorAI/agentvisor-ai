@@ -64,7 +64,7 @@ fn benchmark(c: &mut Criterion) {
         Arc::clone(&sandbox),
         Arc::new(NullBus),
         None,
-        Arc::new(Ed25519Signer::from_seed([31; 32])),
+        Arc::new(Ed25519Signer::from_seed(&[31; 32])),
     )
     .unwrap();
     let mut headers = HeaderMap::new();
@@ -124,7 +124,7 @@ fn benchmark(c: &mut Criterion) {
     });
 
     c.bench_function("receipt_sign", |bench| {
-        let signer = Ed25519Signer::from_seed([32; 32]);
+        let signer = Ed25519Signer::from_seed(&[32; 32]);
         let identity = AgentIdentity {
             version: "1".to_owned(),
             charter: "bench".into(),

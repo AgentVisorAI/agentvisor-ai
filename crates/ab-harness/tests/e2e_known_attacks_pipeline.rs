@@ -243,8 +243,8 @@ fn wasmtime_policy_missing_required_exports_is_denied_cleanly() {
 
 #[test]
 fn cold_store_control_key_derivation_isolates_deployments() {
-    let a = ab_receipts::Ed25519Signer::from_seed([1; 32]);
-    let b = ab_receipts::Ed25519Signer::from_seed([2; 32]);
+    let a = ab_receipts::Ed25519Signer::from_seed(&[1; 32]);
+    let b = ab_receipts::Ed25519Signer::from_seed(&[2; 32]);
     let ka = ab_harness::control_key_from_signer(&a);
     let kb = ab_harness::control_key_from_signer(&b);
     assert_ne!(ka, kb, "signer keys collided — deployments share MAC secret");

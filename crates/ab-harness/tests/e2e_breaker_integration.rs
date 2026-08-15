@@ -75,7 +75,7 @@ fn app_with_breaker(cfg: BreakerConfig) -> Arc<AppState> {
             Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
             Arc::new(CountingBus::default()),
             None,
-            Arc::new(Ed25519Signer::from_seed([55; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[55; 32])),
         )
         .unwrap(),
     )

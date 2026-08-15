@@ -26,7 +26,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 fn signer() -> Ed25519Signer {
-    Ed25519Signer::from_seed([44; 32])
+    Ed25519Signer::from_seed(&[44; 32])
 }
 
 fn ring(s: &Ed25519Signer) -> Keyring {

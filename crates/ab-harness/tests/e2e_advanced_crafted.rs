@@ -184,7 +184,7 @@ fn cross_session_collusion_cannot_pool_budget_ceilings() {
 
 #[test]
 fn receipt_shaped_tool_argument_is_treated_as_opaque_data() {
-    let s = Ed25519Signer::from_seed([201; 32]);
+    let s = Ed25519Signer::from_seed(&[201; 32]);
     // Real, valid receipt body serialized as an argument.
     let honest_body = ab_receipts::ReceiptBody {
         receipt_version: 1,
@@ -375,7 +375,7 @@ fn stringified_payout_amount_does_not_bypass_the_budget_gate() {
 
 #[test]
 fn signature_oracle_reveals_nothing_that_would_forge_a_new_receipt() {
-    let s = Ed25519Signer::from_seed([42; 32]);
+    let s = Ed25519Signer::from_seed(&[42; 32]);
     let ring = {
         let mut r = Keyring::new();
         r.add_key_bytes(&Signer::public_key_bytes(&s)).unwrap();

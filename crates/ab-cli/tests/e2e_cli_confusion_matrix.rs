@@ -92,7 +92,7 @@ fn sign_receipt(dir: &Path) -> (PathBuf, String) {
     use ab_receipts::{
         CostSummary, Ed25519Signer, Receipt, ReceiptBody, ReceiptSubject, Signer, ToolCallSummary,
     };
-    let signer = Ed25519Signer::from_seed([9; 32]);
+    let signer = Ed25519Signer::from_seed(&[9; 32]);
     let body = ReceiptBody {
         receipt_version: 1,
         receipt_id: ab_core::new_event_uid(),

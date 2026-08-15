@@ -85,7 +85,7 @@ fn body_with_event_count(count: u64) -> ReceiptBody {
 
 #[test]
 fn receipt_signs_at_jcs_boundary_and_refuses_above() {
-    let signer = Ed25519Signer::from_seed([1; 32]);
+    let signer = Ed25519Signer::from_seed(&[1; 32]);
     let ok = Receipt::issue(body_with_event_count(1u64 << 53), &signer);
     assert!(ok.is_ok(), "event_count = 2^53 must sign");
 
@@ -102,7 +102,7 @@ fn receipt_signs_at_jcs_boundary_and_refuses_above() {
 
 #[test]
 fn compact_and_pretty_receipt_json_both_verify() {
-    let signer = Ed25519Signer::from_seed([2; 32]);
+    let signer = Ed25519Signer::from_seed(&[2; 32]);
     let receipt = Receipt::issue(body_with_event_count(5), &signer).unwrap();
     let mut ring = Keyring::new();
     ring.add_key_bytes(&Signer::public_key_bytes(&signer)).unwrap();
@@ -139,7 +139,7 @@ fn compact_and_pretty_receipt_json_both_verify() {
 
 #[test]
 fn zero_seed_ed25519_signs_and_verifies() {
-    let signer = Ed25519Signer::from_seed([0; 32]);
+    let signer = Ed25519Signer::from_seed(&[0; 32]);
     let receipt = Receipt::issue(body_with_event_count(1), &signer).unwrap();
     let mut ring = Keyring::new();
     ring.add_key_bytes(&Signer::public_key_bytes(&signer)).unwrap();
@@ -182,7 +182,7 @@ fn state(config: HarnessConfig) -> Arc<AppState> {
             Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
             Arc::new(Bus::default()),
             None,
-            Arc::new(Ed25519Signer::from_seed([3; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[3; 32])),
         )
         .unwrap(),
     )

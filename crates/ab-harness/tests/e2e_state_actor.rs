@@ -28,11 +28,11 @@ use ab_receipts::{
 };
 
 fn signer() -> Ed25519Signer {
-    Ed25519Signer::from_seed([200; 32])
+    Ed25519Signer::from_seed(&[200; 32])
 }
 
 fn attacker_signer() -> Ed25519Signer {
-    Ed25519Signer::from_seed([1; 32])
+    Ed25519Signer::from_seed(&[1; 32])
 }
 
 fn body(session: &str, event_count: u64) -> ReceiptBody {

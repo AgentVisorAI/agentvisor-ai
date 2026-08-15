@@ -117,7 +117,7 @@ fn build_state(sandbox: Sandbox, budget: BudgetSpec) -> Arc<AppState> {
             Arc::new(sandbox),
             Arc::new(CountingBus::default()),
             None,
-            Arc::new(Ed25519Signer::from_seed([7; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[7; 32])),
         )
         .unwrap(),
     )

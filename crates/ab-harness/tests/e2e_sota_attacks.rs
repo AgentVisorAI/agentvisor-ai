@@ -80,7 +80,7 @@ fn make_state(sandbox: Sandbox, budget: BudgetSpec) -> Arc<AppState> {
             Arc::new(sandbox),
             Arc::new(NoopBus::default()),
             None,
-            Arc::new(Ed25519Signer::from_seed([77; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[77; 32])),
         )
         .unwrap(),
     )

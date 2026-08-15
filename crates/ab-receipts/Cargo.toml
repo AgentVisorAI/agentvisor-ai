@@ -18,6 +18,7 @@ hex = { workspace = true }
 base64 = { workspace = true }
 rand = { workspace = true }
 ryu = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

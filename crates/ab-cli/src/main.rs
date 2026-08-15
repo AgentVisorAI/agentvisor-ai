@@ -233,8 +233,19 @@ async fn wizard_then_maybe_start() -> Result<()> {
 }
 
 fn keygen(path: &Path) -> Result<()> {
+    // Round-19 F2/F3: `signer.seed()` returns `Zeroizing<[u8; 32]>`
+    // directly, and the hex encoding is separately wrapped so both
+    // stack and heap copies zero on drop rather than lingering in
+    // freed memory recoverable from a core dump.
+    use zeroize::Zeroizing;
     let signer = Ed25519Signer::generate();
-    if !install_seed_exclusive(path, &hex::encode(signer.seed()))? {
+    let seed = signer.seed();
+    // Round-19 F3: `&*seed` avoids clippy's needless_borrows lint
+    // suggestion (`*seed`) which would move 32 bytes out of the
+    // Zeroizing wrapper into a fresh un-zeroized temp slot.
+    #[allow(clippy::needless_borrows_for_generic_args)]
+    let encoded = Zeroizing::new(hex::encode(&*seed));
+    if !install_seed_exclusive(path, &encoded)? {
         anyhow::bail!("refusing to overwrite existing key {}", path.display());
     }
     println!(
