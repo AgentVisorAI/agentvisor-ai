@@ -357,7 +357,15 @@ fn event_tail(data_dir: &Path, topic: &str, partition: u32, offset: u64, max: us
 async fn session_promote(base_url: &str, id: &str, token_file: Option<&Path>) -> Result<()> {
     let url = format!("{}/v1/sessions/{}/promote", base_url.trim_end_matches('/'), id);
     let token = bearer_token(token_file)?;
-    let mut request = reqwest::Client::new().post(url);
+    // Every other CLI probe bounds its wait (see `doctor` and `probe_endpoint`
+    // at 3 s); without an explicit timeout, a hung harness leaves this call
+    // waiting forever.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .context("build promotion client")?;
+    let mut request = client.post(url);
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }
@@ -393,8 +401,15 @@ async fn loadgen(
     if ab_harness::session::Workflow::parse(workflow).is_none() {
         anyhow::bail!("workflow must be signed or unsigned");
     }
+    // A hung upstream must not turn `loadgen --connections 10000` into an
+    // unbounded resource consumer that never fails — the load *test* would
+    // otherwise mask the failure it is supposed to expose. Per-request
+    // timeout bounds each in-flight probe; connect_timeout catches
+    // upstream unreachable faster than TCP retransmit does.
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(connections)
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(5))
         .build()
         .context("build loadgen client")?;
     let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
