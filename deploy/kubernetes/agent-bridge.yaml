@@ -3,6 +3,13 @@
 #   kubectl create namespace agent-bridge
 #   kubectl -n agent-bridge create secret generic agent-bridge-upstream \
 #       --from-literal=api-key=sk-...
+#   # Round-18 F2: the round-17 F1 initContainer refuses to boot without the
+#   # signing seed Secret. Generate it locally and load it into k8s BEFORE
+#   # `kubectl apply`. The seed IS the receipt trust anchor — do not lose it.
+#   abctl keygen --output /tmp/signing.seed
+#   kubectl -n agent-bridge create secret generic agent-bridge-signing-seed \
+#       --from-file=signing.seed=/tmp/signing.seed
+#   shred -u /tmp/signing.seed
 #   kubectl -n agent-bridge apply -f agent-bridge.yaml
 #
 # Notes:
@@ -11,6 +18,10 @@
 #   bridge_backend to kafka/nats and state_backend to redis (see
 #   config/harness.docker.toml in the repository) — then replicas can grow.
 # - Replace the image with your registry copy; build it from docker/Dockerfile.
+# - Retaining the signing-seed Secret is essential: losing it means every
+#   existing receipt fails verification against the operator's published
+#   pubkey. Back it up out of band (Vault, sealed-secret, KMS-encrypted
+#   backup).
 apiVersion: v1
 kind: ConfigMap
 metadata:

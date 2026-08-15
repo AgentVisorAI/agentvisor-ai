@@ -1067,7 +1067,9 @@ pub(crate) async fn inflight_response_sessions(
                 &journal_key,
                 "in-flight-response",
                 0,
-                &std::fs::read(&path).map_err(|error| error.to_string())?,
+                // Round-18: cap sealed marker read at MAX_CONTROL_BYTES.
+                &ab_core::fsutil::read_capped(&path, ab_core::fsutil::MAX_CONTROL_BYTES)
+                    .map_err(|error| error.to_string())?,
             )?;
             if path != response_marker_path(&spool_dir, &marker.session_id, &marker.attempt_id) {
                 return Err("in-flight response marker path does not match its payload".to_owned());
@@ -1095,7 +1097,9 @@ async fn clear_response_marker(
             &journal_key,
             "in-flight-response",
             0,
-            &std::fs::read(&path).map_err(|error| error.to_string())?,
+            // Round-18: cap sealed marker read at MAX_CONTROL_BYTES.
+            &ab_core::fsutil::read_capped(&path, ab_core::fsutil::MAX_CONTROL_BYTES)
+                .map_err(|error| error.to_string())?,
         )?;
         if marker.session_id != session_id || marker.attempt_id != attempt_id {
             return Err("in-flight response marker does not match completed job".to_owned());
@@ -1175,7 +1179,10 @@ async fn append_journal(
                 &journal_key,
                 "metadata",
                 0,
-                &std::fs::read(&metadata_path).map_err(|error| error.to_string())?,
+                // Round-18: cap sealed journal-metadata read at
+                // MAX_CONTROL_BYTES.
+                &ab_core::fsutil::read_capped(&metadata_path, ab_core::fsutil::MAX_CONTROL_BYTES)
+                    .map_err(|error| error.to_string())?,
             )?;
             if stored != metadata_payload {
                 return Err("journal metadata does not match session workflow and identity".to_owned());
