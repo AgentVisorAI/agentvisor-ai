@@ -17,7 +17,11 @@
         "name": { "type": "string", "minLength": 1 },
         "version": { "type": "string", "minLength": 1 },
         "model_name": { "type": "string" },
-        "tool_definitions": { "type": "array", "items": { "type": "object" } },
+        "tool_definitions": {
+          "type": "array",
+          "maxItems": 512,
+          "items": { "type": "object", "maxProperties": 128 }
+        },
         "extra": {}
       }
     },
