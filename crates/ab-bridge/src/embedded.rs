@@ -128,7 +128,13 @@ impl EmbeddedBroker {
     /// Open an existing bridge, recovering offsets (and truncating at most one
     /// torn trailing line per partition) from the segment files.
     pub fn open(data_dir: &Path) -> Result<Self, BusError> {
-        let manifest_yaml = fs::read_to_string(data_dir.join("manifest.yaml"))?;
+        // Round-22 F4: cap the bridge manifest read. A hostile plant of a
+        // multi-GiB manifest.yaml would OOM the broker at startup before
+        // the YAML parser could complain.
+        let manifest_yaml = ab_core::fsutil::read_capped_string(
+            &data_dir.join("manifest.yaml"),
+            ab_core::fsutil::MAX_CONTROL_BYTES,
+        )?;
         let manifest =
             BridgeManifest::from_yaml(&manifest_yaml).map_err(|e| BusError::Backend(e.to_string()))?;
         let mut partitions = HashMap::new();
@@ -327,6 +333,11 @@ impl EmbeddedBroker {
                 let tmp = part
                     .path
                     .with_extension(format!("jsonl.{}.tmp", ab_core::new_event_uid()));
+                // Round-22 F3: RAII guard cleans up the tmp on any early
+                // Err in the write/sync/rename path so a repeatedly-
+                // failing rewrite (ENOSPC/EIO) does not fill the inode
+                // table with UUID-suffixed orphan .tmp files.
+                let mut guard = ab_core::fsutil::TempPathGuard::new(tmp.clone());
                 {
                     let mut f = fs::File::create(&tmp)?;
                     for line in &kept {
@@ -336,6 +347,7 @@ impl EmbeddedBroker {
                     f.sync_all()?;
                 }
                 fs::rename(&tmp, &part.path)?;
+                guard.disarm();
                 if let Some(parent) = part.path.parent() {
                     ab_core::fsutil::sync_directory(parent)?;
                 }
@@ -456,7 +468,14 @@ fn load_validators(
             continue;
         };
         let schema = crate::manifest::schema_document(reference).or_else(|_| {
-            let bytes = fs::read(data_dir.join(reference))?;
+            // Round-22 F4: cap the schema file read. Schemas are control-
+            // plane data (bounded well below 1 MiB in practice); a hostile
+            // plant of a multi-GiB schema file would OOM the broker before
+            // the JSON parser could complain.
+            let bytes = ab_core::fsutil::read_capped(
+                &data_dir.join(reference),
+                ab_core::fsutil::MAX_CONTROL_BYTES,
+            )?;
             serde_json::from_slice(&bytes).map_err(BusError::from)
         })?;
         let validator = jsonschema::validator_for(&schema)
@@ -514,7 +533,11 @@ fn recover_event_uids(path: &Path) -> Result<HashMap<String, u64>, BusError> {
     if !path.exists() {
         return Ok(HashMap::new());
     }
-    let bytes = fs::read(path)?;
+    // Round-22 F4: cap the idempotency sidecar read. The sidecar grows
+    // proportionally to live UIDs (bounded by retention) so MAX_ATIF_BYTES
+    // (64 MiB) is the operationally-sized ceiling; a hostile plant of a
+    // multi-GiB sidecar file would OOM the broker at startup.
+    let bytes = ab_core::fsutil::read_capped(path, ab_core::fsutil::MAX_ATIF_BYTES)?;
     let complete_len = bytes
         .iter()
         .rposition(|byte| *byte == b'\n')
@@ -618,12 +641,17 @@ fn rewrite_atomic(path: &Path, bytes: &[u8]) -> Result<(), BusError> {
         .parent()
         .ok_or_else(|| BusError::Backend("atomic rewrite has no parent".to_owned()))?;
     let tmp = path.with_extension(format!("jsonl.{}.tmp", ab_core::new_event_uid()));
+    // Round-22 F3: RAII cleanup on any early Err. Without this, a
+    // failing sync/rename leaves a UUID-suffixed orphan .tmp behind
+    // and repeated retries can exhaust ext4/xfs inodes.
+    let mut guard = ab_core::fsutil::TempPathGuard::new(tmp.clone());
     {
         let mut file = fs::File::create(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }
     fs::rename(&tmp, path)?;
+    guard.disarm();
     ab_core::fsutil::sync_directory(parent)?;
     Ok(())
 }
@@ -636,7 +664,12 @@ fn event_uid_from_value(value: &serde_json::Value) -> Option<&str> {
 }
 
 fn read_high_water(path: &Path) -> Result<u64, BusError> {
-    match fs::read_to_string(path) {
+    // Round-22 F4: a watermark is at most u64 in decimal (~20 chars). Cap
+    // the read so a hostile plant of a giant p<N>.next-offset cannot OOM
+    // the broker at startup. Use MAX_CONTROL_BYTES (1 MiB) for the
+    // shared trust boundary; a real watermark is orders of magnitude
+    // smaller.
+    match ab_core::fsutil::read_capped_string(path, ab_core::fsutil::MAX_CONTROL_BYTES) {
         Ok(value) => match value.trim().parse::<u64>() {
             Ok(offset) => Ok(offset),
             // A corrupt watermark file is not fatal: `next_offset` is
@@ -663,12 +696,17 @@ fn persist_high_water(path: &Path, next_offset: u64) -> Result<(), BusError> {
         .parent()
         .ok_or_else(|| BusError::Backend("high-watermark has no parent".to_owned()))?;
     let temporary = path.with_extension(format!("{}.tmp", ab_core::new_event_uid()));
+    // Round-22 F3: RAII cleanup on any early Err — same discipline as
+    // `rewrite_atomic` above. On a bad-disk day, watermark writes fire
+    // on every publish; orphan tmp accumulation would be fastest here.
+    let mut guard = ab_core::fsutil::TempPathGuard::new(temporary.clone());
     {
         let mut file = fs::File::create(&temporary)?;
         file.write_all(next_offset.to_string().as_bytes())?;
         file.sync_all()?;
     }
-    fs::rename(temporary, path)?;
+    fs::rename(&temporary, path)?;
+    guard.disarm();
     ab_core::fsutil::sync_directory(parent)?;
     Ok(())
 }
