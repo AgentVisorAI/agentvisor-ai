@@ -251,7 +251,9 @@ mod tests {
         ev.type_uid = u64::from(ev.class_name.class_uid()) * 100 + 99;
         let errs = validate_event(&ev).map(|_| Vec::new()).unwrap_or_else(|e| e);
         assert!(
-            !errs.iter().any(|e| matches!(e, ValidationError::BadActivityId(_))),
+            !errs
+                .iter()
+                .any(|e| matches!(e, ValidationError::BadActivityId(_))),
             "activity_id=99 must be valid; got {errs:?}"
         );
     }

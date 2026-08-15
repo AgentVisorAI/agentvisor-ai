@@ -325,8 +325,7 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
 /// so both the CLI and the harness reconciler enforce identical
 /// bounds. Kept as thin wrappers here for clearer local error text.
 fn read_capped(path: &Path, max_bytes: u64, label: &str) -> Result<Vec<u8>> {
-    ab_core::fsutil::read_capped(path, max_bytes)
-        .with_context(|| format!("{label} at {}", path.display()))
+    ab_core::fsutil::read_capped(path, max_bytes).with_context(|| format!("{label} at {}", path.display()))
 }
 
 fn read_capped_str(path: &Path, max_bytes: u64, label: &str) -> Result<String> {
@@ -385,8 +384,8 @@ fn receipt_verify(path: &Path, public_key_hex: &str) -> Result<()> {
     // the whole audit posture. `Receipt::from_json_slice` closes
     // that split-brain uniformly.
     let bytes = read_capped(path, MAX_RECEIPT_BYTES, "receipt")?;
-    let receipt = Receipt::from_json_slice(&bytes)
-        .with_context(|| format!("parse receipt {}", path.display()))?;
+    let receipt =
+        Receipt::from_json_slice(&bytes).with_context(|| format!("parse receipt {}", path.display()))?;
     let public_key: [u8; 32] = hex::decode(public_key_hex)
         .context("trusted public key is not hexadecimal")?
         .try_into()
@@ -421,9 +420,7 @@ fn atif_validate(path: &Path, mode: ValidationMode) -> Result<()> {
         // says "at least N" rather than reporting the capped
         // count as if it were exact.
         const ATIF_HEAD: usize = 16;
-        let truncated = issues
-            .last()
-            .is_some_and(|i| i.message.contains("issue cap"));
+        let truncated = issues.last().is_some_and(|i| i.message.contains("issue cap"));
         // Number of "real" issues: strip the synthetic marker if
         // present. The total the user sees is a lower bound when
         // truncated, exact otherwise.
@@ -443,14 +440,10 @@ fn atif_validate(path: &Path, mode: ValidationMode) -> Result<()> {
         if real_total > ATIF_HEAD {
             let suppressed = real_total - ATIF_HEAD;
             let qualifier = if truncated { "at least " } else { "" };
-            eprintln!(
-                "... {qualifier}{suppressed} more issue(s) suppressed (showing first {ATIF_HEAD})"
-            );
+            eprintln!("... {qualifier}{suppressed} more issue(s) suppressed (showing first {ATIF_HEAD})");
         }
         if truncated {
-            anyhow::bail!(
-                "ATIF validation failed with at least {real_total} issue(s) (validator truncated)"
-            );
+            anyhow::bail!("ATIF validation failed with at least {real_total} issue(s) (validator truncated)");
         }
         anyhow::bail!("ATIF validation failed with {real_total} issue(s)");
     }
@@ -489,9 +482,7 @@ fn event_tail(data_dir: &Path, topic: &str, partition: u32, offset: u64, max: us
     // size — a real drain use case should page with --offset.
     const MAX_EVENT_TAIL: usize = 100_000;
     if max > MAX_EVENT_TAIL {
-        anyhow::bail!(
-            "--max {max} exceeds the safety cap of {MAX_EVENT_TAIL}; page with --offset instead"
-        );
+        anyhow::bail!("--max {max} exceeds the safety cap of {MAX_EVENT_TAIL}; page with --offset instead");
     }
     let bridge = EmbeddedBroker::open(data_dir).context("open Bridge")?;
     for event in bridge
@@ -531,10 +522,7 @@ async fn session_promote(base_url: &str, id: &str, token_file: Option<&Path>) ->
         // Round-28 F3: harness error body is attacker-influencable
         // via header echoing / error messages — sanitise before
         // it lands on the operator's terminal.
-        anyhow::bail!(
-            "promotion failed ({status}): {}",
-            sanitize_for_terminal(&body)
-        );
+        anyhow::bail!("promotion failed ({status}): {}", sanitize_for_terminal(&body));
     }
     // Round-28 F3: the promoted receipt is JSON — printing it
     // through serde_json::to_string is not attacker-controllable at
@@ -658,9 +646,7 @@ async fn loadgen(
                     let bytes = chunk.map_err(|error| error.to_string())?;
                     total = total.saturating_add(bytes.len());
                     if total > LOADGEN_MAX_RESPONSE {
-                        return Err(format!(
-                            "response exceeded {LOADGEN_MAX_RESPONSE} bytes"
-                        ));
+                        return Err(format!("response exceeded {LOADGEN_MAX_RESPONSE} bytes"));
                     }
                 }
                 if !status.is_success() {

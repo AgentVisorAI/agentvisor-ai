@@ -373,10 +373,7 @@ fn escape_prom_help(help: &str) -> String {
             // ESC+`[` prefix we already scrub. Space is the
             // same convention prometheus_client-python's
             // `_ESCAPE_RE` uses.
-            c if (c as u32) < 0x20
-                || (c as u32) == 0x7f
-                || (0x80..=0x9f).contains(&(c as u32)) =>
-            {
+            c if (c as u32) < 0x20 || (c as u32) == 0x7f || (0x80..=0x9f).contains(&(c as u32)) => {
                 out.push(' ');
             }
             other => out.push(other),
@@ -492,7 +489,10 @@ mod tests {
             .find(|line| line.starts_with("# HELP ab_dangerous_total"))
             .expect("HELP line present");
         assert!(help_line.contains(r"\n"), "help was not escaped: {help_line:?}");
-        assert!(help_line.contains(r"\\"), "backslash was not escaped: {help_line:?}");
+        assert!(
+            help_line.contains(r"\\"),
+            "backslash was not escaped: {help_line:?}"
+        );
         // And the "line2" fragment must not be on its own line.
         assert!(
             !text.contains("\nline2\\path"),
@@ -651,10 +651,7 @@ mod tests {
         let dangerous = "help\u{7f}with\u{9b}csi\u{80}c1\u{9f}end";
         let out = escape_prom_help(dangerous);
         for c in ['\u{7f}', '\u{9b}', '\u{80}', '\u{9f}'] {
-            assert!(
-                !out.contains(c),
-                "escape_prom_help left {c:?} in {out:?}"
-            );
+            assert!(!out.contains(c), "escape_prom_help left {c:?} in {out:?}");
         }
         // The safe chars are preserved.
         assert!(out.contains("help"));

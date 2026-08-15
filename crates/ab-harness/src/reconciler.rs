@@ -268,7 +268,9 @@ impl Finalizer {
             recovery_lock: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle_locks: Arc::new(SessionLockTable::default()),
             quarantined_sessions: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
-            warned_artifacts: Arc::new(parking_lot::Mutex::new(WarnedArtifacts::new(WARNED_ARTIFACTS_CAP))),
+            warned_artifacts: Arc::new(parking_lot::Mutex::new(WarnedArtifacts::new(
+                WARNED_ARTIFACTS_CAP,
+            ))),
             journal_key,
         }
     }
@@ -290,7 +292,9 @@ impl Finalizer {
             recovery_lock: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle_locks: Arc::new(SessionLockTable::default()),
             quarantined_sessions: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
-            warned_artifacts: Arc::new(parking_lot::Mutex::new(WarnedArtifacts::new(WARNED_ARTIFACTS_CAP))),
+            warned_artifacts: Arc::new(parking_lot::Mutex::new(WarnedArtifacts::new(
+                WARNED_ARTIFACTS_CAP,
+            ))),
             journal_key,
         }
     }
@@ -576,9 +580,7 @@ impl Finalizer {
             // parking_lot MutexGuard drops before `.await` (an
             // `atif_path.lock()` temporary living across the await
             // makes the future !Send).
-            let atif_path_opt: Option<std::path::PathBuf> = {
-                session.atif_path.lock().clone()
-            };
+            let atif_path_opt: Option<std::path::PathBuf> = { session.atif_path.lock().clone() };
             if let Some(atif_path) = atif_path_opt {
                 let marker = atif_path.with_extension("promote");
                 if marker.exists() {
@@ -869,8 +871,7 @@ impl Finalizer {
             // blip) would head-of-line-block every other session on
             // every subsequent restart tick. Mirror the warn+continue
             // discipline used at 792/809/824 so recovery is per-file.
-            let bytes = match read_capped_async(path.clone(), ab_core::fsutil::MAX_ATIF_BYTES).await
-            {
+            let bytes = match read_capped_async(path.clone(), ab_core::fsutil::MAX_ATIF_BYTES).await {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     self.metrics
@@ -1923,8 +1924,7 @@ impl Finalizer {
             // Mirror `replay_lifecycle_outboxes`'s warn+continue on
             // the same two failure modes; leave the bad marker on
             // disk as forensic evidence.
-            let sealed = match read_capped_async(path.clone(), ab_core::fsutil::MAX_CONTROL_BYTES).await
-            {
+            let sealed = match read_capped_async(path.clone(), ab_core::fsutil::MAX_CONTROL_BYTES).await {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     tracing::warn!(
@@ -2577,10 +2577,7 @@ async fn resolve_lifecycle_ack(
 /// the "empty" is actually "torn and moved out for post-mortem" and
 /// the metadata must be preserved (or quarantined itself) rather
 /// than removed.
-async fn quarantine_sibling_exists(
-    spool_dir: &std::path::Path,
-    stem: &str,
-) -> Result<bool, FinalizeError> {
+async fn quarantine_sibling_exists(spool_dir: &std::path::Path, stem: &str) -> Result<bool, FinalizeError> {
     let prefix = format!("{stem}.events.ndjson.corrupt-");
     let spool_dir = spool_dir.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<bool, FinalizeError> {
@@ -2611,10 +2608,7 @@ async fn quarantine_sibling_exists(
 /// OOM the harness on every recovery tick. `spawn_blocking` keeps
 /// the tokio runtime healthy while `File::open` + `metadata` +
 /// bounded `read_to_end` run on the blocking pool.
-async fn read_capped_async(
-    path: std::path::PathBuf,
-    max_bytes: u64,
-) -> Result<Vec<u8>, std::io::Error> {
+async fn read_capped_async(path: std::path::PathBuf, max_bytes: u64) -> Result<Vec<u8>, std::io::Error> {
     tokio::task::spawn_blocking(move || ab_core::fsutil::read_capped(&path, max_bytes))
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?
@@ -3096,16 +3090,12 @@ mod tests {
         // aborted every unrelated session's recovery for the tick.
         let poison_stem = "poisonpoisonpoisonpoisonpoison32";
         std::fs::write(
-            directory
-                .path()
-                .join(format!("{poison_stem}.session.json")),
+            directory.path().join(format!("{poison_stem}.session.json")),
             b"{\"garbage\": true, \"not\": \"a valid sealed metadata\"}",
         )
         .unwrap();
         std::fs::write(
-            directory
-                .path()
-                .join(format!("{poison_stem}.events.ndjson")),
+            directory.path().join(format!("{poison_stem}.events.ndjson")),
             b"{}\n",
         )
         .unwrap();
@@ -3224,7 +3214,12 @@ mod tests {
         let session = session(Workflow::Signed);
         // Install into registry so `pending_close_sessions` can see it.
         sessions.insert_recovered(Arc::try_unwrap(session.clone()).unwrap_or_else(|arc| {
-            Session::new(arc.id.clone(), arc.workflow, arc.current_identity(), Default::default())
+            Session::new(
+                arc.id.clone(),
+                arc.workflow,
+                arc.current_identity(),
+                Default::default(),
+            )
         }));
         // Look up the Arc actually stored in the registry (identity
         // mapping after insert_recovered).
@@ -3305,7 +3300,10 @@ mod tests {
         let outcome = finalizer
             .recover_spooled_sessions(&registry, &Default::default())
             .await;
-        assert!(outcome.is_ok(), "orphan must not fail the outer scan; got {outcome:?}");
+        assert!(
+            outcome.is_ok(),
+            "orphan must not fail the outer scan; got {outcome:?}"
+        );
 
         // The orphan must have been renamed out of the `.json`
         // extension so subsequent ticks skip it in O(1). Pre-fix
@@ -3351,15 +3349,14 @@ mod tests {
         let empty = session(Workflow::Unsigned);
         // Install into the registry so the sweep can see it.
         let empty_id = empty.id.clone();
-        sessions
-            .insert_recovered(Arc::try_unwrap(empty).unwrap_or_else(|arc| {
-                Session::new(
-                    arc.id.clone(),
-                    arc.workflow,
-                    arc.current_identity(),
-                    Default::default(),
-                )
-            }));
+        sessions.insert_recovered(Arc::try_unwrap(empty).unwrap_or_else(|arc| {
+            Session::new(
+                arc.id.clone(),
+                arc.workflow,
+                arc.current_identity(),
+                Default::default(),
+            )
+        }));
         let registered = sessions.get(&empty_id).unwrap();
 
         // The empty-unsigned close reject is the code path we're
@@ -4591,12 +4588,7 @@ mod tests {
         let entries: Vec<_> = std::fs::read_dir(directory.path())
             .unwrap()
             .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .contains(".corrupt-")
-            })
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"))
             .collect();
         assert_eq!(entries.len(), 1, "expected exactly one quarantine file");
         let bytes = std::fs::read(entries[0].path()).unwrap();

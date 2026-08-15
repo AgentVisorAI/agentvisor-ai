@@ -229,11 +229,7 @@ impl StateStore for InMemoryStore {
     /// wanted (probably 0) and there's nothing to compensate.
     fn refund(&self, key: &str, amount: u64) {
         let _transaction = self.transaction_lock.lock();
-        let Some(cell) = self
-            .counters
-            .get(key)
-            .map(|entry| Arc::clone(entry.value()))
-        else {
+        let Some(cell) = self.counters.get(key).map(|entry| Arc::clone(entry.value())) else {
             return;
         };
         let prev = cell.load(Ordering::Acquire);

@@ -549,7 +549,10 @@ fn spawn_bridge_maintenance(
 async fn build_identity(
     config: &HarnessConfig,
     metrics: Arc<ab_core::metrics::Registry>,
-) -> Result<(Option<Arc<IdentityValidator>>, Option<tokio::task::JoinHandle<()>>)> {
+) -> Result<(
+    Option<Arc<IdentityValidator>>,
+    Option<tokio::task::JoinHandle<()>>,
+)> {
     let has_jwks = config
         .identity_jwks_url
         .as_deref()
@@ -722,31 +725,24 @@ async fn refresh_jwks(client: &reqwest::Client, url: &str, validator: &IdentityV
     // cap, refuse without allocating anything for the body.
     if let Some(len) = response.content_length() {
         if len > MAX_JWKS_BYTES as u64 {
-            anyhow::bail!(
-                "JWKS declared Content-Length {len} bytes; cap is {MAX_JWKS_BYTES}"
-            );
+            anyhow::bail!("JWKS declared Content-Length {len} bytes; cap is {MAX_JWKS_BYTES}");
         }
     }
     use futures::StreamExt as _;
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| {
-            anyhow::anyhow!("read JWKS chunk: {}", error.without_url())
-        })?;
+        let chunk = chunk.map_err(|error| anyhow::anyhow!("read JWKS chunk: {}", error.without_url()))?;
         let next = body
             .len()
             .checked_add(chunk.len())
             .ok_or_else(|| anyhow::anyhow!("JWKS body size overflowed usize"))?;
         if next > MAX_JWKS_BYTES {
-            anyhow::bail!(
-                "JWKS exceeded {MAX_JWKS_BYTES} bytes (received at least {next})"
-            );
+            anyhow::bail!("JWKS exceeded {MAX_JWKS_BYTES} bytes (received at least {next})");
         }
         body.extend_from_slice(&chunk);
     }
-    let document: serde_json::Value =
-        serde_json::from_slice(&body).context("parse JWKS JSON")?;
+    let document: serde_json::Value = serde_json::from_slice(&body).context("parse JWKS JSON")?;
     validator.add_jwks(&document).map_err(anyhow::Error::new)
 }
 
@@ -990,9 +986,7 @@ fn read_signer(path: &Path) -> Result<Ed25519Signer> {
         ab_core::fsutil::read_capped_string(path, ab_core::fsutil::MAX_CONTROL_BYTES)
             .with_context(|| format!("read signing seed {}", path.display()))?,
     );
-    let bytes = Zeroizing::new(
-        hex::decode(encoded.trim()).context("decode signing seed as hex")?,
-    );
+    let bytes = Zeroizing::new(hex::decode(encoded.trim()).context("decode signing seed as hex")?);
     // Round-19 F1: copy directly from the Zeroizing<Vec<u8>> slice
     // into a fresh Zeroizing<[u8; 32]>. Historically we did
     // `(*bytes).clone().try_into()` which materialized a bare
@@ -1095,9 +1089,7 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
             // needed. Same for the generic Err arm.
             Ok(false)
         }
-        Err(error) => {
-            Err(error).with_context(|| format!("install signing seed {}", path.display()))
-        }
+        Err(error) => Err(error).with_context(|| format!("install signing seed {}", path.display())),
     }
 }
 
@@ -1152,10 +1144,8 @@ async fn shutdown_signal() {
         // graceful shutdown, the process exits immediately with
         // a clear tracing line.
         tokio::spawn(async {
-            let mut terminate = tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::terminate(),
-            )
-            .ok();
+            let mut terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {}
                 _ = async {
@@ -1225,10 +1215,7 @@ mod tests {
         std::fs::write(&path, "f".repeat(64)).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let err = read_signer(&path).unwrap_err().to_string();
-        assert!(
-            err.contains("0xFF"),
-            "expected all-0xFF rejection, got: {err}",
-        );
+        assert!(err.contains("0xFF"), "expected all-0xFF rejection, got: {err}",);
     }
 
     #[test]
@@ -1320,7 +1307,11 @@ mod tests {
         let mut config = HarnessConfig::for_tests("http://upstream", "/tmp", "/tmp");
         config.require_identity = true;
         config.identity_hmac_secret_file = Some(secret.to_string_lossy().into_owned());
-        assert!(build_identity(&config, Arc::new(ab_core::metrics::Registry::new())).await.is_err());
+        assert!(
+            build_identity(&config, Arc::new(ab_core::metrics::Registry::new()))
+                .await
+                .is_err()
+        );
     }
 
     /// Vicious bug regression: `std::fs::metadata` follows symbolic links,
@@ -1396,12 +1387,7 @@ mod tests {
             "/jwks",
             get(move || {
                 let body = big_body.clone();
-                async move {
-                    (
-                        [(axum::http::header::CONTENT_TYPE, "application/json")],
-                        body,
-                    )
-                }
+                async move { ([(axum::http::header::CONTENT_TYPE, "application/json")], body) }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1421,7 +1407,10 @@ mod tests {
             text.contains("Content-Length") || text.contains("exceeded"),
             "expected JWKS cap error, got: {text}"
         );
-        assert!(text.contains("4194304"), "expected cap size in error, got: {text}");
+        assert!(
+            text.contains("4194304"),
+            "expected cap size in error, got: {text}"
+        );
         // Round-35 F2: the returned error MUST NOT contain the URL.
         // anyhow's Display walks the whole context chain; if any
         // `.with_context(|| format!("... {url}"))` or
@@ -1488,9 +1477,7 @@ mod tests {
         use axum::routing::get;
         let router = axum::Router::new().route(
             "/jwks",
-            get(|| async {
-                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "server broke")
-            }),
+            get(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "server broke") }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1535,9 +1522,8 @@ mod tests {
             get(|| async {
                 // Emit 128 chunks of 64 KiB each = 8 MiB, streamed
                 // (no Content-Length).
-                let chunks = (0..128).map(|_| {
-                    Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b'x'; 64 * 1024]))
-                });
+                let chunks =
+                    (0..128).map(|_| Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b'x'; 64 * 1024])));
                 axum::body::Body::from_stream(stream::iter(chunks.collect::<Vec<_>>()))
             }),
         );
