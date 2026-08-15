@@ -249,11 +249,21 @@ pub async fn session_detail(State(state): State<AppState>, Path(id): Path<String
     // Clone out under the lock and drop it before serialization so the
     // reconciler / worker never blocks on a slow serde_json step.
     let receipt_clone: Option<ab_receipts::Receipt> = session.receipt.lock().clone();
-    let atif_path: Option<String> = session
+    // Round-27 F6: previously returned `path.display().to_string()`,
+    // which disclosed the absolute spool directory (e.g.
+    // `/var/lib/agent-bridge/spool/<uid>.json`) to any unauthenticated
+    // caller of the dashboard. The dashboard's design intent (see
+    // module doc-comment) is "the same session metadata that lands on
+    // disk and in /metrics" — filesystem paths appear in neither.
+    // Disclosing the absolute layout gives a probe attacker a
+    // starting point for later privilege-escalation or path-
+    // traversal attempts. Return only the file name; the UI never
+    // uses the path for anything besides display.
+    let atif_filename: Option<String> = session
         .atif_path
         .lock()
         .as_ref()
-        .map(|path| path.display().to_string());
+        .and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()));
     // Chain head/count are exposed as a small provenance stub so the UI can
     // show "47 events, head=b2b7…". The full chain lives in the journal on
     // disk; we don't stream it through the dashboard.
@@ -269,7 +279,7 @@ pub async fn session_detail(State(state): State<AppState>, Path(id): Path<String
             "count": chain_count,
         },
         "receipt": receipt,
-        "atif_path": atif_path,
+        "atif_filename": atif_filename,
     }));
     record(&state, "detail", "ok", started);
     response

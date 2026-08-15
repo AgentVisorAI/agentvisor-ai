@@ -12,6 +12,7 @@ pub const MANIFEST_VERSION: u32 = 1;
 
 /// Retention policy for one topic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetentionSpec {
     /// Hot retention window in hours (default 720 = 30 days, per the brief).
     pub hot_hours: u32,
@@ -31,6 +32,7 @@ impl Default for RetentionSpec {
 
 /// One topic declaration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TopicSpec {
     /// Topic name (`agent.tool_call`, …).
     pub name: String,
@@ -46,6 +48,7 @@ pub struct TopicSpec {
 
 /// The Bridge manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BridgeManifest {
     /// Manifest format version.
     pub manifest_version: u32,
@@ -187,10 +190,31 @@ impl BridgeManifest {
                     t.name
                 )));
             }
+            // Round-27 F5: cap partitions and hot_hours. `partitions` is
+            // u32, and without a cap `partitions: 4294967295` would
+            // pass validate() and drive the embedded broker to create
+            // 4 billion partition directories on startup — guaranteed
+            // inode/OOM exhaustion. 1024 matches the practical Kafka
+            // per-topic sanity cap. 87_600 hours is 10 years —
+            // realistic ceiling for a long-lived audit trail.
+            const MAX_PARTITIONS: u32 = 1024;
+            const MAX_HOT_HOURS: u32 = 24 * 365 * 10;
+            if t.partitions > MAX_PARTITIONS {
+                return Err(ManifestError::Invalid(format!(
+                    "topic {:?} partitions {} exceeds cap of {MAX_PARTITIONS}",
+                    t.name, t.partitions
+                )));
+            }
             if t.retention.hot_hours == 0 {
                 return Err(ManifestError::Invalid(format!(
                     "topic {:?} has 0h retention",
                     t.name
+                )));
+            }
+            if t.retention.hot_hours > MAX_HOT_HOURS {
+                return Err(ManifestError::Invalid(format!(
+                    "topic {:?} hot_hours {} exceeds cap of {MAX_HOT_HOURS} (10 years)",
+                    t.name, t.retention.hot_hours
                 )));
             }
             if let Some(reference) = &t.schema_ref {
@@ -329,6 +353,61 @@ mod tests {
             topics: vec![],
         };
         assert!(m.validate().is_err());
+
+        // Round-27 F5: upper caps on partitions and hot_hours. Absurd
+        // values (`u32::MAX`) used to pass validate() and would drive
+        // EmbeddedBroker::provision to create 4 billion partition
+        // directories at startup — guaranteed inode/OOM exhaustion.
+        let mut m = BridgeManifest::default_for("x");
+        m.topics[0].partitions = u32::MAX;
+        assert!(matches!(m.validate(), Err(ManifestError::Invalid(_))));
+        let mut m = BridgeManifest::default_for("x");
+        m.topics[0].retention.hot_hours = u32::MAX;
+        assert!(matches!(m.validate(), Err(ManifestError::Invalid(_))));
+    }
+
+    /// Round-27 F5: `deny_unknown_fields` on `BridgeManifest`,
+    /// `TopicSpec`, and `RetentionSpec` catches config-file typos
+    /// that would otherwise silently disable features. `cold_url`
+    /// (misspelling `cold_uri`) or `hot_days` (misspelling
+    /// `hot_hours`) used to pass `abctl manifest-validate` cleanly
+    /// and cold export or retention would silently do nothing.
+    #[test]
+    fn unknown_fields_are_rejected_at_parse_time() {
+        let with_top_level_typo = r"
+manifest_version: 1
+name: probe
+topocs: []
+";
+        assert!(matches!(
+            BridgeManifest::from_yaml(with_top_level_typo),
+            Err(ManifestError::Parse(_))
+        ));
+        let with_topic_typo = r"
+manifest_version: 1
+name: probe
+topics:
+  - name: a
+    partitions: 1
+    schema_reff: something
+";
+        assert!(matches!(
+            BridgeManifest::from_yaml(with_topic_typo),
+            Err(ManifestError::Parse(_))
+        ));
+        let with_retention_typo = r"
+manifest_version: 1
+name: probe
+topics:
+  - name: a
+    partitions: 1
+    retention:
+      hot_horus: 720
+";
+        assert!(matches!(
+            BridgeManifest::from_yaml(with_retention_typo),
+            Err(ManifestError::Parse(_))
+        ));
     }
 
     #[test]
