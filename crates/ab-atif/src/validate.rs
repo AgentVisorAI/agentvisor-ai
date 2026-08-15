@@ -907,10 +907,7 @@ mod tests {
         let mut map = serde_json::Map::new();
         map.insert("schema_version".into(), Value::String("1.7".into()));
         map.insert("session_id".into(), Value::String("s".into()));
-        map.insert(
-            "agent".into(),
-            serde_json::json!({"name": "a", "version": "1"}),
-        );
+        map.insert("agent".into(), serde_json::json!({"name": "a", "version": "1"}));
         map.insert(
             "steps".into(),
             serde_json::json!([{

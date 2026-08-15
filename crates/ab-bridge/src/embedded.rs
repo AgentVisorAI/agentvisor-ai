@@ -483,10 +483,8 @@ fn load_validators(
             // plane data (bounded well below 1 MiB in practice); a hostile
             // plant of a multi-GiB schema file would OOM the broker before
             // the JSON parser could complain.
-            let bytes = ab_core::fsutil::read_capped(
-                &data_dir.join(reference),
-                ab_core::fsutil::MAX_CONTROL_BYTES,
-            )?;
+            let bytes =
+                ab_core::fsutil::read_capped(&data_dir.join(reference), ab_core::fsutil::MAX_CONTROL_BYTES)?;
             serde_json::from_slice(&bytes).map_err(BusError::from)
         })?;
         let validator = jsonschema::validator_for(&schema)

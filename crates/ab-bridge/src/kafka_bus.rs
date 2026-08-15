@@ -367,10 +367,8 @@ impl EventBus for KafkaBus {
                         .record
                         .value
                         .ok_or_else(|| format!("fetch: null record value at offset {}", r.offset))?;
-                    let mut ev: StoredEvent =
-                        serde_json::from_slice(&value).map_err(|e| {
-                            format!("fetch decode at offset {}: {e}", r.offset)
-                        })?;
+                    let mut ev: StoredEvent = serde_json::from_slice(&value)
+                        .map_err(|e| format!("fetch decode at offset {}: {e}", r.offset))?;
                     #[allow(clippy::cast_sign_loss)]
                     {
                         ev.offset = r.offset as u64;

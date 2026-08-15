@@ -345,7 +345,8 @@ impl Receipt {
         if let ReceiptSubject::AtifTrajectory { retroactive, .. } = &self.body.subject {
             if !retroactive {
                 return Err(ReceiptError::SemanticInvariant(
-                    "AtifTrajectory.retroactive must be true (this receipt attests a retroactive promotion)".to_owned(),
+                    "AtifTrajectory.retroactive must be true (this receipt attests a retroactive promotion)"
+                        .to_owned(),
                 ));
             }
         }
@@ -412,16 +413,36 @@ impl<'de> serde::de::Visitor<'de> for NoDupVisitor {
     fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("any JSON value (strict-mode duplicate-key check)")
     }
-    fn visit_bool<E>(self, _: bool) -> Result<(), E> { Ok(()) }
-    fn visit_i64<E>(self, _: i64) -> Result<(), E> { Ok(()) }
-    fn visit_u64<E>(self, _: u64) -> Result<(), E> { Ok(()) }
-    fn visit_f64<E>(self, _: f64) -> Result<(), E> { Ok(()) }
-    fn visit_i128<E>(self, _: i128) -> Result<(), E> { Ok(()) }
-    fn visit_u128<E>(self, _: u128) -> Result<(), E> { Ok(()) }
-    fn visit_str<E>(self, _: &str) -> Result<(), E> { Ok(()) }
-    fn visit_string<E>(self, _: String) -> Result<(), E> { Ok(()) }
-    fn visit_none<E>(self) -> Result<(), E> { Ok(()) }
-    fn visit_unit<E>(self) -> Result<(), E> { Ok(()) }
+    fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_i128<E>(self, _: i128) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_u128<E>(self, _: u128) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_str<E>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_string<E>(self, _: String) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_none<E>(self) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_unit<E>(self) -> Result<(), E> {
+        Ok(())
+    }
     fn visit_seq<S: serde::de::SeqAccess<'de>>(self, mut seq: S) -> Result<(), S::Error> {
         use serde::de::Error as _;
         let next_depth = self.depth.saturating_add(1);
@@ -430,10 +451,7 @@ impl<'de> serde::de::Visitor<'de> for NoDupVisitor {
                 "{DUP_KEY_SENTINEL}JSON nesting exceeds {MAX_NESTED_DEPTH}"
             )));
         }
-        while seq
-            .next_element_seed(NoDupSeed { depth: next_depth })?
-            .is_some()
-        {}
+        while seq.next_element_seed(NoDupSeed { depth: next_depth })?.is_some() {}
         Ok(())
     }
     fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<(), M::Error> {

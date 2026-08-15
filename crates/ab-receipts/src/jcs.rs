@@ -399,10 +399,7 @@ mod tests {
         for _ in 0..MAX_NESTED_DEPTH + 10 {
             v = Value::Array(vec![v]);
         }
-        assert_eq!(
-            canonicalize(&v),
-            Err(JcsError::TooDeep(MAX_NESTED_DEPTH))
-        );
+        assert_eq!(canonicalize(&v), Err(JcsError::TooDeep(MAX_NESTED_DEPTH)));
     }
 
     #[test]

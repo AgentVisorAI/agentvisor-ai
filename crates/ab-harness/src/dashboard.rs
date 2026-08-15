@@ -189,10 +189,9 @@ fn static_asset(body: &'static str, content_type: &'static str) -> Response {
         HeaderName::from_static("x-frame-options"),
         HeaderValue::from_static("DENY"),
     );
-    response.headers_mut().insert(
-        header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
-    );
+    response
+        .headers_mut()
+        .insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     response
 }
 
@@ -207,14 +206,12 @@ fn no_store_json_response(value: impl serde::Serialize) -> Response {
         header::CACHE_CONTROL,
         HeaderValue::from_static("no-store, max-age=0"),
     );
-    response.headers_mut().insert(
-        header::PRAGMA,
-        HeaderValue::from_static("no-cache"),
-    );
-    response.headers_mut().insert(
-        header::VARY,
-        HeaderValue::from_static("Authorization"),
-    );
+    response
+        .headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response
+        .headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("Authorization"));
     response.headers_mut().insert(
         HeaderName::from_static("x-content-type-options"),
         HeaderValue::from_static("nosniff"),
@@ -233,10 +230,9 @@ fn no_store_json_response(value: impl serde::Serialize) -> Response {
         HeaderName::from_static("x-frame-options"),
         HeaderValue::from_static("DENY"),
     );
-    response.headers_mut().insert(
-        header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
-    );
+    response
+        .headers_mut()
+        .insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     response
 }
 
