@@ -648,8 +648,19 @@ async fn build_identity(
                         Ok(_) => {}
                         Err(error) => {
                             refresh_errors.inc();
+                            // Round-35 F2: do NOT `%error` here. The
+                            // anyhow chain in `refresh_jwks` used to
+                            // embed the JWKS URL in every `.with_context`
+                            // and every `anyhow::bail!` message; anyhow's
+                            // Display walks the whole chain and prints
+                            // it. The corp IdP hostname is enterprise-
+                            // topology-sensitive (reveals SSO vendor,
+                            // tenant, region) and does not belong in
+                            // downstream OTLP sinks. `refresh_jwks` now
+                            // returns URL-free error text; log the
+                            // stable classifier only.
                             tracing::warn!(
-                                %error,
+                                category = %classify_jwks_error(&error),
                                 "JWKS refresh failed; retaining previously loaded keys"
                             );
                         }
@@ -683,20 +694,26 @@ async fn refresh_jwks(client: &reqwest::Client, url: &str, validator: &IdentityV
     // the harness before the 10 s request timeout fires: at a fast link
     // (1 Gbit/s) 1 second is enough to deliver >100 MB, so the timeout
     // alone is not a sufficient defense.
+    //
+    // Round-35 F2: every error return must be URL-free. Callers log
+    // this fn's error via anyhow's Display, which walks the whole
+    // context chain — embedding the URL in a `.with_context()` used
+    // to leak the corp IdP hostname to downstream OTLP sinks.
+    // Structured logs at the call site record the stable category.
     const MAX_JWKS_BYTES: usize = 4 * 1024 * 1024;
     let response = client
         .get(url)
         .send()
         .await
-        .with_context(|| format!("fetch JWKS {url}"))?
+        .context("fetch JWKS")?
         .error_for_status()
-        .with_context(|| format!("JWKS endpoint {url} returned an error"))?;
+        .context("JWKS endpoint returned an error")?;
     // Fast reject: if Content-Length is present and already exceeds the
     // cap, refuse without allocating anything for the body.
     if let Some(len) = response.content_length() {
         if len > MAX_JWKS_BYTES as u64 {
             anyhow::bail!(
-                "JWKS at {url} declares Content-Length {len} bytes; cap is {MAX_JWKS_BYTES}"
+                "JWKS declared Content-Length {len} bytes; cap is {MAX_JWKS_BYTES}"
             );
         }
     }
@@ -704,14 +721,14 @@ async fn refresh_jwks(client: &reqwest::Client, url: &str, validator: &IdentityV
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.with_context(|| format!("read JWKS chunk from {url}"))?;
+        let chunk = chunk.context("read JWKS chunk")?;
         let next = body
             .len()
             .checked_add(chunk.len())
             .ok_or_else(|| anyhow::anyhow!("JWKS body size overflowed usize"))?;
         if next > MAX_JWKS_BYTES {
             anyhow::bail!(
-                "JWKS at {url} exceeded {MAX_JWKS_BYTES} bytes (received at least {next})"
+                "JWKS exceeded {MAX_JWKS_BYTES} bytes (received at least {next})"
             );
         }
         body.extend_from_slice(&chunk);
@@ -719,6 +736,30 @@ async fn refresh_jwks(client: &reqwest::Client, url: &str, validator: &IdentityV
     let document: serde_json::Value =
         serde_json::from_slice(&body).context("parse JWKS JSON")?;
     validator.add_jwks(&document).map_err(anyhow::Error::new)
+}
+
+/// Round-35 F2: stable string classifier for JWKS refresh failures
+/// suitable for structured logging without echoing the URL.
+fn classify_jwks_error(error: &anyhow::Error) -> &'static str {
+    if let Some(reqwest_err) = error.downcast_ref::<reqwest::Error>() {
+        if reqwest_err.is_timeout() {
+            "timeout"
+        } else if reqwest_err.is_connect() {
+            "connect"
+        } else if reqwest_err.is_body() {
+            "body"
+        } else if reqwest_err.status().is_some() {
+            "status"
+        } else {
+            "request"
+        }
+    } else if error.to_string().contains("exceeded") {
+        "oversize"
+    } else if error.to_string().contains("parse JWKS JSON") {
+        "parse"
+    } else {
+        "other"
+    }
 }
 
 fn build_bridge(config: &HarnessConfig, manifest: &BridgeManifest) -> Result<Arc<dyn EventBus>> {
@@ -1369,6 +1410,28 @@ mod tests {
             "expected JWKS cap error, got: {text}"
         );
         assert!(text.contains("4194304"), "expected cap size in error, got: {text}");
+        // Round-35 F2: the returned error MUST NOT contain the URL.
+        // anyhow's Display walks the whole context chain; if any
+        // `.with_context(|| format!("... {url}"))` or
+        // `anyhow::bail!("... {url} ...")` slipped back into
+        // refresh_jwks, this assertion fires. The URL character
+        // sequence "://" is the tightest proxy for "any URL leaked".
+        assert!(
+            !text.contains("://"),
+            "refresh_jwks error must be URL-free (JWKS URL is enterprise-topology-sensitive; \
+             see round-35 F2). Got: {text}"
+        );
+        assert!(
+            !text.contains(&addr.to_string()),
+            "refresh_jwks error must not contain the host:port either. Got: {text}"
+        );
+        // classify_jwks_error must return a stable non-identifying
+        // category — same URL-free posture on the log-side.
+        let category = classify_jwks_error(&err);
+        assert!(
+            !category.contains("://") && !category.contains(&addr.to_string()),
+            "classify_jwks_error must be URL-free. Got: {category}"
+        );
         server.abort();
     }
 
