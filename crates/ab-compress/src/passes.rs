@@ -149,9 +149,25 @@ fn stub_middle_to_target(
     tokens_before: u64,
     target_reduction_millis: u64,
 ) -> bool {
-    if messages.iter().any(|message| {
-        msg_content_str(message).is_some_and(|content| content.contains("reason: middle history]"))
-    }) {
+    // Bound the idempotence scan to the middle range only. A legitimate tail
+    // message that happens to quote the marker (a follow-up assistant reply
+    // summarizing a prior compression, or user-controlled content) would
+    // otherwise permanently disable this pass on that conversation.
+    //
+    // TODO(compression-marker): the marker itself is still an unauthenticated
+    // literal substring, so a hostile MIDDLE-range message can still spoof
+    // it and skip stubbing of surrounding messages. Fixing that requires
+    // switching to a keyed marker (HMAC over prior content) or an
+    // out-of-band per-payload flag — both are larger refactors.
+    let scan_end = tail_start.min(messages.len());
+    if messages
+        .get(..scan_end)
+        .into_iter()
+        .flatten()
+        .any(|message| {
+            msg_content_str(message).is_some_and(|content| content.contains("reason: middle history]"))
+        })
+    {
         return false;
     }
     let target_tokens =
