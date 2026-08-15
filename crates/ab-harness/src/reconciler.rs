@@ -889,6 +889,22 @@ impl Finalizer {
             if sessions.get(&session_id).is_some() {
                 continue;
             }
+            // Round-42 F1: previously the per-candidate "adopt +
+            // restore receipt" body used bare `?` on the receipt
+            // read/parse/verify calls, so a single corrupt or
+            // tamper-signed receipt on disk would abort recovery of
+            // every OTHER ATIF trajectory in the same tick (HOL
+            // block). Round-41 F1 fixed the same class of bug in
+            // `recover_signed_journals` and `consolidate_step_journals`;
+            // this branch was missed. Mirror the async-block +
+            // outcome-enum wrap so per-candidate errors warn+skip
+            // via the `ab_atif_trajectory_recovery_skipped_total`
+            // counter instead of stopping the scan.
+            enum AtifCandidateOutcome {
+                Recovered,
+                Skipped,
+            }
+            let outcome: Result<AtifCandidateOutcome, FinalizeError> = async {
             // Per-session lifecycle lock: scoped to this candidate only,
             // released at the end of this loop iteration so the next
             // candidate proceeds without waiting on all previous ones.
@@ -912,7 +928,7 @@ impl Finalizer {
                 .and_then(serde_json::Value::as_u64);
             let recovered_session = match sessions.try_insert_recovered(
                 Session::recover_unsigned(
-                    session_id,
+                    session_id.clone(),
                     ab_events::AgentIdentity {
                         version: trajectory.agent.version.clone(),
                         charter,
@@ -928,7 +944,7 @@ impl Finalizer {
                 Ok(inserted) => inserted,
                 Err(_active) => {
                     tracing::info!(session = %ab_core::fsutil::basename(&path), "unsigned recovery skipped: session already active");
-                    continue;
+                    return Ok(AtifCandidateOutcome::Skipped);
                 }
             };
             let receipt_path = self.receipt_path(&recovered_session.id);
@@ -978,7 +994,27 @@ impl Finalizer {
                     )));
                 }
             }
-            recovered += 1;
+            Ok(AtifCandidateOutcome::Recovered)
+            }.await;
+            match outcome {
+                Ok(AtifCandidateOutcome::Recovered) => recovered += 1,
+                Ok(AtifCandidateOutcome::Skipped) => {}
+                Err(error) => {
+                    self.metrics
+                        .counter(
+                            "ab_atif_trajectory_recovery_skipped_total",
+                            "ATIF trajectories skipped during recovery due to per-session errors (round-42 F1)",
+                        )
+                        .inc();
+                    if self.warn_once(path.clone()) {
+                        tracing::warn!(
+                            %error,
+                            path = %ab_core::fsutil::basename(&path),
+                            "skipping ATIF trajectory recovery due to per-session error; other sessions continue"
+                        );
+                    }
+                }
+            }
         }
         self.remove_acked_lifecycle_outboxes().await?;
         Ok(recovered + signed_recovered)
@@ -1339,9 +1375,34 @@ impl Finalizer {
                 session.mark_capture_failed();
                 return Ok(SignedCandidateOutcome::Recovered);
             }
-            self.close_session_locked(Arc::clone(&session), StopReason::SessionClosed)
-                .await?;
-            Ok(SignedCandidateOutcome::Recovered)
+            // Round-42 F3: `mark_artifact_committed()` above sealed the
+            // session against new leases before `try_insert_recovered`
+            // to plug the race the L1308 comment describes. But if
+            // `close_session_locked` then fails transiently (broker
+            // outage → Bridge; ENOSPC/EIO → Receipt; verify mismatch
+            // after key rotation → Receipt), the session sits in the
+            // registry with `artifact_committed = 1` forever:
+            // `is_closed()` is true so the idle sweeper skips it, and
+            // the next reconciler tick's L1080 registry-hit check
+            // returns Skipped so signed recovery never re-attempts.
+            // Remove the half-committed session on transient error so
+            // the next tick re-reads the still-present journal sidecar
+            // and re-adopts cleanly. `CaptureIncomplete` is a legit
+            // sealed-quarantine outcome (close_session_locked already
+            // set `claim.committed = true`), so leave those installed.
+            match self
+                .close_session_locked(Arc::clone(&session), StopReason::SessionClosed)
+                .await
+            {
+                Ok(_) => Ok(SignedCandidateOutcome::Recovered),
+                Err(FinalizeError::CaptureIncomplete) => {
+                    Err(FinalizeError::CaptureIncomplete)
+                }
+                Err(error) => {
+                    sessions.remove(&session.id);
+                    Err(error)
+                }
+            }
             }.await;
             match outcome {
                 Ok(SignedCandidateOutcome::Recovered) => recovered += 1,
@@ -2820,22 +2881,26 @@ mod tests {
         // Round-41 F1: per-session finalize errors during signed
         // recovery no longer propagate to the outer function's Err
         // — they warn+continue so one broken session cannot HOL-
-        // block every other. The security invariant this test
-        // enforces (post-error try_lease rejection) still holds via
-        // the round-14 F5 mark_artifact_committed-before-
-        // try_insert_recovered ordering: after close_session_locked
-        // Err, `is_closed()` is true, so lease is refused.
+        // block every other.
+        //
+        // Round-42 F3: transient close errors (Bridge / Receipt /
+        // Atif / Task) now REMOVE the half-committed session from
+        // the registry instead of leaving it orphaned with
+        // `artifact_committed = 1` forever. The security invariant
+        // this test enforces (post-error the session cannot be
+        // leased and thus cannot have its chain diverged) still
+        // holds — even more strongly, because the session is no
+        // longer in the registry to be looked up at all. The
+        // journal sidecar remains on disk so the next reconciler
+        // tick re-adopts cleanly once the transient cause clears.
         assert!(
             result.is_ok(),
             "round-41 F1: per-session errors warn+continue; got {result:?}",
         );
 
-        let session = registry
-            .get(session_id)
-            .expect("recovered signed session must remain in the registry after a finalize error");
         assert!(
-            session.try_lease().is_none(),
-            "recovered signed session must reject new leases even after finalize errors — otherwise a racing client request could take a lease, submit a worker job that appends to the recovered chain, and permanently diverge it from the persisted receipt's subject.event_count (also leaving a wrong-index entry sealed at file position N)",
+            registry.get(session_id).is_none(),
+            "round-42 F3: after a transient close error the session must be removed from the registry so the next reconciler tick can re-adopt via the still-present journal sidecar — leaving it in the registry with `is_closed()` = true would starve recovery forever",
         );
     }
 
@@ -3543,6 +3608,107 @@ mod tests {
         assert!(
             rendered.contains("ab_atif_recovery_skipped_total{reason=\"provenance\"}"),
             "skips must be visible to operators via metrics; got: {rendered}",
+        );
+    }
+
+    /// Round-42 F1: a corrupt on-disk receipt for one ATIF-recovered
+    /// session must NOT head-of-line-block recovery of every OTHER
+    /// unsigned session for the tick. Pre-fix, the receipt-restore
+    /// branch inside `recover_spooled_sessions`' ATIF loop used bare
+    /// `?` for `read_capped_async`, `Receipt::from_json_slice`, and
+    /// `verify_configured_receipt`, so a single garbage receipt file
+    /// aborted the entire scan at the outer function's Err.
+    ///
+    /// Round-41 F1 applied the same async-block-with-outcome-enum
+    /// pattern to `recover_signed_journals` +
+    /// `consolidate_step_journals`; this test locks in parity for
+    /// the third recovery loop.
+    #[tokio::test]
+    async fn round_42_f1_corrupt_receipt_does_not_block_other_atif_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let metrics = Arc::new(Registry::new());
+        let finalizer = Finalizer::new(
+            Arc::new(Ed25519Signer::from_seed(&[42; 32])),
+            directory.path().to_path_buf(),
+            Arc::clone(&metrics),
+        );
+        let step = ab_atif::Step {
+            step_id: 0,
+            timestamp: None,
+            source: ab_atif::Source::Agent,
+            message: serde_json::json!("archived response"),
+            reasoning_effort: None,
+            reasoning_content: None,
+            model_name: Some("test-model".into()),
+            tool_calls: None,
+            observation: None,
+            metrics: Some(ab_atif::Metrics {
+                prompt_tokens: Some(1),
+                completion_tokens: Some(1),
+                cached_tokens: Some(0),
+                cost_usd: Some(0.0),
+                logprobs: None,
+                completion_token_ids: None,
+                prompt_token_ids: None,
+                extra: None,
+            }),
+            is_copied_context: None,
+            llm_call_count: Some(1),
+            extra: None,
+        };
+        let identity = AgentIdentity {
+            version: "1".to_owned(),
+            charter: "test".into(),
+            instance_uid: "instance-1".to_owned(),
+            ttl_remaining_s: Some(600),
+        };
+        // Close two unsigned sessions to produce two valid ATIF
+        // trajectories (with matching .atif-auth sidecars). One will
+        // receive a poisoned receipt on disk; the other stays clean
+        // and must still recover.
+        for id in ["poisoned-receipt-session", "healthy-atif-session"] {
+            let session = Arc::new(Session::new(
+                id.to_owned(),
+                Workflow::Unsigned,
+                identity.clone(),
+                Default::default(),
+            ));
+            session.atif.lock().push_step(step.clone()).unwrap();
+            finalizer
+                .close_session(Arc::clone(&session), StopReason::SessionClosed)
+                .await
+                .unwrap();
+        }
+
+        // Plant a garbage receipt file at the exact path
+        // `recover_spooled_sessions` looks up for the first session.
+        // `Receipt::from_json_slice` will reject the bytes, which
+        // pre-round-42 propagated Err out of the outer function and
+        // aborted the whole scan before the second session was even
+        // examined.
+        let poisoned_receipt = directory.path().join("receipts").join(format!(
+            "{}.json",
+            &ab_core::digest::sha256_hex(b"poisoned-receipt-session")[..32]
+        ));
+        std::fs::create_dir_all(poisoned_receipt.parent().unwrap()).unwrap();
+        std::fs::write(&poisoned_receipt, b"{not valid receipt json").unwrap();
+
+        let registry = SessionRegistry::new();
+        let outcome = finalizer
+            .recover_spooled_sessions(&registry, &Default::default())
+            .await;
+        assert!(
+            outcome.is_ok(),
+            "round-42 F1: corrupt receipt must not abort the ATIF recovery scan; got {outcome:?}",
+        );
+        assert!(
+            registry.get("healthy-atif-session").is_some(),
+            "the healthy ATIF session MUST recover even when a sibling has a poisoned receipt — this is the HOL-block invariant",
+        );
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains("ab_atif_trajectory_recovery_skipped_total"),
+            "per-session ATIF recovery skips must be visible to operators via a dedicated counter; got: {rendered}",
         );
     }
 
