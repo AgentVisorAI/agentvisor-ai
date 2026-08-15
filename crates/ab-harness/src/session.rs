@@ -243,6 +243,16 @@ impl Session {
         self.closed.store(0, Ordering::Release);
     }
 
+    /// True once the receipt/ATIF artifact is durably persisted.
+    pub fn artifact_committed_flag(&self) -> bool {
+        self.artifact_committed.load(Ordering::Acquire) != 0
+    }
+
+    /// True once the close ran to full completion (journal removed).
+    pub fn close_complete_flag(&self) -> bool {
+        self.close_complete.load(Ordering::Acquire) != 0
+    }
+
     pub(crate) fn mark_artifact_committed(&self) {
         self.artifact_committed.store(1, Ordering::Release);
     }
@@ -427,6 +437,16 @@ impl Session {
             }
             notified.await;
         }
+    }
+
+    /// Number of forwarded chat responses currently streaming.
+    pub fn active_streams_count(&self) -> u64 {
+        self.active_streams.load(Ordering::Acquire)
+    }
+
+    /// Number of worker jobs accepted but not yet fully captured.
+    pub fn pending_jobs_count(&self) -> u64 {
+        self.pending_jobs.load(Ordering::Acquire)
     }
 
     pub(crate) fn mark_capture_failed(&self) {
@@ -643,6 +663,13 @@ impl SessionRegistry {
             })
             .map(|e| e.clone())
             .collect()
+    }
+
+    /// Snapshot every session in the registry — open, closed, or
+    /// capture-failed. Used by the dashboard to show recent activity
+    /// including sessions that have just been sealed but not yet evicted.
+    pub fn open_sessions_including_closed(&self) -> Vec<Arc<Session>> {
+        self.sessions.iter().map(|entry| entry.clone()).collect()
     }
 
     /// Snapshot every session still accepting work.

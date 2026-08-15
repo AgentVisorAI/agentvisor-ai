@@ -160,14 +160,9 @@ fn stub_middle_to_target(
     // switching to a keyed marker (HMAC over prior content) or an
     // out-of-band per-payload flag — both are larger refactors.
     let scan_end = tail_start.min(messages.len());
-    if messages
-        .get(..scan_end)
-        .into_iter()
-        .flatten()
-        .any(|message| {
-            msg_content_str(message).is_some_and(|content| content.contains("reason: middle history]"))
-        })
-    {
+    if messages.get(..scan_end).into_iter().flatten().any(|message| {
+        msg_content_str(message).is_some_and(|content| content.contains("reason: middle history]"))
+    }) {
         return false;
     }
     let target_tokens =

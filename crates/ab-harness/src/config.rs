@@ -191,6 +191,21 @@ pub struct HarnessConfig {
     /// raise this.
     #[serde(default = "default_max_request_bytes")]
     pub max_request_bytes: usize,
+
+    /// Whether the built-in read-only operator dashboard is enabled.
+    ///
+    /// When true (the default), the harness serves:
+    ///   * `GET /dashboard` — an HTML/CSS/JS single-page dashboard,
+    ///   * `GET /dashboard/{style.css,app.js}` — the bundled assets,
+    ///   * `GET /api/v1/dashboard/{stats,sessions,sessions/:id}` — read-only
+    ///     JSON that mirrors the in-memory session registry.
+    ///
+    /// The endpoints are unauthenticated: they expose the same data that
+    /// already lands on disk (receipts) and in `/metrics`. Front the
+    /// harness with the same ingress control you use for `/metrics` if
+    /// this is a concern, or set this to `false` to disable them.
+    #[serde(default = "default_dashboard_enabled")]
+    pub dashboard_enabled: bool,
 }
 
 fn default_config_version() -> u32 {
@@ -285,6 +300,9 @@ fn default_reconcile_tick() -> u64 {
 }
 fn default_max_request_bytes() -> usize {
     4 * 1024 * 1024
+}
+fn default_dashboard_enabled() -> bool {
+    true
 }
 
 /// Where the effective configuration came from.
@@ -779,6 +797,7 @@ impl HarnessConfig {
             budget: ab_state::BudgetSpec::default(),
             reconcile_tick_s: 1,
             max_request_bytes: default_max_request_bytes(),
+            dashboard_enabled: default_dashboard_enabled(),
         }
     }
 }
