@@ -1128,15 +1128,13 @@ async fn append_journal(
         });
         if !metadata_path.exists() {
             let metadata = crate::journal::seal(&journal_key, "metadata", 0, &metadata_payload)?;
-            let temporary = directory.join(format!("{stem}.{}.tmp", ab_core::new_event_uid()));
-            let mut file = std::fs::File::create(&temporary)
-                .map_err(|error| format!("create journal metadata {}: {error}", temporary.display()))?;
-            file.write_all(&metadata).map_err(|error| error.to_string())?;
-            file.sync_all().map_err(|error| error.to_string())?;
-            std::fs::rename(temporary, &metadata_path).map_err(|error| error.to_string())?;
-            std::fs::File::open(&directory)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|error| error.to_string())?;
+            // Use the centralized atomic writer: it uses an RAII guard
+            // so any intermediate failure (write_all / sync_all /
+            // rename) cannot leak a zero-byte `.tmp` orphan. A
+            // repeatedly-failing journal writer used to be able to
+            // exhaust the ext4 inode table long before disk-full.
+            ab_core::fsutil::write_atomic(&metadata_path, &metadata)
+                .map_err(|error| format!("write journal metadata {}: {error}", metadata_path.display()))?;
         } else {
             let stored: serde_json::Value = crate::journal::open(
                 &journal_key,
