@@ -110,6 +110,15 @@ pub(crate) struct WarnedArtifacts {
 
 impl WarnedArtifacts {
     fn new(cap: usize) -> Self {
+        // Round-20 F6: clamp `cap` to a minimum of 1. Under
+        // `cap: 0` the FIFO oscillated at size 1 (evicting the
+        // one entry on every insert), silently breaking the
+        // "warn once per path per window" contract. A future
+        // caller wiring the cap through `HarnessConfig` and
+        // mistyping the field to `0` would otherwise degrade to
+        // warning-once-for-one-artifact-ever. Clamp closes that
+        // failure mode without a panic path.
+        let cap = cap.max(1);
         Self {
             order: std::collections::VecDeque::new(),
             set: std::collections::HashSet::new(),
@@ -3680,6 +3689,23 @@ mod tests {
     /// artifact re-warn ONCE after it's evicted, but does not cause
     /// every legitimate artifact to re-warn together on the same
     /// tick when a rotating-timestamp attacker fills the cap.
+    /// Round-20 F6: `WarnedArtifacts::new(0)` used to degenerate
+    /// into oscillate-at-size-1 rather than reject or clamp. Now
+    /// clamps to cap.max(1) so a future config-wiring bug that
+    /// passes 0 doesn't silently break "warn once per artifact".
+    #[test]
+    fn warned_artifacts_clamps_zero_cap_to_one() {
+        let mut warned = WarnedArtifacts::new(0);
+        // First distinct entry is accepted.
+        assert!(warned.insert(PathBuf::from("a")));
+        assert_eq!(warned.len(), 1);
+        // Same entry is deduplicated (the whole point).
+        assert!(!warned.insert(PathBuf::from("a")));
+        // A distinct entry evicts the first — cap=1 (clamped).
+        assert!(warned.insert(PathBuf::from("b")));
+        assert_eq!(warned.len(), 1);
+    }
+
     #[test]
     fn warned_artifacts_evicts_one_at_a_time_not_all_at_once() {
         let mut warned = WarnedArtifacts::new(3);

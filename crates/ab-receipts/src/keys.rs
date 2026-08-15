@@ -33,10 +33,25 @@ impl Ed25519Signer {
     /// Generate a fresh keypair. The key id is derived from the public key
     /// (first 32 hex chars of its SHA-256) so ids are collision-resistant and
     /// never chosen by an attacker.
+    ///
+    /// Round-20 F5: defense-in-depth against a compromised
+    /// `getrandom` (VM without entropy, cloud image with a broken
+    /// `/dev/urandom`) — regenerate rather than accept an
+    /// all-zero or all-0xFF seed. Reader-side already refuses
+    /// these known-weak seeds (round-14); this closes the gap
+    /// for generator-side. Astronomically unlikely from a healthy
+    /// OsRng, but the failure mode is silent installation of a
+    /// globally-predictable keypair — cheap to guard.
     pub fn generate() -> Self {
-        let key = SigningKey::generate(&mut rand::rngs::OsRng);
-        let key_id = derive_key_id(&key.verifying_key());
-        Self { key_id, key }
+        loop {
+            let key = SigningKey::generate(&mut rand::rngs::OsRng);
+            let bytes = key.to_bytes();
+            if bytes == [0u8; 32] || bytes == [0xFFu8; 32] {
+                continue;
+            }
+            let key_id = derive_key_id(&key.verifying_key());
+            return Self { key_id, key };
+        }
     }
 
     /// Load from a 32-byte secret seed.
