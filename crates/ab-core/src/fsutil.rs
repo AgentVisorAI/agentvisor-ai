@@ -40,6 +40,27 @@ pub fn sync_directory(path: &Path) -> io::Result<()> {
 /// the spool. A repeatedly-failing writer would otherwise fill the inode
 /// table on ext4/xfs long before the disk is full — an operational silent
 /// death.
+///
+/// **Semantics of `Ok(())` vs `Err(...)` after `rename`:** once the tmp file
+/// has been atomically renamed onto `path`, the caller can consider the
+/// data durably visible. A post-rename `sync_directory` failure means the
+/// dirent may not survive an *immediate* power loss on POSIX-conformant
+/// filesystems (xfs, btrfs, ext4 with `data=ordered`), but the file is
+/// present and readable for every observer running now. Historically this
+/// function still returned `Err` in that case (round-12 F5), which
+/// misled callers whose retry logic assumes "Err → not present": they
+/// would either double-write (harmless but wasted IO) or, worse, treat
+/// the write as failed and skip session-state advancement while the
+/// file was in fact readable — producing a hard split between on-disk
+/// state and in-registry accounting.
+///
+/// Fix: post-rename `sync_directory` failure now becomes a
+/// `tracing::warn!` (best-effort) and `Ok(())` is returned. Callers
+/// that need a stronger guarantee should call `sync_directory` again
+/// after their own operation completes. A dedicated counter is not
+/// registered here because `fsutil` cannot depend on `ab-core`'s
+/// metrics registry without a cycle; harness-level callers can wrap
+/// this with their own counter if needed.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -54,25 +75,42 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()?;
     std::fs::rename(&temporary, path)?;
     guard.disarm();
-    sync_directory(parent)?;
+    if let Err(error) = sync_directory(parent) {
+        // Best-effort — the rename already succeeded so `path` is
+        // observable. Log the failure so operators can investigate
+        // filesystem or disk issues; do NOT return Err, which would
+        // wrongly steer callers into "the file is not there" retry
+        // logic.
+        tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "post-rename directory fsync failed; file is visible but its dirent may not survive an immediate power loss"
+        );
+    }
     Ok(())
 }
 
 /// RAII guard that unlinks a temp path unless [`disarm`](Self::disarm) is
 /// called. Used to prevent orphan `.tmp` files when an intermediate step
 /// between `File::create` and `rename` fails.
-struct TempPathGuard {
+///
+/// Public so callers with their own atomic-rename recipes (harness
+/// `install_seed_exclusive`, per-crate tmp files) can reuse the same
+/// unlink-on-drop discipline as [`write_atomic`].
+pub struct TempPathGuard {
     path: Option<std::path::PathBuf>,
 }
 
 impl TempPathGuard {
-    fn new(path: std::path::PathBuf) -> Self {
+    /// Arm the guard: `path` will be unlinked when the guard drops
+    /// unless [`disarm`](Self::disarm) is called first.
+    pub fn new(path: std::path::PathBuf) -> Self {
         Self { path: Some(path) }
     }
 
     /// Consume the guard without unlinking (call once the temp has been
     /// successfully renamed into its final path).
-    fn disarm(&mut self) {
+    pub fn disarm(&mut self) {
         self.path = None;
     }
 }
