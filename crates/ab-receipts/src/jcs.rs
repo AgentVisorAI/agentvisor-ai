@@ -27,18 +27,39 @@ pub enum JcsError {
     /// Non-finite number (unreachable via `serde_json::Value`, kept for defense).
     #[error("non-finite number cannot be canonicalized")]
     NonFinite,
+    /// Round-40 F5: value nesting exceeds `MAX_NESTED_DEPTH`.
+    ///
+    /// Current call sites all feed `canonicalize` a `Value` that was
+    /// parsed by `serde_json::from_slice` (default recursion limit
+    /// 128), or serialized from a typed struct with bounded depth,
+    /// so this cap is transitively already enforced. The cap here is
+    /// defense-in-depth against a future caller that pipes an
+    /// unbounded-parsed `Value` (e.g. `serde_json::Deserializer::
+    /// disable_recursion_limit`) or a merged deep tree — without
+    /// this bound, `write_value` would recurse until the OS stack
+    /// overflows.
+    #[error("value nesting exceeds {0}; JCS refuses to recurse further")]
+    TooDeep(usize),
 }
+
+/// Round-40 F5: matches `ab_receipts::receipt::MAX_NESTED_DEPTH`
+/// (128), which is also the serde_json default parser recursion
+/// limit — anything a legit strict-load receipt could carry.
+const MAX_NESTED_DEPTH: usize = 128;
 
 /// Canonicalize a JSON value per RFC 8785. Returns the canonical UTF-8 string.
 pub fn canonicalize(value: &Value) -> Result<String, JcsError> {
     // Typical receipt canonicalizes to a few hundred bytes; pre-allocate to
     // avoid the growth-doubling churn on the first few pushes.
     let mut out = String::with_capacity(512);
-    write_value(value, &mut out)?;
+    write_value(value, &mut out, 0)?;
     Ok(out)
 }
 
-fn write_value(value: &Value, out: &mut String) -> Result<(), JcsError> {
+fn write_value(value: &Value, out: &mut String, depth: usize) -> Result<(), JcsError> {
+    if depth > MAX_NESTED_DEPTH {
+        return Err(JcsError::TooDeep(MAX_NESTED_DEPTH));
+    }
     match value {
         Value::Null => out.push_str("null"),
         Value::Bool(true) => out.push_str("true"),
@@ -51,7 +72,7 @@ fn write_value(value: &Value, out: &mut String) -> Result<(), JcsError> {
                 if i > 0 {
                     out.push(',');
                 }
-                write_value(item, out)?;
+                write_value(item, out, depth + 1)?;
             }
             out.push(']');
         }
@@ -67,7 +88,7 @@ fn write_value(value: &Value, out: &mut String) -> Result<(), JcsError> {
                 write_string(key, out);
                 out.push(':');
                 if let Some(v) = map.get(*key) {
-                    write_value(v, out)?;
+                    write_value(v, out, depth + 1)?;
                 }
             }
             out.push('}');
@@ -362,5 +383,37 @@ mod tests {
         // through ryu and emit "-0".
         assert_eq!(ecma_number(0.0), "0");
         assert_eq!(ecma_number(-0.0), "0");
+    }
+
+    /// Round-40 F5: recursion is capped at `MAX_NESTED_DEPTH`. All
+    /// current call sites feed `canonicalize` a `Value` parsed by
+    /// serde_json (default limit 128) so this cap is transitively
+    /// redundant today, but a future caller that pipes a
+    /// disable_recursion_limit-parsed Value would otherwise
+    /// stack-overflow. Build a nested array manually (bypassing
+    /// serde_json's parser cap) and assert `TooDeep` is returned
+    /// cleanly rather than the process crashing.
+    #[test]
+    fn canonicalize_refuses_pathologically_nested_arrays() {
+        let mut v = Value::Array(vec![Value::Null]);
+        for _ in 0..MAX_NESTED_DEPTH + 10 {
+            v = Value::Array(vec![v]);
+        }
+        assert_eq!(
+            canonicalize(&v),
+            Err(JcsError::TooDeep(MAX_NESTED_DEPTH))
+        );
+    }
+
+    #[test]
+    fn canonicalize_accepts_depths_up_to_the_cap() {
+        // Build a nested tree at exactly MAX_NESTED_DEPTH to lock
+        // in the boundary behaviour. `MAX_NESTED_DEPTH + 1` is the
+        // cutoff; MAX itself must still succeed.
+        let mut v = Value::Null;
+        for _ in 0..MAX_NESTED_DEPTH {
+            v = Value::Array(vec![v]);
+        }
+        assert!(canonicalize(&v).is_ok());
     }
 }
