@@ -214,9 +214,28 @@ impl StateStore for InMemoryStore {
     /// or a duplicate refund; the transaction lock keeps the
     /// load/store pair atomic with respect to other spend / add
     /// operations on the same key.
+    ///
+    /// Round-34 F1: NEVER resurrect a cell that a concurrent
+    /// `remove_prefix` already dropped. The prior implementation
+    /// used `self.cell(key)` which materialises a fresh `0`
+    /// AtomicI64 in the DashMap via `entry().or_insert_with(...)`.
+    /// Under the round-33 lost-claim-plus-idle-close ordering
+    /// (mcp_call's sandbox-gate debit races with the reconciler's
+    /// clear_budget_state), the refund path would create a
+    /// permanent 0-cell for a sealed session that no future
+    /// remove_prefix would ever collect — attacker-driven memory
+    /// growth. Skip the refund silently when the cell is gone;
+    /// the "budget spent" state is already whatever the caller
+    /// wanted (probably 0) and there's nothing to compensate.
     fn refund(&self, key: &str, amount: u64) {
         let _transaction = self.transaction_lock.lock();
-        let cell = self.cell(key);
+        let Some(cell) = self
+            .counters
+            .get(key)
+            .map(|entry| Arc::clone(entry.value()))
+        else {
+            return;
+        };
         let prev = cell.load(Ordering::Acquire);
         let amount = i64::try_from(amount).unwrap_or(i64::MAX);
         let next = prev.saturating_sub(amount).max(0);
@@ -489,5 +508,51 @@ mod tests {
             matches!(outcome, Err(StateError::Overflow(_))),
             "expected Overflow rejection, got {outcome:?}"
         );
+    }
+
+    /// Round-34 F1: refund must NEVER resurrect a cell that a prior
+    /// remove_prefix cleared. The round-33 F1 refund path used
+    /// `self.cell(key)` which materialises a fresh 0-entry via
+    /// `entry().or_insert_with(...)`. Under the lost-claim-plus-
+    /// idle-close ordering (mcp_call sandbox-gate debit races
+    /// reconciler's clear_budget_state), that refund on a swept
+    /// session would leave a permanent zero-valued cell that no
+    /// future remove_prefix could reap — attacker-choosable
+    /// memory growth against a sealed session id.
+    #[test]
+    fn refund_after_remove_prefix_does_not_resurrect_cells() {
+        let s = InMemoryStore::new();
+        s.add("budget:{aaaa}:tool:db_write", 1).unwrap();
+        s.add("budget:{aaaa}:total_calls", 1).unwrap();
+        s.add("budget:{aaaa}:payout", 500_000).unwrap();
+        // Simulate the reconciler's clear_budget_state sweeping the
+        // session between the sandbox debit and the harness refund.
+        s.remove_prefix("budget:{aaaa}:");
+        assert_eq!(s.counters.len(), 0, "prefix sweep must have cleared all");
+        // Now the harness's refund path fires on the same three
+        // keys after the sweep — it must be a silent no-op, NOT
+        // a materialize-then-zero.
+        s.refund("budget:{aaaa}:tool:db_write", 1);
+        s.refund("budget:{aaaa}:total_calls", 1);
+        s.refund("budget:{aaaa}:payout", 500_000);
+        assert_eq!(
+            s.counters.len(),
+            0,
+            "refund on a swept session must not resurrect counter cells (attacker-choosable growth)"
+        );
+    }
+
+    /// Round-34 F1: refund on a live session (not swept) still
+    /// compensates the debit exactly. Ensures the no-resurrect
+    /// guard didn't break the happy path.
+    #[test]
+    fn refund_on_live_session_still_compensates_exactly() {
+        let s = InMemoryStore::new();
+        s.add("budget:{live}:tool:db_write", 3).unwrap();
+        s.refund("budget:{live}:tool:db_write", 1);
+        assert_eq!(s.get("budget:{live}:tool:db_write").unwrap(), 2);
+        // Over-refund saturates at 0.
+        s.refund("budget:{live}:tool:db_write", 10);
+        assert_eq!(s.get("budget:{live}:tool:db_write").unwrap(), 0);
     }
 }

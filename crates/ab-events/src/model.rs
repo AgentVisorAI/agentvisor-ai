@@ -219,8 +219,26 @@ pub struct Metadata {
 
 /// A schema-conformant agent event.
 ///
-/// Unknown inbound fields are preserved in `unmapped` (never silently dropped);
-/// outbound serialization is always the current schema shape.
+/// Unknown inbound fields at the TOP LEVEL are preserved in
+/// [`Self::unmapped`] (never silently dropped); outbound serialization
+/// is always the current schema shape.
+///
+/// # Round-34 F3 — additive tolerance is TOP-LEVEL ONLY
+///
+/// The `deny_unknown_fields` attribute on every nested struct
+/// ([`Metadata`], [`AgentIdentity`], [`Product`], [`CharterFile`],
+/// [`EventMetrics`], [`Fingerprint`]) means an unknown field INSIDE
+/// one of those objects fails deserialization for the whole event —
+/// it does NOT flow into `unmapped`. Cross-version replay of a
+/// mixed-fleet stream during a rolling upgrade therefore requires
+/// that nested-object shape additions bump `config_version` in
+/// lockstep with the schema; only newly-added TOP-LEVEL fields are
+/// safe to deploy incrementally. This asymmetry is deliberate:
+/// nested types are the audit-trail schema surface consumers commit
+/// to (SIEM ingestion pipelines depend on their exact shape), while
+/// the top-level union tolerates additive OCSF evolution so
+/// consumers can continue to parse events emitted by newer nodes
+/// during a rolling deploy of the harness itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OcsfEvent {
     /// Event metadata.
