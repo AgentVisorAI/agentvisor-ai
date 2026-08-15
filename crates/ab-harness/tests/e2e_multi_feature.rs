@@ -303,7 +303,7 @@ fn min_manifest() -> BridgeManifest {
 }
 
 #[test]
-fn publish_idempotent_dedup_survives_retention_purge() {
+fn publish_idempotent_dedup_expires_with_retention() {
     let dir = tempfile::tempdir().unwrap();
     let cold = tempfile::tempdir().unwrap();
     let mut m = min_manifest();
@@ -321,16 +321,25 @@ fn publish_idempotent_dedup_survives_retention_purge() {
     let now = record.stored_at + u64::from(m.topics[0].retention.hot_hours) * 3_600_000 + 1;
     let expired = broker.enforce_retention(now).unwrap();
     assert_eq!(expired, 1);
-    // Re-publish the same UID: MUST still dedup to the original offset.
+    // Re-publish the same UID: after retention purged the original record,
+    // the idempotency map must NOT return the stale offset — a follow-up
+    // fetch(old_offset) would return either nothing or an unrelated event.
+    // The correct behavior is to append fresh; the new ack points at a
+    // record that actually exists.
     let ack2 = broker
         .publish_idempotent("agent.tool_call", "inst", &value, "durable-dedup")
         .unwrap();
-    assert_eq!(
-        ack1.offset, ack2.offset,
-        "in-memory UID map must persist across retention: got old={} new={}",
-        ack1.offset, ack2.offset
+    assert!(
+        ack2.offset > ack1.offset,
+        "post-retention republish must land on a fresh offset (old={} new={}); \
+         returning the stale offset would point at expired data",
+        ack1.offset,
+        ack2.offset,
     );
-    assert_eq!(ack1.partition, ack2.partition);
+    // The fresh ack points at a real record.
+    let refetched = broker.fetch("agent.tool_call", 0, ack2.offset, 1).unwrap();
+    assert_eq!(refetched.len(), 1);
+    assert_eq!(refetched[0].offset, ack2.offset);
 }
 
 // ------------------------------------------------------------------
