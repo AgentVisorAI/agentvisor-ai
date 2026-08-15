@@ -11,6 +11,7 @@
     "trajectory_id": { "type": "string" },
     "agent": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["name", "version"],
       "properties": {
         "name": { "type": "string", "minLength": 1 },
@@ -74,6 +75,7 @@
           },
           "metrics": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
               "prompt_tokens": { "type": "integer", "minimum": 0 },
               "completion_tokens": { "type": "integer", "minimum": 0 },

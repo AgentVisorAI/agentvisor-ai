@@ -57,12 +57,6 @@ pub(crate) fn open<T: DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<T, String> {
     let envelope: Envelope = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
-    if envelope.index != expected_index {
-        return Err(format!(
-            "journal index {}, expected {expected_index}",
-            envelope.index
-        ));
-    }
     // Round-17 F9: HMAC-SHA256 renders as exactly 64 hex chars. A
     // fs-tamper attacker with a multi-MB mac field would otherwise
     // force `hex::decode` to allocate half the string length on
@@ -75,10 +69,23 @@ pub(crate) fn open<T: DeserializeOwned>(
         ));
     }
     let claimed = hex::decode(&envelope.mac).map_err(|error| error.to_string())?;
+    // Round-26 F3: verify the MAC BEFORE any index-mismatch branch.
+    // The old order (index check first, MAC last) meant that an
+    // fs-tamper attacker with read access to the journal directory
+    // could probe `expected_index` for every position and learn the
+    // reconciler's on-disk cursor via the disclosed `envelope.index`
+    // and `expected_index` in the error text. Not a forgery hole —
+    // the MAC still guards authenticity — but it's a position
+    // oracle that lets an adversary map the state machine and craft
+    // targeted quarantine denial-of-restore attacks. Verify first,
+    // then compare positions with a generic error.
     let verifier = build_mac(key, domain, envelope.index, &envelope.payload)?;
     verifier
         .verify_slice(&claimed)
         .map_err(|_| "journal authentication failed".to_owned())?;
+    if envelope.index != expected_index {
+        return Err("journal position mismatch".to_owned());
+    }
     serde_json::from_value(envelope.payload).map_err(|error| error.to_string())
 }
 
@@ -169,6 +176,44 @@ mod tests {
         assert!(
             !err.contains("authentication"),
             "missing-mac error {err:?} must not leak MAC-verification status",
+        );
+    }
+
+    /// Round-26 F3: an fs-tamper attacker with read access to the
+    /// journal directory used to be able to probe `expected_index`
+    /// by feeding any envelope with a wrong index and reading both
+    /// values out of the disclosed error text — a position oracle
+    /// for the reconciler's on-disk cursor. Now MAC is verified
+    /// first; a wrong-index envelope with a real MAC returns a
+    /// generic "position mismatch"; a wrong-index envelope with a
+    /// forged MAC returns "authentication failed"; neither reveals
+    /// `envelope.index` or `expected_index`.
+    #[test]
+    fn round_26_f3_index_mismatch_error_does_not_disclose_position() {
+        let key = [17; 32];
+        // Envelope legitimately sealed at index=3.
+        let sealed_at_3 = seal(&key, "domain", 3, &serde_json::json!({"k": "v"})).unwrap();
+        // Caller expects index=99 — the check now fires AFTER MAC verify
+        // succeeds, and the error must not carry either number.
+        let err = open::<serde_json::Value>(&key, "domain", 99, &sealed_at_3).unwrap_err();
+        assert!(
+            !err.contains("3") && !err.contains("99"),
+            "position mismatch error must not disclose either index; got {err:?}"
+        );
+        assert!(
+            !err.contains("authentication"),
+            "mismatch on a genuine envelope must not be labelled an auth failure; got {err:?}"
+        );
+        // A wrong-index envelope with a forged MAC should be labelled
+        // authentication (the MAC check fires first now, so a probe
+        // never reaches the position compare on a forgery).
+        let mut envelope: serde_json::Value = serde_json::from_slice(&sealed_at_3).unwrap();
+        envelope["mac"] = serde_json::json!("00".repeat(32));
+        let forged = serde_json::to_vec(&envelope).unwrap();
+        let err = open::<serde_json::Value>(&key, "domain", 99, &forged).unwrap_err();
+        assert!(
+            err.contains("authentication"),
+            "forged MAC must fail as authentication, not position mismatch; got {err:?}"
         );
     }
 }
