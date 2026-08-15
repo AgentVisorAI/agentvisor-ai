@@ -7,6 +7,30 @@ yanked = "deny"
 # `number_prefix` reached via tokenizers -> indicatif). Real security
 # advisories still fail the check.
 unmaintained = "workspace"
+# Round-44 F5: RUSTSEC-2023-0071 (Marvin Attack on `rsa` 0.9.x) is
+# UNREACHABLE from our runtime. The vulnerability is a timing side
+# channel in RSA private-key operations. `rsa` is pulled in transitively
+# via `jsonwebtoken`'s `rust_crypto` feature (jsonwebtoken 10.4 makes
+# this feature monolithic — no way to opt out of `rsa` while keeping
+# ed25519+hmac).
+#
+# Our JWT validator at crates/ab-identity/src/validator.rs:395-413
+# whitelists exactly two algorithms — `Algorithm::EdDSA` (for Ed25519
+# key material) and `Algorithm::HS256` (for HMAC secrets) — and
+# explicitly rejects any other `alg` header BEFORE calling
+# `jsonwebtoken::decode`. `Validation::new(expected_alg)` further pins
+# the decoder to the whitelisted alg. A malicious JWT claiming
+# `alg: RS256` therefore never reaches the RSA code path.
+#
+# The workspace has no other `rsa`-crate consumers (grep confirms zero
+# `use rsa` and zero `Algorithm::RS*` sites). No safe upgrade of the
+# `rsa` crate is available upstream; RustCrypto's tracking issue is
+# https://github.com/RustCrypto/RSA/issues/626 . Revisit if either
+# (a) jsonwebtoken splits the `rust_crypto` feature so we can drop
+# `rsa`, or (b) an RSA-fixed release ships.
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "rsa crate is a transitive dep of jsonwebtoken's rust_crypto feature; our JWT validator whitelists only EdDSA and HS256 and rejects other algs before decoding, so the RSA timing side-channel code path is unreachable at runtime" },
+]
 
 [licenses]
 version = 2
