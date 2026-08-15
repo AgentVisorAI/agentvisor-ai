@@ -113,7 +113,23 @@ pub struct HarnessConfig {
     #[serde(default = "default_hmac_kid")]
     pub identity_hmac_kid: String,
     /// Enforce operation scopes on validated identities.
-    #[serde(default = "default_true")]
+    ///
+    /// Round-30 F1: default flipped from `true` to `false` so it
+    /// matches the also-default-`false` posture of
+    /// [`Self::require_identity`]. When `require_identity = false`,
+    /// unauthenticated requests short-circuit to the anonymous
+    /// identity BEFORE the scope gate runs — an operator who reads
+    /// `enforce_identity_scopes = true` in the config would
+    /// reasonably conclude "you need the scope to reach /v1/chat",
+    /// but in the default posture curl-with-no-header still
+    /// proceeds as anonymous. `validate()` now rejects the
+    /// `enforce_identity_scopes = true && require_identity = false`
+    /// combination outright; keeping the two defaults aligned makes
+    /// the shipped `harness.example.toml` and `harness.container.toml`
+    /// pass validate without extra changes. Operators turning on
+    /// identity enforcement in production set both flags to `true`
+    /// explicitly (see `harness.docker.toml`).
+    #[serde(default)]
     pub enforce_identity_scopes: bool,
     /// Scope required for chat completion requests.
     #[serde(default = "default_chat_scope")]
@@ -693,6 +709,31 @@ impl HarnessConfig {
         {
             return Err("require_identity=true needs identity_jwks_url or identity_hmac_secret_file".into());
         }
+        // Round-30 F1: reject the silent-anonymous-bypass posture.
+        // `enforce_identity_scopes = true` looks like it's guarding
+        // routes with `chat_scope` / `session_close_scope` / `tool:*`
+        // — but the scope check lives INSIDE the `(Some bearer, Some
+        // validator)` arm of `Pipeline::resolve_identity`. When
+        // `require_identity = false` (the shipped default), a request
+        // with no `Authorization` header short-circuits to the
+        // anonymous fallback and never sees the scope gate. The
+        // operator reads `enforce_identity_scopes = true` in
+        // `agentbridge.toml` and reasonably concludes "you need the
+        // chat scope to reach /v1/chat/completions" — in fact curl
+        // with no header proceeds as `anonymous`, producing the
+        // exact repudiation vector round-15 F3's Bearer-case fix
+        // documented. Refuse the combo so operators either turn
+        // enforcement off (making the posture explicit) or turn
+        // identity on.
+        if self.enforce_identity_scopes && !self.require_identity {
+            return Err(
+                "enforce_identity_scopes=true has no effect while require_identity=false: \
+                 unauthenticated requests fall through to the anonymous identity and bypass \
+                 the scope gate entirely. Either set require_identity=true, or set \
+                 enforce_identity_scopes=false to make the posture explicit."
+                    .into(),
+            );
+        }
         if self.identity_jwks_refresh_s == 0 {
             return Err("identity_jwks_refresh_s must be greater than zero".into());
         }
@@ -831,6 +872,73 @@ impl HarnessConfig {
                 ));
             }
         }
+        // Round-30 F2: extend the scheme allowlist to every URL
+        // field. `identity_jwks_url`, `qdrant_url`, `bridge_endpoint`
+        // (when NATS), and `state_endpoint` (when Redis) all used to
+        // be handed to their respective clients without preflight.
+        // A typo like `identity_jwks_url = "auth.internal/jwks"`
+        // (missing scheme) would pass `abctl config-validate` and
+        // only fail at first fetch — after the process was already
+        // serving traffic with an empty validator (every token ->
+        // UnknownKid). A hostile config-injection
+        // `identity_jwks_url = "file:///etc/passwd"` used to be
+        // just as invisible. Reject shape early.
+        if let Some(url) = self
+            .identity_jwks_url
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return Err(format!(
+                    "identity_jwks_url must be http:// or https://, got {url:?}"
+                ));
+            }
+        }
+        if self.vector_backend == "qdrant" {
+            if let Some(url) = self
+                .qdrant_url
+                .as_deref()
+                .filter(|value| !value.is_empty())
+            {
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
+                    return Err(format!(
+                        "qdrant_url must be http:// or https://, got {url:?}"
+                    ));
+                }
+            }
+        }
+        if self.state_backend == "redis" {
+            if let Some(url) = self
+                .state_endpoint
+                .as_deref()
+                .filter(|value| !value.is_empty())
+            {
+                if !(url.starts_with("redis://")
+                    || url.starts_with("rediss://")
+                    || url.starts_with("unix:"))
+                {
+                    return Err(format!(
+                        "state_endpoint (redis backend) must be redis://, rediss:// or unix:, got {url:?}"
+                    ));
+                }
+            }
+        }
+        if self.bridge_backend == "nats" {
+            if let Some(url) = self
+                .bridge_endpoint
+                .as_deref()
+                .filter(|value| !value.is_empty())
+            {
+                if !(url.starts_with("nats://") || url.starts_with("tls://")) {
+                    return Err(format!(
+                        "bridge_endpoint (nats backend) must be nats:// or tls://, got {url:?}"
+                    ));
+                }
+            }
+        }
+        // Kafka bridge_endpoint is a `host:port[,host:port]` bootstrap
+        // list, not a URL — no scheme check applies. rdkafka rejects
+        // malformed values on connect.
         Ok(())
     }
 
@@ -1229,5 +1337,92 @@ mod tests {
             "err should name the offending field: {err}"
         );
         assert!(err.contains("milliseconds"), "hint should mention ms: {err}");
+    }
+
+    /// Round-30 F1: refuse `enforce_identity_scopes = true` while
+    /// `require_identity = false`. The combo silently falls through
+    /// to the anonymous identity on unauthenticated requests,
+    /// making the scope config a fig leaf.
+    #[test]
+    fn round_30_f1_scope_enforcement_requires_identity_requirement() {
+        let err = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api.openai.com"
+               require_identity = false
+               enforce_identity_scopes = true"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("enforce_identity_scopes"),
+            "err should name the flag: {err}"
+        );
+        assert!(
+            err.contains("require_identity"),
+            "err should name the correlate: {err}"
+        );
+        // Both `false` = clean dev posture, still passes.
+        assert!(HarnessConfig::from_toml(
+            r#"upstream_url = "https://api.openai.com"
+               require_identity = false
+               enforce_identity_scopes = false"#,
+        )
+        .is_ok());
+    }
+
+    /// Round-30 F2: refuse URL fields that omit the scheme or use a
+    /// scheme the client library will not accept. Preflight beats a
+    /// runtime failure after the process is already serving traffic.
+    #[test]
+    fn round_30_f2_url_scheme_allowlist_enforced() {
+        // JWKS URL: missing scheme.
+        let err = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               identity_jwks_url = "auth.internal/jwks""#,
+        )
+        .unwrap_err();
+        assert!(err.contains("identity_jwks_url"), "{err}");
+        assert!(err.contains("http://") || err.contains("https://"), "{err}");
+        // JWKS URL: file scheme is a config-injection surface.
+        let err = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               identity_jwks_url = "file:///etc/passwd""#,
+        )
+        .unwrap_err();
+        assert!(err.contains("identity_jwks_url"), "{err}");
+        // Redis state_endpoint: bad scheme.
+        let err = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               state_backend = "redis"
+               state_endpoint = "http://cache""#,
+        )
+        .unwrap_err();
+        assert!(err.contains("state_endpoint"), "{err}");
+        // NATS bridge_endpoint: bad scheme.
+        let err = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               bridge_backend = "nats"
+               bridge_endpoint = "http://bus""#,
+        )
+        .unwrap_err();
+        assert!(err.contains("bridge_endpoint"), "{err}");
+        // Qdrant: missing scheme.
+        let err = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               vector_backend = "qdrant"
+               qdrant_url = "vectors.internal:6333""#,
+        )
+        .unwrap_err();
+        assert!(err.contains("qdrant_url"), "{err}");
+        // Legit values pass.
+        assert!(HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               identity_jwks_url = "https://auth.internal/jwks"
+               state_backend = "redis"
+               state_endpoint = "redis://cache:6379"
+               bridge_backend = "nats"
+               bridge_endpoint = "nats://bus:4222"
+               vector_backend = "qdrant"
+               qdrant_url = "https://vectors.internal:6333""#,
+        )
+        .is_ok());
     }
 }
