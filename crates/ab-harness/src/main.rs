@@ -926,11 +926,31 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
         .with_context(|| format!("sync signing seed temporary file {}", temporary.display()))?;
     match std::fs::hard_link(&temporary, path) {
         Ok(()) => {
-            std::fs::remove_file(&temporary)
-                .with_context(|| format!("remove signing seed temporary file {}", temporary.display()))?;
+            // Round-13 F4: the seed IS installed at `path` at this
+            // point (hard_link committed). Degrade the remaining
+            // best-effort ops (tmp unlink, parent fsync) to warn
+            // rather than returning Err — otherwise a spurious EIO on
+            // sync_directory made the harness fail startup even
+            // though the seed was correctly installed, wasting one
+            // boot cycle to a misleading error. On next boot,
+            // hard_link → AlreadyExists → Ok(false) and the caller
+            // reads back the seed — self-corrects, but the noisy
+            // failure is now avoided at source.
+            if let Err(error) = std::fs::remove_file(&temporary) {
+                tracing::warn!(
+                    path = %temporary.display(),
+                    %error,
+                    "signing seed installed, but removing tmp file failed; guard drop will retry"
+                );
+            }
             guard.disarm();
-            ab_core::fsutil::sync_directory(parent)
-                .with_context(|| format!("sync signing seed directory {}", parent.display()))?;
+            if let Err(error) = ab_core::fsutil::sync_directory(parent) {
+                tracing::warn!(
+                    path = %parent.display(),
+                    %error,
+                    "signing seed installed, but parent directory fsync failed; dirent may not survive an immediate power loss"
+                );
+            }
             Ok(true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {

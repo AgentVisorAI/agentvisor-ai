@@ -505,6 +505,32 @@ fn bearer_token(path: Option<&Path>) -> Result<Option<String>> {
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("AB_BEARER_TOKEN_FILE").map(PathBuf::from));
     path.map(|path| {
+        // Round-13: refuse a bearer token file that any other local
+        // user can read. On a shared-tenant host, a 0o644 token file
+        // in ~/.abctl/ leaks the operator's credentials to every
+        // process running as another uid. Mirrors the harness's own
+        // discipline for signing seed / HMAC secret files (see
+        // `require_owner_only_mode`).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = std::fs::symlink_metadata(&path)
+                .with_context(|| format!("stat bearer token {}", path.display()))?;
+            if metadata.file_type().is_symlink() {
+                anyhow::bail!(
+                    "bearer token file {} is a symbolic link; refuse to follow (planted-symlink hazard)",
+                    path.display()
+                );
+            }
+            let mode = metadata.mode() & 0o777;
+            if mode & 0o077 != 0 {
+                anyhow::bail!(
+                    "bearer token file {} has mode 0o{mode:03o}; must be 0o600 (chmod 600 {})",
+                    path.display(),
+                    path.display()
+                );
+            }
+        }
         let token = std::fs::read_to_string(&path)
             .with_context(|| format!("read bearer token {}", path.display()))?;
         let token = token.trim().to_owned();
