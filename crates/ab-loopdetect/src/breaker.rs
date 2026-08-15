@@ -157,16 +157,39 @@ impl SessionLoopState {
         let mut inner = self.inner.lock();
         inner.tokens_consumed = inner.tokens_consumed.saturating_add(step_tokens);
 
-        let adjacent_delta = match &inner.prev_embedding {
-            Some(prev) => 1.0 - cosine(prev, &embedding),
-            None => 1.0, // first step: maximum novelty by definition
+        // Fail-closed on non-finite or all-zero embeddings: a hostile
+        // or misconfigured embedder can produce NaN/Inf vectors (any
+        // arithmetic through `cosine`'s clamp path would return NaN,
+        // and NaN < delta_epsilon is false, so the streak resets on
+        // every step and the breaker never trips). An all-zero vector
+        // is the ONNX embedder's error fallback — treating it as
+        // maximum novelty lets a client with malformed prompts drive
+        // the breaker into "novel-forever" mode. In both cases, treat
+        // the step as a duplicate of the previous one (delta = 0),
+        // which conservatively grows the streak.
+        let embedding_is_finite = embedding.iter().all(|x| x.is_finite());
+        let embedding_is_all_zero = embedding.iter().all(|x| *x == 0.0);
+        let embedding_is_hostile = !embedding_is_finite || embedding_is_all_zero;
+
+        let adjacent_delta = if embedding_is_hostile {
+            0.0
+        } else {
+            match &inner.prev_embedding {
+                Some(prev) => 1.0 - cosine(prev, &embedding),
+                None => 1.0, // first step: maximum novelty by definition
+            }
         };
         let delta = nearest_similarity
             .filter(|similarity| similarity.is_finite())
             .map_or(adjacent_delta, |similarity| {
                 adjacent_delta.min(1.0 - similarity.clamp(-1.0, 1.0))
             });
-        inner.prev_embedding = Some(embedding);
+        // Only record the embedding for future adjacent comparisons
+        // when it's usable — a stored NaN vector would poison every
+        // subsequent step's cosine.
+        if !embedding_is_hostile {
+            inner.prev_embedding = Some(embedding);
+        }
         inner.deltas.push_back(delta);
         if inner.deltas.len() > 32 {
             inner.deltas.pop_front();
@@ -345,5 +368,57 @@ mod tests {
             s.observe_embedding_with_similarity(vec![-1.0, 0.0], 10, Some(0.99)),
             BreakerVerdict::Tripped { streak: 2, .. }
         ));
+    }
+
+    /// A hostile / misconfigured embedder that returns all-zero vectors
+    /// (the ONNX embedder's error fallback) or NaN/Inf vectors must not
+    /// let a caller drive the breaker into "novel-forever" mode.
+    /// Zero-vector adjacent delta is `1.0 - cosine(0, 0)`; `cosine`
+    /// short-circuits `0.0` on either magnitude, so the raw delta is
+    /// `1.0` — full novelty on every step, streak never grows, breaker
+    /// never trips. NaN vectors take the clamp path and produce NaN
+    /// deltas which compare false against `delta_epsilon`, same effect.
+    /// Fail-closed: treat both as maximum suspicion (delta = 0).
+    #[test]
+    fn all_zero_embedding_does_not_defeat_the_breaker() {
+        let s = SessionLoopState::new(BreakerConfig {
+            window: 3,
+            min_tokens: 0,
+            ..BreakerConfig::default()
+        });
+        // Three consecutive all-zero steps must trip, not walk indefinitely.
+        for _ in 0..2 {
+            let verdict = s.observe_embedding_with_similarity(vec![0.0; 4], 10, None);
+            assert!(
+                matches!(
+                    verdict,
+                    BreakerVerdict::Suspicious { .. } | BreakerVerdict::Progressing { .. }
+                ),
+                "unexpected verdict during buildup: {verdict:?}"
+            );
+        }
+        let final_verdict = s.observe_embedding_with_similarity(vec![0.0; 4], 10, None);
+        assert!(
+            matches!(final_verdict, BreakerVerdict::Tripped { .. }),
+            "3rd all-zero step must trip the breaker, got {final_verdict:?}"
+        );
+    }
+
+    #[test]
+    fn nan_embedding_does_not_defeat_the_breaker() {
+        let s = SessionLoopState::new(BreakerConfig {
+            window: 2,
+            min_tokens: 0,
+            ..BreakerConfig::default()
+        });
+        // First step establishes prev_embedding.
+        let _ = s.observe_embedding_with_similarity(vec![1.0, 0.0], 10, None);
+        // Two NaN steps: treated as duplicate (delta = 0), streak grows.
+        let _ = s.observe_embedding_with_similarity(vec![f32::NAN, 0.0], 10, None);
+        let tripped = s.observe_embedding_with_similarity(vec![0.0, f32::NAN], 10, None);
+        assert!(
+            matches!(tripped, BreakerVerdict::Tripped { .. }),
+            "NaN vectors must not slip past the breaker; got {tripped:?}"
+        );
     }
 }
