@@ -24,6 +24,12 @@ services:
     # docker compose down sends SIGKILL mid-finalise, dropping receipts
     # and truncating ATIF trajectories.
     stop_grace_period: 120s
+    # Round-24 F2: pair the systemd-side Restart=on-failure hardening
+    # (round-19 F7) with a compose-side policy. Without this, a single
+    # OOMKill leaves agent-bridge Exited with no healthcheck consulted
+    # and no alert path. Use `unless-stopped` so `docker compose down`
+    # still works predictably (as opposed to `always`).
+    restart: unless-stopped
     # Match the Kubernetes securityContext: no fresh privileges after fork,
     # drop every Linux capability, and cap process/memory footprint so a
     # runaway or compromised worker cannot starve the host.
@@ -96,6 +102,7 @@ services:
     # host's network interfaces.
     ports:
       - "127.0.0.1:19092:19092"
+    restart: unless-stopped
     command:
       - redpanda
       - start
@@ -107,6 +114,14 @@ services:
       - --check=false
       - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
       - --advertise-kafka-addr=internal://redpanda:9092,external://127.0.0.1:19092
+    # Round-24 F3: pin the Kafka log dir onto a named volume so
+    # `docker compose down` / `docker rm` / image bumps do not destroy
+    # every signed receipt, ATIF trajectory, and lifecycle outbox the
+    # bridge has published. The compose file's whole reason to exist
+    # (over docker-compose.minimal.yml) is a durable audit trail;
+    # redis-data was already pinned, redpanda-data was missed.
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
     healthcheck:
       test: ["CMD-SHELL", "rpk cluster health | grep -Eq 'Healthy:[[:space:]]+true'"]
       interval: 10s
@@ -120,6 +135,7 @@ services:
     # working without publishing an unauthenticated Redis to the world.
     ports:
       - "127.0.0.1:6379:6379"
+    restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
       - redis-data:/data
@@ -134,6 +150,7 @@ services:
     # Internal-only vector DB (see redpanda note above).
     ports:
       - "127.0.0.1:6333:6333"
+    restart: unless-stopped
     volumes:
       - qdrant-data:/qdrant/storage
     healthcheck:
@@ -147,7 +164,15 @@ services:
     # Internal-only JetStream bus.
     ports:
       - "127.0.0.1:4222:4222"
-    command: ["-js", "-m", "8222"]
+    restart: unless-stopped
+    # Round-24 F3: pin JetStream state to a named volume with `-sd`
+    # so the audit-trail bus (when bridge_backend = "nats") is not
+    # destroyed on container restart. `-js` alone stores JetStream in
+    # a randomly-named tmp dir under /tmp on some images and in
+    # /data on others; being explicit removes that ambiguity.
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    volumes:
+      - nats-data:/data
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8222/healthz"]
       interval: 5s
@@ -160,19 +185,28 @@ services:
     ports:
       - "127.0.0.1:4317:4317"
       - "127.0.0.1:4318:4318"
+    restart: unless-stopped
     volumes:
       - ./vector.toml:/etc/vector/vector.toml:ro
-      # NOTE: mounting the docker socket even read-only lets Vector enumerate
-      # every container's env vars via the docker API. Keep the socket out
-      # of production; switch this source to `journald` or `file` and use
-      # a docker-socket-proxy if you truly need container discovery.
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Round-24 F1: the docker socket was previously mounted read-only
+      # for the docker_logs source. Read-only does NOT prevent Vector
+      # (or a malicious VRL transform) from calling `docker inspect` on
+      # every co-scheduled container, including agent-bridge, whose
+      # environment holds AB_UPSTREAM_API_KEY. The source has been
+      # switched to OTLP-only (agent-bridge already sends OTel logs via
+      # the compose network on 4318). If you need container-log
+      # discovery, put a docker-socket-proxy in front and remount only
+      # the proxy's socket. See docs/ops/vector.md.
+      # - /var/run/docker.sock:/var/run/docker.sock:ro
 
 volumes:
   bridge-data:
   atif-spool:
   qdrant-data:
   redis-data:
+  # Round-24 F3: persistent home for the audit-trail buses.
+  redpanda-data:
+  nats-data:
 
 secrets:
   identity_hmac:

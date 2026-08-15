@@ -66,7 +66,12 @@ async fn main() -> Result<()> {
         .retry_marked_promotions(&state.sessions)
         .await
         .context("retry durable promotions")?;
-    let bridge_maintenance = spawn_bridge_maintenance(Arc::clone(&state.bridge), Arc::clone(&state.metrics));
+    let bridge_maintenance_shutdown = Arc::new(tokio::sync::Notify::new());
+    let bridge_maintenance = spawn_bridge_maintenance(
+        Arc::clone(&state.bridge),
+        Arc::clone(&state.metrics),
+        Arc::clone(&bridge_maintenance_shutdown),
+    );
     let reconciler = spawn_reconciler(
         Arc::clone(&state.sessions),
         state.finalizer.clone(),
@@ -143,7 +148,13 @@ async fn main() -> Result<()> {
         }
     };
     reconciler.abort();
-    bridge_maintenance.abort();
+    // Round-24 F5: signal maintenance to stop instead of aborting.
+    // JoinHandle::abort() only cancels the outer async task; a
+    // spawn_blocking closure that's already running keeps rewriting
+    // Bridge segments to completion and races the process exit.
+    // Notify makes the loop return between ticks so the shutdown
+    // .await below actually waits for the blocking work to finish.
+    bridge_maintenance_shutdown.notify_one();
     // Round-12 F1: abort the JWKS refresh task on shutdown so the
     // infinite `loop { interval.tick() ... }` cannot outlive the
     // harness's outbound HTTP hygiene. Previously the JoinHandle was
@@ -449,6 +460,7 @@ fn load_manifest(config: &HarnessConfig) -> Result<BridgeManifest> {
 fn spawn_bridge_maintenance(
     bridge: Arc<dyn EventBus>,
     metrics: Arc<ab_core::metrics::Registry>,
+    shutdown: Arc<tokio::sync::Notify>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
@@ -457,7 +469,20 @@ fn spawn_bridge_maintenance(
         // once per hour even if the previous run took 30 minutes.
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            interval.tick().await;
+            // Round-24 F5: previously `bridge_maintenance.abort()`
+            // was used at shutdown, but JoinHandle::abort() cancels
+            // only the outer async task — the `spawn_blocking`
+            // closure below cannot be cancelled, so the OS thread
+            // keeps rewriting bridge segments concurrently with
+            // `flush_telemetry` and process exit. Race the shutdown
+            // notify against the tick so the loop can exit cleanly
+            // between ticks, and also skip a fresh spawn_blocking
+            // if shutdown fired during the tick's own await.
+            tokio::select! {
+                biased;
+                () = shutdown.notified() => return,
+                _ = interval.tick() => {}
+            }
             // Supervise the tick body: a panic inside the async wrapper
             // (e.g., an allocator failure in tracing::warn's Display
             // impl) would otherwise silently kill maintenance, and the
