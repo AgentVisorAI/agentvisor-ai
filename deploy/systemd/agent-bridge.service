@@ -3,7 +3,7 @@
 # Install:
 #   sudo useradd --system --home /var/lib/agent-bridge --shell /usr/sbin/nologin agent-bridge
 #   sudo mkdir -p /var/lib/agent-bridge /etc/agent-bridge
-#   sudo cp target/release/agent-bridge /usr/local/bin/
+#   sudo cp target/release/agentbridged /usr/local/bin/
 #   sudo cp target/release/abctl /usr/local/bin/
 #   cd /etc/agent-bridge && sudo abctl init --preset openai --output agentbridge.toml
 #   # Round-18 F1: generate the receipt trust anchor BEFORE first boot.
@@ -53,7 +53,7 @@ Environment=AB_CONFIG=/etc/agent-bridge/agentbridge.toml
 Environment=AB_SIGNING_SEED_FILE=/etc/agent-bridge/signing.seed
 # API keys live here, mode 0600, never in the unit file:
 EnvironmentFile=-/etc/agent-bridge/secrets.env
-ExecStart=/usr/local/bin/agent-bridge
+ExecStart=/usr/local/bin/agentbridged
 Restart=on-failure
 RestartSec=2
 

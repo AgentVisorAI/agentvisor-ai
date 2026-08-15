@@ -37,10 +37,13 @@ client = OpenAI(
 ## Easiest start (no config, no exports)
 
 ```bash
-cargo install --path crates/ab-harness --bin agent-bridge
-cargo install --path crates/ab-cli --bin abctl
+cargo install ab-harness ab-cli    # installs `agentbridged` + `abctl` binaries
 abctl
 ```
+
+> The two crates land on crates.io from `v0.1.0` onwards; until that
+> release is published, use the `--path` variants shown in
+> [Install from source](#install-from-source) below.
 
 Bare `abctl` launches a guided setup: pick your AI provider from a
 numbered list, paste your API key once (typed hidden, stored
@@ -56,14 +59,13 @@ variables, no terminal knowledge beyond typing a number.
 Pick the row that matches your provider, then run two commands.
 
 ```bash
-cargo install --path crates/ab-harness --bin agent-bridge   # or: cargo build --release
-cargo install --path crates/ab-cli --bin abctl
+cargo install ab-harness ab-cli    # or see "Install from source" below
 ```
 
 ```bash
 abctl init --preset openai     # writes agentbridge.toml + prints next steps
 export OPENAI_API_KEY=sk-...
-agent-bridge                   # http://127.0.0.1:8484
+agentbridged                   # http://127.0.0.1:8484
 ```
 
 Point any OpenAI-compatible SDK at `http://127.0.0.1:8484/v1` and use it as normal. Receipts, events, and trajectories appear under `data/`.
@@ -71,8 +73,26 @@ Point any OpenAI-compatible SDK at `http://127.0.0.1:8484/v1` and use it as norm
 No config file at all also works — built-in defaults plus one env var:
 
 ```bash
-AB_UPSTREAM_URL=http://127.0.0.1:11434 agent-bridge   # e.g. Ollama
+AB_UPSTREAM_URL=http://127.0.0.1:11434 agentbridged   # e.g. Ollama
 ```
+
+### Install from source
+
+Cloning the repo works too — useful for development, or before the
+first crates.io release lands:
+
+```bash
+git clone https://github.com/debugmode0/agent-bridge && cd agent-bridge
+cargo install --path crates/ab-harness   # installs `agentbridged`
+cargo install --path crates/ab-cli       # installs `abctl`
+```
+
+### Why the binary is `agentbridged`, not `agent-bridge`
+
+The name `agent-bridge` on crates.io is taken by an unrelated
+project (a Codex/Claude/Gemini CLI). To avoid collision, our server
+binary is `agentbridged` (daemon suffix, `d`) and the crate is
+`ab-harness`. The `abctl` CLI is unchanged and lives in `ab-cli`.
 
 ### Provider presets
 
@@ -124,7 +144,7 @@ Alternatively `upstream_authorization_passthrough = true` relays each client's o
 ## Run from a checkout
 
 ```bash
-cargo run -p ab-harness --bin agent-bridge     # finds config/harness.example.toml
+cargo run -p ab-harness --bin agentbridged     # finds config/harness.example.toml
 curl http://127.0.0.1:8484/health
 curl http://127.0.0.1:8484/metrics
 ```
