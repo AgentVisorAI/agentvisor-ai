@@ -150,8 +150,27 @@ impl IdentityValidator {
     }
 
     /// Register key material under a `kid`.
-    pub fn add_key(&self, kid: impl Into<String>, key: KeyMaterial) {
-        self.keys.write().insert(kid.into(), key);
+    ///
+    /// Round-25 F2: refuse to shadow a JWKS-tracked kid. Without
+    /// this guard, an ordering hazard silently discarded operator
+    /// intent: if `add_key("X", …)` was called for a kid `X` that
+    /// a prior `add_jwks` had installed, the manual entry would
+    /// overwrite the JWKS one — but `jwks_kids` still contained
+    /// `X`, so the *next* `add_jwks` drain would remove `X` and
+    /// reinstall the JWKS version, silently discarding the
+    /// operator's manual key. `add_key` is normally a startup
+    /// call, but nothing in the API constrained late/admin use.
+    pub fn add_key(&self, kid: impl Into<String>, key: KeyMaterial) -> Result<(), IdentityError> {
+        let kid = kid.into();
+        let prior = self.jwks_kids.read();
+        if prior.contains(&kid) {
+            return Err(IdentityError::Jwks(format!(
+                "manual kid {kid:?} conflicts with a JWKS-tracked kid; rotate JWKS first"
+            )));
+        }
+        drop(prior);
+        self.keys.write().insert(kid, key);
+        Ok(())
     }
 
     /// Add all supported Ed25519 keys from a standard JWKS document. Keys
@@ -195,6 +214,40 @@ impl IdentityValidator {
                 || key.get("crv").and_then(serde_json::Value::as_str) != Some("Ed25519")
             {
                 continue;
+            }
+            // Round-25 F1: respect RFC 7517 §4.2/§4.4. A JWK's
+            // `use` (public key use) member — when present — MUST
+            // be "sig" for verification material; "enc" keys are
+            // encryption-only and MUST NOT be installed for
+            // signature verification. Similarly `alg` — when
+            // present — MUST identify the algorithm intended for
+            // this key. For OKP/Ed25519 that's exclusively
+            // "EdDSA" (RFC 8037 §3.1). An IdP that ships an
+            // encryption-only key with a signing-domain kid
+            // (misconfig or partial compromise) would otherwise
+            // be silently installed as a verifier. Signature
+            // correctness is still protected by the alg/kty
+            // check at verify time, so this is defence-in-depth
+            // rather than a direct forgery close, but it aligns
+            // with the IdP's stated policy so audits can rely on
+            // it.
+            let kid_for_diag = key
+                .get("kid")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<missing>");
+            if let Some(use_) = key.get("use").and_then(serde_json::Value::as_str) {
+                if use_ != "sig" {
+                    return Err(IdentityError::Jwks(format!(
+                        "kid {kid_for_diag:?} declares use={use_:?}; only \"sig\" is accepted"
+                    )));
+                }
+            }
+            if let Some(alg) = key.get("alg").and_then(serde_json::Value::as_str) {
+                if alg != "EdDSA" {
+                    return Err(IdentityError::Jwks(format!(
+                        "kid {kid_for_diag:?} declares alg={alg:?}; only \"EdDSA\" is accepted for OKP/Ed25519"
+                    )));
+                }
             }
             let kid = key
                 .get("kid")

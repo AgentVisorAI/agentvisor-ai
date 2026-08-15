@@ -69,7 +69,7 @@ fn mint(keys: &TestKeys, claims: &NhiClaims) -> String {
 
 fn validator(keys: &TestKeys) -> IdentityValidator {
     let v = IdentityValidator::new("harness-prod");
-    v.add_key(keys.kid.clone(), KeyMaterial::Ed25519Pem(keys.public_pem.clone()));
+    v.add_key(keys.kid.clone(), KeyMaterial::Ed25519Pem(keys.public_pem.clone())).unwrap();
     v
 }
 

@@ -66,7 +66,7 @@ fn mint(keys: &TestKeys, claims: &NhiClaims) -> String {
 
 fn validator(keys: &TestKeys) -> IdentityValidator {
     let v = IdentityValidator::new("harness-prod");
-    v.add_key(keys.kid.clone(), KeyMaterial::Ed25519Pem(keys.public_pem.clone()));
+    v.add_key(keys.kid.clone(), KeyMaterial::Ed25519Pem(keys.public_pem.clone())).unwrap();
     v
 }
 
@@ -352,7 +352,8 @@ fn hs256_with_shared_secret_works_and_is_isolated() {
     v.add_key(
         "hmac-1",
         KeyMaterial::HmacSecret(b"super-secret-dev-key".to_vec()),
-    );
+    )
+    .unwrap();
     let mut header = Header::new(Algorithm::HS256);
     header.kid = Some("hmac-1".into());
     let token = jsonwebtoken::encode(
@@ -425,7 +426,9 @@ fn add_jwks_refuses_to_overwrite_a_manually_registered_kid() {
     let manual = ed25519_keys("shared-kid");
     let jwks = ed25519_keys("shared-kid"); // same kid, different key material
     let validator = IdentityValidator::new("harness-prod");
-    validator.add_key(&manual.kid, KeyMaterial::Ed25519Jwk(manual.public_x.clone()));
+    validator
+        .add_key(&manual.kid, KeyMaterial::Ed25519Jwk(manual.public_x.clone()))
+        .unwrap();
     // Refuses with a helpful Jwks error.
     let err = validator
         .add_jwks(&serde_json::json!({
@@ -549,5 +552,87 @@ fn cve_2026_25537_string_nbf_is_rejected_not_bypassed() {
     assert!(
         matches!(outcome, Err(IdentityError::Verification(_) | IdentityError::Malformed(_))),
         "string-nbf token must be rejected (CVE-2026-25537 class), got {outcome:?}",
+    );
+}
+
+/// Round-25 F1: JWKS refuses a key that declares `use = "enc"`.
+/// Signature correctness is still protected by the alg-vs-kty
+/// verify-time check, but silently installing an encryption-only
+/// key as a signing verifier violates the IdP's stated policy —
+/// audits can now rely on the refusal.
+#[test]
+fn round_25_f1_jwks_refuses_use_enc_okp_key() {
+    let keys = ed25519_keys("enc-key");
+    let validator = IdentityValidator::new("harness-prod");
+    let err = validator
+        .add_jwks(&serde_json::json!({
+            "keys": [{
+                "kid": keys.kid,
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "use": "enc",
+                "x": keys.public_x,
+            }]
+        }))
+        .unwrap_err();
+    let text = format!("{err:?}");
+    assert!(
+        text.contains("use") && text.contains("sig"),
+        "expected use=enc rejection, got {text}"
+    );
+}
+
+/// Round-25 F1: JWKS refuses a key that declares alg != "EdDSA".
+#[test]
+fn round_25_f1_jwks_refuses_wrong_alg_okp_key() {
+    let keys = ed25519_keys("bad-alg-key");
+    let validator = IdentityValidator::new("harness-prod");
+    let err = validator
+        .add_jwks(&serde_json::json!({
+            "keys": [{
+                "kid": keys.kid,
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "alg": "RS256",
+                "x": keys.public_x,
+            }]
+        }))
+        .unwrap_err();
+    let text = format!("{err:?}");
+    assert!(
+        text.contains("EdDSA"),
+        "expected wrong-alg rejection, got {text}"
+    );
+}
+
+/// Round-25 F2: `add_key` refuses to shadow a kid the JWKS drain
+/// tracks. Previously a startup or admin `add_key("X", ...)` call
+/// on a kid `X` currently in `jwks_kids` silently overwrote the
+/// JWKS material — and the next `add_jwks` drain silently
+/// discarded the operator's manual key. Refuse at the source.
+#[test]
+fn round_25_f2_add_key_refuses_jwks_tracked_kid() {
+    let jwks_keys = ed25519_keys("shared-kid");
+    let validator = IdentityValidator::new("harness-prod");
+    validator
+        .add_jwks(&serde_json::json!({
+            "keys": [{
+                "kid": jwks_keys.kid,
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": jwks_keys.public_x,
+            }]
+        }))
+        .unwrap();
+    let err = validator
+        .add_key(
+            "shared-kid",
+            KeyMaterial::HmacSecret(b"attempted-manual-override".to_vec()),
+        )
+        .unwrap_err();
+    let text = format!("{err:?}");
+    assert!(
+        text.contains("JWKS-tracked"),
+        "expected JWKS-tracked-conflict rejection, got {text}"
     );
 }
