@@ -129,6 +129,16 @@ spec:
             runAsNonRoot: false
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
+            # Round-26 F6: the pod-level securityContext does not set
+            # a default seccompProfile, so the initContainer would
+            # otherwise inherit `Unconfined` on any cluster whose
+            # namespace does not enforce a PodSecurity `restricted`
+            # label. The main container correctly sets
+            # RuntimeDefault (below), but the initContainer runs as
+            # uid 0 with CHOWN+FOWNER — a much bigger surface if
+            # exposed to the full kernel ABI. Filter the same way.
+            seccompProfile:
+              type: RuntimeDefault
             capabilities:
               add: ["CHOWN", "FOWNER"]
               drop: ["ALL"]

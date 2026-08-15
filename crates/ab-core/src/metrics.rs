@@ -356,17 +356,29 @@ fn escape_prom_help(help: &str) -> String {
         match c {
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
-            // Round-20 F3 + round-21 F4: replace CR and every
-            // other C0 control (0x00–0x1F except LF which we
-            // just escaped) with a literal space. `validate_
-            // metric_key` already refuses these bytes in metric
-            // keys; the HELP-side didn't. NUL trips promtool
-            // lint / grafana-agent; ESC (0x1B) lets a caller who
-            // controls HELP text inject ANSI codes into
-            // operator terminals via `abctl` piped `/metrics`.
-            // Space is the same convention prometheus_client-
-            // python's `_ESCAPE_RE` uses.
-            c if (c as u32) < 0x20 => out.push(' '),
+            // Round-20 F3 + round-21 F4 + round-26 F4: replace CR
+            // and every other C0 control (0x00–0x1F except LF
+            // which we just escaped) with a literal space.
+            // `validate_metric_key` already refuses these bytes
+            // in metric keys; the HELP-side didn't. NUL trips
+            // promtool lint / grafana-agent; ESC (0x1B) lets a
+            // caller who controls HELP text inject ANSI codes
+            // into operator terminals via `abctl` piped
+            // `/metrics`. Round-26 F4 widens the substitution to
+            // cover DEL (0x7F) and the C1 range (0x80..=0x9F) —
+            // CSI (0x9B) is a valid single-byte ANSI escape
+            // prefix under 8-bit terminal emulation, so a HELP
+            // text carrying a `\u{9b}...` sequence renders the
+            // same way in an 8-bit-clean terminal as the C0
+            // ESC+`[` prefix we already scrub. Space is the
+            // same convention prometheus_client-python's
+            // `_ESCAPE_RE` uses.
+            c if (c as u32) < 0x20
+                || (c as u32) == 0x7f
+                || (0x80..=0x9f).contains(&(c as u32)) =>
+            {
+                out.push(' ');
+            }
             other => out.push(other),
         }
     }
@@ -598,5 +610,29 @@ mod tests {
         let h2 = r.histogram("ab_other", "help");
         h1.observe_us(50);
         assert_eq!(h2.count(), 1, "must return the same underlying histogram");
+    }
+
+    /// Round-26 F4: HELP text escaper substitutes DEL (0x7F) and every
+    /// C1 control (0x80..=0x9F) with a literal space. Round-20/21
+    /// hardened C0 already; C1 was left through and CSI (0x9B) is a
+    /// valid single-byte ANSI escape prefix under 8-bit terminal
+    /// emulation. A future counter registration with operator-
+    /// influenced HELP text (charter name / model name / SSE error
+    /// snippet) that happened to include a C1 byte could otherwise
+    /// inject terminal-escape sequences through `curl /metrics | less`.
+    #[test]
+    fn escape_prom_help_scrubs_del_and_c1_controls() {
+        let dangerous = "help\u{7f}with\u{9b}csi\u{80}c1\u{9f}end";
+        let out = escape_prom_help(dangerous);
+        for c in ['\u{7f}', '\u{9b}', '\u{80}', '\u{9f}'] {
+            assert!(
+                !out.contains(c),
+                "escape_prom_help left {c:?} in {out:?}"
+            );
+        }
+        // The safe chars are preserved.
+        assert!(out.contains("help"));
+        assert!(out.contains("csi"));
+        assert!(out.contains("end"));
     }
 }
