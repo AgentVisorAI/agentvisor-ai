@@ -778,6 +778,64 @@ impl Finalizer {
             {
                 continue;
             }
+            // Round-44 F1: cheap sidecar-existence check FIRST — before
+            // the 64 MiB read + serde parse + strict validate. Without
+            // this ordering, N sidecar-less files (attacker-planted OR
+            // honest crashes between reconciler.rs:497 `write_atomic` and
+            // :504 `ensure_atif_provenance`) would burn O(N * 64 MiB)
+            // IO per 5 s reconciler tick, missing tick cadence and
+            // starving lifecycle-outbox replay, close completion,
+            // promotion retry, and idle eviction.
+            //
+            // Round-44 F4: quarantine sidecar-less files after the warn
+            // so per-tick cost is bounded to a single stat+rename per
+            // file, regardless of how many the attacker plants or how
+            // long a crash-torn orphan persists. Data cannot be
+            // authenticated without a `journal_key`-signed sidecar (an
+            // attacker-planted trajectory would forge a session's
+            // audit trail if we generated a sidecar from bytes on
+            // recovery), so orphaned trajectories are unrecoverable by
+            // design; renaming to `<name>.corrupt-<uid>` moves them
+            // out of the recovery scan glob (the `.json` extension
+            // filter at :767 rejects the renamed file) while preserving
+            // the bytes for operator forensic inspection.
+            if !path.with_extension("atif-auth").exists() {
+                self.metrics
+                    .counter(
+                        "ab_atif_recovery_skipped_total{reason=\"unauthenticated\"}",
+                        "ATIF spool files skipped during recovery",
+                    )
+                    .inc();
+                let mut quarantine = path.clone();
+                let stem = quarantine
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .unwrap_or("orphan-atif")
+                    .to_owned();
+                let new_name = format!("{stem}.corrupt-{}", ab_core::new_event_uid());
+                quarantine.set_file_name(new_name);
+                match tokio::fs::rename(&path, &quarantine).await {
+                    Ok(()) => {
+                        if self.warn_once(quarantine.clone()) {
+                            tracing::warn!(
+                                original = %ab_core::fsutil::basename(&path),
+                                quarantine = %ab_core::fsutil::basename(&quarantine),
+                                "quarantined ATIF spool file with no authenticated provenance"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        if self.warn_once(path.clone()) {
+                            tracing::warn!(
+                                %error,
+                                path = %ab_core::fsutil::basename(&path),
+                                "failed to quarantine ATIF spool file with no authenticated provenance; will retry next tick"
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
             // Bounded read: a hostile ATIF file cannot force recovery to
             // buffer arbitrary bytes. The size cap catches the coarsest
             // resource-exhaustion vector; adversarial JSON within the cap
@@ -851,25 +909,10 @@ impl Finalizer {
             let Some(session_id) = trajectory.session_id.clone() else {
                 continue;
             };
-            // Integrity failures must not abort the scan: one tampered or
-            // orphaned artifact would otherwise starve recovery of every
-            // other session on every tick. The file stays on disk as
-            // evidence; warn once and keep going.
-            if !path.with_extension("atif-auth").exists() {
-                self.metrics
-                    .counter(
-                        "ab_atif_recovery_skipped_total{reason=\"unauthenticated\"}",
-                        "ATIF spool files skipped during recovery",
-                    )
-                    .inc();
-                if self.warn_once(path.clone()) {
-                    tracing::warn!(
-                        path = %ab_core::fsutil::basename(&path),
-                        "ignoring ATIF spool file with no authenticated provenance"
-                    );
-                }
-                continue;
-            }
+            // Round-44 F1: sidecar existence is now checked early
+            // (before the read+parse+validate) at the top of this
+            // loop iteration, so orphan sidecar-less files no longer
+            // reach this point.
             if let Err(error) = self.ensure_atif_provenance(&path, &session_id).await {
                 self.metrics
                     .counter(
@@ -2214,6 +2257,34 @@ impl Finalizer {
         let pending = sessions.pending_close_sessions();
         let mut completed = 0usize;
         for session in pending {
+            // Round-44 F3: acquire the per-session lifecycle lock
+            // before running the finalization tail. Without this the
+            // sweep could race with a concurrent client `/v1/close`
+            // (which also enters through `close_session` and holds
+            // `acquire_lifecycle`), producing:
+            //   - two parallel `resolve_lifecycle_ack` calls on the
+            //     same event UID → duplicate SESSION_CLOSE OCSF
+            //     events on the bridge for one session close,
+            //   - transient re-creation of a just-deleted outbox
+            //     file after the client's `remove_lifecycle_outbox`
+            //     ran (visible to disk snapshots / backups),
+            //   - split audit trail if a chat request arriving
+            //     during the sweep triggers `get_or_open` reopen
+            //     while the client's original `/close` is still
+            //     `.await`ing on the old Arc.
+            // The lifecycle lock is the same one every other
+            // finalize path takes (reconciler.rs:302), so this
+            // preserves the "close_session_locked is the single
+            // serialization point for finalization tail work"
+            // invariant.
+            let _lifecycle = self.acquire_lifecycle(&session.id).await;
+            // Re-check state under the lock — a concurrent client
+            // close may have already driven this session to
+            // completion between `pending_close_sessions()` and
+            // this point.
+            if !session.artifact_committed_flag() || session.close_complete_flag() {
+                continue;
+            }
             let workflow = session.workflow.as_str();
             let outcome: Result<(), FinalizeError> = async {
                 self.emit_bridge_event(
@@ -3204,6 +3275,133 @@ mod tests {
         assert!(
             !directory.path().join(format!("{stem}.session.json")).exists(),
             "step journal metadata sidecar must be removed by the completion sweep",
+        );
+    }
+
+    /// Round-44 F1: sidecar-less ATIF files (attacker plants OR
+    /// honest crash-torn state between `write_atomic` and
+    /// `ensure_atif_provenance`) must be checked cheaply and
+    /// quarantined on first sighting — NOT read + parsed +
+    /// strict-validated on every reconciler tick. Pre-fix, N such
+    /// files would each burn a 64 MiB read + serde deserialize +
+    /// strict validate every 5 s, starving the tick cadence and
+    /// blocking lifecycle-outbox replay, close completion,
+    /// promotion retry, and idle eviction.
+    #[tokio::test]
+    async fn round_44_f1_sidecar_less_atif_is_quarantined_without_reading_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let finalizer = finalizer(directory.path());
+        // Plant a `.json` file that would look like an ATIF spool
+        // artifact but has no `.atif-auth` sidecar. Use bytes that
+        // would definitely fail to parse — if the fix regresses and
+        // the parser runs, the test will still pass because the
+        // `invalid_json` skip branch also does `continue`, but the
+        // quarantine rename assertion below distinguishes the
+        // fix from the regression.
+        let orphan = directory.path().join("hostileplant0000000000000000.json");
+        std::fs::write(&orphan, b"{not valid json at all - this MUST NOT be parsed").unwrap();
+
+        let registry = SessionRegistry::new();
+        let outcome = finalizer
+            .recover_spooled_sessions(&registry, &Default::default())
+            .await;
+        assert!(outcome.is_ok(), "orphan must not fail the outer scan; got {outcome:?}");
+
+        // The orphan must have been renamed out of the `.json`
+        // extension so subsequent ticks skip it in O(1). Pre-fix
+        // it would still be at `hostileplant....json` costing a
+        // full read+parse per tick.
+        assert!(
+            !orphan.exists(),
+            "sidecar-less ATIF must be quarantined-renamed after first sighting so subsequent ticks don't re-read it",
+        );
+        // Some sibling file must exist with the same stem plus a
+        // `.corrupt-<uid>` suffix — the operator-forensic bytes.
+        let mut found_quarantine = false;
+        for entry in std::fs::read_dir(directory.path()).unwrap() {
+            let entry = entry.unwrap();
+            if let Some(name) = entry.file_name().to_str() {
+                if name.contains(".json.corrupt-") {
+                    found_quarantine = true;
+                }
+            }
+        }
+        assert!(
+            found_quarantine,
+            "quarantined file must be preserved on disk under a `.corrupt-<uid>` name for forensic inspection",
+        );
+    }
+
+    /// Round-44 F2: the pending-close sweep must NOT touch the
+    /// empty-unsigned quarantine. That reject path
+    /// (reconciler.rs:442-449) sets `artifact_committed = 1` but
+    /// never wrote an ATIF file and never emitted a receipt.
+    /// Driving the finalization tail on it would emit a spurious
+    /// SESSION_CLOSE bridge event for a session that has no
+    /// observable audit event on the wire, AND mark
+    /// `close_complete = 1` which lets `get_or_open` (reopen=true)
+    /// silently replace the quarantined Session on the next chat
+    /// request — losing the incident evidence the reject was
+    /// designed to preserve.
+    #[tokio::test]
+    async fn round_44_f2_empty_unsigned_quarantine_excluded_from_pending_close_sweep() {
+        let directory = tempfile::tempdir().unwrap();
+        let finalizer = finalizer(directory.path());
+        let sessions = SessionRegistry::new();
+        let empty = session(Workflow::Unsigned);
+        // Install into the registry so the sweep can see it.
+        let empty_id = empty.id.clone();
+        sessions
+            .insert_recovered(Arc::try_unwrap(empty).unwrap_or_else(|arc| {
+                Session::new(
+                    arc.id.clone(),
+                    arc.workflow,
+                    arc.current_identity(),
+                    Default::default(),
+                )
+            }));
+        let registered = sessions.get(&empty_id).unwrap();
+
+        // The empty-unsigned close reject is the code path we're
+        // simulating. It returns Err after `mark_artifact_committed`
+        // + `claim.committed = true`, so post-error the session
+        // has `artifact_committed = 1`, `close_complete = 0`,
+        // `capture_failed = 0`, and no `atif_path` — the exact
+        // shape that used to trip the sweep.
+        let result = finalizer
+            .close_session(Arc::clone(&registered), StopReason::SessionClosed)
+            .await;
+        assert!(
+            matches!(result, Err(FinalizeError::Atif(_))),
+            "empty unsigned close must reject; got {result:?}",
+        );
+        assert!(
+            registered.artifact_committed_flag(),
+            "empty-unsigned reject seals with artifact_committed to stop idle-sweep churn",
+        );
+        assert!(
+            registered.is_empty_unsigned_quarantine(),
+            "empty-unsigned reject must be recognizable as a quarantine",
+        );
+
+        // Pre-round-44 F2 the sweep would have picked this up.
+        // Post-fix it must be excluded so no spurious SESSION_CLOSE
+        // event is emitted and `close_complete` stays 0 (preserving
+        // the incident evidence — a subsequent get_or_open won't
+        // replace this session).
+        let pending = sessions.pending_close_sessions();
+        assert!(
+            pending.iter().all(|s| s.id != empty_id),
+            "empty-unsigned quarantine must be excluded from pending_close_sessions()",
+        );
+        let completed = finalizer.complete_pending_closes(&sessions).await.unwrap();
+        assert_eq!(
+            completed, 0,
+            "sweep must NOT complete the empty-unsigned quarantine — evidence would be lost",
+        );
+        assert!(
+            !registered.close_complete_flag(),
+            "close_complete must remain 0 for the empty-unsigned quarantine so it can NOT be reopened by get_or_open (reopen=true) — preserving the incident record",
         );
     }
 
