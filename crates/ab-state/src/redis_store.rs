@@ -239,4 +239,40 @@ impl StateStore for RedisStore {
             }
         }
     }
+
+    /// Round-33 F1: saturating refund via `DECRBY` + a MAX(0) clamp.
+    /// Best-effort — errors are silently swallowed so a Redis blip on
+    /// the compensation path can never turn a lost-race response into
+    /// a 5xx. Redis `DECRBY` on a missing key initialises to
+    /// `-amount`; the `MAX(0)` guard runs unconditionally so that
+    /// case clamps to 0 and never leaves negative budget.
+    fn refund(&self, key: &str, amount: u64) {
+        // Redis DECRBY takes i64. Cap at i64::MAX so a caller passing
+        // u64::MAX cannot silently wrap into a negative value.
+        let amount = i64::try_from(amount).unwrap_or(i64::MAX);
+        let clamp_script = r#"
+            local new = redis.call('DECRBY', KEYS[1], ARGV[1])
+            if new < 0 then
+                redis.call('SET', KEYS[1], 0)
+                return 0
+            end
+            return new
+        "#;
+        match &self.backend {
+            RedisBackend::Single(pool) => {
+                if let Ok(mut connection) = pool.get() {
+                    let _: Result<i64, _> = redis::Script::new(clamp_script)
+                        .key(key)
+                        .arg(amount)
+                        .invoke(&mut *connection);
+                }
+            }
+            RedisBackend::Cluster(connection) => {
+                let _: Result<i64, _> = redis::Script::new(clamp_script)
+                    .key(key)
+                    .arg(amount)
+                    .invoke(&mut *connection.lock());
+            }
+        }
+    }
 }

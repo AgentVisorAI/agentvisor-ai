@@ -375,3 +375,65 @@ fn subagent_recursion_is_depth_capped() {
         issues.first(),
     );
 }
+
+/// Round-33 F3: `subagent_trajectory_ref` inside `observation.results[]`
+/// is v1.7-only. The sibling root-level `subagent_trajectories` is
+/// already gated (validate.rs:258); the observation ref field was
+/// missed and silently accepted on v1.0 files. This test locks in
+/// parity: a v1.0 file with the ref field must produce a version
+/// issue.
+#[test]
+fn subagent_trajectory_ref_requires_v17() {
+    let value = json!({
+        "schema_version": "ATIF-v1.0",
+        "session_id": "s",
+        "agent": {"name": "a", "version": "1.0.0"},
+        "steps": [{
+            "step_id": 1,
+            "source": "agent",
+            "message": "hi",
+            "observation": {
+                "results": [{
+                    "source_call_id": "c1",
+                    "subagent_trajectory_ref": [{
+                        "trajectory_id": "sub-a"
+                    }]
+                }]
+            }
+        }]
+    });
+    let issues = validate_value(&value, Mode::Compat);
+    assert!(
+        issues.iter().any(|i| {
+            i.path.contains("subagent_trajectory_ref")
+                && i.message.contains("ATIF-v1.7+")
+        }),
+        "expected v1.7 gate on subagent_trajectory_ref, got: {issues:#?}"
+    );
+    // v1.7 file with the same field must not produce the version issue.
+    let value = json!({
+        "schema_version": "ATIF-v1.7",
+        "session_id": "s",
+        "agent": {"name": "a", "version": "1.0.0"},
+        "steps": [{
+            "step_id": 1,
+            "source": "agent",
+            "message": "hi",
+            "observation": {
+                "results": [{
+                    "source_call_id": "c1",
+                    "subagent_trajectory_ref": [{
+                        "trajectory_id": "sub-a"
+                    }]
+                }]
+            }
+        }]
+    });
+    let issues = validate_value(&value, Mode::Compat);
+    assert!(
+        !issues
+            .iter()
+            .any(|i| i.message.contains("subagent_trajectory_ref") && i.message.contains("ATIF-v1.7+")),
+        "v1.7 file must not emit the version-gate issue for its own field, got: {issues:#?}"
+    );
+}

@@ -618,6 +618,24 @@ fn validate_step(
                             if let Some(references) =
                                 res.get("subagent_trajectory_ref").and_then(Value::as_array)
                             {
+                                // Round-33 F3: version gate parity with
+                                // the sibling root-level
+                                // `subagent_trajectories` (v1.7-only).
+                                // Both were introduced in v1.7 per the
+                                // shipped schema; without this check an
+                                // ATIF-v1.0 file carrying the ref field
+                                // inside observation.results[] slipped
+                                // past both Strict and Compat modes
+                                // silently.
+                                if ver < (1, 7) {
+                                    issue!(
+                                        issues,
+                                        format!("{rpath}.subagent_trajectory_ref"),
+                                        "field requires ATIF-v1.7+, file is v{}.{}",
+                                        ver.0,
+                                        ver.1
+                                    );
+                                }
                                 for (k, reference) in references.iter().enumerate() {
                                     let ref_path = format!("{rpath}.subagent_trajectory_ref.{k}");
                                     let Some(reference) = reference.as_object() else {

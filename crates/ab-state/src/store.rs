@@ -56,6 +56,26 @@ pub trait StateStore: Send + Sync {
     /// Remove a key (session cleanup).
     fn remove(&self, key: &str);
 
+    /// Return a previously-spent `amount` to a counter. Saturating: if
+    /// the stored value is below `amount` (e.g. a concurrent
+    /// `remove_prefix` cleared it first, or another refund already
+    /// covered part of the debt) the counter clamps at 0 rather than
+    /// underflowing into "negative budget". Backends must never
+    /// propagate a refund error to the caller — the refund is
+    /// best-effort compensation on a lost-race path where the primary
+    /// verdict has already been decided. Default `remove_prefix`
+    /// semantics apply: backends with native TTL expiry may fold this
+    /// into their own cleanup if they prefer.
+    ///
+    /// Round-33 F1: introduced to close the round-32 F3 concurrent-MCP
+    /// budget double-spend. When two identical MCP requests race and
+    /// one loses the atomic `execution.claim()`, the sandbox-gate
+    /// spend is refunded so `payout_remaining` and per-tool counters
+    /// reflect only the admitted work.
+    fn refund(&self, key: &str, amount: u64) {
+        let _ = (key, amount);
+    }
+
     /// Remove every key beginning with `prefix` (whole-session cleanup at
     /// finalization). Backends with native expiry (e.g. Redis TTLs) may
     /// leave this as the default no-op; in-process backends must implement
@@ -187,6 +207,20 @@ impl StateStore for InMemoryStore {
     fn remove(&self, key: &str) {
         let _transaction = self.transaction_lock.lock();
         self.counters.remove(key);
+    }
+
+    /// Round-33 F1: saturating refund. `saturating_sub` on i64 keeps
+    /// the value non-negative even under concurrent `remove_prefix`
+    /// or a duplicate refund; the transaction lock keeps the
+    /// load/store pair atomic with respect to other spend / add
+    /// operations on the same key.
+    fn refund(&self, key: &str, amount: u64) {
+        let _transaction = self.transaction_lock.lock();
+        let cell = self.cell(key);
+        let prev = cell.load(Ordering::Acquire);
+        let amount = i64::try_from(amount).unwrap_or(i64::MAX);
+        let next = prev.saturating_sub(amount).max(0);
+        cell.store(next, Ordering::Release);
     }
 
     fn remove_prefix(&self, prefix: &str) {

@@ -41,6 +41,13 @@ pub enum ToolVerdict {
         budget_remaining: u64,
         /// Decision latency in microseconds (SLA surface, R23).
         elapsed_us: u64,
+        /// Round-33 F1: payout amount (USD micros) that
+        /// `ActionBudget::try_tool_call` debited on this call. Threaded
+        /// out so a lost `execution.claim()` race in the harness can
+        /// call [`ActionBudget::refund_tool_call`] with the exact same
+        /// amount, closing the round-32 F3 concurrent-MCP budget
+        /// double-spend.
+        payout_micros: u64,
     },
     /// Block; respond to the agent with `response`.
     Blocked {
@@ -182,6 +189,10 @@ impl Sandbox {
                 tool: req.tool,
                 budget_remaining: remaining,
                 elapsed_us: elapsed(started),
+                // Round-33 F1: thread the actual debited amount so the
+                // harness can refund exactly this much on a lost
+                // execution.claim() race.
+                payout_micros,
             },
             Ok(BudgetDecision::Refused { limit, cap }) => {
                 let reason = format!("action budget exceeded: {limit} (cap {cap})");

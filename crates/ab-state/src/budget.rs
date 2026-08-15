@@ -145,6 +145,29 @@ impl<'a> ActionBudget<'a> {
         Ok(BudgetDecision::Allowed { remaining })
     }
 
+    /// Round-33 F1: compensating refund for a previously-successful
+    /// [`Self::try_tool_call`]. Reverses the spend on exactly the same
+    /// dimensions that were debited (total_calls, per-tool, payout) so
+    /// a lost-race path in the caller (concurrent identical MCP
+    /// request loses `execution.claim()` after the sandbox gate has
+    /// already spent) does not double-charge the session budget.
+    /// Best-effort: any backend error is silently absorbed by the
+    /// underlying [`StateStore::refund`] contract — a Redis blip on
+    /// the compensation path must never turn a lost-race response
+    /// into a 5xx.
+    pub fn refund_tool_call(&self, tool: &str, payout_usd_micros: u64) {
+        if self.spec.max_total_tool_calls.is_some() {
+            self.store.refund(&self.key("total_calls"), 1);
+        }
+        if self.spec.max_tool_calls.contains_key(tool) {
+            self.store.refund(&self.key(&format!("tool:{tool}")), 1);
+        }
+        if payout_usd_micros > 0 && self.spec.max_payout_usd_micros.is_some() {
+            self.store
+                .refund(&self.key("payout"), payout_usd_micros);
+        }
+    }
+
     /// Check-and-spend `tokens` against `max_tokens`.
     pub fn try_tokens(&self, tokens: u64) -> Result<BudgetDecision, StateError> {
         match self.spec.max_tokens {
@@ -347,5 +370,60 @@ mod tests {
             BudgetDecision::Allowed { remaining } => assert_eq!(remaining, 6),
             other => panic!("expected Allowed with real remaining, got {other:?}"),
         }
+    }
+
+    /// Round-33 F1: refund_tool_call compensates the exact dimensions
+    /// try_tool_call debited. Locks in the primary invariant needed
+    /// by the harness's lost-claim path — after refund, the same
+    /// call succeeds again against the same caps.
+    #[test]
+    fn refund_tool_call_reverses_the_spend_exactly() {
+        let store = InMemoryStore::new();
+        let s = BudgetSpec {
+            max_total_tool_calls: Some(2),
+            max_tool_calls: BTreeMap::from([("db_write".to_owned(), 1u64)]),
+            max_payout_usd_micros: Some(1_000_000),
+            ..BudgetSpec::default()
+        };
+        let b = ActionBudget::new(&store, "sess-refund", &s);
+        // Debit 1 total + 1 per-tool + 500k payout.
+        assert!(b.try_tool_call("db_write", 500_000).unwrap().is_allowed());
+        // Without refund, per-tool cap trips the next call.
+        assert!(matches!(
+            b.try_tool_call("db_write", 100).unwrap(),
+            BudgetDecision::Refused { .. }
+        ));
+        // Refund reverses exactly the spend.
+        b.refund_tool_call("db_write", 500_000);
+        // The same call now succeeds — proving all three dimensions
+        // were compensated.
+        assert!(b.try_tool_call("db_write", 500_000).unwrap().is_allowed());
+    }
+
+    /// Round-33 F1: refund saturates at 0 under a concurrent clear.
+    /// The compensating refund must never leave a negative "budget
+    /// spent" counter — that would give the next legit call a free
+    /// ride relative to its cap.
+    #[test]
+    fn refund_is_saturating() {
+        let store = InMemoryStore::new();
+        let s = BudgetSpec {
+            max_total_tool_calls: Some(10),
+            ..BudgetSpec::default()
+        };
+        let b = ActionBudget::new(&store, "sess-sat", &s);
+        assert!(b.try_tool_call("t", 0).unwrap().is_allowed());
+        // Two refunds in a row: the second must clamp at 0, not
+        // underflow the counter.
+        b.refund_tool_call("t", 0);
+        b.refund_tool_call("t", 0);
+        // 10 successful calls remain — the counter is 0 (clamped).
+        for _ in 0..10 {
+            assert!(b.try_tool_call("t", 0).unwrap().is_allowed());
+        }
+        assert!(matches!(
+            b.try_tool_call("t", 0).unwrap(),
+            BudgetDecision::Refused { .. }
+        ));
     }
 }
