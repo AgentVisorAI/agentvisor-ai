@@ -1959,7 +1959,56 @@ async fn read_complete_journal(path: &std::path::Path) -> Result<Vec<String>, Fi
                 .rposition(|byte| *byte == b'\n')
                 .map_or(0, |index| index + 1)
         };
+        // Round-13 F2: if the file contains NO complete line (no
+        // newline anywhere), truncating to 0 would silently destroy
+        // every byte of a torn-write journal — the caller then sees
+        // an empty journal, deletes the sealed metadata sidecar, and
+        // an operator investigating "session missing" has no
+        // evidence at all. Instead, quarantine the file to
+        // `<path>.corrupt-<uid>` so post-mortem inspection can happen,
+        // then return an error so the reconciler leaves the session
+        // in place rather than progressing to metadata deletion.
+        if complete_len == 0 && !bytes.is_empty() {
+            let mut quarantine = path.clone();
+            let stem = quarantine
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or("journal");
+            let new_name = format!("{stem}.corrupt-{}", ab_core::new_event_uid());
+            quarantine.set_file_name(new_name);
+            match std::fs::rename(&path, &quarantine) {
+                Ok(()) => {
+                    tracing::error!(
+                        original = %path.display(),
+                        quarantine = %quarantine.display(),
+                        bytes = bytes.len(),
+                        "journal has no complete lines; quarantined for post-mortem instead of silent 0-truncate"
+                    );
+                }
+                Err(rename_error) => {
+                    tracing::error!(
+                        path = %path.display(),
+                        bytes = bytes.len(),
+                        error = %rename_error,
+                        "journal has no complete lines and quarantine rename failed; refusing to truncate"
+                    );
+                }
+            }
+            return Err(FinalizeError::Atif(format!(
+                "journal {} contained no complete lines ({} bytes); quarantined at {}",
+                path.display(),
+                bytes.len(),
+                quarantine.display()
+            )));
+        }
         if complete_len < bytes.len() {
+            tracing::warn!(
+                path = %path.display(),
+                stored = bytes.len(),
+                keeping = complete_len,
+                dropping = bytes.len() - complete_len,
+                "trimming partial trailing line from journal recovery"
+            );
             let file = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&path)
@@ -3389,6 +3438,43 @@ mod tests {
         let lines = read_complete_journal(&path).await.unwrap();
         assert_eq!(lines, vec![r#"{"complete":true}"#]);
         assert_eq!(std::fs::read(&path).unwrap(), b"{\"complete\":true}\n");
+    }
+
+    /// Round-13 F2: a journal containing NO newline anywhere (all
+    /// bytes are a single partial record) must NOT be silently
+    /// truncated to 0 bytes — that would destroy the only evidence
+    /// of the failure. Quarantine to `<name>.corrupt-<uid>` instead
+    /// and return an error so the reconciler leaves the sealed
+    /// metadata sidecar in place.
+    #[tokio::test]
+    async fn journal_with_no_complete_lines_is_quarantined_not_truncated() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.ndjson");
+        std::fs::write(&path, b"{\"torn_before_first_newline\":").unwrap();
+        let outcome = read_complete_journal(&path).await;
+        // Must be an error, not an Ok(vec![]).
+        let err = outcome.unwrap_err();
+        assert!(
+            format!("{err:?}").contains("no complete lines"),
+            "expected quarantine error, got {err:?}",
+        );
+        // Original file must NOT exist any more — it was moved out.
+        assert!(!path.exists(), "journal was not moved out of the recovery path");
+        // Quarantine file must exist with the original content and
+        // carry `.corrupt-` in its name.
+        let entries: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".corrupt-")
+            })
+            .collect();
+        assert_eq!(entries.len(), 1, "expected exactly one quarantine file");
+        let bytes = std::fs::read(entries[0].path()).unwrap();
+        assert_eq!(&bytes, b"{\"torn_before_first_newline\":");
     }
 
     #[tokio::test]

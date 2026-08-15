@@ -692,7 +692,7 @@ impl AppState {
             response_permit: Some(response_permit),
             response_attempt_id,
             client_authorization: if self.config.upstream_authorization_passthrough {
-                headers.get(axum::http::header::AUTHORIZATION).cloned()
+                single_header(headers, "authorization")?.cloned()
             } else {
                 None
             },
@@ -1369,8 +1369,33 @@ fn classify_identity_error(error: &ab_identity::IdentityError) -> &'static str {
     }
 }
 
+/// Extract the single value for a control header, refusing duplicates.
+///
+/// `HeaderMap::get(name)` returns only the first entry when a header
+/// appears multiple times. A client sending
+/// `X-AB-Session: sessA` followed by `X-AB-Session: sessB` would then
+/// have `sessA` used for state while an intermediary log-aggregator
+/// might observe `sessA, sessB` (some proxies merge on the wire). The
+/// resulting session-desync is hard to diagnose and is a header
+/// smuggling primitive at boundaries where our proxy is behind
+/// another one. Refuse the multi-value case at ingress rather than
+/// silently accept the first.
+pub(crate) fn single_header<'a>(
+    headers: &'a HeaderMap,
+    name: &'static str,
+) -> Result<Option<&'a axum::http::HeaderValue>, PipelineError> {
+    let mut iter = headers.get_all(name).into_iter();
+    let first = iter.next();
+    if iter.next().is_some() {
+        return Err(PipelineError::BadRequest(format!(
+            "request carries more than one {name} header; provide exactly one"
+        )));
+    }
+    Ok(first)
+}
+
 fn session_id(headers: &HeaderMap) -> Result<String, PipelineError> {
-    match headers.get(SESSION_HEADER) {
+    match single_header(headers, SESSION_HEADER)? {
         Some(value) => {
             let value = value
                 .to_str()
@@ -1384,8 +1409,7 @@ fn session_id(headers: &HeaderMap) -> Result<String, PipelineError> {
 }
 
 fn workflow(headers: &HeaderMap, default: &str) -> Result<Workflow, PipelineError> {
-    let value = headers
-        .get(WORKFLOW_HEADER)
+    let value = single_header(headers, WORKFLOW_HEADER)?
         .map(|header| {
             header
                 .to_str()
@@ -2261,6 +2285,51 @@ mod tests {
         // (3) Field present, is an array, but empty.
         let msg = bad_request_message(serde_json::json!({ "messages": [] }));
         assert!(msg.contains("empty"), "got {msg}");
+    }
+
+    /// Round-13: multiple X-AB-Session (or X-AB-Workflow) headers on
+    /// a single request must be refused. HeaderMap::get() returns
+    /// only the first, so an intermediary that merges duplicates on
+    /// the wire and downstream code that reads them separately can
+    /// disagree on which session id was in effect — a header
+    /// smuggling desync. Refuse loudly at ingress.
+    #[test]
+    fn duplicate_x_ab_session_header_is_refused() {
+        let mut headers = HeaderMap::new();
+        headers.append(SESSION_HEADER, HeaderValue::from_static("sessA"));
+        headers.append(SESSION_HEADER, HeaderValue::from_static("sessB"));
+        match session_id(&headers) {
+            Ok(id) => panic!("expected duplicate-header refusal, got session_id {id:?}"),
+            Err(PipelineError::BadRequest(msg)) => {
+                assert!(msg.contains("more than one"), "got {msg}");
+                assert!(msg.contains("x-ab-session"), "got {msg}");
+            }
+            Err(other) => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_x_ab_workflow_header_is_refused() {
+        let mut headers = HeaderMap::new();
+        headers.append(WORKFLOW_HEADER, HeaderValue::from_static("signed"));
+        headers.append(WORKFLOW_HEADER, HeaderValue::from_static("unsigned"));
+        match workflow(&headers, "signed") {
+            Ok(w) => panic!("expected duplicate-header refusal, got workflow {w:?}"),
+            Err(PipelineError::BadRequest(msg)) => {
+                assert!(msg.contains("more than one"), "got {msg}");
+                assert!(msg.contains("x-ab-workflow"), "got {msg}");
+            }
+            Err(other) => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    /// Single X-AB-Session must continue to work — this is the
+    /// happy-path regression guard for the duplicate-header refusal.
+    #[test]
+    fn single_x_ab_session_header_still_flows() {
+        let mut headers = HeaderMap::new();
+        headers.insert(SESSION_HEADER, HeaderValue::from_static("only-one"));
+        assert_eq!(session_id(&headers).unwrap(), "only-one");
     }
 
     fn scoped_token(scopes: &[&str]) -> String {

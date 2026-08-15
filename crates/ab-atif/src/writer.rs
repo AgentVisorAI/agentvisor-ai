@@ -170,6 +170,21 @@ pub fn metrics(prompt: u64, completion: u64, cached: u64, cost_usd: f64) -> Metr
 /// a torn trajectory (silent-error class D13.16). The trajectory is validated
 /// (strict) before any byte is written — this crate never produces an invalid
 /// file (success criterion R28).
+///
+/// **Post-rename durability semantics**: once `tmp.persist(path)` returns
+/// `Ok`, the file is atomically visible at `path`. A subsequent
+/// `sync_directory` failure means the dirent may not survive an
+/// immediate power loss on POSIX-conformant filesystems, but every
+/// observer running now sees the file. Round-13 F1 change: log a
+/// `tracing::warn!` and return `Ok(())` instead of returning `Err`,
+/// matching `ab_core::fsutil::write_atomic`'s round-12 F5 semantic.
+/// Returning `Err` after a successful rename historically confused
+/// caller retry logic: the reconciler would treat this as
+/// "trajectory not persisted" and redo the whole
+/// validate + serialize + rename cycle on the next tick — wasted IO,
+/// and worse: a caller that gates session-state advancement on `Ok`
+/// would keep the session as "capture failed" while the trajectory
+/// was in fact on disk.
 pub fn write_atomic(trajectory: &Trajectory, path: &Path) -> Result<(), WriterError> {
     let issues = crate::validate::validate_trajectory(trajectory, crate::validate::Mode::Strict);
     if !issues.is_empty() {
@@ -183,7 +198,13 @@ pub fn write_atomic(trajectory: &Trajectory, path: &Path) -> Result<(), WriterEr
     tmp.flush()?;
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| WriterError::Io(e.error))?;
-    ab_core::fsutil::sync_directory(dir)?;
+    if let Err(error) = ab_core::fsutil::sync_directory(dir) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "post-rename ATIF trajectory directory fsync failed; file is visible but its dirent may not survive an immediate power loss"
+        );
+    }
     Ok(())
 }
 
