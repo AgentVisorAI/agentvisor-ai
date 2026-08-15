@@ -8,6 +8,13 @@ ADD --checksum=sha256:be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
 COPY schemas ./schemas
+# `crates/ab-harness/src/main.rs` uses `include_str!("../../../config/
+# policies/payload_limit.wat")` to embed the default policy so
+# `cargo install agent-bridge` works from an empty directory. The build
+# stage therefore needs the config tree available at compile time —
+# without this COPY the build fails with "couldn't read
+# .../config/policies/payload_limit.wat".
+COPY config ./config
 RUN cargo build --locked --release -p ab-harness --features full --bin agent-bridge -p ab-cli --bin abctl
 RUN mkdir -p /tmp/runtime-root/data /tmp/runtime-root/spool
 
