@@ -35,6 +35,17 @@ wildcards = "deny"
 # The workspace uses internal `path = "..."` dependencies which cargo-deny
 # reports as wildcard versions. External wildcard dependencies remain denied.
 allow-wildcard-paths = true
+# Round-32 F6: fail closed on obvious foot-guns even before an advisory
+# exists. `openssl` is banned because the workspace is intentionally
+# rustls-only (round-13 hardening); a stray transitive that pulls in
+# `openssl` is a new TLS surface we must review, not adopt silently.
+# `git2` catches an accidental runtime-git dependency; if a build tool
+# ever needs it, add it explicitly here with a rationale.
+deny = [
+    { name = "openssl", reason = "workspace is rustls-only; a stray openssl import is a new TLS surface" },
+    { name = "openssl-sys", reason = "same; catches transitive openssl pull-ins at the sys-crate layer" },
+    { name = "git2", reason = "no runtime git dependency wanted; catches accidental introduction" },
+]
 
 [sources]
 unknown-registry = "deny"
