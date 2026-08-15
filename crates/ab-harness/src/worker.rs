@@ -190,8 +190,9 @@ pub struct WorkerPermit {
 /// room, which is the common case since response capture happens
 /// tens-of-seconds after the initial worker job has drained.
 ///
-/// Held by [`crate::routes::AbortFinalizingStream`] for the lifetime
-/// of the forwarded response; drops on stream completion or client abort.
+/// Held by the streaming-response wrapper in `routes.rs`
+/// (`AbortFinalizingStream`) for the lifetime of the forwarded response;
+/// drops on stream completion or client abort.
 pub struct ResponsePermit {
     _capacity_permit: tokio::sync::OwnedSemaphorePermit,
 }
