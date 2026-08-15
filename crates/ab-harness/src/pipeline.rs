@@ -1208,8 +1208,17 @@ impl AppState {
         headers: &HeaderMap,
         required_scope: Option<&str>,
     ) -> Result<AgentIdentity, PipelineError> {
-        let bearer = headers
-            .get(axum::http::header::AUTHORIZATION)
+        // Round-14 F1: reuse the round-13 duplicate-header refusal
+        // pattern for `Authorization` on the identity hot path.
+        // Previously `HeaderMap::get(AUTHORIZATION)` returned the
+        // first value while `pipeline::client_authorization` capture
+        // (line 695) and header-smuggling proxies could observe a
+        // merged `A, B` form — auth split-brain: the harness
+        // authenticates as A while log aggregators / WAFs / OTLP
+        // exporters attribute the request to B. Refuse the multi-
+        // value case at ingress, symmetric with the X-AB-Session /
+        // X-AB-Workflow guards.
+        let bearer = single_header(headers, "authorization")?
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "));
         match (bearer, &self.identity) {
@@ -2330,6 +2339,77 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(SESSION_HEADER, HeaderValue::from_static("only-one"));
         assert_eq!(session_id(&headers).unwrap(), "only-one");
+    }
+
+    /// Round-14 F1: identity hot path (`resolve_identity`) must refuse
+    /// duplicate `Authorization` headers, symmetric with X-AB-Session.
+    /// Previously `HeaderMap::get(AUTHORIZATION)` returned the first
+    /// value only — the harness would authenticate as `A` while
+    /// log aggregators / WAFs seeing a merged `A, B` form would
+    /// attribute the request to `B`. This is the identity split-brain
+    /// round-13 tried to close for session headers.
+    #[tokio::test]
+    async fn resolve_identity_refuses_duplicate_authorization_header() {
+        let state = null_state();
+        let mut headers = HeaderMap::new();
+        headers.append(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer aaaa"),
+        );
+        headers.append(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer bbbb"),
+        );
+        match state.resolve_identity(&headers, None) {
+            Ok(_) => panic!("expected duplicate-header refusal, got Ok"),
+            Err(PipelineError::BadRequest(msg)) => {
+                assert!(msg.contains("more than one"), "got {msg}");
+                assert!(msg.contains("authorization"), "got {msg}");
+            }
+            Err(other) => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    /// Single-value Authorization still flows through (happy-path
+    /// regression guard for the dedup refusal).
+    #[tokio::test]
+    async fn resolve_identity_accepts_single_authorization_header() {
+        let state = null_state();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer aaaa"),
+        );
+        // No validator configured → refuse-401 fires per round-10 F3.
+        // The important assertion is that we did NOT get a
+        // BadRequest("more than one") on a single header.
+        let outcome = state.resolve_identity(&headers, None);
+        assert!(
+            !matches!(&outcome, Err(PipelineError::BadRequest(msg)) if msg.contains("more than one")),
+            "single Authorization header must not be refused as duplicate; got {outcome:?}"
+        );
+    }
+
+    fn null_state() -> AppState {
+        let mut config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        config.require_identity = false;
+        let sandbox = Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap();
+        let store = Arc::new(InMemoryStore::new());
+        let bridge: Arc<dyn EventBus> = Arc::new(NullBus);
+        let signer: Arc<dyn Signer> = Arc::new(Ed25519Signer::generate());
+        let embedder = Arc::new(HashEmbedder::default());
+        let vector_sink: Arc<dyn VectorSink> = Arc::new(NoopVectorSink);
+        AppState::new_with_backends(
+            config,
+            store,
+            Arc::new(sandbox),
+            bridge,
+            None,
+            signer,
+            embedder,
+            vector_sink,
+        )
+        .unwrap()
     }
 
     fn scoped_token(scopes: &[&str]) -> String {

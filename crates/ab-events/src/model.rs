@@ -102,6 +102,7 @@ impl StatusId {
 /// The agent config-state identity block bound into every event (Module E,
 /// PR #1 pattern: version + charter + instance_uid).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CharterFile {
     /// Charter document file name.
     pub name: String,
@@ -123,6 +124,7 @@ impl From<&str> for CharterFile {
 
 /// OCSF Product object embedded in event metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Product {
     /// Product name.
     pub name: String,
@@ -151,6 +153,7 @@ pub struct AgentIdentity {
 /// Token metrics mirroring ATIF's `prompt/completion/cached` fields (Module C
 /// mandates the mirror for downstream compatibility).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EventMetrics {
     /// Prompt tokens (approximate unless provider-reported).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -172,6 +175,7 @@ pub struct EventMetrics {
 /// OCSF Fingerprint observable (id 30) — roadmap: per-forward-pass inventory
 /// fingerprinting of tool schemas + sampling params, chained like `prev_event`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Fingerprint {
     /// Hash algorithm id (3 = SHA-256 per OCSF).
     pub algorithm_id: u8,
