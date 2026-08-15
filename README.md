@@ -5,11 +5,23 @@
 [![Docs](https://github.com/debugmode0/agent-bridge/actions/workflows/pages.yml/badge.svg)](https://debugmode0.github.io/agent-bridge/)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-AgentBridge is an inline Rust proxy for OpenAI-compatible agent traffic and MCP tool calls. It applies identity, quota, policy, compression, and loop controls; emits OCSF-shaped events; writes ATIF v1.7 trajectories; and issues offline-verifiable Ed25519 receipts.
+**Put AgentBridge between your app and its model or tools. It records every
+request, tool call, and response, enforces the limits you set, and hands
+you a signed receipt at the end of every session — one anyone can verify
+offline with just a public key. No vendor lock-in, no trust in us.**
 
-- **API docs:** <https://debugmode0.github.io/agent-bridge/>
-- **Releases:** <https://github.com/debugmode0/agent-bridge/releases>
-- **Security:** see [`SECURITY.md`](SECURITY.md) — report vulnerabilities privately.
+- **[The 60-second overview →](https://debugmode0.github.io/agent-bridge/)** (plain English, for anyone)
+- **[Releases](https://github.com/debugmode0/agent-bridge/releases)** — pre-built binaries with SHA-256 checksums
+- **[Security](SECURITY.md)** — trust boundaries and how to deploy safely (report vulnerabilities privately)
+- **[Architecture](ARCHITECTURE.md)**, **[Benchmarks](BENCHMARKS.md)**, **[Verification protocol](VERIFICATION.md)** — for readers going deeper
+- **[API docs](https://debugmode0.github.io/agent-bridge/api/)** — Rust crate reference for library authors
+
+---
+
+Under the hood: an inline Rust proxy for OpenAI-compatible agent traffic
+and MCP tool calls. It applies identity, quota, policy, compression, and
+loop controls; emits OCSF-shaped events; writes ATIF v1.7 trajectories;
+and issues offline-verifiable Ed25519 receipts.
 
 ## Easiest start (no config, no exports)
 
