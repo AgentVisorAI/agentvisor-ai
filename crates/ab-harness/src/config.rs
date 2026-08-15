@@ -752,6 +752,29 @@ impl HarnessConfig {
         if self.identity_hmac_kid.is_empty() {
             return Err("identity_hmac_kid must not be empty".into());
         }
+        // Round-31 F2: scope names must be visible-ASCII non-empty
+        // tokens. An empty `chat_scope = ""` under
+        // `enforce_identity_scopes = true` + `require_identity =
+        // true` used to silently reduce the check to
+        // `identity.scopes.contains("")` — some IdPs emit empty
+        // scope entries after tokenizing a stray whitespace claim,
+        // so tokens without any real scope would satisfy the gate.
+        // Also reject whitespace/control bytes (OAuth scope
+        // tokens must not be re-tokenizable at any layer).
+        for (field, value) in [
+            ("chat_scope", &self.chat_scope),
+            ("session_close_scope", &self.session_close_scope),
+            ("session_promote_scope", &self.session_promote_scope),
+        ] {
+            if value.is_empty() {
+                return Err(format!("{field} must not be empty"));
+            }
+            if value.bytes().any(|byte| !(0x21..=0x7e).contains(&byte)) {
+                return Err(format!(
+                    "{field} {value:?} must be visible ASCII with no whitespace or control bytes"
+                ));
+            }
+        }
         if self.worker_channel_capacity == 0 {
             return Err("worker_channel_capacity must be > 0".into());
         }
@@ -763,6 +786,20 @@ impl HarnessConfig {
         }
         if self.bridge_manifest_path.is_empty() {
             return Err("bridge_manifest_path is required".into());
+        }
+        // Round-31 F1: refuse empty local-fs path fields. If an
+        // operator overrides `atif_spool_dir = ""` in TOML (e.g. by
+        // accidentally interpolating an unset env variable through a
+        // template), every ATIF spool op used to run on Path::new("")
+        // whose joins degrade to CWD-relative writes — receipts land
+        // in the process CWD instead of the expected volume, recovery
+        // scans miss them on the next boot. Same shape for
+        // `bridge_data_dir` (embedded broker segments in CWD).
+        if self.atif_spool_dir.is_empty() {
+            return Err("atif_spool_dir must not be empty".into());
+        }
+        if self.bridge_data_dir.is_empty() {
+            return Err("bridge_data_dir must not be empty".into());
         }
         if self.bridge_backend != "embedded" && self.bridge_endpoint.as_deref().is_none_or(str::is_empty) {
             return Err("bridge_endpoint is required for kafka and nats backends".into());
@@ -1422,6 +1459,75 @@ mod tests {
                bridge_endpoint = "nats://bus:4222"
                vector_backend = "qdrant"
                qdrant_url = "https://vectors.internal:6333""#,
+        )
+        .is_ok());
+    }
+
+    /// Round-31 F1: empty `atif_spool_dir` / `bridge_data_dir` are
+    /// rejected. Without the check they default to `Path::new("")`,
+    /// making every spool op write to the process CWD instead of the
+    /// expected volume.
+    #[test]
+    fn round_31_f1_local_fs_paths_empty_rejected() {
+        let err = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               atif_spool_dir = """#,
+        )
+        .unwrap_err();
+        assert!(err.contains("atif_spool_dir"), "{err}");
+        let err = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               bridge_data_dir = """#,
+        )
+        .unwrap_err();
+        assert!(err.contains("bridge_data_dir"), "{err}");
+    }
+
+    /// Round-31 F2: identity scope names must be visible ASCII, no
+    /// whitespace, no empty strings. Some IdPs tokenize an empty
+    /// "scope" claim into an empty string; without this check the
+    /// gate becomes `scopes.contains("")` and any token satisfies it.
+    #[test]
+    fn round_31_f2_scope_names_rejected_empty_or_whitespaced() {
+        // Empty chat_scope.
+        let err = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               require_identity = true
+               identity_hmac_secret_file = "/tmp/secret"
+               enforce_identity_scopes = true
+               chat_scope = """#,
+        )
+        .unwrap_err();
+        assert!(err.contains("chat_scope"), "{err}");
+        // Whitespace in scope.
+        let err = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               require_identity = true
+               identity_hmac_secret_file = "/tmp/secret"
+               enforce_identity_scopes = true
+               chat_scope = "chat write""#,
+        )
+        .unwrap_err();
+        assert!(err.contains("chat_scope"), "{err}");
+        // Control byte in scope.
+        let err = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               require_identity = true
+               identity_hmac_secret_file = "/tmp/secret"
+               enforce_identity_scopes = true
+               session_close_scope = "close\tsession""#,
+        )
+        .unwrap_err();
+        assert!(err.contains("session_close_scope"), "{err}");
+        // A well-formed scope passes.
+        assert!(HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               require_identity = true
+               identity_hmac_secret_file = "/tmp/secret"
+               enforce_identity_scopes = true
+               chat_scope = "chat:write"
+               session_close_scope = "session:close"
+               session_promote_scope = "session:promote""#,
         )
         .is_ok());
     }

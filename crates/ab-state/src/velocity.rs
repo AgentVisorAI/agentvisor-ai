@@ -1,6 +1,28 @@
 //! Token-velocity tracking: sliding-window tokens-per-second intended for
 //! rate limiting. (The loop-breaker's `N+ tokens` arm uses its own
 //! cumulative per-session counter, not this window.)
+//!
+//! # Round-31 F4 — NOT WIRED INTO ENFORCEMENT
+//!
+//! There are currently zero production callers of [`TokenVelocity`]; the
+//! only users outside this crate are the integration tests in
+//! `crates/ab-state/tests/e2e_race_velocity.rs`. The type predates the
+//! current admission / loop-breaker plumbing and was never connected to
+//! either the breaker's `min_tokens` gate ([`ab_loopdetect`]) or any
+//! harness rate-limit path.
+//!
+//! **Do not wire this into the breaker without a shared per-session
+//! lock.** The velocity `record_at` mutation and the breaker's `observe`
+//! mutation live under different [`parking_lot::Mutex`] instances, so a
+//! blind wire-up races the two counters. If you need per-session
+//! velocity in the breaker, extend `ab_loopdetect::Breaker` with its own
+//! velocity window guarded by the same mutex the breaker already holds.
+//!
+//! The type is kept public for now (rather than deleted) because the
+//! sliding-window arithmetic is exercised by [`e2e_race_velocity`]
+//! adversarial tests that lock in the round-26 F5 `saturating_add`
+//! discipline — reusable ground for the future breaker-integrated
+//! window when someone builds it.
 
 use parking_lot::Mutex;
 use std::collections::VecDeque;

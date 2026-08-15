@@ -27,11 +27,20 @@ pub fn build_router(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
-        .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/mcp", post(mcp_call))
-        .route("/mcp", post(mcp_call))
-        .route("/v1/sessions/{id}/close", post(close_session))
-        .route("/v1/sessions/{id}/promote", post(promote_session));
+        .route(
+            "/v1/chat/completions",
+            post(chat_completions).options(cors_deny),
+        )
+        .route("/v1/mcp", post(mcp_call).options(cors_deny))
+        .route("/mcp", post(mcp_call).options(cors_deny))
+        .route(
+            "/v1/sessions/{id}/close",
+            post(close_session).options(cors_deny),
+        )
+        .route(
+            "/v1/sessions/{id}/promote",
+            post(promote_session).options(cors_deny),
+        );
     if dashboard_enabled {
         router = router
             .route("/dashboard", get(crate::dashboard::index))
@@ -116,6 +125,30 @@ async fn health() -> impl IntoResponse {
         // vulnerability-relevant information.
         "service": "agentbridge",
     }))
+}
+
+/// Round-31 F5: explicit deny-CORS OPTIONS handler.
+///
+/// The harness is a same-origin proxy; no cross-origin client is
+/// expected or supported. Without this route, axum's default reply to
+/// a preflight (`OPTIONS /v1/chat/completions`) is `405 Method Not
+/// Allowed` with an `Allow: POST` header — inconsistent with the
+/// round-29 F6 "no discoverable posture" hygiene, and confusing to any
+/// operator whose LAN browser client accidentally triggers a preflight.
+/// Reply with `204 No Content` and NO `Access-Control-Allow-Origin`
+/// header: browsers correctly treat this as "cross-origin denied" and
+/// refuse the actual request, making the posture explicit at the wire.
+async fn cors_deny() -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::NO_CONTENT;
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    // Do not echo the requester's Origin. Do not include any
+    // Access-Control-Allow-* header. This deliberately fails the
+    // browser's preflight check.
+    response
 }
 
 async fn metrics(State(state): State<AppState>) -> Response {
@@ -3960,5 +3993,56 @@ mod tests {
         assert!(!is_sse_content_type(&ct("text/event-stream-json")));
         // Absent header returns false.
         assert!(!is_sse_content_type(&HeaderMap::new()));
+    }
+
+    /// Round-31 F5: OPTIONS to every mutating route replies with
+    /// `204 No Content` and NO Access-Control-Allow-* headers.
+    /// Browsers must interpret this as "cross-origin denied" and
+    /// refuse the actual request — making the same-origin-only
+    /// posture explicit at the wire. Guards against a future PR
+    /// accidentally adding `CorsLayer::permissive()`.
+    #[tokio::test]
+    async fn options_returns_204_without_cors_headers() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state(directory.path()).await;
+        for path in [
+            "/v1/chat/completions",
+            "/v1/mcp",
+            "/mcp",
+            "/v1/sessions/some-id/close",
+            "/v1/sessions/some-id/promote",
+        ] {
+            let response = build_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(axum::http::Method::OPTIONS)
+                        .uri(path)
+                        .header("origin", "http://attacker.example")
+                        .header("access-control-request-method", "POST")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NO_CONTENT,
+                "OPTIONS {path} should return 204, got {}",
+                response.status()
+            );
+            for header in [
+                "access-control-allow-origin",
+                "access-control-allow-methods",
+                "access-control-allow-headers",
+                "access-control-allow-credentials",
+            ] {
+                assert!(
+                    response.headers().get(header).is_none(),
+                    "OPTIONS {path} must not emit {header} — got {:?}",
+                    response.headers().get(header)
+                );
+            }
+        }
+        provider.abort();
     }
 }
