@@ -399,7 +399,7 @@ function renderSessionDetail(detail) {
         null,
         s.capture_failed ? el('span', { class: 'fail' }, 'yes') : 'no',
       ),
-      el('dt', null, 'ATIF artifact'), el('dd', null, detail.atif_path || '—'),
+      el('dt', null, 'ATIF artifact'), el('dd', null, detail.atif_filename || '—'),
     ),
   );
 
