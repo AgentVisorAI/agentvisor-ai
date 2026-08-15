@@ -94,6 +94,37 @@ pub fn parse_tool_call(raw: &[u8]) -> Result<ToolCallRequest, RpcError> {
             "params.name contains a control character or whitespace".into(),
         ));
     }
+    // Refuse any non-ASCII byte in the tool name. Every downstream
+    // comparison — per-tool schema lookup, deny-list matching, per-tool
+    // budget key — is raw byte-equality. A caller supplying
+    // `de\u{0301}lete` (decomposed) or `𝐝𝐛_𝐰𝐫𝐢𝐭𝐞` (mathematical
+    // bold, NFKC-folds to `db_write`) sees a different byte string
+    // than a policy that lists `delete` / `db_write`, but most MCP
+    // servers apply NFC/NFKC before dispatch — so the visually
+    // "different" name resolves to the same tool downstream.
+    // Restricting to ASCII collapses the Unicode-normalization attack
+    // surface without adding a runtime `unicode-normalization`
+    // dependency to the parse gate.
+    if !tool.is_ascii() {
+        return Err(RpcError::BadParams(
+            "params.name must be ASCII: non-ASCII tool names introduce a Unicode-normalization mismatch \
+             between this proxy's exact-byte matching and downstream MCP servers that fold NFC/NFKC"
+                .into(),
+        ));
+    }
+    // Refuse any uppercase byte. Downstream tool-name comparisons are
+    // exact-byte, but most MCP servers apply ASCII case folding. A
+    // policy that denies `db_write` sees `DB_write` slip through the
+    // deny-list byte-eq check while the server executes the same
+    // tool. Requiring the caller to normalize to lowercase up front
+    // eliminates the class.
+    if tool.chars().any(|c| c.is_ascii_uppercase()) {
+        return Err(RpcError::BadParams(
+            "params.name must be lowercase: mixed-case tool names bypass policy deny-lists that use \
+             exact-byte matching while downstream MCP servers apply ASCII case folding"
+                .into(),
+        ));
+    }
     // JSON-RPC 2.0 §4 requires `id` to be a string, number, or null: reject
     // objects/arrays/bool up front so downstream correlation tables that key
     // on id-as-string cannot be confused by structured ids.
@@ -405,6 +436,58 @@ mod tests {
             .unwrap();
             let parsed = parse_tool_call(&raw).unwrap_or_else(|e| panic!("{good_id:?}: {e:?}"));
             assert_eq!(parsed.id, Some(good_id));
+        }
+    }
+
+    /// Tool-name case-sensitivity bypass: downstream deny-list /
+    /// budget-key / schema-lookup are byte-exact, but most MCP servers
+    /// apply ASCII case folding — so `DB_write` would bypass a policy
+    /// that denies `db_write` while executing the same tool. The parse
+    /// gate now requires lowercase up front.
+    #[test]
+    fn tools_call_with_uppercase_letters_in_name_is_rejected() {
+        for hostile in ["DB_write", "Delete", "readFile", "PING"] {
+            let raw = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": "case-attack",
+                "method": "tools/call",
+                "params": {"name": hostile, "arguments": {}}
+            }))
+            .unwrap();
+            let err = parse_tool_call(&raw).unwrap_err();
+            assert!(
+                matches!(err, RpcError::BadParams(ref msg) if msg.contains("lowercase")),
+                "expected lowercase-refusal for {hostile:?}, got {err:?}"
+            );
+        }
+    }
+
+    /// Unicode-normalization bypass: `de\u{0301}lete` (decomposed) is
+    /// visually identical to `délete` (precomposed) but has a different
+    /// byte string. NFKC-fold variants like `𝐝𝐛_𝐰𝐫𝐢𝐭𝐞` collapse to
+    /// `db_write` on the server side while the proxy sees a distinct
+    /// name. Requiring ASCII bytes collapses this attack surface.
+    #[test]
+    fn tools_call_with_non_ascii_bytes_in_name_is_rejected() {
+        for hostile in [
+            "d\u{0301}elete",
+            "de\u{0301}lete",
+            "délete",
+            "𝐝𝐛_𝐰𝐫𝐢𝐭𝐞",
+            "read_ｆile",
+        ] {
+            let raw = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": "unicode-attack",
+                "method": "tools/call",
+                "params": {"name": hostile, "arguments": {}}
+            }))
+            .unwrap();
+            let err = parse_tool_call(&raw).unwrap_err();
+            assert!(
+                matches!(err, RpcError::BadParams(ref msg) if msg.contains("ASCII")),
+                "expected ASCII-only refusal for {hostile:?}, got {err:?}"
+            );
         }
     }
 }

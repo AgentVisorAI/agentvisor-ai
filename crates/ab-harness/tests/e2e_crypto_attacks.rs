@@ -515,30 +515,27 @@ fn trailing_garbage_after_receipt_json_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// 17. Unknown extra fields on the wire: forward-compat requires them to
-//     round-trip through parsing, but they MUST NOT influence verification.
-//     An attacker adding "admin":true to a signed receipt must not cause
-//     verify to see the field (serde drops unknowns for our struct), and
-//     the receipt must still verify identically.
+// 17. Unknown extra fields on the wire: MUST be rejected at parse time.
+//     `serde(flatten)` silently disables `deny_unknown_fields` on the
+//     inner struct, so an attacker could historically add
+//     "admin":true to a signed receipt and have serde drop it before
+//     verify() — the raw JSON showed the field to a human auditor
+//     but it never entered the signed body. A custom `Deserialize`
+//     impl on Receipt now rejects any unknown top-level field.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn unknown_wire_fields_do_not_participate_in_verification() {
+fn unknown_wire_fields_are_rejected_on_parse_and_never_reach_verification() {
     let s = signer();
-    let ring = ring(&s);
     let receipt = Receipt::issue(body("sess-fwd"), &s).unwrap();
     let mut raw: serde_json::Value = serde_json::to_value(&receipt).unwrap();
     raw.as_object_mut()
         .unwrap()
         .insert("admin".to_owned(), json!(true));
-    let restored: Receipt = serde_json::from_value(raw).unwrap();
-    restored.verify(&ring).expect("unknown field broke verify");
-    // After round-trip through the struct, the field is gone: it never had
-    // a chance to influence any signed logic.
-    let round_tripped: serde_json::Value = serde_json::to_value(&restored).unwrap();
+    let error = serde_json::from_value::<Receipt>(raw).unwrap_err();
     assert!(
-        !round_tripped.as_object().unwrap().contains_key("admin"),
-        "unknown field survived into the verified receipt"
+        error.to_string().contains("admin"),
+        "error should name the tampered field, got: {error}"
     );
 }
 
