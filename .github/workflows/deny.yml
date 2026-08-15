@@ -35,9 +35,10 @@ jobs:
           - licenses
           - sources
     steps:
-      - uses: actions/checkout@v4
+      # Round-29 F2: pin every third-party action by commit SHA.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
         with:
           command: check ${{ matrix.check }}
