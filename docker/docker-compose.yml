@@ -35,8 +35,12 @@ services:
 
   redpanda:
     image: redpandadata/redpanda:v25.2.5
+    # Internal-only: Kafka is consumed via the compose network as
+    # `redpanda:9092`. Binding to 127.0.0.1 keeps the external listener
+    # reachable for a local `rpk` on the host without exposing it to the
+    # host's network interfaces.
     ports:
-      - "19092:19092"
+      - "127.0.0.1:19092:19092"
     command:
       - redpanda
       - start
@@ -56,8 +60,11 @@ services:
 
   redis:
     image: redis:8.2.1-alpine
+    # Internal-only: state store is consumed via `redis://redis:6379` on the
+    # compose network. Localhost binding keeps `redis-cli` on the host
+    # working without publishing an unauthenticated Redis to the world.
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
       - redis-data:/data
@@ -69,8 +76,9 @@ services:
 
   qdrant:
     image: qdrant/qdrant:v1.15.4
+    # Internal-only vector DB (see redpanda note above).
     ports:
-      - "6333:6333"
+      - "127.0.0.1:6333:6333"
     volumes:
       - qdrant-data:/qdrant/storage
     healthcheck:
@@ -81,8 +89,9 @@ services:
 
   nats:
     image: nats:2.11-alpine
+    # Internal-only JetStream bus.
     ports:
-      - "4222:4222"
+      - "127.0.0.1:4222:4222"
     command: ["-js", "-m", "8222"]
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8222/healthz"]
@@ -92,11 +101,16 @@ services:
 
   vector:
     image: timberio/vector:0.48.0-debian
+    # Internal-only OTLP receivers; agent-bridge sends via the compose network.
     ports:
-      - "4317:4317"
-      - "4318:4318"
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
     volumes:
       - ./vector.toml:/etc/vector/vector.toml:ro
+      # NOTE: mounting the docker socket even read-only lets Vector enumerate
+      # every container's env vars via the docker API. Keep the socket out
+      # of production; switch this source to `journald` or `file` and use
+      # a docker-socket-proxy if you truly need container discovery.
       - /var/run/docker.sock:/var/run/docker.sock:ro
 
 volumes:

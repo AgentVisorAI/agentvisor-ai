@@ -83,6 +83,39 @@ pub fn parse_tool_call(raw: &[u8]) -> Result<ToolCallRequest, RpcError> {
             "params.name carries a bidi/zero-width spoofing character".into(),
         ));
     }
+    // Reject ASCII control characters and inner whitespace: without this a
+    // request for `"db_write\n"` would slip past exact-string matchers for
+    // per-tool schemas, per-tool policy deny-lists, per-tool budgets, and
+    // the harness consequential-tools workflow veto, then be normalized by
+    // most downstream MCP servers to `"db_write"`. Also cover the same
+    // trailing/leading whitespace shape.
+    if tool.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(RpcError::BadParams(
+            "params.name contains a control character or whitespace".into(),
+        ));
+    }
+    // JSON-RPC 2.0 §4 requires `id` to be a string, number, or null: reject
+    // objects/arrays/bool up front so downstream correlation tables that key
+    // on id-as-string cannot be confused by structured ids.
+    let id = obj.get("id").cloned();
+    match id.as_ref() {
+        None => {}
+        Some(Value::String(_) | Value::Number(_) | Value::Null) => {}
+        Some(_) => {
+            return Err(RpcError::BadParams(
+                "id must be a string, number, or null per JSON-RPC 2.0 §4".into(),
+            ));
+        }
+    }
+    // Per JSON-RPC 2.0 §4.1 a request with no `id` is a notification: a
+    // notification MUST NOT elicit a response. Refusing them here keeps
+    // attackers from fire-and-forgetting `tools/call` to drain budget
+    // (max_total_tool_calls, payout) without needing to consume responses.
+    if id.is_none() {
+        return Err(RpcError::BadParams(
+            "tools/call requires an id; JSON-RPC notifications are not accepted".into(),
+        ));
+    }
     let arguments = params
         .get("arguments")
         .cloned()
@@ -91,7 +124,7 @@ pub fn parse_tool_call(raw: &[u8]) -> Result<ToolCallRequest, RpcError> {
         return Err(RpcError::BadParams("params.arguments must be an object".into()));
     }
     Ok(ToolCallRequest {
-        id: obj.get("id").cloned(),
+        id,
         tool: tool.to_owned(),
         arguments,
     })
@@ -277,6 +310,96 @@ mod tests {
                 }
                 other => panic!("must reject {spoof:?}, got {other:?}"),
             }
+        }
+    }
+
+    /// A tool name carrying ANY ASCII control character or whitespace must
+    /// be rejected. Otherwise `"db_write\n"` slips past exact-string matchers
+    /// for per-tool schemas, per-tool policy deny-lists, per-tool budget
+    /// caps, AND the harness consequential-tools workflow veto — and most
+    /// downstream MCP servers then normalize whitespace back to `"db_write"`,
+    /// completing the bypass.
+    #[test]
+    fn tool_name_with_control_char_or_whitespace_is_rejected() {
+        for hostile in [
+            "db_write\n",
+            "db_write\r",
+            "db_write\t",
+            "db_write\0",
+            "db_write ",
+            " db_write",
+            "db write",
+            "db_write\u{000B}",
+            "db_write\x7f",
+        ] {
+            let raw = call(hostile, json!({}));
+            match parse_tool_call(&raw) {
+                Err(RpcError::BadParams(reason)) => {
+                    assert!(
+                        reason.contains("control character or whitespace"),
+                        "wrong reason: {reason}",
+                    );
+                }
+                other => panic!("must reject {hostile:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// `tools/call` without an id is a JSON-RPC 2.0 notification. Accepting
+    /// one would let an attacker fire-and-forget consequential calls to drain
+    /// `max_total_tool_calls` and payout budget with no response to consume.
+    /// Notifications must be refused at the parse gate.
+    #[test]
+    fn tools_call_without_id_is_rejected_as_a_notification() {
+        let raw = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "safe_tool", "arguments": {}}
+        }))
+        .unwrap();
+        match parse_tool_call(&raw) {
+            Err(RpcError::BadParams(reason)) => {
+                assert!(reason.contains("notification"), "wrong reason: {reason}");
+            }
+            other => panic!("notification must be rejected, got {other:?}"),
+        }
+    }
+
+    /// JSON-RPC 2.0 §4 restricts `id` to a String, Number, or Null.
+    /// Downstream correlation tables that key on id-as-string cannot survive
+    /// a structured id.
+    #[test]
+    fn tools_call_with_structured_id_is_rejected() {
+        for hostile_id in [json!({"nested": true}), json!([1, 2, 3]), json!(true), json!(false)] {
+            let raw = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": hostile_id,
+                "method": "tools/call",
+                "params": {"name": "safe_tool", "arguments": {}}
+            }))
+            .unwrap();
+            match parse_tool_call(&raw) {
+                Err(RpcError::BadParams(reason)) => {
+                    assert!(reason.contains("JSON-RPC 2.0"), "wrong reason: {reason}");
+                }
+                other => panic!("hostile id {hostile_id:?} must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    /// String, number, and null ids are all accepted (§4 spec shape).
+    #[test]
+    fn valid_id_shapes_are_accepted() {
+        for good_id in [json!("uuid-123"), json!(42), json!(-7), json!(null)] {
+            let raw = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": good_id,
+                "method": "tools/call",
+                "params": {"name": "safe_tool", "arguments": {}}
+            }))
+            .unwrap();
+            let parsed = parse_tool_call(&raw).unwrap_or_else(|e| panic!("{good_id:?}: {e:?}"));
+            assert_eq!(parsed.id, Some(good_id));
         }
     }
 }
