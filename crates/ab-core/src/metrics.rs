@@ -394,12 +394,38 @@ fn escape_prom_help(help: &str) -> String {
 /// series name; catch that at registration.
 #[allow(clippy::panic)]
 fn validate_metric_key(key: &str) {
-    for byte in key.bytes() {
-        if matches!(byte, b'\n' | b'\r' | b'\\' | 0x00) {
+    // Round-33 F4: split the key into base + labels first, then apply
+    // strict byte checks to the base name only. Label values are
+    // enclosed in double quotes by convention (`{stage="worker_queue"}`)
+    // so a global `"` ban would panic on every labelled counter
+    // registration (see round-14 the labelled-counter tests). The
+    // real hazard is a base-name that carries `"` / `\` / `\n` / `\r`
+    // / NUL — those would produce unbalanced quotes or split-line
+    // output that Prometheus rejects as invalid text exposition.
+    // Label values carry their own escape discipline (round-14 F7's
+    // `escape_prom_label_value` fires at render time and covers the
+    // cross-line bytes there); this validator's job is the base.
+    let (base, labels) = split_key(key);
+    for byte in base.bytes() {
+        if matches!(byte, b'\n' | b'\r' | b'\\' | b'"' | 0x00) {
             panic!(
-                "metric key {key:?} contains a byte (0x{byte:02x}) that would corrupt \
+                "metric base name {base:?} contains a byte (0x{byte:02x}) that would corrupt \
                  Prometheus text exposition; interpolating attacker-controlled strings \
-                 into metric keys is unsafe",
+                 into metric names is unsafe",
+            );
+        }
+    }
+    // Also refuse the raw cross-line bytes anywhere in the labels
+    // section — Prometheus parses one metric per line, so any bare
+    // `\n`, `\r`, or NUL slips a synthetic line into the scrape.
+    // Backslash and double quote are legal inside labels because the
+    // render-time escaper handles them.
+    for byte in labels.bytes() {
+        if matches!(byte, b'\n' | b'\r' | 0x00) {
+            panic!(
+                "metric label section {labels:?} contains a byte (0x{byte:02x}) that would \
+                 corrupt Prometheus text exposition; interpolating attacker-controlled \
+                 strings into metric labels is unsafe",
             );
         }
     }

@@ -988,6 +988,7 @@ impl AppState {
                 tool,
                 budget_remaining,
                 elapsed_us,
+                ..
             } => (
                 StatusId::Success,
                 serde_json::json!({

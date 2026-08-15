@@ -667,6 +667,19 @@ async fn process_envelope(
         _capacity_permit: capacity_permit,
     } = envelope;
     let session = Arc::clone(&job.session);
+    // Round-33 F2: guard the session-level pending-jobs decrement in
+    // the same RAII shape as `PendingGuard` (round-12 F3). The bare
+    // `session.worker_job_finished()` after `tokio::spawn(...).await`
+    // used to leak the session-level counter on any panic or drop
+    // between here and line ~712. A stuck `session.pending_jobs` means
+    // `close_session_locked -> wait_for_worker_jobs().await` blocks
+    // forever on `jobs_drained.notified()`, holding the session's
+    // lifecycle lock and starving every subsequent close / promote /
+    // recovery-adopt on that id. Class round-12 F3 closed, one call
+    // frame up.
+    let _session_pending_guard = SessionPendingGuard {
+        session: Arc::clone(&session),
+    };
     let result = tokio::spawn(
         {
             let job_metrics = Arc::clone(&worker_metrics);
@@ -709,7 +722,10 @@ async fn process_envelope(
             .counter("ab_worker_errors_total", "Worker jobs that failed")
             .inc();
     }
-    session.worker_job_finished();
+    // Round-33 F2: `_session_pending_guard`'s Drop calls
+    // `worker_job_finished()` — replaces the bare call previously
+    // here so a panic between `spawn.await` and this point cannot
+    // leak the session pending counter.
     drop(capacity_permit);
     // Guard runs Drop here (or on the panic path). The completion
     // channel below is fine to send after — the receiver only needs
@@ -739,6 +755,26 @@ impl Drop for PendingGuard {
         if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.drained.notify_waiters();
         }
+    }
+}
+
+/// Round-33 F2: RAII pair to [`PendingGuard`] for the session-level
+/// pending-jobs counter. `Session::worker_job_finished()` was
+/// previously called as a bare method after `tokio::spawn(...).await`,
+/// but a panic in the routing-side epilogue (Display-side allocator
+/// failure, catch_unwind of the wrapper future, runtime shutdown
+/// mid-envelope) between `.await` and that call left
+/// `session.pending_jobs` stuck. `close_session_locked` then blocked
+/// forever on `wait_for_worker_jobs().await`, holding the session's
+/// lifecycle lock — the exact class round-12 F3 closed on the
+/// worker-level counter.
+struct SessionPendingGuard {
+    session: Arc<crate::session::Session>,
+}
+
+impl Drop for SessionPendingGuard {
+    fn drop(&mut self) {
+        self.session.worker_job_finished();
     }
 }
 
