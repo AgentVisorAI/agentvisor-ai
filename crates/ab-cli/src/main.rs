@@ -358,10 +358,22 @@ fn atif_validate(path: &Path, mode: ValidationMode) -> Result<()> {
     };
     let issues = ab_atif::validate_value(&value, mode);
     if !issues.is_empty() {
-        for issue in &issues {
+        // Round-20 F2/F8: mirror the reconciler's round-19 F6
+        // discipline — a 4096-line stderr dump followed by an
+        // anyhow-formatted summary produced a hard-to-grep exit
+        // path. Print at most the first 16 issues (via
+        // `ATIF_HEAD` alignment), then fold the total count into
+        // the summary bail message.
+        const ATIF_HEAD: usize = 16;
+        let total = issues.len();
+        let shown = issues.iter().take(ATIF_HEAD);
+        for issue in shown {
             eprintln!("{}: {}", issue.path, issue.message);
         }
-        anyhow::bail!("ATIF validation failed with {} issue(s)", issues.len());
+        if total > ATIF_HEAD {
+            eprintln!("... {} more issue(s) suppressed (showing first {ATIF_HEAD})", total - ATIF_HEAD);
+        }
+        anyhow::bail!("ATIF validation failed with {total} issue(s)");
     }
     println!("valid {}", path.display());
     Ok(())
