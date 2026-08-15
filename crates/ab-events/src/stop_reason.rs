@@ -31,6 +31,19 @@ pub enum StopReason {
     /// Session explicitly closed.
     SessionClosed,
     /// Other (see `stop_reason` free text).
+    ///
+    /// Round-29 F7: `#[serde(other)]` makes this the deserialize
+    /// fallback for any unrecognised variant. Heterogeneous
+    /// cluster upgrades (harness-N publishing a new stop reason
+    /// variant, harness-N-1 reading it back from the bridge
+    /// during recovery) would otherwise fail the whole event
+    /// parse — dropping evidence and breaking chain
+    /// reconstruction on stragglers. Forward-compat: a peer
+    /// emitter that adds `"FutureVariant"` deserializes to
+    /// `Other`; re-serialization emits `"Other"` (lossy on the
+    /// specific variant name, but the free-text `stop_reason`
+    /// field is the intended carrier for that detail anyway).
+    #[serde(other)]
     Other,
 }
 
@@ -126,5 +139,25 @@ mod tests {
     fn unknown_id_tolerated() {
         assert_eq!(StopReason::from_id(42), StopReason::Unknown);
         assert_eq!(StopReason::from_id(255), StopReason::Unknown);
+    }
+
+    /// Round-29 F7: `#[serde(other)]` makes `Other` the deserialize
+    /// fallback for any unrecognised discriminant. Heterogeneous
+    /// cluster upgrades (harness-N publishing a new variant,
+    /// harness-N-1 reading it back from the bridge during recovery)
+    /// would otherwise fail the whole event parse — dropping
+    /// evidence and breaking chain reconstruction on stragglers.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn unknown_serde_variant_falls_back_to_other() {
+        let unknown: StopReason = serde_json::from_str("\"FutureVariant\"").unwrap();
+        assert_eq!(unknown, StopReason::Other);
+        // Known variants still parse to themselves — the fallback
+        // does not shadow them.
+        let known: StopReason = serde_json::from_str("\"MaxTokens\"").unwrap();
+        assert_eq!(known, StopReason::MaxTokens);
+        // Emitted representation of Other stays "Other" (no invisible
+        // renaming of the fallback).
+        assert_eq!(serde_json::to_string(&StopReason::Other).unwrap(), "\"Other\"");
     }
 }
