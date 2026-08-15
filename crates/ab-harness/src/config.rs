@@ -696,6 +696,18 @@ impl HarnessConfig {
         if self.identity_jwks_refresh_s == 0 {
             return Err("identity_jwks_refresh_s must be greater than zero".into());
         }
+        // `tokio::time::interval(Duration::from_secs(0))` panics. Guard
+        // against a value that squeaks past the > 0 check via overflow
+        // arithmetic elsewhere by requiring a minimum plausible cadence
+        // — a JWKS refresh below 30 s hammers the IdP and offers no
+        // real benefit at NHI TTLs measured in minutes.
+        if self.identity_jwks_refresh_s < 30 {
+            return Err(format!(
+                "identity_jwks_refresh_s {} is too aggressive; a value below 30 s hammers the IdP \
+                 without benefit given NHI TTLs measured in minutes",
+                self.identity_jwks_refresh_s
+            ));
+        }
         if self.identity_hmac_kid.is_empty() {
             return Err("identity_hmac_kid must not be empty".into());
         }

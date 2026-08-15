@@ -68,8 +68,22 @@ fn deep_nested_arrays_do_not_stack_overflow_jcs() {
     // Whatever the worker returns is fine — panic-catch not required.
     let (out, elapsed) = handle.join().unwrap();
     assert!(elapsed.as_secs() < 60, "10k-deep canonicalize took {elapsed:?}");
-    if let Ok(canon) = out {
-        assert_eq!(canon.matches('[').count(), 10_000);
+    // Explicitly assert on BOTH the Ok and Err cases so the test can
+    // never silently accept a regression that made canonicalize refuse
+    // deep input outright. Either the operation succeeded and produced
+    // the expected shape, or it failed and the test now surfaces which
+    // error class it failed with (so a change in the failure mode is
+    // reviewed rather than silently accepted).
+    match out {
+        Ok(canon) => assert_eq!(
+            canon.matches('[').count(),
+            10_000,
+            "canonicalize succeeded but produced the wrong depth"
+        ),
+        Err(error) => panic!(
+            "canonicalize on a 10k-deep input must either succeed or fail with a documented \
+             recursion error; got: {error:?}"
+        ),
     }
 }
 
@@ -106,7 +120,18 @@ fn rpc_parse_rejects_just_over_the_depth_cap_and_accepts_at_it() {
     });
     rpc::parse_tool_call(&serde_json::to_vec(&ok_payload).unwrap()).unwrap();
     let err = rpc::parse_tool_call(&serde_json::to_vec(&bad_payload).unwrap()).unwrap_err();
-    assert!(matches!(err, RpcError::NotJsonRpc(_)));
+    // Assert on the CONTENT of the error message, not just the variant:
+    // `RpcError::NotJsonRpc(String)` is emitted from at least four
+    // unrelated call sites in rpc.rs. A regression that broke the deep
+    // parse and now returns "method missing" would otherwise pass this
+    // test green.
+    match err {
+        RpcError::NotJsonRpc(message) => assert!(
+            message.contains("nesting") || message.contains("depth"),
+            "expected depth-cap refusal, got NotJsonRpc({message:?})"
+        ),
+        other => panic!("expected NotJsonRpc(depth-cap message), got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

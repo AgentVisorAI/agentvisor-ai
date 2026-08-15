@@ -72,12 +72,78 @@ pub struct Finalizer {
     /// because lifecycle tests construct a Finalizer without one.
     state_store: Option<Arc<dyn ab_state::StateStore>>,
     recovery_lock: Arc<tokio::sync::Mutex<()>>,
-    lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Per-session lifecycle mutex table. Serialises `close_session`,
+    /// `promote`, and `recover_spooled_sessions` on the *same* session
+    /// id; different sessions proceed concurrently. Replaces the earlier
+    /// single global `lifecycle_lock` which head-of-line-blocked every
+    /// client close behind a long recovery scan or an idle sweep of
+    /// thousands of sessions.
+    lifecycle_locks: Arc<SessionLockTable>,
     quarantined_sessions: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     /// Artifacts already warned about during recovery scans, so a corrupt
     /// file left on disk as evidence does not repeat its warning every tick.
     warned_artifacts: Arc<parking_lot::Mutex<std::collections::HashSet<PathBuf>>>,
     journal_key: [u8; 32],
+}
+
+/// Per-session lifecycle mutex table.
+///
+/// Invariants:
+///   * At most one `close_session` / `promote` / recovery-adopt runs
+///     concurrently for a given session_id.
+///   * Different session_ids proceed concurrently.
+///   * Entries are Arc-refcounted. `SessionLifecycleGuard::drop` opportunistically
+///     removes the entry when this task was the last waiter; readers
+///     that observed the entry before the remove simply create a new
+///     Arc — correctness is preserved because they cannot yet hold
+///     the guard.
+#[derive(Default)]
+pub struct SessionLockTable {
+    inner: dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl SessionLockTable {
+    fn arc_for(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        // `entry().or_insert_with()` is race-free within a shard.
+        self.inner
+            .entry(session_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .value()
+            .clone()
+    }
+
+    /// Called after a caller drops its owned guard. Removes the entry
+    /// IFF the map is the last strong reference. `remove_if` runs under
+    /// a shard write lock so the refcount check is atomic w.r.t. `arc_for`.
+    fn try_gc(&self, session_id: &str) {
+        self.inner
+            .remove_if(session_id, |_, arc| Arc::strong_count(arc) == 1);
+    }
+
+    /// Test-only: how many session lock entries are currently resident.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+/// RAII guard that (a) holds an owned mutex permit and (b) opportunistically
+/// prunes its entry from [`SessionLockTable`] on drop.
+pub struct SessionLifecycleGuard {
+    permit: Option<tokio::sync::OwnedMutexGuard<()>>,
+    table: Arc<SessionLockTable>,
+    session_id: String,
+}
+
+impl Drop for SessionLifecycleGuard {
+    fn drop(&mut self) {
+        // Drop the permit *first* (releasing the mutex) and only then
+        // attempt GC: the strong-count check inside `try_gc` must see
+        // us gone. `Option::take` explicitly sequences the two steps
+        // instead of relying on field-declaration order.
+        drop(self.permit.take());
+        self.table.try_gc(&self.session_id);
+    }
 }
 
 struct CloseClaim<'a> {
@@ -133,7 +199,7 @@ impl Finalizer {
             bridge: None,
             state_store: None,
             recovery_lock: Arc::new(tokio::sync::Mutex::new(())),
-            lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle_locks: Arc::new(SessionLockTable::default()),
             quarantined_sessions: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             warned_artifacts: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             journal_key,
@@ -155,11 +221,30 @@ impl Finalizer {
             bridge: Some(bridge),
             state_store: None,
             recovery_lock: Arc::new(tokio::sync::Mutex::new(())),
-            lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle_locks: Arc::new(SessionLockTable::default()),
             quarantined_sessions: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             warned_artifacts: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             journal_key,
         }
+    }
+
+    /// Acquire the lifecycle lock scoped to a single session id. Held
+    /// during `close_session` / `promote` / recovery-adopt so a single
+    /// session cannot be finalised twice concurrently; different
+    /// sessions proceed in parallel.
+    async fn acquire_lifecycle(&self, session_id: &str) -> SessionLifecycleGuard {
+        let arc = self.lifecycle_locks.arc_for(session_id);
+        let permit = arc.lock_owned().await;
+        SessionLifecycleGuard {
+            permit: Some(permit),
+            table: Arc::clone(&self.lifecycle_locks),
+            session_id: session_id.to_owned(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lifecycle_locks(&self) -> Arc<SessionLockTable> {
+        Arc::clone(&self.lifecycle_locks)
     }
 
     /// Attach the quota/budget state store whose per-session counters are
@@ -193,7 +278,7 @@ impl Finalizer {
         session: Arc<Session>,
         stop_reason: StopReason,
     ) -> Result<FinalizeOutcome, FinalizeError> {
-        let _lifecycle = self.lifecycle_lock.lock().await;
+        let _lifecycle = self.acquire_lifecycle(&session.id).await;
         self.close_session_locked(session, stop_reason).await
     }
 
@@ -377,7 +462,7 @@ impl Finalizer {
         fields(session.id = %session.id)
     )]
     pub async fn promote(&self, session: Arc<Session>) -> Result<Receipt, FinalizeError> {
-        let _lifecycle = self.lifecycle_lock.lock().await;
+        let _lifecycle = self.acquire_lifecycle(&session.id).await;
         if session.workflow != Workflow::Unsigned {
             return session
                 .receipt
@@ -507,7 +592,11 @@ impl Finalizer {
         breaker: &ab_loopdetect::BreakerConfig,
     ) -> Result<usize, FinalizeError> {
         let _recovery = self.recovery_lock.lock().await;
-        let _lifecycle = self.lifecycle_lock.lock().await;
+        // NB: no global lifecycle lock here — per-session locks are
+        // acquired inside the scan loop, right before each candidate is
+        // mutated. Without this change, a large ATIF spool at restart
+        // would block every /v1/close client call for the duration of
+        // the scan.
         let mut quarantined = crate::worker::inflight_response_sessions(&self.spool_dir, &self.journal_key)
             .await
             .map_err(FinalizeError::Atif)?;
@@ -660,6 +749,10 @@ impl Finalizer {
             if sessions.get(&session_id).is_some() {
                 continue;
             }
+            // Per-session lifecycle lock: scoped to this candidate only,
+            // released at the end of this loop iteration so the next
+            // candidate proceeds without waiting on all previous ones.
+            let _lifecycle = self.acquire_lifecycle(&session_id).await;
             let extra = trajectory.agent.extra.as_ref();
             let instance_uid = extra
                 .and_then(|value| value.get("instance_uid"))
@@ -759,6 +852,11 @@ impl Finalizer {
             if sessions.get(session_id).is_some() {
                 continue;
             }
+            // Per-session lifecycle lock for the signed-recovery path,
+            // scoped to this candidate only. Released between candidates
+            // so a client close on session B is not blocked by an
+            // in-flight recovery-adopt of session A.
+            let _lifecycle = self.acquire_lifecycle(session_id).await;
             let identity: ab_events::AgentIdentity = serde_json::from_value(
                 metadata
                     .get("identity")
@@ -921,6 +1019,12 @@ impl Finalizer {
             // entry). `is_closed()` is true whenever `artifact_committed` is
             // set, but `try_close` still transitions `closed` 0→1, so
             // `close_session_locked` still runs its full finalize body.
+            //
+            // NB: the per-session lifecycle lock was already acquired at
+            // the top of this iteration (see the `let _lifecycle = ...`
+            // block near the session_id skip check) and covers this
+            // whole mutation region — a second acquire here would
+            // deadlock on itself.
             unwrapped.mark_artifact_committed();
             let session = match sessions.try_insert_recovered(unwrapped) {
                 Ok(inserted) => inserted,
@@ -1052,6 +1156,11 @@ impl Finalizer {
             if sessions.get(session_id).is_some() {
                 continue;
             }
+            // Per-session lifecycle lock for the unsigned-consolidation
+            // path, scoped to this candidate only. Released between
+            // candidates so the recovery scan cannot head-of-line-block
+            // a client-driven close on an unrelated session.
+            let _lifecycle = self.acquire_lifecycle(session_id).await;
             let identity: ab_events::AgentIdentity = serde_json::from_value(
                 metadata
                     .get("identity")
@@ -3350,6 +3459,97 @@ mod tests {
             let outcome = result.expect("task panicked");
             assert!(outcome.is_ok(), "close failed: {outcome:?}");
         }
+    }
+
+    /// Per-session lock table must not accumulate entries indefinitely.
+    /// Every guard drop attempts to prune the corresponding entry
+    /// (only when the map holds the last strong ref) — steady-state
+    /// resident set = concurrent lifecycle ops, not total distinct
+    /// session_ids ever seen. Otherwise an attacker firing 100k
+    /// distinct session_ids could OOM the process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn per_session_lock_table_prunes_entries_after_close() {
+        const SESSIONS: usize = 200;
+        let directory = tempfile::tempdir().unwrap();
+        let finalizer = Arc::new(finalizer(directory.path()));
+        let locks = finalizer.lifecycle_locks();
+        let mut tasks = Vec::with_capacity(SESSIONS);
+        for i in 0..SESSIONS {
+            let f = Arc::clone(&finalizer);
+            let s = Arc::new(Session::new(
+                format!("prune-{i}"),
+                Workflow::Signed,
+                AgentIdentity {
+                    version: "1".to_owned(),
+                    charter: "test".into(),
+                    instance_uid: format!("instance-{i}"),
+                    ttl_remaining_s: Some(600),
+                },
+                Default::default(),
+            ));
+            tasks.push(tokio::spawn(async move {
+                f.close_session(s, StopReason::SessionClosed).await
+            }));
+        }
+        for task in tasks {
+            let _ = task.await.expect("task panicked");
+        }
+        // With no active lifecycle ops, the table should end up empty.
+        // Some entries may briefly linger if a guard's drop is racing
+        // another `arc_for` call, but a bounded settle window is fine.
+        for _ in 0..20 {
+            if locks.len() == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!(
+            "SessionLockTable did not prune to empty after {SESSIONS} closes; \
+             residual entries = {}",
+            locks.len()
+        );
+    }
+
+    /// A recovery scan of a large ATIF spool must not head-of-line-block
+    /// a client-driven close on an unrelated session. Under the old
+    /// global `lifecycle_lock` the client close waited for the entire
+    /// scan to finish. With per-session locks, close on session B
+    /// proceeds while recovery is still scanning candidate A.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovery_scan_does_not_head_of_line_block_unrelated_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let finalizer = Arc::new(finalizer(directory.path()));
+        // Kick off a recovery scan (no spool candidates, so it returns
+        // immediately — but the recovery_lock is still acquired).
+        let f_scan = Arc::clone(&finalizer);
+        let scan_task = tokio::spawn(async move {
+            f_scan
+                .recover_spooled_sessions(&crate::session::SessionRegistry::new(), &Default::default())
+                .await
+        });
+        // Concurrently close a session with a distinct id. This must
+        // complete without waiting on the scan's recovery lock.
+        let session = Arc::new(Session::new(
+            "unrelated-close".to_owned(),
+            Workflow::Signed,
+            AgentIdentity {
+                version: "1".to_owned(),
+                charter: "test".into(),
+                instance_uid: "instance-close".to_owned(),
+                ttl_remaining_s: Some(600),
+            },
+            Default::default(),
+        ));
+        let close_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            finalizer.close_session(session, StopReason::SessionClosed),
+        )
+        .await;
+        assert!(
+            close_result.is_ok(),
+            "unrelated close was blocked by recovery scan"
+        );
+        let _ = scan_task.await;
     }
 
     /// A saturated worker-side finalizer must not hold the lifecycle_lock
