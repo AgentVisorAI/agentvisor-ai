@@ -1630,6 +1630,21 @@ fn parse_provider_chunk(raw: &str) -> Result<Option<ParsedProviderChunk>, String
     let mut tool_call_deltas = Vec::new();
     let mut is_sse = false;
     let mut data = Vec::new();
+    // Track the last `event:` type seen in this frame. SSE §9.2.8 says
+    // an SSE client dispatches by event name; "message" (empty or
+    // omitted) is the default. AgentBridge attributes the `data:`
+    // payload to the audit trail (receipt, ATIF) as if it were the
+    // model's output — but a hostile upstream (rogue provider,
+    // TLS-MITM at egress, misconfigured cache) can send
+    // `event: error\ndata: {"choices":[{"delta":{"content":"…"}}]}` —
+    // spec-compliant SSE clients (browsers, OpenAI SDK's error hook)
+    // would dispatch that to the ERROR listener, so the user sees an
+    // error UI while our receipt records the payload as the model's
+    // response. That defeats the cryptographic-attestation posture.
+    // Only accept `event:` empty or `"message"` for capture; other
+    // types abort the frame with a diagnostic and let the caller
+    // mark_capture_failed rather than sign attributable content.
+    let mut event_type = String::new();
     for line in raw.split(['\r', '\n']) {
         if let Some(value) = line.strip_prefix("data:") {
             is_sse = true;
@@ -1639,14 +1654,24 @@ fn parse_provider_chunk(raw: &str) -> Result<Option<ParsedProviderChunk>, String
             // mis-account any provider that sends `data:  {...}` with a
             // meaningful second byte.
             data.push(value.strip_prefix(' ').unwrap_or(value));
+        } else if let Some(value) = line.strip_prefix("event:") {
+            is_sse = true;
+            event_type = value.strip_prefix(' ').unwrap_or(value).to_owned();
         } else if line == "data"
-            || line.starts_with("event:")
             || line.starts_with("id:")
             || line.starts_with("retry:")
             || line.starts_with(':')
         {
             is_sse = true;
         }
+    }
+    if is_sse && !event_type.is_empty() && event_type != "message" {
+        return Err(format!(
+            "provider SSE frame carries unsupported event type {event_type:?}; \
+             AgentBridge only captures the default `message` event because non-message \
+             events (error, ping, custom) are dispatched to different client listeners \
+             per SSE §9.2.8 and would be attributed to the wrong audit surface"
+        ));
     }
     let candidate = if is_sse {
         if data.is_empty() {
@@ -1656,7 +1681,18 @@ fn parse_provider_chunk(raw: &str) -> Result<Option<ParsedProviderChunk>, String
     } else {
         raw.trim().to_owned()
     };
-    if candidate.is_empty() || candidate == "[DONE]" {
+    // Robust `[DONE]` sentinel handling. Some providers double-terminate
+    // (`data: [DONE]\ndata: [DONE]`), send trailing whitespace, or emit
+    // an empty keepalive line followed by `[DONE]`. The strict
+    // byte-exact check used to fail every subsequent stream on such
+    // benign variants — `trim` + per-line probe catches them.
+    if candidate.is_empty()
+        || candidate.trim() == "[DONE]"
+        || data
+            .iter()
+            .all(|entry| entry.trim().is_empty() || entry.trim() == "[DONE]")
+            && !data.is_empty()
+    {
         return Ok(None);
     }
     let value = serde_json::from_str::<Value>(&candidate)
@@ -2772,13 +2808,32 @@ mod tests {
             "passthrough must relay the client credential"
         );
 
-        // 4) No auth configured: no Authorization header appears upstream.
+        // 4) No identity validator configured but the client sent a
+        //    bearer: refuse with 401 rather than record the request as
+        //    anonymous (a repudiation vector — see resolve_identity's
+        //    "bearer presented but validator not configured" arm).
+        //    The response is the block; the fact that no wire capture
+        //    landed also proves the credential does not leak.
         let config = crate::config::HarnessConfig::for_tests(&format!("http://{address}"), &spool, &spool);
-        send_chat(build_state(config), Some("Bearer client-owned-key")).await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header("x-ab-session", "auth-wire")
+            .header(axum::http::header::AUTHORIZATION, "Bearer client-owned-key")
+            .body(Body::from(chat_payload().to_string()))
+            .unwrap();
+        let response = build_router(build_state(config)).oneshot(request).await.unwrap();
         assert_eq!(
-            captured.lock().pop().unwrap(),
-            (None, None),
-            "without passthrough the client credential must NOT leak upstream"
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "presenting a bearer with no validator configured must be refused rather than \
+             silently recorded as anonymous — that would let a signed request end up \
+             attributed to `charter=anonymous` in the receipt"
+        );
+        assert!(
+            captured.lock().is_empty(),
+            "no credential must reach upstream when the request was refused"
         );
         provider.abort();
     }
@@ -3140,6 +3195,58 @@ mod tests {
             .expect("BOM-prefixed SSE frame must parse")
             .expect("must yield a chunk");
         assert_eq!(parsed.message, "hi");
+    }
+
+    /// SSE §9.2.8: an SSE client dispatches events by name, so
+    /// `event: error\ndata: {model-shaped-JSON}` is delivered to the
+    /// browser/SDK's `error` listener — NOT the default `message`
+    /// listener. AgentBridge attributes captured `data:` payloads to
+    /// the signed receipt / ATIF as if they were model output, so a
+    /// hostile upstream (rogue provider, TLS-MITM at egress mesh, a
+    /// misconfigured caching proxy) could forge receipt content while
+    /// the user's UI showed nothing suspicious. Refuse the frame with
+    /// a diagnostic so the caller marks capture-failed rather than
+    /// signs attributable content that never was displayed.
+    #[test]
+    fn parse_provider_chunk_refuses_non_message_sse_event_types() {
+        for event in ["error", "ping", "custom_signal"] {
+            let raw = format!(
+                "event: {event}\ndata: {{\"choices\":[{{\"delta\":{{\"content\":\"forged\"}}}}]}}\n\n"
+            );
+            let err = match parse_provider_chunk(&raw) {
+                Ok(_) => panic!("event type {event:?} must be refused"),
+                Err(error) => error,
+            };
+            assert!(
+                err.contains("unsupported event type") && err.contains(event),
+                "expected diagnostic naming event type {event:?}, got: {err}"
+            );
+        }
+        // Explicit `event: message` is accepted (spec default) — must
+        // NOT be refused by the same guard.
+        let ok_raw = "event: message\ndata: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+        let parsed = match parse_provider_chunk(ok_raw) {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => panic!("explicit event: message must yield a chunk"),
+            Err(error) => panic!("explicit event: message must be accepted, got: {error}"),
+        };
+        assert_eq!(parsed.message, "hi");
+    }
+
+    #[test]
+    fn parse_provider_chunk_treats_done_variants_as_stream_end() {
+        for raw in [
+            "data: [DONE]\ndata: [DONE]\n\n",
+            "data: [DONE]  \n\n",
+            "data:\ndata: [DONE]\n\n",
+        ] {
+            let result = parse_provider_chunk(raw);
+            match result {
+                Ok(None) => {}
+                Ok(Some(_)) => panic!("[DONE] variant must terminate stream (None) for {raw:?}"),
+                Err(error) => panic!("[DONE] variant must not fail parse: {raw:?}: {error}"),
+            }
+        }
     }
 
     /// SSE §9.2.6: the `data:` field strips exactly one leading
