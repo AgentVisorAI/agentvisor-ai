@@ -152,9 +152,22 @@ impl StateStore for InMemoryStore {
         }
         let mut prepared = Vec::with_capacity(spends.len());
         for (index, spend) in spends.iter().enumerate() {
+            // Round-21 F1: match RedisStore's Overflow-reject
+            // discipline instead of silently clamping `limit` down
+            // to COUNTER_MAX. A caller with a config typo
+            // (`max_payout_usd_micros` with one extra zero) would
+            // otherwise succeed on the InMemoryStore dev/test path
+            // and fail with `Overflow` in Redis prod — the exact
+            // cross-backend divergence class round-20 F1 closed
+            // for `add`.
+            if spend.amount > ab_core::error::JCS_SAFE_MAX {
+                return Err(StateError::Overflow(spend.key.clone()));
+            }
+            if spend.limit > ab_core::error::JCS_SAFE_MAX {
+                return Err(StateError::Overflow(spend.key.clone()));
+            }
             let amount = i64::try_from(spend.amount).map_err(|_| StateError::Overflow(spend.key.clone()))?;
-            let limit = i64::try_from(spend.limit.min(u64::try_from(COUNTER_MAX).unwrap_or(u64::MAX)))
-                .map_err(|_| StateError::Overflow(spend.key.clone()))?;
+            let limit = i64::try_from(spend.limit).map_err(|_| StateError::Overflow(spend.key.clone()))?;
             let cell = self.cell(&spend.key);
             let current = cell.load(Ordering::Acquire);
             let next = current
@@ -407,5 +420,40 @@ mod tests {
         );
         assert_eq!(s.get("a").unwrap(), 3);
         assert_eq!(s.get("b").unwrap(), 4);
+    }
+
+    /// Round-21 F1: cross-backend divergence closed for
+    /// `try_spend_many`. Historically InMemoryStore silently
+    /// clamped `limit` down to COUNTER_MAX while Redis rejected
+    /// the same call with `Overflow`. A caller with a config typo
+    /// used to succeed in dev/test and fail in Redis prod. Both
+    /// backends now match: reject Overflow on `amount` or `limit`
+    /// past JCS_SAFE_MAX.
+    #[test]
+    fn try_spend_many_rejects_limits_past_counter_max() {
+        let s = InMemoryStore::new();
+        let outcome = s.try_spend_many(&[Spend {
+            key: "a".to_owned(),
+            amount: 1,
+            limit: ab_core::error::JCS_SAFE_MAX + 1,
+        }]);
+        assert!(
+            matches!(outcome, Err(StateError::Overflow(_))),
+            "expected Overflow rejection, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn try_spend_many_rejects_amounts_past_counter_max() {
+        let s = InMemoryStore::new();
+        let outcome = s.try_spend_many(&[Spend {
+            key: "a".to_owned(),
+            amount: ab_core::error::JCS_SAFE_MAX + 1,
+            limit: u64::MAX,
+        }]);
+        assert!(
+            matches!(outcome, Err(StateError::Overflow(_))),
+            "expected Overflow rejection, got {outcome:?}"
+        );
     }
 }

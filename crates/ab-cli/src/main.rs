@@ -358,22 +358,37 @@ fn atif_validate(path: &Path, mode: ValidationMode) -> Result<()> {
     };
     let issues = ab_atif::validate_value(&value, mode);
     if !issues.is_empty() {
-        // Round-20 F2/F8: mirror the reconciler's round-19 F6
-        // discipline — a 4096-line stderr dump followed by an
-        // anyhow-formatted summary produced a hard-to-grep exit
-        // path. Print at most the first 16 issues (via
-        // `ATIF_HEAD` alignment), then fold the total count into
-        // the summary bail message.
+        // Round-20 F2/F8 + round-21 F5: the reconciler already
+        // caps its render at first 16 + total; the CLI mirrors
+        // that. Round-21 also detects the ab_atif truncation
+        // marker (message contains "issue cap") so the summary
+        // says "at least N" rather than reporting the capped
+        // count as if it were exact.
         const ATIF_HEAD: usize = 16;
-        let total = issues.len();
+        let truncated = issues
+            .last()
+            .is_some_and(|i| i.message.contains("issue cap"));
+        // Number of "real" issues: strip the synthetic marker if
+        // present. The total the user sees is a lower bound when
+        // truncated, exact otherwise.
+        let real_total = if truncated { issues.len() - 1 } else { issues.len() };
         let shown = issues.iter().take(ATIF_HEAD);
         for issue in shown {
             eprintln!("{}: {}", issue.path, issue.message);
         }
-        if total > ATIF_HEAD {
-            eprintln!("... {} more issue(s) suppressed (showing first {ATIF_HEAD})", total - ATIF_HEAD);
+        if real_total > ATIF_HEAD {
+            let suppressed = real_total - ATIF_HEAD;
+            let qualifier = if truncated { "at least " } else { "" };
+            eprintln!(
+                "... {qualifier}{suppressed} more issue(s) suppressed (showing first {ATIF_HEAD})"
+            );
         }
-        anyhow::bail!("ATIF validation failed with {total} issue(s)");
+        if truncated {
+            anyhow::bail!(
+                "ATIF validation failed with at least {real_total} issue(s) (validator truncated)"
+            );
+        }
+        anyhow::bail!("ATIF validation failed with {real_total} issue(s)");
     }
     println!("valid {}", path.display());
     Ok(())

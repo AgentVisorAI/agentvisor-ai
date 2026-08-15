@@ -45,8 +45,15 @@ impl Ed25519Signer {
     pub fn generate() -> Self {
         loop {
             let key = SigningKey::generate(&mut rand::rngs::OsRng);
-            let bytes = key.to_bytes();
-            if bytes == [0u8; 32] || bytes == [0xFFu8; 32] {
+            // Round-21 F2: wrap the raw seed comparison buffer in
+            // `Zeroizing` so the stack slot zeroes on scope exit.
+            // A bare `[u8; 32]` has no Drop, so it lingers in
+            // freed stack memory (recoverable from a core dump).
+            // The round-20 F5 loop reintroduced that leak by
+            // reading `key.to_bytes()` into a bare local. Equality
+            // through Deref still works.
+            let bytes = zeroize::Zeroizing::new(key.to_bytes());
+            if *bytes == [0u8; 32] || *bytes == [0xFFu8; 32] {
                 continue;
             }
             let key_id = derive_key_id(&key.verifying_key());
