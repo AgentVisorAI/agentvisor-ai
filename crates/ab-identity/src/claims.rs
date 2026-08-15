@@ -54,9 +54,19 @@ impl<'de> serde::Deserialize<'de> for Audience {
                 f.write_str("a JWT audience: a non-empty string or a non-empty array of strings")
             }
             fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Audience, E> {
+                if value.is_empty() {
+                    return Err(E::custom(
+                        "aud claim must not be an empty string; provide the audience or omit the claim",
+                    ));
+                }
                 Ok(Audience::Single(value.to_owned()))
             }
             fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Audience, E> {
+                if value.is_empty() {
+                    return Err(E::custom(
+                        "aud claim must not be an empty string; provide the audience or omit the claim",
+                    ));
+                }
                 Ok(Audience::Single(value))
             }
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Audience, A::Error> {
@@ -218,6 +228,25 @@ mod tests {
         assert!(value.aud.contains("agentbridge"));
         assert!(value.aud.contains("other"));
         assert!(!value.aud.contains("nope"));
+    }
+
+    /// Round-13 F3: mirror of F10 for the string half. The docstring
+    /// promises "non-empty string or non-empty array". Refuse the
+    /// empty string at deserialize time as defense-in-depth against a
+    /// misconfigured validator whose expected audience is also `""`.
+    #[test]
+    fn audience_empty_string_is_rejected_by_the_concrete_deserialize() {
+        let json = r#"{"aud":""}"#;
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        struct Just {
+            aud: Audience,
+        }
+        let err = serde_json::from_str::<Just>(json).unwrap_err().to_string();
+        assert!(
+            err.contains("empty string"),
+            "expected empty-string rejection, got: {err}",
+        );
     }
 
     /// Round-12 F10: an empty audience array must be rejected at the
