@@ -1083,6 +1083,42 @@ async fn shutdown_signal() {
             }
             _ = terminate.recv() => {}
         }
+        // Round-34 F2: force-exit on a second signal. Once the first
+        // signal fires and this fn returns, the tokio handlers stay
+        // registered process-wide — the OS default action never runs
+        // and subsequent SIGTERM / SIGINT are silently consumed by
+        // the still-armed receivers. An operator sending a second
+        // Ctrl-C to force-abort a hung graceful shutdown (stuck
+        // upstream connection preventing `wait_for_worker_jobs`
+        // from returning, for instance) sees no effect until
+        // Kubernetes' terminationGracePeriodSeconds elapses and
+        // SIGKILL fires — the "docker stop; docker stop" pattern
+        // is broken. Spawn a background task that races a second
+        // signal to `std::process::exit(130)` (the conventional
+        // Ctrl-C exit code). If a second signal arrives during
+        // graceful shutdown, the process exits immediately with
+        // a clear tracing line.
+        tokio::spawn(async {
+            let mut terminate = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate(),
+            )
+            .ok();
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = async {
+                    if let Some(ref mut sig) = terminate {
+                        sig.recv().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {}
+            }
+            tracing::warn!(
+                "second shutdown signal received during graceful shutdown; forcing exit(130) \
+                 — any in-flight receipt or ATIF write will be picked up by recovery on restart"
+            );
+            std::process::exit(130);
+        });
     }
     #[cfg(not(unix))]
     if let Err(error) = tokio::signal::ctrl_c().await {

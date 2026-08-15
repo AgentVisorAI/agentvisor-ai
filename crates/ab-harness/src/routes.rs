@@ -583,10 +583,22 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                         // tool-upstream URL (potentially an internal hostname) to
                         // whichever client called `/mcp`. Report a stable category
                         // and preserve the raw detail server-side for operators.
+                        //
+                        // Round-34 F4: also do not log the raw error to
+                        // tracing::warn — `reqwest::Error::Display` embeds
+                        // the same URL, and the tracing subscriber flows
+                        // to Vector -> OTLP -> SIEM per the deploy
+                        // topology. If OTLP is exported to a third party
+                        // with a lower trust boundary than the operator,
+                        // the internal `tool_upstream_url` leaks there.
+                        // Log structured fields only.
                         let category = crate::pipeline::classify_upstream_error(&error);
                         tracing::warn!(
-                            error = %error,
                             category = category,
+                            error.status = ?error.status(),
+                            error.is_timeout = error.is_timeout(),
+                            error.is_connect = error.is_connect(),
+                            error.is_request = error.is_request(),
                             "tool upstream forwarding failed"
                         );
                         // Upstream faults must surface as 502 (as the chat
@@ -638,13 +650,17 @@ async fn read_limited_tool_response(
     while let Some(chunk) = stream.next().await {
         // CWE-209: `reqwest::Error::Display` embeds the request URL — leaking
         // the operator-configured tool-upstream URL to the client if we
-        // returned it verbatim. Use the stable classifier and log the raw
-        // detail for operators.
+        // returned it verbatim. Use the stable classifier and log
+        // structured fields for operators (round-34 F4: never `%error`
+        // — that renders the URL into any downstream OTLP sink).
         let chunk = chunk.map_err(|error| {
             let category = crate::pipeline::classify_upstream_error(&error);
             tracing::warn!(
-                error = %error,
                 category = category,
+                error.status = ?error.status(),
+                error.is_timeout = error.is_timeout(),
+                error.is_connect = error.is_connect(),
+                error.is_body = error.is_body(),
                 "tool upstream stream chunk failed"
             );
             category.to_owned()
