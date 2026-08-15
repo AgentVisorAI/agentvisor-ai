@@ -152,6 +152,21 @@ pub const MAX_VALIDATION_ISSUES: usize = 4096;
 /// here so no such caller can reopen it.
 const MAX_NESTED_DEPTH: usize = 128;
 
+/// Round-38 F4: upper bound for USD-denominated cost fields
+/// (`total_cost_usd` in `final_metrics`, `cost_usd` per step). Strict
+/// mode's original floor at 0.0 was asymmetric — no ceiling — so a
+/// hostile trajectory carrying `total_cost_usd: 1.7e308` passed
+/// strict validation and flowed into promotion, dashboards, and
+/// receipt subject payloads. Not a signing hazard (receipt subject
+/// uses the ATIF file hash, not the cost fields) but a metrics-
+/// poisoning primitive: Prometheus histograms of ab_session_cost_usd
+/// would blow up their bucketing; downstream billing exporters might
+/// saturate their accumulators. `1e12` (one trillion USD) is
+/// operationally absurd for any real agent run — 1000x the whole
+/// LLM industry's annual spend — while being 1e296 below f64::MAX,
+/// safe for any arithmetic combination downstream.
+const MAX_COST_USD: f64 = 1e12;
+
 /// Validate a raw JSON value as an ATIF trajectory.
 ///
 /// Returns at most [`MAX_VALIDATION_ISSUES`] issues plus a
@@ -343,11 +358,11 @@ fn validate_trajectory_obj(
                 }
                 if let Some(v) = m.get("total_cost_usd") {
                     match v.as_f64() {
-                        Some(n) if n.is_finite() && n >= 0.0 => {}
+                        Some(n) if n.is_finite() && (0.0..=MAX_COST_USD).contains(&n) => {}
                         Some(_) => issue!(
                             issues,
                             format!("{path}.final_metrics.total_cost_usd"),
-                            "must be a finite non-negative number"
+                            "must be a finite non-negative number ≤ {MAX_COST_USD:e}"
                         ),
                         None => issue!(
                             issues,
@@ -724,11 +739,11 @@ fn validate_step(
                 }
                 if let Some(v) = m.get("cost_usd") {
                     match v.as_f64() {
-                        Some(n) if n.is_finite() && n >= 0.0 => {}
+                        Some(n) if n.is_finite() && (0.0..=MAX_COST_USD).contains(&n) => {}
                         Some(_) => issue!(
                             issues,
                             format!("{mpath}.cost_usd"),
-                            "must be a finite non-negative number"
+                            "must be a finite non-negative number ≤ {MAX_COST_USD:e}"
                         ),
                         None => issue!(issues, format!("{mpath}.cost_usd"), "must be a number"),
                     }

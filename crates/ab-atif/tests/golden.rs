@@ -437,3 +437,79 @@ fn subagent_trajectory_ref_requires_v17() {
         "v1.7 file must not emit the version-gate issue for its own field, got: {issues:#?}"
     );
 }
+
+/// Round-38 F4: total_cost_usd is capped at 1e12 (one trillion USD)
+/// in strict mode. Without a ceiling, a hostile trajectory carrying
+/// `total_cost_usd: 1.7e308` used to pass strict validation and
+/// flow into promotion / dashboards / receipt subject payloads —
+/// downstream Prometheus histograms and OTLP billing exporters
+/// would overflow their bucketing / accumulators.
+#[test]
+fn total_cost_usd_capped_in_strict_mode() {
+    let value = json!({
+        "schema_version": "ATIF-v1.7",
+        "session_id": "s",
+        "agent": {"name": "a", "version": "1.0.0"},
+        "steps": [{
+            "step_id": 1,
+            "source": "agent",
+            "message": "hi",
+            "metrics": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "cached_tokens": 0
+            }
+        }],
+        "final_metrics": {
+            "total_prompt_tokens": 1,
+            "total_completion_tokens": 1,
+            "total_cached_tokens": 0,
+            "total_steps": 1,
+            "total_cost_usd": 1.7e308
+        }
+    });
+    let issues = validate_value(&value, Mode::Strict);
+    assert!(
+        issues.iter().any(|i| {
+            i.path.contains("total_cost_usd") && i.message.contains("1e12")
+        }),
+        "expected cost-cap issue, got: {issues:#?}"
+    );
+    // A sane cost (below the cap) still passes.
+    let mut ok = value.clone();
+    ok["final_metrics"]["total_cost_usd"] = json!(1_234.56);
+    let issues = validate_value(&ok, Mode::Strict);
+    assert!(
+        !issues.iter().any(|i| i.path.contains("total_cost_usd")),
+        "sane total_cost_usd must not trigger the cost-cap issue; got: {issues:#?}"
+    );
+}
+
+/// Round-38 F4: per-step `cost_usd` is capped at the same 1e12 in
+/// strict mode.
+#[test]
+fn per_step_cost_usd_capped_in_strict_mode() {
+    let value = json!({
+        "schema_version": "ATIF-v1.7",
+        "session_id": "s",
+        "agent": {"name": "a", "version": "1.0.0"},
+        "steps": [{
+            "step_id": 1,
+            "source": "agent",
+            "message": "hi",
+            "metrics": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "cached_tokens": 0,
+                "cost_usd": 1.5e15
+            }
+        }]
+    });
+    let issues = validate_value(&value, Mode::Strict);
+    assert!(
+        issues.iter().any(|i| {
+            i.path.contains("cost_usd") && i.message.contains("1e12")
+        }),
+        "expected per-step cost-cap issue, got: {issues:#?}"
+    );
+}

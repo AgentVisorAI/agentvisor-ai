@@ -896,16 +896,29 @@ impl HarnessConfig {
         // "openai.internal"` (missing `https://`) does not silently
         // concatenate into a broken url. Full url::Url::parse is
         // deferred to reqwest at request time.
-        if !self.upstream_url.contains("://") {
+        //
+        // Round-38 F1: tighten to a strict http/https allowlist so
+        // this matches the round-30 F2 posture applied to
+        // `identity_jwks_url`, `qdrant_url`, etc. The old
+        // `contains("://")` check accepted `file:///etc/passwd`,
+        // `gopher://…`, and other schemes even though the error text
+        // claimed "must be http:// or https://" — a config-injection
+        // primitive or a templating typo (`${UPSTREAM:-file:///…}`)
+        // used to pass `abctl config-validate` and only fail at
+        // request time. Now every URL field's shape is preflighted
+        // by the same rule.
+        if !(self.upstream_url.starts_with("http://") || self.upstream_url.starts_with("https://")) {
             return Err(format!(
-                "upstream_url must include a scheme (http:// or https://), got {:?}",
+                "upstream_url must be http:// or https://, got {:?}",
                 self.upstream_url
             ));
         }
         if let Some(tool_upstream) = &self.tool_upstream_url {
-            if !tool_upstream.is_empty() && !tool_upstream.contains("://") {
+            if !tool_upstream.is_empty()
+                && !(tool_upstream.starts_with("http://") || tool_upstream.starts_with("https://"))
+            {
                 return Err(format!(
-                    "tool_upstream_url must include a scheme (http:// or https://), got {tool_upstream:?}"
+                    "tool_upstream_url must be http:// or https://, got {tool_upstream:?}"
                 ));
             }
         }
@@ -1368,11 +1381,31 @@ mod tests {
 
     /// `upstream_url` without a scheme is rejected at load — otherwise
     /// the request-time concat would silently misroute to a bogus host.
+    /// Round-38 F1 tightened the shape check from `contains("://")` to
+    /// the strict `http://` / `https://` allowlist, matching the
+    /// round-30 F2 posture on every other URL field.
     #[test]
     fn upstream_url_without_scheme_is_rejected() {
         let err = HarnessConfig::from_toml(r#"upstream_url = "openai.internal""#).unwrap_err();
         assert!(err.contains("upstream_url"), "{err}");
-        assert!(err.contains("scheme"), "{err}");
+        assert!(err.contains("http"), "{err}");
+    }
+
+    /// Round-38 F1: schemes other than http/https are rejected. The
+    /// prior `contains("://")` shape check accepted `file:///…` and
+    /// other schemes even though the error text claimed http/https;
+    /// a config-injection primitive could have pointed the harness
+    /// at `file:///etc/passwd`. `abctl config-validate` now refuses.
+    #[test]
+    fn upstream_url_non_http_scheme_is_rejected() {
+        let err =
+            HarnessConfig::from_toml(r#"upstream_url = "file:///etc/passwd""#).unwrap_err();
+        assert!(err.contains("upstream_url"), "{err}");
+        let err = HarnessConfig::from_toml(r#"upstream_url = "gopher://x""#).unwrap_err();
+        assert!(err.contains("upstream_url"), "{err}");
+        // http and https are the only accepted schemes.
+        assert!(HarnessConfig::from_toml(r#"upstream_url = "https://api.openai.com""#).is_ok());
+        assert!(HarnessConfig::from_toml(r#"upstream_url = "http://gw.local""#).is_ok());
     }
 
     /// A seconds interval > 1 day is almost certainly a unit-conversion
