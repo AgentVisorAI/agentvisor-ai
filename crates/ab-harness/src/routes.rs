@@ -102,12 +102,19 @@ async fn trace_request(request: Request<Body>, next: Next) -> Response {
 }
 
 async fn health() -> impl IntoResponse {
+    // Round-29 F6: DO NOT expose the CARGO_PKG_VERSION on this
+    // unauthenticated endpoint. Version disclosure lets a LAN
+    // attacker correlate an agentbridge deployment to a specific
+    // known-vulnerable release without needing a chat probe. The
+    // authenticated /metrics endpoint still surfaces build info
+    // via the ab_build_info HELP text for operators who need it.
     Json(json!({
         "status": "ok",
         // Product identifier so callers (abctl start) can tell a real
-        // AgentBridge apart from an unrelated service squatting the port.
+        // AgentBridge apart from an unrelated service squatting the
+        // port. This is not a version number and reveals no
+        // vulnerability-relevant information.
         "service": "agentbridge",
-        "version": env!("CARGO_PKG_VERSION"),
     }))
 }
 
@@ -281,6 +288,21 @@ async fn chat_completions(
             .headers_mut()
             .insert(crate::pipeline::MIDDLEWARE_US_HEADER, value);
     }
+    // Round-29 F4: pin `X-Content-Type-Options: nosniff` on every
+    // upstream-relayed response. The relay forwards the upstream's
+    // Content-Type verbatim (validated by our `is_sse_content_type`
+    // for framing decisions, but not sanitised for the client).
+    // A rogue upstream, MITM at egress, or CDN mis-config could
+    // otherwise flip Content-Type to `text/html; charset=utf-8` on
+    // a body carrying prompt-echoed attacker bytes — turning what
+    // the audit trail attests as "assistant output" into HTML the
+    // browser might render. `nosniff` prevents browser-side MIME
+    // sniffing from disagreeing with the declared type and closes
+    // the reflected-content path.
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
     response
 }
 
@@ -1138,6 +1160,18 @@ impl AbortFinalizingStream {
         if !self.is_sse {
             return Ok(0);
         }
+        // Round-29 F1: non-success upstream bodies are relayed
+        // verbatim; do NOT try to parse them as chat-completion SSE
+        // frames. An `event: error` / `data: {"error":...}` frame
+        // from a 4xx/5xx stream would otherwise fail the strict
+        // parser and collapse the true status into a 502. Drop the
+        // buffered bytes on the floor (the wire body has already
+        // been relayed to the client via `pending_output`) and
+        // let flush_protocol_buffer's own guard finalise.
+        if !self.upstream_status.is_success() {
+            self.protocol_buffer.clear();
+            return Ok(0);
+        }
         let mut budget_delta = 0u64;
         while let Some(end) = sse_frame_end(&self.protocol_buffer) {
             let frame: Vec<u8> = self.protocol_buffer.drain(..end).collect();
@@ -1155,6 +1189,22 @@ impl AbortFinalizingStream {
 
     fn flush_protocol_buffer(&mut self) -> Result<u64, String> {
         if self.protocol_buffer.is_empty() {
+            return Ok(0);
+        }
+        // Round-29 F1: never fail-closed on a non-success upstream body.
+        // Providers ship text/plain and HTML error pages on 4xx/5xx
+        // (OpenAI's Cloudflare frontend returns text/html on 429;
+        // Anthropic ships 503 HTML from AWS ALBs during backend
+        // restarts). The strict JSON parse below would fail and be
+        // mapped to a fresh 502, silently dropping the real status +
+        // Retry-After header. SDKs treat "502 without Retry-After" as
+        // an immediate retry candidate, so a rate-limited upstream
+        // gets hammered instead of backed off. Skip the parse for
+        // non-success responses; the buffered body still relays
+        // through the buffered non-SSE branch and the true
+        // upstream_status is preserved into the response later.
+        if !self.upstream_status.is_success() {
+            let _ = std::mem::take(&mut self.protocol_buffer);
             return Ok(0);
         }
         let frame = std::mem::take(&mut self.protocol_buffer);
@@ -1931,6 +1981,21 @@ impl Drop for AbortFinalizingStream {
         let is_closed = self.session.is_closed();
         if !is_closed && self.pending_budget.is_some() {
             self.session.mark_capture_failed();
+        }
+        // Round-29 F5: abort the pending budget task. `spawn_blocking`
+        // returns a JoinHandle whose Drop does NOT cancel the queued
+        // closure; the blocking pool would otherwise run
+        // `ActionBudget::try_tokens(delta)` AFTER the session was
+        // sealed by the preceding `mark_capture_failed`, silently
+        // debiting the session's budget key for a request the client
+        // never received. `abort()` is best-effort for a closure
+        // already picked up by the blocking pool (blocking tasks
+        // have no cancellation points) but reliably cancels a
+        // still-queued task — closing the common case. A full fix
+        // would thread a shutdown token into `try_tokens`; deferred
+        // until that helper takes a cancellation argument.
+        if let Some(pending) = self.pending_budget.take() {
+            pending.task.abort();
         }
         let budget_delta = match self.flush_protocol_buffer() {
             Ok(delta) => delta,
