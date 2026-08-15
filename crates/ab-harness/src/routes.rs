@@ -938,35 +938,40 @@ async fn promote_session(
 fn pipeline_error(error: crate::pipeline::PipelineError) -> Response {
     use crate::pipeline::PipelineError;
     let close = matches!(error, PipelineError::Abort(_));
-    // Capture the classifications BEFORE the error is moved into the
-    // response body so we can attach the right advisory headers.
-    let unavailable = matches!(error, PipelineError::Unavailable(_));
-    let upstream = matches!(error, PipelineError::Upstream(_));
-    let unauthorized = matches!(error, PipelineError::Unauthorized(_));
-    let mut response = (error.status(), Json(json!({"error": error.to_string()}))).into_response();
+    let status = error.status();
+    let mut response = (status, Json(json!({"error": error.to_string()}))).into_response();
     if close {
         response
             .headers_mut()
             .insert(axum::http::header::CONNECTION, HeaderValue::from_static("close"));
     }
-    if unavailable || upstream {
-        // RFC 7231 §7.1.3: a 503/502 SHOULD carry Retry-After so
-        // intermediaries and mainstream SDKs back off in bounded
-        // fashion. Value chosen to be short enough that recovery is
-        // fast under transient failures, long enough that clients do
-        // not hammer during audit-capture unavailability.
-        response
-            .headers_mut()
-            .insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("5"));
-    }
-    if unauthorized {
-        // RFC 7235 §3.1: 401 MUST carry WWW-Authenticate. RFC 6750 §3
-        // gives the Bearer challenge shape for OAuth-style bearer
-        // tokens, which matches AgentBridge's NHI JWT identity model.
-        response.headers_mut().insert(
-            axum::http::header::WWW_AUTHENTICATE,
-            HeaderValue::from_static("Bearer realm=\"agentbridge\", error=\"invalid_token\""),
-        );
+    // Drive advisory-header attachment off the numeric HTTP status
+    // rather than variant identity. `PipelineError` is
+    // `#[non_exhaustive]`, so a future variant (e.g. `Timeout` → 504,
+    // `RateLimited` → 429) would silently skip Retry-After under a
+    // `matches!(error, PipelineError::Unavailable(_))` chain — exactly
+    // the SDK-hammering regression this arm exists to prevent. Using
+    // the status code centralises the semantic once and covers every
+    // present and future variant that maps to the same class.
+    match status.as_u16() {
+        // 429 / 502 / 503 / 504 — retryable per RFC 7231 §7.1.3; the
+        // header value is deliberately short so the audit-capture
+        // recovery window is fast, but long enough that clients do not
+        // hammer during transient failures.
+        429 | 502 | 503 | 504 => {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("5"));
+        }
+        // 401 — RFC 7235 §3.1 MUST send `WWW-Authenticate`; RFC 6750 §3
+        // defines the Bearer challenge shape used with NHI JWTs.
+        401 => {
+            response.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                HeaderValue::from_static("Bearer realm=\"agentbridge\", error=\"invalid_token\""),
+            );
+        }
+        _ => {}
     }
     response
 }
@@ -1795,15 +1800,21 @@ impl Drop for AbortFinalizingStream {
             let session_id = session.id.clone();
             match tokio::runtime::Handle::try_current() {
                 Ok(runtime) => {
-                    // Detach: the drop is sync and cannot await. The
-                    // spawn is supervised only by the runtime's panic
-                    // hook, so mirror the outcome to tracing + a metric
-                    // instead of silently discarding the Result — a
-                    // failed close would otherwise leave the session
-                    // "open" until the idle sweeper reaps it, with zero
-                    // operator signal.
+                    // Detach: the drop is sync and cannot await. Mirror
+                    // the outcome to tracing *and* a Prometheus counter
+                    // so a PromQL alert can catch the class — the
+                    // fallback path is otherwise invisible until the
+                    // idle sweeper reaps the "still open" session.
                     runtime.spawn(async move {
                         if let Err(error) = finalizer.close_session(session, StopReason::Other).await {
+                            finalizer
+                                .metrics()
+                                .counter(
+                                    "ab_stream_abort_close_failures_total",
+                                    "Background close after a stream abort failed; \
+                                     the session is left open until the idle sweeper reaps it",
+                                )
+                                .inc();
                             tracing::warn!(
                                 %error,
                                 %session_id,
@@ -1818,6 +1829,14 @@ impl Drop for AbortFinalizingStream {
                     // Mark capture failed so the reconciler retries on
                     // the next tick instead of finalising a session
                     // that never ran to completion.
+                    self.finalizer
+                        .metrics()
+                        .counter(
+                            "ab_stream_abort_no_runtime_total",
+                            "Stream abort observed no tokio runtime; capture marked failed for \
+                             reconciler retry",
+                        )
+                        .inc();
                     tracing::warn!(
                         %error,
                         %session_id,

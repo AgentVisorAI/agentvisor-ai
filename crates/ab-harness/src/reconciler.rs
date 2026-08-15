@@ -116,6 +116,13 @@ impl Drop for CloseClaim<'_> {
 }
 
 impl Finalizer {
+    /// Access the shared metrics registry so background paths (stream
+    /// abort, worker-side supervision) can bump counters without
+    /// plumbing the registry through every struct field.
+    pub fn metrics(&self) -> &Arc<Registry> {
+        &self.metrics
+    }
+
     /// Create a finalizer writing unsigned artifacts beneath `spool_dir`.
     pub fn new(signer: Arc<dyn Signer>, spool_dir: PathBuf, metrics: Arc<Registry>) -> Self {
         let journal_key = crate::journal::key_from_signer(signer.as_ref());

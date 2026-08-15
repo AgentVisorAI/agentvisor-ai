@@ -32,7 +32,14 @@ local limit = tonumber(ARGV[2])
 if current > limit or amount > limit - current then
     return -1
 end
-return redis.call('INCRBY', KEYS[1], ARGV[1])
+local result = redis.call('INCRBY', KEYS[1], ARGV[1])
+-- Match TRY_SPEND_LUA's 24 h TTL. Without this, any counter touched
+-- only through `add()` (bookkeeping, telemetry, non-budget spending)
+-- persists forever in Redis; over a long-running deployment that
+-- silently leaks memory until Redis OOMs. The two APIs must be
+-- interchangeable from the persistence perspective.
+redis.call('EXPIRE', KEYS[1], 86400)
+return result
 ";
 
 /// Redis-backed store. Connections are pooled internally (r2d2 for

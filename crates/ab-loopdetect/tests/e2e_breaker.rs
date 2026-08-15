@@ -470,16 +470,32 @@ fn vector_db_similarity_catches_periodic_loop_within_session() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zero_vector_embedding_yields_progressing_not_panic() {
-    let s = SessionLoopState::new(std_cfg());
-    // The embedder returns a zero vector for empty strings.
-    let v = s.observe_embedding(vec![0.0; DEFAULT_DIM], 100);
-    assert!(matches!(v, BreakerVerdict::Progressing { .. }), "{v:?}");
-    // Second zero vector: delta = 1 - cos(0,0) = 1 - 0 = 1.0 (undefined
-    // cosine defined as 0 in ab-loopdetect); should be Progressing not trip.
-    let v = s.observe_embedding(vec![0.0; DEFAULT_DIM], 100);
-    // Zero cosine similarity = delta 1.0 = progress.
-    assert!(!matches!(v, BreakerVerdict::Tripped { .. }), "{v:?}");
+fn zero_vector_embedding_is_treated_as_hostile_and_grows_the_streak() {
+    // Design change: a caller supplying an all-zero embedding (the
+    // ONNX embedder's error fallback) used to walk the breaker into
+    // "novel-forever" mode because `1 - cos(0, 0) = 1.0 = maximum
+    // novelty`, so the streak reset on every step and the breaker
+    // never tripped even under a verbatim semantic loop. Now the
+    // breaker fails closed: zero-vector steps register delta = 0
+    // (maximum suspicion) so a misconfigured embedder cannot silently
+    // disable loop detection.
+    let s = SessionLoopState::new(BreakerConfig {
+        window: 3,
+        min_tokens: 0,
+        ..std_cfg()
+    });
+    for _ in 0..2 {
+        let verdict = s.observe_embedding(vec![0.0; DEFAULT_DIM], 100);
+        assert!(
+            !matches!(verdict, BreakerVerdict::Tripped { .. }),
+            "expected not-yet-tripped during buildup: {verdict:?}"
+        );
+    }
+    let tripped = s.observe_embedding(vec![0.0; DEFAULT_DIM], 100);
+    assert!(
+        matches!(tripped, BreakerVerdict::Tripped { .. }),
+        "third zero-vector step must trip: {tripped:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -733,19 +749,24 @@ fn gradual_semantic_drift_never_triggers_false_positive() {
 }
 
 // ---------------------------------------------------------------------------
-// 28. Empty string input: embedder returns zero vector, breaker remains
-//     stable (no panic, no wrong state transition).
+// 28. Empty string input: the embedder returns a zero vector, and the
+//     breaker now treats zero vectors as maximum suspicion (delta = 0)
+//     rather than maximum novelty (delta = 1). Two consecutive empties
+//     therefore grow the streak; assert the behaviour instead of the
+//     old "Progressing" claim.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn empty_string_step_is_handled_without_panic_or_wrong_state() {
-    let s = SessionLoopState::new(std_cfg());
+fn empty_string_step_grows_the_streak_and_does_not_panic() {
+    let s = SessionLoopState::new(cfg_with(2, 0, EPSILON));
     let e = embedder();
-    let v = s.observe(&e, "", 0);
-    assert!(matches!(v, BreakerVerdict::Progressing { .. }), "{v:?}");
-    let v = s.observe(&e, "", 0);
-    // Second empty: cosine(0,0)=0 → delta=1 → still Progressing.
-    assert!(!matches!(v, BreakerVerdict::Tripped { .. }), "{v:?}");
+    let _ = s.observe(&e, "", 0);
+    // Two consecutive empties: streak=2 with window=2 trips the breaker.
+    let tripped = s.observe(&e, "", 0);
+    assert!(
+        matches!(tripped, BreakerVerdict::Tripped { .. }),
+        "empty→empty must trip (streak=2, window=2), got {tripped:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

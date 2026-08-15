@@ -5,9 +5,12 @@ use serde::{Deserialize, Serialize};
 /// Config format version (evolution surface).
 pub const CONFIG_VERSION: u32 = 1;
 
-/// Upper bound on `worker_channel_capacity`. Each bounded mpsc channel
-/// preallocates its slots, so an oversized value OOMs the process at
-/// bind. 1M is already ~4 orders of magnitude above realistic capacity.
+/// Upper bound on `worker_channel_capacity`. `tokio::sync::mpsc::channel`
+/// does not preallocate slots (it links chunks lazily under a Semaphore),
+/// but an oversized value still lets the per-shard buffers grow
+/// unboundedly under overload and hides real backpressure signals. 1M
+/// is orders of magnitude above realistic capacity — this bound is
+/// defence-in-depth against a fat-finger, not a hard OOM prevention.
 pub const MAX_WORKER_CHANNEL_CAPACITY: usize = 1_000_000;
 
 /// Upper bound on `max_request_bytes` (512 MiB). A single request body
@@ -764,7 +767,7 @@ impl HarnessConfig {
         // deliberately loose: they only reject genuinely absurd numbers.
         if self.worker_channel_capacity > MAX_WORKER_CHANNEL_CAPACITY {
             return Err(format!(
-                "worker_channel_capacity {} exceeds the safety cap of {} — mpsc::channel(N) preallocates N slots, so oversizing OOMs the process at bind time",
+                "worker_channel_capacity {} exceeds the safety cap of {} — oversized channels hide real backpressure and let per-shard buffers grow unboundedly under overload",
                 self.worker_channel_capacity, MAX_WORKER_CHANNEL_CAPACITY
             ));
         }
