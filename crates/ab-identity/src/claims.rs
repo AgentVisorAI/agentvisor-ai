@@ -12,13 +12,68 @@ pub const MAX_TTL_SECS: u64 = 15 * 60;
 /// string form silently locks the operator out at go-live with an
 /// `invalid type: sequence, expected string` error deep inside
 /// `jsonwebtoken::decode`, before our validator's aud check runs.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(untagged)]
+///
+/// Round-12 F10 defense-in-depth: reject `"aud": []` at deserialize
+/// time. Without this guard `Multi(vec![])` would still be caught by
+/// `jsonwebtoken`'s `set_audience` intersection check, but a future
+/// refactor that removed the library gate would leave the empty-list
+/// shape silently accepting *any* token. Refusing at the concrete
+/// deserialize step means the audience gate remains sound at both
+/// layers.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Audience {
     /// Single-string form (`"aud": "agentbridge"`).
     Single(String),
     /// Array form (`"aud": ["agentbridge", "other"]`).
     Multi(Vec<String>),
+}
+
+impl serde::Serialize for Audience {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Single(value) => serializer.serialize_str(value),
+            Self::Multi(values) => {
+                use serde::ser::SerializeSeq as _;
+                let mut seq = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    seq.serialize_element(value)?;
+                }
+                seq.end()
+            }
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Audience {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{SeqAccess, Visitor};
+        struct AudienceVisitor;
+        impl<'de> Visitor<'de> for AudienceVisitor {
+            type Value = Audience;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JWT audience: a non-empty string or a non-empty array of strings")
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Audience, E> {
+                Ok(Audience::Single(value.to_owned()))
+            }
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Audience, E> {
+                Ok(Audience::Single(value))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Audience, A::Error> {
+                let mut values = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(value) = seq.next_element::<String>()? {
+                    values.push(value);
+                }
+                if values.is_empty() {
+                    return Err(serde::de::Error::custom(
+                        "aud claim must not be an empty array; provide the audience or omit the claim",
+                    ));
+                }
+                Ok(Audience::Multi(values))
+            }
+        }
+        deserializer.deserialize_any(AudienceVisitor)
+    }
 }
 
 impl Audience {
@@ -163,5 +218,44 @@ mod tests {
         assert!(value.aud.contains("agentbridge"));
         assert!(value.aud.contains("other"));
         assert!(!value.aud.contains("nope"));
+    }
+
+    /// Round-12 F10: an empty audience array must be rejected at the
+    /// concrete deserialize step, so the audience gate remains sound
+    /// even if a future refactor drops `jsonwebtoken`'s
+    /// `set_audience` intersection check.
+    #[test]
+    fn audience_empty_array_is_rejected_by_the_concrete_deserialize() {
+        let json = r#"{"aud":[]}"#;
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        struct Just {
+            aud: Audience,
+        }
+        let err = serde_json::from_str::<Just>(json).unwrap_err().to_string();
+        assert!(
+            err.contains("empty array"),
+            "expected empty-array rejection, got: {err}",
+        );
+    }
+
+    /// Round-12: `aud` present but of an unsupported JSON type (number,
+    /// bool, null) must be rejected with a clear "expected a JWT
+    /// audience" message — the untagged enum variant used to fall
+    /// through with a much more confusing message.
+    #[test]
+    fn audience_unsupported_json_type_is_rejected() {
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        struct Just {
+            aud: Audience,
+        }
+        for wrong in [r#"{"aud":42}"#, r#"{"aud":true}"#, r#"{"aud":null}"#] {
+            let err = serde_json::from_str::<Just>(wrong).unwrap_err().to_string();
+            assert!(
+                err.contains("JWT audience"),
+                "expected JWT-audience rejection for {wrong}, got: {err}",
+            );
+        }
     }
 }

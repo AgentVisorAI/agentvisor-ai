@@ -161,11 +161,24 @@ impl IdentityValidator {
     /// entry whose `kid` collides with a manually-registered key is
     /// refused so the manual key stays authoritative.
     pub fn add_jwks(&self, document: &serde_json::Value) -> Result<usize, IdentityError> {
+        // Round-12 F11: cap the number of parsed entries so a hostile
+        // or misconfigured JWKS with tens of thousands of keys cannot
+        // stall every concurrent `validate_single` call while we hold
+        // `keys.write()` for the install loop. Real deployments have
+        // 5–20 keys; 256 leaves comfortable headroom.
+        const MAX_JWKS_KEYS: usize = 256;
         let keys = document
             .get("keys")
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| IdentityError::Jwks("missing keys array".to_owned()))?;
         let mut parsed = Vec::new();
+        // Round-12 F6: refuse duplicate `kid` within a single JWKS.
+        // HashMap's insert-with-overwrite semantics would otherwise
+        // silently accept a poisoned refresh where an attacker mixes
+        // an alien public key with the same kid as a legitimate one —
+        // the array's LAST entry silently wins verification with no
+        // log line, no counter, no error.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for key in keys {
             if key.get("kty").and_then(serde_json::Value::as_str) != Some("OKP")
                 || key.get("crv").and_then(serde_json::Value::as_str) != Some("Ed25519")
@@ -177,12 +190,22 @@ impl IdentityValidator {
                 .and_then(serde_json::Value::as_str)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| IdentityError::Jwks("Ed25519 key missing kid".to_owned()))?;
+            if !seen.insert(kid.to_owned()) {
+                return Err(IdentityError::Jwks(format!(
+                    "duplicate kid {kid:?} in JWKS document; refusing to accept a poisoned key set"
+                )));
+            }
             let x = key
                 .get("x")
                 .and_then(serde_json::Value::as_str)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| IdentityError::Jwks(format!("key {kid:?} missing x")))?;
             parsed.push((kid.to_owned(), KeyMaterial::Ed25519Jwk(x.to_owned())));
+            if parsed.len() > MAX_JWKS_KEYS {
+                return Err(IdentityError::Jwks(format!(
+                    "JWKS declares more than {MAX_JWKS_KEYS} Ed25519 OKP keys; refusing to install"
+                )));
+            }
         }
         if parsed.is_empty() {
             return Err(IdentityError::Jwks("no Ed25519 OKP keys found".to_owned()));
