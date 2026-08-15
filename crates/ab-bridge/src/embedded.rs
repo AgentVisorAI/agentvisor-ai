@@ -810,7 +810,7 @@ impl EventBus for EmbeddedBroker {
     fn set_control_key(&self, _key: [u8; 32]) -> Result<(), BusError> {
         #[cfg(feature = "cold-store")]
         if let Some(archive) = &self.cold_archive {
-            archive.set_control_key(_key);
+            archive.set_control_key(_key)?;
         }
         Ok(())
     }

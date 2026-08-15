@@ -852,7 +852,17 @@ pub async fn start() -> Result<()> {
     let (config, source) = ab_harness::config::load_config().map_err(|error| {
         anyhow::anyhow!("configuration problem: {error}\nRun `abctl doctor` for a full diagnosis.")
     })?;
-    let probe_host = config.listen.replace("0.0.0.0", "127.0.0.1");
+    // Round-21 F6: also rewrite the IPv6 unspecified address
+    // (`[::]` / `::`) to loopback (`[::1]`). An operator on a
+    // dual-stack host who sets `listen = "[::]:8484"` used to
+    // have `abctl start` poll `[::]:8484` forever (an invalid
+    // connect destination), time out at 20 s, and kill the
+    // perfectly healthy server. Do the string-level rewrite in
+    // both families so probes work regardless of listen form.
+    let probe_host = config
+        .listen
+        .replace("0.0.0.0", "127.0.0.1")
+        .replace("[::]", "[::1]");
     let base = format!("http://{probe_host}");
 
     if health_ok(&base).await {

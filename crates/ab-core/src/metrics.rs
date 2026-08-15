@@ -356,14 +356,17 @@ fn escape_prom_help(help: &str) -> String {
         match c {
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
-            // Round-20 F3: the Prometheus text-format v0.0.4
-            // grammar only defines `\\` and `\n` (plus `\"` inside
-            // label values) as escapes in HELP. `\r` is not
-            // standardized — replacing it with a literal space
-            // matches how prometheus_client-python's _ESCAPE_RE
-            // strips it, and every conforming scraper accepts the
-            // result without a parse error.
-            '\r' => out.push(' '),
+            // Round-20 F3 + round-21 F4: replace CR and every
+            // other C0 control (0x00–0x1F except LF which we
+            // just escaped) with a literal space. `validate_
+            // metric_key` already refuses these bytes in metric
+            // keys; the HELP-side didn't. NUL trips promtool
+            // lint / grafana-agent; ESC (0x1B) lets a caller who
+            // controls HELP text inject ANSI codes into
+            // operator terminals via `abctl` piped `/metrics`.
+            // Space is the same convention prometheus_client-
+            // python's `_ESCAPE_RE` uses.
+            c if (c as u32) < 0x20 => out.push(' '),
             other => out.push(other),
         }
     }

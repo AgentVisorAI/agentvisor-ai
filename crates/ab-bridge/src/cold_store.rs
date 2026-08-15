@@ -82,8 +82,25 @@ impl ColdArchive {
         }))
     }
 
-    pub(crate) fn set_control_key(&self, key: [u8; 32]) {
+    pub(crate) fn set_control_key(&self, key: [u8; 32]) -> Result<(), BusError> {
+        // Round-21 F3: refuse known-weak keys. The default init at
+        // construction is `[0; 32]` (round-14 and round-20 F5
+        // banned both patterns for the primary signing seed;
+        // parity here closes the last legal surface for the
+        // pattern). Silently accepting a weak key would let a
+        // startup-order wiring bug (bus impl forgets to plumb
+        // through set_control_key, or a caller passes an
+        // uninitialized array) produce a cold-outbox whose
+        // authentication tag is forgeable by anyone who guessed
+        // the pattern.
+        if key == [0u8; 32] || key == [0xFFu8; 32] {
+            return Err(BusError::Backend(
+                "cold-outbox control key is all-zero or all-0xFF; refusing (known-weak pattern)"
+                    .to_owned(),
+            ));
+        }
         *self.control_key.write() = key;
+        Ok(())
     }
 
     pub(crate) fn put(&self, topic: &str, event: &StoredEvent) -> Result<(), BusError> {
@@ -469,7 +486,7 @@ mod tests {
         let topic_name = topic.name.clone();
         let mut archive = ColdArchive::from_manifest(&manifest).unwrap().unwrap();
         archive.pending_dir = outbox.path().to_path_buf();
-        archive.set_control_key([41; 32]);
+        archive.set_control_key([41; 32]).unwrap();
         archive
             .stage(
                 &topic_name,
@@ -519,7 +536,7 @@ mod tests {
         let topic_name = topic.name.clone();
         let mut archive = ColdArchive::from_manifest(&manifest).unwrap().unwrap();
         archive.pending_dir = outbox.path().to_path_buf();
-        archive.set_control_key([73; 32]);
+        archive.set_control_key([73; 32]).unwrap();
         archive
             .stage(
                 &topic_name,
@@ -565,7 +582,7 @@ mod tests {
         let topic_name = topic.name.clone();
         let mut archive = ColdArchive::from_manifest(&manifest).unwrap().unwrap();
         archive.pending_dir = outbox.path().to_path_buf();
-        archive.set_control_key([11; 32]);
+        archive.set_control_key([11; 32]).unwrap();
         archive
             .stage(
                 &topic_name,
@@ -581,7 +598,7 @@ mod tests {
             .unwrap();
         // The staged file was authenticated with key [11; 32]. Rotate to a
         // different key and demand authentication of the same file.
-        archive.set_control_key([22; 32]);
+        archive.set_control_key([22; 32]).unwrap();
         let err = archive
             .retry_pending_with(|_| Err(BusError::Backend("unexpected".to_owned())))
             .unwrap_err()
@@ -607,7 +624,7 @@ mod tests {
         let topic_name = topic.name.clone();
         let mut archive = ColdArchive::from_manifest(&manifest).unwrap().unwrap();
         archive.pending_dir = outbox.path().to_path_buf();
-        archive.set_control_key([99; 32]);
+        archive.set_control_key([99; 32]).unwrap();
         archive
             .stage(
                 &topic_name,
@@ -651,5 +668,38 @@ mod tests {
              nibble failed; got {} distinct texts (i.e. a timing/oracle side channel): {errors:?}",
             errors.len()
         );
+    }
+
+    /// Round-21 F3: refuse known-weak control keys — parity with
+    /// round-14 and round-20 F5 for the primary signing seed.
+    /// Silently accepting [0; 32] or [0xFF; 32] would let a
+    /// startup-order wiring bug produce a cold-outbox whose
+    /// authentication tag is forgeable by anyone who guessed
+    /// the pattern.
+    #[test]
+    fn set_control_key_refuses_all_zero_and_all_ff() {
+        let manifest = {
+            let mut m = BridgeManifest::default_for("cold-weak");
+            let topic = &mut m.topics[0];
+            let outbox = tempfile::tempdir().unwrap();
+            let uri = url::Url::from_directory_path(outbox.path())
+                .unwrap()
+                .to_string();
+            topic.retention.cold_uri = Some(uri);
+            m
+        };
+        let archive = ColdArchive::from_manifest(&manifest).unwrap().unwrap();
+        let err = archive.set_control_key([0u8; 32]).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("known-weak"),
+            "expected known-weak rejection for all-zero, got {err:?}"
+        );
+        let err = archive.set_control_key([0xFFu8; 32]).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("known-weak"),
+            "expected known-weak rejection for all-0xFF, got {err:?}"
+        );
+        // A legit key still installs cleanly.
+        archive.set_control_key([7u8; 32]).unwrap();
     }
 }
