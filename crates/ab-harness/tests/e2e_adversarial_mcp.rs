@@ -208,7 +208,17 @@ fn typosquat_tool_names_are_refused_by_allowlist() {
         // 'seаrch' with a cyrillic 'а' (U+0430) is a common homograph attack.
         let raw = tools_call(lookalike, json!({}));
         match sandbox.check(&store, "typosquat", &raw) {
-            ToolVerdict::Blocked { stage, .. } => assert_eq!(stage, "policy"),
+            // Whitespace-padded names now trip the parse gate (`rpc.rs`
+            // rejects any control-or-whitespace character); the semantic
+            // homoglyphs still trip the policy gate against the allow-list.
+            // Both outcomes count as "refused"; the test's contract is that
+            // no lookalike is Allowed.
+            ToolVerdict::Blocked { stage, .. } => {
+                assert!(
+                    stage == "parse" || stage == "policy",
+                    "unexpected block stage {stage:?} for {lookalike:?}",
+                );
+            }
             ToolVerdict::Allowed { .. } => {
                 panic!("typosquat {lookalike:?} bypassed the allow-list")
             }
