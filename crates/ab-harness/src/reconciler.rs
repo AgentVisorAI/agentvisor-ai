@@ -2313,20 +2313,26 @@ async fn read_complete_journal(path: &std::path::Path) -> Result<Vec<String>, Fi
             // chases a phantom `.corrupt-<uid>` path while the real
             // failure (ENOSPC / EACCES / cross-fs rename) sits
             // buried in the tracing log.
+            //
+            // Round-37 F1: return the file basenames only. This
+            // FinalizeError::Atif ultimately flows to
+            // `tracing::warn!(%error, "ATIF spool recovery failed")`
+            // at line ~2092 and `"promotion retry failed"` at line
+            // ~1710; both then export through
+            // tracing_opentelemetry -> OTLP -> SIEM. Round-36 F1's
+            // sweep basenamed the outer tracing fields but missed
+            // this path leak inside a FinalizeError message body,
+            // where `#[error("...{0}")]` re-emits the full string.
+            let name = ab_core::fsutil::basename(&path);
+            let qname = ab_core::fsutil::basename(&quarantine);
             return Err(FinalizeError::Atif(match rename_error_message {
                 None => format!(
-                    "journal {} contained no complete lines ({} bytes); quarantined at {}",
-                    path.display(),
-                    bytes.len(),
-                    quarantine.display()
+                    "journal {name} contained no complete lines ({} bytes); quarantined at {qname}",
+                    bytes.len()
                 ),
                 Some(rename_error) => format!(
-                    "journal {} contained no complete lines ({} bytes); quarantine rename to {} failed: {}; bytes remain at {}",
-                    path.display(),
-                    bytes.len(),
-                    quarantine.display(),
-                    rename_error,
-                    path.display()
+                    "journal {name} contained no complete lines ({} bytes); quarantine rename to {qname} failed: {rename_error}; bytes remain at {name}",
+                    bytes.len()
                 ),
             }));
         }
@@ -3853,6 +3859,29 @@ mod tests {
         assert_eq!(entries.len(), 1, "expected exactly one quarantine file");
         let bytes = std::fs::read(entries[0].path()).unwrap();
         assert_eq!(&bytes, b"{\"torn_before_first_newline\":");
+        // Round-37 F1: `FinalizeError::Atif`'s Display flows to
+        // `tracing::warn!(%error, "ATIF spool recovery failed")`
+        // and thence to `tracing_opentelemetry` -> OTLP -> SIEM.
+        // The message body must NOT embed the absolute spool
+        // directory (round-36 F1 basenamed the tracing FIELDS but
+        // this ERROR STRING was missed). Assert:
+        //   (a) the containing tempdir path is not in the message,
+        //   (b) neither is any parent directory component.
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains(directory.path().to_string_lossy().as_ref()),
+            "FinalizeError::Atif leaked spool dir absolute path: {msg}"
+        );
+        assert!(
+            !msg.contains(std::path::MAIN_SEPARATOR_STR),
+            "FinalizeError::Atif still contains a path separator: {msg}"
+        );
+        // The basename must still be present so an operator can
+        // correlate the message with the quarantined file on disk.
+        assert!(
+            msg.contains("journal.ndjson"),
+            "FinalizeError::Atif should still mention the journal basename: {msg}"
+        );
     }
 
     #[tokio::test]

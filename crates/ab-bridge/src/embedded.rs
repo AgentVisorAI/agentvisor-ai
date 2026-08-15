@@ -110,9 +110,13 @@ impl EmbeddedBroker {
             Err(error) => {
                 if error.kind() == std::io::ErrorKind::AlreadyExists {
                     // Loser arm: tmp is auto-removed by TmpGuard on Err.
+                    // Round-37 F1/F2 class: basename to avoid leaking
+                    // the absolute deployment dir if this BusError
+                    // ever flows through a tracing::warn!(%error)
+                    // path.
                     return Err(BusError::Backend(format!(
                         "bridge already provisioned at {}",
-                        data_dir.display()
+                        ab_core::fsutil::basename(data_dir)
                     )));
                 }
                 return Err(BusError::Io(error));
@@ -431,9 +435,16 @@ fn write_cold_event_once(directory: &Path, event: &StoredEvent) -> Result<(), Bu
             if fs::read(&path)? == bytes {
                 Ok(())
             } else {
+                // Round-37 F1/F2 class: `write_cold_object_exclusive`
+                // errors bubble into `ColdArchive::commit` /
+                // `stage` in the bus impls and can reach a
+                // tracing::warn!(%error) on the maintenance path.
+                // Basename the absolute cold-outbox path so a
+                // duplicate-object collision doesn't ship the
+                // deployment topology to OTLP.
                 Err(BusError::Backend(format!(
                     "cold object {} already exists with different content",
-                    path.display()
+                    ab_core::fsutil::basename(&path)
                 )))
             }
         }

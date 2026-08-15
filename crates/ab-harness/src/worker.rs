@@ -1209,8 +1209,22 @@ async fn append_journal(
             // rename) cannot leak a zero-byte `.tmp` orphan. A
             // repeatedly-failing journal writer used to be able to
             // exhaust the ext4 inode table long before disk-full.
-            ab_core::fsutil::write_atomic(&metadata_path, &metadata)
-                .map_err(|error| format!("write journal metadata {}: {error}", metadata_path.display()))?;
+            //
+            // Round-37 F2: basename the paths in error strings. These
+            // errors bubble to `tracing::warn!(session = %session.id,
+            // %error, "capture job failed; session is fail-closed")`
+            // at process_envelope; that warn exports through
+            // tracing_opentelemetry -> OTLP -> SIEM, so a single
+            // disk-full incident used to emit one span per pending
+            // event with the full absolute journal tree. Basename
+            // preserves enough context for triage (the stem encodes
+            // the session id) without leaking the deployment topology.
+            ab_core::fsutil::write_atomic(&metadata_path, &metadata).map_err(|error| {
+                format!(
+                    "write journal metadata {}: {error}",
+                    ab_core::fsutil::basename(&metadata_path)
+                )
+            })?;
         } else {
             let stored: serde_json::Value = crate::journal::open(
                 &journal_key,
@@ -1240,14 +1254,27 @@ async fn append_journal(
             .create(true)
             .append(true)
             .open(&journal_path)
-            .map_err(|error| format!("open event journal {}: {error}", journal_path.display()))?;
+            .map_err(|error| {
+                format!(
+                    "open event journal {}: {error}",
+                    ab_core::fsutil::basename(&journal_path)
+                )
+            })?;
         journal.write_all(&line).map_err(|error| error.to_string())?;
         journal.write_all(b"\n").map_err(|error| error.to_string())?;
         journal.sync_data().map_err(|error| error.to_string())?;
         if journal_created {
             std::fs::File::open(&directory)
                 .and_then(|dir| dir.sync_all())
-                .map_err(|error| format!("fsync journal directory {}: {error}", directory.display()))?;
+                .map_err(|error| {
+                    // Round-37 F2: drop the full path entirely; the
+                    // sibling `session = %session.id` field on the
+                    // downstream warn already scopes this to a
+                    // specific session, and the containing directory
+                    // is `atif_spool_dir` — same across the whole
+                    // deployment.
+                    format!("fsync journal directory: {error}")
+                })?;
         }
         Ok(())
     })
