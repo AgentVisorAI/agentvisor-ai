@@ -491,26 +491,18 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         };
         return complete_tool_audit(execution, outcome, completion_permit, session).await;
     }
-    // Round-32 F3 (deferred): concurrent identical MCP requests
-    // (same x-ab-session + same JSON-RPC id) race between the
-    // `state=Missing` decision above and `execution.claim()` below.
-    // Both requests pass the `intercept_tool_nonblocking` sandbox
-    // gate — which atomically spends `payout_micros` via
-    // `ActionBudget::try_tool_call` — before the atomic claim.
-    // Loser returns `TOOL_OUTCOME_UNCERTAIN` (CONFLICT) after the
-    // budget has already been debited, so `payout_remaining` is
-    // decremented by `2 x payout_micros` for one successful call.
-    // Full fix requires either (a) moving `execution.claim()`
-    // ahead of `intercept_tool_nonblocking` with a release-on-
-    // block orphan-intent cleanup path, or (b) adding
-    // `ActionBudget::refund_tool_call` on the lost-claim branch.
-    // Both are bigger than a surgical patch; tracked for a
-    // dedicated round.
+    // Round-33 F1: closes the round-32 F3 concurrent-MCP budget
+    // double-spend by threading the debited `payout_micros` out of
+    // `ToolVerdict::Allowed` and calling `ActionBudget::refund_
+    // tool_call` on the lost-claim branch. `refund` is best-effort
+    // (backend errors are silently absorbed) so a Redis blip on the
+    // compensation path cannot turn the CONFLICT response into 5xx.
     match state.intercept_tool_nonblocking(&headers, &body).await {
         Ok(ToolVerdict::Allowed {
             tool,
             budget_remaining,
             elapsed_us,
+            payout_micros,
         }) => {
             if let Some(url) = state.config.tool_upstream_url.as_deref() {
                 let _lease = match state.lease_session(&headers) {
@@ -536,8 +528,17 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                     tracing::warn!(
                         session = %execution.session_id,
                         error = %error,
-                        "concurrent tool execution claim lost"
+                        "concurrent tool execution claim lost; refunding budget"
                     );
+                    // Round-33 F1: refund the exact amount debited so
+                    // `payout_remaining` and per-tool counters reflect
+                    // only admitted work, not the lost race.
+                    ab_state::ActionBudget::new(
+                        state.store.as_ref(),
+                        &execution.session_id,
+                        &state.config.budget,
+                    )
+                    .refund_tool_call(&execution.tool, payout_micros);
                     return (
                         StatusCode::CONFLICT,
                         Json(json!({"error": TOOL_OUTCOME_UNCERTAIN})),
