@@ -7,6 +7,15 @@ services:
     container_name: agent-bridge
     ports:
       - "8484:8484"
+    # Match the Kubernetes securityContext: no fresh privileges after fork,
+    # drop every Linux capability, and cap process/memory footprint so a
+    # runaway or compromised worker cannot starve the host.
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    pids_limit: 4096
+    read_only: false # /app/data and /app/spool are writable named volumes
     environment:
       RUST_LOG: info
       AB_CONFIG: /app/config/harness.docker.toml
@@ -17,7 +26,14 @@ services:
       - bridge-data:/app/data
       - atif-spool:/app/spool
     secrets:
-      - identity_hmac
+      # Long-form: pin the mount to the container's non-root uid so a
+      # co-scheduled exec session cannot read the HMAC via the world bit
+      # of the default 0444 mount.
+      - source: identity_hmac
+        target: identity_hmac
+        uid: "65532"
+        gid: "65532"
+        mode: 0400
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:

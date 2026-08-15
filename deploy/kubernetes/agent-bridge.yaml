@@ -109,27 +109,41 @@ spec:
               mountPath: /app/data
             - name: spool
               mountPath: /app/spool
+          # Cold-start budget: schema compilation, ONNX weights when the
+          # embedder backend is `onnx`, and embedded-bridge recovery from
+          # the mounted PVC can trivially exceed 5 s. A startupProbe with
+          # a longer failureThreshold gives that window without disabling
+          # readiness/liveness afterwards.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60 # 5 minutes total (5 s * 60)
           readinessProbe:
             httpGet:
               path: /health
               port: http
-            initialDelaySeconds: 2
             periodSeconds: 5
           livenessProbe:
             httpGet:
               path: /health
               port: http
-            initialDelaySeconds: 5
             periodSeconds: 10
+            failureThreshold: 3
           resources:
             requests:
               cpu: 250m
               memory: 256Mi
             limits:
+              cpu: "2"
               memory: 1Gi
+              ephemeral-storage: 2Gi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: false # /app/data and /app/spool are writable mounts
+            seccompProfile:
+              type: RuntimeDefault
             capabilities:
               drop: ["ALL"]
       volumes:
@@ -153,3 +167,18 @@ spec:
     - name: http
       port: 8484
       targetPort: http
+---
+# Single-replica starter (see header): a voluntary node drain would otherwise
+# yield an outage window with no gate. minAvailable:1 surfaces the drain to
+# whoever kicks it off, so operators cannot silently interrupt the audit
+# trail without acknowledgment. Delete this PDB when scaling to a stateless
+# backend (kafka/nats + redis).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: agent-bridge
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: agent-bridge
