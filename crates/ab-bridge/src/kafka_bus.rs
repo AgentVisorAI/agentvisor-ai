@@ -233,7 +233,7 @@ async fn provision_topic(
 impl EventBus for KafkaBus {
     fn set_control_key(&self, key: [u8; 32]) -> Result<(), BusError> {
         if let Some(archive) = &self.cold_archive {
-            archive.set_control_key(key);
+            archive.set_control_key(key)?;
         }
         Ok(())
     }
