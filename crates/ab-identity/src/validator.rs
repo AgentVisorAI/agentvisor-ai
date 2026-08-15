@@ -161,16 +161,27 @@ impl IdentityValidator {
     /// entry whose `kid` collides with a manually-registered key is
     /// refused so the manual key stays authoritative.
     pub fn add_jwks(&self, document: &serde_json::Value) -> Result<usize, IdentityError> {
-        // Round-12 F11: cap the number of parsed entries so a hostile
-        // or misconfigured JWKS with tens of thousands of keys cannot
-        // stall every concurrent `validate_single` call while we hold
-        // `keys.write()` for the install loop. Real deployments have
-        // 5–20 keys; 256 leaves comfortable headroom.
+        // Round-12 F11 + round-15 F5: cap the total number of
+        // entries iterated (parsed OR skipped), so a hostile JWKS
+        // full of RSA/EC decoys with a handful of legitimate OKP
+        // keys cannot stall the parse loop just by inflating the
+        // `keys` array to tens of thousands of entries. The
+        // round-12 fix only capped parsed OKP entries, so a JWKS
+        // with 40k `kty=RSA` decoys still walked the whole array.
+        // Cap the outer array up front at the same threshold, and
+        // keep the inner cap as defense-in-depth against a future
+        // parser that stops short-circuiting on non-Ed25519 entries.
         const MAX_JWKS_KEYS: usize = 256;
         let keys = document
             .get("keys")
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| IdentityError::Jwks("missing keys array".to_owned()))?;
+        if keys.len() > MAX_JWKS_KEYS {
+            return Err(IdentityError::Jwks(format!(
+                "JWKS keys array carries {} entries; refusing to walk more than {MAX_JWKS_KEYS} (round-15 F5: fires before the inner parser regardless of `kty`)",
+                keys.len()
+            )));
+        }
         let mut parsed = Vec::new();
         // Round-12 F6: refuse duplicate `kid` within a single JWKS.
         // HashMap's insert-with-overwrite semantics would otherwise

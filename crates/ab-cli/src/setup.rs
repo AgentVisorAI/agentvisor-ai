@@ -298,6 +298,23 @@ pub fn init(
     if output.exists() && !force {
         anyhow::bail!("{} already exists; pass --force to overwrite", output.display());
     }
+    // Round-15 F2: refuse to follow a pre-planted symlink at
+    // `output`. The wizard's `write_config` already has this guard
+    // (see `wizard_replaces_config_symlink_instead_of_following_it`);
+    // `init --force` used to differ, so an attacker who could plant
+    // ~/.config/agent-bridge/agentbridge.toml as a symlink to
+    // ~/.bashrc or /etc/nginx/conf.d/upstream.conf could redirect
+    // the TOML write into the target when the operator ran
+    // `abctl init --force`. Unlink the symlink first so the
+    // subsequent std::fs::write hits a fresh regular file at
+    // `output`.
+    if let Ok(metadata) = std::fs::symlink_metadata(output) {
+        if metadata.file_type().is_symlink() {
+            std::fs::remove_file(output).with_context(|| {
+                format!("remove pre-existing symlink at {}", output.display())
+            })?;
+        }
+    }
     if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).with_context(|| format!("create directory {}", parent.display()))?;
     }

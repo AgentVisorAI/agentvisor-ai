@@ -222,9 +222,46 @@ pub enum ReceiptError {
     /// its key id (substitution attempt).
     #[error("embedded public key mismatches keyring entry for {0:?}")]
     KeyMismatch(String),
+    /// Round-15 F4: a JSON object at some nesting level carried a
+    /// duplicate key. Rejecting these closes the last-wins vs
+    /// first-wins auditor split-brain that would otherwise let a
+    /// hostile issuer sign under one interpretation while an
+    /// external audit tool displayed the other.
+    #[error("duplicate JSON key `{0}` at nesting; strict receipt parsers refuse this")]
+    DuplicateKey(String),
 }
 
 impl Receipt {
+    /// Deserialize a receipt from wire bytes, rejecting any duplicate
+    /// key at ANY nesting level.
+    ///
+    /// The custom `Deserialize` impl for `Receipt` (below) already
+    /// rejects duplicate top-level keys, but nested structs
+    /// (`ai_agent`, `tool_calls`, `cost`, `subject`) went through
+    /// serde's default derive which relies on `serde_json::Map` /
+    /// `IndexMap` — both silently collapse duplicate keys with
+    /// last-wins semantics. A hostile issuer could then sign a
+    /// receipt whose `ai_agent.instance_uid` appeared twice
+    /// (`"a"` then `"b"`); JCS canonicalisation saw only `"b"` so
+    /// the signature verified, but a first-wins auditor tool (jq's
+    /// default, some Python configs) displayed `"a"` — the exact
+    /// split-brain the top-level guard was written to prevent, one
+    /// level deeper.
+    ///
+    /// Round-15 F4: pre-scan the JSON with a strict duplicate-key
+    /// checker (`check_no_duplicate_keys`) before deserialising into
+    /// `Receipt`. Callers verifying a receipt off the wire should
+    /// prefer this over `serde_json::from_slice::<Receipt>`.
+    pub fn from_json_slice(bytes: &[u8]) -> Result<Self, ReceiptError> {
+        check_no_duplicate_keys(bytes)?;
+        serde_json::from_slice(bytes).map_err(ReceiptError::Serde)
+    }
+
+    /// Same as [`Receipt::from_json_slice`] for owned/borrowed strings.
+    pub fn from_json_str(s: &str) -> Result<Self, ReceiptError> {
+        Self::from_json_slice(s.as_bytes())
+    }
+
     /// Issue (sign) a receipt over `body` with `signer`.
     ///
     /// The `key_id` and `public_key_b64` fields of the body are overwritten
@@ -283,6 +320,69 @@ impl Receipt {
             .map_err(|_| ReceiptError::Base64)?;
         ring.verify(&id, canon.as_bytes(), &sig)?;
         Ok(())
+    }
+}
+
+/// Walk a JSON document and reject any object whose keys contain a
+/// duplicate at ANY nesting level.
+///
+/// Used by [`Receipt::from_json_slice`] as a strict pre-parse gate.
+/// serde_json's default `Value` / `Map` uses `IndexMap` (with
+/// `preserve_order`), which silently keeps only the LAST value for a
+/// duplicate key at deserialize time — collapsing evidence that a
+/// hostile issuer signed a document with two spellings of the same
+/// key and a first-wins auditor would see the earlier one. This
+/// walk runs upfront so the collapse never happens.
+fn check_no_duplicate_keys(bytes: &[u8]) -> Result<(), ReceiptError> {
+    use serde::Deserializer as _;
+    let mut deser = serde_json::Deserializer::from_slice(bytes);
+    deser
+        .deserialize_any(NoDupVisitor)
+        .map_err(|error| ReceiptError::DuplicateKey(error.to_string()))
+}
+
+struct NoDupVisitor;
+
+impl<'de> serde::de::Visitor<'de> for NoDupVisitor {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("any JSON value (strict-mode duplicate-key check)")
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<(), E> { Ok(()) }
+    fn visit_i64<E>(self, _: i64) -> Result<(), E> { Ok(()) }
+    fn visit_u64<E>(self, _: u64) -> Result<(), E> { Ok(()) }
+    fn visit_f64<E>(self, _: f64) -> Result<(), E> { Ok(()) }
+    fn visit_i128<E>(self, _: i128) -> Result<(), E> { Ok(()) }
+    fn visit_u128<E>(self, _: u128) -> Result<(), E> { Ok(()) }
+    fn visit_str<E>(self, _: &str) -> Result<(), E> { Ok(()) }
+    fn visit_string<E>(self, _: String) -> Result<(), E> { Ok(()) }
+    fn visit_none<E>(self) -> Result<(), E> { Ok(()) }
+    fn visit_unit<E>(self) -> Result<(), E> { Ok(()) }
+    fn visit_seq<S: serde::de::SeqAccess<'de>>(self, mut seq: S) -> Result<(), S::Error> {
+        while seq.next_element_seed(NoDupSeed)?.is_some() {}
+        Ok(())
+    }
+    fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<(), M::Error> {
+        use serde::de::Error as _;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !seen.insert(key.clone()) {
+                return Err(M::Error::custom(format!(
+                    "duplicate key `{key}` in JSON object"
+                )));
+            }
+            map.next_value_seed(NoDupSeed)?;
+        }
+        Ok(())
+    }
+}
+
+struct NoDupSeed;
+
+impl<'de> serde::de::DeserializeSeed<'de> for NoDupSeed {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, deser: D) -> Result<(), D::Error> {
+        deser.deserialize_any(NoDupVisitor)
     }
 }
 
@@ -362,6 +462,56 @@ mod tests {
         let receipt = Receipt::issue(body(), &signer).unwrap();
         receipt.verify(&ring).unwrap();
         receipt.verify_embedded().unwrap();
+    }
+
+    /// Round-15 F4: `Receipt::from_json_slice` rejects duplicate keys
+    /// at ANY nesting level (top-level, nested inside `ai_agent`,
+    /// nested inside `subject`, deep inside an array element). This
+    /// closes the last-wins vs first-wins auditor split-brain that
+    /// would otherwise let a hostile issuer sign under one
+    /// interpretation while an external audit tool showed the other.
+    #[test]
+    fn from_json_slice_rejects_duplicate_top_level_key() {
+        let bytes = br#"{"receipt_version":1,"receipt_version":2,"receipt_id":"x"}"#;
+        let outcome = Receipt::from_json_slice(bytes);
+        assert!(
+            matches!(outcome, Err(ReceiptError::DuplicateKey(ref msg)) if msg.contains("receipt_version")),
+            "expected DuplicateKey rejection, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn from_json_slice_rejects_duplicate_key_inside_ai_agent() {
+        let bytes = br#"{"ai_agent":{"instance_uid":"a","instance_uid":"b"}}"#;
+        let outcome = Receipt::from_json_slice(bytes);
+        assert!(
+            matches!(outcome, Err(ReceiptError::DuplicateKey(ref msg)) if msg.contains("instance_uid")),
+            "expected DuplicateKey rejection for nested field, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn from_json_slice_rejects_duplicate_key_inside_array_element() {
+        // Rare shape but valid JSON that would slip past the top-level
+        // guard historically. Deep nesting → the walker recurses.
+        let bytes = br#"{"weird":[{"dup":1,"dup":2}]}"#;
+        let outcome = Receipt::from_json_slice(bytes);
+        assert!(
+            matches!(outcome, Err(ReceiptError::DuplicateKey(ref msg)) if msg.contains("dup")),
+            "expected DuplicateKey rejection deep in an array, got {outcome:?}"
+        );
+    }
+
+    /// The happy path (well-formed receipt) still deserializes as
+    /// before — the duplicate-key gate is a strict filter, not a
+    /// disruption.
+    #[test]
+    fn from_json_slice_accepts_a_well_formed_receipt() {
+        let signer = Ed25519Signer::generate();
+        let receipt = Receipt::issue(body(), &signer).unwrap();
+        let bytes = serde_json::to_vec(&receipt).unwrap();
+        let restored = Receipt::from_json_slice(&bytes).unwrap();
+        assert_eq!(restored.body.session_id, "sess-77");
     }
 
     #[test]
