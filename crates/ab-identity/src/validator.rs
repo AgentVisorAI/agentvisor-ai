@@ -157,7 +157,9 @@ impl IdentityValidator {
     /// Add all supported Ed25519 keys from a standard JWKS document. Keys
     /// loaded by a *previous* `add_jwks` call are retired (replace
     /// semantics, so IdP rotation drops superseded JWKS keys); keys
-    /// registered manually via `add_key` are left untouched.
+    /// registered manually via `add_key` are left untouched, and a JWKS
+    /// entry whose `kid` collides with a manually-registered key is
+    /// refused so the manual key stays authoritative.
     pub fn add_jwks(&self, document: &serde_json::Value) -> Result<usize, IdentityError> {
         let keys = document
             .get("keys")
@@ -187,6 +189,18 @@ impl IdentityValidator {
         }
         let mut loaded = self.keys.write();
         let mut prior = self.jwks_kids.write();
+        // A manually-added key must not be silently converted to a
+        // JWKS-tracked entry: without this refusal, the next JWKS refresh
+        // that no longer carries the colliding kid would retire (delete)
+        // an operator-configured key. Report the conflict — the operator
+        // can rename either side.
+        for (kid, _) in &parsed {
+            if loaded.contains_key(kid) && !prior.contains(kid) {
+                return Err(IdentityError::Jwks(format!(
+                    "JWKS kid {kid:?} conflicts with a manually-registered key; rename one"
+                )));
+            }
+        }
         for kid in prior.drain() {
             loaded.remove(&kid);
         }

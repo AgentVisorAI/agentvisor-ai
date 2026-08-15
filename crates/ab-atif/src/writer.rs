@@ -88,12 +88,27 @@ impl TrajectoryBuilder {
                 .ok_or(ab_core::CoreError::Overflow {
                     context: "total_cached_tokens",
                 })?;
-            (
-                next_prompt,
-                next_completion,
-                next_cached,
-                self.total_cost + m.cost_usd.unwrap_or(0.0),
-            )
+            // Reject a non-finite or negative cost the same way tokens are
+            // rejected on overflow: without this the aggregate silently
+            // saturates to +∞ (or drifts negative), and a downstream Strict
+            // validator that trusts final_metrics.total_cost_usd signs
+            // corrupt evidence. serde_json refuses to serialize non-finite
+            // floats, so this also guards against a later write_atomic
+            // erroring out mid-persist and leaving the trajectory in a bad
+            // state.
+            let step_cost = m.cost_usd.unwrap_or(0.0);
+            if !step_cost.is_finite() || step_cost < 0.0 {
+                return Err(ab_core::CoreError::Overflow {
+                    context: "step_cost_usd",
+                });
+            }
+            let next_cost = self.total_cost + step_cost;
+            if !next_cost.is_finite() {
+                return Err(ab_core::CoreError::Overflow {
+                    context: "total_cost_usd",
+                });
+            }
+            (next_prompt, next_completion, next_cached, next_cost)
         } else {
             (
                 self.total_prompt,

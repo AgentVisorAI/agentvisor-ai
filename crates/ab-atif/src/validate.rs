@@ -273,12 +273,18 @@ fn validate_trajectory_obj(
                     }
                 }
                 if let Some(v) = m.get("total_cost_usd") {
-                    if !v.is_number() {
-                        issue!(
+                    match v.as_f64() {
+                        Some(n) if n.is_finite() && n >= 0.0 => {}
+                        Some(_) => issue!(
+                            issues,
+                            format!("{path}.final_metrics.total_cost_usd"),
+                            "must be a finite non-negative number"
+                        ),
+                        None => issue!(
                             issues,
                             format!("{path}.final_metrics.total_cost_usd"),
                             "must be a number"
-                        );
+                        ),
                     }
                 }
             }
@@ -622,8 +628,16 @@ fn validate_step(
                         }
                     }
                 }
-                if m.get("cost_usd").is_some_and(|v| !v.is_number()) {
-                    issue!(issues, format!("{mpath}.cost_usd"), "must be a number");
+                if let Some(v) = m.get("cost_usd") {
+                    match v.as_f64() {
+                        Some(n) if n.is_finite() && n >= 0.0 => {}
+                        Some(_) => issue!(
+                            issues,
+                            format!("{mpath}.cost_usd"),
+                            "must be a finite non-negative number"
+                        ),
+                        None => issue!(issues, format!("{mpath}.cost_usd"), "must be a number"),
+                    }
                 }
                 if m.contains_key("completion_token_ids") && ver < (1, 3) {
                     issue!(
