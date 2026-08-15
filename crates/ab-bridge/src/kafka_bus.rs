@@ -345,29 +345,44 @@ impl EventBus for KafkaBus {
             .run(move || async move {
                 let pc = client
                     .partition_client(topic, partition as i32, UnknownTopicHandling::Error)
-                    .await?;
+                    .await
+                    .map_err(|e| e.to_string())?;
                 #[allow(clippy::cast_possible_wrap)]
                 let (records, _high_watermark) = pc
                     .fetch_records(offset as i64, 1..(16 * 1024 * 1024), 500)
-                    .await?;
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let mut out = Vec::new();
                 for r in records {
-                    if let Some(value) = r.record.value {
-                        if let Ok(mut ev) = serde_json::from_slice::<StoredEvent>(&value) {
-                            #[allow(clippy::cast_sign_loss)]
-                            {
-                                ev.offset = r.offset as u64;
-                            }
-                            out.push(ev);
-                        }
+                    // Round-22 F1: surface the error instead of silently
+                    // dropping a corrupt record. Parity with NatsBus and
+                    // EmbeddedBroker. An auditor or reconciler that sees a
+                    // shorter list than expected — with no error and no
+                    // offset gap — is an evidence gap. Because reconcilers
+                    // advance offset by `events.last().offset + 1`, a
+                    // silently-skipped corrupt record at offset N causes
+                    // the caller to bypass it entirely; keep the record on
+                    // the partition as forensic evidence.
+                    let value = r
+                        .record
+                        .value
+                        .ok_or_else(|| format!("fetch: null record value at offset {}", r.offset))?;
+                    let mut ev: StoredEvent =
+                        serde_json::from_slice(&value).map_err(|e| {
+                            format!("fetch decode at offset {}: {e}", r.offset)
+                        })?;
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        ev.offset = r.offset as u64;
                     }
+                    out.push(ev);
                     if out.len() >= max {
                         break;
                     }
                 }
-                Ok::<_, rskafka::client::error::Error>(out)
+                Ok::<_, String>(out)
             })?
-            .map_err(|e| BusError::Backend(e.to_string()))
+            .map_err(BusError::Backend)
     }
 
     fn partitions(&self, topic: &str) -> Result<u32, BusError> {

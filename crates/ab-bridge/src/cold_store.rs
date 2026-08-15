@@ -292,6 +292,12 @@ fn persist_pending(
         .ok_or_else(|| BusError::Backend("cold outbox has no parent".to_owned()))?;
     std::fs::create_dir_all(parent)?;
     let temporary = path.with_extension(format!("{}.tmp", ab_core::new_event_uid()));
+    // Round-22 F3: arm the RAII guard immediately after choosing the
+    // temp path so that any Err on mac/serialize/write/sync/rename
+    // cleans up the tmp instead of leaving an orphan. Repeated
+    // ENOSPC/EIO on a bad-disk day would otherwise unboundedly
+    // consume inodes (UUIDv7-suffixed .tmp names never collide).
+    let mut guard = ab_core::fsutil::TempPathGuard::new(temporary.clone());
     let mut file = std::fs::File::create(&temporary)?;
     let mac = pending_mac(control_key, pending)?;
     file.write_all(&serde_json::to_vec(&PendingEnvelope {
@@ -300,6 +306,7 @@ fn persist_pending(
     })?)?;
     file.sync_all()?;
     std::fs::rename(&temporary, path)?;
+    guard.disarm();
     ab_core::fsutil::sync_directory(parent)?;
     Ok(())
 }
@@ -311,6 +318,18 @@ fn read_pending(path: &std::path::Path, control_key: &[u8; 32]) -> Result<Pendin
 }
 
 fn pending_mac(control_key: &[u8; 32], pending: &PendingColdEvent) -> Result<String, BusError> {
+    // Round-22 F2: refuse to sign under a known-weak key. Round-21 F3
+    // blocked *installing* [0; 32] / [0xFF; 32] through set_control_key,
+    // but the archive is *constructed* with [0; 32] and a bus impl that
+    // publishes before an operator installs a real key (or that forgets
+    // set_control_key entirely) would sign under the weak default. Fail
+    // closed at the sign site so the default-init window can never
+    // produce a forgeable envelope.
+    if control_key == &[0u8; 32] || control_key == &[0xFFu8; 32] {
+        return Err(BusError::Backend(
+            "cold-outbox control key is uninitialized/known-weak; refusing to sign".to_owned(),
+        ));
+    }
     use hmac::{Hmac, Mac as _};
     use sha2::Sha256;
     let value = serde_json::to_value(pending)?;
@@ -331,6 +350,16 @@ fn verify_pending_mac(
     pending: &PendingColdEvent,
     presented_hex: &str,
 ) -> Result<(), BusError> {
+    // Round-22 F2: refuse to verify under a known-weak key. Mirrors the
+    // sign-time check in `pending_mac`. If the archive is still holding
+    // its default [0; 32] key when a stale envelope is read back on
+    // startup, we do NOT want to accept it as authentic — a
+    // filesystem-tamper attacker knows the weak key too.
+    if control_key == &[0u8; 32] || control_key == &[0xFFu8; 32] {
+        return Err(BusError::Backend(
+            "cold outbox authentication failed".to_owned(),
+        ));
+    }
     use hmac::{Hmac, Mac as _};
     use sha2::Sha256;
     let value = serde_json::to_value(pending)?;
@@ -407,6 +436,7 @@ mod tests {
         topic.retention.cold_uri = Some(uri);
         let topic_name = topic.name.clone();
         let archive = ColdArchive::from_manifest(&manifest).unwrap().unwrap();
+        archive.set_control_key([7u8; 32]).unwrap();
         archive
             .put(
                 &topic_name,
@@ -441,6 +471,7 @@ mod tests {
         let topic_name = topic.name.clone();
         let mut archive = ColdArchive::from_manifest(&manifest).unwrap().unwrap();
         archive.pending_dir = outbox.path().to_path_buf();
+        archive.set_control_key([7u8; 32]).unwrap();
         let event = StoredEvent {
             partition: 2,
             offset: 0,
@@ -701,5 +732,55 @@ mod tests {
         );
         // A legit key still installs cleanly.
         archive.set_control_key([7u8; 32]).unwrap();
+    }
+
+    /// Round-22 F2: sign-time refusal of known-weak keys. Round-21 F3
+    /// only guarded `set_control_key`. If a bus impl publishes before
+    /// (or without) installing a real key, the archive is still holding
+    /// its default `[0; 32]` — and would previously have signed
+    /// envelopes under an all-zero MAC key any attacker could forge.
+    /// `stage()` (which calls `persist_pending` → `pending_mac`) must
+    /// fail closed in that state.
+    #[test]
+    fn stage_refuses_to_sign_under_default_weak_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = tempfile::tempdir().unwrap();
+        let uri = url::Url::from_directory_path(directory.path())
+            .unwrap()
+            .to_string();
+        let mut manifest = BridgeManifest::default_for("cold-default-weak");
+        let topic = &mut manifest.topics[0];
+        topic.retention.cold_uri = Some(uri);
+        let topic_name = topic.name.clone();
+        let mut archive = ColdArchive::from_manifest(&manifest).unwrap().unwrap();
+        archive.pending_dir = outbox.path().to_path_buf();
+        // NOTE: no set_control_key call — the archive is still holding
+        // its constructor default of [0; 32].
+        let event = StoredEvent {
+            partition: 0,
+            offset: 0,
+            key: "instance".to_owned(),
+            value: serde_json::json!({"metadata": {"uid": "cold-default-1"}}),
+            stored_at: 1,
+        };
+        let err = archive
+            .stage(&topic_name, &event, "cold-default-1")
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("uninitialized")
+                || format!("{err:?}").contains("known-weak"),
+            "expected weak-key rejection at sign time, got {err:?}"
+        );
+        // The pending dir must remain empty — a rejected sign attempt
+        // must not leave orphan `.tmp` (round-22 F3 guard) or a
+        // committed pending file.
+        let leftover = std::fs::read_dir(outbox.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .count();
+        assert_eq!(
+            leftover, 0,
+            "sign refusal must not leave any file behind in the pending dir"
+        );
     }
 }
