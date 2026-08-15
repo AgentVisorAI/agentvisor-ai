@@ -38,6 +38,19 @@ struct PendingEnvelope {
 
 impl ColdArchive {
     pub(crate) fn from_manifest(manifest: &BridgeManifest) -> Result<Option<Self>, BusError> {
+        Self::from_manifest_with_pending_default(manifest, None)
+    }
+
+    /// Same as [`Self::from_manifest`] but uses `pending_default` when neither
+    /// the operator-set `AB_COLD_OUTBOX_DIR` env var nor a manifest override
+    /// is present. Callers with a natural data directory (e.g. the embedded
+    /// broker) pass `data_dir.join("cold-outbox")` so two brokers in the
+    /// same process do not cross-consume each other's intents via the
+    /// CWD-relative fallback.
+    pub(crate) fn from_manifest_with_pending_default(
+        manifest: &BridgeManifest,
+        pending_default: Option<std::path::PathBuf>,
+    ) -> Result<Option<Self>, BusError> {
         let mut targets = HashMap::new();
         for topic in &manifest.topics {
             let Some(uri) = topic.retention.cold_uri.as_deref() else {
@@ -57,12 +70,14 @@ impl ColdArchive {
         if targets.is_empty() {
             return Ok(None);
         }
+        let pending_dir = std::env::var_os("AB_COLD_OUTBOX_DIR")
+            .map(std::path::PathBuf::from)
+            .or(pending_default)
+            .unwrap_or_else(|| std::path::PathBuf::from("data/cold-outbox"));
         Ok(Some(Self {
             targets,
             executor: crate::bus::ConnectorExecutor::new("agent-bridge-cold-store")?,
-            pending_dir: std::env::var_os("AB_COLD_OUTBOX_DIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from("data/cold-outbox")),
+            pending_dir,
             control_key: parking_lot::RwLock::new([0; 32]),
         }))
     }

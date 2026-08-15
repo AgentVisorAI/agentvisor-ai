@@ -98,7 +98,20 @@ impl EmbeddedBroker {
                 let mut seen_event_uids = recover_event_uids(&idempotency_path)?;
                 recover_segment_event_uids(&path, &mut seen_event_uids)?;
                 torn_total += torn;
+                // Track first-time creation so we can fsync the directory
+                // after the file is materialised — `sync_data()` on the
+                // append handle flushes bytes and size, but the directory
+                // entry that names the inode is only durable after a
+                // `sync_directory(parent)`. Without this, N successful
+                // publishes → acked → power loss → boot back with the
+                // segment file absent and every acked event lost until the
+                // first retention pass, which is the only other code path
+                // that fsyncs the parent directory.
+                let segment_created = !path.exists();
                 let writer = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+                if segment_created {
+                    ab_core::fsutil::sync_directory(&dir).map_err(BusError::Io)?;
+                }
                 parts.push(Mutex::new(Partition {
                     path,
                     watermark_path,
@@ -112,7 +125,10 @@ impl EmbeddedBroker {
         }
         let validators = load_validators(data_dir, &manifest)?;
         #[cfg(feature = "cold-store")]
-        let cold_archive = crate::cold_store::ColdArchive::from_manifest(&manifest)?;
+        let cold_archive = crate::cold_store::ColdArchive::from_manifest_with_pending_default(
+            &manifest,
+            Some(data_dir.join("cold-outbox")),
+        )?;
         Ok(Self {
             data_dir: data_dir.to_owned(),
             manifest,
@@ -202,6 +218,42 @@ impl EmbeddedBroker {
                 if let Some(parent) = part.path.parent() {
                     ab_core::fsutil::sync_directory(parent)?;
                 }
+                // Prune the idempotency map + sidecar of any UID whose offset
+                // was expired: without this, a subsequent `publish_idempotent`
+                // with a still-cached UID returns an ack pointing at data that
+                // no longer exists, and the caller's follow-up `fetch(offset)`
+                // silently returns the wrong event or nothing. Compute the
+                // surviving offsets from the retained records and drop
+                // everything else.
+                let survivors: std::collections::HashSet<u64> = kept
+                    .iter()
+                    .filter_map(|line| serde_json::from_str::<StoredEvent>(line).ok())
+                    .map(|event| event.offset)
+                    .collect();
+                let before = part.seen_event_uids.len();
+                part.seen_event_uids
+                    .retain(|_, offset| survivors.contains(offset));
+                if part.seen_event_uids.len() != before {
+                    // Sidecar is now stale — rewrite it atomically with only
+                    // the surviving mappings so recovery cannot resurrect a
+                    // just-expired UID.
+                    let mut lines: Vec<(String, u64)> = part
+                        .seen_event_uids
+                        .iter()
+                        .map(|(uid, offset)| (uid.clone(), *offset))
+                        .collect();
+                    lines.sort_by_key(|(_, offset)| *offset);
+                    let mut sidecar = Vec::new();
+                    for (uid, offset) in lines {
+                        let mapping = serde_json::to_string(&EventUidOffset {
+                            event_uid: uid,
+                            offset,
+                        })?;
+                        sidecar.extend_from_slice(mapping.as_bytes());
+                        sidecar.push(b'\n');
+                    }
+                    rewrite_atomic(&part.idempotency_path, &sidecar)?;
+                }
                 part.writer = fs::OpenOptions::new().append(true).open(&part.path)?;
             }
         }
@@ -284,10 +336,11 @@ fn recover_segment(path: &Path) -> Result<(u64, u64), BusError> {
     };
     let torn = usize::from(complete_len < bytes.len());
     if torn == 1 {
-        // Truncate to the last complete record (atomic rewrite).
-        let tmp = path.with_extension("jsonl.tmp");
-        fs::write(&tmp, bytes.get(..complete_len).unwrap_or_default())?;
-        fs::rename(&tmp, path)?;
+        // Same fsync-safe rewrite pattern as `persist_high_water`: without
+        // sync_all()+sync_directory a crash during recovery could turn a
+        // torn-tail single-record loss into total-segment loss on
+        // non-ext4 filesystems.
+        rewrite_atomic(path, bytes.get(..complete_len).unwrap_or_default())?;
     }
     let complete = bytes.get(..complete_len).unwrap_or_default();
     let mut next_offset = 0u64;
@@ -295,8 +348,19 @@ fn recover_segment(path: &Path) -> Result<(u64, u64), BusError> {
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
     {
-        let event: StoredEvent = serde_json::from_slice(line)?;
-        next_offset = next_offset.max(event.offset.saturating_add(1));
+        match serde_json::from_slice::<StoredEvent>(line) {
+            Ok(event) => next_offset = next_offset.max(event.offset.saturating_add(1)),
+            // A single unparseable middle line must not brick the broker.
+            // The corrupted bytes are left on disk as forensic evidence;
+            // subsequent publishes append past the surviving max offset.
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %path.display(),
+                    "skipping unparseable segment record during recovery",
+                );
+            }
+        }
     }
     Ok((next_offset, torn as u64))
 }
@@ -311,9 +375,7 @@ fn recover_event_uids(path: &Path) -> Result<HashMap<String, u64>, BusError> {
         .rposition(|byte| *byte == b'\n')
         .map_or(0, |position| position + 1);
     if complete_len < bytes.len() {
-        let temporary = path.with_extension("jsonl.tmp");
-        fs::write(&temporary, bytes.get(..complete_len).unwrap_or_default())?;
-        fs::rename(&temporary, path)?;
+        rewrite_atomic(path, bytes.get(..complete_len).unwrap_or_default())?;
     }
     let mut seen = HashMap::new();
     for line in bytes
@@ -322,7 +384,21 @@ fn recover_event_uids(path: &Path) -> Result<HashMap<String, u64>, BusError> {
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
     {
-        let mapping: EventUidOffset = serde_json::from_slice(line)?;
+        let mapping: EventUidOffset = match serde_json::from_slice(line) {
+            Ok(mapping) => mapping,
+            // Sidecar corruption also skip-and-log: the segment is the
+            // ground truth (see `recover_segment_event_uids` below), and
+            // an unreadable idempotency line at most costs a duplicate
+            // ack for the same UID.
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %path.display(),
+                    "skipping unparseable event-uid sidecar record during recovery",
+                );
+                continue;
+            }
+        };
         if seen
             .insert(mapping.event_uid.clone(), mapping.offset)
             .is_some_and(|existing| existing != mapping.offset)
@@ -345,7 +421,20 @@ fn recover_segment_event_uids(path: &Path, seen: &mut HashMap<String, u64>) -> R
         if line.is_empty() {
             continue;
         }
-        let event: StoredEvent = serde_json::from_str(&line)?;
+        let event: StoredEvent = match serde_json::from_str(&line) {
+            Ok(event) => event,
+            // Same skip-and-log policy as `recover_segment`: an unreadable
+            // segment record has already been flagged there; here it just
+            // means we cannot reconstruct its UID → offset mapping.
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %path.display(),
+                    "skipping unparseable segment record while rebuilding UID index",
+                );
+                continue;
+            }
+        };
         let Some(uid) = event_uid_from_value(&event.value) else {
             continue;
         };
@@ -361,6 +450,24 @@ fn recover_segment_event_uids(path: &Path, seen: &mut HashMap<String, u64>) -> R
     Ok(())
 }
 
+/// Fsync-safe replace: `File::create` → `write_all` → `sync_all` → rename
+/// → `sync_directory(parent)`. Same shape as `persist_high_water` and the
+/// hot-segment rewrite in `enforce_retention`.
+fn rewrite_atomic(path: &Path, bytes: &[u8]) -> Result<(), BusError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| BusError::Backend("atomic rewrite has no parent".to_owned()))?;
+    let tmp = path.with_extension(format!("jsonl.{}.tmp", ab_core::new_event_uid()));
+    {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    ab_core::fsutil::sync_directory(parent)?;
+    Ok(())
+}
+
 fn event_uid_from_value(value: &serde_json::Value) -> Option<&str> {
     value
         .get("metadata")
@@ -370,10 +477,22 @@ fn event_uid_from_value(value: &serde_json::Value) -> Option<&str> {
 
 fn read_high_water(path: &Path) -> Result<u64, BusError> {
     match fs::read_to_string(path) {
-        Ok(value) => value
-            .trim()
-            .parse::<u64>()
-            .map_err(|error| BusError::Backend(format!("invalid high-watermark: {error}"))),
+        Ok(value) => match value.trim().parse::<u64>() {
+            Ok(offset) => Ok(offset),
+            // A corrupt watermark file is not fatal: `next_offset` is
+            // recomputed as `segment_offset.max(persisted_offset)` in
+            // `open()`, so falling back to 0 lets the segment be
+            // authoritative. The next successful publish rewrites the
+            // watermark via `persist_high_water` and self-heals.
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %path.display(),
+                    "high-watermark file is corrupt; falling back to segment-derived next_offset",
+                );
+                Ok(0)
+            }
+        },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
         Err(error) => Err(BusError::Io(error)),
     }
@@ -499,6 +618,13 @@ impl EmbeddedBroker {
                 event_uid: uid.to_owned(),
                 offset,
             })?;
+            // Directory entry for a first-time-created sidecar is only
+            // durable after sync_directory(parent). Sync the parent when
+            // we discover we're creating the file so a subsequent power
+            // loss cannot lose the whole sidecar (which would silently
+            // convert future publish_idempotent calls into duplicate
+            // appends).
+            let sidecar_created = !part.idempotency_path.exists();
             let mut idempotency = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -506,6 +632,11 @@ impl EmbeddedBroker {
             idempotency.write_all(mapping.as_bytes())?;
             idempotency.write_all(b"\n")?;
             idempotency.sync_data()?;
+            if sidecar_created {
+                if let Some(parent) = part.idempotency_path.parent() {
+                    ab_core::fsutil::sync_directory(parent)?;
+                }
+            }
         }
         Ok(PublishAck {
             topic: topic.to_owned(),
