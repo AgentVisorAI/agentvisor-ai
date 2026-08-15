@@ -447,3 +447,49 @@ fn add_jwks_refuses_to_overwrite_a_manually_registered_kid() {
         .validate(&mint(&manual, &claims(&["tool:read"], 600, None)))
         .unwrap();
 }
+
+/// CVE-2026-25537 (jsonwebtoken < 10.3.0 type-confusion): if `nbf` is
+/// provided as a JSON string like `"99999999999"` (far-future
+/// legacy/mistake), the pre-10.3 library marked it FailedToParse and
+/// silently *skipped* the nbf gate even with `validate_nbf = true`,
+/// because `nbf` was not in the required-claims list. An attacker
+/// could ship a token that was immediately usable despite claiming to
+/// be valid only in the far future.
+///
+/// Our concrete `NhiClaims` uses `nbf: Option<u64>`, so serde would
+/// have already rejected a string here even under the vulnerable
+/// library — but this test locks the behavior so a future refactor to
+/// `serde_json::Value` claims cannot silently reintroduce the bypass.
+#[test]
+fn cve_2026_25537_string_nbf_is_rejected_not_bypassed() {
+    let keys = ed25519_keys("k1");
+    let v = validator(&keys);
+    // Mint a token whose `nbf` is a JSON string. We serialize a
+    // concrete map so the payload contains `"nbf":"99999999999"`
+    // rather than the usual number.
+    let iat = now_s();
+    let payload = serde_json::json!({
+        "sub": "agent:test",
+        "iss": "https://idp.example.com",
+        "aud": "harness-prod",
+        "iat": iat,
+        "nbf": "99999999999",
+        "exp": iat + 600,
+        "jti": ab_core::new_event_uid(),
+        "instance_uid": "inst-1",
+        "charter": "support",
+        "version": "1.2.3",
+        "scopes": [],
+    });
+    let mut header = Header::new(Algorithm::EdDSA);
+    header.kid = Some(keys.kid.clone());
+    let token = jsonwebtoken::encode(&header, &payload, &keys.encoding).unwrap();
+    // Must be rejected — either at the concrete-struct deserialize
+    // step (our defense) or at the library gate (10.3+ defense).
+    // Silently accepting is the vulnerable behavior.
+    let outcome = v.validate(&token);
+    assert!(
+        matches!(outcome, Err(IdentityError::Verification(_) | IdentityError::Malformed(_))),
+        "string-nbf token must be rejected (CVE-2026-25537 class), got {outcome:?}",
+    );
+}
