@@ -35,6 +35,17 @@ pub enum ValidationError {
     /// Status outside 0–2.
     #[error("status_id {0} outside 0..=2")]
     BadStatus(u8),
+    /// Round-38 F3: activity_id must be < 100 or the
+    /// `class_uid × 100 + activity_id` bijection collapses:
+    /// `class_uid=9901, activity_id=100` produces the same
+    /// `type_uid = 990200` as `class_uid=9902, activity_id=0`,
+    /// so downstream SIEM pipelines routing/aggregating by
+    /// type_uid mis-classify. Not currently reachable via the
+    /// builder (defaults 1) but the field is `#[non_exhaustive]`
+    /// and constructable directly; enforce the bijection
+    /// invariant at validate time.
+    #[error("activity_id {0} outside 0..=99 (would collide type_uid namespaces)")]
+    BadActivityId(u8),
     /// stop_reason caption present without id (or vice versa).
     #[error("stop_reason and stop_reason_id must be present together")]
     StopReasonPairMismatch,
@@ -90,6 +101,16 @@ pub fn validate_event(ev: &OcsfEvent) -> Result<(), Vec<ValidationError>> {
             class_uid: ev.class_uid,
             activity_id: ev.activity_id,
         });
+    }
+    // Round-38 F3: the `class_uid × 100 + activity_id` invariant
+    // above is only a bijection when activity_id < 100. Enforce
+    // that at validate time so an adversarial event asserting
+    // `class_uid=9901, activity_id=100, type_uid=990200` (which
+    // is self-consistent per the mismatch check but collides
+    // with `class_uid=9902, activity_id=0`) cannot slip through
+    // and mis-route downstream SIEM aggregation by type_uid.
+    if ev.activity_id >= 100 {
+        errors.push(ValidationError::BadActivityId(ev.activity_id));
     }
     if !(1..=6).contains(&ev.severity_id) {
         errors.push(ValidationError::BadSeverity(ev.severity_id));
@@ -204,5 +225,34 @@ mod tests {
         assert!(validate_event(&ev)
             .unwrap_err()
             .contains(&ValidationError::BadStatus(3)));
+    }
+
+    /// Round-38 F3: activity_id must be < 100 so
+    /// `class_uid × 100 + activity_id` is a bijection. Without this
+    /// check, `class_uid=9901, activity_id=100` produces the same
+    /// type_uid (990200) as `class_uid=9902, activity_id=0`, so
+    /// downstream SIEM pipelines routing by type_uid mis-classify.
+    /// Not currently reachable via the builder (defaults 1) but the
+    /// field is `#[non_exhaustive]` and constructable directly.
+    #[test]
+    fn activity_id_100_is_rejected_even_when_type_uid_matches() {
+        let mut ev = valid_event();
+        ev.activity_id = 100;
+        // Keep type_uid self-consistent so the mismatch check
+        // doesn't fire — this test isolates the bijection guard.
+        ev.type_uid = u64::from(ev.class_name.class_uid()) * 100 + 100;
+        let errs = validate_event(&ev).unwrap_err();
+        assert!(
+            errs.contains(&ValidationError::BadActivityId(100)),
+            "activity_id=100 must be flagged even when type_uid matches; got {errs:?}"
+        );
+        // Boundary: 99 must NOT be flagged.
+        ev.activity_id = 99;
+        ev.type_uid = u64::from(ev.class_name.class_uid()) * 100 + 99;
+        let errs = validate_event(&ev).map(|_| Vec::new()).unwrap_or_else(|e| e);
+        assert!(
+            !errs.iter().any(|e| matches!(e, ValidationError::BadActivityId(_))),
+            "activity_id=99 must be valid; got {errs:?}"
+        );
     }
 }
