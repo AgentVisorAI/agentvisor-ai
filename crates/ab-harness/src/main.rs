@@ -887,6 +887,25 @@ fn read_signer(path: &Path) -> Result<Ed25519Signer> {
     let seed: [u8; 32] = bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("signing seed must contain exactly 32 bytes"))?;
+    // Round-14: refuse known-weak Ed25519 seeds. An all-zero seed
+    // produces a valid keypair with a globally-known public key — any
+    // attacker who knows we accepted `[0; 32]` can forge receipts
+    // that verify against our key id. Same for the all-`0xFF` seed
+    // (both are the "textbook wrong" values operators sometimes
+    // paste in when troubleshooting). Fail fast at startup so the
+    // hazard cannot ship silently.
+    if seed == [0u8; 32] {
+        anyhow::bail!(
+            "signing seed at {} is all zeros; refusing (this is a known-weak seed with a globally predictable public key)",
+            path.display()
+        );
+    }
+    if seed == [0xFFu8; 32] {
+        anyhow::bail!(
+            "signing seed at {} is all 0xFF bytes; refusing (this is a known-weak seed with a globally predictable public key)",
+            path.display()
+        );
+    }
     Ok(Ed25519Signer::from_seed(seed))
 }
 
@@ -1020,6 +1039,42 @@ mod tests {
         let second = load_or_create_signer(&path).unwrap();
         assert_eq!(first.key_id(), second.key_id());
         assert_eq!(std::fs::read_to_string(path).unwrap().trim().len(), 64);
+    }
+
+    /// Round-14: a signing seed of all zeros produces a valid Ed25519
+    /// keypair with a globally-known public key. Any attacker who
+    /// realized we accepted `[0; 32]` could forge receipts that verify
+    /// under the resulting key id. Fail closed at startup rather than
+    /// let a copy-paste-from-test-vector operator error ship as
+    /// production. Same for all-0xFF.
+    #[cfg(unix)]
+    #[test]
+    fn refuses_known_weak_signing_seed_all_zeros() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("zeros.seed");
+        std::fs::write(&path, "0".repeat(64)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let err = read_signer(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("all zeros"),
+            "expected all-zeros rejection, got: {err}",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_known_weak_signing_seed_all_ff() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ff.seed");
+        std::fs::write(&path, "f".repeat(64)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let err = read_signer(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("0xFF"),
+            "expected all-0xFF rejection, got: {err}",
+        );
     }
 
     #[test]
