@@ -63,27 +63,53 @@ impl EmbeddedBroker {
         let yaml = manifest.to_yaml().map_err(|e| BusError::Backend(e.to_string()))?;
         // Atomic single-winner claim on a fresh provision: `create_new`
         // refuses to overwrite an existing file with an OS-level
-        // exclusion primitive (O_EXCL), so 8 concurrent provisions race
+        // exclusion primitive (O_EXCL), so N concurrent provisions race
         // on the same directory and exactly one wins. The old shape
         // (`exists()` check → separate write) had a TOCTOU: two racers
         // could both see "does not exist", both write, both succeed.
+        //
+        // Any error path — write_all, sync_all, hard_link, os signal —
+        // must clean up the tmp file. TmpGuard's Drop covers the
+        // early-return paths (ENOSPC, EIO on write, permission errors
+        // on sync); the winner path explicitly disarms the guard just
+        // before returning Ok so its finalised link is not deleted.
         use std::io::Write as _;
         let tmp = data_dir.join(format!("manifest.yaml.{}.tmp", ab_core::new_event_uid()));
+        struct TmpGuard {
+            path: Option<std::path::PathBuf>,
+        }
+        impl TmpGuard {
+            fn disarm(&mut self) {
+                self.path = None;
+            }
+        }
+        impl Drop for TmpGuard {
+            fn drop(&mut self) {
+                if let Some(path) = self.path.take() {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+        let mut guard = TmpGuard {
+            path: Some(tmp.clone()),
+        };
         {
             let mut file = fs::File::create(&tmp)?;
             file.write_all(yaml.as_bytes())?;
             file.sync_all()?;
         }
-        // hard_link refuses to overwrite, so exactly one racer's
-        // hard_link call succeeds. The losers' link fails with
-        // AlreadyExists and their tmp is cleaned up in the Err arm.
         match fs::hard_link(&tmp, &manifest_path) {
             Ok(_) => {
+                // The tmp file was successfully hard-linked to the
+                // final path; the link itself is now the manifest.
+                // Delete the tmp path entry (the inode stays alive
+                // through the second link) and disarm the guard.
                 let _ = fs::remove_file(&tmp);
+                guard.disarm();
             }
             Err(error) => {
-                let _ = fs::remove_file(&tmp);
                 if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    // Loser arm: tmp is auto-removed by TmpGuard on Err.
                     return Err(BusError::Backend(format!(
                         "bridge already provisioned at {}",
                         data_dir.display()
@@ -128,9 +154,22 @@ impl EmbeddedBroker {
                 // short-circuits to a stale offset and callers fetch
                 // whatever event lives at that offset today, silently
                 // returning the wrong record.
+                //
+                // Mirror `enforce_retention`'s policy for
+                // unparseable-but-kept lines: any UID whose offset
+                // falls in the [min, max] offset range of surviving
+                // parseable records is kept, because it may correspond
+                // to an unparseable-but-authentic line at that offset.
+                // Without this parity, an unparseable segment record
+                // after a crash would drop its sidecar entry, letting
+                // the next publish_idempotent re-append a duplicate
+                // that the following retention pass would choke on.
                 if !seen_event_uids.is_empty() {
                     let mut live_uids =
                         std::collections::HashSet::<String>::with_capacity(seen_event_uids.len());
+                    let mut min_offset = u64::MAX;
+                    let mut max_offset = 0u64;
+                    let mut have_parseable_line = false;
                     if path.exists() {
                         for line in BufReader::new(fs::File::open(&path)?).lines() {
                             let Ok(line) = line else {
@@ -143,11 +182,27 @@ impl EmbeddedBroker {
                                 if let Some(uid) = event_uid_from_value(&event.value) {
                                     live_uids.insert(uid.to_owned());
                                 }
+                                min_offset = min_offset.min(event.offset);
+                                max_offset = max_offset.max(event.offset);
+                                have_parseable_line = true;
                             }
                         }
                     }
+                    let offset_range = if have_parseable_line {
+                        Some((min_offset, max_offset))
+                    } else {
+                        None
+                    };
                     let before = seen_event_uids.len();
-                    seen_event_uids.retain(|uid, _| live_uids.contains(uid));
+                    seen_event_uids.retain(|uid, offset| {
+                        if live_uids.contains(uid) {
+                            return true;
+                        }
+                        match offset_range {
+                            Some((lo, hi)) => *offset >= lo && *offset <= hi,
+                            None => false,
+                        }
+                    });
                     if seen_event_uids.len() != before {
                         tracing::warn!(
                             topic = %t.name,

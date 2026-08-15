@@ -98,13 +98,77 @@ pub struct ReceiptBody {
 }
 
 /// A complete receipt: body + detached signature over `JCS(body)`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// The wire shape is intentionally flat (13 body fields + `signature_b64`
+/// at the top level) — the schema at `schemas/receipt-v1.schema.json`
+/// commits to it and downstream verifiers (`abctl receipt-verify`,
+/// external tools) consume it that way.
+///
+/// `#[serde(flatten)]` normally silently disables `deny_unknown_fields`
+/// on the inner struct, which would let a hostile issuer add extra
+/// top-level fields ("claim_extra": "grant admin") that the human
+/// reviewer sees but `verify()` accepts (the field never survives the
+/// round-trip to `ReceiptBody` used inside `canonicalize`). To close
+/// that gap without breaking the wire shape, the [`Deserialize`] impl
+/// is written by hand and rejects any top-level key outside the
+/// declared whitelist. See the `allowed_list_covers_body_fields_exactly`
+/// test for the compile-time-ish drift guard.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Receipt {
     /// Signed body.
     #[serde(flatten)]
     pub body: ReceiptBody,
     /// Ed25519 signature over the JCS canonicalization of the body, base64.
     pub signature_b64: String,
+}
+
+/// The 14 top-level keys a receipt is allowed to carry over the wire:
+/// the 13 fields of [`ReceiptBody`] plus [`Receipt::signature_b64`].
+///
+/// Kept in lockstep with [`ReceiptBody`] by
+/// `tests::allowed_receipt_top_level_keys_cover_body_fields_exactly`
+/// — adding a field to `ReceiptBody` without updating this list breaks
+/// that test at CI time.
+const ALLOWED_RECEIPT_TOP_LEVEL_KEYS: &[&str] = &[
+    "receipt_version",
+    "receipt_id",
+    "session_id",
+    "issued_at",
+    "issued_at_iso",
+    "ai_agent",
+    "subject",
+    "tool_calls",
+    "cost",
+    "stop_reason_id",
+    "stop_reason",
+    "key_id",
+    "public_key_b64",
+    "signature_b64",
+];
+
+impl<'de> Deserialize<'de> for Receipt {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let mut raw = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        for key in raw.keys() {
+            if !ALLOWED_RECEIPT_TOP_LEVEL_KEYS.contains(&key.as_str()) {
+                return Err(D::Error::custom(format!(
+                    "unknown field `{key}` in Receipt; a signed receipt \
+                     may only carry the fields declared in ReceiptBody + \
+                     signature_b64. Extra fields would be visible to a raw \
+                     JSON reader but not covered by the signature — treat \
+                     as tampering."
+                )));
+            }
+        }
+        let signature_value = raw
+            .remove("signature_b64")
+            .ok_or_else(|| D::Error::missing_field("signature_b64"))?;
+        let signature_b64: String = serde_json::from_value(signature_value).map_err(D::Error::custom)?;
+        let body: ReceiptBody =
+            serde_json::from_value(serde_json::Value::Object(raw)).map_err(D::Error::custom)?;
+        Ok(Self { body, signature_b64 })
+    }
 }
 
 /// Receipt errors.
@@ -472,5 +536,50 @@ mod tests {
         // same physical host running the test.
         let diff_ms = ra.body.issued_at.abs_diff(rb.body.issued_at);
         assert!(diff_ms < 60_000, "clocks {diff_ms} ms apart");
+    }
+
+    /// A receipt with an extra top-level field that the signer did not
+    /// include in the signed body would appear in a raw-JSON audit
+    /// reader but be invisible to `verify()` (the field silently drops
+    /// during the ReceiptBody round-trip inside canonicalize). Our
+    /// custom `Deserialize` rejects it at parse time — a corrupted /
+    /// tampered receipt fails before it can be trusted.
+    #[test]
+    fn receipt_with_unknown_top_level_field_is_rejected_on_parse() {
+        let signer = Ed25519Signer::generate();
+        let receipt = Receipt::issue(body(), &signer).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&receipt).unwrap()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("claim_extra".to_owned(), serde_json::json!("grant admin"));
+        let tampered = serde_json::to_string(&value).unwrap();
+        let error = serde_json::from_str::<Receipt>(&tampered).unwrap_err();
+        assert!(
+            error.to_string().contains("claim_extra"),
+            "error should name the offending field: {error}"
+        );
+    }
+
+    /// The manual whitelist must stay in lockstep with the field set of
+    /// [`ReceiptBody`]. If a new field is added there without updating
+    /// [`ALLOWED_RECEIPT_TOP_LEVEL_KEYS`], parsing that field silently
+    /// fails (or worse, drops it back into the same class of bug we
+    /// fixed). Serializing a canonical body and cross-checking is the
+    /// mechanical guard.
+    #[test]
+    fn allowed_receipt_top_level_keys_cover_body_fields_exactly() {
+        let value = serde_json::to_value(body()).unwrap();
+        let object = value.as_object().unwrap();
+        let mut body_keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        body_keys.push("signature_b64");
+        body_keys.sort_unstable();
+        let mut allowed: Vec<&str> = ALLOWED_RECEIPT_TOP_LEVEL_KEYS.to_vec();
+        allowed.sort_unstable();
+        assert_eq!(
+            body_keys, allowed,
+            "ALLOWED_RECEIPT_TOP_LEVEL_KEYS drift vs ReceiptBody serialization"
+        );
     }
 }
