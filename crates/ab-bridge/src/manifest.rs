@@ -97,7 +97,46 @@ impl BridgeManifest {
     }
 
     /// Parse from YAML.
+    ///
+    /// Enforces a 256 KiB input cap and rejects any document containing
+    /// YAML anchors (`&`) or aliases (`*`). Together these close the
+    /// billion-laughs attack surface: `serde_yaml` 0.9 expands aliases
+    /// eagerly with no depth or expansion cap, so a maliciously crafted
+    /// manifest of a few KiB would OOM the process at parse time.
+    /// Legitimate bridge manifests never need aliases — reject rather
+    /// than trying to bound expansion, which would require a fork.
     pub fn from_yaml(yaml: &str) -> Result<Self, ManifestError> {
+        const MAX_YAML_BYTES: usize = 256 * 1024;
+        if yaml.len() > MAX_YAML_BYTES {
+            return Err(ManifestError::Parse(format!(
+                "manifest is {} bytes, exceeds cap of {MAX_YAML_BYTES}",
+                yaml.len()
+            )));
+        }
+        // Cheap syntactic scan for YAML aliases. Legitimate anchors/
+        // aliases would need explicit `&name`/`*name` syntax; a naive
+        // string search catches every case that serde_yaml would
+        // actually expand. False positives on strings that happen to
+        // contain `&` or `*` are avoided by checking that the char
+        // precedes a valid anchor name character (alphanumeric or `_`).
+        for (marker, kind) in [('&', "anchor"), ('*', "alias")] {
+            let mut chars = yaml.char_indices().peekable();
+            while let Some((_, ch)) = chars.next() {
+                if ch != marker {
+                    continue;
+                }
+                if let Some(&(_, next)) = chars.peek() {
+                    if next.is_ascii_alphanumeric() || next == '_' {
+                        return Err(ManifestError::Parse(format!(
+                            "manifest contains a YAML {kind} ('{marker}<name>'); \
+                             AgentBridge refuses anchor/alias syntax to close the \
+                             billion-laughs attack surface (serde_yaml expands aliases \
+                             with no cap). Rewrite the document without &/* references."
+                        )));
+                    }
+                }
+            }
+        }
         let m: Self = serde_yaml::from_str(yaml).map_err(|e| ManifestError::Parse(e.to_string()))?;
         m.validate()?;
         Ok(m)

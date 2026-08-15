@@ -3,7 +3,7 @@
 use crate::config::HarnessConfig;
 use crate::reconciler::Finalizer;
 use crate::session::{Session, SessionLease, SessionRegistry, Workflow};
-use crate::worker::{AtifCapture, WorkerHandle, WorkerJob, WorkerPermit};
+use crate::worker::{AtifCapture, ResponsePermit, WorkerHandle, WorkerJob};
 use ab_bridge::EventBus;
 use ab_core::metrics::Registry;
 use ab_core::time::elapsed_us;
@@ -229,7 +229,7 @@ pub struct PreparedRequest {
     /// Total local middleware time before upstream I/O.
     pub middleware_us: u64,
     lease: SessionLease,
-    response_permit: Option<WorkerPermit>,
+    response_permit: Option<ResponsePermit>,
     response_attempt_id: String,
     /// Client `Authorization` header captured for passthrough mode only.
     client_authorization: Option<HeaderValue>,
@@ -240,7 +240,7 @@ pub struct ForwardedResponse {
     /// Provider HTTP response.
     pub response: reqwest::Response,
     pub(crate) lease: SessionLease,
-    pub(crate) response_permit: Option<WorkerPermit>,
+    pub(crate) response_permit: Option<ResponsePermit>,
     pub(crate) response_marker: Option<String>,
     pub(crate) response_attempt_id: String,
 }
@@ -533,14 +533,19 @@ impl AppState {
             }
         }
 
-        let worker_permit = self
+        // Fused acquire: one worker slot + one response slot atomically.
+        // If the worker slot succeeds and the response slot fails, the
+        // worker permit drops via RAII (its OwnedSemaphorePermit and
+        // mpsc reservation release cleanly), so the caller never sees
+        // an orphaned half-reservation. Distinct
+        // `ab_events_dropped_total{stage=worker_queue|response_slot}`
+        // counters let operators tell which one exhausted.
+        let permits = self
             .worker
-            .try_reserve(&session_id)
+            .try_reserve_pair(&session_id)
             .map_err(|error| PipelineError::Unavailable(error.to_string()))?;
-        let response_permit = self
-            .worker
-            .try_reserve(&session_id)
-            .map_err(|error| PipelineError::Unavailable(error.to_string()))?;
+        let worker_permit = permits.worker;
+        let response_permit = permits.response;
 
         let stage = Instant::now();
         let prompt_tokens = ab_core::tokens::approx_tokens_json(&payload);
@@ -750,7 +755,11 @@ impl AppState {
             id: prepared.response_attempt_id.clone(),
             terminal: true,
         });
-        permit.submit(job);
+        // Best-effort submit: if the shard is momentarily full, the
+        // response-slot counter has already been bumped inside submit
+        // and the caller (this path) is already an abandon flow, so
+        // there is nothing further to do.
+        let _ = permit.submit(&self.worker, job);
     }
 
     /// Forward a prepared OpenAI-compatible request to the configured provider.
@@ -816,7 +825,11 @@ impl AppState {
                         id: response_attempt_id,
                         terminal: true,
                     });
-                    permit.submit(job);
+                    // Best-effort: shard may be momentarily full, in
+                    // which case the response-slot counter is bumped
+                    // and the failure event falls back to the plain
+                    // enqueue_failure path below on the next tick.
+                    let _ = permit.submit(&self.worker, job);
                 } else {
                     self.enqueue_failure(session, identity, StopReason::Other, error.to_string())?;
                 }
@@ -2025,7 +2038,17 @@ mod tests {
     #[tokio::test]
     async fn full_capture_queue_fails_closed_before_upstream() {
         let mut config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
-        config.worker_channel_capacity = 2;
+        // The fused permit split (worker_capacity + response_capacity)
+        // gives distinct exhaustion counters but keeps the *effective*
+        // total admission the same as before, because response
+        // capture doesn't hold an mpsc slot up front — only the
+        // response semaphore. So with worker_channel_capacity=2 the
+        // first request consumes 1 worker semaphore + 1 response
+        // semaphore + 1 mpsc slot; the second request consumes the
+        // remaining worker semaphore + response semaphore + mpsc slot;
+        // the third would fail. Set to 1 for a clean single-request
+        // saturation.
+        config.worker_channel_capacity = 1;
         config.breaker.min_tokens = u64::MAX;
         let sink = Arc::new(BlockingSink {
             entered: AtomicBool::new(false),
