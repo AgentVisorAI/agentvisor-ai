@@ -82,16 +82,52 @@ pub struct Finalizer {
     quarantined_sessions: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     /// Artifacts already warned about during recovery scans, so a corrupt
     /// file left on disk as evidence does not repeat its warning every tick.
-    /// Round-17 F8: capped via `warn_once`; not raw `HashSet::insert`.
-    warned_artifacts: Arc<parking_lot::Mutex<std::collections::HashSet<PathBuf>>>,
+    /// Round-17 F8 + round-18 F6: bounded by `warn_once` via FIFO
+    /// eviction, not full-clear. FIFO avoids the "clear then all
+    /// 4096 legitimate recurring artifacts re-warn on the same
+    /// tick" log storm the round-17 clear-on-overflow approach
+    /// enabled under a rotating-timestamp attacker.
+    warned_artifacts: Arc<parking_lot::Mutex<WarnedArtifacts>>,
     journal_key: [u8; 32],
 }
 
+/// FIFO-evicting set used by `warn_once`. Round-18 F6: replaces the
+/// round-17 F8 clear-on-overflow HashSet so a rotating-timestamp
+/// attacker who forces one eviction per tick cannot cause every
+/// legitimate recurring artifact to re-warn together — only ONE
+/// entry evicts per insert-past-cap.
+#[derive(Default)]
+pub(crate) struct WarnedArtifacts {
+    order: std::collections::VecDeque<PathBuf>,
+    set: std::collections::HashSet<PathBuf>,
+}
+
+impl WarnedArtifacts {
+    fn insert(&mut self, path: PathBuf, cap: usize) -> bool {
+        if self.set.contains(&path) {
+            return false;
+        }
+        if self.order.len() >= cap {
+            if let Some(evicted) = self.order.pop_front() {
+                self.set.remove(&evicted);
+            }
+        }
+        self.order.push_back(path.clone());
+        self.set.insert(path);
+        true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+}
+
 /// Cap on `warned_artifacts` so a rotating-timestamp attacker (or
-/// unbounded orphan churn) cannot leak memory forever. When the set
-/// exceeds this cap it is fully cleared — this "forgets" prior warns
-/// so recurring artifacts might re-warn once, but the alternative
-/// (unbounded growth over months of uptime) is worse.
+/// unbounded orphan churn) cannot leak memory forever. Round-18 F6:
+/// on insert-past-cap, ONE oldest entry evicts (FIFO) — not a full
+/// clear that would let a legitimate 4096-entry working set re-warn
+/// together every tick.
 const WARNED_ARTIFACTS_CAP: usize = 4096;
 
 /// Per-session lifecycle mutex table.
@@ -209,7 +245,7 @@ impl Finalizer {
             recovery_lock: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle_locks: Arc::new(SessionLockTable::default()),
             quarantined_sessions: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
-            warned_artifacts: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            warned_artifacts: Arc::new(parking_lot::Mutex::new(WarnedArtifacts::default())),
             journal_key,
         }
     }
@@ -231,7 +267,7 @@ impl Finalizer {
             recovery_lock: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle_locks: Arc::new(SessionLockTable::default()),
             quarantined_sessions: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
-            warned_artifacts: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            warned_artifacts: Arc::new(parking_lot::Mutex::new(WarnedArtifacts::default())),
             journal_key,
         }
     }
@@ -257,16 +293,18 @@ impl Finalizer {
 
     /// Round-17 F8: bounded insert-if-absent for `warned_artifacts`.
     /// When the tracked set is about to exceed `WARNED_ARTIFACTS_CAP`,
-    /// clear it first so a rotating-timestamp attacker (or long
-    /// uptime with orphan churn) cannot leak PathBuf entries
-    /// forever. Returns true if this is the first warn for `path`
-    /// in the current cycle (caller emits the warn only then).
+    /// Round-17 F8 + round-18 F6: bounded insert-if-absent for
+    /// `warned_artifacts`. When the tracked set is about to exceed
+    /// `WARNED_ARTIFACTS_CAP`, ONE oldest entry evicts (FIFO) — the
+    /// round-17 approach cleared the whole set, which under a
+    /// rotating-timestamp attacker meant every legitimate recurring
+    /// artifact re-warned together each tick. FIFO cost per insert
+    /// is O(1). Returns true if this is the first warn for `path`
+    /// in the current window (caller emits the warn only then).
     fn warn_once(&self, path: PathBuf) -> bool {
-        let mut set = self.warned_artifacts.lock();
-        if set.len() >= WARNED_ARTIFACTS_CAP {
-            set.clear();
-        }
-        set.insert(path)
+        self.warned_artifacts
+            .lock()
+            .insert(path, WARNED_ARTIFACTS_CAP)
     }
 
     /// Attach the quota/budget state store whose per-session counters are
@@ -535,7 +573,7 @@ impl Finalizer {
             trajectory_digest,
         };
         if marker.exists() {
-            let sealed = tokio::fs::read(&marker)
+            let sealed = read_capped_async(marker.clone(), ab_core::fsutil::MAX_CONTROL_BYTES)
                 .await
                 .map_err(|error| FinalizeError::Atif(error.to_string()))?;
             let actual: PromotionMarker =
@@ -1468,7 +1506,7 @@ impl Finalizer {
             }
             if final_path.exists() {
                 let existing: ab_atif::Trajectory = serde_json::from_slice(
-                    &tokio::fs::read(&final_path)
+                    &read_capped_async(final_path.clone(), ab_core::fsutil::MAX_ATIF_BYTES)
                         .await
                         .map_err(|error| FinalizeError::Atif(error.to_string()))?,
                 )
@@ -1541,7 +1579,7 @@ impl Finalizer {
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("promote") {
                 continue;
             }
-            let sealed = tokio::fs::read(&path)
+            let sealed = read_capped_async(path.clone(), ab_core::fsutil::MAX_CONTROL_BYTES)
                 .await
                 .map_err(|error| FinalizeError::Atif(error.to_string()))?;
             let marker: PromotionMarker =
@@ -1583,7 +1621,9 @@ impl Finalizer {
         path: &std::path::Path,
         session_id: &str,
     ) -> Result<AtifProvenance, FinalizeError> {
-        let bytes = tokio::fs::read(path)
+        // Round-18: ATIF trajectory read is bounded via MAX_ATIF_BYTES.
+        // Sibling of round-17 F3 that missed this internal caller.
+        let bytes = read_capped_async(path.to_path_buf(), ab_core::fsutil::MAX_ATIF_BYTES)
             .await
             .map_err(|error| FinalizeError::Atif(error.to_string()))?;
         let expected = AtifProvenance {
@@ -1592,7 +1632,7 @@ impl Finalizer {
         };
         let provenance_path = path.with_extension("atif-auth");
         if provenance_path.exists() {
-            let sealed = tokio::fs::read(&provenance_path)
+            let sealed = read_capped_async(provenance_path.clone(), ab_core::fsutil::MAX_CONTROL_BYTES)
                 .await
                 .map_err(|error| FinalizeError::Atif(error.to_string()))?;
             let actual: AtifProvenance =
@@ -1615,7 +1655,10 @@ impl Finalizer {
         &self,
         path: &std::path::Path,
     ) -> Result<serde_json::Value, FinalizeError> {
-        let bytes = tokio::fs::read(path)
+        // Round-18: bounded via MAX_CONTROL_BYTES — journal metadata
+        // sidecar is a tiny sealed blob (session_id + identity +
+        // workflow), so 1 MiB is a generous upper bound.
+        let bytes = read_capped_async(path.to_path_buf(), ab_core::fsutil::MAX_CONTROL_BYTES)
             .await
             .map_err(|error| FinalizeError::Atif(error.to_string()))?;
         crate::journal::open(&self.journal_key, "metadata", 0, &bytes).map_err(FinalizeError::Atif)
@@ -1675,7 +1718,7 @@ impl Finalizer {
         };
         let path = self.lifecycle_outbox_path(&session.id, kind);
         let mut outbox = if path.exists() {
-            let sealed = tokio::fs::read(&path)
+            let sealed = read_capped_async(path.clone(), ab_core::fsutil::MAX_CONTROL_BYTES)
                 .await
                 .map_err(|error| FinalizeError::Bridge(error.to_string()))?;
             let outbox: LifecycleOutbox = crate::journal::open(
@@ -1778,7 +1821,7 @@ impl Finalizer {
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
                 continue;
             }
-            let sealed = match tokio::fs::read(&path).await {
+            let sealed = match read_capped_async(path.clone(), ab_core::fsutil::MAX_CONTROL_BYTES).await {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     tracing::warn!(%error, path = %path.display(), "skipping unreadable outbox file");
@@ -1838,7 +1881,7 @@ impl Finalizer {
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
                 continue;
             }
-            let sealed = tokio::fs::read(&path)
+            let sealed = read_capped_async(path.clone(), ab_core::fsutil::MAX_CONTROL_BYTES)
                 .await
                 .map_err(|error| FinalizeError::Bridge(error.to_string()))?;
             let outbox: LifecycleOutbox = crate::journal::open(
@@ -2107,7 +2150,11 @@ async fn read_capped_async(
 async fn read_complete_journal(path: &std::path::Path) -> Result<Vec<String>, FinalizeError> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<Vec<String>, FinalizeError> {
-        let bytes = std::fs::read(&path).map_err(|error| FinalizeError::Atif(error.to_string()))?;
+        // Round-18: bounded via the shared MAX_ATIF_BYTES so a fs-tamper
+        // attacker cannot plant a multi-GB journal and OOM the
+        // recovery scan.
+        let bytes = ab_core::fsutil::read_capped(&path, ab_core::fsutil::MAX_ATIF_BYTES)
+            .map_err(|error| FinalizeError::Atif(error.to_string()))?;
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
@@ -3605,6 +3652,39 @@ mod tests {
             task.await.unwrap().unwrap(),
             FinalizeOutcome::Receipt { .. }
         ));
+    }
+
+    /// Round-18 F6: FIFO eviction lets one legitimate recurring
+    /// artifact re-warn ONCE after it's evicted, but does not cause
+    /// every legitimate artifact to re-warn together on the same
+    /// tick when a rotating-timestamp attacker fills the cap.
+    #[test]
+    fn warned_artifacts_evicts_one_at_a_time_not_all_at_once() {
+        let mut warned = WarnedArtifacts::default();
+        let cap = 3;
+        assert!(warned.insert(PathBuf::from("a"), cap));
+        assert!(warned.insert(PathBuf::from("b"), cap));
+        assert!(warned.insert(PathBuf::from("c"), cap));
+        assert_eq!(warned.len(), cap);
+        // Reinserting an existing entry is a no-op — still in-set,
+        // no warn.
+        assert!(!warned.insert(PathBuf::from("b"), cap));
+        // Fourth distinct entry evicts the OLDEST ("a"), NOT all.
+        // Other legitimate entries (b, c) still tracked.
+        assert!(warned.insert(PathBuf::from("d"), cap));
+        assert_eq!(warned.len(), cap);
+        assert!(!warned.insert(PathBuf::from("b"), cap));
+        assert!(!warned.insert(PathBuf::from("c"), cap));
+        assert!(!warned.insert(PathBuf::from("d"), cap));
+        // "a" was evicted, so a re-warn on "a" returns true.
+        // This new insert evicts b (now the oldest) — but c and d
+        // survive. That's the FIFO contract: ONE eviction per
+        // insert, not a full flush.
+        assert!(warned.insert(PathBuf::from("a"), cap));
+        assert_eq!(warned.len(), cap);
+        assert!(!warned.insert(PathBuf::from("c"), cap));
+        assert!(!warned.insert(PathBuf::from("d"), cap));
+        assert!(!warned.insert(PathBuf::from("a"), cap));
     }
 
     #[tokio::test]
