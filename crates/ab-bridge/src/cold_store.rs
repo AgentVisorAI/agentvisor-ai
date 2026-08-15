@@ -95,8 +95,7 @@ impl ColdArchive {
         // the pattern.
         if key == [0u8; 32] || key == [0xFFu8; 32] {
             return Err(BusError::Backend(
-                "cold-outbox control key is all-zero or all-0xFF; refusing (known-weak pattern)"
-                    .to_owned(),
+                "cold-outbox control key is all-zero or all-0xFF; refusing (known-weak pattern)".to_owned(),
             ));
         }
         *self.control_key.write() = key;
@@ -356,9 +355,7 @@ fn verify_pending_mac(
     // startup, we do NOT want to accept it as authentic — a
     // filesystem-tamper attacker knows the weak key too.
     if control_key == &[0u8; 32] || control_key == &[0xFFu8; 32] {
-        return Err(BusError::Backend(
-            "cold outbox authentication failed".to_owned(),
-        ));
+        return Err(BusError::Backend("cold outbox authentication failed".to_owned()));
     }
     use hmac::{Hmac, Mac as _};
     use sha2::Sha256;
@@ -374,9 +371,7 @@ fn verify_pending_mac(
     // attacker cannot force a huge hex::decode allocation before
     // verify_slice fails.
     if presented_hex.len() > 128 {
-        return Err(BusError::Backend(
-            "cold outbox authentication failed".to_owned(),
-        ));
+        return Err(BusError::Backend("cold outbox authentication failed".to_owned()));
     }
     let presented_bytes = hex::decode(presented_hex)
         .map_err(|_| BusError::Backend("cold outbox authentication failed".to_owned()))?;
@@ -713,9 +708,7 @@ mod tests {
             let mut m = BridgeManifest::default_for("cold-weak");
             let topic = &mut m.topics[0];
             let outbox = tempfile::tempdir().unwrap();
-            let uri = url::Url::from_directory_path(outbox.path())
-                .unwrap()
-                .to_string();
+            let uri = url::Url::from_directory_path(outbox.path()).unwrap().to_string();
             topic.retention.cold_uri = Some(uri);
             m
         };
@@ -763,12 +756,9 @@ mod tests {
             value: serde_json::json!({"metadata": {"uid": "cold-default-1"}}),
             stored_at: 1,
         };
-        let err = archive
-            .stage(&topic_name, &event, "cold-default-1")
-            .unwrap_err();
+        let err = archive.stage(&topic_name, &event, "cold-default-1").unwrap_err();
         assert!(
-            format!("{err:?}").contains("uninitialized")
-                || format!("{err:?}").contains("known-weak"),
+            format!("{err:?}").contains("uninitialized") || format!("{err:?}").contains("known-weak"),
             "expected weak-key rejection at sign time, got {err:?}"
         );
         // The pending dir must remain empty — a rejected sign attempt

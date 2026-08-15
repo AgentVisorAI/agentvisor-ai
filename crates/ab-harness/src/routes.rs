@@ -27,16 +27,10 @@ pub fn build_router(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
-        .route(
-            "/v1/chat/completions",
-            post(chat_completions).options(cors_deny),
-        )
+        .route("/v1/chat/completions", post(chat_completions).options(cors_deny))
         .route("/v1/mcp", post(mcp_call).options(cors_deny))
         .route("/mcp", post(mcp_call).options(cors_deny))
-        .route(
-            "/v1/sessions/{id}/close",
-            post(close_session).options(cors_deny),
-        )
+        .route("/v1/sessions/{id}/close", post(close_session).options(cors_deny))
         .route(
             "/v1/sessions/{id}/promote",
             post(promote_session).options(cors_deny),
@@ -637,9 +631,7 @@ const MAX_TOOL_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// filters mis-classify as binary. We store the string (not
 /// HeaderValue) so it round-trips through the on-disk `ToolOutcome`
 /// journal for cached-outcome replay.
-async fn read_limited_tool_response(
-    response: reqwest::Response,
-) -> Result<(Bytes, Option<String>), String> {
+async fn read_limited_tool_response(response: reqwest::Response) -> Result<(Bytes, Option<String>), String> {
     let content_type = response
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
@@ -1152,9 +1144,7 @@ async fn promote_session(
     // open, additionally require the close scope so promote ⊇ close
     // in the scope authority sense.
     if !session.is_closed() {
-        if let Err(error) =
-            state.authorize_session(&headers, &session, &state.config.session_close_scope)
-        {
+        if let Err(error) = state.authorize_session(&headers, &session, &state.config.session_close_scope) {
             return pipeline_error(error);
         }
     }
@@ -4061,9 +4051,7 @@ mod tests {
         assert!(is_sse_content_type(&ct("Text/Event-Stream")));
         assert!(is_sse_content_type(&ct("TEXT/EVENT-STREAM")));
         assert!(is_sse_content_type(&ct("text/event-stream; charset=utf-8")));
-        assert!(is_sse_content_type(&ct(
-            "Text/Event-Stream ; charset=utf-8"
-        )));
+        assert!(is_sse_content_type(&ct("Text/Event-Stream ; charset=utf-8")));
         // Non-SSE and superstring both must not match.
         assert!(!is_sse_content_type(&ct("application/json")));
         assert!(!is_sse_content_type(&ct("text/event-stream-json")));

@@ -360,10 +360,7 @@ fn subagent_recursion_is_depth_capped() {
     for i in 0..2_000 {
         let mut parent = leaf(&format!("n-{i}"));
         if let Value::Object(ref mut m) = parent {
-            m.insert(
-                "subagent_trajectories".into(),
-                Value::Array(vec![node]),
-            );
+            m.insert("subagent_trajectories".into(), Value::Array(vec![node]));
         }
         node = parent;
     }
@@ -404,10 +401,9 @@ fn subagent_trajectory_ref_requires_v17() {
     });
     let issues = validate_value(&value, Mode::Compat);
     assert!(
-        issues.iter().any(|i| {
-            i.path.contains("subagent_trajectory_ref")
-                && i.message.contains("ATIF-v1.7+")
-        }),
+        issues
+            .iter()
+            .any(|i| { i.path.contains("subagent_trajectory_ref") && i.message.contains("ATIF-v1.7+") }),
         "expected v1.7 gate on subagent_trajectory_ref, got: {issues:#?}"
     );
     // v1.7 file with the same field must not produce the version issue.
@@ -470,9 +466,9 @@ fn total_cost_usd_capped_in_strict_mode() {
     });
     let issues = validate_value(&value, Mode::Strict);
     assert!(
-        issues.iter().any(|i| {
-            i.path.contains("total_cost_usd") && i.message.contains("1e12")
-        }),
+        issues
+            .iter()
+            .any(|i| { i.path.contains("total_cost_usd") && i.message.contains("1e12") }),
         "expected cost-cap issue, got: {issues:#?}"
     );
     // A sane cost (below the cap) still passes.
@@ -507,9 +503,9 @@ fn per_step_cost_usd_capped_in_strict_mode() {
     });
     let issues = validate_value(&value, Mode::Strict);
     assert!(
-        issues.iter().any(|i| {
-            i.path.contains("cost_usd") && i.message.contains("1e12")
-        }),
+        issues
+            .iter()
+            .any(|i| { i.path.contains("cost_usd") && i.message.contains("1e12") }),
         "expected per-step cost-cap issue, got: {issues:#?}"
     );
 }

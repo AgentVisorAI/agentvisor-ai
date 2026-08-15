@@ -943,12 +943,8 @@ impl AppState {
                 let client_error = PipelineError::Upstream(client_reason.to_owned());
                 let persisted_reason = format!("upstream_{client_reason}");
                 if let Some(permit) = response_permit {
-                    let mut job = self.failure_job(
-                        session,
-                        identity,
-                        StopReason::Other,
-                        persisted_reason.clone(),
-                    );
+                    let mut job =
+                        self.failure_job(session, identity, StopReason::Other, persisted_reason.clone());
                     job.response_marker = response_marker;
                     job.response_attempt = Some(crate::worker::ResponseAttempt {
                         id: response_attempt_id,

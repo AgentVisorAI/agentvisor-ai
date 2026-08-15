@@ -66,7 +66,8 @@ fn mint(keys: &TestKeys, claims: &NhiClaims) -> String {
 
 fn validator(keys: &TestKeys) -> IdentityValidator {
     let v = IdentityValidator::new("harness-prod");
-    v.add_key(keys.kid.clone(), KeyMaterial::Ed25519Pem(keys.public_pem.clone())).unwrap();
+    v.add_key(keys.kid.clone(), KeyMaterial::Ed25519Pem(keys.public_pem.clone()))
+        .unwrap();
     v
 }
 
@@ -579,7 +580,10 @@ fn cve_2026_25537_string_nbf_is_rejected_not_bypassed() {
     // Silently accepting is the vulnerable behavior.
     let outcome = v.validate(&token);
     assert!(
-        matches!(outcome, Err(IdentityError::Verification(_) | IdentityError::Malformed(_))),
+        matches!(
+            outcome,
+            Err(IdentityError::Verification(_) | IdentityError::Malformed(_))
+        ),
         "string-nbf token must be rejected (CVE-2026-25537 class), got {outcome:?}",
     );
 }
@@ -628,10 +632,7 @@ fn round_25_f1_jwks_refuses_wrong_alg_okp_key() {
         }))
         .unwrap_err();
     let text = format!("{err:?}");
-    assert!(
-        text.contains("EdDSA"),
-        "expected wrong-alg rejection, got {text}"
-    );
+    assert!(text.contains("EdDSA"), "expected wrong-alg rejection, got {text}");
 }
 
 /// Round-25 F2: `add_key` refuses to shadow a kid the JWKS drain

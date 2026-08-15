@@ -228,7 +228,10 @@ mod tests {
     /// parent directory, always the last segment.
     #[test]
     fn basename_returns_only_the_last_segment() {
-        assert_eq!(basename(Path::new("/var/lib/agent-bridge/spool/foo.json")), "foo.json");
+        assert_eq!(
+            basename(Path::new("/var/lib/agent-bridge/spool/foo.json")),
+            "foo.json"
+        );
         assert_eq!(basename(Path::new("foo.json")), "foo.json");
         assert_eq!(basename(Path::new("/tmp/")), "tmp");
         // Empty path / root is meaningless in the caller context —
