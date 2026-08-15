@@ -448,6 +448,64 @@ fn add_jwks_refuses_to_overwrite_a_manually_registered_kid() {
         .unwrap();
 }
 
+/// Round-12 F6: a JWKS array with two entries carrying the same `kid`
+/// must be refused rather than silently accepting the *last* one.
+/// A compromised or misconfigured IdP could otherwise ship an alien
+/// public key alongside a legitimate one and have it silently overwrite
+/// verification state — with no counter, no log, no user-visible
+/// error.
+#[test]
+fn add_jwks_refuses_duplicate_kid_within_the_same_document() {
+    let legit = ed25519_keys("dup-kid");
+    let alien = ed25519_keys("dup-kid"); // same kid, different x
+    let validator = IdentityValidator::new("harness-prod");
+    let err = validator
+        .add_jwks(&serde_json::json!({
+            "keys": [
+                { "kid": "dup-kid", "kty": "OKP", "crv": "Ed25519", "x": legit.public_x },
+                { "kid": "dup-kid", "kty": "OKP", "crv": "Ed25519", "x": alien.public_x },
+            ]
+        }))
+        .unwrap_err();
+    assert!(
+        matches!(err, IdentityError::Jwks(ref reason) if reason.contains("duplicate kid")),
+        "expected duplicate-kid rejection, got {err:?}",
+    );
+    // No key installed — the whole document is refused, not the
+    // legitimate one accepted with the alien silently discarded.
+    assert_eq!(validator.key_count(), 0);
+}
+
+/// Round-12 F11: a hostile JWKS with tens of thousands of keys must be
+/// refused so a refresh does not stall every concurrent
+/// `validate_single` call while `keys.write()` is held for a giant
+/// install loop. Real deployments have 5–20 keys; the cap sits at
+/// 256.
+#[test]
+fn add_jwks_caps_the_number_of_keys_per_document() {
+    let validator = IdentityValidator::new("harness-prod");
+    // 300 distinct keys, all valid — should still refuse because the
+    // count alone exceeds the safety cap.
+    let keys: Vec<_> = (0..300)
+        .map(|i| {
+            let k = ed25519_keys(&format!("k{i}"));
+            serde_json::json!({
+                "kid": k.kid,
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": k.public_x,
+            })
+        })
+        .collect();
+    let err = validator
+        .add_jwks(&serde_json::json!({ "keys": keys }))
+        .unwrap_err();
+    assert!(
+        matches!(err, IdentityError::Jwks(ref reason) if reason.contains("more than 256")),
+        "expected JWKS-cap rejection, got {err:?}",
+    );
+}
+
 /// CVE-2026-25537 (jsonwebtoken < 10.3.0 type-confusion): if `nbf` is
 /// provided as a JSON string like `"99999999999"` (far-future
 /// legacy/mistake), the pre-10.3 library marked it FailedToParse and

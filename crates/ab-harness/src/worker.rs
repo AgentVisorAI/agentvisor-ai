@@ -647,6 +647,18 @@ async fn process_envelope(
     worker_pending: Arc<std::sync::atomic::AtomicU64>,
     worker_drained: Arc<tokio::sync::Notify>,
 ) {
+    // Round-12 F3: `worker_pending` was previously decremented at the
+    // bottom of this function. Any panic between here and that line
+    // (tokio::spawn(...).await JoinError construction under runtime
+    // shutdown races, or a panic inside tracing::warn's Display
+    // formatter when the error string exceeds the allocator's
+    // fragmentation threshold) would leak the pending count — and
+    // `WorkerHandle::wait_idle()` at shutdown would spin on
+    // `notify.notified().await` forever, tripping the 30 s drain
+    // budget and terminating without capturing evidence. Encode the
+    // decrement in an RAII guard so unwinding is a valid release
+    // point.
+    let _pending_guard = PendingGuard::new(Arc::clone(&worker_pending), Arc::clone(&worker_drained));
     let Envelope {
         job,
         completion,
@@ -698,11 +710,34 @@ async fn process_envelope(
     }
     session.worker_job_finished();
     drop(capacity_permit);
-    if worker_pending.fetch_sub(1, Ordering::AcqRel) == 1 {
-        worker_drained.notify_waiters();
-    }
+    // Guard runs Drop here (or on the panic path). The completion
+    // channel below is fine to send after — the receiver only needs
+    // the outcome, not the pending accounting.
     if let Some(completion) = completion {
         let _ = completion.send(outcome);
+    }
+}
+
+/// RAII decrement for `worker_pending`. Runs on every path — normal
+/// return, error return, or panic — so `wait_idle` never sees a
+/// permanently non-zero pending count after a panic in
+/// [`process_envelope`].
+struct PendingGuard {
+    pending: Arc<std::sync::atomic::AtomicU64>,
+    drained: Arc<tokio::sync::Notify>,
+}
+
+impl PendingGuard {
+    fn new(pending: Arc<std::sync::atomic::AtomicU64>, drained: Arc<tokio::sync::Notify>) -> Self {
+        Self { pending, drained }
+    }
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.drained.notify_waiters();
+        }
     }
 }
 

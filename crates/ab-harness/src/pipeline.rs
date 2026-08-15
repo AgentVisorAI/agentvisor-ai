@@ -810,8 +810,29 @@ impl AppState {
             self.config.upstream_url.trim_end_matches('/'),
             self.config.upstream_chat_path
         );
-        let request_digest =
-            ab_core::digest::sha256_hex(serde_json::to_vec(&payload).unwrap_or_default().as_slice());
+        // Digest the request payload so the in-flight marker can be
+        // matched to the observed response bytes at recovery time.
+        //
+        // `serde_json::to_vec` on a `Value` is effectively infallible
+        // (Value can only carry JSON-serialisable data), but we handle
+        // the theoretical error path anyway: falling back to
+        // `sha256(b"")` — the well-known empty digest — would make
+        // every concurrent failed serialisation collide on the same
+        // request_digest, silently violating the marker's
+        // one-to-one-with-request invariant. Fall back to a
+        // session-id-derived digest so a hypothetical failure at
+        // least keeps distinct sessions distinct.
+        let request_digest = match serde_json::to_vec(&payload) {
+            Ok(bytes) => ab_core::digest::sha256_hex(&bytes),
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    session = %session.id,
+                    "failed to serialise chat payload for request digest; falling back to session-derived digest"
+                );
+                ab_core::digest::sha256_hex(session.id.as_bytes())
+            }
+        };
         let response_marker = crate::worker::create_response_marker(
             std::path::Path::new(&self.config.atif_spool_dir),
             &self.journal_key,

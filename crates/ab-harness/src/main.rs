@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
     // and a silently-stale key set (see F1/F3 in round-11 audit) would
     // remain unalertable.
     let metrics = Arc::new(ab_core::metrics::Registry::new());
-    let identity = build_identity(&config, Arc::clone(&metrics)).await?;
+    let (identity, jwks_refresh) = build_identity(&config, Arc::clone(&metrics)).await?;
     let signer_path = std::env::var_os("AB_SIGNING_SEED_FILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("config/signing.seed"));
@@ -144,6 +144,15 @@ async fn main() -> Result<()> {
     };
     reconciler.abort();
     bridge_maintenance.abort();
+    // Round-12 F1: abort the JWKS refresh task on shutdown so the
+    // infinite `loop { interval.tick() ... }` cannot outlive the
+    // harness's outbound HTTP hygiene. Previously the JoinHandle was
+    // dropped at spawn time, letting the refresher fire another
+    // request during the shutdown window and race the finalizer for
+    // IdentityValidator key state.
+    if let Some(handle) = jwks_refresh.as_ref() {
+        handle.abort();
+    }
     // Silence the expected cancellation; log everything else (panic).
     if let Err(error) = reconciler.await {
         if !error.is_cancelled() {
@@ -153,6 +162,13 @@ async fn main() -> Result<()> {
     if let Err(error) = bridge_maintenance.await {
         if !error.is_cancelled() {
             tracing::warn!(%error, "bridge maintenance task exited with an error before shutdown abort");
+        }
+    }
+    if let Some(handle) = jwks_refresh {
+        if let Err(error) = handle.await {
+            if !error.is_cancelled() {
+                tracing::warn!(%error, "JWKS refresh task exited with an error before shutdown abort");
+            }
         }
     }
     #[cfg(feature = "otel")]
@@ -460,8 +476,29 @@ fn spawn_bridge_maintenance(
                             "Bridge retention expirations and cold-export retries",
                         )
                         .add(actions),
-                    Ok(Err(error)) => tracing::warn!(%error, "Bridge maintenance failed"),
-                    Err(error) => tracing::warn!(%error, "Bridge maintenance task failed"),
+                    Ok(Err(error)) => {
+                        // Round-12 F2: previously only tracing::warn.
+                        // A silent 1-hour cadence made this class of
+                        // failure invisible to alerts — Bridge hot
+                        // retention could grow unbounded until disk
+                        // fills. Bump a counter alongside the log.
+                        metrics
+                            .counter(
+                                "ab_bridge_maintenance_errors_total",
+                                "Bridge maintenance tick returned an error",
+                            )
+                            .inc();
+                        tracing::warn!(%error, "Bridge maintenance failed");
+                    }
+                    Err(error) => {
+                        metrics
+                            .counter(
+                                "ab_bridge_maintenance_join_errors_total",
+                                "spawn_blocking JoinError from bridge maintenance tick",
+                            )
+                            .inc();
+                        tracing::warn!(%error, "Bridge maintenance task failed");
+                    }
                 }
             })
             .catch_unwind()
@@ -487,7 +524,7 @@ fn spawn_bridge_maintenance(
 async fn build_identity(
     config: &HarnessConfig,
     metrics: Arc<ab_core::metrics::Registry>,
-) -> Result<Option<Arc<IdentityValidator>>> {
+) -> Result<(Option<Arc<IdentityValidator>>, Option<tokio::task::JoinHandle<()>>)> {
     let has_jwks = config
         .identity_jwks_url
         .as_deref()
@@ -497,7 +534,7 @@ async fn build_identity(
         .as_deref()
         .is_some_and(|path| !path.is_empty());
     if !has_jwks && !has_hmac {
-        return Ok(None);
+        return Ok((None, None));
     }
 
     let mut validator = IdentityValidator::new(&config.audience);
@@ -514,6 +551,7 @@ async fn build_identity(
     }
 
     let validator = Arc::new(validator);
+    let mut refresh_handle: Option<tokio::task::JoinHandle<()>> = None;
     if let Some(url) = config.identity_jwks_url.as_deref() {
         // Disable redirects: an IdP that returns 302 to an internal URL would
         // let a compromised (or misconfigured) JWKS host pivot the harness
@@ -547,7 +585,7 @@ async fn build_identity(
             "ab_jwks_refresh_panics_total",
             "JWKS refresh task panicked; loop supervised via catch_unwind",
         );
-        tokio::spawn(async move {
+        refresh_handle = Some(tokio::spawn(async move {
             // Wrap the whole loop in AssertUnwindSafe so an unexpected
             // panic (reqwest bug, malformed JWKS, allocator failure)
             // does not silently kill the refresher and leave the harness
@@ -563,41 +601,62 @@ async fn build_identity(
             interval.tick().await;
             loop {
                 interval.tick().await;
-                let outcome = std::panic::AssertUnwindSafe(refresh_jwks(&client, &url, validator.as_ref()))
-                    .catch_unwind()
-                    .await;
-                match outcome {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => {
-                        refresh_errors.inc();
-                        tracing::warn!(
-                            %error,
-                            "JWKS refresh failed; retaining previously loaded keys"
-                        );
+                // Wrap the WHOLE tick body — refresh + result handling
+                // + tracing + counter — in catch_unwind, mirroring the
+                // bridge maintenance pattern. Previously only the
+                // refresh_jwks call itself was supervised, so a panic
+                // in the match arm (e.g., allocator failure inside
+                // tracing::warn's Display, or a refresh_panics.inc()
+                // fault after the registry Arc has been dropped)
+                // would silently kill the spawned task and leave keys
+                // frozen until process restart — with no counter to
+                // page on.
+                let refresh_errors = Arc::clone(&refresh_errors);
+                let refresh_panics_for_error = Arc::clone(&refresh_panics);
+                let client = &client;
+                let url = &url;
+                let validator = validator.as_ref();
+                let tick = std::panic::AssertUnwindSafe(async move {
+                    match refresh_jwks(client, url, validator).await {
+                        Ok(_) => {}
+                        Err(error) => {
+                            refresh_errors.inc();
+                            tracing::warn!(
+                                %error,
+                                "JWKS refresh failed; retaining previously loaded keys"
+                            );
+                        }
                     }
-                    Err(panic) => {
-                        refresh_panics.inc();
-                        let msg = panic
-                            .downcast_ref::<&'static str>()
-                            .copied()
-                            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-                            .unwrap_or("panic payload was not a string");
-                        tracing::error!(
-                            panic = %msg,
-                            "JWKS refresh task panicked; retaining previously loaded keys and continuing"
-                        );
-                    }
+                });
+                if let Err(panic) = tick.catch_unwind().await {
+                    refresh_panics_for_error.inc();
+                    let msg = panic
+                        .downcast_ref::<&'static str>()
+                        .copied()
+                        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("panic payload was not a string");
+                    tracing::error!(
+                        panic = %msg,
+                        "JWKS refresh task panicked; retaining previously loaded keys and continuing"
+                    );
                 }
             }
-        });
+        }));
     }
     if validator.key_count() == 0 {
         anyhow::bail!("identity enforcement configured without any verification keys");
     }
-    Ok(Some(validator))
+    Ok((Some(validator), refresh_handle))
 }
 
 async fn refresh_jwks(client: &reqwest::Client, url: &str, validator: &IdentityValidator) -> Result<usize> {
+    // A typical JWKS is < 10 KB (5–20 keys). Even the largest enterprise
+    // IdPs stay under a few hundred KB. Cap at 4 MiB so a compromised or
+    // misconfigured JWKS host cannot return a multi-GB payload and OOM
+    // the harness before the 10 s request timeout fires: at a fast link
+    // (1 Gbit/s) 1 second is enough to deliver >100 MB, so the timeout
+    // alone is not a sufficient defense.
+    const MAX_JWKS_BYTES: usize = 4 * 1024 * 1024;
     let response = client
         .get(url)
         .send()
@@ -605,7 +664,33 @@ async fn refresh_jwks(client: &reqwest::Client, url: &str, validator: &IdentityV
         .with_context(|| format!("fetch JWKS {url}"))?
         .error_for_status()
         .with_context(|| format!("JWKS endpoint {url} returned an error"))?;
-    let document: serde_json::Value = response.json().await.context("parse JWKS JSON")?;
+    // Fast reject: if Content-Length is present and already exceeds the
+    // cap, refuse without allocating anything for the body.
+    if let Some(len) = response.content_length() {
+        if len > MAX_JWKS_BYTES as u64 {
+            anyhow::bail!(
+                "JWKS at {url} declares Content-Length {len} bytes; cap is {MAX_JWKS_BYTES}"
+            );
+        }
+    }
+    use futures::StreamExt as _;
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.with_context(|| format!("read JWKS chunk from {url}"))?;
+        let next = body
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| anyhow::anyhow!("JWKS body size overflowed usize"))?;
+        if next > MAX_JWKS_BYTES {
+            anyhow::bail!(
+                "JWKS at {url} exceeded {MAX_JWKS_BYTES} bytes (received at least {next})"
+            );
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let document: serde_json::Value =
+        serde_json::from_slice(&body).context("parse JWKS JSON")?;
     validator.add_jwks(&document).map_err(anyhow::Error::new)
 }
 
@@ -814,6 +899,17 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
     std::fs::create_dir_all(parent)
         .with_context(|| format!("create signing seed directory {}", parent.display()))?;
     let temporary = parent.join(format!(".signing-seed-{}.tmp", ab_core::new_event_uid()));
+    // Round-12 F4: previously an early `?` return from write_all or
+    // sync_all would orphan the temp file. The two `Err(...)` match
+    // arms of `hard_link` explicitly removed it, but the earlier
+    // failure paths did not. Use the same TempPathGuard RAII the
+    // round-11 fix landed for `write_atomic` so every failure path
+    // unlinks — this is a startup-only code path, but leaving an
+    // orphan means every subsequent boot leaves another zero-byte
+    // `.signing-seed-*.tmp` alongside the real seed, and a nervous
+    // operator debugging a "signing seed exists twice" symptom is
+    // easily led astray.
+    let mut guard = ab_core::fsutil::TempPathGuard::new(temporary.clone());
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -832,16 +928,17 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
         Ok(()) => {
             std::fs::remove_file(&temporary)
                 .with_context(|| format!("remove signing seed temporary file {}", temporary.display()))?;
+            guard.disarm();
             ab_core::fsutil::sync_directory(parent)
                 .with_context(|| format!("sync signing seed directory {}", parent.display()))?;
             Ok(true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let _ = std::fs::remove_file(&temporary);
+            // Guard drop below unlinks the tmp — no explicit remove
+            // needed. Same for the generic Err arm.
             Ok(false)
         }
         Err(error) => {
-            let _ = std::fs::remove_file(&temporary);
             Err(error).with_context(|| format!("install signing seed {}", path.display()))
         }
     }
@@ -946,7 +1043,10 @@ mod tests {
         let mut config = HarnessConfig::for_tests("http://upstream", "/tmp", "/tmp");
         config.require_identity = true;
         config.identity_hmac_secret_file = Some(secret.to_string_lossy().into_owned());
-        let validator = build_identity(&config, Arc::new(ab_core::metrics::Registry::new())).await.unwrap().unwrap();
+        let (validator, _refresh) = build_identity(&config, Arc::new(ab_core::metrics::Registry::new()))
+            .await
+            .unwrap();
+        let validator = validator.unwrap();
         assert_eq!(validator.key_count(), 1);
     }
 
@@ -1049,6 +1149,91 @@ mod tests {
             err.contains("symbolic link"),
             "expected symlink rejection, got: {err}",
         );
+    }
+
+    /// Round-12: a compromised or misconfigured JWKS host that returns a
+    /// gigantic body must not OOM the harness. Serve 8 MiB (double the
+    /// 4 MiB cap) and assert the refresh returns an error whose text
+    /// mentions the cap so ops can identify the failure mode.
+    #[tokio::test]
+    async fn refresh_jwks_rejects_bodies_over_the_cap() {
+        use axum::routing::get;
+        // 8 MiB of nonsense — well above the 4 MiB cap. We hand it out
+        // in a single `[u8]` buffer wrapped in a `body::Body`, so the
+        // Content-Length header is present. The response type doesn't
+        // even need to be valid JSON: the size check triggers first.
+        let big_body = vec![b'x'; 8 * 1024 * 1024];
+        let router = axum::Router::new().route(
+            "/jwks",
+            get(move || {
+                let body = big_body.clone();
+                async move {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        body,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let validator = ab_identity::IdentityValidator::new("test-aud");
+        let url = format!("http://{addr}/jwks");
+        let err = refresh_jwks(&client, &url, &validator).await.unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("Content-Length") || text.contains("exceeded"),
+            "expected JWKS cap error, got: {text}"
+        );
+        assert!(text.contains("4194304"), "expected cap size in error, got: {text}");
+        server.abort();
+    }
+
+    /// The same cap applies at the streamed-body level: a peer that
+    /// omits Content-Length still cannot bypass the check because
+    /// [`refresh_jwks`] counts bytes as they arrive. This test uses
+    /// chunked transfer encoding via `axum::body::Body::from_stream`
+    /// so no Content-Length is advertised.
+    #[tokio::test]
+    async fn refresh_jwks_rejects_streamed_bodies_over_the_cap() {
+        use axum::routing::get;
+        use futures::stream;
+        let router = axum::Router::new().route(
+            "/jwks",
+            get(|| async {
+                // Emit 128 chunks of 64 KiB each = 8 MiB, streamed
+                // (no Content-Length).
+                let chunks = (0..128).map(|_| {
+                    Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b'x'; 64 * 1024]))
+                });
+                axum::body::Body::from_stream(stream::iter(chunks.collect::<Vec<_>>()))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let validator = ab_identity::IdentityValidator::new("test-aud");
+        let url = format!("http://{addr}/jwks");
+        let err = refresh_jwks(&client, &url, &validator).await.unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("exceeded"),
+            "expected streamed-body cap error, got: {text}"
+        );
+        server.abort();
     }
 
     #[tokio::test]
