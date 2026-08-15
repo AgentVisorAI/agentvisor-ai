@@ -243,19 +243,38 @@ impl StateStore for RedisStore {
     /// Round-33 F1: saturating refund via `DECRBY` + a MAX(0) clamp.
     /// Best-effort — errors are silently swallowed so a Redis blip on
     /// the compensation path can never turn a lost-race response into
-    /// a 5xx. Redis `DECRBY` on a missing key initialises to
-    /// `-amount`; the `MAX(0)` guard runs unconditionally so that
-    /// case clamps to 0 and never leaves negative budget.
+    /// a 5xx.
+    ///
+    /// Round-34 F1: NEVER resurrect a key that was already `DEL`'d
+    /// by a concurrent `remove_prefix`. The prior implementation
+    /// called `DECRBY` on the raw key: Redis initialises a missing
+    /// key to 0 first, so `DECRBY` returned `-amount` and the
+    /// `MAX(0)` clamp branch did `SET key 0` (no `EX`), producing
+    /// a permanent TTL-less key. Under the round-33 lost-claim-
+    /// plus-idle-close ordering (mcp_call sandbox-gate debit
+    /// races with the reconciler's clear_budget_state), the
+    /// refund path leaked one-to-three TTL-less keys per session
+    /// — attacker-choosable memory growth against the exact class
+    /// reconciler.rs:341-343 documents as impossible. Fix: gate
+    /// the whole DECRBY on `EXISTS`. If the session was cleared,
+    /// the budget is already gone and there is nothing to
+    /// compensate; the refund is a silent no-op. If the session
+    /// is alive, we DECRBY-clamp AND refresh the 24 h TTL to
+    /// match `TRY_SPEND_LUA` (a plain DECRBY does not refresh).
     fn refund(&self, key: &str, amount: u64) {
         // Redis DECRBY takes i64. Cap at i64::MAX so a caller passing
         // u64::MAX cannot silently wrap into a negative value.
         let amount = i64::try_from(amount).unwrap_or(i64::MAX);
         let clamp_script = r#"
-            local new = redis.call('DECRBY', KEYS[1], ARGV[1])
-            if new < 0 then
-                redis.call('SET', KEYS[1], 0)
+            if redis.call('EXISTS', KEYS[1]) == 0 then
                 return 0
             end
+            local new = redis.call('DECRBY', KEYS[1], ARGV[1])
+            if new < 0 then
+                redis.call('SET', KEYS[1], 0, 'EX', 86400)
+                return 0
+            end
+            redis.call('EXPIRE', KEYS[1], 86400)
             return new
         "#;
         match &self.backend {
