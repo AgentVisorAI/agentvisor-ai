@@ -139,13 +139,26 @@ const FINAL_METRICS_FIELDS: &[&str] = &[
 /// downstream consumers know the truncation happened.
 pub const MAX_VALIDATION_ISSUES: usize = 4096;
 
+/// Round-25 F4: mirror the `ab_receipts::MAX_NESTED_DEPTH = 128`
+/// bound (round-16). ATIF's public [`validate_value`] accepts any
+/// programmatically-constructed `Value` at unbounded depth, and
+/// each recursion frame of [`validate_trajectory_obj`] allocates
+/// heavily (locals + `format!` on `path`), so stack overflow is
+/// reachable well before serde_json's default 128-frame parser
+/// ceiling would help. The reconciler's `from_slice::<Trajectory>`
+/// path is bounded by serde_json today, but any future call site
+/// that parses ATIF via `Deserializer::disable_recursion_limit()`
+/// (for shallow-but-huge files) silently reopens a crash. Cap
+/// here so no such caller can reopen it.
+const MAX_NESTED_DEPTH: usize = 128;
+
 /// Validate a raw JSON value as an ATIF trajectory.
 ///
 /// Returns at most [`MAX_VALIDATION_ISSUES`] issues plus a
 /// trailing synthetic entry noting truncation when the cap fires.
 pub fn validate_value(root: &Value, mode: Mode) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
-    validate_trajectory_obj(root, "trajectory", mode, &mut issues, true);
+    validate_trajectory_obj(root, "trajectory", mode, &mut issues, true, 0);
     truncate_issues_with_marker(issues)
 }
 
@@ -190,7 +203,20 @@ fn validate_trajectory_obj(
     mode: Mode,
     issues: &mut Vec<ValidationIssue>,
     top_level: bool,
+    depth: usize,
 ) {
+    // Round-25 F4: cap recursion depth. `subagent_trajectories`
+    // recurses; adversarial nesting could otherwise stack-overflow
+    // the validator. Return without adding the whole subtree's
+    // findings — one clear message beats a stack unwind.
+    if depth > MAX_NESTED_DEPTH {
+        issue!(
+            issues,
+            path,
+            "trajectory nesting exceeds {MAX_NESTED_DEPTH}; refusing to recurse further"
+        );
+        return;
+    }
     let Some(obj) = root.as_object() else {
         issue!(issues, path, "trajectory must be a JSON object");
         return;
@@ -362,6 +388,7 @@ fn validate_trajectory_obj(
                 mode,
                 issues,
                 false,
+                depth + 1,
             );
         }
     }

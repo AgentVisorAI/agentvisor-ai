@@ -2512,10 +2512,12 @@ mod tests {
         config.require_identity = true;
         config.enforce_identity_scopes = true;
         let validator = ab_identity::IdentityValidator::new("agent-bridge");
-        validator.add_key(
-            "scope-key",
-            ab_identity::KeyMaterial::HmacSecret(b"scope-secret".to_vec()),
-        );
+        validator
+            .add_key(
+                "scope-key",
+                ab_identity::KeyMaterial::HmacSecret(b"scope-secret".to_vec()),
+            )
+            .unwrap();
         AppState::new(
             config,
             Arc::new(InMemoryStore::new()),

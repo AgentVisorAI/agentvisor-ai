@@ -101,7 +101,7 @@ fn validator_debug_holding_hmac_secret_does_not_leak_it() {
     let secret = b"another-tightly-held-hmac-secret-42-abcdef".to_vec();
     let secret_hex = hex::encode(&secret);
     let v = IdentityValidator::new("harness-prod");
-    v.add_key("kid-hmac", KeyMaterial::HmacSecret(secret.clone()));
+    v.add_key("kid-hmac", KeyMaterial::HmacSecret(secret.clone())).unwrap();
 
     // Token round-trip proves the secret is functional inside the validator.
     let claims = hmac_claims();
@@ -126,7 +126,7 @@ fn hmac_signature_failure_error_text_never_carries_the_secret() {
     let secret = b"hmac-secret-should-never-appear-in-any-error-string-hex-safe".to_vec();
     let secret_hex = hex::encode(&secret);
     let v = IdentityValidator::new("harness-prod");
-    v.add_key("kid-hmac", KeyMaterial::HmacSecret(secret.clone()));
+    v.add_key("kid-hmac", KeyMaterial::HmacSecret(secret.clone())).unwrap();
 
     let claims = hmac_claims();
     let mut header = Header::new(Algorithm::HS256);

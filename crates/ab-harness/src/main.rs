@@ -572,7 +572,9 @@ async fn build_identity(
         if secret.is_empty() {
             anyhow::bail!("identity HMAC secret file {path} is empty");
         }
-        validator.add_key(&config.identity_hmac_kid, KeyMaterial::HmacSecret(secret));
+        validator
+            .add_key(&config.identity_hmac_kid, KeyMaterial::HmacSecret(secret))
+            .context("install identity HMAC key")?;
     }
 
     let validator = Arc::new(validator);
