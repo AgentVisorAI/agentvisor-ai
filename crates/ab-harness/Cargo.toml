@@ -5,9 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "The drop-in agent harness: inline proxy, hot path pipeline, workers, reconciler"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [[bin]]
-name = "agent-bridge"
+name = "agentbridged"
 path = "src/main.rs"
 
 [features]

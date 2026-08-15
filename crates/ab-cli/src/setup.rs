@@ -353,7 +353,7 @@ pub fn init(
         );
         step += 1;
     }
-    println!("  {step}. agent-bridge        # starts on 127.0.0.1:8484");
+    println!("  {step}. agentbridged       # starts on 127.0.0.1:8484");
     step += 1;
     println!("  {step}. point your OpenAI-compatible client at http://127.0.0.1:8484/v1");
     println!();
@@ -880,21 +880,29 @@ async fn health_ok(base: &str) -> bool {
 }
 
 /// Prefer the server binary installed next to abctl; fall back to PATH.
+///
+/// Naming history: prior to v0.1.0 the binary was `agent-bridge`; it was
+/// renamed to `agentbridged` because the `agent-bridge` name on
+/// crates.io is taken by an unrelated project (cote-star/agent-bridge).
+/// We look for the new name first, then fall back to the legacy name so
+/// operators upgrading from a source-built older install keep working.
 fn find_server_binary() -> PathBuf {
-    let name = if cfg!(windows) {
-        "agent-bridge.exe"
+    let (primary, legacy) = if cfg!(windows) {
+        ("agentbridged.exe", "agent-bridge.exe")
     } else {
-        "agent-bridge"
+        ("agentbridged", "agent-bridge")
     };
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let sibling = dir.join(name);
-            if sibling.is_file() {
-                return sibling;
+            for candidate in [primary, legacy] {
+                let sibling = dir.join(candidate);
+                if sibling.is_file() {
+                    return sibling;
+                }
             }
         }
     }
-    PathBuf::from(name)
+    PathBuf::from(primary)
 }
 
 /// Print the last `count` log lines, unwrapping the JSON envelope when
@@ -1005,7 +1013,7 @@ pub async fn start() -> Result<()> {
             anyhow::anyhow!(
                 "could not find the AgentBridge server program ({}).\n\
                  It normally lives next to abctl. To install it:\n\
-                 cargo install --path crates/ab-harness --bin agent-bridge",
+                 cargo install ab-harness   # or: cargo install --path crates/ab-harness",
                 binary.display()
             )
         } else {

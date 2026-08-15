@@ -4,6 +4,36 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Distribution
+
+- **crates.io publishing** — added `.github/workflows/publish-crates.yml`
+  which packages and uploads all 12 workspace crates in topological
+  dependency order on every `v[0-9]+.[0-9]+.[0-9]+` tag push. A
+  `workflow_dispatch` trigger with `dry_run=true` (default) smoke-tests
+  the packaging without uploading. `CARGO_REGISTRY_TOKEN` secret must
+  be set on the repo before the first tag lands.
+- **Binary rename `agent-bridge` → `agentbridged`** — the name
+  `agent-bridge` on crates.io is taken by an unrelated project (a
+  Codex/Claude/Gemini CLI). To avoid `cargo install agent-bridge`
+  installing someone else's tool, the harness binary is now
+  `agentbridged` (daemon-style suffix) and the crate remains
+  `ab-harness`. `abctl` and `ab-cli` are unchanged. `find_server_binary`
+  in setup.rs prefers `agentbridged` and falls back to the legacy
+  `agent-bridge` for smooth upgrades. Dockerfile ENTRYPOINT, systemd
+  ExecStart, and CI release archives updated to match.
+- **Embedded WAT relocation** — `crates/ab-harness/src/main.rs` used
+  `include_str!("../../../config/policies/payload_limit.wat")`, which
+  reaches outside the crate root and would fail on a crates.io
+  consumer build (`cargo package` excludes parent-directory paths).
+  Relocated to `crates/ab-harness/policies/payload_limit.wat`
+  (packaged with the crate); the operator-facing mirror at
+  `<repo>/config/policies/payload_limit.wat` stays for
+  Docker/systemd/k8s deploy-time editing.
+- **Workspace crate metadata** — every crate now inherits
+  `repository`, `homepage`, `documentation`, `keywords`, and
+  `categories` from `[workspace.package]` so crates.io landing pages
+  render cleanly on first publish.
+
 Post-0.1.0 hardening across rounds 11–32 of a systematic bug audit.
 Highlights, grouped by class:
 
