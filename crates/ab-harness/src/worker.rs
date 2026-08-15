@@ -119,6 +119,38 @@ pub enum SubmitError {
     Closed,
 }
 
+/// Which admission stage a drop should be counted against. Each variant
+/// maps to a distinct `ab_events_dropped_total{stage="..."}` counter,
+/// so operators can PromQL-alert on the actual bottleneck class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropStage {
+    /// Initial worker-side admission. `try_reserve` / `try_reserve_pair`'s
+    /// worker half. Bumps `ab_events_dropped_total{stage="worker_queue"}`.
+    WorkerQueue,
+    /// Downstream response-capture submission (`ResponsePermit::submit`).
+    /// The permit itself only holds the response-capacity semaphore; the
+    /// mpsc slot is contested at submit time, so exhaustion at THIS
+    /// stage — which is a real observable class of failure — bumps
+    /// `ab_events_dropped_total{stage="response_slot"}`.
+    ResponseSlot,
+}
+
+impl DropStage {
+    fn full_counter_key(self) -> &'static str {
+        match self {
+            Self::WorkerQueue => "ab_events_dropped_total{stage=\"worker_queue\"}",
+            Self::ResponseSlot => "ab_events_dropped_total{stage=\"response_slot\"}",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::WorkerQueue => "worker_queue",
+            Self::ResponseSlot => "response_slot",
+        }
+    }
+}
+
 /// Cloneable handle used by request handlers to submit worker jobs.
 #[derive(Clone)]
 pub struct WorkerHandle {
@@ -166,20 +198,20 @@ pub struct ResponsePermit {
 
 impl ResponsePermit {
     /// Commit a response-capture job. Consumes the response permit's
-    /// capacity slot and races for a shard's mpsc slot; if the shard
-    /// is momentarily full, returns a `SubmitError::Full` and bumps
-    /// `ab_events_dropped_total{stage="response_slot"}`. The caller
-    /// (`submit_response_capture`) already has retry policy for this
-    /// class of failure.
+    /// capacity slot and races for a shard's mpsc slot; if the shard is
+    /// momentarily full, returns a `SubmitError::Full` and bumps
+    /// `ab_events_dropped_total{stage="response_slot"}` — NOT the
+    /// worker_queue counter. That distinction is the whole point of
+    /// the split: operators need to see which class of exhaustion is
+    /// producing drops.
     pub fn submit(self, worker: &WorkerHandle, job: WorkerJob) -> Result<(), SubmitError> {
-        // capacity_permit drops on the fused permit exit — release
-        // response_capacity before contending for the mpsc slot so a
-        // failed submit does not artificially pin the response budget.
+        // Release the response-capacity permit before contending for
+        // the mpsc slot so a failed submit does not artificially pin
+        // the response budget. Dropping via NLL — the permit is not
+        // used by `try_submit_labeled`, which draws a fresh
+        // worker-capacity slot for the actual queue admission.
         let _capacity_permit = self._capacity_permit;
-        // For the mpsc slot use the plain `try_submit` path. On failure
-        // the semaphore permit is already released (dropped by NLL
-        // above); the counter increment happens inside `try_submit`.
-        worker.try_submit(job)
+        worker.try_submit_labeled(job, DropStage::ResponseSlot)
     }
 }
 
@@ -285,7 +317,15 @@ impl WorkerHandle {
     /// reserves capacity up front via [`WorkerHandle::try_reserve`] and
     /// submits through [`WorkerPermit::submit`].
     pub fn try_submit(&self, job: WorkerJob) -> Result<(), SubmitError> {
-        let capacity_permit = self.try_capacity()?;
+        self.try_submit_labeled(job, DropStage::WorkerQueue)
+    }
+
+    /// Same as [`Self::try_submit`], but the failure counters carry a
+    /// caller-supplied stage label so response-slot exhaustion mid-stream
+    /// can be distinguished from admission-side worker-queue exhaustion.
+    /// See [`ResponsePermit::submit`].
+    fn try_submit_labeled(&self, job: WorkerJob, stage: DropStage) -> Result<(), SubmitError> {
+        let capacity_permit = self.try_capacity_labeled(stage)?;
         let Some(sender) = self.sender_for(&job.session.id).cloned() else {
             return Err(SubmitError::Closed);
         };
@@ -304,12 +344,13 @@ impl WorkerHandle {
                 envelope.job.session.worker_job_finished();
                 self.worker_job_finished();
                 self.metrics
-                    .counter(
-                        "ab_events_dropped_total{stage=\"worker_queue\"}",
-                        "Worker jobs dropped",
-                    )
+                    .counter(stage.full_counter_key(), "Worker jobs dropped")
                     .inc();
-                tracing::warn!(session = %session_id, "worker queue full; request must fail closed");
+                tracing::warn!(
+                    session = %session_id,
+                    stage = %stage.label(),
+                    "worker queue full; request must fail closed"
+                );
                 Err(SubmitError::Full)
             }
             Err(mpsc::error::TrySendError::Closed(envelope)) => {
@@ -322,7 +363,11 @@ impl WorkerHandle {
                         "Worker jobs dropped",
                     )
                     .inc();
-                tracing::warn!(session = %session_id, "worker queue closed; request must fail closed");
+                tracing::warn!(
+                    session = %session_id,
+                    stage = %stage.label(),
+                    "worker queue closed; request must fail closed"
+                );
                 Err(SubmitError::Closed)
             }
         }
@@ -384,12 +429,21 @@ impl WorkerHandle {
     }
 
     fn try_capacity(&self) -> Result<tokio::sync::OwnedSemaphorePermit, SubmitError> {
+        self.try_capacity_labeled(DropStage::WorkerQueue)
+    }
+
+    /// Same as [`Self::try_capacity`] but the failure counter carries a
+    /// caller-supplied stage label. `WorkerQueue` accounts to the main
+    /// worker admission semaphore; `ResponseSlot` accounts to the mid-
+    /// stream response-capture submission path — so operators can tell
+    /// which class of exhaustion is producing drops.
+    fn try_capacity_labeled(
+        &self,
+        stage: DropStage,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, SubmitError> {
         Arc::clone(&self.capacity).try_acquire_owned().map_err(|_| {
             self.metrics
-                .counter(
-                    "ab_events_dropped_total{stage=\"worker_queue\"}",
-                    "Worker jobs dropped",
-                )
+                .counter(stage.full_counter_key(), "Worker jobs dropped")
                 .inc();
             SubmitError::Full
         })
@@ -521,71 +575,135 @@ fn spawn_worker_shard(
     worker_pending: Arc<std::sync::atomic::AtomicU64>,
     worker_drained: Arc<tokio::sync::Notify>,
 ) {
+    use futures::future::FutureExt as _;
     tokio::spawn(async move {
-        while let Some(envelope) = receiver.recv().await {
-            let Envelope {
-                job,
-                completion,
-                span,
-                _capacity_permit: capacity_permit,
-            } = envelope;
-            let bridge = Arc::clone(&bridge);
-            let embedder = Arc::clone(&embedder);
-            let vector_sink = Arc::clone(&vector_sink);
-            let spool_dir = spool_dir.clone();
-            let session = Arc::clone(&job.session);
-            let result = tokio::spawn(
-                {
-                    let job_metrics = Arc::clone(&worker_metrics);
-                    async move {
-                        process_job(
-                            job,
-                            bridge,
-                            embedder,
-                            vector_sink,
-                            spool_dir,
-                            journal_key,
-                            job_metrics,
-                        )
-                        .await
-                    }
-                }
-                .instrument(span),
-            )
-            .await;
-            let outcome = match result {
-                Ok(result) => result,
-                Err(error) => {
-                    worker_metrics
-                        .counter(
-                            "ab_worker_panics_total",
-                            "Worker job panics isolated by supervisor",
-                        )
-                        .inc();
-                    Err(format!("worker job panicked: {error}"))
-                }
+        loop {
+            let Some(envelope) = receiver.recv().await else {
+                break;
             };
-            if let Err(error) = &outcome {
-                // The session flips fail-closed silently otherwise: name the
-                // session and the root cause (e.g. EACCES on the journal
-                // file) so operators can trace "capture is incomplete"
-                // refusals back to this event.
-                tracing::warn!(session = %session.id, %error, "capture job failed; session is fail-closed");
-                session.mark_capture_failed();
+            // Supervise the per-envelope routing code (Arc::clones,
+            // span instrumentation, capacity_permit drop, drained
+            // notify, worker_pending accounting). The INNER
+            // `tokio::spawn(process_job).await` already catches
+            // process_job panics via JoinError → ab_worker_panics_total,
+            // but a panic in the OUTER routing (allocator failure
+            // inside a tracing::warn Display, `worker_pending
+            // .fetch_sub` accounting bug) would kill the whole shard
+            // driver task, and every future envelope routed to this
+            // shard would pile up forever — jamming 1/MAX_SHARDS of
+            // the session id space until process restart.
+            let bridge_ref = Arc::clone(&bridge);
+            let embedder_ref = Arc::clone(&embedder);
+            let vector_sink_ref = Arc::clone(&vector_sink);
+            let spool_dir_ref = spool_dir.clone();
+            let worker_metrics_ref = Arc::clone(&worker_metrics);
+            let worker_pending_ref = Arc::clone(&worker_pending);
+            let worker_drained_ref = Arc::clone(&worker_drained);
+            let outcome = std::panic::AssertUnwindSafe(process_envelope(
+                envelope,
+                bridge_ref,
+                embedder_ref,
+                vector_sink_ref,
+                spool_dir_ref,
+                journal_key,
+                worker_metrics_ref,
+                worker_pending_ref,
+                worker_drained_ref,
+            ))
+            .catch_unwind()
+            .await;
+            if let Err(panic) = outcome {
+                let msg = panic
+                    .downcast_ref::<&'static str>()
+                    .copied()
+                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("panic payload was not a string");
                 worker_metrics
-                    .counter("ab_worker_errors_total", "Worker jobs that failed")
+                    .counter(
+                        "ab_worker_shard_panics_total",
+                        "Worker shard driver panicked outside a job; supervised via catch_unwind",
+                    )
                     .inc();
-            }
-            session.worker_job_finished();
-            drop(capacity_permit);
-            if worker_pending.fetch_sub(1, Ordering::AcqRel) == 1 {
-                worker_drained.notify_waiters();
-            }
-            if let Some(completion) = completion {
-                let _ = completion.send(outcome);
+                tracing::error!(
+                    panic = %msg,
+                    "worker shard driver panicked during envelope routing; continuing"
+                );
             }
         }
     });
+}
+
+/// One envelope's worth of shard-driver work, factored out so
+/// [`spawn_worker_shard`] can wrap the whole body in `catch_unwind`.
+#[allow(clippy::too_many_arguments)]
+async fn process_envelope(
+    envelope: Envelope,
+    bridge: Arc<dyn EventBus>,
+    embedder: Arc<dyn Embedder>,
+    vector_sink: Arc<dyn VectorSink>,
+    spool_dir: Option<std::path::PathBuf>,
+    journal_key: [u8; 32],
+    worker_metrics: Arc<Registry>,
+    worker_pending: Arc<std::sync::atomic::AtomicU64>,
+    worker_drained: Arc<tokio::sync::Notify>,
+) {
+    let Envelope {
+        job,
+        completion,
+        span,
+        _capacity_permit: capacity_permit,
+    } = envelope;
+    let session = Arc::clone(&job.session);
+    let result = tokio::spawn(
+        {
+            let job_metrics = Arc::clone(&worker_metrics);
+            async move {
+                process_job(
+                    job,
+                    bridge,
+                    embedder,
+                    vector_sink,
+                    spool_dir,
+                    journal_key,
+                    job_metrics,
+                )
+                .await
+            }
+        }
+        .instrument(span),
+    )
+    .await;
+    let outcome = match result {
+        Ok(result) => result,
+        Err(error) => {
+            worker_metrics
+                .counter(
+                    "ab_worker_panics_total",
+                    "Worker job panics isolated by supervisor",
+                )
+                .inc();
+            Err(format!("worker job panicked: {error}"))
+        }
+    };
+    if let Err(error) = &outcome {
+        // The session flips fail-closed silently otherwise: name the
+        // session and the root cause (e.g. EACCES on the journal
+        // file) so operators can trace "capture is incomplete"
+        // refusals back to this event.
+        tracing::warn!(session = %session.id, %error, "capture job failed; session is fail-closed");
+        session.mark_capture_failed();
+        worker_metrics
+            .counter("ab_worker_errors_total", "Worker jobs that failed")
+            .inc();
+    }
+    session.worker_job_finished();
+    drop(capacity_permit);
+    if worker_pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+        worker_drained.notify_waiters();
+    }
+    if let Some(completion) = completion {
+        let _ = completion.send(outcome);
+    }
 }
 
 fn worker_span(job: &WorkerJob) -> tracing::Span {
@@ -1875,6 +1993,59 @@ mod tests {
             rendered.contains("ab_events_dropped_total{stage=\"worker_queue\"} 1"),
             "worker_queue must remain at 1 (only response stage exhausted this time), got:\n{rendered}"
         );
+    }
+
+    /// The prior review caught that `ResponsePermit::submit` was going
+    /// through the generic `try_submit` path, which bumps
+    /// `stage="worker_queue"` on any capacity/mpsc-full failure — so a
+    /// mid-stream response-capture job that raced with re-admitted
+    /// worker jobs would be silently misattributed to the wrong
+    /// counter, defeating the observability goal of the fused-permit
+    /// split. Locking the correct routing: saturate worker capacity
+    /// AFTER a response permit is issued, then commit the response job
+    /// and assert it lands on `stage="response_slot"`.
+    #[tokio::test]
+    async fn response_permit_submit_bumps_response_slot_on_worker_capacity_exhaustion() {
+        let bridge = Arc::new(RecordingBus::default());
+        let metrics = Arc::new(Registry::new());
+        let worker = spawn_worker(
+            2,
+            bridge.clone(),
+            Arc::new(HashEmbedder::default()),
+            Arc::clone(&metrics),
+        );
+        // Issue a pair permit (worker=1 held; response=1 held for the
+        // rest of the test).
+        let permits = worker
+            .try_reserve_pair("mid-stream-response")
+            .expect("initial pair");
+        // Drop the worker permit so that half is free; the response
+        // half stays held until we submit below.
+        drop(permits.worker);
+        // Now consume both remaining worker slots directly so any
+        // further worker-side acquire fails. The response semaphore
+        // is untouched — permits.response still holds its slot.
+        let hog_a = worker.try_reserve("hog-a").expect("hog-a");
+        let hog_b = worker.try_reserve("hog-b").expect("hog-b");
+        // Submit the response-capture job. It draws from worker
+        // capacity + mpsc — worker capacity is exhausted → `Full`.
+        // The counter increment MUST be `stage="response_slot"`,
+        // NOT `stage="worker_queue"`.
+        let job = job(session(Workflow::Signed));
+        let err = permits.response.submit(&worker, job).unwrap_err();
+        assert_eq!(err, SubmitError::Full);
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains("ab_events_dropped_total{stage=\"response_slot\"} 1"),
+            "response_slot MUST have been bumped by ResponsePermit::submit; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("ab_events_dropped_total{stage=\"worker_queue\"} 1"),
+            "worker_queue must NOT be bumped by ResponsePermit::submit failure — that would \
+             mask which class of exhaustion produced the drop; got:\n{rendered}"
+        );
+        drop(hog_a);
+        drop(hog_b);
     }
 
     #[tokio::test]

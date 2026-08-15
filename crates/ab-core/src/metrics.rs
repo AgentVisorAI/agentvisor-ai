@@ -161,6 +161,31 @@ enum Metric {
 #[derive(Default)]
 pub struct Registry {
     metrics: Mutex<BTreeMap<String, (String, Metric)>>,
+    /// Track the metric KIND (counter vs histogram) per base name — the
+    /// full-key type-collision guard in `counter`/`histogram_with_bounds`
+    /// only catches same-key clashes, but Prometheus text exposition
+    /// requires that ALL variants of a base name (across every label
+    /// combination) share the same type. Two contributors registering
+    /// `ab_foo_total{stage="a"}` as a counter and
+    /// `ab_foo_total{stage="b"}` as a histogram would produce an
+    /// invalid `# TYPE` header and Prometheus's parser would reject
+    /// the whole scrape.
+    base_kinds: Mutex<BTreeMap<String, MetricKind>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetricKind {
+    Counter,
+    Histogram,
+}
+
+impl MetricKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Counter => "counter",
+            Self::Histogram => "histogram",
+        }
+    }
 }
 
 impl Registry {
@@ -182,6 +207,7 @@ impl Registry {
     #[allow(clippy::panic)]
     pub fn counter(&self, key: &str, help: &str) -> Arc<Counter> {
         validate_metric_key(key);
+        self.reserve_base_kind(key, MetricKind::Counter);
         let mut m = self.metrics.lock();
         match m.get(key) {
             Some((_, Metric::Counter(c))) => Arc::clone(c),
@@ -215,6 +241,7 @@ impl Registry {
     #[allow(clippy::panic)]
     pub fn histogram_with_bounds(&self, key: &str, help: &str, bounds_us: &[u64]) -> Arc<Histogram> {
         validate_metric_key(key);
+        self.reserve_base_kind(key, MetricKind::Histogram);
         let mut m = self.metrics.lock();
         match m.get(key) {
             Some((_, Metric::Histogram(h))) => Arc::clone(h),
@@ -229,6 +256,30 @@ impl Registry {
                     (help.to_owned(), Metric::Histogram(Arc::clone(&h))),
                 );
                 h
+            }
+        }
+    }
+
+    /// Enforce that a base name (the metric name up to `{`) is only
+    /// ever registered as one metric kind across every label
+    /// combination — a Prometheus text-exposition invariant. Panics
+    /// with a clear message on mismatch. Called from `counter` and
+    /// `histogram_with_bounds` before the per-key type check.
+    #[allow(clippy::panic)]
+    fn reserve_base_kind(&self, key: &str, kind: MetricKind) {
+        let (base, _labels) = split_key(key);
+        let mut kinds = self.base_kinds.lock();
+        match kinds.get(base) {
+            Some(existing) if *existing != kind => panic!(
+                "metric base-name kind conflict: {base:?} is already registered as \
+                 `{}` at another label combination; cannot register {key:?} as `{}`. \
+                 Prometheus rejects mismatched TYPE headers across variants of the \
+                 same base name and the whole scrape becomes invalid text exposition.",
+                existing.label(),
+                kind.label(),
+            ),
+            _ => {
+                kinds.insert(base.to_owned(), kind);
             }
         }
     }
@@ -445,7 +496,7 @@ mod tests {
     /// observation. A metric name registered as one type must never be
     /// silently repurposed as the other — panic loudly instead.
     #[test]
-    #[should_panic(expected = "already registered as a histogram")]
+    #[should_panic(expected = "kind conflict")]
     fn counter_over_existing_histogram_panics_instead_of_overwriting() {
         let r = Registry::new();
         r.histogram("ab_metric", "help");
@@ -453,11 +504,23 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "already registered as a counter")]
+    #[should_panic(expected = "kind conflict")]
     fn histogram_over_existing_counter_panics_instead_of_overwriting() {
         let r = Registry::new();
         r.counter("ab_metric", "help");
         r.histogram("ab_metric", "help");
+    }
+
+    /// Cross-label type collision on the same base name: `foo{a="1"}`
+    /// registered as counter, `foo{a="2"}` registered as histogram.
+    /// Prometheus TYPE header would be ambiguous — reject at
+    /// registration.
+    #[test]
+    #[should_panic(expected = "kind conflict")]
+    fn different_labels_same_base_name_type_collision_panics() {
+        let r = Registry::new();
+        r.counter("ab_metric{shard=\"a\"}", "help");
+        r.histogram("ab_metric{shard=\"b\"}", "help");
     }
 
     /// Same-type re-registration must still work (idempotent) — the panic

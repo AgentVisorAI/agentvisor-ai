@@ -229,6 +229,9 @@ fn typosquat_tool_names_are_refused_by_allowlist() {
 // ---------------------------------------------------------------------------
 // MCP-T1 / Session token leakage: a bearer token in the request headers
 // must never appear inside any captured event payload OR receipt subject.
+// Under the current identity posture (no validator, no passthrough), the
+// harness now REFUSES the request with 401 — which is a stronger form of
+// the same invariant: no request means no event/receipt to leak into.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -242,32 +245,31 @@ async fn bearer_token_never_appears_in_receipt_or_event_payloads() {
         "authorization",
         HeaderValue::from_str(&format!("Bearer {SECRET}")).unwrap(),
     );
-    state
-        .prepare_chat(
-            &headers,
-            json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}),
-        )
-        .unwrap();
-    let session = state.sessions.get("token-leak").unwrap();
-    let outcome = state
-        .finalizer
-        .close_session(session, StopReason::SessionClosed)
-        .await
-        .unwrap();
-    // No event payload contains the bearer token.
+    // Under `require_identity=false` + no validator + no passthrough,
+    // presenting a bearer is refused with 401 — the harness declines to
+    // silently record the request as anonymous (repudiation vector).
+    // See `resolve_identity` in pipeline.rs.
+    let result = state.prepare_chat(
+        &headers,
+        json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}),
+    );
+    let error = match result {
+        Ok(_) => panic!("presenting a bearer with no validator must be refused"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, ab_harness::pipeline::PipelineError::Unauthorized(_)),
+        "presenting a bearer with no validator must be refused, got: {error:?}"
+    );
+    // Belt-and-suspenders: even the transient rejection event that
+    // `enqueue_transient_failure` may fire off must not carry the
+    // secret token verbatim. No receipt is issued for a request that
+    // was refused before admission, so we only check events.
     for payload in bus.payloads.lock().iter() {
         let serialized = serde_json::to_string(payload).unwrap();
         assert!(
             !serialized.contains(SECRET),
-            "bearer token leaked into event payload:\n{serialized}"
-        );
-    }
-    // Receipt does not carry the bearer either.
-    if let FinalizeOutcome::Receipt { receipt } = outcome {
-        let serialized = serde_json::to_string(&*receipt).unwrap();
-        assert!(
-            !serialized.contains(SECRET),
-            "bearer token leaked into signed receipt"
+            "bearer token leaked into event payload despite request refusal:\n{serialized}"
         );
     }
 }
