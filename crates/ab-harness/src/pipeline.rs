@@ -427,7 +427,24 @@ impl AppState {
         .with_state_store(Arc::clone(&store));
         let mut client_builder = reqwest::Client::builder()
             .connect_timeout(HTTP_CONNECT_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none());
+            .redirect(reqwest::redirect::Policy::none())
+            // Providers (OpenAI, Anthropic, Azure, Bedrock fronting)
+            // downgrade or block empty / generic UAs; identifying
+            // ourselves also gives operators a stable string for
+            // provider-side triage. Version is baked in at compile
+            // time so a rolling deploy makes the change visible.
+            .user_agent(concat!("AgentBridge/", env!("CARGO_PKG_VERSION")))
+            // TCP keepalive so pooled connections behind NAT/L4 LBs
+            // with short idle windows (AWS NLB 350 s, GCP TCP 600 s,
+            // stateful FWs often 60-120 s) do not turn every first
+            // request per pool cycle into a full TCP+TLS re-handshake
+            // that manifests as a spurious 502/`connection reset`.
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            // Cap pool idle at 60 s: shorter than any realistic NAT
+            // window, longer than any burst-of-requests batch. Bounds
+            // the pool memory footprint and forces frequent-enough
+            // TLS refresh under a rolling cert rotation.
+            .pool_idle_timeout(std::time::Duration::from_secs(60));
         if let Some(seconds) = config.upstream_read_timeout_s {
             client_builder = client_builder.read_timeout(std::time::Duration::from_secs(seconds));
         }
