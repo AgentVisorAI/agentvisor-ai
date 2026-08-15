@@ -27,6 +27,79 @@ pub fn sync_directory(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Receipts JCS-canonicalize to a few hundred bytes; even a huge
+/// tool-call summary stays well under 16 MiB. Shared between the CLI
+/// (`abctl receipt-verify`) and the harness reconciler (round-17 F3).
+pub const MAX_RECEIPT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// ATIF trajectories can carry long transcripts; 64 MiB is generous
+/// (a 200k-token GPT-4 context in ASCII fits in ~800 KiB).
+pub const MAX_ATIF_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Small-file caps for control-plane files (config sidecars, journal
+/// metadata, marker files, ack files). 1 MiB is well above any real
+/// legitimate content but small enough that a hostile plant cannot
+/// materialize an OOM before the parser complains.
+pub const MAX_CONTROL_BYTES: u64 = 1024 * 1024;
+
+/// Read a file into memory subject to a hard byte cap, refusing
+/// non-regular files. The size check runs on the OPEN handle (not
+/// the path — closes the TOCTOU race where a symlink target is
+/// swapped between `metadata()` and `read()`), and the read itself
+/// uses `Read::take` so a target that grows after the metadata
+/// check still cannot exceed the cap.
+///
+/// Shared between the CLI (round-16 F5) and the harness reconciler
+/// (round-17 F3) so both audit tools and the long-running server
+/// enforce identical resource bounds against on-disk tampering.
+pub fn read_capped(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not a regular file (type: {:?})",
+                path.display(),
+                metadata.file_type()
+            ),
+        ));
+    }
+    if metadata.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} is {} bytes; refusing to load more than {max_bytes}",
+                path.display(),
+                metadata.len()
+            ),
+        ));
+    }
+    let mut buf: Vec<u8> = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    (&mut file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut buf)?;
+    if buf.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} grew past {max_bytes} bytes during read; refusing",
+                path.display()
+            ),
+        ));
+    }
+    Ok(buf)
+}
+
+/// UTF-8 variant of [`read_capped`]. Used by the CLI for
+/// operator-supplied config / manifest / bearer token files where
+/// content is textual (round-17 F6).
+pub fn read_capped_string(path: &Path, max_bytes: u64) -> io::Result<String> {
+    let bytes = read_capped(path, max_bytes)?;
+    String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
 /// Durably write `bytes` to `path` via create-tmp + fsync + rename + parent fsync.
 ///
 /// The temporary file uses a UUIDv7-derived suffix to avoid collision with any

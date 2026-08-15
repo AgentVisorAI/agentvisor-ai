@@ -27,7 +27,14 @@ Group=agent-bridge
 WorkingDirectory=/var/lib/agent-bridge
 Environment=RUST_LOG=info
 Environment=AB_CONFIG=/etc/agent-bridge/agentbridge.toml
-Environment=AB_SIGNING_SEED_FILE=/var/lib/agent-bridge/signing.seed
+# Round-17 F10: the signing seed IS the receipt trust anchor.
+# Historically it lived inside WorkingDirectory=/var/lib/agent-bridge,
+# which is ReadWritePaths=. Any operator running `sudo cat` /
+# rsync backup / debug shell traversed the same tree that held the
+# key. Move it to /etc/agent-bridge (read-only config tree),
+# owned agent-bridge:agent-bridge, mode 0400. Install docs already
+# instruct pre-generating the seed with `abctl keygen`.
+Environment=AB_SIGNING_SEED_FILE=/etc/agent-bridge/signing.seed
 # API keys live here, mode 0600, never in the unit file:
 EnvironmentFile=-/etc/agent-bridge/secrets.env
 ExecStart=/usr/local/bin/agent-bridge
@@ -38,6 +45,8 @@ RestartSec=2
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
+# ReadWritePaths does NOT include /etc/agent-bridge on purpose —
+# config + signing seed are read-only after install.
 ReadWritePaths=/var/lib/agent-bridge
 PrivateTmp=true
 PrivateDevices=true
