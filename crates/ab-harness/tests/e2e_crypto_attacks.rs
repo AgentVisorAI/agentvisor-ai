@@ -22,7 +22,7 @@ use base64::Engine as _;
 use serde_json::json;
 
 fn signer() -> Ed25519Signer {
-    Ed25519Signer::from_seed([73; 32])
+    Ed25519Signer::from_seed(&[73; 32])
 }
 
 fn ring(s: &Ed25519Signer) -> Keyring {
@@ -168,7 +168,7 @@ fn signature_field_rejects_url_safe_base64_and_embedded_whitespace() {
 #[test]
 fn embedded_pubkey_swap_is_caught_by_key_id_binding() {
     let honest = signer();
-    let attacker = Ed25519Signer::from_seed([9; 32]);
+    let attacker = Ed25519Signer::from_seed(&[9; 32]);
     let ring = ring(&honest);
     let mut receipt = Receipt::issue(body("sess-bind"), &honest).unwrap();
     // Attacker replaces embedded key bytes with their own, but the outer
@@ -548,9 +548,9 @@ fn unknown_wire_fields_are_rejected_on_parse_and_never_reach_verification() {
 
 #[test]
 fn control_key_derivation_is_deterministic_and_signer_separated() {
-    let a1 = Ed25519Signer::from_seed([5; 32]);
-    let a2 = Ed25519Signer::from_seed([5; 32]);
-    let b = Ed25519Signer::from_seed([6; 32]);
+    let a1 = Ed25519Signer::from_seed(&[5; 32]);
+    let a2 = Ed25519Signer::from_seed(&[5; 32]);
+    let b = Ed25519Signer::from_seed(&[6; 32]);
     let k_a1 = ab_harness::control_key_from_signer(&a1);
     let k_a2 = ab_harness::control_key_from_signer(&a2);
     let k_b = ab_harness::control_key_from_signer(&b);

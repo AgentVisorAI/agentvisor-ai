@@ -40,15 +40,27 @@ impl Ed25519Signer {
     }
 
     /// Load from a 32-byte secret seed.
-    pub fn from_seed(seed: [u8; 32]) -> Self {
-        let key = SigningKey::from_bytes(&seed);
+    ///
+    /// Round-19 F2: takes `&[u8; 32]` (borrow), not by value. Passing
+    /// the seed by value materializes a caller-owned temp slot on
+    /// the stack that Rust does not guarantee to zeroize on drop —
+    /// the round-18 F5 `Zeroizing<[u8; 32]>` wrapper only zeroizes
+    /// the slot IT owns, not the copy the callee received. By taking
+    /// a reference we let the caller keep the seed inside a
+    /// `Zeroizing` and never lose control of the memory.
+    pub fn from_seed(seed: &[u8; 32]) -> Self {
+        let key = SigningKey::from_bytes(seed);
         let key_id = derive_key_id(&key.verifying_key());
         Self { key_id, key }
     }
 
     /// Export the 32-byte secret seed (for `abctl keygen` persistence).
-    pub fn seed(&self) -> [u8; 32] {
-        self.key.to_bytes()
+    ///
+    /// Round-19 F2: returns `Zeroizing<[u8; 32]>` so the caller's
+    /// receiving slot zeroes on drop — historically the bare
+    /// `[u8; 32]` return let a copy linger in freed stack/heap.
+    pub fn seed(&self) -> zeroize::Zeroizing<[u8; 32]> {
+        zeroize::Zeroizing::new(self.key.to_bytes())
     }
 }
 
@@ -213,7 +225,7 @@ mod tests {
     #[test]
     fn seed_roundtrip_preserves_identity() {
         let a = Ed25519Signer::generate();
-        let b = Ed25519Signer::from_seed(a.seed());
+        let b = Ed25519Signer::from_seed(&a.seed());
         assert_eq!(a.key_id(), b.key_id());
         assert_eq!(a.public_key_bytes(), b.public_key_bytes());
     }

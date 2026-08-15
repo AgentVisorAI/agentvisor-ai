@@ -1661,7 +1661,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let bridge = Arc::new(RecordingBus::default());
         let metrics = Arc::new(Registry::new());
-        let signer = Arc::new(ab_receipts::Ed25519Signer::from_seed([14; 32]));
+        let signer = Arc::new(ab_receipts::Ed25519Signer::from_seed(&[14; 32]));
         let journal_key = crate::journal::key_from_signer(signer.as_ref());
         let worker = spawn_worker_with_spool_authenticated(
             4,
@@ -1719,7 +1719,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let bridge = Arc::new(RecordingBus::default());
         let metrics = Arc::new(Registry::new());
-        let signer = Arc::new(ab_receipts::Ed25519Signer::from_seed([27; 32]));
+        let signer = Arc::new(ab_receipts::Ed25519Signer::from_seed(&[27; 32]));
         let journal_key = crate::journal::key_from_signer(signer.as_ref());
         let worker = spawn_worker_with_spool_authenticated(
             8,
@@ -1773,7 +1773,7 @@ mod tests {
     #[tokio::test]
     async fn tampered_signed_journal_is_never_turned_into_a_receipt() {
         let directory = tempfile::tempdir().unwrap();
-        let signer = Arc::new(ab_receipts::Ed25519Signer::from_seed([18; 32]));
+        let signer = Arc::new(ab_receipts::Ed25519Signer::from_seed(&[18; 32]));
         let journal_key = crate::journal::key_from_signer(signer.as_ref());
         let worker = spawn_worker_with_spool_authenticated(
             4,
@@ -1815,7 +1815,7 @@ mod tests {
     #[tokio::test]
     async fn signed_restart_reuses_receipt_persisted_before_journal_cleanup() {
         let directory = tempfile::tempdir().unwrap();
-        let signer = Arc::new(ab_receipts::Ed25519Signer::from_seed([15; 32]));
+        let signer = Arc::new(ab_receipts::Ed25519Signer::from_seed(&[15; 32]));
         let journal_key = crate::journal::key_from_signer(signer.as_ref());
         let worker = spawn_worker_with_spool_authenticated(
             4,
@@ -1904,7 +1904,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let bridge = Arc::new(RecordingBus::default());
         let metrics = Arc::new(Registry::new());
-        let signer = Arc::new(ab_receipts::Ed25519Signer::from_seed([13; 32]));
+        let signer = Arc::new(ab_receipts::Ed25519Signer::from_seed(&[13; 32]));
         let journal_key = crate::journal::key_from_signer(signer.as_ref());
         let worker = spawn_worker_with_spool_authenticated(
             4,

@@ -124,7 +124,7 @@ fn concurrent_keygen_race_produces_exactly_one_winner() {
         .unwrap()
         .try_into()
         .unwrap();
-    let signer = ab_receipts::Ed25519Signer::from_seed(seed_bytes);
+    let signer = ab_receipts::Ed25519Signer::from_seed(&seed_bytes);
     assert_eq!(
         hex::encode(ab_receipts::Signer::public_key_bytes(&signer)),
         winner_pk,
@@ -177,7 +177,7 @@ fn concurrent_bridge_provision_race_produces_exactly_one_winner() {
 fn build_receipt_for(dir: &std::path::Path, seed_bytes: [u8; 32]) -> PathBuf {
     use ab_events::{AgentIdentity, CharterFile};
     use ab_receipts::{CostSummary, Ed25519Signer, Receipt, ReceiptBody, ReceiptSubject, ToolCallSummary};
-    let signer = Ed25519Signer::from_seed(seed_bytes);
+    let signer = Ed25519Signer::from_seed(&seed_bytes);
     let body = ReceiptBody {
         receipt_version: 1,
         receipt_id: "dyn-workflow".to_owned(),

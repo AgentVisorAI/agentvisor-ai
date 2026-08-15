@@ -154,11 +154,20 @@ fn stub_middle_to_target(
     // summarizing a prior compression, or user-controlled content) would
     // otherwise permanently disable this pass on that conversation.
     //
-    // TODO(compression-marker): the marker itself is still an unauthenticated
-    // literal substring, so a hostile MIDDLE-range message can still spoof
-    // it and skip stubbing of surrounding messages. Fixing that requires
-    // switching to a keyed marker (HMAC over prior content) or an
-    // out-of-band per-payload flag — both are larger refactors.
+    // TODO(compression-marker): the marker itself is still an
+    // unauthenticated literal substring, so a hostile MIDDLE-range
+    // message can still spoof it and skip stubbing of surrounding
+    // messages. Fixing that requires switching to a keyed marker
+    // (HMAC over prior content) or an out-of-band per-payload
+    // flag — both are larger refactors.
+    //
+    // Round-19 F8: tracked as a known limitation. Attack requires
+    // an already-compromised prior turn (either an operator who
+    // pasted attacker content verbatim, or a system prompt
+    // hardening bypass) — real-world exploitability is bounded to
+    // "attacker who already has message-content control can force
+    // compression pass to skip." Migration to a keyed-marker
+    // scheme is scheduled behind the round-11 milestone.
     let scan_end = tail_start.min(messages.len());
     if messages.get(..scan_end).into_iter().flatten().any(|message| {
         msg_content_str(message).is_some_and(|content| content.contains("reason: middle history]"))

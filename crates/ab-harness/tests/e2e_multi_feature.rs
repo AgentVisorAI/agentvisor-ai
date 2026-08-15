@@ -71,7 +71,7 @@ fn state_with(sandbox: Sandbox, budget: BudgetSpec) -> Arc<AppState> {
             Arc::new(sandbox),
             Arc::new(Bus::default()),
             None,
-            Arc::new(Ed25519Signer::from_seed([9; 32])),
+            Arc::new(Ed25519Signer::from_seed(&[9; 32])),
         )
         .unwrap(),
     )
@@ -347,7 +347,7 @@ fn publish_idempotent_dedup_expires_with_retention() {
 // ------------------------------------------------------------------
 
 fn signed_receipt_for(seed: [u8; 32]) -> Receipt {
-    let signer = Ed25519Signer::from_seed(seed);
+    let signer = Ed25519Signer::from_seed(&seed);
     let body = ReceiptBody {
         receipt_version: 1,
         receipt_id: "rot".to_owned(),
@@ -376,8 +376,8 @@ fn signed_receipt_for(seed: [u8; 32]) -> Receipt {
 
 #[test]
 fn receipt_verifies_against_multi_key_ring_after_rotation() {
-    let a = Ed25519Signer::from_seed([1; 32]);
-    let b = Ed25519Signer::from_seed([2; 32]);
+    let a = Ed25519Signer::from_seed(&[1; 32]);
+    let b = Ed25519Signer::from_seed(&[2; 32]);
     let receipt = signed_receipt_for([1; 32]);
 
     // ring={B only}: fails.

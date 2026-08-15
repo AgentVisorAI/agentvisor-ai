@@ -120,7 +120,7 @@ fn state(upstream: &str, spool: &std::path::Path, capacity: usize, real_bridge: 
         Arc::new(production_sandbox()),
         bridge,
         None,
-        Arc::new(Ed25519Signer::from_seed([21; 32])),
+        Arc::new(Ed25519Signer::from_seed(&[21; 32])),
     )
     .unwrap()
 }
@@ -247,7 +247,7 @@ async fn sla_core_metrics() {
     assert!(block_p99 < 5_000, "MCP block p99 {block_p99}us exceeds 5000us");
     state.worker.wait_idle().await;
 
-    let signer = Arc::new(Ed25519Signer::from_seed([22; 32]));
+    let signer = Arc::new(Ed25519Signer::from_seed(&[22; 32]));
     let metrics = Arc::new(ab_core::metrics::Registry::new());
     let finalizer = Finalizer::new(signer.clone(), directory.path().to_path_buf(), metrics.clone());
     for index in 0..200 {
