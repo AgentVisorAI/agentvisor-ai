@@ -332,3 +332,46 @@ fn non_object_roots_rejected() {
         assert!(!issues.is_empty(), "root {v} slipped through");
     }
 }
+
+/// Round-25 F4: adversarial deeply-nested subagent_trajectories
+/// cannot stack-overflow the validator. Build a chain of 2_000
+/// nested `subagent_trajectories` (well past the 128-frame
+/// depth cap and past serde_json's own parser ceiling), pass it
+/// as a programmatically-constructed `Value` (so serde_json's
+/// parser cap is not what saves us), and confirm the validator
+/// returns a bounded issue set with the depth-cap marker.
+#[test]
+fn subagent_recursion_is_depth_capped() {
+    fn leaf(id: &str) -> Value {
+        let mut m = serde_json::Map::new();
+        m.insert("schema_version".into(), Value::String("v1.7".into()));
+        m.insert("trajectory_id".into(), Value::String(id.into()));
+        let mut agent = serde_json::Map::new();
+        agent.insert("name".into(), Value::String("a".into()));
+        agent.insert("version".into(), Value::String("1.0.0".into()));
+        m.insert("agent".into(), Value::Object(agent));
+        let mut step = serde_json::Map::new();
+        step.insert("role".into(), Value::String("assistant".into()));
+        step.insert("content".into(), Value::String("x".into()));
+        m.insert("steps".into(), Value::Array(vec![Value::Object(step)]));
+        Value::Object(m)
+    }
+    let mut node = leaf("leaf");
+    for i in 0..2_000 {
+        let mut parent = leaf(&format!("n-{i}"));
+        if let Value::Object(ref mut m) = parent {
+            m.insert(
+                "subagent_trajectories".into(),
+                Value::Array(vec![node]),
+            );
+        }
+        node = parent;
+    }
+    let issues = validate_value(&node, Mode::Strict);
+    assert!(
+        issues.iter().any(|i| i.message.contains("nesting exceeds")),
+        "expected depth-cap marker, got {} issues; head: {:?}",
+        issues.len(),
+        issues.first(),
+    );
+}
