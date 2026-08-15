@@ -478,18 +478,25 @@ fn azure_name_error(value: &str) -> Option<String> {
 
 /// Write `key` to `path` with owner-only permissions, replacing any
 /// previous file (including a symlink, which the server would refuse).
+///
+/// Atomic install (tmp file + hard-link + parent sync) so a crash between
+/// remove and sync cannot leave the final path empty or truncated. Same
+/// posture as the server's signing-seed installer in ab-harness/main.rs.
 fn write_private_key_file(path: &Path, key: &str) -> Result<()> {
     use std::io::Write as _;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create key directory {}", parent.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-        }
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create key directory {}", parent.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
     }
+    // Old file may be a symlink; unlink it so hard_link fails cleanly on a
+    // pre-planted target rather than following the link and overwriting
+    // whatever it points at.
     let _ = std::fs::remove_file(path);
+    let temporary = parent.join(format!(".agentbridge-key-{}.tmp", ab_core::new_event_uid()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -498,19 +505,22 @@ fn write_private_key_file(path: &Path, key: &str) -> Result<()> {
         options.mode(0o600);
     }
     let mut file = options
-        .open(path)
-        .with_context(|| format!("create key file {}", path.display()))?;
+        .open(&temporary)
+        .with_context(|| format!("create key file {}", temporary.display()))?;
     file.write_all(key.as_bytes())
-        .with_context(|| format!("write key file {}", path.display()))?;
-    // Same durability posture as the server's signing-seed install: a crash
-    // right after setup must not leave the key file empty or truncated.
+        .with_context(|| format!("write key file {}", temporary.display()))?;
     file.sync_all()
-        .with_context(|| format!("sync key file {}", path.display()))?;
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        std::fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .with_context(|| format!("sync key directory {}", parent.display()))?;
-    }
+        .with_context(|| format!("sync key file {}", temporary.display()))?;
+    // hard_link installs the final path atomically and refuses to follow a
+    // pre-existing symlink at `path`; a first-run has none anyway because
+    // we removed it above.
+    let result = std::fs::hard_link(&temporary, path)
+        .with_context(|| format!("install key file {}", path.display()));
+    // Always clean up the tmp regardless of link outcome.
+    let _ = std::fs::remove_file(&temporary);
+    result?;
+    ab_core::fsutil::sync_directory(parent)
+        .with_context(|| format!("sync key directory {}", parent.display()))?;
     Ok(())
 }
 
@@ -681,12 +691,12 @@ pub fn wizard(home: &Path, input: &mut dyn std::io::BufRead, secrets: &SecretInp
         std::fs::copy(&config_path, &backup).with_context(|| format!("back up {}", config_path.display()))?;
         println!("\n(Your previous settings were saved to {})", backup.display());
     }
-    // Write-then-rename so a crash mid-write can't leave a truncated
-    // config, and a symlink planted at the config path gets replaced by
-    // a real file instead of silently redirecting the write elsewhere.
-    let staging = config_path.with_extension("toml.tmp");
-    std::fs::write(&staging, &rendered).with_context(|| format!("write {}", staging.display()))?;
-    std::fs::rename(&staging, &config_path).with_context(|| format!("install {}", config_path.display()))?;
+    // Two concurrent wizards on the same $HOME must not interleave into a
+    // fixed `.toml.tmp` name — `write_atomic` uses a UUID-suffixed tmp file
+    // and rename semantics that replace any pre-existing symlink at the
+    // destination without following it.
+    ab_core::fsutil::write_atomic(&config_path, rendered.as_bytes())
+        .with_context(|| format!("install {}", config_path.display()))?;
 
     println!("\nAll set!");
     println!();

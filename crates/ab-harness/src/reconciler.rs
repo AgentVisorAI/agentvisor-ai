@@ -1519,20 +1519,35 @@ impl Finalizer {
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
                 continue;
             }
-            let sealed = tokio::fs::read(&path)
-                .await
-                .map_err(|error| FinalizeError::Bridge(error.to_string()))?;
-            let mut outbox: LifecycleOutbox = crate::journal::open(
+            let sealed = match tokio::fs::read(&path).await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tracing::warn!(%error, path = %path.display(), "skipping unreadable outbox file");
+                    continue;
+                }
+            };
+            let mut outbox: LifecycleOutbox = match crate::journal::open(
                 &self.journal_key,
                 crate::journal::LIFECYCLE_OUTBOX_DOMAIN,
                 0,
                 &sealed,
-            )
-            .map_err(FinalizeError::Bridge)?;
+            ) {
+                Ok(outbox) => outbox,
+                // A single corrupt or MAC-failing outbox file must not abort
+                // the entire scan and stop us from replaying the other
+                // sessions' outboxes. The bad file stays on disk as
+                // forensic evidence (`open` does not delete on failure).
+                Err(error) => {
+                    tracing::warn!(%error, path = %path.display(), "skipping malformed outbox");
+                    continue;
+                }
+            };
             if path != self.lifecycle_outbox_path(&outbox.session_id, &outbox.kind) {
-                return Err(FinalizeError::Bridge(
-                    "lifecycle outbox path does not match authenticated payload".to_owned(),
-                ));
+                tracing::warn!(
+                    path = %path.display(),
+                    "skipping outbox whose filename does not match its authenticated session_id/kind"
+                );
+                continue;
             }
             if outbox.ack.is_none() {
                 let topic = outbox.topic.clone();
