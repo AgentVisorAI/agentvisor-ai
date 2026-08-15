@@ -21,6 +21,13 @@ edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/debugmode0/agent-bridge"
+homepage = "https://debugmode0.github.io/agent-bridge/"
+documentation = "https://debugmode0.github.io/agent-bridge/api/"
+# `keywords` and `categories` are inherited by every workspace crate
+# via `keywords.workspace = true` / `categories.workspace = true`.
+# crates.io caps at 5 keywords / 5 categories.
+keywords = ["ai", "agents", "audit", "atif", "ocsf"]
+categories = ["command-line-utilities", "web-programming::http-server", "asynchronous"]
 
 [workspace.dependencies]
 ab-core = { path = "crates/ab-core", version = "0.1.0" }

@@ -50,7 +50,7 @@ jobs:
           CARGO_PROFILE_RELEASE_STRIP: symbols
         run: |
           cargo build --release --target ${{ matrix.target }} \
-            -p ab-harness --bin agent-bridge \
+            -p ab-harness --bin agentbridged \
             -p ab-cli --bin abctl
       - name: Package archive
         id: package
@@ -60,7 +60,7 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           stage="agent-bridge-${version}-${{ matrix.target }}"
           mkdir -p "$stage"
-          cp target/${{ matrix.target }}/release/agent-bridge "$stage/"
+          cp target/${{ matrix.target }}/release/agentbridged "$stage/"
           cp target/${{ matrix.target }}/release/abctl "$stage/"
           cp LICENSE README.md CHANGELOG.md SECURITY.md "$stage/"
           tar -czf "$stage.tar.gz" "$stage"

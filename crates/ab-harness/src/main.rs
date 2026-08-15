@@ -398,9 +398,16 @@ fn load_sandbox(config: &HarnessConfig) -> Result<Sandbox> {
 }
 
 /// Embedded copy of the default payload-limit policy, compiled into the
-/// binary so `cargo install agent-bridge && agent-bridge` works from an
-/// empty directory. Kept in sync with the repo file by `include_str!`.
-const BUILTIN_POLICY_WAT: &str = include_str!("../../../config/policies/payload_limit.wat");
+/// binary so `cargo install ab-harness && agentbridged` works from an
+/// empty directory. Round-45: relocated INTO the crate at
+/// `crates/ab-harness/policies/payload_limit.wat` so `cargo publish`
+/// packages it — `include_str!` cannot reach outside the crate root on
+/// a crates.io consumer build. The operator-facing copy at
+/// `<repo>/config/policies/payload_limit.wat` is kept as a mirror for
+/// deploy-time editing (Docker/systemd/k8s load that path); both files
+/// MUST be kept in sync during development (there is intentionally no
+/// build-time drift check to keep the compile fast).
+const BUILTIN_POLICY_WAT: &str = include_str!("../policies/payload_limit.wat");
 
 /// Built-in Bridge manifest for zero-config startup. Hot-only retention
 /// (no `cold_uri`: cold export needs the `cold-store` feature and an

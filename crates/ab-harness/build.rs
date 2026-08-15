@@ -18,5 +18,12 @@ fn main() {
     // and re-parsed at every start under a fresh Wasmtime engine —
     // stale bundling here means the wrong sandbox policy is enforced
     // for every request after the operator edits the .wat.
-    println!("cargo:rerun-if-changed=../../config/policies/payload_limit.wat");
+    //
+    // Round-45: the file lives INSIDE the crate now
+    // (`crates/ab-harness/policies/payload_limit.wat`) so `cargo
+    // publish` packages it. The out-of-crate copy at
+    // `<repo>/config/policies/payload_limit.wat` is still shipped with
+    // release tarballs / Docker / systemd / k8s as the operator-editable
+    // runtime path — keep both in sync during development.
+    println!("cargo:rerun-if-changed=policies/payload_limit.wat");
 }
