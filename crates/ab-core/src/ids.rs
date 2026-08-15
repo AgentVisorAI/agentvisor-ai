@@ -5,7 +5,16 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// A session identifier (UUIDv7 canonical text form).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Serialization is transparent (the wire form is a plain string), but
+/// deserialization runs [`Self::parse`] so wire-supplied ids can never
+/// bypass the visible-ASCII / length invariants that downstream code
+/// (loggers, header emitters, filesystem-path composers) relies on.
+/// A `#[serde(transparent)]` derive would forward to `String`'s impl
+/// and silently accept `""`, `"\n\r"`, Trojan-Source unicode, or
+/// megabyte-long ids embedded in any struct field that carries a
+/// SessionId.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct SessionId(String);
 
@@ -25,6 +34,14 @@ impl SessionId {
     }
 }
 
+impl<'de> Deserialize<'de> for SessionId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(|error| D::Error::custom(error.to_string()))
+    }
+}
+
 impl fmt::Display for SessionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -32,7 +49,11 @@ impl fmt::Display for SessionId {
 }
 
 /// An agent instance identifier (`ai_agent.instance_uid`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Same invariants as [`SessionId`]; the custom `Deserialize` runs
+/// [`Self::parse`] so wire-supplied ids embedded in any struct field
+/// cannot bypass the visible-ASCII / length checks.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct InstanceUid(String);
 
@@ -49,6 +70,14 @@ impl InstanceUid {
     /// Access the string form.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for InstanceUid {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(|error| D::Error::custom(error.to_string()))
     }
 }
 
@@ -155,5 +184,51 @@ mod tests {
         let uid = new_event_uid();
         assert_eq!(uid.len(), 36, "UUID text is 36 chars: {uid:?}");
         assert_eq!(uid.matches('-').count(), 4, "UUID has 4 hyphens: {uid:?}");
+    }
+
+    /// Deserializing a `SessionId` MUST run the same visible-ASCII /
+    /// length invariants as `parse` — otherwise any struct with a
+    /// `SessionId` field silently accepts an empty id, a Trojan-Source
+    /// unicode payload, or a megabyte-long string, defeating every
+    /// downstream invariant (log injection, header emission,
+    /// filesystem-path composition) that trusts `parse` succeeded.
+    #[test]
+    fn session_id_deserialize_rejects_hostile_wire_input() {
+        // Empty string — bypasses the `is_empty()` guard if we forwarded
+        // to `String::deserialize`.
+        let empty = serde_json::from_str::<SessionId>(r#""""#);
+        assert!(empty.is_err(), "empty id must be rejected on deserialize");
+        // CRLF injection — every log line embedding a raw id would be
+        // trivially spoofable.
+        let crlf = serde_json::from_str::<SessionId>(r#""a\r\nfake-log""#);
+        assert!(crlf.is_err(), "CRLF must be rejected on deserialize");
+        // Unicode Trojan Source (right-to-left override).
+        let rtl = serde_json::from_str::<SessionId>(r#""\u202Elegit""#);
+        assert!(rtl.is_err(), "non-ASCII must be rejected on deserialize");
+        // 129 chars — one over the boundary.
+        let too_long = format!(r#""{}""#, "x".repeat(129));
+        assert!(
+            serde_json::from_str::<SessionId>(&too_long).is_err(),
+            "> 128 chars must be rejected on deserialize"
+        );
+    }
+
+    #[test]
+    fn instance_uid_deserialize_rejects_hostile_wire_input() {
+        let empty = serde_json::from_str::<InstanceUid>(r#""""#);
+        assert!(empty.is_err(), "empty instance_uid must be rejected");
+        let non_ascii = serde_json::from_str::<InstanceUid>(r#""agent-é""#);
+        assert!(non_ascii.is_err(), "non-ASCII instance_uid must be rejected");
+    }
+
+    /// Serialize is transparent: a `SessionId` round-trips as a plain
+    /// string, and a *valid* id survives the round-trip unchanged.
+    #[test]
+    fn session_id_valid_deserialize_round_trip() {
+        let id = SessionId::parse("sess-abc-123").unwrap();
+        let wire = serde_json::to_string(&id).unwrap();
+        assert_eq!(wire, r#""sess-abc-123""#);
+        let restored: SessionId = serde_json::from_str(&wire).unwrap();
+        assert_eq!(restored, id);
     }
 }

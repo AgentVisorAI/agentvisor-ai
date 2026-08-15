@@ -1812,35 +1812,69 @@ pub fn spawn_reconciler(
     breaker: ab_loopdetect::BreakerConfig,
     metrics: Arc<Registry>,
 ) -> tokio::task::JoinHandle<()> {
+    use futures::future::FutureExt as _;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(tick_s.max(1)));
+        // Skip missed ticks instead of firing them back-to-back. Under
+        // transient overload (a 5 s tick body that takes 60 s) the
+        // default `Burst` behaviour would fire 12 immediate consecutive
+        // ticks, each running the full sweep — turning momentary
+        // pressure into a stall spiral.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
             let started = Instant::now();
-            if let Err(error) = finalizer.recover_spooled_sessions(&sessions, &breaker).await {
-                tracing::warn!(%error, "ATIF spool recovery failed");
-                metrics
-                    .counter("ab_reconcile_errors_total", "Reconciliation errors")
-                    .inc();
-            }
-            if let Err(error) = finalizer.retry_marked_promotions(&sessions).await {
-                tracing::warn!(%error, "durable promotion retry failed");
-                metrics
-                    .counter("ab_reconcile_errors_total", "Reconciliation errors")
-                    .inc();
-            }
-            for session in sessions.idle_sessions(idle_s) {
-                let session_id = session.id.clone();
-                if let Err(error) = finalizer.close_session(session, StopReason::SessionClosed).await {
-                    tracing::warn!(session = %session_id, %error, "idle session finalization failed");
+            // Wrap the whole tick body in catch_unwind: any panic in
+            // the reconciler (fs unwrap, JCS overflow, allocator
+            // failure inside tracing) would otherwise silently kill
+            // the task; idle sessions would then never finalize until
+            // the harness restarts. The JWKS refresh loop uses the
+            // same shape (main.rs).
+            let outcome = std::panic::AssertUnwindSafe(async {
+                if let Err(error) = finalizer.recover_spooled_sessions(&sessions, &breaker).await {
+                    tracing::warn!(%error, "ATIF spool recovery failed");
                     metrics
                         .counter("ab_reconcile_errors_total", "Reconciliation errors")
                         .inc();
                 }
-            }
-            let evicted = sessions.evict_finalized(idle_s);
-            if !evicted.is_empty() {
-                tracing::debug!(count = evicted.len(), "evicted finalized signed sessions");
+                if let Err(error) = finalizer.retry_marked_promotions(&sessions).await {
+                    tracing::warn!(%error, "durable promotion retry failed");
+                    metrics
+                        .counter("ab_reconcile_errors_total", "Reconciliation errors")
+                        .inc();
+                }
+                for session in sessions.idle_sessions(idle_s) {
+                    let session_id = session.id.clone();
+                    if let Err(error) = finalizer.close_session(session, StopReason::SessionClosed).await {
+                        tracing::warn!(session = %session_id, %error, "idle session finalization failed");
+                        metrics
+                            .counter("ab_reconcile_errors_total", "Reconciliation errors")
+                            .inc();
+                    }
+                }
+                let evicted = sessions.evict_finalized(idle_s);
+                if !evicted.is_empty() {
+                    tracing::debug!(count = evicted.len(), "evicted finalized signed sessions");
+                }
+            })
+            .catch_unwind()
+            .await;
+            if let Err(panic) = outcome {
+                let msg = panic
+                    .downcast_ref::<&'static str>()
+                    .copied()
+                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("panic payload was not a string");
+                metrics
+                    .counter(
+                        "ab_reconciler_panics_total",
+                        "Reconciler tick body panicked; loop supervised via catch_unwind",
+                    )
+                    .inc();
+                tracing::error!(
+                    panic = %msg,
+                    "reconciler tick body panicked; continuing on the next tick"
+                );
             }
             metrics
                 .histogram("ab_reconcile_duration_seconds", "Idle reconciliation duration")
@@ -3515,20 +3549,45 @@ mod tests {
     /// global `lifecycle_lock` the client close waited for the entire
     /// scan to finish. With per-session locks, close on session B
     /// proceeds while recovery is still scanning candidate A.
+    ///
+    /// Seeded with real spool candidates that force per-file I/O in
+    /// the scan; a concurrent close on a distinct session must
+    /// complete well below the scan's total duration. Without a
+    /// real spool the scan returns in microseconds and the test
+    /// cannot distinguish per-session locks from the old global lock.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn recovery_scan_does_not_head_of_line_block_unrelated_close() {
         let directory = tempfile::tempdir().unwrap();
         let finalizer = Arc::new(finalizer(directory.path()));
-        // Kick off a recovery scan (no spool candidates, so it returns
-        // immediately — but the recovery_lock is still acquired).
+        // Seed the spool with a pile of candidates that fail provenance
+        // (unauthenticated / not `.session.json`) so recovery iterates
+        // read_dir + read + hash + skip on each, taking observable
+        // wall-clock time. 64 candidates × per-file work ≫ the 200 ms
+        // budget below on the old global lock.
+        for i in 0..64 {
+            let path = directory.path().join(format!("scan-probe-{i}.json"));
+            let payload = serde_json::json!({
+                "atif_version": "1.7",
+                "session_id": format!("scan-probe-{i}"),
+                "agent": {"version": "1", "charter": "test", "instance_uid": "x"},
+                "steps": [],
+                "provenance": {"scheme": "none"},
+            });
+            tokio::fs::write(&path, serde_json::to_vec(&payload).unwrap())
+                .await
+                .unwrap();
+        }
         let f_scan = Arc::clone(&finalizer);
         let scan_task = tokio::spawn(async move {
             f_scan
                 .recover_spooled_sessions(&crate::session::SessionRegistry::new(), &Default::default())
                 .await
         });
-        // Concurrently close a session with a distinct id. This must
-        // complete without waiting on the scan's recovery lock.
+        // Small yield so the scan task grabs `recovery_lock` first —
+        // this is the state where the old global `lifecycle_lock`
+        // would have blocked the client close below.
+        tokio::task::yield_now().await;
+
         let session = Arc::new(Session::new(
             "unrelated-close".to_owned(),
             Workflow::Signed,
@@ -3540,14 +3599,18 @@ mod tests {
             },
             Default::default(),
         ));
+        // Tight timeout: under the OLD global `lifecycle_lock`, the
+        // client close would have waited for the entire 64-file
+        // scan to finish. Under per-session locks the close hits a
+        // different id and proceeds in a few ms.
         let close_result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(200),
             finalizer.close_session(session, StopReason::SessionClosed),
         )
         .await;
         assert!(
             close_result.is_ok(),
-            "unrelated close was blocked by recovery scan"
+            "unrelated close was head-of-line-blocked by the recovery scan (should have completed within 200 ms)"
         );
         let _ = scan_task.await;
     }

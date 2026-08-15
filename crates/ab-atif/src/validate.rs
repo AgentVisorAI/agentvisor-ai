@@ -459,7 +459,14 @@ fn validate_step(
     }
 
     // tool_calls + observation cross-references.
-    let mut call_ids: Vec<String> = Vec::new();
+    //
+    // `HashSet<String>` instead of `Vec<String>` so duplicate detection
+    // AND the observation source-id lookup below run in O(N + M)
+    // instead of O(N² + N·M). A `trajectory.json` with 100k tool calls
+    // and 100k observation results used to burn ~10¹⁰ string
+    // comparisons in the CLI validator (used by CI, promotion, and
+    // external auditors on untrusted files).
+    let mut call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(tc) = obj.get("tool_calls") {
         match tc.as_array() {
             Some(calls) => {
@@ -475,10 +482,9 @@ fn validate_step(
                     }
                     match c.get("tool_call_id").and_then(Value::as_str) {
                         Some(id) if !id.is_empty() => {
-                            if call_ids.iter().any(|existing| existing == id) {
+                            if !call_ids.insert(id.to_owned()) {
                                 issue!(issues, format!("{cpath}.tool_call_id"), "duplicate id {id:?}");
                             }
-                            call_ids.push(id.to_owned());
                         }
                         _ => issue!(
                             issues,
@@ -569,7 +575,7 @@ fn validate_step(
                                 }
                             }
                             if let Some(src_id) = res.get("source_call_id").and_then(Value::as_str) {
-                                if !call_ids.iter().any(|c| c == src_id) {
+                                if !call_ids.contains(src_id) {
                                     issue!(
                                         issues,
                                         format!("{rpath}.source_call_id"),

@@ -402,21 +402,49 @@ fn spawn_bridge_maintenance(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+        // Skip missed ticks under transient overload instead of the
+        // default catch-up burst. Bridge maintenance is fine to run
+        // once per hour even if the previous run took 30 minutes.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            let maintenance_bridge = Arc::clone(&bridge);
-            let result =
-                tokio::task::spawn_blocking(move || maintenance_bridge.maintenance(ab_core::time::now_ms()))
-                    .await;
-            match result {
-                Ok(Ok(actions)) => metrics
+            // Supervise the tick body: a panic inside the async wrapper
+            // (e.g., an allocator failure in tracing::warn's Display
+            // impl) would otherwise silently kill maintenance, and the
+            // 1 h cadence hides the outage until Bridge hot retention
+            // grows unbounded and fills the disk.
+            let outcome = std::panic::AssertUnwindSafe(async {
+                let maintenance_bridge = Arc::clone(&bridge);
+                let result = tokio::task::spawn_blocking(move || {
+                    maintenance_bridge.maintenance(ab_core::time::now_ms())
+                })
+                .await;
+                match result {
+                    Ok(Ok(actions)) => metrics
+                        .counter(
+                            "ab_bridge_maintenance_actions_total",
+                            "Bridge retention expirations and cold-export retries",
+                        )
+                        .add(actions),
+                    Ok(Err(error)) => tracing::warn!(%error, "Bridge maintenance failed"),
+                    Err(error) => tracing::warn!(%error, "Bridge maintenance task failed"),
+                }
+            })
+            .catch_unwind()
+            .await;
+            if let Err(panic) = outcome {
+                let msg = panic
+                    .downcast_ref::<&'static str>()
+                    .copied()
+                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("panic payload was not a string");
+                metrics
                     .counter(
-                        "ab_bridge_maintenance_actions_total",
-                        "Bridge retention expirations and cold-export retries",
+                        "ab_bridge_maintenance_panics_total",
+                        "Bridge maintenance tick panicked; loop supervised via catch_unwind",
                     )
-                    .add(actions),
-                Ok(Err(error)) => tracing::warn!(%error, "Bridge maintenance failed"),
-                Err(error) => tracing::warn!(%error, "Bridge maintenance task failed"),
+                    .inc();
+                tracing::error!(panic = %msg, "Bridge maintenance tick panicked; continuing");
             }
         }
     })
@@ -469,6 +497,12 @@ async fn build_identity(config: &HarnessConfig) -> Result<Option<Arc<IdentityVal
             // running with a stale key set. If the loop *does* panic, we
             // log + count + rebuild the loop.
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(refresh_s));
+            // Skip missed ticks instead of the default catch-up burst
+            // — if a JWKS fetch takes longer than one interval (rare
+            // but possible under IdP overload) we should not
+            // immediately re-fire; another key rotation is minutes
+            // away.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             interval.tick().await;
             loop {
                 interval.tick().await;

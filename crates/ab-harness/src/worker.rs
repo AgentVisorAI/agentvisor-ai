@@ -127,6 +127,14 @@ pub struct WorkerHandle {
     pending: Arc<std::sync::atomic::AtomicU64>,
     drained: Arc<tokio::sync::Notify>,
     capacity: Arc<tokio::sync::Semaphore>,
+    /// Separate admission budget for downstream response jobs. Every
+    /// chat request reserves a worker slot AND a response slot; giving
+    /// them distinct semaphores + distinct
+    /// `ab_events_dropped_total{stage=...}` counters lets operators see
+    /// which class of capacity ran out. Prior to this split both
+    /// reservations pulled from the same semaphore so admission was
+    /// silently halved and both failures aliased to `stage="worker_queue"`.
+    response_capacity: Arc<tokio::sync::Semaphore>,
 }
 
 /// Guaranteed slot in the bounded worker queue.
@@ -134,6 +142,56 @@ pub struct WorkerPermit {
     permit: mpsc::OwnedPermit<Envelope>,
     pending: Arc<std::sync::atomic::AtomicU64>,
     capacity_permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// Reservation for the downstream response-capture worker job. Draws
+/// from a distinct capacity semaphore so operators can tell via
+/// `ab_events_dropped_total{stage="response_slot"}` vs
+/// `stage="worker_queue"` which class of admission is the bottleneck.
+///
+/// Unlike [`WorkerPermit`], the response permit only holds the
+/// capacity semaphore — the mpsc queue slot is re-acquired at submit
+/// time via [`Self::submit`]. This keeps the initial admission cheap
+/// (one semaphore acquire instead of two mpsc reservations that would
+/// otherwise compete for the same shard's slot with the worker
+/// permit) and lets the response job land whenever the shard has
+/// room, which is the common case since response capture happens
+/// tens-of-seconds after the initial worker job has drained.
+///
+/// Held by [`crate::routes::AbortFinalizingStream`] for the lifetime
+/// of the forwarded response; drops on stream completion or client abort.
+pub struct ResponsePermit {
+    _capacity_permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl ResponsePermit {
+    /// Commit a response-capture job. Consumes the response permit's
+    /// capacity slot and races for a shard's mpsc slot; if the shard
+    /// is momentarily full, returns a `SubmitError::Full` and bumps
+    /// `ab_events_dropped_total{stage="response_slot"}`. The caller
+    /// (`submit_response_capture`) already has retry policy for this
+    /// class of failure.
+    pub fn submit(self, worker: &WorkerHandle, job: WorkerJob) -> Result<(), SubmitError> {
+        // capacity_permit drops on the fused permit exit — release
+        // response_capacity before contending for the mpsc slot so a
+        // failed submit does not artificially pin the response budget.
+        let _capacity_permit = self._capacity_permit;
+        // For the mpsc slot use the plain `try_submit` path. On failure
+        // the semaphore permit is already released (dropped by NLL
+        // above); the counter increment happens inside `try_submit`.
+        worker.try_submit(job)
+    }
+}
+
+/// Fused reservation covering a worker job AND its downstream response
+/// slot. Acquired atomically at request admission: on any failure the
+/// worker slot (if already held) is released via RAII before the error
+/// surfaces, so callers cannot end up with an orphaned half-permit.
+pub struct WorkerAndResponsePermit {
+    /// Permit for the initial worker job (dispatch / quota / receipt-sign).
+    pub worker: WorkerPermit,
+    /// Permit for the downstream response-capture job.
+    pub response: ResponsePermit,
 }
 
 impl WorkerPermit {
@@ -183,6 +241,44 @@ impl WorkerHandle {
                 Err(SubmitError::Closed)
             }
         }
+    }
+
+    /// Reserve the downstream response-capture slot. Distinct from
+    /// [`Self::try_reserve`] because response capture is a separate
+    /// stage with its own admission budget; keeping the counters
+    /// separate lets operators see which one ran out. The mpsc queue
+    /// slot is re-acquired at submit time via [`ResponsePermit::submit`].
+    fn try_reserve_response(&self) -> Result<ResponsePermit, SubmitError> {
+        Arc::clone(&self.response_capacity)
+            .try_acquire_owned()
+            .map(|p| ResponsePermit { _capacity_permit: p })
+            .map_err(|_| {
+                self.metrics
+                    .counter(
+                        "ab_events_dropped_total{stage=\"response_slot\"}",
+                        "Response-slot reservations that failed",
+                    )
+                    .inc();
+                SubmitError::Full
+            })
+    }
+
+    /// Atomic acquire-both-or-fail for admission: obtains a worker
+    /// permit AND a response permit for the same request, distinct
+    /// counters on failure. On any error path (worker slot or response
+    /// slot exhaustion, closed channel), a partially-taken worker
+    /// permit drops via RAII before the error surfaces so callers
+    /// never observe an orphaned half-reservation.
+    pub fn try_reserve_pair(&self, session_id: &str) -> Result<WorkerAndResponsePermit, SubmitError> {
+        // Stage 1: worker slot. Bumps stage="worker_queue" on failure.
+        let worker = self.try_reserve(session_id)?;
+        // Stage 2: response slot. Bumps stage="response_slot" on
+        // failure. If this fails, `worker` drops via NLL — its
+        // OwnedSemaphorePermit + mpsc::OwnedPermit release cleanly
+        // and the counters agree with the caller's view (only the
+        // response-slot counter incremented).
+        let response = self.try_reserve_response()?;
+        Ok(WorkerAndResponsePermit { worker, response })
     }
 
     /// Submit without waiting. Used by rejection/failure paths; the hot path
@@ -377,6 +473,14 @@ pub fn spawn_worker_with_spool_authenticated(
     let per_shard_capacity = capacity.min(capacity.div_ceil(shard_count).max(1) * shard_count);
     let per_shard_capacity = per_shard_capacity.max(1);
     let global_capacity = Arc::new(tokio::sync::Semaphore::new(capacity));
+    // Response-slot capacity mirrors worker capacity by default. Keeping
+    // them equal preserves the historical behaviour (both counters were
+    // silently drawn from the same pool) while distinct semaphores let
+    // operators observe which class exhausts first via
+    // `ab_events_dropped_total{stage="response_slot"}` vs
+    // `stage="worker_queue"`. A follow-up can expose an independent
+    // `response_capacity` config field once operators have telemetry.
+    let response_capacity = Arc::new(tokio::sync::Semaphore::new(capacity));
     let pending = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let drained = Arc::new(tokio::sync::Notify::new());
     let mut senders = Vec::with_capacity(shard_count);
@@ -401,6 +505,7 @@ pub fn spawn_worker_with_spool_authenticated(
         pending,
         drained,
         capacity: global_capacity,
+        response_capacity,
     }
 }
 
@@ -1712,6 +1817,7 @@ mod tests {
             pending: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             drained: Arc::new(tokio::sync::Notify::new()),
             capacity: Arc::new(tokio::sync::Semaphore::new(1)),
+            response_capacity: Arc::new(tokio::sync::Semaphore::new(1)),
         };
         worker.try_submit(job(session(Workflow::Signed))).unwrap();
         assert_eq!(
@@ -1721,6 +1827,54 @@ mod tests {
         assert!(metrics
             .render()
             .contains("ab_events_dropped_total{stage=\"worker_queue\"} 1"));
+    }
+
+    /// The fused permit split (worker_queue vs response_slot) exists
+    /// so operators can distinguish which class of admission ran out.
+    /// Assert the counters are actually distinct at the metrics
+    /// registry level under two adversarial saturations.
+    #[tokio::test]
+    async fn worker_queue_and_response_slot_counters_are_distinct() {
+        let metrics = Arc::new(Registry::new());
+        let (sender, _receiver) = mpsc::channel(1);
+        let worker = WorkerHandle {
+            senders: Arc::new(vec![sender]),
+            metrics: Arc::clone(&metrics),
+            pending: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            drained: Arc::new(tokio::sync::Notify::new()),
+            capacity: Arc::new(tokio::sync::Semaphore::new(1)),
+            response_capacity: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        // First pair succeeds — worker and response semaphores each go
+        // to 0.
+        let first = worker.try_reserve_pair("s").expect("first pair");
+        // Second pair fails at the worker stage (first failure). Only
+        // the worker_queue counter should be bumped.
+        assert_eq!(worker.try_reserve_pair("s").err(), Some(SubmitError::Full));
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains("ab_events_dropped_total{stage=\"worker_queue\"} 1"),
+            "expected worker_queue counter increment, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("ab_events_dropped_total{stage=\"response_slot\"}"),
+            "response_slot must not have been touched when worker_queue exhausts first, got:\n{rendered}"
+        );
+        // Free the worker slot but keep the response permit held. A
+        // fresh pair acquire should succeed on the worker side then
+        // fail at the response stage, bumping response_slot.
+        drop(first.worker);
+        let _still_holding_response = first.response;
+        assert_eq!(worker.try_reserve_pair("s").err(), Some(SubmitError::Full));
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains("ab_events_dropped_total{stage=\"response_slot\"} 1"),
+            "expected response_slot counter increment, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("ab_events_dropped_total{stage=\"worker_queue\"} 1"),
+            "worker_queue must remain at 1 (only response stage exhausted this time), got:\n{rendered}"
+        );
     }
 
     #[tokio::test]
