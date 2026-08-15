@@ -186,6 +186,35 @@ fn algorithm_confusion_hs256_signed_with_public_pem_rejected() {
     ));
 }
 
+/// Round-44 F5 / RUSTSEC-2023-0071: our deny.toml ignore of the Marvin
+/// Attack rests on the invariant that the RSA code path in
+/// `jsonwebtoken` is unreachable from our runtime. This test locks that
+/// invariant in against future refactors. A JWT claiming `alg: RS256`
+/// (or PS256, RS384, ...) MUST be rejected by the validator BEFORE any
+/// signature decode runs, so the RSA timing side channel can never leak.
+///
+/// The token below is hand-forged (no `rsa` crate needed to mint it —
+/// the sig can be any bytes because we assert rejection at the alg-
+/// check step, prior to signature verification).
+#[test]
+fn rsa_algorithm_family_rejected_before_decode_marvin_attack_unreachable() {
+    let keys = ed25519_keys("k1");
+    let v = validator(&keys);
+    let claims_json = serde_json::to_string(&claims(&["tool:admin"], 600, None)).unwrap();
+    let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&claims_json);
+    let garbage_sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 256]);
+    for rsa_alg in ["RS256", "RS384", "RS512", "PS256", "PS384", "PS512"] {
+        let header_json = format!(r#"{{"alg":"{rsa_alg}","typ":"JWT","kid":"k1"}}"#);
+        let header_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&header_json);
+        let token = format!("{header_b64}.{payload_b64}.{garbage_sig}");
+        let result = v.validate(&token);
+        assert!(
+            matches!(result, Err(IdentityError::AlgorithmRejected { .. })),
+            "{rsa_alg} MUST be rejected before decode so the RSA timing side channel (RUSTSEC-2023-0071) stays unreachable; got {result:?}",
+        );
+    }
+}
+
 #[test]
 fn wrong_key_signature_rejected() {
     let real = ed25519_keys("k1");
