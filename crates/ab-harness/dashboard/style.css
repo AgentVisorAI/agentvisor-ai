@@ -541,6 +541,9 @@ p code {
 .receipt-block .k { color: #d18ac5; }
 .receipt-block .s { color: #a5cef5; }
 .receipt-block .n { color: #e59b7c; }
+/* Round-28 F6: booleans and null get their own colour so receipt
+   viewers can tell them apart from numbers at a glance. */
+.receipt-block .b { color: #9dd18a; }
 
 /* --- Footer -------------------------------------------------------- */
 

@@ -1291,7 +1291,13 @@ pub async fn doctor(offline: bool) -> Result<()> {
                 match probe_endpoint(endpoint).await {
                     Ok(()) => checks.push(Check::Pass(format!("{label}: {endpoint} reachable"))),
                     Err(error) => {
-                        checks.push(Check::Fail(format!("{label}: {endpoint} unreachable ({error})")));
+                        // Round-28 F5: DO NOT echo `endpoint` verbatim
+                        // in the failure line — a redis/qdrant URL may
+                        // embed userinfo (`redis://user:pass@host/0`)
+                        // and this text lands on stderr, which CI
+                        // pipelines routinely capture. Report the
+                        // label + probe error only.
+                        checks.push(Check::Fail(format!("{label}: unreachable ({error})")));
                     }
                 }
             }
@@ -1319,21 +1325,59 @@ pub async fn doctor(offline: bool) -> Result<()> {
 
 /// TCP-connect to `host:port` extracted from a URL or bare `host:port`.
 async fn probe_endpoint(endpoint: &str) -> Result<()> {
-    let target = match endpoint.split_once("://") {
-        Some((_, rest)) => rest.split(['/', '?']).next().unwrap_or(rest),
-        None => endpoint,
-    };
-    let target = if target.contains(':') {
-        target.to_owned()
-    } else {
-        // Scheme-driven default port for schemeless probing.
-        format!("{target}:80")
-    };
+    let target = probe_target(endpoint)?;
     tokio::time::timeout(Duration::from_secs(3), tokio::net::TcpStream::connect(&target))
         .await
         .map_err(|_| anyhow::anyhow!("timeout"))?
         .map(|_| ())
         .map_err(anyhow::Error::from)
+}
+
+/// Round-28 F1 + F5: extract the `host:port` from a URL or bare
+/// `host:port` string. Split out as a pure helper so tests can lock
+/// in three formerly-buggy behaviours: (F1) scheme-driven default
+/// ports for HTTPS/redis/nats/rediss, (F5) userinfo stripping so
+/// credentials never leak into the connect target or into error text,
+/// and IPv6 bracketed literals staying intact.
+fn probe_target(endpoint: &str) -> Result<String> {
+    let (scheme, rest) = match endpoint.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, endpoint),
+    };
+    // Strip userinfo (`user:pass@`).
+    let hostpart = rest.rsplit_once('@').map_or(rest, |(_userinfo, host)| host);
+    // Trim path/query/fragment.
+    let host_and_port = hostpart
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(hostpart);
+    let (host, port_opt) = if let Some(stripped) = host_and_port.strip_prefix('[') {
+        match stripped.split_once(']') {
+            Some((h, tail)) => {
+                let port = tail.strip_prefix(':').and_then(|p| p.parse::<u16>().ok());
+                (format!("[{h}]"), port)
+            }
+            None => (host_and_port.to_owned(), None),
+        }
+    } else {
+        match host_and_port.rsplit_once(':') {
+            Some((h, p)) if p.parse::<u16>().is_ok() => {
+                (h.to_owned(), p.parse::<u16>().ok())
+            }
+            _ => (host_and_port.to_owned(), None),
+        }
+    };
+    let default_port: u16 = match scheme {
+        Some("https") | Some("wss") | Some("rediss") | Some("qdrant+https") => 443,
+        Some("nats") | Some("tls+nats") | Some("nats+tls") => 4222,
+        Some("redis") => 6379,
+        _ => 80,
+    };
+    let port = port_opt.unwrap_or(default_port);
+    if host.is_empty() {
+        anyhow::bail!("no host in endpoint");
+    }
+    Ok(format!("{host}:{port}"))
 }
 
 /// `abctl health` — probe a running harness; exit 0 only on HTTP 200.
@@ -1702,5 +1746,33 @@ mod tests {
         // "config" is preserved; the victim itself must not gain our TOML.
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
         assert!(std::fs::read_to_string(&config_path).unwrap().contains("11434"));
+    }
+
+    /// Round-28 F1 + F5: probe_target parses URLs correctly across
+    /// scheme-driven default ports, userinfo stripping, and IPv6
+    /// literals.
+    #[test]
+    fn round_28_probe_target_parses_urls_correctly() {
+        // F1: scheme-driven defaults, not the old hardcoded :80.
+        assert_eq!(probe_target("https://api.example.com").unwrap(), "api.example.com:443");
+        assert_eq!(probe_target("redis://cache.example.com").unwrap(), "cache.example.com:6379");
+        assert_eq!(probe_target("rediss://cache.example.com").unwrap(), "cache.example.com:443");
+        assert_eq!(probe_target("nats://bus.example.com").unwrap(), "bus.example.com:4222");
+        // Explicit port always wins over scheme default.
+        assert_eq!(probe_target("https://api.example.com:6333").unwrap(), "api.example.com:6333");
+        assert_eq!(probe_target("http://api.example.com:8080/path?q=1").unwrap(), "api.example.com:8080");
+        // Bare host without scheme defaults to :80.
+        assert_eq!(probe_target("localhost").unwrap(), "localhost:80");
+        assert_eq!(probe_target("localhost:6379").unwrap(), "localhost:6379");
+        // F5: userinfo is stripped before the connect target so
+        // credentials never reach TcpStream::connect or the failure
+        // path's error text.
+        let target = probe_target("redis://user:pass@cache.example.com/0").unwrap();
+        assert_eq!(target, "cache.example.com:6379");
+        assert!(!target.contains("user"), "userinfo leaked into target: {target}");
+        assert!(!target.contains("pass"), "userinfo leaked into target: {target}");
+        // IPv6 literals stay bracketed and preserve default port.
+        assert_eq!(probe_target("http://[::1]").unwrap(), "[::1]:80");
+        assert_eq!(probe_target("https://[2001:db8::1]:8443").unwrap(), "[2001:db8::1]:8443");
     }
 }
