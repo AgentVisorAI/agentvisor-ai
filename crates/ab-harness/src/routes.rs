@@ -491,6 +491,21 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         };
         return complete_tool_audit(execution, outcome, completion_permit, session).await;
     }
+    // Round-32 F3 (deferred): concurrent identical MCP requests
+    // (same x-ab-session + same JSON-RPC id) race between the
+    // `state=Missing` decision above and `execution.claim()` below.
+    // Both requests pass the `intercept_tool_nonblocking` sandbox
+    // gate — which atomically spends `payout_micros` via
+    // `ActionBudget::try_tool_call` — before the atomic claim.
+    // Loser returns `TOOL_OUTCOME_UNCERTAIN` (CONFLICT) after the
+    // budget has already been debited, so `payout_remaining` is
+    // decremented by `2 x payout_micros` for one successful call.
+    // Full fix requires either (a) moving `execution.claim()`
+    // ahead of `intercept_tool_nonblocking` with a release-on-
+    // block orphan-intent cleanup path, or (b) adding
+    // `ActionBudget::refund_tool_call` on the lost-claim branch.
+    // Both are bigger than a surgical patch; tracked for a
+    // dedicated round.
     match state.intercept_tool_nonblocking(&headers, &body).await {
         Ok(ToolVerdict::Allowed {
             tool,
@@ -541,10 +556,11 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                     Ok(upstream) => {
                         let status = upstream.status();
                         match read_limited_tool_response(upstream).await {
-                            Ok(bytes) => {
+                            Ok((bytes, content_type)) => {
                                 let outcome = ToolOutcome {
                                     status: status.as_u16(),
                                     body_hex: hex::encode(&bytes),
+                                    content_type,
                                 };
                                 if let Err(error) = execution.persist(&outcome).await {
                                     return lifecycle_error(error);
@@ -600,7 +616,22 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
 
 const MAX_TOOL_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
-async fn read_limited_tool_response(response: reqwest::Response) -> Result<Bytes, String> {
+/// Round-32 F2: capture and preserve the upstream tool response's
+/// `Content-Type` so the MCP client sees exactly what the tool
+/// upstream sent. Without this, `Bytes: IntoResponse` stamps
+/// `application/octet-stream`, which strict JSON-RPC 2.0 clients
+/// (spec: MUST be `application/json`) reject and downstream SIEM
+/// filters mis-classify as binary. We store the string (not
+/// HeaderValue) so it round-trips through the on-disk `ToolOutcome`
+/// journal for cached-outcome replay.
+async fn read_limited_tool_response(
+    response: reqwest::Response,
+) -> Result<(Bytes, Option<String>), String> {
+    let content_type = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -626,7 +657,22 @@ async fn read_limited_tool_response(response: reqwest::Response) -> Result<Bytes
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(Bytes::from(body))
+    Ok((Bytes::from(body), content_type))
+}
+
+/// Build a tool-response with the round-32 F2 Content-Type
+/// preserved. Defaults to `application/json` — MCP is JSON-RPC 2.0
+/// by convention — when the upstream did not set one or set an
+/// unrepresentable value.
+fn tool_response(status: StatusCode, bytes: Bytes, content_type: Option<&str>) -> Response {
+    let mut response = (status, bytes).into_response();
+    let value = content_type
+        .and_then(|ct| HeaderValue::from_str(ct).ok())
+        .unwrap_or_else(|| HeaderValue::from_static("application/json"));
+    response
+        .headers_mut()
+        .insert(axum::http::header::CONTENT_TYPE, value);
+    response
 }
 
 async fn complete_tool_audit(
@@ -681,20 +727,32 @@ async fn complete_tool_audit(
     if let Err(error) = execution.mark_audited().await {
         return lifecycle_error(error);
     }
-    (status, bytes).into_response()
+    // Round-32 F2: preserve the upstream Content-Type so a spec-
+    // conforming JSON-RPC 2.0 client sees `application/json`
+    // (default) or whatever the tool upstream declared, not axum's
+    // `application/octet-stream`.
+    tool_response(status, bytes, outcome.content_type.as_deref())
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ToolOutcome {
     status: u16,
     body_hex: String,
+    /// Round-32 F2: MCP client requires the upstream tool response's
+    /// `Content-Type` to round-trip on cached-outcome replay too, so
+    /// strict JSON-RPC 2.0 clients see `application/json` on replay
+    /// just as they did on the fresh forward. `#[serde(default)]` so
+    /// journals persisted before the field existed decode as `None`
+    /// (which the response builder will map to the JSON default).
+    #[serde(default)]
+    content_type: Option<String>,
 }
 
 impl ToolOutcome {
     fn into_response(self) -> Response {
         let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::BAD_GATEWAY);
         match hex::decode(self.body_hex) {
-            Ok(body) => (status, Bytes::from(body)).into_response(),
+            Ok(body) => tool_response(status, Bytes::from(body), self.content_type.as_deref()),
             Err(error) => lifecycle_error(format!("decode cached tool response: {error}")),
         }
     }
@@ -3093,6 +3151,7 @@ mod tests {
             .persist(&ToolOutcome {
                 status: 200,
                 body_hex: hex::encode(body),
+                content_type: Some("application/json".to_owned()),
             })
             .await
             .unwrap();
@@ -4044,5 +4103,63 @@ mod tests {
             }
         }
         provider.abort();
+    }
+
+    /// Round-32 F2: cached MCP tool-outcome replays preserve the
+    /// upstream Content-Type end-to-end (including through the
+    /// on-disk journal roundtrip). Strict JSON-RPC 2.0 clients
+    /// (spec: MUST be `application/json`) would previously receive
+    /// `application/octet-stream` on both the fresh forward and the
+    /// cached replay. This test locks in:
+    ///   1. `ToolOutcome::into_response` honours a set content_type.
+    ///   2. A `None` content_type defaults to `application/json`
+    ///      (MCP is JSON-RPC 2.0 by convention).
+    ///   3. Serialising and re-deserialising a `ToolOutcome` (i.e.
+    ///      the on-disk journal round-trip) preserves the field.
+    ///   4. Legacy journals without the field decode as `None` and
+    ///      pick up the default via #1.
+    #[test]
+    fn round_32_f2_tool_outcome_preserves_content_type() {
+        // (1) Custom content_type survives.
+        let outcome = ToolOutcome {
+            status: 200,
+            body_hex: hex::encode(b"{\"jsonrpc\":\"2.0\"}"),
+            content_type: Some("application/problem+json".to_owned()),
+        };
+        let response = outcome.into_response();
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/problem+json")
+        );
+        // (2) None -> application/json default.
+        let outcome_no_ct = ToolOutcome {
+            status: 200,
+            body_hex: hex::encode(b"{}"),
+            content_type: None,
+        };
+        let response = outcome_no_ct.into_response();
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        // (3) Journal round-trip preserves the field.
+        let sealed = serde_json::to_string(&ToolOutcome {
+            status: 429,
+            body_hex: hex::encode(b"{}"),
+            content_type: Some("text/plain".to_owned()),
+        })
+        .unwrap();
+        let recovered: ToolOutcome = serde_json::from_str(&sealed).unwrap();
+        assert_eq!(recovered.content_type.as_deref(), Some("text/plain"));
+        // (4) Legacy journal without the field decodes as None.
+        let legacy = r#"{"status":200,"body_hex":"7b7d"}"#;
+        let outcome: ToolOutcome = serde_json::from_str(legacy).unwrap();
+        assert!(outcome.content_type.is_none());
     }
 }

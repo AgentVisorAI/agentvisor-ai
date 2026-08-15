@@ -8,7 +8,7 @@
 //! only users outside this crate are the integration tests in
 //! `crates/ab-state/tests/e2e_race_velocity.rs`. The type predates the
 //! current admission / loop-breaker plumbing and was never connected to
-//! either the breaker's `min_tokens` gate ([`ab_loopdetect`]) or any
+//! either the breaker's `min_tokens` gate (in `ab_loopdetect`) or any
 //! harness rate-limit path.
 //!
 //! **Do not wire this into the breaker without a shared per-session
@@ -19,10 +19,10 @@
 //! velocity window guarded by the same mutex the breaker already holds.
 //!
 //! The type is kept public for now (rather than deleted) because the
-//! sliding-window arithmetic is exercised by [`e2e_race_velocity`]
-//! adversarial tests that lock in the round-26 F5 `saturating_add`
-//! discipline — reusable ground for the future breaker-integrated
-//! window when someone builds it.
+//! sliding-window arithmetic is exercised by the
+//! `e2e_race_velocity` adversarial tests that lock in the
+//! round-26 F5 `saturating_add` discipline — reusable ground for the
+//! future breaker-integrated window when someone builds it.
 
 use parking_lot::Mutex;
 use std::collections::VecDeque;

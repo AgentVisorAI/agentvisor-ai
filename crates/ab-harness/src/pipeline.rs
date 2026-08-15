@@ -476,9 +476,22 @@ impl AppState {
             // the pool memory footprint and forces frequent-enough
             // TLS refresh under a rolling cert rotation.
             .pool_idle_timeout(std::time::Duration::from_secs(60));
-        if let Some(seconds) = config.upstream_read_timeout_s {
-            client_builder = client_builder.read_timeout(std::time::Duration::from_secs(seconds));
-        }
+        // Round-32 F4: apply a read-timeout floor unconditionally so an
+        // adversarial or merely broken upstream (chat OR tool) cannot pin
+        // a session lease + WorkerPermit + tool-intent claim
+        // indefinitely by accepting the request and then never
+        // responding. TCP keepalive above only detects a hung
+        // *connection*, not a slow/silent HTTP response. Operators can
+        // widen or override via `upstream_read_timeout_s`; the shipped
+        // default (60 s) is well past any realistic first-token
+        // latency (Claude p99 ~15 s, GPT-4 p99 ~30 s) but firm enough
+        // that a stalled provider surfaces as a definite 502 rather
+        // than a resource-starving hang.
+        const DEFAULT_UPSTREAM_READ_TIMEOUT_S: u64 = 60;
+        let read_timeout_s = config
+            .upstream_read_timeout_s
+            .unwrap_or(DEFAULT_UPSTREAM_READ_TIMEOUT_S);
+        client_builder = client_builder.read_timeout(std::time::Duration::from_secs(read_timeout_s));
         if config.upstream_http2_prior_knowledge {
             client_builder = client_builder.http2_prior_knowledge();
         }
