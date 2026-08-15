@@ -1,23 +1,20 @@
-[sources.agent_bridge]
-type = "docker_logs"
-include_containers = ["agent-bridge"]
+# Round-24 F1: previously included [sources.agent_bridge] type =
+# "docker_logs" which required mounting /var/run/docker.sock into the
+# Vector container. Read-only doesn't stop `docker inspect` calls that
+# read every co-scheduled container's env (which includes
+# AB_UPSTREAM_API_KEY). agent-bridge already emits OTel logs over the
+# compose network to :4318, so the docker_logs source is redundant. If
+# you need container-log discovery, put a docker-socket-proxy in front
+# and add a `docker_logs` source pointing at the proxy.
 
 [sources.otlp]
 type = "opentelemetry"
 grpc.address = "0.0.0.0:4317"
 http.address = "0.0.0.0:4318"
 
-[transforms.structured]
-type = "remap"
-inputs = ["agent_bridge"]
-source = '''
-. = merge(., parse_json(.message) ?? {})
-.service = "agent-bridge"
-'''
-
 [sinks.console]
 type = "console"
-inputs = ["structured", "otlp.logs", "otlp.metrics", "otlp.traces"]
+inputs = ["otlp.logs", "otlp.metrics", "otlp.traces"]
 encoding.codec = "json"
 
 # Replace this sink with the customer-owned Datadog, Splunk, or OTLP endpoint.

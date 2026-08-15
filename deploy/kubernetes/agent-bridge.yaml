@@ -174,8 +174,18 @@ spec:
               readOnly: true
             - name: data
               mountPath: /app/data
-            - name: spool
+            # Round-24 F4: the ATIF spool used to be an emptyDir. That
+            # volume is destroyed with the Pod. terminationGracePeriod
+            # protects voluntary shutdown; OOMKill, node loss,
+            # preemption, --force delete, and NodePressure eviction
+            # bypass grace and lose in-flight journals — the very
+            # outcome the four-phase finalize was designed to
+            # prevent. Subpath the spool onto the existing durable
+            # PVC so recover_spooled_sessions() has real inputs on
+            # restart.
+            - name: data
               mountPath: /app/spool
+              subPath: spool
           # Cold-start budget: schema compilation, ONNX weights when the
           # embedder backend is `onnx`, and embedded-bridge recovery from
           # the mounted PVC can trivially exceed 5 s. A startupProbe with
@@ -240,8 +250,10 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: agent-bridge-data
-        - name: spool
-          emptyDir: {}
+        # Round-24 F4: ATIF spool now lives on the durable PVC via
+        # subPath (see the container's volumeMounts). The old
+        # emptyDir volume was destroyed on any involuntary Pod
+        # termination and lost in-flight journals.
 ---
 apiVersion: v1
 kind: Service
