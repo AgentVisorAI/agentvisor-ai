@@ -695,19 +695,29 @@ async fn refresh_jwks(client: &reqwest::Client, url: &str, validator: &IdentityV
     // (1 Gbit/s) 1 second is enough to deliver >100 MB, so the timeout
     // alone is not a sufficient defense.
     //
-    // Round-35 F2: every error return must be URL-free. Callers log
-    // this fn's error via anyhow's Display, which walks the whole
-    // context chain — embedding the URL in a `.with_context()` used
-    // to leak the corp IdP hostname to downstream OTLP sinks.
-    // Structured logs at the call site record the stable category.
+    // Round-35 F2 + round-36 F2: every error return must be URL-free.
+    // The prior fix removed the URL from `.with_context()` prepends,
+    // but `.context("fetch JWKS")` still wraps a `reqwest::Error`
+    // whose Display embeds the URL (`error sending request for url
+    // (...)`) — anyhow's Display walks the whole chain and prints
+    // the inner reqwest error verbatim. Convert the reqwest error
+    // to a URL-free anyhow::Error using `reqwest::Error::without_url`
+    // before the context wrap so no downstream `%error` on the boot
+    // path or future logger can leak the IdP hostname.
     const MAX_JWKS_BYTES: usize = 4 * 1024 * 1024;
     let response = client
         .get(url)
         .send()
         .await
-        .context("fetch JWKS")?
+        .map_err(|error| anyhow::anyhow!("fetch JWKS: {}", error.without_url()))?
         .error_for_status()
-        .context("JWKS endpoint returned an error")?;
+        .map_err(|error| {
+            let status = error
+                .status()
+                .map(|s| s.as_u16().to_string())
+                .unwrap_or_else(|| "unknown".into());
+            anyhow::anyhow!("JWKS endpoint returned status {status}")
+        })?;
     // Fast reject: if Content-Length is present and already exceeds the
     // cap, refuse without allocating anything for the body.
     if let Some(len) = response.content_length() {
@@ -721,7 +731,9 @@ async fn refresh_jwks(client: &reqwest::Client, url: &str, validator: &IdentityV
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("read JWKS chunk")?;
+        let chunk = chunk.map_err(|error| {
+            anyhow::anyhow!("read JWKS chunk: {}", error.without_url())
+        })?;
         let next = body
             .len()
             .checked_add(chunk.len())
@@ -1063,7 +1075,7 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
             // failure is now avoided at source.
             if let Err(error) = std::fs::remove_file(&temporary) {
                 tracing::warn!(
-                    path = %temporary.display(),
+                    path = %ab_core::fsutil::basename(&temporary),
                     %error,
                     "signing seed installed, but removing tmp file failed; guard drop will retry"
                 );
@@ -1071,7 +1083,7 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
             guard.disarm();
             if let Err(error) = ab_core::fsutil::sync_directory(parent) {
                 tracing::warn!(
-                    path = %parent.display(),
+                    dir = %ab_core::fsutil::basename(parent),
                     %error,
                     "signing seed installed, but parent directory fsync failed; dirent may not survive an immediate power loss"
                 );
@@ -1431,6 +1443,80 @@ mod tests {
         assert!(
             !category.contains("://") && !category.contains(&addr.to_string()),
             "classify_jwks_error must be URL-free. Got: {category}"
+        );
+        server.abort();
+    }
+
+    /// Round-36 F2: assert the URL-free posture on the reqwest-error
+    /// branches (`.send()` connect failure, `.error_for_status()`
+    /// non-2xx). Round-35 F2's tests only covered
+    /// `anyhow::bail!("... exceeded ...")` — the two paths above
+    /// wrapped a `reqwest::Error` whose Display embeds the URL,
+    /// and the round-35 `.context("...")` prepend did NOT strip it.
+    /// The round-36 fix converts via `reqwest::Error::without_url`
+    /// before the anyhow wrap; this test locks it in for both
+    /// branches by pointing refresh_jwks at:
+    ///   (a) a socket that immediately closes (send failure), and
+    ///   (b) a server returning 500 (error_for_status failure).
+    #[tokio::test]
+    async fn refresh_jwks_send_failure_is_url_free() {
+        // Bind a listener but immediately drop it so the request
+        // hits a closed port — reqwest surfaces a connect error.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let validator = ab_identity::IdentityValidator::new("test-aud");
+        let url = format!("http://{addr}/jwks");
+        let err = refresh_jwks(&client, &url, &validator).await.unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            !text.contains("://"),
+            "send-failure error must be URL-free; got: {text}"
+        );
+        assert!(
+            !text.contains(&addr.to_string()),
+            "send-failure error must not contain host:port; got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_jwks_non_2xx_is_url_free() {
+        use axum::routing::get;
+        let router = axum::Router::new().route(
+            "/jwks",
+            get(|| async {
+                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "server broke")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let validator = ab_identity::IdentityValidator::new("test-aud");
+        let url = format!("http://{addr}/jwks");
+        let err = refresh_jwks(&client, &url, &validator).await.unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            !text.contains("://"),
+            "non-2xx error must be URL-free; got: {text}"
+        );
+        assert!(
+            !text.contains(&addr.to_string()),
+            "non-2xx error must not contain host:port; got: {text}"
+        );
+        // The stable status number is a legit signal for operators.
+        assert!(
+            text.contains("500"),
+            "non-2xx error should carry the numeric status for triage; got: {text}"
         );
         server.abort();
     }
