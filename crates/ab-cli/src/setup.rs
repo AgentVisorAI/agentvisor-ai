@@ -319,6 +319,24 @@ pub fn init(
         std::fs::create_dir_all(parent).with_context(|| format!("create directory {}", parent.display()))?;
     }
     std::fs::write(output, &rendered).with_context(|| format!("write {}", output.display()))?;
+    // Round-43 F3: match the signing-seed installer at :578 which
+    // explicitly opens with mode(0o600). The rendered config carries
+    // upstream_url / upstream_api_key_env / upstream_auth_header hints
+    // — capability-sensitive metadata that a co-tenant on a shared
+    // workstation could otherwise read via the default umask=022
+    // world-readable bits. Silently no-op on non-Unix (Windows ACLs
+    // are inherited from the parent dir and 0o600 has no analog).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(error) = std::fs::set_permissions(output, std::fs::Permissions::from_mode(0o600))
+        {
+            eprintln!(
+                "warning: failed to chmod 0600 on {}: {error}; contents may be world-readable",
+                output.display(),
+            );
+        }
+    }
     println!("wrote {}", output.display());
     for note in spec_defaults.notes {
         println!("note: {note}");
@@ -801,6 +819,25 @@ pub fn wizard(home: &Path, input: &mut dyn std::io::BufRead, secrets: &SecretInp
     // destination without following it.
     ab_core::fsutil::write_atomic(&config_path, rendered.as_bytes())
         .with_context(|| format!("install {}", config_path.display()))?;
+    // Round-43 F3: chmod 0600 to match the signing-seed installer at
+    // :578 and prevent co-tenants on a shared workstation from reading
+    // upstream_url / upstream_api_key_env metadata via default umask
+    // 022 world-readable bits. `write_atomic` opens with default mode
+    // via `OpenOptions::create_new`; setting the perm post-rename
+    // covers the final path atomically since rename is what makes the
+    // dst visible.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(error) =
+            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
+        {
+            eprintln!(
+                "warning: failed to chmod 0600 on {}: {error}; contents may be world-readable",
+                config_path.display(),
+            );
+        }
+    }
 
     println!("\nAll set!");
     println!();

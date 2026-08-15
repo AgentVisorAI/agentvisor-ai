@@ -1766,7 +1766,19 @@ impl Finalizer {
                     "tool_allowed": tool_allowed,
                     "tool_blocked": tool_blocked,
                     "cost_usd_micros": cost_usd_micros,
-                    "stop_reason_id": stop_reason_id,
+                    // Round-43 F2: match the close-time serialization at
+                    // reconciler.rs:488 which writes `u64` (0 when never
+                    // recorded) via `session.recorded_stop_reason_id()`.
+                    // Emitting `Option<u8>` here made JSON `null` vs
+                    // JSON `0`, so `trajectory != existing` at L1780
+                    // fired on every session that closed without a
+                    // terminal stop-reason event (client hangup mid-
+                    // stream, /close before final assistant message,
+                    // tool-only session). That mismatch marked the
+                    // session `ab_unsigned_recovery_skipped_total`,
+                    // left the step-journal on disk uncleaned, and
+                    // repeated every restart.
+                    "stop_reason_id": stop_reason_id.map_or(0u64, u64::from),
                 }));
             }
             if final_path.exists() {
@@ -2172,6 +2184,77 @@ impl Finalizer {
         Ok(replayed)
     }
 
+    /// Round-43 F1: complete the finalization tail for sessions
+    /// where `close_session_locked` marked `artifact_committed = 1`
+    /// but returned Err before running the tail — typically a
+    /// transient `emit_bridge_event(SESSION_CLOSE)` publish failure
+    /// while the broker was unreachable, or a `remove_step_journal`
+    /// EIO. Round-42 F3 handled the "orphaned in recovery" analogue
+    /// inside `recover_signed_journals`, but the client
+    /// `/v1/sessions/{id}/close` route and the idle-sweeper caller
+    /// (both entering via `Finalizer::close_session`) inherited the
+    /// same orphan-after-partial-close shape. Rather than removing
+    /// the session from the registry (which would break the client
+    /// contract that the id remains queryable), drive the tail to
+    /// completion here: every step is idempotent
+    /// (`emit_bridge_event` re-uses an existing outbox,
+    /// `remove_step_journal` treats ENOENT as success, and
+    /// `remove_lifecycle_outbox` is `rm -f`). Once
+    /// `mark_close_complete` fires, `evict_finalized` can reclaim
+    /// the registry slot.
+    ///
+    /// Per-session errors warn+continue via
+    /// `ab_pending_close_completion_failed_total` so one persistently-
+    /// bad broker for one session does not HOL-block completion of
+    /// every other pending-close session for the tick.
+    pub(crate) async fn complete_pending_closes(
+        &self,
+        sessions: &SessionRegistry,
+    ) -> Result<usize, FinalizeError> {
+        let pending = sessions.pending_close_sessions();
+        let mut completed = 0usize;
+        for session in pending {
+            let workflow = session.workflow.as_str();
+            let outcome: Result<(), FinalizeError> = async {
+                self.emit_bridge_event(
+                    &session,
+                    ab_events::EventClass::Session,
+                    serde_json::json!({"action": "closed", "workflow": workflow}),
+                    crate::journal::SESSION_CLOSE_OUTBOX_KIND,
+                )
+                .await?;
+                self.remove_step_journal(&session.id).await?;
+                self.remove_lifecycle_outbox(&session.id, crate::journal::RECEIPT_OUTBOX_KIND)
+                    .await?;
+                self.remove_lifecycle_outbox(&session.id, crate::journal::SESSION_CLOSE_OUTBOX_KIND)
+                    .await?;
+                session.mark_close_complete();
+                Ok(())
+            }
+            .await;
+            match outcome {
+                Ok(()) => completed = completed.saturating_add(1),
+                Err(error) => {
+                    self.metrics
+                        .counter(
+                            "ab_pending_close_completion_failed_total",
+                            "Pending-close completions that failed to finish their tail (round-43 F1)",
+                        )
+                        .inc();
+                    let key = self.spool_dir.join(format!("pending-close::{}", session.id));
+                    if self.warn_once(key) {
+                        tracing::warn!(
+                            session = %session.id,
+                            %error,
+                            "pending-close completion failed; will retry next tick",
+                        );
+                    }
+                }
+            }
+        }
+        Ok(completed)
+    }
+
     async fn remove_acked_lifecycle_outboxes(&self) -> Result<(), FinalizeError> {
         let directory = self.spool_dir.join(crate::spool::OUTBOX);
         let mut entries = match tokio::fs::read_dir(&directory).await {
@@ -2298,6 +2381,18 @@ pub fn spawn_reconciler(
                 }
                 if let Err(error) = finalizer.retry_marked_promotions(&sessions).await {
                     tracing::warn!(%error, "durable promotion retry failed");
+                    metrics
+                        .counter("ab_reconcile_errors_total", "Reconciliation errors")
+                        .inc();
+                }
+                // Round-43 F1: drive the finalization tail forward for
+                // sessions that got past `mark_artifact_committed` but
+                // failed the subsequent SESSION_CLOSE emit or journal
+                // cleanup on a prior tick / client call. Without this
+                // sweep those sessions accumulate in the registry
+                // forever and their step journals never get removed.
+                if let Err(error) = finalizer.complete_pending_closes(&sessions).await {
+                    tracing::warn!(%error, "pending-close completion sweep failed");
                     metrics
                         .counter("ab_reconcile_errors_total", "Reconciliation errors")
                         .inc();
@@ -3030,6 +3125,86 @@ mod tests {
             receipt_events[1].1["metadata"]["uid"]
         );
         assert!(!finalizer.lifecycle_outbox_path(&session.id, "receipt").exists());
+    }
+
+    /// Round-43 F1: fire-and-forget close (no client retry, no idle
+    /// sweeper hit) that failed at `emit_receipt_event` AFTER
+    /// `mark_artifact_committed` used to leave the session
+    /// permanently orphaned in the registry — `is_closed()` is true
+    /// so the idle sweeper skips it, `close_complete = 0` so
+    /// `evict_finalized` refuses it, and recovery scans hit the
+    /// "already in registry" short-circuit. `complete_pending_closes`
+    /// now drives the finalization tail to completion on the next
+    /// reconciler tick without any client involvement.
+    #[tokio::test]
+    async fn round_43_f1_pending_close_completes_via_reconciler_sweep() {
+        let directory = tempfile::tempdir().unwrap();
+        let bus = Arc::new(FailFirstReceiptBus {
+            fail: std::sync::atomic::AtomicBool::new(true),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+        });
+        let finalizer = Finalizer::with_bridge(
+            Arc::new(Ed25519Signer::from_seed(&[43; 32])),
+            directory.path().to_path_buf(),
+            Arc::new(Registry::new()),
+            bus.clone(),
+        );
+        let sessions = SessionRegistry::new();
+        let session = session(Workflow::Signed);
+        // Install into registry so `pending_close_sessions` can see it.
+        sessions.insert_recovered(Arc::try_unwrap(session.clone()).unwrap_or_else(|arc| {
+            Session::new(arc.id.clone(), arc.workflow, arc.current_identity(), Default::default())
+        }));
+        // Look up the Arc actually stored in the registry (identity
+        // mapping after insert_recovered).
+        let registered = sessions.get(&session.id).unwrap();
+
+        // First close attempt: signed workflow persists receipt on
+        // disk, marks `artifact_committed = 1`, then fails on
+        // `emit_receipt_event` via the injected bus outage. This is
+        // the fire-and-forget window — no second `close_session` call
+        // will follow.
+        assert!(matches!(
+            finalizer
+                .close_session(Arc::clone(&registered), StopReason::SessionClosed)
+                .await,
+            Err(FinalizeError::Bridge(_))
+        ));
+        assert!(
+            registered.artifact_committed_flag(),
+            "signed close must have persisted the receipt and marked artifact_committed before the emit_receipt_event failure",
+        );
+        assert!(
+            !registered.close_complete_flag(),
+            "close_complete must NOT be set yet — the finalization tail did not run",
+        );
+        // Pre-round-43 the session would sit here forever.
+        let pending = sessions.pending_close_sessions();
+        assert_eq!(pending.len(), 1, "sweep must see the orphaned session");
+        assert_eq!(pending[0].id, registered.id);
+
+        // Simulate the next reconciler tick — `replay_lifecycle_outboxes`
+        // publishes the pending receipt event (the bus outage was one-
+        // shot, so the retry succeeds), then `complete_pending_closes`
+        // drives the tail to `mark_close_complete`.
+        finalizer.replay_lifecycle_outboxes().await.unwrap();
+        let completed = finalizer.complete_pending_closes(&sessions).await.unwrap();
+        assert_eq!(completed, 1, "sweep must complete the orphan");
+        assert!(
+            registered.close_complete_flag(),
+            "close_complete must be set after the sweep — round-43 F1 invariant",
+        );
+        assert!(
+            sessions.pending_close_sessions().is_empty(),
+            "no sessions remain in the pending-close set once completed",
+        );
+        // Step journal cleanup ran too — no debris on disk.
+        let digest = ab_core::digest::sha256_hex(registered.id.as_bytes());
+        let stem = digest.get(..32).unwrap();
+        assert!(
+            !directory.path().join(format!("{stem}.session.json")).exists(),
+            "step journal metadata sidecar must be removed by the completion sweep",
+        );
     }
 
     #[tokio::test]

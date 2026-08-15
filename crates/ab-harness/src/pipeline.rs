@@ -428,6 +428,10 @@ impl AppState {
             "ab_atif_trajectory_recovery_skipped_total",
             "ATIF trajectories skipped during recovery due to per-session errors (round-42 F1)",
         );
+        metrics.counter(
+            "ab_pending_close_completion_failed_total",
+            "Pending-close completions that failed to finish their tail (round-43 F1)",
+        );
         for reason in [
             "too_large",
             "read_error",
