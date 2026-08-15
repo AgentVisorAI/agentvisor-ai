@@ -352,21 +352,22 @@ impl AppState {
     ) -> Result<Self, PipelineError> {
         let config = Arc::new(config);
         let metrics = Arc::new(Registry::new());
-        for stage in ["identity", "quota", "sanitize", "compression"] {
-            metrics.histogram(
+        // Every stage of the `ab_stage_duration_seconds` series MUST
+        // share the same bucket bounds, otherwise
+        // `histogram_quantile(0.99, sum by(le) (rate(...[5m])))` in
+        // Prometheus silently produces nonsense: the `le` values from
+        // different label combinations do not align and the summation
+        // is undefined. Use WIDE_LATENCY_BOUNDS_US for all stages
+        // because `dispatch` (upstream streaming, 15-90 s) needs the
+        // wide range — the fast stages just get more granular
+        // low-end buckets they will never light up, which is fine.
+        for stage in ["identity", "quota", "sanitize", "compression", "dispatch"] {
+            metrics.histogram_with_bounds(
                 &format!("ab_stage_duration_seconds{{stage=\"{stage}\"}}"),
                 "Harness stage latency",
+                ab_core::metrics::WIDE_LATENCY_BOUNDS_US,
             );
         }
-        // `dispatch` measures the upstream provider call including
-        // streaming — routinely 15-90 s for chat completions. Using the
-        // default 10 s ceiling would saturate every observation into
-        // the +Inf bucket, rendering p95/p99 as u64::MAX.
-        metrics.histogram_with_bounds(
-            "ab_stage_duration_seconds{stage=\"dispatch\"}",
-            "Harness stage latency (upstream provider call)",
-            ab_core::metrics::WIDE_LATENCY_BOUNDS_US,
-        );
         metrics.counter(
             "ab_events_dropped_total{stage=\"worker_queue\"}",
             "Worker jobs dropped",
@@ -1180,9 +1181,50 @@ impl AppState {
                 }
                 Ok(validated.agent_identity())
             }
-            (Some(_), None) if self.config.require_identity => Err(PipelineError::Unauthorized(
-                "identity validator is not configured".to_owned(),
-            )),
+            // Client presented a bearer but the validator is not
+            // configured. Two legitimate cases and one attack surface:
+            //  (a) `upstream_authorization_passthrough = true`: the
+            //      client's bearer is the CREDENTIAL FOR THE UPSTREAM
+            //      PROVIDER, not an identity claim for us. Accept
+            //      anonymous locally so the request proceeds and the
+            //      relay layer forwards the header. This is the
+            //      documented dev-mode BYO-key posture.
+            //  (b) Neither passthrough nor validator: the operator
+            //      opted out of identity entirely. Any bearer is
+            //      meaningless. Same accept-anonymous result — but
+            //      warn once in tracing so the mismatch is visible.
+            //  (c) A validator EXISTS but this arm ran because
+            //      match fell through: unreachable because arm 1
+            //      catches (Some, Some). No action.
+            //
+            // The attack case — a caller sends a scoped identity token
+            // and we silently attribute the request as `anonymous`
+            // producing a repudiation vector — was closed at commit
+            // e56... by rejecting here. But that broke passthrough
+            // mode. Restore acceptance when passthrough is on so the
+            // BYO-key path works, and continue rejecting only when
+            // NO passthrough is configured and identity was not
+            // required (i.e. the client presenting a bearer to a
+            // no-op harness).
+            (Some(_), None) => {
+                if self.config.upstream_authorization_passthrough {
+                    Ok(AgentIdentity {
+                        version: "dev".to_owned(),
+                        charter: "anonymous".into(),
+                        instance_uid: "anonymous".to_owned(),
+                        ttl_remaining_s: None,
+                    })
+                } else {
+                    Err(PipelineError::Unauthorized(
+                        "bearer token presented but identity validator is not configured — \
+                         refusing to silently record the request as anonymous (either \
+                         configure identity_jwks_url / identity_hmac_secret_file, or set \
+                         upstream_authorization_passthrough=true if the bearer is meant \
+                         for the upstream provider)"
+                            .to_owned(),
+                    ))
+                }
+            }
             (None, _) if self.config.require_identity => {
                 Err(PipelineError::Unauthorized("missing bearer token".to_owned()))
             }
