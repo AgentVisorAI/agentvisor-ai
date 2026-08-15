@@ -585,7 +585,7 @@ impl Finalizer {
                     if let Err(error) = remove_outbox(&marker).await {
                         tracing::warn!(
                             %error,
-                            path = %marker.display(),
+                            path = %ab_core::fsutil::basename(&marker),
                             "failed to clean up orphan promotion marker (promotion still succeeded)"
                         );
                     }
@@ -786,7 +786,7 @@ impl Finalizer {
             let metadata = match tokio::fs::metadata(&path).await {
                 Ok(m) => m,
                 Err(error) => {
-                    tracing::warn!(%error, path = %path.display(), "skipping ATIF spool file whose metadata is unreadable");
+                    tracing::warn!(%error, path = %ab_core::fsutil::basename(&path), "skipping ATIF spool file whose metadata is unreadable");
                     continue;
                 }
             };
@@ -798,7 +798,7 @@ impl Finalizer {
                     )
                     .inc();
                 tracing::warn!(
-                    path = %path.display(),
+                    path = %ab_core::fsutil::basename(&path),
                     size = metadata.len(),
                     max = MAX_ATIF_RECOVERY_BYTES,
                     "ignoring oversize ATIF spool file",
@@ -821,7 +821,7 @@ impl Finalizer {
                             "ATIF spool files skipped during recovery",
                         )
                         .inc();
-                    tracing::warn!(%error, path = %path.display(), "skipping unreadable ATIF spool file");
+                    tracing::warn!(%error, path = %ab_core::fsutil::basename(&path), "skipping unreadable ATIF spool file");
                     continue;
                 }
             };
@@ -834,7 +834,7 @@ impl Finalizer {
                             "ATIF spool files skipped during recovery",
                         )
                         .inc();
-                    tracing::warn!(%error, path = %path.display(), "ignoring invalid ATIF spool file");
+                    tracing::warn!(%error, path = %ab_core::fsutil::basename(&path), "ignoring invalid ATIF spool file");
                     continue;
                 }
             };
@@ -845,7 +845,7 @@ impl Finalizer {
                         "ATIF spool files skipped during recovery",
                     )
                     .inc();
-                tracing::warn!(path = %path.display(), "ignoring nonconformant ATIF spool file");
+                tracing::warn!(path = %ab_core::fsutil::basename(&path), "ignoring nonconformant ATIF spool file");
                 continue;
             }
             let Some(session_id) = trajectory.session_id.clone() else {
@@ -864,7 +864,7 @@ impl Finalizer {
                     .inc();
                 if self.warn_once(path.clone()) {
                     tracing::warn!(
-                        path = %path.display(),
+                        path = %ab_core::fsutil::basename(&path),
                         "ignoring ATIF spool file with no authenticated provenance"
                     );
                 }
@@ -880,7 +880,7 @@ impl Finalizer {
                 if self.warn_once(path.clone()) {
                     tracing::warn!(
                         %error,
-                        path = %path.display(),
+                        path = %ab_core::fsutil::basename(&path),
                         "ignoring ATIF spool file whose provenance does not verify"
                     );
                 }
@@ -927,7 +927,7 @@ impl Finalizer {
             ) {
                 Ok(inserted) => inserted,
                 Err(_active) => {
-                    tracing::info!(session = %path.display(), "unsigned recovery skipped: session already active");
+                    tracing::info!(session = %ab_core::fsutil::basename(&path), "unsigned recovery skipped: session already active");
                     continue;
                 }
             };
@@ -1003,7 +1003,7 @@ impl Finalizer {
                 // process restart, drowning real signal.
                 if self.warn_once(metadata_path.clone()) {
                     tracing::warn!(
-                        path = %metadata_path.display(),
+                        path = %ab_core::fsutil::basename(&metadata_path),
                         version = ?metadata.get("journal_version"),
                         "sidecar has unsupported journal_version; skipping this session so recovery can proceed for the rest"
                     );
@@ -1052,12 +1052,12 @@ impl Finalizer {
                         .join(format!("{stem}.session.json.corrupt-{}", ab_core::new_event_uid()));
                     match tokio::fs::rename(&metadata_path, &quarantine_metadata).await {
                         Ok(()) => tracing::warn!(
-                            metadata = %metadata_path.display(),
-                            quarantine = %quarantine_metadata.display(),
+                            metadata = %ab_core::fsutil::basename(&metadata_path),
+                            quarantine = %ab_core::fsutil::basename(&quarantine_metadata),
                             "sealed metadata sidecar quarantined alongside its torn signed journal (round-14 F5)"
                         ),
                         Err(error) => tracing::error!(
-                            metadata = %metadata_path.display(),
+                            metadata = %ab_core::fsutil::basename(&metadata_path),
                             %error,
                             "failed to quarantine metadata sidecar; leaving in place so a future recovery can try again"
                         ),
@@ -1343,7 +1343,7 @@ impl Finalizer {
                 // Round-16 F4: dedup via `warned_artifacts`.
                 if self.warn_once(metadata_path.clone()) {
                     tracing::warn!(
-                        path = %metadata_path.display(),
+                        path = %ab_core::fsutil::basename(&metadata_path),
                         version = ?metadata.get("journal_version"),
                         "sidecar has unsupported journal_version; skipping this session so recovery can proceed for the rest"
                     );
@@ -1410,12 +1410,12 @@ impl Finalizer {
                         .join(format!("{stem}.session.json.corrupt-{}", ab_core::new_event_uid()));
                     match tokio::fs::rename(&metadata_path, &quarantine_metadata).await {
                         Ok(()) => tracing::warn!(
-                            metadata = %metadata_path.display(),
-                            quarantine = %quarantine_metadata.display(),
+                            metadata = %ab_core::fsutil::basename(&metadata_path),
+                            quarantine = %ab_core::fsutil::basename(&quarantine_metadata),
                             "sealed metadata sidecar quarantined alongside its torn unsigned journal (round-14 F5)"
                         ),
                         Err(error) => tracing::error!(
-                            metadata = %metadata_path.display(),
+                            metadata = %ab_core::fsutil::basename(&metadata_path),
                             %error,
                             "failed to quarantine metadata sidecar; leaving in place so a future recovery can try again"
                         ),
@@ -1672,7 +1672,7 @@ impl Finalizer {
                 Err(error) => {
                     tracing::warn!(
                         %error,
-                        path = %path.display(),
+                        path = %ab_core::fsutil::basename(&path),
                         "skipping unreadable promotion marker"
                     );
                     continue;
@@ -1684,7 +1684,7 @@ impl Finalizer {
                     Err(error) => {
                         tracing::warn!(
                             %error,
-                            path = %path.display(),
+                            path = %ab_core::fsutil::basename(&path),
                             "skipping unauthenticated promotion marker"
                         );
                         continue;
@@ -1707,7 +1707,7 @@ impl Finalizer {
             match self.promote(session).await {
                 Ok(_) => promoted += 1,
                 Err(error) => {
-                    tracing::warn!(%error, path = %path.display(), "promotion retry failed");
+                    tracing::warn!(%error, path = %ab_core::fsutil::basename(&path), "promotion retry failed");
                 }
             }
         }
@@ -1929,7 +1929,7 @@ impl Finalizer {
             let sealed = match read_capped_async(path.clone(), ab_core::fsutil::MAX_CONTROL_BYTES).await {
                 Ok(bytes) => bytes,
                 Err(error) => {
-                    tracing::warn!(%error, path = %path.display(), "skipping unreadable outbox file");
+                    tracing::warn!(%error, path = %ab_core::fsutil::basename(&path), "skipping unreadable outbox file");
                     continue;
                 }
             };
@@ -1945,13 +1945,13 @@ impl Finalizer {
                 // sessions' outboxes. The bad file stays on disk as
                 // forensic evidence (`open` does not delete on failure).
                 Err(error) => {
-                    tracing::warn!(%error, path = %path.display(), "skipping malformed outbox");
+                    tracing::warn!(%error, path = %ab_core::fsutil::basename(&path), "skipping malformed outbox");
                     continue;
                 }
             };
             if path != self.lifecycle_outbox_path(&outbox.session_id, &outbox.kind) {
                 tracing::warn!(
-                    path = %path.display(),
+                    path = %ab_core::fsutil::basename(&path),
                     "skipping outbox whose filename does not match its authenticated session_id/kind"
                 );
                 continue;
@@ -2291,8 +2291,8 @@ async fn read_complete_journal(path: &std::path::Path) -> Result<Vec<String>, Fi
             let rename_error_message = match std::fs::rename(&path, &quarantine) {
                 Ok(()) => {
                     tracing::error!(
-                        original = %path.display(),
-                        quarantine = %quarantine.display(),
+                        original = %ab_core::fsutil::basename(&path),
+                        quarantine = %ab_core::fsutil::basename(&quarantine),
                         bytes = bytes.len(),
                         "journal has no complete lines; quarantined for post-mortem instead of silent 0-truncate"
                     );
@@ -2300,7 +2300,7 @@ async fn read_complete_journal(path: &std::path::Path) -> Result<Vec<String>, Fi
                 }
                 Err(rename_error) => {
                     tracing::error!(
-                        path = %path.display(),
+                        path = %ab_core::fsutil::basename(&path),
                         bytes = bytes.len(),
                         error = %rename_error,
                         "journal has no complete lines and quarantine rename failed; refusing to truncate"
@@ -2332,7 +2332,7 @@ async fn read_complete_journal(path: &std::path::Path) -> Result<Vec<String>, Fi
         }
         if complete_len < bytes.len() {
             tracing::warn!(
-                path = %path.display(),
+                path = %ab_core::fsutil::basename(&path),
                 stored = bytes.len(),
                 keeping = complete_len,
                 dropping = bytes.len() - complete_len,

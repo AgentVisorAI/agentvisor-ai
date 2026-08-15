@@ -520,7 +520,7 @@ fn recover_segment(path: &Path) -> Result<(u64, u64), BusError> {
             Err(error) => {
                 tracing::warn!(
                     %error,
-                    path = %path.display(),
+                    path = %ab_core::fsutil::basename(path),
                     "skipping unparseable segment record during recovery",
                 );
             }
@@ -561,7 +561,7 @@ fn recover_event_uids(path: &Path) -> Result<HashMap<String, u64>, BusError> {
             Err(error) => {
                 tracing::warn!(
                     %error,
-                    path = %path.display(),
+                    path = %ab_core::fsutil::basename(path),
                     "skipping unparseable event-uid sidecar record during recovery",
                 );
                 continue;
@@ -605,7 +605,7 @@ fn recover_segment_event_uids(path: &Path, seen: &mut HashMap<String, u64>) -> R
             Err(error) => {
                 tracing::warn!(
                     %error,
-                    path = %path.display(),
+                    path = %ab_core::fsutil::basename(path),
                     "skipping unparseable segment record while rebuilding UID index",
                 );
                 continue;
@@ -680,7 +680,7 @@ fn read_high_water(path: &Path) -> Result<u64, BusError> {
             Err(error) => {
                 tracing::warn!(
                     %error,
-                    path = %path.display(),
+                    path = %ab_core::fsutil::basename(path),
                     "high-watermark file is corrupt; falling back to segment-derived next_offset",
                 );
                 Ok(0)

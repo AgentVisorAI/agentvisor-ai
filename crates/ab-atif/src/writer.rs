@@ -200,7 +200,7 @@ pub fn write_atomic(trajectory: &Trajectory, path: &Path) -> Result<(), WriterEr
     tmp.persist(path).map_err(|e| WriterError::Io(e.error))?;
     if let Err(error) = ab_core::fsutil::sync_directory(dir) {
         tracing::warn!(
-            path = %path.display(),
+            path = %ab_core::fsutil::basename(path),
             error = %error,
             "post-rename ATIF trajectory directory fsync failed; file is visible but its dirent may not survive an immediate power loss"
         );
