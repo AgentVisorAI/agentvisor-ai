@@ -36,7 +36,14 @@ services:
     environment:
       RUST_LOG: info
       AB_CONFIG: /app/config/harness.docker.toml
-      AB_SIGNING_SEED_FILE: /app/data/signing.seed
+      # Round-16 F3: the signing seed IS the receipt trust anchor.
+      # Living on the shared `bridge-data` named volume meant any
+      # co-scheduled container mounting `-v bridge-data:/x` could
+      # read it — no mode enforcement, no Secret gating. The
+      # docker-compose posture claimed to use a mode:0400 secret,
+      # but that secret was only wired for the identity HMAC.
+      # Now it's a first-class docker secret alongside the HMAC.
+      AB_SIGNING_SEED_FILE: /run/secrets/signing_seed
       OTEL_EXPORTER_OTLP_ENDPOINT: http://vector:4318
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
     volumes:
@@ -48,6 +55,14 @@ services:
       # of the default 0444 mount.
       - source: identity_hmac
         target: identity_hmac
+        uid: "65532"
+        gid: "65532"
+        mode: 0400
+      # Round-16 F3: signing seed pinned identically. Populate the
+      # secret at compose-up time via the secrets: block at the
+      # bottom of this file (or `docker secret create`).
+      - source: signing_seed
+        target: signing_seed
         uid: "65532"
         gid: "65532"
         mode: 0400
@@ -161,4 +176,10 @@ volumes:
 
 secrets:
   identity_hmac:
+    external: true
+  # Round-16 F3: the signing seed IS the receipt trust anchor.
+  # Populate as an external Docker secret before running compose:
+  #   `docker secret create signing_seed ./signing.seed`
+  # Or reference a compose-time file with `file: ./signing.seed`.
+  signing_seed:
     external: true

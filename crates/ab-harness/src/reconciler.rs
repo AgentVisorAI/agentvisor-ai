@@ -793,7 +793,14 @@ impl Finalizer {
             };
             let receipt_path = self.receipt_path(&recovered_session.id);
             if let Ok(bytes) = tokio::fs::read(&receipt_path).await {
-                let receipt = serde_json::from_slice::<Receipt>(&bytes)
+                // Round-16: use the strict deserializer that
+                // refuses duplicate keys at any nesting level. A
+                // post-compromise attacker who overwrote the
+                // on-disk receipt bytes could otherwise smuggle a
+                // duplicate `instance_uid` past round-15 F4's
+                // top-level guard — the round-15 walker closes
+                // that gap uniformly.
+                let receipt = Receipt::from_json_slice(&bytes)
                     .map_err(|error| FinalizeError::Receipt(error.to_string()))?;
                 self.verify_configured_receipt(&receipt)?;
                 if path.with_extension("promote").exists() {
@@ -845,11 +852,19 @@ impl Finalizer {
                 // on this instance. Warn + skip so unrelated
                 // sessions still recover; an operator inspecting
                 // the log can quarantine the specific sidecar.
-                tracing::warn!(
-                    path = %metadata_path.display(),
-                    version = ?metadata.get("journal_version"),
-                    "sidecar has unsupported journal_version; skipping this session so recovery can proceed for the rest"
-                );
+                //
+                // Round-16 F4: recover_spooled_sessions runs on
+                // every reconciler tick. Dedup via
+                // `warned_artifacts` so a persistent hostile plant
+                // does not produce N warn lines every tick until
+                // process restart, drowning real signal.
+                if self.warned_artifacts.lock().insert(metadata_path.clone()) {
+                    tracing::warn!(
+                        path = %metadata_path.display(),
+                        version = ?metadata.get("journal_version"),
+                        "sidecar has unsupported journal_version; skipping this session so recovery can proceed for the rest"
+                    );
+                }
                 continue;
             }
             if metadata.get("workflow").and_then(serde_json::Value::as_str) != Some(Workflow::Signed.as_str())
@@ -1033,7 +1048,9 @@ impl Finalizer {
             };
             let receipt_path = self.receipt_path(&session.id);
             if let Ok(bytes) = tokio::fs::read(receipt_path).await {
-                let receipt = serde_json::from_slice::<Receipt>(&bytes)
+                // Round-16: strict deserializer (see the twin call
+                // in the unsigned recovery path above).
+                let receipt = Receipt::from_json_slice(&bytes)
                     .map_err(|error| FinalizeError::Receipt(error.to_string()))?;
                 self.verify_configured_receipt(&receipt)?;
                 if receipt.body.subject != expected_subject {
@@ -1179,11 +1196,14 @@ impl Finalizer {
                 // Round-15 F1: same HOL-block fix as the signed
                 // branch above — one drifted sidecar must not deny
                 // recovery to unrelated sessions.
-                tracing::warn!(
-                    path = %metadata_path.display(),
-                    version = ?metadata.get("journal_version"),
-                    "sidecar has unsupported journal_version; skipping this session so recovery can proceed for the rest"
-                );
+                // Round-16 F4: dedup via `warned_artifacts`.
+                if self.warned_artifacts.lock().insert(metadata_path.clone()) {
+                    tracing::warn!(
+                        path = %metadata_path.display(),
+                        version = ?metadata.get("journal_version"),
+                        "sidecar has unsupported journal_version; skipping this session so recovery can proceed for the rest"
+                    );
+                }
                 continue;
             }
             if metadata.get("workflow").and_then(serde_json::Value::as_str) == Some(Workflow::Signed.as_str())
