@@ -440,13 +440,24 @@ fn ask_line(prompt: &str, input: &mut dyn std::io::BufRead) -> Result<String> {
     Ok(line.trim().to_owned())
 }
 
-fn ask_secret(prompt: &str, input: &mut dyn std::io::BufRead, mode: &SecretInput) -> Result<String> {
-    match mode {
+/// Round-38 F2: `Zeroizing<String>` so every intermediate copy of
+/// the pasted secret zeroes its heap allocation on drop. Both
+/// branches return plain `String` from their underlying reader; we
+/// wrap immediately at the boundary so the un-zeroized `String`
+/// never outlives this function. Rejected retries in the caller's
+/// loop then drop-zero the previous attempt's buffer as well.
+fn ask_secret(
+    prompt: &str,
+    input: &mut dyn std::io::BufRead,
+    mode: &SecretInput,
+) -> Result<zeroize::Zeroizing<String>> {
+    let raw = match mode {
         SecretInput::Hidden => {
-            rpassword::prompt_password(format!("{prompt} (typing is hidden): ")).context("read key")
+            rpassword::prompt_password(format!("{prompt} (typing is hidden): ")).context("read key")?
         }
-        SecretInput::Plain => ask_line(&format!("{prompt}: "), input),
-    }
+        SecretInput::Plain => ask_line(&format!("{prompt}: "), input)?,
+    };
+    Ok(zeroize::Zeroizing::new(raw))
 }
 
 fn ask_yes_no(prompt: &str, input: &mut dyn std::io::BufRead, default: bool) -> Result<bool> {
@@ -672,41 +683,55 @@ pub fn wizard(home: &Path, input: &mut dyn std::io::BufRead, secrets: &SecretInp
     }
     let key_file = if needs_key {
         let name = friendly_name(preset);
-        let mut key = None;
+        // Round-38 F2: `key` holds the accepted secret wrapped in
+        // Zeroizing so the heap allocation is zeroed on drop. Each
+        // failed retry's `pasted` binding drops-zeros before the
+        // next iteration reaches the reader.
+        let mut key: Option<zeroize::Zeroizing<String>> = None;
         for _ in 0..5 {
             let pasted = ask_secret(&format!("\nPaste your {name} API key"), input, secrets)?;
-            let pasted = pasted.trim();
-            if pasted.is_empty() {
+            // `pasted.trim()` returns a &str borrowed from the
+            // zeroing buffer; we validate against the borrow and
+            // only take ownership of a zeroing copy after all
+            // checks pass, so a rejected paste never spawns a
+            // second un-zeroed String on the heap.
+            let trimmed = pasted.trim();
+            if trimmed.is_empty() {
                 println!("The key looked empty — please paste it again.");
                 continue;
             }
-            if pasted.chars().any(char::is_control) {
+            if trimmed.chars().any(char::is_control) {
                 println!("That key contains characters that don't belong — please try again.");
                 continue;
             }
             // Real API keys are plain ASCII; anything else (emoji, accents,
             // smart quotes from a rich-text paste) would only fail later
             // with a cryptic HTTP-header error, so catch it here.
-            if !pasted.is_ascii() {
+            if !trimmed.is_ascii() {
                 println!(
                     "That key contains non-ASCII characters (accents, emoji, or smart quotes) — API keys never do. Please paste it again."
                 );
                 continue;
             }
-            if pasted.len() > 8192 {
+            if trimmed.len() > 8192 {
                 println!(
                     "That looks far too long to be an API key — it may be the wrong clipboard content. Please paste just the key."
                 );
                 continue;
             }
-            key = Some(pasted.to_owned());
+            // Round-38 F2: build the accepted-key buffer directly
+            // from the trimmed slice into a fresh Zeroizing so the
+            // stored copy is minimal and zero-on-drop.
+            key = Some(zeroize::Zeroizing::new(trimmed.to_owned()));
             break;
         }
         let Some(key) = key else {
             anyhow::bail!("no API key provided");
         };
         let path = root.join("keys").join(format!("{}.key", slug(preset)));
-        write_private_key_file(&path, &key)?;
+        // Round-38 F2: pass by `&str` borrow so the write path
+        // never allocates a plain String copy of the secret.
+        write_private_key_file(&path, key.as_str())?;
         Some(path)
     } else {
         None
