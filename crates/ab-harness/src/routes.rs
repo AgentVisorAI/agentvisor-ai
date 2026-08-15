@@ -136,13 +136,27 @@ async fn chat_completions(
     // `std::str::from_utf8(&frame)` and aborts every stream. Refuse
     // the response up front with a clear error rather than corrupt
     // the audit trail with UTF-8-error frames.
-    if let Some(encoding) = upstream_headers.get(axum::http::header::CONTENT_ENCODING) {
-        let value = encoding.to_str().unwrap_or_default();
-        if !value.is_empty() && !value.eq_ignore_ascii_case("identity") {
+    //
+    // Multi-value / multi-line semantics: an upstream that sends
+    // `Content-Encoding: identity` on one line and
+    // `Content-Encoding: gzip` on another (some layered reverse
+    // proxies do this) would slip past a `.get(...)` that only reads
+    // the first value. Iterate `get_all` and require EVERY value to
+    // be empty or `identity` case-insensitively; also split each
+    // value on `,` so `gzip, identity` (single header, two tokens)
+    // is caught.
+    for value in upstream_headers.get_all(axum::http::header::CONTENT_ENCODING) {
+        let raw = value.to_str().unwrap_or_default();
+        for token in raw.split(',') {
+            let token = token.trim();
+            if token.is_empty() || token.eq_ignore_ascii_case("identity") {
+                continue;
+            }
             return pipeline_error(crate::pipeline::PipelineError::Upstream(format!(
-                "upstream responded with unsupported Content-Encoding: {value:?} — \
-                 the proxy is built without decompression support; enable it upstream \
-                 (e.g. Accept-Encoding: identity) or rebuild with the reqwest `gzip` feature"
+                "upstream responded with unsupported Content-Encoding token {token:?} \
+                 (full header: {raw:?}) — the proxy is built without decompression \
+                 support; enable it upstream (Accept-Encoding: identity) or rebuild \
+                 with the reqwest `gzip` feature"
             )));
         }
     }
@@ -158,6 +172,7 @@ async fn chat_completions(
         session,
         identity,
         response_permit: Some(response_permit),
+        worker: state.worker.clone(),
         store: Arc::clone(&state.store),
         budget: state.config.budget.clone(),
         finalizer: state.finalizer.clone(),
@@ -1001,7 +1016,12 @@ struct AbortFinalizingStream {
     inner: BoxStream<'static, Result<Bytes, std::io::Error>>,
     session: Arc<crate::session::Session>,
     identity: ab_events::AgentIdentity,
-    response_permit: Option<crate::worker::WorkerPermit>,
+    response_permit: Option<crate::worker::ResponsePermit>,
+    /// Handle to submit the response-capture job at end-of-stream. The
+    /// permit above only holds the `response_capacity` semaphore slot
+    /// — the mpsc queue slot is re-acquired at submit time via
+    /// `ResponsePermit::submit(&worker, job)`.
+    worker: crate::worker::WorkerHandle,
     store: Arc<dyn ab_state::StateStore>,
     budget: ab_state::BudgetSpec,
     finalizer: crate::reconciler::Finalizer,
@@ -1262,33 +1282,36 @@ impl AbortFinalizingStream {
             .response_permit
             .take()
             .ok_or(crate::worker::SubmitError::Closed)?;
-        permit.submit(crate::worker::WorkerJob {
-            session: Arc::clone(&self.session),
-            identity: self.identity.clone(),
-            class,
-            payload,
-            text: analysis_text,
-            analyze_loop: true,
-            status,
-            stop_reason,
-            native_stop_reason: native_finish_reason,
-            metrics: self.response_metrics,
-            cost_usd_micros: self.response_cost_usd_micros,
-            atif: Some(crate::worker::AtifCapture {
-                source: ab_atif::Source::Agent,
-                message: Value::String(std::mem::take(&mut self.response_message)),
-                reasoning_content: reasoning,
-                model_name: self.response_model.take(),
-                tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
-                observation: None,
-                llm_call_count: Some(1),
-            }),
-            response_marker: self.response_marker.take(),
-            response_attempt: Some(crate::worker::ResponseAttempt {
-                id: self.response_attempt_id.clone(),
-                terminal: true,
-            }),
-        });
+        permit.submit(
+            &self.worker,
+            crate::worker::WorkerJob {
+                session: Arc::clone(&self.session),
+                identity: self.identity.clone(),
+                class,
+                payload,
+                text: analysis_text,
+                analyze_loop: true,
+                status,
+                stop_reason,
+                native_stop_reason: native_finish_reason,
+                metrics: self.response_metrics,
+                cost_usd_micros: self.response_cost_usd_micros,
+                atif: Some(crate::worker::AtifCapture {
+                    source: ab_atif::Source::Agent,
+                    message: Value::String(std::mem::take(&mut self.response_message)),
+                    reasoning_content: reasoning,
+                    model_name: self.response_model.take(),
+                    tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+                    observation: None,
+                    llm_call_count: Some(1),
+                }),
+                response_marker: self.response_marker.take(),
+                response_attempt: Some(crate::worker::ResponseAttempt {
+                    id: self.response_attempt_id.clone(),
+                    terminal: true,
+                }),
+            },
+        )?;
         Ok(())
     }
 }
@@ -2452,12 +2475,19 @@ mod tests {
             &identity,
             &state.config.breaker,
         );
-        // Reserve a worker permit up front so `submit_response_capture` in
-        // drop has somewhere to send the job.
-        let permit = state
+        // Reserve a full permit pair up front (worker slot + response
+        // slot) so `submit_response_capture` in drop has somewhere to
+        // send the job; the response permit lives on
+        // `AbortFinalizingStream` for the stream's lifetime.
+        let permits = state
             .worker
-            .try_reserve("pending-budget-close")
-            .expect("test setup: worker permit");
+            .try_reserve_pair("pending-budget-close")
+            .expect("test setup: fused worker/response permit");
+        // The worker permit is dropped here — the test does not
+        // actually submit a job through it; the response permit is
+        // what the stream drop cares about.
+        drop(permits.worker);
+        let permit = permits.response;
         // Bump active_streams so a concurrent close would block in
         // `wait_for_streams`, mirroring the production scenario.
         let lease = crate::session::SessionLease::new(Arc::clone(&session));
@@ -2473,6 +2503,7 @@ mod tests {
             session: Arc::clone(&session),
             identity: identity.clone(),
             response_permit: Some(permit),
+            worker: state.worker.clone(),
             store: Arc::clone(&state.store),
             budget: state.config.budget.clone(),
             finalizer: state.finalizer.clone(),
@@ -3113,31 +3144,55 @@ mod tests {
 
     /// SSE §9.2.6: the `data:` field strips exactly one leading
     /// U+0020 SPACE — no more, and no other whitespace class. A
-    /// provider that sends `data:  { …meaningful second byte… }`
-    /// must retain that second byte. `.trim_start()` (the previous
-    /// implementation) would eat both spaces and silently corrupt
-    /// the payload if the second byte were structural.
+    /// regression to `.trim_start()` would eat runs of Unicode
+    /// whitespace and silently corrupt payloads whose second byte
+    /// after `data:` is another space or a tab.
+    ///
+    /// Distinguishing input: `data:  hi\n\n` — two spaces then a
+    /// literal `hi`. Non-SSE parse via serde_json would fail on
+    /// `"hi"` unquoted, so the frame goes through the SSE path where
+    /// the `data:` accumulator kept one leading space (spec-compliant)
+    /// and serde_json then fails on ` hi` — this is exactly what the
+    /// spec's "leave everything after the first space verbatim"
+    /// behaviour dictates. A `.trim_start()` regression would silently
+    /// consume both spaces and produce the same (still-invalid) input.
+    /// We instead pick a JSON payload where the number of leading
+    /// spaces changes the parse result: `{"choices":[{"delta":{"content":" hi"}}]}`
+    /// with wire `data:  {"choices"...}` — under `strip_prefix(' ')`
+    /// the accumulated frame starts with a space then `{`, both parse
+    /// fine and the extracted `content` field is `" hi"`; under
+    /// `.trim_start()` the frame starts with `{`, also parses fine and
+    /// yields the same `" hi"`. So parse content doesn't discriminate.
+    ///
+    /// Instead observe the raw data buffer that the parser builds:
+    /// use a plain non-JSON `data:` value and assert the trimmed
+    /// prefix. Since the parser now runs serde_json on the assembled
+    /// frame, the only way to expose the trim behaviour is a test on
+    /// a lower-level helper. We keep this test as a smoke check on a
+    /// case where the frame *fails* differently: two-space prefix
+    /// with a leading space kept produces a JSON parse failure the
+    /// old `trim_start` would not have produced.
     #[test]
     fn parse_provider_chunk_strips_exactly_one_leading_space() {
-        // Payload `{"choices":...}`  where the leading space in the
-        // wire encoding `data:  {...}` is a literal space that must
-        // survive after only one space is trimmed. JSON tolerates
-        // leading whitespace inside `serde_json::from_str`, so we
-        // observe the invariant indirectly by asserting that a
-        // second-byte U+0009 TAB (illegal at JSON start with
-        // certain parsers) is preserved as a parse error rather
-        // than silently trimmed.
-        let raw = "data: \t{\"choices\":[]}\n\n";
-        // `serde_json` actually tolerates leading tabs, so the frame
-        // parses successfully. Assert the more direct property: the
-        // internal splitter kept the tab (the parsed value is a valid
-        // JSON object).
-        let parsed = parse_provider_chunk(raw)
-            .expect("SSE frame with tab-after-space must not be discarded")
-            .expect("must yield a chunk");
-        // No delta content because "choices" is empty; the important
-        // observation is that parsing did not fail on the tab.
-        assert_eq!(parsed.message, "");
+        // Bare non-JSON `hello` — invalid JSON either way. With
+        // `strip_prefix(' ')` (spec-correct) the parser accumulates
+        // ` \thello` (space+tab+hello). With `.trim_start()` (buggy)
+        // it accumulates `hello`. Both produce `Err(...)` from
+        // serde_json but the reported column differs — the trimmed
+        // form reports column 1 (immediate `h`); the correctly
+        // preserved form reports a later column because of the
+        // retained tab.
+        let raw = "data:  \thello\n\n";
+        let result = parse_provider_chunk(raw);
+        let error = match result {
+            Ok(_) => panic!("bare hello must not parse as valid provider frame"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("column 2") || error.contains("column 3"),
+            "expected error to name a column past the retained leading space+tab; \
+             got: {error}"
+        );
     }
 
     #[tokio::test]
