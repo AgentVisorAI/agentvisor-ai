@@ -350,8 +350,38 @@ impl AppState {
         embedder: Arc<dyn Embedder>,
         vector_sink: Arc<dyn VectorSink>,
     ) -> Result<Self, PipelineError> {
+        Self::new_with_backends_and_metrics(
+            config,
+            store,
+            sandbox,
+            bridge,
+            identity,
+            signer,
+            embedder,
+            vector_sink,
+            Arc::new(Registry::new()),
+        )
+    }
+
+    /// Build application state reusing a pre-existing metrics registry.
+    ///
+    /// `main.rs` uses this so counters registered outside `AppState`
+    /// (JWKS refresh errors, HTTP shutdown drain timeouts) live on the
+    /// same registry that gets scraped at `/metrics` — otherwise their
+    /// samples would be invisible to Prometheus.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_backends_and_metrics(
+        config: HarnessConfig,
+        store: Arc<dyn StateStore>,
+        sandbox: Arc<Sandbox>,
+        bridge: Arc<dyn EventBus>,
+        identity: Option<Arc<IdentityValidator>>,
+        signer: Arc<dyn Signer>,
+        embedder: Arc<dyn Embedder>,
+        vector_sink: Arc<dyn VectorSink>,
+        metrics: Arc<Registry>,
+    ) -> Result<Self, PipelineError> {
         let config = Arc::new(config);
-        let metrics = Arc::new(Registry::new());
         // Every stage of the `ab_stage_duration_seconds` series MUST
         // share the same bucket bounds, otherwise
         // `histogram_quantile(0.99, sum by(le) (rate(...[5m])))` in
@@ -1358,12 +1388,41 @@ fn last_message_text(payload: &Value) -> String {
         .to_owned()
 }
 
+/// Human-readable JSON type name for diagnostics — mirrors `typeof` in
+/// JS. Used by [`atif_capture_from_request`] to say
+/// `'messages' must be a JSON array, got object` rather than the
+/// historical opaque `chat payload has no messages`.
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 fn atif_capture_from_request(payload: &Value) -> Result<AtifCapture, PipelineError> {
-    let message = payload
+    // Split the two failure classes so support engineers can tell
+    // "field missing" from "field is the wrong shape" — chasing a
+    // phantom "no messages" ticket for a caller who typed
+    // `"messages": {}` used to be the top diagnostic-quality complaint
+    // (round-11 F7). The OpenAI Responses API also uses `input`
+    // instead of `messages`; the missing-field message now points
+    // directly at the correct fix.
+    let messages_value = payload
         .get("messages")
-        .and_then(Value::as_array)
-        .and_then(|messages| messages.last())
-        .ok_or_else(|| PipelineError::BadRequest("chat payload has no messages".to_owned()))?;
+        .ok_or_else(|| PipelineError::BadRequest("chat payload is missing 'messages'".to_owned()))?;
+    let messages = messages_value.as_array().ok_or_else(|| {
+        PipelineError::BadRequest(format!(
+            "'messages' must be a JSON array, got {}",
+            json_type_name(messages_value)
+        ))
+    })?;
+    let message = messages
+        .last()
+        .ok_or_else(|| PipelineError::BadRequest("chat payload 'messages' is empty".to_owned()))?;
     let role = message.get("role").and_then(Value::as_str);
     let source = match role {
         Some("system" | "developer" | "tool") => ab_atif::Source::System,
@@ -2151,6 +2210,36 @@ mod tests {
             assert_eq!(capture.observation.is_some(), expects_observation);
             assert!(capture.model_name.is_none());
         }
+    }
+
+    /// Round-11 F7: `messages` field with the wrong type used to return
+    /// the same "chat payload has no messages" as an absent field,
+    /// steering support tickets at a phantom bug. Verify each class
+    /// now returns a discriminating error message.
+    #[test]
+    fn atif_capture_rejects_non_array_messages_with_precise_diagnostics() {
+        fn bad_request_message(payload: serde_json::Value) -> String {
+            match atif_capture_from_request(&payload) {
+                Ok(_) => panic!("expected BadRequest, got Ok"),
+                Err(PipelineError::BadRequest(msg)) => msg,
+                Err(other) => panic!("expected BadRequest, got {other:?}"),
+            }
+        }
+        // (1) Field entirely missing (e.g., OpenAI Responses API caller
+        //     who used `input` instead of `messages`).
+        let msg = bad_request_message(serde_json::json!({
+            "input": [{ "role": "user", "content": "hi" }]
+        }));
+        assert!(msg.contains("missing 'messages'"), "got {msg}");
+        // (2) Field present but wrong JSON shape — object.
+        let msg = bad_request_message(serde_json::json!({
+            "messages": { "0": { "role": "user", "content": "hi" } }
+        }));
+        assert!(msg.contains("must be a JSON array"), "got {msg}");
+        assert!(msg.contains("object"), "got {msg}");
+        // (3) Field present, is an array, but empty.
+        let msg = bad_request_message(serde_json::json!({ "messages": [] }));
+        assert!(msg.contains("empty"), "got {msg}");
     }
 
     fn scoped_token(scopes: &[&str]) -> String {
