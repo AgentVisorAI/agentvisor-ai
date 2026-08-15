@@ -11,6 +11,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Hard upper bound on a single ATIF spool file the recovery scan will
+/// buffer into memory. Chosen to exceed the largest reasonable trajectory
+/// (millions of steps, hundreds of MB of reasoning) while capping the
+/// coarsest resource-exhaustion vector: an attacker-crafted trajectory
+/// with a multi-gigabyte `steps[i].message` cannot force recovery to OOM.
+const MAX_ATIF_RECOVERY_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Result of closing a session.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -550,6 +557,33 @@ impl Finalizer {
                 .and_then(std::ffi::OsStr::to_str)
                 .is_some_and(|name| name.ends_with(".session.json"))
             {
+                continue;
+            }
+            // Bounded read: a hostile ATIF file cannot force recovery to
+            // buffer arbitrary bytes. The size cap catches the coarsest
+            // resource-exhaustion vector; adversarial JSON within the cap
+            // is still handled by serde's default recursion limit + our
+            // Strict validator.
+            let metadata = match tokio::fs::metadata(&path).await {
+                Ok(m) => m,
+                Err(error) => {
+                    tracing::warn!(%error, path = %path.display(), "skipping ATIF spool file whose metadata is unreadable");
+                    continue;
+                }
+            };
+            if metadata.len() > MAX_ATIF_RECOVERY_BYTES {
+                self.metrics
+                    .counter(
+                        "ab_atif_recovery_skipped_total{reason=\"too_large\"}",
+                        "ATIF spool files skipped during recovery",
+                    )
+                    .inc();
+                tracing::warn!(
+                    path = %path.display(),
+                    size = metadata.len(),
+                    max = MAX_ATIF_RECOVERY_BYTES,
+                    "ignoring oversize ATIF spool file",
+                );
                 continue;
             }
             let bytes = tokio::fs::read(&path)
