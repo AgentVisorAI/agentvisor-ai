@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "crates/**"
+      - "docs/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -22,7 +23,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build API docs
+    name: Build site
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -48,19 +49,37 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev
           cargo doc --workspace --no-deps --all-features
-      - name: Write landing page
-        # `cargo doc` without `--enable-index-page` (nightly) leaves target/doc
-        # with no index.html. A tiny meta-refresh to the top-level harness crate
-        # keeps the Pages root URL from being a directory listing.
+      - name: Assemble Pages site
+        # The published site is a hand-authored non-technical landing page
+        # (`docs/index.html` + `docs/style.css`) with the rustdoc build
+        # served underneath at `/api/`. Non-technical operators land on
+        # the plain-English page; library authors follow the "API docs"
+        # link.
         run: |
-          printf '%s\n' \
-            '<!DOCTYPE html>' \
-            '<meta charset="utf-8">' \
-            '<title>AgentBridge — API documentation</title>' \
-            '<meta http-equiv="refresh" content="0; url=ab_harness/index.html">' \
-            '<link rel="canonical" href="ab_harness/index.html">' \
-            '<p><a href="ab_harness/index.html">Continue to <code>ab_harness</code></a></p>' \
-            > target/doc/index.html
+          site="$RUNNER_TEMP/pages"
+          mkdir -p "$site/api"
+          # Move the rustdoc output under /api. `-T` avoids nesting when
+          # /api already exists.
+          cp -a target/doc/. "$site/api/"
+          # A rustdoc build leaves no index at target/doc/; write one so
+          # /api/ itself is not a directory listing.
+          if [ ! -f "$site/api/index.html" ]; then
+            printf '%s\n' \
+              '<!DOCTYPE html>' \
+              '<meta charset="utf-8">' \
+              '<title>AgentBridge — API documentation</title>' \
+              '<meta http-equiv="refresh" content="0; url=ab_harness/index.html">' \
+              '<link rel="canonical" href="ab_harness/index.html">' \
+              '<p><a href="ab_harness/index.html">Continue to <code>ab_harness</code></a></p>' \
+              > "$site/api/index.html"
+          fi
+          # Copy the landing files LAST so they always win over anything
+          # rustdoc might have written at the root.
+          cp docs/index.html "$site/index.html"
+          cp docs/style.css "$site/style.css"
+          # Publish the assembled directory.
+          rm -rf target/doc
+          mv "$site" target/doc
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
