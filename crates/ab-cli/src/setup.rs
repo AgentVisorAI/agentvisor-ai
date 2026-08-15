@@ -913,18 +913,25 @@ pub async fn start() -> Result<()> {
     let (config, source) = ab_harness::config::load_config().map_err(|error| {
         anyhow::anyhow!("configuration problem: {error}\nRun `abctl doctor` for a full diagnosis.")
     })?;
-    // Round-21 F6: also rewrite the IPv6 unspecified address
-    // (`[::]` / `::`) to loopback (`[::1]`). An operator on a
-    // dual-stack host who sets `listen = "[::]:8484"` used to
-    // have `abctl start` poll `[::]:8484` forever (an invalid
-    // connect destination), time out at 20 s, and kill the
-    // perfectly healthy server. Do the string-level rewrite in
-    // both families so probes work regardless of listen form.
-    let probe_host = config
-        .listen
-        .replace("0.0.0.0", "127.0.0.1")
-        .replace("[::]", "[::1]");
-    let base = format!("http://{probe_host}");
+    // Round-21 F6 + round-40 F2: rewrite the listen address to a
+    // loopback probe URL. The prior implementation was a pair of
+    // string replacements (`0.0.0.0`->`127.0.0.1`, `[::]`->`[::1]`)
+    // which missed three real forms:
+    //   1. IPv6 link-local with a zone identifier
+    //      (`[fe80::1%eth0]:8484`) — the raw `%` in the URL fails
+    //      RFC 3986 parsing and every probe URL-parses to `Err`,
+    //      so `abctl start` blocks the full 20 s deadline and
+    //      kills a healthy child.
+    //   2. Fully expanded unspecified `[0:0:0:0:0:0:0:0]:8484`
+    //      (Rust `SocketAddr::to_string()` for `::` may emit
+    //      the shortened form, but operator-typed configs can be
+    //      expanded).
+    //   3. Non-`0.0.0.0` / `[::]` listen literals that happen to
+    //      resolve to an unspecified address.
+    // Parse via `SocketAddr` so the address family drives the
+    // loopback rewrite, and drop any zone identifier since a
+    // loopback connect never needs it.
+    let base = build_probe_base(&config.listen);
 
     if health_ok(&base).await {
         println!("AgentBridge is already running at {base}");
@@ -1441,6 +1448,70 @@ fn probe_target(endpoint: &str) -> Result<String> {
     Ok(format!("{host}:{port}"))
 }
 
+/// Round-40 F2: parse the operator-configured listen address into a
+/// loopback probe URL. Handles four forms explicitly:
+///
+/// * IPv4/IPv6 unspecified addresses map to loopback (matches the
+///   family: `0.0.0.0` -> `127.0.0.1`, `[::]` / expanded
+///   `[0:0:0:0:0:0:0:0]` -> `[::1]`).
+/// * Any other IPv4/IPv6 literal is preserved (an operator binding
+///   to a specific interface probes that same interface).
+/// * IPv6 addresses with a zone identifier (`[fe80::1%eth0]`) drop
+///   the zone id — loopback connects don't need it and the raw `%`
+///   in an unencoded URL breaks RFC 3986 parsers.
+/// * Anything unparsable (hostname, `*:port`, mangled config) falls
+///   back to the pre-round-40 string-replace behaviour so the
+///   change is strictly additive vs. round-21 F6.
+fn build_probe_base(listen: &str) -> String {
+    if let Ok(sa) = listen.parse::<std::net::SocketAddr>() {
+        let host = if sa.ip().is_unspecified() {
+            if sa.is_ipv6() {
+                "[::1]".to_owned()
+            } else {
+                "127.0.0.1".to_owned()
+            }
+        } else {
+            match sa.ip() {
+                std::net::IpAddr::V4(v4) => v4.to_string(),
+                // Rust's `Ipv6Addr::Display` already emits the
+                // shortened form and does not include a zone id
+                // (SocketAddr::parse also drops it), so this branch
+                // gives us a stable bracketed form.
+                std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+            }
+        };
+        format!("http://{host}:{}", sa.port())
+    } else {
+        // Fallback: preserve the round-21 F6 behaviour when parse
+        // fails (bare hostname, `*:port`, IPv6 with zone id — the
+        // last one is REACHABLE here because `SocketAddr::parse`
+        // rejects zone ids on stable Rust; drop the zone id via a
+        // second replace so at least the loopback rewrite still
+        // runs.
+        let rewritten = listen
+            .replace("0.0.0.0", "127.0.0.1")
+            .replace("[::]", "[::1]");
+        // Strip an IPv6 zone identifier if present: `[fe80::1%eth0]`
+        // -> `[fe80::1]`. Loopback connects don't need it, and the
+        // raw `%` breaks URL parsing downstream.
+        let rewritten = if let (Some(start), Some(pct), Some(end)) =
+            (rewritten.find('['), rewritten.find('%'), rewritten.find(']'))
+        {
+            if start < pct && pct < end {
+                let mut owned = String::with_capacity(rewritten.len());
+                owned.push_str(&rewritten[..pct]);
+                owned.push_str(&rewritten[end..]);
+                owned
+            } else {
+                rewritten
+            }
+        } else {
+            rewritten
+        };
+        format!("http://{rewritten}")
+    }
+}
+
 /// `abctl health` — probe a running harness; exit 0 only on HTTP 200.
 pub async fn health(base_url: &str) -> Result<()> {
     // Accept both the base URL (documented) and a pasted full /health URL:
@@ -1861,5 +1932,48 @@ mod tests {
         // IPv6 literals stay bracketed and preserve default port.
         assert_eq!(probe_target("http://[::1]").unwrap(), "[::1]:80");
         assert_eq!(probe_target("https://[2001:db8::1]:8443").unwrap(), "[2001:db8::1]:8443");
+    }
+
+    /// Round-40 F2: `build_probe_base` handles the four listen-form
+    /// variants round-21 F6 missed. The prior string-replace pair
+    /// left every `[fe80::1%eth0]:8484` config broken; the parse-
+    /// based rewrite recovers correctly.
+    #[test]
+    fn build_probe_base_covers_ipv6_zones_and_family_dispatch() {
+        // IPv4 unspecified -> IPv4 loopback.
+        assert_eq!(
+            build_probe_base("0.0.0.0:8484"),
+            "http://127.0.0.1:8484"
+        );
+        // IPv6 unspecified -> IPv6 loopback (bracketed).
+        assert_eq!(build_probe_base("[::]:8484"), "http://[::1]:8484");
+        // IPv6 unspecified expanded form — SocketAddr parse
+        // normalises to `::` so we still get [::1].
+        assert_eq!(
+            build_probe_base("[0:0:0:0:0:0:0:0]:8484"),
+            "http://[::1]:8484"
+        );
+        // Concrete IPv4/IPv6 interface bindings are preserved.
+        assert_eq!(
+            build_probe_base("127.0.0.1:8484"),
+            "http://127.0.0.1:8484"
+        );
+        assert_eq!(
+            build_probe_base("[2001:db8::1]:8484"),
+            "http://[2001:db8::1]:8484"
+        );
+        // IPv6 with a zone id: SocketAddr parse fails on stable
+        // Rust (zone ids are Rust-nightly only), so we fall through
+        // to the string-fallback which now strips the zone id
+        // before the URL is built. The raw `%` MUST NOT survive.
+        let probed = build_probe_base("[fe80::1%eth0]:8484");
+        assert!(
+            !probed.contains('%'),
+            "raw `%` from zone id must not survive into probe URL: {probed}"
+        );
+        assert!(
+            probed.contains("[fe80::1]"),
+            "loopback probe should still target the address (with zone id stripped): {probed}"
+        );
     }
 }

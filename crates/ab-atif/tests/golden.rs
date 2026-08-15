@@ -513,3 +513,123 @@ fn per_step_cost_usd_capped_in_strict_mode() {
         "expected per-step cost-cap issue, got: {issues:#?}"
     );
 }
+
+/// Round-40 F3: subagent_trajectories now detects cycles across
+/// ANY ancestor (A -> B -> A), not just among direct siblings.
+/// Before, a bogus trajectory could claim to be a re-invocation
+/// of its root and downstream analysis would treat the tree as
+/// a genuine recursive call.
+#[test]
+fn subagent_trajectory_cycle_across_ancestors_is_flagged() {
+    let value = json!({
+        "schema_version": "ATIF-v1.7",
+        "trajectory_id": "root",
+        "session_id": "s",
+        "agent": {"name": "a", "version": "1.0.0"},
+        "steps": [{
+            "step_id": 1,
+            "source": "agent",
+            "message": "hi",
+            "metrics": {"prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0}
+        }],
+        "subagent_trajectories": [{
+            "schema_version": "ATIF-v1.7",
+            "trajectory_id": "middle",
+            "agent": {"name": "b", "version": "1.0.0"},
+            "steps": [{
+                "step_id": 1,
+                "source": "agent",
+                "message": "hi",
+                "metrics": {"prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0}
+            }],
+            "subagent_trajectories": [{
+                "schema_version": "ATIF-v1.7",
+                "trajectory_id": "root", // <-- claims to be its own grandparent
+                "agent": {"name": "a", "version": "1.0.0"},
+                "steps": [{
+                    "step_id": 1,
+                    "source": "agent",
+                    "message": "hi",
+                    "metrics": {"prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0}
+                }]
+            }]
+        }]
+    });
+    let issues = validate_value(&value, Mode::Strict);
+    assert!(
+        issues.iter().any(|i| i.message.contains("cycle")),
+        "expected ancestor-cycle issue, got: {issues:#?}"
+    );
+}
+
+/// Round-40 F3: sibling branches sharing a trajectory_id are fine
+/// — the ancestor cleanup on frame exit means A -> [B, B] is
+/// only flagged by the direct-sibling dedup, and A -> [B -> C,
+/// D -> C] is legitimate (C appears twice in the tree but never
+/// as its own ancestor).
+#[test]
+fn subagent_trajectory_sibling_reuse_is_not_a_false_positive() {
+    let value = json!({
+        "schema_version": "ATIF-v1.7",
+        "trajectory_id": "root",
+        "session_id": "s",
+        "agent": {"name": "a", "version": "1.0.0"},
+        "steps": [{
+            "step_id": 1,
+            "source": "agent",
+            "message": "hi",
+            "metrics": {"prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0}
+        }],
+        "subagent_trajectories": [
+            {
+                "schema_version": "ATIF-v1.7",
+                "trajectory_id": "b1",
+                "agent": {"name": "b", "version": "1.0.0"},
+                "steps": [{
+                    "step_id": 1,
+                    "source": "agent",
+                    "message": "hi",
+                    "metrics": {"prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0}
+                }],
+                "subagent_trajectories": [{
+                    "schema_version": "ATIF-v1.7",
+                    "trajectory_id": "leaf-shared",
+                    "agent": {"name": "c", "version": "1.0.0"},
+                    "steps": [{
+                        "step_id": 1,
+                        "source": "agent",
+                        "message": "hi",
+                        "metrics": {"prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0}
+                    }]
+                }]
+            },
+            {
+                "schema_version": "ATIF-v1.7",
+                "trajectory_id": "b2",
+                "agent": {"name": "d", "version": "1.0.0"},
+                "steps": [{
+                    "step_id": 1,
+                    "source": "agent",
+                    "message": "hi",
+                    "metrics": {"prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0}
+                }],
+                "subagent_trajectories": [{
+                    "schema_version": "ATIF-v1.7",
+                    "trajectory_id": "leaf-shared", // same id, sibling branch, not an ancestor
+                    "agent": {"name": "c", "version": "1.0.0"},
+                    "steps": [{
+                        "step_id": 1,
+                        "source": "agent",
+                        "message": "hi",
+                        "metrics": {"prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0}
+                    }]
+                }]
+            }
+        ]
+    });
+    let issues = validate_value(&value, Mode::Strict);
+    assert!(
+        !issues.iter().any(|i| i.message.contains("cycle")),
+        "sibling reuse of trajectory_id must NOT trigger the ancestor-cycle guard; got: {issues:#?}"
+    );
+}
