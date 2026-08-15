@@ -137,6 +137,16 @@ curl http://127.0.0.1:8484/metrics
 - `POST /v1/sessions/{id}/promote`: issue a retroactive receipt for an ATIF trajectory.
 - `GET /health`: liveness.
 - `GET /metrics`: Prometheus text exposition.
+- `GET /dashboard`: read-only operator dashboard (HTML). Disable via
+  `dashboard_enabled = false` in the harness config.
+- `GET /api/v1/dashboard/{stats,sessions,sessions/{id}}`: JSON view of the
+  in-memory session registry the dashboard consumes.
+
+The dashboard shows sessions currently in the registry, their cost, tokens,
+tool-call allow/block counts, and stop reason, with a session drawer that
+renders the latest receipt as JSON. It is unauthenticated — front the
+harness with the same ingress control you already use for `/metrics`, or
+turn it off.
 
 Request headers:
 

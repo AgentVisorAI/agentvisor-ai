@@ -240,9 +240,7 @@ impl EventBus for NatsBus {
                     // record stays on JetStream as forensic evidence.
                     let msg = next?;
                     let mut ev: StoredEvent = serde_json::from_slice(&msg.payload).map_err(|error| {
-                        async_nats::Error::from(std::io::Error::other(format!(
-                            "fetch decode: {error}"
-                        )))
+                        async_nats::Error::from(std::io::Error::other(format!("fetch decode: {error}")))
                     })?;
                     if let Ok(info) = msg.info() {
                         ev.offset = info.stream_sequence;

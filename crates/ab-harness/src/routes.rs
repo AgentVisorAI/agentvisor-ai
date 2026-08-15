@@ -23,14 +23,29 @@ use tracing::Instrument as _;
 /// Build the complete harness router.
 pub fn build_router(state: AppState) -> Router {
     let max_body = state.config.max_request_bytes;
-    Router::new()
+    let dashboard_enabled = state.config.dashboard_enabled;
+    let mut router = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/mcp", post(mcp_call))
         .route("/mcp", post(mcp_call))
         .route("/v1/sessions/{id}/close", post(close_session))
-        .route("/v1/sessions/{id}/promote", post(promote_session))
+        .route("/v1/sessions/{id}/promote", post(promote_session));
+    if dashboard_enabled {
+        router = router
+            .route("/dashboard", get(crate::dashboard::index))
+            .route("/dashboard/", get(crate::dashboard::index))
+            .route("/dashboard/style.css", get(crate::dashboard::style_css))
+            .route("/dashboard/app.js", get(crate::dashboard::app_js))
+            .route("/api/v1/dashboard/stats", get(crate::dashboard::stats))
+            .route("/api/v1/dashboard/sessions", get(crate::dashboard::list_sessions))
+            .route(
+                "/api/v1/dashboard/sessions/{id}",
+                get(crate::dashboard::session_detail),
+            );
+    }
+    router
         .layer(axum::middleware::from_fn(trace_request))
         // axum's default body limit is 2 MiB, which silently rejects large
         // chat contexts (Claude 200k, GPT-4 128k) before the sandbox even

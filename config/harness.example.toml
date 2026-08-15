@@ -34,6 +34,10 @@ strict_stage_budget = false
 compression_enabled = true
 reconcile_tick_s = 5
 
+# Read-only operator dashboard served at /dashboard. Unauthenticated —
+# front the harness with the same ingress control you use for /metrics.
+dashboard_enabled = true
+
 [breaker]
 delta_epsilon = 0.30
 window = 3

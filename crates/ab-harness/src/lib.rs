@@ -15,6 +15,7 @@
 //! worker panics are supervised and counted.
 
 pub mod config;
+pub mod dashboard;
 pub(crate) mod journal;
 pub mod pipeline;
 pub mod reconciler;
