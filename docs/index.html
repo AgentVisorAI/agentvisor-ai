@@ -3,155 +3,353 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>AgentBridge — the audit trail for AI agents</title>
-  <meta name="description" content="AgentBridge records every request, tool call, and response an AI agent makes, enforces cost and policy limits, and issues signed receipts anyone can verify offline.">
+  <title>AgentBridge — AI agents you can hand to an auditor</title>
+  <meta name="description" content="AgentBridge sits in front of your AI agent's LLM and tool calls. Point your OpenAI client at it, and every session ends with a signed receipt anyone can verify offline.">
   <link rel="stylesheet" href="style.css">
   <link rel="canonical" href="https://debugmode0.github.io/agent-bridge/">
+  <meta property="og:title" content="AgentBridge — AI agents you can hand to an auditor">
+  <meta property="og:description" content="One line of code. Every session recorded, capped, and signed.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://debugmode0.github.io/agent-bridge/">
 </head>
 <body>
-  <header class="hero">
+
+  <nav aria-label="Primary">
+    <div class="wrap nav-inner">
+      <a class="brand" href="#top">AgentBridge</a>
+      <div class="nav-links">
+        <a href="#one-line">How it works</a>
+        <a href="#what-you-get">What you get</a>
+        <a href="#try-it">Get started</a>
+        <a href="https://github.com/debugmode0/agent-bridge">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <header class="hero" id="top">
     <div class="wrap">
-      <p class="eyebrow">AgentBridge <span class="pill">v0.1.0</span></p>
-      <h1>The audit trail for AI agents.</h1>
+      <h1>AI agents you can hand to an auditor.</h1>
       <p class="lede">
-        You put AgentBridge between your app and its model or tools.
-        It records everything the agent does, enforces the limits you set,
-        and hands you a signed receipt at the end of every session that
-        anyone can verify offline &mdash; no vendor lock-in, no trust in us.
+        AgentBridge is a small server you drop in front of your agent&rsquo;s LLM
+        and tool calls. Every request is recorded. Every limit you set is
+        enforced before the call goes out. Every session ends with a signed
+        receipt anyone can verify offline &mdash; without asking you or us for
+        anything except a public key.
       </p>
       <p class="cta-row">
-        <a class="cta primary" href="#try-it">See it in 60 seconds</a>
-        <a class="cta" href="https://github.com/debugmode0/agent-bridge">View on GitHub</a>
+        <a class="cta primary" href="#try-it">Try it in 60 seconds</a>
+        <a class="cta" href="https://github.com/debugmode0/agent-bridge">Read the code</a>
+      </p>
+      <p class="hero-meta">
+        v0.1.0 &middot; Apache&#8209;2.0 &middot; Rust &middot; Runs on your machine, your VM, or your cluster
       </p>
     </div>
   </header>
 
-  <main class="wrap">
+  <main>
 
-    <section id="what-it-does" aria-labelledby="what-it-does-h">
-      <h2 id="what-it-does-h">What it does</h2>
-      <div class="tiles">
-        <article class="tile">
-          <h3>Records what the agent did</h3>
+    <section id="one-line">
+      <div class="wrap two-col">
+        <div>
+          <p class="section-kicker">Point your existing OpenAI client at it</p>
+          <h2>One line of code. Zero SDK.</h2>
           <p>
-            Every prompt, tool call, and provider response passes through
-            AgentBridge and lands in an append-only log with timestamps and
-            the caller&rsquo;s identity. Nothing is inferred or summarised;
-            the log is the raw evidence.
+            AgentBridge speaks OpenAI&rsquo;s <code>chat/completions</code> and
+            MCP over plain HTTP. Change the base URL your client points at.
+            Nothing else in your app moves.
           </p>
-        </article>
-        <article class="tile">
-          <h3>Stops runaways</h3>
-          <p>
-            Set caps on total calls, per-tool calls, spend, and prompt
-            tokens. Detect and cut off loops where the agent keeps trying
-            the same thing. Refusals happen at the gateway, before the
-            model or tool sees the request.
+          <p class="muted">
+            Works the same way for Anthropic-compatible clients, Ollama,
+            LM&nbsp;Studio, Azure OpenAI, and anything else that speaks the
+            same wire format.
           </p>
-        </article>
-        <article class="tile">
-          <h3>Proves the session stayed in bounds</h3>
-          <p>
-            When a session ends, AgentBridge signs a compact receipt with
-            an Ed25519 key you own. Anyone with the matching public key
-            can verify the receipt offline &mdash; the vendor, the customer,
-            an auditor, a subpoena.
-          </p>
-        </article>
+        </div>
+        <div>
+<pre class="code-diff"><code><span class="diff-header">python</span>
+  from openai import OpenAI
+
+  client = OpenAI(
+      api_key=os.environ["OPENAI_API_KEY"],
+<span class="diff-add">+     base_url="http://127.0.0.1:8484/v1",</span>
+  )
+
+  client.chat.completions.create(
+      model="gpt-4o-mini",
+      messages=[{"role": "user", "content": "hello"}],
+  )</code></pre>
+        </div>
       </div>
     </section>
 
-    <section id="who" aria-labelledby="who-h">
-      <h2 id="who-h">Who runs it</h2>
-      <ul class="prose-list">
-        <li>
-          <strong>Security teams</strong> that need to know what their AI copilots touched
-          and are tired of relying on the model vendor&rsquo;s dashboard.
-        </li>
-        <li>
-          <strong>Platform / SRE teams</strong> who got burned by an agent leaving a database
-          connection open at 3 AM or generating a $4,000 bill on a Sunday.
-        </li>
-        <li>
-          <strong>Compliance and legal</strong> who need offline-verifiable evidence a customer or
-          regulator can accept without trusting the model vendor&rsquo;s word.
-        </li>
-        <li>
-          <strong>Product teams shipping agents</strong> that want to give customers a receipt
-          for each session &mdash; a real one, cryptographically signed.
-        </li>
-      </ul>
+    <section id="what-you-get" class="alt">
+      <div class="wrap">
+        <p class="section-kicker">What you get</p>
+        <h2>Three things you didn&rsquo;t have before.</h2>
+
+        <div class="feature">
+          <div class="feature-copy">
+            <h3>A signed record of every session</h3>
+            <p>
+              When the agent&rsquo;s session finishes &mdash; whether that&rsquo;s a single
+              chat completion or a 40-step tool-using conversation &mdash; AgentBridge
+              hands back a receipt like the one on the right. It commits to
+              the full event chain, the cost, and how many tool calls were
+              allowed vs blocked.
+            </p>
+            <p>
+              Verification is one <code>abctl receipt-verify</code> call with
+              your public key. Or 30 lines of your language&rsquo;s Ed25519 library.
+              You don&rsquo;t need to trust AgentBridge to trust the receipt.
+            </p>
+          </div>
+          <div class="feature-visual">
+<pre class="filename">receipt.json</pre>
+<pre class="code-json"><code>{
+  <span class="k">"receipt_id"</span>: <span class="s">"01924f8b-1f0c-7c31&hellip;"</span>,
+  <span class="k">"session_id"</span>: <span class="s">"sess-2024-08-14-42"</span>,
+  <span class="k">"issued_at_iso"</span>: <span class="s">"2024-08-14T21:07:14Z"</span>,
+  <span class="k">"subject"</span>: {
+    <span class="k">"kind"</span>: <span class="s">"event_chain"</span>,
+    <span class="k">"chain_head"</span>: <span class="s">"b2b7c9d8&hellip;"</span>,
+    <span class="k">"event_count"</span>: <span class="n">47</span>
+  },
+  <span class="k">"tool_calls"</span>: {
+    <span class="k">"total"</span>: <span class="n">8</span>, <span class="k">"allowed"</span>: <span class="n">7</span>, <span class="k">"blocked"</span>: <span class="n">1</span>
+  },
+  <span class="k">"cost"</span>: {
+    <span class="k">"prompt_tokens"</span>: <span class="n">12408</span>,
+    <span class="k">"completion_tokens"</span>: <span class="n">3819</span>,
+    <span class="k">"cost_usd_micros"</span>: <span class="n">84340</span>
+  },
+  <span class="k">"stop_reason"</span>: <span class="s">"budget_exceeded"</span>,
+  <span class="k">"key_id"</span>: <span class="s">"c8f2&hellip;"</span>,
+  <span class="k">"signature_b64"</span>: <span class="s">"wg7A0Kx3&hellip;"</span>
+}</code></pre>
+          </div>
+        </div>
+
+        <div class="feature">
+          <div class="feature-copy">
+            <h3>Hard limits, refused at the door</h3>
+            <p>
+              That <code>blocked: 1</code> in the receipt was a tool call that
+              would have blown past the session&rsquo;s cost cap. Your agent
+              received a plain HTTP&nbsp;403 and moved on. The provider was
+              never contacted; the money was never spent.
+            </p>
+            <p>
+              Set caps on total tool calls, per-tool calls, spend in
+              micro-USD, and prompt tokens. Turn on the semantic loop
+              breaker if your agent tends to retry the same failing thing
+              until you go broke.
+            </p>
+          </div>
+          <div class="feature-visual">
+<pre class="filename">POST /v1/mcp</pre>
+<pre class="code-http"><code><span class="http-status">HTTP/1.1 403 Forbidden</span>
+Content-Type: application/json
+
+{
+  <span class="k">"error"</span>: {
+    <span class="k">"code"</span>: -32001,
+    <span class="k">"message"</span>: <span class="s">"tool call blocked by AgentBridge policy"</span>,
+    <span class="k">"data"</span>: {
+      <span class="k">"stage"</span>: <span class="s">"budget"</span>,
+      <span class="k">"reason"</span>: <span class="s">"max_payout_usd_micros (cap 50000000)"</span>
+    }
+  }
+}</code></pre>
+          </div>
+        </div>
+
+        <div class="feature">
+          <div class="feature-copy">
+            <h3>Evidence you can send anywhere</h3>
+            <p>
+              Every event is written as OCSF-shaped JSON &mdash; the same
+              schema your SIEM already speaks. Every session that never
+              finishes becomes an ATIF trajectory file compatible with the
+              Harbor validator. Every artifact is just a file under
+              <code>data/</code>.
+            </p>
+            <p>
+              Ship the files to S3, feed them into Vector, hand them to
+              a customer&rsquo;s evidence locker, or archive them for the seven
+              years your industry demands. AgentBridge does not phone home.
+            </p>
+          </div>
+          <div class="feature-visual">
+<pre class="filename">$ ls -R data/</pre>
+<pre class="code-shell"><code>data/
+&#x251C;&#x2500; receipts/
+&#x2502;   &#x2514;&#x2500; 84a3&hellip;.json         <span class="c"># signed session receipt</span>
+&#x251C;&#x2500; sess-2024-08-14-42.json  <span class="c"># ATIF v1.7 trajectory</span>
+&#x251C;&#x2500; outbox/
+&#x2502;   &#x2514;&#x2500; 84a3&hellip;.receipt.json <span class="c"># pending broker publish</span>
+&#x2514;&#x2500; bridge/
+    &#x2514;&#x2500; topics/
+        &#x2514;&#x2500; agent.tool_call/
+            &#x2514;&#x2500; p0.jsonl         <span class="c"># OCSF event stream</span></code></pre>
+          </div>
+        </div>
+      </div>
     </section>
 
-    <section id="try-it" aria-labelledby="try-it-h">
-      <h2 id="try-it-h">Try it in 60 seconds</h2>
-      <p>
-        Requires <a href="https://rustup.rs/">Rust</a> (or grab a pre-built binary from the
-        <a href="https://github.com/debugmode0/agent-bridge/releases">releases page</a>).
-        You&rsquo;ll be asked one question at a time; a config file is written for you.
-      </p>
-<pre><code>cargo install --path crates/ab-cli --bin abctl
-abctl</code></pre>
-      <p class="hint">
-        After the setup wizard finishes, AgentBridge starts on <code>http://127.0.0.1:8484</code>.
-        Point any OpenAI-compatible SDK at that URL as if it were the provider &mdash;
-        no code changes. Receipts, events, and trajectories appear under <code>data/</code>.
-      </p>
+    <section id="when">
+      <div class="wrap">
+        <p class="section-kicker">When you&rsquo;d want it</p>
+        <h2>Three moments this pays for itself.</h2>
+        <div class="scenarios">
+          <article>
+            <h3>The 3 AM cost spike</h3>
+            <p>
+              Your agent gets stuck in a retry loop and burns $2,400 on a
+              Sunday. AgentBridge&rsquo;s loop breaker plus the payout cap would
+              have cut it off at $10, logged what happened, and let your
+              on-call sleep.
+            </p>
+          </article>
+          <article>
+            <h3>The compliance email</h3>
+            <p>
+              An auditor asks which customers&rsquo; data your agent touched
+              last quarter. Instead of running a scavenger hunt through
+              LangSmith and provider dashboards, you hand over a
+              directory of receipts and a public key.
+            </p>
+          </article>
+          <article>
+            <h3>The customer question</h3>
+            <p>
+              A customer wants to know whether the agent you built for
+              them called any model or tool other than the ones you
+              promised. You give them a session receipt and 20 lines
+              of verification code.
+            </p>
+          </article>
+        </div>
+      </div>
     </section>
 
-    <section id="not-included" aria-labelledby="not-included-h">
-      <h2 id="not-included-h">What it is <em>not</em></h2>
-      <p>
-        AgentBridge is not an observability dashboard, an analytics tool,
-        or a service you sign up for. It is a small piece of software that
-        runs next to your agent. It writes files to disk. You keep the
-        signing key. If AgentBridge disappeared tomorrow the receipts you
-        already issued would still verify against your key.
-      </p>
+    <section id="try-it" class="alt">
+      <div class="wrap two-col">
+        <div>
+          <p class="section-kicker">Get started</p>
+          <h2>60 seconds, one prompt at a time.</h2>
+          <p>
+            Requires <a href="https://rustup.rs/">Rust</a>, or a pre-built
+            binary from the
+            <a href="https://github.com/debugmode0/agent-bridge/releases">releases page</a>.
+            The wizard asks one thing at a time and writes the config
+            file for you. When it finishes, AgentBridge is running on
+            <code>http://127.0.0.1:8484</code>.
+          </p>
+          <p>
+            Point your OpenAI client at that URL as if it were the
+            provider. No code changes beyond the one line above.
+          </p>
+        </div>
+        <div>
+<pre class="code-shell"><code><span class="prompt">$</span> cargo install --path crates/ab-cli --bin abctl
+<span class="prompt">$</span> abctl
+
+  <span class="c">1) OpenAI</span>
+  <span class="c">2) Anthropic</span>
+  <span class="c">3) Azure OpenAI</span>
+  <span class="c">4) Ollama (local)</span>
+  <span class="c">5) LM Studio (local)</span>
+  Pick a provider <span class="c">[1]</span>: <span class="in">1</span>
+
+  Paste your OpenAI API key: <span class="in">&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;</span>
+  Key stored under ~/.agentbridge/keys/ (chmod 600).
+
+  Start now? <span class="c">[Y/n]</span>: <span class="in">y</span>
+
+  AgentBridge is running on http://127.0.0.1:8484
+  Point any OpenAI-compatible SDK at it. Ctrl-C to stop.</code></pre>
+        </div>
+      </div>
     </section>
 
-    <section id="read-more" aria-labelledby="read-more-h">
-      <h2 id="read-more-h">Read more</h2>
-      <ul class="link-list">
-        <li>
-          <a href="https://github.com/debugmode0/agent-bridge#readme">README</a>
-          &mdash; full setup, configuration, and the CLI.
-        </li>
-        <li>
-          <a href="https://github.com/debugmode0/agent-bridge/blob/main/ARCHITECTURE.md">Architecture</a>
-          &mdash; how the pipeline fits together.
-        </li>
-        <li>
-          <a href="https://github.com/debugmode0/agent-bridge/blob/main/SECURITY.md">Security model</a>
-          &mdash; trust boundaries, controls, and how to deploy safely.
-        </li>
-        <li>
-          <a href="https://github.com/debugmode0/agent-bridge/blob/main/VERIFICATION.md">Verification protocol</a>
-          &mdash; how a third party checks a receipt without contacting us.
-        </li>
-        <li>
-          <a href="https://github.com/debugmode0/agent-bridge/releases">Releases</a>
-          &mdash; pre-built binaries with SHA-256 checksums.
-        </li>
-        <li>
-          <a href="api/">API documentation</a>
-          &mdash; Rust crate docs for library authors. If you don&rsquo;t know what that
-          means, you don&rsquo;t need it.
-        </li>
-      </ul>
+    <section id="under-hood">
+      <div class="wrap">
+        <p class="section-kicker">Under the hood</p>
+        <h2>Boring, on purpose.</h2>
+        <p class="lede lede-secondary">
+          AgentBridge is a Rust workspace of twelve crates. No hosted
+          service, no phone-home telemetry, no vendored dashboard. It
+          writes files. You keep the signing key.
+        </p>
+        <div class="tech-grid">
+          <div>
+            <h3>Runs anywhere Rust runs</h3>
+            <p>
+              Single static binary or two-container compose (harness &amp;
+              Redpanda). Also ships a hardened Kubernetes manifest and
+              a systemd unit with sensible defaults.
+            </p>
+          </div>
+          <div>
+            <h3>Pluggable backends</h3>
+            <p>
+              Event bus: embedded (files), Kafka&#x202F;/&#x202F;Redpanda, NATS JetStream.
+              State: in-memory or Redis. Vector store: Qdrant or none.
+              Pick what your org already runs.
+            </p>
+          </div>
+          <div>
+            <h3>Interoperable formats</h3>
+            <p>
+              Events are OCSF&nbsp;1.10; trajectories are ATIF&nbsp;v1.7; receipts
+              are Ed25519 over RFC&nbsp;8785 canonical JSON. If you already
+              have a SIEM or an evidence tool, it probably already reads
+              these.
+            </p>
+          </div>
+          <div>
+            <h3>Actually audited</h3>
+            <p>
+              Every fix is regression-tested. The full suite runs on
+              every push; supply-chain policy is enforced by
+              <code>cargo&#8209;deny</code>. Read the security model
+              before you deploy it &mdash; it&rsquo;s honest about what it
+              does and does not defend against.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="read-more" class="alt">
+      <div class="wrap">
+        <p class="section-kicker">Read more</p>
+        <h2>Everything else.</h2>
+        <ul class="link-columns">
+          <li><a href="https://github.com/debugmode0/agent-bridge#readme">README</a> &mdash; full setup, configuration, CLI reference.</li>
+          <li><a href="https://github.com/debugmode0/agent-bridge/blob/main/ARCHITECTURE.md">Architecture</a> &mdash; how the pipeline fits together.</li>
+          <li><a href="https://github.com/debugmode0/agent-bridge/blob/main/SECURITY.md">Security model</a> &mdash; trust boundaries and threat model.</li>
+          <li><a href="https://github.com/debugmode0/agent-bridge/blob/main/VERIFICATION.md">Verification protocol</a> &mdash; verifying a receipt from scratch.</li>
+          <li><a href="https://github.com/debugmode0/agent-bridge/blob/main/BENCHMARKS.md">Benchmarks</a> &mdash; hot-path latency and 10&#x00A0;000-connection SLA.</li>
+          <li><a href="https://github.com/debugmode0/agent-bridge/releases">Releases</a> &mdash; pre-built binaries with SHA-256 checksums.</li>
+          <li><a href="api/">API documentation</a> &mdash; Rust crate reference. Skip unless you&rsquo;re embedding AgentBridge as a library.</li>
+        </ul>
+      </div>
     </section>
   </main>
 
   <footer>
-    <div class="wrap">
+    <div class="wrap footer-inner">
       <p>
-        AgentBridge is open source under the
-        <a href="https://github.com/debugmode0/agent-bridge/blob/main/LICENSE">Apache&nbsp;License&nbsp;2.0</a>.
-        Report vulnerabilities privately via the
-        <a href="https://github.com/debugmode0/agent-bridge/security/advisories/new">security&nbsp;advisory&nbsp;form</a>,
-        never in a public issue.
+        <a href="https://github.com/debugmode0/agent-bridge">GitHub</a> &middot;
+        <a href="https://github.com/debugmode0/agent-bridge/blob/main/LICENSE">Apache&nbsp;2.0</a> &middot;
+        <a href="https://github.com/debugmode0/agent-bridge/security/advisories/new">Report a vulnerability</a>
+      </p>
+      <p class="muted">
+        AgentBridge is open source and free to use. If it saves you
+        from a 3&nbsp;AM incident, please <a href="https://github.com/debugmode0/agent-bridge/stargazers">star the repo</a>.
       </p>
     </div>
   </footer>
+
 </body>
 </html>
