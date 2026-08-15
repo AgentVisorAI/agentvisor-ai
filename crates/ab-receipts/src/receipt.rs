@@ -229,6 +229,12 @@ pub enum ReceiptError {
     /// external audit tool displayed the other.
     #[error("duplicate JSON key `{0}` at nesting; strict receipt parsers refuse this")]
     DuplicateKey(String),
+    /// Round-16 F8: a receipt carries a semantically-invalid field
+    /// (currently: `AtifTrajectory.retroactive == false`). Distinct
+    /// from `Serde` and `DuplicateKey` so ops triage can name the
+    /// class.
+    #[error("semantic invariant violated: {0}")]
+    SemanticInvariant(String),
 }
 
 impl Receipt {
@@ -280,8 +286,14 @@ impl Receipt {
     /// Verify offline against a keyring. Checks:
     /// 1. the embedded public key matches the ring's key for `key_id`
     ///    (anti-substitution);
-    /// 2. the signature verifies over `JCS(body)`.
+    /// 2. the signature verifies over `JCS(body)`;
+    /// 3. `AtifTrajectory.retroactive == true` (round-16 F8 —
+    ///    `retroactive: false` on an ATIF-promoted receipt is
+    ///    semantically nonsense; the schema pins it to `const: true`
+    ///    but the Rust type still accepts `false`; refuse it here so
+    ///    the two agree).
     pub fn verify(&self, ring: &Keyring) -> Result<(), ReceiptError> {
+        self.verify_semantic_invariants()?;
         let embedded = base64::engine::general_purpose::STANDARD
             .decode(&self.body.public_key_b64)
             .map_err(|_| ReceiptError::Base64)?;
@@ -305,6 +317,7 @@ impl Receipt {
     /// the verifier obtained the receipt over an authenticated channel or
     /// pins key ids separately. Prefer [`Receipt::verify`] with a ring.
     pub fn verify_embedded(&self) -> Result<(), ReceiptError> {
+        self.verify_semantic_invariants()?;
         let embedded = base64::engine::general_purpose::STANDARD
             .decode(&self.body.public_key_b64)
             .map_err(|_| ReceiptError::Base64)?;
@@ -321,6 +334,23 @@ impl Receipt {
         ring.verify(&id, canon.as_bytes(), &sig)?;
         Ok(())
     }
+
+    /// Round-16 F8: check semantic invariants that the type system
+    /// cannot express. Currently: `AtifTrajectory.retroactive` must
+    /// be `true` (the schema pins it via `const: true`; the Rust
+    /// type is `bool` for auditability). Called from both
+    /// `verify` and `verify_embedded` so no verification path can
+    /// skip it.
+    fn verify_semantic_invariants(&self) -> Result<(), ReceiptError> {
+        if let ReceiptSubject::AtifTrajectory { retroactive, .. } = &self.body.subject {
+            if !retroactive {
+                return Err(ReceiptError::SemanticInvariant(
+                    "AtifTrajectory.retroactive must be true (this receipt attests a retroactive promotion)".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Walk a JSON document and reject any object whose keys contain a
@@ -333,15 +363,49 @@ impl Receipt {
 /// hostile issuer signed a document with two spellings of the same
 /// key and a first-wins auditor would see the earlier one. This
 /// walk runs upfront so the collapse never happens.
+///
+/// Round-16 hardening: enforce a hard depth cap so a hostile issuer
+/// cannot use a deeply-nested `[[[[…]]]]` payload to blow the walker's
+/// stack. serde_json's own limit is 128 by default, but the cost of
+/// a per-level check is a single u16 increment.
+const MAX_NESTED_DEPTH: usize = 128;
+
+/// Sentinel prefix that lets `check_no_duplicate_keys` distinguish a
+/// duplicate-key rejection (mapped to `ReceiptError::DuplicateKey`)
+/// from a general parse failure (mapped to `ReceiptError::Serde`).
+/// Round-16 F6: the previous blanket `.map_err(DuplicateKey)` folded
+/// serde_json's own EOF / recursion / expected-value errors into the
+/// DuplicateKey variant, actively misleading ops.
+const DUP_KEY_SENTINEL: &str = "__ab_dup:";
+
 fn check_no_duplicate_keys(bytes: &[u8]) -> Result<(), ReceiptError> {
     use serde::Deserializer as _;
     let mut deser = serde_json::Deserializer::from_slice(bytes);
-    deser
-        .deserialize_any(NoDupVisitor)
-        .map_err(|error| ReceiptError::DuplicateKey(error.to_string()))
+    match deser.deserialize_any(NoDupVisitor { depth: 0 }) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let msg = error.to_string();
+            if let Some(rest) = msg.strip_prefix(DUP_KEY_SENTINEL) {
+                Err(ReceiptError::DuplicateKey(rest.to_owned()))
+            } else if msg.contains("recursion limit exceeded") {
+                // Preserve the intent of the depth check even when
+                // serde_json fires first, so callers still see a
+                // DuplicateKey-family error class for hostile
+                // deeply-nested input.
+                Err(ReceiptError::DuplicateKey(msg))
+            } else {
+                // Genuine parse error (EOF, expected value, invalid
+                // number). Bubble the underlying serde_json::Error
+                // via Serde so tracing sites don't misattribute.
+                Err(ReceiptError::Serde(error))
+            }
+        }
+    }
 }
 
-struct NoDupVisitor;
+struct NoDupVisitor {
+    depth: usize,
+}
 
 impl<'de> serde::de::Visitor<'de> for NoDupVisitor {
     type Value = ();
@@ -359,30 +423,53 @@ impl<'de> serde::de::Visitor<'de> for NoDupVisitor {
     fn visit_none<E>(self) -> Result<(), E> { Ok(()) }
     fn visit_unit<E>(self) -> Result<(), E> { Ok(()) }
     fn visit_seq<S: serde::de::SeqAccess<'de>>(self, mut seq: S) -> Result<(), S::Error> {
-        while seq.next_element_seed(NoDupSeed)?.is_some() {}
+        use serde::de::Error as _;
+        let next_depth = self.depth.saturating_add(1);
+        if next_depth > MAX_NESTED_DEPTH {
+            return Err(S::Error::custom(format!(
+                "{DUP_KEY_SENTINEL}JSON nesting exceeds {MAX_NESTED_DEPTH}"
+            )));
+        }
+        while seq
+            .next_element_seed(NoDupSeed { depth: next_depth })?
+            .is_some()
+        {}
         Ok(())
     }
     fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<(), M::Error> {
         use serde::de::Error as _;
+        let next_depth = self.depth.saturating_add(1);
+        if next_depth > MAX_NESTED_DEPTH {
+            return Err(M::Error::custom(format!(
+                "{DUP_KEY_SENTINEL}JSON nesting exceeds {MAX_NESTED_DEPTH}"
+            )));
+        }
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         while let Some(key) = map.next_key::<String>()? {
             if !seen.insert(key.clone()) {
+                // Round-16 F6: escape the key so a hostile spelling
+                // containing `\n` or ANSI escapes cannot inject a
+                // fake extra log line at every tracing site that
+                // logs the resulting error via `%error`.
                 return Err(M::Error::custom(format!(
-                    "duplicate key `{key}` in JSON object"
+                    "{DUP_KEY_SENTINEL}duplicate key `{}` in JSON object",
+                    key.escape_debug()
                 )));
             }
-            map.next_value_seed(NoDupSeed)?;
+            map.next_value_seed(NoDupSeed { depth: next_depth })?;
         }
         Ok(())
     }
 }
 
-struct NoDupSeed;
+struct NoDupSeed {
+    depth: usize,
+}
 
 impl<'de> serde::de::DeserializeSeed<'de> for NoDupSeed {
     type Value = ();
     fn deserialize<D: serde::Deserializer<'de>>(self, deser: D) -> Result<(), D::Error> {
-        deser.deserialize_any(NoDupVisitor)
+        deser.deserialize_any(NoDupVisitor { depth: self.depth })
     }
 }
 
@@ -499,6 +586,80 @@ mod tests {
         assert!(
             matches!(outcome, Err(ReceiptError::DuplicateKey(ref msg)) if msg.contains("dup")),
             "expected DuplicateKey rejection deep in an array, got {outcome:?}"
+        );
+    }
+
+    /// Round-16 F6: `check_no_duplicate_keys` must distinguish
+    /// duplicate-key rejections (mapped to `ReceiptError::DuplicateKey`)
+    /// from ordinary parse failures (mapped to `ReceiptError::Serde`).
+    /// Previously the blanket `.map_err(DuplicateKey)` folded EOF,
+    /// "expected value", and recursion-limit hits into the DuplicateKey
+    /// variant, actively misleading ops during triage.
+    #[test]
+    fn from_json_slice_maps_malformed_json_to_serde_not_duplicate_key() {
+        // Genuine parse failure — no duplicate key involved. Must
+        // surface as ReceiptError::Serde so tracing sites and CLI
+        // error text name the actual class.
+        for garbage in [
+            &b"not json"[..],
+            &b""[..],
+            &b"{\"unterminated"[..],
+            &b"{\"x\": }"[..],
+        ] {
+            let outcome = Receipt::from_json_slice(garbage);
+            assert!(
+                matches!(outcome, Err(ReceiptError::Serde(_))),
+                "expected Serde error for {garbage:?}, got {outcome:?}",
+            );
+        }
+    }
+
+    /// The duplicate-key error message must escape any hostile
+    /// control characters in the key so a `\n`-carrying key does not
+    /// inject a fake extra log line at tracing sites that render
+    /// %error into their output.
+    #[test]
+    fn from_json_slice_escapes_control_chars_in_duplicate_key_names() {
+        // JSON allows control chars in keys via \uXXXX escapes.
+        let bytes = br#"{"a\nb":1,"a\nb":2}"#;
+        let outcome = Receipt::from_json_slice(bytes);
+        let msg = match outcome {
+            Err(ReceiptError::DuplicateKey(msg)) => msg,
+            other => panic!("expected DuplicateKey, got {other:?}"),
+        };
+        // A literal newline in the message would let an operator log
+        // `%error` inject an unrelated line; escape_debug renders it
+        // as `\n`.
+        assert!(!msg.contains('\n'), "unescaped newline in error: {msg:?}");
+        assert!(msg.contains(r"\n"), "expected escaped newline, got {msg:?}");
+    }
+
+    /// Round-16: defense-in-depth against stack overflow via
+    /// deeply-nested JSON payload. serde_json's own recursion limit
+    /// is 128 (fires first with "recursion limit exceeded"); our
+    /// walker enforces the same bound explicitly so a future
+    /// serde_json change couldn't quietly reintroduce the hazard.
+    #[test]
+    fn from_json_slice_rejects_deeply_nested_json() {
+        let mut deep = String::from("{\"x\":");
+        for _ in 0..200 {
+            deep.push('[');
+        }
+        for _ in 0..200 {
+            deep.push(']');
+        }
+        deep.push('}');
+        let outcome = Receipt::from_json_slice(deep.as_bytes());
+        // Either serde_json fires first ("recursion limit exceeded")
+        // or our walker fires ("nesting exceeds 128"). Either way,
+        // the DoS is contained without a stack overflow.
+        assert!(
+            matches!(
+                outcome,
+                Err(ReceiptError::DuplicateKey(ref msg))
+                    if msg.contains("nesting exceeds") || msg.contains("recursion limit")
+            ),
+            "expected nesting-cap error, got {outcome:?}",
         );
     }
 
