@@ -398,6 +398,18 @@ async fn loadgen(
     if connections == 0 {
         anyhow::bail!("connections must be greater than zero");
     }
+    // Cap the requested concurrency: at multi-hundred-thousand
+    // connections the loadgen exhausts source ports / FDs / RAM on the
+    // operator's own host before any latency numbers land, and the load
+    // *test* becomes the very thing it was supposed to measure. 100k is
+    // enough to comfortably cover the 10k SLA gate.
+    const MAX_CONNECTIONS: usize = 100_000;
+    if connections > MAX_CONNECTIONS {
+        anyhow::bail!(
+            "connections must be <= {MAX_CONNECTIONS} — larger values \
+             exhaust source ports / FDs before producing usable results"
+        );
+    }
     if ab_harness::session::Workflow::parse(workflow).is_none() {
         anyhow::bail!("workflow must be signed or unsigned");
     }
@@ -405,9 +417,11 @@ async fn loadgen(
     // unbounded resource consumer that never fails — the load *test* would
     // otherwise mask the failure it is supposed to expose. Per-request
     // timeout bounds each in-flight probe; connect_timeout catches
-    // upstream unreachable faster than TCP retransmit does.
+    // upstream unreachable faster than TCP retransmit does. Idle pool
+    // capped at 1024 — more than that is never useful and just wastes
+    // FDs after the burst ends.
     let client = reqwest::Client::builder()
-        .pool_max_idle_per_host(connections)
+        .pool_max_idle_per_host(connections.min(1024))
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(5))
         .build()

@@ -47,8 +47,37 @@ pub struct Histogram {
 }
 
 /// Default latency bucket upper bounds in microseconds: 50µs … 10s.
+///
+/// Sized for fast internal stages (identity check, quota, sanitize,
+/// dashboard endpoints, receipt sign). Long-running histograms — the
+/// upstream `dispatch` call which includes provider streaming, and the
+/// filesystem-scan reconciler / finalize paths — must use
+/// [`WIDE_LATENCY_BOUNDS_US`] instead, or every observation lands in
+/// the `+Inf` overflow bucket and p95/p99 renders as `u64::MAX`.
 pub const DEFAULT_LATENCY_BOUNDS_US: &[u64] = &[
     50, 100, 250, 500, 1_000, 2_000, 5_000, 8_000, 10_000, 25_000, 50_000, 100_000, 1_000_000, 10_000_000,
+];
+
+/// Wide latency bucket upper bounds in microseconds: 1ms … 300s.
+///
+/// Use for histograms that measure spans dominated by network I/O
+/// (upstream LLM streaming, reconciler recovery scans, finalisation
+/// under load). Provider p99 for GPT-4o / Claude regularly sits in the
+/// 15–90 s band; the top bound of 300 s covers pathological long
+/// contexts without saturating for realistic operator SLA use.
+pub const WIDE_LATENCY_BOUNDS_US: &[u64] = &[
+    1_000,
+    5_000,
+    10_000,
+    100_000,
+    500_000,
+    1_000_000,
+    5_000_000,
+    10_000_000,
+    30_000_000,
+    60_000_000,
+    120_000_000,
+    300_000_000,
 ];
 
 impl Histogram {
@@ -176,6 +205,15 @@ impl Registry {
     /// [`Self::counter`].
     #[allow(clippy::panic)]
     pub fn histogram(&self, key: &str, help: &str) -> Arc<Histogram> {
+        self.histogram_with_bounds(key, help, DEFAULT_LATENCY_BOUNDS_US)
+    }
+
+    /// Register (or fetch) a histogram with explicit bucket bounds. Use
+    /// [`WIDE_LATENCY_BOUNDS_US`] for spans dominated by network I/O
+    /// (upstream LLM streaming, reconciler filesystem scans); use
+    /// [`DEFAULT_LATENCY_BOUNDS_US`] for fast internal stages.
+    #[allow(clippy::panic)]
+    pub fn histogram_with_bounds(&self, key: &str, help: &str, bounds_us: &[u64]) -> Arc<Histogram> {
         validate_metric_key(key);
         let mut m = self.metrics.lock();
         match m.get(key) {
@@ -185,7 +223,7 @@ impl Registry {
                  cannot register as a histogram",
             ),
             None => {
-                let h = Arc::new(Histogram::new(DEFAULT_LATENCY_BOUNDS_US));
+                let h = Arc::new(Histogram::new(bounds_us));
                 m.insert(
                     key.to_owned(),
                     (help.to_owned(), Metric::Histogram(Arc::clone(&h))),

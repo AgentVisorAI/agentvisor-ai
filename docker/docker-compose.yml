@@ -7,6 +7,12 @@ services:
     container_name: agent-bridge
     ports:
       - "8484:8484"
+    # Docker's default stop_grace_period is 10 s — far shorter than the
+    # harness's shutdown budget (up to 30 s per phase for HTTP drain,
+    # worker wait_idle, and finalize_sessions). Without this override,
+    # docker stop / docker compose down sends SIGKILL mid-finalise,
+    # dropping receipts and truncating ATIF trajectories.
+    stop_grace_period: 120s
     # Match the Kubernetes securityContext: no fresh privileges after fork,
     # drop every Linux capability, and cap process/memory footprint so a
     # runaway or compromised worker cannot starve the host.

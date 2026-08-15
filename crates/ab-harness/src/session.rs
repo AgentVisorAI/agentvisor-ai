@@ -560,6 +560,14 @@ impl SessionRegistry {
     /// eviction window. A session that started close but has not yet
     /// finished it (`close_complete = 0`) is *not* replaced: reopening
     /// would race the in-flight close and split the audit trail.
+    ///
+    /// This is the right shape for **chat requests**: the client is
+    /// starting a new turn and it's fine to give them a fresh state
+    /// under the same id. For **tool interception**, use
+    /// [`Self::get_or_open_no_reopen`] — a tool call references an
+    /// in-progress conversation, and silently resurrecting a closed
+    /// session would let the client extend the audit trail past its
+    /// signed receipt.
     pub fn get_or_open(
         &self,
         id: &str,
@@ -567,10 +575,40 @@ impl SessionRegistry {
         identity: &AgentIdentity,
         breaker: &ab_loopdetect::BreakerConfig,
     ) -> Arc<Session> {
+        self.get_or_open_inner(
+            id, workflow, identity, breaker, /* reopen_after_close */ true,
+        )
+    }
+
+    /// Like [`Self::get_or_open`] but hand back the existing session
+    /// **without** recycling completed-close entries — the caller then
+    /// sees `is_closed() == true` and can refuse with `BadRequest`.
+    /// Use this on paths where the caller is trying to extend an
+    /// existing session (tool interception, session-scoped mutations).
+    pub fn get_or_open_no_reopen(
+        &self,
+        id: &str,
+        workflow: Workflow,
+        identity: &AgentIdentity,
+        breaker: &ab_loopdetect::BreakerConfig,
+    ) -> Arc<Session> {
+        self.get_or_open_inner(
+            id, workflow, identity, breaker, /* reopen_after_close */ false,
+        )
+    }
+
+    fn get_or_open_inner(
+        &self,
+        id: &str,
+        workflow: Workflow,
+        identity: &AgentIdentity,
+        breaker: &ab_loopdetect::BreakerConfig,
+        reopen_after_close: bool,
+    ) -> Arc<Session> {
         use dashmap::mapref::entry::Entry;
         match self.sessions.entry(id.to_owned()) {
             Entry::Occupied(mut occupied) => {
-                if occupied.get().close_complete_flag() {
+                if reopen_after_close && occupied.get().close_complete_flag() {
                     let fresh = Arc::new(Session::new(
                         id.to_owned(),
                         workflow,
