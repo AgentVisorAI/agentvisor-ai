@@ -5,6 +5,26 @@ use serde::{Deserialize, Serialize};
 /// Config format version (evolution surface).
 pub const CONFIG_VERSION: u32 = 1;
 
+/// Upper bound on `worker_channel_capacity`. Each bounded mpsc channel
+/// preallocates its slots, so an oversized value OOMs the process at
+/// bind. 1M is already ~4 orders of magnitude above realistic capacity.
+pub const MAX_WORKER_CHANNEL_CAPACITY: usize = 1_000_000;
+
+/// Upper bound on `max_request_bytes` (512 MiB). A single request body
+/// should never legitimately need more; lifting this defeats the
+/// sandbox payload guard and lets one request pin half a GB of RAM.
+pub const MAX_REQUEST_BYTES_CAP: usize = 512 * 1024 * 1024;
+
+/// Upper bound on `onnx_dimension`. Most sentence-transformer models
+/// have <= 4096 dims (Nomic Embed v1.5 = 768, MiniLM = 384, e5-mistral
+/// = 4096, Ada-002 = 1536). 16k is a comfortable ceiling.
+pub const MAX_ONNX_DIMENSION: usize = 16_384;
+
+/// Upper bound on any `_s` seconds interval. 1 day is already far
+/// beyond any reasonable value; anything larger is almost certainly a
+/// unit-conversion error (someone thought the field was in ms).
+pub const MAX_SECONDS_INTERVAL: u64 = 24 * 60 * 60;
+
 /// Top-level harness configuration.
 ///
 /// Unknown keys are rejected (`deny_unknown_fields`) so a typo like
@@ -739,6 +759,63 @@ impl HarnessConfig {
                 self.breaker.delta_epsilon
             ));
         }
+        // Upper bounds so a fat-finger in TOML cannot OOM the process
+        // before the runtime feels the misconfiguration. Values are
+        // deliberately loose: they only reject genuinely absurd numbers.
+        if self.worker_channel_capacity > MAX_WORKER_CHANNEL_CAPACITY {
+            return Err(format!(
+                "worker_channel_capacity {} exceeds the safety cap of {} — mpsc::channel(N) preallocates N slots, so oversizing OOMs the process at bind time",
+                self.worker_channel_capacity, MAX_WORKER_CHANNEL_CAPACITY
+            ));
+        }
+        if self.max_request_bytes > MAX_REQUEST_BYTES_CAP {
+            return Err(format!(
+                "max_request_bytes {} exceeds the safety cap of {} (512 MiB) — a single request should never legitimately need more, and lifting this defeats the sandbox payload guard",
+                self.max_request_bytes, MAX_REQUEST_BYTES_CAP
+            ));
+        }
+        if self.onnx_dimension > MAX_ONNX_DIMENSION {
+            return Err(format!(
+                "onnx_dimension {} exceeds the safety cap of {} — most sentence-transformer models are <= 4096",
+                self.onnx_dimension, MAX_ONNX_DIMENSION
+            ));
+        }
+        // 1 day is already unreasonably long for either an idle window
+        // or a JWKS refresh cadence; anything larger is almost certainly
+        // a unit-conversion error (someone thought the field was in ms).
+        let mut interval_fields: Vec<(&'static str, u64)> = vec![
+            ("reconcile_tick_s", self.reconcile_tick_s),
+            ("session_idle_close_s", self.session_idle_close_s),
+            ("identity_jwks_refresh_s", self.identity_jwks_refresh_s),
+        ];
+        if let Some(read_timeout) = self.upstream_read_timeout_s {
+            interval_fields.push(("upstream_read_timeout_s", read_timeout));
+        }
+        for (field, value) in interval_fields {
+            if value > MAX_SECONDS_INTERVAL {
+                return Err(format!(
+                    "{field} = {value} exceeds the safety cap of {MAX_SECONDS_INTERVAL} seconds (1 day) — did you mean milliseconds?"
+                ));
+            }
+        }
+        // Shape-only URL check: reject `upstream_url` that lacks a
+        // scheme, so an operator setting e.g. `upstream_url =
+        // "openai.internal"` (missing `https://`) does not silently
+        // concatenate into a broken url. Full url::Url::parse is
+        // deferred to reqwest at request time.
+        if !self.upstream_url.contains("://") {
+            return Err(format!(
+                "upstream_url must include a scheme (http:// or https://), got {:?}",
+                self.upstream_url
+            ));
+        }
+        if let Some(tool_upstream) = &self.tool_upstream_url {
+            if !tool_upstream.is_empty() && !tool_upstream.contains("://") {
+                return Err(format!(
+                    "tool_upstream_url must include a scheme (http:// or https://), got {tool_upstream:?}"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1097,5 +1174,45 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("unsupported config_version 2"), "{err}");
         assert!(!err.contains("future_option_from_v2"), "{err}");
+    }
+
+    /// Cap on `worker_channel_capacity` rejects the fat-finger before
+    /// the runtime tries to preallocate the channel and OOMs.
+    #[test]
+    fn worker_channel_capacity_cap_rejects_oversized_values() {
+        let err = HarnessConfig::from_toml(&format!(
+            "upstream_url = \"https://api\"\nworker_channel_capacity = {}",
+            MAX_WORKER_CHANNEL_CAPACITY + 1
+        ))
+        .unwrap_err();
+        assert!(
+            err.contains("worker_channel_capacity"),
+            "err should name the offending field: {err}"
+        );
+    }
+
+    /// `upstream_url` without a scheme is rejected at load — otherwise
+    /// the request-time concat would silently misroute to a bogus host.
+    #[test]
+    fn upstream_url_without_scheme_is_rejected() {
+        let err = HarnessConfig::from_toml(r#"upstream_url = "openai.internal""#).unwrap_err();
+        assert!(err.contains("upstream_url"), "{err}");
+        assert!(err.contains("scheme"), "{err}");
+    }
+
+    /// A seconds interval > 1 day is almost certainly a unit-conversion
+    /// error (someone thought the field was in milliseconds).
+    #[test]
+    fn seconds_intervals_reject_absurdly_large_values() {
+        let err = HarnessConfig::from_toml(&format!(
+            "upstream_url = \"https://api\"\nsession_idle_close_s = {}",
+            MAX_SECONDS_INTERVAL + 1
+        ))
+        .unwrap_err();
+        assert!(
+            err.contains("session_idle_close_s"),
+            "err should name the offending field: {err}"
+        );
+        assert!(err.contains("milliseconds"), "hint should mention ms: {err}");
     }
 }

@@ -79,6 +79,13 @@ spec:
       labels:
         app: agent-bridge
     spec:
+      # Sum of the harness's three shutdown phases (HTTP drain + worker
+      # wait_idle + finalize_sessions), each budgeted at 30 s. If k8s
+      # sends SIGKILL before finalize_sessions returns, receipts and
+      # ATIF trajectories are lost — the very outcome the design is
+      # supposed to prevent. 120 s gives ample headroom for a large
+      # spool at rolling-deploy time.
+      terminationGracePeriodSeconds: 120
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
