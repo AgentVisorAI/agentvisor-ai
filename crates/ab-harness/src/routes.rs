@@ -856,8 +856,8 @@ pub(crate) async fn unresolved_tool_sessions(
                     let quarantine = path.with_extension("intent.torn");
                     tracing::warn!(
                         %error,
-                        original = %path.display(),
-                        quarantine = %quarantine.display(),
+                        original = %ab_core::fsutil::basename(&path),
+                        quarantine = %ab_core::fsutil::basename(&quarantine),
                         "torn tool-execution intent quarantined so recovery can proceed"
                     );
                     if let Err(rename_err) = std::fs::rename(&path, &quarantine) {

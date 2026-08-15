@@ -11,6 +11,26 @@
 use std::io;
 use std::path::Path;
 
+/// Round-36 F1: return just the file name of `path` as a `&str`,
+/// suitable for `path = %basename(&path)` in tracing macros.
+///
+/// The concern is downstream OTLP export. Every `tracing::warn!(path
+/// = %path.display(), ...)` in this workspace flows through
+/// `tracing_opentelemetry::layer` when the `otel` feature is on, so
+/// absolute deployment paths (`/var/lib/agent-bridge/spool/...`,
+/// custom outbox layouts, quarantine locations) land in whatever SIEM
+/// ingests OTLP — same class of leak round-27 F6 closed on the
+/// dashboard and round-35 F1/F2 closed on `%error` on `reqwest::Error`,
+/// with a different producer / same sink. `basename` keeps enough
+/// context for operator triage (the file name usually encodes the
+/// session id or offset) without leaking the deployment topology.
+/// Non-UTF-8 file names or paths that end in `..` fall back to `?`;
+/// callers who need the full path server-side may still route it
+/// through a separate operator-only log channel.
+pub fn basename(path: &Path) -> &str {
+    path.file_name().and_then(|name| name.to_str()).unwrap_or("?")
+}
+
 /// Fsync a directory so its rename/create entries are durable after a crash.
 ///
 /// On Unix this opens the directory and calls `sync_all` on the descriptor.
@@ -155,7 +175,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         // wrongly steer callers into "the file is not there" retry
         // logic.
         tracing::warn!(
-            path = %path.display(),
+            path = %basename(path),
             error = %error,
             "post-rename directory fsync failed; file is visible but its dirent may not survive an immediate power loss"
         );
@@ -201,6 +221,29 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// Round-36 F1: `basename` is a canonical name for the fix to
+    /// the "path.display() in tracing → OTLP → SIEM leak" class.
+    /// Assert the property callers rely on: never returns the
+    /// parent directory, always the last segment.
+    #[test]
+    fn basename_returns_only_the_last_segment() {
+        assert_eq!(basename(Path::new("/var/lib/agent-bridge/spool/foo.json")), "foo.json");
+        assert_eq!(basename(Path::new("foo.json")), "foo.json");
+        assert_eq!(basename(Path::new("/tmp/")), "tmp");
+        // Empty path / root is meaningless in the caller context —
+        // fall back to `?` rather than panic.
+        assert_eq!(basename(Path::new("/")), "?");
+        // Non-UTF-8 path names fall back to `?` (safe default; the
+        // full path could be smuggled if we tried lossy conversion).
+        #[cfg(unix)]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt as _;
+            let raw = std::path::PathBuf::from(OsStr::from_bytes(b"/x/\xff\xfe"));
+            assert_eq!(basename(&raw), "?");
+        }
+    }
 
     #[test]
     fn write_atomic_creates_parent_and_writes_bytes() {
