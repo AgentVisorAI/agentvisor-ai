@@ -356,6 +356,14 @@ fn escape_prom_help(help: &str) -> String {
         match c {
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
+            // Round-20 F3: the Prometheus text-format v0.0.4
+            // grammar only defines `\\` and `\n` (plus `\"` inside
+            // label values) as escapes in HELP. `\r` is not
+            // standardized — replacing it with a literal space
+            // matches how prometheus_client-python's _ESCAPE_RE
+            // strips it, and every conforming scraper accepts the
+            // result without a parse error.
+            '\r' => out.push(' '),
             other => out.push(other),
         }
     }
