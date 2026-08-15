@@ -6,7 +6,17 @@ services:
     image: agent-bridge:local
     container_name: agent-bridge
     ports:
-      - "8484:8484"
+      # Round-15 F7: bind to 127.0.0.1 explicitly. Docker's default
+      # (`"8484:8484"`) means `0.0.0.0:8484`, which reaches the host
+      # from any network interface including LAN and — with a
+      # misconfigured firewall — the public internet. Combined with
+      # the shipped default `require_identity = false` in
+      # `config/harness.docker.toml`, an anonymous internet peer
+      # could otherwise exercise `/v1/chat/completions` against the
+      # operator's upstream credentials. If remote access IS
+      # intended, change this mapping AND set
+      # `require_identity = true` at the same step.
+      - "127.0.0.1:8484:8484"
     # Docker's default stop_grace_period is 10 s — far shorter than the
     # harness's four shutdown phases (HTTP drain, worker wait_idle,
     # finalize_sessions, telemetry flush; up to 30 s each for the first
