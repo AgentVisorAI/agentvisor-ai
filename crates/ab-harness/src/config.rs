@@ -181,6 +181,16 @@ pub struct HarnessConfig {
     /// Reconciler tick interval (seconds).
     #[serde(default = "default_reconcile_tick")]
     pub reconcile_tick_s: u64,
+    /// Maximum request body size accepted on `/v1/chat/completions` and
+    /// `/mcp`. Defaults to 4 MiB, matching the sandbox's `MAX_PAYLOAD_BYTES`
+    /// so both routes carry the same effective limit — axum's own
+    /// `DefaultBodyLimit::MAX` is 2 MiB by default and would silently
+    /// reject legitimate large-context chat requests before the sandbox
+    /// even saw the payload. Operators serving very-long-context models
+    /// (Claude 200k, GPT-4 128k on maximally-verbose inputs) may need to
+    /// raise this.
+    #[serde(default = "default_max_request_bytes")]
+    pub max_request_bytes: usize,
 }
 
 fn default_config_version() -> u32 {
@@ -272,6 +282,9 @@ fn default_compression() -> bool {
 }
 fn default_reconcile_tick() -> u64 {
     5
+}
+fn default_max_request_bytes() -> usize {
+    4 * 1024 * 1024
 }
 
 /// Where the effective configuration came from.
@@ -765,6 +778,7 @@ impl HarnessConfig {
             compression_enabled: true,
             budget: ab_state::BudgetSpec::default(),
             reconcile_tick_s: 1,
+            max_request_bytes: default_max_request_bytes(),
         }
     }
 }

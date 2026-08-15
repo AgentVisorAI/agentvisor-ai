@@ -22,6 +22,7 @@ use tracing::Instrument as _;
 
 /// Build the complete harness router.
 pub fn build_router(state: AppState) -> Router {
+    let max_body = state.config.max_request_bytes;
     Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
@@ -31,6 +32,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/sessions/{id}/close", post(close_session))
         .route("/v1/sessions/{id}/promote", post(promote_session))
         .layer(axum::middleware::from_fn(trace_request))
+        // axum's default body limit is 2 MiB, which silently rejects large
+        // chat contexts (Claude 200k, GPT-4 128k) before the sandbox even
+        // sees the payload. `max_request_bytes` (default 4 MiB, matching
+        // the sandbox `MAX_PAYLOAD_BYTES`) is the single knob operators
+        // control.
+        .layer(axum::extract::DefaultBodyLimit::max(max_body))
         .with_state(state)
 }
 

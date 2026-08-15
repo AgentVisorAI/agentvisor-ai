@@ -216,6 +216,12 @@ impl EventBus for NatsBus {
                             start_sequence: offset.max(1),
                         },
                         filter_subject: subject,
+                        // Ephemeral consumers without an inactive_threshold
+                        // linger on the JetStream server until the client
+                        // disconnects. Since our async_nats client stays
+                        // connected for the lifetime of the process, every
+                        // fetch call otherwise leaks a consumer.
+                        inactive_threshold: std::time::Duration::from_secs(30),
                         ..Default::default()
                     })
                     .await?;
@@ -227,13 +233,21 @@ impl EventBus for NatsBus {
                     .messages()
                     .await?;
                 use futures::StreamExt as _;
-                while let Some(Ok(msg)) = batch.next().await {
-                    if let Ok(mut ev) = serde_json::from_slice::<StoredEvent>(&msg.payload) {
-                        if let Ok(info) = msg.info() {
-                            ev.offset = info.stream_sequence;
-                        }
-                        out.push(ev);
+                while let Some(next) = batch.next().await {
+                    // Surface the error instead of silently continuing on:
+                    // an audit-trail consumer that sees a shorter list than
+                    // expected with no error is an evidence gap. The bad
+                    // record stays on JetStream as forensic evidence.
+                    let msg = next?;
+                    let mut ev: StoredEvent = serde_json::from_slice(&msg.payload).map_err(|error| {
+                        async_nats::Error::from(std::io::Error::other(format!(
+                            "fetch decode: {error}"
+                        )))
+                    })?;
+                    if let Ok(info) = msg.info() {
+                        ev.offset = info.stream_sequence;
                     }
+                    out.push(ev);
                     if out.len() >= max {
                         break;
                     }
