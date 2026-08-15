@@ -484,9 +484,11 @@ fn azure_name_error(value: &str) -> Option<String> {
 /// posture as the server's signing-seed installer in ab-harness/main.rs.
 fn write_private_key_file(path: &Path, key: &str) -> Result<()> {
     use std::io::Write as _;
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("create key directory {}", parent.display()))?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).with_context(|| format!("create key directory {}", parent.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -514,8 +516,8 @@ fn write_private_key_file(path: &Path, key: &str) -> Result<()> {
     // hard_link installs the final path atomically and refuses to follow a
     // pre-existing symlink at `path`; a first-run has none anyway because
     // we removed it above.
-    let result = std::fs::hard_link(&temporary, path)
-        .with_context(|| format!("install key file {}", path.display()));
+    let result =
+        std::fs::hard_link(&temporary, path).with_context(|| format!("install key file {}", path.display()));
     // Always clean up the tmp regardless of link outcome.
     let _ = std::fs::remove_file(&temporary);
     result?;

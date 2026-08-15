@@ -20,6 +20,7 @@
       <div class="nav-links">
         <a href="#one-line">How it works</a>
         <a href="#what-you-get">What you get</a>
+        <a href="#dashboard">Dashboard</a>
         <a href="#try-it">Get started</a>
         <a href="https://github.com/debugmode0/agent-bridge">GitHub</a>
       </div>
@@ -192,6 +193,91 @@ Content-Type: application/json
             &#x2514;&#x2500; p0.jsonl         <span class="c"># OCSF event stream</span></code></pre>
           </div>
         </div>
+      </div>
+    </section>
+
+    <section id="dashboard" class="alt">
+      <div class="wrap two-col two-col-flip">
+        <div>
+          <p class="section-kicker">See what&rsquo;s happening</p>
+          <h2>A dashboard for the agent you already deployed.</h2>
+          <p>
+            Every AgentBridge instance ships a small operator dashboard at
+            <code>/dashboard</code>. Open it in a browser and you can see the
+            sessions your agent is running right now: which prompts, how
+            many tokens, how much money, which tools were called, which
+            calls were blocked, and where the ones that failed got stuck.
+          </p>
+          <p>
+            It reads the same in&#8209;memory state that produces receipts and
+            <code>/metrics</code>. No extra service, no separate database,
+            nothing to log into. Off by a config flag if you don&rsquo;t want it.
+          </p>
+          <ul class="check-list">
+            <li>Live session table with cost, tokens, tool&nbsp;calls, stop reason</li>
+            <li>Click a session to see its receipt as raw JSON, live</li>
+            <li>Filter by open, closed, or capture&#8209;failed &mdash; and by workflow</li>
+            <li>No JavaScript framework, no phone&#8209;home &mdash; served straight from the binary</li>
+          </ul>
+        </div>
+        <aside class="dashboard-preview" aria-label="Dashboard preview">
+          <div class="mock-window">
+            <header class="mock-window-bar">
+              <span class="dot red"></span>
+              <span class="dot yellow"></span>
+              <span class="dot green"></span>
+              <span class="mock-url">agent&#8209;bridge.internal / dashboard</span>
+            </header>
+            <div class="mock-body">
+              <div class="mock-stats">
+                <div class="mock-stat">
+                  <p class="mock-stat-label">Sessions</p>
+                  <p class="mock-stat-value">10</p>
+                  <p class="mock-stat-sub">10 open &middot; 0 closed</p>
+                </div>
+                <div class="mock-stat">
+                  <p class="mock-stat-label">Cost today</p>
+                  <p class="mock-stat-value">$2.84</p>
+                  <p class="mock-stat-sub">under $50 payout cap</p>
+                </div>
+                <div class="mock-stat">
+                  <p class="mock-stat-label">Tool calls</p>
+                  <p class="mock-stat-value">1,412</p>
+                  <p class="mock-stat-sub">
+                    <span class="mock-ok">1,406</span> allowed &middot;
+                    <span class="mock-fail">6</span> blocked
+                  </p>
+                </div>
+              </div>
+              <table class="mock-table">
+                <tr>
+                  <td><span class="mock-sid">coding&#8209;assistant</span></td>
+                  <td><span class="mock-pill live">Live</span></td>
+                  <td class="right">$0.42</td>
+                  <td class="right">312 in&nbsp;/&nbsp;188 out</td>
+                </tr>
+                <tr>
+                  <td><span class="mock-sid">docs&#8209;agent</span></td>
+                  <td><span class="mock-pill live">Live</span></td>
+                  <td class="right">$0.08</td>
+                  <td class="right">40 in&nbsp;/&nbsp;65 out</td>
+                </tr>
+                <tr>
+                  <td><span class="mock-sid">triage&#8209;bot</span></td>
+                  <td><span class="mock-pill closed">Sealed</span></td>
+                  <td class="right">$1.20</td>
+                  <td class="right">918 in&nbsp;/&nbsp;701 out</td>
+                </tr>
+                <tr>
+                  <td><span class="mock-sid">analytics&#8209;copilot</span></td>
+                  <td><span class="mock-pill failed">Blocked</span></td>
+                  <td class="right">$0.00</td>
+                  <td class="right">payout cap</td>
+                </tr>
+              </table>
+            </div>
+          </div>
+        </aside>
       </div>
     </section>
 
