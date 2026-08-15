@@ -4,6 +4,7 @@
   "title": "AgentBridge OCSF ai_operation-profile agent event",
   "description": "Authored extension profile binding stop_reason_id to agent config state, aligned with OCSF PR #1704. Extension class_uid range 9901-9906; category_uid 6 Application Activity; normalized stop ids 0 Unknown, 1 Stop, 2 Length, 3 Tool Use, 4 Session Stop; extension ids 90 provider content filter, 91-94 AgentBridge enforcement, 99 Other.",
   "type": "object",
+  "additionalProperties": false,
   "required": [
     "metadata",
     "class_name",
