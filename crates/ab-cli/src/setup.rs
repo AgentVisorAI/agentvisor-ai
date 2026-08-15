@@ -499,6 +499,13 @@ fn write_private_key_file(path: &Path, key: &str) -> Result<()> {
     // whatever it points at.
     let _ = std::fs::remove_file(path);
     let temporary = parent.join(format!(".agentbridge-key-{}.tmp", ab_core::new_event_uid()));
+    // Round-13: sibling of round-12 F4 (harness `install_seed_exclusive`).
+    // Without the RAII guard, an early `?` return from write_all /
+    // sync_all leaves a zero-byte `.agentbridge-key-*.tmp` behind
+    // that only cargoes up on next boot as a confused operator
+    // symptom ("two key files?"). Use the shared TempPathGuard so
+    // every failure path unlinks.
+    let mut guard = ab_core::fsutil::TempPathGuard::new(temporary.clone());
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -518,8 +525,11 @@ fn write_private_key_file(path: &Path, key: &str) -> Result<()> {
     // we removed it above.
     let result =
         std::fs::hard_link(&temporary, path).with_context(|| format!("install key file {}", path.display()));
-    // Always clean up the tmp regardless of link outcome.
+    // The hard_link created a second inode name for the tmp file;
+    // unlink the tmp name (the final path keeps the data). Guard is
+    // then disarmed so its Drop is a no-op — we already unlinked.
     let _ = std::fs::remove_file(&temporary);
+    guard.disarm();
     result?;
     ab_core::fsutil::sync_directory(parent)
         .with_context(|| format!("sync key directory {}", parent.display()))?;

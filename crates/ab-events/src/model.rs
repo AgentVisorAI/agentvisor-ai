@@ -134,6 +134,7 @@ pub struct Product {
 
 /// Agent configuration state bound into every emitted event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentIdentity {
     /// Deployed agent version (changes on deploy).
     pub version: String,

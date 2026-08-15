@@ -59,12 +59,30 @@ pub fn build_router(state: AppState) -> Router {
 async fn trace_request(request: Request<Body>, next: Next) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
-    let session_id = request
-        .headers()
-        .get(crate::pipeline::SESSION_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("unbound")
-        .to_owned();
+    // Round-13 F5: sanitize the session id BEFORE binding it into the
+    // span. Previously the raw header value went in verbatim, which
+    // (1) risked unbounded label cardinality on OTLP exporters that
+    // map span attributes to metric labels — every distinct
+    // client-supplied session id (including hostile garbage) became
+    // its own series; (2) created a split-brain when a client sent
+    // two `X-AB-Session` headers — `HeaderMap::get` returned the
+    // first while `pipeline::single_header` (round-13) refused the
+    // whole request, so traces named a "friendly" id for a hard-503;
+    // (3) accepted values that pass `HeaderValue::to_str` but fail
+    // `SessionId::parse` (too long, control chars in disguise). Use
+    // `single_header` + `SessionId::parse` to bind ONE consistent
+    // value or the sentinel `"invalid"`.
+    let headers = request.headers();
+    let session_id = match crate::pipeline::single_header(headers, crate::pipeline::SESSION_HEADER) {
+        Ok(Some(value)) => value
+            .to_str()
+            .ok()
+            .and_then(|v| ab_core::SessionId::parse(v).ok())
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "invalid".to_owned()),
+        Ok(None) => "unbound".to_owned(),
+        Err(_) => "invalid".to_owned(),
+    };
     let span = tracing::info_span!(
         "agentbridge.request",
         otel.kind = "server",
@@ -752,8 +770,12 @@ impl ToolExecution {
         body: &[u8],
         control_key: [u8; 32],
     ) -> Result<Self, crate::pipeline::PipelineError> {
-        let session_id = headers
-            .get(crate::pipeline::SESSION_HEADER)
+        // Refuse duplicate x-ab-session headers (see
+        // `pipeline::single_header` for the rationale — proxies
+        // sometimes merge duplicates on the wire and log aggregators
+        // can then observe a comma-joined value that leaks a
+        // client-desync into audit).
+        let session_id = crate::pipeline::single_header(headers, crate::pipeline::SESSION_HEADER)?
             .and_then(|value| value.to_str().ok())
             .ok_or_else(|| crate::pipeline::PipelineError::BadRequest("missing x-ab-session".to_owned()))?;
         // Same validation as the pipeline's `session_id`: an id the intercept
