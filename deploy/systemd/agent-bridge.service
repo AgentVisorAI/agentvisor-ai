@@ -6,6 +6,12 @@
 #   sudo cp target/release/agent-bridge /usr/local/bin/
 #   sudo cp target/release/abctl /usr/local/bin/
 #   cd /etc/agent-bridge && sudo abctl init --preset openai --output agentbridge.toml
+#   # Round-18 F1: generate the receipt trust anchor BEFORE first boot.
+#   # `ProtectSystem=strict` below mounts /etc read-only, so the harness
+#   # cannot auto-create the seed at startup — that would EROFS.
+#   sudo -u agent-bridge abctl keygen --output /etc/agent-bridge/signing.seed
+#   sudo chmod 400 /etc/agent-bridge/signing.seed
+#   sudo chown agent-bridge:agent-bridge /etc/agent-bridge/signing.seed
 #   echo 'AB_UPSTREAM_API_KEY=sk-...' | sudo tee /etc/agent-bridge/secrets.env
 #   sudo chmod 600 /etc/agent-bridge/secrets.env
 #   sudo chown -R agent-bridge:agent-bridge /var/lib/agent-bridge /etc/agent-bridge
@@ -40,6 +46,21 @@ EnvironmentFile=-/etc/agent-bridge/secrets.env
 ExecStart=/usr/local/bin/agent-bridge
 Restart=on-failure
 RestartSec=2
+
+# Round-18 F3: match the docker-compose (120 s stop_grace_period)
+# and k8s (terminationGracePeriodSeconds: 120) shutdown budgets.
+# Default systemd DefaultTimeoutStopSec is 90 s on stock installs
+# and can be as low as 30 s under distro overrides — either way
+# below the harness's documented 4-phase shutdown budget
+# (30 s HTTP drain + 30 s worker wait_idle + 30 s finalize_sessions
+# + 5 s telemetry flush). SIGKILL mid-finalize drops receipts and
+# truncates ATIF trajectories; giving the process 120 s + 5 s slack
+# for a clean systemd stop-then-SIGKILL cycle avoids that.
+TimeoutStopSec=125s
+# Deliver SIGTERM to the process group so any spawned child (rare
+# but possible via wasmtime host functions) gets a chance to run
+# its own cleanup before SIGKILL. Same posture as k8s.
+KillMode=mixed
 
 # Hardening
 NoNewPrivileges=true
