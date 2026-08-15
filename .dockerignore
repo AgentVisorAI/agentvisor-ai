@@ -3,9 +3,17 @@
 target
 spool
 data
+# Any per-directory dotenv or secret bundle: keep the build context clean even
+# when an operator drops a temporary secrets file next to `docker-compose.yml`.
+**/.env
+**/.env.*
+!**/.env.example
+**/secrets.env
 **/*.seed
 **/*.key
 **/*.pem
+**/id_rsa
+**/id_rsa.*
 *.profraw
 criterion
 .DS_Store

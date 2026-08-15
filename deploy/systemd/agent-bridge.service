@@ -16,7 +16,7 @@
 
 [Unit]
 Description=AgentBridge LLM proxy with signed receipts
-Documentation=https://github.com/agentbridge/agentbridge
+Documentation=https://github.com/AgentVisorAI/agent-bridge
 After=network-online.target
 Wants=network-online.target
 

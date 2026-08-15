@@ -40,7 +40,14 @@ jobs:
         env:
           # Match the CI `Docs` job in ci.yml so broken intra-doc links are hard errors.
           RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D warnings"
-        run: cargo doc --workspace --no-deps
+        # `--all-features` mirrors the CI Docs job so the published docs cover
+        # every feature-gated backend (redis, nats, kafka, onnx, qdrant, otel).
+        # Requires the ubuntu-latest runner to have libcurl4-openssl-dev for
+        # the transitive rdkafka-sys build under the `kafka` feature.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev
+          cargo doc --workspace --no-deps --all-features
       - name: Write landing page
         # `cargo doc` without `--enable-index-page` (nightly) leaves target/doc
         # with no index.html. A tiny meta-refresh to the top-level harness crate
