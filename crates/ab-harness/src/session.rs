@@ -550,6 +550,16 @@ impl SessionRegistry {
     }
 
     /// Get or open a session.
+    ///
+    /// If an entry exists but has completed close (receipt/ATIF durably
+    /// committed, journal removed) and has not yet been reaped by the
+    /// idle sweeper, treat the id as free and open a fresh session —
+    /// otherwise a well-behaved client that reuses a session id after a
+    /// server-side close (retry after a 5xx, network partition, TTL
+    /// refresh) would see `400 session is already closed` for the entire
+    /// eviction window. A session that started close but has not yet
+    /// finished it (`close_complete = 0`) is *not* replaced: reopening
+    /// would race the in-flight close and split the audit trail.
     pub fn get_or_open(
         &self,
         id: &str,
@@ -557,17 +567,33 @@ impl SessionRegistry {
         identity: &AgentIdentity,
         breaker: &ab_loopdetect::BreakerConfig,
     ) -> Arc<Session> {
-        self.sessions
-            .entry(id.to_owned())
-            .or_insert_with(|| {
-                Arc::new(Session::new(
+        use dashmap::mapref::entry::Entry;
+        match self.sessions.entry(id.to_owned()) {
+            Entry::Occupied(mut occupied) => {
+                if occupied.get().close_complete_flag() {
+                    let fresh = Arc::new(Session::new(
+                        id.to_owned(),
+                        workflow,
+                        identity.clone(),
+                        breaker.clone(),
+                    ));
+                    occupied.insert(Arc::clone(&fresh));
+                    fresh
+                } else {
+                    occupied.get().clone()
+                }
+            }
+            Entry::Vacant(vacant) => {
+                let fresh = Arc::new(Session::new(
                     id.to_owned(),
                     workflow,
                     identity.clone(),
                     breaker.clone(),
-                ))
-            })
-            .clone()
+                ));
+                vacant.insert(Arc::clone(&fresh));
+                fresh
+            }
+        }
     }
 
     /// Look up a session.
@@ -743,6 +769,53 @@ mod tests {
         let b = r.get_or_open("x", Workflow::Unsigned, &identity(), &Default::default());
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(r.len(), 1);
+    }
+
+    /// A client that reuses a session id after the server-side close
+    /// completes (retry after a 5xx, TTL refresh, network partition
+    /// recovery) must get a fresh session instead of the closed one —
+    /// otherwise every request until the idle sweep would return
+    /// `400 session is already closed`. Only sessions with
+    /// `close_complete = true` are recycled; a session mid-close must
+    /// still be treated as the same one so the ongoing close is not
+    /// raced.
+    #[test]
+    fn get_or_open_recycles_id_after_close_complete() {
+        let registry = SessionRegistry::new();
+        let breaker = ab_loopdetect::BreakerConfig::default();
+
+        // First open. Simulate a full close (artifact committed +
+        // close_complete flipped) so the next get_or_open sees a
+        // fully-sealed session.
+        let first = registry.get_or_open("reused", Workflow::Signed, &identity(), &breaker);
+        assert!(first.try_close(), "first close must land");
+        first.mark_artifact_committed();
+        first.mark_close_complete();
+
+        let second = registry.get_or_open("reused", Workflow::Signed, &identity(), &breaker);
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "closed session must be replaced by a fresh one"
+        );
+        assert!(!second.is_closed(), "reopened session must accept new work");
+        assert_eq!(registry.len(), 1, "id remains a single registry entry");
+    }
+
+    /// A session that has *started* close but has not completed it
+    /// must not be replaced — reopening would race the finaliser and
+    /// split the audit trail across two artifacts for the same id.
+    #[test]
+    fn get_or_open_preserves_session_mid_close() {
+        let registry = SessionRegistry::new();
+        let breaker = ab_loopdetect::BreakerConfig::default();
+        let first = registry.get_or_open("closing", Workflow::Signed, &identity(), &breaker);
+        assert!(first.try_close());
+        // close_complete NOT set — this is the in-flight close state.
+        let second = registry.get_or_open("closing", Workflow::Signed, &identity(), &breaker);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "mid-close session must be handed back unchanged"
+        );
     }
 
     /// A signed-recovery loop that discovers a stale journal for session X

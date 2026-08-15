@@ -98,16 +98,28 @@ function shortId(id) {
 }
 
 async function fetchJson(url, { signal } = {}) {
-  const controller = signal ? null : new AbortController();
+  // Compose the caller signal (if any) with our own timeout: aborting
+  // either one aborts the fetch. Doing this via a dedicated controller
+  // means the 10s guard fires even when the caller passed a signal —
+  // an earlier version silently disabled the timeout in that case.
+  const controller = new AbortController();
+  const onCallerAbort = () => controller.abort(signal?.reason);
+  if (signal) {
+    if (signal.aborted) {
+      controller.abort(signal.reason);
+    } else {
+      signal.addEventListener('abort', onCallerAbort, { once: true });
+    }
+  }
   const timeout = window.setTimeout(
-    () => (signal ? null : controller.abort(new Error('timeout'))),
+    () => controller.abort(new Error('fetch timeout')),
     FETCH_TIMEOUT_MS,
   );
   try {
     const response = await fetch(url, {
       headers: { accept: 'application/json' },
       credentials: 'same-origin',
-      signal: signal ?? controller.signal,
+      signal: controller.signal,
     });
     if (!response.ok) {
       throw new Error(`HTTP ${response.status} on ${url}`);
@@ -115,6 +127,7 @@ async function fetchJson(url, { signal } = {}) {
     return await response.json();
   } finally {
     window.clearTimeout(timeout);
+    if (signal) signal.removeEventListener('abort', onCallerAbort);
   }
 }
 

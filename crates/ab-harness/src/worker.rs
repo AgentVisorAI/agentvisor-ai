@@ -358,15 +358,30 @@ pub fn spawn_worker_with_spool_authenticated(
     journal_key: [u8; 32],
     metrics: Arc<Registry>,
 ) -> WorkerHandle {
+    // Sharding is decoupled from `capacity`: routing is by
+    // `partition_for(session_id, MAX_SHARDS)`, so if we sized
+    // `senders.len() < MAX_SHARDS`, requests whose id hashes to a
+    // partition >= senders.len() would silently see
+    // `SubmitError::Closed` (via `sender_for` returning `None`).
+    // Under `capacity = 1`, 15/16 partitions were unroutable. Always
+    // spawn all MAX_SHARDS shards; the global semaphore continues to
+    // enforce the caller's admission cap so total in-flight work is
+    // still bounded by `capacity`.
     const MAX_SHARDS: usize = 16;
     let capacity = capacity.max(1);
-    let shard_count = capacity.min(MAX_SHARDS);
+    let shard_count = MAX_SHARDS;
+    // Per-shard channel size: enough that a single shard can absorb
+    // the full admission burst if every request happens to hash to it,
+    // capped at `capacity` so we never over-allocate the caller's
+    // memory budget across shards.
+    let per_shard_capacity = capacity.min(capacity.div_ceil(shard_count).max(1) * shard_count);
+    let per_shard_capacity = per_shard_capacity.max(1);
     let global_capacity = Arc::new(tokio::sync::Semaphore::new(capacity));
     let pending = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let drained = Arc::new(tokio::sync::Notify::new());
     let mut senders = Vec::with_capacity(shard_count);
     for _ in 0..shard_count {
-        let (sender, receiver) = mpsc::channel::<Envelope>(capacity);
+        let (sender, receiver) = mpsc::channel::<Envelope>(per_shard_capacity);
         senders.push(sender);
         spawn_worker_shard(
             receiver,
@@ -1927,6 +1942,39 @@ mod tests {
                 (lower..=upper).contains(count),
                 "shard {shard} got {count} hits, expected {expected} (10% band)",
             );
+        }
+    }
+
+    /// All 16 partitions must have a live shard channel, even when the
+    /// caller passes a small `capacity`. An earlier version sized
+    /// `shard_count = capacity.min(16)`, so with `capacity < 16` any
+    /// session id hashing to a partition without a shard silently
+    /// returned `SubmitError::Closed` — 15/16 of the id space was
+    /// unroutable at capacity = 1.
+    #[tokio::test]
+    async fn every_shard_is_routable_at_capacity_one() {
+        let worker = spawn_worker(
+            1,
+            Arc::new(RecordingBus::default()),
+            Arc::new(HashEmbedder::default()),
+            Arc::new(Registry::new()),
+        );
+        // Probe every one of the 16 possible partition indices with a
+        // synthetic id crafted to hash there.
+        for target in 0..16u32 {
+            let mut candidate = None;
+            for i in 0..10_000u64 {
+                let id = format!("probe-{target}-{i}");
+                if ab_bridge::bus::partition_for(&id, 16) == target {
+                    candidate = Some(id);
+                    break;
+                }
+            }
+            let id = candidate.unwrap_or_else(|| panic!("no id found for shard {target}"));
+            let permit = worker
+                .try_reserve(&id)
+                .unwrap_or_else(|error| panic!("shard {target} not routable: {error:?}"));
+            drop(permit);
         }
     }
 
