@@ -18,7 +18,7 @@ pub const RECEIPT_VERSION: u32 = 1;
 
 /// What this receipt attests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum ReceiptSubject {
     /// A signed-workflow session: the OCSF event chain.
@@ -41,6 +41,7 @@ pub enum ReceiptSubject {
 
 /// Aggregate tool-call statistics for the session.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolCallSummary {
     /// Total tool calls observed.
     pub total: u64,
@@ -52,6 +53,7 @@ pub struct ToolCallSummary {
 
 /// Aggregate cost for the session (integers only — JCS-exact).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CostSummary {
     /// Total prompt tokens.
     pub prompt_tokens: u64,
@@ -65,6 +67,7 @@ pub struct CostSummary {
 
 /// The signed body (everything except the signature itself).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptBody {
     /// Receipt format version.
     pub receipt_version: u32,

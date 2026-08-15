@@ -414,3 +414,36 @@ fn standard_ed25519_jwks_is_accepted_and_refreshable() {
         .unwrap();
     assert_eq!(validator.key_count(), 1);
 }
+
+/// A JWKS whose `kid` collides with a manually-added key must be refused
+/// rather than silently overwriting the manual key and — because it also
+/// gets tracked in `jwks_kids` — retiring it on the next JWKS refresh.
+/// The docstring on `add_jwks` says manual keys are left untouched;
+/// without this check that contract failed on collision.
+#[test]
+fn add_jwks_refuses_to_overwrite_a_manually_registered_kid() {
+    let manual = ed25519_keys("shared-kid");
+    let jwks = ed25519_keys("shared-kid"); // same kid, different key material
+    let validator = IdentityValidator::new("harness-prod");
+    validator.add_key(&manual.kid, KeyMaterial::Ed25519Jwk(manual.public_x.clone()));
+    // Refuses with a helpful Jwks error.
+    let err = validator
+        .add_jwks(&serde_json::json!({
+            "keys": [{
+                "kid": jwks.kid,
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": jwks.public_x,
+            }]
+        }))
+        .unwrap_err();
+    assert!(
+        matches!(err, IdentityError::Jwks(ref reason) if reason.contains("conflicts")),
+        "expected a Jwks conflict error, got {err:?}",
+    );
+    // Manual key still validates unchanged.
+    assert_eq!(validator.key_count(), 1);
+    validator
+        .validate(&mint(&manual, &claims(&["tool:read"], 600, None)))
+        .unwrap();
+}
