@@ -169,6 +169,32 @@ fn static_asset(body: &'static str, content_type: &'static str) -> Response {
     response
 }
 
+/// Round-17 F4: wrap dashboard JSON responses with headers that
+/// forbid any intermediary shared cache from re-serving one caller's
+/// session detail to another. The static HTML/CSS/JS assets already
+/// set these; the JSON handlers didn't. Also sets `Vary:
+/// Authorization` for the day the dashboard gets an identity gate.
+fn no_store_json_response(value: impl serde::Serialize) -> Response {
+    let mut response = Json(value).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, max-age=0"),
+    );
+    response.headers_mut().insert(
+        header::PRAGMA,
+        HeaderValue::from_static("no-cache"),
+    );
+    response.headers_mut().insert(
+        header::VARY,
+        HeaderValue::from_static("Authorization"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
 /// GET /api/v1/dashboard/sessions?limit=&status=
 pub async fn list_sessions(
     State(state): State<AppState>,
@@ -196,7 +222,7 @@ pub async fn list_sessions(
     let matched = summaries.len();
     summaries.sort_by_key(|s| std::cmp::Reverse(s.last_activity_ms));
     summaries.truncate(limit);
-    let response = Json(json!({
+    let response = no_store_json_response(json!({
         "sessions": summaries,
         "generated_at_ms": ab_core::time::now_ms(),
         // Total number of sessions currently in the registry (before any
@@ -205,8 +231,7 @@ pub async fn list_sessions(
         // Number of sessions that matched the requested filter (before the
         // `limit` cap). Useful for pagination hints and diagnostics.
         "matched": matched,
-    }))
-    .into_response();
+    }));
     record(&state, "list", "ok", started);
     response
 }
@@ -216,11 +241,9 @@ pub async fn session_detail(State(state): State<AppState>, Path(id): Path<String
     let started = Instant::now();
     let Some(session) = state.sessions.get(&id) else {
         record(&state, "detail", "not_found", started);
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "session not found in registry"})),
-        )
-            .into_response();
+        let mut response = no_store_json_response(json!({"error": "session not found in registry"}));
+        *response.status_mut() = StatusCode::NOT_FOUND;
+        return response;
     };
     let summary = SessionSummary::from_session(&session);
     // Clone out under the lock and drop it before serialization so the
@@ -239,7 +262,7 @@ pub async fn session_detail(State(state): State<AppState>, Path(id): Path<String
         (chain.head_hex(), chain.count())
     };
     let receipt: Option<Value> = receipt_clone.and_then(|r| serde_json::to_value(&r).ok());
-    let response = Json(json!({
+    let response = no_store_json_response(json!({
         "summary": summary,
         "chain": {
             "head_hex": chain_head_hex,
@@ -247,8 +270,7 @@ pub async fn session_detail(State(state): State<AppState>, Path(id): Path<String
         },
         "receipt": receipt,
         "atif_path": atif_path,
-    }))
-    .into_response();
+    }));
     record(&state, "detail", "ok", started);
     response
 }
@@ -308,7 +330,7 @@ pub async fn stats(State(state): State<AppState>) -> Response {
             .total_tool_blocked
             .saturating_add(session.totals.tool_blocked.load(Ordering::Acquire));
     }
-    let response = Json(totals).into_response();
+    let response = no_store_json_response(totals);
     record(&state, "stats", "ok", started);
     response
 }
