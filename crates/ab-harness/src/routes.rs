@@ -183,10 +183,17 @@ async fn chat_completions(
             )));
         }
     }
-    let is_sse = upstream_headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with("text/event-stream"));
+    // Round-25 F3: RFC 7231 §3.1.1.1 says media type/subtype are
+    // case-insensitive and the header value may carry parameters
+    // (`; charset=utf-8`). Byte-exact `starts_with("text/event-stream")`
+    // misses `Text/Event-Stream` (some CDNs re-title-case) and can also
+    // mis-fire on hypothetical `text/event-stream-json`. Split on `;`
+    // then compare with `eq_ignore_ascii_case` so SSE is detected
+    // regardless of casing and parameters. A misclassified SSE stream
+    // gets buffered to the 16 MiB provider cap in the non-SSE branch
+    // and either loses streaming semantics (client sees no deltas
+    // until upstream EOF) or is refused with 502 despite being valid.
+    let is_sse = is_sse_content_type(&upstream_headers);
     let stream = upstream
         .bytes_stream()
         .map(|chunk| chunk.map_err(std::io::Error::other));
@@ -315,6 +322,24 @@ fn is_forwardable_upstream_header(name: &axum::http::HeaderName) -> bool {
         // we set it deliberately in our own router.
         || name.as_str().to_ascii_lowercase().starts_with("access-control-");
     !is_denied
+}
+
+/// Round-25 F3: detect `text/event-stream` in `Content-Type`
+/// case-insensitively, accepting parameters like `; charset=utf-8`.
+/// RFC 7231 §3.1.1.1 says media type/subtype are case-insensitive.
+/// Byte-exact matching missed `Text/Event-Stream` (some CDNs
+/// re-title-case) and mis-fired on hypothetical
+/// `text/event-stream-json`. Misclassification cost: the non-SSE
+/// branch buffers up to the 16 MiB provider cap and either loses
+/// streaming semantics or refuses valid streams with 502.
+fn is_sse_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            let head = value.split(';').next().unwrap_or("").trim();
+            head.eq_ignore_ascii_case("text/event-stream")
+        })
 }
 
 async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -3824,5 +3849,36 @@ mod tests {
         let abort = pipeline_error(PipelineError::Abort("stop retrying".into()));
         assert_eq!(abort.status(), StatusCode::CONFLICT);
         assert!(abort.headers().get(axum::http::header::RETRY_AFTER).is_none());
+    }
+
+    /// Round-25 F3: SSE detection is case-insensitive and tolerates
+    /// media-type parameters. Byte-exact `starts_with` previously
+    /// misclassified `Text/Event-Stream` (some CDNs re-title-case)
+    /// and any `text/event-stream; charset=utf-8` with a leading
+    /// title-cased subtype. Misclassified SSE streams get buffered
+    /// to the 16 MiB provider cap and either lose streaming
+    /// semantics or 502 despite being valid.
+    #[test]
+    fn is_sse_content_type_is_case_insensitive_and_param_tolerant() {
+        fn ct(value: &str) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                value.parse().expect("header value"),
+            );
+            headers
+        }
+        assert!(is_sse_content_type(&ct("text/event-stream")));
+        assert!(is_sse_content_type(&ct("Text/Event-Stream")));
+        assert!(is_sse_content_type(&ct("TEXT/EVENT-STREAM")));
+        assert!(is_sse_content_type(&ct("text/event-stream; charset=utf-8")));
+        assert!(is_sse_content_type(&ct(
+            "Text/Event-Stream ; charset=utf-8"
+        )));
+        // Non-SSE and superstring both must not match.
+        assert!(!is_sse_content_type(&ct("application/json")));
+        assert!(!is_sse_content_type(&ct("text/event-stream-json")));
+        // Absent header returns false.
+        assert!(!is_sse_content_type(&HeaderMap::new()));
     }
 }
