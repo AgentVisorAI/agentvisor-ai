@@ -1,0 +1,147 @@
+name: Publish crates.io
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run cargo publish --dry-run only, no upload"
+        required: false
+        default: "true"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # A pushed tag is immutable; keep the group so a manual dispatch does
+  # not race a tagged release.
+  group: publish-crates-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish workspace crates
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+    steps:
+      # Pin every third-party action by commit SHA (round-29 F2). The
+      # publish workflow uploads to crates.io using a token secret — a
+      # compromised action tag could exfiltrate it.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          key: publish-${{ github.ref_name }}
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake libcurl4-openssl-dev
+
+      # Verify the tag version matches the workspace version so a
+      # `git tag vX.Y.Z` pointing at a workspace still on the OLD
+      # version does not silently republish under the old number.
+      # workflow_dispatch runs skip this check (no tag).
+      - name: Verify tag matches workspace version
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          workspace_version=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = //;s/"//g')
+          if [ "$tag_version" != "$workspace_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME (=$tag_version) does not match workspace version $workspace_version"
+            echo "Update workspace.package.version in Cargo.toml before tagging."
+            exit 1
+          fi
+
+      # Dry-run publish in strict topological order — every crate MUST
+      # `cargo package --list` cleanly and its verification build (which
+      # cargo runs by default) MUST succeed before any real upload. If
+      # a leaf fails here, later crates would fail on the actual publish
+      # after upstream crates are already live (irreversible on
+      # crates.io — you can only yank, not re-upload the same version).
+      - name: Dry-run package (topological order)
+        run: |
+          set -euo pipefail
+          crates=(
+            ab-core
+            ab-events
+            ab-compress
+            ab-loopdetect
+            ab-state
+            ab-atif
+            ab-receipts
+            ab-bridge
+            ab-identity
+            ab-sandbox
+            ab-harness
+            ab-cli
+          )
+          for crate in "${crates[@]}"; do
+            echo "::group::dry-run package $crate"
+            cargo package -p "$crate" --allow-dirty
+            echo "::endgroup::"
+          done
+
+      # workflow_dispatch with dry_run=true stops here — the manual
+      # trigger's purpose is to smoke-test the workflow itself before
+      # a real tag is pushed. Only tag pushes (or dispatch with
+      # dry_run=false) proceed to actual publish.
+      - name: Should publish?
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ inputs.dry_run }}" = "false" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping upload — dry-run only."
+          fi
+
+      # Publish in topological order. Each `cargo publish` waits for the
+      # new version to appear in the index (via crates.io's server-side
+      # confirmation) before returning, so the next crate's dependency
+      # resolution can find its upstream. Rate-limit friendly: crates.io
+      # currently allows ~10 new versions per minute per token, well
+      # under our 12-crate cadence.
+      - name: Publish
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN secret is not set. Add it under Settings → Secrets → Actions."
+            exit 1
+          fi
+          crates=(
+            ab-core
+            ab-events
+            ab-compress
+            ab-loopdetect
+            ab-state
+            ab-atif
+            ab-receipts
+            ab-bridge
+            ab-identity
+            ab-sandbox
+            ab-harness
+            ab-cli
+          )
+          for crate in "${crates[@]}"; do
+            echo "::group::publish $crate"
+            # --allow-dirty because the workflow runs against the tag
+            # tree which cargo considers "dirty" versus its own
+            # packaged tree diff — nothing is actually modified in the
+            # working copy.
+            cargo publish -p "$crate" --allow-dirty
+            echo "::endgroup::"
+          done

@@ -10,17 +10,17 @@ COPY crates ./crates
 COPY schemas ./schemas
 # `crates/ab-harness/src/main.rs` uses `include_str!("../../../config/
 # policies/payload_limit.wat")` to embed the default policy so
-# `cargo install agent-bridge` works from an empty directory. The build
+# `cargo install ab-harness` works from an empty directory. The build
 # stage therefore needs the config tree available at compile time —
 # without this COPY the build fails with "couldn't read
 # .../config/policies/payload_limit.wat".
 COPY config ./config
-RUN cargo build --locked --release -p ab-harness --features full --bin agent-bridge -p ab-cli --bin abctl
+RUN cargo build --locked --release -p ab-harness --features full --bin agentbridged -p ab-cli --bin abctl
 RUN mkdir -p /tmp/runtime-root/data /tmp/runtime-root/spool
 
 FROM cgr.dev/chainguard/glibc-dynamic:latest AS runtime
 WORKDIR /app
-COPY --from=build /src/target/release/agent-bridge /usr/local/bin/agent-bridge
+COPY --from=build /src/target/release/agentbridged /usr/local/bin/agentbridged
 COPY --from=build /src/target/release/abctl /usr/local/bin/abctl
 COPY --from=build --chown=65532:65532 /tmp/models /app/models
 COPY --from=build --chown=65532:65532 /tmp/runtime-root/ /app/
@@ -35,4 +35,4 @@ EXPOSE 8484
 # Standalone single-container defaults (embedded bridge, in-memory state).
 # The full-stack compose file overrides this with harness.docker.toml.
 ENV AB_CONFIG=/app/config/harness.container.toml
-ENTRYPOINT ["agent-bridge"]
+ENTRYPOINT ["agentbridged"]
