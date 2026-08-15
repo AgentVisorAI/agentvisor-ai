@@ -49,7 +49,19 @@ impl NatsBus {
         for t in &manifest.topics {
             let subjects: Vec<String> = (0..t.partitions).map(|p| format!("{}.p{p}", t.name)).collect();
             let context = js.clone();
-            let retention = std::time::Duration::from_secs(u64::from(t.retention.hot_hours) * 3600);
+            // Round-21 F8: match the KafkaBus retention arithmetic
+            // discipline. Today `hot_hours: u32` × 3600 fits in
+            // u64, but a future field-widening (e.g., u64 for
+            // very-long-retention research clusters) would
+            // silently wrap here and surface as `Overflow` on the
+            // Kafka path — the same cross-backend divergence
+            // round-20 F1 closed for counters. Use checked_mul
+            // now so a future widening surfaces the error
+            // consistently.
+            let retention_secs = u64::from(t.retention.hot_hours)
+                .checked_mul(3600)
+                .ok_or_else(|| BusError::Backend("NATS retention overflow".to_owned()))?;
+            let retention = std::time::Duration::from_secs(retention_secs);
             let config = async_nats::jetstream::stream::Config {
                 name: stream_name(&t.name),
                 subjects: subjects.clone(),
@@ -179,7 +191,7 @@ impl NatsBus {
 impl EventBus for NatsBus {
     fn set_control_key(&self, key: [u8; 32]) -> Result<(), BusError> {
         if let Some(archive) = &self.cold_archive {
-            archive.set_control_key(key);
+            archive.set_control_key(key)?;
         }
         Ok(())
     }
