@@ -1,6 +1,12 @@
 //! Live-broker contract tests, env-gated (AV_NATS_URL / AV_KAFKA_BROKER) and
 //! loudly skipped otherwise (D13.21). The same behavioral contract as the
 //! embedded suite: publish → ack, offset-ordered fetch, unknown-topic error.
+//!
+//! Secured-endpoint material (all optional): `AV_KAFKA_CA_FILE` +
+//! `AV_KAFKA_SASL_USERNAME`/`AV_KAFKA_SASL_PASSWORD` for TLS+SASL/PLAIN
+//! Kafka; `AV_NATS_CA_FILE` (forces TLS) + `AV_NATS_USER`/`AV_NATS_PASSWORD`
+//! for NATS. `AV_KAFKA_BROKER` accepts a `host:port[,host:port]` bootstrap
+//! list. Use hostname endpoints with TLS (certificate name verification).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

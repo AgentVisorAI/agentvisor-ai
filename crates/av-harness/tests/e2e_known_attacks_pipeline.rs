@@ -3,7 +3,7 @@
 //! wasmtime. Each test targets a real CVE or public-attack class against
 //! the specific backend AgentVisor AI integrates.
 //!
-//! Contract tests that need a live backend (`AV_REDIS_URL`, `AV_KAFKA_URL`,
+//! Contract tests that need a live backend (`AV_REDIS_URL`, `AV_KAFKA_BROKER`,
 //! `AV_NATS_URL`) live in the crate-local contract suites and skip loudly
 //! when unset. This file targets the LOGIC AgentVisor AI wraps around those
 //! backends — Lua-script atomicity, MAC domain separation, subject
