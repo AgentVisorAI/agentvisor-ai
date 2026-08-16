@@ -3,7 +3,26 @@ name: CI
 on:
   push:
     branches: [main]
+    # Docs-only changes are covered by the Docs workflow; deploy manifests
+    # have no CI-executed checks. Skipping them here saves the full
+    # 30-60 min pipeline on prose commits.
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "deploy/**"
+      - "LICENSE"
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "deploy/**"
+      - "LICENSE"
+
+# A superseded run of this pipeline costs 30-60 runner-minutes; always
+# yield to the newer commit.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -63,6 +82,11 @@ jobs:
           cargo test --workspace
           cargo test --workspace --all-features
       - name: Release SLA
+        # The two release-profile SLA builds are the pipeline's most
+        # expensive step (~15-20 min). Gate them to main pushes: PR runs
+        # (mostly Dependabot) still get fmt/clippy/tests/feature-matrix/
+        # docs/schemas/Harbor, and main re-validates the SLA on merge.
+        if: github.event_name == 'push'
         env:
           AV_REDIS_URL: redis://127.0.0.1:6379
           AV_KAFKA_BROKER: 127.0.0.1:19092
@@ -109,6 +133,10 @@ jobs:
       - name: Compose
         run: docker compose -f docker/docker-compose.yml config >/dev/null
       - name: Container build
+        # Release-profile in-container build (~10-20 min): main-only, same
+        # rationale as the SLA gate. `Compose` above still validates the
+        # compose file itself on every run.
+        if: github.event_name == 'push'
         run: docker compose -f docker/docker-compose.yml build agentvisor-ai
       - name: Stop live contract services
         if: always()

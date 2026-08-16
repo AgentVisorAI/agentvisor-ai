@@ -3,9 +3,19 @@ name: Supply chain
 on:
   push:
     branches: [main]
+    # Dependency policy only changes when these change; code-only pushes
+    # skip the gate (the weekly schedule still catches new advisories on
+    # unchanged code).
+    paths:
+      - Cargo.toml
+      - "crates/*/Cargo.toml"
+      - Cargo.lock
+      - deny.toml
+      - .github/workflows/deny.yml
   pull_request:
     paths:
       - Cargo.toml
+      - "crates/*/Cargo.toml"
       - Cargo.lock
       - deny.toml
       - .github/workflows/deny.yml
@@ -22,23 +32,16 @@ concurrency:
 
 jobs:
   cargo-deny:
-    name: cargo-deny (${{ matrix.check }})
+    name: cargo-deny
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # `advisories` catches unfixed RUSTSEC entries; the others enforce the
-        # policy configured in `deny.toml`.
-        check:
-          - advisories
-          - bans
-          - licenses
-          - sources
     steps:
       # Round-29 F2: pin every third-party action by commit SHA.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      # One `check` invocation runs advisories, bans, licenses, and
+      # sources together (each reported separately in the log) — a single
+      # container spin-up instead of the former four-job matrix.
       - uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
         with:
-          command: check ${{ matrix.check }}
+          command: check
