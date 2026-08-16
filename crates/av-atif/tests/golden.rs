@@ -629,3 +629,132 @@ fn subagent_trajectory_sibling_reuse_is_not_a_false_positive() {
         "sibling reuse of trajectory_id must NOT trigger the ancestor-cycle guard; got: {issues:#?}"
     );
 }
+
+// ---- Mutation-run hardening (round 12): version gates and calendar
+// logic in the strict validator were only tested on one side, so
+// boundary mutants (`< (1,N)` -> `<=`, `&&` -> `||`, leap-year
+// arithmetic) survived. Each version-gated feature is checked at the
+// exact version that legalizes it (accepted) and one minor below
+// (rejected); the ISO-8601 torture table pins month lengths and all
+// three leap-year rules.
+
+fn minimal(version: &str, extra_root: serde_json::Value, step_extra: serde_json::Value) -> serde_json::Value {
+    let mut root = serde_json::json!({
+        "schema_version": format!("ATIF-v{version}"),
+        "session_id": "S-1",
+        "trajectory_id": "traj-x",
+        "agent": {"name": "a", "version": "1"},
+        "steps": [{
+            "step_id": 1,
+            "timestamp": "2025-01-15T10:30:00Z",
+            "source": "agent",
+            "message": "m"
+        }]
+    });
+    if let serde_json::Value::Object(map) = extra_root {
+        for (k, v) in map {
+            root[k.clone()] = v;
+        }
+    }
+    if let serde_json::Value::Object(map) = step_extra {
+        for (k, v) in map {
+            root["steps"][0][k.clone()] = v;
+        }
+    }
+    root
+}
+
+fn has_issue(v: &serde_json::Value, needle: &str) -> bool {
+    validate_value(v, Mode::Strict)
+        .iter()
+        .any(|i| format!("{i}").contains(needle))
+}
+
+#[test]
+fn version_gates_flip_at_exactly_the_documented_version() {
+    use serde_json::json;
+    // (feature name for diagnostics, legal version, illegal version,
+    //  root extra, step extra, issue needle)
+    let cases: &[(&str, &str, &str, serde_json::Value, serde_json::Value, &str)] = &[
+        (
+            "root extra",
+            "1.1",
+            "1.0",
+            json!({"extra": {}}),
+            json!({}),
+            "extra",
+        ),
+        (
+            "tool_definitions",
+            "1.5",
+            "1.4",
+            json!({"agent": {"name": "a", "version": "1", "tool_definitions": []}}),
+            json!({}),
+            "tool_definitions",
+        ),
+        (
+            "system observation",
+            "1.2",
+            "1.1",
+            json!({}),
+            json!({"source": "system", "observation": {"results": []}, "message": "m"}),
+            "observation",
+        ),
+        (
+            "multimodal message",
+            "1.6",
+            "1.5",
+            json!({}),
+            json!({"message": [{"type": "text", "text": "hi"}]}),
+            "message",
+        ),
+    ];
+    for (name, legal, illegal, root_extra, step_extra, needle) in cases {
+        let ok = minimal(legal, root_extra.clone(), step_extra.clone());
+        assert!(
+            !has_issue(&ok, needle),
+            "{name}: must be legal at v{legal}, issues: {:?}",
+            validate_value(&ok, Mode::Strict)
+        );
+        let bad = minimal(illegal, root_extra.clone(), step_extra.clone());
+        assert!(has_issue(&bad, needle), "{name}: must be flagged at v{illegal}");
+    }
+    // session_id became optional in exactly v1.7.
+    let mut ok = minimal("1.7", serde_json::json!({}), serde_json::json!({}));
+    ok.as_object_mut().unwrap().remove("session_id");
+    assert!(!has_issue(&ok, "session_id"), "session_id optional at 1.7");
+    let mut bad = minimal("1.6", serde_json::json!({}), serde_json::json!({}));
+    bad.as_object_mut().unwrap().remove("session_id");
+    assert!(has_issue(&bad, "session_id"), "session_id required below 1.7");
+}
+
+#[test]
+fn iso8601_calendar_rules_are_exact() {
+    let with_ts = |ts: &str| minimal("1.7", serde_json::json!({}), serde_json::json!({"timestamp": ts}));
+    let valid = [
+        "2024-02-29T00:00:00Z", // divisible by 4, not by 100: leap
+        "2000-02-29T23:59:59Z", // divisible by 400: leap
+        "2023-02-28T12:00:00Z",
+        "2025-04-30T12:00:00Z",
+        "2025-12-31T12:00:00Z",
+    ];
+    for ts in valid {
+        assert!(!has_issue(&with_ts(ts), "timestamp"), "{ts} must be accepted");
+    }
+    let invalid = [
+        "2023-02-29T00:00:00Z", // not a leap year
+        "1900-02-29T00:00:00Z", // divisible by 100, not 400: no leap
+        "2025-04-31T12:00:00Z", // April has 30 days
+        "2025-06-31T12:00:00Z",
+        "2025-11-31T12:00:00Z",
+        "2025-01-32T12:00:00Z",
+        "2025-13-01T12:00:00Z",
+        "2025-00-10T12:00:00Z",
+        "2025-01-00T12:00:00Z",
+        "2025-01-15T10.30:00Z", // separator torture
+        "2025-01-15T10:30.00Z",
+    ];
+    for ts in invalid {
+        assert!(has_issue(&with_ts(ts), "timestamp"), "{ts} must be flagged");
+    }
+}

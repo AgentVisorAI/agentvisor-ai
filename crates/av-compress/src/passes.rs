@@ -569,3 +569,27 @@ mod tests {
         assert_eq!(intact, 12, "tool_calls messages must survive verbatim");
     }
 }
+
+#[cfg(test)]
+mod ratio_tests {
+    /// Mutation-run hardening (round 12): pin the R7 metric arithmetic —
+    /// `/` -> `%`/`*` in `pruning_ratio_millis` would corrupt the
+    /// pruning-ratio field that mirrors ATIF metrics.
+    #[test]
+    fn pruning_ratio_millis_is_exact() {
+        let outcome = super::CompressionOutcome {
+            payload: serde_json::Value::Null,
+            tokens_before: 1000,
+            tokens_after: 650,
+            changed: true,
+        };
+        assert_eq!(outcome.pruning_ratio_millis(), 350, "350 = 35.0%");
+        let zero = super::CompressionOutcome {
+            payload: serde_json::Value::Null,
+            tokens_before: 0,
+            tokens_after: 0,
+            changed: false,
+        };
+        assert_eq!(zero.pruning_ratio_millis(), 0, "0/0 guard");
+    }
+}
