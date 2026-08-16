@@ -120,7 +120,10 @@ impl BridgeManifest {
         // aliases would need explicit `&name`/`*name` syntax; a naive
         // string search catches every case that serde_yaml would
         // actually expand. False positives on strings that happen to
-        // contain `&` or `*` are avoided by checking that the char
+        // contain `&` or `*` are reduced (not eliminated — the scan is
+        // not YAML-context-aware, so a quoted string like `"a &name"`
+        // still trips it; failing closed is acceptable for manifests)
+        // by checking that the char
         // precedes a valid anchor name character (alphanumeric or `_`).
         for (marker, kind) in [('&', "anchor"), ('*', "alias")] {
             let mut chars = yaml.char_indices().peekable();
