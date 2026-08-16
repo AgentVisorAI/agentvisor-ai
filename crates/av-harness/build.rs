@@ -2,8 +2,9 @@
 //! its embedded WAT policy.
 //!
 //! `include_str!` in `src/dashboard.rs` and `src/main.rs` embeds files
-//! from `dashboard/` and `policies/` (both inside this crate since
-//! round-45), but Cargo's automatic dep-info fingerprinting proved
+//! from this crate's `dashboard/` and `policies/` directories
+//! (the policy moved in-crate in round-45), but Cargo's automatic
+//! dep-info fingerprinting proved
 //! unreliable for these embedded assets in this workspace — the empirical statement is that editing
 //! `dashboard/` files alone did not rebuild the binary until this
 //! script was added. Once one `rerun-if-changed` line exists, Cargo
