@@ -36,8 +36,9 @@ docker compose -f docker/docker-compose.yml up -d --wait redpanda redis qdrant n
 ```
 
 The 10,000-connection SLA gate is opt-in behind `RUN_HEAVY_PERF=1`; see the
-[`Release SLA` job in `ci.yml`](.github/workflows/ci.yml) for the exact
-invocation.
+[`Release SLA` step in `ci.yml`](.github/workflows/ci.yml) for the exact
+invocation (it runs on pushes to `main`; pull-request runs skip the
+release-profile SLA and container builds to conserve CI minutes).
 
 ## Commits and pull requests
 
