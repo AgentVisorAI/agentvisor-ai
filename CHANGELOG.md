@@ -4,6 +4,28 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Review round 8: soak test findings (2026-08-16)
+
+A 15,600-session soak (release daemon, live Kafka bridge + 3-node Redis
+Cluster + mock upstream, `avctl loadgen` waves) surfaced two cold-tier
+defects; memory and fd behavior were otherwise clean (fds stable, RSS
+reclaimed from 72 MB to 29 MB once the idle sweep finalized sessions —
+retention by design, not a leak; zero failed requests across all waves).
+
+- **Shipped example manifest could never cold-export outside the
+  container** — `manifests/bridge.example.yaml` hardcoded
+  `file:///app/data/cold` (container-absolute). A local run with the
+  documented default accumulated an unbounded durable retry outbox
+  (13,314 intents / 52 MB in one soak) with a WARN per event, forever.
+  The manifest now uses the portable relative `data/cold`, which
+  resolves identically in the container (`WORKDIR /app`).
+- **Relative `cold_uri` never worked** — `cold_url` created the
+  directory and then failed provisioning, because
+  `Url::from_directory_path` rejects relative paths. It now
+  canonicalizes against the CWD first (same resolution rule as the
+  cold-outbox default). Post-fix soak: 0 retry warnings, cold objects
+  land on disk, outbox drains to 0.
+
 ### Review round 4: supply chain + NATS credential downgrade (2026-08-16)
 
 - **quick-xml RUSTSEC advisory (unbounded allocation)** — the `aws` feature
