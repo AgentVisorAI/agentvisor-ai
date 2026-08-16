@@ -54,7 +54,7 @@ impl NatsBus {
         // compiled in (all-feature workspace builds carry both `ring` and
         // `aws-lc-rs`) and none has been installed. Pin `ring` here; if the
         // embedding application already installed one, keep theirs.
-        let _ = rustls_nats::crypto::ring::default_provider().install_default();
+        let _ = rustls_tls::crypto::ring::default_provider().install_default();
         let url = url.to_owned();
         // TLS/auth material comes from the environment so `tls://` endpoints
         // work against private-CA deployments without new constructor
