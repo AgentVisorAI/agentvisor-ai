@@ -1856,7 +1856,9 @@ impl Finalizer {
                 self.metrics
                     .counter(
                         "av_unsigned_recovery_skipped_total",
-                        "Unsigned sessions skipped during consolidation due to per-session errors (round-41 F1)",
+                        // Keep in sync with the pre-registration in pipeline.rs —
+                        // render() emits one HELP per family.
+                        "Unsigned step-journal consolidations skipped during recovery due to per-session errors (round-41 F1)",
                     )
                     .inc();
                 if self.warn_once(metadata_path.clone()) {
