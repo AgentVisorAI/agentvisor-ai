@@ -555,3 +555,47 @@ fn offsets_stay_monotone_across_retention_boundaries() {
         ack.offset
     );
 }
+
+/// Mutation-run hardening (round 13): the trait-default
+/// `find_event_by_uid` — the at-most-once primitive crash recovery uses
+/// to decide whether an effect already committed — had no test on any
+/// backend. Ok(None) regressions mean duplicated effects after a crash;
+/// a wrong match acks the wrong offset. Exercise it through the embedded
+/// broker including the pagination path (fetch pages are 1,024 events).
+#[test]
+fn find_event_by_uid_resolves_committed_events_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = EmbeddedBroker::provision(dir.path(), &manifest()).unwrap();
+    let key = "inst-uid-probe";
+    let mut acks = Vec::new();
+    for i in 0..1_500u32 {
+        let ack = broker
+            .publish(
+                "agent.tool_call",
+                key,
+                &json!({"metadata": {"uid": format!("uid-{i}")}, "i": i}),
+            )
+            .unwrap();
+        acks.push(ack);
+    }
+    // First page, deep into the second page, and the exact page edge.
+    for probe in [0usize, 1_400, 1_023, 1_024] {
+        let found = broker
+            .find_event_by_uid("agent.tool_call", key, &format!("uid-{probe}"))
+            .unwrap()
+            .unwrap_or_else(|| panic!("uid-{probe} must be found"));
+        assert_eq!(found.offset, acks[probe].offset, "uid-{probe} offset");
+        assert_eq!(found.partition, acks[probe].partition);
+    }
+    assert!(
+        broker
+            .find_event_by_uid("agent.tool_call", key, "uid-missing")
+            .unwrap()
+            .is_none(),
+        "unknown uid must be None"
+    );
+    assert!(
+        broker.find_event_by_uid("agent.bogus", key, "uid-0").is_err(),
+        "unknown topic must error"
+    );
+}

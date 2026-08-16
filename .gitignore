@@ -73,3 +73,6 @@ node_modules/
 
 # Log files
 *.log
+
+# CWD-relative cold-outbox residue from crate-local test runs
+crates/*/data/
