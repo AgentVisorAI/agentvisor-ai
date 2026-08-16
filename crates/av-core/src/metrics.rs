@@ -118,8 +118,8 @@ impl Histogram {
     }
 
     /// Approximate quantile (µs) from bucket boundaries. Returns the upper
-    /// bound of the bucket containing quantile `q` (0.0–1.0), or the max bound
-    /// if the sample landed above every bucket.
+    /// bound of the bucket containing quantile `q` (0.0–1.0); a target that
+    /// lands above every bounded bucket returns the sentinel below.
     ///
     /// A `q` whose target is served only by samples in the implicit +Inf
     /// bucket returns `u64::MAX` as a sentinel: this signals "beyond top
@@ -201,7 +201,9 @@ impl Registry {
     /// overwrite would detach the existing metric from the registry and
     /// lose every observation collected against it. Also panics if `key`
     /// contains a byte that would corrupt Prometheus text exposition
-    /// (`"`, `\n`, `\\`) — this catches accidental interpolation of
+    /// (cross-line bytes anywhere; `"` or `\\` in the base name — both
+    /// stay legal inside the label section) — this catches accidental
+    /// interpolation of
     /// attacker-controlled strings into a metric key at registration
     /// rather than surfacing corrupt scrape output later.
     #[allow(clippy::panic)]

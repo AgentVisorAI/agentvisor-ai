@@ -35,9 +35,10 @@ pub const DEFAULT_LIST_LIMIT: usize = 50;
 pub const MAX_LIST_LIMIT: usize = 500;
 
 /// Record latency + outcome for a dashboard request. Kept next to the
-/// handlers so a new endpoint cannot silently forget to register a
-/// counter or histogram — the render() call in av-core/metrics will
-/// panic on a missing key, catching that regression in tests.
+/// handlers so every endpoint funnels through one registration point —
+/// a new endpoint that calls `record()` is instrumented automatically,
+/// and one that doesn't shows up as a missing series in the
+/// dashboard-metrics tests (render() itself never panics on absent keys).
 fn record(state: &AppState, endpoint: &'static str, status: &'static str, started: Instant) {
     let latency_key = format!("av_dashboard_request_duration_seconds{{endpoint=\"{endpoint}\"}}");
     let counter_key = format!("av_dashboard_requests_total{{endpoint=\"{endpoint}\",status=\"{status}\"}}");

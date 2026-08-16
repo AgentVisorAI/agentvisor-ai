@@ -6,8 +6,9 @@
 //! v1.10.0). The roadmap Fingerprint chaining (per-forward-pass inventory) is
 //! implemented behind [`OcsfEvent::inventory`] fields, default `None`.
 //!
-//! Evolution policy (EVOLUTION.md): inbound-tolerant (unknown fields land in
-//! `unmapped`), outbound-strict (emitters always produce the current schema).
+//! Evolution policy (EVOLUTION.md): inbound-tolerant (top-level unknown
+//! fields land in `unmapped`; nested objects stay strict), outbound-strict
+//! (emitters always produce the current schema).
 
 pub mod model;
 pub mod stop_reason;
