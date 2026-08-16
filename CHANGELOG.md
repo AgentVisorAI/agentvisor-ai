@@ -8,6 +8,12 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 Implementation review of the secured-transport work surfaced three defects:
 
+- **Kafka bootstrap lists actually work on the event path** — config
+  documents `bridge_endpoint` as `host:port[,host:port]` and the rdkafka
+  admin client accepts that, but the rskafka event path received the joined
+  string as a single address, so every multi-broker bootstrap list failed
+  to connect. The list is now split per-entry (live-tested single and
+  multi-entry forms).
 - **NATS partial credentials failed silently** — setting only one of
   `AV_NATS_USER`/`AV_NATS_PASSWORD` silently connected anonymously
   (a D13 silent-error violation, and inconsistent with the Kafka
@@ -49,6 +55,15 @@ Full pre-release rename; entries below this one keep the historical names.
   domain-separation tag changed `"ab-genesis"` → `"av-genesis"`, so receipts
   issued by pre-rename builds do not verify against post-rename chains
   (pre-release, nothing published).
+- **Persisted formats** — further pre-release breaks carried by the rename:
+  NATS JetStream stream names are now `av_<topic>` (old `ab_*` streams are
+  orphaned, re-provisioned fresh); the cold-outbox HMAC domain changed to
+  `agentvisor-cold-outbox-v1`, so pre-rename pending intents fail
+  authentication loudly (drain the outbox before upgrading); Kafka records
+  carry the dedupe header `agentvisor-event-uid` (was `agentbridge-…`); the
+  OCSF `metadata.product.name` is `agentvisor-ai`; the default NHI JWT
+  `audience` is `agentvisor-ai`, so tokens minted for the old audience are
+  rejected until re-issued.
 - **Env vars** — `AB_*` → `AV_*` (e.g. `AV_UPSTREAM_URL`, `AV_REDIS_URL`,
   `AV_KAFKA_CA_FILE`, `AV_NATS_CA_FILE`, `AV_COLD_S3_URL`, `AV_SLA_*`).
 - **Metrics** — Prometheus names `ab_*` → `av_*`
