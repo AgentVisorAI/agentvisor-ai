@@ -466,6 +466,64 @@ mod tests {
         );
     }
 
+    /// Mutation-run hardening (round 14): the READ-side twin of the
+    /// weak-key sign guard. `verify_pending_mac` refuses envelopes while
+    /// the archive still holds a known-weak key ([0;32]/[0xFF;32]); the
+    /// surviving `||` -> `&&` mutant only refuses a key that is BOTH
+    /// patterns (impossible), so a filesystem attacker who forges an
+    /// envelope MAC'd with the all-zero default would have it accepted
+    /// during the pre-set_control_key startup window. Forge exactly that
+    /// envelope and require rejection.
+    #[test]
+    fn envelope_forged_with_the_weak_default_key_is_refused_on_read() {
+        use hmac::{Hmac, Mac as _};
+        use sha2::Sha256;
+        let directory = tempfile::tempdir().unwrap();
+        let uri = url::Url::from_directory_path(directory.path())
+            .unwrap()
+            .to_string();
+        let outbox = tempfile::tempdir().unwrap();
+        let mut manifest = BridgeManifest::default_for("cold-forged");
+        let topic = &mut manifest.topics[0];
+        topic.retention.cold_uri = Some(uri);
+        let topic_name = topic.name.clone();
+        let archive =
+            ColdArchive::from_manifest_with_pending_default(&manifest, Some(outbox.path().to_path_buf()))
+                .unwrap()
+                .unwrap();
+        // No set_control_key: the archive holds the [0; 32] default,
+        // exactly the startup window the read guard protects.
+        let payload = PendingColdEvent {
+            topic: topic_name.clone(),
+            event_uid: "uid-forged".to_owned(),
+            partition: 0,
+            key: "instance".to_owned(),
+            value: serde_json::json!({"metadata": {"uid": "uid-forged"}}),
+            stored_at: 1,
+            offset: Some(0),
+        };
+        let canonical = av_receipts::canonicalize(&serde_json::to_value(&payload).unwrap()).unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(&[0u8; 32]).unwrap();
+        mac.update(b"agentvisor-cold-outbox-v1\0");
+        mac.update(canonical.as_bytes());
+        let forged = PendingEnvelope {
+            payload,
+            mac: hex::encode(mac.finalize().into_bytes()),
+        };
+        let forged_path = archive.pending_path(&topic_name, "uid-forged");
+        std::fs::create_dir_all(forged_path.parent().unwrap()).unwrap();
+        std::fs::write(&forged_path, serde_json::to_vec(&forged).unwrap()).unwrap();
+        let outcome = archive.retry_pending_with(|_| {
+            Err(BusError::Backend(
+                "resolver must not run for a forged envelope".to_owned(),
+            ))
+        });
+        assert!(
+            matches!(outcome, Err(BusError::Backend(ref m)) if m.contains("authentication failed")),
+            "weak-key forged envelope must be refused, got {outcome:?}"
+        );
+    }
+
     /// Mutation-run hardening (round 14): `validate_same_intent` binds a
     /// cold-outbox UID to one exact event — nine surviving mutants could
     /// each let a UID be re-staged over a DIFFERENT event's payload
