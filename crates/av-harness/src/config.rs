@@ -444,7 +444,7 @@ pub fn load_config() -> Result<(HarnessConfig, ConfigSource), String> {
              Quick start (pick one):\n\
              \x20 avctl                              # guided setup, two questions\n\
              \x20 avctl init --preset openai        # write an annotated agentvisor.toml\n\
-             \x20 AV_UPSTREAM_URL=http://127.0.0.1:11434 agentvisor-ai   # zero-config\n\
+             \x20 AV_UPSTREAM_URL=http://127.0.0.1:11434 agentvisord   # zero-config\n\
              Searched: $AV_CONFIG, {}, ~/.agentvisor/agentvisor.toml",
             CONFIG_SEARCH_PATHS.join(", ")
         ));
