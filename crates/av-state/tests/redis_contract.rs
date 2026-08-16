@@ -94,3 +94,109 @@ fn redis_never_rounds_a_spend_past_jcs_max() {
     assert_eq!(s.get(&key).unwrap(), av_core::error::JCS_SAFE_MAX);
     s.remove(&key);
 }
+
+/// Mutation-run hardening (round 11): `RedisStore::refund` had no live
+/// contract test at all — a mutant deleting its body survived. Round-trip
+/// a spend + refund and prove the headroom returns; also prove the
+/// round-34 no-resurrect rule holds against a live server (refund on a
+/// removed key must not recreate it).
+#[test]
+fn redis_contract_refund_roundtrip_and_no_resurrect() {
+    let Some(s) = store() else { return };
+    let key = format!("av-test-refund:{{{}}}", av_core::new_event_uid());
+    assert!(s.try_spend(&key, 7, 10).unwrap());
+    s.refund(&key, 3);
+    assert_eq!(s.get(&key).unwrap(), 4, "refund must subtract");
+    // Saturating: refunding more than spent clamps at zero, never negative.
+    s.refund(&key, 100);
+    assert_eq!(s.get(&key).unwrap(), 0);
+    // No-resurrect: refund after remove must not recreate the key.
+    assert!(s.try_spend(&key, 5, 10).unwrap());
+    s.remove(&key);
+    s.refund(&key, 5);
+    assert_eq!(s.get(&key).unwrap(), 0, "refund must not resurrect a removed key");
+}
+
+/// Mutation-run hardening (round 11): the JCS_SAFE_MAX guard in
+/// `spend_many_on` and the duplicate-key rejection lacked exact live
+/// coverage (`>` -> `>=`, `||` -> `&&` survived).
+#[test]
+fn redis_contract_spend_many_guards_are_exact() {
+    use av_state::StateError;
+    let max = av_core::error::JCS_SAFE_MAX;
+    let Some(s) = store() else { return };
+    let tag = av_core::new_event_uid();
+    // amount == limit == JCS_SAFE_MAX commits (kills > -> >=)…
+    let key = format!("av-test-max:{{{tag}}}");
+    assert_eq!(
+        s.try_spend_many(&[Spend {
+            key: key.clone(),
+            amount: max,
+            limit: max,
+        }])
+        .unwrap(),
+        None
+    );
+    s.remove(&key);
+    // …and each side one past the cap is Overflow independently
+    // (kills || -> && which would require BOTH to exceed).
+    for (amount, limit) in [(max + 1, max), (1, max + 1)] {
+        let outcome = s.try_spend_many(&[Spend {
+            key: format!("av-test-over:{{{tag}}}"),
+            amount,
+            limit,
+        }]);
+        assert!(matches!(outcome, Err(StateError::Overflow(_))), "got {outcome:?}");
+    }
+    // Duplicate keys are refused before the Lua script runs.
+    let dup = format!("av-test-dup:{{{tag}}}");
+    let outcome = s.try_spend_many(&[
+        Spend {
+            key: dup.clone(),
+            amount: 1,
+            limit: 10,
+        },
+        Spend {
+            key: dup,
+            amount: 1,
+            limit: 10,
+        },
+    ]);
+    assert!(
+        matches!(outcome, Err(StateError::Backend(ref m)) if m.contains("duplicate")),
+        "got {outcome:?}"
+    );
+}
+
+/// Mutation-run hardening (round 11): the negative-counter defenses in
+/// `add_on`/`get_on` were unreachable through the store's own API (it
+/// never writes negatives), so their guards survived mutation. Poison a
+/// counter out-of-band — an operator's raw DECRBY or a hostile writer —
+/// and prove both paths refuse loudly instead of wrapping into a huge
+/// unsigned balance.
+#[test]
+fn redis_contract_poisoned_negative_counter_is_refused() {
+    use av_state::StateError;
+    let Some(s) = store() else { return };
+    let Ok(url) = std::env::var("AV_REDIS_URL") else {
+        return;
+    };
+    let Some(first) = url.split(',').next() else {
+        return;
+    };
+    let client = redis::Client::open(first.trim()).expect("raw client");
+    let mut raw = client.get_connection().expect("raw conn");
+    let key = format!("av-test-poison:{{{}}}", av_core::new_event_uid());
+    let _: i64 = redis::cmd("DECRBY").arg(&key).arg(5).query(&mut raw).unwrap();
+    let got = s.get(&key);
+    assert!(
+        matches!(got, Err(StateError::Overflow(_))),
+        "get on a poisoned counter must be Overflow, got {got:?}"
+    );
+    let added = s.add(&key, 1);
+    assert!(
+        matches!(added, Err(StateError::Overflow(_))),
+        "add on a poisoned counter must be Overflow, got {added:?}"
+    );
+    s.remove(&key);
+}

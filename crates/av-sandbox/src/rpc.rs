@@ -491,3 +491,54 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod depth_boundary_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    /// Mutation-run hardening (round 11): the depth cap was only proven far
+    /// past the limit, so boundary mutants (`current + 1` -> `current * 1`,
+    /// deleting the Array arm) survived. Pin the exact boundary through the
+    /// public parser for BOTH container kinds. Depth accounting: the
+    /// envelope contributes 3 levels (root -> params -> arguments), and each
+    /// wrapper inside `arguments.k` adds one, so 61 wrappers sit exactly at
+    /// MAX_JSON_DEPTH = 64 and 62 exceed it.
+    #[test]
+    fn json_depth_boundary_is_exact_for_arrays_and_objects() {
+        let build = |inner: String| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"t","arguments":{{"k":{inner}}}}}}}"#
+            )
+        };
+        let arrays = |n: usize| format!("{}0{}", "[".repeat(n), "]".repeat(n));
+        let objects = |n: usize| format!("{}0{}", "{\"x\":".repeat(n), "}".repeat(n));
+        for shape in [&arrays as &dyn Fn(usize) -> String, &objects] {
+            let at_limit = build(shape(MAX_JSON_DEPTH - 3));
+            assert!(
+                parse_tool_call(at_limit.as_bytes()).is_ok(),
+                "depth exactly at MAX_JSON_DEPTH must parse"
+            );
+            let past = build(shape(MAX_JSON_DEPTH - 2));
+            let outcome = parse_tool_call(past.as_bytes());
+            assert!(
+                matches!(outcome, Err(RpcError::NotJsonRpc(ref m)) if m.contains("depth")),
+                "one past MAX_JSON_DEPTH must be refused, got {outcome:?}"
+            );
+        }
+        // Empty containers exercise the `unwrap_or(current + 1)` fallback
+        // arms — an empty object/array is still one level deep, so one
+        // sitting past the cap must be refused too.
+        for leaf in ["{}", "[]"] {
+            let wrappers = "{\"x\":".repeat(MAX_JSON_DEPTH - 3);
+            let closers = "}".repeat(MAX_JSON_DEPTH - 3);
+            let past = build(format!("{wrappers}{leaf}{closers}"));
+            let outcome = parse_tool_call(past.as_bytes());
+            assert!(
+                matches!(outcome, Err(RpcError::NotJsonRpc(ref m)) if m.contains("depth")),
+                "empty {leaf} leaf past MAX_JSON_DEPTH must be refused, got {outcome:?}"
+            );
+        }
+    }
+}
