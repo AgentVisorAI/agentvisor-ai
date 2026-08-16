@@ -1355,8 +1355,9 @@ mod tests {
         assert!(!err.contains("future_option_from_v2"), "{err}");
     }
 
-    /// Cap on `worker_channel_capacity` rejects the fat-finger before
-    /// the runtime tries to preallocate the channel and OOMs.
+    /// Cap on `worker_channel_capacity` rejects the fat-finger config
+    /// before it reaches the runtime (defence-in-depth; tokio's mpsc
+    /// does not preallocate — see the `MAX_WORKER_CHANNEL_CAPACITY` doc).
     #[test]
     fn worker_channel_capacity_cap_rejects_oversized_values() {
         let err = HarnessConfig::from_toml(&format!(

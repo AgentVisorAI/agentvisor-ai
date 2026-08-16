@@ -375,7 +375,7 @@ impl EmbeddedBroker {
                 let range = if survivors.is_empty() {
                     None
                 } else {
-                    // Fold gives min/max in one pass and avoids
+                    // A single manual pass gives min/max and avoids
                     // expect() on the guaranteed-non-empty iterator.
                     let (mut lo, mut hi) = (u64::MAX, 0u64);
                     for offset in &survivors {

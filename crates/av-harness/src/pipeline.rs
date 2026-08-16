@@ -387,9 +387,9 @@ impl AppState {
         // `histogram_quantile(0.99, sum by(le) (rate(...[5m])))` in
         // Prometheus silently produces nonsense: the `le` values from
         // different label combinations do not align and the summation
-        // is undefined. Use WIDE_LATENCY_BOUNDS_US for all stages
-        // because `dispatch` (upstream streaming, 15-90 s) needs the
-        // wide range — the fast stages just get more granular
+        // is undefined. Use WIDE_LATENCY_BOUNDS_US for all stages so
+        // a future stage that spans real I/O fits without a bounds
+        // migration — the fast stages just get more granular
         // low-end buckets they will never light up, which is fine.
         for stage in ["identity", "quota", "sanitize", "compression", "dispatch"] {
             metrics.histogram_with_bounds(
@@ -1285,8 +1285,8 @@ impl AppState {
         // Round-14 F1: reuse the round-13 duplicate-header refusal
         // pattern for `Authorization` on the identity hot path.
         // Previously `HeaderMap::get(AUTHORIZATION)` returned the
-        // first value while `pipeline::client_authorization` capture
-        // (line 695) and header-smuggling proxies could observe a
+        // first value while the `PreparedRequest.client_authorization`
+        // capture and header-smuggling proxies could observe a
         // merged `A, B` form — auth split-brain: the harness
         // authenticates as A while log aggregators / WAFs / OTLP
         // exporters attribute the request to B. Refuse the multi-
@@ -2418,7 +2418,7 @@ mod tests {
     /// disagree on which session id was in effect — a header
     /// smuggling desync. Refuse loudly at ingress.
     #[test]
-    fn duplicate_x_ab_session_header_is_refused() {
+    fn duplicate_x_av_session_header_is_refused() {
         let mut headers = HeaderMap::new();
         headers.append(SESSION_HEADER, HeaderValue::from_static("sessA"));
         headers.append(SESSION_HEADER, HeaderValue::from_static("sessB"));
@@ -2433,7 +2433,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_x_ab_workflow_header_is_refused() {
+    fn duplicate_x_av_workflow_header_is_refused() {
         let mut headers = HeaderMap::new();
         headers.append(WORKFLOW_HEADER, HeaderValue::from_static("signed"));
         headers.append(WORKFLOW_HEADER, HeaderValue::from_static("unsigned"));
@@ -2450,7 +2450,7 @@ mod tests {
     /// Single X-AV-Session must continue to work — this is the
     /// happy-path regression guard for the duplicate-header refusal.
     #[test]
-    fn single_x_ab_session_header_still_flows() {
+    fn single_x_av_session_header_still_flows() {
         let mut headers = HeaderMap::new();
         headers.insert(SESSION_HEADER, HeaderValue::from_static("only-one"));
         assert_eq!(session_id(&headers).unwrap(), "only-one");
