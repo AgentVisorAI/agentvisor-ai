@@ -156,7 +156,19 @@ impl KafkaBus {
                 .map_err(BusError::Backend)?;
         }
         drop(admin);
-        let brokers = vec![broker.to_owned()];
+        // `broker` is a bootstrap list (`host:port[,host:port]`, the same
+        // format rdkafka's `bootstrap.servers` takes above). rskafka wants
+        // one address per element — passing the joined string as a single
+        // entry made every multi-broker list fail to connect.
+        let brokers: Vec<String> = broker
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if brokers.is_empty() {
+            return Err(BusError::Backend("Kafka bootstrap list is empty".to_owned()));
+        }
         let tls_config = security.rskafka_tls()?;
         let sasl_config = security.rskafka_sasl();
         let client = executor
