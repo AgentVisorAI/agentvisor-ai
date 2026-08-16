@@ -4,6 +4,60 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Review round 17: full-codebase comment↔code audit (2026-08-16)
+
+Four parallel reviewers read every comment in all 12 crates (54k lines,
+9.2k comment lines) and verified each checkable claim against the code;
+a fifth pass covered the non-Rust surfaces (Dockerfile, Cargo.toml,
+configs, deploy). 17 stale or false comments fixed — none reflected a
+code bug; in every case the code was right and the prose had drifted:
+
+- **False security/behavior claims**: `/metrics` described as
+  authenticated and surfacing a nonexistent `av_build_info` metric
+  (routes.rs — no harness endpoint exposes build info; the version
+  appears only in the outbound upstream User-Agent); metrics label
+  values attributed to a nonexistent render-time escaper
+  (`escape_prom_label_value` never existed — the real guard is
+  registration-time byte refusal in `validate_metric_key`, twice);
+  `ResponsePermit` claimed admission "whenever the shard has room"
+  (a global worker-capacity slot is also required — the adjacent test
+  proves it); `worker_channel_capacity` cap justified by a tokio mpsc
+  preallocation-OOM that tokio does not do (contradicting the
+  authoritative const doc four lines up).
+- **Stale after refactors**: reconciler test docs still described the
+  removed global `lifecycle_lock` (now per-session `SessionLockTable`,
+  three sites); recovery-scan cost rationale predated round-44 F1's
+  refuse-before-read sidecar check; depth-bomb test called the
+  round-40 F5 recursion cap "a valid future hardening" (it shipped);
+  `dispatch` stage described as covering 15-90 s upstream streaming
+  (it times only local job assembly); "up to 16 shards" (always
+  exactly 16); "Fold gives min/max" over a plain for-loop; duplicate
+  X-AV-Session refusal described as a 503 (it is a 400); Dockerfile
+  build-stage `COPY config` justified by an `include_str!` that
+  round-45 moved inside the crate — the COPY is gone (compile
+  independence proven by building a tree with `config/` deleted) and
+  av-harness/build.rs no longer claims the assets live outside the
+  crate root.
+- **Drifted line-number references** (9 sites): replaced absolute
+  `L1308`/`:578`-style references — every one already pointing at the
+  wrong line — with function-name or grep-able anchors in
+  reconciler.rs, pipeline.rs, setup.rs, and av-atif's golden tests;
+  receipt nesting-boundary doc now states the true off-by-one
+  (`MAX_NESTED_DEPTH - 1` parses, `MAX_NESTED_DEPTH` refused).
+- **Rebrand stragglers** (identifiers, not comments): pipeline test
+  names `x_ab_*` → `x_av_*`; internal `DUP_KEY_SENTINEL` `"__ab_dup:"`
+  → `"__av_dup:"` (never persisted or exposed — stripped before the
+  error maps to `ReceiptError`).
+- Race-suite module doc no longer claims retention-rollover coverage
+  that lives in `embedded_contract.rs` (pointer added instead).
+
+Verified-correct highlights from the same audit: all cross-crate
+constant mirrors (4 MiB payload, 16 MiB provider capture, 2^53 JCS
+bound, depth 128/64, JWKS 256, JWT 8 KiB, breaker ε=0.30), the
+MAC-before-index journal order, seal-before-insert recovery race fix,
+genesis-hash domain tag, Redis Lua TTLs, and every `AV_*` env name a
+comment mentions.
+
 ### Review round 16: ATIF dual-validator agreement contract (2026-08-16)
 
 A consistency sweep of schema surfaces found that the shipped

@@ -377,7 +377,7 @@ const MAX_NESTED_DEPTH: usize = 128;
 /// Round-16 F6: the previous blanket `.map_err(DuplicateKey)` folded
 /// serde_json's own EOF / recursion / expected-value errors into the
 /// DuplicateKey variant, actively misleading ops.
-const DUP_KEY_SENTINEL: &str = "__ab_dup:";
+const DUP_KEY_SENTINEL: &str = "__av_dup:";
 
 fn check_no_duplicate_keys(bytes: &[u8]) -> Result<(), ReceiptError> {
     use serde::Deserializer as _;
@@ -606,8 +606,8 @@ mod tests {
     }
 
     /// The duplicate-key scanner doubles as the nesting-depth guard.
-    /// Pin the boundary exactly: depth == MAX_NESTED_DEPTH parses,
-    /// depth == MAX_NESTED_DEPTH + 1 is refused as the
+    /// Pin the boundary exactly: depth == MAX_NESTED_DEPTH - 1 parses,
+    /// depth == MAX_NESTED_DEPTH is refused as the
     /// DuplicateKey-family class (either our sentinel or serde_json's
     /// own recursion cap, both mapped identically). Kills the
     /// `>` -> `>=`/`==` boundary mutants in NoDupVisitor's seq and

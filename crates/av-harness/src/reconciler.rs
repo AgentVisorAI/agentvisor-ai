@@ -870,7 +870,8 @@ impl Finalizer {
             // file (root-owned test artifact, chattr +i, transient NFS
             // blip) would head-of-line-block every other session on
             // every subsequent restart tick. Mirror the warn+continue
-            // discipline used at 792/809/824 so recovery is per-file.
+            // discipline the other per-file steps in this scan use
+            // so recovery is per-file.
             let bytes = match read_capped_async(path.clone(), av_core::fsutil::MAX_ATIF_BYTES).await {
                 Ok(bytes) => bytes,
                 Err(error) => {
@@ -1421,13 +1422,14 @@ impl Finalizer {
             }
             // Round-42 F3: `mark_artifact_committed()` above sealed the
             // session against new leases before `try_insert_recovered`
-            // to plug the race the L1308 comment describes. But if
+            // to plug the race the seal-before-insert comment above
+            // describes. But if
             // `close_session_locked` then fails transiently (broker
             // outage → Bridge; ENOSPC/EIO → Receipt; verify mismatch
             // after key rotation → Receipt), the session sits in the
             // registry with `artifact_committed = 1` forever:
             // `is_closed()` is true so the idle sweeper skips it, and
-            // the next reconciler tick's L1080 registry-hit check
+            // the next reconciler tick's registry-hit check
             // returns Skipped so signed recovery never re-attempts.
             // Remove the half-committed session on transient error so
             // the next tick re-reads the still-present journal sidecar
@@ -1619,8 +1621,8 @@ impl Finalizer {
                         .map_err(|_| FinalizeError::Atif("active journal length overflow".to_owned()))?,
                 );
                 quarantined.mark_capture_failed();
-                // Also seal the session finalized (like the signed sibling at
-                // line ~773) so the idle sweeper's `!is_closed()` filter
+                // Also seal the session finalized (like the signed-journal
+                // capture-failed path) so the idle sweeper's `!is_closed()` filter
                 // skips it. Otherwise every idle tick re-enters
                 // close_session_locked, hits the capture_failed guard, and
                 // CloseClaim resets `closed` — an unbounded churn loop.
@@ -1814,7 +1816,8 @@ impl Finalizer {
                     // reconciler.rs:488 which writes `u64` (0 when never
                     // recorded) via `session.recorded_stop_reason_id()`.
                     // Emitting `Option<u8>` here made JSON `null` vs
-                    // JSON `0`, so `trajectory != existing` at L1780
+                    // JSON `0`, so the `trajectory != existing`
+                    // comparison below
                     // fired on every session that closed without a
                     // terminal stop-reason event (client hangup mid-
                     // stream, /close before final assistant message,
@@ -2679,8 +2682,8 @@ async fn read_complete_journal(path: &std::path::Path) -> Result<Vec<String>, Fi
             // Round-37 F1: return the file basenames only. This
             // FinalizeError::Atif ultimately flows to
             // `tracing::warn!(%error, "ATIF spool recovery failed")`
-            // at line ~2092 and `"promotion retry failed"` at line
-            // ~1710; both then export through
+            // and `"promotion retry failed"` (grep those literals);
+            // both then export through
             // tracing_opentelemetry -> OTLP -> SIEM. Round-36 F1's
             // sweep basenamed the outer tracing fields but missed
             // this path leak inside a FinalizeError message body,
@@ -4682,9 +4685,10 @@ mod tests {
     // Congestion & bottleneck stress tests.
     // ------------------------------------------------------------------
 
-    /// The lifecycle_lock serializes close_session and promote to prevent
-    /// concurrent lifecycle-outbox rewrites, so many concurrent closes
-    /// queue behind a single Mutex. This test locks the QUEUING behavior:
+    /// Per-session lifecycle locks serialize close_session and promote
+    /// per session id to prevent concurrent lifecycle-outbox rewrites;
+    /// N distinct sessions do NOT queue behind a shared mutex. This
+    /// test locks that behavior:
     /// N distinct sessions closing at once must all complete within a
     /// generous time bound and none must deadlock.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4788,7 +4792,8 @@ mod tests {
         let finalizer = Arc::new(finalizer(directory.path()));
         // Seed the spool with a pile of candidates that fail provenance
         // (unauthenticated / not `.session.json`) so recovery iterates
-        // read_dir + read + hash + skip on each, taking observable
+        // read_dir + sidecar stat + quarantine-rename on each (round-44
+        // F1 refuses them before any read or hash), taking observable
         // wall-clock time (512 candidates so the scan reliably outlasts
         // one unrelated close even on fast disks).
         for i in 0..512 {
@@ -4852,7 +4857,8 @@ mod tests {
         );
     }
 
-    /// A saturated worker-side finalizer must not hold the lifecycle_lock
+    /// A saturated worker-side finalizer must not hold a session's
+    /// lifecycle lock
     /// across independent await points that could stall other closers. We
     /// verify this indirectly by asserting the p50 latency for a single
     /// close under contention stays within 3x the uncontended latency
@@ -4906,8 +4912,9 @@ mod tests {
             t.await.unwrap().unwrap();
         }
         let total = started.elapsed();
-        // A serialized lock gives ~N * baseline. Anything > 10 * N * baseline
-        // signals we're holding the lock across additional awaits.
+        // A shared serialized lock would give ~N * baseline. Anything
+        // > 10 * N * baseline
+        // signals we're holding a lock across additional awaits.
         let multiplier = u32::try_from(N * 10).unwrap_or(u32::MAX);
         let budget = baseline
             .saturating_mul(multiplier)
