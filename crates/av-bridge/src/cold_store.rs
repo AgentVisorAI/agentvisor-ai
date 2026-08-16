@@ -466,6 +466,70 @@ mod tests {
         );
     }
 
+    /// Mutation-run hardening (round 13): the AlreadyExists tolerance in
+    /// `put_remote` compares existing object bytes against the new payload —
+    /// an `==` -> `!=` mutant would silently accept a DIFFERENT object at
+    /// the same deterministic key (an integrity violation) and reject
+    /// legitimate idempotent re-puts. `commit` deliberately converts remote
+    /// failures into durable retry intents (a broker-acked event must not
+    /// fail client-side), so the conflict surfaces on the retry path: the
+    /// intent stays on disk and every retry refuses loudly (feeding the
+    /// maintenance error counter) instead of overwriting or vanishing.
+    #[test]
+    fn same_content_reput_is_idempotent_and_conflicts_poison_loudly() {
+        let directory = tempfile::tempdir().unwrap();
+        let uri = url::Url::from_directory_path(directory.path())
+            .unwrap()
+            .to_string();
+        let outbox = tempfile::tempdir().unwrap();
+        std::env::remove_var("AV_COLD_OUTBOX_DIR");
+        let mut manifest = BridgeManifest::default_for("cold-conflict");
+        let topic = &mut manifest.topics[0];
+        topic.retention.cold_uri = Some(uri);
+        let topic_name = topic.name.clone();
+        let archive =
+            ColdArchive::from_manifest_with_pending_default(&manifest, Some(outbox.path().to_path_buf()))
+                .unwrap()
+                .unwrap();
+        archive.set_control_key([7u8; 32]).unwrap();
+        let event = StoredEvent {
+            partition: 1,
+            offset: 3,
+            key: "instance".to_owned(),
+            value: serde_json::json!({"metadata": {"uid": "uid-c"}, "n": 1}),
+            stored_at: 42,
+        };
+        archive.put(&topic_name, &event).unwrap();
+        // Identical re-put: idempotent success, no pending residue.
+        archive.put(&topic_name, &event).unwrap();
+        assert_eq!(std::fs::read_dir(outbox.path()).unwrap().count(), 0);
+        // Same key, different content: put() keeps the durability contract
+        // (Ok), but the intent must persist for retry…
+        let conflicting = StoredEvent {
+            value: serde_json::json!({"metadata": {"uid": "uid-c"}, "n": 2}),
+            ..event
+        };
+        archive.put(&topic_name, &conflicting).unwrap();
+        assert_eq!(
+            std::fs::read_dir(outbox.path()).unwrap().count(),
+            1,
+            "conflicting intent must stay durable, not vanish"
+        );
+        // …and the retry path must refuse loudly, never overwrite. The
+        // resolver must not be consulted (the intent already carries an
+        // offset); if a regression calls it anyway, this error propagates
+        // and fails the content-conflict assertion below.
+        let outcome = archive.retry_pending_with(|_| {
+            Err(BusError::Backend(
+                "resolver must not be called: the intent already has an offset".to_owned(),
+            ))
+        });
+        assert!(
+            matches!(outcome, Err(BusError::Backend(ref m)) if m.contains("different content")),
+            "conflicting retry must be refused, got {outcome:?}"
+        );
+    }
+
     #[test]
     fn file_uri_uses_the_object_store_contract() {
         let directory = tempfile::tempdir().unwrap();

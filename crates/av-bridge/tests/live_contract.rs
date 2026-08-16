@@ -100,6 +100,40 @@ fn contract(bus: &dyn EventBus) {
             "record for {other_key} leaked across partitions into partition {partition}"
         );
     }
+    // At-most-once dedupe primitive: crash recovery resolves committed
+    // events by stable UID. A regression returning None here would make
+    // recovery re-publish (duplicate effects); a wrong match would ack
+    // the wrong offset.
+    let probe_uid = av_core::new_event_uid();
+    let probe = av_events::OcsfEventBuilder::new(
+        av_events::EventClass::ToolCall,
+        "live-contract",
+        av_events::AgentIdentity {
+            version: "1".into(),
+            charter: "contract".into(),
+            instance_uid: key.clone(),
+            ttl_remaining_s: Some(60),
+        },
+        99,
+    )
+    .payload(json!({"probe": true}))
+    .build()
+    .unwrap();
+    let mut probe_value = serde_json::to_value(probe).unwrap();
+    probe_value["metadata"]["uid"] = json!(probe_uid);
+    let probe_ack = bus.publish("agent.tool_call", &key, &probe_value).unwrap();
+    let found = bus
+        .find_event_by_uid("agent.tool_call", &key, &probe_uid)
+        .unwrap()
+        .expect("committed event must be found by uid");
+    assert_eq!(found.partition, probe_ack.partition);
+    assert_eq!(found.offset, probe_ack.offset);
+    assert!(
+        bus.find_event_by_uid("agent.tool_call", &key, "uid-that-never-existed")
+            .unwrap()
+            .is_none(),
+        "unknown uid must resolve to None, not a fabricated ack"
+    );
     assert!(bus.publish("agent.bogus", &key, &json!({})).is_err());
 }
 
