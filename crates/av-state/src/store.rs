@@ -12,7 +12,8 @@ pub enum StateError {
     /// Arithmetic would overflow.
     #[error("counter overflow for key {0:?}")]
     Overflow(String),
-    /// Backend unavailable (network stores).
+    /// Backend failure or state-operation contract violation (network
+    /// stores; also API misuse such as duplicate keys in one batch).
     #[error("state backend unavailable: {0}")]
     Backend(String),
 }

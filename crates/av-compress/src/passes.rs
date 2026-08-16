@@ -11,9 +11,10 @@ pub struct CompressionConfig {
     /// Tool outputs older than the tail are stubbed when longer than this
     /// many approximate tokens.
     pub tool_output_stub_threshold: u64,
-    /// Also collapse exact-duplicate non-system messages.
+    /// Also collapse exact-duplicate user/assistant messages
+    /// (tool messages are never collapsed).
     pub collapse_duplicates: bool,
-    /// Normalize whitespace inside JSON-looking tool content.
+    /// Normalize whitespace inside JSON-looking tool/assistant string content.
     pub normalize_json: bool,
     /// Only bother when the payload reaches at least this many approximate
     /// tokens (compressing tiny payloads wastes hot-path time).
