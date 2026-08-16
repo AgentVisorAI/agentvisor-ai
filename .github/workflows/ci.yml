@@ -3,9 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
-    # Docs-only changes are covered by the Docs workflow; deploy manifests
-    # have no CI-executed checks. Skipping them here saves the full
-    # 30-60 min pipeline on prose commits.
+    # Prose and deploy manifests have no CI-executed checks (the Docs
+    # workflow owns the docs/ site build). Skipping them here saves the
+    # full 30-60 min pipeline on docs-only commits.
     paths-ignore:
       - "**.md"
       - "docs/**"

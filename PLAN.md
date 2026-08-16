@@ -246,7 +246,7 @@ This is the implementation traceability record, not a test report. Current measu
 | R22 | §10 loop SLA 100 % ≤ 3 cycles | av-loopdetect | R5 suite |
 | R23 | §10 tool block < 5 ms | av-sandbox | R6 bench |
 | R24 | §10 context ≥ 30 % @ ≥ 50 k | av-compress | R7 test |
-| R25 | §10 10 k concurrent connections per node | release socket-level SLA | mandatory CI run at 10,000; BENCHMARKS.md |
+| R25 | §10 10 k concurrent connections per node | release socket-level SLA | mandatory CI run at 10,000 on every `main` push; BENCHMARKS.md |
 | R26 | §10 publish overhead ≤ 0.5 ms p99 | av-bridge enqueue | criterion bench + in-test p99 measurement |
 | R27 | §10 receipt sign < 2 ms async | av-receipts | bench + async-issuance test |
 | R28 | §10 ATIF fidelity 100 % valid v1.7 | av-atif | R17 + validator pass on every exported file in integration runs |
@@ -293,7 +293,7 @@ re-check RTM, record BENCHMARKS.md, memory notes).
 
 - macOS fd limits: heavy loadgen requires `ulimit -n 65536`; Linux CI uses the same 10,000 target.
 - Live-broker/Redis/ONNX tests: env-gated, loudly skipped, never silently green.
-- Docker image construction is a mandatory CI gate. Local Docker API availability is recorded in VERIFICATION.md.
+- Docker image construction is a mandatory CI gate on every `main` push (pull-request runs skip it to conserve CI minutes). Local Docker API availability is recorded in VERIFICATION.md.
 
 ## 8. Documented deviations from the brief (with rationale)
 
