@@ -1,5 +1,6 @@
-//! Action budgets (Module B): stateful tool limits like `max_db_writes: 3`,
-//! `max_payout_usd: 50`, plus per-session token ceilings.
+//! Action budgets (Module B): stateful tool limits — per-tool caps via
+//! `max_tool_calls` (e.g. `db_write: 3`), payout ceilings via
+//! `max_payout_usd_micros` — plus per-session token ceilings.
 //!
 //! Money is tracked in integer micro-USD; a payout of $12.34 spends
 //! 12_340_000. Fractional-cent dust can therefore never accumulate invisibly.

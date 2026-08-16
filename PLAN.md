@@ -226,7 +226,7 @@ This is the implementation traceability record, not a test report. Current measu
 | R2 | §2 > 2 ms work must be off the async request runtime | blocking-pool middleware + bounded sharded workers | all-feature lint/tests; stage histograms |
 | R3 | §2 receipts batched off hot path, finalized once at session close | av-harness session close → av-receipts | test: no signing occurs per-chunk (call-count probe); close issues exactly one |
 | R4 | §2 ATIF path separate from signed hot path | authenticated journals + snapshot writer | write-failure retry, torn-tail, tamper, and restart tests |
-| R5 | A: loop detect via embeddings, Δ≈0 over 3 steps + N tokens → 429/inject, OCSF event with stop_reason_id | av-loopdetect + harness enforcement | synthetic loop suite: 100 % catch ≤ 3 cycles; progressing suite: 0 false trips; emitted event schema-validated |
+| R5 | A: loop detect via embeddings, Δ≈0 over 3 steps + N tokens → reject/inject, OCSF event with stop_reason_id | av-loopdetect + harness enforcement | synthetic loop suite: 100 % catch ≤ 3 cycles; progressing suite: 0 false trips; emitted event schema-validated |
 | R6 | B: MCP JSON-RPC intercept, WASM policies (wasmtime), action budgets (max_db_writes, max_payout_usd), schema-invalid blocked, < 5 ms | av-sandbox (+av-state) | block-latency bench < 5 ms; budget stress; WAT policy tests; JSON-schema negative suite; per-call OCSF event w/ budget consumption |
 | R7 | C: parse payloads, prune, 30-50 % reduction on ≥ 50 k-token histories, metrics mirror ATIF fields | av-compress | 50 k synthetic corpus test asserts ≥ 30 %; invariant property tests; metric name parity test |
 | R8 | D: short-lived JWT/HMAC, IdP-bound, scope inheritance, 15-min TTL, instance_uid+TTL in event identity block | av-identity + av-events | adversarial JWT suite; delegation property tests; event identity-block content test |
@@ -299,8 +299,10 @@ re-check RTM, record BENCHMARKS.md, memory notes).
 
 1. **Qdrant optional at runtime**: the Qdrant connector, collection provisioning, and Compose service ship,
    while embedded deployments may select the in-process session window without external vector storage.
-2. **TCP RST**: raw RST isn't portably expressible at the Axum layer; we implement HTTP 429, corrective
-   payload injection, and hard connection abort — the three enforceable equivalents (config-selectable).
+2. **TCP RST**: raw RST isn't portably expressible at the Axum layer; we implement a hard HTTP policy
+   refusal (403 — deliberately not the brief's 429, which mainstream SDKs auto-retry against an open
+   breaker), corrective payload injection, and hard connection abort — the three enforceable
+   equivalents (config-selectable).
 3. **stop_reason_id numeric values**: upstream enum values are not independently relied upon; we ship our
    authored profile's documented mapping (core 0-4, 99 Other; extension 90-94) in the JSON Schema +
    EVOLUTION.md re-mapping policy.

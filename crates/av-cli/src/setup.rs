@@ -649,14 +649,15 @@ fn absolute_home(home: &Path) -> Result<PathBuf> {
         .join(home))
 }
 
-/// The guided setup: two questions (provider, key), everything stored
+/// The guided setup: a few quick prompts (provider, key, start-now),
+/// everything stored
 /// under `home/.agentvisor/` so no environment variables, exports, or
 /// file editing are ever needed. Drive `input` with scripted answers and
 /// `SecretInput::Plain` in tests.
 pub fn wizard(home: &Path, input: &mut dyn std::io::BufRead, secrets: &SecretInput) -> Result<WizardOutcome> {
     let home = absolute_home(home)?;
     let home = home.as_path();
-    println!("Welcome to AgentVisor AI! Two quick questions and you're done.");
+    println!("Welcome to AgentVisor AI! A couple of quick questions and you're done.");
     println!();
     println!("Where do your AI models come from?");
     println!();
@@ -948,7 +949,7 @@ pub async fn start() -> Result<()> {
     ) && std::env::var_os("AV_UPSTREAM_URL").is_none_or(|value| value.is_empty());
     if not_set_up {
         anyhow::bail!(
-            "AgentVisor AI is not set up yet.\nRun `avctl` (no arguments) and answer two questions, then try again."
+            "AgentVisor AI is not set up yet.\nRun `avctl` (no arguments) and answer a couple of quick questions, then try again."
         );
     }
     let (config, source) = av_harness::config::load_config().map_err(|error| {

@@ -268,7 +268,8 @@ pub struct OcsfEvent {
     /// Stop reason id, when applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason_id: Option<u8>,
-    /// Stop reason caption.
+    /// Stop reason text: the provider's native value when captured,
+    /// otherwise the normalized [`crate::StopReason`] caption.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
     /// Class-specific payload.
