@@ -4,6 +4,22 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Review round 4: supply chain + NATS credential downgrade (2026-08-16)
+
+- **quick-xml RUSTSEC advisory (unbounded allocation)** — the `aws` feature
+  of `object_store` 0.12 pinned quick-xml 0.38, which `cargo deny` flags.
+  Upgraded workspace `object_store` to 0.14 (quick-xml 0.41, fixed),
+  adapting to its API (`ObjectStoreExt` import, `Path::join`). Live
+  MinIO S3 contract re-validated on the new client; `cargo deny check`
+  fully green (advisories, bans, licenses, sources).
+- **NATS credentials could still cross plaintext** (independent-review
+  finding): `require_tls(true)` was only forced when a CA file was
+  pinned, so `AV_NATS_USER`/`AV_NATS_PASSWORD` with a `nats://` URL and
+  no CA (e.g. WebPKI endpoints) sent the CONNECT password over a
+  plaintext socket and stayed MITM-downgradeable. Credentials now force
+  `require_tls(true)` too — live-tested: refused against a plaintext
+  server, works against TLS.
+
 ### Connector-security review fixes (2026-08-16)
 
 Implementation review of the secured-transport work surfaced three defects:
