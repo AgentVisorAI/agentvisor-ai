@@ -466,6 +466,64 @@ mod tests {
         );
     }
 
+    /// Mutation-run hardening (round 14): `validate_same_intent` binds a
+    /// cold-outbox UID to one exact event — nine surviving mutants could
+    /// each let a UID be re-staged over a DIFFERENT event's payload
+    /// (silent audit-trail substitution). Pin every field of the identity
+    /// individually, plus the identical-restage acceptance.
+    #[test]
+    fn restaging_a_uid_with_any_field_changed_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let uri = url::Url::from_directory_path(directory.path())
+            .unwrap()
+            .to_string();
+        let outbox = tempfile::tempdir().unwrap();
+        let mut manifest = BridgeManifest::default_for("cold-bind");
+        for topic in &mut manifest.topics {
+            topic.retention.cold_uri = Some(uri.clone());
+        }
+        let topic_a = manifest.topics[0].name.clone();
+        let topic_b = manifest.topics[1].name.clone();
+        let archive =
+            ColdArchive::from_manifest_with_pending_default(&manifest, Some(outbox.path().to_path_buf()))
+                .unwrap()
+                .unwrap();
+        archive.set_control_key([9u8; 32]).unwrap();
+        let base = StoredEvent {
+            partition: 1,
+            offset: 0,
+            key: "instance-a".to_owned(),
+            value: serde_json::json!({"n": 1}),
+            stored_at: 42,
+        };
+        archive.stage(&topic_a, &base, "uid-bind").unwrap();
+        // Identical restage: idempotent.
+        archive.stage(&topic_a, &base, "uid-bind").unwrap();
+        // Each field mutation individually must be refused. (The topic is
+        // part of the pending path, so a different topic writes a distinct
+        // intent instead — covered by the path-mismatch check elsewhere.)
+        let mut other_partition = base.clone();
+        other_partition.partition = 2;
+        let mut other_key = base.clone();
+        other_key.key = "instance-b".to_owned();
+        let mut other_value = base.clone();
+        other_value.value = serde_json::json!({"n": 2});
+        for (label, mutated) in [
+            ("partition", other_partition),
+            ("key", other_key),
+            ("value", other_value),
+        ] {
+            let outcome = archive.stage(&topic_a, &mutated, "uid-bind");
+            assert!(
+                matches!(outcome, Err(BusError::Backend(ref m)) if m.contains("different event")),
+                "changed {label} must be refused, got {outcome:?}"
+            );
+        }
+        // Same uid staged under another topic is a separate intent file and
+        // must succeed (per-topic namespacing, not a rebinding).
+        archive.stage(&topic_b, &base, "uid-bind").unwrap();
+    }
+
     /// Mutation-run hardening (round 13): the AlreadyExists tolerance in
     /// `put_remote` compares existing object bytes against the new payload —
     /// an `==` -> `!=` mutant would silently accept a DIFFERENT object at
