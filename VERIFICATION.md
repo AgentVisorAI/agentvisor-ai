@@ -37,6 +37,8 @@ The functional MVP is implemented and the executable local correctness gates pas
 - JSON schemas, example TOML, and Bridge manifest: pass.
 - Compose rendering: pass.
 - Harbor pinned reference validator over a real HTTP harness trajectory: pass.
+- Live crash-recovery (2026-08-16): release daemon on live Kafka + Redis SIGKILLed mid-load (300 sessions in flight); restart quarantined all 300 incomplete sessions, served fresh traffic with zero failures, and a second SIGKILL + restart re-quarantined the same set idempotently (no duplication, no re-execution, zero ERROR lines).
+- Offline receipt verification (2026-08-16): a receipt produced by the crash-recovered daemon, consumed from the live Kafka `agent.receipt` topic, verified offline via `avctl receipt-verify` with the independently extracted public key; a single-byte tamper was rejected.
 - Release core SLA: pass using production-route and HTTP-level timing; optional durable admission reported separately.
 - Release 10,000-stream production-feature gate with live Kafka/Redis environment: pass.
 
