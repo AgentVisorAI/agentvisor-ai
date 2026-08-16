@@ -65,9 +65,18 @@ allow-wildcard-paths = true
 # `openssl` is a new TLS surface we must review, not adopt silently.
 # `git2` catches an accidental runtime-git dependency; if a build tool
 # ever needs it, add it explicitly here with a rationale.
+#
+# Scoped exception (review round 15): `rdkafka-sys` may wrap
+# `openssl-sys`. The Kafka ADMIN path (topic provisioning + retention
+# verification over TLS/SASL, feature `kafka`) statically vendors
+# librdkafka, whose TLS and SCRAM support require OpenSSL
+# (`ssl-vendored`). The event hot path stays rustls (rskafka
+# `transport-tls`), and every other crate in the workspace remains
+# under the absolute ban — any second `openssl-sys` parent still
+# fails this gate.
 deny = [
     { name = "openssl", reason = "workspace is rustls-only; a stray openssl import is a new TLS surface" },
-    { name = "openssl-sys", reason = "same; catches transitive openssl pull-ins at the sys-crate layer" },
+    { name = "openssl-sys", reason = "rustls-only except the vendored librdkafka admin client; see wrapper rationale above", wrappers = ["rdkafka-sys"] },
     { name = "git2", reason = "no runtime git dependency wanted; catches accidental introduction" },
 ]
 

@@ -4,6 +4,30 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Review round 15: fix the red CI supply-chain gate (2026-08-16)
+
+The first CI run on the renamed repo failed `cargo-deny --all-features`:
+the round-1 `ssl-vendored` addition to rdkafka violated the workspace's
+rustls-only ban, and the rskafka 0.5 TLS stack pinned an EOL rustls 0.21
+line carrying RUSTSEC-2026-0098 (rustls-webpki URI name constraints) and
+the archived rustls-pemfile (RUSTSEC-2025-0134). Fixed properly:
+
+- **rskafka 0.5 → 0.6**: the Kafka event path now uses rustls 0.23
+  (shared line with async-nats; vulnerable webpki 0.101 and
+  rustls-pemfile dropped from the lock entirely; CA parsing via
+  rustls-pki-types). rskafka 0.6 brings native SASL SCRAM support:
+  new `AV_KAFKA_SASL_MECHANISM` (`SCRAM-SHA-256` default — Redpanda's
+  native credential store — `SCRAM-SHA-512`, or `PLAIN`; unsupported
+  values refused loudly), applied consistently to both the rskafka
+  event path and the librdkafka admin path. Live-validated against
+  Redpanda TLS+SASL: SCRAM-256 default, explicit PLAIN, loud failure
+  for a server-side-unconfigured SCRAM-512, plaintext regression.
+- **deny.toml**: `openssl-sys` ban scoped with `wrappers =
+  ["rdkafka-sys"]` — the vendored librdkafka admin client (topic
+  provisioning + retention verification) is the single sanctioned
+  OpenSSL surface; every other parent still fails the gate. All four
+  cargo-deny checks green under `--all-features`.
+
 ### Review round 8: soak test findings (2026-08-16)
 
 A 15,600-session soak (release daemon, live Kafka bridge + 3-node Redis
