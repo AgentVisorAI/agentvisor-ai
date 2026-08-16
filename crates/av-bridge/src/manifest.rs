@@ -428,3 +428,105 @@ topics:
         assert!(errors.is_empty(), "{errors:?}");
     }
 }
+
+#[cfg(test)]
+mod mutation_boundary_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+
+    use super::*;
+
+    /// Mutation-run hardening (round 14): the alias scan's `||` -> `&&`
+    /// survivor would only refuse markers followed by BOTH alphanumeric
+    /// and `_` (impossible), silently re-opening the YAML anchor-bomb
+    /// vector for `_`-named anchors. Pin each marker/name-class combo,
+    /// and keep innocuous `&`/`*` usage legal.
+    #[test]
+    fn yaml_anchor_and_alias_markers_are_refused_per_name_class() {
+        let base = BridgeManifest::default_for("anchors").to_yaml().unwrap();
+        for snippet in ["&a1", "&_x", "*a1", "*_x"] {
+            let hostile = format!("{base}# {snippet}\n");
+            assert!(
+                BridgeManifest::from_yaml(&hostile).is_err(),
+                "{snippet} must be refused"
+            );
+        }
+        // A trailing bare marker (no name character) stays legal.
+        let benign = format!("{base}# tail & done * \n");
+        BridgeManifest::from_yaml(&benign).unwrap();
+    }
+
+    /// The 256 KiB manifest cap must be exact: at-cap parses, one byte
+    /// past is refused with the cap message (not a YAML error).
+    #[test]
+    fn manifest_size_cap_is_exact() {
+        let base = BridgeManifest::default_for("size-cap").to_yaml().unwrap();
+        let cap = 256 * 1024;
+        let pad_to = |len: usize| {
+            let mut s = base.clone();
+            s.push('#');
+            while s.len() < len {
+                s.push('x');
+            }
+            s
+        };
+        BridgeManifest::from_yaml(&pad_to(cap)).unwrap();
+        let over = BridgeManifest::from_yaml(&pad_to(cap + 1));
+        assert!(
+            matches!(over, Err(ManifestError::Parse(ref m)) if m.contains("exceeds cap")),
+            "one past the cap must refuse, got {over:?}"
+        );
+    }
+
+    /// Path-traversal topic names: `.` and `..` are refused explicitly
+    /// (they pass the character filter), and the partition/hot-hours caps
+    /// hold exactly at their boundaries.
+    #[test]
+    fn topic_name_dots_and_numeric_caps_are_exact() {
+        let mut m = BridgeManifest::default_for("dots");
+        for name in [".", ".."] {
+            m.topics[0].name = name.to_owned();
+            assert!(m.validate().is_err(), "topic name {name:?} must be refused");
+        }
+        m.topics[0].name = "agent.ok".to_owned();
+        m.topics[0].partitions = 1024;
+        m.topics[0].retention.hot_hours = 24 * 365 * 10;
+        m.validate().unwrap();
+        m.topics[0].partitions = 1025;
+        assert!(m.validate().is_err(), "1025 partitions past cap");
+        m.topics[0].partitions = 1;
+        m.topics[0].retention.hot_hours = 24 * 365 * 10 + 1;
+        assert!(m.validate().is_err(), "hot_hours past the 10y cap");
+    }
+
+    /// `validate_topic_event -> Ok(())` survived: with schema_refs set,
+    /// a compile+validate round-trip must actually reject a nonconforming
+    /// event (this is the schema-enforcement path the Kafka and NATS
+    /// connectors share).
+    #[test]
+    #[cfg(any(feature = "nats", feature = "kafka"))]
+    fn compiled_topic_validators_reject_nonconforming_events() {
+        let mut m = BridgeManifest::default_for("schemas");
+        // Give one topic an inline-file schema requiring an object.
+        let dir = tempfile::tempdir().unwrap();
+        let schema_path = dir.path().join("strict.json");
+        std::fs::write(
+            &schema_path,
+            br#"{"type":"object","required":["metadata"],"properties":{"metadata":{"type":"object"}}}"#,
+        )
+        .unwrap();
+        for t in &mut m.topics {
+            t.schema_ref = None;
+        }
+        m.topics[0].schema_ref = Some(schema_path.to_string_lossy().into_owned());
+        let topic = m.topics[0].name.clone();
+        let validators = compile_topic_validators(&m).unwrap();
+        validate_topic_event(&validators, &topic, &serde_json::json!({"metadata": {}})).unwrap();
+        let refused = validate_topic_event(&validators, &topic, &serde_json::json!({"not": "conforming"}));
+        assert!(refused.is_err(), "nonconforming event must be refused");
+    }
+}
