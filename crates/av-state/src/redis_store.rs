@@ -42,15 +42,16 @@ redis.call('EXPIRE', KEYS[1], 86400)
 return result
 ";
 
-/// Redis-backed store. Connections are pooled internally (r2d2 for
-/// single-node; cluster connections are serialized behind a mutex).
+/// Redis-backed store. Connections are pooled internally (r2d2 for both
+/// single-node and cluster; the redis crate implements
+/// `r2d2::ManageConnection` for `ClusterClient` directly).
 pub struct RedisStore {
     backend: RedisBackend,
 }
 
 enum RedisBackend {
     Single(r2d2::Pool<RedisConnectionManager>),
-    Cluster(Box<parking_lot::Mutex<redis::cluster::ClusterConnection>>),
+    Cluster(r2d2::Pool<redis::cluster::ClusterClient>),
 }
 
 struct RedisConnectionManager {
@@ -89,16 +90,24 @@ impl RedisStore {
             .map(str::to_owned)
             .collect();
         if nodes.len() > 1 {
+            // Round-45: previously one `ClusterConnection` behind a mutex —
+            // every quota/budget operation across all sessions serialized on
+            // a single socket, which under 10k-connection load stalled
+            // admission long enough to blow upstream timeouts (observed as
+            // 502 "upstream timed out" in the 10k SLA gate). Pool cluster
+            // connections exactly like the single-node path.
             let client = redis::cluster::ClusterClientBuilder::new(nodes)
                 .connection_timeout(std::time::Duration::from_secs(2))
                 .response_timeout(std::time::Duration::from_secs(2))
                 .build()
                 .map_err(|e| StateError::Backend(e.to_string()))?;
-            let connection = client
-                .get_connection()
+            let pool = r2d2::Pool::builder()
+                .max_size(32)
+                .connection_timeout(std::time::Duration::from_secs(2))
+                .build(client)
                 .map_err(|e| StateError::Backend(e.to_string()))?;
             return Ok(Self {
-                backend: RedisBackend::Cluster(Box::new(parking_lot::Mutex::new(connection))),
+                backend: RedisBackend::Cluster(pool),
             });
         }
         let client = redis::Client::open(url).map_err(|e| StateError::Backend(e.to_string()))?;
@@ -193,7 +202,11 @@ impl StateStore for RedisStore {
                 key,
                 delta,
             ),
-            RedisBackend::Cluster(connection) => add_on(&mut *connection.lock(), key, delta),
+            RedisBackend::Cluster(pool) => add_on(
+                &mut *pool.get().map_err(|e| StateError::Backend(e.to_string()))?,
+                key,
+                delta,
+            ),
         }
     }
 
@@ -203,7 +216,10 @@ impl StateStore for RedisStore {
                 &mut pool.get().map_err(|e| StateError::Backend(e.to_string()))?,
                 key,
             ),
-            RedisBackend::Cluster(connection) => get_on(&mut *connection.lock(), key),
+            RedisBackend::Cluster(pool) => get_on(
+                &mut *pool.get().map_err(|e| StateError::Backend(e.to_string()))?,
+                key,
+            ),
         }
     }
 
@@ -223,7 +239,10 @@ impl StateStore for RedisStore {
                 &mut pool.get().map_err(|e| StateError::Backend(e.to_string()))?,
                 spends,
             ),
-            RedisBackend::Cluster(connection) => spend_many_on(&mut *connection.lock(), spends),
+            RedisBackend::Cluster(pool) => spend_many_on(
+                &mut *pool.get().map_err(|e| StateError::Backend(e.to_string()))?,
+                spends,
+            ),
         }
     }
 
@@ -234,8 +253,10 @@ impl StateStore for RedisStore {
                     let _: Result<(), _> = connection.del(key);
                 }
             }
-            RedisBackend::Cluster(connection) => {
-                let _: Result<(), _> = connection.lock().del(key);
+            RedisBackend::Cluster(pool) => {
+                if let Ok(mut connection) = pool.get() {
+                    let _: Result<(), _> = connection.del(key);
+                }
             }
         }
     }
@@ -286,11 +307,13 @@ impl StateStore for RedisStore {
                         .invoke(&mut *connection);
                 }
             }
-            RedisBackend::Cluster(connection) => {
-                let _: Result<i64, _> = redis::Script::new(clamp_script)
-                    .key(key)
-                    .arg(amount)
-                    .invoke(&mut *connection.lock());
+            RedisBackend::Cluster(pool) => {
+                if let Ok(mut connection) = pool.get() {
+                    let _: Result<i64, _> = redis::Script::new(clamp_script)
+                        .key(key)
+                        .arg(amount)
+                        .invoke(&mut *connection);
+                }
             }
         }
     }
