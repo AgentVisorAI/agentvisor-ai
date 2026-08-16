@@ -70,7 +70,7 @@ async fn trace_request(request: Request<Body>, next: Next) -> Response {
     // its own series; (2) created a split-brain when a client sent
     // two `X-AV-Session` headers — `HeaderMap::get` returned the
     // first while `pipeline::single_header` (round-13) refused the
-    // whole request, so traces named a "friendly" id for a hard-503;
+    // whole request, so traces named a "friendly" id for a hard-400;
     // (3) accepted values that pass `HeaderValue::to_str` but fail
     // `SessionId::parse` (too long, control chars in disguise). Use
     // `single_header` + `SessionId::parse` to bind ONE consistent
@@ -108,9 +108,10 @@ async fn health() -> impl IntoResponse {
     // Round-29 F6: DO NOT expose the CARGO_PKG_VERSION on this
     // unauthenticated endpoint. Version disclosure lets a LAN
     // attacker correlate an agentvisor deployment to a specific
-    // known-vulnerable release without needing a chat probe. The
-    // authenticated /metrics endpoint still surfaces build info
-    // via the av_build_info HELP text for operators who need it.
+    // known-vulnerable release without needing a chat probe. No
+    // harness endpoint surfaces build info (`/metrics` included);
+    // the version appears only in the *outbound* upstream
+    // `User-Agent` built in `pipeline.rs`.
     Json(json!({
         "status": "ok",
         // Product identifier so callers (avctl start) can tell a real

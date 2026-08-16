@@ -318,8 +318,9 @@ pub fn init(
         std::fs::create_dir_all(parent).with_context(|| format!("create directory {}", parent.display()))?;
     }
     std::fs::write(output, &rendered).with_context(|| format!("write {}", output.display()))?;
-    // Round-43 F3: match the signing-seed installer at :578 which
-    // explicitly opens with mode(0o600). The rendered config carries
+    // Round-43 F3: match the key-file installer
+    // (`write_private_key_file`) which explicitly opens with
+    // mode(0o600). The rendered config carries
     // upstream_url / upstream_api_key_env / upstream_auth_header hints
     // — capability-sensitive metadata that a co-tenant on a shared
     // workstation could otherwise read via the default umask=022
@@ -614,9 +615,9 @@ fn write_private_key_file(path: &Path, key: &str) -> Result<()> {
     // sync_directory failure means the dirent may not survive an
     // immediate power loss, but every observer running now sees the
     // key. Returning Err here made `avctl init` report failure; the
-    // operator re-runs, line 500 unlinks the good key, and the
-    // whole install cycle retries. Downgrade to warn+Ok so this
-    // last-stanza fsync is best-effort.
+    // operator re-runs, the `remove_file` at the top of this function
+    // unlinks the good key, and the whole install cycle retries.
+    // Downgrade to warn+Ok so this last-stanza fsync is best-effort.
     if let Err(error) = av_core::fsutil::sync_directory(parent) {
         eprintln!(
             "warning: key installed at {}, but parent directory fsync failed: {error}; \
@@ -814,8 +815,9 @@ pub fn wizard(home: &Path, input: &mut dyn std::io::BufRead, secrets: &SecretInp
     // destination without following it.
     av_core::fsutil::write_atomic(&config_path, rendered.as_bytes())
         .with_context(|| format!("install {}", config_path.display()))?;
-    // Round-43 F3: chmod 0600 to match the signing-seed installer at
-    // :578 and prevent co-tenants on a shared workstation from reading
+    // Round-43 F3: chmod 0600 to match the key-file installer
+    // (`write_private_key_file`) and prevent co-tenants on a shared
+    // workstation from reading
     // upstream_url / upstream_api_key_env metadata via default umask
     // 022 world-readable bits. `write_atomic` opens with default mode
     // via `OpenOptions::create_new`; setting the perm post-rename

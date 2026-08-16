@@ -186,8 +186,9 @@ pub struct WorkerPermit {
 /// time via [`Self::submit`]. This keeps the initial admission cheap
 /// (one semaphore acquire instead of two mpsc reservations that would
 /// otherwise compete for the same shard's slot with the worker
-/// permit) and lets the response job land whenever the shard has
-/// room, which is the common case since response capture happens
+/// permit) and lets the response job land whenever worker capacity
+/// and the shard have room, which is the common case since response
+/// capture happens
 /// tens-of-seconds after the initial worker job has drained.
 ///
 /// Held by the streaming-response wrapper in `routes.rs`
@@ -457,7 +458,7 @@ impl WorkerHandle {
     }
 }
 
-/// Start the session-sharded worker pool (up to 16 shards, each behind a
+/// Start the session-sharded worker pool (16 shards, each behind a
 /// bounded channel). Ordering is per session via hash sharding.
 pub fn spawn_worker(
     capacity: usize,

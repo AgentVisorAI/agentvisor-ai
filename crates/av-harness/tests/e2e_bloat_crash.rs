@@ -43,9 +43,10 @@ fn ring(s: &Ed25519Signer) -> Keyring {
 
 // ---------------------------------------------------------------------------
 // 1. Depth bomb: 10 000 levels of nested arrays. JCS canonicalization uses
-//    recursion, which would overflow the default 8 MiB thread stack; the
-//    test runs the canonicalize call on a 64 MiB stack thread so the
-//    depth bomb cannot take down the process. The call must finish inside
+//    recursion; round-40 F5's `MAX_NESTED_DEPTH = 128` cap refuses the bomb
+//    long before the default 8 MiB thread stack is at risk. The
+//    test still runs the canonicalize call on a 64 MiB stack thread so a
+//    regression of the cap cannot take down the process. The call must finish inside
 //    60 s; a clean `Err` from canonicalize is acceptable, a worker panic
 //    propagates through the join and fails the test.
 // ---------------------------------------------------------------------------
@@ -72,8 +73,9 @@ fn deep_nested_arrays_do_not_stack_overflow_jcs() {
     //   * `Ok(canon)` — canonicalize walked the input to completion
     //     and produced the expected shape.
     //   * `Err(_)` — canonicalize refused the pathological input
-    //     cleanly (a documented recursion limit is a valid future
-    //     hardening; the test's own name only requires "no stack
+    //     cleanly (the expected current outcome: round-40 F5's
+    //     `MAX_NESTED_DEPTH = 128` recursion cap returns `TooDeep`;
+    //     the test's own name only requires "no stack
     //     overflow", not "always Ok").
     // The regression this test guards against is a stack overflow /
     // panic; either arm below proves it didn't happen. Assert the Ok

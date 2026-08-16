@@ -7,14 +7,14 @@ ADD --checksum=sha256:6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616
 ADD --checksum=sha256:be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037 https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/tokenizer.json /tmp/models/tokenizer.json
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
+# `av-bridge/src/manifest.rs` embeds the OCSF + manifest JSON Schemas
+# via `include_str!("../../../schemas/...")`, so the build stage needs
+# the schema tree at compile time. (The embedded WAT policy and the
+# dashboard assets live inside `crates/av-harness/` since round-45 and
+# arrive with the `crates` COPY above; the operator-editable `config/`
+# tree is only needed at runtime and is copied into the runtime stage
+# directly from the build context.)
 COPY schemas ./schemas
-# `crates/av-harness/src/main.rs` uses `include_str!("../../../config/
-# policies/payload_limit.wat")` to embed the default policy so
-# `cargo install av-harness` works from an empty directory. The build
-# stage therefore needs the config tree available at compile time —
-# without this COPY the build fails with "couldn't read
-# .../config/policies/payload_limit.wat".
-COPY config ./config
 RUN cargo build --locked --release -p av-harness --features full --bin agentvisord -p av-cli --bin avctl
 RUN mkdir -p /tmp/runtime-root/data /tmp/runtime-root/spool
 
