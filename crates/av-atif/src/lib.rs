@@ -15,7 +15,8 @@
 //!   / `cost_usd` (+ `logprobs`, `completion_token_ids` v1.3,
 //!   `prompt_token_ids` v1.4) — the cached-token preservation that makes an
 //!   exported trajectory a replayable KV-cache checkpoint (brief Module H);
-//! - validator collects **all** errors (Harbor philosophy), not just the first.
+//! - validator collects errors in one pass (Harbor philosophy), not just the
+//!   first — capped at `MAX_VALIDATION_ISSUES` with a truncation notice.
 //!
 //! Reader accepts every published version v1.0–v1.7 with per-version field
 //! gating; the writer always emits v1.7 (inbound tolerant, outbound strict).

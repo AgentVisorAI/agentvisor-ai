@@ -2421,7 +2421,9 @@ async fn remove_outbox(path: &std::path::Path) -> Result<(), FinalizeError> {
     .map_err(|error| FinalizeError::Task(error.to_string()))?
 }
 
-/// Start periodic idle-session finalization.
+/// Start the periodic reconciler tick: spool recovery, promotion retry,
+/// pending-close completion, idle-session finalization, and
+/// finalized-session eviction.
 pub fn spawn_reconciler(
     sessions: Arc<SessionRegistry>,
     finalizer: Finalizer,
@@ -4862,9 +4864,9 @@ mod tests {
     /// A saturated worker-side finalizer must not hold a session's
     /// lifecycle lock
     /// across independent await points that could stall other closers. We
-    /// verify this indirectly by asserting the p50 latency for a single
-    /// close under contention stays within 3x the uncontended latency
-    /// (with a generous multiplier for CI noise). A regression that
+    /// verify this indirectly: the aggregate wall-clock for 16 concurrent
+    /// closes must stay within `10 × N ×` the uncontended single-close
+    /// baseline (floored at 60 s for CI noise). A regression that
     /// awaited a slow I/O with the lock held would blow this bound.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn close_latency_scales_reasonably_under_lock_contention() {

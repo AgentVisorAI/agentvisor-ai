@@ -111,7 +111,8 @@ pub struct ReceiptBody {
 /// round-trip to `ReceiptBody` used inside `canonicalize`). To close
 /// that gap without breaking the wire shape, the [`Deserialize`] impl
 /// is written by hand and rejects any top-level key outside the
-/// declared whitelist. See the `allowed_list_covers_body_fields_exactly`
+/// declared whitelist. See the
+/// `allowed_receipt_top_level_keys_cover_body_fields_exactly`
 /// test for the compile-time-ish drift guard.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Receipt {
