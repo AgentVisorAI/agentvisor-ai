@@ -803,7 +803,9 @@ fn build_bridge(config: &HarnessConfig, manifest: &BridgeManifest) -> Result<Arc
                 Ok(Arc::new(bus))
             }
             #[cfg(not(feature = "kafka"))]
-            anyhow::bail!("kafka backend requested but agentvisor-ai was built without feature kafka")
+            anyhow::bail!(
+                "kafka backend requested but this agentvisord binary was built without the `kafka` feature (rebuild av-harness with --features kafka or full)"
+            )
         }
         "nats" => {
             #[cfg(feature = "nats")]
@@ -819,7 +821,9 @@ fn build_bridge(config: &HarnessConfig, manifest: &BridgeManifest) -> Result<Arc
                 Ok(Arc::new(bus))
             }
             #[cfg(not(feature = "nats"))]
-            anyhow::bail!("nats backend requested but agentvisor-ai was built without feature nats")
+            anyhow::bail!(
+                "nats backend requested but this agentvisord binary was built without the `nats` feature (rebuild av-harness with --features nats or full)"
+            )
         }
         other => anyhow::bail!("unsupported bridge backend {other:?}"),
     }
@@ -840,7 +844,9 @@ fn build_store(config: &HarnessConfig) -> Result<Arc<dyn StateStore>> {
                 Ok(Arc::new(store))
             }
             #[cfg(not(feature = "redis"))]
-            anyhow::bail!("redis backend requested but agentvisor-ai was built without feature redis")
+            anyhow::bail!(
+                "redis backend requested but this agentvisord binary was built without the `redis` feature (rebuild av-harness with --features redis or full)"
+            )
         }
         other => anyhow::bail!("unsupported state backend {other:?}"),
     }
@@ -869,7 +875,9 @@ fn build_embedder(config: &HarnessConfig) -> Result<Arc<dyn Embedder>> {
                 Ok(Arc::new(embedder))
             }
             #[cfg(not(feature = "onnx"))]
-            anyhow::bail!("onnx backend requested but agentvisor-ai was built without feature onnx")
+            anyhow::bail!(
+                "onnx backend requested but this agentvisord binary was built without the `onnx` feature (rebuild av-harness with --features onnx or full)"
+            )
         }
         other => anyhow::bail!("unsupported embedder backend {other:?}"),
     }
@@ -893,7 +901,9 @@ async fn build_vector_sink(config: &HarnessConfig, _dimension: usize) -> Result<
                 Ok(Arc::new(sink))
             }
             #[cfg(not(feature = "qdrant"))]
-            anyhow::bail!("qdrant backend requested but agentvisor-ai was built without feature qdrant")
+            anyhow::bail!(
+                "qdrant backend requested but this agentvisord binary was built without the `qdrant` feature (rebuild av-harness with --features qdrant or full)"
+            )
         }
         other => anyhow::bail!("unsupported vector backend {other:?}"),
     }
