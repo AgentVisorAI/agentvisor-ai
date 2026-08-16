@@ -18,7 +18,7 @@ use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::types::RDKafkaErrorCode;
 use rskafka::client::partition::{Compression, OffsetAt, UnknownTopicHandling};
-use rskafka::client::{Client, ClientBuilder, SaslConfig};
+use rskafka::client::{ClientBuilder, SaslConfig};
 use rskafka::record::Record;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -117,8 +117,16 @@ impl KafkaSecurity {
 /// Kafka/Redpanda bus.
 pub struct KafkaBus {
     cold_archive: Option<crate::cold_store::ColdArchive>,
-    client: Arc<Client>,
     executor: crate::bus::ConnectorExecutor,
+    /// Per-(topic, partition) clients built once at provision. rskafka's
+    /// `Client::partition_client` performs metadata discovery and broker
+    /// connection setup; constructing one per publish flooded the broker
+    /// under 10k-connection load until audit publishes stalled admission
+    /// past the upstream timeout (observed as 502s in the 10k SLA gate).
+    /// The `Client` itself is not retained: partition clients hold their
+    /// own broker references, and every post-provision operation goes
+    /// through this cache.
+    partition_clients: HashMap<(String, u32), Arc<rskafka::client::partition::PartitionClient>>,
     topics: HashMap<String, u32>,
     validators: HashMap<String, jsonschema::Validator>,
 }
@@ -206,13 +214,40 @@ impl KafkaBus {
                 )));
             }
         }
+        let mut partition_clients = HashMap::new();
+        for t in &manifest.topics {
+            for p in 0..t.partitions {
+                let pc_client = Arc::clone(&client);
+                let name = t.name.clone();
+                let pc = executor
+                    .run(move || async move {
+                        pc_client
+                            .partition_client(name, p as i32, UnknownTopicHandling::Error)
+                            .await
+                    })?
+                    .map_err(|error| BusError::Backend(error.to_string()))?;
+                partition_clients.insert((t.name.clone(), p), Arc::new(pc));
+            }
+        }
         Ok(Self {
             cold_archive,
-            client,
             executor,
+            partition_clients,
             topics,
             validators,
         })
+    }
+
+    /// Cached per-partition client (built at provision; see struct docs).
+    fn partition_client(
+        &self,
+        topic: &str,
+        partition: u32,
+    ) -> Result<Arc<rskafka::client::partition::PartitionClient>, BusError> {
+        self.partition_clients
+            .get(&(topic.to_owned(), partition))
+            .cloned()
+            .ok_or_else(|| BusError::UnknownTopic(topic.to_owned()))
     }
 
     fn publish_with_uid(
@@ -269,17 +304,13 @@ impl KafkaBus {
             stored_at,
         };
         let payload = serde_json::to_vec(&record)?;
-        let client = Arc::clone(&self.client);
-        let topic_name = topic.to_owned();
+        let pc = self.partition_client(topic, partition)?;
         let key_bytes = event_uid.as_bytes().to_vec();
         let mut headers = std::collections::BTreeMap::new();
         headers.insert("agentvisor-event-uid".to_owned(), event_uid.as_bytes().to_vec());
         let offset = self
             .executor
             .run(move || async move {
-                let pc = client
-                    .partition_client(topic_name, partition as i32, UnknownTopicHandling::Error)
-                    .await?;
                 let offsets = pc
                     .produce(
                         vec![Record {
@@ -394,16 +425,11 @@ impl EventBus for KafkaBus {
             .get(topic)
             .ok_or_else(|| BusError::UnknownTopic(topic.to_owned()))?;
         let partition = partition_for(key, partitions);
-        let client = Arc::clone(&self.client);
-        let topic_name = topic.to_owned();
+        let partition_client = self.partition_client(topic, partition)?;
         let event_uid = event_uid.to_owned();
         let found = self
             .executor
             .run(move || async move {
-                let partition_client = client
-                    .partition_client(topic_name, partition as i32, UnknownTopicHandling::Error)
-                    .await
-                    .map_err(|error| error.to_string())?;
                 let mut offset = partition_client
                     .get_offset(OffsetAt::Earliest)
                     .await
@@ -466,14 +492,9 @@ impl EventBus for KafkaBus {
         if !self.topics.contains_key(topic) {
             return Err(BusError::UnknownTopic(topic.to_owned()));
         }
-        let client = Arc::clone(&self.client);
-        let topic = topic.to_owned();
+        let pc = self.partition_client(topic, partition)?;
         self.executor
             .run(move || async move {
-                let pc = client
-                    .partition_client(topic, partition as i32, UnknownTopicHandling::Error)
-                    .await
-                    .map_err(|e| e.to_string())?;
                 #[allow(clippy::cast_possible_wrap)]
                 let (records, _high_watermark) = pc
                     .fetch_records(offset as i64, 1..(16 * 1024 * 1024), 500)
