@@ -490,7 +490,11 @@ async fn sla_10k_streaming_connections() {
     let mut middleware_latencies = Vec::with_capacity(connections);
     for client in clients {
         let response = client.await.unwrap().unwrap();
-        assert!(response.starts_with(b"HTTP/1.1 200"));
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "non-200 under load: {:?}",
+            String::from_utf8_lossy(response.get(..response.len().min(300)).unwrap_or(&response))
+        );
         let headers = std::str::from_utf8(&response).unwrap();
         let middleware_us = headers
             .lines()
