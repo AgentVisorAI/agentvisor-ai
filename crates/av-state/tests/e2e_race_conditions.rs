@@ -281,3 +281,61 @@ fn cross_key_multi_spend_pairs_do_not_deadlock_or_double_spend() {
     assert!(store.get("A").unwrap() <= LIMIT, "double-spend on A");
     assert!(store.get("B").unwrap() <= LIMIT, "double-spend on B");
 }
+
+/// Mutation-run hardening (round 11): the JCS_SAFE_MAX overflow guards in
+/// `InMemoryStore::try_spend_many` were only exercised past the limit, so
+/// `>` -> `>=` boundary mutants survived. Mirror the redis contract's
+/// boundary discipline: amount/limit exactly at JCS_SAFE_MAX succeed,
+/// one past is Overflow.
+#[test]
+fn in_memory_spend_boundary_is_exact_at_jcs_safe_max() {
+    use av_state::{InMemoryStore, Spend, StateError, StateStore};
+    let max = av_core::error::JCS_SAFE_MAX;
+    let store = InMemoryStore::new();
+    assert_eq!(
+        store
+            .try_spend_many(&[Spend {
+                key: "boundary-ok".into(),
+                amount: max,
+                limit: max,
+            }])
+            .unwrap(),
+        None,
+        "amount == limit == JCS_SAFE_MAX must commit"
+    );
+    for (amount, limit) in [(max + 1, max), (1, max + 1)] {
+        let outcome = store.try_spend_many(&[Spend {
+            key: "boundary-over".into(),
+            amount,
+            limit,
+        }]);
+        assert!(
+            matches!(outcome, Err(StateError::Overflow(_))),
+            "amount/limit past JCS_SAFE_MAX must be Overflow, got {outcome:?}"
+        );
+    }
+}
+
+/// Mutation-run hardening (round 11): `refund_tool_call`'s payout arm was
+/// untested — a mutant inverting `payout_usd_micros > 0` never refunded
+/// payout at all. Round-trip: spend with payout, refund, spend again to
+/// prove headroom returned.
+#[test]
+fn refund_returns_payout_headroom() {
+    use av_state::{ActionBudget, BudgetSpec, InMemoryStore};
+    let store = InMemoryStore::new();
+    let spec = BudgetSpec {
+        max_tool_calls: [("payout".to_owned(), 10)].into_iter().collect(),
+        max_payout_usd_micros: Some(1_000),
+        max_total_tool_calls: Some(10),
+        max_tokens: None,
+    };
+    let budget = ActionBudget::new(&store, "refund-payout", &spec);
+    assert!(budget.try_tool_call("payout", 900).unwrap().is_allowed());
+    // Without the refund, a second 900 spend would breach the 1000 cap.
+    budget.refund_tool_call("payout", 900);
+    assert!(
+        budget.try_tool_call("payout", 900).unwrap().is_allowed(),
+        "refund must return payout headroom"
+    );
+}
