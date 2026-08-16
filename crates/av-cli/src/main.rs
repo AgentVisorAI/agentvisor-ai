@@ -25,7 +25,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Guided setup: answer two questions, get a working proxy (default).
+    /// Guided setup: a few quick prompts, then a working proxy (default).
     Setup,
     /// Start AgentVisor AI and print where to point your AI app.
     Start,
