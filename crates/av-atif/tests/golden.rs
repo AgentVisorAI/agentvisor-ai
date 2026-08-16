@@ -825,3 +825,44 @@ fn rust_strict_valid_v17_documents_always_pass_the_shipped_schema() {
         );
     }
 }
+
+/// Round 31: e2e_sota_attacks defers "invisible Unicode tag bytes survive
+/// export byte-exactly" to this suite — pin it. U+E0000–U+E007F tag
+/// characters (Goodside-style prompt smuggling) hidden in a message must
+/// survive the typed round trip bit-exactly, validate strict, and pass
+/// the shipped JSON Schema: a stripping or lossy re-encode would make the
+/// audit trail lie about what the model actually saw.
+#[test]
+fn unicode_tag_characters_survive_the_typed_round_trip_byte_exactly() {
+    use serde_json::json;
+    let smuggled = "review this PR \u{E0001}\u{E0020}\u{E0069}\u{E0067}\u{E0064}\u{E007F} carefully";
+    let metrics = json!({"metrics": {
+        "prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0
+    }});
+    let mut v = minimal("1.7", json!({}), metrics);
+    v["steps"][0]["message"] = json!(smuggled);
+    let issues = validate_value(&v, Mode::Strict);
+    assert!(
+        issues.is_empty(),
+        "tagged message must be strict-valid: {issues:#?}"
+    );
+    let t: Trajectory = serde_json::from_value(v.clone()).unwrap();
+    let back = serde_json::to_value(&t).unwrap();
+    assert_eq!(
+        back, v,
+        "typed round-trip must preserve tag characters bit-exactly"
+    );
+    assert_eq!(
+        back["steps"][0]["message"].as_str().unwrap(),
+        smuggled,
+        "tag characters must not be stripped or re-encoded"
+    );
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../../../schemas/atif-v1.7.schema.json")).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let errors: Vec<String> = validator.iter_errors(&v).map(|e| e.to_string()).collect();
+    assert!(
+        errors.is_empty(),
+        "shipped schema must accept tagged content: {errors:#?}"
+    );
+}
