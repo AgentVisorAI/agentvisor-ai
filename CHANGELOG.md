@@ -4,6 +4,25 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Review round 16: ATIF dual-validator agreement contract (2026-08-16)
+
+A consistency sweep of schema surfaces found that the shipped
+`schemas/atif-v1.7.schema.json` was only ever exercised against the
+single golden trajectory, while the Rust strict validator is a separate
+hand-rolled implementation — the two could silently diverge on any
+other document, and external consumers validate our exports with the
+JSON Schema. Added
+`rust_strict_valid_v17_documents_always_pass_the_shipped_schema`
+(av-atif golden suite): a seven-document corpus (minimal, root `extra`,
+`tool_definitions`, system observation, multimodal message, omitted
+`session_id`, golden) must be accepted by *both* validators. The
+inverse direction is intentionally unenforced — strict mode checks
+Harbor semantics JSON Schema cannot express (sequential step ids,
+version-gated fields). The other three shipped schemas need no such
+contract: bridge manifests are validated *by* the JSON Schema itself
+(single source of truth), and receipts/OCSF events are machine-generated
+shapes already covered by golden schema-conformance tests.
+
 ### Review round 15: fix the red CI supply-chain gate (2026-08-16)
 
 The first CI run on the renamed repo failed `cargo-deny --all-features`:
