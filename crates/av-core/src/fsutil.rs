@@ -310,3 +310,40 @@ mod tests {
         assert!(tmp.exists(), "disarmed guard must not touch the file");
     }
 }
+
+#[cfg(test)]
+mod read_capped_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    /// Mutation-run hardening (round 12): `read_capped -> Ok(vec![])`
+    /// survived — nothing asserted the reader actually returns the file
+    /// bytes or enforces its cap at the exact boundary.
+    #[test]
+    fn read_capped_roundtrips_and_enforces_the_exact_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.bin");
+        let content = b"agentvisor-read-capped-fixture".to_vec();
+        std::fs::write(&path, &content).unwrap();
+        // Content comes back verbatim…
+        assert_eq!(read_capped(&path, MAX_CONTROL_BYTES).unwrap(), content);
+        // …a cap of exactly the length succeeds…
+        assert_eq!(read_capped(&path, content.len() as u64).unwrap(), content);
+        // …and one byte under the length is refused, not truncated.
+        let under = read_capped(&path, content.len() as u64 - 1);
+        assert!(under.is_err(), "under-cap read must refuse, got {under:?}");
+        // Non-regular files are refused (directory).
+        assert!(read_capped(dir.path(), MAX_CONTROL_BYTES).is_err());
+    }
+
+    /// The workspace-wide byte caps are load-bearing resource bounds;
+    /// pin their values so arithmetic mutants can't silently shrink or
+    /// inflate them.
+    #[test]
+    fn byte_caps_are_pinned() {
+        assert_eq!(MAX_RECEIPT_BYTES, 16 * 1024 * 1024);
+        assert_eq!(MAX_ATIF_BYTES, 64 * 1024 * 1024);
+        assert_eq!(MAX_CONTROL_BYTES, 1024 * 1024);
+    }
+}

@@ -659,3 +659,29 @@ mod tests {
         assert!(out.contains("end"));
     }
 }
+
+#[cfg(test)]
+mod histogram_boundary_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    /// Mutation-run hardening (round 12): the overflow-bucket branch of
+    /// `quantile_us` and the seconds conversion in `_sum` rendering were
+    /// unpinned. A sample past the last bound must surface as u64::MAX
+    /// (never silently under-report as the last bound), and the rendered
+    /// sum must be the microsecond total divided by exactly 1e6.
+    #[test]
+    fn quantile_overflow_reports_max_and_sum_renders_in_seconds() {
+        let r = Registry::new();
+        let h = r.histogram_with_bounds("av_overflow_probe", "probe", &[10, 100]);
+        h.observe_us(1_000_000); // beyond the last bound: overflow bucket
+        assert_eq!(h.quantile_us(0.99), u64::MAX);
+        h.observe_us(2_000_000);
+        let text = r.render();
+        assert!(
+            text.contains("av_overflow_probe_sum 3"),
+            "sum must be 3 seconds (3_000_000 us / 1e6), got:\n{text}"
+        );
+    }
+}

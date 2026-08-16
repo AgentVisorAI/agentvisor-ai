@@ -50,3 +50,15 @@ mod tests {
         assert!(check_jcs_safe(u64::MAX).is_err());
     }
 }
+
+#[cfg(test)]
+mod const_tests {
+    /// Mutation-run hardening (round 12): `1 << 53` -> `1 >> 53` would
+    /// silently turn every overflow guard in the workspace into
+    /// "reject everything above 0". Pin the exact value.
+    #[test]
+    fn jcs_safe_max_is_two_to_the_53rd() {
+        assert_eq!(super::JCS_SAFE_MAX, 9_007_199_254_740_992);
+        assert_eq!(super::JCS_SAFE_MAX, 2u64.pow(53));
+    }
+}
