@@ -172,13 +172,18 @@ pub struct HarnessConfig {
     /// Declarative topic-schema manifest used by every Bridge backend.
     #[serde(default = "default_bridge_manifest")]
     pub bridge_manifest_path: String,
-    /// Kafka broker or NATS URL for network Bridge backends.
+    /// Kafka broker (`host:port`) or NATS URL (`nats://`/`tls://`) for
+    /// network Bridge backends. Secured endpoints read their material from
+    /// the environment: `AV_KAFKA_CA_FILE` + `AV_KAFKA_SASL_USERNAME`/
+    /// `AV_KAFKA_SASL_PASSWORD` (SASL/PLAIN, refused without the CA), and
+    /// `AV_NATS_CA_FILE` (forces TLS) + `AV_NATS_USER`/`AV_NATS_PASSWORD`.
     #[serde(default)]
     pub bridge_endpoint: Option<String>,
     /// State backend: `memory` or `redis`.
     #[serde(default = "default_state_backend")]
     pub state_backend: String,
-    /// Redis URL for the distributed state backend.
+    /// Redis URL for the distributed state backend. A comma-separated list
+    /// of URLs selects Redis Cluster mode.
     #[serde(default)]
     pub state_endpoint: Option<String>,
     /// Embedding backend: `hash` or `onnx`.
