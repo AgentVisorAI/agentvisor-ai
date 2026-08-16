@@ -488,3 +488,32 @@ mod tests {
             .is_err());
     }
 }
+
+#[cfg(test)]
+mod payout_boundary_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use serde_json::json;
+
+    /// Mutation-run hardening (round 11): pin the payout parser's exact
+    /// bounds. `usd < 0.0` -> `<=` would refuse a legitimate zero payout;
+    /// `usd > 1.0e12` -> `>=`/`==` shift or invert the sanity ceiling.
+    #[test]
+    fn payout_bounds_are_exact() {
+        let extract = |v: serde_json::Value| extract_payout_micros(&json!({"amount_usd": v}), "amount_usd");
+        assert_eq!(extract(json!(0.0)).unwrap(), 0, "zero payout is legitimate");
+        assert_eq!(
+            extract(json!(1.0e12)).unwrap(),
+            1_000_000_000_000_u64 * av_core::units::USD_MICROS_PER_DOLLAR,
+            "the sanity ceiling itself is accepted"
+        );
+        let over = extract(json!(2.0e12));
+        assert!(
+            matches!(over, Err(ref m) if m.contains("sanity")),
+            "past the ceiling must be refused, got {over:?}"
+        );
+        let negative = extract(json!(-0.25));
+        assert!(matches!(negative, Err(ref m) if m.contains("non-negative")));
+    }
+}
