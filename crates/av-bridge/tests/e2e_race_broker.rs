@@ -1,6 +1,7 @@
 //! Race-condition resilience for the embedded broker: concurrent duplicate
 //! `publish_idempotent`, concurrent fetches racing live publishers, and
-//! interleaved publishers across partitions. (Fetch-during-retention races
+//! interleaved publishers hammering a single hot partition (fixed keys —
+//! the hardest ordering case). (Fetch-during-retention races
 //! are covered by `embedded_contract.rs::concurrent_publish_fetch_and_retention_never_torn`.)
 
 #![allow(
@@ -75,7 +76,7 @@ fn concurrent_duplicate_publish_idempotent_yields_one_record_and_one_ack() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Concurrent fetches during publishing: readers polling one partition
+// 2. Concurrent fetches during publishing: readers sweeping every partition
 //    while writers publish must never see torn records or duplicate
 //    offsets, and every offset returned must be strictly increasing.
 // ---------------------------------------------------------------------------

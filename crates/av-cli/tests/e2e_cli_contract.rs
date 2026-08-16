@@ -187,8 +187,8 @@ fn receipt_verify_stdout_matches_receipt_id_on_success() {
     ]);
     assert!(out.status.success(), "verify failed: {}", stderr(&out));
     assert!(
-        stdout(&out).contains("receipt-01"),
-        "stdout must echo receipt id, got: {}",
+        stdout(&out).starts_with("verified ") && stdout(&out).contains("receipt-01"),
+        "stdout must be the documented `verified <id>` shape, got: {}",
         stdout(&out)
     );
 }

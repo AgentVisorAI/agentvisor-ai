@@ -486,9 +486,9 @@ fn empty_policy_chain_allows_arbitrary_tools() {
 }
 
 // ------------------------------------------------------------------
-// 10. Manifest boundary: partition count 1 accepted (already tested),
-//     partition count u32::MAX rejected only if code says so; large
-//     but sane count 1024 accepted.
+// 10. Manifest boundary: partition count 1 accepted (already tested);
+//     large but sane count 1024 accepted (the exact cap; > 1024 rejection
+//     is pinned by manifest.rs's own boundary tests).
 // ------------------------------------------------------------------
 
 #[test]
