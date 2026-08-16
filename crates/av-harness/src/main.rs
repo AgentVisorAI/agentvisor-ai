@@ -957,7 +957,8 @@ fn require_owner_only_mode(path: &Path) -> Result<()> {
                 path.display(),
             );
         }
-        // Bottom 9 bits are rwxrwxrwx; any of the group/other read bits set is a leak.
+        // Bottom 9 bits are rwxrwxrwx; any group/other bit set (not
+        // just read — mode must be exactly owner-only) is refused.
         let mode = metadata.mode() & 0o777;
         if mode & 0o077 != 0 {
             anyhow::bail!(
