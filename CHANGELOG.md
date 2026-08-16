@@ -4,6 +4,65 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Rebrand: AgentBridge → AgentVisor AI (2026-08-15)
+
+Full pre-release rename; entries below this one keep the historical names.
+
+- **Brand** — all docs, CLI text, dashboards, and crate descriptions now say
+  AgentVisor AI. References to the source brief keep its original filename
+  (`AgentBridge.docx`).
+- **Binaries** — the daemon is `agentvisord` (was `agentbridged`); the CLI is
+  `avctl` (was `abctl`). `find_server_binary` prefers `agentvisord` and
+  falls back to the legacy `agentbridged` / `agent-bridge` names so
+  source-built older installs keep working.
+- **Crates** — all 12 workspace crates renamed `ab-*` → `av-*`
+  (`av-core`, `av-events`, `av-atif`, `av-receipts`, `av-state`,
+  `av-bridge`, `av-identity`, `av-compress`, `av-loopdetect`, `av-sandbox`,
+  `av-harness`, `av-cli`). Nothing had been published to crates.io yet.
+- **Wire protocol** — HTTP headers `X-AB-Session` / `X-AB-Workflow` (and the
+  `x-ab-agent-version`, `x-ab-instance-uid`, `x-ab-middleware-us` response
+  headers) renamed to `X-AV-*` / `x-av-*`. The event-chain genesis
+  domain-separation tag changed `"ab-genesis"` → `"av-genesis"`, so receipts
+  issued by pre-rename builds do not verify against post-rename chains
+  (pre-release, nothing published).
+- **Env vars** — `AB_*` → `AV_*` (e.g. `AV_UPSTREAM_URL`, `AV_REDIS_URL`,
+  `AV_KAFKA_CA_FILE`, `AV_NATS_CA_FILE`, `AV_COLD_S3_URL`, `AV_SLA_*`).
+- **Metrics** — Prometheus names `ab_*` → `av_*`
+  (e.g. `av_events_dropped_total`).
+- **Paths & deploy** — setup root is `~/.agentvisor/`; systemd unit and
+  Kubernetes manifest renamed to `agentvisor-ai.service` /
+  `agentvisor-ai.yaml`; Docker/Compose, release archives, and the publish
+  workflow updated. Repository URLs now point at `agentvisor-ai` (the
+  GitHub repo must be renamed to match before the next release).
+
+### Secured-transport and cluster live coverage (2026-08-15)
+
+Closed the three environment limits recorded in VERIFICATION.md:
+
+- **Kafka TLS/SASL** — `KafkaBus::provision` now honors `AB_KAFKA_CA_FILE`
+  (private-CA TLS on both the rskafka event path and the librdkafka admin
+  path; rskafka gains `transport-tls`, rdkafka gains `ssl-vendored`) and
+  `AB_KAFKA_SASL_USERNAME`/`AB_KAFKA_SASL_PASSWORD` (SASL/PLAIN). Credentials
+  without a CA are refused client-side — PLAIN must not cross the wire
+  without TLS. Live contract passed against Redpanda with a
+  `sasl`-authenticated TLS listener; plaintext path regression-tested
+  unchanged.
+- **NATS TLS/auth** — `NatsBus::provision` now honors `AB_NATS_CA_FILE` and
+  `AB_NATS_USER`/`AB_NATS_PASSWORD`. Live contract passed over `tls://`
+  against nats-server requiring TLS + user/password.
+- **S3-compatible cold tier** — new `cold-store-aws` feature enables
+  `s3://` `cold_uri` targets. Fixed a latent bug where
+  `ColdArchive::from_manifest` passed raw `std::env::vars()` to
+  `object_store::parse_url_opts`, which only parses lowercase config keys —
+  standard `AWS_ACCESS_KEY_ID`/`AWS_ENDPOINT`/… were silently ignored; keys
+  are now lowercased. New `AB_COLD_S3_URL`-gated live contract
+  (`ab-bridge/tests/cold_store_live.rs`) passed against MinIO, covering the
+  staged intent → conditional put → idempotent re-put path.
+- **Redis Cluster** — new `AB_REDIS_URL` contract test drives the multi-key
+  `try_spend_many` Lua script with the production `budget:{hash-tag}:` key
+  shape; passed against a live 3-master cluster (CROSSSLOT safety and
+  cross-key atomicity of a refused spend on a real slot map).
+
 ### Distribution
 
 - **crates.io publishing** — added `.github/workflows/publish-crates.yml`

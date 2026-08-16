@@ -1,0 +1,40 @@
+[package]
+name = "av-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "avctl: keygen, receipt verify, ATIF validate, bridge provision, loadgen"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "avctl"
+path = "src/main.rs"
+
+[dependencies]
+av-core = { workspace = true }
+av-events = { workspace = true }
+av-atif = { workspace = true }
+av-receipts = { workspace = true }
+av-bridge = { workspace = true }
+av-harness = { workspace = true }
+clap = { workspace = true }
+rpassword = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+reqwest = { workspace = true }
+hex = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -30,10 +30,10 @@ The final 10,000-stream run printed `completed_ms=858` and completed in 3.72 s. 
 ## Commands
 
 ```bash
-cargo test -p ab-harness --release --features full --test sla sla_core_metrics -- --ignored --nocapture
+cargo test -p av-harness --release --features full --test sla sla_core_metrics -- --ignored --nocapture
 
 ulimit -n 65536
-RUN_HEAVY_PERF=1 AB_SLA_CONNECTIONS=10000 AB_SLA_ARRIVAL_TIMEOUT_S=900 \
-	cargo test -p ab-harness --release --features full --test sla \
+RUN_HEAVY_PERF=1 AV_SLA_CONNECTIONS=10000 AV_SLA_ARRIVAL_TIMEOUT_S=900 \
+	cargo test -p av-harness --release --features full --test sla \
 	sla_10k_streaming_connections -- --ignored --nocapture
 ```

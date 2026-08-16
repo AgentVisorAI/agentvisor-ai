@@ -8,9 +8,9 @@
 /docker/                @debugmode0
 
 # Security-critical: request an extra pair of eyes on any change here.
-/crates/ab-receipts/    @debugmode0
-/crates/ab-identity/    @debugmode0
-/crates/ab-sandbox/     @debugmode0
-/crates/ab-state/       @debugmode0
+/crates/av-receipts/    @debugmode0
+/crates/av-identity/    @debugmode0
+/crates/av-sandbox/     @debugmode0
+/crates/av-state/       @debugmode0
 /SECURITY.md            @debugmode0
 /SECURITY-AUDIT.md      @debugmode0

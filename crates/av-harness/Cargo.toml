@@ -1,0 +1,94 @@
+[package]
+name = "av-harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The drop-in agent harness: inline proxy, hot path pipeline, workers, reconciler"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "agentvisord"
+path = "src/main.rs"
+
+[features]
+default = []
+redis = ["av-state/redis"]
+nats = ["av-bridge/nats"]
+kafka = ["av-bridge/kafka"]
+onnx = ["av-loopdetect/onnx"]
+qdrant = ["av-loopdetect/qdrant"]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+full = ["redis", "nats", "kafka", "onnx", "qdrant", "otel"]
+
+[dependencies]
+av-core = { workspace = true }
+av-events = { workspace = true }
+av-atif = { workspace = true }
+av-receipts = { workspace = true }
+av-state = { workspace = true }
+av-bridge = { workspace = true }
+av-identity = { workspace = true }
+av-compress = { workspace = true }
+av-loopdetect = { workspace = true }
+av-sandbox = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+tower = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+zeroize = { workspace = true }
+
+[dependencies.opentelemetry]
+version = "0.32"
+optional = true
+default-features = false
+features = ["trace"]
+
+[dependencies.opentelemetry_sdk]
+version = "0.32"
+optional = true
+default-features = false
+features = ["trace"]
+
+[dependencies.opentelemetry-otlp]
+version = "0.32"
+optional = true
+default-features = false
+features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls"]
+
+[dependencies.tracing-opentelemetry]
+version = "0.33"
+optional = true
+default-features = false
+
+[dev-dependencies]
+tempfile = { workspace = true }
+criterion = { workspace = true }
+jsonwebtoken = { workspace = true }
+base64 = { workspace = true }
+
+[[bench]]
+name = "hot_path"
+harness = false
+
+[lints]
+workspace = true

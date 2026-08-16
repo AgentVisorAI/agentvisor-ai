@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://agentbridge.dev/schemas/receipt-v1.json",
-  "title": "AgentBridge Receipt v1",
+  "$id": "https://agentvisor.dev/schemas/receipt-v1.json",
+  "title": "AgentVisor AI Receipt v1",
   "type": "object",
   "additionalProperties": false,
   "required": ["receipt_version", "receipt_id", "session_id", "issued_at", "issued_at_iso", "ai_agent", "subject", "tool_calls", "cost", "stop_reason_id", "stop_reason", "key_id", "public_key_b64", "signature_b64"],

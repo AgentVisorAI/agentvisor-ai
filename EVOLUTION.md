@@ -2,7 +2,7 @@
 
 ## Compatibility
 
-AgentBridge follows inbound-tolerant, outbound-current behavior:
+AgentVisor AI follows inbound-tolerant, outbound-current behavior:
 
 - OCSF events preserve unknown inbound fields and emit metadata version 1.10.0.
 - ATIF accepts v1.0 through v1.7 and always writes v1.7.

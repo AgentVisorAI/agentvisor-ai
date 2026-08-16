@@ -1,0 +1,109 @@
+# AgentVisor AI systemd unit.
+#
+# Install:
+#   sudo useradd --system --home /var/lib/agentvisor-ai --shell /usr/sbin/nologin agentvisor-ai
+#   sudo mkdir -p /var/lib/agentvisor-ai /etc/agentvisor-ai
+#   sudo cp target/release/agentvisord /usr/local/bin/
+#   sudo cp target/release/avctl /usr/local/bin/
+#   cd /etc/agentvisor-ai && sudo avctl init --preset openai --output agentvisor.toml
+#   # Round-18 F1: generate the receipt trust anchor BEFORE first boot.
+#   # `ProtectSystem=strict` below mounts /etc read-only, so the harness
+#   # cannot auto-create the seed at startup — that would EROFS.
+#   sudo -u agentvisor-ai avctl keygen --output /etc/agentvisor-ai/signing.seed
+#   sudo chmod 400 /etc/agentvisor-ai/signing.seed
+#   sudo chown agentvisor-ai:agentvisor-ai /etc/agentvisor-ai/signing.seed
+#   echo 'AV_UPSTREAM_API_KEY=sk-...' | sudo tee /etc/agentvisor-ai/secrets.env
+#   sudo chmod 600 /etc/agentvisor-ai/secrets.env
+#   sudo chown -R agentvisor-ai:agentvisor-ai /var/lib/agentvisor-ai /etc/agentvisor-ai
+#   sudo cp deploy/systemd/agentvisor-ai.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now agentvisor-ai
+#
+# Check: avctl health --url http://127.0.0.1:8484
+
+[Unit]
+Description=AgentVisor AI LLM proxy with signed receipts
+Documentation=https://github.com/debugmode0/agentvisor-ai
+After=network-online.target
+Wants=network-online.target
+# Round-19 F7: bound the restart-loop budget. Without these, a
+# misconfigured AV_CONFIG (bad TOML, port bind conflict) causes
+# exit-nonzero → RestartSec=2 → retry, forever. That floods
+# journald (systemd-journald throttles a unit at ~1000 msg/30s and
+# starts DROPPING messages from unrelated services on the same
+# host). StartLimitBurst=5 with StartLimitIntervalSec=60s means
+# systemd holds the unit in "failed" after 5 crashes in 1 minute,
+# preserving journald capacity for whatever comes next.
+StartLimitBurst=5
+StartLimitIntervalSec=60s
+
+[Service]
+Type=simple
+User=agentvisor-ai
+Group=agentvisor-ai
+WorkingDirectory=/var/lib/agentvisor-ai
+Environment=RUST_LOG=info
+Environment=AV_CONFIG=/etc/agentvisor-ai/agentvisor.toml
+# Round-17 F10: the signing seed IS the receipt trust anchor.
+# Historically it lived inside WorkingDirectory=/var/lib/agentvisor-ai,
+# which is ReadWritePaths=. Any operator running `sudo cat` /
+# rsync backup / debug shell traversed the same tree that held the
+# key. Move it to /etc/agentvisor-ai (read-only config tree),
+# owned agentvisor-ai:agentvisor-ai, mode 0400. Install docs already
+# instruct pre-generating the seed with `avctl keygen`.
+Environment=AV_SIGNING_SEED_FILE=/etc/agentvisor-ai/signing.seed
+# API keys live here, mode 0600, never in the unit file:
+EnvironmentFile=-/etc/agentvisor-ai/secrets.env
+ExecStart=/usr/local/bin/agentvisord
+Restart=on-failure
+RestartSec=2
+
+# Round-18 F3: match the docker-compose (120 s stop_grace_period)
+# and k8s (terminationGracePeriodSeconds: 120) shutdown budgets.
+# Default systemd DefaultTimeoutStopSec is 90 s on stock installs
+# and can be as low as 30 s under distro overrides — either way
+# below the harness's documented 4-phase shutdown budget
+# (30 s HTTP drain + 30 s worker wait_idle + 30 s finalize_sessions
+# + 5 s telemetry flush). SIGKILL mid-finalize drops receipts and
+# truncates ATIF trajectories; giving the process 120 s + 5 s slack
+# for a clean systemd stop-then-SIGKILL cycle avoids that.
+TimeoutStopSec=125s
+# Deliver SIGTERM to the process group so any spawned child (rare
+# but possible via wasmtime host functions) gets a chance to run
+# its own cleanup before SIGKILL. Same posture as k8s.
+KillMode=mixed
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# ReadWritePaths does NOT include /etc/agentvisor-ai on purpose —
+# config + signing seed are read-only after install.
+ReadWritePaths=/var/lib/agentvisor-ai
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectClock=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# MemoryDenyWriteExecute=false is required because the WASM policy engine
+# (crates/av-sandbox/src/wasm_policy.rs) uses a Cranelift JIT that maps
+# executable-writable memory. Do NOT re-enable this without switching to
+# an interpreter-only wasmtime build.
+MemoryDenyWriteExecute=false
+RestrictRealtime=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

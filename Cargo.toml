@@ -1,18 +1,18 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/ab-core",
-    "crates/ab-events",
-    "crates/ab-atif",
-    "crates/ab-receipts",
-    "crates/ab-state",
-    "crates/ab-bridge",
-    "crates/ab-identity",
-    "crates/ab-compress",
-    "crates/ab-loopdetect",
-    "crates/ab-sandbox",
-    "crates/ab-harness",
-    "crates/ab-cli",
+    "crates/av-core",
+    "crates/av-events",
+    "crates/av-atif",
+    "crates/av-receipts",
+    "crates/av-state",
+    "crates/av-bridge",
+    "crates/av-identity",
+    "crates/av-compress",
+    "crates/av-loopdetect",
+    "crates/av-sandbox",
+    "crates/av-harness",
+    "crates/av-cli",
 ]
 
 [workspace.package]
@@ -20,9 +20,9 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
-repository = "https://github.com/debugmode0/agent-bridge"
-homepage = "https://debugmode0.github.io/agent-bridge/"
-documentation = "https://debugmode0.github.io/agent-bridge/api/"
+repository = "https://github.com/debugmode0/agentvisor-ai"
+homepage = "https://debugmode0.github.io/agentvisor-ai/"
+documentation = "https://debugmode0.github.io/agentvisor-ai/api/"
 # `keywords` and `categories` are inherited by every workspace crate
 # via `keywords.workspace = true` / `categories.workspace = true`.
 # crates.io caps at 5 keywords / 5 categories.
@@ -30,17 +30,17 @@ keywords = ["ai", "agents", "audit", "atif", "ocsf"]
 categories = ["command-line-utilities", "web-programming::http-server", "asynchronous"]
 
 [workspace.dependencies]
-ab-core = { path = "crates/ab-core", version = "0.1.0" }
-ab-events = { path = "crates/ab-events", version = "0.1.0" }
-ab-atif = { path = "crates/ab-atif", version = "0.1.0" }
-ab-receipts = { path = "crates/ab-receipts", version = "0.1.0" }
-ab-state = { path = "crates/ab-state", version = "0.1.0" }
-ab-bridge = { path = "crates/ab-bridge", version = "0.1.0" }
-ab-identity = { path = "crates/ab-identity", version = "0.1.0" }
-ab-compress = { path = "crates/ab-compress", version = "0.1.0" }
-ab-loopdetect = { path = "crates/ab-loopdetect", version = "0.1.0" }
-ab-sandbox = { path = "crates/ab-sandbox", version = "0.1.0" }
-ab-harness = { path = "crates/ab-harness", version = "0.1.0" }
+av-core = { path = "crates/av-core", version = "0.1.0" }
+av-events = { path = "crates/av-events", version = "0.1.0" }
+av-atif = { path = "crates/av-atif", version = "0.1.0" }
+av-receipts = { path = "crates/av-receipts", version = "0.1.0" }
+av-state = { path = "crates/av-state", version = "0.1.0" }
+av-bridge = { path = "crates/av-bridge", version = "0.1.0" }
+av-identity = { path = "crates/av-identity", version = "0.1.0" }
+av-compress = { path = "crates/av-compress", version = "0.1.0" }
+av-loopdetect = { path = "crates/av-loopdetect", version = "0.1.0" }
+av-sandbox = { path = "crates/av-sandbox", version = "0.1.0" }
+av-harness = { path = "crates/av-harness", version = "0.1.0" }
 
 tokio = { version = "1.47", features = ["full"] }
 axum = { version = "0.8", features = ["macros"] }
@@ -51,7 +51,7 @@ futures = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 # float_roundtrip is REQUIRED for RFC 8785 correctness: without it serde_json
 # parses floats at reduced precision and canonical hashes differ from other
-# JCS implementations (verified by the RFC Appendix vectors in ab-receipts).
+# JCS implementations (verified by the RFC Appendix vectors in av-receipts).
 serde_json = { version = "1.0", features = ["preserve_order", "float_roundtrip"] }
 serde_yaml = "0.9"
 toml = "0.8"
@@ -83,7 +83,7 @@ proptest = "1.6"
 tempfile = "3.14"
 object_store = { version = "0.12", default-features = false }
 url = "2.5"
-rdkafka = { version = "0.36", default-features = false, features = ["tokio", "cmake-build"] }
+rdkafka = { version = "0.36", default-features = false, features = ["tokio", "cmake-build", "ssl-vendored"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -98,7 +98,7 @@ dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
 indexing_slicing = "warn"
-# Checked arithmetic is enforced by construction in budget/monetary code (ab-state);
+# Checked arithmetic is enforced by construction in budget/monetary code (av-state);
 # blanket-warning every u64 counter/time op only produces noise.
 arithmetic_side_effects = "allow"
 cast_possible_truncation = "warn"

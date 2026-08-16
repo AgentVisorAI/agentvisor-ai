@@ -46,38 +46,38 @@ jobs:
         run: docker compose -f docker/docker-compose.yml up -d --wait redpanda redis qdrant nats
       - name: Fetch pinned MiniLM artifacts
         run: |
-          mkdir -p /tmp/agentbridge-minilm
-          curl -fL --retry 3 -o /tmp/agentbridge-minilm/model.onnx https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/onnx/model.onnx
-          curl -fL --retry 3 -o /tmp/agentbridge-minilm/tokenizer.json https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/tokenizer.json
-          echo "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452  /tmp/agentbridge-minilm/model.onnx" | sha256sum -c -
-          echo "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037  /tmp/agentbridge-minilm/tokenizer.json" | sha256sum -c -
+          mkdir -p /tmp/agentvisor-minilm
+          curl -fL --retry 3 -o /tmp/agentvisor-minilm/model.onnx https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/onnx/model.onnx
+          curl -fL --retry 3 -o /tmp/agentvisor-minilm/tokenizer.json https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/tokenizer.json
+          echo "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452  /tmp/agentvisor-minilm/model.onnx" | sha256sum -c -
+          echo "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037  /tmp/agentvisor-minilm/tokenizer.json" | sha256sum -c -
       - name: Test
         env:
-          AB_REDIS_URL: redis://127.0.0.1:6379
-          AB_KAFKA_BROKER: 127.0.0.1:19092
-          AB_NATS_URL: nats://127.0.0.1:4222
-          AB_QDRANT_URL: http://127.0.0.1:6333
-          AB_ONNX_MODEL_PATH: /tmp/agentbridge-minilm/model.onnx
-          AB_ONNX_TOKENIZER_PATH: /tmp/agentbridge-minilm/tokenizer.json
+          AV_REDIS_URL: redis://127.0.0.1:6379
+          AV_KAFKA_BROKER: 127.0.0.1:19092
+          AV_NATS_URL: nats://127.0.0.1:4222
+          AV_QDRANT_URL: http://127.0.0.1:6333
+          AV_ONNX_MODEL_PATH: /tmp/agentvisor-minilm/model.onnx
+          AV_ONNX_TOKENIZER_PATH: /tmp/agentvisor-minilm/tokenizer.json
         run: |
           cargo test --workspace
           cargo test --workspace --all-features
       - name: Release SLA
         env:
-          AB_REDIS_URL: redis://127.0.0.1:6379
-          AB_KAFKA_BROKER: 127.0.0.1:19092
+          AV_REDIS_URL: redis://127.0.0.1:6379
+          AV_KAFKA_BROKER: 127.0.0.1:19092
           # Round-45: shared GitHub Actions runners have noisy
           # neighbours and observed 10k-streaming p95/p99 sits near
           # 4.5-5.1 ms / 7-9 ms, which trips the tight 5 ms / 8 ms
           # defaults roughly half the time. Loosen the CI gates by
           # ~50 % to account for runner variance; local dev keeps the
           # historic defaults unless the operator overrides.
-          AB_SLA_STREAMING_P95_US: "7500"
-          AB_SLA_STREAMING_P99_US: "12000"
+          AV_SLA_STREAMING_P95_US: "7500"
+          AV_SLA_STREAMING_P99_US: "12000"
         run: |
-          cargo test -p ab-harness --release --features full --test sla sla_core_metrics -- --ignored --nocapture
+          cargo test -p av-harness --release --features full --test sla sla_core_metrics -- --ignored --nocapture
           ulimit -n 65536
-          RUN_HEAVY_PERF=1 AB_SLA_CONNECTIONS=10000 cargo test -p ab-harness --release --features full --test sla sla_10k_streaming_connections -- --ignored --nocapture
+          RUN_HEAVY_PERF=1 AV_SLA_CONNECTIONS=10000 cargo test -p av-harness --release --features full --test sla sla_10k_streaming_connections -- --ignored --nocapture
       - name: Feature matrix
         run: |
           cargo check --workspace --no-default-features
@@ -104,12 +104,12 @@ jobs:
             "annotated-types==0.7.0" "typing-extensions==4.12.2" \
             "typing-inspection==0.4.1"
           python -m pip install --disable-pip-version-check --no-deps "git+https://github.com/harbor-framework/harbor.git@e5e46809a973c91d90a207fcaa232ab8ff89acaf"
-          AB_HARBOR_INTEROP_OUT=/tmp/agentbridge-atif.json cargo test -p ab-harness full_chat_close_and_promotion_flow
-          python -m harbor.utils.trajectory_validator /tmp/agentbridge-atif.json --no-validate-images
+          AV_HARBOR_INTEROP_OUT=/tmp/agentvisor-atif.json cargo test -p av-harness full_chat_close_and_promotion_flow
+          python -m harbor.utils.trajectory_validator /tmp/agentvisor-atif.json --no-validate-images
       - name: Compose
         run: docker compose -f docker/docker-compose.yml config >/dev/null
       - name: Container build
-        run: docker compose -f docker/docker-compose.yml build agent-bridge
+        run: docker compose -f docker/docker-compose.yml build agentvisor-ai
       - name: Stop live contract services
         if: always()
         run: docker compose -f docker/docker-compose.yml down -v

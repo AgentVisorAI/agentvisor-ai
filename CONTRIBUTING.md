@@ -1,4 +1,4 @@
-# Contributing to AgentBridge
+# Contributing to AgentVisor AI
 
 Thank you for wanting to contribute. This file describes what a good change
 looks like and how to verify it locally before you open a pull request.
