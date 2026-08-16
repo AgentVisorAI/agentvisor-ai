@@ -69,11 +69,20 @@ impl NatsBus {
         let client = executor
             .run(move || async move {
                 let mut options = async_nats::ConnectOptions::new();
+                // A pinned CA or supplied credentials both state intent:
+                // this connection must be TLS. Forcing the requirement means
+                // a `nats://` (instead of `tls://`) endpoint typo cannot
+                // silently downgrade to plaintext, and an active MITM
+                // cannot strip `tls_required` from INFO to capture the
+                // CONNECT password in cleartext. A CA file is deliberately
+                // not required for credentials — WebPKI-certified `tls://`
+                // endpoints are legitimate.
+                let secured = ca_file.is_some() || credentials.is_some();
                 if let Some(ca) = ca_file {
-                    // A pinned CA states intent: this endpoint is TLS. Force
-                    // the requirement so a `nats://` (instead of `tls://`)
-                    // endpoint typo cannot silently downgrade to plaintext.
-                    options = options.add_root_certificates(ca).require_tls(true);
+                    options = options.add_root_certificates(ca);
+                }
+                if secured {
+                    options = options.require_tls(true);
                 }
                 if let Some((user, password)) = credentials {
                     options = options.user_and_password(user, password);
