@@ -302,7 +302,7 @@ pub fn init(
     // `output`. The wizard's `write_config` already has this guard
     // (see `wizard_replaces_config_symlink_instead_of_following_it`);
     // `init --force` used to differ, so an attacker who could plant
-    // ~/.config/agentvisor-ai/agentvisor.toml as a symlink to
+    // ~/.agentvisor/agentvisor.toml as a symlink to
     // ~/.bashrc or /etc/nginx/conf.d/upstream.conf could redirect
     // the TOML write into the target when the operator ran
     // `avctl init --force`. Unlink the symlink first so the
