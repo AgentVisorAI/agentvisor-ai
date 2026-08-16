@@ -87,15 +87,6 @@ cargo install --path crates/av-harness   # installs `agentvisord`
 cargo install --path crates/av-cli       # installs `avctl`
 ```
 
-### Why the binary is `agentvisord`
-
-The server binary uses the daemon suffix (`d`) convention. Naming
-history: it started as `agent-bridge`, was renamed `agentbridged`
-because `agent-bridge` on crates.io is taken by an unrelated project
-(a Codex/Claude/Gemini CLI), and became `agentvisord` with the
-AgentVisor AI rebrand. The crate is `av-harness`; the `avctl` CLI
-lives in `av-cli`.
-
 ### Provider presets
 
 | Preset | Endpoint | Key env |
