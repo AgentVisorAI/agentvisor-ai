@@ -54,6 +54,52 @@ fn contract(bus: &dyn EventBus) {
     for (i, e) in mine.iter().enumerate() {
         assert_eq!(e.value["payload"]["i"], i);
     }
+    // Start-offset semantics: a fetch from the middle must not replay this
+    // key's earlier records (kills a deliver-policy regression where the
+    // backend silently falls back to delivering from the beginning).
+    let tail = bus.fetch("agent.tool_call", partition, offsets[3], 50).unwrap();
+    let mine_tail: Vec<_> = tail.iter().filter(|e| e.key == key).collect();
+    assert_eq!(
+        mine_tail.len(),
+        2,
+        "fetch from offsets[3] must return exactly the last two records for {key}, got {mine_tail:?}"
+    );
+    assert_eq!(mine_tail[0].value["payload"]["i"], 3);
+    // Partition isolation: records published to a different partition must
+    // never surface in this partition's fetch (kills a filter regression
+    // where the backend reads the whole stream instead of one partition).
+    let partitions = bus.partitions("agent.tool_call").unwrap();
+    if partitions > 1 {
+        let other_key = (0..u32::MAX)
+            .map(|i| format!("other-{i}-{key}"))
+            .find(|candidate| av_bridge::bus::partition_for(candidate, partitions) != partition)
+            .unwrap();
+        let other_event = av_events::OcsfEventBuilder::new(
+            av_events::EventClass::ToolCall,
+            "live-contract",
+            av_events::AgentIdentity {
+                version: "1".into(),
+                charter: "contract".into(),
+                instance_uid: other_key.clone(),
+                ttl_remaining_s: Some(60),
+            },
+            0,
+        )
+        .payload(json!({"other": true}))
+        .build()
+        .unwrap();
+        bus.publish(
+            "agent.tool_call",
+            &other_key,
+            &serde_json::to_value(other_event).unwrap(),
+        )
+        .unwrap();
+        let after = bus.fetch("agent.tool_call", partition, offsets[0], 100).unwrap();
+        assert!(
+            after.iter().all(|e| e.key != other_key),
+            "record for {other_key} leaked across partitions into partition {partition}"
+        );
+    }
     assert!(bus.publish("agent.bogus", &key, &json!({})).is_err());
 }
 

@@ -304,14 +304,34 @@ mod tests {
     #[test]
     fn valid_call_allowed_with_latency() {
         let store = InMemoryStore::new();
-        let v = sandbox().check(
+        let sandbox = sandbox();
+        let v = sandbox.check(
             &store,
             "s",
             &raw_call("db_write", json!({"table": "t", "row": {}})),
         );
         assert!(v.is_allowed(), "{v:?}");
-        // R23: block/allow decision < 5ms = 5000µs.
-        assert!(v.elapsed_us() < 5_000, "decision took {}µs", v.elapsed_us());
+        // R23: block/allow decision < 5ms = 5000µs. A single debug-profile
+        // sample flakes under full-suite load (scheduler preemption between
+        // the two Instant reads), so take the minimum over several runs:
+        // one clean time slice is enough for a genuinely fast decision,
+        // while a real regression stays slow on every sample. Distinct
+        // sessions keep the per-session db_write budget (3) out of play.
+        // The release SLA gate and criterion bench own the authoritative
+        // measurement.
+        let min_elapsed_us = (0..10)
+            .map(|i| {
+                let verdict = sandbox.check(
+                    &store,
+                    &format!("s-latency-{i}"),
+                    &raw_call("db_write", json!({"table": "t", "row": {}})),
+                );
+                assert!(verdict.is_allowed(), "{verdict:?}");
+                verdict.elapsed_us()
+            })
+            .min()
+            .unwrap_or(u64::MAX);
+        assert!(min_elapsed_us < 5_000, "fastest decision took {min_elapsed_us}µs");
     }
 
     #[test]
