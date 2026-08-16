@@ -4,7 +4,9 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// A session identifier (UUIDv7 canonical text form).
+/// A session identifier: UUIDv7 canonical text when generated here
+/// ([`new_session_id`]); externally supplied ids may be any non-empty
+/// visible-ASCII string ≤ 128 bytes (header-safe).
 ///
 /// Serialization is transparent (the wire form is a plain string), but
 /// deserialization runs [`Self::parse`] so wire-supplied ids can never

@@ -137,8 +137,8 @@ pub(crate) fn resolve_tool_auth(config: &HarnessConfig) -> Result<Option<HeaderV
     Ok(Some(value))
 }
 
-/// Read a secret from an env var or an owner-only file, trimming trailing
-/// whitespace. A configured-but-missing source is a loud startup error:
+/// Read a secret from an env var or an owner-only file, trimming
+/// surrounding whitespace. A configured-but-missing source is a loud startup error:
 /// silently proxying unauthenticated would produce baffling upstream 401s.
 fn read_secret(
     env_name: Option<&str>,
