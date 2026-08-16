@@ -1,5 +1,5 @@
 manifest_version: 1
-name: agent-bridge-local
+name: agentvisor-ai-local
 replication_factor: 1
 topics:
   - name: agent.tool_call

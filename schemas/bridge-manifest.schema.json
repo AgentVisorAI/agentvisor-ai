@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://agentbridge.dev/schemas/bridge-manifest-v1.json",
-  "title": "AgentBridge Bridge Manifest v1",
+  "$id": "https://agentvisor.dev/schemas/bridge-manifest-v1.json",
+  "title": "AgentVisor AI Bridge Manifest v1",
   "type": "object",
   "additionalProperties": false,
   "required": ["manifest_version", "name", "topics"],

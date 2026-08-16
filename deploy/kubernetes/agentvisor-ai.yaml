@@ -1,0 +1,293 @@
+# AgentVisor AI on Kubernetes — single-replica starter manifest.
+#
+#   kubectl create namespace agentvisor-ai
+#   kubectl -n agentvisor-ai create secret generic agentvisor-ai-upstream \
+#       --from-literal=api-key=sk-...
+#   # Round-18 F2: the round-17 F1 initContainer refuses to boot without the
+#   # signing seed Secret. Generate it locally and load it into k8s BEFORE
+#   # `kubectl apply`. The seed IS the receipt trust anchor — do not lose it.
+#   avctl keygen --output /tmp/signing.seed
+#   kubectl -n agentvisor-ai create secret generic agentvisor-ai-signing-seed \
+#       --from-file=signing.seed=/tmp/signing.seed
+#   shred -u /tmp/signing.seed
+#   kubectl -n agentvisor-ai apply -f agentvisor-ai.yaml
+#
+# Notes:
+# - The embedded event bridge stores receipts/events on the PVC, which pins
+#   the Deployment to one replica. For horizontal scale switch
+#   bridge_backend to kafka/nats and state_backend to redis (see
+#   config/harness.docker.toml in the repository) — then replicas can grow.
+# - Replace the image with your registry copy; build it from docker/Dockerfile.
+# - Retaining the signing-seed Secret is essential: losing it means every
+#   existing receipt fails verification against the operator's published
+#   pubkey. Back it up out of band (Vault, sealed-secret, KMS-encrypted
+#   backup).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agentvisor-ai-config
+data:
+  agentvisor.toml: |
+    config_version = 1
+    listen = "0.0.0.0:8484"
+
+    # Override per environment. AV_UPSTREAM_URL beats this value if set.
+    upstream_url = "https://api.openai.com"
+
+    # The API key is mounted as an env var from the Secret below.
+    upstream_api_key_env = "AV_UPSTREAM_API_KEY"
+
+    # Dev posture. In production configure identity_jwks_url and set
+    # require_identity = true.
+    require_identity = false
+
+    atif_spool_dir = "/app/spool/atif"
+    bridge_data_dir = "/app/data/bridge"
+    bridge_backend = "embedded"
+    bridge_manifest_path = "/app/manifests/bridge.example.yaml"
+    tool_schema_dir = "/app/config/tool-schemas"
+    wasm_policy_paths = ["/app/config/policies/payload_limit.wat"]
+    state_backend = "memory"
+    embedder_backend = "hash"
+    vector_backend = "memory"
+
+    [breaker]
+    delta_epsilon = 0.30
+    window = 3
+    min_tokens = 1000
+    action = "reject"
+
+    [budget]
+    max_tokens = 200000
+    max_payout_usd_micros = 50000000
+    max_total_tool_calls = 100
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agentvisor-ai-data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentvisor-ai
+  labels:
+    app: agentvisor-ai
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # the PVC is ReadWriteOnce
+  selector:
+    matchLabels:
+      app: agentvisor-ai
+  template:
+    metadata:
+      labels:
+        app: agentvisor-ai
+    spec:
+      # Sum of the harness's four shutdown phases: HTTP drain (30 s) +
+      # worker wait_idle (30 s) + finalize_sessions (30 s) + telemetry
+      # flush (5 s when the `otel` feature is enabled, which it is in
+      # the default `--features full` build). Total budget 95 s worst
+      # case; 120 s here leaves headroom for a large spool at
+      # rolling-deploy time. If k8s sends SIGKILL before
+      # finalize_sessions returns, receipts and ATIF trajectories are
+      # lost — the very outcome the design is supposed to prevent.
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+      # Round-17 F1: kubelet projects a Secret with defaultMode: 0400
+      # as `root:65532` -r-------- inside the pod's mount namespace.
+      # The main container runs as uid 65532 (non-root) so open() on
+      # the projected file returns EACCES — the round-15 F8 fix as
+      # written blocks the pod from booting. Fix: copy the seed via
+      # an initContainer running as uid 0 into an in-memory
+      # emptyDir, chown to 65532, chmod 0600 (which the round-14
+      # require_owner_only_mode gate accepts). The Secret still
+      # requires explicit RBAC to read; the on-disk file inside the
+      # pod is unreadable to any other uid because emptyDir mode 0700.
+      initContainers:
+        - name: install-signing-seed
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              install -m 0600 -o 65532 -g 65532 \
+                /var/run/agentvisor-ai/signing-seed-source/signing.seed \
+                /etc/agentvisor-ai/signing.seed
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            # Round-26 F6: the pod-level securityContext does not set
+            # a default seccompProfile, so the initContainer would
+            # otherwise inherit `Unconfined` on any cluster whose
+            # namespace does not enforce a PodSecurity `restricted`
+            # label. The main container correctly sets
+            # RuntimeDefault (below), but the initContainer runs as
+            # uid 0 with CHOWN+FOWNER — a much bigger surface if
+            # exposed to the full kernel ABI. Filter the same way.
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              add: ["CHOWN", "FOWNER"]
+              drop: ["ALL"]
+          volumeMounts:
+            - name: signing-seed-source
+              mountPath: /var/run/agentvisor-ai/signing-seed-source
+              readOnly: true
+            - name: signing-seed
+              mountPath: /etc/agentvisor-ai
+      containers:
+        - name: agentvisor-ai
+          image: agentvisor-ai:local # replace with your registry image
+          ports:
+            - containerPort: 8484
+              name: http
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: AV_CONFIG
+              value: /etc/agentvisor-ai/agentvisor.toml
+            - name: AV_SIGNING_SEED_FILE
+              # Round-15 F8 / round-17 F1: the signing seed IS the
+              # receipt trust anchor. Reader-side lives in an in-pod
+              # `emptyDir { medium: Memory }` populated by the
+              # install-signing-seed initContainer (chmod 0600,
+              # chown 65532:65532). Source of truth is the
+              # `agentvisor-ai-signing-seed` k8s Secret — see the
+              # matching `signing-seed-source` volume below.
+              value: /etc/agentvisor-ai/signing.seed
+            - name: AV_UPSTREAM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: agentvisor-ai-upstream
+                  key: api-key
+          volumeMounts:
+            - name: config
+              mountPath: /etc/agentvisor-ai/agentvisor.toml
+              subPath: agentvisor.toml
+              readOnly: true
+            - name: signing-seed
+              mountPath: /etc/agentvisor-ai/signing.seed
+              subPath: signing.seed
+              readOnly: true
+            - name: data
+              mountPath: /app/data
+            # Round-24 F4: the ATIF spool used to be an emptyDir. That
+            # volume is destroyed with the Pod. terminationGracePeriod
+            # protects voluntary shutdown; OOMKill, node loss,
+            # preemption, --force delete, and NodePressure eviction
+            # bypass grace and lose in-flight journals — the very
+            # outcome the four-phase finalize was designed to
+            # prevent. Subpath the spool onto the existing durable
+            # PVC so recover_spooled_sessions() has real inputs on
+            # restart.
+            - name: data
+              mountPath: /app/spool
+              subPath: spool
+          # Cold-start budget: schema compilation, ONNX weights when the
+          # embedder backend is `onnx`, and embedded-bridge recovery from
+          # the mounted PVC can trivially exceed 5 s. A startupProbe with
+          # a longer failureThreshold gives that window without disabling
+          # readiness/liveness afterwards.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60 # 5 minutes total (5 s * 60)
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+              ephemeral-storage: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false # /app/data and /app/spool are writable mounts
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          configMap:
+            name: agentvisor-ai-config
+        # Round-17 F1: source-of-truth for the signing seed. Mounted
+        # only in the install-signing-seed initContainer, which
+        # copies the file to the `signing-seed` in-pod emptyDir with
+        # uid 65532 / mode 0600 (the mode the harness's
+        # `require_owner_only_mode` gate accepts).
+        - name: signing-seed-source
+          secret:
+            secretName: agentvisor-ai-signing-seed
+            defaultMode: 0400
+            items:
+              - key: signing.seed
+                path: signing.seed
+        # In-pod, in-memory home for the copied seed. Emptied on
+        # every pod restart (the initContainer refills it before the
+        # main container starts). `emptyDir { medium: Memory }`
+        # keeps it off disk entirely.
+        - name: signing-seed
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: data
+          persistentVolumeClaim:
+            claimName: agentvisor-ai-data
+        # Round-24 F4: ATIF spool now lives on the durable PVC via
+        # subPath (see the container's volumeMounts). The old
+        # emptyDir volume was destroyed on any involuntary Pod
+        # termination and lost in-flight journals.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentvisor-ai
+spec:
+  selector:
+    app: agentvisor-ai
+  ports:
+    - name: http
+      port: 8484
+      targetPort: http
+---
+# Single-replica starter (see header): a voluntary node drain would otherwise
+# yield an outage window with no gate. minAvailable:1 surfaces the drain to
+# whoever kicks it off, so operators cannot silently interrupt the audit
+# trail without acknowledgment. Delete this PDB when scaling to a stateless
+# backend (kafka/nats + redis).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: agentvisor-ai
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: agentvisor-ai

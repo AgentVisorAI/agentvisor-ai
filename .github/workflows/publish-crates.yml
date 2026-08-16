@@ -71,18 +71,18 @@ jobs:
         run: |
           set -euo pipefail
           crates=(
-            ab-core
-            ab-events
-            ab-compress
-            ab-loopdetect
-            ab-state
-            ab-atif
-            ab-receipts
-            ab-bridge
-            ab-identity
-            ab-sandbox
-            ab-harness
-            ab-cli
+            av-core
+            av-events
+            av-compress
+            av-loopdetect
+            av-state
+            av-atif
+            av-receipts
+            av-bridge
+            av-identity
+            av-sandbox
+            av-harness
+            av-cli
           )
           for crate in "${crates[@]}"; do
             echo "::group::dry-run package $crate"
@@ -123,18 +123,18 @@ jobs:
             exit 1
           fi
           crates=(
-            ab-core
-            ab-events
-            ab-compress
-            ab-loopdetect
-            ab-state
-            ab-atif
-            ab-receipts
-            ab-bridge
-            ab-identity
-            ab-sandbox
-            ab-harness
-            ab-cli
+            av-core
+            av-events
+            av-compress
+            av-loopdetect
+            av-state
+            av-atif
+            av-receipts
+            av-bridge
+            av-identity
+            av-sandbox
+            av-harness
+            av-cli
           )
           for crate in "${crates[@]}"; do
             echo "::group::publish $crate"

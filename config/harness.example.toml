@@ -23,7 +23,7 @@ upstream_read_timeout_s = 300
 # tool_upstream_bearer_file = "/run/secrets/mcp_token"
 
 require_identity = false
-audience = "agent-bridge"
+audience = "agentvisor-ai"
 default_workflow = "unsigned"
 consequential_tools = ["db_write", "payout", "merge", "deploy"]
 session_idle_close_s = 900
