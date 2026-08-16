@@ -758,3 +758,70 @@ fn iso8601_calendar_rules_are_exact() {
         assert!(has_issue(&with_ts(ts), "timestamp"), "{ts} must be flagged");
     }
 }
+
+/// Consistency pass (2026-08-16): the shipped JSON Schema was only ever
+/// checked against the single golden file, so it and the Rust strict
+/// validator could silently diverge on any other document. External
+/// consumers validate our exports with the schema, so the load-bearing
+/// direction is: every v1.7 document the Rust validator accepts as
+/// strict-valid MUST also pass the shipped schema. (The inverse is
+/// intentionally not required — strict mode enforces Harbor semantics
+/// JSON Schema cannot express, like sequential step ids.)
+#[test]
+fn rust_strict_valid_v17_documents_always_pass_the_shipped_schema() {
+    use serde_json::json;
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../../../schemas/atif-v1.7.schema.json")).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    // Strict v1.7 requires complete token metrics on agent-sourced steps.
+    let metrics = json!({"metrics": {
+        "prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0
+    }});
+    let corpus = vec![
+        ("golden", golden()),
+        ("minimal", minimal("1.7", json!({}), metrics.clone())),
+        (
+            "root extra",
+            minimal("1.7", json!({"extra": {"note": "x"}}), metrics.clone()),
+        ),
+        (
+            "tool_definitions",
+            minimal(
+                "1.7",
+                json!({"agent": {"name": "a", "version": "1", "tool_definitions": []}}),
+                metrics.clone(),
+            ),
+        ),
+        (
+            "system observation",
+            minimal(
+                "1.7",
+                json!({}),
+                json!({"source": "system", "observation": {"results": []}, "message": "m"}),
+            ),
+        ),
+        ("multimodal message", {
+            let mut v = minimal("1.7", json!({}), metrics.clone());
+            v["steps"][0]["message"] = json!([{"type": "text", "text": "hi"}]);
+            v
+        }),
+        ("no session_id", {
+            let mut v = minimal("1.7", json!({}), metrics.clone());
+            v.as_object_mut().unwrap().remove("session_id");
+            v
+        }),
+    ];
+    for (label, document) in corpus {
+        let issues = validate_value(&document, Mode::Strict);
+        assert!(
+            issues.is_empty(),
+            "{label}: fixture must be strict-valid: {issues:#?}"
+        );
+        let errors: Vec<String> = validator.iter_errors(&document).map(|e| e.to_string()).collect();
+        assert!(
+            errors.is_empty(),
+            "{label}: strict-valid document rejected by the shipped JSON Schema — the two \
+             validators have diverged: {errors:#?}"
+        );
+    }
+}
