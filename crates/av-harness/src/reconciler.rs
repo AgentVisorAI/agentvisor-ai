@@ -4789,9 +4789,9 @@ mod tests {
         // Seed the spool with a pile of candidates that fail provenance
         // (unauthenticated / not `.session.json`) so recovery iterates
         // read_dir + read + hash + skip on each, taking observable
-        // wall-clock time. 64 candidates × per-file work ≫ the 200 ms
-        // budget below on the old global lock.
-        for i in 0..64 {
+        // wall-clock time (512 candidates so the scan reliably outlasts
+        // one unrelated close even on fast disks).
+        for i in 0..512 {
             let path = directory.path().join(format!("scan-probe-{i}.json"));
             let payload = serde_json::json!({
                 "atif_version": "1.7",
@@ -4806,9 +4806,10 @@ mod tests {
         }
         let f_scan = Arc::clone(&finalizer);
         let scan_task = tokio::spawn(async move {
-            f_scan
+            let _ = f_scan
                 .recover_spooled_sessions(&crate::session::SessionRegistry::new(), &Default::default())
-                .await
+                .await;
+            std::time::Instant::now()
         });
         // Small yield so the scan task grabs `recovery_lock` first —
         // this is the state where the old global `lifecycle_lock`
@@ -4826,20 +4827,29 @@ mod tests {
             },
             Default::default(),
         ));
-        // Tight timeout: under the OLD global `lifecycle_lock`, the
-        // client close would have waited for the entire 64-file
-        // scan to finish. Under per-session locks the close hits a
-        // different id and proceeds in a few ms.
-        let close_result = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
+        // Ordering bound, not wall-clock: under the OLD global
+        // `lifecycle_lock` the close can only complete AFTER the scan
+        // releases the lock, so close_end >= scan_end by construction.
+        // Under per-session locks the close overlaps the still-running
+        // 512-file scan and ends first. The previous absolute 200 ms
+        // budget flaked under full-suite load (CPU starvation and fsync
+        // contention inflate the close even though nothing is blocked);
+        // an end-ordering comparison inflates both sides together. The
+        // generous outer timeout only catches genuine deadlocks.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
             finalizer.close_session(session, StopReason::SessionClosed),
         )
-        .await;
+        .await
+        .expect("unrelated close deadlocked behind the recovery scan");
+        let close_end = std::time::Instant::now();
+        let scan_end = scan_task.await.unwrap();
         assert!(
-            close_result.is_ok(),
-            "unrelated close was head-of-line-blocked by the recovery scan (should have completed within 200 ms)"
+            close_end < scan_end,
+            "unrelated close finished only after the recovery scan ended — the head-of-line \
+             blocking signature of a global lifecycle lock (close_end {close_end:?} >= scan_end \
+             {scan_end:?})"
         );
-        let _ = scan_task.await;
     }
 
     /// A saturated worker-side finalizer must not hold the lifecycle_lock
