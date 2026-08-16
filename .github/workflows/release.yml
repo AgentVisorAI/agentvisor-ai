@@ -50,18 +50,18 @@ jobs:
           CARGO_PROFILE_RELEASE_STRIP: symbols
         run: |
           cargo build --release --target ${{ matrix.target }} \
-            -p ab-harness --bin agentbridged \
-            -p ab-cli --bin abctl
+            -p av-harness --bin agentvisord \
+            -p av-cli --bin avctl
       - name: Package archive
         id: package
         shell: bash
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          stage="agent-bridge-${version}-${{ matrix.target }}"
+          stage="agentvisor-ai-${version}-${{ matrix.target }}"
           mkdir -p "$stage"
-          cp target/${{ matrix.target }}/release/agentbridged "$stage/"
-          cp target/${{ matrix.target }}/release/abctl "$stage/"
+          cp target/${{ matrix.target }}/release/agentvisord "$stage/"
+          cp target/${{ matrix.target }}/release/avctl "$stage/"
           cp LICENSE README.md CHANGELOG.md SECURITY.md "$stage/"
           tar -czf "$stage.tar.gz" "$stage"
           shasum -a 256 "$stage.tar.gz" > "$stage.tar.gz.sha256"

@@ -8,20 +8,20 @@ ADD --checksum=sha256:be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
 COPY schemas ./schemas
-# `crates/ab-harness/src/main.rs` uses `include_str!("../../../config/
+# `crates/av-harness/src/main.rs` uses `include_str!("../../../config/
 # policies/payload_limit.wat")` to embed the default policy so
-# `cargo install ab-harness` works from an empty directory. The build
+# `cargo install av-harness` works from an empty directory. The build
 # stage therefore needs the config tree available at compile time —
 # without this COPY the build fails with "couldn't read
 # .../config/policies/payload_limit.wat".
 COPY config ./config
-RUN cargo build --locked --release -p ab-harness --features full --bin agentbridged -p ab-cli --bin abctl
+RUN cargo build --locked --release -p av-harness --features full --bin agentvisord -p av-cli --bin avctl
 RUN mkdir -p /tmp/runtime-root/data /tmp/runtime-root/spool
 
 FROM cgr.dev/chainguard/glibc-dynamic:latest AS runtime
 WORKDIR /app
-COPY --from=build /src/target/release/agentbridged /usr/local/bin/agentbridged
-COPY --from=build /src/target/release/abctl /usr/local/bin/abctl
+COPY --from=build /src/target/release/agentvisord /usr/local/bin/agentvisord
+COPY --from=build /src/target/release/avctl /usr/local/bin/avctl
 COPY --from=build --chown=65532:65532 /tmp/models /app/models
 COPY --from=build --chown=65532:65532 /tmp/runtime-root/ /app/
 COPY --chown=65532:65532 schemas ./schemas
@@ -34,5 +34,5 @@ USER 65532
 EXPOSE 8484
 # Standalone single-container defaults (embedded bridge, in-memory state).
 # The full-stack compose file overrides this with harness.docker.toml.
-ENV AB_CONFIG=/app/config/harness.container.toml
-ENTRYPOINT ["agentbridged"]
+ENV AV_CONFIG=/app/config/harness.container.toml
+ENTRYPOINT ["agentvisord"]

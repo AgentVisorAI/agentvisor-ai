@@ -1,4 +1,4 @@
-# AgentBridge — Engineering Plan
+# AgentVisor AI — Engineering Plan
 
 Source of truth: `AgentBridge.docx` v2.0 ("Technical Architecture Brief: The Agent Event Bridge & Harness (MVP)").
 External specs verified against primary sources on 2026-08-10:
@@ -14,24 +14,24 @@ No wasm32 rustup targets (not needed: WAT text modules compile in-process via wa
 
 ## 1. What we are building
 
-A Cargo workspace, `agent-bridge`, delivering:
+A Cargo workspace, `agentvisor-ai`, delivering:
 
-1. **The Harness** (`agent-bridge` binary): an Axum/Tokio inline proxy exposing an OpenAI-compatible
+1. **The Harness** (`agentvisor-ai` binary): an Axum/Tokio inline proxy exposing an OpenAI-compatible
    `POST /v1/chat/completions` route (LiteLLM-compatible), an MCP JSON-RPC intercept route, and admin/ops
    routes. Hot path stays under a strict per-stage budget; heavy work is offloaded to async workers over
    bounded channels; every action emits an OCSF event onto the Bridge.
-2. **The Bridge** (`ab-bridge` crate + embedded broker): a portable, self-hostable event bus with a
+2. **The Bridge** (`av-bridge` crate + embedded broker): a portable, self-hostable event bus with a
    declarative topic-schema manifest, partition-by-`instance_uid` ordered replay, retention + cold-tier
    export, and pluggable backends (embedded file-backed reference implementation; NATS JetStream and
    Kafka-wire/Redpanda connectors behind features).
-3. **Receipts** (`ab-receipts`): JCS (RFC 8785) canonicalization, SHA-256 event-chain hashing, Ed25519
+3. **Receipts** (`av-receipts`): JCS (RFC 8785) canonicalization, SHA-256 event-chain hashing, Ed25519
    session receipts, fully offline verification, key rotation via key ids.
-4. **ATIF export** (`ab-atif`): schema-faithful ATIF v1.7 writer + strict validator (Harbor semantics),
+4. **ATIF export** (`av-atif`): schema-faithful ATIF v1.7 writer + strict validator (Harbor semantics),
    reader accepting v1.0-v1.7, atomic spool files, reconciler promotion to retroactive Receipts.
 5. **Enforcement modules**: semantic loop breaker (Module A), MCP tool sandbox with WASM policies and
    action budgets (Module B), in-flight context compression (Module C), NHI identity validation with
    scope-inheritance delegation (Module D).
-6. **`abctl` CLI**: keygen, receipt verify, ATIF validate, manifest validate/provision, event tail,
+6. **`avctl` CLI**: keygen, receipt verify, ATIF validate, manifest validate/provision, event tail,
    session promote, config validate, loadgen (SLA measurement).
 
 Non-goals carried from the brief: no web UI (Prometheus + raw event stream only), no multi-region
@@ -54,23 +54,23 @@ llm_proxy/
 ├── docker/Dockerfile  docker-compose.yml  vector.toml
 ├── .github/workflows/ci.yml
 └── crates/
-    ├── ab-core        # ids (UUIDv7), time, approx tokenizer, digests, metrics registry, errors, config primitives
-    ├── ab-events      # OCSF event model (ai_operation profile), stop_reason ids, schema validation, seq numbering
-    ├── ab-atif        # ATIF v1.7 model, writer, strict validator, v1.0–v1.7 reader, golden files
-    ├── ab-receipts    # JCS canonicalization, event-chain hash, Ed25519 sign/verify, keyring, Signer trait
-    ├── ab-state       # StateStore trait: atomic counters, token velocity, rate limits, action budgets; InMemory + Redis(feature)
-    ├── ab-bridge      # EventBus trait; embedded file-backed broker; manifest model + provisioner; NATS/Kafka connectors (features)
-    ├── ab-identity    # NHI JWT validation (EdDSA/HS256), TTL cap, scope inheritance, delegation chains, JWKS sources
-    ├── ab-compress    # chat-payload parser, pruning passes, invariants, metrics mirroring ATIF token fields
-    ├── ab-loopdetect  # Embedder trait (HashEmbedder default; tract-onnx behind feature), delta window, circuit breaker
-    ├── ab-sandbox     # JSON-RPC/MCP parse, JSON Schema arg validation, native policy engine, wasmtime WASM policies, budgets
-    ├── ab-harness     # Axum app: hot path pipeline, worker pool, session registry, receipt/ATIF issuance, reconciler, /metrics
-    └── ab-cli         # abctl
+    ├── av-core        # ids (UUIDv7), time, approx tokenizer, digests, metrics registry, errors, config primitives
+    ├── av-events      # OCSF event model (ai_operation profile), stop_reason ids, schema validation, seq numbering
+    ├── av-atif        # ATIF v1.7 model, writer, strict validator, v1.0–v1.7 reader, golden files
+    ├── av-receipts    # JCS canonicalization, event-chain hash, Ed25519 sign/verify, keyring, Signer trait
+    ├── av-state       # StateStore trait: atomic counters, token velocity, rate limits, action budgets; InMemory + Redis(feature)
+    ├── av-bridge      # EventBus trait; embedded file-backed broker; manifest model + provisioner; NATS/Kafka connectors (features)
+    ├── av-identity    # NHI JWT validation (EdDSA/HS256), TTL cap, scope inheritance, delegation chains, JWKS sources
+    ├── av-compress    # chat-payload parser, pruning passes, invariants, metrics mirroring ATIF token fields
+    ├── av-loopdetect  # Embedder trait (HashEmbedder default; tract-onnx behind feature), delta window, circuit breaker
+    ├── av-sandbox     # JSON-RPC/MCP parse, JSON Schema arg validation, native policy engine, wasmtime WASM policies, budgets
+    ├── av-harness     # Axum app: hot path pipeline, worker pool, session registry, receipt/ATIF issuance, reconciler, /metrics
+    └── av-cli         # avctl
 ```
 
 Crate DAG (build order; no cycles):
-`ab-core` → `ab-events` → `ab-atif` → `ab-receipts` → `ab-state` → `ab-identity` → `ab-compress` →
-`ab-loopdetect` → `ab-bridge` → `ab-sandbox` → `ab-harness` → `ab-cli`.
+`av-core` → `av-events` → `av-atif` → `av-receipts` → `av-state` → `av-identity` → `av-compress` →
+`av-loopdetect` → `av-bridge` → `av-sandbox` → `av-harness` → `av-cli`.
 
 ---
 
@@ -82,10 +82,10 @@ worker (non-blocking `try_send` on bounded channels) → forward upstream → st
 Workers do: embedding, loop delta, OCSF emission, bridge publish, ATIF append. **Nothing on the hot path
 ever awaits a worker.** Loop-breaker verdicts feed back through shared session state consulted at the
 next request/chunk boundary (enforcement is inline; computation is off-path). Any stage instrumented via
-a per-stage histogram; a strict mode (`AB_STRICT_BUDGET`) flags stages > 2.0 ms.
+a per-stage histogram; a strict mode (`AV_STRICT_BUDGET`) flags stages > 2.0 ms.
 
 ### D2. Channel overflow is never silent
-`try_send` failure increments `ab_events_dropped_total{stage}` and logs at WARN with session id. Tests
+`try_send` failure increments `av_events_dropped_total{stage}` and logs at WARN with session id. Tests
 force overflow and assert the counter. Drop policy: drop-newest for telemetry events (hot path never
 blocks); ATIF-bearing work reserves worker capacity before quota mutation, so overflow fails the
 request closed at admission instead of dropping audit steps mid-flight (fidelity criterion).
@@ -93,15 +93,15 @@ request closed at admission instead of dropping audit steps mid-flight (fidelity
 ### D3. Embedded broker is the reference Bridge backend
 Redpanda requires Docker (daemon down) and NATS is an external binary. To make the Bridge contract
 *hermetically testable* — and to honestly serve the brief's "single container/binary + manifest,
-air-gapped" portability contract — `ab-bridge` ships an embedded, file-backed, Kafka-like log:
+air-gapped" portability contract — `av-bridge` ships an embedded, file-backed, Kafka-like log:
 topics → partitions → append-only JSONL segments with offsets, consumer offset tracking, per-topic
 retention, partition key = `ai_agent.instance_uid` (ordered per-agent replay). NATS JetStream
 (`async-nats`) and Kafka-wire (`rskafka`, works against Redpanda) connectors compile behind `nats` /
-`kafka` features with contract tests gated on `AB_NATS_URL` / `AB_KAFKA_BROKER` (attempted live via brew
+`kafka` features with contract tests gated on `AV_NATS_URL` / `AV_KAFKA_BROKER` (attempted live via brew
 `nats-server` during verification; skipped-with-notice otherwise — a skipped gate prints, never silently passes).
 
 ### D4. Canonicalization = RFC 8785 (JCS)
-Receipts hash `JCS(event)`; chain: `h[0] = SHA256("ab-genesis" ‖ session_id)`,
+Receipts hash `JCS(event)`; chain: `h[0] = SHA256("av-genesis" ‖ session_id)`,
 `h[i] = SHA256(h[i-1] ‖ JCS(event_i))`. JCS chosen because the OCSF Fingerprint object already
 standardizes JCS for canonical JSON (per the PR thread). Numbers: JCS mandates IEEE-754 doubles →
 all counters validated ≤ 2^53 (guard + test; silently-lossy integers are a classic silent error).
@@ -122,7 +122,7 @@ model, and its 384-dimensional output passes the live Qdrant contract. `HashEmbe
 deterministic, zero-artifact fallback for minimal embedded tests and explicitly configured deployments.
 
 ### D7. WASM policies are real, tests need no external toolchain
-`ab-sandbox` embeds wasmtime; policy modules receive the tool-call JSON + budget state and return
+`av-sandbox` embeds wasmtime; policy modules receive the tool-call JSON + budget state and return
 allow/deny + reason via a tiny ABI (linear memory in/out). Tests compile policies from WAT text
 in-process (wasmtime's `wat` feature) — no wasm32 target, no npm/clang. A native (Rust closure) policy
 engine is the default for zero-dependency deployments; WASM is on by default in the workspace build.
@@ -145,16 +145,16 @@ parses; no orphaned `tool_call_id`; compression idempotent (`c(c(x)) == c(x)`); 
 tokens. Metrics mirror ATIF names (`prompt_tokens`, `completion_tokens`, `cached_tokens`) per Module C.
 
 ### D10. Token counting
-Deterministic approximate tokenizer in `ab-core` (word/punct/CJK-aware; documented as an approximation,
+Deterministic approximate tokenizer in `av-core` (word/punct/CJK-aware; documented as an approximation,
 property-tested for monotonicity ­— more text never fewer tokens — and Unicode safety). Used for budgets,
 velocity, compression ratios. Exact provider counts, when present in responses, are recorded alongside.
 
 ### D11. Session lifecycle
-`X-AB-Session` (or generated UUIDv7), `X-AB-Workflow: signed|unsigned` (default unsigned),
+`X-AV-Session` (or generated UUIDv7), `X-AV-Workflow: signed|unsigned` (default unsigned),
 `Authorization: Bearer <NHI JWT>`. Close: explicit `POST /v1/sessions/{id}/close`, idle sweep, or client
 abort (stream-drop still finalizes — silent-error #12). Signed close → receipt issued async (< 2 ms
 sign; measured). Unsigned close → ATIF spool (atomic tmp+rename). Promotion:
-`POST /v1/sessions/{id}/promote` or `abctl session promote` → reconciler (5 s tick) issues retroactive
+`POST /v1/sessions/{id}/promote` or `avctl session promote` → reconciler (5 s tick) issues retroactive
 receipt ≤ 60 s (measured); promotion idempotent (double-promote = one receipt).
 
 ### D12. Evolution with time (explicit user requirement) — see EVOLUTION.md
@@ -190,7 +190,7 @@ receipt ≤ 60 s (measured); promotion idempotent (double-promote = one receipt)
 12. Client abort mid-stream orphans session → drop-guard finalization test.
 13. Reconciler crash/restart double-issues → idempotency test.
 14. Per-partition ordering violated → interleaved-publish replay test asserts per-`instance_uid` order.
-15. Worker panic kills pipeline → supervisor restarts, `ab_worker_panics_total` increments, hot path
+15. Worker panic kills pipeline → supervisor restarts, `av_worker_panics_total` increments, hot path
     unaffected (test kills a worker mid-flight).
 16. Torn ATIF file on crash → atomic tmp+rename; partial-file test rejected by validator, not counted.
 17. Metrics endpoint drift → scrape test parses Prometheus text and asserts required series exist.
@@ -206,7 +206,7 @@ jsonwebtoken; jsonschema; uuid (v7); dashmap, parking_lot; bounded Tokio mpsc sh
 brief); thiserror (libs), anyhow (bins); tracing (+subscriber); serde_yaml (manifest), toml (config);
 clap (CLI); reqwest (CLI/JWKS/loadgen); criterion, proptest, tempfile (dev). Feature-gated: `redis`,
 `async-nats`, `rskafka`, `tract-onnx`, wasmtime (default-on). Metrics registry is hand-rolled in
-`ab-core` (atomic counters/histograms → Prometheus text) — zero dep churn on a hot-path surface.
+`av-core` (atomic counters/histograms → Prometheus text) — zero dep churn on a hot-path surface.
 
 ### D15. Lint & correctness gates
 Workspace lints: `unsafe_code = "forbid"`, `warnings = "deny"` in CI, clippy `pedantic` (curated),
@@ -222,36 +222,36 @@ This is the implementation traceability record, not a test report. Current measu
 
 | # | Brief requirement | Where implemented | Proof (test/bench/doc) |
 |---|---|---|---|
-| R1 | §2 signed hot-path added latency p95 ≤ 5 ms, p99 ≤ 8 ms | ab-harness pipeline | release `sla_core_metrics`; scope and limits in BENCHMARKS.md |
+| R1 | §2 signed hot-path added latency p95 ≤ 5 ms, p99 ≤ 8 ms | av-harness pipeline | release `sla_core_metrics`; scope and limits in BENCHMARKS.md |
 | R2 | §2 > 2 ms work must be off the async request runtime | blocking-pool middleware + bounded sharded workers | all-feature lint/tests; stage histograms |
-| R3 | §2 receipts batched off hot path, finalized once at session close | ab-harness session close → ab-receipts | test: no signing occurs per-chunk (call-count probe); close issues exactly one |
+| R3 | §2 receipts batched off hot path, finalized once at session close | av-harness session close → av-receipts | test: no signing occurs per-chunk (call-count probe); close issues exactly one |
 | R4 | §2 ATIF path separate from signed hot path | authenticated journals + snapshot writer | write-failure retry, torn-tail, tamper, and restart tests |
-| R5 | A: loop detect via embeddings, Δ≈0 over 3 steps + N tokens → 429/inject, OCSF event with stop_reason_id | ab-loopdetect + harness enforcement | synthetic loop suite: 100 % catch ≤ 3 cycles; progressing suite: 0 false trips; emitted event schema-validated |
-| R6 | B: MCP JSON-RPC intercept, WASM policies (wasmtime), action budgets (max_db_writes, max_payout_usd), schema-invalid blocked, < 5 ms | ab-sandbox (+ab-state) | block-latency bench < 5 ms; budget stress; WAT policy tests; JSON-schema negative suite; per-call OCSF event w/ budget consumption |
-| R7 | C: parse payloads, prune, 30-50 % reduction on ≥ 50 k-token histories, metrics mirror ATIF fields | ab-compress | 50 k synthetic corpus test asserts ≥ 30 %; invariant property tests; metric name parity test |
-| R8 | D: short-lived JWT/HMAC, IdP-bound, scope inheritance, 15-min TTL, instance_uid+TTL in event identity block | ab-identity + ab-events | adversarial JWT suite; delegation property tests; event identity-block content test |
-| R9 | E: events carry ai_agent.version/charter/instance_uid + stop_reason_id per PR #1; metadata v1.10.0 | ab-events | golden events validated against shipped JSON Schemas; field-presence tests |
-| R10 | E roadmap: Fingerprint observable (tool schemas + sampling params), JCS | ab-events model/schema only | roadmap shape test; not an MVP gate |
-| R11 | F: broker Redpanda ref + NATS alt; topic per event class; partition by instance_uid; ordered replay | ab-bridge (embedded + `kafka`/`nats` features) | embedded contract suite (ordering, replay, offsets); connector contract tests (live-gated) |
-| R12 | F: portability = single binary + declarative manifest; schema-validated provisioning | ab-bridge manifest + `abctl bridge provision` | provision-from-manifest-alone integration test (fresh dir), events schema-validated, wall-time recorded (≪ 15 min) |
+| R5 | A: loop detect via embeddings, Δ≈0 over 3 steps + N tokens → 429/inject, OCSF event with stop_reason_id | av-loopdetect + harness enforcement | synthetic loop suite: 100 % catch ≤ 3 cycles; progressing suite: 0 false trips; emitted event schema-validated |
+| R6 | B: MCP JSON-RPC intercept, WASM policies (wasmtime), action budgets (max_db_writes, max_payout_usd), schema-invalid blocked, < 5 ms | av-sandbox (+av-state) | block-latency bench < 5 ms; budget stress; WAT policy tests; JSON-schema negative suite; per-call OCSF event w/ budget consumption |
+| R7 | C: parse payloads, prune, 30-50 % reduction on ≥ 50 k-token histories, metrics mirror ATIF fields | av-compress | 50 k synthetic corpus test asserts ≥ 30 %; invariant property tests; metric name parity test |
+| R8 | D: short-lived JWT/HMAC, IdP-bound, scope inheritance, 15-min TTL, instance_uid+TTL in event identity block | av-identity + av-events | adversarial JWT suite; delegation property tests; event identity-block content test |
+| R9 | E: events carry ai_agent.version/charter/instance_uid + stop_reason_id per PR #1; metadata v1.10.0 | av-events | golden events validated against shipped JSON Schemas; field-presence tests |
+| R10 | E roadmap: Fingerprint observable (tool schemas + sampling params), JCS | av-events model/schema only | roadmap shape test; not an MVP gate |
+| R11 | F: broker Redpanda ref + NATS alt; topic per event class; partition by instance_uid; ordered replay | av-bridge (embedded + `kafka`/`nats` features) | embedded contract suite (ordering, replay, offsets); connector contract tests (live-gated) |
+| R12 | F: portability = single binary + declarative manifest; schema-validated provisioning | av-bridge manifest + `avctl bridge provision` | provision-from-manifest-alone integration test (fresh dir), events schema-validated, wall-time recorded (≪ 15 min) |
 | R13 | F: retention 30 d default + cold-tier export to customer storage | broker retention + `ColdArchive` retry outbox | embedded expiry and object-store contract tests |
-| R14 | G: session-close JCS canonicalization + Ed25519 receipt; offline verify; payload fields per brief | ab-receipts | RFC 8785 vectors; tamper/mutation suite; offline verify (no bridge handle in scope); payload field test; sign latency bench < 2 ms |
+| R14 | G: session-close JCS canonicalization + Ed25519 receipt; offline verify; payload fields per brief | av-receipts | RFC 8785 vectors; tamper/mutation suite; offline verify (no bridge handle in scope); payload field test; sign latency bench < 2 ms |
 | R15 | G: signing reserved for consequential actions by policy | harness config (`signed` workflow opt-in) | default-unsigned test; per-workflow policy test |
-| R16 | H: ATIF v1.7 capture: root object, agent config, ordered steps, aggregate metrics | ab-atif | golden trajectories; strict validator (Harbor rules: sequential ids, agent-only fields, source_call_id refs, ISO-8601) |
-| R17 | H: cached-token metrics intact → replayable checkpoint | ab-atif metrics | fidelity test: 100 % steps carry prompt/completion/cached counts through export |
-| R18 | H: reconciler promotes → retroactive receipt, never blocking hot path | ab-harness reconciler | promotion ≤ 60 s test (measured); hot-path isolation test; idempotency test |
+| R16 | H: ATIF v1.7 capture: root object, agent config, ordered steps, aggregate metrics | av-atif | golden trajectories; strict validator (Harbor rules: sequential ids, agent-only fields, source_call_id refs, ISO-8601) |
+| R17 | H: cached-token metrics intact → replayable checkpoint | av-atif metrics | fidelity test: 100 % steps carry prompt/completion/cached counts through export |
+| R18 | H: reconciler promotes → retroactive receipt, never blocking hot path | av-harness reconciler | promotion ≤ 60 s test (measured); hot-path isolation test; idempotency test |
 | R19 | H: Harbor interop | real HTTP harness ATIF export | CI invokes Harbor's pinned reference validator |
 | R20 | §8 stack: Rust+Axum/Tokio, wasmtime, Redis, ONNX-capable, Ed25519, OTLP/Vector | workspace | all-feature build, live OTLP protocol check, Vector config |
-| R21 | §9 data-flow sequence order | ab-harness pipeline | integration test asserts stage order via tracing span capture |
-| R22 | §10 loop SLA 100 % ≤ 3 cycles | ab-loopdetect | R5 suite |
-| R23 | §10 tool block < 5 ms | ab-sandbox | R6 bench |
-| R24 | §10 context ≥ 30 % @ ≥ 50 k | ab-compress | R7 test |
+| R21 | §9 data-flow sequence order | av-harness pipeline | integration test asserts stage order via tracing span capture |
+| R22 | §10 loop SLA 100 % ≤ 3 cycles | av-loopdetect | R5 suite |
+| R23 | §10 tool block < 5 ms | av-sandbox | R6 bench |
+| R24 | §10 context ≥ 30 % @ ≥ 50 k | av-compress | R7 test |
 | R25 | §10 10 k concurrent connections per node | release socket-level SLA | mandatory CI run at 10,000; BENCHMARKS.md |
-| R26 | §10 publish overhead ≤ 0.5 ms p99 | ab-bridge enqueue | criterion bench + in-test p99 measurement |
-| R27 | §10 receipt sign < 2 ms async | ab-receipts | bench + async-issuance test |
-| R28 | §10 ATIF fidelity 100 % valid v1.7 | ab-atif | R17 + validator pass on every exported file in integration runs |
+| R26 | §10 publish overhead ≤ 0.5 ms p99 | av-bridge enqueue | criterion bench + in-test p99 measurement |
+| R27 | §10 receipt sign < 2 ms async | av-receipts | bench + async-issuance test |
+| R28 | §10 ATIF fidelity 100 % valid v1.7 | av-atif | R17 + validator pass on every exported file in integration runs |
 | R29 | §10 reconciliation ≤ 60 s | harness | R18 |
-| R30 | §10 bridge provision < 15 min from manifest alone | ab-bridge/abctl | R12 |
+| R30 | §10 bridge provision < 15 min from manifest alone | av-bridge/avctl | R12 |
 | R31 | Non-goals respected (no UI/consensus/training/RL consumer) | — | README scope section |
 
 Anything in the brief not matching a row is a deviation listed in § 8. This matrix is re-audited at the
@@ -271,7 +271,7 @@ end of the build (final pass re-reads the docx top-to-bottom against the matrix)
   (type confusion, extra fields, oversized payloads, deep nesting), budget race stress.
 - **Concurrency**: state counter stress (64 threads × 10 k ops), bridge ordering under interleaved
   publishers, worker-panic supervision.
-- **Integration** (ab-harness/tests): full proxy flow against in-process mock provider (streaming SSE +
+- **Integration** (av-harness/tests): full proxy flow against in-process mock provider (streaming SSE +
   non-streaming), stage order, session close both workflows, promotion, metrics scrape, malformed-input
   handling, client-abort finalization.
 - **SLA measurements** (opt-in heavy + CI-scale default): R1, R22-R30 as measured numbers written to

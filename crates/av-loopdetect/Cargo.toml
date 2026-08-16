@@ -1,0 +1,44 @@
+[package]
+name = "av-loopdetect"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Semantic loop detection: embeddings, delta window, circuit breaker"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+av-core = { workspace = true }
+serde = { workspace = true }
+parking_lot = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = []
+# ONNX embedding models (MiniLM-class) via pure-Rust tract; model path supplied at runtime.
+onnx = ["dep:tract-onnx", "dep:tokenizers"]
+qdrant = ["dep:reqwest"]
+
+[dependencies.tract-onnx]
+version = "0.23"
+optional = true
+
+[dependencies.tokenizers]
+version = "0.21"
+optional = true
+
+[dependencies.reqwest]
+workspace = true
+optional = true
+
+[dev-dependencies]
+proptest = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true
