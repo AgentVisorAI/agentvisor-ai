@@ -289,8 +289,10 @@ fn policy_chain_first_deny_wins_regardless_of_order() {
 }
 
 // ------------------------------------------------------------------
-// 5. Broker: publish_idempotent + retention + re-publish still dedups.
-//    (In-memory UID map persists even after the hot record is evicted.)
+// 5. Broker: publish_idempotent + retention — a re-publish after the
+//    original expired lands on a FRESH offset (the dedup entry is dropped
+//    with the expired record; returning the stale offset would point at
+//    expired data).
 // ------------------------------------------------------------------
 
 fn min_manifest() -> BridgeManifest {

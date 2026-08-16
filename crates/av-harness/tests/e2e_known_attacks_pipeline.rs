@@ -185,7 +185,8 @@ fn wasmtime_policy_infinite_loop_is_stopped_by_fuel_or_epoch() {
 // ---------------------------------------------------------------------------
 // 6. wasmtime containment: memory-cap enforcement (attack: policy allocates
 // gigabytes to OOM the host). Wasmtime's StoreLimits caps linear memory at
-// MAX_MEMORY_BYTES; a policy trying to grow past that must trap.
+// MAX_MEMORY_BYTES; a policy trying to grow past that is contained — the
+// grow fails (or the alloc traps to a Deny); either way the host never OOMs.
 // ---------------------------------------------------------------------------
 
 #[test]

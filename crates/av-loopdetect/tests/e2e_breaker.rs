@@ -330,9 +330,9 @@ fn wide_window_accumulates_streak_and_trips_exactly_at_threshold() {
 }
 
 // ---------------------------------------------------------------------------
-// 12. Near-epsilon dance — content that alternates just below and just above
-//     the default epsilon (0.30). The breaker must never accrue a streak of 3
-//     when every other step is genuinely progressing.
+// 12. Progressing content — every step scores well above the default
+//     epsilon (0.30) on the hash embedder. The breaker must never accrue a
+//     streak of 3 when each step is genuinely progressing.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -361,7 +361,8 @@ fn near_epsilon_oscillation_never_falsely_trips() {
 // 13. Multilingual loop — same semantic concept in English then French.
 //     The hash embedder sees different character n-grams, so this WILL appear
 //     as progress. That is correct: n-gram overlap drops across languages.
-//     Assert that alternating languages stays Closed (no false positive).
+//     Alternation is embedder-sensitive, so a trip is tolerated — but if it
+//     trips, the state machine must be coherent (Open), never a nonsense state.
 // ---------------------------------------------------------------------------
 
 #[test]

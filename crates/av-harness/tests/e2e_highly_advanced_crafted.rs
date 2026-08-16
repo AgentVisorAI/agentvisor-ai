@@ -1,5 +1,6 @@
-//! Highly advanced crafted attacks — three or more defense primitives
-//! combined at once. Every test in this file simulates an attacker who has
+//! Highly advanced crafted attacks — most tests combine three or more
+//! defense primitives at once (a few isolate one boundary in depth).
+//! Every test in this file simulates an attacker who has
 //! already read the design, controls chat content or tool arguments, and
 //! is trying to open a window between two consecutive gates.
 

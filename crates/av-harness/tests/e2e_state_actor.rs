@@ -229,9 +229,10 @@ fn malformed_signature_lengths_are_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Cross-key ring — an attacker whose key ID matches a trusted id but
-//    whose bytes differ must be refused (defense against a state actor
-//    guessing/colliding a truncated key ID).
+// 7. Cross-key ring — an attacker signing with their own key (own key_id
+//    and pubkey) must be refused by a ring that only trusts the honest
+//    key: an unknown key_id can never satisfy the ring lookup, so a state
+//    actor cannot substitute material a verifier never enrolled.
 // ---------------------------------------------------------------------------
 
 #[test]

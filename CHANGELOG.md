@@ -4,6 +4,38 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Review rounds 18–29: runtime-prose sweeps and the cross-model QC program (2026-08-16)
+
+Rounds 18–25 extended the audit beyond code comments to every other
+claim-bearing surface, each swept as an explicit class: the round-17
+fixes themselves (self-review caught one overreach), TODO/promise
+markers (the compression-marker limitation is now tracked in
+SECURITY-AUDIT.md instead of only in its own comment), runtime error
+strings (the zero-config quick start recommended the nonexistent
+`agentvisor-ai` binary; five feature-gate bails named it too — all now
+name `agentvisord` with the rebuild command), the generated
+`avctl init` config template and clap help (verified drift-proof via
+the from_toml round-trip), Prometheus HELP text (one divergent family
+unified), `avctl doctor` diagnostics (no-schema warnings now state the
+configured posture's real consequence), and the issue template
+(`avctl --version` instead of a command that never existed).
+
+Rounds 26–29 ran an independent cross-model QC program: a second
+model re-reviewed every source file in the workspace (~50 files, four
+tranches). It found 25 genuine misses, all in headline doc summaries —
+rounded-off conditionals ("all"/"every"/"never" where the code has
+caps, role filters, or opt-ins), mechanisms that had been refactored
+away (a render()-panics claim, a global-lock test narrative, a p50/3×
+bound that is actually aggregate 10×N), self-contradicting quantile
+docs, and one promise that produced a real fix: `avctl doctor` said it
+never prints secrets, but its *success* lines printed configured
+endpoints verbatim — a `redis://user:pass@host` state endpoint leaked
+credentials on every healthy run. A new `redact_userinfo()` display
+helper (unit-tested across all doctor display shapes) now backs the
+stronger, true promise. Also: NATS ack offsets documented as JetStream
+stream sequences rather than partition-local offsets, and the
+loop-detect Δ formula now documents the nearest-prior-step tightening.
+
 ### Review round 17: full-codebase comment↔code audit (2026-08-16)
 
 Four parallel reviewers read every comment in all 12 crates (54k lines,
