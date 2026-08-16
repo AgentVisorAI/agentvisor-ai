@@ -16,7 +16,7 @@ body:
     id: version
     attributes:
       label: Version
-      description: Output of `agentvisor-ai --version` or the release/commit you ran.
+      description: Output of `avctl --version` or the release/commit you ran.
       placeholder: v0.1.0 (or 68e4d1b)
     validations:
       required: true
