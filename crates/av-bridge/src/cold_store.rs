@@ -423,7 +423,12 @@ fn cold_url(value: &str) -> Result<url::Url, BusError> {
             .map_err(|error| BusError::Backend(format!("invalid cold_uri {value:?}: {error}")));
     }
     std::fs::create_dir_all(value)?;
-    url::Url::from_directory_path(value)
+    // `Url::from_directory_path` rejects relative paths outright, so a
+    // portable manifest entry like `cold_uri: "data/cold"` used to create
+    // the directory and then fail provisioning. Canonicalize against the
+    // CWD first (same resolution rule as the cold-outbox default).
+    let absolute = std::fs::canonicalize(value)?;
+    url::Url::from_directory_path(&absolute)
         .map_err(|()| BusError::Backend(format!("invalid cold directory {value:?}")))
 }
 

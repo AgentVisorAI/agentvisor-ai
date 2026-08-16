@@ -4,25 +4,25 @@ replication_factor: 1
 topics:
   - name: agent.tool_call
     partitions: 8
-    retention: { hot_hours: 720, cold_uri: "file:///app/data/cold" }
+    retention: { hot_hours: 720, cold_uri: "data/cold" }
     schema_ref: schemas/ocsf-agent-event.schema.json
   - name: agent.stop_reason
     partitions: 8
-    retention: { hot_hours: 720, cold_uri: "file:///app/data/cold" }
+    retention: { hot_hours: 720, cold_uri: "data/cold" }
     schema_ref: schemas/ocsf-agent-event.schema.json
   - name: agent.receipt
     partitions: 8
-    retention: { hot_hours: 720, cold_uri: "file:///app/data/cold" }
+    retention: { hot_hours: 720, cold_uri: "data/cold" }
     schema_ref: schemas/ocsf-agent-event.schema.json
   - name: agent.compression
     partitions: 8
-    retention: { hot_hours: 720, cold_uri: "file:///app/data/cold" }
+    retention: { hot_hours: 720, cold_uri: "data/cold" }
     schema_ref: schemas/ocsf-agent-event.schema.json
   - name: agent.identity
     partitions: 8
-    retention: { hot_hours: 720, cold_uri: "file:///app/data/cold" }
+    retention: { hot_hours: 720, cold_uri: "data/cold" }
     schema_ref: schemas/ocsf-agent-event.schema.json
   - name: agent.session
     partitions: 8
-    retention: { hot_hours: 720, cold_uri: "file:///app/data/cold" }
+    retention: { hot_hours: 720, cold_uri: "data/cold" }
     schema_ref: schemas/ocsf-agent-event.schema.json
