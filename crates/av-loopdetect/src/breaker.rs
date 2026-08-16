@@ -31,7 +31,9 @@ pub struct BreakerConfig {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum BreakerAction {
-    /// Respond HTTP 429 to the offending request.
+    /// Respond with a permanent policy refusal (HTTP 403 in the harness;
+    /// deliberately not 429, which mainstream SDKs auto-retry — see
+    /// `PipelineError::status`).
     Reject,
     /// Inject a corrective system payload into the conversation.
     Inject,

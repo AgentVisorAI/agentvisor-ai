@@ -126,7 +126,9 @@ impl ValidatedIdentity {
     }
 }
 
-/// The validator: keyed by `kid`, audience-bound, issuer-allowlisted.
+/// The validator: keyed by `kid`, audience-bound, and optionally
+/// issuer-allowlisted (opt in via [`IdentityValidator::allow_issuers`];
+/// with no allowlist configured, any issuer is accepted).
 pub struct IdentityValidator {
     keys: RwLock<HashMap<String, KeyMaterial>>,
     jwks_kids: RwLock<HashSet<String>>,
