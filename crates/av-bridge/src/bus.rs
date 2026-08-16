@@ -28,7 +28,8 @@ pub struct PublishAck {
     pub topic: String,
     /// Partition index (derived from the partition key).
     pub partition: u32,
-    /// Offset within the partition.
+    /// Backend replay cursor: partition-local offset for the embedded
+    /// broker and Kafka; JetStream stream sequence for NATS.
     pub offset: u64,
 }
 
@@ -37,7 +38,7 @@ pub struct PublishAck {
 pub struct StoredEvent {
     /// Partition index.
     pub partition: u32,
-    /// Offset within the partition.
+    /// Backend replay cursor (see [`PublishAck::offset`]).
     pub offset: u64,
     /// Partition key (`ai_agent.instance_uid`).
     pub key: String,

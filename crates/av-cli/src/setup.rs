@@ -1176,7 +1176,8 @@ fn report(checks: &[Check]) -> (usize, usize) {
 }
 
 /// `avctl doctor` — resolve config exactly like the server and verify every
-/// runtime prerequisite. Never prints secret values, only source names.
+/// runtime prerequisite. Never prints secret values or URL userinfo —
+/// key sources by name only, endpoints with credentials redacted.
 pub async fn doctor(offline: bool) -> Result<()> {
     let mut checks = Vec::new();
 
@@ -1237,7 +1238,8 @@ pub async fn doctor(offline: bool) -> Result<()> {
                 .context("build probe client")?;
             match client.get(&url).send().await {
                 Ok(response) => checks.push(Check::Pass(format!(
-                    "upstream: {url} reachable (HTTP {})",
+                    "upstream: {} reachable (HTTP {})",
+                    redact_userinfo(&url),
                     response.status().as_u16()
                 ))),
                 Err(error) => {
@@ -1406,7 +1408,12 @@ pub async fn doctor(offline: bool) -> Result<()> {
                     continue;
                 };
                 match probe_endpoint(endpoint).await {
-                    Ok(()) => checks.push(Check::Pass(format!("{label}: {endpoint} reachable"))),
+                    Ok(()) => checks.push(Check::Pass(format!(
+                        // Round-28 F5 partner fix: the success line must
+                        // redact userinfo too, not just the failure line.
+                        "{label}: {} reachable",
+                        redact_userinfo(endpoint)
+                    ))),
                     Err(error) => {
                         // Round-28 F5: DO NOT echo `endpoint` verbatim
                         // in the failure line — a redis/qdrant URL may
@@ -1441,6 +1448,29 @@ pub async fn doctor(offline: bool) -> Result<()> {
 }
 
 /// TCP-connect to `host:port` extracted from a URL or bare `host:port`.
+/// Strip URL userinfo (`user:pass@`) for safe display. Handles
+/// comma-separated endpoint lists (Redis Cluster). Display-only — never
+/// used for connecting.
+fn redact_userinfo(endpoints: &str) -> String {
+    endpoints
+        .split(',')
+        .map(|endpoint| {
+            let Some((scheme, rest)) = endpoint.split_once("://") else {
+                return endpoint.to_owned();
+            };
+            let (authority, path) = match rest.find('/') {
+                Some(i) => rest.split_at(i),
+                None => (rest, ""),
+            };
+            match authority.rsplit_once('@') {
+                Some((_, host)) => format!("{scheme}://***@{host}{path}"),
+                None => endpoint.to_owned(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 async fn probe_endpoint(endpoint: &str) -> Result<()> {
     let target = probe_target(endpoint)?;
     tokio::time::timeout(Duration::from_secs(3), tokio::net::TcpStream::connect(&target))
@@ -1554,7 +1584,7 @@ fn build_probe_base(listen: &str) -> String {
     }
 }
 
-/// `avctl health` — probe a running harness; exit 0 only on HTTP 200.
+/// `avctl health` — probe a running harness; exit 0 only on an HTTP 2xx.
 pub async fn health(base_url: &str) -> Result<()> {
     // Accept both the base URL (documented) and a pasted full /health URL:
     // silently appending a second /health would probe a nonexistent path and
@@ -1584,6 +1614,26 @@ mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
 
     use super::*;
+
+    /// QC round 28: the doctor promise is "never prints secret values or
+    /// URL userinfo" — the redactor must strip credentials from every
+    /// display shape doctor prints (single URLs, cluster lists, bare
+    /// host:port) without corrupting credential-free endpoints.
+    #[test]
+    fn redact_userinfo_strips_credentials_from_every_display_shape() {
+        assert_eq!(
+            redact_userinfo("redis://user:s3cret@host:6379/0"),
+            "redis://***@host:6379/0"
+        );
+        assert_eq!(
+            redact_userinfo("redis://a:p@h1:7000,redis://a:p@h2:7001"),
+            "redis://***@h1:7000,redis://***@h2:7001"
+        );
+        assert_eq!(redact_userinfo("http://plain:8484/v1"), "http://plain:8484/v1");
+        assert_eq!(redact_userinfo("host:9092"), "host:9092");
+        // '@' after the authority (in a path) is not userinfo.
+        assert_eq!(redact_userinfo("http://h/p@th"), "http://h/p@th");
+    }
 
     /// Round-39 F1: the piped-stdin (Plain) secret-reading path uses
     /// a `Zeroizing<String>` buffer from the first allocation.
