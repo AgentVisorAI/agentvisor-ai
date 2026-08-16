@@ -172,10 +172,11 @@ fn long_expired_token_is_rejected() {
 // Malformed timestamp claims.
 // ------------------------------------------------------------------
 
-/// A token with `exp == iat` has zero TTL — nonsensical. Rejected as
-/// `BadTimestamps` (before the TTL check would fire).
+/// A token with `exp == iat` has zero TTL — nonsensical. Must never
+/// validate: refused as `BadTimestamps`, or as `Verification` when the
+/// JWT library rejects the already-expired instant first.
 #[test]
-fn exp_equal_to_iat_is_rejected_as_bad_timestamps() {
+fn exp_equal_to_iat_never_validates() {
     let keys = ed25519_keys("k1");
     let v = validator(&keys);
     let now = now_s();
@@ -254,7 +255,8 @@ fn extreme_future_iat_is_rejected_without_panicking() {
 // signed claim body.
 // ------------------------------------------------------------------
 
-/// Two independently-minted tokens with identical claim values must
+/// Two independently-minted tokens with identical timestamp claims
+/// (each carries a fresh random `jti`) must
 /// validate identically regardless of what local timezone the minter's
 /// process was configured for — because the wire format is UTC epoch
 /// seconds, not a formatted local timestamp.

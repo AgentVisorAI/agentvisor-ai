@@ -123,8 +123,9 @@ fn dissimilar_paraphrases_produce_low_lexical_similarity() {
 }
 
 /// End-to-end evasion: an agent cycling through semantically equivalent
-/// but lexically dissimilar restatements must NOT be caught by the hash
-/// breaker. This documents the residual false-negative surface: any
+/// but lexically dissimilar restatements is essentially not caught by the
+/// hash breaker (at most one coincidental trip is tolerated). This
+/// documents the residual false-negative surface: any
 /// deployment relying on real semantic loop detection must enable the
 /// ONNX embedder (see `sla::production_onnx_model_meets_loop_sla`).
 #[test]
