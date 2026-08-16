@@ -599,3 +599,56 @@ fn find_event_by_uid_resolves_committed_events_exactly() {
         "unknown topic must error"
     );
 }
+
+/// Mutation-run hardening (round 14): in-process UID dedupe was tested,
+/// but the `recover_event_uids` restart path wasn't — a mutant returning
+/// an empty map made every crash-restart re-publish acked events
+/// (duplicate records in the audit stream). Publish, reopen, republish
+/// the same UID: the ack must be identical and the partition must hold
+/// exactly one copy — including after a torn sidecar tail (the incomplete
+/// line is discarded; intact lines keep deduping).
+#[test]
+fn uid_dedupe_survives_restart_and_torn_sidecar_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let value = json!({"metadata": {"uid": "uid-restart"}, "n": 1});
+    let first = {
+        let broker = EmbeddedBroker::provision(dir.path(), &manifest()).unwrap();
+        broker.publish("agent.tool_call", "inst-r", &value).unwrap()
+    };
+    let reopened = EmbeddedBroker::open(dir.path()).unwrap();
+    let again = reopened.publish("agent.tool_call", "inst-r", &value).unwrap();
+    assert_eq!(
+        again.offset, first.offset,
+        "restart must not re-publish an acked uid"
+    );
+    let events = reopened
+        .fetch("agent.tool_call", first.partition, 0, 100)
+        .unwrap();
+    assert_eq!(events.len(), 1, "exactly one copy after restart republish");
+    drop(reopened);
+
+    // Torn tail: garbage half-line at the sidecar end is discarded on the
+    // next open; the intact mapping must still dedupe.
+    let sidecar = dir
+        .path()
+        .join("topics/agent.tool_call")
+        .join(format!("p{}.event-uids.jsonl", first.partition));
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&sidecar).unwrap();
+        f.write_all(br#"{"uid":"torn-"#).unwrap();
+    }
+    let recovered = EmbeddedBroker::open(dir.path()).unwrap();
+    let third = recovered.publish("agent.tool_call", "inst-r", &value).unwrap();
+    assert_eq!(
+        third.offset, first.offset,
+        "dedupe must survive a torn sidecar tail"
+    );
+    assert_eq!(
+        recovered
+            .fetch("agent.tool_call", first.partition, 0, 100)
+            .unwrap()
+            .len(),
+        1
+    );
+}
