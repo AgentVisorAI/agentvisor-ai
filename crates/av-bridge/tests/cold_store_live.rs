@@ -14,6 +14,7 @@
 )]
 
 use av_bridge::{BridgeManifest, EmbeddedBroker, EventBus};
+use object_store::ObjectStoreExt as _;
 use serde_json::json;
 
 #[test]
@@ -50,9 +51,9 @@ fn s3_cold_tier_receives_expired_events_and_reput_is_idempotent() {
     let options = std::env::vars().map(|(key, value)| (key.to_ascii_lowercase(), value));
     let (store, prefix) = object_store::parse_url_opts(&url, options).unwrap();
     let location = prefix
-        .child("agent.receipt")
-        .child(format!("p{}", ack.partition))
-        .child(format!("{:020}.json", ack.offset));
+        .join("agent.receipt")
+        .join(format!("p{}", ack.partition))
+        .join(format!("{:020}.json", ack.offset));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

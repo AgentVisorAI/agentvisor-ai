@@ -2,7 +2,7 @@
 
 use crate::{BridgeManifest, BusError, StoredEvent};
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt as _};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -224,9 +224,10 @@ impl ColdArchive {
         };
         let location = target
             .prefix
-            .child(pending.topic.as_str())
-            .child(format!("p{}", pending.partition))
-            .child(format!(
+            .clone()
+            .join(pending.topic.as_str())
+            .join(format!("p{}", pending.partition))
+            .join(format!(
                 "{:020}.json",
                 pending
                     .offset
