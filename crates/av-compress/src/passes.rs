@@ -161,13 +161,14 @@ fn stub_middle_to_target(
     // (HMAC over prior content) or an out-of-band per-payload
     // flag — both are larger refactors.
     //
-    // Round-19 F8: tracked as a known limitation. Attack requires
+    // Round-19 F8: tracked as a known limitation (see the
+    // compression-marker entry in SECURITY-AUDIT.md). Attack requires
     // an already-compromised prior turn (either an operator who
     // pasted attacker content verbatim, or a system prompt
     // hardening bypass) — real-world exploitability is bounded to
     // "attacker who already has message-content control can force
-    // compression pass to skip." Migration to a keyed-marker
-    // scheme is scheduled behind the round-11 milestone.
+    // compression pass to skip." A keyed-marker
+    // scheme remains future work, currently unscheduled.
     let scan_end = tail_start.min(messages.len());
     if messages.get(..scan_end).into_iter().flatten().any(|message| {
         msg_content_str(message).is_some_and(|content| content.contains("reason: middle history]"))
