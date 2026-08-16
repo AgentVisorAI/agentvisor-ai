@@ -9,8 +9,8 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
 # `av-bridge/src/manifest.rs` embeds the OCSF + manifest JSON Schemas
 # via `include_str!("../../../schemas/...")`, so the build stage needs
-# the schema tree at compile time. (The embedded WAT policy and the
-# dashboard assets live inside `crates/av-harness/` since round-45 and
+# the schema tree at compile time. (The embedded WAT policy — in-crate
+# since round-45 — and the always-in-crate dashboard assets
 # arrive with the `crates` COPY above; the operator-editable `config/`
 # tree is only needed at runtime and is copied into the runtime stage
 # directly from the build context.)
