@@ -65,8 +65,10 @@ fn s3_cold_tier_receives_expired_events_and_reput_is_idempotent() {
     assert_eq!(stored["key"], "inst-s3");
     assert_eq!(stored["offset"], ack.offset);
 
-    // A second retention pass must not fail on the already-present object
-    // (conditional put + same-content tolerance), and must export nothing new.
+    // A second retention pass must be a clean no-op: nothing left in the
+    // hot tier, no failure from the already-present object. (The
+    // AlreadyExists/same-content tolerance of the conditional put is
+    // unit-tested against the file:// backend in cold_store.rs.)
     let expired_again = broker.enforce_retention(later).unwrap();
     assert_eq!(expired_again, 0, "re-run must be a no-op, not a conflict");
 }
