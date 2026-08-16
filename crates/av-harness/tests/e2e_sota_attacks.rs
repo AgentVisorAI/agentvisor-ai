@@ -250,8 +250,10 @@ fn rug_pull_argument_drift_is_refused_when_schema_is_pinned() {
 // 4. Unicode Tags smuggling (Riley Goodside 2024, wunderwuzzi): U+E0000
 //    -U+E007F range is invisible in most UIs but tokenized by LLMs. In
 //    AgentVisor AI, the schema/policy layer does not silently strip these,
-//    and JCS canonicalization preserves them exactly so the receipt shows
-//    what the model actually saw. Prove the audit trail survives.
+//    and the finalize→receipt path canonicalizes and signs over the tagged
+//    payload without crashing or refusing — the signature verifying below
+//    covers the canonicalized bytes (byte-level tag survival in exports is
+//    ATIF round-trip territory, covered by av-atif's golden tests).
 // ---------------------------------------------------------------------------
 
 fn tag_encoded(plain: &str) -> String {

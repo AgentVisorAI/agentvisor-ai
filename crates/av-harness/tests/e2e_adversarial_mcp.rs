@@ -366,7 +366,7 @@ async fn tampered_atif_trajectory_is_rejected_on_promotion() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn session_hijack_with_different_identity_is_refused() {
+async fn session_hijack_via_headers_cannot_swap_identity() {
     let bus = Arc::new(RecordingBus::default());
     let sandbox = Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap();
     let state = make_state(sandbox, BudgetSpec::default(), Arc::clone(&bus));

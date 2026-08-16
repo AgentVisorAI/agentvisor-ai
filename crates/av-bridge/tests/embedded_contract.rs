@@ -296,8 +296,8 @@ fn declared_event_schema_is_enforced_on_publish() {
 }
 
 /// Adversarial: publishers, readers, and retention run concurrently on the same
-/// partition. Every fetched record must decode cleanly (no torn line) and have
-/// an offset that appears in the current retained/expired set.
+/// partition. Every fetched record must decode cleanly — a retention rewrite
+/// racing a fetch must never expose a torn or half-written segment.
 #[test]
 fn concurrent_publish_fetch_and_retention_never_torn() {
     let dir = tempfile::tempdir().unwrap();

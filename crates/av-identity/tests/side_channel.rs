@@ -144,6 +144,10 @@ fn hmac_signature_failure_error_text_never_carries_the_secret() {
     let err = v
         .validate(&tampered)
         .expect_err("tampered signature must not validate");
+    assert!(
+        matches!(err, av_identity::IdentityError::Verification(_)),
+        "tampered signature must map to the opaque Verification variant, got {err:?}",
+    );
     let err_text = err.to_string();
     assert!(
         !err_text.contains(&secret_hex),
