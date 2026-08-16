@@ -4,6 +4,30 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Connector-security review fixes (2026-08-16)
+
+Implementation review of the secured-transport work surfaced three defects:
+
+- **NATS partial credentials failed silently** — setting only one of
+  `AV_NATS_USER`/`AV_NATS_PASSWORD` silently connected anonymously
+  (a D13 silent-error violation, and inconsistent with the Kafka
+  connector). Now refused loudly, unit- and live-tested.
+- **NATS plaintext downgrade on endpoint typo** — a pinned
+  `AV_NATS_CA_FILE` with a `nats://` (instead of `tls://`) URL could
+  yield a plaintext connection. A pinned CA now forces
+  `require_tls(true)`; live-tested to negotiate TLS on `nats://`.
+- **Cold-store env over-capture** — lowercasing the whole environment for
+  `object_store::parse_url_opts` let generic variable names (`ENDPOINT`,
+  `REGION`, `TIMEOUT`, `TOKEN`, `PROXY_URL`) silently reconfigure the
+  S3 client. Only `AWS_*`-prefixed variables are honored now
+  (`aws_env_options`, unit-tested).
+
+Also: `KafkaSecurity` gained a testable `from_lookup` seam (harness
+`apply_env_overrides_from` pattern) plus unit tests for credential
+pairing, the SASL-requires-TLS guard, protocol selection, and CA-file
+error paths — deliberately without `derive(Debug)`, which would have
+made the SASL password printable.
+
 ### Rebrand: AgentBridge → AgentVisor AI (2026-08-15)
 
 Full pre-release rename; entries below this one keep the historical names.

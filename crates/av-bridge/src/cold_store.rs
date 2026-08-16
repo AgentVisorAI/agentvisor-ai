@@ -57,12 +57,7 @@ impl ColdArchive {
                 continue;
             };
             let url = cold_url(uri)?;
-            // `AmazonS3ConfigKey`/`ClientConfigKey` parse lowercase names
-            // only; raw `std::env::vars()` carries env-style `AWS_ENDPOINT`,
-            // `AWS_ACCESS_KEY_ID`, … which `parse_url_opts` would silently
-            // drop. Lowercase the keys so standard AWS env credentials are
-            // honored; unknown keys are still ignored by the parser.
-            let options = std::env::vars().map(|(key, value)| (key.to_ascii_lowercase(), value));
+            let options = aws_env_options(std::env::vars());
             let (store, prefix) = object_store::parse_url_opts(&url, options)
                 .map_err(|error| BusError::Backend(format!("cold store {uri:?}: {error}")))?;
             targets.insert(
@@ -410,6 +405,17 @@ fn remove_pending(path: &std::path::Path) -> Result<(), BusError> {
     }
 }
 
+/// Honor only `AWS_*`-prefixed env credentials, lowercased for
+/// `parse_url_opts` (its config-key parser accepts lowercase names only).
+/// Passing the whole environment would let generic variable names —
+/// `ENDPOINT`, `REGION`, `TIMEOUT`, `TOKEN`, `PROXY_URL` — silently
+/// reconfigure the cold-store client; standard AWS tooling scopes
+/// credential discovery to `AWS_*`.
+fn aws_env_options(vars: impl Iterator<Item = (String, String)>) -> Vec<(String, String)> {
+    vars.filter_map(|(key, value)| key.starts_with("AWS_").then(|| (key.to_ascii_lowercase(), value)))
+        .collect()
+}
+
 fn cold_url(value: &str) -> Result<url::Url, BusError> {
     if value.contains("://") {
         return url::Url::parse(value)
@@ -425,6 +431,34 @@ mod tests {
     #![allow(clippy::indexing_slicing, clippy::unwrap_used)]
 
     use super::*;
+
+    /// Generic env names must never leak into the object-store client
+    /// config; only `AWS_*` names pass, lowercased for the options parser.
+    #[test]
+    fn only_aws_prefixed_env_reaches_the_object_store_config() {
+        let vars = [
+            ("AWS_ACCESS_KEY_ID", "id"),
+            ("AWS_ENDPOINT", "http://127.0.0.1:9000"),
+            ("AWS_ALLOW_HTTP", "true"),
+            ("ENDPOINT", "http://evil.example"),
+            ("REGION", "hijack"),
+            ("TIMEOUT", "1ns"),
+            ("TOKEN", "stolen"),
+            ("PROXY_URL", "http://mitm.example"),
+            ("PATH", "/usr/bin"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()));
+        let options = aws_env_options(vars);
+        assert_eq!(
+            options,
+            vec![
+                ("aws_access_key_id".to_owned(), "id".to_owned()),
+                ("aws_endpoint".to_owned(), "http://127.0.0.1:9000".to_owned()),
+                ("aws_allow_http".to_owned(), "true".to_owned()),
+            ]
+        );
+    }
 
     #[test]
     fn file_uri_uses_the_object_store_contract() {

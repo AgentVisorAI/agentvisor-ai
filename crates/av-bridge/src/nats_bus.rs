@@ -23,6 +23,23 @@ fn stream_name(topic: &str) -> String {
     format!("av_{}", topic.replace('.', "_"))
 }
 
+/// Pair up broker credentials, refusing half-configured auth loudly. A
+/// typo'd or unexported password must not silently downgrade the
+/// connection to anonymous (D13: a dropped credential is a silent error;
+/// same contract as the Kafka connector's `KafkaSecurity`).
+fn nats_credentials(
+    user: Option<String>,
+    password: Option<String>,
+) -> Result<Option<(String, String)>, BusError> {
+    match (user, password) {
+        (Some(user), Some(password)) => Ok(Some((user, password))),
+        (None, None) => Ok(None),
+        _ => Err(BusError::Backend(
+            "AV_NATS_USER and AV_NATS_PASSWORD must be set together".to_owned(),
+        )),
+    }
+}
+
 impl NatsBus {
     /// Connect and provision streams per the manifest.
     pub fn provision(url: &str, manifest: &BridgeManifest) -> Result<Self, BusError> {
@@ -45,15 +62,18 @@ impl NatsBus {
         // rarely use WebPKI certs), `AV_NATS_USER`/`AV_NATS_PASSWORD` supply
         // broker auth. Values are paths/identifiers, never logged.
         let ca_file = std::env::var_os("AV_NATS_CA_FILE").map(std::path::PathBuf::from);
-        let credentials = match (std::env::var("AV_NATS_USER"), std::env::var("AV_NATS_PASSWORD")) {
-            (Ok(user), Ok(password)) => Some((user, password)),
-            _ => None,
-        };
+        let credentials = nats_credentials(
+            std::env::var("AV_NATS_USER").ok(),
+            std::env::var("AV_NATS_PASSWORD").ok(),
+        )?;
         let client = executor
             .run(move || async move {
                 let mut options = async_nats::ConnectOptions::new();
                 if let Some(ca) = ca_file {
-                    options = options.add_root_certificates(ca);
+                    // A pinned CA states intent: this endpoint is TLS. Force
+                    // the requirement so a `nats://` (instead of `tls://`)
+                    // endpoint typo cannot silently downgrade to plaintext.
+                    options = options.add_root_certificates(ca).require_tls(true);
                 }
                 if let Some((user, password)) = credentials {
                     options = options.user_and_password(user, password);
@@ -325,5 +345,28 @@ impl EventBus for NatsBus {
                 )
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::nats_credentials;
+
+    #[test]
+    fn credentials_pair_or_fail_loudly() {
+        assert!(nats_credentials(None, None).unwrap().is_none());
+        assert_eq!(
+            nats_credentials(Some("u".into()), Some("p".into())).unwrap(),
+            Some(("u".into(), "p".into()))
+        );
+        for (user, password) in [(Some("u".to_owned()), None), (None, Some("p".to_owned()))] {
+            let error = nats_credentials(user, password).unwrap_err();
+            assert!(
+                error.to_string().contains("must be set together"),
+                "partial credentials must fail loudly, got: {error}"
+            );
+        }
     }
 }
