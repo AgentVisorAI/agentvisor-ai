@@ -1,10 +1,10 @@
 //! Build-time asset dependency tracking for the harness dashboard and
 //! its embedded WAT policy.
 //!
-//! `include_str!` in `src/dashboard.rs` and `src/main.rs` reads files
-//! outside the crate root at compile time, but Cargo's automatic
-//! dep-info fingerprinting is unreliable for parent-relative embedded
-//! assets in this workspace — the empirical statement is that editing
+//! `include_str!` in `src/dashboard.rs` and `src/main.rs` embeds files
+//! from `dashboard/` and `policies/` (both inside this crate since
+//! round-45), but Cargo's automatic dep-info fingerprinting proved
+//! unreliable for these embedded assets in this workspace — the empirical statement is that editing
 //! `dashboard/` files alone did not rebuild the binary until this
 //! script was added. Once one `rerun-if-changed` line exists, Cargo
 //! narrows the fingerprint to exactly the listed paths, so every

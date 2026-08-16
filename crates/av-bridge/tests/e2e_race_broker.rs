@@ -1,6 +1,7 @@
 //! Race-condition resilience for the embedded broker: concurrent duplicate
-//! `publish_idempotent`, concurrent fetches during retention rollovers, and
-//! interleaved publishers across partitions.
+//! `publish_idempotent`, concurrent fetches racing live publishers, and
+//! interleaved publishers across partitions. (Fetch-during-retention races
+//! are covered by `embedded_contract.rs::concurrent_publish_fetch_and_retention_never_torn`.)
 
 #![allow(
     clippy::expect_used,

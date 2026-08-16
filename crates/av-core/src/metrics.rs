@@ -399,9 +399,10 @@ fn validate_metric_key(key: &str) {
     // real hazard is a base-name that carries `"` / `\` / `\n` / `\r`
     // / NUL — those would produce unbalanced quotes or split-line
     // output that Prometheus rejects as invalid text exposition.
-    // Label values carry their own escape discipline (round-14 F7's
-    // `escape_prom_label_value` fires at render time and covers the
-    // cross-line bytes there); this validator's job is the base.
+    // Label values carry no render-time escaper: cross-line bytes
+    // (`\n` / `\r` / NUL) anywhere in the labels section are refused
+    // at registration by the loop below; this validator is the only
+    // guard, and its job covers both the base and the labels bytes.
     let (base, labels) = split_key(key);
     for byte in base.bytes() {
         if matches!(byte, b'\n' | b'\r' | b'\\' | b'"' | 0x00) {
@@ -415,8 +416,11 @@ fn validate_metric_key(key: &str) {
     // Also refuse the raw cross-line bytes anywhere in the labels
     // section — Prometheus parses one metric per line, so any bare
     // `\n`, `\r`, or NUL slips a synthetic line into the scrape.
-    // Backslash and double quote are legal inside labels because the
-    // render-time escaper handles them.
+    // Backslash and double quote stay legal here because the quotes
+    // are structural to the `l="v"` convention and label sections are
+    // built from code-controlled constants (never attacker input);
+    // labels render verbatim — there is no render-time escaper for
+    // them (only HELP text gets `escape_prom_help`).
     for byte in labels.bytes() {
         if matches!(byte, b'\n' | b'\r' | 0x00) {
             panic!(

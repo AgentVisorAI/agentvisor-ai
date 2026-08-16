@@ -375,7 +375,7 @@ fn subagent_recursion_is_depth_capped() {
 
 /// Round-33 F3: `subagent_trajectory_ref` inside `observation.results[]`
 /// is v1.7-only. The sibling root-level `subagent_trajectories` is
-/// already gated (validate.rs:258); the observation ref field was
+/// already gated (the v1.7 root-field gate in `validate.rs`); the observation ref field was
 /// missed and silently accepted on v1.0 files. This test locks in
 /// parity: a v1.0 file with the ref field must produce a version
 /// issue.
