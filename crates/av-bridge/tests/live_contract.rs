@@ -3,10 +3,12 @@
 //! embedded suite: publish → ack, offset-ordered fetch, unknown-topic error.
 //!
 //! Secured-endpoint material (all optional): `AV_KAFKA_CA_FILE` +
-//! `AV_KAFKA_SASL_USERNAME`/`AV_KAFKA_SASL_PASSWORD` for TLS+SASL/PLAIN
-//! Kafka; `AV_NATS_CA_FILE` (forces TLS) + `AV_NATS_USER`/`AV_NATS_PASSWORD`
-//! for NATS. `AV_KAFKA_BROKER` accepts a `host:port[,host:port]` bootstrap
-//! list. Use hostname endpoints with TLS (certificate name verification).
+//! `AV_KAFKA_SASL_USERNAME`/`AV_KAFKA_SASL_PASSWORD` (+ optional
+//! `AV_KAFKA_SASL_MECHANISM`: `SCRAM-SHA-256` default, `SCRAM-SHA-512`,
+//! or `PLAIN`) for TLS+SASL Kafka; `AV_NATS_CA_FILE` (forces TLS) +
+//! `AV_NATS_USER`/`AV_NATS_PASSWORD` for NATS. `AV_KAFKA_BROKER` accepts
+//! a `host:port[,host:port]` bootstrap list. Use hostname endpoints with
+//! TLS (certificate name verification).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

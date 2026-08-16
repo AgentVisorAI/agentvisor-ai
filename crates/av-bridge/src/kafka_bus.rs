@@ -5,11 +5,14 @@
 //! TLS/SASL comes from the environment so secured endpoints need no new
 //! constructor surface: `AV_KAFKA_CA_FILE` pins a root CA (PEM) and enables
 //! TLS on both the admin and event paths; `AV_KAFKA_SASL_USERNAME` /
-//! `AV_KAFKA_SASL_PASSWORD` enable SASL. The event path (rskafka) speaks
-//! SASL/PLAIN, so credentials are only accepted together with TLS — plaintext
-//! SASL would ship the password in the clear. Use hostname (not bare-IP)
-//! broker endpoints with TLS: certificate verification runs against the
-//! dialed name, and IP-SAN support varies across rustls versions.
+//! `AV_KAFKA_SASL_PASSWORD` enable SASL with the mechanism from
+//! `AV_KAFKA_SASL_MECHANISM` (`SCRAM-SHA-256` by default — Redpanda's
+//! native credential store — or `SCRAM-SHA-512` / `PLAIN`). Credentials
+//! are only accepted together with TLS: PLAIN would ship the password in
+//! the clear, and even SCRAM without TLS is exposed to MITM relay. Use
+//! hostname (not bare-IP) broker endpoints with TLS: certificate
+//! verification runs against the dialed name, and IP-SAN support varies
+//! across rustls versions.
 
 use crate::bus::{partition_for, BusError, EventBus, PublishAck, StoredEvent};
 use crate::manifest::BridgeManifest;
@@ -27,6 +30,37 @@ use std::sync::Arc;
 struct KafkaSecurity {
     ca_file: Option<std::path::PathBuf>,
     credentials: Option<(String, String)>,
+    mechanism: SaslMechanism,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SaslMechanism {
+    Plain,
+    ScramSha256,
+    ScramSha512,
+}
+
+impl SaslMechanism {
+    fn parse(value: &str) -> Result<Self, BusError> {
+        match value {
+            "PLAIN" => Ok(Self::Plain),
+            "SCRAM-SHA-256" => Ok(Self::ScramSha256),
+            "SCRAM-SHA-512" => Ok(Self::ScramSha512),
+            other => Err(BusError::Backend(format!(
+                "AV_KAFKA_SASL_MECHANISM {other:?} is not supported \
+                 (use PLAIN, SCRAM-SHA-256, or SCRAM-SHA-512)"
+            ))),
+        }
+    }
+
+    /// librdkafka's `sasl.mechanism` spelling.
+    fn librdkafka_name(self) -> &'static str {
+        match self {
+            Self::Plain => "PLAIN",
+            Self::ScramSha256 => "SCRAM-SHA-256",
+            Self::ScramSha512 => "SCRAM-SHA-512",
+        }
+    }
 }
 
 impl KafkaSecurity {
@@ -48,14 +82,22 @@ impl KafkaSecurity {
                 ))
             }
         };
+        let mechanism = match get("AV_KAFKA_SASL_MECHANISM") {
+            Some(value) => SaslMechanism::parse(&value)?,
+            None => SaslMechanism::ScramSha256,
+        };
         if credentials.is_some() && ca_file.is_none() {
             return Err(BusError::Backend(
-                "Kafka SASL credentials require AV_KAFKA_CA_FILE: the event path speaks \
-                 SASL/PLAIN, which must not cross the wire without TLS"
+                "Kafka SASL credentials require AV_KAFKA_CA_FILE: PLAIN ships the password in \
+                 the clear and even SCRAM without TLS is exposed to MITM relay"
                     .to_owned(),
             ));
         }
-        Ok(Self { ca_file, credentials })
+        Ok(Self {
+            ca_file,
+            credentials,
+            mechanism,
+        })
     }
 
     /// librdkafka admin-client settings mirroring the rskafka event path.
@@ -70,47 +112,55 @@ impl KafkaSecurity {
             config.set("ssl.ca.location", ca.to_string_lossy().as_ref());
         }
         if let Some((username, password)) = &self.credentials {
-            config.set("sasl.mechanism", "PLAIN");
+            config.set("sasl.mechanism", self.mechanism.librdkafka_name());
             config.set("sasl.username", username);
             config.set("sasl.password", password);
         }
     }
 
     /// Root-pinned rustls config for the rskafka event path.
-    fn rskafka_tls(&self) -> Result<Option<Arc<rustls::ClientConfig>>, BusError> {
+    fn rskafka_tls(&self) -> Result<Option<Arc<rustls_tls::ClientConfig>>, BusError> {
         let Some(ca) = &self.ca_file else {
             return Ok(None);
         };
+        // Same provider discipline as NatsBus::provision: rustls 0.23
+        // resolves its process CryptoProvider lazily and panics when both
+        // `ring` and `aws-lc-rs` are compiled in with none installed.
+        let _ = rustls_tls::crypto::ring::default_provider().install_default();
         let pem = std::fs::read(ca)
             .map_err(|error| BusError::Backend(format!("Kafka CA file {}: {error}", ca.display())))?;
-        let certs = rustls_pemfile::certs(&mut pem.as_slice())
-            .map_err(|error| BusError::Backend(format!("Kafka CA file {}: {error}", ca.display())))?;
-        if certs.is_empty() {
+        use rustls_pki_types::pem::PemObject as _;
+        let mut roots = rustls_tls::RootCertStore::empty();
+        let mut certs = 0usize;
+        for cert in rustls_pki_types::CertificateDer::pem_slice_iter(&pem) {
+            let cert = cert
+                .map_err(|error| BusError::Backend(format!("Kafka CA file {}: {error:?}", ca.display())))?;
+            roots
+                .add(cert)
+                .map_err(|error| BusError::Backend(format!("Kafka CA file {}: {error}", ca.display())))?;
+            certs = certs.saturating_add(1);
+        }
+        if certs == 0 {
             return Err(BusError::Backend(format!(
                 "Kafka CA file {} contains no PEM certificates",
                 ca.display()
             )));
         }
-        let mut roots = rustls::RootCertStore::empty();
-        for cert in certs {
-            roots
-                .add(&rustls::Certificate(cert))
-                .map_err(|error| BusError::Backend(format!("Kafka CA file {}: {error}", ca.display())))?;
-        }
-        let config = rustls::ClientConfig::builder()
-            .with_safe_defaults()
+        let config = rustls_tls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
         Ok(Some(Arc::new(config)))
     }
 
     fn rskafka_sasl(&self) -> Option<SaslConfig> {
-        self.credentials
-            .as_ref()
-            .map(|(username, password)| SaslConfig::Plain {
-                username: username.clone(),
-                password: password.clone(),
-            })
+        self.credentials.as_ref().map(|(username, password)| {
+            let credentials = rskafka::client::Credentials::new(username.clone(), password.clone());
+            match self.mechanism {
+                SaslMechanism::Plain => SaslConfig::Plain(credentials),
+                SaslMechanism::ScramSha256 => SaslConfig::ScramSha256(credentials),
+                SaslMechanism::ScramSha512 => SaslConfig::ScramSha512(credentials),
+            }
+        })
     }
 }
 
@@ -636,15 +686,51 @@ mod tests {
         let mut config = ClientConfig::new();
         full.apply_admin(&mut config);
         assert_eq!(config.get("security.protocol"), Some("sasl_ssl"));
-        assert_eq!(config.get("sasl.mechanism"), Some("PLAIN"));
+        // SCRAM-SHA-256 is the default mechanism (Redpanda's native store).
+        assert_eq!(config.get("sasl.mechanism"), Some("SCRAM-SHA-256"));
         assert_eq!(config.get("sasl.username"), Some("u"));
         match full.rskafka_sasl() {
-            Some(SaslConfig::Plain { username, password }) => {
-                assert_eq!(username, "u");
-                assert_eq!(password, "p");
+            Some(SaslConfig::ScramSha256(credentials)) => {
+                assert_eq!(credentials.username, "u");
+                assert_eq!(credentials.password, "p");
             }
-            other => panic!("expected PLAIN sasl config, got {other:?}"),
+            other => panic!("expected SCRAM-SHA-256 sasl config, got {other:?}"),
         }
+    }
+
+    /// Every supported mechanism maps consistently onto both client stacks,
+    /// and unknown mechanisms fail loudly instead of downgrading.
+    #[test]
+    fn sasl_mechanism_selection_is_explicit_and_validated() {
+        for (name, is_match) in [
+            (
+                "PLAIN",
+                (|s| matches!(s, Some(SaslConfig::Plain(_)))) as fn(Option<SaslConfig>) -> bool,
+            ),
+            ("SCRAM-SHA-256", |s| matches!(s, Some(SaslConfig::ScramSha256(_)))),
+            ("SCRAM-SHA-512", |s| matches!(s, Some(SaslConfig::ScramSha512(_)))),
+        ] {
+            let security = KafkaSecurity::from_lookup(lookup(&[
+                ("AV_KAFKA_CA_FILE", "/tmp/ca.crt"),
+                ("AV_KAFKA_SASL_USERNAME", "u"),
+                ("AV_KAFKA_SASL_PASSWORD", "p"),
+                ("AV_KAFKA_SASL_MECHANISM", name),
+            ]))
+            .unwrap();
+            let mut config = ClientConfig::new();
+            security.apply_admin(&mut config);
+            assert_eq!(config.get("sasl.mechanism"), Some(name));
+            assert!(is_match(security.rskafka_sasl()), "{name} must map on rskafka");
+        }
+        let Err(error) = KafkaSecurity::from_lookup(lookup(&[
+            ("AV_KAFKA_CA_FILE", "/tmp/ca.crt"),
+            ("AV_KAFKA_SASL_USERNAME", "u"),
+            ("AV_KAFKA_SASL_PASSWORD", "p"),
+            ("AV_KAFKA_SASL_MECHANISM", "GSSAPI"),
+        ])) else {
+            panic!("unsupported mechanism must be refused");
+        };
+        assert!(error.to_string().contains("not supported"), "{error}");
     }
 
     #[test]
@@ -652,6 +738,7 @@ mod tests {
         let missing = KafkaSecurity {
             ca_file: Some(std::path::PathBuf::from("/nonexistent/ab-ca.crt")),
             credentials: None,
+            mechanism: SaslMechanism::ScramSha256,
         };
         assert!(missing.rskafka_tls().is_err(), "missing CA file must error");
 
@@ -661,6 +748,7 @@ mod tests {
         let security = KafkaSecurity {
             ca_file: Some(empty),
             credentials: None,
+            mechanism: SaslMechanism::ScramSha256,
         };
         let error = security.rskafka_tls().unwrap_err();
         assert!(
