@@ -14,7 +14,7 @@ unmaintained = "workspace"
 # this feature monolithic — no way to opt out of `rsa` while keeping
 # ed25519+hmac).
 #
-# Our JWT validator at crates/ab-identity/src/validator.rs:395-413
+# Our JWT validator at crates/av-identity/src/validator.rs:395-413
 # whitelists exactly two algorithms — `Algorithm::EdDSA` (for Ed25519
 # key material) and `Algorithm::HS256` (for HMAC secrets) — and
 # explicitly rejects any other `alg` header BEFORE calling

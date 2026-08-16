@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AgentVisor AI — Dashboard</title>
+  <link rel="stylesheet" href="/dashboard/style.css">
+  <meta name="robots" content="noindex,nofollow">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="wrap">
+    <div class="brand">
+      <span class="mark" aria-hidden="true"></span>
+      <span>AgentVisor AI</span>
+      <span class="tag" id="version-tag">Dashboard</span>
+    </div>
+    <div class="topbar-right">
+      <span class="live" id="live-badge" aria-live="polite">
+        <span class="dot"></span>
+        <span id="live-text">Live &middot; updated just now</span>
+      </span>
+      <button class="btn ghost" id="pause-btn" title="Pause live refresh">Pause</button>
+      <a class="btn ghost" href="/metrics" target="_blank" rel="noopener">/metrics</a>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <section id="stats" class="stat-strip" aria-label="Aggregate statistics">
+    <article class="stat">
+      <p class="stat-label">Sessions</p>
+      <p class="stat-value" data-stat="session_count">&mdash;</p>
+      <p class="stat-sub">
+        <span data-stat="open_count">&mdash;</span> open &middot;
+        <span data-stat="closed_count">&mdash;</span> closed
+      </p>
+    </article>
+    <article class="stat">
+      <p class="stat-label">Cost</p>
+      <p class="stat-value" data-stat="cost_display">&mdash;</p>
+      <p class="stat-sub"><span data-stat="cost_micros_raw">&mdash;</span> micro&#8209;USD</p>
+    </article>
+    <article class="stat">
+      <p class="stat-label">Tokens</p>
+      <p class="stat-value" data-stat="tokens_total">&mdash;</p>
+      <p class="stat-sub">
+        <span data-stat="total_prompt_tokens">&mdash;</span> in &middot;
+        <span data-stat="total_completion_tokens">&mdash;</span> out
+      </p>
+    </article>
+    <article class="stat">
+      <p class="stat-label">Tool calls</p>
+      <p class="stat-value" data-stat="total_tool_calls">&mdash;</p>
+      <p class="stat-sub">
+        <span class="ok" data-stat="total_tool_allowed">&mdash;</span> allowed &middot;
+        <span class="fail" data-stat="total_tool_blocked">&mdash;</span> blocked
+      </p>
+    </article>
+    <article class="stat">
+      <p class="stat-label">Failures</p>
+      <p class="stat-value" data-stat="capture_failed_count">&mdash;</p>
+      <p class="stat-sub">Sessions with capture&nbsp;failed</p>
+    </article>
+    <article class="stat">
+      <p class="stat-label">Workflow mix</p>
+      <p class="stat-value" data-stat="workflow_signed_pct">&mdash;</p>
+      <p class="stat-sub">
+        <span data-stat="workflow_signed">&mdash;</span> signed /
+        <span data-stat="workflow_unsigned">&mdash;</span> unsigned
+      </p>
+    </article>
+  </section>
+
+  <section id="sessions" aria-labelledby="sessions-h">
+    <div class="sessions-head">
+      <h2 id="sessions-h">Sessions</h2>
+      <div class="filter-row" role="tablist" aria-label="Session filters">
+        <button class="chip on" data-filter-status="all" role="tab" aria-selected="true">All</button>
+        <button class="chip" data-filter-status="open" role="tab" aria-selected="false">Open</button>
+        <button class="chip" data-filter-status="closed" role="tab" aria-selected="false">Closed</button>
+        <button class="chip warn" data-filter-status="failed" role="tab" aria-selected="false">Capture&nbsp;failed</button>
+        <span class="sep" aria-hidden="true"></span>
+        <button class="chip" data-filter-workflow="all" aria-selected="true">Any</button>
+        <button class="chip" data-filter-workflow="signed" aria-selected="false">Signed</button>
+        <button class="chip" data-filter-workflow="unsigned" aria-selected="false">Unsigned</button>
+      </div>
+    </div>
+
+    <div class="empty" id="empty-hint" hidden>
+      <p>No sessions in the registry yet.</p>
+      <p class="empty-sub">
+        Send a request through the harness &mdash; e.g.
+        <code>curl http://127.0.0.1:8484/health</code> &mdash; and it will show up here.
+      </p>
+    </div>
+
+    <div class="table-wrap">
+      <table class="sessions">
+        <thead>
+          <tr>
+            <th class="col-id">Session</th>
+            <th>Status</th>
+            <th class="col-num">Tool calls</th>
+            <th class="col-num">Prompt&nbsp;/&nbsp;out</th>
+            <th class="col-num">Cost</th>
+            <th>Last activity</th>
+            <th>Stop reason</th>
+            <th aria-label="Actions" class="col-actions"></th>
+          </tr>
+        </thead>
+        <tbody id="session-body">
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+</main>
+
+<div class="drawer" id="session-drawer" hidden aria-modal="true" role="dialog" aria-labelledby="drawer-title">
+  <div class="drawer-backdrop" data-drawer-close></div>
+  <aside class="drawer-panel">
+    <header class="drawer-head">
+      <div>
+        <p class="drawer-kicker">Session</p>
+        <h3 id="drawer-title" class="drawer-id">&mdash;</h3>
+      </div>
+      <button class="btn close" data-drawer-close aria-label="Close">&times;</button>
+    </header>
+    <div class="drawer-body" id="drawer-body">
+      <p class="muted">Loading&hellip;</p>
+    </div>
+  </aside>
+</div>
+
+<footer>
+  <div class="wrap">
+    <p>
+      AgentVisor AI dashboard &middot; read&#8209;only view of the in&#8209;memory session registry.
+      <a href="/dashboard/api/help">API</a>
+      &middot; <a href="https://github.com/debugmode0/agentvisor-ai">GitHub</a>
+    </p>
+  </div>
+</footer>
+
+<script src="/dashboard/app.js" defer></script>
+</body>
+</html>

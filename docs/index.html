@@ -3,26 +3,26 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>AgentBridge — AI agents you can hand to an auditor</title>
-  <meta name="description" content="AgentBridge sits in front of your AI agent's LLM and tool calls. Point your OpenAI client at it, and every session ends with a signed receipt anyone can verify offline.">
+  <title>AgentVisor AI — AI agents you can hand to an auditor</title>
+  <meta name="description" content="AgentVisor AI sits in front of your AI agent's LLM and tool calls. Point your OpenAI client at it, and every session ends with a signed receipt anyone can verify offline.">
   <link rel="stylesheet" href="style.css">
-  <link rel="canonical" href="https://debugmode0.github.io/agent-bridge/">
-  <meta property="og:title" content="AgentBridge — AI agents you can hand to an auditor">
+  <link rel="canonical" href="https://debugmode0.github.io/agentvisor-ai/">
+  <meta property="og:title" content="AgentVisor AI — AI agents you can hand to an auditor">
   <meta property="og:description" content="One line of code. Every session recorded, capped, and signed.">
   <meta property="og:type" content="website">
-  <meta property="og:url" content="https://debugmode0.github.io/agent-bridge/">
+  <meta property="og:url" content="https://debugmode0.github.io/agentvisor-ai/">
 </head>
 <body>
 
   <nav aria-label="Primary">
     <div class="wrap nav-inner">
-      <a class="brand" href="#top">AgentBridge</a>
+      <a class="brand" href="#top">AgentVisor AI</a>
       <div class="nav-links">
         <a href="#one-line">How it works</a>
         <a href="#what-you-get">What you get</a>
         <a href="#dashboard">Dashboard</a>
         <a href="#try-it">Get started</a>
-        <a href="https://github.com/debugmode0/agent-bridge">GitHub</a>
+        <a href="https://github.com/debugmode0/agentvisor-ai">GitHub</a>
       </div>
     </div>
   </nav>
@@ -31,7 +31,7 @@
     <div class="wrap">
       <h1>AI agents you can hand to an auditor.</h1>
       <p class="lede">
-        AgentBridge is a small server you drop in front of your agent&rsquo;s LLM
+        AgentVisor AI is a small server you drop in front of your agent&rsquo;s LLM
         and tool calls. Every request is recorded. Every limit you set is
         enforced before the call goes out. Every session ends with a signed
         receipt anyone can verify offline &mdash; without asking you or us for
@@ -39,7 +39,7 @@
       </p>
       <p class="cta-row">
         <a class="cta primary" href="#try-it">Try it in 60 seconds</a>
-        <a class="cta" href="https://github.com/debugmode0/agent-bridge">Read the code</a>
+        <a class="cta" href="https://github.com/debugmode0/agentvisor-ai">Read the code</a>
       </p>
       <p class="hero-meta">
         v0.1.0 &middot; Apache&#8209;2.0 &middot; Rust &middot; Runs on your machine, your VM, or your cluster
@@ -55,7 +55,7 @@
           <p class="section-kicker">Point your existing OpenAI client at it</p>
           <h2>One line of code. Zero SDK.</h2>
           <p>
-            AgentBridge speaks OpenAI&rsquo;s <code>chat/completions</code> and
+            AgentVisor AI speaks OpenAI&rsquo;s <code>chat/completions</code> and
             MCP over plain HTTP. Change the base URL your client points at.
             Nothing else in your app moves.
           </p>
@@ -92,15 +92,15 @@
             <h3>A signed record of every session</h3>
             <p>
               When the agent&rsquo;s session finishes &mdash; whether that&rsquo;s a single
-              chat completion or a 40-step tool-using conversation &mdash; AgentBridge
+              chat completion or a 40-step tool-using conversation &mdash; AgentVisor AI
               hands back a receipt like the one on the right. It commits to
               the full event chain, the cost, and how many tool calls were
               allowed vs blocked.
             </p>
             <p>
-              Verification is one <code>abctl receipt-verify</code> call with
+              Verification is one <code>avctl receipt-verify</code> call with
               your public key. Or 30 lines of your language&rsquo;s Ed25519 library.
-              You don&rsquo;t need to trust AgentBridge to trust the receipt.
+              You don&rsquo;t need to trust AgentVisor AI to trust the receipt.
             </p>
           </div>
           <div class="feature-visual">
@@ -153,7 +153,7 @@ Content-Type: application/json
 {
   <span class="k">"error"</span>: {
     <span class="k">"code"</span>: -32001,
-    <span class="k">"message"</span>: <span class="s">"tool call blocked by AgentBridge policy"</span>,
+    <span class="k">"message"</span>: <span class="s">"tool call blocked by AgentVisor AI policy"</span>,
     <span class="k">"data"</span>: {
       <span class="k">"stage"</span>: <span class="s">"budget"</span>,
       <span class="k">"reason"</span>: <span class="s">"max_payout_usd_micros (cap 50000000)"</span>
@@ -176,7 +176,7 @@ Content-Type: application/json
             <p>
               Ship the files to S3, feed them into Vector, hand them to
               a customer&rsquo;s evidence locker, or archive them for the seven
-              years your industry demands. AgentBridge does not phone home.
+              years your industry demands. AgentVisor AI does not phone home.
             </p>
           </div>
           <div class="feature-visual">
@@ -202,7 +202,7 @@ Content-Type: application/json
           <p class="section-kicker">See what&rsquo;s happening</p>
           <h2>A dashboard for the agent you already deployed.</h2>
           <p>
-            Every AgentBridge instance ships a small operator dashboard at
+            Every AgentVisor AI instance ships a small operator dashboard at
             <code>/dashboard</code>. Open it in a browser and you can see the
             sessions your agent is running right now: which prompts, how
             many tokens, how much money, which tools were called, which
@@ -290,7 +290,7 @@ Content-Type: application/json
             <h3>The 3 AM cost spike</h3>
             <p>
               Your agent gets stuck in a retry loop and burns $2,400 on a
-              Sunday. AgentBridge&rsquo;s loop breaker plus the payout cap would
+              Sunday. AgentVisor AI&rsquo;s loop breaker plus the payout cap would
               have cut it off at $10, logged what happened, and let your
               on-call sleep.
             </p>
@@ -325,9 +325,9 @@ Content-Type: application/json
           <p>
             Requires <a href="https://rustup.rs/">Rust</a>, or a pre-built
             binary from the
-            <a href="https://github.com/debugmode0/agent-bridge/releases">releases page</a>.
+            <a href="https://github.com/debugmode0/agentvisor-ai/releases">releases page</a>.
             The wizard asks one thing at a time and writes the config
-            file for you. When it finishes, AgentBridge is running on
+            file for you. When it finishes, AgentVisor AI is running on
             <code>http://127.0.0.1:8484</code>.
           </p>
           <p>
@@ -336,8 +336,8 @@ Content-Type: application/json
           </p>
         </div>
         <div>
-<pre class="code-shell"><code><span class="prompt">$</span> cargo install ab-harness ab-cli
-<span class="prompt">$</span> abctl
+<pre class="code-shell"><code><span class="prompt">$</span> cargo install av-harness av-cli
+<span class="prompt">$</span> avctl
 
   <span class="c">1) OpenAI</span>
   <span class="c">2) Anthropic</span>
@@ -347,11 +347,11 @@ Content-Type: application/json
   Pick a provider <span class="c">[1]</span>: <span class="in">1</span>
 
   Paste your OpenAI API key: <span class="in">&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;</span>
-  Key stored under ~/.agentbridge/keys/ (chmod 600).
+  Key stored under ~/.agentvisor/keys/ (chmod 600).
 
   Start now? <span class="c">[Y/n]</span>: <span class="in">y</span>
 
-  AgentBridge is running on http://127.0.0.1:8484
+  AgentVisor AI is running on http://127.0.0.1:8484
   Point any OpenAI-compatible SDK at it. Ctrl-C to stop.</code></pre>
         </div>
       </div>
@@ -362,7 +362,7 @@ Content-Type: application/json
         <p class="section-kicker">Under the hood</p>
         <h2>Boring, on purpose.</h2>
         <p class="lede lede-secondary">
-          AgentBridge is a Rust workspace of twelve crates. No hosted
+          AgentVisor AI is a Rust workspace of twelve crates. No hosted
           service, no phone-home telemetry, no vendored dashboard. It
           writes files. You keep the signing key.
         </p>
@@ -411,13 +411,13 @@ Content-Type: application/json
         <p class="section-kicker">Read more</p>
         <h2>Everything else.</h2>
         <ul class="link-columns">
-          <li><a href="https://github.com/debugmode0/agent-bridge#readme">README</a> &mdash; full setup, configuration, CLI reference.</li>
-          <li><a href="https://github.com/debugmode0/agent-bridge/blob/main/ARCHITECTURE.md">Architecture</a> &mdash; how the pipeline fits together.</li>
-          <li><a href="https://github.com/debugmode0/agent-bridge/blob/main/SECURITY.md">Security model</a> &mdash; trust boundaries and threat model.</li>
-          <li><a href="https://github.com/debugmode0/agent-bridge/blob/main/VERIFICATION.md">Verification protocol</a> &mdash; verifying a receipt from scratch.</li>
-          <li><a href="https://github.com/debugmode0/agent-bridge/blob/main/BENCHMARKS.md">Benchmarks</a> &mdash; hot-path latency and 10&#x00A0;000-connection SLA.</li>
-          <li><a href="https://github.com/debugmode0/agent-bridge/releases">Releases</a> &mdash; pre-built binaries with SHA-256 checksums.</li>
-          <li><a href="api/">API documentation</a> &mdash; Rust crate reference. Skip unless you&rsquo;re embedding AgentBridge as a library.</li>
+          <li><a href="https://github.com/debugmode0/agentvisor-ai#readme">README</a> &mdash; full setup, configuration, CLI reference.</li>
+          <li><a href="https://github.com/debugmode0/agentvisor-ai/blob/main/ARCHITECTURE.md">Architecture</a> &mdash; how the pipeline fits together.</li>
+          <li><a href="https://github.com/debugmode0/agentvisor-ai/blob/main/SECURITY.md">Security model</a> &mdash; trust boundaries and threat model.</li>
+          <li><a href="https://github.com/debugmode0/agentvisor-ai/blob/main/VERIFICATION.md">Verification protocol</a> &mdash; verifying a receipt from scratch.</li>
+          <li><a href="https://github.com/debugmode0/agentvisor-ai/blob/main/BENCHMARKS.md">Benchmarks</a> &mdash; hot-path latency and 10&#x00A0;000-connection SLA.</li>
+          <li><a href="https://github.com/debugmode0/agentvisor-ai/releases">Releases</a> &mdash; pre-built binaries with SHA-256 checksums.</li>
+          <li><a href="api/">API documentation</a> &mdash; Rust crate reference. Skip unless you&rsquo;re embedding AgentVisor AI as a library.</li>
         </ul>
       </div>
     </section>
@@ -426,13 +426,13 @@ Content-Type: application/json
   <footer>
     <div class="wrap footer-inner">
       <p>
-        <a href="https://github.com/debugmode0/agent-bridge">GitHub</a> &middot;
-        <a href="https://github.com/debugmode0/agent-bridge/blob/main/LICENSE">Apache&nbsp;2.0</a> &middot;
-        <a href="https://github.com/debugmode0/agent-bridge/security/advisories/new">Report a vulnerability</a>
+        <a href="https://github.com/debugmode0/agentvisor-ai">GitHub</a> &middot;
+        <a href="https://github.com/debugmode0/agentvisor-ai/blob/main/LICENSE">Apache&nbsp;2.0</a> &middot;
+        <a href="https://github.com/debugmode0/agentvisor-ai/security/advisories/new">Report a vulnerability</a>
       </p>
       <p class="muted">
-        AgentBridge is open source and free to use. If it saves you
-        from a 3&nbsp;AM incident, please <a href="https://github.com/debugmode0/agent-bridge/stargazers">star the repo</a>.
+        AgentVisor AI is open source and free to use. If it saves you
+        from a 3&nbsp;AM incident, please <a href="https://github.com/debugmode0/agentvisor-ai/stargazers">star the repo</a>.
       </p>
     </div>
   </footer>

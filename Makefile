@@ -1,10 +1,10 @@
 .PHONY: fmt fmt-check lint lint-all-features test test-all bench sla schema-check compose-check ci doc clean run doctor
 
 run:
-	cargo run -p ab-harness --bin agent-bridge
+	cargo run -p av-harness --bin agentvisord
 
 doctor:
-	cargo run -q -p ab-cli --bin abctl -- doctor
+	cargo run -q -p av-cli --bin avctl -- doctor
 
 fmt:
 	cargo fmt --all
@@ -36,10 +36,10 @@ doc:
 
 schema-check:
 	for schema in schemas/*.json; do node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$$schema"; done
-	cargo run -q -p ab-cli -- manifest-validate manifests/bridge.example.yaml
-	cargo run -q -p ab-cli -- config-validate config/harness.example.toml
-	cargo run -q -p ab-cli -- config-validate config/harness.docker.toml
-	cargo run -q -p ab-cli -- config-validate config/harness.container.toml
+	cargo run -q -p av-cli -- manifest-validate manifests/bridge.example.yaml
+	cargo run -q -p av-cli -- config-validate config/harness.example.toml
+	cargo run -q -p av-cli -- config-validate config/harness.docker.toml
+	cargo run -q -p av-cli -- config-validate config/harness.container.toml
 
 compose-check:
 	docker compose -f docker/docker-compose.yml config >/dev/null

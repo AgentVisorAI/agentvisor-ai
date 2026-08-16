@@ -1,10 +1,10 @@
 services:
-  agent-bridge:
+  agentvisor-ai:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: agent-bridge:local
-    container_name: agent-bridge
+    image: agentvisor-ai:local
+    container_name: agentvisor-ai
     ports:
       # Round-15 F7: bind to 127.0.0.1 explicitly. Docker's default
       # (`"8484:8484"`) means `0.0.0.0:8484`, which reaches the host
@@ -26,7 +26,7 @@ services:
     stop_grace_period: 120s
     # Round-24 F2: pair the systemd-side Restart=on-failure hardening
     # (round-19 F7) with a compose-side policy. Without this, a single
-    # OOMKill leaves agent-bridge Exited with no healthcheck consulted
+    # OOMKill leaves agentvisor-ai Exited with no healthcheck consulted
     # and no alert path. Use `unless-stopped` so `docker compose down`
     # still works predictably (as opposed to `always`).
     restart: unless-stopped
@@ -41,7 +41,7 @@ services:
     read_only: false # /app/data and /app/spool are writable named volumes
     environment:
       RUST_LOG: info
-      AB_CONFIG: /app/config/harness.docker.toml
+      AV_CONFIG: /app/config/harness.docker.toml
       # Round-16 F3: the signing seed IS the receipt trust anchor.
       # Living on the shared `bridge-data` named volume meant any
       # co-scheduled container mounting `-v bridge-data:/x` could
@@ -49,7 +49,7 @@ services:
       # docker-compose posture claimed to use a mode:0400 secret,
       # but that secret was only wired for the identity HMAC.
       # Now it's a first-class docker secret alongside the HMAC.
-      AB_SIGNING_SEED_FILE: /run/secrets/signing_seed
+      AV_SIGNING_SEED_FILE: /run/secrets/signing_seed
       OTEL_EXPORTER_OTLP_ENDPOINT: http://vector:4318
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
     volumes:
@@ -75,14 +75,14 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
-      # Hardcode the URL rather than relying on `abctl health`'s default
+      # Hardcode the URL rather than relying on `avctl health`'s default
       # matching whatever `listen` is in `config/harness.docker.toml`.
       # A silent drift between the two used to make the healthcheck
       # report *green* against the wrong endpoint (round-11 F8) — the
       # `listen` port changing without the CLI default updating still
       # returned 200 from a stale sidecar or an unrelated in-container
       # service.
-      test: ["CMD", "abctl", "health", "--url", "http://127.0.0.1:8484"]
+      test: ["CMD", "avctl", "health", "--url", "http://127.0.0.1:8484"]
       interval: 10s
       timeout: 3s
       retries: 5
@@ -181,7 +181,7 @@ services:
 
   vector:
     image: timberio/vector:0.48.0-debian
-    # Internal-only OTLP receivers; agent-bridge sends via the compose network.
+    # Internal-only OTLP receivers; agentvisor-ai sends via the compose network.
     ports:
       - "127.0.0.1:4317:4317"
       - "127.0.0.1:4318:4318"
@@ -191,9 +191,9 @@ services:
       # Round-24 F1: the docker socket was previously mounted read-only
       # for the docker_logs source. Read-only does NOT prevent Vector
       # (or a malicious VRL transform) from calling `docker inspect` on
-      # every co-scheduled container, including agent-bridge, whose
-      # environment holds AB_UPSTREAM_API_KEY. The source has been
-      # switched to OTLP-only (agent-bridge already sends OTel logs via
+      # every co-scheduled container, including agentvisor-ai, whose
+      # environment holds AV_UPSTREAM_API_KEY. The source has been
+      # switched to OTLP-only (agentvisor-ai already sends OTel logs via
       # the compose network on 4318). If you need container-log
       # discovery, put a docker-socket-proxy in front and remount only
       # the proxy's socket. See docs/ops/vector.md.
