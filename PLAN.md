@@ -154,7 +154,7 @@ velocity, compression ratios. Exact provider counts, when present in responses, 
 `Authorization: Bearer <NHI JWT>`. Close: explicit `POST /v1/sessions/{id}/close`, idle sweep, or client
 abort (stream-drop still finalizes — silent-error #12). Signed close → receipt issued async (< 2 ms
 sign; measured). Unsigned close → ATIF spool (atomic tmp+rename). Promotion:
-`POST /v1/sessions/{id}/promote` or `avctl session promote` → reconciler (5 s tick) issues retroactive
+`POST /v1/sessions/{id}/promote` or `avctl session-promote` → reconciler (5 s tick) issues retroactive
 receipt ≤ 60 s (measured); promotion idempotent (double-promote = one receipt).
 
 ### D12. Evolution with time (explicit user requirement) — see EVOLUTION.md
@@ -233,7 +233,7 @@ This is the implementation traceability record, not a test report. Current measu
 | R9 | E: events carry ai_agent.version/charter/instance_uid + stop_reason_id per PR #1; metadata v1.10.0 | av-events | golden events validated against shipped JSON Schemas; field-presence tests |
 | R10 | E roadmap: Fingerprint observable (tool schemas + sampling params), JCS | av-events model/schema only | roadmap shape test; not an MVP gate |
 | R11 | F: broker Redpanda ref + NATS alt; topic per event class; partition by instance_uid; ordered replay | av-bridge (embedded + `kafka`/`nats` features) | embedded contract suite (ordering, replay, offsets); connector contract tests (live-gated) |
-| R12 | F: portability = single binary + declarative manifest; schema-validated provisioning | av-bridge manifest + `avctl bridge provision` | provision-from-manifest-alone integration test (fresh dir), events schema-validated, wall-time recorded (≪ 15 min) |
+| R12 | F: portability = single binary + declarative manifest; schema-validated provisioning | av-bridge manifest + `avctl bridge-provision` | provision-from-manifest-alone integration test (fresh dir), events schema-validated, wall-time recorded (≪ 15 min) |
 | R13 | F: retention 30 d default + cold-tier export to customer storage | broker retention + `ColdArchive` retry outbox | embedded expiry and object-store contract tests |
 | R14 | G: session-close JCS canonicalization + Ed25519 receipt; offline verify; payload fields per brief | av-receipts | RFC 8785 vectors; tamper/mutation suite; offline verify (no bridge handle in scope); payload field test; sign latency bench < 2 ms |
 | R15 | G: signing reserved for consequential actions by policy | harness config (`signed` workflow opt-in) | default-unsigned test; per-workflow policy test |
