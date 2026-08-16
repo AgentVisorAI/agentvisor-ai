@@ -569,6 +569,75 @@ mod tests {
         receipt.verify_embedded().unwrap();
     }
 
+    /// Round-16 F8 shipped the `AtifTrajectory.retroactive == true`
+    /// semantic invariant without a test — the mutation run caught
+    /// `verify_semantic_invariants -> Ok(())` surviving, meaning a
+    /// forged non-retroactive promotion receipt verified fine. Pin
+    /// both verification paths: a `retroactive: false` receipt must
+    /// fail as SemanticInvariant even though its signature is valid,
+    /// and the honest `retroactive: true` twin must pass.
+    #[test]
+    fn retroactive_false_is_refused_on_both_verify_paths() {
+        let signer = Ed25519Signer::generate();
+        let mut ring = Keyring::new();
+        ring.add_signer(&signer).unwrap();
+        let subject = |retroactive| ReceiptSubject::AtifTrajectory {
+            trajectory_digest: "cd".repeat(32),
+            step_count: 7,
+            retroactive,
+        };
+        let make = |retroactive| {
+            let mut body = body();
+            body.subject = subject(retroactive);
+            Receipt::issue(body, &signer).unwrap()
+        };
+
+        let forged = make(false);
+        for outcome in [forged.verify(&ring), forged.verify_embedded()] {
+            assert!(
+                matches!(outcome, Err(ReceiptError::SemanticInvariant(ref msg)) if msg.contains("retroactive")),
+                "retroactive=false must be refused, got {outcome:?}"
+            );
+        }
+
+        let honest = make(true);
+        honest.verify(&ring).unwrap();
+        honest.verify_embedded().unwrap();
+    }
+
+    /// The duplicate-key scanner doubles as the nesting-depth guard.
+    /// Pin the boundary exactly: depth == MAX_NESTED_DEPTH parses,
+    /// depth == MAX_NESTED_DEPTH + 1 is refused as the
+    /// DuplicateKey-family class (either our sentinel or serde_json's
+    /// own recursion cap, both mapped identically). Kills the
+    /// `>` -> `>=`/`==` boundary mutants in NoDupVisitor's seq and
+    /// map arms.
+    #[test]
+    fn nesting_depth_boundary_is_exact_for_arrays_and_maps() {
+        let nested_arrays = |depth: usize| format!("{}null{}", "[".repeat(depth), "]".repeat(depth));
+        let nested_maps = |depth: usize| format!("{}null{}", "{\"k\":".repeat(depth), "}".repeat(depth));
+        for build in [&nested_arrays as &dyn Fn(usize) -> String, &nested_maps] {
+            // serde_json's own recursion cap fires at 128 containers, so
+            // the deepest reachable input is 127; the visitor's own
+            // `> MAX_NESTED_DEPTH` arm is defense-in-depth for
+            // hypothetical cap-free parsers. Pin the user-visible
+            // contract: 127 parses, 128 is refused as the DuplicateKey
+            // family (serde's recursion error is mapped there
+            // deliberately so hostile-nesting triage has one class).
+            let deepest_reachable = build(MAX_NESTED_DEPTH - 1);
+            assert!(
+                check_no_duplicate_keys(deepest_reachable.as_bytes()).is_ok(),
+                "depth == MAX_NESTED_DEPTH - 1 must be accepted"
+            );
+            let past_limit = build(MAX_NESTED_DEPTH);
+            let outcome = check_no_duplicate_keys(past_limit.as_bytes());
+            assert!(
+                matches!(outcome, Err(ReceiptError::DuplicateKey(_))),
+                "depth == MAX_NESTED_DEPTH must be refused, got {outcome:?}"
+            );
+        }
+    }
+
     /// Round-15 F4: `Receipt::from_json_slice` rejects duplicate keys
     /// at ANY nesting level (top-level, nested inside `ai_agent`,
     /// nested inside `subject`, deep inside an array element). This

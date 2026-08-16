@@ -393,6 +393,22 @@ mod tests {
     /// stack-overflow. Build a nested array manually (bypassing
     /// serde_json's parser cap) and assert `TooDeep` is returned
     /// cleanly rather than the process crashing.
+    /// Round-40 F5 (object branch): the array test above leaves the
+    /// `write_value(v, out, depth + 1)` recursion in the *object* arm
+    /// unpinned — a mutant that stops incrementing depth there would
+    /// canonicalize unbounded object nesting and stack-overflow on
+    /// hostile input. Same construction, maps instead of arrays.
+    #[test]
+    fn canonicalize_refuses_pathologically_nested_objects() {
+        let mut v = Value::Null;
+        for _ in 0..MAX_NESTED_DEPTH + 10 {
+            let mut map = serde_json::Map::new();
+            map.insert("k".to_owned(), v);
+            v = Value::Object(map);
+        }
+        assert_eq!(canonicalize(&v), Err(JcsError::TooDeep(MAX_NESTED_DEPTH)));
+    }
+
     #[test]
     fn canonicalize_refuses_pathologically_nested_arrays() {
         let mut v = Value::Array(vec![Value::Null]);
