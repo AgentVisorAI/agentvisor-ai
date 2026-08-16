@@ -7,7 +7,9 @@
 //! TLS on both the admin and event paths; `AV_KAFKA_SASL_USERNAME` /
 //! `AV_KAFKA_SASL_PASSWORD` enable SASL. The event path (rskafka) speaks
 //! SASL/PLAIN, so credentials are only accepted together with TLS — plaintext
-//! SASL would ship the password in the clear.
+//! SASL would ship the password in the clear. Use hostname (not bare-IP)
+//! broker endpoints with TLS: certificate verification runs against the
+//! dialed name, and IP-SAN support varies across rustls versions.
 
 use crate::bus::{partition_for, BusError, EventBus, PublishAck, StoredEvent};
 use crate::manifest::BridgeManifest;
@@ -29,13 +31,17 @@ struct KafkaSecurity {
 
 impl KafkaSecurity {
     fn from_env() -> Result<Self, BusError> {
-        let ca_file = std::env::var_os("AV_KAFKA_CA_FILE").map(std::path::PathBuf::from);
-        let credentials = match (
-            std::env::var("AV_KAFKA_SASL_USERNAME"),
-            std::env::var("AV_KAFKA_SASL_PASSWORD"),
-        ) {
-            (Ok(username), Ok(password)) => Some((username, password)),
-            (Err(_), Err(_)) => None,
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// Testable core of [`Self::from_env`] (same pattern as the harness
+    /// config's `apply_env_overrides_from`): `get` returns the value of a
+    /// named environment variable, or `None` when unset.
+    fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, BusError> {
+        let ca_file = get("AV_KAFKA_CA_FILE").map(std::path::PathBuf::from);
+        let credentials = match (get("AV_KAFKA_SASL_USERNAME"), get("AV_KAFKA_SASL_PASSWORD")) {
+            (Some(username), Some(password)) => Some((username, password)),
+            (None, None) => None,
             _ => {
                 return Err(BusError::Backend(
                     "AV_KAFKA_SASL_USERNAME and AV_KAFKA_SASL_PASSWORD must be set together".to_owned(),
@@ -522,4 +528,111 @@ impl EventBus for KafkaBus {
 
 fn chrono_now() -> chrono::DateTime<chrono::Utc> {
     chrono::Utc::now()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    fn lookup<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        }
+    }
+
+    #[test]
+    fn no_security_env_means_plaintext_with_no_admin_overrides() {
+        let security = KafkaSecurity::from_lookup(lookup(&[])).unwrap();
+        assert!(security.ca_file.is_none() && security.credentials.is_none());
+        let mut config = ClientConfig::new();
+        security.apply_admin(&mut config);
+        assert!(config.get("security.protocol").is_none());
+        assert!(security.rskafka_tls().unwrap().is_none());
+        assert!(security.rskafka_sasl().is_none());
+    }
+
+    #[test]
+    fn partial_credentials_fail_loudly_not_anonymously() {
+        for pairs in [
+            &[("AV_KAFKA_SASL_USERNAME", "u")][..],
+            &[("AV_KAFKA_SASL_PASSWORD", "p")][..],
+        ] {
+            // No `unwrap_err`: that would require `Debug` on `KafkaSecurity`,
+            // and a derived `Debug` would make the SASL password printable.
+            let Err(error) = KafkaSecurity::from_lookup(lookup(pairs)) else {
+                panic!("partial credentials must be refused");
+            };
+            assert!(
+                error.to_string().contains("must be set together"),
+                "wrong error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn sasl_plain_without_tls_is_refused() {
+        let Err(error) = KafkaSecurity::from_lookup(lookup(&[
+            ("AV_KAFKA_SASL_USERNAME", "u"),
+            ("AV_KAFKA_SASL_PASSWORD", "p"),
+        ])) else {
+            panic!("SASL without TLS must be refused");
+        };
+        assert!(error.to_string().contains("AV_KAFKA_CA_FILE"), "{error}");
+    }
+
+    #[test]
+    fn ca_only_selects_ssl_and_ca_plus_credentials_selects_sasl_ssl() {
+        let ssl_only = KafkaSecurity::from_lookup(lookup(&[("AV_KAFKA_CA_FILE", "/tmp/ca.crt")])).unwrap();
+        let mut config = ClientConfig::new();
+        ssl_only.apply_admin(&mut config);
+        assert_eq!(config.get("security.protocol"), Some("ssl"));
+        assert_eq!(config.get("ssl.ca.location"), Some("/tmp/ca.crt"));
+        assert!(config.get("sasl.mechanism").is_none());
+
+        let full = KafkaSecurity::from_lookup(lookup(&[
+            ("AV_KAFKA_CA_FILE", "/tmp/ca.crt"),
+            ("AV_KAFKA_SASL_USERNAME", "u"),
+            ("AV_KAFKA_SASL_PASSWORD", "p"),
+        ]))
+        .unwrap();
+        let mut config = ClientConfig::new();
+        full.apply_admin(&mut config);
+        assert_eq!(config.get("security.protocol"), Some("sasl_ssl"));
+        assert_eq!(config.get("sasl.mechanism"), Some("PLAIN"));
+        assert_eq!(config.get("sasl.username"), Some("u"));
+        match full.rskafka_sasl() {
+            Some(SaslConfig::Plain { username, password }) => {
+                assert_eq!(username, "u");
+                assert_eq!(password, "p");
+            }
+            other => panic!("expected PLAIN sasl config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_or_empty_ca_file_fails_loudly() {
+        let missing = KafkaSecurity {
+            ca_file: Some(std::path::PathBuf::from("/nonexistent/ab-ca.crt")),
+            credentials: None,
+        };
+        assert!(missing.rskafka_tls().is_err(), "missing CA file must error");
+
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty.pem");
+        std::fs::write(&empty, b"not a pem").unwrap();
+        let security = KafkaSecurity {
+            ca_file: Some(empty),
+            credentials: None,
+        };
+        let error = security.rskafka_tls().unwrap_err();
+        assert!(
+            error.to_string().contains("no PEM certificates"),
+            "wrong error: {error}"
+        );
+    }
 }
