@@ -251,3 +251,17 @@ mod tests {
         assert!(a < u64::MAX);
     }
 }
+
+#[cfg(test)]
+mod calendar_tests {
+    /// Mutation-run hardening (round 12): pin Hinnant's calendar math
+    /// through the public formatter at epoch, a 400-rule leap day, and
+    /// a century non-leap boundary — kills the `z + 719_468` arithmetic
+    /// mutants that would shift every rendered audit timestamp.
+    #[test]
+    fn iso8601_ms_pins_known_dates() {
+        assert_eq!(super::iso8601_ms(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(super::iso8601_ms(951_782_400_000), "2000-02-29T00:00:00.000Z");
+        assert_eq!(super::iso8601_ms(4_107_542_399_000), "2100-02-28T23:59:59.000Z");
+    }
+}

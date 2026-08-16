@@ -422,3 +422,59 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod similarity_path_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+
+    use super::*;
+
+    /// Mutation-run hardening (round 12): the Qdrant-similarity arm
+    /// (`1.0 - similarity`) had no direct test — a mutant deleting the
+    /// subtraction turns "nearly identical to history" (similarity ~1,
+    /// delta ~0) into "maximum novelty" (delta ~1) and the breaker
+    /// never trips through the vector-store path. Feed orthogonal
+    /// adjacent embeddings (adjacent delta = 1.0: never trips) with
+    /// near-1 nearest_similarity and require the trip; then prove
+    /// near-0 similarity does NOT trip.
+    #[test]
+    fn near_duplicate_history_similarity_trips_the_breaker() {
+        let cfg = BreakerConfig {
+            min_tokens: 100,
+            ..BreakerConfig::default()
+        };
+        let looping = SessionLoopState::new(cfg.clone());
+        let mut tripped = false;
+        for step in 0..8u32 {
+            // Orthogonal one-hot embeddings: adjacent cosine = 0, so
+            // only the similarity path can produce a small delta.
+            let mut e = vec![0.0f32; 16];
+            e[(step as usize) % 16] = 1.0;
+            let verdict = looping.observe_embedding_with_similarity(e, 50, Some(0.999));
+            if matches!(verdict, BreakerVerdict::Tripped { .. }) {
+                tripped = true;
+                break;
+            }
+        }
+        assert!(
+            tripped,
+            "similarity ~1 against history must trip within the window"
+        );
+
+        let progressing = SessionLoopState::new(cfg);
+        for step in 0..8u32 {
+            let mut e = vec![0.0f32; 16];
+            e[(step as usize) % 16] = 1.0;
+            let verdict = progressing.observe_embedding_with_similarity(e, 50, Some(0.01));
+            assert!(
+                !matches!(verdict, BreakerVerdict::Tripped { .. }),
+                "low similarity must not trip"
+            );
+        }
+    }
+}
