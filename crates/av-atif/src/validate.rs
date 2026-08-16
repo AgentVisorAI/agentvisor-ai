@@ -1,8 +1,9 @@
 //! ATIF validator, mirroring Harbor's trajectory-validator semantics:
 //! validates required fields, types and constraints, sequential step ids
 //! (starting from 1), tool-call references in observations, ISO-8601
-//! timestamps, agent-only field placement — and collects **all** errors before
-//! returning, not just the first.
+//! timestamps, agent-only field placement — and collects errors as it goes
+//! (not just the first), up to [`MAX_VALIDATION_ISSUES`], after which a
+//! truncation notice is appended.
 //!
 //! Two modes ([`Mode`]): `Strict` additionally rejects unknown fields outside
 //! the spec's `extra` escape hatches (outbound gate for files we produce);

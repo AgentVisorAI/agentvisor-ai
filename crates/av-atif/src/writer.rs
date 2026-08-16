@@ -151,7 +151,8 @@ impl TrajectoryBuilder {
 }
 
 /// Convenience: build a metrics block with the three token counts the fidelity
-/// criterion (R17) requires on every exported step.
+/// criterion (R17) requires on strict v1.7 agent steps with nonzero
+/// `llm_call_count` — in practice, every LLM-backed exported step.
 pub fn metrics(prompt: u64, completion: u64, cached: u64, cost_usd: f64) -> Metrics {
     Metrics {
         prompt_tokens: Some(prompt),
