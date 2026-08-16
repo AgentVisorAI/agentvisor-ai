@@ -1279,7 +1279,14 @@ pub async fn doctor(offline: bool) -> Result<()> {
             }
         }
 
-        // 7. Tool schemas.
+        // 7. Tool schemas. The consequence differs by posture:
+        // require_tool_schema = true (default) rejects schema-less tool
+        // calls; false lets them through the schema gate unvalidated.
+        let no_schema_consequence = if config.require_tool_schema {
+            "tool calls will be rejected"
+        } else {
+            "require_tool_schema = false, so tool arguments will skip schema validation (policy and budget gates still apply)"
+        };
         match config.tool_schema_dir.as_deref() {
             Some(dir) => match std::fs::read_dir(dir) {
                 Ok(entries) => {
@@ -1295,18 +1302,18 @@ pub async fn doctor(offline: bool) -> Result<()> {
                         )));
                     } else {
                         checks.push(Check::Warn(format!(
-                            "tool schemas: none in {dir}; tool calls will be rejected"
+                            "tool schemas: none in {dir}; {no_schema_consequence}"
                         )));
                     }
                 }
-                Err(_) if config.uses_default_tool_schema_dir() => checks.push(Check::Warn(
-                    "tool schemas: default directory missing; tool calls will be rejected".to_owned(),
-                )),
+                Err(_) if config.uses_default_tool_schema_dir() => checks.push(Check::Warn(format!(
+                    "tool schemas: default directory missing; {no_schema_consequence}"
+                ))),
                 Err(error) => checks.push(Check::Fail(format!("tool schemas: {dir}: {error}"))),
             },
-            None => checks.push(Check::Warn(
-                "tool schemas: no directory configured; tool calls will be rejected".to_owned(),
-            )),
+            None => checks.push(Check::Warn(format!(
+                "tool schemas: no directory configured; {no_schema_consequence}"
+            ))),
         }
 
         // 8. Signing seed (created on first run if absent).
