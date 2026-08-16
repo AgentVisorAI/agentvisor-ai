@@ -666,3 +666,119 @@ fn round_25_f2_add_key_refuses_jwks_tracked_kid() {
         "expected JWKS-tracked-conflict rejection, got {text}"
     );
 }
+
+// ---- Mutation-run hardening (round 10): pin the exact security
+// boundaries. The original suite proved the over-limit rejections but
+// never the accepted-at-boundary twins, so `>` -> `>=` mutants survived
+// in the JWKS cap, chain depth, exp-escalation, size cap, and
+// future-iat checks — and `||` -> `&&` survived in the OKP/Ed25519
+// JWKS filter.
+
+#[test]
+fn jwks_key_count_cap_is_exact() {
+    let keys = ed25519_keys("k1");
+    let v = validator(&keys);
+    let entry = serde_json::json!({"kty": "RSA"});
+    let at_cap = serde_json::json!({ "keys": vec![entry.clone(); 256] });
+    assert!(
+        matches!(v.add_jwks(&at_cap), Err(IdentityError::Jwks(ref m)) if m.contains("no Ed25519")),
+        "256 non-OKP entries must be walked (then refused as empty), not cap-refused"
+    );
+    let over_cap = serde_json::json!({ "keys": vec![entry; 257] });
+    assert!(
+        matches!(v.add_jwks(&over_cap), Err(IdentityError::Jwks(ref m)) if m.contains("257")),
+        "257 entries must refuse before any per-key parsing"
+    );
+}
+
+#[test]
+fn jwks_filter_requires_both_okp_and_ed25519() {
+    let keys = ed25519_keys("k1");
+    let donor = ed25519_keys("donor");
+    let v = validator(&keys);
+    // kty=OKP with a non-Ed25519 curve must be skipped, not installed:
+    // an X25519 (encryption) point must never become a signature
+    // verification key even though its `x` is a valid 32-byte value.
+    let x25519 = serde_json::json!({
+        "keys": [{"kty": "OKP", "crv": "X25519", "kid": "x25519-k", "x": donor.public_x}]
+    });
+    assert!(
+        matches!(v.add_jwks(&x25519), Err(IdentityError::Jwks(ref m)) if m.contains("no Ed25519")),
+        "X25519 must be skipped, never installed"
+    );
+    // Non-OKP kty with crv=Ed25519 must also be skipped.
+    let wrong_kty = serde_json::json!({
+        "keys": [{"kty": "EC", "crv": "Ed25519", "kid": "ec-k", "x": donor.public_x}]
+    });
+    assert!(
+        matches!(v.add_jwks(&wrong_kty), Err(IdentityError::Jwks(ref m)) if m.contains("no Ed25519")),
+        "non-OKP must be skipped, never installed"
+    );
+    // The genuine article installs exactly one.
+    let genuine = serde_json::json!({
+        "keys": [{"kty": "OKP", "crv": "Ed25519", "kid": "good-k", "x": donor.public_x}]
+    });
+    assert_eq!(v.add_jwks(&genuine).unwrap(), 1);
+}
+
+#[test]
+fn chain_depth_at_exact_limit_is_accepted() {
+    let keys = ed25519_keys("k1");
+    let mut v = validator(&keys);
+    v.set_max_chain_depth(2);
+    // Two ancestors: depth reaches exactly the limit and must pass.
+    let root = claims(&["s"], 890, None);
+    let root_token = mint(&keys, &root);
+    let mut mid = claims(&["s"], 800, Some(root_token));
+    mid.exp = root.exp - 10;
+    let mid_token = mint(&keys, &mid);
+    let mut leaf = claims(&["s"], 700, Some(mid_token));
+    leaf.exp = mid.exp - 10;
+    let id = v.validate(&mint(&keys, &leaf)).unwrap();
+    assert_eq!(id.chain_depth, 2);
+}
+
+#[test]
+fn child_exp_equal_to_parent_exp_is_accepted() {
+    let keys = ed25519_keys("k1");
+    let v = validator(&keys);
+    let parent = claims(&["s"], 600, None);
+    let parent_token = mint(&keys, &parent);
+    let mut child = claims(&["s"], 600, Some(parent_token));
+    child.exp = parent.exp; // equality is not an escalation
+    v.validate(&mint(&keys, &child)).unwrap();
+}
+
+#[test]
+fn jwt_size_cap_is_exact() {
+    let keys = ed25519_keys("k1");
+    let v = validator(&keys);
+    // 8192 bytes of garbage passes the size gate (fails later, but NOT
+    // with the pre-auth cap message)…
+    let at_cap = "x".repeat(8 * 1024);
+    let outcome = v.validate(&at_cap);
+    assert!(
+        matches!(outcome, Err(IdentityError::Malformed(ref m)) if !m.contains("pre-auth cap")),
+        "8192 bytes must pass the size gate, got {outcome:?}"
+    );
+    // …while 8193+ is refused by the cap itself.
+    let over_cap = "x".repeat(8 * 1024 + 1);
+    assert!(
+        matches!(v.validate(&over_cap), Err(IdentityError::Malformed(ref m)) if m.contains("pre-auth cap"))
+    );
+}
+
+#[test]
+fn iat_at_exact_leeway_edge_is_accepted() {
+    let keys = ed25519_keys("k1");
+    let v = validator(&keys);
+    // Default leeway is 30 s: iat == now + 30 is tolerated clock skew;
+    // use +29 to stay robustly inside the boundary across the seconds
+    // that elapse between minting and validating, which still kills the
+    // `>` -> `>=` mutant (that mutant rejects iat == now + leeway, and
+    // with sub-second test latency now is unchanged).
+    let mut c = claims(&["s"], 600, None);
+    c.iat = now_s() + 29;
+    c.exp = c.iat + 600;
+    v.validate(&mint(&keys, &c)).unwrap();
+}
