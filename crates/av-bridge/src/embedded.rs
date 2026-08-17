@@ -230,9 +230,10 @@ impl EmbeddedBroker {
                 // entry that names the inode is only durable after a
                 // `sync_directory(parent)`. Without this, N successful
                 // publishes → acked → power loss → boot back with the
-                // segment file absent and every acked event lost until the
-                // first retention pass, which is the only other code path
-                // that fsyncs the parent directory.
+                // segment file absent and every acked event lost until
+                // another directory-fsyncing path runs (the retention
+                // rewrite, or the sidecar-creation fsync in
+                // `publish_with_uid`).
                 let segment_created = !path.exists();
                 let writer = fs::OpenOptions::new().create(true).append(true).open(&path)?;
                 if segment_created {
@@ -276,11 +277,14 @@ impl EmbeddedBroker {
         &self.data_dir
     }
 
-    /// Enforce per-topic hot retention at time `now_ms`: each expired record
-    /// is exported to the cold tier as its own write-once object (via the
+    /// Enforce per-topic hot retention at time `now_ms`: when
+    /// `retention.cold_uri` is set, each expired record
+    /// is first exported to the cold tier as its own write-once object (via the
     /// authenticated `ColdArchive` for `scheme://` URIs, or
     /// `write_cold_event_once` for local directory paths) before being
-    /// removed from the hot segment via atomic rewrite. Returns the number of
+    /// removed from the hot segment via atomic rewrite; with `cold_uri`
+    /// unset, expired records are dropped from the hot segment without
+    /// export. Returns the number of
     /// records expired.
     pub fn enforce_retention(&self, now_ms: u64) -> Result<u64, BusError> {
         let mut expired_total = 0u64;
