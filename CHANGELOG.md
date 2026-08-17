@@ -4,6 +4,27 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Review rounds 33–34: third-model QC (2026-08-16)
+
+Escalated the QC program to a third independent reviewer model on the
+highest-stakes files. Fifteen findings across fourteen files, severity
+still declining but nonzero — including the session's second genuine
+code fix: `ResponsePermit::submit` documented an early permit release
+that a named `_`-prefixed binding cannot deliver (named bindings live
+to end of scope; NLL shortens borrows, not `Drop` timing) — the code
+now performs the explicit `drop()` the comment always described.
+Other notable corrections: `enforce_retention`'s headline claimed
+unconditional cold export over a `cold_uri` guard (unset means expired
+records drop without export — both arms now documented);
+`verify()`'s numbered checklist was in reverse execution order; the
+JWT validation checklist omitted its own first check (pre-auth 8 KiB
+cap) and the `exp > iat` guard; a cited "manifest override" for the
+cold outbox never existed; `budget.max_tokens` was mislabeled a
+completion budget; seven stale absolute line references were
+symbolized to rot-proof anchors. The reviewers also adjudicated and
+rejected 33 borderline candidates with recorded reasons so future
+audits do not relitigate them.
+
 ### Review rounds 30–32: test-suite QC, self-review closure, echo sweep (2026-08-16)
 
 The cross-model QC program's final surface: the standalone integration
