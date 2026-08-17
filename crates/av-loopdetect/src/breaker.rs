@@ -20,7 +20,9 @@ pub struct BreakerConfig {
     /// Minimum session token consumption before the breaker may trip
     /// (prevents tripping on short legitimate confirmations).
     pub min_tokens: u64,
-    /// Action on trip: `reject` (HTTP 429), `inject` (corrective system
+    /// Action on trip: `reject` (HTTP 403 — deliberately not the brief's
+    /// 429, which SDKs auto-retry; see `PipelineError::status`), `inject`
+    /// (corrective system
     /// payload), or `abort` (connection abort) — the enforceable equivalents
     /// of the brief's TCP RST / 429 / corrective-payload triple.
     pub action: BreakerAction,
