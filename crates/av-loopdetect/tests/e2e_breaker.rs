@@ -9,10 +9,11 @@
 //!   6. Token-gate precision — trips at exactly the right budget
 //!   7. Streak resets cleanly on genuine progress
 //!   8. Manual reset re-opens every path
-//!   9. Corrective inject followed by loop convergence
+//!   9. Corrective `Inject` action reported in the tripped verdict;
+//!      breaker stays Open until manual reset
 //!  10. Very short streak window (window = 1)
 //!  11. Very wide streak window (window = 10)
-//!  12. Near-epsilon dance — oscillating just below/above threshold
+//!  12. Genuinely progressing content never accrues a false streak
 //! 13. Multilingual loop (transliteration or same concept)
 //! 14. Massive token count — tokens_consumed arithmetic never overflows
 //! 15. Concurrent observe — no panics, no data corruption
@@ -336,7 +337,7 @@ fn wide_window_accumulates_streak_and_trips_exactly_at_threshold() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn near_epsilon_oscillation_never_falsely_trips() {
+fn progressing_content_never_falsely_trips() {
     let s = SessionLoopState::new(std_cfg());
     let e = embedder();
     // High-entropy steps (should always score Δ > 0.30 on the hash embedder).

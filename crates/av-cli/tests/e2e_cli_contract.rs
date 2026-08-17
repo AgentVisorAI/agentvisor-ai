@@ -59,6 +59,11 @@ fn help_mentions_every_subcommand() {
 #[test]
 fn each_subcommand_has_its_own_help() {
     for cmd in [
+        "setup",
+        "start",
+        "init",
+        "doctor",
+        "health",
         "keygen",
         "receipt-verify",
         "atif-validate",

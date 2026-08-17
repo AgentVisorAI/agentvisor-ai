@@ -88,6 +88,11 @@ fn receipt_signs_at_jcs_boundary_and_refuses_above() {
     let signer = Ed25519Signer::from_seed(&[1; 32]);
     let ok = Receipt::issue(body_with_event_count(1u64 << 53), &signer);
     assert!(ok.is_ok(), "event_count = 2^53 must sign");
+    // Round 36: the header promises "signs+verifies" — prove the verify half.
+    let receipt = ok.unwrap();
+    let mut ring = Keyring::new();
+    ring.add_key_bytes(&Signer::public_key_bytes(&signer)).unwrap();
+    receipt.verify(&ring).unwrap();
 
     let over = Receipt::issue(body_with_event_count((1u64 << 53) + 1), &signer);
     match over {
