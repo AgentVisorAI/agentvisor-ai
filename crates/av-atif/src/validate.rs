@@ -317,8 +317,20 @@ fn validate_trajectory_obj(
             );
         }
     }
+    // Optional string fields: `and_then(Value::as_str)` elsewhere treats
+    // a wrong-typed value like an absent one, so e.g. `"notes": 42`
+    // passed Strict validation with zero issues yet fails typed
+    // deserialization. Flag the type mismatch explicitly (null stays
+    // legal — serde maps it to None).
+    for f in ["session_id", "trajectory_id", "notes", "continued_trajectory_ref"] {
+        if obj.get(f).is_some_and(|v| !v.is_string() && !v.is_null()) {
+            issue!(issues, format!("{path}.{f}"), "must be a string");
+        }
+    }
     // session_id optionality was relaxed in v1.7; older files must carry it.
-    if top_level && ver < (1, 7) && obj.get("session_id").and_then(Value::as_str).is_none() {
+    // A present-but-wrong-typed value is a type error (flagged above), not
+    // a missing field.
+    if top_level && ver < (1, 7) && obj.get("session_id").is_none_or(Value::is_null) {
         issue!(
             issues,
             format!("{path}.session_id"),
@@ -413,36 +425,46 @@ fn validate_trajectory_obj(
     }
 
     // subagent trajectories recurse with the same rules.
-    if let Some(Value::Array(subs)) = obj.get("subagent_trajectories") {
-        let mut trajectory_ids = std::collections::HashSet::new();
-        for (i, sub) in subs.iter().enumerate() {
-            let id = sub
-                .get("trajectory_id")
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty());
-            match id {
-                Some(id) if trajectory_ids.insert(id.to_owned()) => {}
-                Some(id) => issue!(
+    match obj.get("subagent_trajectories") {
+        Some(Value::Array(subs)) => {
+            let mut trajectory_ids = std::collections::HashSet::new();
+            for (i, sub) in subs.iter().enumerate() {
+                let id = sub
+                    .get("trajectory_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty());
+                match id {
+                    Some(id) if trajectory_ids.insert(id.to_owned()) => {}
+                    Some(id) => issue!(
+                        issues,
+                        format!("{path}.subagent_trajectories.{i}.trajectory_id"),
+                        "duplicate embedded trajectory_id {id:?}"
+                    ),
+                    None => issue!(
+                        issues,
+                        format!("{path}.subagent_trajectories.{i}.trajectory_id"),
+                        "required for embedded subagent trajectories"
+                    ),
+                }
+                validate_trajectory_obj(
+                    sub,
+                    &format!("{path}.subagent_trajectories.{i}"),
+                    mode,
                     issues,
-                    format!("{path}.subagent_trajectories.{i}.trajectory_id"),
-                    "duplicate embedded trajectory_id {id:?}"
-                ),
-                None => issue!(
-                    issues,
-                    format!("{path}.subagent_trajectories.{i}.trajectory_id"),
-                    "required for embedded subagent trajectories"
-                ),
+                    false,
+                    depth + 1,
+                    ancestors,
+                );
             }
-            validate_trajectory_obj(
-                sub,
-                &format!("{path}.subagent_trajectories.{i}"),
-                mode,
-                issues,
-                false,
-                depth + 1,
-                ancestors,
-            );
         }
+        // A non-array value previously slipped through (no else-arm) yet
+        // fails typed deserialization. Null stays legal (serde -> None).
+        Some(v) if !v.is_null() => issue!(
+            issues,
+            format!("{path}.subagent_trajectories"),
+            "must be an array"
+        ),
+        _ => {}
     }
 
     // Round-40 F3: remove this frame's id so sibling branches (a
@@ -976,5 +998,94 @@ mod tests {
         assert_eq!(parse_version("ATIF-v1.0"), Some((1, 0)));
         assert_eq!(parse_version("v1.7"), None);
         assert_eq!(parse_version("ATIF-v1"), None);
+    }
+
+    /// Wrong-typed optional fields must be flagged: `and_then(Value::as_str)`
+    /// used to skip them silently, so documents that fail typed
+    /// deserialization passed Strict validation with zero issues.
+    #[test]
+    fn wrong_typed_optional_fields_are_flagged() {
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": 123,
+            "trajectory_id": 42,
+            "notes": 42,
+            "continued_trajectory_ref": {},
+            "subagent_trajectories": "nope",
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{"step_id": 1, "source": "user", "message": "hi"}],
+        });
+        let issues = validate_value(&value, Mode::Strict);
+        for f in ["session_id", "trajectory_id", "notes", "continued_trajectory_ref"] {
+            assert!(
+                issues
+                    .iter()
+                    .any(|i| i.path == format!("trajectory.{f}") && i.message == "must be a string"),
+                "expected type issue for {f}: {issues:?}"
+            );
+        }
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == "trajectory.subagent_trajectories" && i.message == "must be an array"),
+            "expected array issue: {issues:?}"
+        );
+        // Validator and serde must agree: typed deserialization also rejects.
+        assert!(serde_json::from_value::<crate::model::Trajectory>(value).is_err());
+    }
+
+    /// Explicit nulls deserialize to `None` for optional fields, so the
+    /// type checks must not flag them.
+    #[test]
+    fn null_optional_fields_remain_valid() {
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": null,
+            "notes": null,
+            "continued_trajectory_ref": null,
+            "subagent_trajectories": null,
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{"step_id": 1, "source": "user", "message": "hi"}],
+        });
+        let issues = validate_value(&value, Mode::Strict);
+        assert!(issues.is_empty(), "nulls must stay valid: {issues:?}");
+        assert!(serde_json::from_value::<crate::model::Trajectory>(value).is_ok());
+    }
+
+    /// Pre-1.7 files require `session_id`; a present-but-wrong-typed value
+    /// is a type error, not the misleading "required field is missing".
+    #[test]
+    fn pre_v17_session_id_distinguishes_missing_from_wrong_type() {
+        let base = |session_id: Option<Value>| {
+            let mut map = serde_json::Map::new();
+            map.insert("schema_version".into(), Value::String("ATIF-v1.0".into()));
+            if let Some(v) = session_id {
+                map.insert("session_id".into(), v);
+            }
+            map.insert("agent".into(), serde_json::json!({"name": "a", "version": "1"}));
+            map.insert(
+                "steps".into(),
+                serde_json::json!([{"step_id": 1, "source": "user", "message": "hi"}]),
+            );
+            Value::Object(map)
+        };
+        let issues = validate_value(&base(None), Mode::Strict);
+        assert!(
+            issues.iter().any(|i| i.path == "trajectory.session_id"
+                && i.message.contains("required field is missing")),
+            "missing session_id must be reported: {issues:?}"
+        );
+        let issues = validate_value(&base(Some(serde_json::json!(123))), Mode::Strict);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == "trajectory.session_id" && i.message == "must be a string"),
+            "wrong-typed session_id must be a type error: {issues:?}"
+        );
+        assert!(
+            !issues.iter().any(|i| i.path == "trajectory.session_id"
+                && i.message.contains("required field is missing")),
+            "wrong type must not be reported as missing: {issues:?}"
+        );
     }
 }

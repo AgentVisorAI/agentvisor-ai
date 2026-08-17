@@ -432,31 +432,44 @@ impl EmbeddedBroker {
 fn write_cold_event_once(directory: &Path, event: &StoredEvent) -> Result<(), BusError> {
     let path = directory.join(format!("{:020}.json", event.offset));
     let bytes = serde_json::to_vec(event)?;
-    match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(mut file) => {
-            file.write_all(&bytes)?;
-            file.sync_all()?;
+    if path.exists() {
+        return if fs::read(&path)? == bytes {
+            // Idempotent re-export (e.g. a retention pass that crashed
+            // after the cold copy landed but before the hot rewrite).
             Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            if fs::read(&path)? == bytes {
-                Ok(())
-            } else {
-                // Round-37 F1/F2 class: `write_cold_event_once`
-                // errors bubble up through `enforce_retention` and can
-                // reach a
-                // tracing::warn!(%error) on the maintenance path.
-                // Basename the absolute cold-destination path so a
-                // duplicate-object collision doesn't ship the
-                // deployment topology to OTLP.
-                Err(BusError::Backend(format!(
-                    "cold object {} already exists with different content",
-                    av_core::fsutil::basename(&path)
-                )))
-            }
-        }
-        Err(error) => Err(BusError::Io(error)),
+        } else {
+            // Round-37 F1/F2 class: `write_cold_event_once`
+            // errors bubble up through `enforce_retention` and can
+            // reach a
+            // tracing::warn!(%error) on the maintenance path.
+            // Basename the absolute cold-destination path so a
+            // duplicate-object collision doesn't ship the
+            // deployment topology to OTLP.
+            Err(BusError::Backend(format!(
+                "cold object {} already exists with different content",
+                av_core::fsutil::basename(&path)
+            )))
+        };
     }
+    // Crash-atomic write-once. Writing directly at the final name
+    // (create_new → write_all → sync_all) meant a crash/ENOSPC mid-write
+    // left a torn file there, and every subsequent retention pass hit
+    // AlreadyExists + content mismatch → enforce_retention aborted for
+    // all topics, forever. Stage in a UUID-suffixed tmp, fsync, then
+    // rename — the final path only ever holds complete objects (same
+    // shape as `rewrite_atomic`; the caller fsyncs the directory after
+    // the batch). True conflicts are still detected by the pre-existing
+    // content comparison above.
+    let tmp = path.with_extension(format!("json.{}.tmp", av_core::new_event_uid()));
+    let mut guard = av_core::fsutil::TempPathGuard::new(tmp.clone());
+    {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, &path)?;
+    guard.disarm();
+    Ok(())
 }
 
 fn copy_referenced_schemas(data_dir: &Path, manifest: &BridgeManifest) -> Result<(), BusError> {
@@ -533,7 +546,14 @@ fn recover_segment(path: &Path) -> Result<(u64, u64), BusError> {
             // A single unparseable middle line must not brick the broker.
             // The corrupted bytes are left on disk as forensic evidence;
             // subsequent publishes append past the surviving max offset.
+            // The line still occupies one logical offset (segment lines are
+            // appended in offset order), so advance next_offset past it —
+            // computing next_offset from parseable lines only let a corrupt
+            // *trailing* line regress next_offset, and the next publish
+            // reused that line's live offset (offset collision in the
+            // audit stream).
             Err(error) => {
+                next_offset = next_offset.saturating_add(1);
                 tracing::warn!(
                     %error,
                     path = %av_core::fsutil::basename(path),
@@ -936,6 +956,134 @@ impl EventBus for EmbeddedBroker {
     }
 
     fn maintenance(&self, now_ms: u64) -> Result<u64, BusError> {
-        EmbeddedBroker::enforce_retention(self, now_ms)
+        let expired = EmbeddedBroker::enforce_retention(self, now_ms)?;
+        // Drain cold-export intents that a previous `ColdArchive::commit`
+        // converted from a transient remote failure into a durable
+        // "queued for retry" file. Only the Kafka/NATS maintenance paths
+        // used to drain the queue; the embedded broker never did, so the
+        // retry promise was never fulfilled — a silent permanent
+        // cold-tier gap after the record left the hot segment.
+        #[cfg(feature = "cold-store")]
+        if let Some(archive) = &self.cold_archive {
+            archive.retry_pending_with(|pending| {
+                // Embedded intents are staged and committed inside one
+                // `put()` call during retention, so a surviving
+                // offset-None intent means a crash landed between stage
+                // and commit while the record was still hot (the segment
+                // rewrite only happens after export). Resolve the offset
+                // from the partition's idempotency map instead of
+                // re-publishing, which would append a duplicate record.
+                let parts = self
+                    .partitions
+                    .get(&pending.topic)
+                    .ok_or_else(|| BusError::UnknownTopic(pending.topic.clone()))?;
+                let slot = parts.get(pending.partition as usize).ok_or_else(|| {
+                    BusError::Backend(format!("partition {} out of range", pending.partition))
+                })?;
+                let offset = slot
+                    .lock()
+                    .seen_event_uids
+                    .get(&pending.event_uid)
+                    .copied()
+                    .ok_or_else(|| {
+                        BusError::Backend(format!(
+                            "cold intent {:?} has no broker offset and no live segment \
+                             record to resolve it from; refusing to fabricate one",
+                            pending.event_uid
+                        ))
+                    })?;
+                Ok(PublishAck {
+                    topic: pending.topic.clone(),
+                    partition: pending.partition,
+                    offset,
+                })
+            })?;
+        }
+        Ok(expired)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    fn stored(offset: u64) -> StoredEvent {
+        StoredEvent {
+            partition: 0,
+            offset,
+            key: "inst".to_owned(),
+            value: serde_json::json!({"n": offset}),
+            stored_at: 1,
+        }
+    }
+
+    /// A corrupt complete line occupies one logical offset. If it is the
+    /// *last* line, next_offset must not regress below it — computing
+    /// next_offset from parseable lines only made the next publish reuse
+    /// the corrupt line's live offset.
+    #[test]
+    fn recover_segment_counts_a_corrupt_trailing_line_as_one_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p0.jsonl");
+        let mut lines = String::new();
+        for offset in 0..2u64 {
+            lines.push_str(&serde_json::to_string(&stored(offset)).unwrap());
+            lines.push('\n');
+        }
+        lines.push_str("{corrupt-but-complete\n");
+        fs::write(&path, &lines).unwrap();
+        let (next_offset, torn) = recover_segment(&path).unwrap();
+        assert_eq!(torn, 0, "a complete corrupt line is kept, not a torn tail");
+        assert_eq!(next_offset, 3, "the corrupt line at offset 2 must be counted");
+    }
+
+    /// A corrupt *middle* line must not overshoot: the running counter
+    /// advances by one for the corrupt line and the trailing parseable
+    /// line still governs.
+    #[test]
+    fn recover_segment_keeps_next_offset_exact_with_a_corrupt_middle_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p0.jsonl");
+        let mut lines = String::new();
+        lines.push_str(&serde_json::to_string(&stored(0)).unwrap());
+        lines.push_str("\n{corrupt-but-complete\n");
+        lines.push_str(&serde_json::to_string(&stored(2)).unwrap());
+        lines.push('\n');
+        fs::write(&path, &lines).unwrap();
+        let (next_offset, torn) = recover_segment(&path).unwrap();
+        assert_eq!(torn, 0);
+        assert_eq!(next_offset, 3);
+    }
+
+    /// Crash-atomic write-once contract: identical re-export is
+    /// idempotent, divergent content is refused loudly, and no tmp
+    /// staging file survives either path (a torn own-write can therefore
+    /// never appear at the final name and poison retention forever).
+    #[test]
+    fn write_cold_event_once_is_idempotent_and_refuses_divergent_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let event = stored(7);
+        write_cold_event_once(dir.path(), &event).unwrap();
+        // Identical re-export: idempotent.
+        write_cold_event_once(dir.path(), &event).unwrap();
+        // Divergent content at the same offset: refused, original kept.
+        let mut divergent = stored(7);
+        divergent.value = serde_json::json!({"tampered": true});
+        let err = write_cold_event_once(dir.path(), &divergent).unwrap_err();
+        assert!(
+            err.to_string().contains("already exists with different content"),
+            "{err}"
+        );
+        let kept: StoredEvent =
+            serde_json::from_slice(&fs::read(dir.path().join("00000000000000000007.json")).unwrap()).unwrap();
+        assert_eq!(kept.value, event.value, "conflict must not overwrite");
+        // No staging residue: exactly the one final object remains.
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["00000000000000000007.json".to_owned()], "{names:?}");
     }
 }

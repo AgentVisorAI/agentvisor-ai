@@ -892,6 +892,14 @@ impl HarnessConfig {
             ("identity_jwks_refresh_s", self.identity_jwks_refresh_s),
         ];
         if let Some(read_timeout) = self.upstream_read_timeout_s {
+            // 0 passes the cap check below but makes reqwest's
+            // read_timeout fire immediately — every upstream request
+            // fails before the first byte arrives.
+            if read_timeout == 0 {
+                return Err(
+                    "upstream_read_timeout_s = 0 would time out every upstream read immediately — omit the key to use the built-in 60 s default".into(),
+                );
+            }
             interval_fields.push(("upstream_read_timeout_s", read_timeout));
         }
         for (field, value) in interval_fields {
@@ -1416,6 +1424,29 @@ mod tests {
             "err should name the offending field: {err}"
         );
         assert!(err.contains("milliseconds"), "hint should mention ms: {err}");
+    }
+
+    /// `upstream_read_timeout_s = 0` would make every upstream request
+    /// time out before its first byte; reject it with a pointer at the
+    /// omit-for-default posture.
+    #[test]
+    fn upstream_read_timeout_rejects_zero() {
+        let err = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               upstream_read_timeout_s = 0"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("upstream_read_timeout_s"),
+            "err should name the offending field: {err}"
+        );
+        assert!(err.contains("omit"), "err should point at the default: {err}");
+        // Any positive value under the 1-day cap remains valid.
+        assert!(HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               upstream_read_timeout_s = 1"#,
+        )
+        .is_ok());
     }
 
     /// Round-30 F1: refuse `enforce_identity_scopes = true` while

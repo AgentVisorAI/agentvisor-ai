@@ -182,6 +182,19 @@ async fn chat_completions(
         response_attempt_id,
     } = forwarded;
     let Some(response_permit) = response_permit else {
+        // Defensive: `prepare_chat` always reserves a permit. Even so,
+        // retire the durable marker and the journalled attempt through
+        // the plain worker queue before failing — returning directly
+        // would leak the spool/inflight-responses/ marker (crash
+        // recovery then quarantines the session) and leave a dangling
+        // non-terminal ResponseAttempt.
+        let _ = state.worker.try_submit(refused_response_failure_job(
+            session,
+            identity,
+            "response_capture_permit_missing".to_owned(),
+            response_marker,
+            response_attempt_id,
+        ));
         return lifecycle_error("durable response capture permit is missing".to_owned());
     };
 
@@ -203,20 +216,43 @@ async fn chat_completions(
     // be empty or `identity` case-insensitively; also split each
     // value on `,` so `gzip, identity` (single header, two tokens)
     // is caught.
-    for value in upstream_headers.get_all(axum::http::header::CONTENT_ENCODING) {
+    let mut refused_encoding: Option<(String, String)> = None;
+    'encodings: for value in upstream_headers.get_all(axum::http::header::CONTENT_ENCODING) {
         let raw = value.to_str().unwrap_or_default();
         for token in raw.split(',') {
             let token = token.trim();
             if token.is_empty() || token.eq_ignore_ascii_case("identity") {
                 continue;
             }
-            return pipeline_error(crate::pipeline::PipelineError::Upstream(format!(
-                "upstream responded with unsupported Content-Encoding token {token:?} \
-                 (full header: {raw:?}) — the proxy is built without decompression \
-                 support; enable it upstream (Accept-Encoding: identity) or rebuild \
-                 with the reqwest `gzip` feature"
-            )));
+            refused_encoding = Some((token.to_owned(), raw.to_owned()));
+            break 'encodings;
         }
+    }
+    if let Some((token, raw)) = refused_encoding {
+        // Retire the durable in-flight marker and terminally fail the
+        // journalled response attempt before refusing — mirroring
+        // forward_chat's Err arm. Returning without this leaked the
+        // marker (recover_spooled_sessions quarantined the session on
+        // every subsequent boot) and left a dangling non-terminal
+        // attempt while the session later closed with a "clean"
+        // receipt. Stable classifier only in the persisted record —
+        // the header token is upstream-controlled bytes.
+        let _ = response_permit.submit(
+            &state.worker,
+            refused_response_failure_job(
+                session,
+                identity,
+                "upstream_unsupported_content_encoding".to_owned(),
+                response_marker,
+                response_attempt_id,
+            ),
+        );
+        return pipeline_error(crate::pipeline::PipelineError::Upstream(format!(
+            "upstream responded with unsupported Content-Encoding token {token:?} \
+             (full header: {raw:?}) — the proxy is built without decompression \
+             support; enable it upstream (Accept-Encoding: identity) or rebuild \
+             with the reqwest `gzip` feature"
+        )));
     }
     // Round-25 F3: RFC 7231 §3.1.1.1 says media type/subtype are
     // case-insensitive and the header value may carry parameters
@@ -1198,6 +1234,49 @@ fn pipeline_error(error: crate::pipeline::PipelineError) -> Response {
 
 fn lifecycle_error(error: String) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": error}))).into_response()
+}
+
+/// Terminal failure capture for an upstream response refused inside
+/// `chat_completions` after `forward_chat` already succeeded. Mirrors
+/// `forward_chat`'s Err arm: carrying `response_marker` lets the worker
+/// retire the durable in-flight marker, and `terminal: true` closes the
+/// journalled response attempt so crash recovery does not quarantine
+/// the session over a request the client already saw fail.
+fn refused_response_failure_job(
+    session: Arc<crate::session::Session>,
+    identity: av_events::AgentIdentity,
+    reason: String,
+    response_marker: Option<String>,
+    response_attempt_id: String,
+) -> crate::worker::WorkerJob {
+    let atif = (session.workflow == crate::session::Workflow::Unsigned).then(|| crate::worker::AtifCapture {
+        source: av_atif::Source::Agent,
+        message: Value::String(reason.clone()),
+        reasoning_content: None,
+        model_name: None,
+        tool_calls: None,
+        observation: None,
+        llm_call_count: Some(0),
+    });
+    crate::worker::WorkerJob {
+        session,
+        identity,
+        class: av_events::EventClass::StopReason,
+        payload: json!({"reason": reason, "direction": "upstream_response"}),
+        text: String::new(),
+        analyze_loop: false,
+        status: av_events::StatusId::Failure,
+        stop_reason: Some(StopReason::Other),
+        native_stop_reason: None,
+        metrics: av_events::EventMetrics::default(),
+        cost_usd_micros: 0,
+        atif,
+        response_marker,
+        response_attempt: Some(crate::worker::ResponseAttempt {
+            id: response_attempt_id,
+            terminal: true,
+        }),
+    }
 }
 
 struct AbortFinalizingStream {
@@ -2342,6 +2421,20 @@ mod tests {
             response.headers_mut().insert(
                 axum::http::header::CONTENT_TYPE,
                 HeaderValue::from_static("application/json"),
+            );
+            return response;
+        }
+        if payload.get("model").and_then(Value::as_str) == Some("gzip-encoded") {
+            // Body content is irrelevant: the encoding refusal fires on
+            // the header alone, before any byte is read.
+            let mut response = Response::new(Body::from("compressed-bytes"));
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_ENCODING,
+                HeaderValue::from_static("gzip"),
             );
             return response;
         }
@@ -3605,6 +3698,56 @@ mod tests {
         assert!(serde_json::from_slice::<Value>(&body).unwrap()["error"].is_string());
         let session = state.sessions.get("malformed-json").unwrap();
         assert!(session.capture_failed());
+        provider.abort();
+    }
+
+    /// Refusing an unsupported Content-Encoding must retire the durable
+    /// in-flight response marker and terminally fail the journalled
+    /// response attempt — otherwise `recover_spooled_sessions`
+    /// quarantines the session forever over a request the client
+    /// already saw fail as a clean 502.
+    #[tokio::test]
+    async fn unsupported_content_encoding_refusal_retires_marker_and_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state(directory.path()).await;
+        let response = build_router(state.clone())
+            .oneshot(chat_request_with_payload(
+                "gzip-encoded",
+                json!({
+                    "model": "gzip-encoded",
+                    "stream": false,
+                    "messages": [{"role": "user", "content": "hello"}]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let error = serde_json::from_slice::<Value>(&body).unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(error.contains("Content-Encoding"), "unexpected error: {error}");
+        let session = state.sessions.get("gzip-encoded").unwrap();
+        session.wait_for_worker_jobs().await;
+        crate::worker::ensure_no_inflight_responses(directory.path(), &state.journal_key)
+            .await
+            .expect("refusal must retire the in-flight response marker");
+        let records = active_records(directory.path(), &state, "gzip-encoded");
+        assert!(
+            records
+                .iter()
+                .filter_map(|record| record.response_attempt.as_ref())
+                .any(|attempt| attempt.terminal),
+            "refusal must journal a terminal response attempt"
+        );
+        let event: av_events::OcsfEvent =
+            serde_json::from_value(records.last().unwrap().event.clone()).unwrap();
+        assert_eq!(event.class_name, av_events::EventClass::StopReason);
+        assert_eq!(event.status_id, av_events::StatusId::Failure.id());
+        assert_eq!(event.payload["reason"], "upstream_unsupported_content_encoding");
         provider.abort();
     }
 

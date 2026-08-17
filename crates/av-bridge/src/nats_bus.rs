@@ -316,9 +316,15 @@ impl EventBus for NatsBus {
                     let mut ev: StoredEvent = serde_json::from_slice(&msg.payload).map_err(|error| {
                         async_nats::Error::from(std::io::Error::other(format!("fetch decode: {error}")))
                     })?;
-                    if let Ok(info) = msg.info() {
-                        ev.offset = info.stream_sequence;
-                    }
+                    // Surface an info() failure like the payload-decode
+                    // path above: silently keeping the offset-0
+                    // placeholder would break offset-based pagination
+                    // (reconcilers resume from `last.offset + 1`, so a
+                    // zeroed offset restarts the scan from the head).
+                    let info = msg.info().map_err(|error| {
+                        async_nats::Error::from(std::io::Error::other(format!("fetch info: {error}")))
+                    })?;
+                    ev.offset = info.stream_sequence;
                     out.push(ev);
                     if out.len() >= max {
                         break;

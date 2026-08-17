@@ -8,8 +8,21 @@
 use crate::store::{Spend, StateError, StateStore};
 use redis::Commands;
 
+/// TTL (seconds) applied to every counter key this store touches (the
+/// spend/add INCRBY paths and the refund clamp). 24 h: counters are
+/// session-scoped and the TTL is the backstop that keeps abandoned
+/// sessions from leaking Redis memory forever. NOTE the prod/dev
+/// divergence this creates: `InMemoryStore` never expires, so a session
+/// idle longer than this window has its budget counters silently reset
+/// against Redis only. Callers must keep session lifetimes within this
+/// window (or persist budgets elsewhere) — see the `StateStore` trait
+/// docs on counter lifetime.
+const BUDGET_COUNTER_TTL_SECS: u64 = 86_400;
+
 /// Atomic check-and-spend using subtraction so `current + amount` never rounds.
-const TRY_SPEND_LUA: &str = r"
+static TRY_SPEND_LUA: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        r"
 for i, key in ipairs(KEYS) do
     local current = tonumber(redis.call('GET', key) or '0')
     local amount = tonumber(ARGV[(i - 1) * 2 + 1])
@@ -20,12 +33,16 @@ for i, key in ipairs(KEYS) do
 end
 for i, key in ipairs(KEYS) do
     redis.call('INCRBY', key, ARGV[(i - 1) * 2 + 1])
-    redis.call('EXPIRE', key, 86400)
+    redis.call('EXPIRE', key, {BUDGET_COUNTER_TTL_SECS})
 end
 return 0
-";
+"
+    )
+});
 
-const ADD_LUA: &str = r"
+static ADD_LUA: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        r"
 local current = tonumber(redis.call('GET', KEYS[1]) or '0')
 local amount = tonumber(ARGV[1])
 local limit = tonumber(ARGV[2])
@@ -33,14 +50,16 @@ if current > limit or amount > limit - current then
     return -1
 end
 local result = redis.call('INCRBY', KEYS[1], ARGV[1])
--- Match TRY_SPEND_LUA's 24 h TTL. Without this, any counter touched
+-- Match TRY_SPEND_LUA's TTL. Without this, any counter touched
 -- only through `add()` (bookkeeping, telemetry, non-budget spending)
 -- persists forever in Redis; over a long-running deployment that
 -- silently leaks memory until Redis OOMs. The two APIs must be
 -- interchangeable from the persistence perspective.
-redis.call('EXPIRE', KEYS[1], 86400)
+redis.call('EXPIRE', KEYS[1], {BUDGET_COUNTER_TTL_SECS})
 return result
-";
+"
+    )
+});
 
 /// Redis-backed store. Connections are pooled internally (r2d2 for both
 /// single-node and cluster; the redis crate implements
@@ -130,7 +149,7 @@ fn add_on<C: redis::ConnectionLike>(conn: &mut C, key: &str, delta: u64) -> Resu
     if delta > av_core::error::JCS_SAFE_MAX {
         return Err(StateError::Overflow(key.to_owned()));
     }
-    let value: i64 = redis::Script::new(ADD_LUA)
+    let value: i64 = redis::Script::new(&ADD_LUA)
         .key(key)
         .arg(delta)
         .arg(av_core::error::JCS_SAFE_MAX)
@@ -177,7 +196,7 @@ fn spend_many_on<C: redis::ConnectionLike>(
             return Err(StateError::Overflow(spend.key.clone()));
         }
     }
-    let script = redis::Script::new(TRY_SPEND_LUA);
+    let script = redis::Script::new(&TRY_SPEND_LUA);
     let mut invocation = script.prepare_invoke();
     for spend in spends {
         invocation.key(&spend.key).arg(spend.amount).arg(spend.limit);
@@ -281,28 +300,30 @@ impl StateStore for RedisStore {
     /// the whole DECRBY on `EXISTS`. If the session was cleared,
     /// the budget is already gone and there is nothing to
     /// compensate; the refund is a silent no-op. If the session
-    /// is alive, we DECRBY-clamp AND refresh the 24 h TTL to
+    /// is alive, we DECRBY-clamp AND refresh the counter TTL to
     /// match `TRY_SPEND_LUA` (a plain DECRBY does not refresh).
     fn refund(&self, key: &str, amount: u64) {
         // Redis DECRBY takes i64. Cap at i64::MAX so a caller passing
         // u64::MAX cannot silently wrap into a negative value.
         let amount = i64::try_from(amount).unwrap_or(i64::MAX);
-        let clamp_script = r#"
+        let clamp_script = format!(
+            r"
             if redis.call('EXISTS', KEYS[1]) == 0 then
                 return 0
             end
             local new = redis.call('DECRBY', KEYS[1], ARGV[1])
             if new < 0 then
-                redis.call('SET', KEYS[1], 0, 'EX', 86400)
+                redis.call('SET', KEYS[1], 0, 'EX', {BUDGET_COUNTER_TTL_SECS})
                 return 0
             end
-            redis.call('EXPIRE', KEYS[1], 86400)
+            redis.call('EXPIRE', KEYS[1], {BUDGET_COUNTER_TTL_SECS})
             return new
-        "#;
+        "
+        );
         match &self.backend {
             RedisBackend::Single(pool) => {
                 if let Ok(mut connection) = pool.get() {
-                    let _: Result<i64, _> = redis::Script::new(clamp_script)
+                    let _: Result<i64, _> = redis::Script::new(&clamp_script)
                         .key(key)
                         .arg(amount)
                         .invoke(&mut *connection);
@@ -310,12 +331,42 @@ impl StateStore for RedisStore {
             }
             RedisBackend::Cluster(pool) => {
                 if let Ok(mut connection) = pool.get() {
-                    let _: Result<i64, _> = redis::Script::new(clamp_script)
+                    let _: Result<i64, _> = redis::Script::new(&clamp_script)
                         .key(key)
                         .arg(amount)
                         .invoke(&mut *connection);
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    /// Every Lua script that mutates a counter must apply the single
+    /// shared TTL constant — a hardcoded-literal drift between the
+    /// spend/add/refund paths would make some counters outlive others
+    /// and silently split the session-expiry policy.
+    #[test]
+    fn every_counter_script_applies_the_shared_ttl() {
+        let ttl = BUDGET_COUNTER_TTL_SECS.to_string();
+        for (name, script) in [
+            ("TRY_SPEND_LUA", TRY_SPEND_LUA.as_str()),
+            ("ADD_LUA", ADD_LUA.as_str()),
+        ] {
+            assert!(
+                script.contains(&format!("EXPIRE', KEYS[1], {ttl}"))
+                    || script.contains(&format!("EXPIRE', key, {ttl}")),
+                "{name} must EXPIRE with BUDGET_COUNTER_TTL_SECS: {script}"
+            );
+            assert!(
+                !script.contains('{'),
+                "{name} has an unexpanded format placeholder"
+            );
         }
     }
 }

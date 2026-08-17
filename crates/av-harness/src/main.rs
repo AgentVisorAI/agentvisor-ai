@@ -589,7 +589,11 @@ async fn build_identity(
 
     let validator = Arc::new(validator);
     let mut refresh_handle: Option<tokio::task::JoinHandle<()>> = None;
-    if let Some(url) = config.identity_jwks_url.as_deref() {
+    // Empty string means "unset" — same posture as `has_jwks` above.
+    // Without the filter, `identity_jwks_url = ""` built a client and
+    // fetched "" at boot, killing startup despite the HMAC path being
+    // fully configured.
+    if let Some(url) = config.identity_jwks_url.as_deref().filter(|url| !url.is_empty()) {
         // Disable redirects: an IdP that returns 302 to an internal URL would
         // let a compromised (or misconfigured) JWKS host pivot the harness
         // into an SSRF probe against private services.
@@ -713,20 +717,23 @@ async fn refresh_jwks(client: &reqwest::Client, url: &str, validator: &IdentityV
     // the inner reqwest error verbatim. Convert the reqwest error
     // to a URL-free anyhow::Error using `reqwest::Error::without_url`
     // before the context wrap so no downstream `%error` on the boot
-    // path or future logger can leak the IdP hostname.
+    // path or future logger can leak the IdP hostname. Keep the
+    // stripped reqwest error as the anyhow *source* (not a
+    // stringified message) so `classify_jwks_error`'s downcast can
+    // still label timeout/connect/body/status failures.
     const MAX_JWKS_BYTES: usize = 4 * 1024 * 1024;
     let response = client
         .get(url)
         .send()
         .await
-        .map_err(|error| anyhow::anyhow!("fetch JWKS: {}", error.without_url()))?
+        .map_err(|error| anyhow::Error::new(error.without_url()).context("fetch JWKS"))?
         .error_for_status()
         .map_err(|error| {
             let status = error
                 .status()
                 .map(|s| s.as_u16().to_string())
                 .unwrap_or_else(|| "unknown".into());
-            anyhow::anyhow!("JWKS endpoint returned status {status}")
+            anyhow::Error::new(error.without_url()).context(format!("JWKS endpoint returned status {status}"))
         })?;
     // Fast reject: if Content-Length is present and already exceeds the
     // cap, refuse without allocating anything for the body.
@@ -739,7 +746,8 @@ async fn refresh_jwks(client: &reqwest::Client, url: &str, validator: &IdentityV
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| anyhow::anyhow!("read JWKS chunk: {}", error.without_url()))?;
+        let chunk =
+            chunk.map_err(|error| anyhow::Error::new(error.without_url()).context("read JWKS chunk"))?;
         let next = body
             .len()
             .checked_add(chunk.len())
@@ -1085,14 +1093,19 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
             // hard_link → AlreadyExists → Ok(false) and the caller
             // reads back the seed — self-corrects, but the noisy
             // failure is now avoided at source.
-            if let Err(error) = std::fs::remove_file(&temporary) {
-                tracing::warn!(
-                    path = %av_core::fsutil::basename(&temporary),
-                    %error,
-                    "signing seed installed, but removing tmp file failed; guard drop will retry"
-                );
+            match std::fs::remove_file(&temporary) {
+                // Only a successful unlink may disarm the guard — an
+                // unconditional disarm made "guard drop will retry" a
+                // lie and orphaned a mode-0600 copy of the seed.
+                Ok(()) => guard.disarm(),
+                Err(error) => {
+                    tracing::warn!(
+                        path = %av_core::fsutil::basename(&temporary),
+                        %error,
+                        "signing seed installed, but removing tmp file failed; guard drop will retry"
+                    );
+                }
             }
-            guard.disarm();
             if let Err(error) = av_core::fsutil::sync_directory(parent) {
                 tracing::warn!(
                     dir = %av_core::fsutil::basename(parent),
@@ -1488,6 +1501,9 @@ mod tests {
             !text.contains(&addr.to_string()),
             "send-failure error must not contain host:port; got: {text}"
         );
+        // The reqwest error is preserved as the anyhow source, so the
+        // classifier's downcast labels the failure instead of "other".
+        assert_eq!(classify_jwks_error(&err), "connect");
     }
 
     #[tokio::test]
@@ -1522,6 +1538,41 @@ mod tests {
         assert!(
             text.contains("500"),
             "non-2xx error should carry the numeric status for triage; got: {text}"
+        );
+        // The status-carrying reqwest error survives as the anyhow
+        // source, so the classifier labels it "status" (not "other").
+        assert_eq!(classify_jwks_error(&err), "status");
+        server.abort();
+    }
+
+    /// A peer that accepts the connection but never responds must
+    /// classify as "timeout" — the downcast only works because
+    /// `refresh_jwks` keeps the reqwest error as the anyhow source.
+    #[tokio::test]
+    async fn refresh_jwks_timeout_is_classified() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept and hold connections open without sending any bytes.
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                if let Ok((socket, _)) = listener.accept().await {
+                    held.push(socket);
+                }
+            }
+        });
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let validator = av_identity::IdentityValidator::new("test-aud");
+        let url = format!("http://{addr}/jwks");
+        let err = refresh_jwks(&client, &url, &validator).await.unwrap_err();
+        assert_eq!(classify_jwks_error(&err), "timeout");
+        let text = format!("{err:#}");
+        assert!(
+            !text.contains("://") && !text.contains(&addr.to_string()),
+            "timeout error must be URL-free; got: {text}"
         );
         server.abort();
     }
