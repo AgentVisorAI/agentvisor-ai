@@ -151,8 +151,9 @@ pub fn read_capped_string(path: &Path, max_bytes: u64) -> io::Result<String> {
 /// `tracing::warn!` (best-effort) and `Ok(())` is returned. Callers
 /// that need a stronger guarantee should call `sync_directory` again
 /// after their own operation completes. A dedicated counter is not
-/// registered here because `fsutil` cannot depend on `av-core`'s
-/// metrics registry without a cycle; harness-level callers can wrap
+/// registered here because the metrics `Registry` is instance-scoped
+/// (there is no global registry) and this free function holds no
+/// registry handle; harness-level callers can wrap
 /// this with their own counter if needed.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
