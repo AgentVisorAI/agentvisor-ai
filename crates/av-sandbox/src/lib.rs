@@ -11,8 +11,9 @@
 //! 3. **Policy gate** — native Rust rules and/or WebAssembly policy modules
 //!    executed in wasmtime with fuel + memory bounds (a hung or hostile
 //!    policy cannot stall the pipeline);
-//! 4. **Budget gate** — atomic action budgets (`max_db_writes: 3`,
-//!    `max_payout_usd: 50`) via `av-state`.
+//! 4. **Budget gate** — atomic action budgets (per-tool
+//!    `max_tool_calls["db_write"]: 3`, `max_payout_usd_micros:
+//!    50_000_000` = $50) via `av-state`.
 //!
 //! Every verdict is returned with machine-readable context so the harness can
 //! emit the per-call OCSF event (allowed or blocked, with budget consumption).

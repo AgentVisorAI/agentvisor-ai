@@ -1243,8 +1243,15 @@ pub async fn doctor(offline: bool) -> Result<()> {
                     response.status().as_u16()
                 ))),
                 Err(error) => {
-                    // Sanitize: reqwest Display includes the URL, never a key.
-                    checks.push(Check::Fail(format!("upstream: {url} unreachable ({error})")));
+                    // Round-34 S1: redact userinfo here too — this failure
+                    // line was the missing half of the round-28 F5 pair.
+                    // `without_url()` strips reqwest's own embedded copy of
+                    // the URL from the error Display as well.
+                    checks.push(Check::Fail(format!(
+                        "upstream: {} unreachable ({})",
+                        redact_userinfo(&url),
+                        error.without_url()
+                    )));
                 }
             }
         }
