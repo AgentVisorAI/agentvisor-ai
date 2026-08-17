@@ -366,9 +366,11 @@ impl IdentityValidator {
         })
     }
 
-    /// Validate one JWT: header sanity, kid lookup, alg/key-type match,
-    /// signature, exp/nbf/aud, future-iat, TTL cap, field presence,
-    /// bidi/zero-width spoofing guard, issuer allowlist.
+    /// Validate one JWT, in order: pre-auth 8 KiB size cap, header sanity,
+    /// kid lookup, alg/key-type match, signature,
+    /// exp/aud/sub/iss required (+ `nbf` when present), `exp > iat`
+    /// consistency, future-iat, TTL cap, field presence,
+    /// bidi/zero-width spoofing guard, issuer allowlist (when configured).
     fn validate_single(&self, token: &str) -> Result<NhiClaims, IdentityError> {
         // Reject oversized tokens up front so an unauthenticated caller
         // cannot amplify their pre-auth memory footprint through
