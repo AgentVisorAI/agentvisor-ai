@@ -730,9 +730,11 @@ async fn process_envelope(
     // here so a panic between `spawn.await` and this point cannot
     // leak the session pending counter.
     drop(capacity_permit);
-    // Guard runs Drop here (or on the panic path). The completion
-    // channel below is fine to send after — the receiver only needs
-    // the outcome, not the pending accounting.
+    // The pending guards (named bindings above) drop at end of scope —
+    // AFTER the completion send below, not here. That order is fine:
+    // the receiver needs only the outcome, and `wait_idle` /
+    // `wait_for_worker_jobs` re-check the pending counters in a loop,
+    // so a momentary completed-but-still-pending window is benign.
     if let Some(completion) = completion {
         let _ = completion.send(outcome);
     }
