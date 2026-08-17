@@ -209,10 +209,12 @@ impl ResponsePermit {
     pub fn submit(self, worker: &WorkerHandle, job: WorkerJob) -> Result<(), SubmitError> {
         // Release the response-capacity permit before contending for
         // the mpsc slot so a failed submit does not artificially pin
-        // the response budget. Dropping via NLL — the permit is not
+        // the response budget. An explicit drop — a named `_`-prefixed
+        // binding would live to end of scope (NLL shortens borrows,
+        // not Drop timing). The permit is not
         // used by `try_submit_labeled`, which draws a fresh
         // worker-capacity slot for the actual queue admission.
-        let _capacity_permit = self._capacity_permit;
+        drop(self._capacity_permit);
         worker.try_submit_labeled(job, DropStage::ResponseSlot)
     }
 }

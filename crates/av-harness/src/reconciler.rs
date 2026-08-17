@@ -783,8 +783,9 @@ impl Finalizer {
             // Round-44 F1: cheap sidecar-existence check FIRST — before
             // the 64 MiB read + serde parse + strict validate. Without
             // this ordering, N sidecar-less files (attacker-planted OR
-            // honest crashes between reconciler.rs:497 `write_atomic` and
-            // :504 `ensure_atif_provenance`) would burn O(N * 64 MiB)
+            // honest crashes between the ATIF `write_atomic` and the
+            // subsequent `ensure_atif_provenance` in
+            // `close_session_locked`'s Unsigned branch) would burn O(N * 64 MiB)
             // IO per 5 s reconciler tick, missing tick cadence and
             // starving lifecycle-outbox replay, close completion,
             // promotion retry, and idle eviction.
@@ -799,7 +800,8 @@ impl Finalizer {
             // recovery), so orphaned trajectories are unrecoverable by
             // design; renaming to `<name>.corrupt-<uid>` moves them
             // out of the recovery scan glob (the `.json` extension
-            // filter at :767 rejects the renamed file) while preserving
+            // filter at the top of this scan loop rejects the
+            // renamed file) while preserving
             // the bytes for operator forensic inspection.
             if !path.with_extension("atif-auth").exists() {
                 self.metrics
@@ -1116,7 +1118,8 @@ impl Finalizer {
             // Round-41 F1: per-candidate body wrapped in an inner
             // async block so every `?` and `return Err(...)` inside
             // gets caught by the outer match instead of propagating
-            // up through `recover_spooled_sessions:753` and killing
+            // up through `recover_spooled_sessions`'s `?` on the
+            // `recover_signed_journals` call and killing
             // the whole recovery scan for the tick. Every prior
             // `continue;` becomes `return Ok(Skipped);`; every
             // `recovered += 1; continue;` becomes `return Ok(Recovered);`.
@@ -1182,8 +1185,8 @@ impl Finalizer {
             if journal.is_empty() {
                 // Round-14 F5: preserve the sealed metadata sidecar
                 // when a torn-write journal has been quarantined in
-                // a prior tick (see `read_complete_journal` at
-                // ~:1980). Without this, we'd delete the sidecar the
+                // a prior tick (see `read_complete_journal` further
+                // down this file). Without this, we'd delete the sidecar the
                 // very next tick, orphaning the `.corrupt-<uid>`
                 // bytes with no linkage back to session identity.
                 if quarantine_sibling_exists(&self.spool_dir, stem).await? {
@@ -1812,8 +1815,9 @@ impl Finalizer {
                     "tool_allowed": tool_allowed,
                     "tool_blocked": tool_blocked,
                     "cost_usd_micros": cost_usd_micros,
-                    // Round-43 F2: match the close-time serialization at
-                    // reconciler.rs:488 which writes `u64` (0 when never
+                    // Round-43 F2: match the close-time `metrics.extra`
+                    // `stop_reason_id` serialization in
+                    // `close_session_locked` which writes `u64` (0 when never
                     // recorded) via `session.recorded_stop_reason_id()`.
                     // Emitting `Option<u8>` here made JSON `null` vs
                     // JSON `0`, so the `trajectory != existing`
