@@ -4,6 +4,29 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Review round 40: fourth-model tranche closes a real guard bypass (2026-08-16)
+
+The fourth model's mid-size-file tranche (eleven files, ~5,200 lines)
+produced the program's most significant find since the doctor
+credential leak: the manifest billion-laughs guard's anchor-name
+predicate (alphanumeric | `_`) omitted `-`, which libyaml's IS_ALPHA
+anchor class accepts — empirically confirmed against the workspace's
+serde_yaml 0.9.34 (`x: &-a [1,2]` / `y: *-a` parses and expands), so a
+bomb built from hyphen-led anchor names walked past the refusal while
+the comment claimed the scan "catches every case that serde_yaml would
+actually expand". The predicate now matches libyaml, the round-14
+name-class regression test pins `&-a`/`*-a` refusal, no shipped
+manifest false-positives, and the full CI pipeline is green on the
+fix. Two smaller finds: a CLI test doc describing a tmp-path
+simulation the test cannot perform (it exercises hard_link's
+AlreadyExists on the seed path, as its own inline comment concedes),
+and the last `ab-` brand residue in any identifier (a test fixture CA
+path). Notable adjudication: the reviewer empirically CONFIRMED
+jcs.rs's claim that Rust's `{:e}` float formatting is
+shortest-but-not-always-correctly-rounded (bits 0x43143ff3c1cb0959),
+validating the ryu justification. Eight of eleven files fully clean,
+including validator.rs, jcs.rs, and journal.rs.
+
 ### Review rounds 37–39: fourth-model residual measurement (2026-08-16)
 
 A fourth reviewer model measured the residual after three on the three

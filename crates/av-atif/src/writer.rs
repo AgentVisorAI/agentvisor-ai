@@ -92,10 +92,11 @@ impl TrajectoryBuilder {
             // rejected on overflow: without this the aggregate silently
             // saturates to +∞ (or drifts negative), and a downstream Strict
             // validator that trusts final_metrics.total_cost_usd signs
-            // corrupt evidence. serde_json refuses to serialize non-finite
-            // floats, so this also guards against a later write_atomic
-            // erroring out mid-persist and leaving the trajectory in a bad
-            // state.
+            // corrupt evidence. serde_json does NOT refuse non-finite
+            // floats — it silently serializes them as `null` (empirically
+            // verified against the workspace serde_json), which would
+            // corrupt `total_cost_usd` in the persisted file. Reject them
+            // here, before they can reach serialization.
             let step_cost = m.cost_usd.unwrap_or(0.0);
             if !step_cost.is_finite() || step_cost < 0.0 {
                 return Err(av_core::CoreError::Overflow {

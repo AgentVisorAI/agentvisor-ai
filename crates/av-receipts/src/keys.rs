@@ -86,7 +86,7 @@ impl Ed25519Signer {
     }
 }
 
-/// `sha256(pubkey)[..16]` hex — 32 chars (128-bit collision resistance).
+/// `sha256(pubkey)[..16]` hex — 32 chars (a 128-bit id; ~2^64 birthday bound).
 ///
 /// 64 bits would put birthday attacks at ~2^32, cheap on modern hardware;
 /// 128 bits pushes the birthday bound to ~2^64, comfortably infeasible.
