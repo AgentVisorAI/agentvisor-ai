@@ -123,8 +123,13 @@ impl BridgeManifest {
         // contain `&` or `*` are reduced (not eliminated — the scan is
         // not YAML-context-aware, so a quoted string like `"a &name"`
         // still trips it; failing closed is acceptable for manifests)
-        // by checking that the char
-        // precedes a valid anchor name character (alphanumeric or `_`).
+        // by checking that the char precedes a valid anchor-name
+        // character. Round 40 (fourth-model QC): libyaml's anchor-name
+        // class is alphanumeric | `_` | `-` (unsafe-libyaml IS_ALPHA);
+        // the original predicate omitted `-`, so hyphen-led anchors
+        // (`&-a`) expanded while evading this guard — empirically
+        // confirmed against the workspace's serde_yaml and pinned by
+        // the hyphen regression test below.
         for (marker, kind) in [('&', "anchor"), ('*', "alias")] {
             let mut chars = yaml.char_indices().peekable();
             while let Some((_, ch)) = chars.next() {
@@ -132,7 +137,7 @@ impl BridgeManifest {
                     continue;
                 }
                 if let Some(&(_, next)) = chars.peek() {
-                    if next.is_ascii_alphanumeric() || next == '_' {
+                    if next.is_ascii_alphanumeric() || next == '_' || next == '-' {
                         return Err(ManifestError::Parse(format!(
                             "manifest contains a YAML {kind} ('{marker}<name>'); \
                              AgentVisor AI refuses anchor/alias syntax to close the \
@@ -451,7 +456,11 @@ mod mutation_boundary_tests {
     #[test]
     fn yaml_anchor_and_alias_markers_are_refused_per_name_class() {
         let base = BridgeManifest::default_for("anchors").to_yaml().unwrap();
-        for snippet in ["&a1", "&_x", "*a1", "*_x"] {
+        // Round 40: `&-a`/`*-a` included — libyaml's anchor-name class is
+        // alphanumeric | `_` | `-`, and hyphen-led anchors demonstrably
+        // expand in serde_yaml; omitting `-` from the scan re-opens the
+        // billion-laughs vector for hyphen-named anchors.
+        for snippet in ["&a1", "&_x", "&-a", "*a1", "*_x", "*-a"] {
             let hostile = format!("{base}# {snippet}\n");
             assert!(
                 BridgeManifest::from_yaml(&hostile).is_err(),
