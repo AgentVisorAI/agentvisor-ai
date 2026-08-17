@@ -4,7 +4,7 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
-### Review rounds 33–34: third-model QC (2026-08-16)
+### Review rounds 33–35: third-model QC (2026-08-16)
 
 Escalated the QC program to a third independent reviewer model on the
 highest-stakes files. Fifteen findings across fourteen files, severity
@@ -23,7 +23,16 @@ cold outbox never existed; `budget.max_tokens` was mislabeled a
 completion budget; seven stale absolute line references were
 symbolized to rot-proof anchors. The reviewers also adjudicated and
 rejected 33 borderline candidates with recorded reasons so future
-audits do not relitigate them.
+audits do not relitigate them. Round 35 closed the doctor leak's other
+half — the upstream-failure line still printed the configured URL
+verbatim (reqwest additionally embeds it in the error Display); it now
+redacts userinfo and strips the error's URL copy — and extinguished
+the last two claim echoes (the 429 in the breaker *field* doc; the
+phantom budget keys in av-sandbox's module doc, whose `$50` literal
+would have meant 50 micro-USD under the real `_micros` field). A
+dedicated pairing-claims sweep ("partner"/"mirrors"/"must match"/
+"lockstep") then verified every such cross-reference in the workspace
+intact.
 
 ### Review rounds 30–32: test-suite QC, self-review closure, echo sweep (2026-08-16)
 
