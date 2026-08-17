@@ -952,9 +952,11 @@ impl AppState {
                         terminal: true,
                     });
                     // Best-effort: shard may be momentarily full, in
-                    // which case the response-slot counter is bumped
-                    // and the failure event falls back to the plain
-                    // enqueue_failure path below on the next tick.
+                    // which case the terminal failure event is dropped
+                    // and only av_events_dropped_total{stage=
+                    // "response_slot"} records it (no retry mechanism
+                    // exists here; the else branch below runs only when
+                    // no response permit was reserved at all).
                     let _ = permit.submit(&self.worker, job);
                 } else {
                     self.enqueue_failure(session, identity, StopReason::Other, persisted_reason)?;
@@ -1335,10 +1337,11 @@ impl AppState {
             //      anonymous locally so the request proceeds and the
             //      relay layer forwards the header. This is the
             //      documented dev-mode BYO-key posture.
-            //  (b) Neither passthrough nor validator: the operator
-            //      opted out of identity entirely. Any bearer is
-            //      meaningless. Same accept-anonymous result — but
-            //      warn once in tracing so the mismatch is visible.
+            //  (b) Neither passthrough nor validator: a bearer sent to
+            //      a no-op harness is a configuration mismatch —
+            //      REJECTED with a diagnostic 401 (see the closing
+            //      paragraph below and the arm's else branch) rather
+            //      than silently recorded as anonymous.
             //  (c) A validator EXISTS but this arm ran because
             //      match fell through: unreachable because arm 1
             //      catches (Some, Some). No action.

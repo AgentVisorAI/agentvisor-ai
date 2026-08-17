@@ -4,6 +4,22 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Review round 37: fourth-model residual measurement (2026-08-16)
+
+A fourth reviewer model measured the residual after three on the three
+historically richest files: seven findings, all prose, several
+empirically disproven in the fixing (numeric IPv6 zone ids parse on
+stable rustc 1.97.1 — `sa.ip()` is what discards the scope, contrary
+to three comments; the single-winner provision primitive is
+`hard_link(2)` EEXIST, not `create_new`/O_EXCL; the recovery-scan
+256 MiB constant only classifies the `too_large` metric while the
+64 MiB read cap does the buffering defence; a cited `write_config`
+guard and a `write_cold_object_exclusive` function never existed; and
+round 28's own edit had orphaned `probe_endpoint`'s doc line onto the
+redactor). Sixteen borderlines adjudicated and rejected on the record.
+Marginal-model yield: 40 → 18 → 7, all prose, code correct at every
+site.
+
 ### Review round 36: third-model test-suite QC — three-model coverage complete (2026-08-16)
 
 The third reviewer finished the integration-test suites, closing the
