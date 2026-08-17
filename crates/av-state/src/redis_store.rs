@@ -276,7 +276,8 @@ impl StateStore for RedisStore {
     /// races with the reconciler's clear_budget_state), the
     /// refund path leaked one-to-three TTL-less keys per session
     /// — attacker-choosable memory growth against the exact class
-    /// reconciler.rs:341-343 documents as impossible. Fix: gate
+    /// the `clear_budget_state` doc in reconciler.rs documents as
+    /// impossible. Fix: gate
     /// the whole DECRBY on `EXISTS`. If the session was cleared,
     /// the budget is already gone and there is nothing to
     /// compensate; the refund is a silent no-op. If the session
