@@ -2059,10 +2059,15 @@ impl Finalizer {
         let path = self.receipt_path(session_id);
         let bytes =
             serde_json::to_vec_pretty(receipt).map_err(|error| FinalizeError::Receipt(error.to_string()))?;
-        tokio::task::spawn_blocking(move || av_core::fsutil::write_atomic(&path, &bytes))
-            .await
-            .map_err(|error| FinalizeError::Task(error.to_string()))?
-            .map_err(|error| FinalizeError::Receipt(error.to_string()))
+        let receipt_id = receipt.body.receipt_id.clone();
+        let session = session_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            archive_conflicting_receipt(&path, &receipt_id, &session)?;
+            av_core::fsutil::write_atomic(&path, &bytes)
+        })
+        .await
+        .map_err(|error| FinalizeError::Task(error.to_string()))?
+        .map_err(|error| FinalizeError::Receipt(error.to_string()))
     }
 
     async fn emit_receipt_event(&self, session: &Session, receipt: &Receipt) -> Result<(), FinalizeError> {
@@ -2311,7 +2316,17 @@ impl Finalizer {
                     .await?;
                 self.remove_lifecycle_outbox(&session.id, crate::journal::SESSION_CLOSE_OUTBOX_KIND)
                     .await?;
+                self.metrics
+                    .counter("av_sessions_finalized_total", "Sessions finalized")
+                    .inc();
                 session.mark_close_complete();
+                // Mirror the normal close tail (close_session_locked):
+                // without this the sweep leaked the session's budget
+                // counters in the state store forever, and a recycled id
+                // (get_or_open reopens completed-close entries) inherited
+                // the stale counters → spurious BudgetExceeded on the
+                // fresh incarnation.
+                self.clear_budget_state(&session.id);
                 Ok(())
             }
             .await;
@@ -2386,6 +2401,56 @@ impl Finalizer {
     async fn remove_lifecycle_outbox(&self, session_id: &str, kind: &str) -> Result<(), FinalizeError> {
         remove_outbox(&self.lifecycle_outbox_path(session_id, kind)).await
     }
+}
+
+/// Receipt paths are keyed by `sha256(session_id)`, and `get_or_open`
+/// recycles completed-close session ids — a second incarnation of a
+/// recycled id would otherwise silently overwrite the first
+/// incarnation's on-disk receipt (local evidence loss; the receipt
+/// event was already published via the bridge, so not total loss).
+/// Archive any existing receipt whose id differs before writing.
+/// Same-receipt-id rewrites stay idempotent overwrites on the primary
+/// path; an unreadable or corrupt existing file is archived too rather
+/// than destroyed.
+fn archive_conflicting_receipt(
+    path: &std::path::Path,
+    new_receipt_id: &str,
+    session_id: &str,
+) -> std::io::Result<()> {
+    let existing_id = match av_core::fsutil::read_capped(path, av_core::fsutil::MAX_RECEIPT_BYTES) {
+        Ok(bytes) => serde_json::from_slice::<Receipt>(&bytes)
+            .ok()
+            .map(|existing| existing.body.receipt_id),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        // Unreadable existing file: treat conservatively as evidence
+        // from a prior incarnation and archive it.
+        Err(_) => None,
+    };
+    if existing_id.as_deref() == Some(new_receipt_id) {
+        return Ok(());
+    }
+    // Old receipt ids come from `new_event_uid` (UUIDv7), but the bytes
+    // on disk are untrusted — keep only filesystem-safe characters so a
+    // planted receipt_id cannot steer the archive path.
+    let mut suffix: String = existing_id
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .take(64)
+        .collect();
+    if suffix.is_empty() {
+        suffix = format!("corrupt-{}", av_core::new_event_uid());
+    }
+    let mut archived = path.with_extension(format!("archived-{suffix}.json"));
+    if archived.exists() {
+        archived = path.with_extension(format!("archived-{suffix}-{}.json", av_core::new_event_uid()));
+    }
+    tracing::warn!(
+        session = %session_id,
+        archived = %av_core::fsutil::basename(&archived),
+        "receipt path collision (recycled session id); archiving previous incarnation's receipt",
+    );
+    std::fs::rename(path, &archived)
 }
 
 async fn persist_outbox(
@@ -3285,6 +3350,147 @@ mod tests {
             !directory.path().join(format!("{stem}.session.json")).exists(),
             "step journal metadata sidecar must be removed by the completion sweep",
         );
+    }
+
+    /// The round-43 pending-close sweep runs the same finalization tail
+    /// as `close_session_locked` and must therefore also clear the
+    /// session's budget counters — otherwise they leak in the state
+    /// store unboundedly and a recycled session id (`get_or_open`
+    /// reopens completed-close entries) inherits the stale counters,
+    /// tripping a spurious BudgetExceeded on the fresh incarnation.
+    #[tokio::test]
+    async fn pending_close_sweep_clears_budget_state_like_normal_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let bus = Arc::new(FailFirstReceiptBus {
+            fail: std::sync::atomic::AtomicBool::new(true),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+        });
+        let store: Arc<dyn av_state::StateStore> = Arc::new(av_state::InMemoryStore::new());
+        let finalizer = Finalizer::with_bridge(
+            Arc::new(Ed25519Signer::from_seed(&[43; 32])),
+            directory.path().to_path_buf(),
+            Arc::new(Registry::new()),
+            bus,
+        )
+        .with_state_store(Arc::clone(&store));
+        let sessions = SessionRegistry::new();
+        let session = session(Workflow::Signed);
+        sessions.insert_recovered(Session::new(
+            session.id.clone(),
+            session.workflow,
+            session.current_identity(),
+            Default::default(),
+        ));
+        let registered = sessions.get(&session.id).unwrap();
+        let budget_key = format!(
+            "{}tool_calls",
+            av_state::ActionBudget::session_prefix(&registered.id)
+        );
+        store.add(&budget_key, 5).unwrap();
+
+        // First close fails on the injected receipt-bus outage AFTER
+        // mark_artifact_committed — the fire-and-forget orphan window.
+        assert!(matches!(
+            finalizer
+                .close_session(Arc::clone(&registered), StopReason::SessionClosed)
+                .await,
+            Err(FinalizeError::Bridge(_))
+        ));
+        assert_eq!(
+            store.get(&budget_key).unwrap(),
+            5,
+            "budget counters must survive a failed close (session may still be retried)",
+        );
+
+        finalizer.replay_lifecycle_outboxes().await.unwrap();
+        let completed = finalizer.complete_pending_closes(&sessions).await.unwrap();
+        assert_eq!(completed, 1);
+        assert!(registered.close_complete_flag());
+        assert_eq!(
+            store.get(&budget_key).unwrap(),
+            0,
+            "sweep must clear budget counters exactly like close_session_locked",
+        );
+        assert_eq!(
+            finalizer
+                .metrics
+                .counter("av_sessions_finalized_total", "Sessions finalized")
+                .get(),
+            1,
+            "sweep completion must count as a finalized session",
+        );
+    }
+
+    /// Receipt paths are keyed by sha256(session_id) and `get_or_open`
+    /// recycles completed-close session ids, so a second incarnation
+    /// writing its receipt must archive — not overwrite — the first
+    /// incarnation's on-disk receipt. Same-receipt-id rewrites stay
+    /// idempotent, and a corrupt existing file is archived too.
+    #[tokio::test]
+    async fn persist_receipt_archives_previous_incarnation_on_recycled_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let finalizer = finalizer(directory.path());
+        let session = session(Workflow::Signed);
+        let subject = || av_receipts::ReceiptSubject::EventChain {
+            chain_head: "aa".repeat(32),
+            event_count: 0,
+        };
+        let receipts_dir = directory.path().join("receipts");
+        let json_files = |dir: &std::path::Path| {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.path().extension().and_then(std::ffi::OsStr::to_str) == Some("json"))
+                .count()
+        };
+
+        let first = Receipt::issue(
+            session.receipt_body(subject(), StopReason::SessionClosed),
+            finalizer.signer.as_ref(),
+        )
+        .unwrap();
+        finalizer.persist_receipt(&session.id, &first).await.unwrap();
+        // Idempotent same-id rewrite: no archive appears.
+        finalizer.persist_receipt(&session.id, &first).await.unwrap();
+        assert_eq!(
+            json_files(&receipts_dir),
+            1,
+            "same-id rewrite must stay idempotent"
+        );
+
+        // Second incarnation of the recycled id issues a fresh receipt.
+        let second = Receipt::issue(
+            session.receipt_body(subject(), StopReason::SessionClosed),
+            finalizer.signer.as_ref(),
+        )
+        .unwrap();
+        assert_ne!(first.body.receipt_id, second.body.receipt_id);
+        finalizer.persist_receipt(&session.id, &second).await.unwrap();
+        assert_eq!(
+            json_files(&receipts_dir),
+            2,
+            "first incarnation's receipt must be archived, not overwritten",
+        );
+        let primary: Receipt =
+            serde_json::from_slice(&std::fs::read(finalizer.receipt_path(&session.id)).unwrap()).unwrap();
+        assert_eq!(primary.body.receipt_id, second.body.receipt_id);
+        let archived = finalizer
+            .receipt_path(&session.id)
+            .with_extension(format!("archived-{}.json", first.body.receipt_id));
+        let archived: Receipt = serde_json::from_slice(&std::fs::read(&archived).unwrap()).unwrap();
+        assert_eq!(archived.body.receipt_id, first.body.receipt_id);
+
+        // Corrupt existing file at the primary path is archived conservatively.
+        std::fs::write(finalizer.receipt_path(&session.id), b"{not json").unwrap();
+        finalizer.persist_receipt(&session.id, &second).await.unwrap();
+        assert_eq!(
+            json_files(&receipts_dir),
+            3,
+            "corrupt bytes at the receipt path must be archived, not destroyed",
+        );
+        let primary: Receipt =
+            serde_json::from_slice(&std::fs::read(finalizer.receipt_path(&session.id)).unwrap()).unwrap();
+        assert_eq!(primary.body.receipt_id, second.body.receipt_id);
     }
 
     /// Round-44 F1: sidecar-less ATIF files (attacker plants OR

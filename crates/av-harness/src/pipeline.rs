@@ -843,7 +843,61 @@ impl AppState {
     }
 
     /// Forward a prepared OpenAI-compatible request to the configured provider.
-    pub async fn forward_chat(&self, request: PreparedRequest) -> Result<ForwardedResponse, PipelineError> {
+    pub async fn forward_chat(
+        &self,
+        mut request: PreparedRequest,
+    ) -> Result<ForwardedResponse, PipelineError> {
+        // Digest the request payload so the in-flight marker can be
+        // matched to the observed response bytes at recovery time.
+        //
+        // `serde_json::to_vec` on a `Value` is effectively infallible
+        // (Value can only carry JSON-serialisable data), but we handle
+        // the theoretical error path anyway: falling back to
+        // `sha256(b"")` — the well-known empty digest — would make
+        // every concurrent failed serialisation collide on the same
+        // request_digest, silently violating the marker's
+        // one-to-one-with-request invariant. Fall back to a
+        // session-id-derived digest so a hypothetical failure at
+        // least keeps distinct sessions distinct.
+        let request_digest = match serde_json::to_vec(&request.payload) {
+            Ok(bytes) => av_core::digest::sha256_hex(&bytes),
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    session = %request.session.id,
+                    "failed to serialise chat payload for request digest; falling back to session-derived digest"
+                );
+                av_core::digest::sha256_hex(request.session.id.as_bytes())
+            }
+        };
+        let response_marker = match crate::worker::create_response_marker(
+            std::path::Path::new(&self.config.atif_spool_dir),
+            &self.journal_key,
+            &request.session.id,
+            request_digest,
+        )
+        .await
+        {
+            Ok(marker) => Some(marker),
+            Err(error) => {
+                // Fail closed: the marker is what lets a restart-time scan
+                // (`inflight_response_sessions`) quarantine sessions whose
+                // provider response may have been observed but never
+                // captured. Dispatching without it would silently drop that
+                // crash-durability guarantee, so refuse before upstream I/O
+                // — terminating the journaled response attempt like every
+                // other post-admission abort (see `abandon_prepared`).
+                tracing::warn!(
+                    %error,
+                    session = %request.session.id,
+                    "could not write in-flight response marker; refusing upstream dispatch"
+                );
+                let client_error =
+                    PipelineError::Unavailable("in-flight response marker could not be persisted".to_owned());
+                self.abandon_prepared(&mut request, StopReason::Other, &client_error.to_string());
+                return Err(client_error);
+            }
+        };
         let PreparedRequest {
             session,
             identity,
@@ -859,40 +913,6 @@ impl AppState {
             self.config.upstream_url.trim_end_matches('/'),
             self.config.upstream_chat_path
         );
-        // Digest the request payload so the in-flight marker can be
-        // matched to the observed response bytes at recovery time.
-        //
-        // `serde_json::to_vec` on a `Value` is effectively infallible
-        // (Value can only carry JSON-serialisable data), but we handle
-        // the theoretical error path anyway: falling back to
-        // `sha256(b"")` — the well-known empty digest — would make
-        // every concurrent failed serialisation collide on the same
-        // request_digest, silently violating the marker's
-        // one-to-one-with-request invariant. Fall back to a
-        // session-id-derived digest so a hypothetical failure at
-        // least keeps distinct sessions distinct.
-        let request_digest = match serde_json::to_vec(&payload) {
-            Ok(bytes) => av_core::digest::sha256_hex(&bytes),
-            Err(error) => {
-                tracing::error!(
-                    %error,
-                    session = %session.id,
-                    "failed to serialise chat payload for request digest; falling back to session-derived digest"
-                );
-                av_core::digest::sha256_hex(session.id.as_bytes())
-            }
-        };
-        let response_marker = crate::worker::create_response_marker(
-            std::path::Path::new(&self.config.atif_spool_dir),
-            &self.journal_key,
-            &session.id,
-            request_digest,
-        )
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, session = %session.id, "could not write in-flight response marker");
-        })
-        .ok();
         let mut upstream_request = self.client.post(url).json(&payload);
         if let Some((name, value)) = &self.upstream_auth {
             upstream_request = upstream_request.header(name.clone(), value.clone());
@@ -2209,6 +2229,71 @@ mod tests {
             dangling, abandoned_by_test,
             "the refused request's response attempt must be terminated in the journal; \
              only attempts the test itself dropped may remain open",
+        );
+    }
+
+    /// `forward_chat` must fail closed when the in-flight response marker
+    /// cannot be persisted: the marker is what lets the restart-time scan
+    /// (`inflight_response_sessions`) quarantine sessions whose provider
+    /// response may have been observed but never captured. Dispatching
+    /// without it would silently drop that crash-durability guarantee.
+    /// The refusal must also terminate the journaled response attempt so
+    /// no dangling non-terminal record quarantines the session later.
+    #[tokio::test]
+    async fn forward_chat_fails_closed_when_marker_cannot_persist() {
+        let config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        let state = state(config);
+        let mut headers = HeaderMap::new();
+        headers.insert(SESSION_HEADER, HeaderValue::from_static("marker-outage"));
+        let prepared = state.prepare_chat(&headers, payload()).unwrap();
+        let attempt_id = prepared.response_attempt_id.clone();
+        // Sabotage the marker directory: a regular file at
+        // <spool>/inflight-responses makes `create_dir_all` inside
+        // `write_atomic` fail for every marker write.
+        std::fs::write(
+            std::path::Path::new(&state.config.atif_spool_dir).join(crate::spool::INFLIGHT_RESPONSES),
+            b"",
+        )
+        .unwrap();
+        let error = state.forward_chat(prepared).await.err().unwrap();
+        // Unavailable (not Upstream) proves the refusal happened BEFORE
+        // any upstream dispatch was attempted.
+        assert!(
+            matches!(error, PipelineError::Unavailable(_)),
+            "marker persist failure must map to Unavailable, got {error:?}",
+        );
+
+        let session = state.sessions.get("marker-outage").unwrap();
+        session.wait_for_worker_jobs().await;
+        let digest = av_core::digest::sha256_hex("marker-outage".as_bytes());
+        let stem = digest.get(..32).unwrap();
+        let journal_path =
+            std::path::Path::new(&state.config.atif_spool_dir).join(format!("{stem}.events.ndjson"));
+        let journal = std::fs::read_to_string(&journal_path).unwrap();
+        let mut saw_admission = false;
+        let mut saw_terminal = false;
+        for (index, line) in journal.lines().enumerate() {
+            let record: crate::worker::ActiveJournalRecord = crate::journal::open(
+                &state.journal_key,
+                "marker-outage:active",
+                index as u64,
+                line.as_bytes(),
+            )
+            .unwrap();
+            if let Some(attempt) = record.response_attempt {
+                if attempt.id == attempt_id {
+                    if attempt.terminal {
+                        saw_terminal = true;
+                    } else {
+                        saw_admission = true;
+                    }
+                }
+            }
+        }
+        assert!(saw_admission, "admission must have journaled the attempt");
+        assert!(
+            saw_terminal,
+            "the refused request's response attempt must be terminated in the journal",
         );
     }
 

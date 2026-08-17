@@ -32,6 +32,16 @@ pub struct Spend {
 /// Atomic counter operations. Every mutation is atomic with respect to
 /// concurrent callers; `try_spend` is a single check-and-spend (never a
 /// read-then-write).
+///
+/// # Counter lifetime
+///
+/// Backends with native expiry apply a TTL to every counter they touch:
+/// `RedisStore` refreshes a 24 h TTL (`BUDGET_COUNTER_TTL_SECS` in
+/// `redis_store.rs`) on each spend/add/refund, so a session idle past
+/// that window has its budget counters silently reset. `InMemoryStore`
+/// never expires. Callers must bound session lifetimes to the backend
+/// TTL (or clean up explicitly via `remove`/`remove_prefix`) so the two
+/// backends stay behaviorally aligned across dev and prod.
 pub trait StateStore: Send + Sync {
     /// Add `delta` to `key`, returning the new value.
     fn add(&self, key: &str, delta: u64) -> Result<u64, StateError>;

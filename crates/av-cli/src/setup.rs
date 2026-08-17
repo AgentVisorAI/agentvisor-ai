@@ -1499,10 +1499,15 @@ fn probe_target(endpoint: &str) -> Result<String> {
         Some((scheme, rest)) => (Some(scheme), rest),
         None => (None, endpoint),
     };
+    // Trim path/query/fragment BEFORE stripping userinfo: RFC 3986
+    // userinfo cannot contain '/', so an '@' after the first '/' is
+    // path data, not credentials ("http://h/p@th" must probe h, not
+    // "th"). Mirrors redact_userinfo's authority-first parse.
+    let hostpart = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     // Strip userinfo (`user:pass@`).
-    let hostpart = rest.rsplit_once('@').map_or(rest, |(_userinfo, host)| host);
-    // Trim path/query/fragment.
-    let host_and_port = hostpart.split(['/', '?', '#']).next().unwrap_or(hostpart);
+    let host_and_port = hostpart
+        .rsplit_once('@')
+        .map_or(hostpart, |(_userinfo, host)| host);
     let (host, port_opt) = if let Some(stripped) = host_and_port.strip_prefix('[') {
         match stripped.split_once(']') {
             Some((h, tail)) => {
@@ -2054,6 +2059,14 @@ mod tests {
             probe_target("https://[2001:db8::1]:8443").unwrap(),
             "[2001:db8::1]:8443"
         );
+        // '@' after the authority (in path/query) is not userinfo — the
+        // authority must be isolated before stripping credentials.
+        assert_eq!(probe_target("http://h/p@th").unwrap(), "h:80");
+        assert_eq!(probe_target("http://h:8080/p@th").unwrap(), "h:8080");
+        assert_eq!(probe_target("http://h?q=a@b").unwrap(), "h:80");
+        // Userinfo combined with a path containing '@' still strips
+        // only the real credentials.
+        assert_eq!(probe_target("http://u:p@h:8080/p@th").unwrap(), "h:8080");
     }
 
     /// Round-40 F2: `build_probe_base` handles the four listen-form

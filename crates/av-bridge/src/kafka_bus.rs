@@ -599,6 +599,15 @@ impl EventBus for KafkaBus {
     fn maintenance(&self, _now_ms: u64) -> Result<u64, BusError> {
         self.cold_archive.as_ref().map_or(Ok(0), |archive| {
             archive.retry_pending_with(|pending| {
+                // A crash/timeout between a successful produce and
+                // `commit()` leaves the intent offset-None while the event
+                // IS already on the partition; blindly re-producing here
+                // would append a duplicate to the audit stream. Consult the
+                // partition first and only publish when the UID is
+                // genuinely absent.
+                if let Some(ack) = self.find_event_by_uid(&pending.topic, &pending.key, &pending.event_uid)? {
+                    return Ok(ack);
+                }
                 self.publish_broker_only(
                     &pending.topic,
                     &pending.key,
