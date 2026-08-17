@@ -284,15 +284,15 @@ impl Receipt {
         })
     }
 
-    /// Verify offline against a keyring. Checks:
-    /// 1. the embedded public key matches the ring's key for `key_id`
-    ///    (anti-substitution);
-    /// 2. the signature verifies over `JCS(body)`;
-    /// 3. `AtifTrajectory.retroactive == true` (round-16 F8 —
+    /// Verify offline against a keyring. Checks, in execution order:
+    /// 1. `AtifTrajectory.retroactive == true` (round-16 F8 —
     ///    `retroactive: false` on an ATIF-promoted receipt is
     ///    semantically nonsense; the schema pins it to `const: true`
     ///    but the Rust type still accepts `false`; refuse it here so
-    ///    the two agree).
+    ///    the two agree);
+    /// 2. the embedded public key matches the ring's key for `key_id`
+    ///    (anti-substitution);
+    /// 3. the signature verifies over `JCS(body)`.
     pub fn verify(&self, ring: &Keyring) -> Result<(), ReceiptError> {
         self.verify_semantic_invariants()?;
         let embedded = base64::engine::general_purpose::STANDARD
@@ -369,7 +369,7 @@ impl Receipt {
 /// Round-16 hardening: enforce a hard depth cap so a hostile issuer
 /// cannot use a deeply-nested `[[[[…]]]]` payload to blow the walker's
 /// stack. serde_json's own limit is 128 by default, but the cost of
-/// a per-level check is a single u16 increment.
+/// a per-level check is a single integer increment.
 const MAX_NESTED_DEPTH: usize = 128;
 
 /// Sentinel prefix that lets `check_no_duplicate_keys` distinguish a
