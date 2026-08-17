@@ -95,9 +95,10 @@ fn jcs_rejects_integers_beyond_ieee754_safe_range() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Ed25519 all-zero public key: point of order 1 (identity) must be
+// 3. Ed25519 all-zero public key: a small-order point (order 4, y = 0;
+//    NOT the identity — that encodes as [0x01, 0, …]) must be
 //    refused by strict verification. The verifier must not accept a
-//    signature under the identity element.
+//    signature under a small-order element.
 // ---------------------------------------------------------------------------
 
 #[test]

@@ -423,6 +423,41 @@ fn signature_oracle_reveals_nothing_that_would_forge_a_new_receipt() {
     }
     // 200 distinct canonicalized bodies must yield 200 distinct signatures.
     assert_eq!(sigs.lock().len(), 200);
+    // Determinism arm (round 36): the loop's bodies are all distinct, so
+    // the insert-collision branch above can never fire — force one true
+    // identical-body pair here. RFC 8032 Ed25519 is deterministic: same
+    // canonical body under the same key must yield the identical signature.
+    {
+        let make_body = |receipt_id: &str| av_receipts::ReceiptBody {
+            receipt_version: 1,
+            receipt_id: receipt_id.to_owned(),
+            session_id: "det".to_owned(),
+            issued_at: 7,
+            issued_at_iso: "1970-01-01T00:00:00.007Z".to_owned(),
+            ai_agent: av_events::AgentIdentity {
+                version: "1".to_owned(),
+                charter: av_events::CharterFile::from("c"),
+                instance_uid: "i".to_owned(),
+                ttl_remaining_s: None,
+            },
+            subject: av_receipts::ReceiptSubject::EventChain {
+                chain_head: "00".repeat(32),
+                event_count: 7,
+            },
+            tool_calls: av_receipts::ToolCallSummary::default(),
+            cost: av_receipts::CostSummary::default(),
+            stop_reason_id: 1,
+            stop_reason: "SessionClosed".to_owned(),
+            key_id: String::new(),
+            public_key_b64: String::new(),
+        };
+        let first = Receipt::issue(make_body("r-det"), &s).unwrap();
+        let second = Receipt::issue(make_body("r-det"), &s).unwrap();
+        assert_eq!(
+            first.signature_b64, second.signature_b64,
+            "identical canonical bodies must yield identical signatures (RFC 8032 determinism)"
+        );
+    }
     // Cross-check: try to reuse any one signature under a fresh forged
     // body — must fail. HashMap iteration order is arbitrary; any stolen
     // signature must fail equally.

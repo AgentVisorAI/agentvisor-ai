@@ -197,8 +197,8 @@ fn tokenizer_is_monotone_and_finite_on_4mib_unicode() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Deep nested object (500 levels) inside a signed receipt subject:
-//    verify still passes end-to-end.
+// 7. Deep nested object (500 levels) serialized into a signed receipt's
+//    stop_reason string: verify still passes end-to-end.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -228,6 +228,9 @@ fn receipt_verify_survives_deeply_nested_charter_metadata_in_stop_reason() {
 #[test]
 fn tiny_inputs_are_handled_deterministically() {
     assert_eq!(approx_tokens(""), 0);
+    // Round 36: the header promises the single-char boundary too.
+    assert_eq!(approx_tokens("a"), 1);
+    assert_eq!(canonicalize(&json!("a")).unwrap(), "\"a\"");
     assert_eq!(approx_tokens_json(&Value::Null), approx_tokens("null"));
     assert_eq!(canonicalize(&Value::Null).unwrap(), "null");
     assert_eq!(canonicalize(&json!([])).unwrap(), "[]");
