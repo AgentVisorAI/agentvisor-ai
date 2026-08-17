@@ -567,10 +567,12 @@ impl EventBus for KafkaBus {
                         .ok_or_else(|| format!("fetch: null record value at offset {}", r.offset))?;
                     let mut ev: StoredEvent = serde_json::from_slice(&value)
                         .map_err(|e| format!("fetch decode at offset {}: {e}", r.offset))?;
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        ev.offset = r.offset as u64;
-                    }
+                    // Kafka offsets are non-negative by contract; a broken
+                    // or hostile broker returning a negative i64 must fail
+                    // the fetch instead of sign-wrapping into a huge u64
+                    // that corrupts the caller's offset ledger.
+                    ev.offset = u64::try_from(r.offset)
+                        .map_err(|_| format!("fetch: negative broker offset {}", r.offset))?;
                     out.push(ev);
                     if out.len() >= max {
                         break;
