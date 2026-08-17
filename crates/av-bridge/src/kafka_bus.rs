@@ -736,7 +736,7 @@ mod tests {
     #[test]
     fn missing_or_empty_ca_file_fails_loudly() {
         let missing = KafkaSecurity {
-            ca_file: Some(std::path::PathBuf::from("/nonexistent/ab-ca.crt")),
+            ca_file: Some(std::path::PathBuf::from("/nonexistent/av-ca.crt")),
             credentials: None,
             mechanism: SaslMechanism::ScramSha256,
         };
