@@ -284,9 +284,10 @@ mod tests {
             PolicyDecision::Allow => {
                 // The memory.grow can legally return -1 (denied) without
                 // trapping. That's fine — the module correctly declined to
-                // exceed the limit. What we're proving is that the guest can
-                // NOT actually grow past the cap; verifying via a follow-up
-                // policy that writes at the (would-be) grown address.
+                // exceed the limit. The proof that the guest can NOT
+                // actually use memory past the cap is the companion test
+                // `memory_grow_past_cap_leaves_grown_region_inaccessible`,
+                // which stores at a beyond-cap address and must fail closed.
             }
             PolicyDecision::Deny { reason } => {
                 assert!(
@@ -295,6 +296,42 @@ mod tests {
                         || reason.contains("failed closed"),
                     "expected memory-cap failure, got {reason}"
                 );
+            }
+        }
+    }
+
+    /// Round 41 (fourth-model QC): the companion proof the memory-bomb
+    /// test's Allow arm defers to. After a beyond-cap `memory.grow`, the
+    /// guest tries to STORE at an address inside the would-be grown
+    /// region (page 512 = 32 MiB, past the 16 MiB cap). StoreLimits must
+    /// have refused the growth, so the store is out of bounds and the
+    /// evaluation must fail closed (Deny) — the grown region is
+    /// inaccessible, not silently usable.
+    #[test]
+    fn memory_grow_past_cap_leaves_grown_region_inaccessible() {
+        const GROW_THEN_TOUCH: &str = r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "alloc") (param i32) (result i32)
+            (i32.const 0))
+          (func (export "evaluate") (param i32 i32) (result i32)
+            (drop (memory.grow (i32.const 4096)))
+            ;; store at 32 MiB — inside the grown region iff growth succeeded
+            (i32.store (i32.const 33554432) (i32.const 1))
+            (i32.const 0)))
+        "#;
+        let p = WasmPolicy::from_bytes("grow-then-touch", GROW_THEN_TOUCH.as_bytes()).unwrap();
+        match p.evaluate("anything", &json!({})) {
+            PolicyDecision::Deny { reason } => {
+                assert!(
+                    reason.contains("out of bounds")
+                        || reason.contains("trapped")
+                        || reason.contains("failed closed"),
+                    "beyond-cap store must fail closed with a containment reason, got: {reason}"
+                );
+            }
+            PolicyDecision::Allow => {
+                panic!("store at 32 MiB succeeded — the memory cap did not hold")
             }
         }
     }
