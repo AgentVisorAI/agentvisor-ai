@@ -450,7 +450,8 @@ impl Session {
     }
 
     /// Round-44 F2: distinguish the "empty unsigned session close
-    /// was rejected" quarantine (reconciler.rs:442-449) from a
+    /// was rejected" quarantine (the reconciler's "no captured steps"
+    /// refusal) from a
     /// successfully-persisted unsigned session. The reject path sets
     /// `artifact_committed = 1` (so `is_closed()` stays true) but
     /// never writes an ATIF file, never sets `atif_path`, and never
@@ -739,8 +740,8 @@ impl SessionRegistry {
     /// empty-unsigned quarantines are excluded — they intentionally
     /// stay in the registry as evidence of the incident.
     ///
-    /// Round-44 F2: the empty-unsigned quarantine at
-    /// reconciler.rs:442-449 does NOT set `capture_failed = 1` (it
+    /// Round-44 F2: the empty-unsigned quarantine (the reconciler's
+    /// "no captured steps" refusal) does NOT set `capture_failed = 1` (it
     /// is a distinct semantic — "no work was captured" rather than
     /// "capture was lost mid-flight"), so `!capture_failed()` alone
     /// let the sweep pick it up and emit a spurious SESSION_CLOSE

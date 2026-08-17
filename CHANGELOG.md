@@ -4,7 +4,7 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
-### Review rounds 30–31: test-suite QC and the self-review closure (2026-08-16)
+### Review rounds 30–32: test-suite QC, self-review closure, echo sweep (2026-08-16)
 
 The cross-model QC program's final surface: the standalone integration
 test suites (~14k lines, 36 files). 13 test docs claimed things their
@@ -23,7 +23,11 @@ redacted the reviewer's view). Self-review of the rewrites then caught
 one over-claim of ours — a banner deferring unicode-tag byte-survival
 to golden tests that contained no tag characters — resolved by adding
 the missing test: tag-smuggled messages survive the typed round trip
-bit-exactly and pass both validators.
+bit-exactly and pass both validators. A final echo sweep re-grepped
+every corrected claim across the prose docs and found two survivors in
+PLAN.md (the brief's illustrative budget keys presented as the config
+surface; the top-level-only `unmapped` nuance), both aligned with the
+code-comment fixes they echoed.
 
 Final certification: fmt, workspace clippy -D warnings all-features,
 cargo-deny (4 checks), and the full 69-binary / 895-test all-features
