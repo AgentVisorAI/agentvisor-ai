@@ -258,7 +258,7 @@ async fn chat_completions(
         last_reported_cached_tokens: None,
         last_reported_cost_usd_micros: None,
         saw_chunk: false,
-        capture_submitted: false,
+        capture_attempted: false,
         is_sse,
         protocol_buffer: Vec::new(),
         pending_output: std::collections::VecDeque::new(),
@@ -1230,7 +1230,14 @@ struct AbortFinalizingStream {
     last_reported_cached_tokens: Option<u64>,
     last_reported_cost_usd_micros: Option<u64>,
     saw_chunk: bool,
-    capture_submitted: bool,
+    /// At-most-once guard for `submit_response_capture`. Set BEFORE the
+    /// fallible `ResponsePermit::submit` on purpose: if the shard is full
+    /// the capture event is intentionally dropped (counted in
+    /// `av_events_dropped_total{stage="response_slot"}`) and MUST NOT be
+    /// retried by a later call. Do not "fix" the ordering by setting this
+    /// after the submit — that would reintroduce double-submit attempts
+    /// against a consumed permit.
+    capture_attempted: bool,
     is_sse: bool,
     protocol_buffer: Vec<u8>,
     pending_output: std::collections::VecDeque<Bytes>,
@@ -1434,10 +1441,10 @@ impl AbortFinalizingStream {
     }
 
     fn submit_response_capture(&mut self, failure: Option<String>) -> Result<(), crate::worker::SubmitError> {
-        if self.capture_submitted {
+        if self.capture_attempted {
             return Ok(());
         }
-        self.capture_submitted = true;
+        self.capture_attempted = true;
         let reasoning =
             (!self.response_reasoning.is_empty()).then(|| std::mem::take(&mut self.response_reasoning));
         let analysis_text = reasoning.clone().unwrap_or_else(|| self.response_message.clone());
@@ -2791,7 +2798,7 @@ mod tests {
             last_reported_cached_tokens: None,
             last_reported_cost_usd_micros: None,
             saw_chunk: true,
-            capture_submitted: false,
+            capture_attempted: false,
             is_sse: true,
             protocol_buffer: Vec::new(),
             pending_output: std::collections::VecDeque::new(),
