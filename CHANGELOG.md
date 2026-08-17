@@ -4,7 +4,7 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
-### Review round 37: fourth-model residual measurement (2026-08-16)
+### Review rounds 37–39: fourth-model residual measurement (2026-08-16)
 
 A fourth reviewer model measured the residual after three on the three
 historically richest files: seven findings, all prose, several
@@ -17,8 +17,20 @@ to three comments; the single-winner provision primitive is
 guard and a `write_cold_object_exclusive` function never existed; and
 round 28's own edit had orphaned `probe_endpoint`'s doc line onto the
 redactor). Sixteen borderlines adjudicated and rejected on the record.
-Marginal-model yield: 40 → 18 → 7, all prose, code correct at every
-site.
+
+Rounds 38–39 extended the measurement to eleven more files (pipeline,
+session, cold_store, receipt; then routes, worker, config, main —
+~18k lines): yields of 2 and 2, with routes.rs, main.rs, session.rs,
+cold_store.rs and receipt.rs fully clean. All four finds were stale
+shadows of earlier behavior changes: an accept-and-warn identity
+bullet the shipped 401 rejection superseded (contradicted by its own
+comment's closing paragraph), a phantom next-tick retry on the
+response-slot drop path, a `None`-disables-timeout claim that
+round-32 F4's unconditional 60 s floor had obsoleted, and a
+Drop-ordering guarantee named bindings never provided.
+Marginal-yield curve across the QC program: model 2: 40, model 3: 18,
+model 4: 7→2→2 with rejection ratios near 10:1; every find since
+round 27 has been prose, with the code correct at every site.
 
 ### Review round 36: third-model test-suite QC — three-model coverage complete (2026-08-16)
 

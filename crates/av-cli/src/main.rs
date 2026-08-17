@@ -775,11 +775,14 @@ mod tests {
     }
 
     /// Round-23 F1: `install_seed_exclusive` must not leave a tmp
-    /// containing seed material on disk when the pre-hard-link phase
-    /// fails. Simulate the failure by pre-creating the tmp path (so
-    /// `open(create_new(true))` returns `AlreadyExists`) and confirm
-    /// the parent dir contains only the pre-existing file — no
-    /// `.avctl-key-*.tmp` orphan carrying real seed hex.
+    /// containing seed material on disk when installation does not
+    /// complete. Exercised here on the AlreadyExists branch: the SEED
+    /// path is pre-occupied, install returns `Ok(false)`, and the
+    /// parent dir contains only the pre-existing file — no
+    /// `.avctl-key-*.tmp` orphan carrying real seed hex. (The tmp name
+    /// itself is a fresh `new_event_uid()`, so tmp-phase failures are
+    /// not injectable from here; `TempPathGuard`'s own tests in fsutil
+    /// cover that phase.)
     #[test]
     fn install_seed_exclusive_leaves_no_orphan_on_pre_hardlink_failure() {
         let dir = tempfile::tempdir().unwrap();
