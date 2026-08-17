@@ -46,8 +46,9 @@ pub struct EmbeddedBroker {
     // topic -> partitions
     partitions: HashMap<String, Vec<Mutex<Partition>>>,
     validators: HashMap<String, jsonschema::Validator>,
-    /// Torn trailing lines dropped during recovery (public field read by
-    /// callers and the contract tests; not currently exported as a metric).
+    /// Torn trailing lines dropped during recovery (public field asserted
+    /// by the contract tests; not currently read by any caller or
+    /// exported as a metric).
     pub recovered_torn_lines: u64,
 }
 
