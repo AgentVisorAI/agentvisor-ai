@@ -99,7 +99,9 @@ fn chat_payload() -> Value {
 }
 
 // ------------------------------------------------------------------
-// 1. Session binding: cross-workflow AND cross-identity rejection.
+// 1. Session binding: cross-workflow rejection (an open session refuses a
+//    workflow flip; identity cannot be swapped by headers — see
+//    e2e_adversarial_mcp's hijack test for that half).
 // ------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
