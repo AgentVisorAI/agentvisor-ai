@@ -52,7 +52,10 @@ pub struct HarnessConfig {
     /// Use cleartext HTTP/2 prior knowledge for trusted h2c upstreams.
     #[serde(default)]
     pub upstream_http2_prior_knowledge: bool,
-    /// Optional provider read-idle timeout. `None` permits intentionally held streams.
+    /// Optional provider read-idle timeout override. When unset the
+    /// pipeline applies its 60 s default unconditionally (round-32 F4)
+    /// — streams cannot be held indefinitely; widen this to extend it
+    /// (capped at one day like every `_s` interval).
     #[serde(default)]
     pub upstream_read_timeout_s: Option<u64>,
     /// Chat-completions path appended to `upstream_url`. Override for
