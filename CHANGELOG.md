@@ -4,6 +4,26 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Review round 41: phantom proof made real; serde_json claim disproven (2026-08-16)
+
+The fourth model's security-remainder tranche (21 files, ~5,900 lines;
+sixteen fully clean including av-core's primitive set minus fsutil and
+the full ATIF validator). The standout: wasm_policy's memory-bomb test
+accepted `Allow` citing a follow-up write-at-grown-address
+verification that did not exist — it exists now
+(`memory_grow_past_cap_leaves_grown_region_inaccessible`: grow 4096
+pages, store at 32 MiB past the 16 MiB cap, StoreLimits refuses, the
+store faults, evaluation fails closed) and passes. Also: writer.rs's
+"serde_json refuses to serialize non-finite floats" was empirically
+false (`to_string(NAN) == Ok("null")` — it silently nulls them, which
+is exactly why the writer's rejection guard matters); fsutil justified
+a missing counter with an impossible dependency cycle (fsutil IS an
+av-core module — the real constraint is the instance-scoped Registry);
+keys.rs called a 128-bit id "128-bit collision resistance"
+(~2^64 birthday bound, as its own test states); one stale line-ref
+symbolized. Rounds 40–41's lesson: the residual after three
+reading-models concentrates in claims only execution can check.
+
 ### Review round 40: fourth-model tranche closes a real guard bypass (2026-08-16)
 
 The fourth model's mid-size-file tranche (eleven files, ~5,200 lines)

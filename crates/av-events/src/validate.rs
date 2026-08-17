@@ -41,8 +41,10 @@ pub enum ValidationError {
     /// `type_uid = 990200` as `class_uid=9902, activity_id=0`,
     /// so downstream SIEM pipelines routing/aggregating by
     /// type_uid mis-classify. Not currently reachable via the
-    /// builder (defaults 1) but the field is `#[non_exhaustive]`
-    /// and constructable directly; enforce the bijection
+    /// builder (defaults 1), but `OcsfEvent`'s fields are all pub
+    /// and the struct is not `#[non_exhaustive]`, so callers can
+    /// construct or mutate events directly, bypassing the builder;
+    /// enforce the bijection
     /// invariant at validate time.
     #[error("activity_id {0} outside 0..=99 (would collide type_uid namespaces)")]
     BadActivityId(u8),
@@ -232,8 +234,9 @@ mod tests {
     /// check, `class_uid=9901, activity_id=100` produces the same
     /// type_uid (990200) as `class_uid=9902, activity_id=0`, so
     /// downstream SIEM pipelines routing by type_uid mis-classify.
-    /// Not currently reachable via the builder (defaults 1) but the
-    /// field is `#[non_exhaustive]` and constructable directly.
+    /// Not currently reachable via the builder (defaults 1), but the
+    /// all-pub, non-`#[non_exhaustive]` struct is mutable directly
+    /// (as this test does below), bypassing the builder.
     #[test]
     fn activity_id_100_is_rejected_even_when_type_uid_matches() {
         let mut ev = valid_event();
