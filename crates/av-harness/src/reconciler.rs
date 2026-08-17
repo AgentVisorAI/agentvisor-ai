@@ -11,11 +11,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Hard upper bound on a single ATIF spool file the recovery scan will
-/// buffer into memory. Chosen to exceed the largest reasonable trajectory
-/// (millions of steps, hundreds of MB of reasoning) while capping the
-/// coarsest resource-exhaustion vector: an attacker-crafted trajectory
-/// with a multi-gigabyte `steps[i].message` cannot force recovery to OOM.
+/// Classification bound for the recovery scan's `too_large` skip metric:
+/// files above this are refused up front without any read attempt. The
+/// effective buffering cap is the smaller `fsutil::MAX_ATIF_BYTES`
+/// (64 MiB) enforced by `read_capped_async` at the read site — a file
+/// between the two bounds passes this gate but fails the capped read
+/// (`reason="read_error"`); nothing larger than 64 MiB is ever buffered,
+/// so an attacker-crafted multi-gigabyte trajectory cannot force
+/// recovery to OOM.
 const MAX_ATIF_RECOVERY_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Result of closing a session.

@@ -299,7 +299,8 @@ pub fn init(
         anyhow::bail!("{} already exists; pass --force to overwrite", output.display());
     }
     // Round-15 F2: refuse to follow a pre-planted symlink at
-    // `output`. The wizard's `write_config` already has this guard
+    // `output`. The wizard path is protected by `write_atomic`'s
+    // rename-over semantics
     // (see `wizard_replaces_config_symlink_instead_of_following_it`);
     // `init --force` used to differ, so an attacker who could plant
     // ~/.agentvisor/agentvisor.toml as a symlink to
@@ -1454,7 +1455,6 @@ pub async fn doctor(offline: bool) -> Result<()> {
     Ok(())
 }
 
-/// TCP-connect to `host:port` extracted from a URL or bare `host:port`.
 /// Strip URL userinfo (`user:pass@`) for safe display. Handles
 /// comma-separated endpoint lists (Redis Cluster). Display-only — never
 /// used for connecting.
@@ -1478,6 +1478,7 @@ fn redact_userinfo(endpoints: &str) -> String {
         .join(",")
 }
 
+/// TCP-connect to `host:port` extracted from a URL or bare `host:port`.
 async fn probe_endpoint(endpoint: &str) -> Result<()> {
     let target = probe_target(endpoint)?;
     tokio::time::timeout(Duration::from_secs(3), tokio::net::TcpStream::connect(&target))
@@ -1556,7 +1557,7 @@ fn build_probe_base(listen: &str) -> String {
                 std::net::IpAddr::V4(v4) => v4.to_string(),
                 // Rust's `Ipv6Addr::Display` already emits the
                 // shortened form and does not include a zone id
-                // (SocketAddr::parse also drops it), so this branch
+                // (`sa.ip()` discards any scope id that parsed), so this branch
                 // gives us a stable bracketed form.
                 std::net::IpAddr::V6(v6) => format!("[{v6}]"),
             }
@@ -1564,9 +1565,10 @@ fn build_probe_base(listen: &str) -> String {
         format!("http://{host}:{}", sa.port())
     } else {
         // Fallback: preserve the round-21 F6 behaviour when parse
-        // fails (bare hostname, `*:port`, IPv6 with zone id — the
-        // last one is REACHABLE here because `SocketAddr::parse`
-        // rejects zone ids on stable Rust; drop the zone id via a
+        // fails (bare hostname, `*:port`, IPv6 with an interface-NAME
+        // zone id like `%eth0` — numeric ids such as `%1` parse fine
+        // on stable and take the branch above, where `sa.ip()` drops
+        // the scope); drop the zone id via a
         // second replace so at least the loopback rewrite still
         // runs.
         let rewritten = listen.replace("0.0.0.0", "127.0.0.1").replace("[::]", "[::1]");
