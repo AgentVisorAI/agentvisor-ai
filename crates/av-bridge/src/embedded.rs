@@ -46,7 +46,8 @@ pub struct EmbeddedBroker {
     // topic -> partitions
     partitions: HashMap<String, Vec<Mutex<Partition>>>,
     validators: HashMap<String, jsonschema::Validator>,
-    /// Torn trailing lines dropped during recovery (exposed to metrics).
+    /// Torn trailing lines dropped during recovery (public field read by
+    /// callers and the contract tests; not currently exported as a metric).
     pub recovered_torn_lines: u64,
 }
 
@@ -61,9 +62,10 @@ impl EmbeddedBroker {
         fs::create_dir_all(data_dir)?;
         copy_referenced_schemas(data_dir, manifest)?;
         let yaml = manifest.to_yaml().map_err(|e| BusError::Backend(e.to_string()))?;
-        // Atomic single-winner claim on a fresh provision: `create_new`
-        // refuses to overwrite an existing file with an OS-level
-        // exclusion primitive (O_EXCL), so N concurrent provisions race
+        // Atomic single-winner claim on a fresh provision: the
+        // `hard_link(2)` below fails with EEXIST if the target already
+        // exists — an OS-level
+        // exclusion primitive, so N concurrent provisions race
         // on the same directory and exactly one wins. The old shape
         // (`exists()` check → separate write) had a TOCTOU: two racers
         // could both see "does not exist", both write, both succeed.
@@ -439,11 +441,11 @@ fn write_cold_event_once(directory: &Path, event: &StoredEvent) -> Result<(), Bu
             if fs::read(&path)? == bytes {
                 Ok(())
             } else {
-                // Round-37 F1/F2 class: `write_cold_object_exclusive`
-                // errors bubble into `ColdArchive::commit` /
-                // `stage` in the bus impls and can reach a
+                // Round-37 F1/F2 class: `write_cold_event_once`
+                // errors bubble up through `enforce_retention` and can
+                // reach a
                 // tracing::warn!(%error) on the maintenance path.
-                // Basename the absolute cold-outbox path so a
+                // Basename the absolute cold-destination path so a
                 // duplicate-object collision doesn't ship the
                 // deployment topology to OTLP.
                 Err(BusError::Backend(format!(
