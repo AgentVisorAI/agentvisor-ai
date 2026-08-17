@@ -4,6 +4,32 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Review rounds 30–31: test-suite QC and the self-review closure (2026-08-16)
+
+The cross-model QC program's final surface: the standalone integration
+test suites (~14k lines, 36 files). 13 test docs claimed things their
+assertions do not check — banners describing retention-dedup behavior
+the test (correctly) asserts the opposite of, a "hijack is refused"
+test where nothing is refused (the real invariant: headers cannot swap
+identity), a wasm "must trap" over a Deny-or-Allow assertion, and
+loop-breaker docs promising strictness the embedder-tolerant
+assertions deliberately avoid. Two tests were strengthened to match
+their docs instead (receipt-verify stdout pinned to the documented
+`verified <id>` shape; tampered-signature errors pinned to the opaque
+`Verification` variant), and one QC finding was rejected as a
+tooling artifact (byte-level inspection proved the "vacuous
+bearer-leak test" really sends the secret; the session's masking had
+redacted the reviewer's view). Self-review of the rewrites then caught
+one over-claim of ours — a banner deferring unicode-tag byte-survival
+to golden tests that contained no tag characters — resolved by adding
+the missing test: tag-smuggled messages survive the typed round trip
+bit-exactly and pass both validators.
+
+Final certification: fmt, workspace clippy -D warnings all-features,
+cargo-deny (4 checks), and the full 69-binary / 895-test all-features
+suite green locally; the full CI pipeline (live services, release SLA,
+container build, Harbor interop) green on the same commit.
+
 ### Review rounds 18–29: runtime-prose sweeps and the cross-model QC program (2026-08-16)
 
 Rounds 18–25 extended the audit beyond code comments to every other
