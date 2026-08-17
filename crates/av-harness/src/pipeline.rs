@@ -748,8 +748,9 @@ impl AppState {
     }
 
     /// Run synchronous local gates without waiting for off-path journal,
-    /// embedding, or broker work. When a completion-token budget is
-    /// configured (`budget.max_tokens`) the gates run on the blocking pool;
+    /// embedding, or broker work. When a session token budget is
+    /// configured (`budget.max_tokens`, prompt+completion combined) the
+    /// gates run on the blocking pool;
     /// otherwise they are cheap enough to run inline.
     pub async fn prepare_chat_nonblocking(
         &self,

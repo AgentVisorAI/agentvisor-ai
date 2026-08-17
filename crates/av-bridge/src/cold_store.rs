@@ -41,9 +41,10 @@ impl ColdArchive {
         Self::from_manifest_with_pending_default(manifest, None)
     }
 
-    /// Same as [`Self::from_manifest`] but uses `pending_default` when neither
-    /// the operator-set `AV_COLD_OUTBOX_DIR` env var nor a manifest override
-    /// is present. Callers with a natural data directory (e.g. the embedded
+    /// Same as [`Self::from_manifest`] but uses `pending_default` when the
+    /// operator-set `AV_COLD_OUTBOX_DIR` env var is absent (falling back to
+    /// `data/cold-outbox` when the caller passes no default either).
+    /// Callers with a natural data directory (e.g. the embedded
     /// broker) pass `data_dir.join("cold-outbox")` so two brokers in the
     /// same process do not cross-consume each other's intents via the
     /// CWD-relative fallback.
@@ -406,7 +407,8 @@ fn remove_pending(path: &std::path::Path) -> Result<(), BusError> {
     }
 }
 
-/// Honor only `AWS_*`-prefixed env credentials, lowercased for
+/// Honor only `AWS_*`-prefixed env vars (credentials plus AWS-scoped
+/// configuration like `AWS_ENDPOINT`), lowercased for
 /// `parse_url_opts` (its config-key parser accepts lowercase names only).
 /// Passing the whole environment would let generic variable names —
 /// `ENDPOINT`, `REGION`, `TIMEOUT`, `TOKEN`, `PROXY_URL` — silently
