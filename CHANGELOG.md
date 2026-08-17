@@ -4,6 +4,34 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Review round 36: third-model test-suite QC — three-model coverage complete (2026-08-16)
+
+The third reviewer finished the integration-test suites, closing the
+program at three independent models over every file in the repository.
+Nine findings; the important ones were resolved by strengthening tests
+rather than weakening docs: the CLI "help mentions every subcommand"
+lists were missing five of the fourteen subcommands
+(setup/start/init/doctor/health — both the discoverability and the
+per-subcommand `--help` loops now cover all 14); the
+Ed25519-determinism assertion was unreachable (all 200 oracle bodies
+distinct — an explicit identical-body pair now proves RFC 8032
+determinism); the 2^53-boundary receipt is verified, not just signed;
+the tiny-inputs test now actually covers a single character. Prose
+fixes: the all-zero Ed25519 key is the order-4 small-order point
+(y = 0), not "the identity"; deep nesting lives in `stop_reason`, not
+the receipt subject; "cross-workflow AND cross-identity" had no
+cross-identity half here; the breaker coverage list promised "loop
+convergence" where the design keeps the breaker Open until manual
+reset (the mislabeled near-epsilon test is now
+`progressing_content_never_falsely_trips`). Twenty-five borderline
+candidates adjudicated and rejected on the record.
+
+Program totals across rounds 17–36: three models × 100 % of src and
+tests; ≈ 90 prose corrections, 7 strengthened assertions, 4 new tests,
+3 code fixes (both halves of the doctor credential leak; a Drop-timing
+release that a named `_`-binding could not deliver), ≈ 80 borderlines
+adjudicated with recorded reasons, all echo families extinguished.
+
 ### Review rounds 33–35: third-model QC (2026-08-16)
 
 Escalated the QC program to a third independent reviewer model on the
