@@ -4,6 +4,21 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Review round 42: the audit catches its own round-38 artifact (2026-08-16)
+
+The fourth model's final src tranche (events, loopdetect, compress,
+all lib.rs docs — 100 % fourth-model src coverage). One finding, the
+program's most instructive: a comment introduced BY this session's
+round-38 fixes claimed `OcsfEvent`'s field is "`#[non_exhaustive]` and
+constructable directly" — the struct carries no such attribute, and
+the attribute would prevent precisely the construction described. An
+earlier reviewer had adjudicated the phrasing as acceptable; the
+fourth model correctly overturned that. Both sites now state the true
+mechanism (all-pub fields on a non-`non_exhaustive` struct bypass the
+builder). Every pairing claim in the tranche chased to its partner,
+including the twice-relied-on all-zero ONNX error fallback and the
+proptest-backed "property-tested" claim.
+
 ### Review round 41: phantom proof made real; serde_json claim disproven (2026-08-16)
 
 The fourth model's security-remainder tranche (21 files, ~5,900 lines;
