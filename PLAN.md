@@ -158,7 +158,8 @@ sign; measured). Unsigned close → ATIF spool (atomic tmp+rename). Promotion:
 receipt ≤ 60 s (measured); promotion idempotent (double-promote = one receipt).
 
 ### D12. Evolution with time (explicit user requirement) — see EVOLUTION.md
-- **Inbound tolerant, outbound strict**: parsers accept unknown fields (captured into `unmapped`/`extra`),
+- **Inbound tolerant, outbound strict**: parsers accept top-level unknown fields (captured into
+  `unmapped`/`extra`; nested objects stay strict),
   emitters always produce the newest schema; validators have strict + compat modes.
 - **Versions everywhere**: OCSF `metadata.version` = "1.10.0"; ATIF `schema_version` = "ATIF-v1.7"
   (reader: v1.0-v1.7 with per-version gating tests); `receipt_version`; `manifest_version`;
@@ -227,7 +228,7 @@ This is the implementation traceability record, not a test report. Current measu
 | R3 | §2 receipts batched off hot path, finalized once at session close | av-harness session close → av-receipts | test: no signing occurs per-chunk (call-count probe); close issues exactly one |
 | R4 | §2 ATIF path separate from signed hot path | authenticated journals + snapshot writer | write-failure retry, torn-tail, tamper, and restart tests |
 | R5 | A: loop detect via embeddings, Δ≈0 over 3 steps + N tokens → reject/inject, OCSF event with stop_reason_id | av-loopdetect + harness enforcement | synthetic loop suite: 100 % catch ≤ 3 cycles; progressing suite: 0 false trips; emitted event schema-validated |
-| R6 | B: MCP JSON-RPC intercept, WASM policies (wasmtime), action budgets (max_db_writes, max_payout_usd), schema-invalid blocked, < 5 ms | av-sandbox (+av-state) | block-latency bench < 5 ms; budget stress; WAT policy tests; JSON-schema negative suite; per-call OCSF event w/ budget consumption |
+| R6 | B: MCP JSON-RPC intercept, WASM policies (wasmtime), action budgets (per-tool `max_tool_calls` caps + `max_payout_usd_micros`; the brief's illustrative `max_db_writes`/`max_payout_usd` names), schema-invalid blocked, < 5 ms | av-sandbox (+av-state) | block-latency bench < 5 ms; budget stress; WAT policy tests; JSON-schema negative suite; per-call OCSF event w/ budget consumption |
 | R7 | C: parse payloads, prune, 30-50 % reduction on ≥ 50 k-token histories, metrics mirror ATIF fields | av-compress | 50 k synthetic corpus test asserts ≥ 30 %; invariant property tests; metric name parity test |
 | R8 | D: short-lived JWT/HMAC, IdP-bound, scope inheritance, 15-min TTL, instance_uid+TTL in event identity block | av-identity + av-events | adversarial JWT suite; delegation property tests; event identity-block content test |
 | R9 | E: events carry ai_agent.version/charter/instance_uid + stop_reason_id per PR #1; metadata v1.10.0 | av-events | golden events validated against shipped JSON Schemas; field-presence tests |
