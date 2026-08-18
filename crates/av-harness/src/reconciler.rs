@@ -5039,11 +5039,7 @@ mod tests {
             "workflow": "signed",
         });
         let sealed = crate::journal::seal(&journal_key, "metadata", 0, &metadata_payload).unwrap();
-        std::fs::write(
-            directory.path().join(format!("{stem}.session.json")),
-            &sealed,
-        )
-        .unwrap();
+        std::fs::write(directory.path().join(format!("{stem}.session.json")), &sealed).unwrap();
 
         // Pre-hold the blocker's lifecycle lock. The scan cannot finish
         // while this guard lives: it must park at `acquire_lifecycle`
