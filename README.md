@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" width="128" alt="AgentVisor AI logo">
+</p>
+
 # AgentVisor AI
 
 [![CI](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/ci.yml)

@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="AgentVisor AI logo">
+  <defs>
+    <linearGradient id="visor" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2f9edb"/>
+      <stop offset="1" stop-color="#0a5c8b"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9fb6c4"/>
+      <stop offset="1" stop-color="#5f7c8e"/>
+    </linearGradient>
+    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="14"/>
+    </filter>
+  </defs>
+
+  <rect width="512" height="512" rx="96" fill="#0d1117"/>
+
+  <!-- shield -->
+  <path d="M256 84
+           L404 134
+           V262
+           C404 352 340 410 256 436
+           C172 410 108 352 108 262
+           V134
+           Z"
+        fill="#14161b" stroke="url(#shield)" stroke-width="18" stroke-linejoin="round"/>
+
+  <!-- visor glow -->
+  <rect x="156" y="212" width="200" height="46" rx="23" fill="url(#visor)" filter="url(#glow)" opacity="0.85"/>
+  <!-- visor -->
+  <rect x="156" y="212" width="200" height="46" rx="23" fill="url(#visor)"/>
+  <!-- visor highlight -->
+  <rect x="172" y="220" width="76" height="10" rx="5" fill="#bfe3f7" opacity="0.75"/>
+
+  <!-- verified light -->
+  <circle cx="256" cy="330" r="13" fill="#2fae5d"/>
+  <circle cx="256" cy="330" r="13" fill="#2fae5d" filter="url(#glow)" opacity="0.6"/>
+</svg>
