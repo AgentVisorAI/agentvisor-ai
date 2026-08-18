@@ -1,6 +1,6 @@
 //! Authenticated envelopes for active-workflow crash journals.
 
-use hmac::{Hmac, Mac as _};
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;

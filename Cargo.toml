@@ -64,8 +64,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.18", features = ["v7", "v4", "serde"] }
 ed25519-dalek = { version = "2.2", features = ["rand_core", "pkcs8", "pem", "zeroize"] }
 zeroize = { version = "1.8", features = ["derive"] }
-sha2 = "0.10"
-hmac = "0.12"
+sha2 = "0.11"
+hmac = "0.13"
 hex = "0.4"
 base64 = "0.23"
 rand = "0.10"
