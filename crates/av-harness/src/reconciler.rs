@@ -4996,47 +4996,67 @@ mod tests {
     /// a client-driven close on an unrelated session. Under the old
     /// global `lifecycle_lock` the client close waited for the entire
     /// scan to finish. With per-session locks, close on session B
-    /// proceeds while recovery is still scanning candidate A.
+    /// proceeds while recovery is still working on candidate A.
     ///
-    /// Seeded with real spool candidates that force per-file I/O in
-    /// the scan; a concurrent close on a distinct session must
-    /// complete well below the scan's total duration. Without a
-    /// real spool the scan returns in microseconds and the test
-    /// cannot distinguish per-session locks from the old global lock.
+    /// Deterministic construction (the previous end-ordering comparison
+    /// `close_end < scan_end` still raced: on a fast runner the scan
+    /// can legitimately finish milliseconds before an fsync-heavy close
+    /// with nothing blocked). Here the test plants a sealed signed-journal
+    /// sidecar for a "blocker" session and pre-holds that session's
+    /// lifecycle lock, so `recover_signed_journals` provably parks at its
+    /// `acquire_lifecycle` mid-scan. While the scan is parked:
+    ///
+    /// * under per-session locks the unrelated close acquires its own
+    ///   lock and completes;
+    /// * under a regressed global lock the close would queue behind the
+    ///   very lock the test holds, and the outer timeout fires.
+    ///
+    /// No wall-clock ordering is asserted anywhere.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn recovery_scan_does_not_head_of_line_block_unrelated_close() {
         let directory = tempfile::tempdir().unwrap();
         let finalizer = Arc::new(finalizer(directory.path()));
-        // Seed the spool with a pile of candidates that fail provenance
-        // (unauthenticated / not `.session.json`) so recovery iterates
-        // read_dir + sidecar stat + quarantine-rename on each (round-44
-        // F1 refuses them before any read or hash), taking observable
-        // wall-clock time (512 candidates so the scan reliably outlasts
-        // one unrelated close even on fast disks).
-        for i in 0..512 {
-            let path = directory.path().join(format!("scan-probe-{i}.json"));
-            let payload = serde_json::json!({
-                "atif_version": "1.7",
-                "session_id": format!("scan-probe-{i}"),
-                "agent": {"version": "1", "charter": "test", "instance_uid": "x"},
-                "steps": [],
-                "provenance": {"scheme": "none"},
-            });
-            tokio::fs::write(&path, serde_json::to_vec(&payload).unwrap())
-                .await
-                .unwrap();
-        }
+        // Same seed as the `finalizer` helper so the sealed sidecar
+        // authenticates against the finalizer's journal key.
+        let signer: Arc<dyn Signer> = Arc::new(Ed25519Signer::from_seed(&[7; 32]));
+        let journal_key = crate::journal::key_from_signer(signer.as_ref());
+
+        // Plant a signed-journal sidecar the scan must adopt: it passes
+        // the metadata checks in `recover_signed_journals` and reaches
+        // that path's per-candidate `acquire_lifecycle`.
+        let blocker_id = "scan-blocker";
+        let digest = av_core::digest::sha256_hex(blocker_id.as_bytes());
+        let stem = &digest[..32];
+        let metadata_payload = serde_json::json!({
+            "journal_version": 2,
+            "session_id": blocker_id,
+            "identity": AgentIdentity {
+                version: "1".to_owned(),
+                charter: "test".into(),
+                instance_uid: "instance-blocker".to_owned(),
+                ttl_remaining_s: Some(600),
+            },
+            "workflow": "signed",
+        });
+        let sealed = crate::journal::seal(&journal_key, "metadata", 0, &metadata_payload).unwrap();
+        std::fs::write(
+            directory.path().join(format!("{stem}.session.json")),
+            &sealed,
+        )
+        .unwrap();
+
+        // Pre-hold the blocker's lifecycle lock. The scan cannot finish
+        // while this guard lives: it must park at `acquire_lifecycle`
+        // for the planted candidate.
+        let locks = finalizer.lifecycle_locks();
+        let held = locks.arc_for(blocker_id).lock_owned().await;
+
         let f_scan = Arc::clone(&finalizer);
         let scan_task = tokio::spawn(async move {
-            let _ = f_scan
+            f_scan
                 .recover_spooled_sessions(&crate::session::SessionRegistry::new(), &Default::default())
-                .await;
-            std::time::Instant::now()
+                .await
         });
-        // Small yield so the scan task grabs `recovery_lock` first —
-        // this is the state where the old global `lifecycle_lock`
-        // would have blocked the client close below.
-        tokio::task::yield_now().await;
 
         let session = Arc::new(Session::new(
             "unrelated-close".to_owned(),
@@ -5049,29 +5069,30 @@ mod tests {
             },
             Default::default(),
         ));
-        // Ordering bound, not wall-clock: under the OLD global
-        // `lifecycle_lock` the close can only complete AFTER the scan
-        // releases the lock, so close_end >= scan_end by construction.
-        // Under per-session locks the close overlaps the still-running
-        // 512-file scan and ends first. The previous absolute 200 ms
-        // budget flaked under full-suite load (CPU starvation and fsync
-        // contention inflate the close even though nothing is blocked);
-        // an end-ordering comparison inflates both sides together. The
-        // generous outer timeout only catches genuine deadlocks.
+        // The generous timeout only fires on a genuine global-lock
+        // regression (the close queuing behind the lock held above) or
+        // a deadlock; it is not a performance gate.
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(60),
             finalizer.close_session(session, StopReason::SessionClosed),
         )
         .await
-        .expect("unrelated close deadlocked behind the recovery scan");
-        let close_end = std::time::Instant::now();
-        let scan_end = scan_task.await.unwrap();
+        .expect("unrelated close blocked behind the in-flight recovery scan — the head-of-line blocking signature of a global lifecycle lock");
+
+        // The close finished while the scan was provably still in
+        // flight: the scan cannot complete until the blocker guard is
+        // released.
         assert!(
-            close_end < scan_end,
-            "unrelated close finished only after the recovery scan ended — the head-of-line \
-             blocking signature of a global lifecycle lock (close_end {close_end:?} >= scan_end \
-             {scan_end:?})"
+            !scan_task.is_finished(),
+            "recovery scan finished while its candidate's lifecycle lock was externally held — \
+             the scan never acquired the per-session lock, so this test lost its teeth"
         );
+
+        drop(held);
+        scan_task
+            .await
+            .unwrap()
+            .expect("recovery scan must complete after the blocker lock is released");
     }
 
     /// A saturated worker-side finalizer must not hold a session's
