@@ -83,7 +83,7 @@ proptest = "1.6"
 tempfile = "3.14"
 object_store = { version = "0.14", default-features = false }
 url = "2.5"
-rdkafka = { version = "0.36", default-features = false, features = ["tokio", "cmake-build", "ssl-vendored"] }
+rdkafka = { version = "0.39", default-features = false, features = ["tokio", "cmake-build", "ssl-vendored"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
