@@ -392,7 +392,7 @@ fn pending_mac(control_key: &[u8; 32], pending: &PendingColdEvent) -> Result<Str
             "cold-outbox control key is uninitialized/known-weak; refusing to sign".to_owned(),
         ));
     }
-    use hmac::{Hmac, Mac as _};
+    use hmac::{Hmac, KeyInit as _, Mac as _};
     use sha2::Sha256;
     let value = serde_json::to_value(pending)?;
     let canonical =
@@ -420,7 +420,7 @@ fn verify_pending_mac(
     if control_key == &[0u8; 32] || control_key == &[0xFFu8; 32] {
         return Err(BusError::Backend("cold outbox authentication failed".to_owned()));
     }
-    use hmac::{Hmac, Mac as _};
+    use hmac::{Hmac, KeyInit as _, Mac as _};
     use sha2::Sha256;
     let value = serde_json::to_value(pending)?;
     let canonical =
@@ -538,7 +538,7 @@ mod tests {
     /// envelope and require rejection.
     #[test]
     fn envelope_forged_with_the_weak_default_key_is_refused_on_read() {
-        use hmac::{Hmac, Mac as _};
+        use hmac::{Hmac, KeyInit as _, Mac as _};
         use sha2::Sha256;
         let directory = tempfile::tempdir().unwrap();
         let uri = url::Url::from_directory_path(directory.path())
