@@ -42,6 +42,6 @@ jobs:
       # One `check` invocation runs advisories, bans, licenses, and
       # sources together (each reported separately in the log) — a single
       # container spin-up instead of the former four-job matrix.
-      - uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check
