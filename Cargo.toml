@@ -69,7 +69,7 @@ hmac = "0.13"
 hex = "0.4"
 base64 = "0.23"
 rand = "0.10"
-jsonwebtoken = { version = "10.4", default-features = false, features = ["use_pem", "rust_crypto"] }
+jsonwebtoken = { version = "11.0", default-features = false, features = ["use_pem", "rust_crypto"] }
 jsonschema = "0.26"
 dashmap = "6.1"
 parking_lot = "0.12"
