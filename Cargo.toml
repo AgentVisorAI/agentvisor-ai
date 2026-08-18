@@ -62,7 +62,7 @@ ryu = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.18", features = ["v7", "v4", "serde"] }
-ed25519-dalek = { version = "2.2", features = ["rand_core", "pkcs8", "pem", "zeroize"] }
+ed25519-dalek = { version = "3.0", features = ["rand_core", "pkcs8", "pem", "zeroize"] }
 zeroize = { version = "1.8", features = ["derive"] }
 sha2 = "0.11"
 hmac = "0.13"
