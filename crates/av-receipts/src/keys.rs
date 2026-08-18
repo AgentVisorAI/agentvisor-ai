@@ -43,19 +43,29 @@ impl Ed25519Signer {
     /// OsRng, but the failure mode is silent installation of a
     /// globally-predictable keypair — cheap to guard.
     pub fn generate() -> Self {
+        use rand::TryRng;
         loop {
-            let key = SigningKey::generate(&mut rand::rngs::OsRng);
-            // Round-21 F2: wrap the raw seed comparison buffer in
-            // `Zeroizing` so the stack slot zeroes on scope exit.
-            // A bare `[u8; 32]` has no Drop, so it lingers in
-            // freed stack memory (recoverable from a core dump).
-            // The round-20 F5 loop reintroduced that leak by
-            // reading `key.to_bytes()` into a bare local. Equality
-            // through Deref still works.
-            let bytes = zeroize::Zeroizing::new(key.to_bytes());
+            // rand 0.9+ removed the infallible `OsRng` that
+            // `SigningKey::generate` (rand_core 0.6) accepted; draw the
+            // seed through the fallible `SysRng` interface instead and
+            // build the key from bytes.
+            //
+            // Round-21 F2: wrap the raw seed buffer in `Zeroizing` so the
+            // stack slot zeroes on scope exit. A bare `[u8; 32]` has no
+            // Drop, so it lingers in freed stack memory (recoverable from
+            // a core dump).
+            let mut bytes = zeroize::Zeroizing::new([0u8; 32]);
+            // An OS entropy failure is unrecoverable for key generation;
+            // the pre-0.9 `OsRng` path aborted here too (it panicked
+            // inside `getrandom`). Panicking keeps the infallible API.
+            #[allow(clippy::expect_used)]
+            rand::rngs::SysRng
+                .try_fill_bytes(&mut *bytes)
+                .expect("OS random source unavailable");
             if *bytes == [0u8; 32] || *bytes == [0xFFu8; 32] {
                 continue;
             }
+            let key = SigningKey::from_bytes(&bytes);
             let key_id = derive_key_id(&key.verifying_key());
             return Self { key_id, key };
         }

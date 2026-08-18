@@ -24,8 +24,17 @@ struct TestKeys {
     public_pem: String,
 }
 
+/// rand 0.9+ removed the infallible `OsRng` that `SigningKey::generate`
+/// (rand_core 0.6) accepted; draw the seed via the fallible `SysRng` instead.
+fn generate_signing_key() -> ed25519_dalek::SigningKey {
+    use rand::TryRng;
+    let mut seed = [0u8; 32];
+    rand::rngs::SysRng.try_fill_bytes(&mut seed).unwrap();
+    ed25519_dalek::SigningKey::from_bytes(&seed)
+}
+
 fn ed25519_keys(kid: &str) -> TestKeys {
-    let signing = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let signing = generate_signing_key();
     let private_pem = signing.to_pkcs8_pem(LineEnding::LF).unwrap().to_string();
     let public_pem = signing.verifying_key().to_public_key_pem(LineEnding::LF).unwrap();
     TestKeys {
