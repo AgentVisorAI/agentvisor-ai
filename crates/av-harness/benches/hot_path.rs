@@ -10,8 +10,9 @@ use av_receipts::{Ed25519Signer, Receipt, ReceiptSubject};
 use av_sandbox::{Sandbox, SandboxConfig};
 use av_state::InMemoryStore;
 use axum::http::{HeaderMap, HeaderValue};
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use serde_json::{json, Value};
+use std::hint::black_box;
 use std::sync::Arc;
 
 struct NullBus;
