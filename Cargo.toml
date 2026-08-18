@@ -54,7 +54,7 @@ serde = { version = "1.0", features = ["derive"] }
 # JCS implementations (verified by the RFC Appendix vectors in av-receipts).
 serde_json = { version = "1.0", features = ["preserve_order", "float_roundtrip"] }
 serde_yaml = "0.9"
-toml = "0.8"
+toml = "1.1"
 thiserror = "2.0"
 anyhow = "1.0"
 # Correctly-rounded shortest float digits for RFC 8785 (already in-tree via serde_json).
