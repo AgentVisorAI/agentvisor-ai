@@ -495,7 +495,7 @@ fn event_tail(data_dir: &Path, topic: &str, partition: u32, offset: u64, max: us
 }
 
 async fn session_promote(base_url: &str, id: &str, token_file: Option<&Path>) -> Result<()> {
-    let url = format!("{}/v1/sessions/{}/promote", base_url.trim_end_matches('/'), id);
+    let url = promote_url(base_url, id)?;
     let token = bearer_token(token_file)?;
     // Every other CLI probe bounds its wait (see `doctor` and `probe_endpoint`
     // at 3 s); without an explicit timeout, a hung harness leaves this call
@@ -530,6 +530,22 @@ async fn session_promote(base_url: &str, id: &str, token_file: Option<&Path>) ->
     // if a proxy adulterates the response. Sanitise to be safe.
     println!("{}", sanitize_for_terminal(&body));
     Ok(())
+}
+
+/// Build the promotion URL with proper path-segment encoding. Session
+/// ids accept any printable ASCII (see `SessionId::parse`), including
+/// `/`, `?` and `#`; raw string interpolation let such an id split the
+/// path or start a query string, sending the promotion to the wrong
+/// route. The harness router percent-decodes `{id}` captures, so
+/// encoding here round-trips exactly.
+fn promote_url(base_url: &str, id: &str) -> Result<reqwest::Url> {
+    let mut url =
+        reqwest::Url::parse(base_url).with_context(|| format!("parse harness base URL {base_url:?}"))?;
+    url.path_segments_mut()
+        .map_err(|()| anyhow::anyhow!("harness base URL {base_url:?} cannot carry a path"))?
+        .pop_if_empty()
+        .extend(["v1", "sessions", id, "promote"]);
+    Ok(url)
 }
 
 /// Round-28 F4: capped, streaming replacement for
@@ -763,6 +779,24 @@ mod tests {
         ] {
             Cli::try_parse_from(args).unwrap();
         }
+    }
+
+    /// Regression: session ids accept any printable ASCII, so a raw
+    /// `format!` URL let ids containing `/`, `?` or `#` split the path
+    /// or start a query/fragment — promoting the wrong route entirely.
+    /// The builder must percent-encode the id as one path segment.
+    #[test]
+    fn promote_url_percent_encodes_reserved_session_id_characters() {
+        let url = promote_url("http://localhost:8080", "sess?x/y#z").unwrap();
+        assert_eq!(url.path(), "/v1/sessions/sess%3Fx%2Fy%23z/promote");
+        assert_eq!(url.query(), None, "id must not leak into the query");
+        assert_eq!(url.fragment(), None, "id must not leak into the fragment");
+        // Trailing slash on the base must not double up.
+        let url = promote_url("http://localhost:8080/", "plain-id").unwrap();
+        assert_eq!(url.path(), "/v1/sessions/plain-id/promote");
+        // A base URL carrying a path prefix keeps it.
+        let url = promote_url("http://localhost:8080/proxy", "plain-id").unwrap();
+        assert_eq!(url.path(), "/proxy/v1/sessions/plain-id/promote");
     }
 
     #[test]

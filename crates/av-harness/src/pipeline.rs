@@ -60,6 +60,17 @@ pub struct AppState {
     pub(crate) upstream_auth: Option<(HeaderName, HeaderValue)>,
     /// Bearer credential injected into every tool-upstream forward.
     pub(crate) tool_auth: Option<HeaderValue>,
+    /// Serializes tool-audit completion per execution key (see
+    /// `routes.rs::complete_tool_audit`): an Unaudited replay racing a
+    /// fresh completion for the same key would otherwise submit a second
+    /// `tool_completed` worker job — a duplicate execution record on the
+    /// audit stream and in the signed chain.
+    pub(crate) tool_audit_gates:
+        Arc<parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Execution keys whose `tool_completed` audit job has been durably
+    /// journaled in this process but whose `.audited` marker write failed;
+    /// a retry must re-attempt the marker without re-emitting the event.
+    pub(crate) tool_audits_emitted: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     /// Asynchronous session close and promotion service.
     pub finalizer: Finalizer,
     pub(crate) journal_key: [u8; 32],
@@ -547,6 +558,8 @@ impl AppState {
             client,
             upstream_auth,
             tool_auth,
+            tool_audit_gates: Arc::default(),
+            tool_audits_emitted: Arc::default(),
             finalizer,
             journal_key,
         })
@@ -964,6 +977,7 @@ impl AppState {
                 let client_error = PipelineError::Upstream(client_reason.to_owned());
                 let persisted_reason = format!("upstream_{client_reason}");
                 if let Some(permit) = response_permit {
+                    let capture_session = Arc::clone(&session);
                     let mut job =
                         self.failure_job(session, identity, StopReason::Other, persisted_reason.clone());
                     job.response_marker = response_marker;
@@ -971,13 +985,17 @@ impl AppState {
                         id: response_attempt_id,
                         terminal: true,
                     });
-                    // Best-effort: shard may be momentarily full, in
-                    // which case the terminal failure event is dropped
-                    // and only av_events_dropped_total{stage=
-                    // "response_slot"} records it (no retry mechanism
-                    // exists here; the else branch below runs only when
-                    // no response permit was reserved at all).
-                    let _ = permit.submit(&self.worker, job);
+                    // This terminal failure capture is the only thing that
+                    // retires the durable in-flight marker and the
+                    // journalled response attempt. If the shard is full,
+                    // fail the session closed instead of dropping the
+                    // capture silently: otherwise the marker strands, no
+                    // terminal response event exists, and the session can
+                    // still close "cleanly" with a receipt over an
+                    // unresolved response attempt.
+                    if permit.submit(&self.worker, job).is_err() {
+                        capture_session.mark_capture_failed();
+                    }
                 } else {
                     self.enqueue_failure(session, identity, StopReason::Other, persisted_reason)?;
                 }
@@ -1341,7 +1359,13 @@ impl AppState {
                 if self.config.enforce_identity_scopes {
                     if let Some(required) = required_scope {
                         if !scope_allows(&validated.claims.scopes, required) {
-                            return Err(PipelineError::Unauthorized(format!(
+                            // RFC 6750 §3.1: a syntactically valid, correctly
+                            // signed token that lacks the required scope is an
+                            // AUTHORIZATION failure — 403 insufficient_scope —
+                            // not a 401. Returning 401 (the old behavior) told
+                            // SDK token-refreshers to re-authenticate, which
+                            // cannot help: the grant itself lacks the scope.
+                            return Err(PipelineError::Blocked(format!(
                                 "identity scope {required:?} is required"
                             )));
                         }
@@ -2702,9 +2726,13 @@ mod tests {
             HeaderValue::from_str(&format!("Bearer {}", scoped_token(&["chat:write"]))).unwrap(),
         );
         let prepared = state.prepare_chat(&headers, payload()).unwrap();
+        // RFC 6750 §3.1: missing scope on a valid token is 403
+        // insufficient_scope (Blocked), NOT 401 — a refreshed token would
+        // carry the same grant, so telling the SDK to re-authenticate
+        // (401's semantic) is wrong and loops.
         assert!(matches!(
             state.authorize_session(&headers, &prepared.session, "session:close"),
-            Err(PipelineError::Unauthorized(_))
+            Err(PipelineError::Blocked(_))
         ));
         headers.insert(
             axum::http::header::AUTHORIZATION,
