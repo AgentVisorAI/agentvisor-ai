@@ -193,7 +193,13 @@ pub fn write_atomic(trajectory: &Trajectory, path: &Path) -> Result<(), WriterEr
         return Err(WriterError::Invalid(issues));
     }
     let json = serde_json::to_vec_pretty(trajectory)?;
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    // `parent()` of a relative leaf like "t.json" is `Some("")`, which is
+    // not a usable directory path; normalize to `.` (same fix as
+    // `av_core::fsutil::write_atomic`).
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.write_all(&json)?;
@@ -273,6 +279,32 @@ mod tests {
         let mut s2 = step(Source::Agent);
         s2.metrics = Some(metrics(1, 0, 0, 0.0));
         assert!(b.push_step(s2).is_err(), "overflow must not wrap silently");
+    }
+
+    /// Mutation-run hardening: the cost guard is
+    /// `!is_finite() || cost < 0.0` — flipping `||` to `&&` (which
+    /// disables the guard entirely, since no value is both non-finite
+    /// AND negative) survived the suite. Pin each arm independently:
+    /// NaN, +∞, and negative costs must all be refused, and a valid
+    /// cost on the same builder must still be accepted afterwards.
+    #[test]
+    fn non_finite_and_negative_costs_are_each_refused() {
+        for bad_cost in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.001] {
+            let mut b = TrajectoryBuilder::new(agent(), None);
+            let mut s = step(Source::Agent);
+            s.metrics = Some(metrics(1, 1, 0, bad_cost));
+            assert!(
+                b.push_step(s).is_err(),
+                "cost {bad_cost} must be refused before it can reach serialization",
+            );
+            // The refusal must not have partially updated the aggregates.
+            let mut ok = step(Source::Agent);
+            ok.metrics = Some(metrics(1, 1, 0, 0.5));
+            b.push_step(ok).unwrap();
+            let fm = b.finish().final_metrics.unwrap();
+            assert_eq!(fm.total_prompt_tokens, Some(1));
+            assert!((fm.total_cost_usd.unwrap() - 0.5).abs() < 1e-12);
+        }
     }
 
     #[test]

@@ -586,6 +586,20 @@ fn validate_step(
             "field requires ATIF-v1.7+"
         );
     }
+    // Wrong-typed values must be flagged, not silently treated as absent:
+    // `and_then(Value::as_u64)` below maps `"llm_call_count": "1"` to None,
+    // which passed Strict validation while typed deserialization fails
+    // (same class as the optional-string fields at the trajectory root).
+    if obj
+        .get("llm_call_count")
+        .is_some_and(|v| !v.is_u64() && !v.is_null())
+    {
+        issue!(
+            issues,
+            format!("{path}.llm_call_count"),
+            "must be a non-negative integer"
+        );
+    }
     if source == Some("agent") && obj.get("llm_call_count").and_then(Value::as_u64) == Some(0) {
         for field in ["metrics", "reasoning_content"] {
             if obj.contains_key(field) {
@@ -696,6 +710,19 @@ fn validate_step(
                                     );
                                 }
                             }
+                            // Wrong-typed refs must be flagged, not silently
+                            // treated as absent (`and_then(Value::as_array)`
+                            // maps an object/string here to None).
+                            if res
+                                .get("subagent_trajectory_ref")
+                                .is_some_and(|v| !v.is_array() && !v.is_null())
+                            {
+                                issue!(
+                                    issues,
+                                    format!("{rpath}.subagent_trajectory_ref"),
+                                    "must be an array"
+                                );
+                            }
                             if let Some(references) =
                                 res.get("subagent_trajectory_ref").and_then(Value::as_array)
                             {
@@ -743,13 +770,23 @@ fn validate_step(
                                     }
                                 }
                             }
-                            if let Some(src_id) = res.get("source_call_id").and_then(Value::as_str) {
-                                if !call_ids.contains(src_id) {
-                                    issue!(
-                                        issues,
-                                        format!("{rpath}.source_call_id"),
-                                        "references unknown tool_call_id {src_id:?} (must match a tool call in the same step)"
-                                    );
+                            match res.get("source_call_id") {
+                                None | Some(Value::Null) => {}
+                                Some(Value::String(src_id)) => {
+                                    if !call_ids.contains(src_id.as_str()) {
+                                        issue!(
+                                            issues,
+                                            format!("{rpath}.source_call_id"),
+                                            "references unknown tool_call_id {src_id:?} (must match a tool call in the same step)"
+                                        );
+                                    }
+                                }
+                                // Wrong-typed ids must be flagged, not silently
+                                // skipped: `and_then(Value::as_str)` mapped
+                                // `"source_call_id": 123` to None, bypassing
+                                // the same-step linkage check entirely.
+                                Some(_) => {
+                                    issue!(issues, format!("{rpath}.source_call_id"), "must be a string")
                                 }
                             }
                         }
@@ -1032,6 +1069,107 @@ mod tests {
         );
         // Validator and serde must agree: typed deserialization also rejects.
         assert!(serde_json::from_value::<crate::model::Trajectory>(value).is_err());
+    }
+
+    /// Wrong-typed step-level optional fields must be flagged, not silently
+    /// treated as absent: `llm_call_count`, `source_call_id`, and
+    /// `subagent_trajectory_ref` all used `and_then(as_*)`, which mapped a
+    /// wrong-typed value to `None` and passed Strict validation while typed
+    /// deserialization fails.
+    #[test]
+    fn wrong_typed_step_fields_are_flagged() {
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": "s",
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{
+                "step_id": 1,
+                "source": "agent",
+                "message": "hi",
+                "llm_call_count": "1",
+                "metrics": {"prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0},
+                "observation": {"results": [{
+                    "source_call_id": 123,
+                    "subagent_trajectory_ref": {"trajectory_id": "x"},
+                }]},
+            }],
+        });
+        let issues = validate_value(&value, Mode::Strict);
+        let results_path = "trajectory.steps.0.observation.results.0";
+        for (path, message) in [
+            (
+                "trajectory.steps.0.llm_call_count",
+                "must be a non-negative integer",
+            ),
+            (&format!("{results_path}.source_call_id"), "must be a string"),
+            (
+                &format!("{results_path}.subagent_trajectory_ref"),
+                "must be an array",
+            ),
+        ] {
+            assert!(
+                issues.iter().any(|i| i.path == path && i.message == message),
+                "expected {message:?} at {path}: {issues:?}"
+            );
+        }
+        // Null still means absent for all three.
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": "s",
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{
+                "step_id": 1,
+                "source": "agent",
+                "message": "hi",
+                "llm_call_count": null,
+                "metrics": {"prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0},
+                "observation": {"results": [{
+                    "source_call_id": null,
+                    "subagent_trajectory_ref": null,
+                }]},
+            }],
+        });
+        let issues = validate_value(&value, Mode::Strict);
+        assert!(issues.is_empty(), "nulls must stay valid: {issues:?}");
+    }
+
+    /// Mutation-run hardening: the `llm_call_count == 0` consistency
+    /// rule (agent steps with zero LLM calls must not carry `metrics`
+    /// or `reasoning_content`) had no test — flipping its `==` to `!=`
+    /// survived. Pin both sides: 0 + metrics is flagged, nonzero +
+    /// metrics is not.
+    #[test]
+    fn zero_llm_call_count_forbids_metrics_and_reasoning() {
+        let step_with = |llm_calls: u64| {
+            serde_json::json!({
+                "schema_version": "ATIF-v1.7",
+                "session_id": "s",
+                "agent": {"name": "a", "version": "1"},
+                "steps": [{
+                    "step_id": 1,
+                    "source": "agent",
+                    "message": "hi",
+                    "llm_call_count": llm_calls,
+                    "reasoning_content": "thinking",
+                    "metrics": {"prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0},
+                }],
+            })
+        };
+        let issues = validate_value(&step_with(0), Mode::Strict);
+        for field in ["metrics", "reasoning_content"] {
+            assert!(
+                issues.iter().any(|i| {
+                    i.path == format!("trajectory.steps.0.{field}")
+                        && i.message.contains("llm_call_count is 0")
+                }),
+                "expected {field} flagged when llm_call_count is 0: {issues:?}"
+            );
+        }
+        let issues = validate_value(&step_with(1), Mode::Strict);
+        assert!(
+            !issues.iter().any(|i| i.message.contains("llm_call_count is 0")),
+            "nonzero llm_call_count must not trip the zero-call rule: {issues:?}"
+        );
     }
 
     /// Explicit nulls deserialize to `None` for optional fields, so the

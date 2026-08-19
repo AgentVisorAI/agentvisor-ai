@@ -140,7 +140,11 @@ impl StateStore for InMemoryStore {
             .ok_or_else(|| StateError::Overflow(key.to_owned()))?;
         // Only write after confirming no overflow — no transient negative visible to readers.
         cell.store(new, Ordering::Release);
-        Ok(u64::try_from(new).unwrap_or(0))
+        // A negative counter is unreachable through this API (spends check
+        // limits, refunds clamp at 0), but if one ever appears the silent
+        // `unwrap_or(0)` below would mask the corruption; surface it like
+        // `get` does.
+        u64::try_from(new).map_err(|_| StateError::Overflow(key.to_owned()))
     }
 
     fn get(&self, key: &str) -> Result<u64, StateError> {

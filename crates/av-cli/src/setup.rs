@@ -573,10 +573,6 @@ fn write_private_key_file(path: &Path, key: &str) -> Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
         let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
     }
-    // Old file may be a symlink; unlink it so hard_link fails cleanly on a
-    // pre-planted target rather than following the link and overwriting
-    // whatever it points at.
-    let _ = std::fs::remove_file(path);
     let temporary = parent.join(format!(".agentvisor-key-{}.tmp", av_core::new_event_uid()));
     // Round-13: sibling of round-12 F4 (harness `install_seed_exclusive`).
     // Without the RAII guard, an early `?` return from write_all /
@@ -599,8 +595,16 @@ fn write_private_key_file(path: &Path, key: &str) -> Result<()> {
         .with_context(|| format!("write key file {}", temporary.display()))?;
     file.sync_all()
         .with_context(|| format!("sync key file {}", temporary.display()))?;
+    // Only unlink the previous key once the replacement is durably on
+    // disk. Removing it before the temp write (the old order) meant a
+    // write/sync failure — ENOSPC, EIO — destroyed the only copy of the
+    // existing key with nothing to install in its place. The old file may
+    // be a symlink; unlink it so hard_link below fails cleanly on a
+    // pre-planted target rather than following the link and overwriting
+    // whatever it points at.
+    let _ = std::fs::remove_file(path);
     // hard_link installs the final path atomically and refuses to follow a
-    // pre-existing symlink at `path`; a first-run has none anyway because
+    // pre-existing symlink at `path`; none exists at this point because
     // we removed it above.
     let result =
         std::fs::hard_link(&temporary, path).with_context(|| format!("install key file {}", path.display()));

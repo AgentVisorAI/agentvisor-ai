@@ -450,6 +450,128 @@ mod tests {
         assert_eq!(*result.last().unwrap(), tail_tool);
     }
 
+    /// Mutation-run hardening: `collapse_duplicate_messages` had no
+    /// behavioral coverage at all — replacing the whole function with a
+    /// constant `true`/`false` survived the suite. Pin its contract:
+    /// exact user/assistant duplicates outside the tail collapse to audit
+    /// stubs, the first occurrence and the tail stay byte-identical, and
+    /// tool-role messages are never collapsed even when identical.
+    #[test]
+    fn duplicate_user_and_assistant_messages_collapse_outside_tail() {
+        let dup_user = json!({"role": "user", "content": "please retry the exact same thing ".repeat(8)});
+        let dup_tool = json!({"role": "tool", "tool_call_id": "c1", "content": "identical tool payload"});
+        let mut msgs = vec![json!({"role": "system", "content": "sys"})];
+        for _ in 0..6 {
+            msgs.push(dup_user.clone());
+            msgs.push(dup_tool.clone());
+        }
+        let tail = json!({"role": "user", "content": "fresh tail question"});
+        msgs.push(tail.clone());
+        let out = compress(&payload(msgs.clone()), &engage_all());
+        assert!(out.changed);
+        let result = out.payload["messages"].as_array().unwrap();
+        // First occurrence byte-identical.
+        let first_user = result.iter().find(|m| msg_role(m) == "user").unwrap();
+        assert_eq!(*first_user, dup_user, "first duplicate must be kept verbatim");
+        // Later duplicates outside the tail become audit stubs that keep
+        // the role and reference the original via digest.
+        let expected_digest = av_core::digest::sha256_hex(dup_user.to_string().as_bytes());
+        let stubbed = result
+            .iter()
+            .filter(|m| {
+                msg_role(m) == "user"
+                    && msg_content_str(m)
+                        .is_some_and(|c| c.starts_with("[pruned:") && c.contains(&expected_digest))
+            })
+            .count();
+        assert!(stubbed >= 1, "no duplicate user message was stubbed: {result:?}");
+        // Tool messages are never collapsed, even when identical.
+        assert!(
+            result
+                .iter()
+                .filter(|m| msg_role(m) == "tool")
+                .all(|m| *m == dup_tool),
+            "tool messages must never be collapsed by the duplicate pass"
+        );
+        // Tail untouched.
+        assert_eq!(*result.last().unwrap(), tail);
+        // And the whole pass is disable-able: collapse_duplicates=false
+        // leaves every user duplicate verbatim.
+        let cfg = CompressionConfig {
+            collapse_duplicates: false,
+            normalize_json: false,
+            summarize_middle: false,
+            tool_output_stub_threshold: u64::MAX,
+            ..engage_all()
+        };
+        let untouched = compress(&payload(msgs), &cfg);
+        let kept = untouched.payload["messages"].as_array().unwrap();
+        assert!(
+            kept.iter().filter(|m| **m == dup_user).count() == 6,
+            "collapse_duplicates=false must keep every duplicate verbatim"
+        );
+    }
+
+    /// Mutation-run hardening: the middle-history stub pass's role
+    /// exclusions (`role == "system" || role == "tool" || tool_calls`)
+    /// and its `tokens < 32` floor survived operator mutations. Pin them:
+    /// system/tool/tool-calls/small messages in the middle range survive
+    /// verbatim while large plain messages are stubbed, and stubbing
+    /// stops once the target reduction is reached.
+    #[test]
+    fn middle_stub_skips_protected_roles_and_small_messages() {
+        let big = "long analysis paragraph ".repeat(600); // well past 50k total below
+        let protected_system = json!({"role": "system", "content": big.clone()});
+        let protected_tool = json!({"role": "tool", "tool_call_id": "c1", "content": big.clone()});
+        let protected_calls = json!({"role": "assistant", "content": big.clone(),
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]});
+        let small = json!({"role": "user", "content": "tiny"});
+        let mut msgs = vec![
+            protected_system.clone(),
+            protected_tool.clone(),
+            protected_calls.clone(),
+            small.clone(),
+        ];
+        for _ in 0..40 {
+            msgs.push(json!({"role": "assistant", "content": big.clone()}));
+        }
+        let cfg = CompressionConfig {
+            collapse_duplicates: false,
+            normalize_json: false,
+            tool_output_stub_threshold: u64::MAX,
+            ..engage_all()
+        };
+        let out = compress(&payload(msgs), &cfg);
+        assert!(out.changed, "large history must engage the middle stub pass");
+        let result = out.payload["messages"].as_array().unwrap();
+        assert_eq!(result[0], protected_system, "system messages must survive");
+        assert_eq!(result[1], protected_tool, "tool messages must survive");
+        assert_eq!(result[2], protected_calls, "tool-call carriers must survive");
+        assert_eq!(result[3], small, "sub-32-token messages must survive");
+        let stubbed = result
+            .iter()
+            .filter(|m| msg_content_str(m).is_some_and(|c| c.contains("reason: middle history]")))
+            .count();
+        assert!(stubbed > 0, "large plain middle messages must be stubbed");
+        // The pass stops at the target: with the default 30% target on a
+        // uniform history it must NOT stub everything eligible.
+        let eligible = result
+            .iter()
+            .filter(|m| msg_role(m) == "assistant" && m.get("tool_calls").is_none())
+            .count();
+        assert!(
+            stubbed < eligible,
+            "stubbing must stop at the target reduction, not consume the whole middle"
+        );
+        // Reduction reached the configured target ratio.
+        assert!(
+            out.pruning_ratio_millis() >= cfg.target_reduction_millis,
+            "reduction {} must reach the target {}",
+            out.pruning_ratio_millis(),
+            cfg.target_reduction_millis
+        );
+    }
+
     #[test]
     fn json_content_minified() {
         let pretty = serde_json::to_string_pretty(&json!({"a": [1, 2, 3], "b": {"c": "d"}})).unwrap();
