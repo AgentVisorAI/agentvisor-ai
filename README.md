@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.svg" width="128" alt="AgentVisor AI logo">
+  <img src="assets/logo.png" width="128" alt="AgentVisor AI logo">
 </p>
 
 # AgentVisor AI
