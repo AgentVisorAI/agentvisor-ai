@@ -80,6 +80,10 @@ jobs:
           cp docs/style.css "$site/style.css"
           cp docs/logo.png "$site/logo.png"
           cp docs/social-preview.png "$site/social-preview.png"
+          # Custom-domain marker for GitHub Pages. Without a CNAME file in
+          # the published artifact, Pages resets the configured custom
+          # domain on each deploy.
+          cp docs/CNAME "$site/CNAME"
           # Publish the assembled directory.
           rm -rf target/doc
           mv "$site" target/doc
