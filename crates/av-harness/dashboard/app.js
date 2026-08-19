@@ -186,6 +186,10 @@ function statusOf(s) {
 }
 
 function stopReasonCaption(s) {
+  // An open session has no final stop reason yet — the recorded id is
+  // just the running default, so showing it (e.g. "Stop" on a Live row)
+  // reads as a contradiction.
+  if (s.open) return '—';
   if (!s.stop_reason || s.stop_reason === 'unknown') return '—';
   return s.stop_reason;
 }
