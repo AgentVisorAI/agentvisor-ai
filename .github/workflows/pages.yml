@@ -78,6 +78,8 @@ jobs:
           # rustdoc might have written at the root.
           cp docs/index.html "$site/index.html"
           cp docs/style.css "$site/style.css"
+          cp docs/logo.svg "$site/logo.svg"
+          cp docs/social-preview.png "$site/social-preview.png"
           # Publish the assembled directory.
           rm -rf target/doc
           mv "$site" target/doc
