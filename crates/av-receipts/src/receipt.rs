@@ -751,6 +751,44 @@ mod tests {
         );
     }
 
+    /// Mutation-run hardening: nothing pinned the *pass* side of the
+    /// nesting guard. The observable boundary today is serde_json's own
+    /// recursion limit (fires entering level 128, before our
+    /// `MAX_NESTED_DEPTH` walk — which is deliberate defense-in-depth
+    /// behind it): 127 levels must clear the gate (rejection is the
+    /// schema/parse `Serde` error, not the nesting cap), 128 must be
+    /// refused by the recursion/nesting guard class.
+    #[test]
+    fn nesting_gate_boundary_is_exactly_the_recursion_limit() {
+        let nested = |levels: usize| {
+            let mut doc = String::new();
+            for _ in 0..levels {
+                doc.push('[');
+            }
+            for _ in 0..levels {
+                doc.push(']');
+            }
+            doc
+        };
+        // Just under the limit: the gate passes; the failure is the
+        // schema mismatch (an array is not a Receipt), NOT the cap.
+        let under_cap = Receipt::from_json_slice(nested(127).as_bytes());
+        assert!(
+            matches!(under_cap, Err(ReceiptError::Serde(_))),
+            "127 levels must clear the nesting gate, got {under_cap:?}",
+        );
+        // At the limit: refused by the nesting/recursion guard.
+        let at_cap = Receipt::from_json_slice(nested(128).as_bytes());
+        assert!(
+            matches!(
+                at_cap,
+                Err(ReceiptError::DuplicateKey(ref msg))
+                    if msg.contains("nesting exceeds") || msg.contains("recursion limit")
+            ),
+            "128 levels must hit the nesting cap, got {at_cap:?}",
+        );
+    }
+
     /// The happy path (well-formed receipt) still deserializes as
     /// before — the duplicate-key gate is a strict filter, not a
     /// disruption.
