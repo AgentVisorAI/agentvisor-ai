@@ -533,7 +533,14 @@ p code {
   color: #eef1f6;
   padding: 1rem 1.15rem;
   border-radius: 8px;
-  overflow-x: auto;
+  /* `auto` on both axes: the receipt JSON is taller than the 18rem cap,
+     and clipping the vertical overflow made the signature block at the
+     bottom of the receipt unreachable in the drawer. */
+  overflow: auto;
+  /* Long base64 values (public key, signature) must wrap rather than
+     run off the panel edge looking like clipped text. */
+  white-space: pre-wrap;
+  word-break: break-all;
   font: 0.82rem/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace;
   max-height: 18rem;
 }
