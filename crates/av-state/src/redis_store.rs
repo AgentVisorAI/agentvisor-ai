@@ -353,8 +353,9 @@ impl StateStore for RedisStore {
     ///
     /// All of a session's keys share one cluster slot by construction
     /// (`ActionBudget::session_prefix` wraps the digest in a `{hash-tag}`),
-    /// so a single SCAN cursor + bounded DEL batches routed by the prefix
-    /// pattern reach every key on both single-node and cluster backends.
+    /// so a SCAN cursor + bounded DEL batches — routed by the prefix
+    /// pattern's hash-tag to the owning master in cluster mode — reach
+    /// every key on both single-node and cluster backends.
     ///
     /// Round-47: SCAN, not KEYS. The first take used
     /// `redis.call('KEYS', pattern)` inside a Lua script, which is
@@ -364,8 +365,18 @@ impl StateStore for RedisStore {
     /// other Redis clients (including hot-path `try_spend_many` gates)
     /// for the duration. SCAN is O(matches) amortized and yields between
     /// batches, so per-session cleanup no longer blocks concurrent
-    /// traffic. Best-effort like `remove`/`refund`: any Redis blip on
-    /// the cleanup path must not fail the close.
+    /// traffic.
+    ///
+    /// Round-48: `route_command` with an explicit slot for cluster
+    /// mode. The intermediate round-47 revision used
+    /// `Commands::scan_match` on the cluster connection, but bare
+    /// `SCAN` has no key argument — `RoutingInfo::for_routable` returns
+    /// `None`, and `ClusterConnection::request` treats that as an
+    /// immediate `UNROUTABLE_ERROR`. The iterator failed on
+    /// construction, the `Err(_) => return` arm swallowed it, and
+    /// cleanup silently did nothing on every cluster deployment.
+    /// Best-effort like `remove`/`refund`: any Redis blip on the
+    /// cleanup path must not fail the close.
     fn remove_prefix(&self, prefix: &str) {
         // `MATCH` glob treats `* ? [ ] \` as metacharacters. The prefix
         // is `budget:{<32 hex>}:` today (no metacharacters), but escape
@@ -423,24 +434,58 @@ fn scan_and_delete_single(conn: &mut redis::Connection, pattern: &str) {
     }
 }
 
-/// Cluster variant: `Commands::scan_match` on the cluster connection
-/// yields matches across the cluster's masters. Our prefix is
-/// hash-tag-anchored so all matches live on one master; the iterator
-/// still terminates cleanly (empty responses from the other nodes).
-/// DEL is per-key here (rather than batched): every key is
-/// hash-tag-routed to the same slot, so a MULTI-key DEL would work in
-/// principle, but building it inside the borrow of the iterator is
-/// awkward and one DEL per key is still O(cluster keys under prefix) —
-/// unchanged from the loop's overall bound.
+/// Cluster variant: bare `SCAN` has no key argument so
+/// `redis::cluster_routing::RoutingInfo::for_routable` returns `None`
+/// on it (the sync ClusterConnection then fails with
+/// `UNROUTABLE_ERROR`, silently deleting nothing — the round-3
+/// regression this replaces). All matches share one hash-slot by
+/// construction (`ActionBudget::session_prefix` wraps the digest in
+/// `{hash-tag}`), so compute the slot from the prefix and route both
+/// SCAN and DEL through `route_command` to that specific master.
 fn scan_and_delete_cluster(conn: &mut redis::cluster::ClusterConnection, pattern: &str) {
-    use redis::Commands;
-    let iter = match conn.scan_match::<_, String>(pattern) {
-        Ok(iter) => iter,
-        Err(_) => return,
-    };
-    let keys: Vec<String> = iter.collect();
-    for key in keys {
-        let _: Result<i64, _> = conn.del(&key);
+    use redis::cluster_routing::{Route, RoutingInfo, SingleNodeRoutingInfo, SlotAddr};
+    const SCAN_COUNT: usize = 500;
+    // `redis::cluster_routing::get_slot` extracts the hash-tag content
+    // (`{HASH}`) itself, so passing the pattern's non-wildcard prefix
+    // (which contains the hash tag verbatim) yields the same slot every
+    // key under the prefix maps to.
+    let route_key = pattern.trim_end_matches('*');
+    let slot = redis::cluster_routing::get_slot(route_key.as_bytes());
+    let routing = RoutingInfo::SingleNode(SingleNodeRoutingInfo::SpecificNode(Route::new(
+        slot,
+        SlotAddr::Master,
+    )));
+    let mut cursor: u64 = 0;
+    loop {
+        let scan_cmd = {
+            let mut cmd = redis::cmd("SCAN");
+            cmd.arg(cursor)
+                .arg("MATCH")
+                .arg(pattern)
+                .arg("COUNT")
+                .arg(SCAN_COUNT);
+            cmd
+        };
+        let value = match conn.route_command(&scan_cmd, routing.clone()) {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        let parsed: Result<(u64, Vec<String>), _> = redis::FromRedisValue::from_redis_value(&value);
+        let Ok((next, batch)) = parsed else { return };
+        if !batch.is_empty() {
+            let mut del = redis::cmd("DEL");
+            for key in &batch {
+                del.arg(key);
+            }
+            // Multi-key DEL is safe here because every match shares the
+            // slot we already computed above — route it explicitly so
+            // the driver does not need to inspect the keys again.
+            let _ = conn.route_command(&del, routing.clone());
+        }
+        if next == 0 {
+            return;
+        }
+        cursor = next;
     }
 }
 
