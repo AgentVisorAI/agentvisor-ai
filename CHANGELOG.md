@@ -4,6 +4,55 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 9: three fixes + one deferred design item; one 0-finding audit (2026-08-20)
+
+Four fresh lenses this round — a code-review of round 8's own commit
+(came back clean), a realistic end-to-end scenario audit (found one
+dual-harness misconfiguration scenario, deferred), an error-handling
+audit (three findings, all fixed), and an input-validation
+completeness audit (one gap, fixed).
+
+- **harness (medium, input validation):** `read_broker_ack` at
+  `worker.rs:1329` used unbounded `tokio::fs::read` before feeding
+  bytes to `journal::open`. A local fs-tamper plant of a
+  hundreds-of-MB file at `spool/broker-acks/<hash>/<hash>.json`
+  would blow up memory during finalize/recovery before MAC
+  rejection. Now capped at `MAX_CONTROL_BYTES` (1 MiB) via
+  `av_core::fsutil::read_capped` — matches the policy every other
+  sealed marker in the spool uses (close-complete, promotion,
+  response, ATIF sidecar).
+- **harness (medium, error classification):** `ToolExecution::claim`
+  mapped every failure — genuine race (`create_new` →
+  `AlreadyExists`) and infrastructure faults alike (StorageFull,
+  PermissionDenied, ReadOnlyFilesystem) — to the same `String`
+  error, and `mcp_call_inner` answered every one with `409
+  TOOL_OUTCOME_UNCERTAIN`. Real disk faults were reported to
+  clients as if they had lost a concurrent race, so retries looped
+  on the underlying infra problem while the client learned nothing
+  useful. Split into a `ClaimError { Race, Backend }` enum; the
+  caller now answers 409 only for Race and 503 with a fresh budget
+  refund for Backend.
+- **harness (medium, error consistency):** `release_unexecuted` (the
+  connect-failure release path for tool intents) returned Err on any
+  post-remove directory-fsync failure. `mcp_call_inner`'s
+  connect-failure branch then skipped the budget refund, leaving
+  the key unclaimed on disk AND the budget debited — the exact
+  budget-stuck state the release-then-refund ordering was designed
+  to prevent. Now treats "remove_file succeeded but dir fsync
+  failed" as still-released (with a warn); a crash before fsync
+  makes the intent resurrect on recovery, at which point
+  `unresolved_tool_sessions` correctly quarantines the session
+  fail-closed.
+
+Deferred to design cycle:
+- **e2e scenario audit — dual-harness misconfiguration:** two
+  harness instances running against the same spool independently
+  finalize the same recovered session, publishing duplicate
+  `RECEIPT_ISSUED` / `SESSION_CLOSE` events with distinct UIDs
+  that bypass every dedup path. Needs a spool-root lockfile at
+  startup (fcntl F_SETLK). Operational-safety feature, not a
+  bug fix — deferred.
+
 ### Bug-hunt round 8: monotonic idle clock, comment correction, two audits with actionable follow-up items (2026-08-20)
 
 Four fresh lenses this round — a code-review of round 7's own commit
