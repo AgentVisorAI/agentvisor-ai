@@ -283,6 +283,29 @@ impl Drop for CloseClaim<'_> {
     }
 }
 
+/// RAII owner of the promotion claim taken by `try_promote`.
+///
+/// `promote()` awaits several fallible operations between claiming and
+/// committing. The explicit error arms used to call `reset_promotion()`
+/// by hand — but the /promote request future is dropped wholesale when
+/// the client disconnects (axum cancels handler futures), running NONE
+/// of those arms. The claim then stayed at 1 forever: every subsequent
+/// promotion attempt hit `try_promote() == false` and returned
+/// "promotion is already in progress" (409) with no recovery path short
+/// of a restart. Mirror `CloseClaim`: reset on drop unless committed.
+struct PromotionClaim<'a> {
+    session: &'a Session,
+    committed: bool,
+}
+
+impl Drop for PromotionClaim<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.session.reset_promotion();
+        }
+    }
+}
+
 impl Finalizer {
     /// Access the shared metrics registry so background paths (stream
     /// abort, worker-side supervision) can bump counters without
@@ -375,11 +398,14 @@ impl Finalizer {
         self
     }
 
-    /// Drop a sealed session's budget counters. Admission gates reject
-    /// closed and capture-failed sessions before any quota check, so the
-    /// counters can never be consulted again; leaving them would grow the
-    /// in-memory state store by a few cells per session forever
-    /// (attacker-chosen session ids make that unbounded).
+    /// Drop a sealed session's budget counters. Two reasons, both load-
+    /// bearing: (a) leaving them grows the state store by a few cells per
+    /// session forever (attacker-chosen session ids make that unbounded);
+    /// (b) `SessionRegistry::get_or_open` recycles a finalized session id
+    /// into a fresh open session that spends against the same keys, so a
+    /// stale counter would bill the new incarnation for the old one's
+    /// spend (see `RedisStore::remove_prefix` for the backend parity
+    /// history).
     fn clear_budget_state(&self, session_id: &str) {
         if let Some(store) = self.state_store.as_deref() {
             store.remove_prefix(&av_state::ActionBudget::session_prefix(session_id));
@@ -712,13 +738,16 @@ impl Finalizer {
                 "promotion is already in progress".to_owned(),
             ));
         }
+        // Cancellation-safe claim release: if this future is dropped at any
+        // await below (client disconnect), the guard resets the claim so
+        // promotion can be retried. Explicit error arms rely on it too.
+        let mut claim = PromotionClaim {
+            session: &session,
+            committed: false,
+        };
         let receipt = if let Some(receipt) = persisted_receipt {
-            if let Err(error) = self.verify_configured_receipt(&receipt) {
-                session.reset_promotion();
-                return Err(error);
-            }
+            self.verify_configured_receipt(&receipt)?;
             if receipt.body.subject != subject {
-                session.reset_promotion();
                 return Err(FinalizeError::Receipt(
                     "persisted promotion receipt does not match ATIF artifact".to_owned(),
                 ));
@@ -726,26 +755,14 @@ impl Finalizer {
             receipt
         } else {
             let body = session.receipt_body(subject, StopReason::SessionClosed);
-            let issued = Receipt::issue(body, self.signer.as_ref())
-                .map_err(|error| FinalizeError::Receipt(error.to_string()));
-            let receipt = match issued {
-                Ok(receipt) => receipt,
-                Err(error) => {
-                    session.reset_promotion();
-                    return Err(error);
-                }
-            };
-            if let Err(error) = self.persist_receipt(&session.id, &receipt).await {
-                session.reset_promotion();
-                return Err(error);
-            }
+            let receipt = Receipt::issue(body, self.signer.as_ref())
+                .map_err(|error| FinalizeError::Receipt(error.to_string()))?;
+            self.persist_receipt(&session.id, &receipt).await?;
             *session.receipt.lock() = Some(receipt.clone());
             receipt
         };
-        if let Err(error) = self.emit_receipt_event(&session, &receipt).await {
-            session.reset_promotion();
-            return Err(error);
-        }
+        self.emit_receipt_event(&session, &receipt).await?;
+        claim.committed = true;
         session.finish_promotion();
         remove_outbox(&marker).await?;
         self.remove_lifecycle_outbox(&session.id, crate::journal::RECEIPT_OUTBOX_KIND)
@@ -1067,7 +1084,10 @@ impl Finalizer {
                     // One bridge event was published per persisted step (the
                     // journal enforces sequence == index during
                     // consolidation), so the step count is the next free
-                    // sequence for the close/receipt tail.
+                    // sequence when the close tail has NOT yet run. When a
+                    // verified close-complete marker proves it has, the
+                    // marker branch below additionally advances past the
+                    // published SESSION_CLOSE.
                     trajectory.steps.len() as u64,
                 )
                 .map_err(FinalizeError::Atif)?,
@@ -1102,6 +1122,16 @@ impl Finalizer {
                                 && marker.digest == av_core::digest::sha256_hex(&bytes) =>
                         {
                             recovered_session.mark_close_complete();
+                            // The verified marker proves the close tail ran:
+                            // SESSION_CLOSE was published at sequence
+                            // `steps.len()` (both lifecycle outboxes are
+                            // removed before the marker is written, so no
+                            // fast-forward source survives). Advance past it
+                            // or the first retroactive-receipt event would be
+                            // minted at the close's sequence — the exact
+                            // collision `restore_next_seq` above exists to
+                            // prevent.
+                            recovered_session.advance_seq_past(trajectory.steps.len() as u64);
                         }
                         Ok(_) | Err(_) => {
                             // Stale (prior incarnation) or corrupt marker:

@@ -241,7 +241,7 @@ pub struct PreparedRequest {
     pub middleware_us: u64,
     lease: SessionLease,
     response_permit: Option<ResponsePermit>,
-    response_attempt_id: String,
+    capture_guard: ResponseCaptureGuard,
     /// Client `Authorization` header captured for passthrough mode only.
     client_authorization: Option<HeaderValue>,
 }
@@ -252,8 +252,134 @@ pub struct ForwardedResponse {
     pub response: reqwest::Response,
     pub(crate) lease: SessionLease,
     pub(crate) response_permit: Option<ResponsePermit>,
-    pub(crate) response_marker: Option<String>,
-    pub(crate) response_attempt_id: String,
+    pub(crate) capture_guard: ResponseCaptureGuard,
+}
+
+/// RAII owner of the journalled response attempt and (once created) the
+/// durable in-flight response marker, from request admission until a
+/// downstream owner takes over (`AbortFinalizingStream`, a terminal
+/// failure job, or the worker's capture publish).
+///
+/// Axum drops the request future wholesale when the client disconnects.
+/// Every *explicit* failure path already retires the marker and closes
+/// the journalled attempt — but a cancelled future runs none of them:
+/// the journal kept a dangling non-terminal attempt (crash recovery then
+/// quarantines the whole session, see `track_response_attempt`) and the
+/// marker stranded on disk (once the session evicts, every reconciler
+/// tick re-quarantines its id forever). Drop submits the same terminal
+/// failure job the explicit paths use.
+pub(crate) struct ResponseCaptureGuard {
+    worker: crate::worker::WorkerHandle,
+    session: Arc<Session>,
+    identity: AgentIdentity,
+    marker: Option<String>,
+    attempt_id: String,
+    armed: bool,
+}
+
+impl ResponseCaptureGuard {
+    fn new(
+        worker: crate::worker::WorkerHandle,
+        session: Arc<Session>,
+        identity: AgentIdentity,
+        attempt_id: String,
+    ) -> Self {
+        Self {
+            worker,
+            session,
+            identity,
+            marker: None,
+            attempt_id,
+            armed: true,
+        }
+    }
+
+    /// Record the durable in-flight marker so a later drop retires it.
+    pub(crate) fn set_marker(&mut self, marker: String) {
+        self.marker = Some(marker);
+    }
+
+    pub(crate) fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+
+    /// Take ownership of the marker and attempt id, disarming the guard.
+    /// The caller now owns terminal-record submission.
+    pub(crate) fn disarm(mut self) -> (Option<String>, String) {
+        self.armed = false;
+        (self.marker.take(), std::mem::take(&mut self.attempt_id))
+    }
+
+    /// Disarm in place, returning any marker: for callers that submit the
+    /// terminal record themselves while retaining the guard (abandon paths).
+    fn defuse(&mut self) -> Option<String> {
+        self.armed = false;
+        self.marker.take()
+    }
+}
+
+impl Drop for ResponseCaptureGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let job = refused_response_failure_job(
+            Arc::clone(&self.session),
+            self.identity.clone(),
+            "request_cancelled_before_response_capture".to_owned(),
+            self.marker.take(),
+            std::mem::take(&mut self.attempt_id),
+        );
+        // Same fallback as every explicit refusal path: if the queue is
+        // full, fail the session closed rather than dropping the capture
+        // silently.
+        if self.worker.try_submit(job).is_err() {
+            self.session.mark_capture_failed();
+        }
+    }
+}
+
+/// Terminal failure job used by response-refusal paths (permit missing,
+/// unsupported content-encoding, cancelled request future). Carrying
+/// `response_marker` lets the worker retire the durable in-flight marker,
+/// and `terminal: true` closes the journalled response attempt so crash
+/// recovery does not quarantine the session over a request the client
+/// already saw fail (or abandoned).
+pub(crate) fn refused_response_failure_job(
+    session: Arc<Session>,
+    identity: AgentIdentity,
+    reason: String,
+    response_marker: Option<String>,
+    response_attempt_id: String,
+) -> WorkerJob {
+    let atif = (session.workflow == Workflow::Unsigned).then(|| AtifCapture {
+        source: av_atif::Source::Agent,
+        message: Value::String(reason.clone()),
+        reasoning_content: None,
+        model_name: None,
+        tool_calls: None,
+        observation: None,
+        llm_call_count: Some(0),
+    });
+    WorkerJob {
+        session,
+        identity,
+        class: EventClass::StopReason,
+        payload: serde_json::json!({"reason": reason, "direction": "upstream_response"}),
+        text: String::new(),
+        analyze_loop: false,
+        status: StatusId::Failure,
+        stop_reason: Some(StopReason::Other),
+        native_stop_reason: None,
+        metrics: EventMetrics::default(),
+        cost_usd_micros: 0,
+        atif,
+        response_marker,
+        response_attempt: Some(crate::worker::ResponseAttempt {
+            id: response_attempt_id,
+            terminal: true,
+        }),
+    }
 }
 
 /// Hot-path failures, each carrying an HTTP status mapping.
@@ -742,6 +868,18 @@ impl AppState {
         worker_permit.submit(job);
         self.observe_stage("dispatch", stage);
         let lease = SessionLease::new(Arc::clone(&session));
+        // Armed from here on: any early exit that drops the request —
+        // including the `?` on the passthrough header below and, above
+        // all, the request future being cancelled by a client disconnect
+        // at any later await — submits the terminal failure record that
+        // closes the journalled attempt (and retires the marker, once
+        // `forward_chat` sets one).
+        let capture_guard = ResponseCaptureGuard::new(
+            self.worker.clone(),
+            Arc::clone(&session),
+            identity.clone(),
+            response_attempt_id,
+        );
         drop(admission);
 
         Ok(PreparedRequest {
@@ -751,7 +889,7 @@ impl AppState {
             middleware_us: elapsed_us(total_started),
             lease,
             response_permit: Some(response_permit),
-            response_attempt_id,
+            capture_guard,
             client_authorization: if self.config.upstream_authorization_passthrough {
                 single_header(headers, "authorization")?.cloned()
             } else {
@@ -835,6 +973,10 @@ impl AppState {
     /// attempt and a later crash-recovery scan quarantines the whole session
     /// over a request the client already saw fail.
     fn abandon_prepared(&self, prepared: &mut PreparedRequest, stop_reason: StopReason, reason: &str) {
+        // This caller owns terminal-record submission from here; the
+        // guard must not double-submit on drop. Take any marker so the
+        // terminal job retires it too.
+        let response_marker = prepared.capture_guard.defuse();
         let Some(permit) = prepared.response_permit.take() else {
             return;
         };
@@ -844,8 +986,9 @@ impl AppState {
             stop_reason,
             reason.to_owned(),
         );
+        job.response_marker = response_marker;
         job.response_attempt = Some(crate::worker::ResponseAttempt {
-            id: prepared.response_attempt_id.clone(),
+            id: prepared.capture_guard.attempt_id().to_owned(),
             terminal: true,
         });
         // Best-effort submit: if the shard is momentarily full, the
@@ -883,7 +1026,7 @@ impl AppState {
                 av_core::digest::sha256_hex(request.session.id.as_bytes())
             }
         };
-        let response_marker = match crate::worker::create_response_marker(
+        match crate::worker::create_response_marker(
             std::path::Path::new(&self.config.atif_spool_dir),
             &self.journal_key,
             &request.session.id,
@@ -891,7 +1034,11 @@ impl AppState {
         )
         .await
         {
-            Ok(marker) => Some(marker),
+            // The guard owns the marker from here: a cancelled request
+            // future (client disconnect during `send()` below or in the
+            // handler before `AbortFinalizingStream` takes over) retires
+            // it via the guard's terminal failure job.
+            Ok(marker) => request.capture_guard.set_marker(marker),
             Err(error) => {
                 // Fail closed: the marker is what lets a restart-time scan
                 // (`inflight_response_sessions`) quarantine sessions whose
@@ -917,7 +1064,7 @@ impl AppState {
             payload,
             lease,
             response_permit,
-            response_attempt_id,
+            capture_guard,
             client_authorization,
             ..
         } = request;
@@ -940,8 +1087,7 @@ impl AppState {
                 response,
                 lease,
                 response_permit,
-                response_marker,
-                response_attempt_id,
+                capture_guard,
             }),
             Err(error) => {
                 // Round-35 F1: `reqwest::Error::Display` embeds the
@@ -977,6 +1123,7 @@ impl AppState {
                 let client_error = PipelineError::Upstream(client_reason.to_owned());
                 let persisted_reason = format!("upstream_{client_reason}");
                 if let Some(permit) = response_permit {
+                    let (response_marker, response_attempt_id) = capture_guard.disarm();
                     let capture_session = Arc::clone(&session);
                     let mut job =
                         self.failure_job(session, identity, StopReason::Other, persisted_reason.clone());
@@ -997,6 +1144,10 @@ impl AppState {
                         capture_session.mark_capture_failed();
                     }
                 } else {
+                    // Defensive (a permit always exists here): keep the
+                    // guard armed so its drop retires the marker and
+                    // closes the attempt through the plain worker queue.
+                    drop(capture_guard);
                     self.enqueue_failure(session, identity, StopReason::Other, persisted_reason)?;
                 }
                 Err(client_error)
@@ -1853,7 +2004,13 @@ mod tests {
 
     async fn trip_loop(state: &AppState, headers: &HeaderMap, repeated: &Value) {
         for expected in 1..=4u64 {
-            state.prepare_chat(headers, repeated.clone()).unwrap();
+            let mut prepared = state.prepare_chat(headers, repeated.clone()).unwrap();
+            // This helper abandons the prepared request without forwarding.
+            // Defuse the capture guard so its terminal failure job does not
+            // pad the chain — the chain-count waits below must count only
+            // the admission jobs, or the analyze jobs race the assertion.
+            prepared.capture_guard.defuse();
+            drop(prepared);
             let session = state.sessions.get("loop-session").unwrap();
             // Generous budget: the chain append rides an async worker job and
             // must survive heavily loaded parallel test runs.
@@ -2197,14 +2354,15 @@ mod tests {
                 "content": "I should check the database again for pending orders"
             }],
         });
-        // Attempts the test itself abandons after a successful prepare: they
-        // are expected to stay non-terminal because no forward happens here.
+        // Attempts the test itself abandons after a successful prepare: the
+        // capture guard terminates them on drop (same as a client
+        // disconnect), so the journal must end with NO dangling attempts.
         let mut abandoned_by_test = std::collections::HashSet::new();
         let mut refusal = None;
         for _ in 0..8 {
             match state.prepare_chat_durable(&headers, repeated.clone()).await {
                 Ok(prepared) => {
-                    abandoned_by_test.insert(prepared.response_attempt_id.clone());
+                    abandoned_by_test.insert(prepared.capture_guard.attempt_id().to_owned());
                 }
                 Err(error) => {
                     refusal = Some(error);
@@ -2249,10 +2407,11 @@ mod tests {
                 }
             }
         }
-        assert_eq!(
-            dangling, abandoned_by_test,
-            "the refused request's response attempt must be terminated in the journal; \
-             only attempts the test itself dropped may remain open",
+        assert!(
+            dangling.is_empty(),
+            "every response attempt must be terminated: the refusal terminates its own \
+             attempt, and dropping a PreparedRequest (client disconnect) terminates via \
+             the capture guard; still dangling: {dangling:?} (test dropped: {abandoned_by_test:?})",
         );
     }
 
@@ -2270,7 +2429,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(SESSION_HEADER, HeaderValue::from_static("marker-outage"));
         let prepared = state.prepare_chat(&headers, payload()).unwrap();
-        let attempt_id = prepared.response_attempt_id.clone();
+        let attempt_id = prepared.capture_guard.attempt_id().to_owned();
         // Sabotage the marker directory: a regular file at
         // <spool>/inflight-responses makes `create_dir_all` inside
         // `write_atomic` fail for every marker write.
@@ -2453,7 +2612,12 @@ mod tests {
         headers.insert(WORKFLOW_HEADER, HeaderValue::from_static("signed"));
         let mut agent_payload = payload();
         agent_payload["messages"][0]["role"] = Value::String("assistant".to_owned());
-        state.prepare_chat(&headers, agent_payload.clone()).unwrap();
+        let mut first = state.prepare_chat(&headers, agent_payload.clone()).unwrap();
+        // Abandoning without forwarding: defuse the guard, or its terminal
+        // job (refused by the size-1 queue) marks the session
+        // capture-failed and the worker skips the sink this test blocks on.
+        first.capture_guard.defuse();
+        drop(first);
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while !sink.entered.load(AtomicOrdering::Acquire) {
                 tokio::task::yield_now().await;

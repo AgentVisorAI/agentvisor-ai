@@ -141,7 +141,11 @@ async fn many_medium_requests_accumulate_correctly_on_one_session() {
     match outcome {
         FinalizeOutcome::Receipt { receipt } => match &receipt.body.subject {
             ReceiptSubject::EventChain { event_count, .. } => {
-                assert_eq!(*event_count, N, "event_count drift on massive stream");
+                // Two chain events per prepared-then-dropped request: the
+                // admission event plus the capture guard's terminal
+                // resolution (a dropped PreparedRequest models a client
+                // disconnect and must not leave a dangling attempt).
+                assert_eq!(*event_count, N * 2, "event_count drift on massive stream");
             }
             other => panic!("expected EventChain, got {other:?}"),
         },
@@ -165,7 +169,8 @@ async fn prepare_chat_handles_wide_turn_conversation() {
     let payload = json!({"model": "m", "messages": messages});
     state.prepare_chat(&h, payload).unwrap();
     // The wide payload made it through without panicking; close produces
-    // a receipt with event_count = 1 (one prepare call).
+    // a receipt with event_count = 2 (one prepare call: admission event +
+    // the capture guard's terminal resolution of the dropped request).
     let s = state.sessions.get("mass-turns").unwrap();
     let outcome = state
         .finalizer
@@ -175,7 +180,7 @@ async fn prepare_chat_handles_wide_turn_conversation() {
     match outcome {
         FinalizeOutcome::Receipt { receipt } => match &receipt.body.subject {
             ReceiptSubject::EventChain { event_count, .. } => {
-                assert_eq!(*event_count, 1);
+                assert_eq!(*event_count, 2);
             }
             other => panic!("expected EventChain, got {other:?}"),
         },
@@ -185,8 +190,9 @@ async fn prepare_chat_handles_wide_turn_conversation() {
 
 // ---------------------------------------------------------------------------
 // 5. Massive-context multi-session: 8 concurrent sessions each pushing a
-//    64 KiB prompt; every receipt still shows event_count = 1 (no leakage
-//    across the shared harness state under memory pressure).
+//    64 KiB prompt; every receipt still shows event_count = 2 (admission +
+//    guard resolution — no leakage across the shared harness state under
+//    memory pressure).
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -214,7 +220,7 @@ async fn concurrent_massive_prompts_across_sessions_do_not_leak() {
         match t.await.unwrap() {
             FinalizeOutcome::Receipt { receipt } => match &receipt.body.subject {
                 ReceiptSubject::EventChain { event_count, .. } => {
-                    assert_eq!(*event_count, 1);
+                    assert_eq!(*event_count, 2);
                 }
                 other => panic!("expected EventChain, got {other:?}"),
             },

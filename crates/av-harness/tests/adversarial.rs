@@ -84,7 +84,7 @@ async fn sixty_four_agents_preserve_all_signed_steps_under_contention() {
             headers.insert("x-av-session", HeaderValue::from_str(&session_id).unwrap());
             headers.insert("x-av-workflow", HeaderValue::from_static("signed"));
             for step in 0..STEPS {
-                state
+                let prepared = state
                     .prepare_chat(
                         &headers,
                         json!({
@@ -96,6 +96,11 @@ async fn sixty_four_agents_preserve_all_signed_steps_under_contention() {
                         }),
                     )
                     .unwrap();
+                // Dropping without forwarding models a client disconnect:
+                // the capture guard resolves the journalled attempt with a
+                // terminal failure event, so every step contributes TWO
+                // chain events (admission + resolution).
+                drop(prepared);
             }
             session_id
         }));
@@ -119,7 +124,9 @@ async fn sixty_four_agents_preserve_all_signed_steps_under_contention() {
         receipt.verify_embedded().unwrap();
         match &receipt.body.subject {
             ReceiptSubject::EventChain { event_count, .. } => {
-                assert_eq!(*event_count, STEPS as u64);
+                // Admission + guard-resolution event per step (see the
+                // drop comment above).
+                assert_eq!(*event_count, (STEPS * 2) as u64);
             }
             other => panic!("unexpected receipt subject: {other:?}"),
         }
@@ -127,8 +134,8 @@ async fn sixty_four_agents_preserve_all_signed_steps_under_contention() {
 
     assert_eq!(
         bus.published.load(Ordering::Acquire),
-        (AGENTS * STEPS + AGENTS * 2) as u64,
-        "every action, session close, and issued receipt must emit an event"
+        (AGENTS * STEPS * 2 + AGENTS * 2) as u64,
+        "every action, its capture-guard resolution, session close, and issued receipt must emit an event"
     );
     let metrics = state.metrics.render();
     assert!(metrics.contains("av_events_dropped_total{stage=\"worker_queue\"} 0"));

@@ -247,9 +247,14 @@ mod tests {
 
     #[test]
     fn partition_assignment_is_stable() {
-        // Pinned values: changing the hash silently re-partitions every
-        // deployment's replay order — this test makes that loud.
-        assert_eq!(partition_for("agent-inst-1", 8), partition_for("agent-inst-1", 8));
+        // Pinned values (FNV-1a 64 mod 8): changing the hash silently
+        // re-partitions every deployment's replay order — this test makes
+        // that loud. A self-comparison would pass under ANY hash; the
+        // literals are the regression anchor.
+        assert_eq!(partition_for("agent-inst-1", 8), 3);
+        assert_eq!(partition_for("agent-inst-2", 8), 6);
+        assert_eq!(partition_for("session-abc", 8), 2);
+        assert_eq!(partition_for("", 8), 5);
         let spread: std::collections::HashSet<u32> =
             (0..100).map(|i| partition_for(&format!("inst-{i}"), 8)).collect();
         assert!(spread.len() >= 6, "poor partition spread: {spread:?}");
