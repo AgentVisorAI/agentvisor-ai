@@ -48,7 +48,7 @@ fn record(state: &AppState, endpoint: &'static str, status: &'static str, starte
         .observe_us(elapsed_us(started));
     state
         .metrics
-        .counter(&counter_key, "Dashboard endpoint requests")
+        .counter(&counter_key, "Dashboard endpoint requests, labeled by status")
         .inc();
 }
 
