@@ -64,6 +64,20 @@ return result
 /// Redis-backed store. Connections are pooled internally (r2d2 for both
 /// single-node and cluster; the redis crate implements
 /// `r2d2::ManageConnection` for `ClusterClient` directly).
+///
+/// **EVAL uncertainty on network drop.** `try_spend_many` / `add` invoke
+/// atomic Lua scripts server-side; if the connection breaks between the
+/// server's INCRBY commit and the client's response read, the caller
+/// sees `StateError::Backend` and cannot distinguish "commit succeeded,
+/// response lost" from "commit never ran". Sandbox path treats
+/// backend-error as blocked (fails closed for the request) — but a
+/// subsequent client retry that lands with the same intent then hits a
+/// pre-debited counter and cumulates the two spends into one intended
+/// tool call, overcharging the budget by the retry's amount. The
+/// 24 h counter TTL bounds unbounded growth, and refund-on-loss-race
+/// (`refund_tool_call`) recovers the common cases, but the strictly
+/// idempotent shape would require a client-supplied request nonce
+/// stored briefly in Redis — deferred as a design change.
 pub struct RedisStore {
     backend: RedisBackend,
 }
