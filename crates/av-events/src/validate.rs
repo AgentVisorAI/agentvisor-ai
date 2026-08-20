@@ -81,6 +81,23 @@ pub enum ValidationError {
         /// Offending value.
         value: u64,
     },
+    /// Round-26 F1 (self-fix): a numeric field is out of its
+    /// schema-declared range. Currently only `pruning_ratio_millis`
+    /// (permille ratio, capped at 1000) enforces this, but the
+    /// variant is variant-generic so future range-bound fields can
+    /// reuse it. Parallel to `JcsUnsafeInteger` — build() and
+    /// `validate_event` (the deserialize backstop) both enforce the
+    /// bound, closing the emitter/validator drift the wire-side path
+    /// used to have.
+    #[error("field {field} = {value} exceeds schema max {max}")]
+    OutOfSchemaRange {
+        /// Field name.
+        field: &'static str,
+        /// Offending value.
+        value: u64,
+        /// Declared inclusive max.
+        max: u64,
+    },
     /// Timestamp is zero.
     #[error("time is zero")]
     ZeroTime,
@@ -232,6 +249,23 @@ pub fn validate_event(ev: &OcsfEvent) -> Result<(), Vec<ValidationError>> {
                 if av_core::error::check_jcs_safe(v).is_err() {
                     errors.push(ValidationError::JcsUnsafeInteger { field, value: v });
                 }
+            }
+        }
+        // Round-26 F1 (self-fix): mirror the `> 1000` guard from
+        // `OcsfEventBuilder::build`. The schema declares
+        // `pruning_ratio_millis` in `[0, 1000]`; round-17 F2 already
+        // introduced this validator as the wire-side backstop for
+        // build's checks, and round-26 F1 added the range check to
+        // build. Adding it here closes the emitter/validator drift
+        // — an event with `pruning_ratio_millis = 5000` now fails
+        // both paths, not just build.
+        if let Some(v) = m.pruning_ratio_millis {
+            if v > 1000 {
+                errors.push(ValidationError::OutOfSchemaRange {
+                    field: "metrics.pruning_ratio_millis",
+                    value: v,
+                    max: 1000,
+                });
             }
         }
     }
@@ -455,6 +489,47 @@ mod tests {
                 "{field} above JCS_SAFE_MAX must be flagged, got {errs:?}"
             );
         }
+    }
+
+    /// Round-26 F1 (self-fix from round-27): `validate_event` must
+    /// mirror `OcsfEventBuilder::build`'s `pruning_ratio_millis <=
+    /// 1000` guard. Round-17 F2 introduced this validator
+    /// specifically as the wire-side backstop for build's guards;
+    /// leaving the range check only on build left an
+    /// emitter/validator drift where an event with a 500%
+    /// compression ratio would parse-and-validate but fail the
+    /// external JSON schema check downstream.
+    #[test]
+    fn out_of_schema_pruning_ratio_is_flagged_on_validate() {
+        let mut ev = valid_event();
+        ev.metrics = Some(crate::model::EventMetrics {
+            pruning_ratio_millis: Some(5000),
+            ..crate::model::EventMetrics::default()
+        });
+        let errs = validate_event(&ev).unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::OutOfSchemaRange {
+                    field: "metrics.pruning_ratio_millis",
+                    value: 5000,
+                    max: 1000,
+                }
+            )),
+            "pruning_ratio_millis=5000 must be flagged, got {errs:?}"
+        );
+        // Boundary: 1000 is accepted.
+        ev.metrics = Some(crate::model::EventMetrics {
+            pruning_ratio_millis: Some(1000),
+            ..crate::model::EventMetrics::default()
+        });
+        let errs = validate_event(&ev).map(|_| Vec::new()).unwrap_or_else(|e| e);
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e, ValidationError::OutOfSchemaRange { .. })),
+            "boundary 1000 must not be flagged, got {errs:?}"
+        );
     }
 
     /// Round-38 F3: activity_id must be < 100 so
