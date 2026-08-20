@@ -85,12 +85,13 @@ impl Ed25519Signer {
     ///
     /// This constructor does NOT reject the all-zero or all-0xFF seeds
     /// (both produce globally-predictable keypairs). The production
-    /// seed-loading path in `av-harness::main::load_signer_from_file`
-    /// refuses both before reaching this function; every OTHER caller
-    /// (tests, `avctl keygen`) must apply the same policy or use
-    /// [`Ed25519Signer::generate`] which loops until a non-weak seed
-    /// is drawn. Round-51 F2 documents this contract in-signature so a
-    /// future refactor cannot silently drop the pre-validation.
+    /// seed-loading path in `av-harness::main::read_signer` refuses
+    /// both before reaching this function (see the `[0u8; 32]` /
+    /// `[0xFFu8; 32]` guard in `av-harness/src/main.rs`); every OTHER
+    /// caller (tests, `avctl keygen`) must apply the same policy or
+    /// use [`Ed25519Signer::generate`] which loops until a non-weak
+    /// seed is drawn. Round-51 F2 documents this contract in-signature
+    /// so a future refactor cannot silently drop the pre-validation.
     pub fn from_seed(seed: &[u8; 32]) -> Self {
         let key = SigningKey::from_bytes(seed);
         let key_id = derive_key_id(&key.verifying_key());
