@@ -454,7 +454,17 @@ fn atif_validate(path: &Path, mode: ValidationMode) -> Result<()> {
 fn manifest_validate(path: &Path) -> Result<()> {
     let yaml = read_capped_str(path, MAX_CONFIG_BYTES, "manifest")?;
     let manifest = BridgeManifest::from_yaml(&yaml).map_err(anyhow::Error::new)?;
-    println!("valid {} topics={}", manifest.name, manifest.topics.len());
+    // Round-42 F4: `manifest.name` is operator-supplied text with no
+    // control-byte restriction (see av-bridge/src/manifest.rs::validate,
+    // which only refuses YAML anchor markers). A crafted manifest with
+    // an ANSI CSI sequence in `name:` would reach the operator terminal
+    // unfiltered — same CVE-2003-0063 class as the receipt/atif prints
+    // fixed in round-28 F3.
+    println!(
+        "valid {} topics={}",
+        sanitize_for_terminal(&manifest.name),
+        manifest.topics.len()
+    );
     Ok(())
 }
 
@@ -465,7 +475,7 @@ fn bridge_provision(manifest_path: &Path, data_dir: &Path) -> Result<()> {
     EmbeddedBroker::provision(data_dir, &manifest).context("provision Bridge")?;
     println!(
         "provisioned {} topics={} elapsed_ms={}",
-        manifest.name,
+        sanitize_for_terminal(&manifest.name),
         manifest.topics.len(),
         started.elapsed().as_millis()
     );
