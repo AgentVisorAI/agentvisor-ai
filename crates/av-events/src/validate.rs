@@ -51,6 +51,36 @@ pub enum ValidationError {
     /// stop_reason caption present without id (or vice versa).
     #[error("stop_reason and stop_reason_id must be present together")]
     StopReasonPairMismatch,
+    /// Round-17 F1: stop_reason_id maps to a KNOWN `StopReason` variant,
+    /// but the accompanying caption does not match that variant's
+    /// canonical caption. The two fields split downstream analytics
+    /// (SIEM pipelines that group by id disagree with dashboards that
+    /// group by caption) — reject the disagreement so both fields
+    /// mean the same thing.
+    #[error("stop_reason_id {id} maps to {expected_caption:?} but stop_reason is {actual_caption:?}")]
+    StopReasonCaptionMismatch {
+        /// Stated stop reason id.
+        id: u8,
+        /// Canonical caption for that id.
+        expected_caption: &'static str,
+        /// Actual caption that was emitted with the id.
+        actual_caption: String,
+    },
+    /// Round-17 F2: a numeric field exceeds `av_core::error::JCS_SAFE_MAX`
+    /// (2^53) on the deserialize path. `OcsfEventBuilder::build`
+    /// already refuses values above the JCS-safe integer range, but
+    /// wire deserialization (`serde_json::from_slice::<OcsfEvent>`)
+    /// bypassed the guard — an issuer sending `prompt_tokens = 2^53+1`
+    /// would round-trip through JS-based auditors (JSON.parse) as a
+    /// silently-truncated value, losing 1 or more low bits and
+    /// breaking any receipt hash computed by JS consumers.
+    #[error("field {field} = {value} exceeds JCS-safe integer range 2^53")]
+    JcsUnsafeInteger {
+        /// Field name.
+        field: &'static str,
+        /// Offending value.
+        value: u64,
+    },
     /// Timestamp is zero.
     #[error("time is zero")]
     ZeroTime,
@@ -123,8 +153,65 @@ pub fn validate_event(ev: &OcsfEvent) -> Result<(), Vec<ValidationError>> {
     if ev.stop_reason_id.is_some() != ev.stop_reason.is_some() {
         errors.push(ValidationError::StopReasonPairMismatch);
     }
+    // Round-17 F1: when both id and caption are present, cross-check
+    // that they agree. `StopReason::from_id` returns `Unknown` for
+    // unknown ids (forward-compat), so we only assert the equality
+    // when the id maps to a KNOWN variant. This lets a
+    // heterogeneous-cluster peer emit a new caption without failing
+    // validation on the older reader (round-29 F7's `#[serde(other)]`
+    // rationale), while still rejecting `id=93` +
+    // `caption="Loop Detected"` (both known but disagreeing).
+    if let (Some(id), Some(caption)) = (ev.stop_reason_id, ev.stop_reason.as_deref()) {
+        let derived = crate::StopReason::from_id(id);
+        let is_known_id = id == 0
+            || id == 1
+            || id == 2
+            || id == 3
+            || id == 4
+            || id == 90
+            || id == 91
+            || id == 92
+            || id == 93
+            || id == 94
+            || id == 99;
+        if is_known_id && derived.caption() != caption {
+            errors.push(ValidationError::StopReasonCaptionMismatch {
+                id,
+                expected_caption: derived.caption(),
+                actual_caption: caption.to_owned(),
+            });
+        }
+    }
     if ev.time == 0 {
         errors.push(ValidationError::ZeroTime);
+    }
+    // Round-17 F2: JCS-safe integer guard on deserialize path.
+    // `OcsfEventBuilder::build` already enforces this for its own
+    // outputs, but a wire event bypasses build(). Values above
+    // `av_core::error::JCS_SAFE_MAX` (2^53) round-trip through
+    // JS-based JSON parsers as silently-truncated values,
+    // breaking any receipt hash a JS auditor computes over the
+    // event. Cover the fields build() covers: `time`, `seq`, and
+    // every `EventMetrics` counter.
+    for (field, value) in [("time", ev.time), ("metadata.sequence", ev.metadata.sequence)] {
+        if av_core::error::check_jcs_safe(value).is_err() {
+            errors.push(ValidationError::JcsUnsafeInteger { field, value });
+        }
+    }
+    if let Some(m) = &ev.metrics {
+        for (field, value) in [
+            ("metrics.prompt_tokens", m.prompt_tokens),
+            ("metrics.completion_tokens", m.completion_tokens),
+            ("metrics.cached_tokens", m.cached_tokens),
+            ("metrics.pruned_tokens", m.pruned_tokens),
+            ("metrics.pruning_ratio_millis", m.pruning_ratio_millis),
+        ] {
+            if let Some(v) = value {
+                if av_core::error::check_jcs_safe(v).is_err() {
+                    errors.push(ValidationError::JcsUnsafeInteger { field, value: v });
+                }
+            }
+        }
     }
     if errors.is_empty() {
         Ok(())

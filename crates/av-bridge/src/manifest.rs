@@ -251,6 +251,30 @@ impl BridgeManifest {
             }
             if let Some(uri) = &t.retention.cold_uri {
                 refuse_yaml_marker_chars("cold_uri", uri)?;
+                // Round-17 F3 (av-bridge): a local (non-scheme) cold_uri
+                // is used directly as a filesystem root at retention
+                // enforcement time (`Path::new(cold).join(...)` in
+                // embedded.rs). A `..` component would let the cold-
+                // archive tree land outside the intended prefix — a
+                // manifest-supplied path escape (CWE-22 class). The
+                // scheme forms (`s3://`, `gs://`, `file://`) are
+                // handled by the cold-store feature layer and are not
+                // subject to this check. Absolute paths are allowed:
+                // legitimate deployments point `cold_uri` at a
+                // dedicated partition or mount (e.g. `/mnt/cold`).
+                if !uri.contains("://") {
+                    let path = Path::new(uri);
+                    if path
+                        .components()
+                        .any(|component| matches!(component, std::path::Component::ParentDir))
+                    {
+                        return Err(ManifestError::Invalid(format!(
+                            "unsafe cold_uri {uri:?} (must not contain `..` components; \
+                             use a scheme URI or a concrete absolute/relative path with \
+                             no parent-directory traversal)"
+                        )));
+                    }
+                }
             }
         }
         Ok(())
@@ -449,6 +473,38 @@ topics:
             BridgeManifest::from_yaml(with_retention_typo),
             Err(ManifestError::Parse(_))
         ));
+    }
+
+    #[test]
+    fn validate_refuses_cold_uri_with_parent_directory_escape() {
+        // Round-17 F3 (av-bridge): a local (non-scheme) cold_uri with
+        // `..` components would let retention enforcement write cold
+        // objects outside the intended prefix. Verify each shape.
+        for uri in [
+            "data/../../etc",
+            "../escape",
+            "/mnt/cold/../..",
+            "topics/../../..",
+        ] {
+            let mut m = BridgeManifest::default_for("t");
+            m.topics[0].retention.cold_uri = Some(uri.to_owned());
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(err, ManifestError::Invalid(ref msg) if msg.contains("cold_uri") && msg.contains("..")),
+                "cold_uri {uri:?} must be refused as unsafe, got {err:?}"
+            );
+        }
+        // Absolute paths without `..` are the operator's choice and
+        // remain allowed (a dedicated `/mnt/cold` partition is a
+        // legitimate deployment shape).
+        let mut m = BridgeManifest::default_for("t");
+        m.topics[0].retention.cold_uri = Some("/mnt/cold".to_owned());
+        m.validate().unwrap();
+        // Scheme URIs skip the check entirely — the cold-store feature
+        // layer parses them.
+        let mut m = BridgeManifest::default_for("t");
+        m.topics[0].retention.cold_uri = Some("s3://bucket/../elsewhere".to_owned());
+        m.validate().unwrap();
     }
 
     /// A manifest that passes validate() must round-trip through
