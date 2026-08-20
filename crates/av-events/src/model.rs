@@ -386,6 +386,23 @@ impl OcsfEventBuilder {
             {
                 check_jcs_safe(v)?;
             }
+            // Round-26 F1 (av-events builder): schema declares
+            // `pruning_ratio_millis` as an integer in `[0, 1000]`
+            // (0.0%–100.0%). The prior build path only enforced
+            // JCS-safety, so a caller could construct an event
+            // with `pruning_ratio_millis: 5000` (500%) that later
+            // failed strict schema validation on ingest. Cap here
+            // so both emitter and validator agree at build time.
+            if let Some(ratio) = m.pruning_ratio_millis {
+                if ratio > 1000 {
+                    // The schema's declared max is 1000 (100.0 %);
+                    // reuse the JCS-unsafe error variant here since
+                    // both classes represent "out-of-declared-range
+                    // integer that would silently misrepresent at
+                    // the wire boundary."
+                    return Err(av_core::CoreError::UnsafeInteger(ratio));
+                }
+            }
         }
         let now = av_core::time::now_ms();
         check_jcs_safe(now)?;
@@ -464,6 +481,32 @@ mod tests {
         assert_eq!(ev.category_uid, CATEGORY_UID);
         assert_eq!(ev.metadata.product.name, PRODUCT_NAME);
         assert_eq!(ev.metadata.version, OCSF_VERSION);
+    }
+
+    /// Round-26 F1: `pruning_ratio_millis` is a permille ratio
+    /// (0..=1000 → 0.0%..=100.0%). Round-15 F3 (schema declares
+    /// the max) but the builder used to only enforce JCS-safety,
+    /// so `Some(5000)` (500%) built successfully and only failed
+    /// at strict-validate time downstream. Now caught at build.
+    #[test]
+    fn build_refuses_pruning_ratio_millis_above_1000() {
+        let outcome = OcsfEventBuilder::new(EventClass::ToolCall, "sess-x", identity(), 1)
+            .metrics(EventMetrics {
+                prompt_tokens: Some(10),
+                completion_tokens: Some(10),
+                cached_tokens: Some(0),
+                pruned_tokens: Some(5),
+                pruning_ratio_millis: Some(5000),
+            })
+            .build();
+        assert!(outcome.is_err(), "over-cap ratio must fail build");
+        // At the boundary, 1000 (100.0 %) still builds.
+        let mut metrics = EventMetrics::default();
+        metrics.pruning_ratio_millis = Some(1000);
+        let outcome = OcsfEventBuilder::new(EventClass::ToolCall, "sess-x", identity(), 1)
+            .metrics(metrics)
+            .build();
+        assert!(outcome.is_ok(), "boundary ratio 1000 must still build");
     }
 
     #[test]
