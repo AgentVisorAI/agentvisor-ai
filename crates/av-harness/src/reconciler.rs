@@ -637,24 +637,26 @@ impl Finalizer {
             self.close_session_locked(Arc::clone(&session), StopReason::SessionClosed)
                 .await?;
         }
-        // Check `is_promoted()` BEFORE taking the receipt lock. Round-7
-        // F1: `restore_receipt` (called from unsigned-recovery on a
-        // freshly-inserted session) writes `session.receipt` and then
-        // calls `finish_promotion()` — but `restore_receipt` does NOT
-        // hold the per-session lifecycle mutex, and `retry_marked_promotions`
-        // (which invokes this `promote()`) runs concurrently with
-        // `recover_spooled_sessions` (they share no lock — the recovery
-        // lock guards only the recovery scan). Reading the receipt
-        // FIRST under the parking_lot mutex and THEN checking
-        // `is_promoted()` could observe `promoted == 2` (Acquire pairs
-        // with `finish_promotion`'s Release) while carrying a stale
-        // `None` receipt read from before the writer's mutex release,
-        // producing a spurious "promoted session has no persisted
-        // receipt" error that self-heals on the next reconciler tick
-        // but pollutes the promotion-retry error metrics with a real
-        // false positive. Checking `is_promoted()` first pins the
-        // synchronizes-with edge: any subsequent mutex lock observes
-        // writes released before the Release-store on `promoted`.
+        // Check `is_promoted()` BEFORE taking the receipt lock —
+        // preemptive hardening. The per-session lifecycle mutex
+        // acquired at line 628 already serializes the only
+        // `restore_receipt` writer in this codebase (called from
+        // `recover_spooled_sessions` inside the per-candidate
+        // `acquire_lifecycle` block at line 1126, and both invocation
+        // paths — `main.rs` startup and the reconciler tick — await
+        // recovery to completion before calling
+        // `retry_marked_promotions`), so the reader-writer race the
+        // read-then-check ordering allows in isolation is not
+        // observable in the current code. Reordering to check first
+        // documents the invariant explicitly and hardens against a
+        // future refactor that could shrink the lifecycle-lock scope
+        // to expose the observable race (reader reads
+        // `receipt = None`, writer commits receipt + `finish_promotion()`,
+        // reader observes `promoted = 2` via Acquire but returns the
+        // stale `None` → spurious "promoted session has no persisted
+        // receipt"). Checking `is_promoted()` first pins the read
+        // order: any subsequent mutex lock observes the writer's
+        // fully-committed state.
         if session.is_promoted() {
             let persisted_receipt = { session.receipt.lock().clone() };
             let receipt = persisted_receipt.ok_or_else(|| {
