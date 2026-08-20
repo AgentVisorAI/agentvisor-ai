@@ -4,6 +4,71 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 20: self-audit caught object-shape argument bug + config sanity + regression tests (2026-08-20)
+
+Four fresh deep-dives — code-review of round-19 (caught a
+MEDIUM-severity bug I introduced in the loop-breaker request-side
+fix), `av-harness/src/config.rs` (2 real findings applied), AppState
++ session lifecycle (2 findings; deferred), and test-coverage audit
+(3 tests added filling round-17/18/19 regression gaps).
+
+- **harness (MEDIUM, regression self-fix from round-19):** the
+  round-19 `last_message_text` synthesis extracted `function.arguments`
+  via `.and_then(Value::as_str)`, which returned `None` on
+  object-shaped arguments (bare JSON object on the wire — the
+  Anthropic-shaped variant that some gateways use). The synthesized
+  text then collapsed to `tool_name()`, and two DIFFERENT tool
+  calls to the same tool produced IDENTICAL synthesized text →
+  false loop trips. Fix mirrors the tolerant pattern already used
+  in `atif_capture_from_request` in the same file: render the raw
+  Value via `serde_json::to_string` when it isn't a stringified
+  JSON. Two regression tests added:
+  `last_message_text_tool_call_synthesis_varies_with_object_arguments`
+  (asserts distinct output for `{"path":"a"}` vs `{"path":"b"}`)
+  and `last_message_text_tool_call_with_empty_arguments_still_synthesizes`.
+  **This fix ships in the same round because round-19 is not yet
+  released and a false loop-trip regression would ship with it.**
+- **config (medium, silent breakage):** `max_request_bytes = 0`
+  passed validate and forwarded to axum's `DefaultBodyLimit::max(0)`,
+  silently rejecting every non-empty POST body. Now refused at
+  validate with a specific error message.
+- **config (medium, false-positive & false-negative):**
+  `state_endpoint` field docstring documents it as a
+  comma-separated list of URLs for Redis Cluster mode, but the
+  scheme allowlist was a prefix check on the WHOLE string. So
+  `redis://a:6379,http://b:6379` passed (the check saw `redis://`
+  prefix) and only failed at connect. Also `redis+unix:` — a
+  legitimate Unix-socket form the redis crate accepts, and one the
+  round-14 doctor already recognizes — was rejected. Now splits
+  on `,` and validates each member independently; the scheme
+  allowlist includes `redis+unix:`.
+
+Regression tests added (filling coverage gaps identified by the
+test-coverage audit):
+- `av-compress::passes::tests::quoted_marker_phrase_in_normal_text_does_not_disable_compression`
+  — round-18 F1 pin.
+- `av-events::validate::tests::jcs_unsafe_integer_flagged_on_every_deserialize_carrier`
+  — round-17 F2 pin covering `time`, `metadata.sequence`, and all
+  five `EventMetrics` counters.
+
+Not actionable this round:
+- **harness (medium, deferred):** `AppState.tool_audits_emitted` is
+  an unbounded HashSet keyed by `sha256(session_id:jsonrpc_id)`.
+  A `mark_audited` disk write failure leaves the key set forever;
+  if session id is later recycled AND the same jsonrpc_id
+  reappears, the new call is falsely deduped. Fix requires either
+  a bounded LRU (memory-visible) or an on-disk `.audited` presence
+  check as the primary gate (I/O per request). Deferred for design
+  input.
+- **harness (medium, deferred):** delayed/retried `/close` for an
+  OLD session generation closes whatever session id is CURRENTLY
+  mapped (get_or_open recycles ids). Fix requires generation
+  tracking; deferred.
+- **config (deferred):** feature-gated backends (redis, kafka,
+  nats, onnx, qdrant) are accepted at validate but rejected at
+  startup when the feature is not compiled in. Arguably design
+  intent (validate is compile-agnostic).
+
 ### Bug-hunt round 19: request-side loop-breaker false trip + duplicate lifecycle events on outbox unsync (2026-08-20)
 
 Four fresh deep-dives — code-review of round-18 (clean, all 10
