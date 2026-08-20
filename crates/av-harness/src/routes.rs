@@ -155,11 +155,27 @@ async fn metrics(State(state): State<AppState>) -> Response {
     response
 }
 
-async fn chat_completions(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(payload): Json<Value>,
-) -> Response {
+async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    // Round-22 F1 (av-harness routes): refuse duplicate top-level or
+    // nested JSON keys before parsing. `Json<Value>` used
+    // `serde_json` default "last-wins" semantics, so a hostile client
+    // could send `{"messages":[safe],"messages":[hostile]}` — the
+    // harness saw the hostile array, but any auditor/dashboard
+    // reading the raw request bytes (e.g. via
+    // `av_events::atif_capture_from_request` chain input) sees an
+    // ambiguous document, breaking the "same signature ⇔ same
+    // bytes" auditor invariant that round-15 F3 pinned for receipts.
+    // Same fix as `parse_tool_call` on the MCP path — use the shared
+    // primitive.
+    if let Err(reason) = av_sandbox::refuse_duplicate_json_keys(&body) {
+        return pipeline_error(crate::pipeline::PipelineError::BadRequest(format!(
+            "chat request rejected: {reason}"
+        )));
+    }
+    let payload: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => return pipeline_error(crate::pipeline::PipelineError::BadRequest(error.to_string())),
+    };
     let admission_started = std::time::Instant::now();
     let mut prepared = match state.prepare_chat_nonblocking(&headers, payload).await {
         Ok(prepared) => prepared,
@@ -1147,7 +1163,25 @@ pub(crate) async fn unresolved_tool_sessions(
             ) {
                 Ok(intent) => intent,
                 Err(error) => {
-                    let quarantine = path.with_extension("intent.torn");
+                    // Round-22 F2 (self-fix of round-21 F4): build
+                    // the quarantine name EXPLICITLY. The prior use
+                    // of `path.with_extension("intent.torn")` on a
+                    // `<key>.intent.json` path replaces only the
+                    // `json` component and produces
+                    // `<key>.intent.intent.torn` — the ugly
+                    // double-`intent` form. Explicit join gives the
+                    // clean `<key>.intent.torn` name that
+                    // remove_tool_executions's defense-in-depth
+                    // cleanup expects.
+                    let file_name = path
+                        .file_stem()
+                        .and_then(std::ffi::OsStr::to_str)
+                        .and_then(|stem| stem.strip_suffix(".intent"))
+                        .map(|key| format!("{key}.intent.torn"));
+                    let quarantine = match file_name {
+                        Some(name) => path.with_file_name(name),
+                        None => path.with_extension("intent.torn"),
+                    };
                     tracing::warn!(
                         %error,
                         original = %av_core::fsutil::basename(&path),
@@ -3003,6 +3037,49 @@ mod tests {
             "stream": true,
             "messages": [{"role": "user", "content": "hello"}],
         })
+    }
+
+    /// Round-22 F1 (av-harness routes): `/v1/chat/completions` must
+    /// refuse duplicate top-level or nested JSON keys, mirroring the
+    /// MCP path's `parse_tool_call` policy. `serde_json`'s default
+    /// last-wins semantics would otherwise let a hostile client
+    /// send `{"messages":[safe],"messages":[hostile]}` and the
+    /// harness would see the hostile array while any auditor reading
+    /// the raw request bytes sees the ambiguous document. Same
+    /// class as round-15 F3's receipt-null malleability, applied at
+    /// chat ingress.
+    #[tokio::test]
+    async fn chat_completions_refuses_duplicate_json_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state(directory.path()).await;
+        let app = build_router(state.clone());
+        // Two `messages` keys in the top-level object; second wins by
+        // `serde_json` default, but the harness must refuse ambiguity
+        // instead of silently taking the last value.
+        let dup = br#"{"model":"mock","messages":[{"role":"user","content":"safe"}],"messages":[{"role":"user","content":"hostile"}]}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header("x-av-session", "dup-key")
+            .header("x-av-workflow", "unsigned")
+            .body(Body::from(&dup[..]))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "duplicate `messages` key must be refused with 400, not silently taken"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4 * 1024)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("duplicate"),
+            "response body must name the reason, got {text:?}"
+        );
+        provider.abort();
     }
 
     fn active_records(

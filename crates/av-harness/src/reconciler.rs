@@ -629,12 +629,13 @@ impl Finalizer {
             .await?;
         self.remove_lifecycle_outbox(&session.id, crate::journal::SESSION_CLOSE_OUTBOX_KIND)
             .await?;
-        self.metrics
-            .histogram(
-                "av_session_finalize_duration_seconds",
-                "Session finalization latency",
-            )
-            .observe_us(elapsed_us(started));
+        // Round-21 F2 (round-22 self-fix): finalize latency is now
+        // observed via `_finalize_observer`'s Drop at the top of
+        // this function so it also fires on early Err returns. The
+        // prior terminal observation here would DOUBLE-count on
+        // every successful close — inflating rate/QPS by ~2× and
+        // distorting error-ratio alerting. Kept the counter
+        // increment; only the histogram observation is removed.
         self.metrics
             .counter("av_sessions_finalized_total", "Sessions finalized")
             .inc();
