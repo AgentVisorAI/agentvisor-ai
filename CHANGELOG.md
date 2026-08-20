@@ -4,6 +4,64 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 14: doctor drift + CLI terminal-injection surface (2026-08-20)
+
+Four fresh deep-dives — code-review of round-13's loop-breaker fix (clean),
+`av-core/` primitives (metrics wrap-on-overflow is theoretical only,
+no other findings), `av-harness::journal` sealed-envelope primitive
+(clean — HMAC-SHA256, domain-separated with length prefixes, MAC-first
+verify, 128-byte cap, unique domain strings, unique outbox kinds), and
+`av-cli` operator surface (four real findings).
+
+- **cli (medium, doctor false-negative):** `avctl doctor`'s
+  `upstream_api_key_file` check called only `std::fs::metadata` and
+  reported PASS on files the harness itself would refuse at startup —
+  a symlink, a mode-0644 file, or an empty file all snuck past
+  doctor and then failed `avctl start` with a stale-cache-looking
+  error. Doctor now mirrors
+  `av_harness::pipeline::require_owner_only_secret` posture exactly:
+  symlink refusal, regular-file, `mode & 0o077 == 0` on Unix, and
+  non-empty content.
+- **cli (medium, doctor path drift + no content check):** the
+  signing-seed check probed `AV_SIGNING_SEED_FILE || config/signing.seed`,
+  but `avctl start` overrides that env var to
+  `<user_config_dir>/signing.seed` when the resolved config is at
+  `av_harness::config::user_config_path()`. So on a stock
+  `~/.agentvisor/agentvisor.toml` deployment, doctor probed a
+  never-touched `config/signing.seed` and reported "will be
+  generated on first run" while the real seed sat elsewhere. Doctor
+  now computes the same path start would use. It also validates
+  seed content the way `av_harness::main::read_signer` will —
+  hex-decoded, exactly 32 bytes, and not a known-weak seed (all-0
+  or all-0xFF) — so a truncated or textbook-wrong seed no longer
+  passes doctor.
+- **cli (medium, doctor false-positive):** the endpoint TCP probe
+  rejected two config forms `HarnessConfig::validate` accepts as
+  valid: Redis `unix:` (UDS socket, no host:port) and Kafka
+  bootstrap lists (`k1:9092,k2:9092,...`). Both would produce
+  spurious "unreachable" doctor failures with correct configs.
+  `probe_endpoint_any` now stat-probes the UDS path for `unix:`
+  and treats a comma-separated bootstrap list as reachable if any
+  single member is reachable (which matches the runtime — Kafka
+  only needs one contactable bootstrap).
+- **cli (low, terminal-control injection):** `manifest_validate`
+  and `bridge_provision` printed `manifest.name` verbatim to stdout;
+  `av-bridge::manifest::validate` only refuses YAML anchor markers
+  (`&`/`*`) and does not restrict control bytes in `name`. A crafted
+  manifest with ANSI CSI in the name field could reprogram the
+  operator's terminal (same CVE-2003-0063 class as receipts and
+  ATIF issues fixed in round-28 F3). Both prints now flow through
+  `sanitize_for_terminal`.
+
+Not actionable this round:
+- **`av-core::metrics` u64 wrap-on-overflow** — real in theory
+  (`Counter::add(u64::MAX); .inc()` wraps to 0), unreachable in
+  practice: sane microsecond durations and request rates would take
+  ~585,000 years to reach 2^64, and every callsite passes constants
+  or clock deltas from `Instant::elapsed().as_micros()`. Prometheus
+  rate math already handles counter resets. Deferred as a
+  hardening item, not a bug.
+
 ### Bug-hunt round 13: fix false loop-breaker trips on tool-only responses; three 0-actionable deep-dives (2026-08-20)
 
 Four fresh line-by-line deep-dives — a code-review of the round-12
