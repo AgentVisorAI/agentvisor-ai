@@ -4,6 +4,55 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 23: ATIF ingest malleability + fsutil durability gap (2026-08-20)
+
+Four fresh deep-dives — code-review of round-22 (clean),
+`av-core::fsutil` (2 findings; 1 applied), ATIF ingest fuzz-thinking
+(2 real findings applied), panic reachability sweep (0 wire-reachable
+panics across the workspace).
+
+- **atif (HIGH, ingest malleability):** ATIF trajectory ingest
+  accepted duplicate JSON keys silently (serde_json's default is
+  last-wins). Verified by running `avctl atif-validate` on a
+  crafted file with two `schema_version` keys — it reported
+  "valid". A hostile issuer could sign under one version-reading
+  while an auditor's raw-bytes reader sees the other. Same class
+  as round-15 F3 for receipts and round-22 F1 for chat, now
+  applied at the ATIF surface. New primitive
+  `av_atif::validate_bytes(bytes, mode) -> Result<Vec<Issue>, String>`
+  that (a) refuses duplicate keys via a strict pre-scan, (b) runs
+  `validate_value` on the parsed untyped form. Both `avctl
+  atif-validate` and `av-harness::reconciler::promote` +
+  `recover_spooled_sessions` now go through it. Three regression
+  tests.
+- **atif (medium, strict/typed drift):** `Trajectory` doesn't
+  derive `deny_unknown_fields`, so serde silently dropped unknown
+  fields before strict validation ran on the typed form. The
+  bytes path via `validate_bytes` now exercises
+  `check_unknown_fields` on the untyped `Value`, catching
+  unknown fields that the typed path drops. Regression test:
+  `validate_bytes_flags_unknown_fields_that_typed_path_would_drop`.
+- **core (medium, durability gap):** `av_core::fsutil::write_atomic`
+  used `create_dir_all` (not `create_dir_all_synced`) for the
+  parent directory. The FIRST write into a new spool subtree
+  (`spool/outbox/`, `spool/receipts/`, `spool/tool-executions/`,
+  …) created the subdir, fsynced the leaf, but left the ancestor
+  dirents volatile — a power loss between the initial `mkdir`
+  and any ambient dirent sync could drop the entire subtree
+  losing the marker even though its bytes were fsynced. Switched
+  to `create_dir_all_synced`. The helper's fast path (skip fsync
+  when the directory already exists) means the extra cost is
+  only paid on FIRST writes.
+
+Not actionable this round:
+- **core (deferred):** `std::fs::rename` on Windows was flagged as
+  possibly-not-overwrite-safe; the Rust stdlib implementation
+  actually uses `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`,
+  so overwrite works. False positive.
+- **panic (audit clean):** 0 `unwrap`/`expect`/`unreachable!` in
+  non-test code reachable from external input; `clippy::unwrap_used`
+  is `deny` workspace-wide. Excellent defensive posture.
+
 ### Bug-hunt round 22: chat duplicate-key rejection + self-fix of round-21 double-observation + quarantine filename (2026-08-20)
 
 Four fresh deep-dives — code-review of round-21 (caught TWO real
