@@ -94,6 +94,19 @@ pub trait StateStore: Send + Sync {
     /// would inherit the prior incarnation's counters. In-process backends
     /// additionally need it or session-keyed counters accumulate for the
     /// process lifetime.
+    ///
+    /// Round-15 F2 (av-state): CLUSTER-MODE HAZARD FOR FUTURE CALLERS.
+    /// The Redis Cluster implementation of `remove_prefix` routes SCAN
+    /// and DEL to a SINGLE hash slot — the one derived from the prefix.
+    /// This works only when every key under the prefix shares that
+    /// slot, i.e. the prefix contains a Redis Cluster hash tag
+    /// (`{...}`). Today `ActionBudget::session_prefix` wraps the digest
+    /// in a `{hash-tag}` (see `budget.rs`), so all its keys land in
+    /// the same slot and this is safe. A future caller that does NOT
+    /// hash-tag its prefix would silently leave keys behind in other
+    /// slots. Cross-slot SCAN is not supported by Redis Cluster —
+    /// there is no correct implementation for a non-tagged prefix, so
+    /// this remains a caller-side invariant.
     fn remove_prefix(&self, prefix: &str) {
         let _ = prefix;
     }
