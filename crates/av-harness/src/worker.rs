@@ -262,7 +262,7 @@ impl WorkerHandle {
                 self.metrics
                     .counter(
                         "av_events_dropped_total{stage=\"worker_queue\"}",
-                        "Worker jobs dropped",
+                        "Worker jobs or response-slot reservations dropped, labeled by admission stage",
                     )
                     .inc();
                 Err(SubmitError::Full)
@@ -271,7 +271,7 @@ impl WorkerHandle {
                 self.metrics
                     .counter(
                         "av_events_dropped_total{stage=\"worker_closed\"}",
-                        "Worker jobs dropped",
+                        "Worker jobs or response-slot reservations dropped, labeled by admission stage",
                     )
                     .inc();
                 Err(SubmitError::Closed)
@@ -292,7 +292,7 @@ impl WorkerHandle {
                 self.metrics
                     .counter(
                         "av_events_dropped_total{stage=\"response_slot\"}",
-                        "Response-slot reservations that failed",
+                        "Worker jobs or response-slot reservations dropped, labeled by admission stage",
                     )
                     .inc();
                 SubmitError::Full
@@ -348,7 +348,10 @@ impl WorkerHandle {
                 envelope.job.session.worker_job_finished();
                 self.worker_job_finished();
                 self.metrics
-                    .counter(stage.full_counter_key(), "Worker jobs dropped")
+                    .counter(
+                        stage.full_counter_key(),
+                        "Worker jobs or response-slot reservations dropped, labeled by admission stage",
+                    )
                     .inc();
                 tracing::warn!(
                     session = %session_id,
@@ -364,7 +367,7 @@ impl WorkerHandle {
                 self.metrics
                     .counter(
                         "av_events_dropped_total{stage=\"worker_closed\"}",
-                        "Worker jobs dropped",
+                        "Worker jobs or response-slot reservations dropped, labeled by admission stage",
                     )
                     .inc();
                 tracing::warn!(
@@ -447,7 +450,10 @@ impl WorkerHandle {
     ) -> Result<tokio::sync::OwnedSemaphorePermit, SubmitError> {
         Arc::clone(&self.capacity).try_acquire_owned().map_err(|_| {
             self.metrics
-                .counter(stage.full_counter_key(), "Worker jobs dropped")
+                .counter(
+                    stage.full_counter_key(),
+                    "Worker jobs or response-slot reservations dropped, labeled by admission stage",
+                )
                 .inc();
             SubmitError::Full
         })
