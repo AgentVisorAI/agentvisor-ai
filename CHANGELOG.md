@@ -4,6 +4,42 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 7: two fixes, two 0-finding audits (2026-08-20)
+
+Four fresh lenses this round — a code-review of round 6's own commit
+(caught a real gap I introduced), an atomic-memory-ordering audit on
+weakly-ordered architectures (found one visibility bug), a config-
+boundary audit (0 findings — every numeric field bounded, every URL
+scheme allowlisted, every auth-mode combination checked), and a
+serialization roundtrip audit (0 findings — receipt custom-Deserialize
+duplicate-key check at every depth, JCS rejects ±2⁵³ on all three
+number paths, OCSF flatten collision-free by construction).
+
+- **harness (medium):** the round-6 metrics HELP unification for
+  `av_dashboard_requests_total` missed the actual firing site at
+  `dashboard.rs:51`, which still passed the old `"Dashboard endpoint
+  requests"` HELP. Masked today because `AppState::new` pre-registers
+  every `{endpoint,status}` combination in `pipeline.rs`, but a future
+  endpoint or status that sorted earlier lexicographically would win
+  the family HELP with the stale string — the exact first-wins
+  fragility round 6 was meant to eliminate. Fixed to the unified
+  `"Dashboard endpoint requests, labeled by status"`.
+- **harness (medium):** `promote()` read `session.receipt` under the
+  parking_lot mutex BEFORE checking `session.is_promoted()`. On
+  AArch64 (weakly-ordered), a concurrent `restore_receipt` (called
+  from `recover_spooled_sessions` for freshly-inserted sessions,
+  outside the per-session lifecycle mutex; `retry_marked_promotions`
+  runs on the same registry with no shared lock) could write the
+  receipt and `finish_promotion` after this thread's mutex-read of
+  `receipt = None` but before its `is_promoted()` load — the Acquire
+  on `is_promoted` synchronizes-with the writer's Release-store, so
+  we'd see `promoted = 2` while holding a stale `None` receipt read.
+  Result: a spurious `"promoted session has no persisted receipt"`
+  error that self-healed on the next reconciler tick but polluted
+  the promotion-retry error signal with a false positive. Fixed by
+  checking `is_promoted()` FIRST so any subsequent mutex lock
+  observes writes released before the Release-store.
+
 ### Bug-hunt round 6: three metrics fixes; three 0-finding audits (2026-08-20)
 
 Four fresh lenses this round — a code-review of round 5's own commit
