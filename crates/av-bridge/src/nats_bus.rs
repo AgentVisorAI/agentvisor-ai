@@ -490,6 +490,19 @@ impl EventBus for NatsBus {
     fn maintenance(&self, _now_ms: u64) -> Result<u64, BusError> {
         self.cold_archive.as_ref().map_or(Ok(0), |archive| {
             archive.retry_pending_with(|pending| {
+                // Same rationale as `KafkaBus::maintenance`: a crash or
+                // executor timeout between a successful publish and the
+                // subsequent `commit()` leaves the intent offset-None
+                // while the event IS already on the stream. Blindly
+                // re-producing here would double the audit stream. NATS
+                // dedupe via `Nats-Msg-Id` catches this only inside the
+                // stream's `duplicate_window == retention` — a retry
+                // after retention expiry (or after a per-consumer
+                // stream reset) escapes it. Consult the stream first
+                // and only publish when the UID is genuinely absent.
+                if let Some(ack) = self.find_event_by_uid(&pending.topic, &pending.key, &pending.event_uid)? {
+                    return Ok(ack);
+                }
                 self.publish_broker_only(
                     &pending.topic,
                     &pending.key,

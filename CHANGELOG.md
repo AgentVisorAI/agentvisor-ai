@@ -4,6 +4,42 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 5: NATS retry parity, doc drift, and known-limitation docs (2026-08-20)
+
+Four fresh lenses this round — a code-review of round 4's own commit
+(came back clean — first no-findings self-audit in the streak), a
+dedicated security-review (0 findings; every attack surface carries its
+specific hardening), an idempotency audit tracing every retry path, and
+a documentation-vs-code drift audit. Two production fixes plus one
+known-limitation doc:
+
+- **bridge (medium):** `NatsBus::maintenance` blindly re-published
+  pending cold-store intents whose `offset` was `None` (crash between
+  publish and commit), relying on the `Nats-Msg-Id` dedupe window
+  bounded by `retention` — a retry landing after retention expiry (or
+  after a stream reset) escaped dedupe and duplicated the event on the
+  audit stream. Kafka's `maintenance` already consulted
+  `find_event_by_uid` before re-producing (round-1 F2 established the
+  paged NATS lookup); NATS now uses the same guard.
+- **docs (medium):** `ARCHITECTURE.md` claimed "Chat and MCP effects
+  wait until their request or authorization event is journaled and
+  published" — but `mcp_call` uses `intercept_tool_nonblocking` (which
+  explicitly does NOT wait for broker publish), and chat gates run
+  inline unless a token budget is configured. Reality: durability
+  comes from the local response-marker / tool-intent files (which the
+  reconciler reasons about on crash recovery); OCSF broker publish is
+  fire-and-forget on the worker pool. Doc rewritten to state what
+  the code actually delivers.
+- **state (known-limitation doc):** Redis `try_spend_many` / `add`
+  are atomic Lua scripts server-side, but a connection drop between
+  the server's INCRBY commit and the client's response read makes the
+  outcome ambiguous — a client retry with the same intent overcharges
+  the budget by the retry amount. Documented in `RedisStore`'s
+  docstring: 24 h counter TTL bounds unbounded growth and
+  `refund_tool_call` covers common cases; strict idempotency would
+  need a client-supplied request nonce and is deferred as a design
+  change.
+
 ### Bug-hunt round 4: three fixes across cluster routing, tool-execution replay, and a filesystem re-scan bug (2026-08-20)
 
 Four fresh lenses this round — code-review of round-3's own commit,
