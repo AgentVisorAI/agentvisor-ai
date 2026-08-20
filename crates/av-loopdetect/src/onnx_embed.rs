@@ -164,8 +164,29 @@ impl Embedder for OnnxEmbedder {
 
     fn embed(&self, text: &str) -> Vec<f32> {
         self.infer(text).unwrap_or_else(|error| {
-            tracing::warn!(%error, dim = self.dim, "ONNX inference failed; returning zero vector");
-            vec![0.0; self.dim]
+            // Round-31 F1 (silent-bug): the prior fallback returned a
+            // zero vector on ONNX inference failure. Zero vectors are
+            // the trait's documented signal for "empty/degenerate
+            // input", so an inference failure LOOKED like empty input
+            // to the breaker (`av-loopdetect::breaker`) — which then
+            // treats consecutive zero-vector observations as a
+            // near-perfect duplicate signal (`delta ≈ 0`) and can
+            // trip the loop breaker mid-flight on repeated ONNX
+            // outages. Round-13 F5 fixed the same class on the
+            // response-side path by refusing to feed the breaker
+            // empty text. Here we fall back to a NON-ZERO
+            // deterministic HashEmbedder over the same text: same
+            // text always produces the same vector (breaker
+            // stability preserved), the vector is derived from
+            // content (not a false-duplicate signal), and the
+            // failure is still logged for operator triage.
+            tracing::warn!(
+                %error,
+                dim = self.dim,
+                "ONNX inference failed; falling back to deterministic HashEmbedder \
+                 (non-zero so the breaker does not treat outages as false duplicates)"
+            );
+            crate::HashEmbedder::new(self.dim).embed(text)
         })
     }
 

@@ -4,6 +4,59 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 31: silent-bug hunt — ONNX zero-vector fallback poisons breaker (2026-08-20)
+
+Three focused deep-dives on SILENT bugs (the worst class — they
+don't fail loudly, they drop data / corrupt state / produce
+plausible-but-wrong output): silent error swallowing, silent
+numeric behavior, silent state corruption. Combined: ~25
+candidate silent bugs identified. 1 applied; the rest are either
+documented best-effort (Redis refund/remove warns from prior
+rounds), astronomically rare (u64 sequence overflow at
+2^64 events), or design items requiring cross-cutting change.
+
+- **loopdetect (medium, silent breaker poison):** `OnnxEmbedder::embed`
+  returned a **zero vector** on ONNX inference failure. The
+  `Embedder` trait doc says "zero vector is allowed for
+  empty/degenerate input", so the breaker
+  (`SessionLoopState::observe_embedding_with_similarity`) treated
+  a real ONNX outage as if the agent had emitted degenerate
+  input — and consecutive zero-vector observations register as a
+  near-perfect duplicate signal (`delta ≈ 0`), tripping the loop
+  breaker mid-flight on repeated ONNX outages. Same class as
+  round-13 F5's response-side fix (zero-vector poisoning from
+  empty text). Fixed by falling back to a deterministic
+  `HashEmbedder` over the same text on failure: same text still
+  produces the same vector (breaker stability preserved), the
+  vector is derived from content (not a false-duplicate signal),
+  and the failure is still logged for operator triage.
+
+Not actionable this round (deferred / documented):
+- **fsutil `write_atomic` post-rename dir fsync warn+Ok**: documented
+  round-6 F5 rationale — the rename already succeeded so the file is
+  observable; failing the caller would trigger wrong "file not there"
+  retry logic. Real durability gap acknowledged.
+- **Redis `refund`/`remove` warn-only**: intentional per
+  StateStore trait contract (best-effort compensation on
+  lost-race paths; documented round-9 F2 and round-15 F2).
+- **Kafka fetch offset sign-wrap**: fixed in round-30 F1.
+- **Sequence u64 overflow via `saturating_add`**: 2^64 events per
+  session is astronomically improbable; defensive but not a
+  practical concern.
+- **Choice-index BTreeMap key merge on duplicate provider indices**:
+  requires a within-chunk uniqueness check; malformed provider
+  responses would be rare.
+- **Float→micros drift for money**: money is stored as u64 micros
+  everywhere for JCS-safety; the drift is upstream of ingestion
+  and outside the harness's canonicalization boundary.
+- **Recovery defaults missing counters to zero**: documented
+  round-N behavior; recovered session is under-attributed on the
+  first tick and self-corrects.
+- **`.ok()` on MAC-verified intent decode**: defense-in-depth —
+  unauthenticated intents legitimately don't belong to any
+  session, so per-session cleanup can't reach them; age-based
+  sweep is a separate feature.
+
 ### Bug-hunt round 30: Kafka offset sign-wrap refusal (2026-08-20)
 
 Two fresh deep-dives — code-review of round-29 (clean), final
