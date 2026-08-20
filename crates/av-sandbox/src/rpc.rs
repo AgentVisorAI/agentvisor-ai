@@ -211,14 +211,30 @@ fn reject_duplicate_keys(raw: &[u8]) -> Result<(), RpcError> {
             f.write_str("any JSON value without duplicate object keys")
         }
 
-        fn visit_bool<E>(self, _: bool) -> Result<(), E> { Ok(()) }
-        fn visit_i64<E>(self, _: i64) -> Result<(), E> { Ok(()) }
-        fn visit_u64<E>(self, _: u64) -> Result<(), E> { Ok(()) }
-        fn visit_f64<E>(self, _: f64) -> Result<(), E> { Ok(()) }
-        fn visit_str<E>(self, _: &str) -> Result<(), E> { Ok(()) }
-        fn visit_string<E>(self, _: String) -> Result<(), E> { Ok(()) }
-        fn visit_none<E>(self) -> Result<(), E> { Ok(()) }
-        fn visit_unit<E>(self) -> Result<(), E> { Ok(()) }
+        fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_str<E>(self, _: &str) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_string<E>(self, _: String) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_none<E>(self) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_unit<E>(self) -> Result<(), E> {
+            Ok(())
+        }
 
         fn visit_some<D>(self, deserializer: D) -> Result<(), D::Error>
         where
@@ -242,9 +258,7 @@ fn reject_duplicate_keys(raw: &[u8]) -> Result<(), RpcError> {
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             while let Some(key) = map.next_key::<String>()? {
                 if !seen.insert(key.clone()) {
-                    return Err(serde::de::Error::custom(format!(
-                        "duplicate object key {key:?}"
-                    )));
+                    return Err(serde::de::Error::custom(format!("duplicate object key {key:?}")));
                 }
                 let _: NoDupWrap = map.next_value()?;
             }
