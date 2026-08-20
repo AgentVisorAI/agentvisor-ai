@@ -390,6 +390,73 @@ mod tests {
             .contains(&ValidationError::BadStatus(3)));
     }
 
+    /// Round-17 F2 regression: the deserialize path bypasses
+    /// `OcsfEventBuilder::build`'s JCS-safe integer check, so a
+    /// wire event with a token counter above 2^53 would round-trip
+    /// through JS-based JSON parsers as silently-truncated,
+    /// breaking any receipt hash JS consumers compute over the
+    /// event. `validate_event` must flag it on every JCS-safe
+    /// carrier field: `time`, `metadata.sequence`, and every
+    /// `EventMetrics.*_tokens`.
+    #[test]
+    fn jcs_unsafe_integer_flagged_on_every_deserialize_carrier() {
+        let unsafe_value = av_core::error::JCS_SAFE_MAX + 1;
+
+        // time
+        let mut ev = valid_event();
+        ev.time = unsafe_value;
+        let errs = validate_event(&ev).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::JcsUnsafeInteger { field: "time", .. })),
+            "time above JCS_SAFE_MAX must be flagged, got {errs:?}"
+        );
+
+        // metadata.sequence
+        let mut ev = valid_event();
+        ev.metadata.sequence = unsafe_value;
+        let errs = validate_event(&ev).unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::JcsUnsafeInteger {
+                    field: "metadata.sequence",
+                    ..
+                }
+            )),
+            "sequence above JCS_SAFE_MAX must be flagged, got {errs:?}"
+        );
+
+        // EventMetrics counters
+        for field in [
+            "metrics.prompt_tokens",
+            "metrics.completion_tokens",
+            "metrics.cached_tokens",
+            "metrics.pruned_tokens",
+            "metrics.pruning_ratio_millis",
+        ] {
+            let mut ev = valid_event();
+            let mut metrics = crate::model::EventMetrics::default();
+            match field {
+                "metrics.prompt_tokens" => metrics.prompt_tokens = Some(unsafe_value),
+                "metrics.completion_tokens" => metrics.completion_tokens = Some(unsafe_value),
+                "metrics.cached_tokens" => metrics.cached_tokens = Some(unsafe_value),
+                "metrics.pruned_tokens" => metrics.pruned_tokens = Some(unsafe_value),
+                "metrics.pruning_ratio_millis" => metrics.pruning_ratio_millis = Some(unsafe_value),
+                _ => unreachable!(),
+            }
+            ev.metrics = Some(metrics);
+            let errs = validate_event(&ev).unwrap_err();
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    ValidationError::JcsUnsafeInteger { field: f, .. } if *f == field
+                )),
+                "{field} above JCS_SAFE_MAX must be flagged, got {errs:?}"
+            );
+        }
+    }
+
     /// Round-38 F3: activity_id must be < 100 so
     /// `class_uid × 100 + activity_id` is a bijection. Without this
     /// check, `class_uid=9901, activity_id=100` produces the same
