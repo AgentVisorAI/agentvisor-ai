@@ -4,6 +4,69 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 16: upstream credential-header leak + ATIF strict/schema drift (2026-08-20)
+
+Four fresh deep-dives — code-review of round-15 (clean, all 10 concerns
+verified), `av-atif` strict validator (2 real drift findings + several
+deferred), `av-harness::pipeline` (1 real API-key leak + 1 slot-pin
+DoS), and harness startup ordering (1 signal-handling race + 3 design
+items). One production-severity fix applied (upstream credential
+header leak).
+
+- **routes (HIGH, credential leak):** `is_forwardable_upstream_header`
+  was a denylist that stripped RFC 7235 `Authorization` but no
+  provider-custom API-key header names. Every LLM provider uses a
+  distinct custom header — `api-key` (Azure), `x-api-key` (Amazon
+  Bedrock, Together AI), `x-goog-api-key` (Google), `anthropic-api-key`
+  (Anthropic). A malicious or compromised upstream that echoed its
+  request's auth header in the response would then leak the operator's
+  outbound provider credential straight to the caller. Two-layer
+  fix: (a) added every well-known API-key header name to the static
+  denylist, AND (b) the filter now takes the runtime
+  `upstream_auth_header` string and refuses any header that matches
+  it case-insensitively — so operator-picked exotic header names are
+  also covered. Regression test extended with all 7 provider names +
+  the operator-configured case.
+- **atif (medium, strict/schema drift):** `validate_value(Strict)`
+  did not type-check three fields that the JSON Schema declares as
+  strings — `agent.model_name`, `steps[*].model_name`, and each
+  typed field on `SubagentTrajectoryRef` (`trajectory_id`,
+  `session_id`, `trajectory_path`). A payload with
+  `model_name: 123` passed Strict but failed typed
+  deserialization and failed the shipped schema — a validator
+  that accepts documents the reader will reject is worse than
+  useless. All three now emit `"must be a string"` when
+  wrong-typed. `SubagentTrajectoryRef`'s misleading
+  `"must set trajectory_id or trajectory_path"` (fired even when
+  trajectory_id existed but was the wrong type) is now preceded by
+  the actual type-mismatch issue.
+
+Not actionable this round:
+- **pipeline (medium, DoS):** no total upstream request lifetime cap
+  — only connect_timeout + per-read timeout. A slow-drip upstream
+  can hold a `SessionLease` + `ResponsePermit` indefinitely.
+  Deferred: needs coordinated design across the streaming state
+  machine and the existing `session_idle_close_s` semantics.
+- **startup (medium):** shutdown signal handler installed AFTER
+  spool recovery. A SIGTERM during recovery is handled by the
+  default signal action (kill) rather than the graceful drain
+  path. Real but only visible during operator-initiated shutdown
+  in the recovery window (typically <1s). Deferred: a proper fix
+  needs a cancellable recovery future.
+- **atif (low):** no timestamp monotonicity across steps, no
+  aggregate consistency (final_metrics = sum of step metrics), no
+  cross-step tool_call_id uniqueness. All three are trust-but-verify
+  gaps for external ATIF ingestion; the harness's own emissions
+  are correct by construction. Deferred to a future
+  validator-completeness pass.
+- **atif (low):** promotion validates the typed model, not the raw
+  wire JSON. Unknown fields / explicit-null-Options / duplicate-key
+  ambiguity get lost before strict validation runs. Same class as
+  the round-15-F3 receipts fix, but applied at a different layer
+  (typed deserialize → validate vs. bytes → strict validate);
+  deferred pending a decision on whether promotion should re-hash
+  the raw ATIF bytes or the canonicalized re-serialization.
+
 ### Bug-hunt round 15: signature malleability + sandbox host-DoS caps + state cleanup observability (2026-08-20)
 
 Four fresh deep-dives — code-review of round-14 (clean), `av-receipts`

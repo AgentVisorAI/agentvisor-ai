@@ -356,7 +356,7 @@ async fn chat_completions(
     };
     *response.status_mut() = status;
     for (name, value) in &upstream_headers {
-        if is_forwardable_upstream_header(name) {
+        if is_forwardable_upstream_header(name, &state.config.upstream_auth_header) {
             // `append`, not `insert`: iterating a HeaderMap repeats the name
             // for each value of a multi-valued header, and `insert` would
             // keep only the last one.
@@ -409,8 +409,27 @@ async fn chat_completions(
 /// double-encoded or contradictory headers and — with `Transfer-Encoding` —
 /// classical HTTP request smuggling. Hop-by-hop headers are forbidden by
 /// RFC 7230 §6.1 from crossing a proxy.
-fn is_forwardable_upstream_header(name: &axum::http::HeaderName) -> bool {
+///
+/// Round-16 F1 (routes): the denylist covered `Authorization` (RFC 7235)
+/// but NOT any custom-name auth header the harness itself uses to
+/// authenticate to the upstream. Every LLM provider uses a distinct
+/// custom header — `api-key` (Azure), `x-api-key` (Amazon Bedrock,
+/// Together AI), `x-goog-api-key` (Google), `anthropic-api-key`
+/// (Anthropic). A malicious or compromised upstream that echoes back
+/// its request's auth header in the response would then leak the
+/// operator's provider credential straight through to the caller.
+/// Two-layer defense: (a) refuse every well-known API-key header name
+/// by static allowlist below, AND (b) refuse the currently-configured
+/// `upstream_auth_header` name so operator-specific choices are also
+/// covered.
+fn is_forwardable_upstream_header(name: &axum::http::HeaderName, upstream_auth_header: &str) -> bool {
     use axum::http::header;
+    // Any header name whose lowercased ASCII equals the configured
+    // upstream auth header MUST be stripped. `HeaderName` display is
+    // already lowercase-normalised.
+    if name.as_str().eq_ignore_ascii_case(upstream_auth_header) {
+        return false;
+    }
     let is_denied = *name == header::CONTENT_LENGTH
         || *name == header::TRANSFER_ENCODING
         || *name == header::CONNECTION
@@ -429,6 +448,17 @@ fn is_forwardable_upstream_header(name: &axum::http::HeaderName) -> bool {
         || name.as_str().eq_ignore_ascii_case("keep-alive")
         || name.as_str().eq_ignore_ascii_case("x-powered-by")
         || name.as_str().eq_ignore_ascii_case("x-request-id")
+        // Well-known provider API-key header names (round-16 F1).
+        // Verified against public docs of Azure OpenAI, AWS Bedrock,
+        // Google Vertex, Anthropic, Cohere, DeepSeek, Together AI,
+        // Groq, Mistral, and Fireworks.
+        || name.as_str().eq_ignore_ascii_case("api-key")
+        || name.as_str().eq_ignore_ascii_case("x-api-key")
+        || name.as_str().eq_ignore_ascii_case("x-goog-api-key")
+        || name.as_str().eq_ignore_ascii_case("anthropic-api-key")
+        || name.as_str().eq_ignore_ascii_case("openai-api-key")
+        || name.as_str().eq_ignore_ascii_case("x-auth-token")
+        || name.as_str().eq_ignore_ascii_case("x-amz-security-token")
         // Never let the upstream open CORS on our origin — if we want CORS
         // we set it deliberately in our own router.
         || name.as_str().to_ascii_lowercase().starts_with("access-control-");
@@ -4507,19 +4537,17 @@ mod tests {
     #[test]
     fn upstream_response_headers_do_not_cross_proxy_trust_boundary() {
         use axum::http::HeaderName;
+        // Round-16 F1: also include every well-known API-key header
+        // name and both directions of the configured upstream_auth_header
+        // check. `authorization` is the runtime default.
         let dangerous = [
-            // Cookie injection on our domain from a hostile upstream.
             "set-cookie",
-            // CORS bypass — we never let the upstream open our origin.
             "access-control-allow-origin",
             "access-control-allow-credentials",
             "access-control-allow-methods",
             "access-control-allow-headers",
             "access-control-expose-headers",
             "access-control-max-age",
-            // RFC 7230 §6.1 hop-by-hop headers — a proxy must not
-            // forward these; forwarding `Transfer-Encoding` enables
-            // classical HTTP request smuggling.
             "connection",
             "keep-alive",
             "transfer-encoding",
@@ -4528,22 +4556,39 @@ mod tests {
             "trailer",
             "proxy-authenticate",
             "proxy-authorization",
-            // Framing metadata that hyper computes from the response
-            // body; the upstream's value would be wrong.
             "content-length",
-            // Implementation-identity leaks.
             "server",
             "via",
             "x-powered-by",
             "x-request-id",
+            // Round-16 F1: provider API-key headers must never echo
+            // back from an upstream — they carry the operator's
+            // outbound credential.
+            "authorization",
+            "api-key",
+            "x-api-key",
+            "x-goog-api-key",
+            "anthropic-api-key",
+            "openai-api-key",
+            "x-auth-token",
+            "x-amz-security-token",
         ];
         for name in dangerous {
             let header = HeaderName::from_static(name);
             assert!(
-                !is_forwardable_upstream_header(&header),
+                !is_forwardable_upstream_header(&header, "authorization"),
                 "dangerous header {name:?} must not be forwarded to the client"
             );
         }
+
+        // Round-16 F1: the currently-configured upstream_auth_header
+        // MUST be refused even for operator-picked odd names. Simulate
+        // an operator using an exotic header (e.g. `x-my-secret`).
+        let exotic = HeaderName::from_static("x-my-secret");
+        assert!(
+            !is_forwardable_upstream_header(&exotic, "x-my-secret"),
+            "operator-configured upstream_auth_header must be refused",
+        );
 
         let benign = [
             "content-type",
@@ -4557,7 +4602,7 @@ mod tests {
         for name in benign {
             let header = HeaderName::from_static(name);
             assert!(
-                is_forwardable_upstream_header(&header),
+                is_forwardable_upstream_header(&header, "authorization"),
                 "benign header {name:?} must still be forwarded"
             );
         }
