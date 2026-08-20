@@ -353,15 +353,22 @@ impl StateStore for RedisStore {
     ///
     /// All of a session's keys share one cluster slot by construction
     /// (`ActionBudget::session_prefix` wraps the digest in a `{hash-tag}`),
-    /// so a single script routed by the prefix reaches every key on both
-    /// single-node and cluster backends. `KEYS` inside the script is
-    /// bounded by the node's keyspace (session-scoped counters, a handful
-    /// per live session under TTL) and runs once per session finalization.
-    /// Best-effort like `remove`/`refund`: a Redis blip on the cleanup
-    /// path must not fail the close.
+    /// so a single SCAN cursor + bounded DEL batches routed by the prefix
+    /// pattern reach every key on both single-node and cluster backends.
+    ///
+    /// Round-47: SCAN, not KEYS. The first take used
+    /// `redis.call('KEYS', pattern)` inside a Lua script, which is
+    /// O(entire keyspace per node) AND blocks the Redis event loop
+    /// atomically for the whole scan+delete. On a shared Redis with high
+    /// session churn or attacker-chosen ids, every close stalled all
+    /// other Redis clients (including hot-path `try_spend_many` gates)
+    /// for the duration. SCAN is O(matches) amortized and yields between
+    /// batches, so per-session cleanup no longer blocks concurrent
+    /// traffic. Best-effort like `remove`/`refund`: any Redis blip on
+    /// the cleanup path must not fail the close.
     fn remove_prefix(&self, prefix: &str) {
-        // `KEYS`' glob treats `* ? [ ] \` as metacharacters. The prefix is
-        // `budget:{<32 hex>}:` today (no metacharacters), but escape
+        // `MATCH` glob treats `* ? [ ] \` as metacharacters. The prefix
+        // is `budget:{<32 hex>}:` today (no metacharacters), but escape
         // defensively so a future prefix shape cannot over-match.
         let mut pattern = String::with_capacity(prefix.len() + 1);
         for c in prefix.chars() {
@@ -371,32 +378,69 @@ impl StateStore for RedisStore {
             pattern.push(c);
         }
         pattern.push('*');
-        const REMOVE_PREFIX_LUA: &str = r"
-            local removed = 0
-            for _, key in ipairs(redis.call('KEYS', ARGV[1])) do
-                redis.call('DEL', key)
-                removed = removed + 1
-            end
-            return removed
-        ";
         match &self.backend {
             RedisBackend::Single(pool) => {
                 if let Ok(mut connection) = pool.get() {
-                    let _: Result<i64, _> = redis::Script::new(REMOVE_PREFIX_LUA)
-                        .key(prefix)
-                        .arg(&pattern)
-                        .invoke(&mut *connection);
+                    scan_and_delete_single(&mut connection, &pattern);
                 }
             }
             RedisBackend::Cluster(pool) => {
                 if let Ok(mut connection) = pool.get() {
-                    let _: Result<i64, _> = redis::Script::new(REMOVE_PREFIX_LUA)
-                        .key(prefix)
-                        .arg(&pattern)
-                        .invoke(&mut *connection);
+                    scan_and_delete_cluster(&mut connection, &pattern);
                 }
             }
         }
+    }
+}
+
+/// Bounded SCAN+DEL loop against a single-node connection. Each SCAN
+/// call is O(COUNT) at the server; the loop terminates when the cursor
+/// returns to 0. DEL is batched so one round-trip retires up to
+/// `SCAN_COUNT` keys.
+fn scan_and_delete_single(conn: &mut redis::Connection, pattern: &str) {
+    const SCAN_COUNT: usize = 500;
+    let mut cursor: u64 = 0;
+    loop {
+        let scan: Result<(u64, Vec<String>), _> = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(pattern)
+            .arg("COUNT")
+            .arg(SCAN_COUNT)
+            .query(conn);
+        let Ok((next, batch)) = scan else { return };
+        if !batch.is_empty() {
+            let mut del = redis::cmd("DEL");
+            for key in &batch {
+                del.arg(key);
+            }
+            let _: Result<i64, _> = del.query(conn);
+        }
+        if next == 0 {
+            return;
+        }
+        cursor = next;
+    }
+}
+
+/// Cluster variant: `Commands::scan_match` on the cluster connection
+/// yields matches across the cluster's masters. Our prefix is
+/// hash-tag-anchored so all matches live on one master; the iterator
+/// still terminates cleanly (empty responses from the other nodes).
+/// DEL is per-key here (rather than batched): every key is
+/// hash-tag-routed to the same slot, so a MULTI-key DEL would work in
+/// principle, but building it inside the borrow of the iterator is
+/// awkward and one DEL per key is still O(cluster keys under prefix) —
+/// unchanged from the loop's overall bound.
+fn scan_and_delete_cluster(conn: &mut redis::cluster::ClusterConnection, pattern: &str) {
+    use redis::Commands;
+    let iter = match conn.scan_match::<_, String>(pattern) {
+        Ok(iter) => iter,
+        Err(_) => return,
+    };
+    let keys: Vec<String> = iter.collect();
+    for key in keys {
+        let _: Result<i64, _> = conn.del(&key);
     }
 }
 
