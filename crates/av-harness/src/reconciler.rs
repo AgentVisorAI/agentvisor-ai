@@ -637,8 +637,26 @@ impl Finalizer {
             self.close_session_locked(Arc::clone(&session), StopReason::SessionClosed)
                 .await?;
         }
-        let persisted_receipt = { session.receipt.lock().clone() };
+        // Check `is_promoted()` BEFORE taking the receipt lock. Round-7
+        // F1: `restore_receipt` (called from unsigned-recovery on a
+        // freshly-inserted session) writes `session.receipt` and then
+        // calls `finish_promotion()` — but `restore_receipt` does NOT
+        // hold the per-session lifecycle mutex, and `retry_marked_promotions`
+        // (which invokes this `promote()`) runs concurrently with
+        // `recover_spooled_sessions` (they share no lock — the recovery
+        // lock guards only the recovery scan). Reading the receipt
+        // FIRST under the parking_lot mutex and THEN checking
+        // `is_promoted()` could observe `promoted == 2` (Acquire pairs
+        // with `finish_promotion`'s Release) while carrying a stale
+        // `None` receipt read from before the writer's mutex release,
+        // producing a spurious "promoted session has no persisted
+        // receipt" error that self-heals on the next reconciler tick
+        // but pollutes the promotion-retry error metrics with a real
+        // false positive. Checking `is_promoted()` first pins the
+        // synchronizes-with edge: any subsequent mutex lock observes
+        // writes released before the Release-store on `promoted`.
         if session.is_promoted() {
+            let persisted_receipt = { session.receipt.lock().clone() };
             let receipt = persisted_receipt.ok_or_else(|| {
                 FinalizeError::Promotion("promoted session has no persisted receipt".to_owned())
             })?;
@@ -673,6 +691,7 @@ impl Finalizer {
             }
             return Ok(receipt);
         }
+        let persisted_receipt = { session.receipt.lock().clone() };
         let path =
             session.atif_path.lock().clone().ok_or_else(|| {
                 FinalizeError::Promotion("session has no persisted ATIF artifact".to_owned())
