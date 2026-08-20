@@ -239,9 +239,19 @@ pub struct PreparedRequest {
     pub payload: Value,
     /// Total local middleware time before upstream I/O.
     pub middleware_us: u64,
-    lease: SessionLease,
-    response_permit: Option<ResponsePermit>,
+    // Fields drop in declaration order. `capture_guard` MUST drop before
+    // `lease` on a cancelled request future — the lease's Drop notifies
+    // `wait_for_streams`, unblocking `close_session_locked`, which then
+    // checks `wait_for_worker_jobs()`. If the guard submits its terminal
+    // job after the lease releases, the close's `pending_jobs == 0` load
+    // can win the race, finalize proceeds, and the guard's job lands
+    // after the receipt was sealed (chain/receipt divergence for signed
+    // sessions; a resurrected step journal after remove_step_journal for
+    // unsigned). AbortFinalizingStream preserves the same invariant by
+    // convention (its Drop runs before `_lease` drops).
     capture_guard: ResponseCaptureGuard,
+    response_permit: Option<ResponsePermit>,
+    lease: SessionLease,
     /// Client `Authorization` header captured for passthrough mode only.
     client_authorization: Option<HeaderValue>,
 }
@@ -250,9 +260,12 @@ pub struct PreparedRequest {
 pub struct ForwardedResponse {
     /// Provider HTTP response.
     pub response: reqwest::Response,
-    pub(crate) lease: SessionLease,
-    pub(crate) response_permit: Option<ResponsePermit>,
+    // Same ordering invariant as `PreparedRequest`: guard drops before
+    // lease so its terminal job registers `pending_jobs` before the
+    // close barrier sees the streams drained.
     pub(crate) capture_guard: ResponseCaptureGuard,
+    pub(crate) response_permit: Option<ResponsePermit>,
+    pub(crate) lease: SessionLease,
 }
 
 /// RAII owner of the journalled response attempt and (once created) the
@@ -973,13 +986,14 @@ impl AppState {
     /// attempt and a later crash-recovery scan quarantines the whole session
     /// over a request the client already saw fail.
     fn abandon_prepared(&self, prepared: &mut PreparedRequest, stop_reason: StopReason, reason: &str) {
-        // This caller owns terminal-record submission from here; the
-        // guard must not double-submit on drop. Take any marker so the
-        // terminal job retires it too.
-        let response_marker = prepared.capture_guard.defuse();
         let Some(permit) = prepared.response_permit.take() else {
+            // Defensive: no permit means the guard's Drop is the only
+            // resolver left. Leave it armed so the terminal record lands
+            // through the plain worker queue on drop.
             return;
         };
+        // Take the marker so the terminal job below retires it too.
+        let response_marker = prepared.capture_guard.defuse();
         let mut job = self.failure_job(
             Arc::clone(&prepared.session),
             prepared.identity.clone(),
@@ -991,11 +1005,15 @@ impl AppState {
             id: prepared.capture_guard.attempt_id().to_owned(),
             terminal: true,
         });
-        // Best-effort submit: if the shard is momentarily full, the
-        // response-slot counter has already been bumped inside submit
-        // and the caller (this path) is already an abandon flow, so
-        // there is nothing further to do.
-        let _ = permit.submit(&self.worker, job);
+        // Every sibling refusal path (`forward_chat` Err, both
+        // `chat_completions` arms, the guard's own Drop) fails the
+        // session closed on submit failure so the dangling attempt
+        // cannot silently strand. Mirror that here: without it,
+        // defusing the guard first would lose the safety net this whole
+        // guard machinery exists to provide.
+        if permit.submit(&self.worker, job).is_err() {
+            prepared.session.mark_capture_failed();
+        }
     }
 
     /// Forward a prepared OpenAI-compatible request to the configured provider.

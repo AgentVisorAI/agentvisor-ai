@@ -1027,6 +1027,48 @@ impl Finalizer {
                         "ignoring ATIF spool file whose provenance does not verify"
                     );
                 }
+                // Quarantine files old enough that no live close can
+                // still be repairing the sidecar (same MIN_ORPHAN_AGE
+                // guard used for sidecar-less files at the top of this
+                // scan). Without this, a strict-valid attacker-planted
+                // trajectory paired with a bogus-MAC sidecar re-parses
+                // and re-strict-validates every tick forever — the read
+                // + parse + strict validate walk of the whole trajectory
+                // (up to `MAX_ATIF_RECOVERY_BYTES`) runs on the recovery
+                // scan task, so N planted files burn O(N × file_size)
+                // CPU per tick indefinitely. `warn_once` only bounds the
+                // log noise, not the work. Quarantine (rename out of
+                // the `.json` glob) so the file drops out of the scan
+                // after one pass. Young files (< MIN_ORPHAN_AGE) skip
+                // this tick and retry: a legitimate MAC mismatch during
+                // a torn-sidecar-write window resolves the moment the
+                // close finishes writing.
+                const MIN_ORPHAN_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+                let age = tokio::fs::metadata(&path)
+                    .await
+                    .ok()
+                    .and_then(|meta| meta.modified().ok())
+                    .and_then(|mtime| std::time::SystemTime::now().duration_since(mtime).ok());
+                if !age.is_some_and(|age| age >= MIN_ORPHAN_AGE) {
+                    continue;
+                }
+                let mut quarantine = path.clone();
+                let stem = quarantine
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .unwrap_or("provenance-fail-atif")
+                    .to_owned();
+                let new_name = format!("{stem}.corrupt-{}", av_core::new_event_uid());
+                quarantine.set_file_name(new_name);
+                if let Err(rename_error) = tokio::fs::rename(&path, &quarantine).await {
+                    if self.warn_once(path.clone()) {
+                        tracing::warn!(
+                            %rename_error,
+                            path = %av_core::fsutil::basename(&path),
+                            "failed to quarantine ATIF file with bad provenance; will retry next tick"
+                        );
+                    }
+                }
                 continue;
             }
             if sessions.get(&session_id).is_some() {

@@ -47,6 +47,19 @@ pub fn parse_tool_call(raw: &[u8]) -> Result<ToolCallRequest, RpcError> {
     if raw.len() > MAX_PAYLOAD_BYTES {
         return Err(RpcError::TooLarge(raw.len(), MAX_PAYLOAD_BYTES));
     }
+    // Duplicate-key rejection: `serde_json` silently keeps the LAST value
+    // on duplicate keys, but the raw body is forwarded unchanged to the
+    // configured tool upstream. If the upstream's JSON decoder is
+    // first-wins (jackson, some Go decoders) or exposes both values, a
+    // request like
+    //   {"params":{"name":"safe_read","name":"db_write","arguments":{}}}
+    // parses here as `tool = "db_write"` (last-wins), passes the
+    // safe_read policy/budget gate, then executes `db_write` upstream —
+    // a permissions-model split with full audit-trail mismatch. Reject
+    // duplicates so gate and upstream see the same request or neither
+    // does. RFC 8259 §4 makes duplicate-name handling "implementation-
+    // defined", so the trust-boundary policy is: refuse ambiguity.
+    reject_duplicate_keys(raw)?;
     let v: Value = serde_json::from_slice(raw).map_err(|e| RpcError::Json(e.to_string()))?;
     if depth_of(&v, 0) > MAX_JSON_DEPTH {
         return Err(RpcError::NotJsonRpc("nesting exceeds depth bound".into()));
@@ -178,6 +191,83 @@ fn depth_of(v: &Value, current: usize) -> usize {
             .unwrap_or(current + 1),
         _ => current,
     }
+}
+
+/// Refuse any JSON object with duplicate keys anywhere in the payload.
+/// `serde_json` silently keeps the last value; downstream MCP servers may
+/// keep the first, expose both, or interpret the collapse differently.
+/// The trust-boundary policy is "refuse ambiguity" — see the call-site
+/// comment in `parse_tool_call`.
+fn reject_duplicate_keys(raw: &[u8]) -> Result<(), RpcError> {
+    use serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct NoDupKeys;
+
+    impl<'de> Visitor<'de> for NoDupKeys {
+        type Value = ();
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("any JSON value without duplicate object keys")
+        }
+
+        fn visit_bool<E>(self, _: bool) -> Result<(), E> { Ok(()) }
+        fn visit_i64<E>(self, _: i64) -> Result<(), E> { Ok(()) }
+        fn visit_u64<E>(self, _: u64) -> Result<(), E> { Ok(()) }
+        fn visit_f64<E>(self, _: f64) -> Result<(), E> { Ok(()) }
+        fn visit_str<E>(self, _: &str) -> Result<(), E> { Ok(()) }
+        fn visit_string<E>(self, _: String) -> Result<(), E> { Ok(()) }
+        fn visit_none<E>(self) -> Result<(), E> { Ok(()) }
+        fn visit_unit<E>(self) -> Result<(), E> { Ok(()) }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<(), D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserializer.deserialize_any(NoDupKeys)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<(), A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            while seq.next_element::<NoDupWrap>()?.is_some() {}
+            Ok(())
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<(), A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if !seen.insert(key.clone()) {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate object key {key:?}"
+                    )));
+                }
+                let _: NoDupWrap = map.next_value()?;
+            }
+            Ok(())
+        }
+    }
+
+    // Wrapper so nested structures use the same visitor.
+    struct NoDupWrap;
+    impl<'de> serde::Deserialize<'de> for NoDupWrap {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserializer.deserialize_any(NoDupKeys)?;
+            Ok(NoDupWrap)
+        }
+    }
+
+    let mut de = serde_json::Deserializer::from_slice(raw);
+    de.deserialize_any(NoDupKeys)
+        .map_err(|e| RpcError::Json(format!("duplicate JSON key rejected: {e}")))?;
+    Ok(())
 }
 
 /// Build the JSON-RPC error response for a blocked call (the "immediate

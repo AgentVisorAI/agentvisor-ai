@@ -1678,11 +1678,19 @@ impl AbortFinalizingStream {
             }
             self.last_reported_completion_tokens = Some(reported_completion);
             let delta = reported_completion.saturating_sub(self.charged_completion_tokens);
-            self.response_metrics.completion_tokens = Some(
-                self.response_metrics
-                    .completion_tokens
-                    .map_or(reported_completion, |current| current.max(reported_completion)),
-            );
+            // Authoritative usage overrides any prior estimate. The
+            // regression check above guarantees monotonicity across
+            // authoritative frames, so `max()` here would only keep a
+            // stale estimate that happened to exceed the true count —
+            // and that estimate lands in the attested `completion_tokens`
+            // recorded on the ATIF step, signed receipt, and session
+            // totals. Trigger: content chunks land with `"usage": null`
+            // (OpenAI `stream_options.include_usage`), the parser fills
+            // in `approx_tokens`, and those estimates get folded into
+            // `response_metrics.completion_tokens` via the estimate
+            // branch below; a final cumulative `{"usage":{"completion_tokens":6}}`
+            // with the accumulated estimate at 10 would attest 10.
+            self.response_metrics.completion_tokens = Some(reported_completion);
             delta
         } else {
             let total = self

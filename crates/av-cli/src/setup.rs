@@ -231,11 +231,16 @@ fn render_config(plan: &ConfigPlan) -> String {
     out.push_str("\n# Signed receipts, OCSF events, and ATIF trajectories are written here.\n");
     match &plan.data_root {
         Some(root) => {
-            out.push_str(&format!("atif_spool_dir = \"{root}/spool\"\n"));
-            out.push_str(&format!("bridge_data_dir = \"{root}/bridge\"\n"));
+            // These paths mirror the harness `default_spool` / `default_bridge`
+            // shapes (see crates/av-harness/src/config.rs) so that removing a
+            // key from the generated config leaves the runtime pointing at the
+            // same directory the generated config named. Diverging silently
+            // relocates the spool the moment an operator edits the file.
+            out.push_str(&format!("atif_spool_dir = \"{root}/spool/atif\"\n"));
+            out.push_str(&format!("bridge_data_dir = \"{root}/data/bridge\"\n"));
         }
         None => {
-            out.push_str("atif_spool_dir = \"data/spool\"\n");
+            out.push_str("atif_spool_dir = \"spool/atif\"\n");
             out.push_str("bridge_data_dir = \"data/bridge\"\n");
         }
     }
