@@ -3154,8 +3154,36 @@ async fn remove_outbox(path: &std::path::Path) -> Result<(), FinalizeError> {
             .parent()
             .ok_or_else(|| FinalizeError::Bridge("outbox has no parent".to_owned()))?;
         match std::fs::remove_file(&path) {
-            Ok(()) => av_core::fsutil::sync_directory(parent)
-                .map_err(|error| FinalizeError::Bridge(error.to_string())),
+            Ok(()) => {
+                // Round-19 F2 (av-harness reconciler): the file is
+                // gone from the caller's perspective — its inode is
+                // released once the last handle closes. A failing
+                // `sync_directory` here means the DIRECTORY ENTRY
+                // removal is not yet durable across a crash, but the
+                // caller-observable state ("no such outbox marker")
+                // is stable. Returning `Err` in this arm made
+                // callers retry the whole operation, and paths that
+                // infer state from outbox presence — see
+                // `recover_signed_journals` around
+                // reconciler.rs:2778-2793 — would then re-emit
+                // duplicate lifecycle events off the retry, because
+                // the first pass had ALREADY moved the state
+                // forward. Log the durability warning and return Ok:
+                // an unsynced dirent survives a normal shutdown and
+                // is retried by the reconciler on next tick if a
+                // crash truly loses it.
+                if let Err(error) = av_core::fsutil::sync_directory(parent) {
+                    tracing::warn!(
+                        target: "av_harness::reconciler",
+                        path = %path.display(),
+                        parent = %parent.display(),
+                        detail = %error,
+                        "remove_outbox: dirent unsync but file removed; caller state is stable, \
+                         relying on reconciler retry to re-sync on next tick"
+                    );
+                }
+                Ok(())
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(FinalizeError::Bridge(error.to_string())),
         }

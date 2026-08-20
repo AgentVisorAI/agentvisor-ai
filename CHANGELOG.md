@@ -4,6 +4,66 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 19: request-side loop-breaker false trip + duplicate lifecycle events on outbox unsync (2026-08-20)
+
+Four fresh deep-dives — code-review of round-18 (clean, all 10
+concerns verified), `av-identity` (0 HIGH; 3 medium design items),
+`av-harness/src/reconciler.rs` (3 findings; 1 applied, 2 deferred),
+`av-harness/src/worker.rs` (1 real REQUEST-side loop-breaker false
+trip — the mirror of round-13's response-side fix).
+
+- **harness (medium, correctness):** the request-side path in
+  `PreparedRequest::prepare_chat` set `analyze_loop =
+  (source == Agent)` and got its text from
+  `last_message_text`, which only reads string `content`. For an
+  assistant tool-call turn (`content: null`, has `tool_calls`), the
+  text was `""` → zero-vector embedding → breaker treats as hostile
+  duplicate. Round-13 fixed the RESPONSE-side path but the REQUEST
+  side had the same shape. Two-part fix:
+  1. `last_message_text` now falls back to synthesizing
+     `tool_name(arguments)` per tool call (same wire-order rule as
+     the response-side synthesis in
+     `routes.rs::AbortFinalizingStream::submit_response_capture`),
+     and also handles multimodal `content: [{text: ...}, ...]` parts.
+  2. `analyze_loop` is now gated on `!text.is_empty()` so a truly
+     empty message doesn't feed a zero vector into the breaker.
+- **reconciler (medium, non-idempotency):** `remove_outbox`
+  returned `Err` if the file was deleted successfully but the
+  parent-directory fsync then failed. From the caller's perspective
+  the file is GONE — its inode is released once the last handle
+  closes; only the dirent removal is unsync. Callers that infer
+  state from outbox presence (`recover_signed_journals` around
+  reconciler.rs:2778-2793) would retry and re-emit duplicate
+  lifecycle events on the retry, because the first pass had
+  already moved state forward. The dirent unsync survives normal
+  shutdown and the reconciler retries on the next tick if a crash
+  truly loses it. Now logs a structured warn and returns Ok.
+
+Not actionable this round:
+- **reconciler (medium, deferred):** acked-outbox GC race —
+  `recover_signed_journals` removes a session on transient close-tail
+  failure; `remove_acked_lifecycle_outboxes` then deletes its acked
+  outboxes because `sessions.get(...)` is None; next successful
+  recovery re-emits receipt/close with fresh UIDs, producing
+  duplicate lifecycle events. Fix requires ordering the
+  session-removal and outbox-GC decisions on ONE atomic view; a
+  broader refactor than fits round-19.
+- **reconciler (low, deferred):** `persist_receipt` /
+  `persist_outbox` / `persist_marker` rely on `write_atomic`
+  which uses `create_dir_all` (not the round-3
+  `create_dir_all_synced`). Cold/missing `receipts/` or `outbox/`
+  can be created without ancestor-dir fsync. On a crash before
+  the next ambient dirent sync, the file may be reachable only
+  after fsck — the receipt itself is still fsync'd by
+  write_atomic. Fix: switch these callers to
+  `create_dir_all_synced` (av-core/fsutil.rs already exposes it).
+  Deferred: needs to verify no perf regression from the extra
+  sync on hot paths.
+- **identity (0 HIGH):** issuer/audience/JTI checks are all
+  operator-configurable but default-permissive. Design intent
+  (deployment-flexibility); operator documentation is the
+  remedy, not code.
+
 ### Bug-hunt round 18: stop_reason over-strict regression fix + MCP Content-Type + compression marker (2026-08-20)
 
 Four fresh deep-dives — code-review of round-17 (caught a
