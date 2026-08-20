@@ -1064,6 +1064,11 @@ impl Finalizer {
                     breaker.clone(),
                     path.clone(),
                     trajectory.final_metrics.as_ref(),
+                    // One bridge event was published per persisted step (the
+                    // journal enforces sequence == index during
+                    // consolidation), so the step count is the next free
+                    // sequence for the close/receipt tail.
+                    trajectory.steps.len() as u64,
                 )
                 .map_err(FinalizeError::Atif)?,
             ) {
@@ -2801,11 +2806,16 @@ fn archive_conflicting_atif(
     }
     // Trajectory ids come from `new_event_uid` (UUIDv7), but the bytes
     // on disk are untrusted — keep only filesystem-safe characters so a
-    // planted trajectory_id cannot steer the archive path.
+    // planted trajectory_id cannot steer the archive path. `'.'` is
+    // deliberately excluded: a planted id ending in `.json` would give
+    // `with_extension` an archived name whose `extension()` is still
+    // `json`, re-entering the recovery scan this rename exists to escape
+    // (the scan would then quarantine the archive as sidecar-less,
+    // splitting the archived evidence pair).
     let mut suffix: String = existing_id
         .unwrap_or_default()
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
         .take(64)
         .collect();
     if suffix.is_empty() {

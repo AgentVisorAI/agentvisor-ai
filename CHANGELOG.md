@@ -4,6 +4,48 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Full-codebase bug hunt: eight fixes across bridge, harness, and dashboard (2026-08-20)
+
+A four-agent parallel sweep of all twelve crates (~58k lines) after the
+round-42 close. Eight verified findings, all fixed:
+
+- **embedded bus (high):** a failure after retention's hot-segment
+  rename (directory sync, sidecar rewrite, or writer reopen) left the
+  append handle on the unlinked pre-rewrite inode without poisoning the
+  partition — every subsequent publish was acked as durable but written
+  to freed disk. Post-rename failures now poison the partition
+  (fail-closed until restart), matching the append-truncation posture.
+- **Kafka bus (medium-high):** `find_event_by_uid` ran the whole
+  earliest→latest scan inside one 10 s executor window, so lookups on
+  large partitions timed out on every attempt forever — blocking cold
+  intent draining and crash-recovery UID lookups. Now pages one fetch
+  per executor call, the shape the NATS implementation already
+  documented as required.
+- **embedded bus (medium):** `fetch` hard-errored on the first
+  unparseable segment line while retention keeps such lines forever and
+  recovery deliberately tolerates them — one corrupt line bricked the
+  read side permanently while publishes kept acking. `fetch` now skips
+  the line with a warning, consistent with `recover_segment`.
+- **harness (medium):** ATIF-adopted unsigned sessions never restored
+  their event sequence (both sibling recovery paths do), so a
+  post-crash SESSION_CLOSE or retroactive-receipt event was minted with
+  `metadata.sequence = 0`, colliding with step event 0 already on the
+  bridge. `Session::recover_unsigned` now takes and restores the
+  published-event count.
+- **bridge (low-medium):** cold exports and the cold outbox fsynced
+  only the leaf directory; newly created ancestor dirents were
+  volatile, so a power loss after the hot rewrite could drop the only
+  remaining copy. New `fsutil::create_dir_all_synced` syncs the parent
+  of every directory it creates.
+- **harness (low):** `archive_conflicting_atif` admitted `'.'` in the
+  untrusted archived-name suffix, so a planted `trajectory_id` ending
+  in `.json` produced an archive the recovery scan re-adopts and then
+  quarantines, splitting the archived evidence pair. Dots are now
+  stripped.
+- **dashboard (low):** the footer linked `/dashboard/api/help`, which
+  no route serves (404); the link is removed. `fmtAge` rounded past
+  its unit boundary ("60m ago", "24h ago"); it now floors.
+
 ### Review round 42: the audit catches its own round-38 artifact (2026-08-16)
 
 The fourth model's final src tranche (events, loopdetect, compress,

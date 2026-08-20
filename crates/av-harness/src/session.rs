@@ -313,14 +313,25 @@ impl Session {
     }
 
     /// Recreate a closed unsigned session from a persisted ATIF trajectory.
+    ///
+    /// `next_seq` is the number of per-session events already published to
+    /// the bridge for this session (steps ↔ journal records are 1:1, so the
+    /// step count is exact). Without restoring it, an adopted session
+    /// reports `peek_seq() == 0` and a post-crash SESSION_CLOSE or
+    /// retroactive-receipt event is minted with `metadata.sequence = 0`,
+    /// colliding with the session's first step event already on the bridge
+    /// (both sibling recovery paths call `restore_next_seq`; this one used
+    /// to be the exception).
     pub fn recover_unsigned(
         id: String,
         identity: AgentIdentity,
         breaker: av_loopdetect::BreakerConfig,
         path: PathBuf,
         metrics: Option<&av_atif::FinalMetrics>,
+        next_seq: u64,
     ) -> Result<Self, String> {
         let session = Self::new(id, Workflow::Unsigned, identity, breaker);
+        session.restore_next_seq(next_seq);
         session.closed.store(1, Ordering::Release);
         session.mark_artifact_committed();
         *session.atif_path.lock() = Some(path);

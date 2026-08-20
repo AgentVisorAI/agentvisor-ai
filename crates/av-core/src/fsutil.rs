@@ -47,6 +47,33 @@ pub fn sync_directory(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Create `path` and any missing ancestors, then fsync the parent of every
+/// directory that was newly created so the dirents naming them survive a
+/// crash. A bare `create_dir_all` + `sync_directory(leaf)` leaves newly
+/// created *ancestor* entries volatile: a power loss can drop the whole
+/// subtree even though the leaf's own contents were fsynced.
+pub fn create_dir_all_synced(path: &Path) -> io::Result<()> {
+    let mut missing: Vec<std::path::PathBuf> = Vec::new();
+    let mut current = Some(path);
+    while let Some(dir) = current {
+        if dir.as_os_str().is_empty() || dir.exists() {
+            break;
+        }
+        missing.push(dir.to_path_buf());
+        current = dir.parent();
+    }
+    std::fs::create_dir_all(path)?;
+    // Highest new ancestor first, so each synced parent already exists.
+    for dir in missing.iter().rev() {
+        if let Some(parent) = dir.parent() {
+            if !parent.as_os_str().is_empty() {
+                sync_directory(parent)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Receipts JCS-canonicalize to a few hundred bytes; even a huge
 /// tool-call summary stays well under 16 MiB. Shared between the CLI
 /// (`avctl receipt-verify`) and the harness reconciler (round-17 F3).

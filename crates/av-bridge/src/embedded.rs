@@ -351,7 +351,10 @@ impl EmbeddedBroker {
                             .and_then(std::ffi::OsStr::to_str)
                             .unwrap_or("partition");
                         let cold_dir = Path::new(cold).join(&t.name).join(partition);
-                        fs::create_dir_all(&cold_dir)?;
+                        // Sync newly created ancestors too: the hot rewrite
+                        // below destroys the only other copy, so the cold
+                        // subtree's dirents must be durable before it runs.
+                        av_core::fsutil::create_dir_all_synced(&cold_dir)?;
                         for line in &expired {
                             let event: StoredEvent = serde_json::from_str(line)?;
                             write_cold_event_once(&cold_dir, &event)?;
@@ -382,70 +385,91 @@ impl EmbeddedBroker {
                 }
                 fs::rename(&tmp, &part.path)?;
                 guard.disarm();
-                if let Some(parent) = part.path.parent() {
-                    av_core::fsutil::sync_directory(parent)?;
-                }
-                // Prune the idempotency map + sidecar of any UID whose offset
-                // was expired: without this, a subsequent `publish_idempotent`
-                // with a still-cached UID returns an ack pointing at data that
-                // no longer exists, and the caller's follow-up `fetch(offset)`
-                // silently returns the wrong event or nothing.
-                //
-                // We compute survivors from parseable lines, but ALSO keep
-                // the range [min_kept_offset, max_kept_offset]: any UID
-                // whose offset falls in that range is potentially attached
-                // to an unparseable-but-kept line, and dropping it would
-                // let the next publish_idempotent re-append a duplicate
-                // record (which retention would then choke on next pass).
-                let survivors: std::collections::HashSet<u64> = kept
-                    .iter()
-                    .filter_map(|line| serde_json::from_str::<StoredEvent>(line).ok())
-                    .map(|event| event.offset)
-                    .collect();
-                let range = if survivors.is_empty() {
-                    None
-                } else {
-                    // A single manual pass gives min/max and avoids
-                    // expect() on the guaranteed-non-empty iterator.
-                    let (mut lo, mut hi) = (u64::MAX, 0u64);
-                    for offset in &survivors {
-                        lo = lo.min(*offset);
-                        hi = hi.max(*offset);
+                // Everything between the rename above and a successful
+                // writer reopen below runs while `part.writer` still holds
+                // the fd of the pre-rewrite (now unlinked) inode. If any of
+                // it fails, propagating the error WITHOUT poisoning the
+                // partition would leave that stale handle live: every
+                // subsequent publish would append to the unlinked inode —
+                // acked as durable, invisible to `fetch`, and irrecoverably
+                // freed at process exit. Poison the partition on any
+                // post-rename failure so appends fail closed until a
+                // restart reopens the renamed segment (same fail-closed
+                // posture as an unrepaired append truncation).
+                let post_rename: Result<(), BusError> = (|| {
+                    if let Some(parent) = part.path.parent() {
+                        av_core::fsutil::sync_directory(parent)?;
                     }
-                    Some((lo, hi))
-                };
-                let before = part.seen_event_uids.len();
-                part.seen_event_uids.retain(|_, offset| {
-                    if survivors.contains(offset) {
-                        return true;
-                    }
-                    match range {
-                        Some((lo, hi)) => *offset >= lo && *offset <= hi,
-                        None => false,
-                    }
-                });
-                if part.seen_event_uids.len() != before {
-                    // Sidecar is now stale — rewrite it atomically with only
-                    // the surviving mappings so recovery cannot resurrect a
-                    // just-expired UID.
-                    let mut lines: Vec<(String, u64)> = part
-                        .seen_event_uids
+                    // Prune the idempotency map + sidecar of any UID whose offset
+                    // was expired: without this, a subsequent `publish_idempotent`
+                    // with a still-cached UID returns an ack pointing at data that
+                    // no longer exists, and the caller's follow-up `fetch(offset)`
+                    // silently returns the wrong event or nothing.
+                    //
+                    // We compute survivors from parseable lines, but ALSO keep
+                    // the range [min_kept_offset, max_kept_offset]: any UID
+                    // whose offset falls in that range is potentially attached
+                    // to an unparseable-but-kept line, and dropping it would
+                    // let the next publish_idempotent re-append a duplicate
+                    // record (which retention would then choke on next pass).
+                    let survivors: std::collections::HashSet<u64> = kept
                         .iter()
-                        .map(|(uid, offset)| (uid.clone(), *offset))
+                        .filter_map(|line| serde_json::from_str::<StoredEvent>(line).ok())
+                        .map(|event| event.offset)
                         .collect();
-                    lines.sort_by_key(|(_, offset)| *offset);
-                    let mut sidecar = Vec::new();
-                    for (uid, offset) in lines {
-                        let mapping = serde_json::to_string(&EventUidOffset {
-                            event_uid: uid,
-                            offset,
-                        })?;
-                        sidecar.extend_from_slice(mapping.as_bytes());
-                        sidecar.push(b'\n');
+                    let range = if survivors.is_empty() {
+                        None
+                    } else {
+                        // A single manual pass gives min/max and avoids
+                        // expect() on the guaranteed-non-empty iterator.
+                        let (mut lo, mut hi) = (u64::MAX, 0u64);
+                        for offset in &survivors {
+                            lo = lo.min(*offset);
+                            hi = hi.max(*offset);
+                        }
+                        Some((lo, hi))
+                    };
+                    let before = part.seen_event_uids.len();
+                    part.seen_event_uids.retain(|_, offset| {
+                        if survivors.contains(offset) {
+                            return true;
+                        }
+                        match range {
+                            Some((lo, hi)) => *offset >= lo && *offset <= hi,
+                            None => false,
+                        }
+                    });
+                    if part.seen_event_uids.len() != before {
+                        // Sidecar is now stale — rewrite it atomically with only
+                        // the surviving mappings so recovery cannot resurrect a
+                        // just-expired UID.
+                        let mut lines: Vec<(String, u64)> = part
+                            .seen_event_uids
+                            .iter()
+                            .map(|(uid, offset)| (uid.clone(), *offset))
+                            .collect();
+                        lines.sort_by_key(|(_, offset)| *offset);
+                        let mut sidecar = Vec::new();
+                        for (uid, offset) in lines {
+                            let mapping = serde_json::to_string(&EventUidOffset {
+                                event_uid: uid,
+                                offset,
+                            })?;
+                            sidecar.extend_from_slice(mapping.as_bytes());
+                            sidecar.push(b'\n');
+                        }
+                        rewrite_atomic(&part.idempotency_path, &sidecar)?;
                     }
-                    rewrite_atomic(&part.idempotency_path, &sidecar)?;
+                    part.writer = fs::OpenOptions::new().append(true).open(&part.path)?;
+                    Ok(())
+                })();
+                if let Err(error) = post_rename {
+                    part.poisoned = Some(format!(
+                        "retention post-rename failure ({error}); the append handle may still \
+                         reference the replaced segment inode (restart to recover)"
+                    ));
+                    return Err(error);
                 }
-                part.writer = fs::OpenOptions::new().append(true).open(&part.path)?;
             }
         }
         Ok(expired_total)
@@ -987,7 +1011,24 @@ impl EventBus for EmbeddedBroker {
             if line.is_empty() {
                 continue;
             }
-            let ev: StoredEvent = serde_json::from_str(&line)?;
+            let ev: StoredEvent = match serde_json::from_str(&line) {
+                Ok(ev) => ev,
+                // Same policy as `recover_segment`: a single unparseable
+                // complete line (bit-rot, tamper, a crash mode recovery
+                // does not repair) must not brick the read side. Retention
+                // keeps unparseable lines forever (`split_by_time` treats
+                // them as non-expired), so erroring here made every fetch
+                // spanning the line fail permanently while publishes kept
+                // acking events that could never be delivered.
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        path = %av_core::fsutil::basename(&part.path),
+                        "skipping unparseable segment record during fetch",
+                    );
+                    continue;
+                }
+            };
             if ev.offset < offset {
                 continue;
             }
