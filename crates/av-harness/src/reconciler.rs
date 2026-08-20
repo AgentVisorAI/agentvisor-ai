@@ -3458,14 +3458,14 @@ async fn resolve_lifecycle_ack(
     })
     .await
     .map_err(|error| FinalizeError::Task(error.to_string()))?
-    .map_err(|error| FinalizeError::Bridge(error.to_string()))?
+    .map_err(FinalizeError::from)?
     {
         return Ok(ack);
     }
     tokio::task::spawn_blocking(move || bridge.publish_idempotent(&topic, &key, &value, &event_uid))
         .await
         .map_err(|error| FinalizeError::Task(error.to_string()))?
-        .map_err(|error| FinalizeError::Bridge(error.to_string()))
+        .map_err(FinalizeError::from)
 }
 
 /// Round-14 F5: check whether `read_complete_journal` has previously

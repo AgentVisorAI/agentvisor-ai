@@ -240,6 +240,13 @@ impl Registry {
     /// [`WIDE_LATENCY_BOUNDS_US`] for spans dominated by network I/O
     /// (upstream LLM streaming, reconciler filesystem scans); use
     /// [`DEFAULT_LATENCY_BOUNDS_US`] for fast internal stages.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `key` is already registered as a counter; a silent
+    /// overwrite would detach the existing metric from the registry
+    /// and lose every observation collected against it. Same
+    /// key-byte guard as [`Self::counter`] applies.
     #[allow(clippy::panic)]
     pub fn histogram_with_bounds(&self, key: &str, help: &str, bounds_us: &[u64]) -> Arc<Histogram> {
         validate_metric_key(key);

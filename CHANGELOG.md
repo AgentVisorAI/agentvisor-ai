@@ -4,6 +4,59 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 29: round-28 primary-path fix + config UX polish + panic docs (2026-08-20)
+
+Four fresh deep-dives — code-review of round-28 (caught a HIGH-severity
+regression I introduced), config UX audit (5 findings; 2 applied),
+doc-code drift (5 findings; 1 applied), dead-code audit (mostly
+intentional defense-in-depth).
+
+- **harness (HIGH, regression self-fix from round-28):** the
+  round-28 BusError classification fix updated only 2 of the 4
+  BusError→FinalizeError conversion sites. The two missed sites
+  live in `resolve_lifecycle_ack`, which is the emission path
+  taken by the PRIMARY HTTP `close_session` and
+  `promote_session` handlers. Round-28's fix therefore did nothing
+  for the request path that motivated it — the exact retry-storm
+  it claimed to eliminate was still active. Both sites now use
+  `.map_err(FinalizeError::from)`. **This fix ships in the same
+  round because round-28 is not yet released and the
+  primary-path miss would defeat its stated goal.**
+- **config (medium, UX):** `HarnessConfig::validate` refused
+  ambiguity and dangling for `tool_upstream_bearer_env/_file` but
+  did NOT refuse explicit empty strings; an operator setting
+  `tool_upstream_bearer_env = ""` would fail only at first tool
+  call with a less actionable error. Now caught at config load
+  with a specific "must not be empty when set" error.
+- **cli (medium, UX):** `avctl doctor` did not probe
+  `tool_upstream_bearer_env/_file` — a mis-permissioned bearer
+  file or unset env var would pass doctor and fail at first MCP
+  call. Now applies the same
+  `require_owner_only_secret` posture to the tool bearer that
+  round-14 F1 applied to the upstream API key.
+- **core (low, docs):** `Registry::histogram_with_bounds` panics
+  on metric-type conflicts but lacked a `# Panics` section in
+  its doc comment. Sibling `Registry::histogram` did have it.
+  Now consistent.
+
+Not actionable this round:
+- **docs (deferred):** `OcsfEventBuilder` claim "enforces
+  invariants" is overstated — build() JCS-checks integers and now
+  range-checks pruning_ratio_millis, but doesn't validate
+  severity/activity/status. Round-38 F3 documented the
+  workaround; docstring rewording deferred.
+- **docs (deferred):** README overstates "every session ends
+  with a signed receipt" — the unsigned workflow exists too.
+  Text change deferred pending decision on which flow is the
+  primary customer-facing default.
+- **config UX (deferred):** `dashboard_enabled=true` unauthed
+  dashboard default is real; would need auth infra to change
+  safely.
+- **dead code (deferred):** three `pub` items with no callers
+  (`data_dir`, `from_json_str`, `scopes_cover`) could be
+  demoted to `pub(crate)` or removed, but that's cosmetic and
+  might break unreleased API expectations.
+
 ### Bug-hunt round 28: permanent vs transient bridge error classification (2026-08-20)
 
 Round-27 flagged BusError classification as a deferred design item.

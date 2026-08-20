@@ -720,6 +720,30 @@ impl HarnessConfig {
                     .into(),
             );
         }
+        // Round-29 F1 (av-harness config): parity with the
+        // `upstream_api_key_env`/`_file` non-empty checks above.
+        // The prior code refused ambiguity (both set) and refused
+        // dangling (bearer without tool URL), but a caller supplying
+        // an explicit empty string would fail only at first tool
+        // call — at which point `resolve_upstream_bearer` returns
+        // the same "environment variable {name} is not set (or
+        // empty)" error the harness surfaces for a missing key.
+        // Catch it here so the actionable message reaches the
+        // operator at config load.
+        if self
+            .tool_upstream_bearer_env
+            .as_deref()
+            .is_some_and(str::is_empty)
+        {
+            return Err("tool_upstream_bearer_env must not be empty when set".into());
+        }
+        if self
+            .tool_upstream_bearer_file
+            .as_deref()
+            .is_some_and(str::is_empty)
+        {
+            return Err("tool_upstream_bearer_file must not be empty when set".into());
+        }
         if (self.tool_upstream_bearer_env.is_some() || self.tool_upstream_bearer_file.is_some())
             && self.tool_upstream_url.as_deref().is_none_or(str::is_empty)
         {
