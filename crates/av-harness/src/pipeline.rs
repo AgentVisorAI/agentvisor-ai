@@ -550,7 +550,7 @@ impl AppState {
         }
         metrics.counter(
             "av_events_dropped_total{stage=\"worker_queue\"}",
-            "Worker jobs dropped",
+            "Worker jobs or response-slot reservations dropped, labeled by admission stage",
         );
         metrics.counter(
             "av_worker_panics_total",
@@ -616,11 +616,11 @@ impl AppState {
             );
             metrics.counter(
                 &format!("av_dashboard_requests_total{{endpoint=\"{endpoint}\",status=\"ok\"}}"),
-                "Dashboard endpoint requests served",
+                "Dashboard endpoint requests, labeled by status",
             );
             metrics.counter(
                 &format!("av_dashboard_requests_total{{endpoint=\"{endpoint}\",status=\"not_found\"}}"),
-                "Dashboard endpoint requests that could not be served",
+                "Dashboard endpoint requests, labeled by status",
             );
         }
         let sessions = Arc::new(SessionRegistry::new());
