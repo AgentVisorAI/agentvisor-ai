@@ -1807,7 +1807,45 @@ impl AbortFinalizingStream {
         self.capture_attempted = true;
         let reasoning =
             (!self.response_reasoning.is_empty()).then(|| std::mem::take(&mut self.response_reasoning));
-        let analysis_text = reasoning.clone().unwrap_or_else(|| self.response_message.clone());
+        // Materialize the tool-call list up front so we can fall back to
+        // its content when the response body has neither an assistant
+        // message nor reasoning. Round-53 F1: without this, tool-only
+        // responses (a legitimate agent mode: "return only tool_calls,
+        // no assistant text") collapsed to an all-zero embedding at
+        // `av_loopdetect::embed`, which the breaker treats as a hostile
+        // duplicate and grows the loop streak on — so a healthy agent
+        // that just happened to be tool-driven would get flagged as
+        // looping after the min-tokens threshold.
+        let tool_calls: Vec<av_atif::ToolCall> = std::mem::take(&mut self.response_tool_calls)
+            .into_values()
+            .map(|partial| {
+                let arguments = serde_json::from_str(&partial.arguments)
+                    .unwrap_or_else(|_| json!({"raw": partial.arguments}));
+                av_atif::ToolCall {
+                    tool_call_id: partial.id.unwrap_or_else(av_core::new_event_uid),
+                    function_name: partial.name.unwrap_or_else(|| "unknown".to_owned()),
+                    arguments,
+                    extra: None,
+                }
+            })
+            .collect();
+        let analysis_text = if let Some(text) = reasoning.clone() {
+            text
+        } else if !self.response_message.is_empty() {
+            self.response_message.clone()
+        } else if !tool_calls.is_empty() {
+            tool_calls
+                .iter()
+                .map(|tc| format!("{}({})", tc.function_name, tc.arguments))
+                .collect::<Vec<_>>()
+                .join(" ")
+        } else {
+            String::new()
+        };
+        // Skip loop analysis when the response is genuinely empty (no
+        // reasoning, no message, no tool calls) — a zero-vector embed
+        // would otherwise poison the breaker's duplicate detection.
+        let analyze_loop = !analysis_text.is_empty();
         let native_finish_reason = self.response_finish_reason.clone();
         let (class, status, stop_reason, payload) = if let Some(reason) = failure {
             (
@@ -1848,19 +1886,6 @@ impl AbortFinalizingStream {
                 }),
             )
         };
-        let tool_calls: Vec<av_atif::ToolCall> = std::mem::take(&mut self.response_tool_calls)
-            .into_values()
-            .map(|partial| {
-                let arguments = serde_json::from_str(&partial.arguments)
-                    .unwrap_or_else(|_| json!({"raw": partial.arguments}));
-                av_atif::ToolCall {
-                    tool_call_id: partial.id.unwrap_or_else(av_core::new_event_uid),
-                    function_name: partial.name.unwrap_or_else(|| "unknown".to_owned()),
-                    arguments,
-                    extra: None,
-                }
-            })
-            .collect();
         let permit = self
             .response_permit
             .take()
@@ -1873,7 +1898,7 @@ impl AbortFinalizingStream {
                 class,
                 payload,
                 text: analysis_text,
-                analyze_loop: true,
+                analyze_loop,
                 status,
                 stop_reason,
                 native_stop_reason: native_finish_reason,

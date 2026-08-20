@@ -4,6 +4,52 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 13: fix false loop-breaker trips on tool-only responses; three 0-actionable deep-dives (2026-08-20)
+
+Four fresh line-by-line deep-dives — a code-review of the round-12
+identity + CI cleanup commits (came back clean; workspace builds
+verified), and audits of `av-atif/`, `av-events/`, and
+`av-loopdetect/` + `av-compress/`. One real production bug found in
+loop detection; the other three deep-dives surfaced either
+false-positives or defensible-by-design behaviors.
+
+- **harness (high, correctness):** `AbortFinalizingStream::submit_response_capture`
+  computed `analysis_text = reasoning || response_message` and always
+  passed `analyze_loop: true`. For tool-call-only responses (a
+  legitimate agent mode — "return only `tool_calls`, no assistant
+  text"), both are empty. `av_loopdetect::embed` collapses empty
+  input to a zero-vector embedding; the breaker at `breaker.rs:174-179`
+  treats non-finite/all-zero embeddings as hostile duplicates
+  (`delta = 0`), so every tool-only turn grew the loop streak until
+  `min_tokens` was met and the breaker tripped — silently blocking
+  healthy tool-driven agents as "looping". `analysis_text` now falls
+  back to synthesizing `"tool_name(arguments)"` for each of the
+  response's tool calls, and `analyze_loop` is skipped entirely when
+  every input is empty.
+
+Not actionable this round:
+- **ATIF strict-validator type-check gaps** on `agent.model_name`,
+  `step.model_name`, `subagent_trajectory_ref` typed members —
+  real for third-party ATIF ingestion, low impact for the harness's
+  own emissions (which are typed at construction). Full typed check
+  deferred as a validator-completeness pass.
+- **Loop-detect Qdrant cross-session vector contamination** —
+  `vector_sink` searches by `session_id` only; recycled session ids
+  inherit old vectors. Real but production-Qdrant only; needs
+  vector-time TTL or session-close cleanup.
+- **Compression O(n²) work** in the duplicate and middle passes on
+  large payloads (up to `max_request_bytes = 4 MiB`). Bounded but
+  noticeable; refactor to O(n) via HashSet + one-shot payload walk
+  deferred.
+
+False positives:
+- **OCSF class/type_uid linkage** — the deep-dive claimed
+  `validate_event` isn't called on the publish path, so linkage
+  could break. But `OcsfEventBuilder::build()` derives
+  `type_uid = class_uid × 100 + activity_id` (model.rs:408), so the
+  linkage is enforced by construction. The harness has no path that
+  bypasses the builder.
+
 ### Bug-hunt round 12: two identity fixes + round-11 doc fix; one 0-finding-actionable deep-dive (2026-08-20)
 
 Four fresh line-by-line deep-dives this round — a code-review of round
