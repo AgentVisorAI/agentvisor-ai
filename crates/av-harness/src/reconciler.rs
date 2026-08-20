@@ -460,6 +460,32 @@ impl Finalizer {
             return Err(FinalizeError::CaptureIncomplete);
         }
         let started = Instant::now();
+        // Round-21 F2 (av-harness metrics): observe finalize latency
+        // on EVERY exit path, not only on the success terminal at
+        // ~line 597. `close_session_locked` is a long function with
+        // multiple `?`-propagations; a failing bridge/fs/receipt
+        // step would return without an observation, hiding the
+        // fact that repeated finalize attempts were themselves
+        // slow. `_finalize_observer`'s Drop records duration under
+        // every exit including early Err returns.
+        struct FinalizeObserver<'a> {
+            metrics: &'a Registry,
+            started: Instant,
+        }
+        impl Drop for FinalizeObserver<'_> {
+            fn drop(&mut self) {
+                self.metrics
+                    .histogram(
+                        "av_session_finalize_duration_seconds",
+                        "Session finalization latency",
+                    )
+                    .observe_us(elapsed_us(self.started));
+            }
+        }
+        let _finalize_observer = FinalizeObserver {
+            metrics: self.metrics.as_ref(),
+            started,
+        };
         let outcome = match session.workflow {
             Workflow::Signed => {
                 let subject = {
@@ -481,11 +507,20 @@ impl Finalizer {
                 } else {
                     let body = session.receipt_body(subject, stop_reason);
                     let sign_started = Instant::now();
-                    let receipt = Receipt::issue(body, self.signer.as_ref())
-                        .map_err(|error| FinalizeError::Receipt(error.to_string()))?;
+                    let receipt_result = Receipt::issue(body, self.signer.as_ref());
+                    // Round-21 F1 (av-harness metrics): observe the
+                    // signing histogram BEFORE `?`-propagating the
+                    // error, so a Receipt::issue failure still
+                    // produces a latency sample. The prior code
+                    // observed only on the success branch, so
+                    // sudden signing-latency regressions on error
+                    // paths (e.g. key-provider timeouts) were
+                    // invisible to alerting.
                     self.metrics
                         .histogram("av_receipt_sign_duration_seconds", "Receipt signing latency")
                         .observe_us(elapsed_us(sign_started));
+                    let receipt =
+                        receipt_result.map_err(|error| FinalizeError::Receipt(error.to_string()))?;
                     self.persist_receipt(&session.id, &receipt).await?;
                     *session.receipt.lock() = Some(receipt.clone());
                     receipt
@@ -783,12 +818,16 @@ impl Finalizer {
             // promotion signing latency invisible. An operator
             // watching `av_receipt_sign_duration_seconds` would
             // see promotion-signing regressions as a flat metric.
+            //
+            // Round-21 F1 (av-harness metrics): observe the
+            // histogram BEFORE `?`-propagating so signing failures
+            // still produce samples.
             let sign_started = Instant::now();
-            let receipt = Receipt::issue(body, self.signer.as_ref())
-                .map_err(|error| FinalizeError::Receipt(error.to_string()))?;
+            let receipt_result = Receipt::issue(body, self.signer.as_ref());
             self.metrics
                 .histogram("av_receipt_sign_duration_seconds", "Receipt signing latency")
                 .observe_us(elapsed_us(sign_started));
+            let receipt = receipt_result.map_err(|error| FinalizeError::Receipt(error.to_string()))?;
             self.persist_receipt(&session.id, &receipt).await?;
             *session.receipt.lock() = Some(receipt.clone());
             receipt
@@ -2218,10 +2257,29 @@ impl Finalizer {
                 if intent_session_id.as_deref() != Some(session_id.as_str()) {
                     continue;
                 }
+                // Round-21 F3 (av-harness spool): delete AUDITED first,
+                // OUTCOME next, INTENT last. Recovery invariant: the
+                // outcome file exists only if the intent exists.
+                // Historically we deleted intent FIRST, so a crash
+                // between the intent removal and the outcome removal
+                // left an orphaned outcome that startup recovery
+                // treats as fatal (routes.rs::from_request refuses
+                // outcome-without-intent), and main.rs bubbles that
+                // up as a startup failure. Reversing the order keeps
+                // the invariant intact under any crash timing.
+                //
+                // Round-21 F4 (defense-in-depth): also try to remove
+                // any `.intent.torn` twin for the same key. Note
+                // that orphan `.intent.torn` files (whose companion
+                // `.intent.json` was quarantined by rename) are not
+                // reached by this loop and are preserved as
+                // forensic evidence; they are the operator's
+                // choice to sweep by age.
                 for suffix in [
-                    crate::spool::TOOL_INTENT_SUFFIX,
-                    crate::spool::TOOL_OUTCOME_SUFFIX,
                     crate::spool::TOOL_AUDITED_SUFFIX,
+                    crate::spool::TOOL_OUTCOME_SUFFIX,
+                    crate::spool::TOOL_INTENT_SUFFIX,
+                    ".intent.torn",
                 ] {
                     let file = directory.join(format!("{key}{suffix}"));
                     match std::fs::remove_file(&file) {
