@@ -4,6 +4,53 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 25: sandbox scanner classification + trailing-content refusal (2026-08-20)
+
+Four fresh deep-dives — code-review of round-24 (clean), av-bridge JSON
+ingest surface (1 finding; deferred), av-sandbox scanner classification
+(2 real findings applied), NHI identity claims (2 design-level items).
+
+- **sandbox (medium, misleading triage):** `reject_duplicate_keys`
+  wrapped EVERY scanner error with the "duplicate JSON key
+  rejected: ..." prefix. Malformed JSON (unbalanced brace), EOF,
+  recursion-limit exceeded, and invalid escapes ALL surfaced as
+  if they were duplicate-key rejections — operators paged on
+  "dup-key spike" alerts saw noise from ordinary malformed
+  broker payloads. Mirrors round-16 F6's sentinel fix in
+  `av_receipts::check_no_duplicate_keys`: a `DUP_KEY_SENTINEL`
+  prefix internal to the scanner tags real dup-key errors, and
+  the map-err arm strips it and preserves the class. Parse
+  errors now surface with their own class (`RpcError::Json(msg)`
+  with the underlying serde_json message, no fake prefix).
+  Regression test: `duplicate_key_class_distinguished_from_generic_parse_error`.
+- **sandbox (medium, smuggled-second-value refusal):** the
+  scanner used `deserialize_any`, which returns after the first
+  complete JSON value. An input like `{"ok":1}garbage` was
+  silently accepted. A proxy that inspected only the first value
+  could disagree with a downstream that concatenated the buffer
+  differently — a classic "smuggled second document" surface.
+  Added `Deserializer::end()` after the scan; trailing whitespace
+  is still accepted (benign network padding). Regression test:
+  `trailing_garbage_after_valid_json_is_refused`.
+
+Not actionable this round:
+- **bridge (deferred):** `nats_bus`/`kafka_bus` deserialize
+  broker payloads without duplicate-key pre-scan; a compromised
+  emitter can publish malformed JSON that keeps consumers stuck
+  at that offset until retention or manual cleanup. Kafka has a
+  16 MiB byte cap; NATS has no app-level byte cap. Requires
+  topic-schema decisions to fix.
+- **identity (deferred):** no explicit NHI type discriminator
+  (`token_type=nhi` claim). Any JWT with the required custom
+  claims that verifies against the trusted issuer/audience is
+  accepted as an NHI. Design intent (broad deployment
+  flexibility); operator IdP config is the current lever.
+- **identity (deferred):** session/tool binding uses only
+  `{version, charter, instance_uid}`; two valid tokens with
+  different `sub` but the same triple bind as the same
+  principal. Design item; may want `sub` binding in a future
+  major.
+
 ### Bug-hunt round 24: dangling subagent refs + ATIF writer durability parity (2026-08-20)
 
 Four fresh deep-dives — code-review of round-23 (clean), duplicate-key
