@@ -66,6 +66,17 @@ impl EmbeddedBroker {
         manifest
             .validate()
             .map_err(|e| BusError::Backend(e.to_string()))?;
+        // Round-17 F3 (av-bridge): reject a scheme-URI cold_uri BEFORE
+        // any filesystem side effect. The prior check lived in
+        // `open()` (after provision had already written manifest.yaml,
+        // per-topic dirs, and schema copies to disk); when
+        // provision-then-open failed here, the operator saw a "bridge
+        // already provisioned" error on retry after fixing the
+        // manifest, because the botched files still sat in data_dir.
+        // Move the check to the top of provision so a failure leaves
+        // data_dir untouched and retry-clean.
+        #[cfg(not(feature = "cold-store"))]
+        reject_cold_uri_without_feature(manifest)?;
         let manifest_path = data_dir.join("manifest.yaml");
         fs::create_dir_all(data_dir)?;
         copy_referenced_schemas(data_dir, manifest)?;

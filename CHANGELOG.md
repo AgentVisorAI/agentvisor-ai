@@ -4,6 +4,70 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 17: cold_uri path escape + event/stop-reason consistency + JCS-safe deserialize guard (2026-08-20)
+
+Four fresh deep-dives — code-review of round-16 (clean, all 10 concerns
+verified), `av-events` (2 real findings applied), `av-bridge::cold_store`
++ embedded (1 real path escape + 1 provision-atomicity finding
+applied), and `av-loopdetect` (1 false-positive already-guarded, 3 low
+severity).
+
+- **bridge (HIGH, path escape):** a local (non-scheme) `cold_uri` was
+  used directly as a filesystem root at retention enforcement time
+  (`Path::new(cold).join(topic).join(partition)` in embedded.rs). A
+  manifest with `cold_uri: "data/../../etc/foo"` would land cold
+  objects outside the intended prefix — CWE-22 class. Fixed at
+  manifest validation: `BridgeManifest::validate` now refuses any
+  `..` component in a non-scheme cold_uri, and both absolute and
+  relative shapes are checked. Scheme URIs (`s3://`, `gs://`,
+  `file://`) skip the check — they are handled by the cold-store
+  feature layer. Regression test:
+  `validate_refuses_cold_uri_with_parent_directory_escape`.
+- **bridge (medium, provision atomicity):** the `cold-store`
+  feature-gate check `reject_cold_uri_without_feature` ran in
+  `EmbeddedBroker::open` — AFTER `provision` had already written
+  `manifest.yaml`, per-topic dirs, and schema copies to disk. When
+  provision-then-open failed here, the operator saw "bridge already
+  provisioned" on retry after fixing the manifest, because the
+  botched files still sat in `data_dir`. Moved the check to the top
+  of `provision` so a rejection leaves `data_dir` untouched and
+  retry-clean.
+- **events (medium, analytics split):** `validate_event` checked
+  that `stop_reason_id` and `stop_reason` were both present or both
+  absent, but did not check that they AGREED. An event with
+  `stop_reason_id=93` (PolicyBlocked) but `stop_reason="Loop
+  Detected"` passed validation, splitting downstream analytics
+  between id-groupers and caption-groupers. Now cross-checks that
+  `StopReason::from_id(id).caption() == stop_reason` whenever the
+  id maps to a known variant. Unknown ids remain forward-compatible
+  (round-29 F7's `#[serde(other)]` rationale).
+- **events (medium, JCS integer bypass):**
+  `OcsfEventBuilder::build` already refused values above
+  `av_core::error::JCS_SAFE_MAX` (2^53), but the deserialize path
+  (`serde_json::from_slice::<OcsfEvent>`) bypassed the guard. An
+  issuer sending `prompt_tokens = 2^53+1` would round-trip through
+  JS-based JSON auditors (`JSON.parse`) as a silently-truncated
+  value, breaking any receipt hash computed by JS consumers.
+  `validate_event` now applies the same JCS-safe check to `time`,
+  `metadata.sequence`, and every `EventMetrics` counter — matching
+  the builder's coverage.
+
+Not actionable this round:
+- **cold-store (medium, deferred):** no bounded retry/backoff on
+  persistent cold-store export failure — 403 forever. No DLQ /
+  poison-quarantine. Head-of-line blocking in retry queue: one bad
+  entry stalls later ones. All three are known deferred design
+  items from prior rounds.
+- **loopdetect (false positive):** `window == 0` finding — the
+  harness's `HarnessConfig::validate` already refuses this at
+  config load. A direct crate consumer (not via harness) could
+  still hit it, so the finding is a defense-in-depth note; not
+  fixed to preserve the crate's minimal invariant surface.
+- **loopdetect (low):** short-text (`len < 3`) `HashEmbedder`
+  collisions are inherent to the fallback embedder. Real agent
+  reasoning does not produce sub-3-char steps. `Qdrant` unbounded
+  retention: deferred design item from round-13.
+
 ### Bug-hunt round 16: upstream credential-header leak + ATIF strict/schema drift (2026-08-20)
 
 Four fresh deep-dives — code-review of round-15 (clean, all 10 concerns
