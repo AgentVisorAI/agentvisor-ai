@@ -128,11 +128,33 @@ proptest! {
 
         // Terminal check: an over-refund clamps at zero rather than
         // resurrecting headroom past the caps (documented saturating
-        // semantics).
+        // semantics). Assert against the model — a version of this check
+        // that ignored the verdicts could not fail.
+        let tool_held = model.per_tool.get(&0).copied().unwrap_or(0);
         let budget = ActionBudget::new(&store, session, &spec);
         budget.refund_tool_call(TOOLS[0], u64::MAX);
+        model.total_calls = model.total_calls.saturating_sub(1);
+        if tool_held > 0 {
+            *model.per_tool.entry(0).or_default() -= 1;
+        }
+        // The store clamps the payout counter at zero on over-refund.
+        model.payout = 0;
         for _ in 0..2 {
-            let _ = budget.try_tool_call(TOOLS[0], 0);
+            let model_allowed = max_total.is_none_or(|cap| model.total_calls + 1 <= cap)
+                && per_tool_cap
+                    .is_none_or(|cap| model.per_tool.get(&0).copied().unwrap_or(0) + 1 <= cap);
+            let decision = budget.try_tool_call(TOOLS[0], 0).unwrap();
+            prop_assert_eq!(
+                decision.is_allowed(),
+                model_allowed,
+                "post-over-refund verdict diverged from model: {:?}/{:?}",
+                model.total_calls,
+                model.per_tool
+            );
+            if model_allowed {
+                model.total_calls += 1;
+                *model.per_tool.entry(0).or_default() += 1;
+            }
         }
     }
 }

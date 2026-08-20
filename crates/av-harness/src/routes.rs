@@ -178,8 +178,7 @@ async fn chat_completions(
         response: upstream,
         lease,
         response_permit,
-        response_marker,
-        response_attempt_id,
+        capture_guard,
     } = forwarded;
     let Some(response_permit) = response_permit else {
         // Defensive: `prepare_chat` always reserves a permit. Even so,
@@ -189,10 +188,11 @@ async fn chat_completions(
         // recovery then quarantines the session) and leave a dangling
         // non-terminal ResponseAttempt. If even that submit fails, fail
         // the session closed rather than dropping the capture silently.
+        let (response_marker, response_attempt_id) = capture_guard.disarm();
         let capture_session = Arc::clone(&session);
         if state
             .worker
-            .try_submit(refused_response_failure_job(
+            .try_submit(crate::pipeline::refused_response_failure_job(
                 session,
                 identity,
                 "response_capture_permit_missing".to_owned(),
@@ -247,11 +247,12 @@ async fn chat_completions(
         // the header token is upstream-controlled bytes. If the shard
         // is full, fail the session closed rather than dropping the
         // capture silently (same rationale as forward_chat's Err arm).
+        let (response_marker, response_attempt_id) = capture_guard.disarm();
         let capture_session = Arc::clone(&session);
         if response_permit
             .submit(
                 &state.worker,
-                refused_response_failure_job(
+                crate::pipeline::refused_response_failure_job(
                     session,
                     identity,
                     "upstream_unsupported_content_encoding".to_owned(),
@@ -284,6 +285,10 @@ async fn chat_completions(
     let stream = upstream
         .bytes_stream()
         .map(|chunk| chunk.map_err(std::io::Error::other));
+    // `AbortFinalizingStream` owns marker retirement and attempt
+    // termination from here (including on mid-stream client disconnect,
+    // via its own Drop); hand both over and disarm the guard.
+    let (response_marker, response_attempt_id) = capture_guard.disarm();
     let stream = AbortFinalizingStream {
         inner: stream.boxed(),
         session,
@@ -458,6 +463,25 @@ fn tool_audit_gate(state: &AppState, key: &str) -> Arc<tokio::sync::Mutex<()>> {
 }
 
 async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    // The tool path mutates durable state at several awaits: the sandbox
+    // gate debits the budget, `execution.claim()` claims the execution
+    // key, the upstream call executes the tool, and persist/audit resolve
+    // the outcome. Axum drops the handler future on client disconnect; a
+    // cancellation between any two of those steps used to strand the
+    // intermediate state with no owner — a claimed-but-unresolved key
+    // answers every retry with 409 TOOL_OUTCOME_UNCERTAIN while the
+    // session lives (restart-time quarantine skips active sessions), and
+    // a debited-but-unrefunded budget burns quota headroom per
+    // disconnect. Run the whole body on a spawned task so it always runs
+    // to completion; the handler merely awaits (and may abandon) the
+    // result.
+    match tokio::spawn(mcp_call_inner(state, headers, body)).await {
+        Ok(response) => response,
+        Err(join_error) => lifecycle_error(format!("tool call task failed: {join_error}")),
+    }
+}
+
+async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Response {
     let (execution, unaudited_outcome) = if state.config.tool_upstream_url.is_some() {
         match ToolExecution::from_request(&state.config.atif_spool_dir, &headers, &body, state.journal_key) {
             Ok(mut execution) => {
@@ -1450,49 +1474,6 @@ fn pipeline_error(error: crate::pipeline::PipelineError) -> Response {
 
 fn lifecycle_error(error: String) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": error}))).into_response()
-}
-
-/// Terminal failure capture for an upstream response refused inside
-/// `chat_completions` after `forward_chat` already succeeded. Mirrors
-/// `forward_chat`'s Err arm: carrying `response_marker` lets the worker
-/// retire the durable in-flight marker, and `terminal: true` closes the
-/// journalled response attempt so crash recovery does not quarantine
-/// the session over a request the client already saw fail.
-fn refused_response_failure_job(
-    session: Arc<crate::session::Session>,
-    identity: av_events::AgentIdentity,
-    reason: String,
-    response_marker: Option<String>,
-    response_attempt_id: String,
-) -> crate::worker::WorkerJob {
-    let atif = (session.workflow == crate::session::Workflow::Unsigned).then(|| crate::worker::AtifCapture {
-        source: av_atif::Source::Agent,
-        message: Value::String(reason.clone()),
-        reasoning_content: None,
-        model_name: None,
-        tool_calls: None,
-        observation: None,
-        llm_call_count: Some(0),
-    });
-    crate::worker::WorkerJob {
-        session,
-        identity,
-        class: av_events::EventClass::StopReason,
-        payload: json!({"reason": reason, "direction": "upstream_response"}),
-        text: String::new(),
-        analyze_loop: false,
-        status: av_events::StatusId::Failure,
-        stop_reason: Some(StopReason::Other),
-        native_stop_reason: None,
-        metrics: av_events::EventMetrics::default(),
-        cost_usd_micros: 0,
-        atif,
-        response_marker,
-        response_attempt: Some(crate::worker::ResponseAttempt {
-            id: response_attempt_id,
-            terminal: true,
-        }),
-    }
 }
 
 struct AbortFinalizingStream {
