@@ -61,6 +61,33 @@ pub enum FinalizeError {
     /// Lifecycle event could not be durably published.
     #[error("lifecycle event publication failed: {0}")]
     Bridge(String),
+    /// Round-28 F1: lifecycle bridge failed due to a PERMANENT
+    /// misconfiguration (e.g. `BusError::UnknownTopic` — the topic
+    /// was not provisioned via the manifest). SDKs should NOT
+    /// retry this; the operator must fix the config. Historically
+    /// this collapsed into `Bridge(_)` and mapped to HTTP 503 +
+    /// `Retry-After`, so clients retried pointlessly. Kept as a
+    /// distinct variant so `finalize_error_response` can route it
+    /// to 400 (no Retry-After) while genuine transient failures
+    /// keep 503 semantics.
+    #[error("lifecycle event publication failed (permanent): {0}")]
+    BridgeConfig(String),
+}
+
+impl From<av_bridge::BusError> for FinalizeError {
+    /// Round-28 F1: preserve the permanence classification when
+    /// converting a bridge error into a Finalize error. Permanent
+    /// causes (unknown topic, serde) route to `BridgeConfig` so
+    /// clients see a 4xx status without `Retry-After`; transient
+    /// causes (I/O, backend outage) stay `Bridge` and keep 503
+    /// with `Retry-After`.
+    fn from(error: av_bridge::BusError) -> Self {
+        if error.is_permanent() {
+            Self::BridgeConfig(error.to_string())
+        } else {
+            Self::Bridge(error.to_string())
+        }
+    }
 }
 
 /// Shared asynchronous finalization service.
@@ -1829,7 +1856,7 @@ impl Finalizer {
         })
         .await
         .map_err(|error| FinalizeError::Task(error.to_string()))?
-        .map_err(|error| FinalizeError::Bridge(error.to_string()))?
+        .map_err(FinalizeError::from)?
         {
             crate::worker::persist_broker_ack(
                 &self.spool_dir,
@@ -1845,7 +1872,7 @@ impl Finalizer {
         let ack = tokio::task::spawn_blocking(move || bridge.publish_idempotent(&topic, &key, &value, &uid))
             .await
             .map_err(|error| FinalizeError::Task(error.to_string()))?
-            .map_err(|error| FinalizeError::Bridge(error.to_string()))?;
+            .map_err(FinalizeError::from)?;
         crate::worker::persist_broker_ack(&self.spool_dir, session_id, event_uid, &ack, &self.journal_key)
             .await
             .map_err(FinalizeError::Bridge)
