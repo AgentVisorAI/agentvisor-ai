@@ -324,7 +324,6 @@ fn reject_cold_uri_without_feature(manifest: &BridgeManifest) -> Result<(), BusE
 }
 
 impl EmbeddedBroker {
-
     /// Enforce per-topic hot retention at time `now_ms`: when
     /// `retention.cold_uri` is set, each expired record
     /// is first exported to the cold tier as its own write-once object (via the

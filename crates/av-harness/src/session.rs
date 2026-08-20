@@ -232,8 +232,7 @@ impl Session {
     pub(crate) fn set_idle_for_testing(&self, ago_seconds: u64) {
         let ago = Duration::from_secs(ago_seconds);
         self.last_activity_ms.store(
-            av_core::time::now_ms()
-                .saturating_sub(ago_seconds.saturating_mul(av_core::units::MS_PER_SEC)),
+            av_core::time::now_ms().saturating_sub(ago_seconds.saturating_mul(av_core::units::MS_PER_SEC)),
             Ordering::Release,
         );
         // `Instant::checked_sub` fails if the resulting Instant would

@@ -1322,8 +1322,7 @@ impl ToolExecution {
                 Err(error) => return Err(error.to_string()),
             }
             if let Some(directory) = execution.intent_path.parent() {
-                if let Err(error) = std::fs::File::open(directory)
-                    .and_then(|directory| directory.sync_all())
+                if let Err(error) = std::fs::File::open(directory).and_then(|directory| directory.sync_all())
                 {
                     tracing::warn!(
                         path = %av_core::fsutil::basename(&execution.intent_path),
@@ -1371,8 +1370,10 @@ impl ToolExecution {
             &self.intent(),
         )
         .map_err(ClaimError::Backend)?;
-        file.write_all(&intent).map_err(|error| ClaimError::Backend(error.to_string()))?;
-        file.sync_all().map_err(|error| ClaimError::Backend(error.to_string()))?;
+        file.write_all(&intent)
+            .map_err(|error| ClaimError::Backend(error.to_string()))?;
+        file.sync_all()
+            .map_err(|error| ClaimError::Backend(error.to_string()))?;
         std::fs::File::open(directory)
             .and_then(|directory| directory.sync_all())
             .map_err(|error| ClaimError::Backend(error.to_string()))

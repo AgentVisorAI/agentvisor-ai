@@ -367,10 +367,11 @@ impl StateStore for RedisStore {
             },
         };
         if let Err(error) = outcome {
+            let error_kind = error.kind();
             tracing::warn!(
                 target: "av_state::redis",
-                error.kind = ?error.kind(),
-                error.detail = %error,
+                kind = ?error_kind,
+                detail = %error,
                 "Redis refund failed silently; per-key compensation was not applied — \
                  budget counter may remain over-charged until the 24 h TTL expires or a \
                  successful spend/refund lands"
