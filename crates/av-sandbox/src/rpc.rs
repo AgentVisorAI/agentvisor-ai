@@ -210,9 +210,28 @@ pub fn refuse_duplicate_json_keys(raw: &[u8]) -> Result<(), String> {
 /// keep the first, expose both, or interpret the collapse differently.
 /// The trust-boundary policy is "refuse ambiguity" — see the call-site
 /// comment in `parse_tool_call`.
+///
+/// Round-25 F2 (av-sandbox): distinguish scanner-created "duplicate key"
+/// errors from underlying `serde_json` parse errors (EOF, unbalanced
+/// braces, invalid escape, recursion limit). The prior blanket
+/// `.map_err(|e| RpcError::Json(format!("duplicate JSON key rejected:
+/// {e}")))` gave EVERY scanner error the same misleading
+/// "duplicate JSON key rejected" prefix, so operator triage on
+/// dup-key alerts fired on any malformed JSON. Mirrors the round-16
+/// F6 sentinel fix in `av_receipts::check_no_duplicate_keys`.
+///
+/// Round-25 F3 (av-sandbox): also refuse trailing garbage AFTER a
+/// valid JSON value. `deserialize_any` returns after the first
+/// complete value, so an input like `{"ok":1}garbage` was silently
+/// accepted. `Deserializer::end()` returns Err if any non-whitespace
+/// bytes remain, closing the class of "smuggled second document"
+/// attacks (JSON body-splitting through a proxy that only inspected
+/// the first value).
 fn reject_duplicate_keys(raw: &[u8]) -> Result<(), RpcError> {
     use serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
     use std::fmt;
+
+    const DUP_KEY_SENTINEL: &str = "__av_sandbox_dup:";
 
     struct NoDupKeys;
 
@@ -270,7 +289,10 @@ fn reject_duplicate_keys(raw: &[u8]) -> Result<(), RpcError> {
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             while let Some(key) = map.next_key::<String>()? {
                 if !seen.insert(key.clone()) {
-                    return Err(serde::de::Error::custom(format!("duplicate object key {key:?}")));
+                    return Err(serde::de::Error::custom(format!(
+                        "{DUP_KEY_SENTINEL}duplicate object key `{}`",
+                        key.escape_debug()
+                    )));
                 }
                 let _: NoDupWrap = map.next_value()?;
             }
@@ -291,8 +313,23 @@ fn reject_duplicate_keys(raw: &[u8]) -> Result<(), RpcError> {
     }
 
     let mut de = serde_json::Deserializer::from_slice(raw);
-    de.deserialize_any(NoDupKeys)
-        .map_err(|e| RpcError::Json(format!("duplicate JSON key rejected: {e}")))?;
+    if let Err(error) = de.deserialize_any(NoDupKeys) {
+        let msg = error.to_string();
+        return if let Some(rest) = msg.strip_prefix(DUP_KEY_SENTINEL) {
+            Err(RpcError::Json(format!("duplicate JSON key rejected: {rest}")))
+        } else {
+            // Not a duplicate-key error — the underlying serde_json
+            // error (EOF, unbalanced braces, invalid escape,
+            // recursion limit) surfaces with its own prefix so
+            // triage doesn't misattribute the class.
+            Err(RpcError::Json(msg))
+        };
+    }
+    // Round-25 F3: refuse trailing content after the first complete
+    // JSON value. `de.end()` returns Err on any non-whitespace
+    // trailing bytes.
+    de.end()
+        .map_err(|error| RpcError::Json(format!("trailing content after JSON value: {error}")))?;
     Ok(())
 }
 
@@ -605,6 +642,94 @@ mod tests {
                 "expected ASCII-only refusal for {hostile:?}, got {err:?}"
             );
         }
+    }
+    /// Round-25 F2 (self-fix from round-24 audit): `reject_duplicate_keys`
+    /// used to wrap EVERY scanner error with the "duplicate JSON key
+    /// rejected: ..." prefix — misleading operator triage on
+    /// dup-key alerts because malformed JSON, EOF, and recursion
+    /// limits were all reported as if they were duplicate-key
+    /// rejections. Mirror the round-16 F6 sentinel fix from
+    /// `av_receipts`: real duplicate-key errors still get the
+    /// dup-key prefix; parse errors surface their own class.
+    #[test]
+    fn duplicate_key_class_distinguished_from_generic_parse_error() {
+        // Duplicate top-level key → "duplicate JSON key rejected: ..."
+        let real_dup = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": "dup",
+            "method": "tools/call",
+            "params": {"name": "read", "arguments": {}}
+        }))
+        .unwrap();
+        // Inject a duplicate by hand — serde_json's default parser
+        // would take last-wins.
+        let dup_raw: Vec<u8> = {
+            let mut v = real_dup.clone();
+            // Insert a second `"jsonrpc": "2.0"` right after the
+            // opening brace.
+            let insertion = br#""jsonrpc":"2.0","#;
+            v.splice(1..1, insertion.iter().copied());
+            v
+        };
+        let err = parse_tool_call(&dup_raw).unwrap_err();
+        assert!(
+            matches!(&err, RpcError::Json(msg) if msg.contains("duplicate JSON key rejected")),
+            "real dup-key must carry the dup-key prefix, got {err:?}"
+        );
+
+        // Malformed JSON (unbalanced brace) → NO dup-key prefix.
+        let malformed: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1,";
+        let err = parse_tool_call(malformed).unwrap_err();
+        match &err {
+            RpcError::Json(msg) => assert!(
+                !msg.contains("duplicate JSON key rejected"),
+                "malformed JSON must not be labeled as duplicate-key, got {msg:?}"
+            ),
+            other => panic!("expected RpcError::Json for malformed input, got {other:?}"),
+        }
+
+        // Empty input → NO dup-key prefix.
+        let err = parse_tool_call(b"").unwrap_err();
+        if let RpcError::Json(msg) = &err {
+            assert!(
+                !msg.contains("duplicate JSON key rejected"),
+                "empty input must not be labeled as duplicate-key, got {msg:?}"
+            );
+        }
+    }
+
+    /// Round-25 F3 (self-fix from round-24 audit): the scanner used
+    /// `deserialize_any`, which returns after the first complete JSON
+    /// value — so `{"ok":1}garbage` was silently accepted. A proxy
+    /// that inspected only the first value could disagree with a
+    /// downstream that concatenated the buffer differently
+    /// ("smuggled second document"). `Deserializer::end()` after
+    /// the scan closes this class.
+    #[test]
+    fn trailing_garbage_after_valid_json_is_refused() {
+        // A well-formed tools/call followed by trailing bytes.
+        let valid = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": "trail",
+            "method": "tools/call",
+            "params": {"name": "read", "arguments": {}}
+        }))
+        .unwrap();
+        let mut with_trail = valid.clone();
+        with_trail.extend_from_slice(b"garbage");
+        let err = parse_tool_call(&with_trail).unwrap_err();
+        assert!(
+            matches!(&err, RpcError::Json(msg) if msg.contains("trailing content")),
+            "trailing bytes must be refused, got {err:?}"
+        );
+        // A well-formed value with only trailing whitespace is
+        // still accepted — that's benign network padding.
+        let mut with_ws = valid.clone();
+        with_ws.extend_from_slice(b"   \n\t");
+        assert!(
+            parse_tool_call(&with_ws).is_ok(),
+            "trailing whitespace must be allowed"
+        );
     }
 }
 
