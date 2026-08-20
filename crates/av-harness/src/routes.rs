@@ -1576,6 +1576,12 @@ fn finalize_error_response(error: &crate::reconciler::FinalizeError) -> Response
         // (quarantined capture, no artifact to promote, promotion already
         // in progress).
         FinalizeError::CaptureIncomplete | FinalizeError::Promotion(_) => StatusCode::CONFLICT,
+        // Round-28 F1: permanent bridge misconfiguration (unknown
+        // topic, unresolvable schema) — retrying without operator
+        // action cannot succeed. Map to 400 so SDKs stop retrying
+        // and pagers fire on operator config errors, not on
+        // transient outages.
+        FinalizeError::BridgeConfig(_) => StatusCode::BAD_REQUEST,
         // Transient infrastructure: the broker is unreachable; the close
         // stays pending and a retry (or the reconciler sweep) completes it.
         FinalizeError::Bridge(_) => StatusCode::SERVICE_UNAVAILABLE,

@@ -4,6 +4,39 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 28: permanent vs transient bridge error classification (2026-08-20)
+
+Round-27 flagged BusError classification as a deferred design item.
+This round applies it — a well-scoped, non-breaking fix.
+
+- **bridge/harness (medium, retry semantics):** `BusError::UnknownTopic`
+  (topic not provisioned via the manifest) is a permanent
+  misconfiguration — retrying without operator action cannot
+  succeed. Historically it flowed through
+  `FinalizeError::Bridge(String)` and mapped to HTTP 503 +
+  `Retry-After`, so SDKs retried pointlessly and pagers fired on
+  what was really an operator config error, not a transient
+  outage.
+  1. New `BusError::is_permanent()` method: `true` for
+     `UnknownTopic` and `Serde` (permanent for that payload;
+     retry can't fix a wire-shape violation), `false` for
+     `Io`/`Backend` (transient by default).
+  2. New `FinalizeError::BridgeConfig(String)` variant for
+     permanent lifecycle-publish failures; `Bridge(String)` keeps
+     the transient semantic. `impl From<BusError> for
+     FinalizeError` routes automatically based on
+     `is_permanent()`.
+  3. `finalize_error_response` in routes.rs maps
+     `BridgeConfig` → HTTP 400 (no `Retry-After`), `Bridge` →
+     HTTP 503 (with `Retry-After: 5`). SDKs that respect
+     Retry-After now stop retrying on permanent errors.
+  4. Two conversion call sites in reconciler.rs
+     (`find_event_by_uid`, `publish_idempotent`) switched from
+     `.map_err(|e| Bridge(e.to_string()))` to
+     `.map_err(FinalizeError::from)`.
+
+Regression test: `bus_error_is_permanent_split`.
+
 ### Bug-hunt round 27: emitter/validator parity for pruning_ratio range + specialist security review (2026-08-20)
 
 Three fresh deep-dives — code-review of round-26 (caught a real
