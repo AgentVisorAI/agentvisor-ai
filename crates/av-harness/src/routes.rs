@@ -635,29 +635,52 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                         ));
                     }
                 };
-                if let Err(error) = execution.claim().await {
-                    // A lost claim race means another in-flight request owns
-                    // this execution; answer exactly like the Pending state
-                    // and keep the underlying io detail out of the wire.
-                    tracing::warn!(
-                        session = %execution.session_id,
-                        error = %error,
-                        "concurrent tool execution claim lost; refunding budget"
-                    );
-                    // Round-33 F1: refund the exact amount debited so
-                    // `payout_remaining` and per-tool counters reflect
-                    // only admitted work, not the lost race.
-                    av_state::ActionBudget::new(
-                        state.store.as_ref(),
-                        &execution.session_id,
-                        &state.config.budget,
-                    )
-                    .refund_tool_call(&execution.tool, payout_micros);
-                    return (
-                        StatusCode::CONFLICT,
-                        Json(json!({"error": TOOL_OUTCOME_UNCERTAIN})),
-                    )
-                        .into_response();
+                match execution.claim().await {
+                    Ok(()) => {}
+                    Err(ClaimError::Race) => {
+                        // A lost claim race means another in-flight request owns
+                        // this execution; answer exactly like the Pending state
+                        // and keep the underlying io detail out of the wire.
+                        tracing::warn!(
+                            session = %execution.session_id,
+                            "concurrent tool execution claim lost; refunding budget"
+                        );
+                        // Round-33 F1: refund the exact amount debited so
+                        // `payout_remaining` and per-tool counters reflect
+                        // only admitted work, not the lost race.
+                        av_state::ActionBudget::new(
+                            state.store.as_ref(),
+                            &execution.session_id,
+                            &state.config.budget,
+                        )
+                        .refund_tool_call(&execution.tool, payout_micros);
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(json!({"error": TOOL_OUTCOME_UNCERTAIN})),
+                        )
+                            .into_response();
+                    }
+                    Err(ClaimError::Backend(error)) => {
+                        // Infrastructure failure — StorageFull, PermissionDenied,
+                        // etc. The tool provably did not execute (we never
+                        // reached upstream); refund the admission charge and
+                        // surface a 503 so the client backs off, instead of a
+                        // 409 that implies "someone else already ran it".
+                        tracing::warn!(
+                            session = %execution.session_id,
+                            %error,
+                            "tool execution claim failed; refunding budget"
+                        );
+                        av_state::ActionBudget::new(
+                            state.store.as_ref(),
+                            &execution.session_id,
+                            &state.config.budget,
+                        )
+                        .refund_tool_call(&execution.tool, payout_micros);
+                        return pipeline_error(crate::pipeline::PipelineError::Unavailable(
+                            "tool execution intent could not be persisted".to_owned(),
+                        ));
+                    }
                 }
                 let mut tool_request = state
                     .client
@@ -971,6 +994,27 @@ enum ToolExecutionState {
     Completed(ToolOutcome),
 }
 
+/// Two distinct failure modes for `ToolExecution::claim` that must
+/// produce different client responses. Round-49 F3: previously
+/// `claim_sync` mapped ALL failures to a `String` and the caller in
+/// `mcp_call_inner` answered every one with `409 TOOL_OUTCOME_UNCERTAIN`
+/// — reporting infrastructure faults (StorageFull, PermissionDenied,
+/// ReadOnlyFilesystem, Interrupted) as if the client had lost a
+/// concurrent race, so retries looped on the underlying disk fault
+/// while the client learned nothing useful.
+#[derive(Debug)]
+enum ClaimError {
+    /// The intent file already existed (`create_new` returned
+    /// `AlreadyExists`). Another in-flight request owns this
+    /// execution key — the legitimate race case that `409
+    /// TOOL_OUTCOME_UNCERTAIN` was designed for.
+    Race,
+    /// An I/O or MAC-seal failure independent of concurrent claim
+    /// contention. Maps to a 5xx so operators are alerted to a real
+    /// infrastructure problem instead of retrying on false uncertainty.
+    Backend(String),
+}
+
 const TOOL_REQUEST_MISMATCH: &str = "JSON-RPC id is already bound to a different tool request or principal";
 /// Canonical duplicate-execution refusal, shared by the pre-flight Pending
 /// state and a lost concurrent claim race so neither reveals more than the
@@ -1248,17 +1292,27 @@ impl ToolExecution {
         Ok(ToolExecutionState::Pending)
     }
 
-    async fn claim(&self) -> Result<(), String> {
+    async fn claim(&self) -> Result<(), ClaimError> {
         let execution = self.clone();
         tokio::task::spawn_blocking(move || execution.claim_sync())
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|error| ClaimError::Backend(error.to_string()))?
     }
 
     /// Delete this execution's intent file after a provably-not-executed
     /// forward (connect failure), restoring the key for a clean retry.
     /// NotFound is tolerated — the claim was ours, so a missing file only
     /// means a prior release already ran.
+    ///
+    /// Round-49 F2: the post-remove directory fsync is best-effort.
+    /// `remove_file` returning Ok is durable-enough for the release
+    /// semantics — a crash before the dir fsync makes the intent file
+    /// resurrect on recovery, at which point `unresolved_tool_sessions`
+    /// correctly quarantines the session (fail-closed). Previously any
+    /// fsync failure returned Err and the caller at `mcp_call_inner`'s
+    /// connect-failure branch skipped the budget refund, leaving the
+    /// key unclaimed AND the budget debited — the exact bug the
+    /// release-then-refund ordering was supposed to prevent.
     async fn release_unexecuted(&self) -> Result<(), String> {
         let execution = self.clone();
         tokio::task::spawn_blocking(move || {
@@ -1267,41 +1321,61 @@ impl ToolExecution {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(error) => return Err(error.to_string()),
             }
-            let directory = execution
-                .intent_path
-                .parent()
-                .ok_or_else(|| "tool execution directory is missing".to_owned())?;
-            std::fs::File::open(directory)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|error| error.to_string())
+            if let Some(directory) = execution.intent_path.parent() {
+                if let Err(error) = std::fs::File::open(directory)
+                    .and_then(|directory| directory.sync_all())
+                {
+                    tracing::warn!(
+                        path = %av_core::fsutil::basename(&execution.intent_path),
+                        %error,
+                        "release_unexecuted: intent removed but directory fsync failed; treating as released"
+                    );
+                }
+            }
+            Ok(())
         })
         .await
         .map_err(|error| error.to_string())?
     }
 
-    fn claim_sync(&self) -> Result<(), String> {
+    fn claim_sync(&self) -> Result<(), ClaimError> {
         use std::io::Write as _;
         let directory = self
             .intent_path
             .parent()
-            .ok_or_else(|| "tool execution directory is missing".to_owned())?;
-        std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+            .ok_or_else(|| ClaimError::Backend("tool execution directory is missing".to_owned()))?;
+        std::fs::create_dir_all(directory).map_err(|error| ClaimError::Backend(error.to_string()))?;
+        // `create_new(true)` is atomic on the underlying filesystem —
+        // its only reason to return `AlreadyExists` is that another
+        // in-flight request has already claimed this execution key
+        // (the sole legitimate race source). Any other IoError kind
+        // (StorageFull, PermissionDenied, InvalidInput, ReadOnlyFilesystem,
+        // Interrupted, etc.) is a genuine infrastructure failure and
+        // must NOT be reported to the client as a lost race — the
+        // caller would answer 409 TOOL_OUTCOME_UNCERTAIN and retries
+        // would loop on the same underlying disk fault while the
+        // client learns nothing useful. Split the two shapes at the
+        // source so the caller can respond appropriately.
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&self.intent_path)
-            .map_err(|error| format!("tool execution already claimed or unavailable: {error}"))?;
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::AlreadyExists => ClaimError::Race,
+                _ => ClaimError::Backend(format!("tool execution intent unavailable: {error}")),
+            })?;
         let intent = crate::journal::seal(
             &self.control_key,
             &format!("{}:{}", crate::journal::TOOL_INTENT_DOMAIN, self.key),
             0,
             &self.intent(),
-        )?;
-        file.write_all(&intent).map_err(|error| error.to_string())?;
-        file.sync_all().map_err(|error| error.to_string())?;
+        )
+        .map_err(ClaimError::Backend)?;
+        file.write_all(&intent).map_err(|error| ClaimError::Backend(error.to_string()))?;
+        file.sync_all().map_err(|error| ClaimError::Backend(error.to_string()))?;
         std::fs::File::open(directory)
             .and_then(|directory| directory.sync_all())
-            .map_err(|error| error.to_string())
+            .map_err(|error| ClaimError::Backend(error.to_string()))
     }
 
     async fn persist(&self, outcome: &ToolOutcome) -> Result<(), String> {

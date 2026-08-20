@@ -1326,7 +1326,22 @@ pub(crate) async fn read_broker_ack(
     journal_key: &[u8; 32],
 ) -> Result<Option<PublishAck>, String> {
     let path = broker_ack_path(directory, session_id, event_uid);
-    let bytes = match tokio::fs::read(&path).await {
+    // Bounded read — same policy as every other sealed marker in the
+    // spool (close-complete marker, promotion marker, response marker,
+    // ATIF sidecar). A local fs-tamper attacker plant at
+    // `spool/broker-acks/<hash>/<hash>.json` would otherwise blow up
+    // memory during finalize before MAC rejection: `journal::open` calls
+    // `serde_json::from_slice` on the raw bytes, and a multi-GB file
+    // reaches serde_json's own limit only after the initial `read` has
+    // already allocated the whole buffer. `MAX_CONTROL_BYTES` (1 MiB)
+    // is far above any legitimate ack record.
+    let bytes = match tokio::task::spawn_blocking({
+        let path = path.clone();
+        move || av_core::fsutil::read_capped(&path, av_core::fsutil::MAX_CONTROL_BYTES)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.to_string()),
