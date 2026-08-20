@@ -4,6 +4,48 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 27: emitter/validator parity for pruning_ratio range + specialist security review (2026-08-20)
+
+Three fresh deep-dives — code-review of round-26 (caught a real
+emitter/validator drift I just introduced), a specialist
+security-review pass on the full workspace (**0 HIGH-severity
+findings**), and BusError variant classification (design item;
+deferred).
+
+- **events (MEDIUM, regression self-fix from round-26):**
+  round-26 added `pruning_ratio_millis > 1000` refusal to
+  `OcsfEventBuilder::build`, but did NOT mirror it in the
+  sibling wire-side `validate_event`. Round-17 F2 introduced
+  `validate_event` specifically as the deserialize-path backstop
+  for build's guards, so leaving the range check only on build
+  reopens the exact class of emitter/validator drift the two
+  fixes were meant to close. `validate_event` now emits a new
+  `ValidationError::OutOfSchemaRange` variant when
+  `pruning_ratio_millis > 1000`. Regression test:
+  `out_of_schema_pruning_ratio_is_flagged_on_validate`. **This
+  fix ships in the same round because round-26 is not yet
+  released and shipping build-but-not-validate parity would be
+  worse than shipping neither.**
+
+- **specialist security review:** a dedicated security-review
+  agent performed a full-workspace pass focused on
+  cryptographic-signature bypass, JWT bypass, path traversal,
+  SSRF, XSS, sandbox escape, timing attacks, budget
+  double-spend races, deserialization DoS, and disk-poisoning
+  state corruption. **0 HIGH-severity findings** — 27 rounds of
+  bug hunting have hardened the codebase to the point that a
+  specialist security agent finds nothing new.
+
+Not actionable this round:
+- **BusError classification (deferred):** the audit confirmed
+  that `BusError::UnknownTopic` (permanent misconfiguration) is
+  currently returned to clients as retryable HTTP 503 with a
+  `Retry-After` header — SDKs retry pointlessly. The minimal fix
+  requires adding a permanence flag to `FinalizeError::Bridge`
+  and routing at `routes.rs::finalize_error_response`. It's a
+  clean fix but not surgical enough for a mid-round application;
+  scheduled for a dedicated error-classification pass.
+
 ### Bug-hunt round 26: schema range check for pruning_ratio_millis at build (2026-08-20)
 
 Four fresh deep-dives — code-review of round-25 (clean), CHANGELOG

@@ -501,10 +501,11 @@ mod tests {
             .build();
         assert!(outcome.is_err(), "over-cap ratio must fail build");
         // At the boundary, 1000 (100.0 %) still builds.
-        let mut metrics = EventMetrics::default();
-        metrics.pruning_ratio_millis = Some(1000);
         let outcome = OcsfEventBuilder::new(EventClass::ToolCall, "sess-x", identity(), 1)
-            .metrics(metrics)
+            .metrics(EventMetrics {
+                pruning_ratio_millis: Some(1000),
+                ..EventMetrics::default()
+            })
             .build();
         assert!(outcome.is_ok(), "boundary ratio 1000 must still build");
     }
