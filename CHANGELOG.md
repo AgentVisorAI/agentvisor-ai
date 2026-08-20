@@ -4,6 +4,58 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 11: Ed25519 signature malleability fixed; three 0-finding-actionable audits (2026-08-20)
+
+Four fresh lenses this round — a code-review of round 10's own commit
+(came back clean, 3rd consecutive), a protocol-spec compliance audit
+(6 findings, most either interop-only or defensible), a receipts
+deep-dive line-by-line (found one critical signature malleability),
+and a combined-failures audit (4 findings, most deferred as design work).
+
+- **receipts (high, cryptographic):** `Keyring::verify` used
+  ed25519-dalek's non-strict `verify` API, which accepts signatures
+  whose R component OR the verifying key itself is a small-order
+  Curve25519 point. In that regime a SINGLE signature can validate
+  against MULTIPLE distinct canonical bodies — an attacker who could
+  register a small-order pubkey (via any downstream path that admits
+  external verification keys) could mutate receipt bodies while
+  keeping the signature intact, and `verify_embedded()` would still
+  return `Ok(())`. Now uses `verify_strict` (ed25519-dalek
+  verifying.rs:367-390 in 3.0.0), which rejects small-order R and
+  small-order pubkeys. Documented Ed25519 signature-malleability class
+  fix.
+- **receipts (docs, defense-in-depth):** `Ed25519Signer::from_seed`
+  does not reject the all-zero or all-0xFF seeds. Production seed
+  loading in `av-harness::main::load_signer_from_file` already
+  refuses both before reaching this function, but a future refactor
+  could silently drop that pre-validation. The contract is now
+  documented in-signature so the caveat cannot be forgotten.
+
+Deferred to design cycle (real but need bigger changes):
+- **NATS retry HOL blocking:** one bad cold-outbox intent's
+  `find_event_by_uid` transient error aborts the whole retry pass;
+  later intents accumulate. Bounded by TTL; needs a per-intent
+  backoff + skip-and-continue policy (feeds into the DoS-audit
+  cold-outbox backoff+DLQ item from round 8).
+- **Signer rotation + in-flight promotion:** an unsigned session
+  mid-promotion whose old on-disk receipt was signed by a
+  now-rotated key can livelock — retries keep hitting the same
+  wrong-key error. Needs a multi-key verification ring or an
+  on-rotation receipt-migration pass.
+
+Not actionable (defensible-by-design):
+- **JSON-RPC notification MUST-NOT-reply:** the harness rejects
+  notifications with an error response. Compliance would allow
+  fire-and-forget tool calls to drain budget without observable
+  responses — refuse-with-error is more secure.
+- **Bridge down + Redis refund correlation:** round 10's
+  observability fix now surfaces the Redis-refund failure; the
+  capture-failed side is already observable via
+  `av_events_dropped_total{stage=response_slot}`.
+- **Disk-full close-complete marker fallback:** documented behavior
+  in CloseCompleteMarker (round 4 explicitly acknowledged the
+  at-most-one duplicate-per-restart trade-off).
+
 ### Bug-hunt round 10: one observability fix + one test-quality doc + two 0-finding audits (2026-08-20)
 
 Four fresh lenses this round — a code-review of round 9's own commit
