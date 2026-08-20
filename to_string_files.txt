@@ -1,0 +1,10 @@
+crates/av-harness/src/worker.rs
+crates/av-bridge/src/embedded.rs
+crates/av-receipts/src/receipt.rs
+crates/av-harness/src/pipeline.rs
+crates/av-events/src/model.rs
+crates/av-cli/src/main.rs
+crates/av-harness/src/routes.rs
+crates/av-core/src/ids.rs
+crates/av-events/src/stop_reason.rs
+crates/av-compress/src/passes.rs
