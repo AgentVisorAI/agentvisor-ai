@@ -283,9 +283,7 @@ impl IdentityValidator {
             let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(x)
                 .map_err(|error| {
-                    IdentityError::Jwks(format!(
-                        "key {kid:?} has malformed base64url `x`: {error}"
-                    ))
+                    IdentityError::Jwks(format!("key {kid:?} has malformed base64url `x`: {error}"))
                 })?;
             if decoded.len() != 32 {
                 return Err(IdentityError::Jwks(format!(

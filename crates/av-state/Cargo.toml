@@ -17,6 +17,7 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
+tracing = { workspace = true }
 
 [features]
 default = []
