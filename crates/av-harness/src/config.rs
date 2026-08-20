@@ -430,7 +430,28 @@ pub fn resolve_config_source() -> Result<ConfigSource, String> {
 
 /// Load, apply environment overrides, and validate the effective config.
 pub fn load_config() -> Result<(HarnessConfig, ConfigSource), String> {
-    let source = resolve_config_source()?;
+    load_config_with_override(None)
+}
+
+/// [`load_config`] with an explicit config path (e.g. from `--config`)
+/// taking precedence over `$AV_CONFIG` and the search paths. The explicit
+/// path must exist — a dangling operator-supplied path is a hard error,
+/// never a silent fallback to a different config.
+pub fn load_config_with_override(
+    explicit: Option<std::path::PathBuf>,
+) -> Result<(HarnessConfig, ConfigSource), String> {
+    let source = match explicit {
+        Some(path) => {
+            if !path.is_file() {
+                return Err(format!(
+                    "--config points to {} which does not exist or is not a file",
+                    path.display()
+                ));
+            }
+            ConfigSource::File(path)
+        }
+        None => resolve_config_source()?,
+    };
     let mut config = match &source {
         ConfigSource::File(path) => {
             let text = std::fs::read_to_string(path)
@@ -932,9 +953,18 @@ impl HarnessConfig {
             ));
         }
         if let Some(tool_upstream) = &self.tool_upstream_url {
-            if !tool_upstream.is_empty()
-                && !(tool_upstream.starts_with("http://") || tool_upstream.starts_with("https://"))
-            {
+            // Empty is rejected rather than treated as unset: routing gates
+            // tool forwarding on `is_some()` (routes.rs), so an empty string
+            // would silently enable the tool-upstream branches and only fail
+            // at the first request with a reqwest URL error. Fail loudly at
+            // startup like every other config-shape problem.
+            if tool_upstream.is_empty() {
+                return Err(
+                    "tool_upstream_url must not be empty; omit the field to disable tool forwarding"
+                        .to_owned(),
+                );
+            }
+            if !(tool_upstream.starts_with("http://") || tool_upstream.starts_with("https://")) {
                 return Err(format!(
                     "tool_upstream_url must be http:// or https://, got {tool_upstream:?}"
                 ));
@@ -1408,6 +1438,22 @@ mod tests {
         // http and https are the only accepted schemes.
         assert!(HarnessConfig::from_toml(r#"upstream_url = "https://api.openai.com""#).is_ok());
         assert!(HarnessConfig::from_toml(r#"upstream_url = "http://gw.local""#).is_ok());
+    }
+
+    /// `tool_upstream_url = ""` used to pass validation while runtime
+    /// routing gates tool forwarding on `is_some()` — the empty string
+    /// silently enabled the tool-upstream branches and only failed at the
+    /// first request with a reqwest URL error. Reject it at startup.
+    #[test]
+    fn empty_tool_upstream_url_is_rejected() {
+        let err =
+            HarnessConfig::from_toml("upstream_url = \"https://api\"\ntool_upstream_url = \"\"").unwrap_err();
+        assert!(err.contains("tool_upstream_url"), "{err}");
+        assert!(err.contains("omit"), "should point at omitting the field: {err}");
+        assert!(HarnessConfig::from_toml(
+            "upstream_url = \"https://api\"\ntool_upstream_url = \"http://tools/mcp\"",
+        )
+        .is_ok());
     }
 
     /// A seconds interval > 1 day is almost certainly a unit-conversion
