@@ -1105,13 +1105,20 @@ pub(crate) async fn inflight_response_sessions(
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
                 continue;
             }
+            let marker_bytes = match av_core::fsutil::read_capped(&path, av_core::fsutil::MAX_CONTROL_BYTES) {
+                Ok(bytes) => bytes,
+                // A live request legitimately clears its marker between
+                // the directory listing and this read — the response
+                // completed; it is not in flight.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.to_string()),
+            };
             let marker: InFlightResponse = crate::journal::open(
                 &journal_key,
                 "in-flight-response",
                 0,
                 // Round-18: cap sealed marker read at MAX_CONTROL_BYTES.
-                &av_core::fsutil::read_capped(&path, av_core::fsutil::MAX_CONTROL_BYTES)
-                    .map_err(|error| error.to_string())?,
+                &marker_bytes,
             )?;
             if path != response_marker_path(&spool_dir, &marker.session_id, &marker.attempt_id) {
                 return Err("in-flight response marker path does not match its payload".to_owned());

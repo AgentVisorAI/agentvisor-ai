@@ -157,7 +157,14 @@ pub fn read_capped_string(path: &Path, max_bytes: u64) -> io::Result<String> {
 /// this with their own counter if needed.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    // `Path::new("file.json").parent()` is `Some("")`, not `None` — the
+    // empty path fails `sync_directory` (and is not a valid directory for
+    // `create_dir_all` on all platforms). Normalize to `.` so relative
+    // leaf paths behave like `./file.json`.
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
     let temporary = path.with_extension(format!("{}.tmp", crate::new_event_uid()));
     let mut guard = TempPathGuard::new(temporary.clone());

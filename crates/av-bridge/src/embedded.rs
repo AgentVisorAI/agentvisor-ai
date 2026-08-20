@@ -29,6 +29,13 @@ struct Partition {
     seen_event_uids: HashMap<String, u64>,
     next_offset: u64,
     writer: fs::File,
+    /// Set when a failed append could not be repaired by truncating the
+    /// segment back to its last known-good length. Every subsequent
+    /// publish on this partition is refused (fail-closed) — appending
+    /// after torn bytes would merge into the next record and make the
+    /// whole partition unreadable to `fetch`. Cleared only by restart,
+    /// where segment recovery re-establishes a consistent tail.
+    poisoned: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -249,6 +256,7 @@ impl EmbeddedBroker {
                     seen_event_uids,
                     next_offset: segment_offset.max(persisted_offset),
                     writer,
+                    poisoned: None,
                 }));
             }
             partitions.insert(t.name.clone(), parts);
@@ -299,6 +307,21 @@ impl EmbeddedBroker {
             };
             for p in parts {
                 let mut part = p.lock();
+                // A poisoned partition's segment may carry torn bytes from
+                // an unrepaired append failure. Rewriting it here would
+                // preserve the partial line WITH a trailing newline —
+                // converting a restart-repairable torn tail (recover_segment
+                // truncates a no-newline tail) into a permanent corrupt
+                // line that breaks `fetch` forever. Skip until a restart
+                // re-establishes a consistent tail.
+                if let Some(reason) = &part.poisoned {
+                    tracing::warn!(
+                        topic = %t.name,
+                        reason = %reason,
+                        "skipping retention on a poisoned partition (restart to recover)"
+                    );
+                    continue;
+                }
                 let (kept, expired) = split_by_time(&part.path, cutoff)?;
                 if expired.is_empty() {
                     continue;
@@ -820,6 +843,12 @@ impl EmbeddedBroker {
             .get(partition as usize)
             .ok_or_else(|| BusError::Backend(format!("partition {partition} out of range")))?;
         let mut part = slot.lock();
+        if let Some(reason) = &part.poisoned {
+            return Err(BusError::Backend(format!(
+                "partition {partition} of topic {topic:?} is poisoned by an unrepaired append failure \
+                 (restart to recover): {reason}"
+            )));
+        }
         if let Some(uid) = event_uid {
             if let Some(offset) = part.seen_event_uids.get(uid).copied() {
                 return Ok(PublishAck {
@@ -838,10 +867,38 @@ impl EmbeddedBroker {
             stored_at: av_core::time::now_ms(),
         };
         let line = serde_json::to_string(&record)?;
-        part.writer.write_all(line.as_bytes())?;
-        part.writer.write_all(b"\n")?;
-        part.writer.flush()?;
-        part.writer.sync_data()?;
+        // Capture the durable length before appending so a failed append can
+        // be repaired. Without the truncate-on-error below, two failure
+        // modes leave the partition permanently inconsistent while the same
+        // writer stays live:
+        //   1. a torn write (ENOSPC/EIO mid-`write_all`) leaves partial
+        //      bytes that the NEXT publish appends after, merging both into
+        //      one unparseable line that ends in '\n' — `fetch` then errors
+        //      on every read, and startup recovery only repairs torn
+        //      *trailing* lines (no newline at EOF), not mid-file ones;
+        //   2. a failed `sync_data` after a complete write leaves the
+        //      record durable while `next_offset` was never advanced, so
+        //      the next publish stamps a different record with the same
+        //      offset (duplicate offsets hidden by max(offset)+1 recovery).
+        let known_good = part.writer.metadata()?.len();
+        let append = (|| {
+            part.writer.write_all(line.as_bytes())?;
+            part.writer.write_all(b"\n")?;
+            part.writer.flush()?;
+            part.writer.sync_data()
+        })();
+        if let Err(error) = append {
+            if let Err(repair) = part
+                .writer
+                .set_len(known_good)
+                .and_then(|()| part.writer.sync_data())
+            {
+                // The segment may still carry torn bytes; refuse further
+                // appends (fail-closed) rather than corrupt the next record.
+                part.poisoned = Some(format!("append failed ({error}); truncation failed ({repair})"));
+            }
+            return Err(BusError::Io(error));
+        }
         part.next_offset = part
             .next_offset
             .checked_add(1)

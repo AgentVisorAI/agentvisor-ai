@@ -164,6 +164,12 @@ impl IdentityValidator {
     /// call, but nothing in the API constrained late/admin use.
     pub fn add_key(&self, kid: impl Into<String>, key: KeyMaterial) -> Result<(), IdentityError> {
         let kid = kid.into();
+        // Lock order matches `add_jwks` (keys before jwks_kids) and the
+        // keys lock is held across the check AND the insert: releasing
+        // between them let a concurrent `add_jwks` install kid X in the
+        // gap, after which this insert silently shadowed the JWKS entry —
+        // exactly the ordering hazard this guard exists to refuse.
+        let mut loaded = self.keys.write();
         let prior = self.jwks_kids.read();
         if prior.contains(&kid) {
             return Err(IdentityError::Jwks(format!(
@@ -171,7 +177,7 @@ impl IdentityValidator {
             )));
         }
         drop(prior);
-        self.keys.write().insert(kid, key);
+        loaded.insert(kid, key);
         Ok(())
     }
 
