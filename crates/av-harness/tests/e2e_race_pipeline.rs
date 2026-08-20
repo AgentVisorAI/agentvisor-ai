@@ -86,9 +86,10 @@ fn chat_payload() -> Value {
 
 // ---------------------------------------------------------------------------
 // 1. Concurrent `prepare_chat` on ONE session id from N tokio tasks: all
-//    calls must succeed, the resulting Session's seq counter advances by
-//    exactly N (no lost preps, no duplicate seqs), and a subsequent close
-//    issues exactly one signed receipt whose event_count matches N.
+//    calls must succeed, and a subsequent close issues exactly one signed
+//    receipt whose event_count matches 2 × N (each prepared-then-dropped
+//    request contributes its admission event plus the capture guard's
+//    terminal resolution — no lost preps, no duplicate seqs).
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -115,7 +116,7 @@ async fn concurrent_prepare_chat_on_one_session_produces_matching_receipt() {
     match outcome {
         FinalizeOutcome::Receipt { receipt } => match &receipt.body.subject {
             ReceiptSubject::EventChain { event_count, .. } => {
-                assert_eq!(*event_count, N, "event_count drifted under contention");
+                assert_eq!(*event_count, N * 2, "event_count drifted under contention");
             }
             other => panic!("expected EventChain subject, got {other:?}"),
         },
@@ -195,8 +196,10 @@ async fn concurrent_multi_session_fanout_produces_correct_per_session_receipts()
         match t.await.unwrap() {
             FinalizeOutcome::Receipt { receipt } => match &receipt.body.subject {
                 ReceiptSubject::EventChain { event_count, .. } => {
+                    // Admission + capture-guard resolution per step.
                     assert_eq!(
-                        *event_count, STEPS_PER_SESSION,
+                        *event_count,
+                        STEPS_PER_SESSION * 2,
                         "cross-session event_count leaked"
                     );
                 }

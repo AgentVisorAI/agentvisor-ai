@@ -339,6 +339,65 @@ impl StateStore for RedisStore {
             }
         }
     }
+
+    /// Whole-session counter cleanup. Round-46: previously left as the
+    /// trait's default no-op on the assumption that the 24 h TTL made it
+    /// pure hygiene — but `SessionRegistry::get_or_open` recycles a
+    /// finalized session id into a fresh open session, which then spends
+    /// against the SAME hash-tagged keys. Against `InMemoryStore` (dev,
+    /// CI, and every budget test) the recycled incarnation starts from
+    /// zero; against Redis it silently inherited up to 24 h of the prior
+    /// incarnation's `tokens`/`total_calls`/`tool:*`/`payout` counters —
+    /// the exact cross-backend divergence class rounds 20/21 aligned
+    /// `add`/`try_spend_many` for.
+    ///
+    /// All of a session's keys share one cluster slot by construction
+    /// (`ActionBudget::session_prefix` wraps the digest in a `{hash-tag}`),
+    /// so a single script routed by the prefix reaches every key on both
+    /// single-node and cluster backends. `KEYS` inside the script is
+    /// bounded by the node's keyspace (session-scoped counters, a handful
+    /// per live session under TTL) and runs once per session finalization.
+    /// Best-effort like `remove`/`refund`: a Redis blip on the cleanup
+    /// path must not fail the close.
+    fn remove_prefix(&self, prefix: &str) {
+        // `KEYS`' glob treats `* ? [ ] \` as metacharacters. The prefix is
+        // `budget:{<32 hex>}:` today (no metacharacters), but escape
+        // defensively so a future prefix shape cannot over-match.
+        let mut pattern = String::with_capacity(prefix.len() + 1);
+        for c in prefix.chars() {
+            if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+                pattern.push('\\');
+            }
+            pattern.push(c);
+        }
+        pattern.push('*');
+        const REMOVE_PREFIX_LUA: &str = r"
+            local removed = 0
+            for _, key in ipairs(redis.call('KEYS', ARGV[1])) do
+                redis.call('DEL', key)
+                removed = removed + 1
+            end
+            return removed
+        ";
+        match &self.backend {
+            RedisBackend::Single(pool) => {
+                if let Ok(mut connection) = pool.get() {
+                    let _: Result<i64, _> = redis::Script::new(REMOVE_PREFIX_LUA)
+                        .key(prefix)
+                        .arg(&pattern)
+                        .invoke(&mut *connection);
+                }
+            }
+            RedisBackend::Cluster(pool) => {
+                if let Ok(mut connection) = pool.get() {
+                    let _: Result<i64, _> = redis::Script::new(REMOVE_PREFIX_LUA)
+                        .key(prefix)
+                        .arg(&pattern)
+                        .invoke(&mut *connection);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

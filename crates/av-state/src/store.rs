@@ -88,9 +88,12 @@ pub trait StateStore: Send + Sync {
     }
 
     /// Remove every key beginning with `prefix` (whole-session cleanup at
-    /// finalization). Backends with native expiry (e.g. Redis TTLs) may
-    /// leave this as the default no-op; in-process backends must implement
-    /// it or session-keyed counters accumulate for the process lifetime.
+    /// finalization). Every backend must implement this: native expiry
+    /// (e.g. Redis TTLs) is NOT a substitute, because a finalized session
+    /// id can be recycled into a fresh session within the TTL window and
+    /// would inherit the prior incarnation's counters. In-process backends
+    /// additionally need it or session-keyed counters accumulate for the
+    /// process lifetime.
     fn remove_prefix(&self, prefix: &str) {
         let _ = prefix;
     }

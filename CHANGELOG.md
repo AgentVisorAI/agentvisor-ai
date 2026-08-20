@@ -4,6 +4,50 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 2: cancellation safety, backend parity, and a round-1 correction (2026-08-20)
+
+A second sweep with fresh lenses — cancellation safety (axum drops
+request futures on client disconnect; the codebase modeled crashes and
+explicit errors meticulously but never modeled cancellation), cross-crate
+contract seams, an adversarial review of round 1's own commit, and a
+tests-that-cannot-fail audit. Six production fixes, three test fixes:
+
+- **harness (high):** dropping an in-flight `/v1/chat/completions`
+  request future stranded the durable response marker and left a
+  dangling non-terminal response attempt in the signed journal — the
+  session later closed "cleanly" over an unresolved capture, then its
+  id was re-quarantined every reconciler tick after eviction. A new
+  `ResponseCaptureGuard` (RAII, armed at admission, handed from
+  `PreparedRequest` → `ForwardedResponse` → `AbortFinalizingStream`)
+  submits the same terminal failure job every explicit refusal path
+  uses. Consequence: every admitted attempt now resolves, so a
+  prepared-then-dropped request contributes two chain events —
+  integration tests updated accordingly.
+- **harness (high):** a client disconnect during `/promote` left the
+  promotion claim permanently at "in progress" (every retry 409'd until
+  restart). `PromotionClaim` now mirrors `CloseClaim`: reset on drop
+  unless committed.
+- **harness (medium):** a client disconnect inside `/mcp` stranded a
+  claimed-but-unresolved execution key (every retry answered 409
+  TOOL_OUTCOME_UNCERTAIN while the session lived) and burned the
+  debited budget. The whole tool path now runs on a spawned task that
+  completes regardless of the caller's fate.
+- **state (medium):** `RedisStore` never implemented `remove_prefix`
+  (silent trait-default no-op), so a recycled session id inherited the
+  prior incarnation's budget counters for up to 24 h in production
+  while dev/CI (in-memory) started fresh. Implemented via a Lua
+  script routed by the hash-tagged prefix (cluster-safe: all of a
+  session's keys share one slot by construction).
+- **harness (medium, round-1 correction):** for ATIF-adopted sessions
+  whose close-complete marker verifies, the SESSION_CLOSE already
+  consumed sequence `steps.len()`; recovery now advances past it so a
+  retroactive receipt cannot collide with the published close.
+- **tests:** `partition_assignment_is_stable` compared a value to
+  itself (pinned FNV-1a literals now anchor the hash); the budget
+  model's over-refund terminal check asserted nothing (now checked
+  against the reference model); two `?`-style manual error arms in
+  `promote()` simplified.
+
 ### Full-codebase bug hunt: eight fixes across bridge, harness, and dashboard (2026-08-20)
 
 A four-agent parallel sweep of all twelve crates (~58k lines) after the
