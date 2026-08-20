@@ -1240,6 +1240,33 @@ pub async fn doctor(offline: bool) -> Result<()> {
             checks.push(Check::Pass(format!("upstream auth: {auth}")));
         }
 
+        // Round-29 F1 (avctl doctor): parity with the upstream API key
+        // check above. `tool_upstream_bearer_env/_file` is the MCP
+        // path's bearer token; the runtime applies the SAME
+        // `require_owner_only_secret` posture at first tool call,
+        // but doctor used to check neither.
+        if let Some(env) = &config.tool_upstream_bearer_env {
+            match std::env::var(env) {
+                Ok(value) if !value.trim().is_empty() => {
+                    checks.push(Check::Pass(format!("tool bearer: env {env} (set)")));
+                }
+                _ => checks.push(Check::Fail(format!(
+                    "tool bearer: environment variable {env} is unset or empty"
+                ))),
+            }
+        } else if let Some(file) = &config.tool_upstream_bearer_file {
+            match check_owner_only_secret(std::path::Path::new(file)) {
+                Ok(()) => checks.push(Check::Pass(format!("tool bearer: {file}"))),
+                Err(reason) => {
+                    checks.push(Check::Fail(format!("tool bearer: {file} — {reason}")));
+                }
+            }
+        } else if config.tool_upstream_url.is_some() {
+            checks.push(Check::Warn(
+                "tool bearer: none configured (MCP calls will proxy unauthenticated)".to_owned(),
+            ));
+        }
+
         // 4. Upstream reachability (TCP + HTTP; any HTTP status counts).
         if offline {
             checks.push(Check::Warn("upstream: skipped (--offline)".to_owned()));

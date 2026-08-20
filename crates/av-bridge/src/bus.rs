@@ -304,8 +304,7 @@ mod tests {
             "backend outages are transient by default"
         );
         assert!(
-            !BusError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "slow disk"))
-                .is_permanent(),
+            !BusError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "slow disk")).is_permanent(),
             "I/O timeouts are transient"
         );
         // Serde errors are permanent for that payload — the sender
