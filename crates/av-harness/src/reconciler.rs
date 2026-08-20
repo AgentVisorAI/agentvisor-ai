@@ -756,8 +756,18 @@ impl Finalizer {
             receipt
         } else {
             let body = session.receipt_body(subject, StopReason::SessionClosed);
+            // Round-49 F2: also observe here — the receipt-signing
+            // histogram was only observed in `close_session_locked`
+            // (the signed-close path), leaving retroactive
+            // promotion signing latency invisible. An operator
+            // watching `av_receipt_sign_duration_seconds` would
+            // see promotion-signing regressions as a flat metric.
+            let sign_started = Instant::now();
             let receipt = Receipt::issue(body, self.signer.as_ref())
                 .map_err(|error| FinalizeError::Receipt(error.to_string()))?;
+            self.metrics
+                .histogram("av_receipt_sign_duration_seconds", "Receipt signing latency")
+                .observe_us(elapsed_us(sign_started));
             self.persist_receipt(&session.id, &receipt).await?;
             *session.receipt.lock() = Some(receipt.clone());
             receipt

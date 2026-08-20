@@ -4,6 +4,36 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 6: three metrics fixes; three 0-finding audits (2026-08-20)
+
+Four fresh lenses this round — a code-review of round 5's own commit
+(came back clean, 2nd clean self-audit in a row), an exhaustive panic-
+reachability trace from every attacker-controlled ingress (0 findings —
+`SessionId::parse` / `read_capped` / `is_char_boundary` backoff cover
+every panic-capable op), a resource-leak audit under adversarial load
+(0 findings — every allocation site cited a release path or a
+design-documented retention), and a metrics-accuracy audit. Three fixes:
+
+- **harness (low, observability):** `av_dashboard_requests_total`
+  registered `status="ok"` with HELP "requests served" and
+  `status="not_found"` with HELP "requests that could not be served".
+  Prometheus renders one HELP per family/base name, so whichever
+  label registered first became the family's HELP — operators reading
+  the family as failures-only misdiagnosed healthy traffic spikes.
+  Both variants now share a stage-agnostic HELP.
+- **harness (low, observability):** same pattern in
+  `av_events_dropped_total`: `worker_queue` and `worker_closed`
+  registered "Worker jobs dropped", `response_slot` registered
+  "Response-slot reservations that failed". Whichever stage
+  registered first won the family HELP. All four firing sites now
+  share a HELP that names every stage.
+- **harness (medium, observability):** `av_receipt_sign_duration_seconds`
+  was observed only in `close_session_locked` (signed close path);
+  the `promote()` receipt path called `Receipt::issue` without an
+  observation, so retroactive-promotion signing latency regressions
+  were invisible while the metric stayed flat. Now observed in both
+  paths.
+
 ### Bug-hunt round 5: NATS retry parity, doc drift, and known-limitation docs (2026-08-20)
 
 Four fresh lenses this round — a code-review of round 4's own commit
