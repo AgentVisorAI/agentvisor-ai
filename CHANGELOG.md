@@ -4,6 +4,63 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 22: chat duplicate-key rejection + self-fix of round-21 double-observation + quarantine filename (2026-08-20)
+
+Four fresh deep-dives — code-review of round-21 (caught TWO real
+regressions I introduced), adversarial-input audit (1 finding
+applied), cross-crate error handling (3 findings; deferred),
+cancellation semantics (1 finding, already deferred).
+
+- **routes (HIGH, ingress dup-key malleability):** `POST
+  /v1/chat/completions` accepted duplicate top-level or nested JSON
+  keys silently (serde_json's default is last-wins). A hostile
+  client could send `{"messages":[safe],"messages":[hostile]}` —
+  the harness saw the hostile array while any auditor reading the
+  raw request bytes saw an ambiguous document, violating the
+  "same signature ⇔ same bytes" invariant. Same class as
+  round-15 F3's receipt-null malleability, applied at chat
+  ingress. Now uses the newly-exposed
+  `av_sandbox::refuse_duplicate_json_keys` helper (extracted from
+  `parse_tool_call`'s existing check) before parsing. Regression
+  test: `chat_completions_refuses_duplicate_json_keys`.
+- **harness (HIGH, self-fix of round-21):** the round-21 F2 Drop
+  observer for `av_session_finalize_duration_seconds` was added
+  WITHOUT removing the pre-existing terminal-line observation.
+  Every successful `close_session_locked` recorded the histogram
+  TWICE — inflating rate/QPS by ~2× and distorting error-ratio
+  alerting exactly opposite to the intent. Removed the terminal
+  observation; the Drop observer is now the sole record site
+  (also covers all `?` early-Err paths, keeping the round-21 F2
+  intent).
+- **routes (MEDIUM, self-fix of round-21):** the round-21 F4
+  `.intent.torn` defense-in-depth was a silent no-op — the
+  quarantine writer at `routes.rs:1150` used
+  `path.with_extension("intent.torn")` which on a
+  `<key>.intent.json` path produces `<key>.intent.intent.torn`,
+  not `<key>.intent.torn`. Fixed the writer to build the
+  quarantine name explicitly (`{key}.intent.torn`) so
+  `remove_tool_executions`'s cleanup entry matches.
+
+Not actionable this round:
+- **receipts (medium, deferred):** the round-15 F3
+  null-rejection uses the `DUP_KEY_SENTINEL` prefix, so
+  null-rejection errors are classified as
+  `ReceiptError::DuplicateKey` — misleading for triage. Fix
+  requires a new error variant (breaking change on the
+  `#[non_exhaustive]` enum's match sites).
+- **cross-crate (medium, deferred):** all `BusError` variants
+  collapse to `FinalizeError::Bridge(String)` → HTTP 503.
+  `BusError::UnknownTopic` is a permanent config error but
+  client sees retryable 503; SDKs retry pointlessly. Fix
+  requires structured variant preservation through Finalize/
+  Pipeline error layers.
+- **cross-crate (medium, deferred):** `StateError::Backend`
+  (transient Redis outage) maps to `PipelineError::Blocked` →
+  HTTP 403 (policy refusal). Client can't distinguish transient
+  from permanent. Needs distinct pipeline variant.
+- **cancel (deferred):** spawn_blocking budget-task race on
+  disconnect — known from prior rounds.
+
 ### Bug-hunt round 21: metrics-on-failure + tool-cleanup crash safety (2026-08-20)
 
 Four fresh deep-dives — code-review of round-20 (clean, all 10

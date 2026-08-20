@@ -193,6 +193,18 @@ fn depth_of(v: &Value, current: usize) -> usize {
     }
 }
 
+/// Round-22 F1 (av-sandbox): the general-purpose duplicate-key
+/// rejection primitive, exposed for callers outside this crate (chat
+/// completions ingress, admin body parsers) that want the same
+/// trust-boundary "refuse ambiguous JSON" semantics without pulling in
+/// `RpcError`.
+///
+/// Returns `Ok(())` if `raw` contains no duplicate keys at any nesting
+/// level; otherwise a description of the offending key.
+pub fn refuse_duplicate_json_keys(raw: &[u8]) -> Result<(), String> {
+    reject_duplicate_keys(raw).map_err(|error| error.to_string())
+}
+
 /// Refuse any JSON object with duplicate keys anywhere in the payload.
 /// `serde_json` silently keeps the last value; downstream MCP servers may
 /// keep the first, expose both, or interpret the collapse differently.
