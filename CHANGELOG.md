@@ -4,6 +4,46 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 26: schema range check for pruning_ratio_millis at build (2026-08-20)
+
+Four fresh deep-dives — code-review of round-25 (clean), CHANGELOG
+accuracy audit (0 substantive inaccuracies), `av-events` builder
+(1 real range-check gap applied), integration smoke-test coverage
+(5 gaps flagged, all Large-effort, deferred).
+
+- **events (medium, schema range gap):** the JSON Schema declares
+  `pruning_ratio_millis` as an integer in `[0, 1000]` (permille
+  representation of 0.0%–100.0%). `OcsfEventBuilder::build` only
+  enforced JCS-safety, so `Some(5000)` (500%) built successfully
+  and only failed at strict-validate ingest time downstream — an
+  emitter/validator disagreement that shipped invalid events onto
+  the audit chain before rejection. Now caught at build. Boundary
+  test at `pruning_ratio_millis == 1000` still passes; `> 1000`
+  fails build. Regression test:
+  `build_refuses_pruning_ratio_millis_above_1000`.
+
+Not actionable this round:
+- **events builder (deferred):** `build()` doesn't call
+  `validate_event`; a caller can construct an event with
+  `severity_id=0` that build accepts but every reader rejects.
+  Fix would require every caller to handle a broader error set;
+  larger refactor.
+- **events builder (deferred):** `.stop_reason_native(...).stop_reason(...)`
+  leaves a stale native caption. Fix would require enforcing
+  invariant at set time or clearing native on stop_reason set.
+- **events builder (deferred):** `payload` has no maxProperties cap.
+- **events builder (deferred):** `Fingerprint` chain has no
+  digest/algorithm shape checks. All these deferred as
+  builder-completeness work.
+- **integration coverage (all Large):** full signed+unsigned
+  operator round-trip, crash-recover, SIGTERM drain, concurrent
+  external-client stress, malicious-ingress matrix. All flagged
+  by the test-coverage audit; each is a Large-effort epic.
+- **CHANGELOG (0 findings):** the audit found rounds 12-25
+  entries match code correctly. Older `Round-XX F#` comments in
+  source (rounds 26+) predate this session's numbering and refer
+  to a different bug-hunt scheme.
+
 ### Bug-hunt round 25: sandbox scanner classification + trailing-content refusal (2026-08-20)
 
 Four fresh deep-dives — code-review of round-24 (clean), av-bridge JSON
