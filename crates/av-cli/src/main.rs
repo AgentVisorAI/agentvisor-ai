@@ -7,7 +7,6 @@ use av_bridge::{BridgeManifest, EmbeddedBroker, EventBus};
 use av_receipts::{Ed25519Signer, Keyring, Receipt, Signer};
 use clap::{Parser, Subcommand, ValueEnum};
 use futures::{stream, StreamExt};
-use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -405,13 +404,19 @@ fn receipt_verify(path: &Path, public_key_hex: &str) -> Result<()> {
 
 fn atif_validate(path: &Path, mode: ValidationMode) -> Result<()> {
     let bytes = read_capped(path, MAX_ATIF_BYTES, "trajectory")?;
-    let value: Value =
-        serde_json::from_slice(&bytes).with_context(|| format!("parse JSON {}", path.display()))?;
     let mode = match mode {
         ValidationMode::Strict => av_atif::Mode::Strict,
         ValidationMode::Compat => av_atif::Mode::Compat,
     };
-    let issues = av_atif::validate_value(&value, mode);
+    // Round-23 F2: `validate_bytes` refuses duplicate keys before
+    // parsing (parallel to `Receipt::from_json_slice`'s round-16
+    // strict scanner) and runs `validate_value` on the untyped
+    // form, which exercises unknown-field checks that the typed
+    // `Trajectory` (no `deny_unknown_fields`) silently drops.
+    let issues = match av_atif::validate_bytes(&bytes, mode) {
+        Ok(issues) => issues,
+        Err(reason) => anyhow::bail!("parse {}: {reason}", path.display()),
+    };
     if !issues.is_empty() {
         // Round-20 F2/F8 + round-21 F5: the reconciler already
         // caps its render at first 16 + total; the CLI mirrors

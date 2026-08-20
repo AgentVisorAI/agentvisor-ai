@@ -29,5 +29,5 @@ pub use model::{
     Agent, FinalMetrics, Metrics, Observation, ObservationResult, ReasoningEffort, Source, Step,
     SubagentTrajectoryRef, ToolCall, Trajectory, ATIF_VERSION, SUPPORTED_VERSIONS,
 };
-pub use validate::{validate_trajectory, validate_value, Mode, ValidationIssue};
+pub use validate::{validate_bytes, validate_trajectory, validate_value, Mode, ValidationIssue};
 pub use writer::{write_atomic, TrajectoryBuilder};
