@@ -847,7 +847,7 @@ impl AppState {
                 return Err(error);
             }
         };
-        let analyze_loop = atif.source == av_atif::Source::Agent;
+        let analyze_loop = atif.source == av_atif::Source::Agent && !text.is_empty();
         let response_attempt_id = av_core::new_event_uid();
         let job = WorkerJob {
             session: Arc::clone(&session),
@@ -1764,14 +1764,61 @@ fn workflow(headers: &HeaderMap, default: &str) -> Result<Workflow, PipelineErro
 }
 
 fn last_message_text(payload: &Value) -> String {
-    payload
+    let Some(message) = payload
         .get("messages")
         .and_then(Value::as_array)
         .and_then(|messages| messages.last())
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned()
+    else {
+        return String::new();
+    };
+    // Primary source: string `content`.
+    if let Some(text) = message.get("content").and_then(Value::as_str) {
+        if !text.is_empty() {
+            return text.to_owned();
+        }
+    }
+    // Round-19 F1 (mirror of round-13's response-side fix): a
+    // tool-call-only assistant message carries `content: null` and a
+    // `tool_calls` array. `last_message_text` returning "" here would
+    // feed a zero-vector embedding into the breaker in worker.rs and
+    // false-trip legitimate tool-driven agents on the request side.
+    // Synthesize `tool_name(arguments)` for each tool call, in
+    // wire-order — same shape as the response-side synthesis in
+    // routes.rs::AbortFinalizingStream::submit_response_capture.
+    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+        let synthesized: Vec<String> = tool_calls
+            .iter()
+            .filter_map(|call| {
+                let name = call
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)?;
+                let args = call
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                Some(format!("{name}({args})"))
+            })
+            .collect();
+        if !synthesized.is_empty() {
+            return synthesized.join("\n");
+        }
+    }
+    // Content-parts array (multimodal). Concatenate every text part
+    // so an assistant reply built from mixed text+image parts still
+    // feeds a non-zero vector to the breaker rather than "".
+    if let Some(parts) = message.get("content").and_then(Value::as_array) {
+        let text: String = parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            return text;
+        }
+    }
+    String::new()
 }
 
 /// Human-readable JSON type name for diagnostics — mirrors `typeof` in
