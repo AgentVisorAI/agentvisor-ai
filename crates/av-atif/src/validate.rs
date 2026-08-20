@@ -349,6 +349,20 @@ fn validate_trajectory_obj(
                     None => issue!(issues, format!("{path}.agent.{req}"), "required field is missing"),
                 }
             }
+            // Round-16 F2: optional-string type check parity with the
+            // trajectory-root optional strings above. `Trajectory` types
+            // `model_name` as `Option<String>`, so a wrong-typed value
+            // (`model_name: 123`) would fail typed deserialization but
+            // used to pass Strict — the schema at
+            // `schemas/atif-v1.7.schema.json` also declares it as
+            // `string`. Flag the type mismatch so the strict validator
+            // does not silently accept documents the schema refuses.
+            if agent
+                .get("model_name")
+                .is_some_and(|v| !v.is_string() && !v.is_null())
+            {
+                issue!(issues, format!("{path}.agent.model_name"), "must be a string");
+            }
             if agent.contains_key("tool_definitions") && ver < (1, 5) {
                 issue!(
                     issues,
@@ -551,6 +565,16 @@ fn validate_step(
             format!("{path}.reasoning_effort"),
             "must be a string or number"
         );
+    }
+
+    // Round-16 F2: `Step.model_name` is `Option<String>` on the typed
+    // model; a wrong-typed value (`"model_name": 123`) fails typed
+    // deserialisation but used to pass Strict.
+    if obj
+        .get("model_name")
+        .is_some_and(|v| !v.is_string() && !v.is_null())
+    {
+        issue!(issues, format!("{path}.model_name"), "must be a string");
     }
 
     // Agent-only fields.
@@ -757,6 +781,23 @@ fn validate_step(
                                         mode,
                                         issues,
                                     );
+                                    // Round-16 F2: each SubagentTrajectoryRef
+                                    // typed member is `Option<String>` in
+                                    // model.rs. Wrong-typed values would
+                                    // fail typed deserialisation but used
+                                    // to only surface as the misleading
+                                    // "must set trajectory_id or
+                                    // trajectory_path" — because the
+                                    // has_id/has_path check maps a bad
+                                    // type to None via `as_str`.
+                                    for field in ["trajectory_id", "session_id", "trajectory_path"] {
+                                        if reference
+                                            .get(field)
+                                            .is_some_and(|v| !v.is_string() && !v.is_null())
+                                        {
+                                            issue!(issues, format!("{ref_path}.{field}"), "must be a string");
+                                        }
+                                    }
                                     let has_id = reference
                                         .get("trajectory_id")
                                         .and_then(Value::as_str)
