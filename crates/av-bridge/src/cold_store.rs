@@ -365,7 +365,10 @@ fn persist_pending(
     let parent = path
         .parent()
         .ok_or_else(|| BusError::Backend("cold outbox has no parent".to_owned()))?;
-    std::fs::create_dir_all(parent)?;
+    // Sync newly created ancestors too: the intent this file records is
+    // the only durable trace of a staged cold export, and an unsynced
+    // ancestor dirent can drop the whole outbox subtree on power loss.
+    av_core::fsutil::create_dir_all_synced(parent)?;
     let temporary = path.with_extension(format!("{}.tmp", av_core::new_event_uid()));
     // Round-22 F3: arm the RAII guard immediately after choosing the
     // temp path so that any Err on mac/serialize/write/sync/rename
