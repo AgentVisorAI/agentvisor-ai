@@ -4,6 +4,34 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 30: Kafka offset sign-wrap refusal (2026-08-20)
+
+Two fresh deep-dives — code-review of round-29 (clean), final
+catch-all sweep across `unsafe`, `extern`, `static mut`, `mem::forget`,
+integer overflow, DST, and build-time behavior. **Final sweep found
+1 real fix; all other classes came back clean.**
+
+- **bridge (medium, replay divergence):** the Kafka fetch path
+  cast `offset as i64` unconditionally. The Kafka wire protocol
+  reserves negative offsets as sentinels (-1 = latest, -2 =
+  earliest), so a `u64` value above `i64::MAX` would sign-wrap
+  into a negative number and silently redirect the fetch to the
+  log tail (or head, depending on the exact wrap value) instead
+  of the requested offset — a very hard-to-diagnose replay
+  divergence. In practice legitimate offsets stay well below
+  `2^63`, but crash-recovery from a manifest whose offset field
+  was tampered on disk could supply a value in `(i64::MAX,
+  u64::MAX]`. Now uses `i64::try_from(offset)` and returns
+  `BusError::Backend` with a clear message on overflow.
+
+Final-sweep classes all clean:
+- No workspace `unsafe`, `extern`, `static mut`, `unsafe impl
+  Send/Sync`, or `#[repr(C)]` blocks.
+- No `git=` or `*` Cargo dependencies.
+- No local-time/DST-dependent timestamp logic.
+- `mem::forget` uses are test-only.
+- Build scripts are benign.
+
 ### Bug-hunt round 29: round-28 primary-path fix + config UX polish + panic docs (2026-08-20)
 
 Four fresh deep-dives — code-review of round-28 (caught a HIGH-severity
