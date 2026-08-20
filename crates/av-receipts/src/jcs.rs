@@ -143,6 +143,19 @@ fn write_number(n: &serde_json::Number, out: &mut String) -> Result<(), JcsError
     if !f.is_finite() {
         return Err(JcsError::NonFinite);
     }
+    // Round-trip guard, symmetric with the integer paths above: every
+    // double with magnitude in (2^53, 10^21) is integer-valued (the
+    // IEEE-754 spacing is ≥ 1 past 2^53) and ECMAScript rendering emits
+    // it as pure integer digits. Re-parsing that canonical text yields an
+    // integer above the ±2^53 cap, which the integer path refuses — so a
+    // document signed over such a value could never re-canonicalize for
+    // verification from its parsed form (silent-error class D13.4, via
+    // the float back door). At or below 2^53 the value is exact; at or
+    // above 10^21 the rendering is exponential and re-parses as a double.
+    #[allow(clippy::cast_precision_loss)] // 2^53 is exactly representable
+    if f.abs() > JCS_SAFE_MAX as f64 && f.abs() < 1e21 {
+        return Err(JcsError::UnsafeInteger(ecma_number(f)));
+    }
     out.push_str(&ecma_number(f));
     Ok(())
 }
@@ -279,6 +292,33 @@ mod tests {
         assert_eq!(ecma_number(1e20), "100000000000000000000");
         assert_eq!(ecma_number(1e21), "1e+21");
         assert_eq!(ecma_number(-1e21), "-1e+21");
+    }
+
+    /// A double in (2^53, 10^21) renders as pure integer digits whose
+    /// re-parse is an integer above the ±2^53 cap — the canonical text of
+    /// a signed document would fail re-canonicalization at verify time.
+    /// Refused at write time, symmetric with the integer path; the
+    /// boundaries stay accepted and idempotent.
+    #[test]
+    fn integer_form_doubles_beyond_2_53_are_refused() {
+        let refused = [2.993466907830268e18, 9007199254740994.0, -9.999e20];
+        for f in refused {
+            let value = json!([f]);
+            assert!(
+                matches!(canonicalize(&value), Err(JcsError::UnsafeInteger(_))),
+                "expected UnsafeInteger for {f}"
+            );
+        }
+        // Boundary and beyond-range values stay accepted and roundtrip.
+        for f in [9007199254740992.0f64, -9007199254740992.0, 1e21, 1e300, -5e-324] {
+            let first = canonicalize(&json!([f])).unwrap();
+            let reparsed: Value = serde_json::from_str(&first).unwrap();
+            assert_eq!(
+                canonicalize(&reparsed).unwrap(),
+                first,
+                "canonical form of {f} must re-canonicalize identically"
+            );
+        }
     }
 
     #[test]

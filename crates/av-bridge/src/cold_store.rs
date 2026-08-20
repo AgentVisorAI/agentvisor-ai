@@ -180,7 +180,20 @@ impl ColdArchive {
         // bytes and both removals tolerate NotFound).
         let pending = {
             let _guard = self.intent_lock.lock();
-            let mut pending = read_pending(&pending_path, &self.control_key.read())?;
+            let mut pending = match read_pending(&pending_path, &self.control_key.read()) {
+                Ok(pending) => pending,
+                // A racing maintenance pass may have resolved, exported, and
+                // removed this intent while the publisher sat between
+                // `stage` and `commit` (stalled thread or wall-clock jump
+                // past RETRY_GRACE_MS). The export already happened, so the
+                // publish as a whole succeeded — mirror the NotFound
+                // tolerance of `retry_pending_with` instead of failing a
+                // fully-successful publish.
+                Err(BusError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
             if pending.topic != topic || pending.event_uid != event_uid {
                 return Err(BusError::Backend(
                     "cold intent does not match broker acknowledgment".to_owned(),
@@ -584,6 +597,42 @@ mod tests {
             matches!(outcome, Err(BusError::Backend(ref m)) if m.contains("authentication failed")),
             "weak-key forged envelope must be refused, got {outcome:?}"
         );
+    }
+
+    /// A racing maintenance pass can resolve, export, and remove an intent
+    /// while the publisher sits between `stage` and `commit` (stalled
+    /// thread or wall-clock jump past the retry grace). The export already
+    /// happened, so `commit` must treat the missing intent as success —
+    /// mirroring `retry_pending_with`'s NotFound tolerance — instead of
+    /// failing a fully-successful publish (which would push callers into a
+    /// retry that duplicates the event on backends without local dedup).
+    #[test]
+    fn commit_tolerates_an_intent_already_exported_by_maintenance() {
+        let directory = tempfile::tempdir().unwrap();
+        let uri = url::Url::from_directory_path(directory.path())
+            .unwrap()
+            .to_string();
+        let outbox = tempfile::tempdir().unwrap();
+        let mut manifest = BridgeManifest::default_for("cold-race");
+        let topic = &mut manifest.topics[0];
+        topic.retention.cold_uri = Some(uri);
+        let topic_name = topic.name.clone();
+        let archive =
+            ColdArchive::from_manifest_with_pending_default(&manifest, Some(outbox.path().to_path_buf()))
+                .unwrap()
+                .unwrap();
+        archive.set_control_key([17u8; 32]).unwrap();
+        let event = StoredEvent {
+            partition: 0,
+            offset: 5,
+            key: "instance".to_owned(),
+            value: serde_json::json!({"metadata": {"uid": "uid-race"}}),
+            stored_at: 1,
+        };
+        archive.stage(&topic_name, &event, "uid-race").unwrap();
+        // Simulate the racing maintenance export+removal.
+        std::fs::remove_file(archive.pending_path(&topic_name, "uid-race")).unwrap();
+        archive.commit(&topic_name, "uid-race", 5).unwrap(); // commit after a racing export must succeed
     }
 
     /// Mutation-run hardening (round 14): `validate_same_intent` binds a

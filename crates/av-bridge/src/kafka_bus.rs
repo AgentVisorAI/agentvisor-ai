@@ -488,14 +488,32 @@ impl EventBus for KafkaBus {
                     .get_offset(OffsetAt::Latest)
                     .await
                     .map_err(|error| error.to_string())?;
+                let mut empty_fetches = 0u32;
                 while offset < latest {
                     let (records, _) = partition_client
                         .fetch_records(offset, 1..(16 * 1024 * 1024), 500)
                         .await
                         .map_err(|error| error.to_string())?;
                     if records.is_empty() {
-                        break;
+                        // `offset < latest` proves the broker still holds
+                        // records we have not seen; an empty response here is
+                        // a timing artifact (the 500 ms max_wait expired on a
+                        // loaded/rebalancing broker), NOT proof of absence.
+                        // Returning Ok(None) would let maintenance re-produce
+                        // an already-committed event — a duplicate in the
+                        // audit stream, the exact outcome this lookup exists
+                        // to prevent. Retry bounded, then fail the lookup so
+                        // the caller retries the whole pass later (the cold
+                        // intent is durable).
+                        empty_fetches += 1;
+                        if empty_fetches >= 8 {
+                            return Err(format!(
+                                "Kafka event lookup stalled: empty fetch at offset {offset} below latest {latest}"
+                            ));
+                        }
+                        continue;
                     }
+                    empty_fetches = 0;
                     for record in &records {
                         if let Some(payload) = record.record.value.as_deref() {
                             let stored: StoredEvent =
