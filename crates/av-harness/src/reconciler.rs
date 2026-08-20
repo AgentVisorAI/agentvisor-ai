@@ -3838,6 +3838,17 @@ mod tests {
         // HMAC verification and return Err. Pre-round-41 F1 this
         // Err propagated through recover_spooled_sessions and
         // aborted every unrelated session's recovery for the tick.
+        //
+        // Note (round-49 audit): this test does NOT plant a healthy
+        // signed session alongside — a healthy signed session that
+        // actually reaches recovery requires a mid-flight-crashed
+        // journal fixture (the live `close_session` path
+        // fully removes the journal on success, so the healthy
+        // recovery corpus is intentionally empty here). The invariant
+        // this test locks in is the OUTER `Ok(())` — any regression
+        // that propagates the sidecar Err through
+        // `recover_spooled_sessions` would fail
+        // `assert!(outcome.is_ok())`.
         let poison_stem = "poisonpoisonpoisonpoisonpoison32";
         std::fs::write(
             directory.path().join(format!("{poison_stem}.session.json")),

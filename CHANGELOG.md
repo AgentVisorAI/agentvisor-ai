@@ -4,6 +4,53 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 10: one observability fix + one test-quality doc + two 0-finding audits (2026-08-20)
+
+Four fresh lenses this round — a code-review of round 9's own commit
+(came back clean — 2nd consecutive clean self-audit), a graceful-
+shutdown audit (found only the by-design 30s hard drain deadline),
+a test-integrity deep-dive on round-N regression tests (4 findings,
+1 addressed), and an observability completeness audit (one silent-
+failure gap, fixed).
+
+- **state (medium, observability):** `RedisStore::refund` swallowed
+  every Redis error silently (best-effort by trait contract), so an
+  operator seeing budget depletion during a Redis outage had NO
+  signal that per-key compensation had been failing — logs still
+  said "refunding budget" without indicating the refund never
+  landed. Now emits a `tracing::warn!` with structured error fields
+  (`error.kind`, `error.detail`, target `av_state::redis`) on every
+  refund failure. The response path stays 200 OK so the caller
+  never learns compensation failure as a 5xx (preserving the
+  best-effort contract).
+- **tests (docs):** the round-41 F1 regression test
+  (`round_41_f1_corrupt_signed_sidecar_does_not_block_other_signed_recovery`)
+  was flagged as unable to catch a regression that skips ALL
+  signed sessions rather than just the poisoned one. A meaningful
+  strengthening would need a healthy signed session fixture — but
+  the live `close_session` path fully removes the journal on
+  success, so recovery has nothing to re-adopt. Attempting to add
+  a healthy neighbor legitimately failed at the assertion, so the
+  test now documents the limitation inline and holds the outer
+  `Ok(())` invariant (the round-41 F1 fix's exact regression
+  target).
+
+Investigated with no code change needed:
+- **Graceful-shutdown audit:** the 30 s hard drain deadline can
+  cut off long-running requests on SIGTERM; that trade-off is
+  intentional (K8s rolling updates require a bounded stop, longer
+  deadlines would exceed pod-termination timeouts). Documented in
+  `main.rs:159-163` already.
+- **Test-integrity audit:** two timing-based tests
+  (`routes.rs:4407`, `worker.rs:1567`) use `sleep(10ms)` without
+  a barrier that the slow path has actually entered — brittle but
+  hard to fix generically without introducing test-only APIs on the
+  code under test. Deferred.
+- **Dashboard receipt visibility test** (`dashboard.rs:666`) uses
+  `restore_receipt` directly rather than going through recovery;
+  this test's stated purpose is dashboard serialization, not
+  recovery, so the shortcut is defensible.
+
 ### Bug-hunt round 9: three fixes + one deferred design item; one 0-finding audit (2026-08-20)
 
 Four fresh lenses this round — a code-review of round 8's own commit

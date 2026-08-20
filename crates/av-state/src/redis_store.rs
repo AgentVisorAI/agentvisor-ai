@@ -334,23 +334,47 @@ impl StateStore for RedisStore {
             return new
         "
         );
-        match &self.backend {
-            RedisBackend::Single(pool) => {
-                if let Ok(mut connection) = pool.get() {
-                    let _: Result<i64, _> = redis::Script::new(&clamp_script)
-                        .key(key)
-                        .arg(amount)
-                        .invoke(&mut *connection);
-                }
-            }
-            RedisBackend::Cluster(pool) => {
-                if let Ok(mut connection) = pool.get() {
-                    let _: Result<i64, _> = redis::Script::new(&clamp_script)
-                        .key(key)
-                        .arg(amount)
-                        .invoke(&mut *connection);
-                }
-            }
+        // Round-50 F1: refund is best-effort by the trait contract, but
+        // its silent-swallow used to be COMPLETELY invisible — no log,
+        // no metric — so an operator seeing budget depletion during a
+        // Redis outage had no signal that compensation had been
+        // failing. Log the failed refund with structured fields so
+        // downstream aggregators (Vector → OTLP → SIEM) can alert on
+        // it. The response path still stays 200 OK so the caller
+        // never learns a compensation failure as a 5xx.
+        let outcome: Result<i64, redis::RedisError> = match &self.backend {
+            RedisBackend::Single(pool) => match pool.get() {
+                Ok(mut connection) => redis::Script::new(&clamp_script)
+                    .key(key)
+                    .arg(amount)
+                    .invoke(&mut *connection),
+                Err(error) => Err(redis::RedisError::from((
+                    redis::ErrorKind::IoError,
+                    "connection pool exhausted",
+                    error.to_string(),
+                ))),
+            },
+            RedisBackend::Cluster(pool) => match pool.get() {
+                Ok(mut connection) => redis::Script::new(&clamp_script)
+                    .key(key)
+                    .arg(amount)
+                    .invoke(&mut *connection),
+                Err(error) => Err(redis::RedisError::from((
+                    redis::ErrorKind::IoError,
+                    "connection pool exhausted",
+                    error.to_string(),
+                ))),
+            },
+        };
+        if let Err(error) = outcome {
+            tracing::warn!(
+                target: "av_state::redis",
+                error.kind = ?error.kind(),
+                error.detail = %error,
+                "Redis refund failed silently; per-key compensation was not applied — \
+                 budget counter may remain over-charged until the 24 h TTL expires or a \
+                 successful spend/refund lands"
+            );
         }
     }
 
