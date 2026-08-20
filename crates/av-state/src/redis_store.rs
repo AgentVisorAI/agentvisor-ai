@@ -280,17 +280,40 @@ impl StateStore for RedisStore {
     }
 
     fn remove(&self, key: &str) {
-        match &self.backend {
-            RedisBackend::Single(pool) => {
-                if let Ok(mut connection) = pool.get() {
-                    let _: Result<(), _> = connection.del(key);
-                }
-            }
-            RedisBackend::Cluster(pool) => {
-                if let Ok(mut connection) = pool.get() {
-                    let _: Result<(), _> = connection.del(key);
-                }
-            }
+        // Round-15 F2 (av-state): mirror the round-10 `refund` treatment
+        // — best-effort by contract, but a completely-silent Redis
+        // failure on the cleanup path leaves an operator with no
+        // signal that a session's stale key wasn't removed. The next
+        // recycled-session-id can then inherit the counter. Warn on
+        // both pool-get and DEL failure with structured fields.
+        let outcome: Result<(), redis::RedisError> = match &self.backend {
+            RedisBackend::Single(pool) => match pool.get() {
+                Ok(mut connection) => connection.del(key),
+                Err(error) => Err(redis::RedisError::from((
+                    redis::ErrorKind::IoError,
+                    "connection pool exhausted",
+                    error.to_string(),
+                ))),
+            },
+            RedisBackend::Cluster(pool) => match pool.get() {
+                Ok(mut connection) => connection.del(key),
+                Err(error) => Err(redis::RedisError::from((
+                    redis::ErrorKind::IoError,
+                    "connection pool exhausted",
+                    error.to_string(),
+                ))),
+            },
+        };
+        if let Err(error) = outcome {
+            let error_kind = error.kind();
+            tracing::warn!(
+                target: "av_state::redis",
+                kind = ?error_kind,
+                detail = %error,
+                "Redis remove failed silently; per-key cleanup was not applied — \
+                 a subsequent session recycling this key may inherit its counter \
+                 until the 24 h TTL expires"
+            );
         }
     }
 
@@ -458,13 +481,44 @@ fn scan_and_delete_single(conn: &mut redis::Connection, pattern: &str) {
             .arg("COUNT")
             .arg(SCAN_COUNT)
             .query(conn);
-        let Ok((next, batch)) = scan else { return };
+        let (next, batch) = match scan {
+            Ok(pair) => pair,
+            Err(error) => {
+                // Round-15 F2 (av-state): SCAN failing means we bail
+                // out mid-cleanup — the remaining keys survive with
+                // their TTLs, and a future session recycling this id
+                // (within 24 h) would inherit the leftover counters
+                // silently. Log with structured fields so an operator
+                // aggregating warns can spot chronic backend outages.
+                let error_kind = error.kind();
+                tracing::warn!(
+                    target: "av_state::redis",
+                    kind = ?error_kind,
+                    detail = %error,
+                    "Redis SCAN failed during remove_prefix; partial cleanup — surviving \
+                     keys will expire at the 24 h TTL or on the next successful \
+                     remove_prefix for the same prefix"
+                );
+                return;
+            }
+        };
         if !batch.is_empty() {
             let mut del = redis::cmd("DEL");
             for key in &batch {
                 del.arg(key);
             }
-            let _: Result<i64, _> = del.query(conn);
+            let outcome: Result<i64, _> = del.query(conn);
+            if let Err(error) = outcome {
+                let error_kind = error.kind();
+                tracing::warn!(
+                    target: "av_state::redis",
+                    kind = ?error_kind,
+                    detail = %error,
+                    batch_len = batch.len(),
+                    "Redis DEL batch failed during remove_prefix; these keys survive \
+                     until the 24 h TTL expires"
+                );
+            }
         }
         if next == 0 {
             return;
@@ -507,10 +561,41 @@ fn scan_and_delete_cluster(conn: &mut redis::cluster::ClusterConnection, pattern
         };
         let value = match conn.route_command(&scan_cmd, routing.clone()) {
             Ok(value) => value,
-            Err(_) => return,
+            Err(error) => {
+                // Round-15 F2 (av-state): parity with
+                // `scan_and_delete_single`. Cluster-mode SCAN failure
+                // was completely silent, so an operator watching
+                // `av_state::redis::warn` for cleanup problems saw
+                // nothing on cluster deployments even under Redis
+                // slowdown.
+                let error_kind = error.kind();
+                tracing::warn!(
+                    target: "av_state::redis",
+                    kind = ?error_kind,
+                    detail = %error,
+                    slot,
+                    "Redis cluster SCAN failed during remove_prefix; partial cleanup — \
+                     surviving keys will expire at the 24 h TTL or on the next successful \
+                     remove_prefix for the same prefix"
+                );
+                return;
+            }
         };
         let parsed: Result<(u64, Vec<String>), _> = redis::FromRedisValue::from_redis_value(&value);
-        let Ok((next, batch)) = parsed else { return };
+        let (next, batch) = match parsed {
+            Ok(pair) => pair,
+            Err(error) => {
+                let error_kind = error.kind();
+                tracing::warn!(
+                    target: "av_state::redis",
+                    kind = ?error_kind,
+                    detail = %error,
+                    "Redis cluster SCAN returned an unparsable response during remove_prefix; \
+                     aborting further cleanup for this prefix"
+                );
+                return;
+            }
+        };
         if !batch.is_empty() {
             let mut del = redis::cmd("DEL");
             for key in &batch {
@@ -519,7 +604,18 @@ fn scan_and_delete_cluster(conn: &mut redis::cluster::ClusterConnection, pattern
             // Multi-key DEL is safe here because every match shares the
             // slot we already computed above — route it explicitly so
             // the driver does not need to inspect the keys again.
-            let _ = conn.route_command(&del, routing.clone());
+            if let Err(error) = conn.route_command(&del, routing.clone()) {
+                let error_kind = error.kind();
+                tracing::warn!(
+                    target: "av_state::redis",
+                    kind = ?error_kind,
+                    detail = %error,
+                    slot,
+                    batch_len = batch.len(),
+                    "Redis cluster DEL batch failed during remove_prefix; these keys survive \
+                     until the 24 h TTL expires"
+                );
+            }
         }
         if next == 0 {
             return;

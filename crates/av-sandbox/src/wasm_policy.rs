@@ -24,6 +24,25 @@ const FUEL_PER_CALL: u64 = 50_000_000;
 /// Linear memory cap per evaluation.
 const MAX_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 
+/// Round-15 F1 (av-sandbox): host-memory DoS caps for guest-visible
+/// resource growth. `StoreLimitsBuilder::memory_size` bounds one
+/// `Memory`, but a hostile policy could:
+///
+/// * declare many `(memory ...)` sections and reach ~10k×16 MiB of
+///   allocation before fuel meaningfully activates;
+/// * `table.grow` a table by millions of function-reference slots
+///   (each `Option<Func>` ≈ 16 bytes on 64-bit), forcing a huge host
+///   allocation on the growth step;
+/// * declare many tables per module to multiply the above.
+///
+/// Fuel/epoch help only against runtime-bounded exploits — allocation
+/// pressure lands at instantiation or on a single `memory.grow` /
+/// `table.grow` instruction. Cap every dimension explicitly.
+const MAX_MEMORIES: usize = 1;
+const MAX_TABLES: usize = 4;
+const MAX_TABLE_ELEMENTS: usize = 65_536;
+const MAX_INSTANCES: usize = 4;
+
 /// Maximum wall time is approximately this many 1 ms epoch ticks.
 const EPOCH_DEADLINE_TICKS: u64 = 25;
 
@@ -61,7 +80,13 @@ impl WasmPolicy {
     }
 
     fn run(&self, payload: &[u8]) -> Result<i32, String> {
-        let limits = StoreLimitsBuilder::new().memory_size(MAX_MEMORY_BYTES).build();
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(MAX_MEMORY_BYTES)
+            .memories(MAX_MEMORIES)
+            .tables(MAX_TABLES)
+            .table_elements(MAX_TABLE_ELEMENTS)
+            .instances(MAX_INSTANCES)
+            .build();
         let mut store: Store<StoreLimits> = Store::new(&self.engine, limits);
         store.limiter(|l| l);
         store.set_fuel(FUEL_PER_CALL).map_err(|e| e.to_string())?;

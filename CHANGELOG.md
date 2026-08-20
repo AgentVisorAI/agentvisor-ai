@@ -4,6 +4,61 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 15: signature malleability + sandbox host-DoS caps + state cleanup observability (2026-08-20)
+
+Four fresh deep-dives — code-review of round-14 (clean), `av-receipts`
+(1 high-severity finding), `av-sandbox` (2 host-DoS caps missing), and
+`av-state` (silent-failure observability gaps + cluster-mode caller
+invariant to document).
+
+- **receipts (HIGH, signature malleability):** `Receipt::from_json_slice`
+  accepted `"ttl_remaining_s": null` (and every other
+  `Option<T>`-with-`skip_serializing_if="Option::is_none"` field on
+  `ReceiptBody` / `AgentIdentity` / `EventMetrics` / …) as a
+  synonym for the field being absent. But `Receipt::verify` (and
+  `verify_embedded`) re-canonicalises via
+  `serde_json::to_value(&self.body)`, which drops `None` again. The
+  consequence: a valid signature over TWO byte-different wire
+  encodings. An intermediary could toggle `"field": null` on/off in
+  the stored bytes without invalidating the signature — a violation
+  of the "same signature ⇔ same bytes" auditor invariant that
+  underpins receipts. The strict pre-scanner `check_no_duplicate_keys`
+  now also refuses explicit JSON `null` anywhere in the payload
+  (receipts contain no legitimate JSON null — top level is an
+  object, every field is a value-type or omit-on-none). Regression
+  test added: `from_json_slice_rejects_explicit_null_option_field`.
+- **sandbox (medium, host-DoS):** `StoreLimitsBuilder` set only
+  `memory_size(16 MiB)` — no caps on the number of `Memory`
+  instances, `Table` instances, table element count, or instance
+  count. A hostile policy could:
+  - declare many `(memory ...)` sections and reach thousands of
+    16 MiB allocations before fuel/epoch meaningfully activates,
+  - `table.grow` a table by millions of function-reference slots
+    (each `Option<Func>` ≈ 16 bytes on 64-bit), forcing a huge
+    host allocation on the growth step, or
+  - declare many tables per module to multiply the above.
+  Fuel and epoch protect only runtime-bounded exploits; allocation
+  pressure lands at instantiation or on a single `memory.grow` /
+  `table.grow` instruction. Added: `memories(1)`, `tables(4)`,
+  `table_elements(65_536)`, `instances(4)`.
+- **state (medium, observability):** round-10 added a `tracing::warn!`
+  on silent `refund` failures. The parallel silent-failure paths in
+  `RedisStore::remove` and both `scan_and_delete_single` /
+  `scan_and_delete_cluster` (SCAN failure + DEL failure) had no
+  telemetry — an operator watching `av_state::redis::warn` for
+  cleanup issues saw nothing when Redis slowdowns or connection-pool
+  exhaustion left stale counters behind. All four paths now emit
+  structured warns naming the operation, error kind, batch size
+  (where applicable), and consequence (24 h TTL survival + recycled-
+  session inheritance risk).
+- **state (low, doc-only):** documented the caller-side invariant
+  that `remove_prefix` in Redis Cluster mode routes to ONE hash
+  slot derived from the prefix, so callers MUST include a Redis
+  Cluster hash tag (`{...}`) in the prefix or their non-tagged
+  keys will silently persist in other slots. `ActionBudget::session_prefix`
+  is already tagged, so this is not a live bug — but a future caller
+  adding a non-tagged prefix would silently regress.
+
 ### Bug-hunt round 14: doctor drift + CLI terminal-injection surface (2026-08-20)
 
 Four fresh deep-dives — code-review of round-13's loop-breaker fix (clean),
