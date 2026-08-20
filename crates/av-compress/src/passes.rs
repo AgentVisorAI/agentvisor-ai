@@ -171,8 +171,26 @@ fn stub_middle_to_target(
     // compression pass to skip." A keyed-marker
     // scheme remains future work, currently unscheduled.
     let scan_end = tail_start.min(messages.len());
+    // Round-18 F1 (av-compress): the prior check refused to run a
+    // second pass if ANY pre-tail message content contained the
+    // literal substring "reason: middle history]" — but a
+    // user/assistant message that legitimately quotes that phrase
+    // (or a compromised prior turn that includes it as free text)
+    // could silently disable compression. Narrow the check to
+    // exactly what the marker produces: content must START with
+    // "[pruned:" AND contain the marker tail. A user quoting the
+    // phrase in free text no longer matches (their content will
+    // start with their own words, not "[pruned:"). This is not
+    // the full keyed-marker fix (round-19 F8 known limitation) —
+    // but the spoofing surface shrinks from "any message contains
+    // the substring" to "any message perfectly mimics the marker
+    // prefix + tail." Realistic user text does not shape like a
+    // machine-emitted `[pruned: N tokens, sha256:HEX, reason: middle
+    // history]`.
     if messages.get(..scan_end).into_iter().flatten().any(|message| {
-        msg_content_str(message).is_some_and(|content| content.contains("reason: middle history]"))
+        msg_content_str(message).is_some_and(|content| {
+            content.starts_with("[pruned:") && content.contains("reason: middle history]")
+        })
     }) {
         return false;
     }

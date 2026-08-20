@@ -4,6 +4,88 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 18: stop_reason over-strict regression fix + MCP Content-Type + compression marker (2026-08-20)
+
+Four fresh deep-dives — code-review of round-17 (caught a
+HIGH-severity regression I introduced in the round-17 stop-reason
+check), `av-compress` (2 findings; 1 hardening applied),
+`av-harness/src/routes.rs` (1 spec-conformance fix; 3 deferred), and
+supply-chain (2 RUSTSEC-flagged crates in the tree).
+
+- **events (HIGH, regression fix):** Round-17's
+  `StopReasonCaptionMismatch` required
+  `StopReason::from_id(id).caption() == stop_reason` whenever the
+  id was known — but the `stop_reason` field docstring and the
+  builder API `OcsfEventBuilder::stop_reason_native` both document
+  the field as carrying the provider's NATIVE finish_reason
+  (`"stop"`, `"end_turn"`, `"length"`, `"tool_calls"`,
+  `"content_filter"`, `"function_call"`, etc.). The over-strict
+  check rejected the vast majority of production events. Round-18
+  narrows the check to the specific cross-wiring case: caption is
+  ITSELF a canonical caption for a DIFFERENT known variant. `id=93
+  (PolicyBlocked)` + `caption="Loop Detected"` (canonical for
+  id=91) is flagged; `id=1 + caption="stop"` (OpenAI native) is
+  not. Two regression tests added:
+  `stop_reason_provider_native_captions_are_accepted` and
+  `stop_reason_cross_wired_captions_are_flagged`. **This fix
+  ships in the same round because round-17 is not yet released and
+  a broken validator would ship with it.**
+- **routes (medium, spec conformance):** `/v1/mcp` accepted any
+  inbound `Content-Type`. MCP is JSON-RPC 2.0 (spec: MUST be
+  `application/json`); a client sending `Content-Type:
+  multipart/form-data` with a JSON body would process
+  successfully — a spec-violation surface with no defensible use
+  case. The handler now rejects any Content-Type that is not
+  `application/json` (missing Content-Type is tolerated as some
+  minimal clients skip it).
+- **compress (medium, marker robustness):** the middle-pass
+  compression's idempotency check refused to run if any pre-tail
+  message content contained the literal substring `"reason:
+  middle history]"` — but a user/assistant message legitimately
+  quoting that phrase could silently disable compression. Narrowed
+  the check to messages whose content START WITH `"[pruned:"` AND
+  contain the marker tail — the actual machine-emitted marker
+  shape. This is not the full keyed-marker fix (round-19 F8
+  known limitation) but shrinks the spoofing surface from "any
+  substring occurrence" to "exact marker shape."
+
+Not actionable this round:
+- **supply chain (HIGH, upstream-blocked):** `rsa 0.9.10` has
+  **RUSTSEC-2023-0071** (Marvin timing side-channel attack) and no
+  patched version exists upstream. Pulled in via `jsonwebtoken
+  11.0.0` in `av-identity`. The RSA code path is only exercised
+  when a JWKS advertises an RS256/RS384/RS512 key — Ed25519 (EdDSA)
+  and HS256 paths do not exercise it. **Deferred: needs upstream
+  jsonwebtoken to drop RSA or migrate to a JWT library that lets
+  us disable RSA at compile time (e.g., `josekit` with feature
+  selection).**
+- **supply chain (low):** `paste 1.0.15` (RUSTSEC-2024-0436,
+  unmaintained) and `number_prefix 0.4.0` (RUSTSEC-2025-0119,
+  unmaintained) enter the tree ONLY when the `onnx` feature is
+  enabled on `av-loopdetect`. Neither has a known active
+  vulnerability; both are unmaintained-status advisories.
+  Deferred until the ONNX toolchain upgrades its dep tree.
+- **routes (medium, deferred):** `/dashboard` and
+  `/api/v1/dashboard/*` are mounted without route-layer auth when
+  `dashboard_enabled=true`. Real for a misconfigured operator but
+  the endpoint defaults to disabled. Adding auth is a design
+  change (currently no auth infrastructure for dashboard); tracked.
+- **routes (medium, deferred):** completion-budget refusal
+  produces `200 + broken body` because streaming commits the
+  upstream status before the budget check runs. Known design
+  tradeoff — SSE requires headers-first; the audit trail
+  compensates via `AbortFinalizingStream::Drop`.
+- **routes (low, deferred):** on client disconnect, a
+  `spawn_blocking` budget task's cancellation is best-effort; a
+  small window between disconnect and task abort could still
+  debit tokens.
+- **compress (medium, deferred):** duplicate/middle passes are
+  O(n²) allocation. Known deferred item from round-13.
+- **compress (medium, deferred):** duplicate-stub replacement
+  drops `name`, `refusal`, and other structural fields from the
+  original message. Not structure-lossless. Fix requires
+  understanding downstream reader expectations.
+
 ### Bug-hunt round 17: cold_uri path escape + event/stop-reason consistency + JCS-safe deserialize guard (2026-08-20)
 
 Four fresh deep-dives — code-review of round-16 (clean, all 10 concerns

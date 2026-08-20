@@ -153,31 +153,53 @@ pub fn validate_event(ev: &OcsfEvent) -> Result<(), Vec<ValidationError>> {
     if ev.stop_reason_id.is_some() != ev.stop_reason.is_some() {
         errors.push(ValidationError::StopReasonPairMismatch);
     }
-    // Round-17 F1: when both id and caption are present, cross-check
-    // that they agree. `StopReason::from_id` returns `Unknown` for
-    // unknown ids (forward-compat), so we only assert the equality
-    // when the id maps to a KNOWN variant. This lets a
-    // heterogeneous-cluster peer emit a new caption without failing
-    // validation on the older reader (round-29 F7's `#[serde(other)]`
-    // rationale), while still rejecting `id=93` +
-    // `caption="Loop Detected"` (both known but disagreeing).
+    // Round-17 F1 (revised in round-18 after self-audit): the initial
+    // fix required `StopReason::from_id(id).caption() == stop_reason`
+    // whenever id was known. That's WRONG — the field docstring at
+    // `model.rs::OcsfEvent::stop_reason` and the builder API
+    // `OcsfEventBuilder::stop_reason_native` both document
+    // `stop_reason` as "the provider's native value when captured".
+    // So `id=1, caption="stop"` (OpenAI native), `id=1,
+    // caption="end_turn"` (Anthropic native), `id=99, caption="Custom
+    // Free Text"` (Other) are ALL legitimate emissions from the
+    // official builder. The over-strict check would have rejected the
+    // vast majority of production events.
+    //
+    // Narrow to the specific cross-wiring case that started this
+    // finding: the caption is ITSELF a canonical caption for a
+    // DIFFERENT known variant. `id=93 (PolicyBlocked)` +
+    // `caption="Loop Detected"` (canonical caption of variant 91) is
+    // an unambiguous mistake — the two fields disagree on which
+    // enforcement fired. Provider-native captions like `"stop"` or
+    // `"tool_calls"` are not canonical captions of any variant, so
+    // they pass. Round-33's `map_finish_reason` in routes.rs uses the
+    // lowercase provider tokens; none of those coincide with a
+    // canonical caption (which are Title-cased: `"Stop"`, `"Tool
+    // Use"`, `"Length"`, `"Content Filter"`, …).
     if let (Some(id), Some(caption)) = (ev.stop_reason_id, ev.stop_reason.as_deref()) {
-        let derived = crate::StopReason::from_id(id);
-        let is_known_id = id == 0
-            || id == 1
-            || id == 2
-            || id == 3
-            || id == 4
-            || id == 90
-            || id == 91
-            || id == 92
-            || id == 93
-            || id == 94
-            || id == 99;
-        if is_known_id && derived.caption() != caption {
+        let expected = crate::StopReason::from_id(id).caption();
+        let is_known_id = matches!(id, 0..=4 | 90..=94 | 99);
+        let caption_is_canonical_of_other_variant = is_known_id
+            && expected != caption
+            && [
+                crate::StopReason::Unknown,
+                crate::StopReason::Stop,
+                crate::StopReason::MaxTokens,
+                crate::StopReason::ToolUse,
+                crate::StopReason::SessionClosed,
+                crate::StopReason::ContentFilter,
+                crate::StopReason::LoopDetected,
+                crate::StopReason::BudgetExceeded,
+                crate::StopReason::PolicyBlocked,
+                crate::StopReason::IdentityRejected,
+                crate::StopReason::Other,
+            ]
+            .iter()
+            .any(|other| other.caption() == caption);
+        if caption_is_canonical_of_other_variant {
             errors.push(ValidationError::StopReasonCaptionMismatch {
                 id,
-                expected_caption: derived.caption(),
+                expected_caption: expected,
                 actual_caption: caption.to_owned(),
             });
         }
@@ -282,6 +304,58 @@ mod tests {
         assert!(validate_event(&ev)
             .unwrap_err()
             .contains(&ValidationError::StopReasonPairMismatch));
+    }
+
+    /// Round-18 F1 self-fix: `stop_reason` carries the provider's
+    /// NATIVE finish_reason token (documented at
+    /// `model.rs::OcsfEvent::stop_reason` and the builder API
+    /// `OcsfEventBuilder::stop_reason_native`). Provider-native
+    /// captions (OpenAI `"stop"`, Anthropic `"end_turn"`, `"length"`,
+    /// `"tool_calls"`, `"content_filter"`, `"function_call"`) plus
+    /// `Other`-family free text MUST NOT be flagged as a caption
+    /// mismatch even though they differ from the canonical caption.
+    #[test]
+    fn stop_reason_provider_native_captions_are_accepted() {
+        for (id, native) in [
+            (1u8, "stop"),
+            (1, "end_turn"),
+            (1, "stop_sequence"),
+            (2, "length"),
+            (2, "max_tokens"),
+            (3, "tool_calls"),
+            (3, "function_call"),
+            (3, "tool_use"),
+            (90, "content_filter"),
+            (99, "provider_specific_free_text"),
+        ] {
+            let mut ev = valid_event();
+            ev.stop_reason_id = Some(id);
+            ev.stop_reason = Some(native.to_owned());
+            let errs = validate_event(&ev).map(|_| Vec::new()).unwrap_or_else(|e| e);
+            assert!(
+                !errs
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::StopReasonCaptionMismatch { .. })),
+                "provider-native caption ({id}, {native:?}) must not be flagged, got {errs:?}"
+            );
+        }
+    }
+
+    /// The one shape the check DOES flag: the caption is itself a
+    /// canonical caption for a DIFFERENT known variant. `id=93` +
+    /// `caption="Loop Detected"` (canonical for id=91) is the
+    /// unambiguous cross-wiring case.
+    #[test]
+    fn stop_reason_cross_wired_captions_are_flagged() {
+        let mut ev = valid_event();
+        ev.stop_reason_id = Some(93);
+        ev.stop_reason = Some("Loop Detected".into());
+        let errs = validate_event(&ev).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::StopReasonCaptionMismatch { id: 93, .. })),
+            "cross-wired caption must be flagged: {errs:?}"
+        );
     }
 
     #[test]
