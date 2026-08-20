@@ -197,8 +197,21 @@ fn stub_middle_to_target(
     let target_tokens =
         tokens_before.saturating_mul(1000u64.saturating_sub(target_reduction_millis.min(1000))) / 1000;
     let mut changed = false;
+    // Round-32 F3 (av-compress): the prior loop called
+    // `payload_tokens_with_messages(payload, messages)` on every
+    // iteration — each call clones the entire payload AND the
+    // entire messages Vec, then serializes to string. For a 4 MiB
+    // payload with N messages that's O(N²) work AND O(N) transient
+    // allocations per iteration. Instead track a running
+    // `current_tokens` counter that is decremented by the message's
+    // pre-stub token count and incremented by the stub's on each
+    // successful substitution. `payload_tokens_with_messages` is
+    // still called once at loop entry to seed the counter (the
+    // envelope's token count includes non-messages fields like
+    // `model` and `stream`, which the incremental delta preserves).
+    let mut current_tokens = payload_tokens_with_messages(payload, messages);
     for index in 0..tail_start {
-        if payload_tokens_with_messages(payload, messages) <= target_tokens {
+        if current_tokens <= target_tokens {
             break;
         }
         let Some(message) = messages.get_mut(index) else {
@@ -219,13 +232,14 @@ fn stub_middle_to_target(
             continue;
         }
         let digest = av_core::digest::sha256_hex(content.as_bytes());
+        let stub_content = format!("[pruned: {tokens} tokens, sha256:{digest}, reason: middle history]");
+        let stub_tokens = approx_tokens(&stub_content);
         if let Some(object) = message.as_object_mut() {
-            object.insert(
-                "content".to_owned(),
-                Value::String(format!(
-                    "[pruned: {tokens} tokens, sha256:{digest}, reason: middle history]"
-                )),
-            );
+            object.insert("content".to_owned(), Value::String(stub_content));
+            // Update the running counter: original message content
+            // contributed `tokens`, new stub contributes `stub_tokens`.
+            // Everything else in the payload envelope is unchanged.
+            current_tokens = current_tokens.saturating_sub(tokens).saturating_add(stub_tokens);
             changed = true;
         }
     }
@@ -275,8 +289,21 @@ fn collapse_duplicate_system(messages: &mut [Value], tail_start: usize) -> bool 
 
 /// Collapse exact-duplicate user/assistant messages outside the tail
 /// (identical retries / framework echoes).
+///
+/// Round-32 F2 (av-compress): the prior implementation used
+/// `Vec<Value>` + `Vec::contains` (linear per-lookup, O(n²) total)
+/// AND cloned every non-duplicate message into the seen-list on push.
+/// On a 4 MiB payload with hundreds of messages this dominated
+/// compression latency and could momentarily hold ~2× the payload
+/// in RAM. Now uses a `HashSet<u64>` keyed by a stable content hash
+/// derived from `(role, content_str)` — the ONLY two components
+/// `contains` used to compare, since the guards above already
+/// exclude tool_calls-carrying and pre-stubbed messages. O(1)
+/// average lookup, and no message clone.
 fn collapse_duplicate_messages(messages: &mut [Value], tail_start: usize) -> bool {
-    let mut seen: Vec<Value> = Vec::new();
+    use std::collections::HashSet;
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut seen: HashSet<u64> = HashSet::new();
     let mut changed = false;
     for (i, m) in messages.iter_mut().enumerate() {
         if i >= tail_start {
@@ -287,20 +314,29 @@ fn collapse_duplicate_messages(messages: &mut [Value], tail_start: usize) -> boo
             continue;
         }
         // Only collapse pure-content messages — never anything carrying tool_calls.
-        if m.get("tool_calls").is_some() || msg_content_str(m).is_none() {
+        if m.get("tool_calls").is_some() {
             continue;
         }
+        let Some(content) = msg_content_str(m) else {
+            continue;
+        };
         // Never re-collapse audit stubs (stub-of-stub would break idempotence).
-        if msg_content_str(m).is_some_and(|c| c.starts_with("[pruned:")) {
+        if content.starts_with("[pruned:") {
             continue;
         }
-        if seen.contains(m) {
-            let tokens = approx_tokens(&m.to_string());
+        // Composite hash of (role, content) — the two fields the
+        // prior `Vec::contains` on Value compared. Guards above
+        // exclude every other field that could vary between
+        // otherwise-identical duplicates.
+        let mut hasher = DefaultHasher::new();
+        role.hash(&mut hasher);
+        content.hash(&mut hasher);
+        let key = hasher.finish();
+        if !seen.insert(key) {
+            let tokens = approx_tokens(content);
             let stub = audit_stub("duplicate message", tokens, m);
             *m = json!({ "role": role, "content": stub });
             changed = true;
-        } else {
-            seen.push(m.clone());
         }
     }
     changed

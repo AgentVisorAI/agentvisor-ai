@@ -832,14 +832,14 @@ async fn process_job(
             .await
             .map_err(|error| error.to_string())??;
         let nearest_similarity = vector_sink
-            .nearest_similarity(&job.session.id, &embedding)
+            .nearest_similarity(&job.session.session_scope, &embedding)
             .await?;
         let verdict = job.session.loop_state.observe_embedding_with_similarity(
             embedding.clone(),
             step_tokens,
             nearest_similarity,
         );
-        vector_sink.record(&job.session.id, &embedding).await?;
+        vector_sink.record(&job.session.session_scope, &embedding).await?;
         Some(verdict)
     } else {
         None

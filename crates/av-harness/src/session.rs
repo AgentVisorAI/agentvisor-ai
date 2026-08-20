@@ -41,6 +41,21 @@ impl Workflow {
 pub struct Session {
     /// Session id.
     pub id: String,
+    /// Round-32 F1 (av-loopdetect): a per-open UUID that disambiguates
+    /// recycled session ids in the off-path vector store. Client
+    /// callers may reuse the same `id` after a finalize; the
+    /// `SessionRegistry::get_or_open` path historically returned a
+    /// fresh `Session` under the same key. A Qdrant vector search
+    /// filtered ONLY on `session_id` would then return the prior
+    /// incarnation's vectors, causing false semantic-loop signals
+    /// from an unrelated past session. Every vector record and
+    /// query is now scoped by
+    /// `session_scope = "{id}#{generation_uid}"` — the UUID is
+    /// fresh for every `Session::new`, so a recycled id lands in
+    /// a distinct scope. The bare `id` remains the primary key for
+    /// on-disk artifacts (spool paths, journal filenames), which
+    /// use crash-safe generation logic of their own.
+    pub session_scope: String,
     /// Workflow kind.
     pub workflow: Workflow,
     /// Agent identity bound at open (from NHI validation).
@@ -142,6 +157,9 @@ impl Session {
         Self {
             chain: Mutex::new(EventChain::new(&id)),
             atif: Mutex::new(av_atif::TrajectoryBuilder::new(agent, Some(id.clone()))),
+            // Round-32 F1: fresh generation UUID per Session::new so
+            // recycled ids get a distinct vector-sink scope.
+            session_scope: format!("{id}#{}", av_core::new_event_uid()),
             id,
             workflow,
             identity: identity.clone(),
