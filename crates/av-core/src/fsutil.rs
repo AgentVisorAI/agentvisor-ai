@@ -192,7 +192,19 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
+    // Round-23 F1 (av-core fsutil): use `create_dir_all_synced` (not
+    // `create_dir_all`) so the FIRST write into a new spool subtree
+    // (`spool/outbox/`, `spool/receipts/`, `spool/tool-executions/`,
+    // …) also fsyncs the newly-created ancestor entries. A bare
+    // `create_dir_all` followed by fsyncing only the leaf on
+    // line 206 left the ancestor dirents volatile — a power loss
+    // between the initial `mkdir` and any ambient dirent sync
+    // could drop the entire subtree, losing the marker even though
+    // its bytes were fsynced. This is the durability gap round-21
+    // flagged and deferred; the helper's fast path (skip when the
+    // directory already exists) means the cost is only paid on
+    // FIRST writes into a fresh directory tree.
+    create_dir_all_synced(parent)?;
     let temporary = path.with_extension(format!("{}.tmp", crate::new_event_uid()));
     let mut guard = TempPathGuard::new(temporary.clone());
     let mut file = std::fs::OpenOptions::new()

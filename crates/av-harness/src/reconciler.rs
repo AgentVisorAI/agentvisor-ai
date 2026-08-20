@@ -746,7 +746,20 @@ impl Finalizer {
             .map_err(|error| FinalizeError::Atif(error.to_string()))?;
         let trajectory: av_atif::Trajectory =
             serde_json::from_slice(&bytes).map_err(|error| FinalizeError::Atif(error.to_string()))?;
-        let issues = av_atif::validate_trajectory(&trajectory, av_atif::Mode::Strict);
+        // Round-23 F2: also strict-validate the raw bytes so
+        // duplicate JSON keys and unknown-fields (both silently
+        // accepted by the typed `serde_json::from_slice::<Trajectory>`
+        // path) are refused. `validate_bytes` returns Err for a
+        // parse/duplicate-key failure; treat that as a strict
+        // failure with a short reason.
+        let issues = match av_atif::validate_bytes(&bytes, av_atif::Mode::Strict) {
+            Ok(issues) => issues,
+            Err(reason) => {
+                return Err(FinalizeError::Atif(format!(
+                    "strict validation failed (bytes-level): {reason}"
+                )))
+            }
+        };
         if !issues.is_empty() {
             // Round-19 F6: cap the rendered head. An attacker-planted
             // trajectory can legitimately fit millions of issues
@@ -1068,7 +1081,29 @@ impl Finalizer {
                     continue;
                 }
             };
-            if !av_atif::validate_trajectory(&trajectory, av_atif::Mode::Strict).is_empty() {
+            // Round-23 F2: parity with `promote` — the recovery path
+            // must also refuse duplicate-key / unknown-field wire
+            // bytes that the typed path silently accepts.
+            let bytes_issues = match av_atif::validate_bytes(&bytes, av_atif::Mode::Strict) {
+                Ok(issues) => issues,
+                Err(reason) => {
+                    self.metrics
+                        .counter(
+                            "av_atif_recovery_skipped_total{reason=\"invalid_json\"}",
+                            "ATIF spool files skipped during recovery",
+                        )
+                        .inc();
+                    tracing::warn!(
+                        reason = %reason,
+                        path = %av_core::fsutil::basename(&path),
+                        "ignoring ATIF spool file rejected at bytes level"
+                    );
+                    continue;
+                }
+            };
+            if !bytes_issues.is_empty()
+                || !av_atif::validate_trajectory(&trajectory, av_atif::Mode::Strict).is_empty()
+            {
                 self.metrics
                     .counter(
                         "av_atif_recovery_skipped_total{reason=\"nonconformant\"}",

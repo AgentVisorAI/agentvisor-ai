@@ -55,6 +55,102 @@ pub fn validate_trajectory(t: &crate::model::Trajectory, mode: Mode) -> Vec<Vali
     }
 }
 
+/// Round-23 F2 (av-atif ingest): validate an ATIF trajectory from
+/// its RAW BYTES. This is the correct entry point for every path
+/// that receives operator/attacker-supplied ATIF content (CLI
+/// `avctl atif-validate`, reconciler recovery + promotion). Unlike
+/// `serde_json::from_slice::<Trajectory>()` + `validate_trajectory`,
+/// the bytes path:
+///
+///   1. Refuses duplicate JSON keys anywhere in the payload
+///      (parallel to `av_receipts::Receipt::from_json_slice`'s
+///      strict pre-scan added in round-16 F5), so the auditor cannot
+///      be shown a document whose "last wins" reading differs from
+///      the "first wins" reading.
+///   2. Runs `validate_value` on the parsed `serde_json::Value` — the
+///      untyped path exercises `check_unknown_fields`, which the
+///      typed `Trajectory` (no `deny_unknown_fields`) silently drops.
+///
+/// Returns `Err(reason)` on duplicate-key or parse failure; returns
+/// `Ok(issues)` on successful parse (issues may be empty).
+pub fn validate_bytes(bytes: &[u8], mode: Mode) -> Result<Vec<ValidationIssue>, String> {
+    refuse_duplicate_json_keys(bytes)?;
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| format!("parse JSON: {error}"))?;
+    Ok(validate_value(&value, mode))
+}
+
+/// Refuse any JSON object with duplicate keys anywhere in the payload.
+/// Mirrors the internal check in `av-receipts::Receipt::from_json_slice`
+/// and `av-sandbox::refuse_duplicate_json_keys`; exposed here to give
+/// ATIF ingest a single strict-parse primitive without cross-crate
+/// coupling.
+fn refuse_duplicate_json_keys(raw: &[u8]) -> Result<(), String> {
+    use serde::de::{Deserializer as _, MapAccess, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct NoDupKeys;
+    impl<'de> Visitor<'de> for NoDupKeys {
+        type Value = ();
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("any JSON value without duplicate object keys")
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_str<E>(self, _: &str) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_string<E>(self, _: String) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_none<E>(self) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_unit<E>(self) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_some<D: serde::de::Deserializer<'de>>(self, deser: D) -> Result<(), D::Error> {
+            deser.deserialize_any(NoDupKeys)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+            while seq.next_element::<NoDupWrap>()?.is_some() {}
+            Ok(())
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if !seen.insert(key.clone()) {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate object key `{}` in ATIF",
+                        key.escape_debug()
+                    )));
+                }
+                let _: NoDupWrap = map.next_value()?;
+            }
+            Ok(())
+        }
+    }
+    struct NoDupWrap;
+    impl<'de> serde::Deserialize<'de> for NoDupWrap {
+        fn deserialize<D: serde::de::Deserializer<'de>>(deser: D) -> Result<Self, D::Error> {
+            deser.deserialize_any(NoDupKeys)?;
+            Ok(NoDupWrap)
+        }
+    }
+    let mut de = serde_json::Deserializer::from_slice(raw);
+    de.deserialize_any(NoDupKeys).map_err(|error| error.to_string())
+}
+
 macro_rules! issue {
     ($issues:expr, $path:expr, $($msg:tt)*) => {
         // Round-20: cap issue collection so a pathological
@@ -1229,6 +1325,49 @@ mod tests {
         let issues = validate_value(&value, Mode::Strict);
         assert!(issues.is_empty(), "nulls must stay valid: {issues:?}");
         assert!(serde_json::from_value::<crate::model::Trajectory>(value).is_ok());
+    }
+
+    /// Round-23 F2: `validate_bytes` refuses duplicate JSON keys at
+    /// any nesting level. Serde-typed parse alone would silently keep
+    /// the last value, letting a hostile issuer sign under one
+    /// interpretation while an auditor's raw-bytes reader sees the
+    /// other.
+    #[test]
+    fn validate_bytes_rejects_duplicate_top_level_key() {
+        let bytes =
+            br#"{"schema_version":"ATIF-v9.9","schema_version":"ATIF-v1.7","agent":{"name":"a","version":"1"},"steps":[{"step_id":1,"source":"user","message":"hi"}]}"#;
+        let outcome = validate_bytes(bytes, Mode::Strict);
+        assert!(
+            matches!(&outcome, Err(reason) if reason.contains("schema_version") && reason.contains("duplicate")),
+            "expected duplicate-key rejection at bytes level, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn validate_bytes_rejects_duplicate_key_inside_step() {
+        let bytes = br#"{"schema_version":"ATIF-v1.7","agent":{"name":"a","version":"1"},"steps":[{"step_id":1,"source":"agent","message":"x","message":"y"}]}"#;
+        let outcome = validate_bytes(bytes, Mode::Strict);
+        assert!(
+            matches!(&outcome, Err(reason) if reason.contains("message") && reason.contains("duplicate")),
+            "expected duplicate-key rejection inside step, got {outcome:?}"
+        );
+    }
+
+    /// Round-23 F2 partner: even when the bytes are legit, the
+    /// `validate_bytes` path also runs `validate_value` on the
+    /// untyped form, exercising `check_unknown_fields` — a rejection
+    /// class the typed `validate_trajectory` path silently drops.
+    #[test]
+    fn validate_bytes_flags_unknown_fields_that_typed_path_would_drop() {
+        let bytes = br#"{"schema_version":"ATIF-v1.7","agent":{"name":"a","version":"1"},"steps":[{"step_id":1,"source":"user","message":"hi"}],"future_experimental_field":"planted"}"#;
+        let issues = validate_bytes(bytes, Mode::Strict).expect("parses ok");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.message.contains("unknown field")
+                    || i.message.contains("future_experimental_field")),
+            "unknown field must be flagged in Strict mode: {issues:?}"
+        );
     }
 
     /// Pre-1.7 files require `session_id`; a present-but-wrong-typed value
