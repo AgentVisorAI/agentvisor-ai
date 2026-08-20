@@ -4,6 +4,56 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 8: monotonic idle clock, comment correction, two audits with actionable follow-up items (2026-08-20)
+
+Four fresh lenses this round — a code-review of round 7's own commit
+(caught false claims in my atomic-ordering comment — the lifecycle
+mutex already serialized the writer and reader), a time/clock audit
+(one real production bug: wall-clock used as monotonic for idle
+tracking), a DoS-via-legitimate-operations audit (11 findings across
+critical/high/medium, most requiring design changes), and a
+version-compatibility audit (7 findings, mostly fail-safe-by-design
+behaviors + one doc-vs-code drift on signer rotation).
+
+- **harness (high, clock correctness):** `SessionRegistry`'s
+  `idle_sessions` and `evict_finalized` used wall-clock
+  `last_activity_ms` for idle decisions. A forward wall-clock jump
+  (VM resume from a long pause, NTP correction) could make every
+  active session look premature-idle and close them mid-conversation.
+  `Session` now carries a parallel `Mutex<Instant>` for monotonic
+  last-activity tracking; the wall clock is retained only for
+  dashboard display. Test suite migrated to a new
+  `set_idle_for_testing` helper that ages both anchors atomically.
+- **harness (docs, round-7 self-audit correction):** the round-7
+  atomic-ordering "fix" comment and CHANGELOG entry claimed that
+  `restore_receipt` runs outside the per-session lifecycle mutex and
+  that `retry_marked_promotions` races `recover_spooled_sessions` —
+  both false. `restore_receipt` is only called from
+  `recover_spooled_sessions` inside the `acquire_lifecycle` guard
+  block (`reconciler.rs:1126`), and both main.rs and the reconciler
+  tick await recovery to completion before invoking
+  `retry_marked_promotions`. The reordering itself remains as
+  preemptive hardening against a future refactor that could shrink
+  the lifecycle-lock scope; the comment now describes it as such
+  rather than as a fix for an observable bug.
+
+Deferred to future work — audit findings captured but not yet
+addressed:
+- **DoS audit (11 findings):** session registry admission cap;
+  tool-execution spool per-session cap + TTL; cold-outbox
+  retry-count + exponential-backoff + dead-letter directory;
+  dashboard `/api/v1/dashboard/*` auth or caching + change of
+  `dashboard_enabled` default; distinct `response_capacity` config
+  knob; HTTP 503 with `Retry-After` on `SubmitError::Full`;
+  per-session journal size cap. Each requires a real design
+  decision beyond a mechanical bug fix.
+- **Version-compat audit (7 findings):** signer rotation doc-vs-code
+  drift in EVOLUTION.md (recovery uses only the configured signer,
+  so old receipts fail verify after rotation) — will address as a
+  documentation update. Other findings (ReceiptSubject and manifest
+  strict-parse-on-unknown-variant, StoredEvent breaking changes on
+  Kafka/NATS) are fail-safe-by-design and acceptable.
+
 ### Bug-hunt round 7: two fixes, two 0-finding audits (2026-08-20)
 
 Four fresh lenses this round — a code-review of round 6's own commit
