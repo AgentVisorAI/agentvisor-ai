@@ -595,11 +595,27 @@ impl EventBus for KafkaBus {
             return Err(BusError::UnknownTopic(topic.to_owned()));
         }
         let pc = self.partition_client(topic, partition)?;
+        // Round-30 F1 (av-bridge kafka): reject offsets above
+        // `i64::MAX` explicitly rather than let `as i64` sign-wrap
+        // into a negative Kafka offset. The Kafka wire protocol
+        // treats -1 as "latest" and -2 as "earliest" (its own
+        // sentinel semantics), so a wrap could silently redirect
+        // the fetch to the log tail instead of the requested
+        // offset — a hard-to-diagnose replay divergence. In
+        // practice `u64` offsets that survive our provisioning
+        // stay well below 2^63, but crash recovery from a
+        // manifest whose offset field was tampered on disk could
+        // still supply a value in `(i64::MAX, u64::MAX]`.
+        let signed_offset = i64::try_from(offset).map_err(|_| {
+            BusError::Backend(format!(
+                "kafka fetch offset {offset} exceeds i64::MAX and would wrap to a negative \
+                 sentinel; refusing the fetch"
+            ))
+        })?;
         self.executor
             .run(move || async move {
-                #[allow(clippy::cast_possible_wrap)]
                 let (records, _high_watermark) = pc
-                    .fetch_records(offset as i64, 1..(16 * 1024 * 1024), 500)
+                    .fetch_records(signed_offset, 1..(16 * 1024 * 1024), 500)
                     .await
                     .map_err(|e| e.to_string())?;
                 let mut out = Vec::new();
