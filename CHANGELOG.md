@@ -4,6 +4,62 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 3: fixes across parsers, numerics, wiring, and a round-2 self-audit (2026-08-20)
+
+Four fresh lenses — a code-review agent auditing my own round-2 commit,
+a parser adversarial audit (GPT-5.3-Codex), numerics and unit-suffix
+audit, and a startup/wiring audit. Seven production fixes:
+
+- **round-2 self-audit (high):** `ResponseCaptureGuard` was declared
+  AFTER `SessionLease` in `PreparedRequest` / `ForwardedResponse`, so a
+  cancelled request future dropped the lease first — releasing the
+  close barrier's `wait_for_streams` notify — before the guard could
+  register its terminal job. The close's `pending_jobs == 0` load could
+  win the race, finalize proceeded, and the guard's job landed after
+  the receipt was sealed (chain/receipt divergence for signed;
+  resurrected step journal for unsigned). Field order corrected so the
+  guard drops first, matching the invariant `AbortFinalizingStream`
+  already documents.
+- **round-2 self-audit (medium):** `abandon_prepared` defused the guard
+  BEFORE the fallible `permit.submit`, and ignored the result — the
+  submit-full safety net that every sibling path uses to fail the
+  session closed was unreachable. Reordered: defuse only on success,
+  fall through to `mark_capture_failed` on failure.
+- **state (medium):** the round-2 Redis `remove_prefix` used
+  `redis.call('KEYS', pattern)` inside Lua — O(entire keyspace) AND
+  blocking the Redis event loop atomically for every session close.
+  Replaced with cursor-based SCAN outside Lua (bounded per-call,
+  yields between batches). Cluster mode uses `Commands::scan_match`.
+- **sandbox (medium):** `parse_tool_call` accepted the JSON parser's
+  implementation-defined last-wins pick on duplicate keys. The raw
+  body is forwarded unchanged to the tool upstream — a first-wins
+  decoder there produces a permissions-model split (harness attests
+  one tool, upstream executes another). A streaming visitor now
+  rejects any duplicate key anywhere in the payload before the parse
+  succeeds. Existing differential test tightened to enforce it.
+- **harness (medium):** ATIF recovery re-parsed and re-strict-validated
+  provenance-failing files every reconciler tick forever (a strict-
+  valid attacker-planted trajectory paired with a bogus-MAC sidecar
+  burns O(N × file_size) CPU per tick with `warn_once` only bounding
+  logs). Now quarantines after `MIN_ORPHAN_AGE` (the same guard the
+  sidecar-less branch uses to avoid corrupting in-flight closes).
+- **harness (medium):** authoritative provider usage frames used
+  `max(current, reported)` to update `completion_tokens` — a chunk-
+  estimate accumulated before the first usage frame could exceed the
+  true count and get attested in the signed receipt / ATIF / session
+  totals. Authoritative frames now override; the regression check
+  above already guarantees monotonicity across authoritative frames.
+- **bridge (medium):** a manifest with a scheme-URI `cold_uri` in a
+  `--no-default-features` (no `cold-store`) build accepted the value
+  at boot and failed on the first retention tick (up to `hot_hours`
+  = 168 h later); the `?`-propagation halted retention for every
+  topic ordered after it. Boot-time refusal matches the fail-fast
+  policy of every other feature-gated backend.
+- **cli (low):** `avctl init`'s generated `atif_spool_dir` /
+  `bridge_data_dir` defaults now match the harness's `default_spool`
+  / `default_bridge`, so removing an explicit key from the generated
+  config does not silently relocate the spool.
+
 ### Bug-hunt round 2: cancellation safety, backend parity, and a round-1 correction (2026-08-20)
 
 A second sweep with fresh lenses — cancellation safety (axum drops

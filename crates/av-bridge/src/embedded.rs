@@ -267,6 +267,16 @@ impl EmbeddedBroker {
             &manifest,
             Some(data_dir.join("cold-outbox")),
         )?;
+        // Fail fast at boot on a scheme-URI `cold_uri` in a build without
+        // the `cold-store` feature. Previously the error only surfaced
+        // when the first record actually expired — up to `hot_hours`
+        // (default 168 h) after boot — and, because `enforce_retention`
+        // `?`-propagates out of the per-topic loop, halted retention for
+        // every topic ordered after the misconfigured one. Boot-time
+        // validation matches the fail-fast policy of every other
+        // feature-gated backend (kafka/nats/redis/onnx/qdrant).
+        #[cfg(not(feature = "cold-store"))]
+        reject_cold_uri_without_feature(&manifest)?;
         Ok(Self {
             data_dir: data_dir.to_owned(),
             manifest,
@@ -287,6 +297,33 @@ impl EmbeddedBroker {
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
+}
+
+/// Reject a manifest that names a scheme-URI `cold_uri` when this build
+/// lacks the `cold-store` feature: retention would silently accept the
+/// value at boot and only fail on the first tick that produced expired
+/// records (up to `hot_hours` later), and — because `enforce_retention`
+/// `?`-propagates out of the per-topic loop — halt retention for every
+/// topic ordered after it. Boot-time refusal matches the fail-fast
+/// policy of every other feature-gated backend.
+#[cfg(not(feature = "cold-store"))]
+fn reject_cold_uri_without_feature(manifest: &BridgeManifest) -> Result<(), BusError> {
+    for topic in &manifest.topics {
+        if let Some(cold) = topic.retention.cold_uri.as_deref() {
+            if cold.contains("://") {
+                return Err(BusError::Backend(format!(
+                    "topic {:?} configures cold_uri {cold:?} which requires feature cold-store; \
+                     rebuild av-bridge with `--features cold-store` (or `cold-store-aws`) or clear \
+                     the field",
+                    topic.name,
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+impl EmbeddedBroker {
 
     /// Enforce per-topic hot retention at time `now_ms`: when
     /// `retention.cold_uri` is set, each expired record
