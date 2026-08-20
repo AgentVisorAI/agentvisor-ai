@@ -892,6 +892,13 @@ impl HarnessConfig {
                 self.worker_channel_capacity, MAX_WORKER_CHANNEL_CAPACITY
             ));
         }
+        if self.max_request_bytes == 0 {
+            return Err(
+                "max_request_bytes must be > 0 — a 0 cap forwards to DefaultBodyLimit::max(0), \
+                 rejecting every non-empty POST body silently"
+                    .into(),
+            );
+        }
         if self.max_request_bytes > MAX_REQUEST_BYTES_CAP {
             return Err(format!(
                 "max_request_bytes {} exceeds the safety cap of {} (512 MiB) — a single request should never legitimately need more, and lifting this defeats the sandbox payload guard",
@@ -1001,11 +1008,29 @@ impl HarnessConfig {
         }
         if self.state_backend == "redis" {
             if let Some(url) = self.state_endpoint.as_deref().filter(|value| !value.is_empty()) {
-                if !(url.starts_with("redis://") || url.starts_with("rediss://") || url.starts_with("unix:"))
-                {
-                    return Err(format!(
-                        "state_endpoint (redis backend) must be redis://, rediss:// or unix:, got {url:?}"
-                    ));
+                // Round-20 F2 (av-harness config): the state_endpoint
+                // field is docstring-documented as a comma-separated
+                // list of URLs for Redis Cluster mode (see the field
+                // doc above). The scheme allowlist used to be a
+                // prefix check on the WHOLE string, so
+                // `redis://a:6379,http://b` passed validate (the
+                // check saw the `redis://` prefix) and only failed
+                // at connect. `redis+unix:` was also rejected here
+                // even though it's a legitimate Unix-socket form the
+                // redis crate accepts and the round-14 doctor
+                // `probe_endpoint_any` already recognizes. Split on
+                // ',' and validate each member independently.
+                for member in url.split(',').map(str::trim).filter(|m| !m.is_empty()) {
+                    let ok = member.starts_with("redis://")
+                        || member.starts_with("rediss://")
+                        || member.starts_with("unix:")
+                        || member.starts_with("redis+unix:");
+                    if !ok {
+                        return Err(format!(
+                            "state_endpoint (redis backend) member {member:?} must be \
+                             redis://, rediss://, unix:, or redis+unix: (got {member:?} in {url:?})"
+                        ));
+                    }
                 }
             }
         }
@@ -1552,6 +1577,41 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("state_endpoint"), "{err}");
+        // Round-20 F2: Redis state_endpoint cluster list — one bad
+        // member must fail validation even if the FIRST member has
+        // an allowed scheme (the prior prefix-on-whole-string check
+        // passed on any list beginning with `redis://`).
+        let err = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               state_backend = "redis"
+               state_endpoint = "redis://a:6379,http://b:6379""#,
+        )
+        .unwrap_err();
+        assert!(err.contains("state_endpoint"), "{err}");
+        // Round-20 F2: valid cluster list of two Redis URLs passes.
+        HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               state_backend = "redis"
+               state_endpoint = "redis://a:6379,rediss://b:6380""#,
+        )
+        .unwrap();
+        // Round-20 F2: redis+unix: is a legitimate Unix-socket form
+        // the redis crate accepts; validate must not reject it.
+        HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               state_backend = "redis"
+               state_endpoint = "redis+unix:/tmp/redis.sock""#,
+        )
+        .unwrap();
+        // Round-20 F1: max_request_bytes = 0 is a silent-breakage
+        // config (DefaultBodyLimit::max(0) rejects every non-empty
+        // POST body); validate must refuse it.
+        let err = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               max_request_bytes = 0"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("max_request_bytes"), "{err}");
         // NATS bridge_endpoint: bad scheme.
         let err = HarnessConfig::from_toml(
             r#"upstream_url = "https://api"

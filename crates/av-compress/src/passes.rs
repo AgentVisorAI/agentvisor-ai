@@ -590,6 +590,67 @@ mod tests {
         );
     }
 
+    /// Round-18 F1 regression: a message that legitimately QUOTES the
+    /// marker tail phrase in free text must NOT disable the middle
+    /// pass. The prior check refused to run if any pre-tail message
+    /// content contained the literal substring; the round-18 fix
+    /// narrowed the check to require the message to also START WITH
+    /// `[pruned:`. A user turn that says `"the log said 'reason:
+    /// middle history]'"` is normal text; compression must still run.
+    #[test]
+    fn quoted_marker_phrase_in_normal_text_does_not_disable_compression() {
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            // The quoted-marker phrase — no `[pruned:` prefix, so
+            // the narrowed check should NOT match it.
+            json!({"role": "user", "content": "the log said 'reason: middle history]' earlier"}),
+        ];
+        // Make each assistant message unique so the duplicate pass
+        // doesn't consume them before the middle pass runs. The
+        // middle pass has a 50_000 token entry threshold; size each
+        // message to comfortably clear it in aggregate.
+        for i in 0..80 {
+            msgs.push(json!({
+                "role": "assistant",
+                "content": format!("unique analysis paragraph {i} {}", "detail ".repeat(1200))
+            }));
+        }
+        // Disable the duplicate + normalize passes so we specifically
+        // exercise the middle-pass kill-switch narrowing.
+        let cfg = CompressionConfig {
+            collapse_duplicates: false,
+            normalize_json: false,
+            tool_output_stub_threshold: u64::MAX,
+            ..engage_all()
+        };
+        let out = compress(&payload(msgs), &cfg);
+        assert!(
+            out.changed,
+            "middle pass must run despite the user quoting the marker phrase in free text"
+        );
+        let result = out.payload["messages"].as_array().unwrap();
+        // The quoted message is preserved verbatim (it's below the
+        // 32-token floor and it's a `user` role — no pass touches it).
+        assert_eq!(
+            msg_content_str(&result[1]).unwrap(),
+            "the log said 'reason: middle history]' earlier",
+            "the quoted user message must be preserved verbatim"
+        );
+        // Middle-pass stubs are produced for the large assistant
+        // messages.
+        let stubbed = result
+            .iter()
+            .filter(|m| {
+                msg_content_str(m)
+                    .is_some_and(|c| c.starts_with("[pruned:") && c.contains("reason: middle history]"))
+            })
+            .count();
+        assert!(
+            stubbed > 0,
+            "large plain middle messages must still be stubbed, got {result:#?}"
+        );
+    }
+
     #[test]
     fn json_content_minified() {
         let pretty = serde_json::to_string_pretty(&json!({"a": [1, 2, 3], "b": {"c": "d"}})).unwrap();

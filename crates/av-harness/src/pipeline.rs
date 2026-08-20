@@ -1785,6 +1785,19 @@ fn last_message_text(payload: &Value) -> String {
     // Synthesize `tool_name(arguments)` for each tool call, in
     // wire-order — same shape as the response-side synthesis in
     // routes.rs::AbortFinalizingStream::submit_response_capture.
+    //
+    // Round-20 F3 (self-audit fix): `function.arguments` reaches the
+    // wire in TWO shapes: a JSON-encoded string (OpenAI reference)
+    // OR a bare JSON object (some clients / most Anthropic-shaped
+    // gateways). `.as_str()` on the object variant returned None and
+    // the synthesis collapsed to `tool_name()` — worse than the
+    // pre-fix behavior, because now two different-argument calls to
+    // the same tool produced IDENTICAL synthesized text, causing
+    // false loop trips. Match the tolerant pattern from
+    // `atif_capture_from_request` in the same file: render the raw
+    // Value directly when it isn't a stringified JSON. Empty and
+    // missing collapse to "" and get gated off analyze_loop
+    // downstream.
     if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
         let synthesized: Vec<String> = tool_calls
             .iter()
@@ -1793,12 +1806,13 @@ fn last_message_text(payload: &Value) -> String {
                     .get("function")
                     .and_then(|f| f.get("name"))
                     .and_then(Value::as_str)?;
-                let args = call
-                    .get("function")
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                Some(format!("{name}({args})"))
+                let arguments = call.get("function").and_then(|f| f.get("arguments"));
+                let args_rendered = match arguments {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(other) => serde_json::to_string(other).unwrap_or_default(),
+                    None => String::new(),
+                };
+                Some(format!("{name}({args_rendered})"))
             })
             .collect();
         if !synthesized.is_empty() {
@@ -1994,6 +2008,84 @@ mod tests {
     use av_state::InMemoryStore;
     use axum::http::HeaderValue;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    /// Round-19 F1 + round-20 F3 (self-audit): `last_message_text`
+    /// must produce distinct output for two different tool-call
+    /// argument shapes so the loop breaker's embedding varies.
+    /// Both string-shaped and object-shaped arguments MUST reach the
+    /// synthesized text — round-19's first take collapsed
+    /// object-shaped arguments to `tool_name()`.
+    #[test]
+    fn last_message_text_tool_call_synthesis_varies_with_object_arguments() {
+        let payload_string_args = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{\"path\":\"a\"}"}
+                }]
+            }]
+        });
+        let payload_object_args_a = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": {"path": "a"}}
+                }]
+            }]
+        });
+        let payload_object_args_b = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": {"path": "b"}}
+                }]
+            }]
+        });
+        let t_string = last_message_text(&payload_string_args);
+        let t_obj_a = last_message_text(&payload_object_args_a);
+        let t_obj_b = last_message_text(&payload_object_args_b);
+        assert!(!t_string.is_empty(), "string-arg synthesis must not be empty");
+        assert!(!t_obj_a.is_empty(), "object-arg synthesis must not be empty");
+        assert_ne!(
+            t_obj_a, t_obj_b,
+            "object-shape args with different content must produce different text; \
+             got identical {t_obj_a:?}"
+        );
+        assert!(
+            t_obj_a.contains("\"path\":\"a\"") || t_obj_a.contains("path"),
+            "object-arg synthesis must include the argument content, got {t_obj_a:?}"
+        );
+    }
+
+    /// A tool-call message with EMPTY arguments still synthesizes to
+    /// `tool_name()` and reaches the breaker as a non-empty string
+    /// — otherwise every tool call with no arguments would false-trip
+    /// the breaker via zero-vector embedding.
+    #[test]
+    fn last_message_text_tool_call_with_empty_arguments_still_synthesizes() {
+        let payload = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "ping"}
+                }]
+            }]
+        });
+        let text = last_message_text(&payload);
+        assert_eq!(text, "ping()");
+    }
 
     struct NullBus;
 
