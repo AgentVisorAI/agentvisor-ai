@@ -200,7 +200,13 @@ pub fn write_atomic(trajectory: &Trajectory, path: &Path) -> Result<(), WriterEr
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(dir)?;
+    // Round-24 F3 (av-atif writer): parity with `av_core::fsutil::write_atomic`
+    // (round-23) — use `create_dir_all_synced` so a first ATIF write
+    // into a new subtree also fsyncs the newly-created ancestor
+    // dirents. `create_dir_all` alone left them volatile until the
+    // next ambient sync; a power loss between mkdir and sync could
+    // drop the trajectory even though its bytes were fsynced.
+    av_core::fsutil::create_dir_all_synced(dir).map_err(WriterError::Io)?;
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.write_all(&json)?;
     tmp.flush()?;

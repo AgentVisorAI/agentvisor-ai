@@ -4,6 +4,64 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 24: dangling subagent refs + ATIF writer durability parity (2026-08-20)
+
+Four fresh deep-dives — code-review of round-23 (clean), duplicate-key
+consistency across scanners (2 real gaps flagged, 1 fixed),
+middleware chain (0 actionable), ATIF writer (4 findings; 2 applied).
+
+- **atif (medium, unverifiable delegation):** ATIF strict validation
+  refused a `subagent_trajectory_ref` that omitted both
+  `trajectory_id` and `trajectory_path`, but did NOT check that a
+  supplied `trajectory_id` actually names an embedded
+  `subagent_trajectories[*]`. A hostile producer could emit
+  `subagent_trajectory_ref: [{"trajectory_id": "sub-does-not-exist"}]`
+  and it passed validation — the auditor is then pointed at a
+  subagent trajectory that doesn't exist in the document, giving
+  unverifiable delegation provenance. Fixed by pre-collecting the
+  embedded `trajectory_id` set and cross-checking each step's
+  `subagent_trajectory_ref` against it. `trajectory_path` (external
+  refs) remain uncheckable at strict-validate time and are excluded
+  from the rule. Regression test:
+  `dangling_subagent_trajectory_ref_is_flagged`.
+- **atif (medium, durability parity):** `av_atif::write_atomic` used
+  `create_dir_all` (not `create_dir_all_synced`) for the parent —
+  the same class round-23 fixed in `av_core::fsutil::write_atomic`.
+  Now goes through `av_core::fsutil::create_dir_all_synced` so a
+  first ATIF write into a new subtree also fsyncs the newly-created
+  ancestor dirents. The helper's fast path (single stat) makes the
+  hot-path cost negligible.
+
+Not actionable this round:
+- **dup-key consistency (deferred):** the three duplicate-key
+  scanners (av-receipts, av-sandbox, av-atif) diverge on
+  null-handling (receipts refuses, others accept), nesting-depth
+  cap (receipts caps at 128, others uncapped), and error message
+  format. Consolidation into a shared `av_core` helper with
+  per-caller policy flags is possible but requires design input.
+- **dup-key consistency (deferred):** `av-sandbox`'s scanner
+  misclassifies malformed JSON as "duplicate key rejected"
+  because the sentinel-map at `reject_duplicate_keys`'s return
+  wraps ALL scanner errors under the DuplicateKey class. Same
+  class as receipts round-16 F6 — fix would extract a
+  `check_no_duplicate_keys`-style sentinel-vs-parse-error
+  discriminator.
+- **dup-key (deferred):** `av-bridge` (nats_bus/kafka_bus/embedded)
+  ingests JSON from external brokers without dup-key pre-scan.
+  Real potential attack surface for topic emitters. Adding pre-scan
+  requires topic-schema decisions.
+- **atif writer (medium, deferred):** `TrajectoryBuilder::finish`
+  computes final_metrics but `write_atomic` accepts any Trajectory,
+  so a caller bypassing the builder can emit a trajectory whose
+  final_metrics disagrees with per-step sums. Round-16 flagged this;
+  fix requires validator-completeness pass.
+- **atif writer (deferred):** producers CAN emit older schema
+  versions to bypass v1.7-only fidelity checks. Design intent
+  (compat).
+- **middleware (deferred):** no request rate-limiting, no custom
+  404/405 fallback, no explicit HTTP/2 hardening knobs. All
+  design items requiring operator-configurable policy.
+
 ### Bug-hunt round 23: ATIF ingest malleability + fsutil durability gap (2026-08-20)
 
 Four fresh deep-dives — code-review of round-22 (clean),

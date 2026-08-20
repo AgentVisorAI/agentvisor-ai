@@ -473,6 +473,29 @@ fn validate_trajectory_obj(
         None => issue!(issues, format!("{path}.agent"), "required field is missing"),
     }
 
+    // Round-24 F1 (av-atif validate): pre-collect embedded
+    // `subagent_trajectories[*].trajectory_id` so we can cross-check
+    // step-level `subagent_trajectory_ref` entries against them.
+    // Historically the ref shape was only "must have trajectory_id
+    // or trajectory_path"; a producer could emit `trajectory_id:
+    // "does-not-exist"` and it would pass validation, giving
+    // unverifiable delegation provenance. Collect the id set here so
+    // `validate_step` (via observation.results processing) can flag
+    // dangling refs.
+    let embedded_trajectory_ids: std::collections::HashSet<String> =
+        match obj.get("subagent_trajectories").and_then(Value::as_array) {
+            Some(subs) => subs
+                .iter()
+                .filter_map(|sub| {
+                    sub.get("trajectory_id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_owned)
+                })
+                .collect(),
+            None => std::collections::HashSet::new(),
+        };
+
     // steps
     match obj.get("steps") {
         Some(Value::Array(steps)) => {
@@ -480,7 +503,15 @@ fn validate_trajectory_obj(
                 issue!(issues, format!("{path}.steps"), "must contain at least one step");
             }
             for (i, step) in steps.iter().enumerate() {
-                validate_step(step, &format!("{path}.steps.{i}"), i, ver, mode, issues);
+                validate_step(
+                    step,
+                    &format!("{path}.steps.{i}"),
+                    i,
+                    ver,
+                    mode,
+                    issues,
+                    &embedded_trajectory_ids,
+                );
             }
         }
         Some(_) => issue!(issues, format!("{path}.steps"), "must be an array"),
@@ -592,6 +623,7 @@ fn validate_step(
     ver: (u32, u32),
     mode: Mode,
     issues: &mut Vec<ValidationIssue>,
+    embedded_trajectory_ids: &std::collections::HashSet<String>,
 ) {
     let Some(obj) = step.as_object() else {
         issue!(issues, path, "step must be an object");
@@ -904,6 +936,32 @@ fn validate_step(
                                         .is_some_and(|value| !value.is_empty());
                                     if !has_id && !has_path {
                                         issue!(issues, ref_path, "must set trajectory_id or trajectory_path");
+                                    }
+                                    // Round-24 F1 (av-atif validate):
+                                    // if `trajectory_id` names an
+                                    // embedded delegation, it MUST
+                                    // resolve. A dangling id is
+                                    // unverifiable delegation
+                                    // provenance — a producer could
+                                    // point downstream auditors at
+                                    // "sub-999" that never existed.
+                                    // `trajectory_path` remains
+                                    // uncheckable at strict-validate
+                                    // time (external ref) and is not
+                                    // subject to this rule.
+                                    if let Some(id) = reference
+                                        .get("trajectory_id")
+                                        .and_then(Value::as_str)
+                                        .filter(|v| !v.is_empty())
+                                    {
+                                        if !embedded_trajectory_ids.contains(id) {
+                                            issue!(
+                                                issues,
+                                                format!("{ref_path}.trajectory_id"),
+                                                "references trajectory_id {id:?} that is not present in \
+                                                 the outer trajectory's `subagent_trajectories` array"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -1367,6 +1425,98 @@ mod tests {
                 .any(|i| i.message.contains("unknown field")
                     || i.message.contains("future_experimental_field")),
             "unknown field must be flagged in Strict mode: {issues:?}"
+        );
+    }
+
+    /// Round-24 F1: a `subagent_trajectory_ref` with a `trajectory_id`
+    /// must resolve against the outer trajectory's embedded
+    /// `subagent_trajectories` array. A dangling id gives
+    /// unverifiable delegation provenance — the auditor is pointed at
+    /// a subagent trajectory that doesn't exist in the document.
+    #[test]
+    fn dangling_subagent_trajectory_ref_is_flagged() {
+        // Reference an embedded id that DOES NOT appear in
+        // subagent_trajectories.
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": "s",
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{
+                "step_id": 1,
+                "source": "agent",
+                "message": "delegating",
+                "tool_calls": [{"tool_call_id": "c1", "function_name": "delegate", "arguments": {}}],
+                "observation": {"results": [{
+                    "source_call_id": "c1",
+                    "subagent_trajectory_ref": [{"trajectory_id": "sub-does-not-exist"}]
+                }]},
+            }],
+            "subagent_trajectories": [{
+                "trajectory_id": "sub-actual",
+                "agent": {"name": "sub-a", "version": "1"},
+                "steps": [{"step_id": 1, "source": "agent", "message": "sub"}]
+            }],
+        });
+        let issues = validate_value(&value, Mode::Strict);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.message.contains("sub-does-not-exist")
+                    && i.message.contains("subagent_trajectories")),
+            "dangling trajectory_id must be flagged, got {issues:?}"
+        );
+
+        // A resolvable ref passes.
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": "s",
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{
+                "step_id": 1,
+                "source": "agent",
+                "message": "delegating",
+                "tool_calls": [{"tool_call_id": "c1", "function_name": "delegate", "arguments": {}}],
+                "observation": {"results": [{
+                    "source_call_id": "c1",
+                    "subagent_trajectory_ref": [{"trajectory_id": "sub-actual"}]
+                }]},
+            }],
+            "subagent_trajectories": [{
+                "trajectory_id": "sub-actual",
+                "agent": {"name": "sub-a", "version": "1"},
+                "steps": [{"step_id": 1, "source": "agent", "message": "sub"}]
+            }],
+        });
+        let issues = validate_value(&value, Mode::Strict);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.message.contains("not present in the outer")),
+            "resolvable subagent_trajectory_ref must not be flagged: {issues:?}"
+        );
+
+        // trajectory_path (external ref) is not subject to the check.
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": "s",
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{
+                "step_id": 1,
+                "source": "agent",
+                "message": "delegating",
+                "tool_calls": [{"tool_call_id": "c1", "function_name": "delegate", "arguments": {}}],
+                "observation": {"results": [{
+                    "source_call_id": "c1",
+                    "subagent_trajectory_ref": [{"trajectory_path": "external://s3/bucket/traj.json"}]
+                }]},
+            }],
+        });
+        let issues = validate_value(&value, Mode::Strict);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.message.contains("not present in the outer")),
+            "external trajectory_path refs must not be flagged as dangling: {issues:?}"
         );
     }
 
