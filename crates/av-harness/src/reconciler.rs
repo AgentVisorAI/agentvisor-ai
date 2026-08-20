@@ -589,6 +589,7 @@ impl Finalizer {
         )
         .await?;
         self.remove_step_journal(&session.id).await?;
+        self.remove_tool_executions(&session.id).await?;
         self.remove_lifecycle_outbox(&session.id, crate::journal::RECEIPT_OUTBOX_KIND)
             .await?;
         self.remove_lifecycle_outbox(&session.id, crate::journal::SESSION_CLOSE_OUTBOX_KIND)
@@ -2123,6 +2124,92 @@ impl Finalizer {
         .map_err(|error| FinalizeError::Task(error.to_string()))?
     }
 
+    /// Remove all forwarded MCP tool-execution intent/outcome/audited
+    /// files for `session_id`. Runs at successful close time so that a
+    /// recycled session id (see `SessionRegistry::get_or_open` — a
+    /// completed-closed entry is replaced with a fresh `Session`) does
+    /// not inherit prior-incarnation execution keys. Without this, a
+    /// client reusing `(x-av-session, JSON-RPC id, body, identity)`
+    /// against a recycled session hit the `Completed` fast-path in
+    /// `mcp_call_inner` and got the prior incarnation's cached
+    /// response — with NO new audit event on the recycled session's
+    /// event chain. The tool-completed audit event for the original
+    /// execution is already durably on the bridge before we reach
+    /// this cleanup, so the on-disk files are pure idempotency
+    /// markers and safe to drop.
+    ///
+    /// Bounded scan across the `tool-executions/` directory; each
+    /// intent's authenticated `session_id` field is checked before
+    /// removal, so unrelated sessions' files are never touched.
+    async fn remove_tool_executions(&self, session_id: &str) -> Result<(), FinalizeError> {
+        let spool_dir = self.spool_dir.clone();
+        let session_id = session_id.to_owned();
+        let control_key = self.journal_key;
+        tokio::task::spawn_blocking(move || -> Result<(), FinalizeError> {
+            let directory = spool_dir.join(crate::spool::TOOL_EXECUTIONS);
+            let entries = match std::fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+            };
+            let mut removed_any = false;
+            for entry in entries {
+                let entry = entry.map_err(|error| FinalizeError::Atif(error.to_string()))?;
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+                    continue;
+                };
+                let Some(key) = name.strip_suffix(crate::spool::TOOL_INTENT_SUFFIX) else {
+                    continue;
+                };
+                let intent_bytes = match std::fs::read(&path) {
+                    Ok(bytes) => bytes,
+                    // Concurrent removal or a torn intent already
+                    // quarantined by the recovery scan: skip and
+                    // continue rather than aborting the cleanup pass
+                    // over unrelated files.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+                };
+                let intent_session_id = crate::journal::open::<serde_json::Value>(
+                    &control_key,
+                    &format!("{}:{key}", crate::journal::TOOL_INTENT_DOMAIN),
+                    0,
+                    &intent_bytes,
+                )
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("session_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                });
+                if intent_session_id.as_deref() != Some(session_id.as_str()) {
+                    continue;
+                }
+                for suffix in [
+                    crate::spool::TOOL_INTENT_SUFFIX,
+                    crate::spool::TOOL_OUTCOME_SUFFIX,
+                    crate::spool::TOOL_AUDITED_SUFFIX,
+                ] {
+                    let file = directory.join(format!("{key}{suffix}"));
+                    match std::fs::remove_file(&file) {
+                        Ok(()) => removed_any = true,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+                    }
+                }
+            }
+            if removed_any {
+                av_core::fsutil::sync_directory(&directory)
+                    .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| FinalizeError::Task(error.to_string()))?
+    }
+
     /// Retry every durable promotion marker whose session can be recovered.
     pub async fn retry_marked_promotions(&self, sessions: &SessionRegistry) -> Result<usize, FinalizeError> {
         let mut entries = match tokio::fs::read_dir(&self.spool_dir).await {
@@ -2690,6 +2777,7 @@ impl Finalizer {
                 )
                 .await?;
                 self.remove_step_journal(&session.id).await?;
+                self.remove_tool_executions(&session.id).await?;
                 self.remove_lifecycle_outbox(&session.id, crate::journal::RECEIPT_OUTBOX_KIND)
                     .await?;
                 self.remove_lifecycle_outbox(&session.id, crate::journal::SESSION_CLOSE_OUTBOX_KIND)
@@ -2932,9 +3020,22 @@ fn archive_conflicting_atif(
     // place, so the stale marker would permanently block every future
     // promotion of the recycled id (and warn from retry_marked_promotions
     // every tick) until manual removal.
+    //
+    // Round-48 F1: the archived name MUST NOT have `Path::extension()`
+    // equal to `"promote"` — that extension re-enters the
+    // `retry_marked_promotions` scan filter (`reconciler.rs:2227`), which
+    // then MAC-verifies the archived bytes (unchanged by rename), looks
+    // up `sessions.get(&marker.session_id)` and gets the *recycled*
+    // Session (S2) — and calls `promote(S2)` on it. Effect: an
+    // unrequested promotion of S2 minted a receipt and emitted a
+    // receipt event no operator asked for; the archived marker stayed
+    // on disk forever, re-firing every tick. Appending
+    // `.promote-archived` keeps the "promote" hint in the name while
+    // making the extension `promote-archived` — outside the scan
+    // filter — and is stable for forensic inspection.
     let promote_marker = path.with_extension("promote");
-    let mut archived_promote = archived;
-    archived_promote.as_mut_os_string().push(".promote");
+    let mut archived_promote = archived.clone();
+    archived_promote.as_mut_os_string().push(".promote-archived");
     match std::fs::rename(&promote_marker, &archived_promote) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),

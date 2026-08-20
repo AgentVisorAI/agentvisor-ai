@@ -4,6 +4,47 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 4: three fixes across cluster routing, tool-execution replay, and a filesystem re-scan bug (2026-08-20)
+
+Four fresh lenses this round — code-review of round-3's own commit,
+filesystem atomicity across every rename+fsync site, an exhaustive
+state-machine enumeration, and audit-trail integrity. Three production
+fixes and one deferred (documented) finding:
+
+- **state (high, round-3 self-audit regression):** the round-3
+  `remove_prefix` cluster branch used `Commands::scan_match` on the
+  sync `ClusterConnection`, but bare `SCAN` has no key argument —
+  `RoutingInfo::for_routable` returns `None`, `ClusterConnection::
+  request` treats that as `UNROUTABLE_ERROR`, and cluster cleanup
+  silently deleted nothing (round-2's Lua+`KEYS` routed via `EVAL`
+  had actually worked; round-3 broke it). Now uses `route_command`
+  with an explicit `RoutingInfo::SingleNode(SpecificNode(...))`
+  routed to the slot the prefix's hash-tag pins every match to. TTL
+  still bounds counter growth, but immediate cleanup is restored.
+- **harness (medium, audit-integrity):** the audit-integrity audit
+  found that `mcp_call_inner`'s tool-execution key = `sha256(
+  "{session_id}:{jsonrpc_id}")` was silently reused across session
+  recycling. A client reusing `(session_id, jsonrpc_id, body,
+  identity)` after close hit `Completed` fast-path and got the prior
+  incarnation's cached response with NO new audit event on the
+  recycled session's chain — an audit gap. The close tail now runs
+  `remove_tool_executions(session_id)` to drop the on-disk
+  intent/outcome/audited files; the underlying tool-completed audit
+  event is already durably on the bridge before this cleanup, so
+  the files are pure idempotency markers and safe to drop.
+- **harness (high, fs-atomicity):** `archive_conflicting_atif`
+  renamed a colliding `.promote` marker to
+  `{stem}.archived-{suffix}.promote` — whose `Path::extension()`
+  still evaluates to `"promote"`, so it re-entered
+  `retry_marked_promotions`' scan filter, MAC-verified against the
+  unchanged bytes, looked up the recycled session's live entry, and
+  triggered an unrequested promotion (minting a receipt and
+  emitting a receipt event no operator asked for). The archived
+  marker also stayed on disk forever, re-firing every tick. Now
+  renamed to `{stem}.archived-{suffix}.promote-archived`, outside
+  the scan filter — mirrors the round-1 fix that excluded `.` from
+  the ATIF suffix for the same reason (`.json` re-scan).
+
 ### Bug-hunt round 3: fixes across parsers, numerics, wiring, and a round-2 self-audit (2026-08-20)
 
 Four fresh lenses — a code-review agent auditing my own round-2 commit,
