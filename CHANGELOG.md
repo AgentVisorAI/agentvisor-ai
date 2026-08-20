@@ -4,6 +4,66 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 21: metrics-on-failure + tool-cleanup crash safety (2026-08-20)
+
+Four fresh deep-dives — code-review of round-20 (clean, all 10
+concerns verified), metrics accuracy (5 findings; 3 applied),
+concurrency race audit (0 findings — well-defended), spool
+paths + tool-execution cleanup (5 findings; 2 applied).
+
+- **harness (medium, metrics accuracy):** three histograms were
+  observed only on the success branch, hiding failure-latency
+  regressions from alerting:
+  1. `av_receipt_sign_duration_seconds` in
+     `close_session_locked` (Receipt::issue error skipped observe).
+     Moved observe BEFORE the `?`-propagation.
+  2. `av_receipt_sign_duration_seconds` in `retry_marked_promotions`
+     (same shape). Same fix.
+  3. `av_session_finalize_duration_seconds` observed only at the
+     terminal success line — every `?`-propagation earlier in the
+     function skipped it. Now observed via a `FinalizeObserver`
+     scope guard whose `Drop` records duration on every exit
+     including early Err returns.
+- **harness (medium, crash safety):** `remove_tool_executions`
+  deleted `.intent.json` FIRST, then `.outcome.json`, then
+  `.audited.json`. Recovery invariant is "outcome exists only if
+  intent exists"; a crash between the intent removal and outcome
+  removal left an orphaned outcome that startup recovery treats
+  as fatal (`routes.rs::from_request` refuses
+  outcome-without-intent), and `main.rs` bubbles that up as a
+  startup failure. Reversed the order to AUDITED → OUTCOME →
+  INTENT so the invariant holds under any crash timing.
+- **harness (low, defense-in-depth):** tool-execution cleanup also
+  removes any `.intent.torn` twin for the same key (defense in
+  depth against the rare case where a torn intent coexists with
+  a re-created `.intent.json`).
+
+Not actionable this round:
+- **metrics (deferred):** `av_stage_duration_seconds` misses
+  failure exits in `prepare_chat` at four `return Err(...)` sites.
+  Fix requires per-stage RAII scope guards; deferred.
+- **metrics (deferred):** `av_lifecycle_event_errors_total` and
+  `av_reconcile_errors_total` cover only some code paths and
+  overload multiple subsystems respectively. Fix requires
+  per-subsystem counter split (breaking change for dashboards).
+- **spool (deferred):** `av_core::fsutil::write_atomic` uses
+  `create_dir_all` (not `create_dir_all_synced`) — a first
+  post-cold-start write followed by a power loss can lose the
+  newly-created subdir dirent. Fix touches every write_atomic
+  caller in the workspace.
+- **spool (deferred):** signer/journal key rotation has no
+  migration path; leftover in-flight MAC-sealed markers become
+  unverifiable. Requires a keyring/journal-key versioning scheme.
+- **spool (deferred):** no cross-process spool lockfile — a
+  second harness process on the same spool would race sequence
+  allocation and marker journaling. Known deferred design item.
+- **spool (deferred):** orphan `.intent.torn` files (whose
+  companion `.intent.json` was quarantined by rename) accumulate
+  indefinitely — preserved as forensic evidence by design.
+  Operator sweep by age is the recommended remedy.
+- **race audit:** 0 concurrency invariant violations. This area
+  is well-defended after rounds 8-19.
+
 ### Bug-hunt round 20: self-audit caught object-shape argument bug + config sanity + regression tests (2026-08-20)
 
 Four fresh deep-dives — code-review of round-19 (caught a
