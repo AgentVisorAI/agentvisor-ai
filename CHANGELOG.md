@@ -4,6 +4,53 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 12: two identity fixes + round-11 doc fix; one 0-finding-actionable deep-dive (2026-08-20)
+
+Four fresh line-by-line deep-dives this round — a code-review of round
+11's Ed25519 malleability fix (caught one low-sev doc reference to a
+non-existent function), and exhaustive audits of `av-identity/`,
+`av-sandbox/`, and `av-receipts::jcs`. Two real functional bugs found
+in identity; sandbox and JCS both surfaced only defensible-by-design
+behaviors.
+
+- **identity (medium):** the delegation-chain scope-subset check at
+  `validator.rs:348-352` used exact string equality, but the runtime
+  authorization check `pipeline::scope_allows` (harness) uses wildcard
+  semantics (`*`, `prefix:*`). A legitimately-delegated narrower child
+  scope (parent `["tool:*"]`, child `["tool:db_write"]`) was rejected
+  as `ScopeEscalation("tool:db_write")` even though the runtime gate
+  would authorize it — so the delegation gate was strictly stricter
+  than the authorization gate, making wildcard-parent tokens
+  effectively unusable for narrowing delegation (their canonical use
+  case). Now uses the same wildcard-aware `scope_covered_by`.
+- **identity (low):** JWKS `x` field (Ed25519 pubkey material) was
+  only checked for non-empty at `add_jwks` time. A malformed
+  base64url `x` or a wrong-length key installed silently; every JWT
+  with that `kid` then failed at verify time with a confusing "bad
+  JWK for kid" message — while the operator saw no signal at boot.
+  Now base64url-decoded and length-checked (must be exactly 32
+  bytes) during `add_jwks`, so config errors surface at boot/JWKS
+  refresh.
+- **receipts (docs, round-11 self-audit correction):** the round-11
+  `from_seed` caveat comment referenced
+  `av-harness::main::load_signer_from_file`, which doesn't exist —
+  the actual production caller is `av-harness::main::read_signer`.
+  A future maintainer greping for the referenced symbol would find
+  nothing and might not identify the correct site to preserve the
+  weak-seed pre-validation. Doc reference corrected.
+
+Not actionable (defensible-by-design):
+- **Sandbox policy/budget config-key case mismatch:** operator-error
+  class where deny-list `["DB_WRITE"]` misses lowercase-only tool
+  requests. Real UX issue but not a security bypass; needs
+  normalization design decision. Deferred.
+- **JCS finite-number rejection above 2^53 and 128-depth cap:** both
+  are defensive additions stricter than RFC 8785. The receipts this
+  crate generates never contain such values by construction (bounded
+  by `JCS_SAFE_MAX`), so this only affects interop with external
+  peers producing receipts we would need to verify — not a current
+  target use case.
+
 ### Bug-hunt round 11: Ed25519 signature malleability fixed; three 0-finding-actionable audits (2026-08-20)
 
 Four fresh lenses this round — a code-review of round 10's own commit
