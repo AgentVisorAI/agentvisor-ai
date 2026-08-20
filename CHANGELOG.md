@@ -4,6 +4,54 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Bug-hunt round 32: Qdrant cross-session contamination + compression O(n²) → O(n) (2026-08-20)
+
+Applied three surgical fixes from a user-supplied list of deferred
+items. Verified that item #1 in the list (**ATIF strict-validator
+type gaps on `agent.model_name` / `step.model_name` /
+`SubagentTrajectoryRef` typed members**) is already fixed in
+round-16 F2 (`validate.rs:460, 705` and elsewhere).
+
+- **loopdetect (medium, false loop signals):** the Qdrant vector
+  sink filtered `nearest_similarity` by `session_id` only. When a
+  session id is recycled (`SessionRegistry::get_or_open` returns a
+  fresh Session under the same key after finalize), the new
+  session's queries returned the PRIOR incarnation's vectors —
+  causing false semantic-loop signals from an unrelated past
+  session. Fixed by adding `Session::session_scope`, a UUID
+  scoped as `format!("{id}#{generation_uid}")` where
+  `generation_uid` is a fresh `av_core::new_event_uid()` per
+  `Session::new`. Every vector record and query in
+  `worker.rs` now uses `session.session_scope` instead of
+  `session.id`. Recycled ids land in a distinct scope. The bare
+  `id` remains the primary key for on-disk artifacts (spool
+  paths, journal filenames) which use crash-safe generation logic
+  of their own.
+- **compress (medium, O(n²) → O(n) allocation):**
+  `collapse_duplicate_messages` used `Vec<Value>` + `Vec::contains`
+  for duplicate detection, giving O(N²) lookup on N messages AND
+  cloning every non-duplicate into the seen-list. Now uses a
+  `HashSet<u64>` keyed by a stable content hash derived from
+  `(role, content_str)` — the two components `contains` used to
+  compare, since the guards above already exclude tool_calls-
+  carrying and pre-stubbed messages. O(1) average lookup and no
+  message clone.
+- **compress (medium, O(n²) → O(n) work):** `stub_middle_to_target`
+  called `payload_tokens_with_messages(payload, messages)` on
+  every loop iteration — each call clones the entire payload AND
+  the entire messages Vec, then serializes to string. On a 4 MiB
+  payload with hundreds of messages that's O(N²) work and O(N)
+  transient allocations per iteration. Now tracks a running
+  `current_tokens` counter that is decremented by the message's
+  pre-stub token count and incremented by the stub's on each
+  successful substitution. Single seed call at loop entry.
+
+Verified already-fixed (from the user's deferred-item list):
+- **ATIF strict-validator type gaps** on `agent.model_name`,
+  `step.model_name`, and `SubagentTrajectoryRef.{trajectory_id,
+  session_id, trajectory_path}` — all covered by round-16 F2's
+  strict-validator type checks. No further action needed.
+
 ### Bug-hunt round 31: silent-bug hunt — ONNX zero-vector fallback poisons breaker (2026-08-20)
 
 Three focused deep-dives on SILENT bugs (the worst class — they
