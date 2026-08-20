@@ -493,6 +493,28 @@ fn tool_audit_gate(state: &AppState, key: &str) -> Arc<tokio::sync::Mutex<()>> {
 }
 
 async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    // Round-18 F2 (routes): reject an inbound request whose declared
+    // `Content-Type` is not `application/json`. MCP is JSON-RPC 2.0
+    // (spec: MUST be `application/json`), and a client sending e.g.
+    // `Content-Type: multipart/form-data` with a JSON body would
+    // otherwise process successfully — a spec-violation surface with
+    // no defensible use case. Missing Content-Type is tolerated
+    // (some minimal clients skip it and JSON-RPC parsers accept the
+    // body's shape).
+    if let Some(value) = headers.get(axum::http::header::CONTENT_TYPE) {
+        let is_json = value
+            .to_str()
+            .ok()
+            .and_then(|s| s.split(';').next())
+            .map(|main| main.trim().eq_ignore_ascii_case("application/json"))
+            .unwrap_or(false);
+        if !is_json {
+            let display = value.to_str().unwrap_or("<non-ascii>");
+            return pipeline_error(crate::pipeline::PipelineError::BadRequest(format!(
+                "MCP requires Content-Type: application/json (spec: JSON-RPC 2.0), got {display:?}"
+            )));
+        }
+    }
     // The tool path mutates durable state at several awaits: the sandbox
     // gate debits the budget, `execution.claim()` claims the execution
     // key, the upstream call executes the tool, and persist/audit resolve
