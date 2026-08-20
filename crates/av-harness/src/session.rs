@@ -61,7 +61,8 @@ pub struct Session {
     pub totals: Totals,
     /// Last-activity timestamp (dashboard/display only), epoch ms.
     /// Wall-clock time subject to VM/NTP jumps; not safe to use for
-    /// idle-eviction decisions — see [`Session::last_activity_instant`].
+    /// idle-eviction decisions — the private `last_activity_instant`
+    /// field carries a monotonic anchor the idle sweeper uses instead.
     pub last_activity_ms: AtomicU64,
     /// Monotonic last-activity instant. Used by the idle sweeper so a
     /// forward wall-clock jump (VM resume, NTP correction) cannot make
