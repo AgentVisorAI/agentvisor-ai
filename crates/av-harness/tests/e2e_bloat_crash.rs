@@ -252,7 +252,9 @@ fn five_thousand_receipt_issuances_never_leak_or_diverge() {
             receipt_id: format!("r{i}"),
             session_id: format!("s{i}"),
             issued_at: i,
-            issued_at_iso: format!("1970-01-01T00:00:00.{i:03}Z"),
+            // Round-6 (hunt2 F3): derive ISO from the ms field so the
+            // fixture spans i>=1000 without the old `{i:03}` overflow.
+            issued_at_iso: av_core::time::iso8601_ms(i),
             ai_agent: av_events::AgentIdentity {
                 version: "1".to_owned(),
                 charter: av_events::CharterFile::from("c"),

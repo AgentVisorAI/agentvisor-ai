@@ -357,7 +357,7 @@ fn signed_receipt_for(seed: [u8; 32]) -> Receipt {
         receipt_id: "rot".to_owned(),
         session_id: "s".to_owned(),
         issued_at: 0,
-        issued_at_iso: "1970-01-01T00:00:00Z".to_owned(),
+        issued_at_iso: "1970-01-01T00:00:00.000Z".to_owned(),
         ai_agent: AgentIdentity {
             version: "1".to_owned(),
             charter: CharterFile::from("c"),

@@ -761,6 +761,62 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                 match tool_request.send().await {
                     Ok(upstream) => {
                         let status = upstream.status();
+                        // Round-6 (hunt4 protocol F1): reject non-identity
+                        // Content-Encoding on the tool relay for the same
+                        // reason the chat path does (reqwest 0.12 has no
+                        // decompression features enabled). Without this
+                        // guard the compressed bytes would be relayed to
+                        // the MCP client with a plain application/json
+                        // header, persisted as the durable ToolOutcome
+                        // replayed on every retry, and journaled via
+                        // from_utf8_lossy as the ATTESTED tool output —
+                        // mojibake in the signed audit chain.
+                        let upstream_headers = upstream.headers();
+                        let mut refused_encoding: Option<(String, String)> = None;
+                        'tool_encodings: for value in
+                            upstream_headers.get_all(axum::http::header::CONTENT_ENCODING)
+                        {
+                            let raw = value.to_str().unwrap_or_default();
+                            for token in raw.split(',') {
+                                let token = token.trim();
+                                if token.is_empty() || token.eq_ignore_ascii_case("identity") {
+                                    continue;
+                                }
+                                refused_encoding = Some((token.to_owned(), raw.to_owned()));
+                                break 'tool_encodings;
+                            }
+                        }
+                        if let Some((token, raw)) = refused_encoding {
+                            let failure = ToolOutcome {
+                                status: StatusCode::BAD_GATEWAY.as_u16(),
+                                body_hex: hex::encode(
+                                    serde_json::to_vec(&json!({
+                                        "error": format!(
+                                            "tool upstream responded with unsupported Content-Encoding token {token:?} (full header: {raw:?})",
+                                        ),
+                                    }))
+                                    .unwrap_or_default(),
+                                ),
+                                content_type: Some("application/json".to_owned()),
+                            };
+                            let gate = tool_audit_gate(&state, &execution.key);
+                            let _gate = gate.lock().await;
+                            if let Err(error) = execution.persist(&failure).await {
+                                return lifecycle_error(error);
+                            }
+                            let session = match state.sessions.get(&execution.session_id) {
+                                Some(session) => session,
+                                None => return lifecycle_error("tool session disappeared".to_owned()),
+                            };
+                            return complete_tool_audit(
+                                &state,
+                                &execution,
+                                failure,
+                                completion_permit,
+                                session,
+                            )
+                            .await;
+                        }
                         match read_limited_tool_response(upstream).await {
                             Ok((bytes, content_type)) => {
                                 let outcome = ToolOutcome {
@@ -1191,6 +1247,24 @@ pub(crate) async fn unresolved_tool_sessions(
                     if let Err(rename_err) = std::fs::rename(&path, &quarantine) {
                         tracing::warn!(%rename_err, "failed to quarantine torn intent — leaving in place");
                     }
+                    // Round-6 (hunt3 F2): also quarantine the outcome
+                    // and audited siblings. Leaving them behind trips
+                    // the orphan-outcome check below in the same tick
+                    // and every tick thereafter, permanently stalling
+                    // recovery — the exact brick this quarantine
+                    // discipline exists to prevent.
+                    quarantine_orphan_sibling(
+                        &directory,
+                        key,
+                        crate::spool::TOOL_OUTCOME_SUFFIX,
+                        "outcome",
+                    );
+                    quarantine_orphan_sibling(
+                        &directory,
+                        key,
+                        crate::spool::TOOL_AUDITED_SUFFIX,
+                        "audited",
+                    );
                     intent_keys.remove(key);
                     continue;
                 }
@@ -1211,12 +1285,39 @@ pub(crate) async fn unresolved_tool_sessions(
                 }
                 Err(error) => return Err(error.to_string()),
             };
-            let _: ToolOutcome = crate::journal::open(
+            let _: ToolOutcome = match crate::journal::open(
                 &control_key,
                 &format!("{}:{key}", crate::journal::TOOL_OUTCOME_DOMAIN),
                 0,
                 &outcome_bytes,
-            )?;
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    // Round-6 (hunt3 F2): warn+quarantine the unverifiable
+                    // outcome (and any sibling audited file) instead of
+                    // aborting the whole recovery pass and bricking the
+                    // startup.
+                    tracing::warn!(
+                        %error,
+                        key = %key,
+                        "torn tool-execution outcome quarantined so recovery can proceed"
+                    );
+                    quarantine_orphan_sibling(
+                        &directory,
+                        key,
+                        crate::spool::TOOL_OUTCOME_SUFFIX,
+                        "outcome",
+                    );
+                    quarantine_orphan_sibling(
+                        &directory,
+                        key,
+                        crate::spool::TOOL_AUDITED_SUFFIX,
+                        "audited",
+                    );
+                    unresolved_sessions.insert(intent.session_id);
+                    continue;
+                }
+            };
             let audited_path = directory.join(format!("{key}{}", crate::spool::TOOL_AUDITED_SUFFIX));
             let audited_bytes = match std::fs::read(&audited_path) {
                 Ok(bytes) => bytes,
@@ -1226,12 +1327,29 @@ pub(crate) async fn unresolved_tool_sessions(
                 }
                 Err(error) => return Err(error.to_string()),
             };
-            let _: serde_json::Value = crate::journal::open(
+            let _: serde_json::Value = match crate::journal::open(
                 &control_key,
                 &format!("{}:{key}", crate::journal::TOOL_AUDITED_DOMAIN),
                 0,
                 &audited_bytes,
-            )?;
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        key = %key,
+                        "torn tool-execution audited record quarantined so recovery can proceed"
+                    );
+                    quarantine_orphan_sibling(
+                        &directory,
+                        key,
+                        crate::spool::TOOL_AUDITED_SUFFIX,
+                        "audited",
+                    );
+                    unresolved_sessions.insert(intent.session_id);
+                    continue;
+                }
+            };
         }
         for entry in std::fs::read_dir(&directory).map_err(|error| error.to_string())? {
             let path = entry.map_err(|error| error.to_string())?.path();
@@ -1240,7 +1358,28 @@ pub(crate) async fn unresolved_tool_sessions(
             };
             if let Some(key) = name.strip_suffix(crate::spool::TOOL_OUTCOME_SUFFIX) {
                 if !intent_keys.contains(key) {
-                    return Err("tool outcome exists without an authenticated intent".to_owned());
+                    // Round-6 (hunt3 F2): an orphan outcome must not
+                    // return Err — that turns the recovery tick into a
+                    // permanent brick, especially at boot where
+                    // recover_spooled_sessions is fatal. Rename the
+                    // outcome (and any sibling audited) to a
+                    // `.corrupt-*` name so nothing scans them again.
+                    tracing::warn!(
+                        key = %key,
+                        "orphan tool outcome without authenticated intent quarantined"
+                    );
+                    quarantine_orphan_sibling(
+                        &directory,
+                        key,
+                        crate::spool::TOOL_OUTCOME_SUFFIX,
+                        "outcome",
+                    );
+                    quarantine_orphan_sibling(
+                        &directory,
+                        key,
+                        crate::spool::TOOL_AUDITED_SUFFIX,
+                        "audited",
+                    );
                 }
             }
         }
@@ -1248,6 +1387,38 @@ pub(crate) async fn unresolved_tool_sessions(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+/// Rename `<directory>/<key><suffix>` to a `.corrupt-<uid>` name so
+/// nothing else scans it. Silent-ok when the sibling doesn't exist
+/// (the common case). See round-5 hunt3 F2.
+fn quarantine_orphan_sibling(
+    directory: &std::path::Path,
+    key: &str,
+    suffix: &str,
+    role: &str,
+) {
+    let path = directory.join(format!("{key}{suffix}"));
+    if !path.exists() {
+        return;
+    }
+    let uid = av_core::new_event_uid();
+    let quarantine = directory.join(format!("{key}{suffix}.corrupt-{uid}"));
+    if let Err(rename_err) = std::fs::rename(&path, &quarantine) {
+        tracing::warn!(
+            %rename_err,
+            role = %role,
+            original = %av_core::fsutil::basename(&path),
+            "failed to quarantine orphan tool-execution sibling — leaving in place"
+        );
+    } else {
+        tracing::warn!(
+            role = %role,
+            original = %av_core::fsutil::basename(&path),
+            quarantine = %av_core::fsutil::basename(&quarantine),
+            "orphan tool-execution sibling quarantined"
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -2466,7 +2637,17 @@ fn parse_provider_chunk(raw: &str) -> Result<Option<ParsedProviderChunk>, String
                 .and_then(Value::as_u64)
                 .or_else(|| u64::try_from(choice_position).ok())
                 .unwrap_or(u64::MAX);
-            if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            if let Some(reason) = choice
+                .get("finish_reason")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                // Round-6 (hunt2 F4): empty-string finish_reason from
+                // OpenAI-compatible shims used to enter the audit
+                // chain as `Some("")`, which the JSON schema then
+                // rejects at publish (`minLength: 1`) — permanently
+                // fail-closing the session AFTER the bytes were
+                // already relayed. Treat empty as absent.
                 finish_reason = Some(reason.to_owned());
             }
             let content = choice

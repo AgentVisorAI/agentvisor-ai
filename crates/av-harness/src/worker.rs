@@ -828,19 +828,77 @@ async fn process_job(
         .saturating_add(job.metrics.completion_tokens.unwrap_or(0));
     let breaker = if job.analyze_loop {
         let text = job.text.clone();
-        let embedding = tokio::task::spawn_blocking(move || embedder.try_embed(&text))
+        // Round-6 (hunt5 F2): vector-sink and embedder errors must not
+        // brick the session — the sink's trait doc-comment describes it
+        // as "off-path observability, not participating in the hot
+        // path". A single 2 s Qdrant timeout or one transient
+        // ONNX/HashEmbedder error used to `?`-propagate all the way to
+        // `mark_capture_failed` (sticky) → 503 forever. Downgrade all
+        // three failure modes (embed, query, record) to warn+counter +
+        // continue-without-breaker: the audit chain still gets the
+        // step; only the semantic-loop breaker is skipped for that
+        // step. Journal and receipt integrity still fail-close as
+        // before via other paths.
+        let embedding_result = tokio::task::spawn_blocking(move || embedder.try_embed(&text))
             .await
-            .map_err(|error| error.to_string())??;
-        let nearest_similarity = vector_sink
-            .nearest_similarity(&job.session.session_scope, &embedding)
-            .await?;
-        let verdict = job.session.loop_state.observe_embedding_with_similarity(
-            embedding.clone(),
-            step_tokens,
-            nearest_similarity,
-        );
-        vector_sink.record(&job.session.session_scope, &embedding).await?;
-        Some(verdict)
+            .map_err(|error| error.to_string())?;
+        match embedding_result {
+            Ok(embedding) => {
+                let similarity =
+                    match vector_sink.nearest_similarity(&job.session.session_scope, &embedding).await {
+                        Ok(similarity) => similarity,
+                        Err(error) => {
+                            tracing::warn!(
+                                session = %job.session.id,
+                                %error,
+                                "vector-sink nearest_similarity failed; skipping breaker for this step"
+                            );
+                            metrics
+                                .counter(
+                                    "av_vector_sink_errors_total",
+                                    "Vector-sink errors demoted to warn (round-6 hunt5 F2)",
+                                )
+                                .inc();
+                            None
+                        }
+                    };
+                let verdict = job.session.loop_state.observe_embedding_with_similarity(
+                    embedding.clone(),
+                    step_tokens,
+                    similarity,
+                );
+                if let Err(error) =
+                    vector_sink.record(&job.session.session_scope, &embedding).await
+                {
+                    tracing::warn!(
+                        session = %job.session.id,
+                        %error,
+                        "vector-sink record failed; the local breaker still observed this step"
+                    );
+                    metrics
+                        .counter(
+                            "av_vector_sink_errors_total",
+                            "Vector-sink errors demoted to warn (round-6 hunt5 F2)",
+                        )
+                        .inc();
+                }
+                Some(verdict)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session = %job.session.id,
+                    %error,
+                    "embedder try_embed failed; skipping breaker for this step"
+                );
+                metrics
+                    .counter(
+                        "av_embedder_errors_total",
+                        "Embedder errors demoted to warn (round-6 hunt5 F2/F3)",
+                    )
+                    .inc();
+                None
+            }
+        }
     } else {
         None
     };
@@ -1055,23 +1113,45 @@ fn checked_atomic_add(counter: &std::sync::atomic::AtomicU64, value: u64, field:
         .map_err(|_| format!("{field} accounting exceeds JCS-safe bounds"))
 }
 
+/// Reserve a fresh attempt id without touching the disk. The guard
+/// **must** be armed with this id before the `write_response_marker`
+/// await below, so a client cancellation between the two doesn't leave
+/// a durable marker no in-memory guard owns (round-6 cancellation fix).
+pub(crate) fn reserve_response_attempt_id() -> String {
+    av_core::new_event_uid()
+}
+
+pub(crate) async fn write_response_marker(
+    spool_dir: &std::path::Path,
+    journal_key: &[u8; 32],
+    session_id: &str,
+    attempt_id: &str,
+    request_digest: String,
+) -> Result<(), String> {
+    let marker = InFlightResponse {
+        session_id: session_id.to_owned(),
+        attempt_id: attempt_id.to_owned(),
+        request_digest,
+    };
+    let sealed = crate::journal::seal(journal_key, "in-flight-response", 0, &marker)?;
+    let path = response_marker_path(spool_dir, session_id, attempt_id);
+    tokio::task::spawn_blocking(move || write_atomic_control(&path, &sealed))
+        .await
+        .map_err(|error| error.to_string())??;
+    Ok(())
+}
+
+// Retained for tests + backwards compat — reserves id, writes marker,
+// returns the id. Do not use on cancellable paths (see round-6 fix).
+#[allow(dead_code)]
 pub(crate) async fn create_response_marker(
     spool_dir: &std::path::Path,
     journal_key: &[u8; 32],
     session_id: &str,
     request_digest: String,
 ) -> Result<String, String> {
-    let attempt_id = av_core::new_event_uid();
-    let marker = InFlightResponse {
-        session_id: session_id.to_owned(),
-        attempt_id: attempt_id.clone(),
-        request_digest,
-    };
-    let sealed = crate::journal::seal(journal_key, "in-flight-response", 0, &marker)?;
-    let path = response_marker_path(spool_dir, session_id, &attempt_id);
-    tokio::task::spawn_blocking(move || write_atomic_control(&path, &sealed))
-        .await
-        .map_err(|error| error.to_string())??;
+    let attempt_id = reserve_response_attempt_id();
+    write_response_marker(spool_dir, journal_key, session_id, &attempt_id, request_digest).await?;
     Ok(attempt_id)
 }
 
@@ -1119,15 +1199,32 @@ pub(crate) async fn inflight_response_sessions(
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.to_string()),
             };
-            let marker: InFlightResponse = crate::journal::open(
+            // A single unverifiable marker (seed rotation, future field
+            // added to `InFlightResponse`, torn payload) must not brick
+            // recovery — which is fatal at boot in main.rs. Mirror the
+            // tool-intent quarantine discipline: warn, rename to
+            // `.corrupt-<uid>`, skip. The signed chain never referenced
+            // this file; nothing else claims it. See round-5 hunt3 F1.
+            let marker: InFlightResponse = match crate::journal::open(
                 &journal_key,
                 "in-flight-response",
                 0,
-                // Round-18: cap sealed marker read at MAX_CONTROL_BYTES.
                 &marker_bytes,
-            )?;
+            ) {
+                Ok(marker) => marker,
+                Err(error) => {
+                    quarantine_inflight_marker(&path, &error);
+                    continue;
+                }
+            };
             if path != response_marker_path(&spool_dir, &marker.session_id, &marker.attempt_id) {
-                return Err("in-flight response marker path does not match its payload".to_owned());
+                // Same defense: a marker whose payload's ids don't
+                // reconstruct its filename must not stall recovery.
+                quarantine_inflight_marker(
+                    &path,
+                    "in-flight response marker path does not match its payload",
+                );
+                continue;
             }
             sessions.insert(marker.session_id);
         }
@@ -1148,18 +1245,34 @@ async fn clear_response_marker(
     let session_id = session_id.to_owned();
     let attempt_id = attempt_id.to_owned();
     tokio::task::spawn_blocking(move || {
+        // Round-6 cancellation fix: the caller may race a write that
+        // never landed (cancellation between spawn_blocking and
+        // set_marker), or a marker that recovery already quarantined.
+        // Absent marker means "already cleared" — do not surface as an
+        // error, which would poison the terminal job and leak the
+        // marker into unbounded scan/growth.
+        let marker_bytes = match av_core::fsutil::read_capped(
+            &path,
+            av_core::fsutil::MAX_CONTROL_BYTES,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
         let marker: InFlightResponse = crate::journal::open(
             &journal_key,
             "in-flight-response",
             0,
-            // Round-18: cap sealed marker read at MAX_CONTROL_BYTES.
-            &av_core::fsutil::read_capped(&path, av_core::fsutil::MAX_CONTROL_BYTES)
-                .map_err(|error| error.to_string())?,
+            &marker_bytes,
         )?;
         if marker.session_id != session_id || marker.attempt_id != attempt_id {
             return Err("in-flight response marker does not match completed job".to_owned());
         }
-        std::fs::remove_file(&path).map_err(|error| error.to_string())?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        }
         let parent = path
             .parent()
             .ok_or_else(|| "in-flight response marker has no parent".to_owned())?;
@@ -1167,6 +1280,32 @@ async fn clear_response_marker(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+/// Rename an unverifiable in-flight-response marker out of the way and
+/// log a single warn. Keeps the file as evidence at a stable
+/// `.corrupt-<uid>` name so operators can retrieve it; nothing else
+/// scans that suffix. See round-5 hunt3 F1.
+fn quarantine_inflight_marker(path: &std::path::Path, error: impl std::fmt::Display) {
+    let uid = av_core::new_event_uid();
+    let name = path
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .map(|stem| format!("{stem}.corrupt-{uid}.json"))
+        .unwrap_or_else(|| format!("corrupt-{uid}.json"));
+    let quarantine = path.with_file_name(name);
+    tracing::warn!(
+        %error,
+        original = %av_core::fsutil::basename(path),
+        quarantine = %av_core::fsutil::basename(&quarantine),
+        "unverifiable in-flight-response marker quarantined so recovery can proceed"
+    );
+    if let Err(rename_err) = std::fs::rename(path, &quarantine) {
+        tracing::warn!(
+            %rename_err,
+            "failed to quarantine in-flight-response marker — leaving in place"
+        );
+    }
 }
 
 fn response_marker_path(
@@ -1619,6 +1758,13 @@ mod tests {
 
     #[tokio::test]
     async fn response_marker_rejects_payload_mutation() {
+        // Round-6 (hunt3 F1) behavior change: an unverifiable marker is
+        // now quarantined (renamed to `.corrupt-<uid>`) instead of
+        // bricking the recovery scan. Verify (a) the tampered file is
+        // moved out of the way, so it no longer counts as "in-flight",
+        // and (b) recovery reports "no in-flight sessions" cleanly. A
+        // hard error would fail-close the entire boot, the exact
+        // regression the fix eliminates.
         let directory = tempfile::tempdir().unwrap();
         let journal_key = [17; 32];
         create_response_marker(
@@ -1637,11 +1783,23 @@ mod tests {
             .path();
         let mut envelope: Value = serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
         envelope["payload"]["request_digest"] = Value::String("forged".to_owned());
-        std::fs::write(marker_path, serde_json::to_vec(&envelope).unwrap()).unwrap();
-        assert!(ensure_no_inflight_responses(directory.path(), &journal_key)
+        std::fs::write(&marker_path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+        ensure_no_inflight_responses(directory.path(), &journal_key)
             .await
-            .unwrap_err()
-            .contains("authentication failed"));
+            .expect("tampered marker quarantines cleanly instead of poisoning recovery");
+        // Original path is renamed; a `.corrupt-*.json` sibling remains
+        // for operator evidence retrieval.
+        assert!(!marker_path.exists(), "tampered marker should be quarantined out of the primary name");
+        let inflight_dir = directory.path().join(crate::spool::INFLIGHT_RESPONSES);
+        let mut has_corrupt = false;
+        for entry in std::fs::read_dir(&inflight_dir).unwrap() {
+            let name = entry.unwrap().file_name();
+            if name.to_string_lossy().contains(".corrupt-") {
+                has_corrupt = true;
+                break;
+            }
+        }
+        assert!(has_corrupt, "expected a `.corrupt-<uid>.json` sibling as evidence");
     }
 
     #[tokio::test]

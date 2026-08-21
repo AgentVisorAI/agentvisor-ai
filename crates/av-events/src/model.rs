@@ -404,6 +404,24 @@ impl OcsfEventBuilder {
                 }
             }
         }
+        // Round-6 (hunt2 F1): mirror the JCS-safety guard for
+        // ai_agent.ttl_remaining_s at build time so signed emits from
+        // this crate can never produce an event that the wire-side
+        // validator would refuse.
+        if let Some(ttl) = self.ai_agent.ttl_remaining_s {
+            check_jcs_safe(ttl)?;
+        }
+        // Round-6 (hunt1 F5): the JSON schema (`schemas/ocsf-agent-event.schema.json`)
+        // and the Rust validator both declare `severity_id` in 1..=6.
+        // The builder previously accepted any u8, so a caller passing
+        // `.severity(0)` or `.severity(7)` produced a signed/journaled
+        // event that then failed the embedded broker's schema validator
+        // at publish — surfacing as an opaque Backend error and marking
+        // the session capture-failed. Refuse at build time, matching
+        // the round-26 pruning_ratio_millis fix pattern above.
+        if !(1..=6).contains(&self.severity_id) {
+            return Err(av_core::CoreError::UnsafeInteger(u64::from(self.severity_id)));
+        }
         let now = av_core::time::now_ms();
         check_jcs_safe(now)?;
         let class_uid = self.class.class_uid();

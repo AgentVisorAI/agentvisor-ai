@@ -183,7 +183,7 @@ fn build_receipt_for(dir: &std::path::Path, seed_bytes: [u8; 32]) -> PathBuf {
         receipt_id: "dyn-workflow".to_owned(),
         session_id: "dyn".to_owned(),
         issued_at: 0,
-        issued_at_iso: "1970-01-01T00:00:00Z".to_owned(),
+        issued_at_iso: "1970-01-01T00:00:00.000Z".to_owned(),
         ai_agent: AgentIdentity {
             version: "1".to_owned(),
             charter: CharterFile::from("c"),

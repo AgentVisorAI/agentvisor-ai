@@ -85,6 +85,18 @@
               "completion_tokens": { "type": "integer", "minimum": 0 },
               "cached_tokens": { "type": "integer", "minimum": 0 },
               "cost_usd": { "type": "number", "minimum": 0 },
+              "logprobs": {
+                "type": "array",
+                "items": { "type": "number" }
+              },
+              "completion_token_ids": {
+                "type": "array",
+                "items": { "type": "integer", "minimum": 0 }
+              },
+              "prompt_token_ids": {
+                "type": "array",
+                "items": { "type": "integer", "minimum": 0 }
+              },
               "extra": { "type": "object" }
             }
           },

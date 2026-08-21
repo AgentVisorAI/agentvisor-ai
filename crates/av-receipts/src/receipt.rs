@@ -351,6 +351,21 @@ impl Receipt {
                 ));
             }
         }
+        // Round-6 (hunt2 F3): cross-check `issued_at_iso` against the
+        // authoritative epoch-ms `issued_at`. Verification previously
+        // only checked shapes plus the retroactive invariant, so a
+        // hostile-but-keyholding issuer could sign a receipt whose ISO
+        // caption and epoch-ms disagreed — auditors reading ISO and
+        // tooling reading ms saw different facts from the same
+        // verified receipt. Derive the ISO deterministically and
+        // require equality.
+        let expected_iso = av_core::time::iso8601_ms(self.body.issued_at);
+        if self.body.issued_at_iso != expected_iso {
+            return Err(ReceiptError::SemanticInvariant(format!(
+                "issued_at_iso {:?} does not match issued_at ({}); expected {:?}",
+                self.body.issued_at_iso, self.body.issued_at, expected_iso
+            )));
+        }
         Ok(())
     }
 }

@@ -163,36 +163,37 @@ impl Embedder for OnnxEmbedder {
     }
 
     fn embed(&self, text: &str) -> Vec<f32> {
-        self.infer(text).unwrap_or_else(|error| {
-            // Round-31 F1 (silent-bug): the prior fallback returned a
-            // zero vector on ONNX inference failure. Zero vectors are
-            // the trait's documented signal for "empty/degenerate
-            // input", so an inference failure LOOKED like empty input
-            // to the breaker (`av-loopdetect::breaker`) — which then
-            // treats consecutive zero-vector observations as a
-            // near-perfect duplicate signal (`delta ≈ 0`) and can
-            // trip the loop breaker mid-flight on repeated ONNX
-            // outages. Round-13 F5 fixed the same class on the
-            // response-side path by refusing to feed the breaker
-            // empty text. Here we fall back to a NON-ZERO
-            // deterministic HashEmbedder over the same text: same
-            // text always produces the same vector (breaker
-            // stability preserved), the vector is derived from
-            // content (not a false-duplicate signal), and the
-            // failure is still logged for operator triage.
-            tracing::warn!(
-                %error,
-                dim = self.dim,
-                "ONNX inference failed; falling back to deterministic HashEmbedder \
-                 (non-zero so the breaker does not treat outages as false duplicates)"
-            );
-            crate::HashEmbedder::new(self.dim).embed(text)
-        })
+        self.infer(text).unwrap_or_else(|error| fallback_hash_embedding(self.dim, text, &error))
     }
 
     fn try_embed(&self, text: &str) -> Result<Vec<f32>, String> {
-        self.infer(text)
+        // Round-6 (hunt5 F3): production callers go through
+        // `try_embed`, so a fallback that lived only in `embed()` was
+        // dead code — every ONNX inference failure bricked the session
+        // upstream (round-6 hunt5 F2 pairs with this). Apply the same
+        // HashEmbedder fallback here so we always return Ok. The sink
+        // path is now warn+continue anyway, but this preserves breaker
+        // observations on transient ONNX errors.
+        Ok(self
+            .infer(text)
+            .unwrap_or_else(|error| fallback_hash_embedding(self.dim, text, &error)))
     }
+}
+
+/// Round-31 F1: the prior fallback returned a zero vector on ONNX
+/// inference failure, which the breaker interprets as an
+/// empty/degenerate input signal (`delta ≈ 0`) — so an outage could
+/// trip the loop-breaker mid-flight. HashEmbedder returns a non-zero
+/// content-derived vector: same text → same vector, distinct texts →
+/// distinct vectors, breaker semantics preserved through the outage.
+fn fallback_hash_embedding(dim: usize, text: &str, error: &str) -> Vec<f32> {
+    tracing::warn!(
+        error = %error,
+        dim,
+        "ONNX inference failed; falling back to deterministic HashEmbedder \
+         (non-zero so the breaker does not treat outages as false duplicates)"
+    );
+    crate::HashEmbedder::new(dim).embed(text)
 }
 
 #[cfg(test)]

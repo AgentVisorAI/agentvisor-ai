@@ -921,6 +921,15 @@ fn find_server_binary() -> PathBuf {
 
 /// Print the last `count` log lines, unwrapping the JSON envelope when
 /// possible so failures read like sentences instead of telemetry.
+///
+/// Round-6 (hunt4 F15): JSON-decoding the tracing envelope RESURRECTS
+/// escaped control bytes (tracing writes `\u001b`; `serde_json` decodes
+/// it back to live ESC). An attacker who can influence a logged string
+/// (any upstream/tool response payload that got captured into an error
+/// message) could then paint spoofed diagnostics on the operator's
+/// terminal via CSI sequences. Route both the JSON-decoded message and
+/// the raw-line fallback through the same terminal sanitizer used
+/// everywhere else in this crate.
 fn print_log_tail(path: &Path, count: usize) {
     let Ok(text) = std::fs::read_to_string(path) else {
         return;
@@ -936,7 +945,7 @@ fn print_log_tail(path: &Path, count: usize) {
                 Some(format!("{level:<5} {message}"))
             })
             .unwrap_or_else(|| line.to_owned());
-        eprintln!("    {friendly}");
+        eprintln!("    {}", crate::sanitize_for_terminal(&friendly));
     }
 }
 
@@ -1516,26 +1525,13 @@ pub async fn doctor(offline: bool) -> Result<()> {
 }
 
 /// Strip URL userinfo (`user:pass@`) for safe display. Handles
-/// comma-separated endpoint lists (Redis Cluster). Display-only — never
-/// used for connecting.
+/// comma-separated endpoint lists (Redis Cluster) AND passwords
+/// containing `,`. Display-only — never used for connecting.
+///
+/// Round-6: delegate to `av_core::url_redact::redact_userinfo` so the
+/// harness startup logs and the CLI doctor use identical semantics.
 fn redact_userinfo(endpoints: &str) -> String {
-    endpoints
-        .split(',')
-        .map(|endpoint| {
-            let Some((scheme, rest)) = endpoint.split_once("://") else {
-                return endpoint.to_owned();
-            };
-            let (authority, path) = match rest.find('/') {
-                Some(i) => rest.split_at(i),
-                None => (rest, ""),
-            };
-            match authority.rsplit_once('@') {
-                Some((_, host)) => format!("{scheme}://***@{host}{path}"),
-                None => endpoint.to_owned(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(",")
+    av_core::url_redact::redact_userinfo(endpoints)
 }
 
 /// TCP-connect to `host:port` extracted from a URL or bare `host:port`.
