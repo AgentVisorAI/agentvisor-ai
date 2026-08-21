@@ -166,6 +166,15 @@ impl BridgeManifest {
         if self.name.is_empty() {
             return Err(ManifestError::Invalid("name is empty".into()));
         }
+        // `from_yaml`'s anchor/alias scan (the billion-laughs guard)
+        // rejects any '&'/'*' followed by an anchor-name character
+        // anywhere in the document — including inside quoted strings.
+        // Refuse those characters in every free-text field `to_yaml`
+        // serializes, so `provision()` can never persist a manifest that
+        // `open()` then refuses to re-parse (a name like "R&D-east" used
+        // to provision once and permanently brick the directory as
+        // already-provisioned-but-unopenable).
+        refuse_yaml_marker_chars("name", &self.name)?;
         if self.topics.is_empty() {
             return Err(ManifestError::Invalid("no topics declared".into()));
         }
@@ -226,6 +235,11 @@ impl BridgeManifest {
                 )));
             }
             if let Some(reference) = &t.schema_ref {
+                // schema_ref and cold_uri are the remaining serialized
+                // fields that admit '&'/'*' (topic names are already
+                // restricted to [A-Za-z0-9._-]); same round-trip rationale
+                // as the deployment-name check above.
+                refuse_yaml_marker_chars("schema_ref", reference)?;
                 let path = Path::new(reference);
                 if path.is_absolute()
                     || path
@@ -235,9 +249,52 @@ impl BridgeManifest {
                     return Err(ManifestError::Invalid(format!("unsafe schema_ref {reference:?}")));
                 }
             }
+            if let Some(uri) = &t.retention.cold_uri {
+                refuse_yaml_marker_chars("cold_uri", uri)?;
+                // Round-17 F3 (av-bridge): a local (non-scheme) cold_uri
+                // is used directly as a filesystem root at retention
+                // enforcement time (`Path::new(cold).join(...)` in
+                // embedded.rs). A `..` component would let the cold-
+                // archive tree land outside the intended prefix — a
+                // manifest-supplied path escape (CWE-22 class). The
+                // scheme forms (`s3://`, `gs://`, `file://`) are
+                // handled by the cold-store feature layer and are not
+                // subject to this check. Absolute paths are allowed:
+                // legitimate deployments point `cold_uri` at a
+                // dedicated partition or mount (e.g. `/mnt/cold`).
+                if !uri.contains("://") {
+                    let path = Path::new(uri);
+                    if path
+                        .components()
+                        .any(|component| matches!(component, std::path::Component::ParentDir))
+                    {
+                        return Err(ManifestError::Invalid(format!(
+                            "unsafe cold_uri {uri:?} (must not contain `..` components; \
+                             use a scheme URI or a concrete absolute/relative path with \
+                             no parent-directory traversal)"
+                        )));
+                    }
+                }
+            }
         }
         Ok(())
     }
+}
+
+/// Reject '&' and '*' in a free-text manifest field. These are the exact
+/// markers `from_yaml`'s anchor/alias scan keys on; allowing them in a
+/// serialized field would let `to_yaml` produce a document the scan
+/// refuses to re-parse. Rejected wholesale (not just marker+name-char)
+/// so the rule stays obvious and robust against scan refinements.
+fn refuse_yaml_marker_chars(field: &str, value: &str) -> Result<(), ManifestError> {
+    if value.contains('&') || value.contains('*') {
+        return Err(ManifestError::Invalid(format!(
+            "{field} {value:?} contains '&' or '*', which the YAML anchor/alias \
+             guard refuses at parse time; remove those characters so the \
+             provisioned manifest can be re-opened"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(any(feature = "nats", feature = "kafka"))]
@@ -416,6 +473,75 @@ topics:
             BridgeManifest::from_yaml(with_retention_typo),
             Err(ManifestError::Parse(_))
         ));
+    }
+
+    #[test]
+    fn validate_refuses_cold_uri_with_parent_directory_escape() {
+        // Round-17 F3 (av-bridge): a local (non-scheme) cold_uri with
+        // `..` components would let retention enforcement write cold
+        // objects outside the intended prefix. Verify each shape.
+        for uri in [
+            "data/../../etc",
+            "../escape",
+            "/mnt/cold/../..",
+            "topics/../../..",
+        ] {
+            let mut m = BridgeManifest::default_for("t");
+            m.topics[0].retention.cold_uri = Some(uri.to_owned());
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(err, ManifestError::Invalid(ref msg) if msg.contains("cold_uri") && msg.contains("..")),
+                "cold_uri {uri:?} must be refused as unsafe, got {err:?}"
+            );
+        }
+        // Absolute paths without `..` are the operator's choice and
+        // remain allowed (a dedicated `/mnt/cold` partition is a
+        // legitimate deployment shape).
+        let mut m = BridgeManifest::default_for("t");
+        m.topics[0].retention.cold_uri = Some("/mnt/cold".to_owned());
+        m.validate().unwrap();
+        // Scheme URIs skip the check entirely — the cold-store feature
+        // layer parses them.
+        let mut m = BridgeManifest::default_for("t");
+        m.topics[0].retention.cold_uri = Some("s3://bucket/../elsewhere".to_owned());
+        m.validate().unwrap();
+    }
+
+    /// A manifest that passes validate() must round-trip through
+    /// to_yaml/from_yaml. The from_yaml anchor scan rejects '&'/'*'
+    /// followed by an anchor-name character even inside quoted strings,
+    /// so validate() must refuse those characters in every free-text
+    /// field to_yaml serializes — otherwise provision() writes a
+    /// manifest that open() can never re-parse and the directory is
+    /// permanently "already provisioned" yet unopenable.
+    #[test]
+    fn validate_refuses_fields_the_yaml_anchor_guard_cannot_reparse() {
+        for name in ["R&D-east", "region*star"] {
+            let mut m = BridgeManifest::default_for(name);
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(err, ManifestError::Invalid(ref msg) if msg.contains("'&' or '*'")),
+                "name {name:?} must be refused with the round-trip rationale, got {err:?}"
+            );
+            // And the refusal is exactly what saves the round-trip: the
+            // serialized form is indeed unparseable by from_yaml.
+            m.name = name.to_owned();
+            let yaml = m.to_yaml().unwrap();
+            assert!(
+                matches!(BridgeManifest::from_yaml(&yaml), Err(ManifestError::Parse(_))),
+                "the anchor scan rejects the serialized {name:?} manifest"
+            );
+        }
+        let mut m = BridgeManifest::default_for("clean");
+        m.topics[0].retention.cold_uri = Some("s3://bucket/a&b".to_owned());
+        assert!(matches!(m.validate(), Err(ManifestError::Invalid(_))));
+        let mut m = BridgeManifest::default_for("clean");
+        m.topics[0].schema_ref = Some("schemas/a&b.json".to_owned());
+        assert!(matches!(m.validate(), Err(ManifestError::Invalid(_))));
+        // Marker-free free-text fields stay legal.
+        let mut m = BridgeManifest::default_for("R-and-D-east");
+        m.topics[0].retention.cold_uri = Some("s3://bucket/prefix".to_owned());
+        m.validate().unwrap();
     }
 
     #[test]

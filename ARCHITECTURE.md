@@ -23,7 +23,7 @@ flowchart LR
     T --> R[Finalizer, lifecycle outbox, receipt]
 ```
 
-Production routes reserve bounded worker capacity before mutating quotas. Chat and MCP effects wait until their request or authorization event is journaled and published; synchronous quota, WASM, and compression work runs on Tokio's blocking pool. Provider responses have a pre-reserved capture slot. Non-SSE responses are bounded and validated before delivery; SSE uses a bounded byte-oriented decoder.
+Production routes reserve bounded worker capacity before mutating quotas. Chat effects gate on a durable in-flight response marker before the upstream call, and MCP tool effects gate on a MAC-authenticated durable intent file before the upstream call, so a crash between authorization and effect always leaves crash-recovery evidence for the reconciler. The corresponding OCSF audit event is queued to the worker pool and published asynchronously (the request path does not block on broker `publish`); the durable local records — response marker and tool intent — are what the recovery scan reasons about. Synchronous quota, WASM, and compression work runs on Tokio's blocking pool when a token budget is configured (`budget.max_tokens`); with no token budget those local gates are cheap enough to run inline. Provider responses have a pre-reserved capture slot. Non-SSE responses are bounded and validated before delivery; SSE uses a bounded byte-oriented decoder.
 
 Receipt signing and ATIF serialization remain off the request path. Worker overload fails before quota mutation and is counted in `av_events_dropped_total`.
 

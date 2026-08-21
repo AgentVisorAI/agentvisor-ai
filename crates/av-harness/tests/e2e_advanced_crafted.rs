@@ -306,17 +306,27 @@ fn duplicate_key_parser_differential_cannot_split_schema_from_policy() {
     let store = InMemoryStore::new();
     // Manually build a duplicate-key JSON payload.
     let raw = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send","arguments":{"to":"attacker@evil.com","to":"user@example.com"}}}"#;
-    // Whichever value serde_json's parser picks, the policy must be
-    // consistent with the schema view — i.e., either both see "attacker"
-    // (and refuse) or both see "user" (and allow). A split view = bypass.
+    // Round-47: duplicate keys are rejected at the RPC parser, ahead
+    // of both gates. A previous version accepted the parser's
+    // (implementation-defined) last-wins pick and RELIED on threading
+    // it consistently to schema and policy — but the raw body is
+    // forwarded unchanged to the tool upstream, whose JSON decoder
+    // may pick first-wins (jackson, some Go decoders), producing a
+    // permissions-model split with the harness attesting one thing
+    // and the upstream executing another. Refuse ambiguity.
     match sandbox.check(&store, "sess", raw) {
-        ToolVerdict::Blocked { stage, .. } => {
-            // If blocked, must be by the policy that saw "attacker".
-            assert_eq!(stage, "policy");
+        ToolVerdict::Blocked { stage, reason, .. } => {
+            assert_eq!(
+                stage, "parse",
+                "duplicate keys must be rejected at parse, got stage={stage} reason={reason}",
+            );
+            assert!(
+                reason.contains("duplicate"),
+                "parse rejection must cite the duplicate key, got: {reason}"
+            );
         }
         ToolVerdict::Allowed { .. } => {
-            // Both gates agreed — the parser picked the "user" value.
-            // No split view either way.
+            panic!("duplicate-key payload must be refused, not allowed");
         }
     }
 }

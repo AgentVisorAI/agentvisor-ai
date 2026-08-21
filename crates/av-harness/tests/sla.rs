@@ -360,7 +360,14 @@ async fn held_provider(State(mut state): State<HoldState>, Json(_): Json<Value>)
             break;
         }
     }
-    Response::new(Body::from("{\"choices\":[]}"))
+    // Keep the mock response above h2 0.4.16's small-DATA-frame overhead
+    // threshold (256 bytes). Real completion payloads are always larger;
+    // a 14-byte body across 10k multiplexed streams exhausts the
+    // connection's anti-DoS framing budget and triggers ENHANCE_YOUR_CALM.
+    let padding = "x".repeat(512);
+    Response::new(Body::from(format!(
+        "{{\"choices\":[],\"padding\":\"{padding}\"}}"
+    )))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 12)]
@@ -438,7 +445,12 @@ async fn sla_10k_streaming_connections() {
         axum::serve(harness_listener, build_router(state)).await.unwrap();
     });
 
-    let body = r#"{"model":"sla","stream":true,"messages":[{"role":"user","content":"hold"}]}"#;
+    // The prompt padding keeps the forwarded request body above h2
+    // 0.4.16's 256-byte small-DATA-frame threshold; see held_provider.
+    let body = format!(
+        r#"{{"model":"sla","stream":true,"messages":[{{"role":"user","content":"hold {}"}}]}}"#,
+        "x".repeat(384)
+    );
     let started = Instant::now();
     let mut clients = Vec::with_capacity(connections);
     let connect_limit = Arc::new(tokio::sync::Semaphore::new(256));

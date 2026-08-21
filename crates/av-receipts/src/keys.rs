@@ -1,7 +1,7 @@
 //! Signing keys: the `Signer` trait (in-process Ed25519 now, KMS post-MVP) and
 //! an offline `Keyring` for verification with key rotation via key ids.
 
-use ed25519_dalek::{Signature, Signer as DalekSigner, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer as DalekSigner, SigningKey, VerifyingKey};
 use std::collections::HashMap;
 
 /// Abstract signer — the KMS integration point (brief Module G, post-MVP).
@@ -43,19 +43,29 @@ impl Ed25519Signer {
     /// OsRng, but the failure mode is silent installation of a
     /// globally-predictable keypair — cheap to guard.
     pub fn generate() -> Self {
+        use rand::TryRng;
         loop {
-            let key = SigningKey::generate(&mut rand::rngs::OsRng);
-            // Round-21 F2: wrap the raw seed comparison buffer in
-            // `Zeroizing` so the stack slot zeroes on scope exit.
-            // A bare `[u8; 32]` has no Drop, so it lingers in
-            // freed stack memory (recoverable from a core dump).
-            // The round-20 F5 loop reintroduced that leak by
-            // reading `key.to_bytes()` into a bare local. Equality
-            // through Deref still works.
-            let bytes = zeroize::Zeroizing::new(key.to_bytes());
+            // rand 0.9+ removed the infallible `OsRng` that
+            // `SigningKey::generate` (rand_core 0.6) accepted; draw the
+            // seed through the fallible `SysRng` interface instead and
+            // build the key from bytes.
+            //
+            // Round-21 F2: wrap the raw seed buffer in `Zeroizing` so the
+            // stack slot zeroes on scope exit. A bare `[u8; 32]` has no
+            // Drop, so it lingers in freed stack memory (recoverable from
+            // a core dump).
+            let mut bytes = zeroize::Zeroizing::new([0u8; 32]);
+            // An OS entropy failure is unrecoverable for key generation;
+            // the pre-0.9 `OsRng` path aborted here too (it panicked
+            // inside `getrandom`). Panicking keeps the infallible API.
+            #[allow(clippy::expect_used)]
+            rand::rngs::SysRng
+                .try_fill_bytes(&mut *bytes)
+                .expect("OS random source unavailable");
             if *bytes == [0u8; 32] || *bytes == [0xFFu8; 32] {
                 continue;
             }
+            let key = SigningKey::from_bytes(&bytes);
             let key_id = derive_key_id(&key.verifying_key());
             return Self { key_id, key };
         }
@@ -70,6 +80,18 @@ impl Ed25519Signer {
     /// the slot IT owns, not the copy the callee received. By taking
     /// a reference we let the caller keep the seed inside a
     /// `Zeroizing` and never lose control of the memory.
+    ///
+    /// # Caveat: caller must reject known-weak seeds
+    ///
+    /// This constructor does NOT reject the all-zero or all-0xFF seeds
+    /// (both produce globally-predictable keypairs). The production
+    /// seed-loading path in `av-harness::main::read_signer` refuses
+    /// both before reaching this function (see the `[0u8; 32]` /
+    /// `[0xFFu8; 32]` guard in `av-harness/src/main.rs`); every OTHER
+    /// caller (tests, `avctl keygen`) must apply the same policy or
+    /// use [`Ed25519Signer::generate`] which loops until a non-weak
+    /// seed is drawn. Round-51 F2 documents this contract in-signature
+    /// so a future refactor cannot silently drop the pre-validation.
     pub fn from_seed(seed: &[u8; 32]) -> Self {
         let key = SigningKey::from_bytes(seed);
         let key_id = derive_key_id(&key.verifying_key());
@@ -168,6 +190,15 @@ impl Keyring {
     }
 
     /// Verify `sig` over `msg` with the key identified by `key_id`.
+    ///
+    /// Uses `verify_strict` (ed25519-dalek), NOT `verify`. Round-51 F1:
+    /// non-strict `verify` accepts signatures whose R component or the
+    /// verifying key itself is a small-order Curve25519 point. In that
+    /// regime a single signature can validate against multiple distinct
+    /// messages, so a mutated receipt body whose signature is untouched
+    /// can still verify. `verify_strict` rejects small-order R AND
+    /// small-order pubkeys (dalek verifying.rs:367-390 in 3.0.0) and is
+    /// the documented recommendation for new protocols.
     pub fn verify(&self, key_id: &str, msg: &[u8], sig: &[u8]) -> Result<(), KeyError> {
         let vk = self
             .keys
@@ -175,7 +206,7 @@ impl Keyring {
             .ok_or_else(|| KeyError::UnknownKeyId(key_id.to_owned()))?;
         let sig_bytes: [u8; 64] = sig.try_into().map_err(|_| KeyError::InvalidSignature)?;
         let signature = Signature::from_bytes(&sig_bytes);
-        vk.verify(msg, &signature)
+        vk.verify_strict(msg, &signature)
             .map_err(|_| KeyError::BadSignature(key_id.to_owned()))
     }
 

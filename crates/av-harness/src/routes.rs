@@ -155,11 +155,27 @@ async fn metrics(State(state): State<AppState>) -> Response {
     response
 }
 
-async fn chat_completions(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(payload): Json<Value>,
-) -> Response {
+async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    // Round-22 F1 (av-harness routes): refuse duplicate top-level or
+    // nested JSON keys before parsing. `Json<Value>` used
+    // `serde_json` default "last-wins" semantics, so a hostile client
+    // could send `{"messages":[safe],"messages":[hostile]}` — the
+    // harness saw the hostile array, but any auditor/dashboard
+    // reading the raw request bytes (e.g. via
+    // `av_events::atif_capture_from_request` chain input) sees an
+    // ambiguous document, breaking the "same signature ⇔ same
+    // bytes" auditor invariant that round-15 F3 pinned for receipts.
+    // Same fix as `parse_tool_call` on the MCP path — use the shared
+    // primitive.
+    if let Err(reason) = av_sandbox::refuse_duplicate_json_keys(&body) {
+        return pipeline_error(crate::pipeline::PipelineError::BadRequest(format!(
+            "chat request rejected: {reason}"
+        )));
+    }
+    let payload: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => return pipeline_error(crate::pipeline::PipelineError::BadRequest(error.to_string())),
+    };
     let admission_started = std::time::Instant::now();
     let mut prepared = match state.prepare_chat_nonblocking(&headers, payload).await {
         Ok(prepared) => prepared,
@@ -178,10 +194,31 @@ async fn chat_completions(
         response: upstream,
         lease,
         response_permit,
-        response_marker,
-        response_attempt_id,
+        capture_guard,
     } = forwarded;
     let Some(response_permit) = response_permit else {
+        // Defensive: `prepare_chat` always reserves a permit. Even so,
+        // retire the durable marker and the journalled attempt through
+        // the plain worker queue before failing — returning directly
+        // would leak the spool/inflight-responses/ marker (crash
+        // recovery then quarantines the session) and leave a dangling
+        // non-terminal ResponseAttempt. If even that submit fails, fail
+        // the session closed rather than dropping the capture silently.
+        let (response_marker, response_attempt_id) = capture_guard.disarm();
+        let capture_session = Arc::clone(&session);
+        if state
+            .worker
+            .try_submit(crate::pipeline::refused_response_failure_job(
+                session,
+                identity,
+                "response_capture_permit_missing".to_owned(),
+                response_marker,
+                response_attempt_id,
+            ))
+            .is_err()
+        {
+            capture_session.mark_capture_failed();
+        }
         return lifecycle_error("durable response capture permit is missing".to_owned());
     };
 
@@ -203,20 +240,52 @@ async fn chat_completions(
     // be empty or `identity` case-insensitively; also split each
     // value on `,` so `gzip, identity` (single header, two tokens)
     // is caught.
-    for value in upstream_headers.get_all(axum::http::header::CONTENT_ENCODING) {
+    let mut refused_encoding: Option<(String, String)> = None;
+    'encodings: for value in upstream_headers.get_all(axum::http::header::CONTENT_ENCODING) {
         let raw = value.to_str().unwrap_or_default();
         for token in raw.split(',') {
             let token = token.trim();
             if token.is_empty() || token.eq_ignore_ascii_case("identity") {
                 continue;
             }
-            return pipeline_error(crate::pipeline::PipelineError::Upstream(format!(
-                "upstream responded with unsupported Content-Encoding token {token:?} \
-                 (full header: {raw:?}) — the proxy is built without decompression \
-                 support; enable it upstream (Accept-Encoding: identity) or rebuild \
-                 with the reqwest `gzip` feature"
-            )));
+            refused_encoding = Some((token.to_owned(), raw.to_owned()));
+            break 'encodings;
         }
+    }
+    if let Some((token, raw)) = refused_encoding {
+        // Retire the durable in-flight marker and terminally fail the
+        // journalled response attempt before refusing — mirroring
+        // forward_chat's Err arm. Returning without this leaked the
+        // marker (recover_spooled_sessions quarantined the session on
+        // every subsequent boot) and left a dangling non-terminal
+        // attempt while the session later closed with a "clean"
+        // receipt. Stable classifier only in the persisted record —
+        // the header token is upstream-controlled bytes. If the shard
+        // is full, fail the session closed rather than dropping the
+        // capture silently (same rationale as forward_chat's Err arm).
+        let (response_marker, response_attempt_id) = capture_guard.disarm();
+        let capture_session = Arc::clone(&session);
+        if response_permit
+            .submit(
+                &state.worker,
+                crate::pipeline::refused_response_failure_job(
+                    session,
+                    identity,
+                    "upstream_unsupported_content_encoding".to_owned(),
+                    response_marker,
+                    response_attempt_id,
+                ),
+            )
+            .is_err()
+        {
+            capture_session.mark_capture_failed();
+        }
+        return pipeline_error(crate::pipeline::PipelineError::Upstream(format!(
+            "upstream responded with unsupported Content-Encoding token {token:?} \
+             (full header: {raw:?}) — the proxy is built without decompression \
+             support; enable it upstream (Accept-Encoding: identity) or rebuild \
+             with the reqwest `gzip` feature"
+        )));
     }
     // Round-25 F3: RFC 7231 §3.1.1.1 says media type/subtype are
     // case-insensitive and the header value may carry parameters
@@ -232,6 +301,10 @@ async fn chat_completions(
     let stream = upstream
         .bytes_stream()
         .map(|chunk| chunk.map_err(std::io::Error::other));
+    // `AbortFinalizingStream` owns marker retirement and attempt
+    // termination from here (including on mid-stream client disconnect,
+    // via its own Drop); hand both over and disarm the guard.
+    let (response_marker, response_attempt_id) = capture_guard.disarm();
     let stream = AbortFinalizingStream {
         inner: stream.boxed(),
         session,
@@ -299,7 +372,7 @@ async fn chat_completions(
     };
     *response.status_mut() = status;
     for (name, value) in &upstream_headers {
-        if is_forwardable_upstream_header(name) {
+        if is_forwardable_upstream_header(name, &state.config.upstream_auth_header) {
             // `append`, not `insert`: iterating a HeaderMap repeats the name
             // for each value of a multi-valued header, and `insert` would
             // keep only the last one.
@@ -352,8 +425,27 @@ async fn chat_completions(
 /// double-encoded or contradictory headers and — with `Transfer-Encoding` —
 /// classical HTTP request smuggling. Hop-by-hop headers are forbidden by
 /// RFC 7230 §6.1 from crossing a proxy.
-fn is_forwardable_upstream_header(name: &axum::http::HeaderName) -> bool {
+///
+/// Round-16 F1 (routes): the denylist covered `Authorization` (RFC 7235)
+/// but NOT any custom-name auth header the harness itself uses to
+/// authenticate to the upstream. Every LLM provider uses a distinct
+/// custom header — `api-key` (Azure), `x-api-key` (Amazon Bedrock,
+/// Together AI), `x-goog-api-key` (Google), `anthropic-api-key`
+/// (Anthropic). A malicious or compromised upstream that echoes back
+/// its request's auth header in the response would then leak the
+/// operator's provider credential straight through to the caller.
+/// Two-layer defense: (a) refuse every well-known API-key header name
+/// by static allowlist below, AND (b) refuse the currently-configured
+/// `upstream_auth_header` name so operator-specific choices are also
+/// covered.
+fn is_forwardable_upstream_header(name: &axum::http::HeaderName, upstream_auth_header: &str) -> bool {
     use axum::http::header;
+    // Any header name whose lowercased ASCII equals the configured
+    // upstream auth header MUST be stripped. `HeaderName` display is
+    // already lowercase-normalised.
+    if name.as_str().eq_ignore_ascii_case(upstream_auth_header) {
+        return false;
+    }
     let is_denied = *name == header::CONTENT_LENGTH
         || *name == header::TRANSFER_ENCODING
         || *name == header::CONNECTION
@@ -362,12 +454,27 @@ fn is_forwardable_upstream_header(name: &axum::http::HeaderName) -> bool {
         || *name == header::TRAILER
         || *name == header::PROXY_AUTHENTICATE
         || *name == header::PROXY_AUTHORIZATION
+        // The harness holds the operator's provider credential; an upstream
+        // that echoes the request's Authorization header back in its
+        // response must not leak it to the client.
+        || *name == header::AUTHORIZATION
         || *name == header::SET_COOKIE
         || *name == header::SERVER
         || *name == header::VIA
         || name.as_str().eq_ignore_ascii_case("keep-alive")
         || name.as_str().eq_ignore_ascii_case("x-powered-by")
         || name.as_str().eq_ignore_ascii_case("x-request-id")
+        // Well-known provider API-key header names (round-16 F1).
+        // Verified against public docs of Azure OpenAI, AWS Bedrock,
+        // Google Vertex, Anthropic, Cohere, DeepSeek, Together AI,
+        // Groq, Mistral, and Fireworks.
+        || name.as_str().eq_ignore_ascii_case("api-key")
+        || name.as_str().eq_ignore_ascii_case("x-api-key")
+        || name.as_str().eq_ignore_ascii_case("x-goog-api-key")
+        || name.as_str().eq_ignore_ascii_case("anthropic-api-key")
+        || name.as_str().eq_ignore_ascii_case("openai-api-key")
+        || name.as_str().eq_ignore_ascii_case("x-auth-token")
+        || name.as_str().eq_ignore_ascii_case("x-amz-security-token")
         // Never let the upstream open CORS on our origin — if we want CORS
         // we set it deliberately in our own router.
         || name.as_str().to_ascii_lowercase().starts_with("access-control-");
@@ -392,7 +499,57 @@ fn is_sse_content_type(headers: &HeaderMap) -> bool {
         })
 }
 
+/// Per-execution-key completion gate. Retains only gates that another
+/// request currently holds (strong count > 1), so the map stays bounded
+/// by in-flight completions rather than growing per historical key.
+fn tool_audit_gate(state: &AppState, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut gates = state.tool_audit_gates.lock();
+    gates.retain(|_, gate| Arc::strong_count(gate) > 1);
+    Arc::clone(gates.entry(key.to_owned()).or_default())
+}
+
 async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    // Round-18 F2 (routes): reject an inbound request whose declared
+    // `Content-Type` is not `application/json`. MCP is JSON-RPC 2.0
+    // (spec: MUST be `application/json`), and a client sending e.g.
+    // `Content-Type: multipart/form-data` with a JSON body would
+    // otherwise process successfully — a spec-violation surface with
+    // no defensible use case. Missing Content-Type is tolerated
+    // (some minimal clients skip it and JSON-RPC parsers accept the
+    // body's shape).
+    if let Some(value) = headers.get(axum::http::header::CONTENT_TYPE) {
+        let is_json = value
+            .to_str()
+            .ok()
+            .and_then(|s| s.split(';').next())
+            .map(|main| main.trim().eq_ignore_ascii_case("application/json"))
+            .unwrap_or(false);
+        if !is_json {
+            let display = value.to_str().unwrap_or("<non-ascii>");
+            return pipeline_error(crate::pipeline::PipelineError::BadRequest(format!(
+                "MCP requires Content-Type: application/json (spec: JSON-RPC 2.0), got {display:?}"
+            )));
+        }
+    }
+    // The tool path mutates durable state at several awaits: the sandbox
+    // gate debits the budget, `execution.claim()` claims the execution
+    // key, the upstream call executes the tool, and persist/audit resolve
+    // the outcome. Axum drops the handler future on client disconnect; a
+    // cancellation between any two of those steps used to strand the
+    // intermediate state with no owner — a claimed-but-unresolved key
+    // answers every retry with 409 TOOL_OUTCOME_UNCERTAIN while the
+    // session lives (restart-time quarantine skips active sessions), and
+    // a debited-but-unrefunded budget burns quota headroom per
+    // disconnect. Run the whole body on a spawned task so it always runs
+    // to completion; the handler merely awaits (and may abandon) the
+    // result.
+    match tokio::spawn(mcp_call_inner(state, headers, body)).await {
+        Ok(response) => response,
+        Err(join_error) => lifecycle_error(format!("tool call task failed: {join_error}")),
+    }
+}
+
+async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Response {
     let (execution, unaudited_outcome) = if state.config.tool_upstream_url.is_some() {
         match ToolExecution::from_request(&state.config.atif_spool_dir, &headers, &body, state.journal_key) {
             Ok(mut execution) => {
@@ -470,10 +627,23 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     } else {
         (None, None)
     };
-    if let (Some(execution), Some(outcome)) = (execution.as_ref(), unaudited_outcome) {
+    if let (Some(execution), Some(_)) = (execution.as_ref(), unaudited_outcome.as_ref()) {
         let _lease = match state.lease_session(&headers) {
             Ok(lease) => lease,
             Err(error) => return pipeline_error(error),
+        };
+        // Serialize with any racing completion of the same execution key
+        // (fresh forward awaiting its audit, or another replay), then
+        // re-check the on-disk state: without this, both requests would
+        // submit a `tool_completed` job for one execution — two durable
+        // execution records on the audit stream and in the signed chain.
+        let gate = tool_audit_gate(&state, &execution.key);
+        let _gate = gate.lock().await;
+        let outcome = match execution.load().await {
+            Ok(ToolExecutionState::Completed(outcome)) => return outcome.into_response(),
+            Ok(ToolExecutionState::Unaudited(outcome)) => outcome,
+            Ok(_) => return lifecycle_error("tool execution state changed during audit".to_owned()),
+            Err(error) => return lifecycle_error(error),
         };
         let completion_permit = match state.worker.try_reserve(&execution.session_id) {
             Ok(permit) => permit,
@@ -484,7 +654,7 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         let Some(session) = state.sessions.get(&execution.session_id) else {
             return lifecycle_error("tool session disappeared".to_owned());
         };
-        return complete_tool_audit(execution, outcome, completion_permit, session).await;
+        return complete_tool_audit(&state, execution, outcome, completion_permit, session).await;
     }
     // Round-33 F1: closes the round-32 F3 concurrent-MCP budget
     // double-spend by threading the debited `payout_micros` out of
@@ -500,45 +670,85 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             payout_micros,
         }) => {
             if let Some(url) = state.config.tool_upstream_url.as_deref() {
-                let _lease = match state.lease_session(&headers) {
-                    Ok(lease) => lease,
-                    Err(error) => return pipeline_error(error),
-                };
                 let execution = match execution {
                     Some(execution) => execution,
                     None => return lifecycle_error("tool execution state is missing".to_owned()),
                 };
-                let completion_permit = match state.worker.try_reserve(&execution.session_id) {
-                    Ok(permit) => permit,
-                    Err(error) => {
-                        return pipeline_error(crate::pipeline::PipelineError::Unavailable(
-                            error.to_string(),
-                        ));
-                    }
-                };
-                if let Err(error) = execution.claim().await {
-                    // A lost claim race means another in-flight request owns
-                    // this execution; answer exactly like the Pending state
-                    // and keep the underlying io detail out of the wire.
-                    tracing::warn!(
-                        session = %execution.session_id,
-                        error = %error,
-                        "concurrent tool execution claim lost; refunding budget"
-                    );
-                    // Round-33 F1: refund the exact amount debited so
-                    // `payout_remaining` and per-tool counters reflect
-                    // only admitted work, not the lost race.
+                // The sandbox debited the budget when it returned Allowed;
+                // every failure between here and a successful `claim()`
+                // must refund it, or a saturated worker / close race
+                // drains `max_total_tool_calls` and payout headroom with
+                // zero tools executed (each client retry re-debits).
+                let refund_admission = || {
                     av_state::ActionBudget::new(
                         state.store.as_ref(),
                         &execution.session_id,
                         &state.config.budget,
                     )
                     .refund_tool_call(&execution.tool, payout_micros);
-                    return (
-                        StatusCode::CONFLICT,
-                        Json(json!({"error": TOOL_OUTCOME_UNCERTAIN})),
-                    )
-                        .into_response();
+                };
+                let _lease = match state.lease_session(&headers) {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        refund_admission();
+                        return pipeline_error(error);
+                    }
+                };
+                let completion_permit = match state.worker.try_reserve(&execution.session_id) {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        refund_admission();
+                        return pipeline_error(crate::pipeline::PipelineError::Unavailable(
+                            error.to_string(),
+                        ));
+                    }
+                };
+                match execution.claim().await {
+                    Ok(()) => {}
+                    Err(ClaimError::Race) => {
+                        // A lost claim race means another in-flight request owns
+                        // this execution; answer exactly like the Pending state
+                        // and keep the underlying io detail out of the wire.
+                        tracing::warn!(
+                            session = %execution.session_id,
+                            "concurrent tool execution claim lost; refunding budget"
+                        );
+                        // Round-33 F1: refund the exact amount debited so
+                        // `payout_remaining` and per-tool counters reflect
+                        // only admitted work, not the lost race.
+                        av_state::ActionBudget::new(
+                            state.store.as_ref(),
+                            &execution.session_id,
+                            &state.config.budget,
+                        )
+                        .refund_tool_call(&execution.tool, payout_micros);
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(json!({"error": TOOL_OUTCOME_UNCERTAIN})),
+                        )
+                            .into_response();
+                    }
+                    Err(ClaimError::Backend(error)) => {
+                        // Infrastructure failure — StorageFull, PermissionDenied,
+                        // etc. The tool provably did not execute (we never
+                        // reached upstream); refund the admission charge and
+                        // surface a 503 so the client backs off, instead of a
+                        // 409 that implies "someone else already ran it".
+                        tracing::warn!(
+                            session = %execution.session_id,
+                            %error,
+                            "tool execution claim failed; refunding budget"
+                        );
+                        av_state::ActionBudget::new(
+                            state.store.as_ref(),
+                            &execution.session_id,
+                            &state.config.budget,
+                        )
+                        .refund_tool_call(&execution.tool, payout_micros);
+                        return pipeline_error(crate::pipeline::PipelineError::Unavailable(
+                            "tool execution intent could not be persisted".to_owned(),
+                        ));
+                    }
                 }
                 let mut tool_request = state
                     .client
@@ -558,6 +768,13 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                                     body_hex: hex::encode(&bytes),
                                     content_type,
                                 };
+                                // Hold the per-key gate across persist +
+                                // audit so an Unaudited replay arriving
+                                // between them serializes behind us and
+                                // re-checks state instead of double-
+                                // emitting the completion event.
+                                let gate = tool_audit_gate(&state, &execution.key);
+                                let _gate = gate.lock().await;
                                 if let Err(error) = execution.persist(&outcome).await {
                                     return lifecycle_error(error);
                                 }
@@ -565,11 +782,49 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                                     Some(session) => session,
                                     None => return lifecycle_error("tool session disappeared".to_owned()),
                                 };
-                                complete_tool_audit(&execution, outcome, completion_permit, session).await
+                                complete_tool_audit(&state, &execution, outcome, completion_permit, session)
+                                    .await
                             }
-                            Err(error) => pipeline_error(crate::pipeline::PipelineError::Upstream(format!(
-                                "read tool response: {error}"
-                            ))),
+                            Err(error) => {
+                                // The upstream received the request and began
+                                // responding: the tool executed (or may
+                                // have). Record the failure as the outcome so
+                                // the execution key resolves and the
+                                // completion audit is emitted — otherwise the
+                                // key strands at Pending (every retry gets
+                                // 409) with an Allowed verdict and no
+                                // completion on the audit stream, resolvable
+                                // only by restart-time quarantine. `error`
+                                // carries only the stable category / size
+                                // text, never the upstream URL.
+                                let failure = ToolOutcome {
+                                    status: StatusCode::BAD_GATEWAY.as_u16(),
+                                    body_hex: hex::encode(
+                                        serde_json::to_vec(&json!({
+                                            "error": format!("tool executed but its response could not be read: {error}"),
+                                        }))
+                                        .unwrap_or_default(),
+                                    ),
+                                    content_type: Some("application/json".to_owned()),
+                                };
+                                let gate = tool_audit_gate(&state, &execution.key);
+                                let _gate = gate.lock().await;
+                                if execution.persist(&failure).await.is_ok() {
+                                    if let Some(session) = state.sessions.get(&execution.session_id) {
+                                        return complete_tool_audit(
+                                            &state,
+                                            &execution,
+                                            failure,
+                                            completion_permit,
+                                            session,
+                                        )
+                                        .await;
+                                    }
+                                }
+                                pipeline_error(crate::pipeline::PipelineError::Upstream(format!(
+                                    "read tool response: {error}"
+                                )))
+                            }
                         }
                     }
                     Err(error) => {
@@ -596,6 +851,26 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                             error.is_request = error.is_request(),
                             "tool upstream forwarding failed"
                         );
+                        // A connect failure means the connection never
+                        // opened: the upstream provably did not execute the
+                        // tool. Release the claimed execution key and refund
+                        // the admission charge so the client's retry is
+                        // clean, instead of stranded at "outcome uncertain"
+                        // with a burned budget slot. Release-then-refund
+                        // ordering: a crash between the two leaves the
+                        // charge in place (conservative) rather than a
+                        // refunded-but-claimed key. Timeout/read/request
+                        // failures stay claimed — the tool may have executed.
+                        if error.is_connect() {
+                            match execution.release_unexecuted().await {
+                                Ok(()) => refund_admission(),
+                                Err(release_error) => tracing::warn!(
+                                    session = %execution.session_id,
+                                    error = %release_error,
+                                    "failed to release unexecuted tool intent; charge kept, key stays claimed"
+                                ),
+                            }
+                        }
                         // Upstream faults must surface as 502 (as the chat
                         // relay does), not 500: a 500 blames the harness and
                         // misroutes operator alerting/retry policy.
@@ -686,6 +961,7 @@ fn tool_response(status: StatusCode, bytes: Bytes, content_type: Option<&str>) -
 }
 
 async fn complete_tool_audit(
+    state: &AppState,
     execution: &ToolExecution,
     outcome: ToolOutcome,
     completion_permit: crate::worker::WorkerPermit,
@@ -697,46 +973,57 @@ async fn complete_tool_audit(
         Err(error) => return lifecycle_error(format!("decode tool response: {error}")),
     };
     let success = status.is_success();
-    completion_permit.submit(crate::worker::WorkerJob {
-        session: Arc::clone(&session),
-        identity: session.current_identity(),
-        class: av_events::EventClass::Session,
-        payload: json!({
-            "action": "tool_completed",
-            "execution_key": &execution.key,
-            "status": status.as_u16(),
-            "response_sha256": av_core::digest::sha256_hex(&bytes),
-        }),
-        text: String::new(),
-        analyze_loop: false,
-        status: if success {
-            av_events::StatusId::Success
-        } else {
-            av_events::StatusId::Failure
-        },
-        stop_reason: (!success).then_some(StopReason::Other),
-        native_stop_reason: None,
-        metrics: av_events::EventMetrics::default(),
-        cost_usd_micros: 0,
-        atif: Some(crate::worker::AtifCapture {
-            source: av_atif::Source::System,
-            message: Value::String(String::from_utf8_lossy(&bytes).into_owned()),
-            reasoning_content: None,
-            model_name: None,
-            tool_calls: None,
-            observation: None,
-            llm_call_count: None,
-        }),
-        response_marker: None,
-        response_attempt: None,
-    });
-    session.wait_for_worker_jobs().await;
-    if session.capture_failed() {
-        return lifecycle_error("tool completed but completion audit failed".to_owned());
+    // If a prior attempt in this process already journaled the completion
+    // event but failed to write the `.audited` marker, re-attempt only the
+    // marker — re-submitting the job would put a second execution record
+    // (with a fresh event uid) on the audit stream and in the signed chain.
+    let already_emitted = state.tool_audits_emitted.lock().contains(&execution.key);
+    if !already_emitted {
+        completion_permit.submit(crate::worker::WorkerJob {
+            session: Arc::clone(&session),
+            identity: session.current_identity(),
+            class: av_events::EventClass::Session,
+            payload: json!({
+                "action": "tool_completed",
+                "execution_key": &execution.key,
+                "status": status.as_u16(),
+                "response_sha256": av_core::digest::sha256_hex(&bytes),
+            }),
+            text: String::new(),
+            analyze_loop: false,
+            status: if success {
+                av_events::StatusId::Success
+            } else {
+                av_events::StatusId::Failure
+            },
+            stop_reason: (!success).then_some(StopReason::Other),
+            native_stop_reason: None,
+            metrics: av_events::EventMetrics::default(),
+            cost_usd_micros: 0,
+            atif: Some(crate::worker::AtifCapture {
+                source: av_atif::Source::System,
+                message: Value::String(String::from_utf8_lossy(&bytes).into_owned()),
+                reasoning_content: None,
+                model_name: None,
+                tool_calls: None,
+                observation: None,
+                llm_call_count: None,
+            }),
+            response_marker: None,
+            response_attempt: None,
+        });
+        session.wait_for_worker_jobs().await;
+        if session.capture_failed() {
+            return lifecycle_error("tool completed but completion audit failed".to_owned());
+        }
+        // The event is durably journaled; remember that before attempting
+        // the marker so a marker failure retries without re-emitting.
+        state.tool_audits_emitted.lock().insert(execution.key.clone());
     }
     if let Err(error) = execution.mark_audited().await {
         return lifecycle_error(error);
     }
+    state.tool_audits_emitted.lock().remove(&execution.key);
     // Round-32 F2: preserve the upstream Content-Type so a spec-
     // conforming JSON-RPC 2.0 client sees `application/json`
     // (default) or whatever the tool upstream declared, not axum's
@@ -773,6 +1060,27 @@ enum ToolExecutionState {
     Pending,
     Unaudited(ToolOutcome),
     Completed(ToolOutcome),
+}
+
+/// Two distinct failure modes for `ToolExecution::claim` that must
+/// produce different client responses. Round-49 F3: previously
+/// `claim_sync` mapped ALL failures to a `String` and the caller in
+/// `mcp_call_inner` answered every one with `409 TOOL_OUTCOME_UNCERTAIN`
+/// — reporting infrastructure faults (StorageFull, PermissionDenied,
+/// ReadOnlyFilesystem, Interrupted) as if the client had lost a
+/// concurrent race, so retries looped on the underlying disk fault
+/// while the client learned nothing useful.
+#[derive(Debug)]
+enum ClaimError {
+    /// The intent file already existed (`create_new` returned
+    /// `AlreadyExists`). Another in-flight request owns this
+    /// execution key — the legitimate race case that `409
+    /// TOOL_OUTCOME_UNCERTAIN` was designed for.
+    Race,
+    /// An I/O or MAC-seal failure independent of concurrent claim
+    /// contention. Maps to a 5xx so operators are alerted to a real
+    /// infrastructure problem instead of retrying on false uncertainty.
+    Backend(String),
 }
 
 const TOOL_REQUEST_MISMATCH: &str = "JSON-RPC id is already bound to a different tool request or principal";
@@ -837,7 +1145,16 @@ pub(crate) async fn unresolved_tool_sessions(
             // progress on the rest of the spool; the tool execution
             // itself is still uncertain — a subsequent retry by the
             // client will get TOOL_OUTCOME_UNCERTAIN and can decide.
-            let intent_bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+            let intent_bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                // The session's close legitimately removes its tool-execution
+                // files between the directory listing and this read.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    intent_keys.remove(key);
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            };
             let intent: ToolIntent = match crate::journal::open(
                 &control_key,
                 &format!("{}:{key}", crate::journal::TOOL_INTENT_DOMAIN),
@@ -846,7 +1163,25 @@ pub(crate) async fn unresolved_tool_sessions(
             ) {
                 Ok(intent) => intent,
                 Err(error) => {
-                    let quarantine = path.with_extension("intent.torn");
+                    // Round-22 F2 (self-fix of round-21 F4): build
+                    // the quarantine name EXPLICITLY. The prior use
+                    // of `path.with_extension("intent.torn")` on a
+                    // `<key>.intent.json` path replaces only the
+                    // `json` component and produces
+                    // `<key>.intent.intent.torn` — the ugly
+                    // double-`intent` form. Explicit join gives the
+                    // clean `<key>.intent.torn` name that
+                    // remove_tool_executions's defense-in-depth
+                    // cleanup expects.
+                    let file_name = path
+                        .file_stem()
+                        .and_then(std::ffi::OsStr::to_str)
+                        .and_then(|stem| stem.strip_suffix(".intent"))
+                        .map(|key| format!("{key}.intent.torn"));
+                    let quarantine = match file_name {
+                        Some(name) => path.with_file_name(name),
+                        None => path.with_extension("intent.torn"),
+                    };
                     tracing::warn!(
                         %error,
                         original = %av_core::fsutil::basename(&path),
@@ -864,26 +1199,38 @@ pub(crate) async fn unresolved_tool_sessions(
                 return Err("tool intent path does not match authenticated execution key".to_owned());
             }
             let outcome_path = directory.join(format!("{key}{}", crate::spool::TOOL_OUTCOME_SUFFIX));
-            if !outcome_path.exists() {
-                unresolved_sessions.insert(intent.session_id);
-                continue;
-            }
+            // NotFound between the exists-style check and the read: the
+            // outcome is genuinely absent (or was GC'd with its session's
+            // close mid-scan) — record unresolved and move on rather than
+            // aborting the whole recovery pass.
+            let outcome_bytes = match std::fs::read(&outcome_path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    unresolved_sessions.insert(intent.session_id);
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            };
             let _: ToolOutcome = crate::journal::open(
                 &control_key,
                 &format!("{}:{key}", crate::journal::TOOL_OUTCOME_DOMAIN),
                 0,
-                &std::fs::read(&outcome_path).map_err(|error| error.to_string())?,
+                &outcome_bytes,
             )?;
             let audited_path = directory.join(format!("{key}{}", crate::spool::TOOL_AUDITED_SUFFIX));
-            if !audited_path.exists() {
-                unresolved_sessions.insert(intent.session_id);
-                continue;
-            }
+            let audited_bytes = match std::fs::read(&audited_path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    unresolved_sessions.insert(intent.session_id);
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            };
             let _: serde_json::Value = crate::journal::open(
                 &control_key,
                 &format!("{}:{key}", crate::journal::TOOL_AUDITED_DOMAIN),
                 0,
-                &std::fs::read(&audited_path).map_err(|error| error.to_string())?,
+                &audited_bytes,
             )?;
         }
         for entry in std::fs::read_dir(&directory).map_err(|error| error.to_string())? {
@@ -938,9 +1285,14 @@ impl ToolExecution {
             .map_err(|error| crate::pipeline::PipelineError::BadRequest(error.to_string()))?;
         let call = av_sandbox::parse_tool_call(body)
             .map_err(|error| crate::pipeline::PipelineError::BadRequest(error.to_string()))?;
-        let id = call.id.ok_or_else(|| {
+        // `parse_tool_call` accepts `"id": null` per JSON-RPC 2.0, but the
+        // forwarded-execution key is `sha256("{session}:{id}")` — a null id
+        // would collapse every null-id call in a session onto one execution
+        // key, replaying the first call's cached outcome for later,
+        // different calls. Require a concrete id here.
+        let id = call.id.filter(|id| !id.is_null()).ok_or_else(|| {
             crate::pipeline::PipelineError::BadRequest(
-                "forwarded tool calls require a JSON-RPC id for idempotency".to_owned(),
+                "forwarded tool calls require a non-null JSON-RPC id for idempotency".to_owned(),
             )
         })?;
         let request: Value = serde_json::from_slice(body)
@@ -1026,36 +1378,91 @@ impl ToolExecution {
         Ok(ToolExecutionState::Pending)
     }
 
-    async fn claim(&self) -> Result<(), String> {
+    async fn claim(&self) -> Result<(), ClaimError> {
         let execution = self.clone();
         tokio::task::spawn_blocking(move || execution.claim_sync())
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|error| ClaimError::Backend(error.to_string()))?
     }
 
-    fn claim_sync(&self) -> Result<(), String> {
+    /// Delete this execution's intent file after a provably-not-executed
+    /// forward (connect failure), restoring the key for a clean retry.
+    /// NotFound is tolerated — the claim was ours, so a missing file only
+    /// means a prior release already ran.
+    ///
+    /// Round-49 F2: the post-remove directory fsync is best-effort.
+    /// `remove_file` returning Ok is durable-enough for the release
+    /// semantics — a crash before the dir fsync makes the intent file
+    /// resurrect on recovery, at which point `unresolved_tool_sessions`
+    /// correctly quarantines the session (fail-closed). Previously any
+    /// fsync failure returned Err and the caller at `mcp_call_inner`'s
+    /// connect-failure branch skipped the budget refund, leaving the
+    /// key unclaimed AND the budget debited — the exact bug the
+    /// release-then-refund ordering was supposed to prevent.
+    async fn release_unexecuted(&self) -> Result<(), String> {
+        let execution = self.clone();
+        tokio::task::spawn_blocking(move || {
+            match std::fs::remove_file(&execution.intent_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error.to_string()),
+            }
+            if let Some(directory) = execution.intent_path.parent() {
+                if let Err(error) = std::fs::File::open(directory).and_then(|directory| directory.sync_all())
+                {
+                    tracing::warn!(
+                        path = %av_core::fsutil::basename(&execution.intent_path),
+                        %error,
+                        "release_unexecuted: intent removed but directory fsync failed; treating as released"
+                    );
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    fn claim_sync(&self) -> Result<(), ClaimError> {
         use std::io::Write as _;
         let directory = self
             .intent_path
             .parent()
-            .ok_or_else(|| "tool execution directory is missing".to_owned())?;
-        std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+            .ok_or_else(|| ClaimError::Backend("tool execution directory is missing".to_owned()))?;
+        std::fs::create_dir_all(directory).map_err(|error| ClaimError::Backend(error.to_string()))?;
+        // `create_new(true)` is atomic on the underlying filesystem —
+        // its only reason to return `AlreadyExists` is that another
+        // in-flight request has already claimed this execution key
+        // (the sole legitimate race source). Any other IoError kind
+        // (StorageFull, PermissionDenied, InvalidInput, ReadOnlyFilesystem,
+        // Interrupted, etc.) is a genuine infrastructure failure and
+        // must NOT be reported to the client as a lost race — the
+        // caller would answer 409 TOOL_OUTCOME_UNCERTAIN and retries
+        // would loop on the same underlying disk fault while the
+        // client learns nothing useful. Split the two shapes at the
+        // source so the caller can respond appropriately.
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&self.intent_path)
-            .map_err(|error| format!("tool execution already claimed or unavailable: {error}"))?;
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::AlreadyExists => ClaimError::Race,
+                _ => ClaimError::Backend(format!("tool execution intent unavailable: {error}")),
+            })?;
         let intent = crate::journal::seal(
             &self.control_key,
             &format!("{}:{}", crate::journal::TOOL_INTENT_DOMAIN, self.key),
             0,
             &self.intent(),
-        )?;
-        file.write_all(&intent).map_err(|error| error.to_string())?;
-        file.sync_all().map_err(|error| error.to_string())?;
+        )
+        .map_err(ClaimError::Backend)?;
+        file.write_all(&intent)
+            .map_err(|error| ClaimError::Backend(error.to_string()))?;
+        file.sync_all()
+            .map_err(|error| ClaimError::Backend(error.to_string()))?;
         std::fs::File::open(directory)
             .and_then(|directory| directory.sync_all())
-            .map_err(|error| error.to_string())
+            .map_err(|error| ClaimError::Backend(error.to_string()))
     }
 
     async fn persist(&self, outcome: &ToolOutcome) -> Result<(), String> {
@@ -1121,7 +1528,7 @@ async fn close_session(
         .await
     {
         Ok(outcome) => Json(outcome).into_response(),
-        Err(error) => lifecycle_error(error.to_string()),
+        Err(error) => finalize_error_response(&error),
     }
 }
 
@@ -1151,8 +1558,44 @@ async fn promote_session(
     }
     match state.finalizer.promote(session).await {
         Ok(receipt) => Json(receipt).into_response(),
-        Err(error) => lifecycle_error(error.to_string()),
+        Err(error) => finalize_error_response(&error),
     }
+}
+
+/// Typed status mapping for close/promote failures. Flattening every
+/// `FinalizeError` to 500 (the old behavior) misclassified deterministic
+/// fail-closed refusals as server faults: SDKs retry 500s pointlessly
+/// against a permanently-quarantined session, and operators page on 5xx
+/// rates for what is working policy (the same rationale as the breaker's
+/// deliberate 403-not-429 choice, and the tool path's CONFLICT mapping).
+fn finalize_error_response(error: &crate::reconciler::FinalizeError) -> Response {
+    use crate::reconciler::FinalizeError;
+    let status = match error {
+        // Deterministic state conflicts: the request conflicts with the
+        // session's current state and retrying cannot change the outcome
+        // (quarantined capture, no artifact to promote, promotion already
+        // in progress).
+        FinalizeError::CaptureIncomplete | FinalizeError::Promotion(_) => StatusCode::CONFLICT,
+        // Round-28 F1: permanent bridge misconfiguration (unknown
+        // topic, unresolvable schema) — retrying without operator
+        // action cannot succeed. Map to 400 so SDKs stop retrying
+        // and pagers fire on operator config errors, not on
+        // transient outages.
+        FinalizeError::BridgeConfig(_) => StatusCode::BAD_REQUEST,
+        // Transient infrastructure: the broker is unreachable; the close
+        // stays pending and a retry (or the reconciler sweep) completes it.
+        FinalizeError::Bridge(_) => StatusCode::SERVICE_UNAVAILABLE,
+        // Everything else is a genuine internal fault.
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    let mut response = (status, Json(json!({"error": error.to_string()}))).into_response();
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        // Same advisory as pipeline_error's retryable class.
+        response
+            .headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("5"));
+    }
+    response
 }
 
 fn pipeline_error(error: crate::pipeline::PipelineError) -> Response {
@@ -1222,7 +1665,7 @@ struct AbortFinalizingStream {
     response_finish_reason: Option<String>,
     upstream_status: StatusCode,
     response_cost_usd_micros: u64,
-    response_tool_calls: std::collections::BTreeMap<u64, PartialToolCall>,
+    response_tool_calls: std::collections::BTreeMap<(u64, u64), PartialToolCall>,
     response_metrics: av_events::EventMetrics,
     charged_completion_tokens: u64,
     last_reported_completion_tokens: Option<u64>,
@@ -1344,14 +1787,15 @@ impl AbortFinalizingStream {
                     delta.index
                 ));
             }
-            if !self.response_tool_calls.contains_key(&delta.index)
+            let key = (delta.choice_index, delta.index);
+            if !self.response_tool_calls.contains_key(&key)
                 && self.response_tool_calls.len() >= MAX_PROVIDER_TOOL_CALLS
             {
                 return Err(format!(
                     "provider response exceeds {MAX_PROVIDER_TOOL_CALLS} tool calls"
                 ));
             }
-            let partial = self.response_tool_calls.entry(delta.index).or_default();
+            let partial = self.response_tool_calls.entry(key).or_default();
             if delta.id.is_some() {
                 partial.id = delta.id;
             }
@@ -1394,18 +1838,26 @@ impl AbortFinalizingStream {
             );
         }
         let reported_completion = parsed.metrics.completion_tokens.unwrap_or(0);
-        let delta = if parsed.usage_reported {
+        let delta = if parsed.usage_reported && parsed.completion_reported {
             let previous = self.last_reported_completion_tokens.unwrap_or(0);
             if reported_completion < previous {
                 return Err("provider completion usage regressed".to_owned());
             }
             self.last_reported_completion_tokens = Some(reported_completion);
             let delta = reported_completion.saturating_sub(self.charged_completion_tokens);
-            self.response_metrics.completion_tokens = Some(
-                self.response_metrics
-                    .completion_tokens
-                    .map_or(reported_completion, |current| current.max(reported_completion)),
-            );
+            // Authoritative usage overrides any prior estimate. The
+            // regression check above guarantees monotonicity across
+            // authoritative frames, so `max()` here would only keep a
+            // stale estimate that happened to exceed the true count —
+            // and that estimate lands in the attested `completion_tokens`
+            // recorded on the ATIF step, signed receipt, and session
+            // totals. Trigger: content chunks land with `"usage": null`
+            // (OpenAI `stream_options.include_usage`), the parser fills
+            // in `approx_tokens`, and those estimates get folded into
+            // `response_metrics.completion_tokens` via the estimate
+            // branch below; a final cumulative `{"usage":{"completion_tokens":6}}`
+            // with the accumulated estimate at 10 would attest 10.
+            self.response_metrics.completion_tokens = Some(reported_completion);
             delta
         } else {
             let total = self
@@ -1447,7 +1899,45 @@ impl AbortFinalizingStream {
         self.capture_attempted = true;
         let reasoning =
             (!self.response_reasoning.is_empty()).then(|| std::mem::take(&mut self.response_reasoning));
-        let analysis_text = reasoning.clone().unwrap_or_else(|| self.response_message.clone());
+        // Materialize the tool-call list up front so we can fall back to
+        // its content when the response body has neither an assistant
+        // message nor reasoning. Round-53 F1: without this, tool-only
+        // responses (a legitimate agent mode: "return only tool_calls,
+        // no assistant text") collapsed to an all-zero embedding at
+        // `av_loopdetect::embed`, which the breaker treats as a hostile
+        // duplicate and grows the loop streak on — so a healthy agent
+        // that just happened to be tool-driven would get flagged as
+        // looping after the min-tokens threshold.
+        let tool_calls: Vec<av_atif::ToolCall> = std::mem::take(&mut self.response_tool_calls)
+            .into_values()
+            .map(|partial| {
+                let arguments = serde_json::from_str(&partial.arguments)
+                    .unwrap_or_else(|_| json!({"raw": partial.arguments}));
+                av_atif::ToolCall {
+                    tool_call_id: partial.id.unwrap_or_else(av_core::new_event_uid),
+                    function_name: partial.name.unwrap_or_else(|| "unknown".to_owned()),
+                    arguments,
+                    extra: None,
+                }
+            })
+            .collect();
+        let analysis_text = if let Some(text) = reasoning.clone() {
+            text
+        } else if !self.response_message.is_empty() {
+            self.response_message.clone()
+        } else if !tool_calls.is_empty() {
+            tool_calls
+                .iter()
+                .map(|tc| format!("{}({})", tc.function_name, tc.arguments))
+                .collect::<Vec<_>>()
+                .join(" ")
+        } else {
+            String::new()
+        };
+        // Skip loop analysis when the response is genuinely empty (no
+        // reasoning, no message, no tool calls) — a zero-vector embed
+        // would otherwise poison the breaker's duplicate detection.
+        let analyze_loop = !analysis_text.is_empty();
         let native_finish_reason = self.response_finish_reason.clone();
         let (class, status, stop_reason, payload) = if let Some(reason) = failure {
             (
@@ -1488,19 +1978,6 @@ impl AbortFinalizingStream {
                 }),
             )
         };
-        let tool_calls: Vec<av_atif::ToolCall> = std::mem::take(&mut self.response_tool_calls)
-            .into_values()
-            .map(|partial| {
-                let arguments = serde_json::from_str(&partial.arguments)
-                    .unwrap_or_else(|_| json!({"raw": partial.arguments}));
-                av_atif::ToolCall {
-                    tool_call_id: partial.id.unwrap_or_else(av_core::new_event_uid),
-                    function_name: partial.name.unwrap_or_else(|| "unknown".to_owned()),
-                    arguments,
-                    extra: None,
-                }
-            })
-            .collect();
         let permit = self
             .response_permit
             .take()
@@ -1513,7 +1990,7 @@ impl AbortFinalizingStream {
                 class,
                 payload,
                 text: analysis_text,
-                analyze_loop: true,
+                analyze_loop,
                 status,
                 stop_reason,
                 native_stop_reason: native_finish_reason,
@@ -1559,6 +2036,11 @@ struct PartialToolCall {
 }
 
 struct ProviderToolCallDelta {
+    /// The `choices[].index` this delta belongs to. Multi-choice
+    /// (`n > 1`) responses reuse tool-call index 0 in every choice, so
+    /// reassembly must key on (choice, tool index) or distinct calls
+    /// merge into one corrupt audit record.
+    choice_index: u64,
     index: u64,
     id: Option<String>,
     name: Option<String>,
@@ -1571,6 +2053,13 @@ struct ParsedProviderChunk {
     model_name: Option<String>,
     metrics: av_events::EventMetrics,
     usage_reported: bool,
+    /// True only when the provider itself supplied `completion_tokens`
+    /// (as opposed to the per-chunk heuristic estimate filled in below).
+    /// `absorb_frame`'s cumulative-usage branch must key on this, not on
+    /// `usage_reported` alone: a usage object without a completion count
+    /// (`{"prompt_tokens": 7}` or `"completion_tokens": null`) would
+    /// otherwise feed a non-cumulative estimate into cumulative math.
+    completion_reported: bool,
     finish_reason: Option<String>,
     cost_usd_micros: u64,
     cost_reported: bool,
@@ -1921,7 +2410,16 @@ fn parse_provider_chunk(raw: &str) -> Result<Option<ParsedProviderChunk>, String
     let value = serde_json::from_str::<Value>(&candidate)
         .map_err(|error| format!("invalid provider JSON frame: {error}"))?;
     let model_name = value.get("model").and_then(Value::as_str).map(str::to_owned);
-    if let Some(usage) = value.get("usage") {
+    // OpenAI streams with `stream_options: {"include_usage": true}` carry
+    // `"usage": null` on every content chunk, with the real usage object
+    // only on the final chunk (vLLM/LiteLLM shims do the same). A null
+    // usage must fall through to the estimate/accumulate path exactly like
+    // an absent key: flagging it as reported would feed absorb_frame's
+    // cumulative-usage branch a per-chunk heuristic estimate, which both
+    // kills the stream with a spurious "provider completion usage
+    // regressed" error (estimates are not monotonic) and, when estimates
+    // happen to stay monotonic, zeroes every mid-stream budget delta.
+    if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
         usage_reported = true;
         prompt_tokens = provider_u64(usage.get("prompt_tokens"), "prompt_tokens")?.or(prompt_tokens);
         completion_tokens =
@@ -1957,7 +2455,17 @@ fn parse_provider_chunk(raw: &str) -> Result<Option<ParsedProviderChunk>, String
         None => None,
     };
     if let Some(choices) = choices {
-        for choice in choices {
+        for (choice_position, choice) in choices.iter().enumerate() {
+            // Distinguish choices in multi-choice (`n > 1`) responses:
+            // tool-call deltas are keyed by (choice, tool index) downstream,
+            // otherwise `choices[0].tool_calls[0]` and
+            // `choices[1].tool_calls[0]` merge into one corrupt audit record
+            // (concatenated argument fragments, last-writer-wins id/name).
+            let choice_index = choice
+                .get("index")
+                .and_then(Value::as_u64)
+                .or_else(|| u64::try_from(choice_position).ok())
+                .unwrap_or(u64::MAX);
             if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
                 finish_reason = Some(reason.to_owned());
             }
@@ -1995,6 +2503,7 @@ fn parse_provider_chunk(raw: &str) -> Result<Option<ParsedProviderChunk>, String
                             .map_err(|_| "provider tool-call index overflow".to_owned())?,
                     };
                     tool_call_deltas.push(ProviderToolCallDelta {
+                        choice_index,
                         index,
                         id: call.get("id").and_then(Value::as_str).map(str::to_owned),
                         name: call
@@ -2011,6 +2520,7 @@ fn parse_provider_chunk(raw: &str) -> Result<Option<ParsedProviderChunk>, String
             }
         }
     }
+    let completion_reported = completion_tokens.is_some();
     let completion_tokens = completion_tokens.unwrap_or_else(|| {
         let mut estimated = av_core::tokens::approx_tokens(&message)
             .saturating_add(av_core::tokens::approx_tokens(&reasoning));
@@ -2033,6 +2543,7 @@ fn parse_provider_chunk(raw: &str) -> Result<Option<ParsedProviderChunk>, String
             pruning_ratio_millis: None,
         },
         usage_reported,
+        completion_reported,
         finish_reason,
         cost_usd_micros,
         cost_reported,
@@ -2045,6 +2556,12 @@ fn provider_u64(value: Option<&Value>, field: &str) -> Result<Option<u64>, Strin
     let Some(value) = value else {
         return Ok(None);
     };
+    // Some OpenAI-compatible shims emit explicit nulls for usage fields
+    // they don't track; treat them like absent keys rather than failing
+    // the frame.
+    if value.is_null() {
+        return Ok(None);
+    }
     let value = value
         .as_u64()
         .ok_or_else(|| format!("provider {field} is not a nonnegative integer"))?;
@@ -2345,6 +2862,20 @@ mod tests {
             );
             return response;
         }
+        if payload.get("model").and_then(Value::as_str) == Some("gzip-encoded") {
+            // Body content is irrelevant: the encoding refusal fires on
+            // the header alone, before any byte is read.
+            let mut response = Response::new(Body::from("compressed-bytes"));
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_ENCODING,
+                HeaderValue::from_static("gzip"),
+            );
+            return response;
+        }
         if payload.get("model").and_then(Value::as_str) == Some("malformed-json") {
             let mut response = Response::new(Body::from("{\"choices\":["));
             response.headers_mut().insert(
@@ -2441,6 +2972,60 @@ mod tests {
         chat_request_with_payload(session, chat_payload())
     }
 
+    /// Round-17 live-stress finding: deterministic fail-closed lifecycle
+    /// refusals (quarantined capture, unfulfillable promotion) used to
+    /// surface as HTTP 500 — SDKs retried them pointlessly and 5xx-rate
+    /// pagers fired on working policy. They must map to 409 Conflict,
+    /// mirroring the tool path's state-conflict convention.
+    #[tokio::test]
+    async fn quarantined_session_close_and_promote_map_to_conflict_not_500() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state(directory.path()).await;
+        let app = build_router(state.clone());
+        // Open a session, then quarantine it (capture failed).
+        let opened = app.clone().oneshot(chat_request("quarantine-409")).await.unwrap();
+        assert_eq!(opened.status(), StatusCode::OK);
+        axum::body::to_bytes(opened.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let session = state.sessions.get("quarantine-409").unwrap();
+        session.wait_for_worker_jobs().await;
+        session.mark_capture_failed();
+
+        let close = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/quarantine-409/close")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            close.status(),
+            StatusCode::CONFLICT,
+            "capture-incomplete close refusal is a state conflict, not a server fault"
+        );
+        let promote = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/quarantine-409/promote")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            promote.status(),
+            StatusCode::CONFLICT,
+            "unfulfillable promotion refusal is a state conflict, not a server fault"
+        );
+        provider.abort();
+    }
+
     fn chat_request_with_payload(session: &str, payload: Value) -> Request<Body> {
         Request::builder()
             .method("POST")
@@ -2458,6 +3043,49 @@ mod tests {
             "stream": true,
             "messages": [{"role": "user", "content": "hello"}],
         })
+    }
+
+    /// Round-22 F1 (av-harness routes): `/v1/chat/completions` must
+    /// refuse duplicate top-level or nested JSON keys, mirroring the
+    /// MCP path's `parse_tool_call` policy. `serde_json`'s default
+    /// last-wins semantics would otherwise let a hostile client
+    /// send `{"messages":[safe],"messages":[hostile]}` and the
+    /// harness would see the hostile array while any auditor reading
+    /// the raw request bytes sees the ambiguous document. Same
+    /// class as round-15 F3's receipt-null malleability, applied at
+    /// chat ingress.
+    #[tokio::test]
+    async fn chat_completions_refuses_duplicate_json_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state(directory.path()).await;
+        let app = build_router(state.clone());
+        // Two `messages` keys in the top-level object; second wins by
+        // `serde_json` default, but the harness must refuse ambiguity
+        // instead of silently taking the last value.
+        let dup = br#"{"model":"mock","messages":[{"role":"user","content":"safe"}],"messages":[{"role":"user","content":"hostile"}]}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header("x-av-session", "dup-key")
+            .header("x-av-workflow", "unsigned")
+            .body(Body::from(&dup[..]))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "duplicate `messages` key must be refused with 400, not silently taken"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4 * 1024)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("duplicate"),
+            "response body must name the reason, got {text:?}"
+        );
+        provider.abort();
     }
 
     fn active_records(
@@ -3342,6 +3970,56 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)] // xorshift indices; truncation is harmless fuzz entropy
+    fn fuzz_parse_provider_chunk_is_total() {
+        // Randomized totality check (hand-rolled xorshift so no
+        // new dev-dependency): mutations of valid frames plus raw garbage
+        // must never panic the parser, only return Ok/Err.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let seeds: Vec<&str> = vec![
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":null}\n\n",
+            "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"a\",\"reasoning_content\":\"r\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3,\"cost_usd\":0.001,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\n",
+            "data: {\"choices\":[{\"index\":1,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n",
+            "event: message\ndata: {\"choices\":[]}\n\n",
+            "{\"choices\":[{\"message\":{\"content\":\"x\",\"tool_calls\":[{\"id\":\"a\",\"function\":{\"name\":\"n\",\"arguments\":\"{}\"}}]}}],\"usage\":{\"completion_tokens\":1}}",
+        ];
+        for _ in 0..200_000 {
+            let seed = seeds[(next() as usize) % seeds.len()];
+            let mut bytes = seed.as_bytes().to_vec();
+            for _ in 0..=(next() % 8) {
+                match next() % 3 {
+                    0 if !bytes.is_empty() => {
+                        let idx = (next() as usize) % bytes.len();
+                        bytes[idx] = (next() & 0xFF) as u8;
+                    }
+                    1 if !bytes.is_empty() => {
+                        let idx = (next() as usize) % bytes.len();
+                        bytes.truncate(idx);
+                    }
+                    _ => {
+                        let idx = if bytes.is_empty() {
+                            0
+                        } else {
+                            (next() as usize) % bytes.len()
+                        };
+                        bytes.insert(idx, (next() & 0xFF) as u8);
+                    }
+                }
+            }
+            let raw = String::from_utf8_lossy(&bytes).into_owned();
+            let _ = parse_provider_chunk(&raw);
+            let _ = sse_frame_end(&bytes);
+        }
+    }
+
+    #[test]
     fn provider_usage_and_reasoning_are_preserved() {
         let raw = concat!(
             "data: {\"model\":\"gpt-test\",\"choices\":[{\"delta\":{",
@@ -3360,6 +4038,41 @@ mod tests {
         assert_eq!(parsed.finish_reason.as_deref(), Some("stop"));
         assert_eq!(parsed.cost_usd_micros, 1250);
         assert!(parsed.tool_call_deltas.is_empty());
+    }
+
+    #[test]
+    fn null_usage_chunks_are_not_reported_usage() {
+        // OpenAI `stream_options: {"include_usage": true}` emits
+        // `"usage": null` on every content chunk; only the final chunk
+        // carries the real object. A null usage must behave exactly like
+        // an absent key: usage_reported = false, completion tokens
+        // estimated. Treating it as reported previously fed absorb_frame's
+        // cumulative branch per-chunk estimates → spurious "usage
+        // regressed" stream kill + session quarantine.
+        let raw = r#"data: {"choices":[{"delta":{"content":"Hello"}}],"usage":null}"#;
+        let parsed = parse_provider_chunk(raw).unwrap().unwrap();
+        assert!(!parsed.usage_reported, "null usage must not count as reported");
+        assert!(!parsed.completion_reported);
+        assert_eq!(parsed.message, "Hello");
+        // Estimated from the delta text, not taken from the null object.
+        assert_eq!(
+            parsed.metrics.completion_tokens,
+            Some(av_core::tokens::approx_tokens("Hello"))
+        );
+        // Null fields inside a real usage object are tolerated like
+        // absent keys (some OpenAI-compatible shims emit them).
+        let raw = r#"data: {"choices":[{"delta":{"content":"x"}}],"usage":{"prompt_tokens":7,"completion_tokens":null}}"#;
+        let parsed = parse_provider_chunk(raw).unwrap().unwrap();
+        assert!(parsed.usage_reported);
+        assert!(
+            !parsed.completion_reported,
+            "a null completion count must not drive cumulative-usage math"
+        );
+        assert_eq!(parsed.metrics.prompt_tokens, Some(7));
+        assert_eq!(
+            parsed.metrics.completion_tokens,
+            Some(av_core::tokens::approx_tokens("x"))
+        );
     }
 
     #[test]
@@ -3605,6 +4318,56 @@ mod tests {
         assert!(serde_json::from_slice::<Value>(&body).unwrap()["error"].is_string());
         let session = state.sessions.get("malformed-json").unwrap();
         assert!(session.capture_failed());
+        provider.abort();
+    }
+
+    /// Refusing an unsupported Content-Encoding must retire the durable
+    /// in-flight response marker and terminally fail the journalled
+    /// response attempt — otherwise `recover_spooled_sessions`
+    /// quarantines the session forever over a request the client
+    /// already saw fail as a clean 502.
+    #[tokio::test]
+    async fn unsupported_content_encoding_refusal_retires_marker_and_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state(directory.path()).await;
+        let response = build_router(state.clone())
+            .oneshot(chat_request_with_payload(
+                "gzip-encoded",
+                json!({
+                    "model": "gzip-encoded",
+                    "stream": false,
+                    "messages": [{"role": "user", "content": "hello"}]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let error = serde_json::from_slice::<Value>(&body).unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(error.contains("Content-Encoding"), "unexpected error: {error}");
+        let session = state.sessions.get("gzip-encoded").unwrap();
+        session.wait_for_worker_jobs().await;
+        crate::worker::ensure_no_inflight_responses(directory.path(), &state.journal_key)
+            .await
+            .expect("refusal must retire the in-flight response marker");
+        let records = active_records(directory.path(), &state, "gzip-encoded");
+        assert!(
+            records
+                .iter()
+                .filter_map(|record| record.response_attempt.as_ref())
+                .any(|attempt| attempt.terminal),
+            "refusal must journal a terminal response attempt"
+        );
+        let event: av_events::OcsfEvent =
+            serde_json::from_value(records.last().unwrap().event.clone()).unwrap();
+        assert_eq!(event.class_name, av_events::EventClass::StopReason);
+        assert_eq!(event.status_id, av_events::StatusId::Failure.id());
+        assert_eq!(event.payload["reason"], "upstream_unsupported_content_encoding");
         provider.abort();
     }
 
@@ -3879,19 +4642,17 @@ mod tests {
     #[test]
     fn upstream_response_headers_do_not_cross_proxy_trust_boundary() {
         use axum::http::HeaderName;
+        // Round-16 F1: also include every well-known API-key header
+        // name and both directions of the configured upstream_auth_header
+        // check. `authorization` is the runtime default.
         let dangerous = [
-            // Cookie injection on our domain from a hostile upstream.
             "set-cookie",
-            // CORS bypass — we never let the upstream open our origin.
             "access-control-allow-origin",
             "access-control-allow-credentials",
             "access-control-allow-methods",
             "access-control-allow-headers",
             "access-control-expose-headers",
             "access-control-max-age",
-            // RFC 7230 §6.1 hop-by-hop headers — a proxy must not
-            // forward these; forwarding `Transfer-Encoding` enables
-            // classical HTTP request smuggling.
             "connection",
             "keep-alive",
             "transfer-encoding",
@@ -3900,22 +4661,39 @@ mod tests {
             "trailer",
             "proxy-authenticate",
             "proxy-authorization",
-            // Framing metadata that hyper computes from the response
-            // body; the upstream's value would be wrong.
             "content-length",
-            // Implementation-identity leaks.
             "server",
             "via",
             "x-powered-by",
             "x-request-id",
+            // Round-16 F1: provider API-key headers must never echo
+            // back from an upstream — they carry the operator's
+            // outbound credential.
+            "authorization",
+            "api-key",
+            "x-api-key",
+            "x-goog-api-key",
+            "anthropic-api-key",
+            "openai-api-key",
+            "x-auth-token",
+            "x-amz-security-token",
         ];
         for name in dangerous {
             let header = HeaderName::from_static(name);
             assert!(
-                !is_forwardable_upstream_header(&header),
+                !is_forwardable_upstream_header(&header, "authorization"),
                 "dangerous header {name:?} must not be forwarded to the client"
             );
         }
+
+        // Round-16 F1: the currently-configured upstream_auth_header
+        // MUST be refused even for operator-picked odd names. Simulate
+        // an operator using an exotic header (e.g. `x-my-secret`).
+        let exotic = HeaderName::from_static("x-my-secret");
+        assert!(
+            !is_forwardable_upstream_header(&exotic, "x-my-secret"),
+            "operator-configured upstream_auth_header must be refused",
+        );
 
         let benign = [
             "content-type",
@@ -3929,7 +4707,7 @@ mod tests {
         for name in benign {
             let header = HeaderName::from_static(name);
             assert!(
-                is_forwardable_upstream_header(&header),
+                is_forwardable_upstream_header(&header, "authorization"),
                 "benign header {name:?} must still be forwarded"
             );
         }

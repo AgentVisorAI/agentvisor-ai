@@ -20,9 +20,9 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
-repository = "https://github.com/debugmode0/agentvisor-ai"
-homepage = "https://debugmode0.github.io/agentvisor-ai/"
-documentation = "https://debugmode0.github.io/agentvisor-ai/api/"
+repository = "https://github.com/AgentVisorAI/agentvisor-ai"
+homepage = "https://agentvisorai.github.io/agentvisor-ai/"
+documentation = "https://agentvisorai.github.io/agentvisor-ai/api/"
 # `keywords` and `categories` are inherited by every workspace crate
 # via `keywords.workspace = true` / `categories.workspace = true`.
 # crates.io caps at 5 keywords / 5 categories.
@@ -54,7 +54,7 @@ serde = { version = "1.0", features = ["derive"] }
 # JCS implementations (verified by the RFC Appendix vectors in av-receipts).
 serde_json = { version = "1.0", features = ["preserve_order", "float_roundtrip"] }
 serde_yaml = "0.9"
-toml = "0.8"
+toml = "1.1"
 thiserror = "2.0"
 anyhow = "1.0"
 # Correctly-rounded shortest float digits for RFC 8785 (already in-tree via serde_json).
@@ -62,15 +62,15 @@ ryu = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.18", features = ["v7", "v4", "serde"] }
-ed25519-dalek = { version = "2.2", features = ["rand_core", "pkcs8", "pem", "zeroize"] }
+ed25519-dalek = { version = "3.0", features = ["rand_core", "pkcs8", "pem", "zeroize"] }
 zeroize = { version = "1.8", features = ["derive"] }
-sha2 = "0.10"
-hmac = "0.12"
+sha2 = "0.11"
+hmac = "0.13"
 hex = "0.4"
-base64 = "0.22"
-rand = "0.8"
-jsonwebtoken = { version = "10.4", default-features = false, features = ["use_pem", "rust_crypto"] }
-jsonschema = "0.26"
+base64 = "0.23"
+rand = "0.10"
+jsonwebtoken = { version = "11.0", default-features = false, features = ["use_pem", "rust_crypto"] }
+jsonschema = "0.49"
 dashmap = "6.1"
 parking_lot = "0.12"
 r2d2 = "0.8"
@@ -78,12 +78,12 @@ clap = { version = "4.5", features = ["derive"] }
 rpassword = "7.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "http2"] }
 wasmtime = { version = "47", default-features = false, features = ["runtime", "cranelift", "wat"] }
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 proptest = "1.6"
 tempfile = "3.14"
 object_store = { version = "0.14", default-features = false }
 url = "2.5"
-rdkafka = { version = "0.36", default-features = false, features = ["tokio", "cmake-build", "ssl-vendored"] }
+rdkafka = { version = "0.39", default-features = false, features = ["tokio", "cmake-build", "ssl-vendored"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

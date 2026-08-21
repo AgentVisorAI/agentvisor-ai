@@ -8,8 +8,21 @@
 use crate::store::{Spend, StateError, StateStore};
 use redis::Commands;
 
+/// TTL (seconds) applied to every counter key this store touches (the
+/// spend/add INCRBY paths and the refund clamp). 24 h: counters are
+/// session-scoped and the TTL is the backstop that keeps abandoned
+/// sessions from leaking Redis memory forever. NOTE the prod/dev
+/// divergence this creates: `InMemoryStore` never expires, so a session
+/// idle longer than this window has its budget counters silently reset
+/// against Redis only. Callers must keep session lifetimes within this
+/// window (or persist budgets elsewhere) — see the `StateStore` trait
+/// docs on counter lifetime.
+const BUDGET_COUNTER_TTL_SECS: u64 = 86_400;
+
 /// Atomic check-and-spend using subtraction so `current + amount` never rounds.
-const TRY_SPEND_LUA: &str = r"
+static TRY_SPEND_LUA: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        r"
 for i, key in ipairs(KEYS) do
     local current = tonumber(redis.call('GET', key) or '0')
     local amount = tonumber(ARGV[(i - 1) * 2 + 1])
@@ -20,12 +33,16 @@ for i, key in ipairs(KEYS) do
 end
 for i, key in ipairs(KEYS) do
     redis.call('INCRBY', key, ARGV[(i - 1) * 2 + 1])
-    redis.call('EXPIRE', key, 86400)
+    redis.call('EXPIRE', key, {BUDGET_COUNTER_TTL_SECS})
 end
 return 0
-";
+"
+    )
+});
 
-const ADD_LUA: &str = r"
+static ADD_LUA: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        r"
 local current = tonumber(redis.call('GET', KEYS[1]) or '0')
 local amount = tonumber(ARGV[1])
 local limit = tonumber(ARGV[2])
@@ -33,18 +50,34 @@ if current > limit or amount > limit - current then
     return -1
 end
 local result = redis.call('INCRBY', KEYS[1], ARGV[1])
--- Match TRY_SPEND_LUA's 24 h TTL. Without this, any counter touched
+-- Match TRY_SPEND_LUA's TTL. Without this, any counter touched
 -- only through `add()` (bookkeeping, telemetry, non-budget spending)
 -- persists forever in Redis; over a long-running deployment that
 -- silently leaks memory until Redis OOMs. The two APIs must be
 -- interchangeable from the persistence perspective.
-redis.call('EXPIRE', KEYS[1], 86400)
+redis.call('EXPIRE', KEYS[1], {BUDGET_COUNTER_TTL_SECS})
 return result
-";
+"
+    )
+});
 
 /// Redis-backed store. Connections are pooled internally (r2d2 for both
 /// single-node and cluster; the redis crate implements
 /// `r2d2::ManageConnection` for `ClusterClient` directly).
+///
+/// **EVAL uncertainty on network drop.** `try_spend_many` / `add` invoke
+/// atomic Lua scripts server-side; if the connection breaks between the
+/// server's INCRBY commit and the client's response read, the caller
+/// sees `StateError::Backend` and cannot distinguish "commit succeeded,
+/// response lost" from "commit never ran". Sandbox path treats
+/// backend-error as blocked (fails closed for the request) — but a
+/// subsequent client retry that lands with the same intent then hits a
+/// pre-debited counter and cumulates the two spends into one intended
+/// tool call, overcharging the budget by the retry's amount. The
+/// 24 h counter TTL bounds unbounded growth, and refund-on-loss-race
+/// (`refund_tool_call`) recovers the common cases, but the strictly
+/// idempotent shape would require a client-supplied request nonce
+/// stored briefly in Redis — deferred as a design change.
 pub struct RedisStore {
     backend: RedisBackend,
 }
@@ -130,7 +163,7 @@ fn add_on<C: redis::ConnectionLike>(conn: &mut C, key: &str, delta: u64) -> Resu
     if delta > av_core::error::JCS_SAFE_MAX {
         return Err(StateError::Overflow(key.to_owned()));
     }
-    let value: i64 = redis::Script::new(ADD_LUA)
+    let value: i64 = redis::Script::new(&ADD_LUA)
         .key(key)
         .arg(delta)
         .arg(av_core::error::JCS_SAFE_MAX)
@@ -177,7 +210,7 @@ fn spend_many_on<C: redis::ConnectionLike>(
             return Err(StateError::Overflow(spend.key.clone()));
         }
     }
-    let script = redis::Script::new(TRY_SPEND_LUA);
+    let script = redis::Script::new(&TRY_SPEND_LUA);
     let mut invocation = script.prepare_invoke();
     for spend in spends {
         invocation.key(&spend.key).arg(spend.amount).arg(spend.limit);
@@ -247,17 +280,40 @@ impl StateStore for RedisStore {
     }
 
     fn remove(&self, key: &str) {
-        match &self.backend {
-            RedisBackend::Single(pool) => {
-                if let Ok(mut connection) = pool.get() {
-                    let _: Result<(), _> = connection.del(key);
-                }
-            }
-            RedisBackend::Cluster(pool) => {
-                if let Ok(mut connection) = pool.get() {
-                    let _: Result<(), _> = connection.del(key);
-                }
-            }
+        // Round-15 F2 (av-state): mirror the round-10 `refund` treatment
+        // — best-effort by contract, but a completely-silent Redis
+        // failure on the cleanup path leaves an operator with no
+        // signal that a session's stale key wasn't removed. The next
+        // recycled-session-id can then inherit the counter. Warn on
+        // both pool-get and DEL failure with structured fields.
+        let outcome: Result<(), redis::RedisError> = match &self.backend {
+            RedisBackend::Single(pool) => match pool.get() {
+                Ok(mut connection) => connection.del(key),
+                Err(error) => Err(redis::RedisError::from((
+                    redis::ErrorKind::IoError,
+                    "connection pool exhausted",
+                    error.to_string(),
+                ))),
+            },
+            RedisBackend::Cluster(pool) => match pool.get() {
+                Ok(mut connection) => connection.del(key),
+                Err(error) => Err(redis::RedisError::from((
+                    redis::ErrorKind::IoError,
+                    "connection pool exhausted",
+                    error.to_string(),
+                ))),
+            },
+        };
+        if let Err(error) = outcome {
+            let error_kind = error.kind();
+            tracing::warn!(
+                target: "av_state::redis",
+                kind = ?error_kind,
+                detail = %error,
+                "Redis remove failed silently; per-key cleanup was not applied — \
+                 a subsequent session recycling this key may inherit its counter \
+                 until the 24 h TTL expires"
+            );
         }
     }
 
@@ -281,41 +337,319 @@ impl StateStore for RedisStore {
     /// the whole DECRBY on `EXISTS`. If the session was cleared,
     /// the budget is already gone and there is nothing to
     /// compensate; the refund is a silent no-op. If the session
-    /// is alive, we DECRBY-clamp AND refresh the 24 h TTL to
+    /// is alive, we DECRBY-clamp AND refresh the counter TTL to
     /// match `TRY_SPEND_LUA` (a plain DECRBY does not refresh).
     fn refund(&self, key: &str, amount: u64) {
         // Redis DECRBY takes i64. Cap at i64::MAX so a caller passing
         // u64::MAX cannot silently wrap into a negative value.
         let amount = i64::try_from(amount).unwrap_or(i64::MAX);
-        let clamp_script = r#"
+        let clamp_script = format!(
+            r"
             if redis.call('EXISTS', KEYS[1]) == 0 then
                 return 0
             end
             local new = redis.call('DECRBY', KEYS[1], ARGV[1])
             if new < 0 then
-                redis.call('SET', KEYS[1], 0, 'EX', 86400)
+                redis.call('SET', KEYS[1], 0, 'EX', {BUDGET_COUNTER_TTL_SECS})
                 return 0
             end
-            redis.call('EXPIRE', KEYS[1], 86400)
+            redis.call('EXPIRE', KEYS[1], {BUDGET_COUNTER_TTL_SECS})
             return new
-        "#;
+        "
+        );
+        // Round-50 F1: refund is best-effort by the trait contract, but
+        // its silent-swallow used to be COMPLETELY invisible — no log,
+        // no metric — so an operator seeing budget depletion during a
+        // Redis outage had no signal that compensation had been
+        // failing. Log the failed refund with structured fields so
+        // downstream aggregators (Vector → OTLP → SIEM) can alert on
+        // it. The response path still stays 200 OK so the caller
+        // never learns a compensation failure as a 5xx.
+        let outcome: Result<i64, redis::RedisError> = match &self.backend {
+            RedisBackend::Single(pool) => match pool.get() {
+                Ok(mut connection) => redis::Script::new(&clamp_script)
+                    .key(key)
+                    .arg(amount)
+                    .invoke(&mut *connection),
+                Err(error) => Err(redis::RedisError::from((
+                    redis::ErrorKind::IoError,
+                    "connection pool exhausted",
+                    error.to_string(),
+                ))),
+            },
+            RedisBackend::Cluster(pool) => match pool.get() {
+                Ok(mut connection) => redis::Script::new(&clamp_script)
+                    .key(key)
+                    .arg(amount)
+                    .invoke(&mut *connection),
+                Err(error) => Err(redis::RedisError::from((
+                    redis::ErrorKind::IoError,
+                    "connection pool exhausted",
+                    error.to_string(),
+                ))),
+            },
+        };
+        if let Err(error) = outcome {
+            let error_kind = error.kind();
+            tracing::warn!(
+                target: "av_state::redis",
+                kind = ?error_kind,
+                detail = %error,
+                "Redis refund failed silently; per-key compensation was not applied — \
+                 budget counter may remain over-charged until the 24 h TTL expires or a \
+                 successful spend/refund lands"
+            );
+        }
+    }
+
+    /// Whole-session counter cleanup. Round-46: previously left as the
+    /// trait's default no-op on the assumption that the 24 h TTL made it
+    /// pure hygiene — but `SessionRegistry::get_or_open` recycles a
+    /// finalized session id into a fresh open session, which then spends
+    /// against the SAME hash-tagged keys. Against `InMemoryStore` (dev,
+    /// CI, and every budget test) the recycled incarnation starts from
+    /// zero; against Redis it silently inherited up to 24 h of the prior
+    /// incarnation's `tokens`/`total_calls`/`tool:*`/`payout` counters —
+    /// the exact cross-backend divergence class rounds 20/21 aligned
+    /// `add`/`try_spend_many` for.
+    ///
+    /// All of a session's keys share one cluster slot by construction
+    /// (`ActionBudget::session_prefix` wraps the digest in a `{hash-tag}`),
+    /// so a SCAN cursor + bounded DEL batches — routed by the prefix
+    /// pattern's hash-tag to the owning master in cluster mode — reach
+    /// every key on both single-node and cluster backends.
+    ///
+    /// Round-47: SCAN, not KEYS. The first take used
+    /// `redis.call('KEYS', pattern)` inside a Lua script, which is
+    /// O(entire keyspace per node) AND blocks the Redis event loop
+    /// atomically for the whole scan+delete. On a shared Redis with high
+    /// session churn or attacker-chosen ids, every close stalled all
+    /// other Redis clients (including hot-path `try_spend_many` gates)
+    /// for the duration. SCAN is O(matches) amortized and yields between
+    /// batches, so per-session cleanup no longer blocks concurrent
+    /// traffic.
+    ///
+    /// Round-48: `route_command` with an explicit slot for cluster
+    /// mode. The intermediate round-47 revision used
+    /// `Commands::scan_match` on the cluster connection, but bare
+    /// `SCAN` has no key argument — `RoutingInfo::for_routable` returns
+    /// `None`, and `ClusterConnection::request` treats that as an
+    /// immediate `UNROUTABLE_ERROR`. The iterator failed on
+    /// construction, the `Err(_) => return` arm swallowed it, and
+    /// cleanup silently did nothing on every cluster deployment.
+    /// Best-effort like `remove`/`refund`: any Redis blip on the
+    /// cleanup path must not fail the close.
+    fn remove_prefix(&self, prefix: &str) {
+        // `MATCH` glob treats `* ? [ ] \` as metacharacters. The prefix
+        // is `budget:{<32 hex>}:` today (no metacharacters), but escape
+        // defensively so a future prefix shape cannot over-match.
+        let mut pattern = String::with_capacity(prefix.len() + 1);
+        for c in prefix.chars() {
+            if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+                pattern.push('\\');
+            }
+            pattern.push(c);
+        }
+        pattern.push('*');
         match &self.backend {
             RedisBackend::Single(pool) => {
                 if let Ok(mut connection) = pool.get() {
-                    let _: Result<i64, _> = redis::Script::new(clamp_script)
-                        .key(key)
-                        .arg(amount)
-                        .invoke(&mut *connection);
+                    scan_and_delete_single(&mut connection, &pattern);
                 }
             }
             RedisBackend::Cluster(pool) => {
                 if let Ok(mut connection) = pool.get() {
-                    let _: Result<i64, _> = redis::Script::new(clamp_script)
-                        .key(key)
-                        .arg(amount)
-                        .invoke(&mut *connection);
+                    scan_and_delete_cluster(&mut connection, &pattern);
                 }
             }
+        }
+    }
+}
+
+/// Bounded SCAN+DEL loop against a single-node connection. Each SCAN
+/// call is O(COUNT) at the server; the loop terminates when the cursor
+/// returns to 0. DEL is batched so one round-trip retires up to
+/// `SCAN_COUNT` keys.
+fn scan_and_delete_single(conn: &mut redis::Connection, pattern: &str) {
+    const SCAN_COUNT: usize = 500;
+    let mut cursor: u64 = 0;
+    loop {
+        let scan: Result<(u64, Vec<String>), _> = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(pattern)
+            .arg("COUNT")
+            .arg(SCAN_COUNT)
+            .query(conn);
+        let (next, batch) = match scan {
+            Ok(pair) => pair,
+            Err(error) => {
+                // Round-15 F2 (av-state): SCAN failing means we bail
+                // out mid-cleanup — the remaining keys survive with
+                // their TTLs, and a future session recycling this id
+                // (within 24 h) would inherit the leftover counters
+                // silently. Log with structured fields so an operator
+                // aggregating warns can spot chronic backend outages.
+                let error_kind = error.kind();
+                tracing::warn!(
+                    target: "av_state::redis",
+                    kind = ?error_kind,
+                    detail = %error,
+                    "Redis SCAN failed during remove_prefix; partial cleanup — surviving \
+                     keys will expire at the 24 h TTL or on the next successful \
+                     remove_prefix for the same prefix"
+                );
+                return;
+            }
+        };
+        if !batch.is_empty() {
+            let mut del = redis::cmd("DEL");
+            for key in &batch {
+                del.arg(key);
+            }
+            let outcome: Result<i64, _> = del.query(conn);
+            if let Err(error) = outcome {
+                let error_kind = error.kind();
+                tracing::warn!(
+                    target: "av_state::redis",
+                    kind = ?error_kind,
+                    detail = %error,
+                    batch_len = batch.len(),
+                    "Redis DEL batch failed during remove_prefix; these keys survive \
+                     until the 24 h TTL expires"
+                );
+            }
+        }
+        if next == 0 {
+            return;
+        }
+        cursor = next;
+    }
+}
+
+/// Cluster variant: bare `SCAN` has no key argument so
+/// `redis::cluster_routing::RoutingInfo::for_routable` returns `None`
+/// on it (the sync ClusterConnection then fails with
+/// `UNROUTABLE_ERROR`, silently deleting nothing — the round-3
+/// regression this replaces). All matches share one hash-slot by
+/// construction (`ActionBudget::session_prefix` wraps the digest in
+/// `{hash-tag}`), so compute the slot from the prefix and route both
+/// SCAN and DEL through `route_command` to that specific master.
+fn scan_and_delete_cluster(conn: &mut redis::cluster::ClusterConnection, pattern: &str) {
+    use redis::cluster_routing::{Route, RoutingInfo, SingleNodeRoutingInfo, SlotAddr};
+    const SCAN_COUNT: usize = 500;
+    // `redis::cluster_routing::get_slot` extracts the hash-tag content
+    // (`{HASH}`) itself, so passing the pattern's non-wildcard prefix
+    // (which contains the hash tag verbatim) yields the same slot every
+    // key under the prefix maps to.
+    let route_key = pattern.trim_end_matches('*');
+    let slot = redis::cluster_routing::get_slot(route_key.as_bytes());
+    let routing = RoutingInfo::SingleNode(SingleNodeRoutingInfo::SpecificNode(Route::new(
+        slot,
+        SlotAddr::Master,
+    )));
+    let mut cursor: u64 = 0;
+    loop {
+        let scan_cmd = {
+            let mut cmd = redis::cmd("SCAN");
+            cmd.arg(cursor)
+                .arg("MATCH")
+                .arg(pattern)
+                .arg("COUNT")
+                .arg(SCAN_COUNT);
+            cmd
+        };
+        let value = match conn.route_command(&scan_cmd, routing.clone()) {
+            Ok(value) => value,
+            Err(error) => {
+                // Round-15 F2 (av-state): parity with
+                // `scan_and_delete_single`. Cluster-mode SCAN failure
+                // was completely silent, so an operator watching
+                // `av_state::redis::warn` for cleanup problems saw
+                // nothing on cluster deployments even under Redis
+                // slowdown.
+                let error_kind = error.kind();
+                tracing::warn!(
+                    target: "av_state::redis",
+                    kind = ?error_kind,
+                    detail = %error,
+                    slot,
+                    "Redis cluster SCAN failed during remove_prefix; partial cleanup — \
+                     surviving keys will expire at the 24 h TTL or on the next successful \
+                     remove_prefix for the same prefix"
+                );
+                return;
+            }
+        };
+        let parsed: Result<(u64, Vec<String>), _> = redis::FromRedisValue::from_redis_value(&value);
+        let (next, batch) = match parsed {
+            Ok(pair) => pair,
+            Err(error) => {
+                let error_kind = error.kind();
+                tracing::warn!(
+                    target: "av_state::redis",
+                    kind = ?error_kind,
+                    detail = %error,
+                    "Redis cluster SCAN returned an unparsable response during remove_prefix; \
+                     aborting further cleanup for this prefix"
+                );
+                return;
+            }
+        };
+        if !batch.is_empty() {
+            let mut del = redis::cmd("DEL");
+            for key in &batch {
+                del.arg(key);
+            }
+            // Multi-key DEL is safe here because every match shares the
+            // slot we already computed above — route it explicitly so
+            // the driver does not need to inspect the keys again.
+            if let Err(error) = conn.route_command(&del, routing.clone()) {
+                let error_kind = error.kind();
+                tracing::warn!(
+                    target: "av_state::redis",
+                    kind = ?error_kind,
+                    detail = %error,
+                    slot,
+                    batch_len = batch.len(),
+                    "Redis cluster DEL batch failed during remove_prefix; these keys survive \
+                     until the 24 h TTL expires"
+                );
+            }
+        }
+        if next == 0 {
+            return;
+        }
+        cursor = next;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    /// Every Lua script that mutates a counter must apply the single
+    /// shared TTL constant — a hardcoded-literal drift between the
+    /// spend/add/refund paths would make some counters outlive others
+    /// and silently split the session-expiry policy.
+    #[test]
+    fn every_counter_script_applies_the_shared_ttl() {
+        let ttl = BUDGET_COUNTER_TTL_SECS.to_string();
+        for (name, script) in [
+            ("TRY_SPEND_LUA", TRY_SPEND_LUA.as_str()),
+            ("ADD_LUA", ADD_LUA.as_str()),
+        ] {
+            assert!(
+                script.contains(&format!("EXPIRE', KEYS[1], {ttl}"))
+                    || script.contains(&format!("EXPIRE', key, {ttl}")),
+                "{name} must EXPIRE with BUDGET_COUNTER_TTL_SECS: {script}"
+            );
+            assert!(
+                !script.contains('{'),
+                "{name} has an unexpanded format placeholder"
+            );
         }
     }
 }

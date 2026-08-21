@@ -171,16 +171,47 @@ fn stub_middle_to_target(
     // compression pass to skip." A keyed-marker
     // scheme remains future work, currently unscheduled.
     let scan_end = tail_start.min(messages.len());
+    // Round-18 F1 (av-compress): the prior check refused to run a
+    // second pass if ANY pre-tail message content contained the
+    // literal substring "reason: middle history]" — but a
+    // user/assistant message that legitimately quotes that phrase
+    // (or a compromised prior turn that includes it as free text)
+    // could silently disable compression. Narrow the check to
+    // exactly what the marker produces: content must START with
+    // "[pruned:" AND contain the marker tail. A user quoting the
+    // phrase in free text no longer matches (their content will
+    // start with their own words, not "[pruned:"). This is not
+    // the full keyed-marker fix (round-19 F8 known limitation) —
+    // but the spoofing surface shrinks from "any message contains
+    // the substring" to "any message perfectly mimics the marker
+    // prefix + tail." Realistic user text does not shape like a
+    // machine-emitted `[pruned: N tokens, sha256:HEX, reason: middle
+    // history]`.
     if messages.get(..scan_end).into_iter().flatten().any(|message| {
-        msg_content_str(message).is_some_and(|content| content.contains("reason: middle history]"))
+        msg_content_str(message).is_some_and(|content| {
+            content.starts_with("[pruned:") && content.contains("reason: middle history]")
+        })
     }) {
         return false;
     }
     let target_tokens =
         tokens_before.saturating_mul(1000u64.saturating_sub(target_reduction_millis.min(1000))) / 1000;
     let mut changed = false;
+    // Round-32 F3 (av-compress): the prior loop called
+    // `payload_tokens_with_messages(payload, messages)` on every
+    // iteration — each call clones the entire payload AND the
+    // entire messages Vec, then serializes to string. For a 4 MiB
+    // payload with N messages that's O(N²) work AND O(N) transient
+    // allocations per iteration. Instead track a running
+    // `current_tokens` counter that is decremented by the message's
+    // pre-stub token count and incremented by the stub's on each
+    // successful substitution. `payload_tokens_with_messages` is
+    // still called once at loop entry to seed the counter (the
+    // envelope's token count includes non-messages fields like
+    // `model` and `stream`, which the incremental delta preserves).
+    let mut current_tokens = payload_tokens_with_messages(payload, messages);
     for index in 0..tail_start {
-        if payload_tokens_with_messages(payload, messages) <= target_tokens {
+        if current_tokens <= target_tokens {
             break;
         }
         let Some(message) = messages.get_mut(index) else {
@@ -201,13 +232,14 @@ fn stub_middle_to_target(
             continue;
         }
         let digest = av_core::digest::sha256_hex(content.as_bytes());
+        let stub_content = format!("[pruned: {tokens} tokens, sha256:{digest}, reason: middle history]");
+        let stub_tokens = approx_tokens(&stub_content);
         if let Some(object) = message.as_object_mut() {
-            object.insert(
-                "content".to_owned(),
-                Value::String(format!(
-                    "[pruned: {tokens} tokens, sha256:{digest}, reason: middle history]"
-                )),
-            );
+            object.insert("content".to_owned(), Value::String(stub_content));
+            // Update the running counter: original message content
+            // contributed `tokens`, new stub contributes `stub_tokens`.
+            // Everything else in the payload envelope is unchanged.
+            current_tokens = current_tokens.saturating_sub(tokens).saturating_add(stub_tokens);
             changed = true;
         }
     }
@@ -257,8 +289,21 @@ fn collapse_duplicate_system(messages: &mut [Value], tail_start: usize) -> bool 
 
 /// Collapse exact-duplicate user/assistant messages outside the tail
 /// (identical retries / framework echoes).
+///
+/// Round-32 F2 (av-compress): the prior implementation used
+/// `Vec<Value>` + `Vec::contains` (linear per-lookup, O(n²) total)
+/// AND cloned every non-duplicate message into the seen-list on push.
+/// On a 4 MiB payload with hundreds of messages this dominated
+/// compression latency and could momentarily hold ~2× the payload
+/// in RAM. Now uses a `HashSet<u64>` keyed by a stable content hash
+/// derived from `(role, content_str)` — the ONLY two components
+/// `contains` used to compare, since the guards above already
+/// exclude tool_calls-carrying and pre-stubbed messages. O(1)
+/// average lookup, and no message clone.
 fn collapse_duplicate_messages(messages: &mut [Value], tail_start: usize) -> bool {
-    let mut seen: Vec<Value> = Vec::new();
+    use std::collections::HashSet;
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut seen: HashSet<u64> = HashSet::new();
     let mut changed = false;
     for (i, m) in messages.iter_mut().enumerate() {
         if i >= tail_start {
@@ -269,20 +314,29 @@ fn collapse_duplicate_messages(messages: &mut [Value], tail_start: usize) -> boo
             continue;
         }
         // Only collapse pure-content messages — never anything carrying tool_calls.
-        if m.get("tool_calls").is_some() || msg_content_str(m).is_none() {
+        if m.get("tool_calls").is_some() {
             continue;
         }
+        let Some(content) = msg_content_str(m) else {
+            continue;
+        };
         // Never re-collapse audit stubs (stub-of-stub would break idempotence).
-        if msg_content_str(m).is_some_and(|c| c.starts_with("[pruned:")) {
+        if content.starts_with("[pruned:") {
             continue;
         }
-        if seen.contains(m) {
-            let tokens = approx_tokens(&m.to_string());
+        // Composite hash of (role, content) — the two fields the
+        // prior `Vec::contains` on Value compared. Guards above
+        // exclude every other field that could vary between
+        // otherwise-identical duplicates.
+        let mut hasher = DefaultHasher::new();
+        role.hash(&mut hasher);
+        content.hash(&mut hasher);
+        let key = hasher.finish();
+        if !seen.insert(key) {
+            let tokens = approx_tokens(content);
             let stub = audit_stub("duplicate message", tokens, m);
             *m = json!({ "role": role, "content": stub });
             changed = true;
-        } else {
-            seen.push(m.clone());
         }
     }
     changed
@@ -448,6 +502,189 @@ mod tests {
         assert!(first_tool.get("tool_call_id").is_some());
         // Tail messages byte-identical.
         assert_eq!(*result.last().unwrap(), tail_tool);
+    }
+
+    /// Mutation-run hardening: `collapse_duplicate_messages` had no
+    /// behavioral coverage at all — replacing the whole function with a
+    /// constant `true`/`false` survived the suite. Pin its contract:
+    /// exact user/assistant duplicates outside the tail collapse to audit
+    /// stubs, the first occurrence and the tail stay byte-identical, and
+    /// tool-role messages are never collapsed even when identical.
+    #[test]
+    fn duplicate_user_and_assistant_messages_collapse_outside_tail() {
+        let dup_user = json!({"role": "user", "content": "please retry the exact same thing ".repeat(8)});
+        let dup_tool = json!({"role": "tool", "tool_call_id": "c1", "content": "identical tool payload"});
+        let mut msgs = vec![json!({"role": "system", "content": "sys"})];
+        for _ in 0..6 {
+            msgs.push(dup_user.clone());
+            msgs.push(dup_tool.clone());
+        }
+        let tail = json!({"role": "user", "content": "fresh tail question"});
+        msgs.push(tail.clone());
+        let out = compress(&payload(msgs.clone()), &engage_all());
+        assert!(out.changed);
+        let result = out.payload["messages"].as_array().unwrap();
+        // First occurrence byte-identical.
+        let first_user = result.iter().find(|m| msg_role(m) == "user").unwrap();
+        assert_eq!(*first_user, dup_user, "first duplicate must be kept verbatim");
+        // Later duplicates outside the tail become audit stubs that keep
+        // the role and reference the original via digest.
+        let expected_digest = av_core::digest::sha256_hex(dup_user.to_string().as_bytes());
+        let stubbed = result
+            .iter()
+            .filter(|m| {
+                msg_role(m) == "user"
+                    && msg_content_str(m)
+                        .is_some_and(|c| c.starts_with("[pruned:") && c.contains(&expected_digest))
+            })
+            .count();
+        assert!(stubbed >= 1, "no duplicate user message was stubbed: {result:?}");
+        // Tool messages are never collapsed, even when identical.
+        assert!(
+            result
+                .iter()
+                .filter(|m| msg_role(m) == "tool")
+                .all(|m| *m == dup_tool),
+            "tool messages must never be collapsed by the duplicate pass"
+        );
+        // Tail untouched.
+        assert_eq!(*result.last().unwrap(), tail);
+        // And the whole pass is disable-able: collapse_duplicates=false
+        // leaves every user duplicate verbatim.
+        let cfg = CompressionConfig {
+            collapse_duplicates: false,
+            normalize_json: false,
+            summarize_middle: false,
+            tool_output_stub_threshold: u64::MAX,
+            ..engage_all()
+        };
+        let untouched = compress(&payload(msgs), &cfg);
+        let kept = untouched.payload["messages"].as_array().unwrap();
+        assert!(
+            kept.iter().filter(|m| **m == dup_user).count() == 6,
+            "collapse_duplicates=false must keep every duplicate verbatim"
+        );
+    }
+
+    /// Mutation-run hardening: the middle-history stub pass's role
+    /// exclusions (`role == "system" || role == "tool" || tool_calls`)
+    /// and its `tokens < 32` floor survived operator mutations. Pin them:
+    /// system/tool/tool-calls/small messages in the middle range survive
+    /// verbatim while large plain messages are stubbed, and stubbing
+    /// stops once the target reduction is reached.
+    #[test]
+    fn middle_stub_skips_protected_roles_and_small_messages() {
+        let big = "long analysis paragraph ".repeat(600); // well past 50k total below
+        let protected_system = json!({"role": "system", "content": big.clone()});
+        let protected_tool = json!({"role": "tool", "tool_call_id": "c1", "content": big.clone()});
+        let protected_calls = json!({"role": "assistant", "content": big.clone(),
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]});
+        let small = json!({"role": "user", "content": "tiny"});
+        let mut msgs = vec![
+            protected_system.clone(),
+            protected_tool.clone(),
+            protected_calls.clone(),
+            small.clone(),
+        ];
+        for _ in 0..40 {
+            msgs.push(json!({"role": "assistant", "content": big.clone()}));
+        }
+        let cfg = CompressionConfig {
+            collapse_duplicates: false,
+            normalize_json: false,
+            tool_output_stub_threshold: u64::MAX,
+            ..engage_all()
+        };
+        let out = compress(&payload(msgs), &cfg);
+        assert!(out.changed, "large history must engage the middle stub pass");
+        let result = out.payload["messages"].as_array().unwrap();
+        assert_eq!(result[0], protected_system, "system messages must survive");
+        assert_eq!(result[1], protected_tool, "tool messages must survive");
+        assert_eq!(result[2], protected_calls, "tool-call carriers must survive");
+        assert_eq!(result[3], small, "sub-32-token messages must survive");
+        let stubbed = result
+            .iter()
+            .filter(|m| msg_content_str(m).is_some_and(|c| c.contains("reason: middle history]")))
+            .count();
+        assert!(stubbed > 0, "large plain middle messages must be stubbed");
+        // The pass stops at the target: with the default 30% target on a
+        // uniform history it must NOT stub everything eligible.
+        let eligible = result
+            .iter()
+            .filter(|m| msg_role(m) == "assistant" && m.get("tool_calls").is_none())
+            .count();
+        assert!(
+            stubbed < eligible,
+            "stubbing must stop at the target reduction, not consume the whole middle"
+        );
+        // Reduction reached the configured target ratio.
+        assert!(
+            out.pruning_ratio_millis() >= cfg.target_reduction_millis,
+            "reduction {} must reach the target {}",
+            out.pruning_ratio_millis(),
+            cfg.target_reduction_millis
+        );
+    }
+
+    /// Round-18 F1 regression: a message that legitimately QUOTES the
+    /// marker tail phrase in free text must NOT disable the middle
+    /// pass. The prior check refused to run if any pre-tail message
+    /// content contained the literal substring; the round-18 fix
+    /// narrowed the check to require the message to also START WITH
+    /// `[pruned:`. A user turn that says `"the log said 'reason:
+    /// middle history]'"` is normal text; compression must still run.
+    #[test]
+    fn quoted_marker_phrase_in_normal_text_does_not_disable_compression() {
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            // The quoted-marker phrase — no `[pruned:` prefix, so
+            // the narrowed check should NOT match it.
+            json!({"role": "user", "content": "the log said 'reason: middle history]' earlier"}),
+        ];
+        // Make each assistant message unique so the duplicate pass
+        // doesn't consume them before the middle pass runs. The
+        // middle pass has a 50_000 token entry threshold; size each
+        // message to comfortably clear it in aggregate.
+        for i in 0..80 {
+            msgs.push(json!({
+                "role": "assistant",
+                "content": format!("unique analysis paragraph {i} {}", "detail ".repeat(1200))
+            }));
+        }
+        // Disable the duplicate + normalize passes so we specifically
+        // exercise the middle-pass kill-switch narrowing.
+        let cfg = CompressionConfig {
+            collapse_duplicates: false,
+            normalize_json: false,
+            tool_output_stub_threshold: u64::MAX,
+            ..engage_all()
+        };
+        let out = compress(&payload(msgs), &cfg);
+        assert!(
+            out.changed,
+            "middle pass must run despite the user quoting the marker phrase in free text"
+        );
+        let result = out.payload["messages"].as_array().unwrap();
+        // The quoted message is preserved verbatim (it's below the
+        // 32-token floor and it's a `user` role — no pass touches it).
+        assert_eq!(
+            msg_content_str(&result[1]).unwrap(),
+            "the log said 'reason: middle history]' earlier",
+            "the quoted user message must be preserved verbatim"
+        );
+        // Middle-pass stubs are produced for the large assistant
+        // messages.
+        let stubbed = result
+            .iter()
+            .filter(|m| {
+                msg_content_str(m)
+                    .is_some_and(|c| c.starts_with("[pruned:") && c.contains("reason: middle history]"))
+            })
+            .count();
+        assert!(
+            stubbed > 0,
+            "large plain middle messages must still be stubbed, got {result:#?}"
+        );
     }
 
     #[test]

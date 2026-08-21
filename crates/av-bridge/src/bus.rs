@@ -21,6 +21,29 @@ pub enum BusError {
     Backend(String),
 }
 
+impl BusError {
+    /// Round-28 F1 (av-bridge): distinguish permanent config errors
+    /// from transient outages so downstream error mapping can route
+    /// them to the right HTTP status. `UnknownTopic` is a
+    /// misconfiguration — the topic must be provisioned via the
+    /// manifest before publishing, so a retry without operator
+    /// action cannot succeed. `Serde` is a wire-shape violation
+    /// from the sender — also permanent for that specific payload.
+    /// `Io` and `Backend` are transient by default (network blip,
+    /// disk temporarily full, broker restarting); reclassifying
+    /// specific-message shapes here would require pattern-matching
+    /// the underlying error, which is fragile.
+    ///
+    /// Callers should use `is_permanent()` to decide whether to
+    /// return HTTP 400/409 (permanent, no Retry-After) or 503
+    /// (transient, with Retry-After) — see
+    /// `av-harness::routes::finalize_error_response`.
+    #[must_use]
+    pub fn is_permanent(&self) -> bool {
+        matches!(self, Self::UnknownTopic(_) | Self::Serde(_))
+    }
+}
+
 /// Acknowledgment for a published event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishAck {
@@ -247,9 +270,14 @@ mod tests {
 
     #[test]
     fn partition_assignment_is_stable() {
-        // Pinned values: changing the hash silently re-partitions every
-        // deployment's replay order — this test makes that loud.
-        assert_eq!(partition_for("agent-inst-1", 8), partition_for("agent-inst-1", 8));
+        // Pinned values (FNV-1a 64 mod 8): changing the hash silently
+        // re-partitions every deployment's replay order — this test makes
+        // that loud. A self-comparison would pass under ANY hash; the
+        // literals are the regression anchor.
+        assert_eq!(partition_for("agent-inst-1", 8), 3);
+        assert_eq!(partition_for("agent-inst-2", 8), 6);
+        assert_eq!(partition_for("session-abc", 8), 2);
+        assert_eq!(partition_for("", 8), 5);
         let spread: std::collections::HashSet<u32> =
             (0..100).map(|i| partition_for(&format!("inst-{i}"), 8)).collect();
         assert!(spread.len() >= 6, "poor partition spread: {spread:?}");
@@ -258,6 +286,34 @@ mod tests {
     #[test]
     fn zero_partitions_clamped() {
         assert_eq!(partition_for("x", 0), 0);
+    }
+
+    /// Round-28 F1: permanent vs transient classification is what
+    /// downstream error mapping (av-harness FinalizeError) uses to
+    /// decide between HTTP 400 (permanent misconfig, no retry) and
+    /// HTTP 503 (transient outage, Retry-After). Pin the two-way
+    /// split.
+    #[test]
+    fn bus_error_is_permanent_split() {
+        assert!(
+            BusError::UnknownTopic("orders".to_owned()).is_permanent(),
+            "unknown topic is a misconfiguration; retry cannot succeed"
+        );
+        assert!(
+            !BusError::Backend("network reset".to_owned()).is_permanent(),
+            "backend outages are transient by default"
+        );
+        assert!(
+            !BusError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "slow disk")).is_permanent(),
+            "I/O timeouts are transient"
+        );
+        // Serde errors are permanent for that payload — the sender
+        // must fix the wire shape.
+        let serde_err = serde_json::from_slice::<serde_json::Value>(b"not json").unwrap_err();
+        assert!(
+            BusError::Serde(serde_err).is_permanent(),
+            "serde errors are permanent for that payload"
+        );
     }
 
     #[cfg(any(feature = "nats", feature = "kafka"))]

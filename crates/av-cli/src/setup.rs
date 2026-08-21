@@ -231,11 +231,16 @@ fn render_config(plan: &ConfigPlan) -> String {
     out.push_str("\n# Signed receipts, OCSF events, and ATIF trajectories are written here.\n");
     match &plan.data_root {
         Some(root) => {
-            out.push_str(&format!("atif_spool_dir = \"{root}/spool\"\n"));
-            out.push_str(&format!("bridge_data_dir = \"{root}/bridge\"\n"));
+            // These paths mirror the harness `default_spool` / `default_bridge`
+            // shapes (see crates/av-harness/src/config.rs) so that removing a
+            // key from the generated config leaves the runtime pointing at the
+            // same directory the generated config named. Diverging silently
+            // relocates the spool the moment an operator edits the file.
+            out.push_str(&format!("atif_spool_dir = \"{root}/spool/atif\"\n"));
+            out.push_str(&format!("bridge_data_dir = \"{root}/data/bridge\"\n"));
         }
         None => {
-            out.push_str("atif_spool_dir = \"data/spool\"\n");
+            out.push_str("atif_spool_dir = \"spool/atif\"\n");
             out.push_str("bridge_data_dir = \"data/bridge\"\n");
         }
     }
@@ -573,10 +578,6 @@ fn write_private_key_file(path: &Path, key: &str) -> Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
         let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
     }
-    // Old file may be a symlink; unlink it so hard_link fails cleanly on a
-    // pre-planted target rather than following the link and overwriting
-    // whatever it points at.
-    let _ = std::fs::remove_file(path);
     let temporary = parent.join(format!(".agentvisor-key-{}.tmp", av_core::new_event_uid()));
     // Round-13: sibling of round-12 F4 (harness `install_seed_exclusive`).
     // Without the RAII guard, an early `?` return from write_all /
@@ -599,8 +600,16 @@ fn write_private_key_file(path: &Path, key: &str) -> Result<()> {
         .with_context(|| format!("write key file {}", temporary.display()))?;
     file.sync_all()
         .with_context(|| format!("sync key file {}", temporary.display()))?;
+    // Only unlink the previous key once the replacement is durably on
+    // disk. Removing it before the temp write (the old order) meant a
+    // write/sync failure — ENOSPC, EIO — destroyed the only copy of the
+    // existing key with nothing to install in its place. The old file may
+    // be a symlink; unlink it so hard_link below fails cleanly on a
+    // pre-planted target rather than following the link and overwriting
+    // whatever it points at.
+    let _ = std::fs::remove_file(path);
     // hard_link installs the final path atomically and refuses to follow a
-    // pre-existing symlink at `path`; a first-run has none anyway because
+    // pre-existing symlink at `path`; none exists at this point because
     // we removed it above.
     let result =
         std::fs::hard_link(&temporary, path).with_context(|| format!("install key file {}", path.display()));
@@ -1184,14 +1193,14 @@ pub async fn doctor(offline: bool) -> Result<()> {
 
     // 1. Config resolution (same search order as the server).
     let resolved = av_harness::config::load_config();
-    let config = match resolved {
+    let (config, source) = match resolved {
         Ok((config, source)) => {
             checks.push(Check::Pass(format!("config: {source}")));
-            Some(config)
+            (Some(config), Some(source))
         }
         Err(error) => {
             checks.push(Check::Fail(format!("config: {error}")));
-            None
+            (None, None)
         }
     };
 
@@ -1217,14 +1226,45 @@ pub async fn doctor(offline: bool) -> Result<()> {
                 ))),
             }
         } else if let Some(file) = &config.upstream_api_key_file {
-            match std::fs::metadata(file) {
-                Ok(_) => checks.push(Check::Pass(format!("upstream auth: {auth}"))),
-                Err(error) => {
-                    checks.push(Check::Fail(format!("upstream auth: {auth} — {error}")));
-                }
+            // Round-42 F1: mirror `av_harness::pipeline::require_owner_only_secret`
+            // exactly — the runtime refuses symlinks, non-regular files,
+            // group/other-readable modes, and empty content. Doctor used to
+            // only `metadata(file).ok()`-check existence, so an operator
+            // whose key file was chmod 644 or a dangling symlink would see
+            // `avctl doctor` PASS and `avctl start`/harness startup FAIL.
+            match check_owner_only_secret(std::path::Path::new(file)) {
+                Ok(()) => checks.push(Check::Pass(format!("upstream auth: {auth}"))),
+                Err(reason) => checks.push(Check::Fail(format!("upstream auth: {auth} — {reason}"))),
             }
         } else {
             checks.push(Check::Pass(format!("upstream auth: {auth}")));
+        }
+
+        // Round-29 F1 (avctl doctor): parity with the upstream API key
+        // check above. `tool_upstream_bearer_env/_file` is the MCP
+        // path's bearer token; the runtime applies the SAME
+        // `require_owner_only_secret` posture at first tool call,
+        // but doctor used to check neither.
+        if let Some(env) = &config.tool_upstream_bearer_env {
+            match std::env::var(env) {
+                Ok(value) if !value.trim().is_empty() => {
+                    checks.push(Check::Pass(format!("tool bearer: env {env} (set)")));
+                }
+                _ => checks.push(Check::Fail(format!(
+                    "tool bearer: environment variable {env} is unset or empty"
+                ))),
+            }
+        } else if let Some(file) = &config.tool_upstream_bearer_file {
+            match check_owner_only_secret(std::path::Path::new(file)) {
+                Ok(()) => checks.push(Check::Pass(format!("tool bearer: {file}"))),
+                Err(reason) => {
+                    checks.push(Check::Fail(format!("tool bearer: {file} — {reason}")));
+                }
+            }
+        } else if config.tool_upstream_url.is_some() {
+            checks.push(Check::Warn(
+                "tool bearer: none configured (MCP calls will proxy unauthenticated)".to_owned(),
+            ));
         }
 
         // 4. Upstream reachability (TCP + HTTP; any HTTP status counts).
@@ -1327,10 +1367,18 @@ pub async fn doctor(offline: bool) -> Result<()> {
             ))),
         }
 
-        // 8. Signing seed (created on first run if absent).
-        let seed_path = std::env::var_os("AV_SIGNING_SEED_FILE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("config/signing.seed"));
+        // 8. Signing seed (created on first run if absent). Round-42 F2:
+        // pick the same path `avctl start` will actually pass to the
+        // harness — when the user config is at `user_config_path()`,
+        // start overrides `AV_SIGNING_SEED_FILE` to
+        // `<user_config_dir>/signing.seed` (see main.rs
+        // `avctl_start`, "Starting AgentVisor AI"). Doctor used to
+        // probe `config/signing.seed` regardless, so a bad seed in
+        // the user directory would pass doctor and fail startup.
+        // Additionally, verify the seed content (hex, 32 bytes, not
+        // known-weak) so a corrupt seed cannot survive doctor —
+        // `av_harness::main::read_signer` refuses those at startup.
+        let seed_path = seed_path_for(source.as_ref());
         if seed_path.is_file() {
             #[cfg(unix)]
             {
@@ -1344,7 +1392,13 @@ pub async fn doctor(offline: bool) -> Result<()> {
                         "signing seed: {} is group/world accessible (chmod 600 it)",
                         seed_path.display()
                     ))),
-                    Ok(_) => checks.push(Check::Pass(format!("signing seed: {}", seed_path.display()))),
+                    Ok(_) => match check_signing_seed_content(&seed_path) {
+                        Ok(()) => checks.push(Check::Pass(format!("signing seed: {}", seed_path.display()))),
+                        Err(reason) => checks.push(Check::Fail(format!(
+                            "signing seed: {}: {reason}",
+                            seed_path.display()
+                        ))),
+                    },
                     Err(error) => {
                         checks.push(Check::Fail(format!(
                             "signing seed: {}: {error}",
@@ -1354,7 +1408,13 @@ pub async fn doctor(offline: bool) -> Result<()> {
                 }
             }
             #[cfg(not(unix))]
-            checks.push(Check::Pass(format!("signing seed: {}", seed_path.display())));
+            match check_signing_seed_content(&seed_path) {
+                Ok(()) => checks.push(Check::Pass(format!("signing seed: {}", seed_path.display()))),
+                Err(reason) => checks.push(Check::Fail(format!(
+                    "signing seed: {}: {reason}",
+                    seed_path.display()
+                ))),
+            }
         } else {
             checks.push(Check::Pass(format!(
                 "signing seed: {} will be generated on first run",
@@ -1415,7 +1475,7 @@ pub async fn doctor(offline: bool) -> Result<()> {
                 let Some(endpoint) = endpoint.filter(|e| !e.is_empty()) else {
                     continue;
                 };
-                match probe_endpoint(endpoint).await {
+                match probe_endpoint_any(endpoint).await {
                     Ok(()) => checks.push(Check::Pass(format!(
                         // Round-28 F5 partner fix: the success line must
                         // redact userinfo too, not just the failure line.
@@ -1488,6 +1548,139 @@ async fn probe_endpoint(endpoint: &str) -> Result<()> {
         .map_err(anyhow::Error::from)
 }
 
+/// Round-42 F3: probe a config-shaped endpoint. Two forms that
+/// `probe_endpoint` alone cannot handle without emitting a spurious
+/// "unreachable" for a perfectly valid config:
+///
+/// 1. Redis `unix:` (and `redis+unix:`) — a local UDS socket, not a
+///    TCP host:port. Config-validate at `HarnessConfig::validate`
+///    (state_endpoint scheme allowlist) accepts `unix:...` for Redis.
+///    We probe the socket file's existence and move on.
+///
+/// 2. Kafka bootstrap list — a comma-separated `host:port,host:port,...`
+///    string. The bare list has no scheme, so `probe_target` would
+///    misparse the first comma as trailing garbage in the port.
+///    Probing every bootstrap is overkill; the runtime only needs
+///    ONE reachable broker. We treat the whole list as "reachable"
+///    if any single member is reachable.
+async fn probe_endpoint_any(endpoint: &str) -> Result<()> {
+    if endpoint.starts_with("unix:") || endpoint.starts_with("redis+unix:") {
+        let path = endpoint
+            .strip_prefix("redis+unix:")
+            .or_else(|| endpoint.strip_prefix("unix:"))
+            .unwrap_or(endpoint)
+            .trim_start_matches("//");
+        if path.is_empty() {
+            anyhow::bail!("unix endpoint has empty path");
+        }
+        match std::fs::metadata(path) {
+            Ok(_) => return Ok(()),
+            Err(error) => anyhow::bail!("unix socket {path}: {error}"),
+        }
+    }
+    if endpoint.contains(',') {
+        let mut last_err: Option<anyhow::Error> = None;
+        for member in endpoint.split(',').map(str::trim).filter(|m| !m.is_empty()) {
+            match probe_endpoint(member).await {
+                Ok(()) => return Ok(()),
+                Err(error) => last_err = Some(error),
+            }
+        }
+        return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no bootstrap members configured")));
+    }
+    probe_endpoint(endpoint).await
+}
+
+/// Round-42 F1: mirror `av_harness::pipeline::require_owner_only_secret`
+/// posture so `avctl doctor` cannot falsely PASS a key file the
+/// harness would refuse: symlinks, non-regular files,
+/// group/other-readable modes on Unix, and empty content.
+fn check_owner_only_secret(path: &Path) -> std::result::Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata =
+            std::fs::symlink_metadata(path).map_err(|error| format!("stat {}: {error}", path.display()))?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            return Err(format!(
+                "{} is a symbolic link; refusing to follow",
+                path.display()
+            ));
+        }
+        if !file_type.is_file() {
+            return Err(format!("{} is not a regular file", path.display()));
+        }
+        let mode = metadata.mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "{} has mode 0o{mode:03o}; must be owner-only (chmod 600 {})",
+                path.display(),
+                path.display()
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let metadata =
+            std::fs::metadata(path).map_err(|error| format!("stat {}: {error}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(format!("{} is not a regular file", path.display()));
+        }
+    }
+    let contents = std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    if contents.iter().all(u8::is_ascii_whitespace) {
+        return Err(format!("{} is empty", path.display()));
+    }
+    Ok(())
+}
+
+/// Round-42 F2: return the same signing-seed path `avctl start`
+/// will actually hand to the harness. Precedence:
+///
+/// 1. `AV_SIGNING_SEED_FILE` — explicit operator override, always wins.
+/// 2. `<user_config_dir>/signing.seed` — when the running config was
+///    resolved from `user_config_path()`, `avctl start` sets
+///    `AV_SIGNING_SEED_FILE` to this path (see main.rs "Starting
+///    AgentVisor AI"). Without this override, doctor would probe a
+///    stale `config/signing.seed` and miss real seed problems.
+/// 3. `config/signing.seed` — the harness default.
+fn seed_path_for(source: Option<&av_harness::config::ConfigSource>) -> PathBuf {
+    if let Some(explicit) = std::env::var_os("AV_SIGNING_SEED_FILE") {
+        return PathBuf::from(explicit);
+    }
+    if let Some(av_harness::config::ConfigSource::File(config_path)) = source {
+        if Some(config_path) == av_harness::config::user_config_path().as_ref() {
+            if let Some(root) = config_path.parent() {
+                return root.join("signing.seed");
+            }
+        }
+    }
+    PathBuf::from("config/signing.seed")
+}
+
+/// Round-42 F2 partner: validate signing-seed contents the way
+/// `av_harness::main::read_signer` will at startup — hex-decoded,
+/// exactly 32 bytes, and not a known-weak seed (all-zero or all-0xFF).
+/// A doctor that only checks file mode / symlink status lets a
+/// truncated or textbook-wrong seed pass, and the operator only
+/// discovers the problem when `avctl start` fails.
+fn check_signing_seed_content(path: &Path) -> std::result::Result<(), String> {
+    let contents =
+        std::fs::read_to_string(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let decoded = hex::decode(contents.trim()).map_err(|error| format!("decode as hex: {error}"))?;
+    if decoded.len() != 32 {
+        return Err(format!("must be exactly 32 bytes, got {}", decoded.len()));
+    }
+    if decoded.iter().all(|byte| *byte == 0x00) {
+        return Err("all-zero seed (known-weak, globally predictable public key)".to_owned());
+    }
+    if decoded.iter().all(|byte| *byte == 0xFF) {
+        return Err("all-0xFF seed (known-weak, globally predictable public key)".to_owned());
+    }
+    Ok(())
+}
+
 /// Round-28 F1 + F5: extract the `host:port` from a URL or bare
 /// `host:port` string. Split out as a pure helper so tests can lock
 /// in three formerly-buggy behaviours: (F1) scheme-driven default
@@ -1499,10 +1692,15 @@ fn probe_target(endpoint: &str) -> Result<String> {
         Some((scheme, rest)) => (Some(scheme), rest),
         None => (None, endpoint),
     };
+    // Trim path/query/fragment BEFORE stripping userinfo: RFC 3986
+    // userinfo cannot contain '/', so an '@' after the first '/' is
+    // path data, not credentials ("http://h/p@th" must probe h, not
+    // "th"). Mirrors redact_userinfo's authority-first parse.
+    let hostpart = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     // Strip userinfo (`user:pass@`).
-    let hostpart = rest.rsplit_once('@').map_or(rest, |(_userinfo, host)| host);
-    // Trim path/query/fragment.
-    let host_and_port = hostpart.split(['/', '?', '#']).next().unwrap_or(hostpart);
+    let host_and_port = hostpart
+        .rsplit_once('@')
+        .map_or(hostpart, |(_userinfo, host)| host);
     let (host, port_opt) = if let Some(stripped) = host_and_port.strip_prefix('[') {
         match stripped.split_once(']') {
             Some((h, tail)) => {
@@ -2054,6 +2252,14 @@ mod tests {
             probe_target("https://[2001:db8::1]:8443").unwrap(),
             "[2001:db8::1]:8443"
         );
+        // '@' after the authority (in path/query) is not userinfo — the
+        // authority must be isolated before stripping credentials.
+        assert_eq!(probe_target("http://h/p@th").unwrap(), "h:80");
+        assert_eq!(probe_target("http://h:8080/p@th").unwrap(), "h:8080");
+        assert_eq!(probe_target("http://h?q=a@b").unwrap(), "h:80");
+        // Userinfo combined with a path containing '@' still strips
+        // only the real credentials.
+        assert_eq!(probe_target("http://u:p@h:8080/p@th").unwrap(), "h:8080");
     }
 
     /// Round-40 F2: `build_probe_base` handles the four listen-form

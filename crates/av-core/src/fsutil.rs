@@ -47,6 +47,33 @@ pub fn sync_directory(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Create `path` and any missing ancestors, then fsync the parent of every
+/// directory that was newly created so the dirents naming them survive a
+/// crash. A bare `create_dir_all` + `sync_directory(leaf)` leaves newly
+/// created *ancestor* entries volatile: a power loss can drop the whole
+/// subtree even though the leaf's own contents were fsynced.
+pub fn create_dir_all_synced(path: &Path) -> io::Result<()> {
+    let mut missing: Vec<std::path::PathBuf> = Vec::new();
+    let mut current = Some(path);
+    while let Some(dir) = current {
+        if dir.as_os_str().is_empty() || dir.exists() {
+            break;
+        }
+        missing.push(dir.to_path_buf());
+        current = dir.parent();
+    }
+    std::fs::create_dir_all(path)?;
+    // Highest new ancestor first, so each synced parent already exists.
+    for dir in missing.iter().rev() {
+        if let Some(parent) = dir.parent() {
+            if !parent.as_os_str().is_empty() {
+                sync_directory(parent)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Receipts JCS-canonicalize to a few hundred bytes; even a huge
 /// tool-call summary stays well under 16 MiB. Shared between the CLI
 /// (`avctl receipt-verify`) and the harness reconciler (round-17 F3).
@@ -157,8 +184,27 @@ pub fn read_capped_string(path: &Path, max_bytes: u64) -> io::Result<String> {
 /// this with their own counter if needed.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
+    // `Path::new("file.json").parent()` is `Some("")`, not `None` — the
+    // empty path fails `sync_directory` (and is not a valid directory for
+    // `create_dir_all` on all platforms). Normalize to `.` so relative
+    // leaf paths behave like `./file.json`.
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    // Round-23 F1 (av-core fsutil): use `create_dir_all_synced` (not
+    // `create_dir_all`) so the FIRST write into a new spool subtree
+    // (`spool/outbox/`, `spool/receipts/`, `spool/tool-executions/`,
+    // …) also fsyncs the newly-created ancestor entries. A bare
+    // `create_dir_all` followed by fsyncing only the leaf on
+    // line 206 left the ancestor dirents volatile — a power loss
+    // between the initial `mkdir` and any ambient dirent sync
+    // could drop the entire subtree, losing the marker even though
+    // its bytes were fsynced. This is the durability gap round-21
+    // flagged and deferred; the helper's fast path (skip when the
+    // directory already exists) means the cost is only paid on
+    // FIRST writes into a fresh directory tree.
+    create_dir_all_synced(parent)?;
     let temporary = path.with_extension(format!("{}.tmp", crate::new_event_uid()));
     let mut guard = TempPathGuard::new(temporary.clone());
     let mut file = std::fs::OpenOptions::new()

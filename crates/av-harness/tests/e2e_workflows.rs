@@ -124,8 +124,11 @@ async fn signed_workflow_close_produces_receipt_with_matching_event_count() {
     // Verify subject matches the recorded chain.
     match &receipt.body.subject {
         ReceiptSubject::EventChain { event_count, .. } => {
+            // Two chain events per prepared-then-dropped request:
+            // admission plus the capture guard's terminal resolution.
             assert_eq!(
-                *event_count, STEPS,
+                *event_count,
+                STEPS * 2,
                 "receipt event_count must match published steps"
             );
         }

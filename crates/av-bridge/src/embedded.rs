@@ -29,6 +29,13 @@ struct Partition {
     seen_event_uids: HashMap<String, u64>,
     next_offset: u64,
     writer: fs::File,
+    /// Set when a failed append could not be repaired by truncating the
+    /// segment back to its last known-good length. Every subsequent
+    /// publish on this partition is refused (fail-closed) — appending
+    /// after torn bytes would merge into the next record and make the
+    /// whole partition unreadable to `fetch`. Cleared only by restart,
+    /// where segment recovery re-establishes a consistent tail.
+    poisoned: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -59,6 +66,17 @@ impl EmbeddedBroker {
         manifest
             .validate()
             .map_err(|e| BusError::Backend(e.to_string()))?;
+        // Round-17 F3 (av-bridge): reject a scheme-URI cold_uri BEFORE
+        // any filesystem side effect. The prior check lived in
+        // `open()` (after provision had already written manifest.yaml,
+        // per-topic dirs, and schema copies to disk); when
+        // provision-then-open failed here, the operator saw a "bridge
+        // already provisioned" error on retry after fixing the
+        // manifest, because the botched files still sat in data_dir.
+        // Move the check to the top of provision so a failure leaves
+        // data_dir untouched and retry-clean.
+        #[cfg(not(feature = "cold-store"))]
+        reject_cold_uri_without_feature(manifest)?;
         let manifest_path = data_dir.join("manifest.yaml");
         fs::create_dir_all(data_dir)?;
         copy_referenced_schemas(data_dir, manifest)?;
@@ -249,6 +267,7 @@ impl EmbeddedBroker {
                     seen_event_uids,
                     next_offset: segment_offset.max(persisted_offset),
                     writer,
+                    poisoned: None,
                 }));
             }
             partitions.insert(t.name.clone(), parts);
@@ -259,6 +278,16 @@ impl EmbeddedBroker {
             &manifest,
             Some(data_dir.join("cold-outbox")),
         )?;
+        // Fail fast at boot on a scheme-URI `cold_uri` in a build without
+        // the `cold-store` feature. Previously the error only surfaced
+        // when the first record actually expired — up to `hot_hours`
+        // (default 168 h) after boot — and, because `enforce_retention`
+        // `?`-propagates out of the per-topic loop, halted retention for
+        // every topic ordered after the misconfigured one. Boot-time
+        // validation matches the fail-fast policy of every other
+        // feature-gated backend (kafka/nats/redis/onnx/qdrant).
+        #[cfg(not(feature = "cold-store"))]
+        reject_cold_uri_without_feature(&manifest)?;
         Ok(Self {
             data_dir: data_dir.to_owned(),
             manifest,
@@ -279,7 +308,33 @@ impl EmbeddedBroker {
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
+}
 
+/// Reject a manifest that names a scheme-URI `cold_uri` when this build
+/// lacks the `cold-store` feature: retention would silently accept the
+/// value at boot and only fail on the first tick that produced expired
+/// records (up to `hot_hours` later), and — because `enforce_retention`
+/// `?`-propagates out of the per-topic loop — halt retention for every
+/// topic ordered after it. Boot-time refusal matches the fail-fast
+/// policy of every other feature-gated backend.
+#[cfg(not(feature = "cold-store"))]
+fn reject_cold_uri_without_feature(manifest: &BridgeManifest) -> Result<(), BusError> {
+    for topic in &manifest.topics {
+        if let Some(cold) = topic.retention.cold_uri.as_deref() {
+            if cold.contains("://") {
+                return Err(BusError::Backend(format!(
+                    "topic {:?} configures cold_uri {cold:?} which requires feature cold-store; \
+                     rebuild av-bridge with `--features cold-store` (or `cold-store-aws`) or clear \
+                     the field",
+                    topic.name,
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+impl EmbeddedBroker {
     /// Enforce per-topic hot retention at time `now_ms`: when
     /// `retention.cold_uri` is set, each expired record
     /// is first exported to the cold tier as its own write-once object (via the
@@ -299,6 +354,21 @@ impl EmbeddedBroker {
             };
             for p in parts {
                 let mut part = p.lock();
+                // A poisoned partition's segment may carry torn bytes from
+                // an unrepaired append failure. Rewriting it here would
+                // preserve the partial line WITH a trailing newline —
+                // converting a restart-repairable torn tail (recover_segment
+                // truncates a no-newline tail) into a permanent corrupt
+                // line that breaks `fetch` forever. Skip until a restart
+                // re-establishes a consistent tail.
+                if let Some(reason) = &part.poisoned {
+                    tracing::warn!(
+                        topic = %t.name,
+                        reason = %reason,
+                        "skipping retention on a poisoned partition (restart to recover)"
+                    );
+                    continue;
+                }
                 let (kept, expired) = split_by_time(&part.path, cutoff)?;
                 if expired.is_empty() {
                     continue;
@@ -328,7 +398,10 @@ impl EmbeddedBroker {
                             .and_then(std::ffi::OsStr::to_str)
                             .unwrap_or("partition");
                         let cold_dir = Path::new(cold).join(&t.name).join(partition);
-                        fs::create_dir_all(&cold_dir)?;
+                        // Sync newly created ancestors too: the hot rewrite
+                        // below destroys the only other copy, so the cold
+                        // subtree's dirents must be durable before it runs.
+                        av_core::fsutil::create_dir_all_synced(&cold_dir)?;
                         for line in &expired {
                             let event: StoredEvent = serde_json::from_str(line)?;
                             write_cold_event_once(&cold_dir, &event)?;
@@ -359,70 +432,91 @@ impl EmbeddedBroker {
                 }
                 fs::rename(&tmp, &part.path)?;
                 guard.disarm();
-                if let Some(parent) = part.path.parent() {
-                    av_core::fsutil::sync_directory(parent)?;
-                }
-                // Prune the idempotency map + sidecar of any UID whose offset
-                // was expired: without this, a subsequent `publish_idempotent`
-                // with a still-cached UID returns an ack pointing at data that
-                // no longer exists, and the caller's follow-up `fetch(offset)`
-                // silently returns the wrong event or nothing.
-                //
-                // We compute survivors from parseable lines, but ALSO keep
-                // the range [min_kept_offset, max_kept_offset]: any UID
-                // whose offset falls in that range is potentially attached
-                // to an unparseable-but-kept line, and dropping it would
-                // let the next publish_idempotent re-append a duplicate
-                // record (which retention would then choke on next pass).
-                let survivors: std::collections::HashSet<u64> = kept
-                    .iter()
-                    .filter_map(|line| serde_json::from_str::<StoredEvent>(line).ok())
-                    .map(|event| event.offset)
-                    .collect();
-                let range = if survivors.is_empty() {
-                    None
-                } else {
-                    // A single manual pass gives min/max and avoids
-                    // expect() on the guaranteed-non-empty iterator.
-                    let (mut lo, mut hi) = (u64::MAX, 0u64);
-                    for offset in &survivors {
-                        lo = lo.min(*offset);
-                        hi = hi.max(*offset);
+                // Everything between the rename above and a successful
+                // writer reopen below runs while `part.writer` still holds
+                // the fd of the pre-rewrite (now unlinked) inode. If any of
+                // it fails, propagating the error WITHOUT poisoning the
+                // partition would leave that stale handle live: every
+                // subsequent publish would append to the unlinked inode —
+                // acked as durable, invisible to `fetch`, and irrecoverably
+                // freed at process exit. Poison the partition on any
+                // post-rename failure so appends fail closed until a
+                // restart reopens the renamed segment (same fail-closed
+                // posture as an unrepaired append truncation).
+                let post_rename: Result<(), BusError> = (|| {
+                    if let Some(parent) = part.path.parent() {
+                        av_core::fsutil::sync_directory(parent)?;
                     }
-                    Some((lo, hi))
-                };
-                let before = part.seen_event_uids.len();
-                part.seen_event_uids.retain(|_, offset| {
-                    if survivors.contains(offset) {
-                        return true;
-                    }
-                    match range {
-                        Some((lo, hi)) => *offset >= lo && *offset <= hi,
-                        None => false,
-                    }
-                });
-                if part.seen_event_uids.len() != before {
-                    // Sidecar is now stale — rewrite it atomically with only
-                    // the surviving mappings so recovery cannot resurrect a
-                    // just-expired UID.
-                    let mut lines: Vec<(String, u64)> = part
-                        .seen_event_uids
+                    // Prune the idempotency map + sidecar of any UID whose offset
+                    // was expired: without this, a subsequent `publish_idempotent`
+                    // with a still-cached UID returns an ack pointing at data that
+                    // no longer exists, and the caller's follow-up `fetch(offset)`
+                    // silently returns the wrong event or nothing.
+                    //
+                    // We compute survivors from parseable lines, but ALSO keep
+                    // the range [min_kept_offset, max_kept_offset]: any UID
+                    // whose offset falls in that range is potentially attached
+                    // to an unparseable-but-kept line, and dropping it would
+                    // let the next publish_idempotent re-append a duplicate
+                    // record (which retention would then choke on next pass).
+                    let survivors: std::collections::HashSet<u64> = kept
                         .iter()
-                        .map(|(uid, offset)| (uid.clone(), *offset))
+                        .filter_map(|line| serde_json::from_str::<StoredEvent>(line).ok())
+                        .map(|event| event.offset)
                         .collect();
-                    lines.sort_by_key(|(_, offset)| *offset);
-                    let mut sidecar = Vec::new();
-                    for (uid, offset) in lines {
-                        let mapping = serde_json::to_string(&EventUidOffset {
-                            event_uid: uid,
-                            offset,
-                        })?;
-                        sidecar.extend_from_slice(mapping.as_bytes());
-                        sidecar.push(b'\n');
+                    let range = if survivors.is_empty() {
+                        None
+                    } else {
+                        // A single manual pass gives min/max and avoids
+                        // expect() on the guaranteed-non-empty iterator.
+                        let (mut lo, mut hi) = (u64::MAX, 0u64);
+                        for offset in &survivors {
+                            lo = lo.min(*offset);
+                            hi = hi.max(*offset);
+                        }
+                        Some((lo, hi))
+                    };
+                    let before = part.seen_event_uids.len();
+                    part.seen_event_uids.retain(|_, offset| {
+                        if survivors.contains(offset) {
+                            return true;
+                        }
+                        match range {
+                            Some((lo, hi)) => *offset >= lo && *offset <= hi,
+                            None => false,
+                        }
+                    });
+                    if part.seen_event_uids.len() != before {
+                        // Sidecar is now stale — rewrite it atomically with only
+                        // the surviving mappings so recovery cannot resurrect a
+                        // just-expired UID.
+                        let mut lines: Vec<(String, u64)> = part
+                            .seen_event_uids
+                            .iter()
+                            .map(|(uid, offset)| (uid.clone(), *offset))
+                            .collect();
+                        lines.sort_by_key(|(_, offset)| *offset);
+                        let mut sidecar = Vec::new();
+                        for (uid, offset) in lines {
+                            let mapping = serde_json::to_string(&EventUidOffset {
+                                event_uid: uid,
+                                offset,
+                            })?;
+                            sidecar.extend_from_slice(mapping.as_bytes());
+                            sidecar.push(b'\n');
+                        }
+                        rewrite_atomic(&part.idempotency_path, &sidecar)?;
                     }
-                    rewrite_atomic(&part.idempotency_path, &sidecar)?;
+                    part.writer = fs::OpenOptions::new().append(true).open(&part.path)?;
+                    Ok(())
+                })();
+                if let Err(error) = post_rename {
+                    part.poisoned = Some(format!(
+                        "retention post-rename failure ({error}); the append handle may still \
+                         reference the replaced segment inode (restart to recover)"
+                    ));
+                    return Err(error);
                 }
-                part.writer = fs::OpenOptions::new().append(true).open(&part.path)?;
             }
         }
         Ok(expired_total)
@@ -432,31 +526,44 @@ impl EmbeddedBroker {
 fn write_cold_event_once(directory: &Path, event: &StoredEvent) -> Result<(), BusError> {
     let path = directory.join(format!("{:020}.json", event.offset));
     let bytes = serde_json::to_vec(event)?;
-    match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(mut file) => {
-            file.write_all(&bytes)?;
-            file.sync_all()?;
+    if path.exists() {
+        return if fs::read(&path)? == bytes {
+            // Idempotent re-export (e.g. a retention pass that crashed
+            // after the cold copy landed but before the hot rewrite).
             Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            if fs::read(&path)? == bytes {
-                Ok(())
-            } else {
-                // Round-37 F1/F2 class: `write_cold_event_once`
-                // errors bubble up through `enforce_retention` and can
-                // reach a
-                // tracing::warn!(%error) on the maintenance path.
-                // Basename the absolute cold-destination path so a
-                // duplicate-object collision doesn't ship the
-                // deployment topology to OTLP.
-                Err(BusError::Backend(format!(
-                    "cold object {} already exists with different content",
-                    av_core::fsutil::basename(&path)
-                )))
-            }
-        }
-        Err(error) => Err(BusError::Io(error)),
+        } else {
+            // Round-37 F1/F2 class: `write_cold_event_once`
+            // errors bubble up through `enforce_retention` and can
+            // reach a
+            // tracing::warn!(%error) on the maintenance path.
+            // Basename the absolute cold-destination path so a
+            // duplicate-object collision doesn't ship the
+            // deployment topology to OTLP.
+            Err(BusError::Backend(format!(
+                "cold object {} already exists with different content",
+                av_core::fsutil::basename(&path)
+            )))
+        };
     }
+    // Crash-atomic write-once. Writing directly at the final name
+    // (create_new → write_all → sync_all) meant a crash/ENOSPC mid-write
+    // left a torn file there, and every subsequent retention pass hit
+    // AlreadyExists + content mismatch → enforce_retention aborted for
+    // all topics, forever. Stage in a UUID-suffixed tmp, fsync, then
+    // rename — the final path only ever holds complete objects (same
+    // shape as `rewrite_atomic`; the caller fsyncs the directory after
+    // the batch). True conflicts are still detected by the pre-existing
+    // content comparison above.
+    let tmp = path.with_extension(format!("json.{}.tmp", av_core::new_event_uid()));
+    let mut guard = av_core::fsutil::TempPathGuard::new(tmp.clone());
+    {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, &path)?;
+    guard.disarm();
+    Ok(())
 }
 
 fn copy_referenced_schemas(data_dir: &Path, manifest: &BridgeManifest) -> Result<(), BusError> {
@@ -533,7 +640,14 @@ fn recover_segment(path: &Path) -> Result<(u64, u64), BusError> {
             // A single unparseable middle line must not brick the broker.
             // The corrupted bytes are left on disk as forensic evidence;
             // subsequent publishes append past the surviving max offset.
+            // The line still occupies one logical offset (segment lines are
+            // appended in offset order), so advance next_offset past it —
+            // computing next_offset from parseable lines only let a corrupt
+            // *trailing* line regress next_offset, and the next publish
+            // reused that line's live offset (offset collision in the
+            // audit stream).
             Err(error) => {
+                next_offset = next_offset.saturating_add(1);
                 tracing::warn!(
                     %error,
                     path = %av_core::fsutil::basename(path),
@@ -800,6 +914,12 @@ impl EmbeddedBroker {
             .get(partition as usize)
             .ok_or_else(|| BusError::Backend(format!("partition {partition} out of range")))?;
         let mut part = slot.lock();
+        if let Some(reason) = &part.poisoned {
+            return Err(BusError::Backend(format!(
+                "partition {partition} of topic {topic:?} is poisoned by an unrepaired append failure \
+                 (restart to recover): {reason}"
+            )));
+        }
         if let Some(uid) = event_uid {
             if let Some(offset) = part.seen_event_uids.get(uid).copied() {
                 return Ok(PublishAck {
@@ -818,10 +938,38 @@ impl EmbeddedBroker {
             stored_at: av_core::time::now_ms(),
         };
         let line = serde_json::to_string(&record)?;
-        part.writer.write_all(line.as_bytes())?;
-        part.writer.write_all(b"\n")?;
-        part.writer.flush()?;
-        part.writer.sync_data()?;
+        // Capture the durable length before appending so a failed append can
+        // be repaired. Without the truncate-on-error below, two failure
+        // modes leave the partition permanently inconsistent while the same
+        // writer stays live:
+        //   1. a torn write (ENOSPC/EIO mid-`write_all`) leaves partial
+        //      bytes that the NEXT publish appends after, merging both into
+        //      one unparseable line that ends in '\n' — `fetch` then errors
+        //      on every read, and startup recovery only repairs torn
+        //      *trailing* lines (no newline at EOF), not mid-file ones;
+        //   2. a failed `sync_data` after a complete write leaves the
+        //      record durable while `next_offset` was never advanced, so
+        //      the next publish stamps a different record with the same
+        //      offset (duplicate offsets hidden by max(offset)+1 recovery).
+        let known_good = part.writer.metadata()?.len();
+        let append = (|| {
+            part.writer.write_all(line.as_bytes())?;
+            part.writer.write_all(b"\n")?;
+            part.writer.flush()?;
+            part.writer.sync_data()
+        })();
+        if let Err(error) = append {
+            if let Err(repair) = part
+                .writer
+                .set_len(known_good)
+                .and_then(|()| part.writer.sync_data())
+            {
+                // The segment may still carry torn bytes; refuse further
+                // appends (fail-closed) rather than corrupt the next record.
+                part.poisoned = Some(format!("append failed ({error}); truncation failed ({repair})"));
+            }
+            return Err(BusError::Io(error));
+        }
         part.next_offset = part
             .next_offset
             .checked_add(1)
@@ -910,7 +1058,24 @@ impl EventBus for EmbeddedBroker {
             if line.is_empty() {
                 continue;
             }
-            let ev: StoredEvent = serde_json::from_str(&line)?;
+            let ev: StoredEvent = match serde_json::from_str(&line) {
+                Ok(ev) => ev,
+                // Same policy as `recover_segment`: a single unparseable
+                // complete line (bit-rot, tamper, a crash mode recovery
+                // does not repair) must not brick the read side. Retention
+                // keeps unparseable lines forever (`split_by_time` treats
+                // them as non-expired), so erroring here made every fetch
+                // spanning the line fail permanently while publishes kept
+                // acking events that could never be delivered.
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        path = %av_core::fsutil::basename(&part.path),
+                        "skipping unparseable segment record during fetch",
+                    );
+                    continue;
+                }
+            };
             if ev.offset < offset {
                 continue;
             }
@@ -936,6 +1101,134 @@ impl EventBus for EmbeddedBroker {
     }
 
     fn maintenance(&self, now_ms: u64) -> Result<u64, BusError> {
-        EmbeddedBroker::enforce_retention(self, now_ms)
+        let expired = EmbeddedBroker::enforce_retention(self, now_ms)?;
+        // Drain cold-export intents that a previous `ColdArchive::commit`
+        // converted from a transient remote failure into a durable
+        // "queued for retry" file. Only the Kafka/NATS maintenance paths
+        // used to drain the queue; the embedded broker never did, so the
+        // retry promise was never fulfilled — a silent permanent
+        // cold-tier gap after the record left the hot segment.
+        #[cfg(feature = "cold-store")]
+        if let Some(archive) = &self.cold_archive {
+            archive.retry_pending_with(|pending| {
+                // Embedded intents are staged and committed inside one
+                // `put()` call during retention, so a surviving
+                // offset-None intent means a crash landed between stage
+                // and commit while the record was still hot (the segment
+                // rewrite only happens after export). Resolve the offset
+                // from the partition's idempotency map instead of
+                // re-publishing, which would append a duplicate record.
+                let parts = self
+                    .partitions
+                    .get(&pending.topic)
+                    .ok_or_else(|| BusError::UnknownTopic(pending.topic.clone()))?;
+                let slot = parts.get(pending.partition as usize).ok_or_else(|| {
+                    BusError::Backend(format!("partition {} out of range", pending.partition))
+                })?;
+                let offset = slot
+                    .lock()
+                    .seen_event_uids
+                    .get(&pending.event_uid)
+                    .copied()
+                    .ok_or_else(|| {
+                        BusError::Backend(format!(
+                            "cold intent {:?} has no broker offset and no live segment \
+                             record to resolve it from; refusing to fabricate one",
+                            pending.event_uid
+                        ))
+                    })?;
+                Ok(PublishAck {
+                    topic: pending.topic.clone(),
+                    partition: pending.partition,
+                    offset,
+                })
+            })?;
+        }
+        Ok(expired)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    fn stored(offset: u64) -> StoredEvent {
+        StoredEvent {
+            partition: 0,
+            offset,
+            key: "inst".to_owned(),
+            value: serde_json::json!({"n": offset}),
+            stored_at: 1,
+        }
+    }
+
+    /// A corrupt complete line occupies one logical offset. If it is the
+    /// *last* line, next_offset must not regress below it — computing
+    /// next_offset from parseable lines only made the next publish reuse
+    /// the corrupt line's live offset.
+    #[test]
+    fn recover_segment_counts_a_corrupt_trailing_line_as_one_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p0.jsonl");
+        let mut lines = String::new();
+        for offset in 0..2u64 {
+            lines.push_str(&serde_json::to_string(&stored(offset)).unwrap());
+            lines.push('\n');
+        }
+        lines.push_str("{corrupt-but-complete\n");
+        fs::write(&path, &lines).unwrap();
+        let (next_offset, torn) = recover_segment(&path).unwrap();
+        assert_eq!(torn, 0, "a complete corrupt line is kept, not a torn tail");
+        assert_eq!(next_offset, 3, "the corrupt line at offset 2 must be counted");
+    }
+
+    /// A corrupt *middle* line must not overshoot: the running counter
+    /// advances by one for the corrupt line and the trailing parseable
+    /// line still governs.
+    #[test]
+    fn recover_segment_keeps_next_offset_exact_with_a_corrupt_middle_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p0.jsonl");
+        let mut lines = String::new();
+        lines.push_str(&serde_json::to_string(&stored(0)).unwrap());
+        lines.push_str("\n{corrupt-but-complete\n");
+        lines.push_str(&serde_json::to_string(&stored(2)).unwrap());
+        lines.push('\n');
+        fs::write(&path, &lines).unwrap();
+        let (next_offset, torn) = recover_segment(&path).unwrap();
+        assert_eq!(torn, 0);
+        assert_eq!(next_offset, 3);
+    }
+
+    /// Crash-atomic write-once contract: identical re-export is
+    /// idempotent, divergent content is refused loudly, and no tmp
+    /// staging file survives either path (a torn own-write can therefore
+    /// never appear at the final name and poison retention forever).
+    #[test]
+    fn write_cold_event_once_is_idempotent_and_refuses_divergent_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let event = stored(7);
+        write_cold_event_once(dir.path(), &event).unwrap();
+        // Identical re-export: idempotent.
+        write_cold_event_once(dir.path(), &event).unwrap();
+        // Divergent content at the same offset: refused, original kept.
+        let mut divergent = stored(7);
+        divergent.value = serde_json::json!({"tampered": true});
+        let err = write_cold_event_once(dir.path(), &divergent).unwrap_err();
+        assert!(
+            err.to_string().contains("already exists with different content"),
+            "{err}"
+        );
+        let kept: StoredEvent =
+            serde_json::from_slice(&fs::read(dir.path().join("00000000000000000007.json")).unwrap()).unwrap();
+        assert_eq!(kept.value, event.value, "conflict must not overwrite");
+        // No staging residue: exactly the one final object remains.
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["00000000000000000007.json".to_owned()], "{names:?}");
     }
 }

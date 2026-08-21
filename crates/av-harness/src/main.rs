@@ -16,12 +16,34 @@ use tracing_subscriber::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Fail-closed CLI contract: agentvisord historically ignored ALL
+    // arguments, so `agentvisord --config /etc/prod.toml` silently booted
+    // from the env/search-path config instead (possibly permissive
+    // defaults), and `--help` started a server. For a security proxy,
+    // unrecognized arguments must refuse to start.
+    let config_override = match parse_cli_args(std::env::args().skip(1)) {
+        Ok(CliAction::Run(config_override)) => config_override,
+        Ok(CliAction::Help) => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        Ok(CliAction::Version) => {
+            println!("agentvisord {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Err(error) => {
+            eprintln!("{error}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+
     #[cfg(feature = "otel")]
     let telemetry_provider = init_tracing()?;
     #[cfg(not(feature = "otel"))]
     init_tracing()?;
 
-    let (config, config_source) = av_harness::config::load_config().map_err(anyhow::Error::msg)?;
+    let (config, config_source) =
+        av_harness::config::load_config_with_override(config_override).map_err(anyhow::Error::msg)?;
     let manifest = load_manifest(&config)?;
     let bridge = build_bridge(&config, &manifest)?;
 
@@ -219,6 +241,58 @@ async fn main() -> Result<()> {
         flush_telemetry,
     )
     .await
+}
+
+const USAGE: &str = "Usage: agentvisord [--config <path>]\n\
+\n\
+Options:\n\
+\x20 --config <path>  Load the harness config from <path> (overrides $AV_CONFIG\n\
+\x20                  and the default search paths)\n\
+\x20 -h, --help       Print this help and exit\n\
+\x20 -V, --version    Print the version and exit\n\
+\n\
+Without --config, configuration is resolved from $AV_CONFIG, the default\n\
+search paths, or built-in defaults (see the README).";
+
+enum CliAction {
+    Run(Option<PathBuf>),
+    Help,
+    Version,
+}
+
+/// Fail-closed argument parsing: anything unrecognized refuses startup
+/// rather than being silently ignored (a mistyped flag must never let a
+/// security proxy boot with a different config than the operator intended).
+fn parse_cli_args(args: impl Iterator<Item = String>) -> Result<CliAction, String> {
+    let mut config: Option<PathBuf> = None;
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(CliAction::Help),
+            "-V" | "--version" => return Ok(CliAction::Version),
+            "--config" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--config requires a path argument".to_owned())?;
+                if config.replace(PathBuf::from(value)).is_some() {
+                    return Err("--config may only be given once".to_owned());
+                }
+            }
+            other => {
+                if let Some(value) = other.strip_prefix("--config=") {
+                    if value.is_empty() {
+                        return Err("--config requires a non-empty path".to_owned());
+                    }
+                    if config.replace(PathBuf::from(value)).is_some() {
+                        return Err("--config may only be given once".to_owned());
+                    }
+                } else {
+                    return Err(format!("unrecognized argument {other:?}"));
+                }
+            }
+        }
+    }
+    Ok(CliAction::Run(config))
 }
 
 async fn finish_shutdown<F, G, T>(
@@ -576,7 +650,16 @@ async fn build_identity(
     if !config.identity_allowed_issuers.is_empty() {
         validator.allow_issuers(config.identity_allowed_issuers.clone());
     }
-    if let Some(path) = config.identity_hmac_secret_file.as_deref() {
+    // Empty string means "unset" — the same posture `has_hmac` above and
+    // the JWKS branch below already apply. Without the filter, a config
+    // carrying a valid `identity_jwks_url` plus `identity_hmac_secret_file
+    // = ""` passed the `has_hmac`-or-`has_jwks` gate and then died here
+    // trying to stat "".
+    if let Some(path) = config
+        .identity_hmac_secret_file
+        .as_deref()
+        .filter(|path| !path.is_empty())
+    {
         require_owner_only_mode(Path::new(path))?;
         let secret = std::fs::read(path).with_context(|| format!("read identity HMAC secret {path}"))?;
         if secret.is_empty() {
@@ -589,7 +672,11 @@ async fn build_identity(
 
     let validator = Arc::new(validator);
     let mut refresh_handle: Option<tokio::task::JoinHandle<()>> = None;
-    if let Some(url) = config.identity_jwks_url.as_deref() {
+    // Empty string means "unset" — same posture as `has_jwks` above.
+    // Without the filter, `identity_jwks_url = ""` built a client and
+    // fetched "" at boot, killing startup despite the HMAC path being
+    // fully configured.
+    if let Some(url) = config.identity_jwks_url.as_deref().filter(|url| !url.is_empty()) {
         // Disable redirects: an IdP that returns 302 to an internal URL would
         // let a compromised (or misconfigured) JWKS host pivot the harness
         // into an SSRF probe against private services.
@@ -713,20 +800,23 @@ async fn refresh_jwks(client: &reqwest::Client, url: &str, validator: &IdentityV
     // the inner reqwest error verbatim. Convert the reqwest error
     // to a URL-free anyhow::Error using `reqwest::Error::without_url`
     // before the context wrap so no downstream `%error` on the boot
-    // path or future logger can leak the IdP hostname.
+    // path or future logger can leak the IdP hostname. Keep the
+    // stripped reqwest error as the anyhow *source* (not a
+    // stringified message) so `classify_jwks_error`'s downcast can
+    // still label timeout/connect/body/status failures.
     const MAX_JWKS_BYTES: usize = 4 * 1024 * 1024;
     let response = client
         .get(url)
         .send()
         .await
-        .map_err(|error| anyhow::anyhow!("fetch JWKS: {}", error.without_url()))?
+        .map_err(|error| anyhow::Error::new(error.without_url()).context("fetch JWKS"))?
         .error_for_status()
         .map_err(|error| {
             let status = error
                 .status()
                 .map(|s| s.as_u16().to_string())
                 .unwrap_or_else(|| "unknown".into());
-            anyhow::anyhow!("JWKS endpoint returned status {status}")
+            anyhow::Error::new(error.without_url()).context(format!("JWKS endpoint returned status {status}"))
         })?;
     // Fast reject: if Content-Length is present and already exceeds the
     // cap, refuse without allocating anything for the body.
@@ -739,7 +829,8 @@ async fn refresh_jwks(client: &reqwest::Client, url: &str, validator: &IdentityV
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| anyhow::anyhow!("read JWKS chunk: {}", error.without_url()))?;
+        let chunk =
+            chunk.map_err(|error| anyhow::Error::new(error.without_url()).context("read JWKS chunk"))?;
         let next = body
             .len()
             .checked_add(chunk.len())
@@ -1085,14 +1176,19 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
             // hard_link → AlreadyExists → Ok(false) and the caller
             // reads back the seed — self-corrects, but the noisy
             // failure is now avoided at source.
-            if let Err(error) = std::fs::remove_file(&temporary) {
-                tracing::warn!(
-                    path = %av_core::fsutil::basename(&temporary),
-                    %error,
-                    "signing seed installed, but removing tmp file failed; guard drop will retry"
-                );
+            match std::fs::remove_file(&temporary) {
+                // Only a successful unlink may disarm the guard — an
+                // unconditional disarm made "guard drop will retry" a
+                // lie and orphaned a mode-0600 copy of the seed.
+                Ok(()) => guard.disarm(),
+                Err(error) => {
+                    tracing::warn!(
+                        path = %av_core::fsutil::basename(&temporary),
+                        %error,
+                        "signing seed installed, but removing tmp file failed; guard drop will retry"
+                    );
+                }
             }
-            guard.disarm();
             if let Err(error) = av_core::fsutil::sync_directory(parent) {
                 tracing::warn!(
                     dir = %av_core::fsutil::basename(parent),
@@ -1189,9 +1285,68 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+
+    /// Fail-closed CLI contract: agentvisord used to ignore ALL arguments,
+    /// so `agentvisord --config /etc/prod.toml` silently booted from the
+    /// env/search-path config instead, and `--help` started a server.
+    #[test]
+    fn cli_args_are_parsed_fail_closed() {
+        let parse = |args: &[&str]| parse_cli_args(args.iter().map(ToString::to_string));
+        assert!(matches!(parse(&[]), Ok(CliAction::Run(None))));
+        match parse(&["--config", "/tmp/h.toml"]) {
+            Ok(CliAction::Run(Some(path))) => assert_eq!(path, PathBuf::from("/tmp/h.toml")),
+            other => panic!("expected Run(Some(..)), got {:?}", other.is_ok()),
+        }
+        match parse(&["--config=/tmp/h.toml"]) {
+            Ok(CliAction::Run(Some(path))) => assert_eq!(path, PathBuf::from("/tmp/h.toml")),
+            other => panic!("expected Run(Some(..)), got {:?}", other.is_ok()),
+        }
+        assert!(matches!(parse(&["--help"]), Ok(CliAction::Help)));
+        assert!(matches!(parse(&["-h"]), Ok(CliAction::Help)));
+        assert!(matches!(parse(&["--version"]), Ok(CliAction::Version)));
+        assert!(matches!(parse(&["-V"]), Ok(CliAction::Version)));
+        // Everything unrecognized refuses startup.
+        assert!(
+            parse(&["--confg", "x"]).is_err(),
+            "typos must not boot the server"
+        );
+        assert!(parse(&["start"]).is_err());
+        assert!(parse(&["--config"]).is_err(), "missing value must error");
+        assert!(parse(&["--config="]).is_err(), "empty value must error");
+        assert!(
+            parse(&["--config", "a", "--config", "b"]).is_err(),
+            "duplicate --config must error"
+        );
+    }
+
+    /// An explicit --config path that does not exist must be a hard error,
+    /// never a silent fallback to $AV_CONFIG / search paths / defaults.
+    #[test]
+    fn explicit_config_path_must_exist() {
+        let error = av_harness::config::load_config_with_override(Some(PathBuf::from(
+            "/nonexistent/agentvisor-smoke.toml",
+        )))
+        .unwrap_err();
+        assert!(error.contains("--config points to"), "got: {error}");
+    }
+
+    /// An explicit --config path takes precedence and actually loads.
+    #[test]
+    fn explicit_config_path_is_loaded() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("harness.toml");
+        std::fs::write(
+            &path,
+            "config_version = 1\nupstream_url = \"http://127.0.0.1:1\"\nlisten = \"127.0.0.1:0\"\n",
+        )
+        .unwrap();
+        let (config, source) = av_harness::config::load_config_with_override(Some(path.clone())).unwrap();
+        assert_eq!(config.upstream_url, "http://127.0.0.1:1");
+        assert!(format!("{source}").contains("harness.toml"), "{source}");
+    }
 
     #[test]
     fn signing_seed_is_persisted_and_reused() {
@@ -1330,6 +1485,51 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// Regression: `identity_hmac_secret_file = ""` means "unset" for the
+    /// `has_hmac` gate, but the HMAC load branch used to match the bare
+    /// `Some("")` and die at boot trying to stat `""` — even when a fully
+    /// valid JWKS URL was configured. The empty string must be treated as
+    /// unset everywhere, mirroring the `identity_jwks_url = ""` posture.
+    #[tokio::test]
+    async fn empty_hmac_secret_path_is_unset_alongside_valid_jwks() {
+        use axum::routing::get;
+        use base64::Engine as _;
+        let key = Ed25519Signer::generate();
+        let jwks = serde_json::json!({
+            "keys": [{
+                "kid": key.key_id(),
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "alg": "EdDSA",
+                "x": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.public_key_bytes()),
+            }]
+        })
+        .to_string();
+        let router = axum::Router::new().route(
+            "/jwks",
+            get(move || {
+                let body = jwks.clone();
+                async move { ([(axum::http::header::CONTENT_TYPE, "application/json")], body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let mut config = HarnessConfig::for_tests("http://upstream", "/tmp", "/tmp");
+        config.identity_jwks_url = Some(format!("http://{addr}/jwks"));
+        config.identity_hmac_secret_file = Some(String::new());
+        let (validator, refresh) = build_identity(&config, Arc::new(av_core::metrics::Registry::new()))
+            .await
+            .expect("empty HMAC path must be treated as unset, not stat'ed");
+        assert!(validator.is_some(), "JWKS-only identity must be enabled");
+        if let Some(handle) = refresh {
+            handle.abort();
+        }
+        server.abort();
     }
 
     /// Vicious bug regression: `std::fs::metadata` follows symbolic links,
@@ -1488,6 +1688,9 @@ mod tests {
             !text.contains(&addr.to_string()),
             "send-failure error must not contain host:port; got: {text}"
         );
+        // The reqwest error is preserved as the anyhow source, so the
+        // classifier's downcast labels the failure instead of "other".
+        assert_eq!(classify_jwks_error(&err), "connect");
     }
 
     #[tokio::test]
@@ -1522,6 +1725,41 @@ mod tests {
         assert!(
             text.contains("500"),
             "non-2xx error should carry the numeric status for triage; got: {text}"
+        );
+        // The status-carrying reqwest error survives as the anyhow
+        // source, so the classifier labels it "status" (not "other").
+        assert_eq!(classify_jwks_error(&err), "status");
+        server.abort();
+    }
+
+    /// A peer that accepts the connection but never responds must
+    /// classify as "timeout" — the downcast only works because
+    /// `refresh_jwks` keeps the reqwest error as the anyhow source.
+    #[tokio::test]
+    async fn refresh_jwks_timeout_is_classified() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept and hold connections open without sending any bytes.
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                if let Ok((socket, _)) = listener.accept().await {
+                    held.push(socket);
+                }
+            }
+        });
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let validator = av_identity::IdentityValidator::new("test-aud");
+        let url = format!("http://{addr}/jwks");
+        let err = refresh_jwks(&client, &url, &validator).await.unwrap_err();
+        assert_eq!(classify_jwks_error(&err), "timeout");
+        let text = format!("{err:#}");
+        assert!(
+            !text.contains("://") && !text.contains(&addr.to_string()),
+            "timeout error must be URL-free; got: {text}"
         );
         server.abort();
     }

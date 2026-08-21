@@ -1,6 +1,7 @@
 //! Token validation and delegation-chain verification.
 
 use crate::claims::{NhiClaims, MAX_TTL_SECS};
+use base64::Engine as _;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
@@ -164,6 +165,12 @@ impl IdentityValidator {
     /// call, but nothing in the API constrained late/admin use.
     pub fn add_key(&self, kid: impl Into<String>, key: KeyMaterial) -> Result<(), IdentityError> {
         let kid = kid.into();
+        // Lock order matches `add_jwks` (keys before jwks_kids) and the
+        // keys lock is held across the check AND the insert: releasing
+        // between them let a concurrent `add_jwks` install kid X in the
+        // gap, after which this insert silently shadowed the JWKS entry —
+        // exactly the ordering hazard this guard exists to refuse.
+        let mut loaded = self.keys.write();
         let prior = self.jwks_kids.read();
         if prior.contains(&kid) {
             return Err(IdentityError::Jwks(format!(
@@ -171,7 +178,7 @@ impl IdentityValidator {
             )));
         }
         drop(prior);
-        self.keys.write().insert(kid, key);
+        loaded.insert(kid, key);
         Ok(())
     }
 
@@ -266,6 +273,24 @@ impl IdentityValidator {
                 .and_then(serde_json::Value::as_str)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| IdentityError::Jwks(format!("key {kid:?} missing x")))?;
+            // Round-52 F2: shape-check the key at load time. Without
+            // this, a malformed base64url `x` (e.g., "!!!") or a
+            // wrong-length pubkey installs successfully, then every
+            // JWT with that kid fails at verify time with a confusing
+            // "bad JWK for kid" error. Rejecting during `add_jwks`
+            // surfaces operator config errors at boot/JWKS refresh
+            // instead of silently poisoning every downstream request.
+            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(x)
+                .map_err(|error| {
+                    IdentityError::Jwks(format!("key {kid:?} has malformed base64url `x`: {error}"))
+                })?;
+            if decoded.len() != 32 {
+                return Err(IdentityError::Jwks(format!(
+                    "key {kid:?} `x` decodes to {} bytes; Ed25519 public keys must be exactly 32",
+                    decoded.len()
+                )));
+            }
             parsed.push((kid.to_owned(), KeyMaterial::Ed25519Jwk(x.to_owned())));
             // Round-16 F9: the outer `keys.len() > MAX_JWKS_KEYS`
             // guard at the top of the function already bounds
@@ -338,11 +363,22 @@ impl IdentityValidator {
                 return Err(IdentityError::ChainTooDeep(self.max_chain_depth));
             }
             let parent = self.validate_single(&pt)?;
-            // Scope inheritance: child ⊆ parent.
+            // Scope inheritance: child ⊆ parent, with the SAME wildcard
+            // semantics the harness's runtime authorization uses
+            // (`av-harness::pipeline::scope_allows`). Round-52 F1:
+            // exact-string equality here rejected legitimately-delegated
+            // narrower scopes when the parent held a wildcard — e.g.,
+            // parent `["tool:*"]`, child `["tool:db_write"]` was refused
+            // as `ScopeEscalation("tool:db_write")` even though the
+            // runtime gate would authorize it, so the delegation
+            // machinery was strictly stricter than the authorization
+            // machinery. That asymmetry made wildcard-parent tokens
+            // effectively unusable for narrowing delegation, the
+            // canonical use case for scope subsetting.
             if let Some(escalated) = child
                 .scopes
                 .iter()
-                .find(|s| !parent.scopes.iter().any(|p| p == *s))
+                .find(|scope| !scope_covered_by(scope, &parent.scopes))
             {
                 return Err(IdentityError::ScopeEscalation {
                     scope: escalated.clone(),
@@ -475,4 +511,22 @@ impl IdentityValidator {
         }
         Ok(claims)
     }
+}
+
+/// Return true if `scope` is authorized by any of the `parent_scopes`,
+/// using the SAME wildcard semantics
+/// (`av-harness::pipeline::scope_allows`) applied at runtime
+/// authorization. Duplicating (rather than re-exporting) the check
+/// keeps `av-identity` free of an `av-harness` dependency; if these
+/// two ever diverge, the delegation gate becomes strictly stricter or
+/// looser than the runtime gate — Round-52 F1 documents the class of
+/// bug that produced.
+fn scope_covered_by(scope: &str, parent_scopes: &[String]) -> bool {
+    parent_scopes.iter().any(|parent| {
+        parent == "*"
+            || parent == scope
+            || parent
+                .strip_suffix(":*")
+                .is_some_and(|prefix| scope.starts_with(&format!("{prefix}:")))
+    })
 }

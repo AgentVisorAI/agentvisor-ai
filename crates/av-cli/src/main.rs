@@ -7,7 +7,6 @@ use av_bridge::{BridgeManifest, EmbeddedBroker, EventBus};
 use av_receipts::{Ed25519Signer, Keyring, Receipt, Signer};
 use clap::{Parser, Subcommand, ValueEnum};
 use futures::{stream, StreamExt};
-use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -405,13 +404,19 @@ fn receipt_verify(path: &Path, public_key_hex: &str) -> Result<()> {
 
 fn atif_validate(path: &Path, mode: ValidationMode) -> Result<()> {
     let bytes = read_capped(path, MAX_ATIF_BYTES, "trajectory")?;
-    let value: Value =
-        serde_json::from_slice(&bytes).with_context(|| format!("parse JSON {}", path.display()))?;
     let mode = match mode {
         ValidationMode::Strict => av_atif::Mode::Strict,
         ValidationMode::Compat => av_atif::Mode::Compat,
     };
-    let issues = av_atif::validate_value(&value, mode);
+    // Round-23 F2: `validate_bytes` refuses duplicate keys before
+    // parsing (parallel to `Receipt::from_json_slice`'s round-16
+    // strict scanner) and runs `validate_value` on the untyped
+    // form, which exercises unknown-field checks that the typed
+    // `Trajectory` (no `deny_unknown_fields`) silently drops.
+    let issues = match av_atif::validate_bytes(&bytes, mode) {
+        Ok(issues) => issues,
+        Err(reason) => anyhow::bail!("parse {}: {reason}", path.display()),
+    };
     if !issues.is_empty() {
         // Round-20 F2/F8 + round-21 F5: the reconciler already
         // caps its render at first 16 + total; the CLI mirrors
@@ -454,7 +459,17 @@ fn atif_validate(path: &Path, mode: ValidationMode) -> Result<()> {
 fn manifest_validate(path: &Path) -> Result<()> {
     let yaml = read_capped_str(path, MAX_CONFIG_BYTES, "manifest")?;
     let manifest = BridgeManifest::from_yaml(&yaml).map_err(anyhow::Error::new)?;
-    println!("valid {} topics={}", manifest.name, manifest.topics.len());
+    // Round-42 F4: `manifest.name` is operator-supplied text with no
+    // control-byte restriction (see av-bridge/src/manifest.rs::validate,
+    // which only refuses YAML anchor markers). A crafted manifest with
+    // an ANSI CSI sequence in `name:` would reach the operator terminal
+    // unfiltered — same CVE-2003-0063 class as the receipt/atif prints
+    // fixed in round-28 F3.
+    println!(
+        "valid {} topics={}",
+        sanitize_for_terminal(&manifest.name),
+        manifest.topics.len()
+    );
     Ok(())
 }
 
@@ -465,7 +480,7 @@ fn bridge_provision(manifest_path: &Path, data_dir: &Path) -> Result<()> {
     EmbeddedBroker::provision(data_dir, &manifest).context("provision Bridge")?;
     println!(
         "provisioned {} topics={} elapsed_ms={}",
-        manifest.name,
+        sanitize_for_terminal(&manifest.name),
         manifest.topics.len(),
         started.elapsed().as_millis()
     );
@@ -495,7 +510,7 @@ fn event_tail(data_dir: &Path, topic: &str, partition: u32, offset: u64, max: us
 }
 
 async fn session_promote(base_url: &str, id: &str, token_file: Option<&Path>) -> Result<()> {
-    let url = format!("{}/v1/sessions/{}/promote", base_url.trim_end_matches('/'), id);
+    let url = promote_url(base_url, id)?;
     let token = bearer_token(token_file)?;
     // Every other CLI probe bounds its wait (see `doctor` and `probe_endpoint`
     // at 3 s); without an explicit timeout, a hung harness leaves this call
@@ -530,6 +545,22 @@ async fn session_promote(base_url: &str, id: &str, token_file: Option<&Path>) ->
     // if a proxy adulterates the response. Sanitise to be safe.
     println!("{}", sanitize_for_terminal(&body));
     Ok(())
+}
+
+/// Build the promotion URL with proper path-segment encoding. Session
+/// ids accept any printable ASCII (see `SessionId::parse`), including
+/// `/`, `?` and `#`; raw string interpolation let such an id split the
+/// path or start a query string, sending the promotion to the wrong
+/// route. The harness router percent-decodes `{id}` captures, so
+/// encoding here round-trips exactly.
+fn promote_url(base_url: &str, id: &str) -> Result<reqwest::Url> {
+    let mut url =
+        reqwest::Url::parse(base_url).with_context(|| format!("parse harness base URL {base_url:?}"))?;
+    url.path_segments_mut()
+        .map_err(|()| anyhow::anyhow!("harness base URL {base_url:?} cannot carry a path"))?
+        .pop_if_empty()
+        .extend(["v1", "sessions", id, "promote"]);
+    Ok(url)
 }
 
 /// Round-28 F4: capped, streaming replacement for
@@ -763,6 +794,24 @@ mod tests {
         ] {
             Cli::try_parse_from(args).unwrap();
         }
+    }
+
+    /// Regression: session ids accept any printable ASCII, so a raw
+    /// `format!` URL let ids containing `/`, `?` or `#` split the path
+    /// or start a query/fragment — promoting the wrong route entirely.
+    /// The builder must percent-encode the id as one path segment.
+    #[test]
+    fn promote_url_percent_encodes_reserved_session_id_characters() {
+        let url = promote_url("http://localhost:8080", "sess?x/y#z").unwrap();
+        assert_eq!(url.path(), "/v1/sessions/sess%3Fx%2Fy%23z/promote");
+        assert_eq!(url.query(), None, "id must not leak into the query");
+        assert_eq!(url.fragment(), None, "id must not leak into the fragment");
+        // Trailing slash on the base must not double up.
+        let url = promote_url("http://localhost:8080/", "plain-id").unwrap();
+        assert_eq!(url.path(), "/v1/sessions/plain-id/promote");
+        // A base URL carrying a path prefix keeps it.
+        let url = promote_url("http://localhost:8080/proxy", "plain-id").unwrap();
+        assert_eq!(url.path(), "/proxy/v1/sessions/plain-id/promote");
     }
 
     #[test]

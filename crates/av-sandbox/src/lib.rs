@@ -23,7 +23,7 @@ pub mod rpc;
 pub mod sandbox;
 
 pub use policy::{NativePolicy, PolicyDecision, PolicyEngine};
-pub use rpc::{parse_tool_call, RpcError, ToolCallRequest};
+pub use rpc::{parse_tool_call, refuse_duplicate_json_keys, RpcError, ToolCallRequest};
 pub use sandbox::{Sandbox, SandboxConfig, ToolVerdict};
 
 #[cfg(feature = "wasm")]

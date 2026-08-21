@@ -55,6 +55,102 @@ pub fn validate_trajectory(t: &crate::model::Trajectory, mode: Mode) -> Vec<Vali
     }
 }
 
+/// Round-23 F2 (av-atif ingest): validate an ATIF trajectory from
+/// its RAW BYTES. This is the correct entry point for every path
+/// that receives operator/attacker-supplied ATIF content (CLI
+/// `avctl atif-validate`, reconciler recovery + promotion). Unlike
+/// `serde_json::from_slice::<Trajectory>()` + `validate_trajectory`,
+/// the bytes path:
+///
+///   1. Refuses duplicate JSON keys anywhere in the payload
+///      (parallel to `av_receipts::Receipt::from_json_slice`'s
+///      strict pre-scan added in round-16 F5), so the auditor cannot
+///      be shown a document whose "last wins" reading differs from
+///      the "first wins" reading.
+///   2. Runs `validate_value` on the parsed `serde_json::Value` — the
+///      untyped path exercises `check_unknown_fields`, which the
+///      typed `Trajectory` (no `deny_unknown_fields`) silently drops.
+///
+/// Returns `Err(reason)` on duplicate-key or parse failure; returns
+/// `Ok(issues)` on successful parse (issues may be empty).
+pub fn validate_bytes(bytes: &[u8], mode: Mode) -> Result<Vec<ValidationIssue>, String> {
+    refuse_duplicate_json_keys(bytes)?;
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| format!("parse JSON: {error}"))?;
+    Ok(validate_value(&value, mode))
+}
+
+/// Refuse any JSON object with duplicate keys anywhere in the payload.
+/// Mirrors the internal check in `av-receipts::Receipt::from_json_slice`
+/// and `av-sandbox::refuse_duplicate_json_keys`; exposed here to give
+/// ATIF ingest a single strict-parse primitive without cross-crate
+/// coupling.
+fn refuse_duplicate_json_keys(raw: &[u8]) -> Result<(), String> {
+    use serde::de::{Deserializer as _, MapAccess, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct NoDupKeys;
+    impl<'de> Visitor<'de> for NoDupKeys {
+        type Value = ();
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("any JSON value without duplicate object keys")
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_str<E>(self, _: &str) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_string<E>(self, _: String) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_none<E>(self) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_unit<E>(self) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_some<D: serde::de::Deserializer<'de>>(self, deser: D) -> Result<(), D::Error> {
+            deser.deserialize_any(NoDupKeys)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+            while seq.next_element::<NoDupWrap>()?.is_some() {}
+            Ok(())
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if !seen.insert(key.clone()) {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate object key `{}` in ATIF",
+                        key.escape_debug()
+                    )));
+                }
+                let _: NoDupWrap = map.next_value()?;
+            }
+            Ok(())
+        }
+    }
+    struct NoDupWrap;
+    impl<'de> serde::Deserialize<'de> for NoDupWrap {
+        fn deserialize<D: serde::de::Deserializer<'de>>(deser: D) -> Result<Self, D::Error> {
+            deser.deserialize_any(NoDupKeys)?;
+            Ok(NoDupWrap)
+        }
+    }
+    let mut de = serde_json::Deserializer::from_slice(raw);
+    de.deserialize_any(NoDupKeys).map_err(|error| error.to_string())
+}
+
 macro_rules! issue {
     ($issues:expr, $path:expr, $($msg:tt)*) => {
         // Round-20: cap issue collection so a pathological
@@ -317,8 +413,20 @@ fn validate_trajectory_obj(
             );
         }
     }
+    // Optional string fields: `and_then(Value::as_str)` elsewhere treats
+    // a wrong-typed value like an absent one, so e.g. `"notes": 42`
+    // passed Strict validation with zero issues yet fails typed
+    // deserialization. Flag the type mismatch explicitly (null stays
+    // legal — serde maps it to None).
+    for f in ["session_id", "trajectory_id", "notes", "continued_trajectory_ref"] {
+        if obj.get(f).is_some_and(|v| !v.is_string() && !v.is_null()) {
+            issue!(issues, format!("{path}.{f}"), "must be a string");
+        }
+    }
     // session_id optionality was relaxed in v1.7; older files must carry it.
-    if top_level && ver < (1, 7) && obj.get("session_id").and_then(Value::as_str).is_none() {
+    // A present-but-wrong-typed value is a type error (flagged above), not
+    // a missing field.
+    if top_level && ver < (1, 7) && obj.get("session_id").is_none_or(Value::is_null) {
         issue!(
             issues,
             format!("{path}.session_id"),
@@ -337,6 +445,20 @@ fn validate_trajectory_obj(
                     None => issue!(issues, format!("{path}.agent.{req}"), "required field is missing"),
                 }
             }
+            // Round-16 F2: optional-string type check parity with the
+            // trajectory-root optional strings above. `Trajectory` types
+            // `model_name` as `Option<String>`, so a wrong-typed value
+            // (`model_name: 123`) would fail typed deserialization but
+            // used to pass Strict — the schema at
+            // `schemas/atif-v1.7.schema.json` also declares it as
+            // `string`. Flag the type mismatch so the strict validator
+            // does not silently accept documents the schema refuses.
+            if agent
+                .get("model_name")
+                .is_some_and(|v| !v.is_string() && !v.is_null())
+            {
+                issue!(issues, format!("{path}.agent.model_name"), "must be a string");
+            }
             if agent.contains_key("tool_definitions") && ver < (1, 5) {
                 issue!(
                     issues,
@@ -351,6 +473,29 @@ fn validate_trajectory_obj(
         None => issue!(issues, format!("{path}.agent"), "required field is missing"),
     }
 
+    // Round-24 F1 (av-atif validate): pre-collect embedded
+    // `subagent_trajectories[*].trajectory_id` so we can cross-check
+    // step-level `subagent_trajectory_ref` entries against them.
+    // Historically the ref shape was only "must have trajectory_id
+    // or trajectory_path"; a producer could emit `trajectory_id:
+    // "does-not-exist"` and it would pass validation, giving
+    // unverifiable delegation provenance. Collect the id set here so
+    // `validate_step` (via observation.results processing) can flag
+    // dangling refs.
+    let embedded_trajectory_ids: std::collections::HashSet<String> =
+        match obj.get("subagent_trajectories").and_then(Value::as_array) {
+            Some(subs) => subs
+                .iter()
+                .filter_map(|sub| {
+                    sub.get("trajectory_id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_owned)
+                })
+                .collect(),
+            None => std::collections::HashSet::new(),
+        };
+
     // steps
     match obj.get("steps") {
         Some(Value::Array(steps)) => {
@@ -358,7 +503,15 @@ fn validate_trajectory_obj(
                 issue!(issues, format!("{path}.steps"), "must contain at least one step");
             }
             for (i, step) in steps.iter().enumerate() {
-                validate_step(step, &format!("{path}.steps.{i}"), i, ver, mode, issues);
+                validate_step(
+                    step,
+                    &format!("{path}.steps.{i}"),
+                    i,
+                    ver,
+                    mode,
+                    issues,
+                    &embedded_trajectory_ids,
+                );
             }
         }
         Some(_) => issue!(issues, format!("{path}.steps"), "must be an array"),
@@ -413,36 +566,46 @@ fn validate_trajectory_obj(
     }
 
     // subagent trajectories recurse with the same rules.
-    if let Some(Value::Array(subs)) = obj.get("subagent_trajectories") {
-        let mut trajectory_ids = std::collections::HashSet::new();
-        for (i, sub) in subs.iter().enumerate() {
-            let id = sub
-                .get("trajectory_id")
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty());
-            match id {
-                Some(id) if trajectory_ids.insert(id.to_owned()) => {}
-                Some(id) => issue!(
+    match obj.get("subagent_trajectories") {
+        Some(Value::Array(subs)) => {
+            let mut trajectory_ids = std::collections::HashSet::new();
+            for (i, sub) in subs.iter().enumerate() {
+                let id = sub
+                    .get("trajectory_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty());
+                match id {
+                    Some(id) if trajectory_ids.insert(id.to_owned()) => {}
+                    Some(id) => issue!(
+                        issues,
+                        format!("{path}.subagent_trajectories.{i}.trajectory_id"),
+                        "duplicate embedded trajectory_id {id:?}"
+                    ),
+                    None => issue!(
+                        issues,
+                        format!("{path}.subagent_trajectories.{i}.trajectory_id"),
+                        "required for embedded subagent trajectories"
+                    ),
+                }
+                validate_trajectory_obj(
+                    sub,
+                    &format!("{path}.subagent_trajectories.{i}"),
+                    mode,
                     issues,
-                    format!("{path}.subagent_trajectories.{i}.trajectory_id"),
-                    "duplicate embedded trajectory_id {id:?}"
-                ),
-                None => issue!(
-                    issues,
-                    format!("{path}.subagent_trajectories.{i}.trajectory_id"),
-                    "required for embedded subagent trajectories"
-                ),
+                    false,
+                    depth + 1,
+                    ancestors,
+                );
             }
-            validate_trajectory_obj(
-                sub,
-                &format!("{path}.subagent_trajectories.{i}"),
-                mode,
-                issues,
-                false,
-                depth + 1,
-                ancestors,
-            );
         }
+        // A non-array value previously slipped through (no else-arm) yet
+        // fails typed deserialization. Null stays legal (serde -> None).
+        Some(v) if !v.is_null() => issue!(
+            issues,
+            format!("{path}.subagent_trajectories"),
+            "must be an array"
+        ),
+        _ => {}
     }
 
     // Round-40 F3: remove this frame's id so sibling branches (a
@@ -460,6 +623,7 @@ fn validate_step(
     ver: (u32, u32),
     mode: Mode,
     issues: &mut Vec<ValidationIssue>,
+    embedded_trajectory_ids: &std::collections::HashSet<String>,
 ) {
     let Some(obj) = step.as_object() else {
         issue!(issues, path, "step must be an object");
@@ -531,6 +695,16 @@ fn validate_step(
         );
     }
 
+    // Round-16 F2: `Step.model_name` is `Option<String>` on the typed
+    // model; a wrong-typed value (`"model_name": 123`) fails typed
+    // deserialisation but used to pass Strict.
+    if obj
+        .get("model_name")
+        .is_some_and(|v| !v.is_string() && !v.is_null())
+    {
+        issue!(issues, format!("{path}.model_name"), "must be a string");
+    }
+
     // Agent-only fields.
     if let Some(src) = source {
         if src != "agent" {
@@ -562,6 +736,20 @@ fn validate_step(
             issues,
             format!("{path}.llm_call_count"),
             "field requires ATIF-v1.7+"
+        );
+    }
+    // Wrong-typed values must be flagged, not silently treated as absent:
+    // `and_then(Value::as_u64)` below maps `"llm_call_count": "1"` to None,
+    // which passed Strict validation while typed deserialization fails
+    // (same class as the optional-string fields at the trajectory root).
+    if obj
+        .get("llm_call_count")
+        .is_some_and(|v| !v.is_u64() && !v.is_null())
+    {
+        issue!(
+            issues,
+            format!("{path}.llm_call_count"),
+            "must be a non-negative integer"
         );
     }
     if source == Some("agent") && obj.get("llm_call_count").and_then(Value::as_u64) == Some(0) {
@@ -674,6 +862,19 @@ fn validate_step(
                                     );
                                 }
                             }
+                            // Wrong-typed refs must be flagged, not silently
+                            // treated as absent (`and_then(Value::as_array)`
+                            // maps an object/string here to None).
+                            if res
+                                .get("subagent_trajectory_ref")
+                                .is_some_and(|v| !v.is_array() && !v.is_null())
+                            {
+                                issue!(
+                                    issues,
+                                    format!("{rpath}.subagent_trajectory_ref"),
+                                    "must be an array"
+                                );
+                            }
                             if let Some(references) =
                                 res.get("subagent_trajectory_ref").and_then(Value::as_array)
                             {
@@ -708,6 +909,23 @@ fn validate_step(
                                         mode,
                                         issues,
                                     );
+                                    // Round-16 F2: each SubagentTrajectoryRef
+                                    // typed member is `Option<String>` in
+                                    // model.rs. Wrong-typed values would
+                                    // fail typed deserialisation but used
+                                    // to only surface as the misleading
+                                    // "must set trajectory_id or
+                                    // trajectory_path" — because the
+                                    // has_id/has_path check maps a bad
+                                    // type to None via `as_str`.
+                                    for field in ["trajectory_id", "session_id", "trajectory_path"] {
+                                        if reference
+                                            .get(field)
+                                            .is_some_and(|v| !v.is_string() && !v.is_null())
+                                        {
+                                            issue!(issues, format!("{ref_path}.{field}"), "must be a string");
+                                        }
+                                    }
                                     let has_id = reference
                                         .get("trajectory_id")
                                         .and_then(Value::as_str)
@@ -719,15 +937,51 @@ fn validate_step(
                                     if !has_id && !has_path {
                                         issue!(issues, ref_path, "must set trajectory_id or trajectory_path");
                                     }
+                                    // Round-24 F1 (av-atif validate):
+                                    // if `trajectory_id` names an
+                                    // embedded delegation, it MUST
+                                    // resolve. A dangling id is
+                                    // unverifiable delegation
+                                    // provenance — a producer could
+                                    // point downstream auditors at
+                                    // "sub-999" that never existed.
+                                    // `trajectory_path` remains
+                                    // uncheckable at strict-validate
+                                    // time (external ref) and is not
+                                    // subject to this rule.
+                                    if let Some(id) = reference
+                                        .get("trajectory_id")
+                                        .and_then(Value::as_str)
+                                        .filter(|v| !v.is_empty())
+                                    {
+                                        if !embedded_trajectory_ids.contains(id) {
+                                            issue!(
+                                                issues,
+                                                format!("{ref_path}.trajectory_id"),
+                                                "references trajectory_id {id:?} that is not present in \
+                                                 the outer trajectory's `subagent_trajectories` array"
+                                            );
+                                        }
+                                    }
                                 }
                             }
-                            if let Some(src_id) = res.get("source_call_id").and_then(Value::as_str) {
-                                if !call_ids.contains(src_id) {
-                                    issue!(
-                                        issues,
-                                        format!("{rpath}.source_call_id"),
-                                        "references unknown tool_call_id {src_id:?} (must match a tool call in the same step)"
-                                    );
+                            match res.get("source_call_id") {
+                                None | Some(Value::Null) => {}
+                                Some(Value::String(src_id)) => {
+                                    if !call_ids.contains(src_id.as_str()) {
+                                        issue!(
+                                            issues,
+                                            format!("{rpath}.source_call_id"),
+                                            "references unknown tool_call_id {src_id:?} (must match a tool call in the same step)"
+                                        );
+                                    }
+                                }
+                                // Wrong-typed ids must be flagged, not silently
+                                // skipped: `and_then(Value::as_str)` mapped
+                                // `"source_call_id": 123` to None, bypassing
+                                // the same-step linkage check entirely.
+                                Some(_) => {
+                                    issue!(issues, format!("{rpath}.source_call_id"), "must be a string")
                                 }
                             }
                         }
@@ -976,5 +1230,330 @@ mod tests {
         assert_eq!(parse_version("ATIF-v1.0"), Some((1, 0)));
         assert_eq!(parse_version("v1.7"), None);
         assert_eq!(parse_version("ATIF-v1"), None);
+    }
+
+    /// Wrong-typed optional fields must be flagged: `and_then(Value::as_str)`
+    /// used to skip them silently, so documents that fail typed
+    /// deserialization passed Strict validation with zero issues.
+    #[test]
+    fn wrong_typed_optional_fields_are_flagged() {
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": 123,
+            "trajectory_id": 42,
+            "notes": 42,
+            "continued_trajectory_ref": {},
+            "subagent_trajectories": "nope",
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{"step_id": 1, "source": "user", "message": "hi"}],
+        });
+        let issues = validate_value(&value, Mode::Strict);
+        for f in ["session_id", "trajectory_id", "notes", "continued_trajectory_ref"] {
+            assert!(
+                issues
+                    .iter()
+                    .any(|i| i.path == format!("trajectory.{f}") && i.message == "must be a string"),
+                "expected type issue for {f}: {issues:?}"
+            );
+        }
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == "trajectory.subagent_trajectories" && i.message == "must be an array"),
+            "expected array issue: {issues:?}"
+        );
+        // Validator and serde must agree: typed deserialization also rejects.
+        assert!(serde_json::from_value::<crate::model::Trajectory>(value).is_err());
+    }
+
+    /// Wrong-typed step-level optional fields must be flagged, not silently
+    /// treated as absent: `llm_call_count`, `source_call_id`, and
+    /// `subagent_trajectory_ref` all used `and_then(as_*)`, which mapped a
+    /// wrong-typed value to `None` and passed Strict validation while typed
+    /// deserialization fails.
+    #[test]
+    fn wrong_typed_step_fields_are_flagged() {
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": "s",
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{
+                "step_id": 1,
+                "source": "agent",
+                "message": "hi",
+                "llm_call_count": "1",
+                "metrics": {"prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0},
+                "observation": {"results": [{
+                    "source_call_id": 123,
+                    "subagent_trajectory_ref": {"trajectory_id": "x"},
+                }]},
+            }],
+        });
+        let issues = validate_value(&value, Mode::Strict);
+        let results_path = "trajectory.steps.0.observation.results.0";
+        for (path, message) in [
+            (
+                "trajectory.steps.0.llm_call_count",
+                "must be a non-negative integer",
+            ),
+            (&format!("{results_path}.source_call_id"), "must be a string"),
+            (
+                &format!("{results_path}.subagent_trajectory_ref"),
+                "must be an array",
+            ),
+        ] {
+            assert!(
+                issues.iter().any(|i| i.path == path && i.message == message),
+                "expected {message:?} at {path}: {issues:?}"
+            );
+        }
+        // Null still means absent for all three.
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": "s",
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{
+                "step_id": 1,
+                "source": "agent",
+                "message": "hi",
+                "llm_call_count": null,
+                "metrics": {"prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0},
+                "observation": {"results": [{
+                    "source_call_id": null,
+                    "subagent_trajectory_ref": null,
+                }]},
+            }],
+        });
+        let issues = validate_value(&value, Mode::Strict);
+        assert!(issues.is_empty(), "nulls must stay valid: {issues:?}");
+    }
+
+    /// Mutation-run hardening: the `llm_call_count == 0` consistency
+    /// rule (agent steps with zero LLM calls must not carry `metrics`
+    /// or `reasoning_content`) had no test — flipping its `==` to `!=`
+    /// survived. Pin both sides: 0 + metrics is flagged, nonzero +
+    /// metrics is not.
+    #[test]
+    fn zero_llm_call_count_forbids_metrics_and_reasoning() {
+        let step_with = |llm_calls: u64| {
+            serde_json::json!({
+                "schema_version": "ATIF-v1.7",
+                "session_id": "s",
+                "agent": {"name": "a", "version": "1"},
+                "steps": [{
+                    "step_id": 1,
+                    "source": "agent",
+                    "message": "hi",
+                    "llm_call_count": llm_calls,
+                    "reasoning_content": "thinking",
+                    "metrics": {"prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0},
+                }],
+            })
+        };
+        let issues = validate_value(&step_with(0), Mode::Strict);
+        for field in ["metrics", "reasoning_content"] {
+            assert!(
+                issues.iter().any(|i| {
+                    i.path == format!("trajectory.steps.0.{field}")
+                        && i.message.contains("llm_call_count is 0")
+                }),
+                "expected {field} flagged when llm_call_count is 0: {issues:?}"
+            );
+        }
+        let issues = validate_value(&step_with(1), Mode::Strict);
+        assert!(
+            !issues.iter().any(|i| i.message.contains("llm_call_count is 0")),
+            "nonzero llm_call_count must not trip the zero-call rule: {issues:?}"
+        );
+    }
+
+    /// Explicit nulls deserialize to `None` for optional fields, so the
+    /// type checks must not flag them.
+    #[test]
+    fn null_optional_fields_remain_valid() {
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": null,
+            "notes": null,
+            "continued_trajectory_ref": null,
+            "subagent_trajectories": null,
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{"step_id": 1, "source": "user", "message": "hi"}],
+        });
+        let issues = validate_value(&value, Mode::Strict);
+        assert!(issues.is_empty(), "nulls must stay valid: {issues:?}");
+        assert!(serde_json::from_value::<crate::model::Trajectory>(value).is_ok());
+    }
+
+    /// Round-23 F2: `validate_bytes` refuses duplicate JSON keys at
+    /// any nesting level. Serde-typed parse alone would silently keep
+    /// the last value, letting a hostile issuer sign under one
+    /// interpretation while an auditor's raw-bytes reader sees the
+    /// other.
+    #[test]
+    fn validate_bytes_rejects_duplicate_top_level_key() {
+        let bytes =
+            br#"{"schema_version":"ATIF-v9.9","schema_version":"ATIF-v1.7","agent":{"name":"a","version":"1"},"steps":[{"step_id":1,"source":"user","message":"hi"}]}"#;
+        let outcome = validate_bytes(bytes, Mode::Strict);
+        assert!(
+            matches!(&outcome, Err(reason) if reason.contains("schema_version") && reason.contains("duplicate")),
+            "expected duplicate-key rejection at bytes level, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn validate_bytes_rejects_duplicate_key_inside_step() {
+        let bytes = br#"{"schema_version":"ATIF-v1.7","agent":{"name":"a","version":"1"},"steps":[{"step_id":1,"source":"agent","message":"x","message":"y"}]}"#;
+        let outcome = validate_bytes(bytes, Mode::Strict);
+        assert!(
+            matches!(&outcome, Err(reason) if reason.contains("message") && reason.contains("duplicate")),
+            "expected duplicate-key rejection inside step, got {outcome:?}"
+        );
+    }
+
+    /// Round-23 F2 partner: even when the bytes are legit, the
+    /// `validate_bytes` path also runs `validate_value` on the
+    /// untyped form, exercising `check_unknown_fields` — a rejection
+    /// class the typed `validate_trajectory` path silently drops.
+    #[test]
+    fn validate_bytes_flags_unknown_fields_that_typed_path_would_drop() {
+        let bytes = br#"{"schema_version":"ATIF-v1.7","agent":{"name":"a","version":"1"},"steps":[{"step_id":1,"source":"user","message":"hi"}],"future_experimental_field":"planted"}"#;
+        let issues = validate_bytes(bytes, Mode::Strict).expect("parses ok");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.message.contains("unknown field")
+                    || i.message.contains("future_experimental_field")),
+            "unknown field must be flagged in Strict mode: {issues:?}"
+        );
+    }
+
+    /// Round-24 F1: a `subagent_trajectory_ref` with a `trajectory_id`
+    /// must resolve against the outer trajectory's embedded
+    /// `subagent_trajectories` array. A dangling id gives
+    /// unverifiable delegation provenance — the auditor is pointed at
+    /// a subagent trajectory that doesn't exist in the document.
+    #[test]
+    fn dangling_subagent_trajectory_ref_is_flagged() {
+        // Reference an embedded id that DOES NOT appear in
+        // subagent_trajectories.
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": "s",
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{
+                "step_id": 1,
+                "source": "agent",
+                "message": "delegating",
+                "tool_calls": [{"tool_call_id": "c1", "function_name": "delegate", "arguments": {}}],
+                "observation": {"results": [{
+                    "source_call_id": "c1",
+                    "subagent_trajectory_ref": [{"trajectory_id": "sub-does-not-exist"}]
+                }]},
+            }],
+            "subagent_trajectories": [{
+                "trajectory_id": "sub-actual",
+                "agent": {"name": "sub-a", "version": "1"},
+                "steps": [{"step_id": 1, "source": "agent", "message": "sub"}]
+            }],
+        });
+        let issues = validate_value(&value, Mode::Strict);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.message.contains("sub-does-not-exist")
+                    && i.message.contains("subagent_trajectories")),
+            "dangling trajectory_id must be flagged, got {issues:?}"
+        );
+
+        // A resolvable ref passes.
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": "s",
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{
+                "step_id": 1,
+                "source": "agent",
+                "message": "delegating",
+                "tool_calls": [{"tool_call_id": "c1", "function_name": "delegate", "arguments": {}}],
+                "observation": {"results": [{
+                    "source_call_id": "c1",
+                    "subagent_trajectory_ref": [{"trajectory_id": "sub-actual"}]
+                }]},
+            }],
+            "subagent_trajectories": [{
+                "trajectory_id": "sub-actual",
+                "agent": {"name": "sub-a", "version": "1"},
+                "steps": [{"step_id": 1, "source": "agent", "message": "sub"}]
+            }],
+        });
+        let issues = validate_value(&value, Mode::Strict);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.message.contains("not present in the outer")),
+            "resolvable subagent_trajectory_ref must not be flagged: {issues:?}"
+        );
+
+        // trajectory_path (external ref) is not subject to the check.
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": "s",
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{
+                "step_id": 1,
+                "source": "agent",
+                "message": "delegating",
+                "tool_calls": [{"tool_call_id": "c1", "function_name": "delegate", "arguments": {}}],
+                "observation": {"results": [{
+                    "source_call_id": "c1",
+                    "subagent_trajectory_ref": [{"trajectory_path": "external://s3/bucket/traj.json"}]
+                }]},
+            }],
+        });
+        let issues = validate_value(&value, Mode::Strict);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.message.contains("not present in the outer")),
+            "external trajectory_path refs must not be flagged as dangling: {issues:?}"
+        );
+    }
+
+    /// Pre-1.7 files require `session_id`; a present-but-wrong-typed value
+    /// is a type error, not the misleading "required field is missing".
+    #[test]
+    fn pre_v17_session_id_distinguishes_missing_from_wrong_type() {
+        let base = |session_id: Option<Value>| {
+            let mut map = serde_json::Map::new();
+            map.insert("schema_version".into(), Value::String("ATIF-v1.0".into()));
+            if let Some(v) = session_id {
+                map.insert("session_id".into(), v);
+            }
+            map.insert("agent".into(), serde_json::json!({"name": "a", "version": "1"}));
+            map.insert(
+                "steps".into(),
+                serde_json::json!([{"step_id": 1, "source": "user", "message": "hi"}]),
+            );
+            Value::Object(map)
+        };
+        let issues = validate_value(&base(None), Mode::Strict);
+        assert!(
+            issues.iter().any(|i| i.path == "trajectory.session_id"
+                && i.message.contains("required field is missing")),
+            "missing session_id must be reported: {issues:?}"
+        );
+        let issues = validate_value(&base(Some(serde_json::json!(123))), Mode::Strict);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == "trajectory.session_id" && i.message == "must be a string"),
+            "wrong-typed session_id must be a type error: {issues:?}"
+        );
+        assert!(
+            !issues.iter().any(|i| i.path == "trajectory.session_id"
+                && i.message.contains("required field is missing")),
+            "wrong type must not be reported as missing: {issues:?}"
+        );
     }
 }

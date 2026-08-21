@@ -28,6 +28,13 @@ const state = {
   // click or drawer close does not leak an old response into a newly
   // opened session.
   drawerAbort: null,
+  // Fingerprint of the last-rendered session list. `renderSessions` wipes
+  // and rebuilds the whole <tbody>; doing that on every poll tick even
+  // when nothing changed destroyed rows out from under an in-progress
+  // click (the Details button vanished mid-press) and reset text
+  // selection. Skip the rebuild when the data is identical — except the
+  // relative "age" captions, which are refreshed in place.
+  lastSessionsKey: '',
 };
 
 // ---- Utilities ------------------------------------------------------
@@ -80,9 +87,11 @@ function fmtAge(ms) {
   if (!ms) return '—';
   const seconds = Math.max(0, Math.round((Date.now() - ms) / 1000));
   if (seconds < 60) return `${seconds}s ago`;
-  if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`;
-  if (seconds < 86400) return `${Math.round(seconds / 3600)}h ago`;
-  return `${Math.round(seconds / 86400)}d ago`;
+  // Floor, not round: rounding lets values just under a boundary jump
+  // past the unit (3599s → "60m ago" instead of "59m ago").
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86400)}d ago`;
 }
 
 function fmtWhen(ms) {
@@ -179,12 +188,30 @@ function statusOf(s) {
 }
 
 function stopReasonCaption(s) {
+  // An open session has no final stop reason yet — the recorded id is
+  // just the running default, so showing it (e.g. "Stop" on a Live row)
+  // reads as a contradiction.
+  if (s.open) return '—';
   if (!s.stop_reason || s.stop_reason === 'unknown') return '—';
   return s.stop_reason;
 }
 
 function renderSessions(rows) {
   const body = document.getElementById('session-body');
+  // Rebuild only when the rendered data actually changed. A rebuild on
+  // every poll tick destroys DOM nodes out from under an in-progress
+  // click (the row/Details button vanish mid-press) and drops text
+  // selection. `last_activity_ms` is part of the key, so any real change
+  // still re-renders; between changes only the relative age captions
+  // need refreshing, done in place below.
+  const key = JSON.stringify(rows);
+  if (key === state.lastSessionsKey) {
+    for (const span of body.querySelectorAll('.age[data-ms]')) {
+      span.textContent = fmtAge(Number(span.dataset.ms));
+    }
+    return;
+  }
+  state.lastSessionsKey = key;
   body.innerHTML = '';
   const empty = document.getElementById('empty-hint');
   if (!rows.length) {
@@ -238,7 +265,11 @@ function renderSessions(rows) {
       el(
         'td',
         null,
-        el('span', { class: 'age', title: fmtWhen(s.last_activity_ms) }, fmtAge(s.last_activity_ms)),
+        el(
+          'span',
+          { class: 'age', title: fmtWhen(s.last_activity_ms), 'data-ms': String(s.last_activity_ms) },
+          fmtAge(s.last_activity_ms),
+        ),
       ),
       el('td', { class: 'stop-reason' }, stopReasonCaption(s)),
       el(
@@ -414,13 +445,16 @@ function renderSessionDetail(detail) {
     pre.innerHTML = highlightJson(detail.receipt);
     body.appendChild(pre);
   } else {
-    body.appendChild(
-      el(
-        'p',
-        { class: 'muted' },
-        'No receipt yet — will appear once the session is closed.',
-      ),
-    );
+    // Accurate guidance per workflow/state: unsigned sessions only get a
+    // receipt via promotion, and a closed session without one won't grow
+    // one on its own — "will appear once the session is closed" was wrong
+    // (and misleading) for both of those cases.
+    const caption = s.closed
+      ? s.workflow === 'unsigned'
+        ? 'No receipt — promote this session to issue a retroactive receipt.'
+        : 'No receipt was issued for this session.'
+      : 'No receipt yet — one is issued when the session closes (signed) or is promoted (unsigned).';
+    body.appendChild(el('p', { class: 'muted' }, caption));
   }
 }
 
