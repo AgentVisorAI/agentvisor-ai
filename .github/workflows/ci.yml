@@ -106,6 +106,15 @@ jobs:
         run: |
           cargo check --workspace --no-default-features
           cargo check --workspace --all-features
+          # Round-6 (hunt5 portability F2): feature unification defeats
+          # the workspace-level --no-default-features check for
+          # av-sandbox — av-harness depends on it WITH default features
+          # (wasm), so the wasm-off arm was never compiled anywhere.
+          # Check the crate in isolation so a non-gated wasmtime
+          # reference cannot ship broken.
+          cargo check -p av-sandbox --no-default-features
+          # Single-feature arms that no other combination exercises.
+          cargo check -p av-bridge --no-default-features --features cold-store
       - name: Docs
         run: RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D warnings" cargo doc --workspace --all-features --no-deps
       - name: Schemas and examples

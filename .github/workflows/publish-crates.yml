@@ -61,12 +61,21 @@ jobs:
             exit 1
           fi
 
-      # Dry-run publish in strict topological order — every crate MUST
-      # `cargo package --list` cleanly and its verification build (which
-      # cargo runs by default) MUST succeed before any real upload. If
-      # a leaf fails here, later crates would fail on the actual publish
+      # Dry-run package in strict topological order — every crate MUST
+      # `cargo package` cleanly (manifest completeness, packaged file
+      # list, out-of-crate path detection) before any real upload. If a
+      # leaf fails here, later crates would fail on the actual publish
       # after upstream crates are already live (irreversible on
       # crates.io — you can only yank, not re-upload the same version).
+      #
+      # Round-6 (hunt2 ops F5): `--no-verify` is REQUIRED here. The
+      # verification build resolves `{ path, version }` dependencies
+      # from crates.io, and during a version bump the new sibling
+      # versions are not published yet — so every crate except av-core
+      # would fail dry-run verification on precisely the releases this
+      # gate exists to protect. The real `cargo publish` loop below
+      # still runs a full verification build per crate, at a point
+      # where its dependencies ARE live in the index.
       - name: Dry-run package (topological order)
         run: |
           set -euo pipefail
@@ -86,7 +95,7 @@ jobs:
           )
           for crate in "${crates[@]}"; do
             echo "::group::dry-run package $crate"
-            cargo package -p "$crate" --allow-dirty
+            cargo package -p "$crate" --allow-dirty --no-verify
             echo "::endgroup::"
           done
 

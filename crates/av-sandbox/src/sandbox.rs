@@ -113,14 +113,21 @@ impl Sandbox {
             Ok(r) => r,
             Err(e) => {
                 let (stage, reason) = match &e {
-                    RpcError::NotToolCall(_) => ("parse", format!("passthrough refused: {e}")),
+                    // Passthrough refusal parsed fine as JSON-RPC — a
+                    // deliberate policy choice, distinct HTTP class
+                    // (403) from true protocol failures (400).
+                    RpcError::NotToolCall(_) => ("passthrough", format!("passthrough refused: {e}")),
                     _ => ("parse", e.to_string()),
                 };
+                // Round-6 (hunt4 protocol F5): protocol-level failures
+                // get the reserved JSON-RPC codes (-32700/-32600/
+                // -32602), not the -32001 policy code — the request
+                // never reached an authorization decision.
                 return ToolVerdict::Blocked {
                     tool: "<unparsed>".into(),
                     stage,
-                    reason: reason.clone(),
-                    response: authorization_error(None, &reason),
+                    reason,
+                    response: crate::rpc::protocol_error(None, &e),
                     elapsed_us: elapsed(started),
                 };
             }

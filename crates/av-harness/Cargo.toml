@@ -22,8 +22,14 @@ nats = ["av-bridge/nats"]
 kafka = ["av-bridge/kafka"]
 onnx = ["av-loopdetect/onnx"]
 qdrant = ["av-loopdetect/qdrant"]
+# Round-6 (hunt5 portability F3): passthrough for the S3 cold tier —
+# without it no shipped artifact (docker builds `--features full`)
+# could reach an `s3://` cold_uri at all; the boot error then named an
+# object_store-internal feature instead of a cargo feature an operator
+# could act on.
+cold-store-aws = ["av-bridge/cold-store-aws"]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
-full = ["redis", "nats", "kafka", "onnx", "qdrant", "otel"]
+full = ["redis", "nats", "kafka", "onnx", "qdrant", "cold-store-aws", "otel"]
 
 [dependencies]
 av-core = { workspace = true }

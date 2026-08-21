@@ -355,15 +355,24 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
             match relay.next().await {
                 Some(Ok(bytes)) => buffered.extend_from_slice(&bytes),
                 Some(Err(error)) => {
-                    let refusal_status = if error.kind() == std::io::ErrorKind::QuotaExceeded {
-                        StatusCode::TOO_MANY_REQUESTS
+                    // Round-6 (hunt4 protocol F3): route through
+                    // `pipeline_error` so the status class matches the
+                    // admission-time decision for the SAME condition
+                    // and the advisory headers are attached. The prior
+                    // hand-built 429 contradicted the deliberate
+                    // 403-not-429 choice for budget caps (a permanent
+                    // per-session refusal SDKs must not auto-retry)
+                    // and omitted the Retry-After that this file's own
+                    // policy mandates on every 502.
+                    let mapped = if error.kind() == std::io::ErrorKind::QuotaExceeded {
+                        crate::pipeline::PipelineError::Blocked(error.to_string())
                     } else {
-                        StatusCode::BAD_GATEWAY
+                        crate::pipeline::PipelineError::Upstream(error.to_string())
                     };
                     // Dropping the relay here runs its finalization Drop
                     // (evidence capture + session seal), same as when a
                     // client observed the severed stream.
-                    return (refusal_status, Json(json!({"error": error.to_string()}))).into_response();
+                    return pipeline_error(mapped);
                 }
                 None => break,
             }
@@ -936,19 +945,42 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                     }
                 }
             } else {
+                // Round-6 (hunt4 protocol F4): verdict-only mode must
+                // return a conformant JSON-RPC response — the Blocked
+                // arm already does (id echo + error object), so a
+                // client could correlate failures but not successes.
+                // Echo the request id (string/number/null per spec).
+                let request_id = serde_json::from_slice::<Value>(&body)
+                    .ok()
+                    .and_then(|request| request.get("id").cloned())
+                    .unwrap_or(Value::Null);
                 (
                     StatusCode::OK,
                     Json(json!({
-                        "allowed": true,
-                        "tool": tool,
-                        "budget_remaining": budget_remaining,
-                        "decision_us": elapsed_us,
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {
+                            "allowed": true,
+                            "tool": tool,
+                            "budget_remaining": budget_remaining,
+                            "decision_us": elapsed_us,
+                        },
                     })),
                 )
                     .into_response()
             }
         }
-        Ok(ToolVerdict::Blocked { response, .. }) => (StatusCode::FORBIDDEN, Json(response)).into_response(),
+        Ok(ToolVerdict::Blocked { response, stage, .. }) => {
+            // Round-6 (hunt4 protocol F5): a request that never parsed
+            // (stage "parse") gets 400, not 403 — no authorization
+            // decision was made. Policy/schema/budget refusals keep 403.
+            let status = if stage == "parse" {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            (status, Json(response)).into_response()
+        }
         Err(error) => pipeline_error(error),
     }
 }
@@ -3410,7 +3442,11 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert!(allowed_body["decision_us"].as_u64().unwrap() < 5_000);
+        // Round-6 (hunt4 protocol F4): the ack is a conformant JSON-RPC
+        // response now — id echoed, result envelope present.
+        assert_eq!(allowed_body["jsonrpc"], "2.0");
+        assert_eq!(allowed_body["id"], 1);
+        assert!(allowed_body["result"]["decision_us"].as_u64().unwrap() < 5_000);
 
         let blocked = app
             .clone()
@@ -3424,7 +3460,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+        // Round-6 (hunt4 protocol F5): invalid JSON is a protocol
+        // failure (-32700 / HTTP 400), not a policy decision (403).
+        assert_eq!(blocked.status(), StatusCode::BAD_REQUEST);
+        let blocked_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(blocked.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(blocked_body["error"]["code"], -32700);
 
         let metrics_response = app
             .clone()

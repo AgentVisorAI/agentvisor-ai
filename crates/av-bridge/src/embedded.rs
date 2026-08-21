@@ -201,6 +201,7 @@ impl EmbeddedBroker {
                     let mut min_offset = u64::MAX;
                     let mut max_offset = 0u64;
                     let mut have_parseable_line = false;
+                    let mut unparseable_lines = 0u64;
                     if path.exists() {
                         for line in BufReader::new(fs::File::open(&path)?).lines() {
                             let Ok(line) = line else {
@@ -216,11 +217,34 @@ impl EmbeddedBroker {
                                 min_offset = min_offset.min(event.offset);
                                 max_offset = max_offset.max(event.offset);
                                 have_parseable_line = true;
+                            } else {
+                                unparseable_lines = unparseable_lines.saturating_add(1);
                             }
                         }
                     }
+                    // Round-6 (hunt5 broker F3): a TRAILING unparseable
+                    // complete line occupies an offset ABOVE the max
+                    // parseable one, so the previous [min, max]-of-
+                    // parseable range dropped its UID — the exact
+                    // duplicate-re-append case the range heuristic was
+                    // added for, just at the other edge. Extend the
+                    // upper bound by the count of unparseable lines
+                    // (each occupies exactly one offset). When the
+                    // segment has ONLY unparseable lines we have no
+                    // offset information at all — keep every sidecar
+                    // entry (conservative: at worst a stale ack that
+                    // the fetch-side digest checks catch) rather than
+                    // dropping evidence.
                     let offset_range = if have_parseable_line {
-                        Some((min_offset, max_offset))
+                        Some((min_offset, max_offset.saturating_add(unparseable_lines)))
+                    } else if unparseable_lines > 0 {
+                        tracing::warn!(
+                            topic = %t.name,
+                            partition = p,
+                            unparseable_lines,
+                            "segment has only unparseable lines; keeping all sidecar UID entries"
+                        );
+                        Some((0, u64::MAX))
                     } else {
                         None
                     };
@@ -346,6 +370,15 @@ impl EmbeddedBroker {
     /// records expired.
     pub fn enforce_retention(&self, now_ms: u64) -> Result<u64, BusError> {
         let mut expired_total = 0u64;
+        // Round-6 (hunt5 broker F4): contain per-partition failures. A
+        // persistent error class (divergent cold intent, cold-dir
+        // permission error, content-mismatch) used to `?`-propagate out
+        // of the whole two-level loop — starving retention for that
+        // topic AND every topic after it in manifest order, forever,
+        // until disk filled. Process every partition, then surface the
+        // first error as an aggregate so the maintenance counter still
+        // fires.
+        let mut first_error: Option<(String, BusError)> = None;
         for t in &self.manifest.topics {
             let cutoff =
                 now_ms.saturating_sub(u64::from(t.retention.hot_hours) * av_core::units::MS_PER_HOUR);
@@ -369,11 +402,12 @@ impl EmbeddedBroker {
                     );
                     continue;
                 }
+                let outcome: Result<u64, BusError> = (|| {
                 let (kept, expired) = split_by_time(&part.path, cutoff)?;
                 if expired.is_empty() {
-                    continue;
+                    return Ok(0);
                 }
-                expired_total += expired.len() as u64;
+                let expired_count = expired.len() as u64;
                 // Cold export first (never destroy before the copy lands).
                 if let Some(cold) = &t.retention.cold_uri {
                     if cold.contains("://") {
@@ -453,39 +487,25 @@ impl EmbeddedBroker {
                     // no longer exists, and the caller's follow-up `fetch(offset)`
                     // silently returns the wrong event or nothing.
                     //
-                    // We compute survivors from parseable lines, but ALSO keep
-                    // the range [min_kept_offset, max_kept_offset]: any UID
-                    // whose offset falls in that range is potentially attached
-                    // to an unparseable-but-kept line, and dropping it would
-                    // let the next publish_idempotent re-append a duplicate
-                    // record (which retention would then choke on next pass).
-                    let survivors: std::collections::HashSet<u64> = kept
+                    // Round-6 (hunt5 broker F3): expired lines are parseable
+                    // BY CONSTRUCTION (`split_by_time` never expires an
+                    // unparseable line), so we can remove exactly the
+                    // expired offsets. The previous survivors+[min,max]
+                    // range heuristic was unsound at both edges: a
+                    // wall-clock regression could expire a MIDDLE-offset
+                    // record whose UID then survived pruning (stale ack →
+                    // wrong-record fetch), and a trailing unparseable
+                    // kept line's offset fell OUTSIDE the range so its
+                    // UID was dropped (duplicate re-append on the next
+                    // publish_idempotent).
+                    let expired_offsets: std::collections::HashSet<u64> = expired
                         .iter()
                         .filter_map(|line| serde_json::from_str::<StoredEvent>(line).ok())
                         .map(|event| event.offset)
                         .collect();
-                    let range = if survivors.is_empty() {
-                        None
-                    } else {
-                        // A single manual pass gives min/max and avoids
-                        // expect() on the guaranteed-non-empty iterator.
-                        let (mut lo, mut hi) = (u64::MAX, 0u64);
-                        for offset in &survivors {
-                            lo = lo.min(*offset);
-                            hi = hi.max(*offset);
-                        }
-                        Some((lo, hi))
-                    };
                     let before = part.seen_event_uids.len();
-                    part.seen_event_uids.retain(|_, offset| {
-                        if survivors.contains(offset) {
-                            return true;
-                        }
-                        match range {
-                            Some((lo, hi)) => *offset >= lo && *offset <= hi,
-                            None => false,
-                        }
-                    });
+                    part.seen_event_uids
+                        .retain(|_, offset| !expired_offsets.contains(offset));
                     if part.seen_event_uids.len() != before {
                         // Sidecar is now stale — rewrite it atomically with only
                         // the surviving mappings so recovery cannot resurrect a
@@ -517,9 +537,30 @@ impl EmbeddedBroker {
                     ));
                     return Err(error);
                 }
+                Ok(expired_count)
+                })();
+                match outcome {
+                    Ok(count) => expired_total += count,
+                    Err(error) => {
+                        tracing::warn!(
+                            topic = %t.name,
+                            %error,
+                            "retention failed for this partition; remaining topics/partitions continue"
+                        );
+                        if first_error.is_none() {
+                            first_error = Some((t.name.clone(), error));
+                        }
+                    }
+                }
             }
         }
-        Ok(expired_total)
+        match first_error {
+            Some((topic, error)) => Err(BusError::Backend(format!(
+                "retention failed for topic {topic:?} (remaining topics were still processed, \
+                 {expired_total} records expired): {error}"
+            ))),
+            None => Ok(expired_total),
+        }
     }
 }
 

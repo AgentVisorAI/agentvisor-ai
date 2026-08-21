@@ -190,6 +190,48 @@ impl BridgeManifest {
         if names.len() != before {
             return Err(ManifestError::Invalid("duplicate topic names".into()));
         }
+        // Round-6 (hunt5 portability F4): the embedded broker uses topic
+        // names verbatim as directory names, so on case-insensitive
+        // filesystems (macOS APFS/HFS+ — the documented dev platform)
+        // two topics differing only by case ("Audit" vs "audit")
+        // resolve to ONE directory and silently interleave segments,
+        // offsets, and idempotency state. Reject case-insensitive
+        // collisions everywhere so a manifest behaves identically on
+        // macOS and Linux (Kafka refuses the same collision).
+        let mut folded: Vec<String> = self
+            .topics
+            .iter()
+            .map(|t| t.name.to_ascii_lowercase())
+            .collect();
+        folded.sort_unstable();
+        let before = folded.len();
+        folded.dedup();
+        if folded.len() != before {
+            return Err(ManifestError::Invalid(
+                "topic names collide case-insensitively (unsafe on case-insensitive filesystems)"
+                    .into(),
+            ));
+        }
+        // Round-6 (hunt1 F2): the NATS backend maps topics to stream
+        // names via `.`→`_` (`av_{topic.replace('.', "_")}`), which is
+        // not injective: `agent.x` and `agent_x` collide onto stream
+        // `av_agent_x`, and the second provision's update_stream
+        // silently REPLACES the first topic's subjects — destroying its
+        // capture. Reject the collision at manifest validation for all
+        // backends so a manifest is portable across them.
+        let mut stream_folded: Vec<String> = self
+            .topics
+            .iter()
+            .map(|t| t.name.to_ascii_lowercase().replace('.', "_"))
+            .collect();
+        stream_folded.sort_unstable();
+        let before = stream_folded.len();
+        stream_folded.dedup();
+        if stream_folded.len() != before {
+            return Err(ManifestError::Invalid(
+                "topic names collide after '.'→'_' folding (ambiguous NATS stream names)".into(),
+            ));
+        }
         for t in &self.topics {
             if t.name.is_empty()
                 || !t
@@ -340,7 +382,12 @@ pub(crate) fn validate_topic_event(
 
 pub(crate) fn schema_document(reference: &str) -> Result<serde_json::Value, crate::BusError> {
     if reference == "schemas/ocsf-agent-event.schema.json" {
-        return serde_json::from_str(include_str!("../../../schemas/ocsf-agent-event.schema.json"))
+        // Round-6 (hunt5 portability F1): the embedded copy lives INSIDE
+        // the crate (`crates/av-bridge/schemas/`) — an `include_str!`
+        // that reaches outside the package root breaks `cargo package`
+        // (and therefore every crates.io publish). A sync test in this
+        // module asserts byte-equality with the workspace-level copy.
+        return serde_json::from_str(include_str!("../schemas/ocsf-agent-event.schema.json"))
             .map_err(crate::BusError::from);
     }
     let direct = PathBuf::from(reference);
@@ -369,6 +416,27 @@ mod tests {
     )]
 
     use super::*;
+
+    /// Round-6 (hunt5 portability F1): the crate-local embedded schema
+    /// copy must stay byte-identical to the canonical workspace-level
+    /// artifact external consumers validate against. Reads the
+    /// workspace copy at runtime (not include_str!) so the packaged
+    /// crate's tests skip cleanly when the workspace file is absent.
+    #[test]
+    fn embedded_schema_matches_workspace_copy() {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../schemas/ocsf-agent-event.schema.json");
+        let Ok(canonical) = std::fs::read_to_string(&workspace) else {
+            // Packaged-crate build: no workspace copy to compare with.
+            return;
+        };
+        assert_eq!(
+            include_str!("../schemas/ocsf-agent-event.schema.json"),
+            canonical,
+            "crates/av-bridge/schemas/ocsf-agent-event.schema.json has drifted from \
+             schemas/ocsf-agent-event.schema.json — copy the canonical file over the vendored one"
+        );
+    }
 
     #[test]
     fn default_manifest_covers_all_event_classes() {

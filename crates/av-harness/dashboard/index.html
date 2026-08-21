@@ -92,8 +92,9 @@
     <div class="empty" id="empty-hint" hidden>
       <p>No sessions in the registry yet.</p>
       <p class="empty-sub">
-        Send a request through the harness &mdash; e.g.
-        <code>curl http://127.0.0.1:8484/health</code> &mdash; and it will show up here.
+        Send a chat request through the harness &mdash; e.g.
+        <code>curl http://127.0.0.1:8484/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'</code>
+        &mdash; and its session will show up here.
       </p>
     </div>
 
