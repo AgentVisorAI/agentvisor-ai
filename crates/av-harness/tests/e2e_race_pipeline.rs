@@ -232,11 +232,28 @@ async fn prepare_racing_close_produces_a_coherent_receipt() {
     let hp = h.clone();
     let stop = Arc::new(AtomicU64::new(0));
     let stop_p = Arc::clone(&stop);
+    // Round-6 (hunt3 tests F1): COUNT the racing successes instead of
+    // discarding them. Every prep that returned Ok FOR THIS INCARNATION
+    // contributed exactly 2 chain events, and close waits for streams +
+    // worker jobs before sealing — so the receipt's event_count must be
+    // exactly 2 × (seeded + racing successes). The prior `let _ =` +
+    // `>= 3` bound could not detect chain/receipt divergence at all
+    // (even a 50% undercount passed). `Arc::ptr_eq` scopes the count to
+    // the pre-close incarnation: once close completes, `get_or_open`
+    // legitimately recycles the id into a FRESH session whose preps are
+    // attested by a future receipt, not this one.
+    let session_for_count = Arc::clone(&session);
     let prep = tokio::spawn(async move {
+        let mut successes = 0u64;
         while stop_p.load(Ordering::Acquire) == 0 {
-            let _ = state_prep.prepare_chat(&hp, chat_payload());
+            if let Ok(prepared) = state_prep.prepare_chat(&hp, chat_payload()) {
+                if Arc::ptr_eq(&prepared.session, &session_for_count) {
+                    successes += 1;
+                }
+            }
             tokio::task::yield_now().await;
         }
+        successes
     });
     // Close after a couple of scheduler ticks.
     for _ in 0..8 {
@@ -248,9 +265,7 @@ async fn prepare_racing_close_produces_a_coherent_receipt() {
         .await
         .unwrap();
     stop.store(1, Ordering::Release);
-    prep.await.unwrap();
-    // The receipt exists AND its event_count is whatever the chain
-    // observed. A second close must be AlreadyClosed.
+    let racing_successes = prep.await.unwrap();
     let event_count = match outcome {
         FinalizeOutcome::Receipt { receipt } => match &receipt.body.subject {
             ReceiptSubject::EventChain { event_count, .. } => *event_count,
@@ -258,7 +273,21 @@ async fn prepare_racing_close_produces_a_coherent_receipt() {
         },
         other => panic!("expected Receipt, got {other:?}"),
     };
-    assert!(event_count >= 3, "receipt undercounted seeded preps");
+    assert_eq!(
+        event_count,
+        (3 + racing_successes) * 2,
+        "receipt event_count diverged from the number of admitted preps \
+         (seeded 3 + racing {racing_successes}, 2 events each)"
+    );
+    // Post-close preps on the SAME incarnation are impossible: either
+    // the id maps to a fresh recycled session (by design) or admission
+    // refuses. Either way this receipt's chain is sealed.
+    if let Ok(prepared) = state.prepare_chat(&h, chat_payload()) {
+        assert!(
+            !Arc::ptr_eq(&prepared.session, &session),
+            "post-close admission must not reuse the sealed incarnation"
+        );
+    }
     let outcome2 = state
         .finalizer
         .close_session(session, StopReason::SessionClosed)

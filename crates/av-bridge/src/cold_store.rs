@@ -270,11 +270,7 @@ impl ColdArchive {
         Ok(completed)
     }
 
-    fn retry_pending_one<F>(
-        &self,
-        path: &std::path::Path,
-        resolve: &mut F,
-    ) -> Result<(), BusError>
+    fn retry_pending_one<F>(&self, path: &std::path::Path, resolve: &mut F) -> Result<(), BusError>
     where
         F: FnMut(&PendingColdEvent) -> Result<crate::PublishAck, BusError>,
     {

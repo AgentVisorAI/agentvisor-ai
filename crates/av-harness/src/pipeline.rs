@@ -629,7 +629,7 @@ impl AppState {
             config.worker_channel_capacity,
             Arc::clone(&bridge),
             embedder,
-            vector_sink,
+            Arc::clone(&vector_sink),
             Some(std::path::PathBuf::from(&config.atif_spool_dir)),
             journal_key,
             Arc::clone(&metrics),
@@ -640,7 +640,10 @@ impl AppState {
             Arc::clone(&metrics),
             Arc::clone(&bridge),
         )
-        .with_state_store(Arc::clone(&store));
+        .with_state_store(Arc::clone(&store))
+        // Round-6 (hunt4 R-F4): closes delete the session's vector-store
+        // points (best-effort).
+        .with_vector_sink(Arc::clone(&vector_sink));
         let mut client_builder = reqwest::Client::builder()
             .connect_timeout(HTTP_CONNECT_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())

@@ -844,32 +844,32 @@ async fn process_job(
             .map_err(|error| error.to_string())?;
         match embedding_result {
             Ok(embedding) => {
-                let similarity =
-                    match vector_sink.nearest_similarity(&job.session.session_scope, &embedding).await {
-                        Ok(similarity) => similarity,
-                        Err(error) => {
-                            tracing::warn!(
-                                session = %job.session.id,
-                                %error,
-                                "vector-sink nearest_similarity failed; skipping breaker for this step"
-                            );
-                            metrics
-                                .counter(
-                                    "av_vector_sink_errors_total",
-                                    "Vector-sink errors demoted to warn (round-6 hunt5 F2)",
-                                )
-                                .inc();
-                            None
-                        }
-                    };
+                let similarity = match vector_sink
+                    .nearest_similarity(&job.session.session_scope, &embedding)
+                    .await
+                {
+                    Ok(similarity) => similarity,
+                    Err(error) => {
+                        tracing::warn!(
+                            session = %job.session.id,
+                            %error,
+                            "vector-sink nearest_similarity failed; skipping breaker for this step"
+                        );
+                        metrics
+                            .counter(
+                                "av_vector_sink_errors_total",
+                                "Vector-sink errors demoted to warn (round-6 hunt5 F2)",
+                            )
+                            .inc();
+                        None
+                    }
+                };
                 let verdict = job.session.loop_state.observe_embedding_with_similarity(
                     embedding.clone(),
                     step_tokens,
                     similarity,
                 );
-                if let Err(error) =
-                    vector_sink.record(&job.session.session_scope, &embedding).await
-                {
+                if let Err(error) = vector_sink.record(&job.session.session_scope, &embedding).await {
                     tracing::warn!(
                         session = %job.session.id,
                         %error,
@@ -1205,18 +1205,14 @@ pub(crate) async fn inflight_response_sessions(
             // tool-intent quarantine discipline: warn, rename to
             // `.corrupt-<uid>`, skip. The signed chain never referenced
             // this file; nothing else claims it. See round-5 hunt3 F1.
-            let marker: InFlightResponse = match crate::journal::open(
-                &journal_key,
-                "in-flight-response",
-                0,
-                &marker_bytes,
-            ) {
-                Ok(marker) => marker,
-                Err(error) => {
-                    quarantine_inflight_marker(&path, &error);
-                    continue;
-                }
-            };
+            let marker: InFlightResponse =
+                match crate::journal::open(&journal_key, "in-flight-response", 0, &marker_bytes) {
+                    Ok(marker) => marker,
+                    Err(error) => {
+                        quarantine_inflight_marker(&path, &error);
+                        continue;
+                    }
+                };
             if path != response_marker_path(&spool_dir, &marker.session_id, &marker.attempt_id) {
                 // Same defense: a marker whose payload's ids don't
                 // reconstruct its filename must not stall recovery.
@@ -1251,20 +1247,13 @@ async fn clear_response_marker(
         // Absent marker means "already cleared" — do not surface as an
         // error, which would poison the terminal job and leak the
         // marker into unbounded scan/growth.
-        let marker_bytes = match av_core::fsutil::read_capped(
-            &path,
-            av_core::fsutil::MAX_CONTROL_BYTES,
-        ) {
+        let marker_bytes = match av_core::fsutil::read_capped(&path, av_core::fsutil::MAX_CONTROL_BYTES) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.to_string()),
         };
-        let marker: InFlightResponse = crate::journal::open(
-            &journal_key,
-            "in-flight-response",
-            0,
-            &marker_bytes,
-        )?;
+        let marker: InFlightResponse =
+            crate::journal::open(&journal_key, "in-flight-response", 0, &marker_bytes)?;
         if marker.session_id != session_id || marker.attempt_id != attempt_id {
             return Err("in-flight response marker does not match completed job".to_owned());
         }
@@ -1789,7 +1778,10 @@ mod tests {
             .expect("tampered marker quarantines cleanly instead of poisoning recovery");
         // Original path is renamed; a `.corrupt-*.json` sibling remains
         // for operator evidence retrieval.
-        assert!(!marker_path.exists(), "tampered marker should be quarantined out of the primary name");
+        assert!(
+            !marker_path.exists(),
+            "tampered marker should be quarantined out of the primary name"
+        );
         let inflight_dir = directory.path().join(crate::spool::INFLIGHT_RESPONSES);
         let mut has_corrupt = false;
         for entry in std::fs::read_dir(&inflight_dir).unwrap() {
@@ -1799,7 +1791,10 @@ mod tests {
                 break;
             }
         }
-        assert!(has_corrupt, "expected a `.corrupt-<uid>.json` sibling as evidence");
+        assert!(
+            has_corrupt,
+            "expected a `.corrupt-<uid>.json` sibling as evidence"
+        );
     }
 
     #[tokio::test]

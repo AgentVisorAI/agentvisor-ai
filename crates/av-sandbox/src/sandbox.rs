@@ -92,7 +92,14 @@ impl Sandbox {
     pub fn new(config: SandboxConfig, policies: Vec<Box<dyn PolicyEngine>>) -> Result<Self, String> {
         let mut validators = HashMap::new();
         for (tool, schema) in &config.schemas {
-            let v = jsonschema::validator_for(schema)
+            // Round-6 (hunt3 deps F1): enforce `format` keywords. In
+            // jsonschema 0.49 / draft 2020-12, `format` is
+            // annotation-only unless opted in — an operator writing
+            // `"format": "uri"` into a tool-argument schema expected an
+            // enforced gate, not a no-op.
+            let v = jsonschema::options()
+                .should_validate_formats(true)
+                .build(schema)
                 .map_err(|e| format!("schema for tool {tool:?} does not compile: {e}"))?;
             validators.insert(tool.clone(), v);
         }

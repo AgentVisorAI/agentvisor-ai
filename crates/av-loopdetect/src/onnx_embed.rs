@@ -163,7 +163,8 @@ impl Embedder for OnnxEmbedder {
     }
 
     fn embed(&self, text: &str) -> Vec<f32> {
-        self.infer(text).unwrap_or_else(|error| fallback_hash_embedding(self.dim, text, &error))
+        self.infer(text)
+            .unwrap_or_else(|error| fallback_hash_embedding(self.dim, text, &error))
     }
 
     fn try_embed(&self, text: &str) -> Result<Vec<f32>, String> {

@@ -24,7 +24,7 @@ AgentVisor AI treats request bodies, JWTs, MCP arguments, upstream responses, ma
 - Set `require_identity = true` and configure `identity_jwks_url` plus `identity_allowed_issuers`.
 - Mount signing seeds from a secret manager. Do not bake them into images.
 - Use TLS/SASL or authenticated private networks for provider, Redis, Redpanda, NATS, Qdrant, and IdP endpoints.
-- Restrict `/metrics`, close, and promotion routes at the ingress layer.
+- Restrict `/metrics`, close, promotion, and the dashboard routes (`/dashboard`, `/api/v1/dashboard/*` — enabled by default and unauthenticated, exposing per-session receipts and costs; or set `dashboard_enabled = false`) at the ingress layer.
 - Configure customer-owned cold storage and SIEM sinks in Vector.
 - Keep old public verification keys available for receipt validation.
 - Keep the configured signing key stable until active journals have drained; rotate only after preserving historical receipt verification keys.

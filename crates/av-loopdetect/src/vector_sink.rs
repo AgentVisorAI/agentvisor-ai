@@ -18,6 +18,16 @@ pub trait VectorSink: Send + Sync {
 
     /// Persist one session vector without participating in the hot path.
     fn record<'a>(&'a self, session_id: &'a str, vector: &'a [f32]) -> VectorSinkFuture<'a>;
+
+    /// Round-6 (hunt4 R-F4): delete every vector recorded under
+    /// `session_scope`. Called best-effort when a session finalizes so
+    /// the external store does not grow without bound — the round-32
+    /// `id#generation` scoping makes prior-generation points
+    /// permanently unreachable dead weight otherwise. Default no-op
+    /// for sinks without external state.
+    fn delete_scope<'a>(&'a self, _session_scope: &'a str) -> VectorSinkFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Sink used when external vector persistence is disabled.
@@ -210,6 +220,31 @@ impl VectorSink for QdrantVectorSink {
                             "recorded_at": recorded_at,
                         }
                     }]
+                }))
+                .send()
+                .await
+                .map_err(|error| classify_qdrant_error(error))?
+                .error_for_status()
+                .map_err(|error| classify_qdrant_error(error))?;
+            Ok(())
+        })
+    }
+
+    fn delete_scope<'a>(&'a self, session_scope: &'a str) -> VectorSinkFuture<'a> {
+        Box::pin(async move {
+            let url = format!(
+                "{}/collections/{}/points/delete?wait=true",
+                self.base_url, self.collection
+            );
+            self.client
+                .post(url)
+                .json(&serde_json::json!({
+                    "filter": {
+                        "must": [{
+                            "key": "session_id",
+                            "match": { "value": session_scope }
+                        }]
+                    }
                 }))
                 .send()
                 .await

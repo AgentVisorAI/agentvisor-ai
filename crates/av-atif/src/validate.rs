@@ -740,11 +740,7 @@ fn validate_step(
         .get("is_copied_context")
         .is_some_and(|v| !v.is_boolean() && !v.is_null())
     {
-        issue!(
-            issues,
-            format!("{path}.is_copied_context"),
-            "must be a boolean"
-        );
+        issue!(issues, format!("{path}.is_copied_context"), "must be a boolean");
     }
 
     // Agent-only fields.

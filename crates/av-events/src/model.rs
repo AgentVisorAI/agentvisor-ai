@@ -223,6 +223,12 @@ pub struct Metadata {
 /// [`Self::unmapped`] (never silently dropped); outbound serialization
 /// is always the current schema shape.
 ///
+/// Round-6 (hunt2 F11): the tolerance is **inbound-only** — an event
+/// whose `unmapped` is non-empty is refused by `validate_event` (and
+/// would be refused by the broker's schema gate, which declares
+/// `additionalProperties: false`). Consumers may parse newer-node
+/// events; they may not republish them carrying unknown fields.
+///
 /// # Round-34 F3 — additive tolerance is TOP-LEVEL ONLY
 ///
 /// The `deny_unknown_fields` attribute on every nested struct
