@@ -28,6 +28,20 @@ for i, key in ipairs(KEYS) do
     local amount = tonumber(ARGV[(i - 1) * 2 + 1])
     local limit = tonumber(ARGV[(i - 1) * 2 + 2])
     if current > limit or amount > limit - current then
+        -- Round-6 (hunt5 broker F2): refresh TTL on every EXISTING key
+        -- in this invocation before returning the refusal. Without
+        -- this, a session that hit its cap and keeps retrying (every
+        -- attempt refused, commit loop never reached) has its counter
+        -- expire {BUDGET_COUNTER_TTL_SECS}s after the last SUCCESSFUL
+        -- spend — the next attempt then sees current=0 and the cap
+        -- silently RESETS mid-session, doubling the budget. The TTL's
+        -- purpose is reclaiming ABANDONED sessions; an actively
+        -- retrying session is not abandoned.
+        for j, k in ipairs(KEYS) do
+            if redis.call('EXISTS', k) == 1 then
+                redis.call('EXPIRE', k, {BUDGET_COUNTER_TTL_SECS})
+            end
+        end
         return i
     end
 end
@@ -47,6 +61,11 @@ local current = tonumber(redis.call('GET', KEYS[1]) or '0')
 local amount = tonumber(ARGV[1])
 local limit = tonumber(ARGV[2])
 if current > limit or amount > limit - current then
+    -- Round-6 (hunt5 broker F2): keep an actively-refused counter
+    -- alive — see the twin comment in TRY_SPEND_LUA.
+    if redis.call('EXISTS', KEYS[1]) == 1 then
+        redis.call('EXPIRE', KEYS[1], {BUDGET_COUNTER_TTL_SECS})
+    end
     return -1
 end
 local result = redis.call('INCRBY', KEYS[1], ARGV[1])

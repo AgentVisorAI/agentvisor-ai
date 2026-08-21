@@ -56,6 +56,9 @@ struct PendingEnvelope {
 }
 
 impl ColdArchive {
+    // Only called from the kafka/nats bus arms; benign dead code in
+    // feature combinations that enable cold-store without either bus.
+    #[cfg_attr(not(any(feature = "kafka", feature = "nats")), allow(dead_code))]
     pub(crate) fn from_manifest(manifest: &BridgeManifest) -> Result<Option<Self>, BusError> {
         Self::from_manifest_with_pending_default(manifest, None)
     }
@@ -78,8 +81,21 @@ impl ColdArchive {
             };
             let url = cold_url(uri)?;
             let options = aws_env_options(std::env::vars());
-            let (store, prefix) = object_store::parse_url_opts(&url, options)
-                .map_err(|error| BusError::Backend(format!("cold store {uri:?}: {error}")))?;
+            let (store, prefix) = object_store::parse_url_opts(&url, options).map_err(|error| {
+                // Round-6 (hunt5 portability F3): object_store's
+                // "feature for AmazonS3 not enabled" names an internal
+                // feature the operator cannot act on; map it to the
+                // cargo feature that actually fixes the build.
+                let detail = error.to_string();
+                if detail.contains("not enabled") && url.scheme() == "s3" {
+                    BusError::Backend(format!(
+                        "cold store {uri:?}: this build has no S3 support — rebuild with \
+                         `--features cold-store-aws` (or `full`)"
+                    ))
+                } else {
+                    BusError::Backend(format!("cold store {uri:?}: {detail}"))
+                }
+            })?;
             targets.insert(
                 topic.name.clone(),
                 ColdTarget {

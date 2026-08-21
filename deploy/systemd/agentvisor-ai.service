@@ -6,15 +6,25 @@
 #   sudo cp target/release/agentvisord /usr/local/bin/
 #   sudo cp target/release/avctl /usr/local/bin/
 #   cd /etc/agentvisor-ai && sudo avctl init --preset openai --output agentvisor.toml
+#   # Round-6: chown BEFORE keygen — `avctl keygen` hard-links a temp
+#   # file in the parent directory, which needs write permission as the
+#   # service user; a root-owned 0755 /etc/agentvisor-ai would EACCES.
+#   sudo chown -R agentvisor-ai:agentvisor-ai /var/lib/agentvisor-ai /etc/agentvisor-ai
 #   # Round-18 F1: generate the receipt trust anchor BEFORE first boot.
 #   # `ProtectSystem=strict` below mounts /etc read-only, so the harness
 #   # cannot auto-create the seed at startup — that would EROFS.
 #   sudo -u agentvisor-ai avctl keygen --output /etc/agentvisor-ai/signing.seed
 #   sudo chmod 400 /etc/agentvisor-ai/signing.seed
 #   sudo chown agentvisor-ai:agentvisor-ai /etc/agentvisor-ai/signing.seed
-#   echo 'AV_UPSTREAM_API_KEY=sk-...' | sudo tee /etc/agentvisor-ai/secrets.env
+#   # Round-6: the variable name must match the config's
+#   # `upstream_api_key_env` — `init --preset openai` writes
+#   # `upstream_api_key_env = "OPENAI_API_KEY"`, and the generic
+#   # AV_UPSTREAM_API_KEY fallback is only consulted when the config
+#   # names NO key source. The prior instruction here caused a
+#   # boot loop ("environment variable OPENAI_API_KEY is not set").
+#   echo 'OPENAI_API_KEY=sk-...' | sudo tee /etc/agentvisor-ai/secrets.env
 #   sudo chmod 600 /etc/agentvisor-ai/secrets.env
-#   sudo chown -R agentvisor-ai:agentvisor-ai /var/lib/agentvisor-ai /etc/agentvisor-ai
+#   sudo chown agentvisor-ai:agentvisor-ai /etc/agentvisor-ai/secrets.env
 #   sudo cp deploy/systemd/agentvisor-ai.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now agentvisor-ai
 #

@@ -344,7 +344,21 @@ fn init_tracing() -> Result<()> {
         )
         .with(tracing_subscriber::fmt::layer().json())
         .try_init()
-        .map_err(|error| anyhow::anyhow!("initialize tracing: {error}"))
+        .map_err(|error| anyhow::anyhow!("initialize tracing: {error}"))?;
+    // Round-6 (hunt5 portability F5): every other feature-gated
+    // capability refuses loudly when configured but compiled out; the
+    // OTLP env vars were the one silent no-op. An operator pointing a
+    // default-features binary at a collector got no traces and no
+    // diagnostic.
+    if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some()
+        || std::env::var_os("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").is_some()
+    {
+        tracing::warn!(
+            "OTEL_EXPORTER_OTLP_* is set but this build has no OpenTelemetry support; \
+             rebuild with `--features otel` (or `full`) to export traces"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(feature = "otel")]
@@ -457,6 +471,23 @@ fn load_sandbox(config: &HarnessConfig) -> Result<Sandbox> {
             }
             Err(error) => return Err(error).with_context(|| format!("read WASM policy {path}")),
         };
+        // Round-6 (hunt5 config F1): the default payload-limit policy
+        // denies bodies above 4 MiB. If the operator raised
+        // `max_request_bytes` past that, chat requests the HTTP body
+        // limit admits get 403 PolicyBlocked — misattributed as a
+        // policy violation and invisible from the config file. Warn
+        // loudly at boot so the mismatch is discoverable.
+        const DEFAULT_POLICY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+        if is_default_policy && config.max_request_bytes > DEFAULT_POLICY_LIMIT_BYTES {
+            tracing::warn!(
+                max_request_bytes = config.max_request_bytes,
+                policy_limit = DEFAULT_POLICY_LIMIT_BYTES,
+                "max_request_bytes exceeds the default payload-limit policy's 4 MiB threshold; \
+                 chat requests between the two sizes will be refused as policy-blocked — raise \
+                 the constant in the payload_limit.wat policy (or remove it from \
+                 wasm_policy_paths) to match"
+            );
+        }
         policies.push(Box::new(
             WasmPolicy::from_bytes(path, &bytes).map_err(anyhow::Error::msg)?,
         ));
@@ -873,6 +904,17 @@ fn classify_jwks_error(error: &anyhow::Error) -> &'static str {
 fn build_bridge(config: &HarnessConfig, manifest: &BridgeManifest) -> Result<Arc<dyn EventBus>> {
     match config.bridge_backend.as_str() {
         "embedded" => {
+            // Round-6 (hunt5 config F2): an endpoint without the
+            // backend that consumes it is a silent misconfiguration —
+            // e.g. `docker run -e AV_BRIDGE_ENDPOINT=…` against the
+            // shipped embedded-backend config does nothing. Warn so
+            // 12-factor operators see why their override is inert.
+            if config.bridge_endpoint.is_some() {
+                tracing::warn!(
+                    "bridge_endpoint (or AV_BRIDGE_ENDPOINT) is set but bridge_backend=\"embedded\" \
+                     ignores it; set bridge_backend=\"kafka\" or \"nats\" to use the endpoint"
+                );
+            }
             let path = PathBuf::from(&config.bridge_data_dir);
             let bridge = if path.join("manifest.yaml").exists() {
                 EmbeddedBroker::open(&path)
@@ -924,7 +966,19 @@ fn build_bridge(config: &HarnessConfig, manifest: &BridgeManifest) -> Result<Arc
 
 fn build_store(config: &HarnessConfig) -> Result<Arc<dyn StateStore>> {
     match config.state_backend.as_str() {
-        "memory" => Ok(Arc::new(InMemoryStore::new())),
+        "memory" => {
+            // Round-6 (hunt5 config F2): warn on an inert endpoint —
+            // budget/velocity counters stay process-local (neither
+            // shared nor durable), exactly what setting a Redis
+            // endpoint was meant to fix.
+            if config.state_endpoint.is_some() {
+                tracing::warn!(
+                    "state_endpoint (or AV_STATE_ENDPOINT) is set but state_backend=\"memory\" \
+                     ignores it; set state_backend=\"redis\" to use the endpoint"
+                );
+            }
+            Ok(Arc::new(InMemoryStore::new()))
+        }
         "redis" => {
             #[cfg(feature = "redis")]
             {
@@ -978,7 +1032,16 @@ fn build_embedder(config: &HarnessConfig) -> Result<Arc<dyn Embedder>> {
 
 async fn build_vector_sink(config: &HarnessConfig, _dimension: usize) -> Result<Arc<dyn VectorSink>> {
     match config.vector_backend.as_str() {
-        "memory" => Ok(Arc::new(NoopVectorSink)),
+        "memory" => {
+            // Round-6 (hunt5 config F2): warn on an inert Qdrant URL.
+            if config.qdrant_url.is_some() {
+                tracing::warn!(
+                    "qdrant_url (or AV_QDRANT_URL) is set but vector_backend=\"memory\" ignores \
+                     it; set vector_backend=\"qdrant\" to use the endpoint"
+                );
+            }
+            Ok(Arc::new(NoopVectorSink))
+        }
         "qdrant" => {
             #[cfg(feature = "qdrant")]
             {
@@ -1871,10 +1934,20 @@ mod tests {
         }))
         .unwrap();
         assert!(!sandbox.check(&store, "session", &unknown).is_allowed());
+        // Round-6 (hunt5 config F1): the default policy threshold now
+        // matches the default max_request_bytes (4 MiB). A payload in
+        // the 1–4 MiB band — which the HTTP body limit admits — must
+        // NOT be policy-blocked anymore.
         assert!(sandbox
             .sanitize(
                 "chat/completions",
                 &serde_json::json!({"content": "x".repeat(1_100_000)}),
+            )
+            .is_ok());
+        assert!(sandbox
+            .sanitize(
+                "chat/completions",
+                &serde_json::json!({"content": "x".repeat(4_300_000)}),
             )
             .is_err());
     }

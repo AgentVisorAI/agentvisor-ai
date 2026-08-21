@@ -1155,15 +1155,36 @@ fn forward_signal(child: &tokio::process::Child, signal: &str) {
 #[cfg(not(unix))]
 fn forward_signal(_child: &tokio::process::Child, _signal: &str) {}
 
-/// Give the server ten seconds to flush trajectories and exit; only
-/// force-kill if it hangs.
+/// Wait for the server's four-phase graceful shutdown, then force-kill
+/// only if it truly hangs.
+///
+/// Round-6 (hunt4 ops F6): the harness's documented shutdown budget is
+/// up to 95 s (30 s HTTP drain + 30 s worker wait_idle + 30 s
+/// finalize_sessions + 5 s telemetry flush) — the systemd unit and
+/// compose files are tuned to 120–125 s for exactly this reason. The
+/// prior 10 s SIGKILL here dropped receipts and truncated trajectories
+/// mid-finalize on the desktop path while printing "Your data is
+/// saved." Print progress so a long flush doesn't look like a hang.
 async fn wait_for_graceful_exit(child: &mut tokio::process::Child) {
+    const GRACEFUL_BUDGET_S: u64 = 100;
     match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+        Ok(_) => {
+            println!("Stopped. Your data is saved.");
+            return;
+        }
+        Err(_) => {
+            println!("Waiting for the server to flush sessions and receipts (up to {GRACEFUL_BUDGET_S}s)...");
+        }
+    }
+    match tokio::time::timeout(Duration::from_secs(GRACEFUL_BUDGET_S - 10), child.wait()).await {
         Ok(_) => println!("Stopped. Your data is saved."),
         Err(_) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            println!("Stopped (forced).");
+            // Do NOT claim data safety: a SIGKILL mid-finalize can
+            // leave receipts unminted and trajectories truncated —
+            // recovery will quarantine them on next start.
+            println!("Stopped (forced). Some sessions may need recovery on next start.");
         }
     }
 }

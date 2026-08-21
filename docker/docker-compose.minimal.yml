@@ -71,10 +71,16 @@ services:
       # Round-16 F3: dedicated tmpfs for the signing seed so no
       # named volume (which could be re-attached to any other
       # container) ever carries the receipt trust anchor.
+      # Round-6: tmpfs mounts default to root:root, but the container
+      # runs as uid 65532 (Dockerfile USER) — without uid/gid options
+      # the harness cannot create /run/signing.seed and the first boot
+      # crash-loops on Permission denied.
       - type: tmpfs
         target: /run
         tmpfs:
           mode: 0700
+          uid: 65532
+          gid: 65532
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:

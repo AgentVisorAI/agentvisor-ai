@@ -347,6 +347,32 @@ pub fn authorization_error(id: Option<&Value>, reason: &str) -> Value {
     })
 }
 
+/// Round-6 (hunt4 protocol F5): JSON-RPC 2.0 reserves -32700 (parse
+/// error), -32600 (invalid request), and -32602 (invalid params) for
+/// requests that never reached application logic. Reporting those as
+/// -32001 "blocked by policy" (with HTTP 403) falsely told clients an
+/// authorization decision was made about a request that never parsed.
+pub fn protocol_error(id: Option<&Value>, error: &RpcError) -> Value {
+    let (code, message) = match error {
+        RpcError::Json(_) => (-32700, "parse error"),
+        RpcError::NotJsonRpc(_) | RpcError::TooLarge(..) => (-32600, "invalid request"),
+        RpcError::BadParams(_) => (-32602, "invalid params"),
+        // Passthrough refusal is an application-level policy choice.
+        RpcError::NotToolCall(_) => {
+            return authorization_error(id, &error.to_string());
+        }
+    };
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id.cloned().unwrap_or(Value::Null),
+        "error": {
+            "code": code,
+            "message": message,
+            "data": { "reason": error.to_string() }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
