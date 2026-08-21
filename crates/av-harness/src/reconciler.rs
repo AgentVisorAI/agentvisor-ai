@@ -563,6 +563,13 @@ impl Finalizer {
                 let path = if let Some(path) = existing_path {
                     path
                 } else {
+                    // Round-6 (hunt4 R2): snapshot for the write so a
+                    // failed atomic write leaves the builder intact for
+                    // retry; drain the builder AFTER the write is
+                    // durable (below, right before `close_complete`)
+                    // to reclaim RAM. The prior code kept the builder
+                    // populated forever because evict_finalized only
+                    // evicts Signed sessions.
                     let mut trajectory = session.snapshot_trajectory();
                     // An unsigned session that captured no steps cannot ever produce a strict-valid
                     // ATIF; seal it here so the idle sweeper skips it instead of churning forever.
@@ -677,6 +684,17 @@ impl Finalizer {
         // Only now — with lifecycle events published and the on-disk journal
         // removed — may the registry evict this session.
         session.mark_close_complete();
+        // Round-6 (hunt4 R2): reclaim the trajectory builder's RAM.
+        // Signed sessions are handled by evict_finalized; unsigned
+        // sessions live in the registry forever, so their builders
+        // must be released here or RSS grows unbounded under
+        // sustained traffic. Safe to drop unconditionally: any
+        // subsequent read of the trajectory comes from the durable
+        // on-disk artifact via promote()'s read_capped_async, not the
+        // builder.
+        if session.workflow == Workflow::Unsigned {
+            session.drain_trajectory_builder();
+        }
         self.clear_budget_state(&session.id);
         Ok(outcome)
     }
@@ -1334,6 +1352,15 @@ impl Finalizer {
                     );
                 }
             }
+            // Round-6 (hunt3 F5): the ATIF adoption path must consult
+            // quarantined_sessions like both sibling recovery paths do
+            // (signed at :1766, consolidate at :1963). Skipping this
+            // check lets a quarantined recycled-id session be restored
+            // as cleanly closed — masking the incident evidence the
+            // quarantine exists to preserve.
+            if self.quarantined_sessions.lock().contains(&session_id) {
+                recovered_session.mark_capture_failed();
+            }
             let receipt_path = self.receipt_path(&recovered_session.id);
             // Round-40 F4: distinguish ENOENT from other read
             // failures (see the twin in recover_signed_journals
@@ -1343,7 +1370,7 @@ impl Finalizer {
             // original.
             match tokio::fs::metadata(&receipt_path).await {
                 Ok(_) => {
-                    let bytes = read_capped_async(
+                    let bytes_receipt = read_capped_async(
                         receipt_path.clone(),
                         av_core::fsutil::MAX_RECEIPT_BYTES,
                     )
@@ -1361,10 +1388,29 @@ impl Finalizer {
                     // Round-17 F3: read is bounded by MAX_RECEIPT_BYTES
                     // so a hostile plant can no longer OOM the
                     // recovery scan on this session.
-                    let receipt = Receipt::from_json_slice(&bytes)
+                    let receipt = Receipt::from_json_slice(&bytes_receipt)
                         .map_err(|error| FinalizeError::Receipt(error.to_string()))?;
                     self.verify_configured_receipt(&receipt)?;
-                    if path.with_extension("promote").exists() {
+                    // Round-6 (hunt3 F3): also bind the persisted
+                    // receipt to THIS artifact by its digest before
+                    // restoring it. A recycled session id can leave a
+                    // prior incarnation's receipt at the shared hash
+                    // path; without this check the ATIF adoption
+                    // restored it as if it attested the current
+                    // trajectory. The signed twin at :1712 enforces the
+                    // same invariant; parity here closes the gap.
+                    let atif_digest = av_core::digest::sha256_hex(&bytes);
+                    let receipt_matches = matches!(
+                        &receipt.body.subject,
+                        ReceiptSubject::AtifTrajectory { trajectory_digest, .. }
+                            if *trajectory_digest == atif_digest
+                    );
+                    if !receipt_matches {
+                        tracing::warn!(
+                            session = %av_core::fsutil::basename(&path),
+                            "prior receipt does not attest the recovered ATIF trajectory; ignoring as prior-incarnation evidence"
+                        );
+                    } else if path.with_extension("promote").exists() {
                         recovered_session.restore_pending_receipt(receipt);
                     } else {
                         recovered_session.restore_receipt(receipt);
@@ -2189,9 +2235,44 @@ impl Finalizer {
                 .map_err(|error| FinalizeError::Atif(error.to_string()))?;
                 trajectory.trajectory_id.clone_from(&existing.trajectory_id);
                 if trajectory != existing {
-                    return Err(FinalizeError::Atif(
-                        "persisted ATIF does not match authenticated active journal".to_owned(),
-                    ));
+                    // Round-6 (hunt3 F4): a recycled session id whose
+                    // prior incarnation finalized an unsigned artifact
+                    // will land its follow-up incarnation here — the
+                    // journal we just consolidated is genuinely
+                    // different from the prior artifact. The close-time
+                    // path (see round-6 F1 at ~:630) archives the
+                    // existing artifact via `archive_conflicting_atif`;
+                    // the recovery path did the wrong thing (hard warn,
+                    // skip, retry every tick, journal never cleaned,
+                    // and if a later incarnation reopens the id the
+                    // next journal append lands at position 0 onto
+                    // leftover events.ndjson — breaking the
+                    // position-vs-seq invariant forever). Apply the
+                    // twin: archive prior incarnation's artifact +
+                    // sidecar + markers, then write our consolidated
+                    // trajectory in its place.
+                    let write_path = final_path.clone();
+                    let archive_session = session_id.to_owned();
+                    let new_trajectory_id = trajectory.trajectory_id.clone();
+                    let archive_result = tokio::task::spawn_blocking(move || {
+                        archive_conflicting_atif(
+                            &write_path,
+                            new_trajectory_id.as_deref(),
+                            &archive_session,
+                        )
+                    })
+                    .await
+                    .map_err(|error| FinalizeError::Task(error.to_string()))?;
+                    if let Err(error) = archive_result {
+                        return Err(FinalizeError::Atif(format!(
+                            "failed to archive prior-incarnation ATIF during recovery: {error}"
+                        )));
+                    }
+                    let write_path = final_path.clone();
+                    tokio::task::spawn_blocking(move || av_atif::write_atomic(&trajectory, &write_path))
+                        .await
+                        .map_err(|error| FinalizeError::Task(error.to_string()))?
+                        .map_err(|error| FinalizeError::Atif(error.to_string()))?;
                 }
             } else {
                 let write_path = final_path.clone();
@@ -3294,10 +3375,13 @@ async fn remove_outbox(path: &std::path::Path) -> Result<(), FinalizeError> {
                 // is retried by the reconciler on next tick if a
                 // crash truly loses it.
                 if let Err(error) = av_core::fsutil::sync_directory(parent) {
+                    // Round-6 (hunt4 F20): basename discipline —
+                    // absolute paths in log fields defeat the round-36
+                    // sweep everywhere else in this file.
                     tracing::warn!(
                         target: "av_harness::reconciler",
-                        path = %path.display(),
-                        parent = %parent.display(),
+                        path = %av_core::fsutil::basename(&path),
+                        parent = %av_core::fsutil::basename(parent),
                         detail = %error,
                         "remove_outbox: dirent unsync but file removed; caller state is stable, \
                          relying on reconciler retry to re-sync on next tick"

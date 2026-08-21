@@ -163,7 +163,7 @@ fn receipt_verify_stdout_matches_receipt_id_on_success() {
         receipt_id: "receipt-01".to_owned(),
         session_id: "sess-01".to_owned(),
         issued_at: 0,
-        issued_at_iso: "1970-01-01T00:00:00Z".to_owned(),
+        issued_at_iso: "1970-01-01T00:00:00.000Z".to_owned(),
         ai_agent: AgentIdentity {
             version: "1".to_owned(),
             charter: CharterFile::from("charter"),
@@ -210,7 +210,7 @@ fn receipt_verify_wrong_key_writes_reason_to_stderr() {
         receipt_id: "r".to_owned(),
         session_id: "s".to_owned(),
         issued_at: 0,
-        issued_at_iso: "1970-01-01T00:00:00Z".to_owned(),
+        issued_at_iso: "1970-01-01T00:00:00.000Z".to_owned(),
         ai_agent: AgentIdentity {
             version: "1".to_owned(),
             charter: CharterFile::from("c"),
@@ -271,7 +271,7 @@ fn keygen_public_key_verifies_a_receipt_signed_by_the_same_seed_when_reloaded() 
         receipt_id: "roundtrip".to_owned(),
         session_id: "s".to_owned(),
         issued_at: 0,
-        issued_at_iso: "1970-01-01T00:00:00Z".to_owned(),
+        issued_at_iso: "1970-01-01T00:00:00.000Z".to_owned(),
         ai_agent: AgentIdentity {
             version: "1".to_owned(),
             charter: CharterFile::from("c"),

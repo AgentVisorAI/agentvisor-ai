@@ -262,7 +262,7 @@ const MAX_NESTED_DEPTH: usize = 128;
 /// operationally absurd for any real agent run — 1000x the whole
 /// LLM industry's annual spend — while being 1e296 below f64::MAX,
 /// safe for any arithmetic combination downstream.
-const MAX_COST_USD: f64 = 1e12;
+pub(crate) const MAX_COST_USD: f64 = 1e12;
 
 /// Validate a raw JSON value as an ATIF trajectory.
 ///
@@ -467,6 +467,32 @@ fn validate_trajectory_obj(
                     ver.0,
                     ver.1
                 );
+            }
+            // Round-6 (hunt2 F1): `Agent.tool_definitions` is
+            // `Option<Vec<Map>>` on the typed model — an array-of-object
+            // shape. STEP_FIELDS-style presence gating alone let a
+            // wrong-typed value pass the strict validator while
+            // deserialization then failed.
+            if let Some(defs) = agent.get("tool_definitions") {
+                match defs.as_array() {
+                    Some(items) => {
+                        for (index, item) in items.iter().enumerate() {
+                            if !item.is_object() {
+                                issue!(
+                                    issues,
+                                    format!("{path}.agent.tool_definitions[{index}]"),
+                                    "must be an object"
+                                );
+                            }
+                        }
+                    }
+                    None if !defs.is_null() => issue!(
+                        issues,
+                        format!("{path}.agent.tool_definitions"),
+                        "must be an array of objects"
+                    ),
+                    None => {}
+                }
             }
         }
         Some(_) => issue!(issues, format!("{path}.agent"), "must be an object"),
@@ -703,6 +729,22 @@ fn validate_step(
         .is_some_and(|v| !v.is_string() && !v.is_null())
     {
         issue!(issues, format!("{path}.model_name"), "must be a string");
+    }
+
+    // Round-6 (hunt2 F1): `Step.is_copied_context` is `Option<bool>`
+    // on the typed model. It was only listed in STEP_FIELDS (so
+    // check_unknown_fields let it through) but never type-checked, so
+    // a wrong-typed value (`"is_copied_context": "yes"`) diverged the
+    // CLI validator ("valid") from the typed deserializer ("invalid").
+    if obj
+        .get("is_copied_context")
+        .is_some_and(|v| !v.is_boolean() && !v.is_null())
+    {
+        issue!(
+            issues,
+            format!("{path}.is_copied_context"),
+            "must be a boolean"
+        );
     }
 
     // Agent-only fields.
@@ -1059,6 +1101,38 @@ fn validate_step(
                         format!("{mpath}.prompt_token_ids"),
                         "field requires ATIF-v1.4+"
                     );
+                }
+                // Round-6 (hunt2 F1): strict-mode type checks for
+                // fields the round-16 F2 sweep missed. The typed model
+                // rejects a wrong type at deserialize (e.g. logprobs =
+                // "x"), but validate_bytes/validate_value(Strict)
+                // previously only presence-gated these — so the CLI
+                // said "valid" while the harness reconciler's typed
+                // path said "invalid", diverging the two verdicts on
+                // the same file.
+                if let Mode::Strict = mode {
+                    for numeric_array_field in ["logprobs", "completion_token_ids", "prompt_token_ids"] {
+                        if let Some(v) = m.get(numeric_array_field) {
+                            match v.as_array() {
+                                Some(items) => {
+                                    for (index, item) in items.iter().enumerate() {
+                                        if !item.is_number() {
+                                            issue!(
+                                                issues,
+                                                format!("{mpath}.{numeric_array_field}[{index}]"),
+                                                "must be a number"
+                                            );
+                                        }
+                                    }
+                                }
+                                None => issue!(
+                                    issues,
+                                    format!("{mpath}.{numeric_array_field}"),
+                                    "must be an array of numbers"
+                                ),
+                            }
+                        }
+                    }
                 }
             }
             None => issue!(issues, mpath, "must be an object"),

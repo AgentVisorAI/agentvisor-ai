@@ -107,7 +107,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("bind {}", config.listen))?;
     if let Some(segment) = config.duplicated_chat_path_segment() {
         tracing::warn!(
-            upstream_url = %config.upstream_url,
+            upstream_url = %av_core::url_redact::redact_userinfo(&config.upstream_url),
             upstream_chat_path = %config.upstream_chat_path,
             "upstream_url already ends with \"/{segment}\" and upstream_chat_path repeats it; \
              the joined URL will contain \"/{segment}/{segment}/\" — most providers expect the \
@@ -117,7 +117,9 @@ async fn main() -> Result<()> {
     tracing::info!(
         listen = %config.listen,
         config = %config_source,
-        upstream = %format!("{}{}", config.upstream_url.trim_end_matches('/'), config.upstream_chat_path),
+        upstream = %av_core::url_redact::redact_userinfo(
+            &format!("{}{}", config.upstream_url.trim_end_matches('/'), config.upstream_chat_path)
+        ),
         upstream_auth = %av_harness::pipeline::describe_upstream_auth(&config),
         bridge = %config.bridge_backend,
         state = %config.state_backend,

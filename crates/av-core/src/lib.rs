@@ -14,6 +14,7 @@ pub mod text;
 pub mod time;
 pub mod tokens;
 pub mod units;
+pub mod url_redact;
 
 pub use error::CoreError;
 pub use ids::{new_event_uid, new_session_id, InstanceUid, SessionId};

@@ -58,10 +58,68 @@ impl QdrantVectorSink {
         })
     }
 
-    /// Create or update the collection with cosine distance and the configured
-    /// embedding width.
+    /// Round-6 (hunt5 F1): idempotent create — GET the collection first,
+    /// verify size + distance if it exists, PUT-create only when
+    /// absent. The prior code used PUT unconditionally, but Qdrant's
+    /// `PUT /collections/{name}` is CREATE, not create-or-update (see
+    /// qdrant/qdrant#3217/#3422). Every daemon restart hit the existing
+    /// collection and boot aborted with a misleading "provision Qdrant
+    /// collection" error; an embedder-dimension change also surfaced
+    /// as the same message rather than a precise dim-conflict.
     pub async fn ensure_collection(&self, dimension: usize) -> Result<(), String> {
         let url = format!("{}/collections/{}", self.base_url, self.collection);
+        let get_response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|error| classify_qdrant_error(error))?;
+        let status = get_response.status();
+        if status.is_success() {
+            let body: serde_json::Value = get_response
+                .json()
+                .await
+                .map_err(|error| classify_qdrant_error(error))?;
+            let params = body.pointer("/result/config/params/vectors");
+            let existing_size = params
+                .and_then(|value| value.get("size"))
+                .and_then(serde_json::Value::as_u64);
+            let existing_distance = params
+                .and_then(|value| value.get("distance"))
+                .and_then(serde_json::Value::as_str);
+            match (existing_size, existing_distance) {
+                (Some(size), Some(distance))
+                    if size as usize == dimension && distance.eq_ignore_ascii_case("Cosine") =>
+                {
+                    return Ok(());
+                }
+                (Some(size), Some(distance)) => {
+                    return Err(format!(
+                        "Qdrant collection {:?} exists with size={size}, distance={distance:?} \
+                         but embedder configured for size={dimension}, distance=\"Cosine\" — \
+                         refusing to overwrite; delete the collection or reconfigure the embedder",
+                        self.collection
+                    ));
+                }
+                _ => {
+                    // Existing but with an unrecognized shape — treat
+                    // as a hostile/unexpected environment and refuse
+                    // rather than silently reprovisioning.
+                    return Err(format!(
+                        "Qdrant collection {:?} exists but its config shape is unrecognized \
+                         (no `vectors.size`/`vectors.distance`); refusing to overwrite",
+                        self.collection
+                    ));
+                }
+            }
+        }
+        if status.as_u16() != 404 {
+            return Err(format!(
+                "Qdrant returned {status} when probing collection {:?}",
+                self.collection
+            ));
+        }
+        // Absent: create.
         self.client
             .put(url)
             .json(&serde_json::json!({
@@ -72,11 +130,22 @@ impl QdrantVectorSink {
             }))
             .send()
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|error| classify_qdrant_error(error))?
             .error_for_status()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| classify_qdrant_error(error))?;
         Ok(())
     }
+}
+
+/// Round-6 (hunt4 F14): Qdrant reqwest errors embed the request URL in
+/// `Display`, leaking the internal vector-store hostname/collection to
+/// every downstream log (worker warn, boot bail). Strip the URL so the
+/// logged text carries only the failure class. `without_url` moves the
+/// error so we accept ownership; the callers were about to `to_string`
+/// and drop it anyway.
+#[cfg(feature = "qdrant")]
+fn classify_qdrant_error(error: reqwest::Error) -> String {
+    error.without_url().to_string()
 }
 
 #[cfg(feature = "qdrant")]
@@ -101,12 +170,12 @@ impl VectorSink for QdrantVectorSink {
                 }))
                 .send()
                 .await
-                .map_err(|error| error.to_string())?
+                .map_err(|error| classify_qdrant_error(error))?
                 .error_for_status()
-                .map_err(|error| error.to_string())?
+                .map_err(|error| classify_qdrant_error(error))?
                 .json()
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| classify_qdrant_error(error))?;
             let Some(score) = response
                 .pointer("/result/0/score")
                 .and_then(serde_json::Value::as_f64)
@@ -144,9 +213,9 @@ impl VectorSink for QdrantVectorSink {
                 }))
                 .send()
                 .await
-                .map_err(|error| error.to_string())?
+                .map_err(|error| classify_qdrant_error(error))?
                 .error_for_status()
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| classify_qdrant_error(error))?;
             Ok(())
         })
     }

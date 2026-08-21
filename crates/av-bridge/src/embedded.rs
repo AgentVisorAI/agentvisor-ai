@@ -663,28 +663,67 @@ fn recover_event_uids(path: &Path) -> Result<HashMap<String, u64>, BusError> {
     if !path.exists() {
         return Ok(HashMap::new());
     }
-    // Round-22 F4: cap the idempotency sidecar read. The sidecar grows
-    // proportionally to live UIDs (bounded by retention) so MAX_ATIF_BYTES
-    // (64 MiB) is the operationally-sized ceiling; a hostile plant of a
-    // multi-GiB sidecar file would OOM the broker at startup.
-    let bytes = av_core::fsutil::read_capped(path, av_core::fsutil::MAX_ATIF_BYTES)?;
-    let complete_len = bytes
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |position| position + 1);
-    if complete_len < bytes.len() {
-        rewrite_atomic(path, bytes.get(..complete_len).unwrap_or_default())?;
-    }
+    // Round-6 (hunt5 F4): stream the sidecar with BufReader rather than
+    // reading it whole and capping at MAX_ATIF_BYTES. The sidecar grows
+    // one line per idempotent publish, compacted only when retention
+    // expires UIDs — at 30-day default hot retention, ~1M live events
+    // per partition (≈0.4 ev/s) crosses 64 MiB. The previous hard cap
+    // would then fail `open()` on every restart, permanently bricking
+    // the broker even though the segment on disk is authoritative and
+    // `recover_segment_event_uids` will fix the map either way. Bound
+    // per-line via `read_line` (line length is only limited by
+    // `EventUidOffset`'s JSON encoding at ~200 B); an oversize line is
+    // treated as sidecar corruption and skipped, matching the parse
+    // failure discipline just below.
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
     let mut seen = HashMap::new();
-    for line in bytes
-        .get(..complete_len)
-        .unwrap_or_default()
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-    {
-        let mapping: EventUidOffset = match serde_json::from_slice(line) {
+    let mut line_buffer = Vec::new();
+    let mut valid_bytes: u64 = 0;
+    let mut has_torn_tail = false;
+    let mut logged_oversize_line = false;
+    // A single oversized-line hard cap: 4 KiB is 20x the fattest
+    // sidecar record we produce and keeps `read_until`'s worst-case
+    // allocation bounded on adversarial inputs.
+    const MAX_SIDECAR_LINE: usize = 4096;
+    loop {
+        line_buffer.clear();
+        let bytes_read = match reader.read_until(b'\n', &mut line_buffer) {
+            Ok(0) => break,
+            Ok(bytes) => bytes,
+            Err(error) => return Err(BusError::Io(error)),
+        };
+        let terminated = line_buffer.last() == Some(&b'\n');
+        if !terminated {
+            // Trailing partial line (crash between newline appends);
+            // the atomic-append discipline in `publish_with_uid`
+            // guarantees any complete line is fully synced before the
+            // next one starts, so this is the classic torn tail.
+            has_torn_tail = true;
+            break;
+        }
+        if bytes_read > MAX_SIDECAR_LINE {
+            if !logged_oversize_line {
+                tracing::warn!(
+                    path = %av_core::fsutil::basename(path),
+                    line_bytes = bytes_read,
+                    "oversized event-uid sidecar record skipped during recovery"
+                );
+                logged_oversize_line = true;
+            }
+            valid_bytes = valid_bytes.saturating_add(bytes_read as u64);
+            continue;
+        }
+        valid_bytes = valid_bytes.saturating_add(bytes_read as u64);
+        let payload = line_buffer
+            .strip_suffix(b"\n")
+            .unwrap_or(&line_buffer);
+        if payload.is_empty() {
+            continue;
+        }
+        let mapping: EventUidOffset = match serde_json::from_slice(payload) {
             Ok(mapping) => mapping,
-            // Sidecar corruption also skip-and-log: the segment is the
+            // Sidecar corruption skip-and-log: the segment is the
             // ground truth (see `recover_segment_event_uids` below), and
             // an unreadable idempotency line at most costs a duplicate
             // ack for the same UID.
@@ -715,7 +754,24 @@ fn recover_event_uids(path: &Path) -> Result<HashMap<String, u64>, BusError> {
             }
         }
     }
+    if has_torn_tail {
+        // Truncate to the last complete line so future appends land
+        // cleanly (the on-disk record set is unchanged).
+        rewrite_atomic(
+            path,
+            &read_valid_prefix(path, valid_bytes).unwrap_or_default(),
+        )?;
+    }
     Ok(seen)
+}
+
+fn read_valid_prefix(path: &Path, len: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)?;
+    let mut reader = file.take(len);
+    let mut out = Vec::with_capacity(len.try_into().unwrap_or(usize::MAX));
+    reader.read_to_end(&mut out)?;
+    Ok(out)
 }
 
 fn recover_segment_event_uids(path: &Path, seen: &mut HashMap<String, u64>) -> Result<(), BusError> {

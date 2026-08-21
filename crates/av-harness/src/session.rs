@@ -483,6 +483,30 @@ impl Session {
         self.atif.lock().clone().finish()
     }
 
+    /// Release the trajectory builder's memory after a durable close.
+    /// Round-6 (hunt4 R2): SUCCESSFUL unsigned closes previously kept
+    /// the full trajectory (every captured Step, up to 8 MiB each) in
+    /// RAM for the process lifetime because `evict_finalized` only
+    /// evicts Signed sessions. Drain the builder AFTER the artifact +
+    /// sidecar are durable, so a failed write can still be retried (it
+    /// re-uses the still-populated builder) but a succeeded close
+    /// promptly reclaims the memory.
+    pub(crate) fn drain_trajectory_builder(&self) {
+        let identity = self.current_identity();
+        let agent = av_atif::Agent {
+            name: "agentvisor-ai-harness".into(),
+            version: identity.version.clone(),
+            model_name: None,
+            tool_definitions: None,
+            extra: Some(serde_json::json!({
+                "charter": identity.charter,
+                "instance_uid": identity.instance_uid,
+                "ttl_remaining_s": identity.ttl_remaining_s,
+            })),
+        };
+        *self.atif.lock() = av_atif::TrajectoryBuilder::new(agent, Some(self.id.clone()));
+    }
+
     pub(crate) fn worker_job_started(&self) {
         self.pending_jobs.fetch_add(1, Ordering::AcqRel);
     }

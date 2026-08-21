@@ -661,6 +661,22 @@ impl AppState {
             // the pool memory footprint and forces frequent-enough
             // TLS refresh under a rolling cert rotation.
             .pool_idle_timeout(std::time::Duration::from_secs(60));
+        // Round-6 (hunt4 protocol F2): reqwest 0.12 is built here
+        // without decompression features, so the proxy cannot decode any
+        // content-coding an origin might apply. RFC 9110 §12.5.3 says
+        // an ABSENT Accept-Encoding permits any coding, so a CDN in
+        // front of the upstream may legally gzip the response — which
+        // the chat path then 502's on and the tool path (with the
+        // round-6 guard applied above) would also refuse. Advertise
+        // `Accept-Encoding: identity` so the routine outcome is
+        // "identity as requested" and the refusal guards are pure
+        // defense-in-depth.
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        default_headers.insert(
+            reqwest::header::ACCEPT_ENCODING,
+            reqwest::header::HeaderValue::from_static("identity"),
+        );
+        client_builder = client_builder.default_headers(default_headers);
         // Round-32 F4: apply a read-timeout floor unconditionally so an
         // adversarial or merely broken upstream (chat OR tool) cannot pin
         // a session lease + WorkerPermit + tool-intent claim
@@ -1044,38 +1060,44 @@ impl AppState {
                 av_core::digest::sha256_hex(request.session.id.as_bytes())
             }
         };
-        match crate::worker::create_response_marker(
+        // Round-6 cancellation fix: arm the guard with the marker id
+        // BEFORE the awaited disk write. If the client disconnects
+        // between here and the write completing, `spawn_blocking` still
+        // runs the write to durability; the guard's terminal-failure
+        // job then retires the marker via `clear_response_marker`,
+        // which now treats an absent file as success — so a never-written
+        // marker is a clean no-op and a written one is deleted. Under
+        // the previous ordering, cancellation between the write and
+        // `set_marker` left the marker stranded, poisoning quarantine
+        // sets and (across restart) bricking receipts.
+        let attempt_id = crate::worker::reserve_response_attempt_id();
+        request.capture_guard.set_marker(attempt_id.clone());
+        if let Err(error) = crate::worker::write_response_marker(
             std::path::Path::new(&self.config.atif_spool_dir),
             &self.journal_key,
             &request.session.id,
+            &attempt_id,
             request_digest,
         )
         .await
         {
-            // The guard owns the marker from here: a cancelled request
-            // future (client disconnect during `send()` below or in the
-            // handler before `AbortFinalizingStream` takes over) retires
-            // it via the guard's terminal failure job.
-            Ok(marker) => request.capture_guard.set_marker(marker),
-            Err(error) => {
-                // Fail closed: the marker is what lets a restart-time scan
-                // (`inflight_response_sessions`) quarantine sessions whose
-                // provider response may have been observed but never
-                // captured. Dispatching without it would silently drop that
-                // crash-durability guarantee, so refuse before upstream I/O
-                // — terminating the journaled response attempt like every
-                // other post-admission abort (see `abandon_prepared`).
-                tracing::warn!(
-                    %error,
-                    session = %request.session.id,
-                    "could not write in-flight response marker; refusing upstream dispatch"
-                );
-                let client_error =
-                    PipelineError::Unavailable("in-flight response marker could not be persisted".to_owned());
-                self.abandon_prepared(&mut request, StopReason::Other, &client_error.to_string());
-                return Err(client_error);
-            }
-        };
+            // Fail closed: the marker is what lets a restart-time scan
+            // (`inflight_response_sessions`) quarantine sessions whose
+            // provider response may have been observed but never
+            // captured. Dispatching without it would silently drop that
+            // crash-durability guarantee, so refuse before upstream I/O
+            // — terminating the journaled response attempt like every
+            // other post-admission abort (see `abandon_prepared`).
+            tracing::warn!(
+                %error,
+                session = %request.session.id,
+                "could not write in-flight response marker; refusing upstream dispatch"
+            );
+            let client_error =
+                PipelineError::Unavailable("in-flight response marker could not be persisted".to_owned());
+            self.abandon_prepared(&mut request, StopReason::Other, &client_error.to_string());
+            return Err(client_error);
+        }
         let PreparedRequest {
             session,
             identity,

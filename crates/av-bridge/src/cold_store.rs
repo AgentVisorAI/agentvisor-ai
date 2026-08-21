@@ -238,55 +238,101 @@ impl ColdArchive {
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
                 continue;
             }
-            // Read under the intent lock so a concurrent stage/commit
-            // rewrite is never observed mid-swap; NotFound means a racing
-            // commit already exported and removed the intent.
-            let mut pending = {
-                let _guard = self.intent_lock.lock();
-                match read_pending(&path, &self.control_key.read()) {
-                    Ok(pending) => pending,
-                    Err(BusError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(error),
-                }
-            };
-            if path != self.pending_path(&pending.topic, &pending.event_uid) {
-                return Err(BusError::Backend(
-                    "cold outbox path does not match its payload".to_owned(),
-                ));
+            // Round-6 (hunt3 F6): isolate per-file failures so ONE
+            // corrupt intent does not head-of-line-block cold export
+            // for every other durable intent forever. Any error class
+            // that would abort the loop (unverifiable MAC, decode
+            // failure, filename↔payload mismatch, unavailable target,
+            // remote put failure) is now downgraded to warn + quarantine
+            // + continue.
+            if let Err(error) = self.retry_pending_one(&path, &mut resolve) {
+                self.quarantine_cold_intent(&path, &error);
+                continue;
             }
-            if pending.offset.is_none() {
-                // In-flight publisher window: skip young offset-None
-                // intents entirely (see RETRY_GRACE_MS). `stored_at` is
-                // MAC-authenticated, so a filesystem tamperer cannot park
-                // an intent in the grace window forever.
-                if av_core::time::now_ms().saturating_sub(pending.stored_at) < RETRY_GRACE_MS {
-                    continue;
-                }
-                let ack = resolve(&pending)?;
-                if ack.topic != pending.topic || ack.partition != pending.partition {
-                    return Err(BusError::Backend(
-                        "broker resolver returned an acknowledgment for another cold intent".to_owned(),
-                    ));
-                }
-                // Re-read after the (unlocked) resolve: a racing commit may
-                // have exported+removed the intent (skip it) or persisted
-                // the broker-acked offset (which wins over ours).
-                let _guard = self.intent_lock.lock();
-                match read_pending(&path, &self.control_key.read()) {
-                    Ok(current) if current.offset.is_some() => pending = current,
-                    Ok(_) => {
-                        pending.offset = Some(ack.offset);
-                        persist_pending(&path, &pending, &self.control_key.read())?;
-                    }
-                    Err(BusError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(error),
-                }
-            }
-            self.put_remote(&pending)?;
-            remove_pending(&path)?;
             completed = completed.saturating_add(1);
         }
         Ok(completed)
+    }
+
+    fn retry_pending_one<F>(
+        &self,
+        path: &std::path::Path,
+        resolve: &mut F,
+    ) -> Result<(), BusError>
+    where
+        F: FnMut(&PendingColdEvent) -> Result<crate::PublishAck, BusError>,
+    {
+        // Read under the intent lock so a concurrent stage/commit
+        // rewrite is never observed mid-swap; NotFound means a racing
+        // commit already exported and removed the intent.
+        let mut pending = {
+            let _guard = self.intent_lock.lock();
+            match read_pending(path, &self.control_key.read()) {
+                Ok(pending) => pending,
+                Err(BusError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        if path != self.pending_path(&pending.topic, &pending.event_uid) {
+            return Err(BusError::Backend(
+                "cold outbox path does not match its payload".to_owned(),
+            ));
+        }
+        if pending.offset.is_none() {
+            // In-flight publisher window: skip young offset-None
+            // intents entirely (see RETRY_GRACE_MS). `stored_at` is
+            // MAC-authenticated, so a filesystem tamperer cannot park
+            // an intent in the grace window forever.
+            if av_core::time::now_ms().saturating_sub(pending.stored_at) < RETRY_GRACE_MS {
+                return Ok(());
+            }
+            let ack = resolve(&pending)?;
+            if ack.topic != pending.topic || ack.partition != pending.partition {
+                return Err(BusError::Backend(
+                    "broker resolver returned an acknowledgment for another cold intent".to_owned(),
+                ));
+            }
+            // Re-read after the (unlocked) resolve: a racing commit may
+            // have exported+removed the intent (skip it) or persisted
+            // the broker-acked offset (which wins over ours).
+            let _guard = self.intent_lock.lock();
+            match read_pending(path, &self.control_key.read()) {
+                Ok(current) if current.offset.is_some() => pending = current,
+                Ok(_) => {
+                    pending.offset = Some(ack.offset);
+                    persist_pending(path, &pending, &self.control_key.read())?;
+                }
+                Err(BusError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.put_remote(&pending)?;
+        remove_pending(path)?;
+        Ok(())
+    }
+
+    fn quarantine_cold_intent(&self, path: &std::path::Path, error: &BusError) {
+        let uid = av_core::new_event_uid();
+        let quarantine = path.with_extension(format!("json.corrupt-{uid}"));
+        if let Err(rename_err) = std::fs::rename(path, &quarantine) {
+            tracing::warn!(
+                %error,
+                %rename_err,
+                path = %av_core::fsutil::basename(path),
+                "cold outbox intent failed and could not be quarantined — leaving in place"
+            );
+        } else {
+            tracing::warn!(
+                %error,
+                path = %av_core::fsutil::basename(path),
+                quarantine = %av_core::fsutil::basename(&quarantine),
+                "cold outbox intent quarantined so remaining exports can proceed"
+            );
+        }
     }
 
     fn put_remote(&self, pending: &PendingColdEvent) -> Result<(), BusError> {

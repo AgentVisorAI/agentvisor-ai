@@ -103,8 +103,27 @@ impl TrajectoryBuilder {
                     context: "step_cost_usd",
                 });
             }
+            // Round-6 (hunt2 F2): the validator caps step and total
+            // cost at MAX_COST_USD (1e12) and refuses to persist
+            // anything beyond. The prior writer accepted any finite
+            // non-negative step cost, so the reconciler's u64-micros ↔
+            // f64 USD round-trip could construct a step whose cost
+            // exceeded the cap — the trajectory then became
+            // permanently un-writable at `write_atomic` (evidence loss
+            // at export time). Refuse here so the builder never
+            // produces validator-invalid output.
+            if step_cost > crate::validate::MAX_COST_USD {
+                return Err(av_core::CoreError::Overflow {
+                    context: "step_cost_usd",
+                });
+            }
             let next_cost = self.total_cost + step_cost;
             if !next_cost.is_finite() {
+                return Err(av_core::CoreError::Overflow {
+                    context: "total_cost_usd",
+                });
+            }
+            if next_cost > crate::validate::MAX_COST_USD {
                 return Err(av_core::CoreError::Overflow {
                     context: "total_cost_usd",
                 });

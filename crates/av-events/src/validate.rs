@@ -170,6 +170,18 @@ pub fn validate_event(ev: &OcsfEvent) -> Result<(), Vec<ValidationError>> {
     if ev.stop_reason_id.is_some() != ev.stop_reason.is_some() {
         errors.push(ValidationError::StopReasonPairMismatch);
     }
+    // Round-6 (hunt2 F4): match the shipped JSON schema's
+    // `"stop_reason": {"type": "string", "minLength": 1}`. Some
+    // OpenAI-compatible shims emit `finish_reason: ""` mid-stream; the
+    // parse-site filter in routes.rs::parse_provider_chunk drops that,
+    // but this defense-in-depth check ensures any other emitter path
+    // (`stop_reason_native`, direct builder use) also cannot produce
+    // an event that would pass the Rust validator here yet fail the
+    // schema validator at publish — which permanently fail-closes the
+    // session AFTER the bytes are relayed.
+    if ev.stop_reason.as_deref() == Some("") {
+        errors.push(ValidationError::EmptyField("stop_reason"));
+    }
     // Round-17 F1 (revised in round-18 after self-audit): the initial
     // fix required `StopReason::from_id(id).caption() == stop_reason`
     // whenever id was known. That's WRONG — the field docstring at
@@ -235,6 +247,22 @@ pub fn validate_event(ev: &OcsfEvent) -> Result<(), Vec<ValidationError>> {
     for (field, value) in [("time", ev.time), ("metadata.sequence", ev.metadata.sequence)] {
         if av_core::error::check_jcs_safe(value).is_err() {
             errors.push(ValidationError::JcsUnsafeInteger { field, value });
+        }
+    }
+    // Round-6 (hunt2 F1): `ai_agent.ttl_remaining_s` is a schema-typed
+    // u64 with no maximum in the shipped JSON schema. Any value above
+    // 2^53 silently truncates in JS-based auditors and hard-fails
+    // `av_receipts::canonicalize`. `OcsfEventBuilder::build`'s
+    // check_jcs_safe loop already covers the fields listed above; add
+    // ttl_remaining_s here so the wire/deserialize path also refuses.
+    // (`OcsfEvent.ai_agent.ttl_remaining_s` was omitted from the
+    // original round-17 F2 sweep.)
+    if let Some(ttl) = ev.ai_agent.ttl_remaining_s {
+        if av_core::error::check_jcs_safe(ttl).is_err() {
+            errors.push(ValidationError::JcsUnsafeInteger {
+                field: "ai_agent.ttl_remaining_s",
+                value: ttl,
+            });
         }
     }
     if let Some(m) = &ev.metrics {

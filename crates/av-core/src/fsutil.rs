@@ -104,11 +104,14 @@ pub fn read_capped(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
     let mut file = std::fs::File::open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
+        // Round-6 (hunt4 F13): error messages must not embed the full
+        // absolute path — they surface into logs (defeating the round-36
+        // basename discipline) and into HTTP close/promote error bodies.
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
                 "{} is not a regular file (type: {:?})",
-                path.display(),
+                basename(path),
                 metadata.file_type()
             ),
         ));
@@ -118,7 +121,7 @@ pub fn read_capped(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
             io::ErrorKind::InvalidData,
             format!(
                 "{} is {} bytes; refusing to load more than {max_bytes}",
-                path.display(),
+                basename(path),
                 metadata.len()
             ),
         ));
@@ -132,7 +135,7 @@ pub fn read_capped(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
             io::ErrorKind::InvalidData,
             format!(
                 "{} grew past {max_bytes} bytes during read; refusing",
-                path.display()
+                basename(path)
             ),
         ));
     }
