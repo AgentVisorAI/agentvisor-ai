@@ -262,7 +262,7 @@ impl WorkerHandle {
                 self.metrics
                     .counter(
                         "av_events_dropped_total{stage=\"worker_queue\"}",
-                        "Worker jobs dropped",
+                        "Worker jobs or response-slot reservations dropped, labeled by admission stage",
                     )
                     .inc();
                 Err(SubmitError::Full)
@@ -271,7 +271,7 @@ impl WorkerHandle {
                 self.metrics
                     .counter(
                         "av_events_dropped_total{stage=\"worker_closed\"}",
-                        "Worker jobs dropped",
+                        "Worker jobs or response-slot reservations dropped, labeled by admission stage",
                     )
                     .inc();
                 Err(SubmitError::Closed)
@@ -292,7 +292,7 @@ impl WorkerHandle {
                 self.metrics
                     .counter(
                         "av_events_dropped_total{stage=\"response_slot\"}",
-                        "Response-slot reservations that failed",
+                        "Worker jobs or response-slot reservations dropped, labeled by admission stage",
                     )
                     .inc();
                 SubmitError::Full
@@ -348,7 +348,10 @@ impl WorkerHandle {
                 envelope.job.session.worker_job_finished();
                 self.worker_job_finished();
                 self.metrics
-                    .counter(stage.full_counter_key(), "Worker jobs dropped")
+                    .counter(
+                        stage.full_counter_key(),
+                        "Worker jobs or response-slot reservations dropped, labeled by admission stage",
+                    )
                     .inc();
                 tracing::warn!(
                     session = %session_id,
@@ -364,7 +367,7 @@ impl WorkerHandle {
                 self.metrics
                     .counter(
                         "av_events_dropped_total{stage=\"worker_closed\"}",
-                        "Worker jobs dropped",
+                        "Worker jobs or response-slot reservations dropped, labeled by admission stage",
                     )
                     .inc();
                 tracing::warn!(
@@ -447,7 +450,10 @@ impl WorkerHandle {
     ) -> Result<tokio::sync::OwnedSemaphorePermit, SubmitError> {
         Arc::clone(&self.capacity).try_acquire_owned().map_err(|_| {
             self.metrics
-                .counter(stage.full_counter_key(), "Worker jobs dropped")
+                .counter(
+                    stage.full_counter_key(),
+                    "Worker jobs or response-slot reservations dropped, labeled by admission stage",
+                )
                 .inc();
             SubmitError::Full
         })
@@ -826,14 +832,14 @@ async fn process_job(
             .await
             .map_err(|error| error.to_string())??;
         let nearest_similarity = vector_sink
-            .nearest_similarity(&job.session.id, &embedding)
+            .nearest_similarity(&job.session.session_scope, &embedding)
             .await?;
         let verdict = job.session.loop_state.observe_embedding_with_similarity(
             embedding.clone(),
             step_tokens,
             nearest_similarity,
         );
-        vector_sink.record(&job.session.id, &embedding).await?;
+        vector_sink.record(&job.session.session_scope, &embedding).await?;
         Some(verdict)
     } else {
         None
@@ -1105,13 +1111,20 @@ pub(crate) async fn inflight_response_sessions(
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
                 continue;
             }
+            let marker_bytes = match av_core::fsutil::read_capped(&path, av_core::fsutil::MAX_CONTROL_BYTES) {
+                Ok(bytes) => bytes,
+                // A live request legitimately clears its marker between
+                // the directory listing and this read — the response
+                // completed; it is not in flight.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.to_string()),
+            };
             let marker: InFlightResponse = crate::journal::open(
                 &journal_key,
                 "in-flight-response",
                 0,
                 // Round-18: cap sealed marker read at MAX_CONTROL_BYTES.
-                &av_core::fsutil::read_capped(&path, av_core::fsutil::MAX_CONTROL_BYTES)
-                    .map_err(|error| error.to_string())?,
+                &marker_bytes,
             )?;
             if path != response_marker_path(&spool_dir, &marker.session_id, &marker.attempt_id) {
                 return Err("in-flight response marker path does not match its payload".to_owned());
@@ -1313,7 +1326,22 @@ pub(crate) async fn read_broker_ack(
     journal_key: &[u8; 32],
 ) -> Result<Option<PublishAck>, String> {
     let path = broker_ack_path(directory, session_id, event_uid);
-    let bytes = match tokio::fs::read(&path).await {
+    // Bounded read — same policy as every other sealed marker in the
+    // spool (close-complete marker, promotion marker, response marker,
+    // ATIF sidecar). A local fs-tamper attacker plant at
+    // `spool/broker-acks/<hash>/<hash>.json` would otherwise blow up
+    // memory during finalize before MAC rejection: `journal::open` calls
+    // `serde_json::from_slice` on the raw bytes, and a multi-GB file
+    // reaches serde_json's own limit only after the initial `read` has
+    // already allocated the whole buffer. `MAX_CONTROL_BYTES` (1 MiB)
+    // is far above any legitimate ack record.
+    let bytes = match tokio::task::spawn_blocking({
+        let path = path.clone();
+        move || av_core::fsutil::read_capped(&path, av_core::fsutil::MAX_CONTROL_BYTES)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.to_string()),

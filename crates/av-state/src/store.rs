@@ -32,6 +32,16 @@ pub struct Spend {
 /// Atomic counter operations. Every mutation is atomic with respect to
 /// concurrent callers; `try_spend` is a single check-and-spend (never a
 /// read-then-write).
+///
+/// # Counter lifetime
+///
+/// Backends with native expiry apply a TTL to every counter they touch:
+/// `RedisStore` refreshes a 24 h TTL (`BUDGET_COUNTER_TTL_SECS` in
+/// `redis_store.rs`) on each spend/add/refund, so a session idle past
+/// that window has its budget counters silently reset. `InMemoryStore`
+/// never expires. Callers must bound session lifetimes to the backend
+/// TTL (or clean up explicitly via `remove`/`remove_prefix`) so the two
+/// backends stay behaviorally aligned across dev and prod.
 pub trait StateStore: Send + Sync {
     /// Add `delta` to `key`, returning the new value.
     fn add(&self, key: &str, delta: u64) -> Result<u64, StateError>;
@@ -78,9 +88,25 @@ pub trait StateStore: Send + Sync {
     }
 
     /// Remove every key beginning with `prefix` (whole-session cleanup at
-    /// finalization). Backends with native expiry (e.g. Redis TTLs) may
-    /// leave this as the default no-op; in-process backends must implement
-    /// it or session-keyed counters accumulate for the process lifetime.
+    /// finalization). Every backend must implement this: native expiry
+    /// (e.g. Redis TTLs) is NOT a substitute, because a finalized session
+    /// id can be recycled into a fresh session within the TTL window and
+    /// would inherit the prior incarnation's counters. In-process backends
+    /// additionally need it or session-keyed counters accumulate for the
+    /// process lifetime.
+    ///
+    /// Round-15 F2 (av-state): CLUSTER-MODE HAZARD FOR FUTURE CALLERS.
+    /// The Redis Cluster implementation of `remove_prefix` routes SCAN
+    /// and DEL to a SINGLE hash slot — the one derived from the prefix.
+    /// This works only when every key under the prefix shares that
+    /// slot, i.e. the prefix contains a Redis Cluster hash tag
+    /// (`{...}`). Today `ActionBudget::session_prefix` wraps the digest
+    /// in a `{hash-tag}` (see `budget.rs`), so all its keys land in
+    /// the same slot and this is safe. A future caller that does NOT
+    /// hash-tag its prefix would silently leave keys behind in other
+    /// slots. Cross-slot SCAN is not supported by Redis Cluster —
+    /// there is no correct implementation for a non-tagged prefix, so
+    /// this remains a caller-side invariant.
     fn remove_prefix(&self, prefix: &str) {
         let _ = prefix;
     }
@@ -130,7 +156,11 @@ impl StateStore for InMemoryStore {
             .ok_or_else(|| StateError::Overflow(key.to_owned()))?;
         // Only write after confirming no overflow — no transient negative visible to readers.
         cell.store(new, Ordering::Release);
-        Ok(u64::try_from(new).unwrap_or(0))
+        // A negative counter is unreachable through this API (spends check
+        // limits, refunds clamp at 0), but if one ever appears the silent
+        // `unwrap_or(0)` below would mask the corruption; surface it like
+        // `get` does.
+        u64::try_from(new).map_err(|_| StateError::Overflow(key.to_owned()))
     }
 
     fn get(&self, key: &str) -> Result<u64, StateError> {

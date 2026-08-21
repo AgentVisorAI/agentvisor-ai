@@ -268,6 +268,145 @@ impl EventBus for NatsBus {
         self.publish_with_uid(topic, key, value, Some(event_uid))
     }
 
+    /// JetStream-aware UID lookup. The default trait implementation
+    /// treats an empty `fetch` as proof of absence, but a NATS batch
+    /// with a 500 ms `expires` can legitimately deliver zero messages
+    /// before expiry on a loaded server even when matching messages
+    /// exist — and a false "absent" makes crash-recovery maintenance
+    /// re-produce an already-committed event (a duplicate in the audit
+    /// stream once outside the JetStream dedup window). Use the
+    /// consumer's server-computed `num_pending` instead: zero pending
+    /// on a freshly-created filtered consumer proves absence; an empty
+    /// batch with pending remaining is a timing artifact and retries
+    /// bounded, then fails the pass (callers retry later — the cold
+    /// intent is durable).
+    fn find_event_by_uid(
+        &self,
+        topic: &str,
+        key: &str,
+        event_uid: &str,
+    ) -> Result<Option<PublishAck>, BusError> {
+        let partitions = *self
+            .topics
+            .get(topic)
+            .ok_or_else(|| BusError::UnknownTopic(topic.to_owned()))?;
+        let partition = partition_for(key, partitions);
+        let stream_name = stream_name(topic);
+        let subject = format!("{topic}.p{partition}");
+        // One page per `executor.run` call: the executor imposes a hard
+        // 10 s timeout per operation, so running the whole from-sequence-1
+        // scan inside a single call would make lookups on large streams
+        // fail with a timeout on every attempt, forever (each retry
+        // restarts from sequence 1 under the same cap). Paging gives each
+        // bounded step its own budget — the same shape as the default
+        // trait implementation's per-`fetch` paging.
+        enum Page {
+            Found(u64),
+            Absent,
+            Advanced(u64),
+            Empty,
+        }
+        let mut offset = 1u64;
+        let mut empty_batches = 0u32;
+        loop {
+            let context = self.js.clone();
+            let page_stream = stream_name.clone();
+            let page_subject = subject.clone();
+            let page_uid = event_uid.to_owned();
+            let page = self
+                .executor
+                .run(move || async move {
+                    let stream = context.get_stream(&page_stream).await?;
+                    let consumer = stream
+                        .create_consumer(async_nats::jetstream::consumer::pull::Config {
+                            deliver_policy: async_nats::jetstream::consumer::DeliverPolicy::ByStartSequence {
+                                start_sequence: offset,
+                            },
+                            filter_subject: page_subject,
+                            // See `fetch`: ephemeral consumers without an
+                            // inactive_threshold linger server-side for the
+                            // lifetime of the connection.
+                            inactive_threshold: std::time::Duration::from_secs(30),
+                            ..Default::default()
+                        })
+                        .await?;
+                    if consumer.cached_info().num_pending == 0 {
+                        // Server-attested: no messages at or after `offset`
+                        // match the filter — genuinely absent.
+                        return Ok::<_, async_nats::Error>(Page::Absent);
+                    }
+                    let mut batch = consumer
+                        .batch()
+                        .max_messages(1_024)
+                        .expires(std::time::Duration::from_millis(500))
+                        .messages()
+                        .await?;
+                    let mut next_offset = offset;
+                    let mut delivered = false;
+                    use futures::StreamExt as _;
+                    while let Some(next) = batch.next().await {
+                        let msg = next?;
+                        delivered = true;
+                        let info = msg.info().map_err(|error| {
+                            async_nats::Error::from(std::io::Error::other(format!(
+                                "uid lookup info: {error}"
+                            )))
+                        })?;
+                        let stored: StoredEvent = serde_json::from_slice(&msg.payload).map_err(|error| {
+                            async_nats::Error::from(std::io::Error::other(format!(
+                                "uid lookup decode at sequence {}: {error}",
+                                info.stream_sequence
+                            )))
+                        })?;
+                        if stored
+                            .value
+                            .get("metadata")
+                            .and_then(|metadata| metadata.get("uid"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some(page_uid.as_str())
+                        {
+                            return Ok(Page::Found(info.stream_sequence));
+                        }
+                        next_offset = info.stream_sequence.checked_add(1).ok_or_else(|| {
+                            async_nats::Error::from(std::io::Error::other("uid lookup sequence overflow"))
+                        })?;
+                    }
+                    Ok(if delivered {
+                        Page::Advanced(next_offset)
+                    } else {
+                        Page::Empty
+                    })
+                })?
+                .map_err(|e| BusError::Backend(e.to_string()))?;
+            match page {
+                Page::Found(sequence) => {
+                    return Ok(Some(PublishAck {
+                        topic: topic.to_owned(),
+                        partition,
+                        offset: sequence,
+                    }));
+                }
+                Page::Absent => return Ok(None),
+                Page::Advanced(next_offset) => {
+                    offset = next_offset;
+                    empty_batches = 0;
+                }
+                Page::Empty => {
+                    // Messages are pending past `offset` but the 500 ms
+                    // batch delivered nothing — a timing artifact, NOT
+                    // proof of absence. Retry bounded, then fail the
+                    // lookup so the caller retries the whole pass later.
+                    empty_batches += 1;
+                    if empty_batches >= 8 {
+                        return Err(BusError::Backend(format!(
+                            "uid lookup stalled: messages pending past sequence {offset} but batches deliver nothing"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
     fn fetch(
         &self,
         topic: &str,
@@ -316,9 +455,15 @@ impl EventBus for NatsBus {
                     let mut ev: StoredEvent = serde_json::from_slice(&msg.payload).map_err(|error| {
                         async_nats::Error::from(std::io::Error::other(format!("fetch decode: {error}")))
                     })?;
-                    if let Ok(info) = msg.info() {
-                        ev.offset = info.stream_sequence;
-                    }
+                    // Surface an info() failure like the payload-decode
+                    // path above: silently keeping the offset-0
+                    // placeholder would break offset-based pagination
+                    // (reconcilers resume from `last.offset + 1`, so a
+                    // zeroed offset restarts the scan from the head).
+                    let info = msg.info().map_err(|error| {
+                        async_nats::Error::from(std::io::Error::other(format!("fetch info: {error}")))
+                    })?;
+                    ev.offset = info.stream_sequence;
                     out.push(ev);
                     if out.len() >= max {
                         break;
@@ -345,6 +490,19 @@ impl EventBus for NatsBus {
     fn maintenance(&self, _now_ms: u64) -> Result<u64, BusError> {
         self.cold_archive.as_ref().map_or(Ok(0), |archive| {
             archive.retry_pending_with(|pending| {
+                // Same rationale as `KafkaBus::maintenance`: a crash or
+                // executor timeout between a successful publish and the
+                // subsequent `commit()` leaves the intent offset-None
+                // while the event IS already on the stream. Blindly
+                // re-producing here would double the audit stream. NATS
+                // dedupe via `Nats-Msg-Id` catches this only inside the
+                // stream's `duplicate_window == retention` — a retry
+                // after retention expiry (or after a per-consumer
+                // stream reset) escapes it. Consult the stream first
+                // and only publish when the UID is genuinely absent.
+                if let Some(ack) = self.find_event_by_uid(&pending.topic, &pending.key, &pending.event_uid)? {
+                    return Ok(ack);
+                }
                 self.publish_broker_only(
                     &pending.topic,
                     &pending.key,

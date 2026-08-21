@@ -652,3 +652,68 @@ fn uid_dedupe_survives_restart_and_torn_sidecar_tail() {
         1
     );
 }
+
+/// The embedded broker's maintenance must drain cold-export intents that
+/// `ColdArchive::commit` queued after a transient remote failure. Retention
+/// deletes the record from the hot segment on the "queued for retry"
+/// promise; before this fix only the Kafka/NATS maintenance paths ever
+/// called `retry_pending_with`, so the embedded promise was never
+/// fulfilled — a silent permanent cold-tier gap. Simulate the transient
+/// failure by making the cold target unwritable for the first export.
+#[cfg(all(feature = "cold-store", unix))]
+#[test]
+fn maintenance_retries_queued_cold_export_intents() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let cold = tempfile::tempdir().unwrap();
+    let mut m = manifest();
+    for topic in &mut m.topics {
+        topic.retention.hot_hours = 1;
+        // A scheme URI routes retention exports through the ColdArchive
+        // two-phase (stage/commit) path instead of write_cold_event_once.
+        topic.retention.cold_uri = Some(format!("file://{}", cold.path().display()));
+    }
+    let broker = EmbeddedBroker::provision(dir.path(), &m).unwrap();
+    broker.set_control_key([7u8; 32]).unwrap();
+    let ack = broker
+        .publish(
+            "agent.receipt",
+            "inst-R",
+            &json!({"metadata": {"uid": "cold-retry-1"}, "old": true}),
+        )
+        .unwrap();
+
+    // Transient remote outage: the cold target refuses writes.
+    std::fs::set_permissions(cold.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let later = av_core::time::now_ms() + 2 * 3_600_000;
+    let expired = broker.enforce_retention(later).unwrap();
+    assert_eq!(
+        expired, 1,
+        "commit converts the remote failure into a durable intent"
+    );
+    let outbox = dir.path().join("cold-outbox");
+    assert_eq!(
+        std::fs::read_dir(&outbox).unwrap().count(),
+        1,
+        "the failed export must be queued for retry"
+    );
+    let cold_object = cold
+        .path()
+        .join("agent.receipt")
+        .join(format!("p{}", ack.partition))
+        .join(format!("{:020}.json", ack.offset));
+    assert!(!cold_object.exists(), "nothing landed during the outage");
+
+    // Outage over: maintenance must fulfill the retry promise.
+    std::fs::set_permissions(cold.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    broker.maintenance(later).unwrap();
+    assert_eq!(
+        std::fs::read_dir(&outbox).unwrap().count(),
+        0,
+        "maintenance must drain the cold-export retry queue"
+    );
+    let stored: av_bridge::StoredEvent =
+        serde_json::from_slice(&std::fs::read(&cold_object).unwrap()).unwrap();
+    assert_eq!(stored.offset, ack.offset);
+    assert_eq!(stored.value["metadata"]["uid"], "cold-retry-1");
+}

@@ -1,8 +1,12 @@
+<p align="center">
+  <img src="assets/logo.png" width="128" alt="AgentVisor AI logo">
+</p>
+
 # AgentVisor AI
 
-[![CI](https://github.com/debugmode0/agentvisor-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/debugmode0/agentvisor-ai/actions/workflows/ci.yml)
-[![Supply chain](https://github.com/debugmode0/agentvisor-ai/actions/workflows/deny.yml/badge.svg)](https://github.com/debugmode0/agentvisor-ai/actions/workflows/deny.yml)
-[![Docs](https://github.com/debugmode0/agentvisor-ai/actions/workflows/pages.yml/badge.svg)](https://debugmode0.github.io/agentvisor-ai/)
+[![CI](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/ci.yml)
+[![Supply chain](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/deny.yml/badge.svg)](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/deny.yml)
+[![Docs](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/pages.yml/badge.svg)](https://agentvisorai.github.io/agentvisor-ai/)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 **AI agents you can hand to an auditor.**
@@ -20,16 +24,16 @@ client = OpenAI(
 )
 ```
 
-- **[Landing page](https://debugmode0.github.io/agentvisor-ai/)** — the story, in
+- **[Landing page](https://agentvisorai.github.io/agentvisor-ai/)** — the story, in
   three concrete examples.
-- **[Releases](https://github.com/debugmode0/agentvisor-ai/releases)** —
+- **[Releases](https://github.com/AgentVisorAI/agentvisor-ai/releases)** —
   pre-built binaries with SHA-256 checksums.
 - **[Security model](SECURITY.md)** — trust boundaries, controls, and how
   to deploy safely. Report vulnerabilities privately via the
-  [advisory form](https://github.com/debugmode0/agentvisor-ai/security/advisories/new).
+  [advisory form](https://github.com/AgentVisorAI/agentvisor-ai/security/advisories/new).
 - **[Architecture](ARCHITECTURE.md)** · **[Benchmarks](BENCHMARKS.md)** ·
   **[Verification protocol](VERIFICATION.md)** — going deeper.
-- **[API docs](https://debugmode0.github.io/agentvisor-ai/api/)** — Rust crate
+- **[API docs](https://agentvisorai.github.io/agentvisor-ai/api/)** — Rust crate
   reference. Skip unless you're embedding AgentVisor AI as a library.
 
 ---
@@ -82,7 +86,7 @@ Cloning the repo works too — useful for development, or before the
 first crates.io release lands:
 
 ```bash
-git clone https://github.com/debugmode0/agentvisor-ai && cd agentvisor-ai
+git clone https://github.com/AgentVisorAI/agentvisor-ai && cd agentvisor-ai
 cargo install --path crates/av-harness   # installs `agentvisord`
 cargo install --path crates/av-cli       # installs `avctl`
 ```

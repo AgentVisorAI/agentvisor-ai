@@ -6,23 +6,26 @@
   <title>AgentVisor AI — AI agents you can hand to an auditor</title>
   <meta name="description" content="AgentVisor AI sits in front of your AI agent's LLM and tool calls. Point your OpenAI client at it, and every session ends with a signed receipt anyone can verify offline.">
   <link rel="stylesheet" href="style.css">
-  <link rel="canonical" href="https://debugmode0.github.io/agentvisor-ai/">
+  <link rel="icon" type="image/png" href="logo.png">
+  <link rel="canonical" href="https://agentvisorai.me/">
   <meta property="og:title" content="AgentVisor AI — AI agents you can hand to an auditor">
   <meta property="og:description" content="One line of code. Every session recorded, capped, and signed.">
   <meta property="og:type" content="website">
-  <meta property="og:url" content="https://debugmode0.github.io/agentvisor-ai/">
+  <meta property="og:url" content="https://agentvisorai.me/">
+  <meta property="og:image" content="https://agentvisorai.me/social-preview.png">
+  <meta name="twitter:card" content="summary_large_image">
 </head>
 <body>
 
   <nav aria-label="Primary">
     <div class="wrap nav-inner">
-      <a class="brand" href="#top">AgentVisor AI</a>
+      <a class="brand" href="#top"><img src="logo.png" alt="" width="26" height="26" style="vertical-align:-6px;margin-right:8px">AgentVisor AI</a>
       <div class="nav-links">
         <a href="#one-line">How it works</a>
         <a href="#what-you-get">What you get</a>
         <a href="#dashboard">Dashboard</a>
         <a href="#try-it">Get started</a>
-        <a href="https://github.com/debugmode0/agentvisor-ai">GitHub</a>
+        <a href="https://github.com/AgentVisorAI/agentvisor-ai">GitHub</a>
       </div>
     </div>
   </nav>
@@ -39,7 +42,7 @@
       </p>
       <p class="cta-row">
         <a class="cta primary" href="#try-it">Try it in 60 seconds</a>
-        <a class="cta" href="https://github.com/debugmode0/agentvisor-ai">Read the code</a>
+        <a class="cta" href="https://github.com/AgentVisorAI/agentvisor-ai">Read the code</a>
       </p>
       <p class="hero-meta">
         v0.1.0 &middot; Apache&#8209;2.0 &middot; Rust &middot; Runs on your machine, your VM, or your cluster
@@ -325,7 +328,7 @@ Content-Type: application/json
           <p>
             Requires <a href="https://rustup.rs/">Rust</a>, or a pre-built
             binary from the
-            <a href="https://github.com/debugmode0/agentvisor-ai/releases">releases page</a>.
+            <a href="https://github.com/AgentVisorAI/agentvisor-ai/releases">releases page</a>.
             The wizard asks one thing at a time and writes the config
             file for you. When it finishes, AgentVisor AI is running on
             <code>http://127.0.0.1:8484</code>.
@@ -411,12 +414,12 @@ Content-Type: application/json
         <p class="section-kicker">Read more</p>
         <h2>Everything else.</h2>
         <ul class="link-columns">
-          <li><a href="https://github.com/debugmode0/agentvisor-ai#readme">README</a> &mdash; full setup, configuration, CLI reference.</li>
-          <li><a href="https://github.com/debugmode0/agentvisor-ai/blob/main/ARCHITECTURE.md">Architecture</a> &mdash; how the pipeline fits together.</li>
-          <li><a href="https://github.com/debugmode0/agentvisor-ai/blob/main/SECURITY.md">Security model</a> &mdash; trust boundaries and threat model.</li>
-          <li><a href="https://github.com/debugmode0/agentvisor-ai/blob/main/VERIFICATION.md">Verification protocol</a> &mdash; verifying a receipt from scratch.</li>
-          <li><a href="https://github.com/debugmode0/agentvisor-ai/blob/main/BENCHMARKS.md">Benchmarks</a> &mdash; hot-path latency and 10&#x00A0;000-connection SLA.</li>
-          <li><a href="https://github.com/debugmode0/agentvisor-ai/releases">Releases</a> &mdash; pre-built binaries with SHA-256 checksums.</li>
+          <li><a href="https://github.com/AgentVisorAI/agentvisor-ai#readme">README</a> &mdash; full setup, configuration, CLI reference.</li>
+          <li><a href="https://github.com/AgentVisorAI/agentvisor-ai/blob/main/ARCHITECTURE.md">Architecture</a> &mdash; how the pipeline fits together.</li>
+          <li><a href="https://github.com/AgentVisorAI/agentvisor-ai/blob/main/SECURITY.md">Security model</a> &mdash; trust boundaries and threat model.</li>
+          <li><a href="https://github.com/AgentVisorAI/agentvisor-ai/blob/main/VERIFICATION.md">Verification protocol</a> &mdash; verifying a receipt from scratch.</li>
+          <li><a href="https://github.com/AgentVisorAI/agentvisor-ai/blob/main/BENCHMARKS.md">Benchmarks</a> &mdash; hot-path latency and 10&#x00A0;000-connection SLA.</li>
+          <li><a href="https://github.com/AgentVisorAI/agentvisor-ai/releases">Releases</a> &mdash; pre-built binaries with SHA-256 checksums.</li>
           <li><a href="api/">API documentation</a> &mdash; Rust crate reference. Skip unless you&rsquo;re embedding AgentVisor AI as a library.</li>
         </ul>
       </div>
@@ -426,13 +429,13 @@ Content-Type: application/json
   <footer>
     <div class="wrap footer-inner">
       <p>
-        <a href="https://github.com/debugmode0/agentvisor-ai">GitHub</a> &middot;
-        <a href="https://github.com/debugmode0/agentvisor-ai/blob/main/LICENSE">Apache&nbsp;2.0</a> &middot;
-        <a href="https://github.com/debugmode0/agentvisor-ai/security/advisories/new">Report a vulnerability</a>
+        <a href="https://github.com/AgentVisorAI/agentvisor-ai">GitHub</a> &middot;
+        <a href="https://github.com/AgentVisorAI/agentvisor-ai/blob/main/LICENSE">Apache&nbsp;2.0</a> &middot;
+        <a href="https://github.com/AgentVisorAI/agentvisor-ai/security/advisories/new">Report a vulnerability</a>
       </p>
       <p class="muted">
         AgentVisor AI is open source and free to use. If it saves you
-        from a 3&nbsp;AM incident, please <a href="https://github.com/debugmode0/agentvisor-ai/stargazers">star the repo</a>.
+        from a 3&nbsp;AM incident, please <a href="https://github.com/AgentVisorAI/agentvisor-ai/stargazers">star the repo</a>.
       </p>
     </div>
   </footer>

@@ -477,24 +477,51 @@ impl EventBus for KafkaBus {
         let partition = partition_for(key, partitions);
         let partition_client = self.partition_client(topic, partition)?;
         let event_uid = event_uid.to_owned();
-        let found = self
-            .executor
-            .run(move || async move {
-                let mut offset = partition_client
-                    .get_offset(OffsetAt::Earliest)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let latest = partition_client
-                    .get_offset(OffsetAt::Latest)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                while offset < latest {
-                    let (records, _) = partition_client
+        // One page per `executor.run` call: the executor imposes a hard
+        // 10 s timeout per operation, so running the whole earliest→latest
+        // scan inside a single call made lookups on partitions larger than
+        // one timeout's worth of fetches time out on every attempt, forever
+        // (each retry restarted from earliest under the same cap). Paging
+        // gives each bounded step its own budget — the same shape as the
+        // NATS implementation and the default trait implementation's
+        // per-`fetch` paging.
+        enum Page {
+            Found(i64),
+            Advanced(i64),
+            Empty,
+        }
+        let (mut offset, latest) = {
+            let client = Arc::clone(&partition_client);
+            self.executor
+                .run(move || async move {
+                    let earliest = client
+                        .get_offset(OffsetAt::Earliest)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let latest = client
+                        .get_offset(OffsetAt::Latest)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    Ok::<_, String>((earliest, latest))
+                })?
+                .map_err(BusError::Backend)?
+        };
+        let mut empty_fetches = 0u32;
+        let found = loop {
+            if offset >= latest {
+                break None;
+            }
+            let client = Arc::clone(&partition_client);
+            let page_uid = event_uid.clone();
+            let page = self
+                .executor
+                .run(move || async move {
+                    let (records, _) = client
                         .fetch_records(offset, 1..(16 * 1024 * 1024), 500)
                         .await
                         .map_err(|error| error.to_string())?;
                     if records.is_empty() {
-                        break;
+                        return Ok::<_, String>(Page::Empty);
                     }
                     for record in &records {
                         if let Some(payload) = record.record.value.as_deref() {
@@ -505,20 +532,45 @@ impl EventBus for KafkaBus {
                                 .get("metadata")
                                 .and_then(|metadata| metadata.get("uid"))
                                 .and_then(serde_json::Value::as_str)
-                                == Some(event_uid.as_str())
+                                == Some(page_uid.as_str())
                             {
-                                return Ok::<_, String>(Some(record.offset));
+                                return Ok(Page::Found(record.offset));
                             }
                         }
                     }
-                    offset = records
+                    let next = records
                         .last()
                         .and_then(|record| record.offset.checked_add(1))
                         .ok_or_else(|| "Kafka event lookup offset overflow".to_owned())?;
+                    Ok(Page::Advanced(next))
+                })?
+                .map_err(BusError::Backend)?;
+            match page {
+                Page::Found(found_offset) => break Some(found_offset),
+                Page::Advanced(next) => {
+                    empty_fetches = 0;
+                    offset = next;
                 }
-                Ok::<_, String>(None)
-            })?
-            .map_err(BusError::Backend)?;
+                Page::Empty => {
+                    // `offset < latest` proves the broker still holds
+                    // records we have not seen; an empty response here is
+                    // a timing artifact (the 500 ms max_wait expired on a
+                    // loaded/rebalancing broker), NOT proof of absence.
+                    // Returning Ok(None) would let maintenance re-produce
+                    // an already-committed event — a duplicate in the
+                    // audit stream, the exact outcome this lookup exists
+                    // to prevent. Retry bounded, then fail the lookup so
+                    // the caller retries the whole pass later (the cold
+                    // intent is durable).
+                    empty_fetches += 1;
+                    if empty_fetches >= 8 {
+                        return Err(BusError::Backend(format!(
+                            "Kafka event lookup stalled: empty fetch at offset {offset} below latest {latest}"
+                        )));
+                    }
+                }
+            }
+        };
         found
             .map(|offset| {
                 u64::try_from(offset)
@@ -543,11 +595,27 @@ impl EventBus for KafkaBus {
             return Err(BusError::UnknownTopic(topic.to_owned()));
         }
         let pc = self.partition_client(topic, partition)?;
+        // Round-30 F1 (av-bridge kafka): reject offsets above
+        // `i64::MAX` explicitly rather than let `as i64` sign-wrap
+        // into a negative Kafka offset. The Kafka wire protocol
+        // treats -1 as "latest" and -2 as "earliest" (its own
+        // sentinel semantics), so a wrap could silently redirect
+        // the fetch to the log tail instead of the requested
+        // offset — a hard-to-diagnose replay divergence. In
+        // practice `u64` offsets that survive our provisioning
+        // stay well below 2^63, but crash recovery from a
+        // manifest whose offset field was tampered on disk could
+        // still supply a value in `(i64::MAX, u64::MAX]`.
+        let signed_offset = i64::try_from(offset).map_err(|_| {
+            BusError::Backend(format!(
+                "kafka fetch offset {offset} exceeds i64::MAX and would wrap to a negative \
+                 sentinel; refusing the fetch"
+            ))
+        })?;
         self.executor
             .run(move || async move {
-                #[allow(clippy::cast_possible_wrap)]
                 let (records, _high_watermark) = pc
-                    .fetch_records(offset as i64, 1..(16 * 1024 * 1024), 500)
+                    .fetch_records(signed_offset, 1..(16 * 1024 * 1024), 500)
                     .await
                     .map_err(|e| e.to_string())?;
                 let mut out = Vec::new();
@@ -599,6 +667,15 @@ impl EventBus for KafkaBus {
     fn maintenance(&self, _now_ms: u64) -> Result<u64, BusError> {
         self.cold_archive.as_ref().map_or(Ok(0), |archive| {
             archive.retry_pending_with(|pending| {
+                // A crash/timeout between a successful produce and
+                // `commit()` leaves the intent offset-None while the event
+                // IS already on the partition; blindly re-producing here
+                // would append a duplicate to the audit stream. Consult the
+                // partition first and only publish when the UID is
+                // genuinely absent.
+                if let Some(ack) = self.find_event_by_uid(&pending.topic, &pending.key, &pending.event_uid)? {
+                    return Ok(ack);
+                }
                 self.publish_broker_only(
                     &pending.topic,
                     &pending.key,

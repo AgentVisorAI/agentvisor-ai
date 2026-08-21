@@ -60,6 +60,17 @@ pub struct AppState {
     pub(crate) upstream_auth: Option<(HeaderName, HeaderValue)>,
     /// Bearer credential injected into every tool-upstream forward.
     pub(crate) tool_auth: Option<HeaderValue>,
+    /// Serializes tool-audit completion per execution key (see
+    /// `routes.rs::complete_tool_audit`): an Unaudited replay racing a
+    /// fresh completion for the same key would otherwise submit a second
+    /// `tool_completed` worker job — a duplicate execution record on the
+    /// audit stream and in the signed chain.
+    pub(crate) tool_audit_gates:
+        Arc<parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Execution keys whose `tool_completed` audit job has been durably
+    /// journaled in this process but whose `.audited` marker write failed;
+    /// a retry must re-attempt the marker without re-emitting the event.
+    pub(crate) tool_audits_emitted: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     /// Asynchronous session close and promotion service.
     pub finalizer: Finalizer,
     pub(crate) journal_key: [u8; 32],
@@ -228,9 +239,19 @@ pub struct PreparedRequest {
     pub payload: Value,
     /// Total local middleware time before upstream I/O.
     pub middleware_us: u64,
-    lease: SessionLease,
+    // Fields drop in declaration order. `capture_guard` MUST drop before
+    // `lease` on a cancelled request future — the lease's Drop notifies
+    // `wait_for_streams`, unblocking `close_session_locked`, which then
+    // checks `wait_for_worker_jobs()`. If the guard submits its terminal
+    // job after the lease releases, the close's `pending_jobs == 0` load
+    // can win the race, finalize proceeds, and the guard's job lands
+    // after the receipt was sealed (chain/receipt divergence for signed
+    // sessions; a resurrected step journal after remove_step_journal for
+    // unsigned). AbortFinalizingStream preserves the same invariant by
+    // convention (its Drop runs before `_lease` drops).
+    capture_guard: ResponseCaptureGuard,
     response_permit: Option<ResponsePermit>,
-    response_attempt_id: String,
+    lease: SessionLease,
     /// Client `Authorization` header captured for passthrough mode only.
     client_authorization: Option<HeaderValue>,
 }
@@ -239,10 +260,139 @@ pub struct PreparedRequest {
 pub struct ForwardedResponse {
     /// Provider HTTP response.
     pub response: reqwest::Response,
-    pub(crate) lease: SessionLease,
+    // Same ordering invariant as `PreparedRequest`: guard drops before
+    // lease so its terminal job registers `pending_jobs` before the
+    // close barrier sees the streams drained.
+    pub(crate) capture_guard: ResponseCaptureGuard,
     pub(crate) response_permit: Option<ResponsePermit>,
-    pub(crate) response_marker: Option<String>,
-    pub(crate) response_attempt_id: String,
+    pub(crate) lease: SessionLease,
+}
+
+/// RAII owner of the journalled response attempt and (once created) the
+/// durable in-flight response marker, from request admission until a
+/// downstream owner takes over (`AbortFinalizingStream`, a terminal
+/// failure job, or the worker's capture publish).
+///
+/// Axum drops the request future wholesale when the client disconnects.
+/// Every *explicit* failure path already retires the marker and closes
+/// the journalled attempt — but a cancelled future runs none of them:
+/// the journal kept a dangling non-terminal attempt (crash recovery then
+/// quarantines the whole session, see `track_response_attempt`) and the
+/// marker stranded on disk (once the session evicts, every reconciler
+/// tick re-quarantines its id forever). Drop submits the same terminal
+/// failure job the explicit paths use.
+pub(crate) struct ResponseCaptureGuard {
+    worker: crate::worker::WorkerHandle,
+    session: Arc<Session>,
+    identity: AgentIdentity,
+    marker: Option<String>,
+    attempt_id: String,
+    armed: bool,
+}
+
+impl ResponseCaptureGuard {
+    fn new(
+        worker: crate::worker::WorkerHandle,
+        session: Arc<Session>,
+        identity: AgentIdentity,
+        attempt_id: String,
+    ) -> Self {
+        Self {
+            worker,
+            session,
+            identity,
+            marker: None,
+            attempt_id,
+            armed: true,
+        }
+    }
+
+    /// Record the durable in-flight marker so a later drop retires it.
+    pub(crate) fn set_marker(&mut self, marker: String) {
+        self.marker = Some(marker);
+    }
+
+    pub(crate) fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+
+    /// Take ownership of the marker and attempt id, disarming the guard.
+    /// The caller now owns terminal-record submission.
+    pub(crate) fn disarm(mut self) -> (Option<String>, String) {
+        self.armed = false;
+        (self.marker.take(), std::mem::take(&mut self.attempt_id))
+    }
+
+    /// Disarm in place, returning any marker: for callers that submit the
+    /// terminal record themselves while retaining the guard (abandon paths).
+    fn defuse(&mut self) -> Option<String> {
+        self.armed = false;
+        self.marker.take()
+    }
+}
+
+impl Drop for ResponseCaptureGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let job = refused_response_failure_job(
+            Arc::clone(&self.session),
+            self.identity.clone(),
+            "request_cancelled_before_response_capture".to_owned(),
+            self.marker.take(),
+            std::mem::take(&mut self.attempt_id),
+        );
+        // Same fallback as every explicit refusal path: if the queue is
+        // full, fail the session closed rather than dropping the capture
+        // silently.
+        if self.worker.try_submit(job).is_err() {
+            self.session.mark_capture_failed();
+        }
+    }
+}
+
+/// Terminal failure job used by response-refusal paths (permit missing,
+/// unsupported content-encoding, cancelled request future). Carrying
+/// `response_marker` lets the worker retire the durable in-flight marker,
+/// and `terminal: true` closes the journalled response attempt so crash
+/// recovery does not quarantine the session over a request the client
+/// already saw fail (or abandoned).
+pub(crate) fn refused_response_failure_job(
+    session: Arc<Session>,
+    identity: AgentIdentity,
+    reason: String,
+    response_marker: Option<String>,
+    response_attempt_id: String,
+) -> WorkerJob {
+    let atif = (session.workflow == Workflow::Unsigned).then(|| AtifCapture {
+        source: av_atif::Source::Agent,
+        message: Value::String(reason.clone()),
+        reasoning_content: None,
+        model_name: None,
+        tool_calls: None,
+        observation: None,
+        llm_call_count: Some(0),
+    });
+    WorkerJob {
+        session,
+        identity,
+        class: EventClass::StopReason,
+        payload: serde_json::json!({"reason": reason, "direction": "upstream_response"}),
+        text: String::new(),
+        analyze_loop: false,
+        status: StatusId::Failure,
+        stop_reason: Some(StopReason::Other),
+        native_stop_reason: None,
+        metrics: EventMetrics::default(),
+        cost_usd_micros: 0,
+        atif,
+        response_marker,
+        response_attempt: Some(crate::worker::ResponseAttempt {
+            id: response_attempt_id,
+            terminal: true,
+        }),
+    }
 }
 
 /// Hot-path failures, each carrying an HTTP status mapping.
@@ -400,7 +550,7 @@ impl AppState {
         }
         metrics.counter(
             "av_events_dropped_total{stage=\"worker_queue\"}",
-            "Worker jobs dropped",
+            "Worker jobs or response-slot reservations dropped, labeled by admission stage",
         );
         metrics.counter(
             "av_worker_panics_total",
@@ -466,11 +616,11 @@ impl AppState {
             );
             metrics.counter(
                 &format!("av_dashboard_requests_total{{endpoint=\"{endpoint}\",status=\"ok\"}}"),
-                "Dashboard endpoint requests served",
+                "Dashboard endpoint requests, labeled by status",
             );
             metrics.counter(
                 &format!("av_dashboard_requests_total{{endpoint=\"{endpoint}\",status=\"not_found\"}}"),
-                "Dashboard endpoint requests that could not be served",
+                "Dashboard endpoint requests, labeled by status",
             );
         }
         let sessions = Arc::new(SessionRegistry::new());
@@ -547,6 +697,8 @@ impl AppState {
             client,
             upstream_auth,
             tool_auth,
+            tool_audit_gates: Arc::default(),
+            tool_audits_emitted: Arc::default(),
             finalizer,
             journal_key,
         })
@@ -695,7 +847,7 @@ impl AppState {
                 return Err(error);
             }
         };
-        let analyze_loop = atif.source == av_atif::Source::Agent;
+        let analyze_loop = atif.source == av_atif::Source::Agent && !text.is_empty();
         let response_attempt_id = av_core::new_event_uid();
         let job = WorkerJob {
             session: Arc::clone(&session),
@@ -729,6 +881,18 @@ impl AppState {
         worker_permit.submit(job);
         self.observe_stage("dispatch", stage);
         let lease = SessionLease::new(Arc::clone(&session));
+        // Armed from here on: any early exit that drops the request —
+        // including the `?` on the passthrough header below and, above
+        // all, the request future being cancelled by a client disconnect
+        // at any later await — submits the terminal failure record that
+        // closes the journalled attempt (and retires the marker, once
+        // `forward_chat` sets one).
+        let capture_guard = ResponseCaptureGuard::new(
+            self.worker.clone(),
+            Arc::clone(&session),
+            identity.clone(),
+            response_attempt_id,
+        );
         drop(admission);
 
         Ok(PreparedRequest {
@@ -738,7 +902,7 @@ impl AppState {
             middleware_us: elapsed_us(total_started),
             lease,
             response_permit: Some(response_permit),
-            response_attempt_id,
+            capture_guard,
             client_authorization: if self.config.upstream_authorization_passthrough {
                 single_header(headers, "authorization")?.cloned()
             } else {
@@ -823,42 +987,40 @@ impl AppState {
     /// over a request the client already saw fail.
     fn abandon_prepared(&self, prepared: &mut PreparedRequest, stop_reason: StopReason, reason: &str) {
         let Some(permit) = prepared.response_permit.take() else {
+            // Defensive: no permit means the guard's Drop is the only
+            // resolver left. Leave it armed so the terminal record lands
+            // through the plain worker queue on drop.
             return;
         };
+        // Take the marker so the terminal job below retires it too.
+        let response_marker = prepared.capture_guard.defuse();
         let mut job = self.failure_job(
             Arc::clone(&prepared.session),
             prepared.identity.clone(),
             stop_reason,
             reason.to_owned(),
         );
+        job.response_marker = response_marker;
         job.response_attempt = Some(crate::worker::ResponseAttempt {
-            id: prepared.response_attempt_id.clone(),
+            id: prepared.capture_guard.attempt_id().to_owned(),
             terminal: true,
         });
-        // Best-effort submit: if the shard is momentarily full, the
-        // response-slot counter has already been bumped inside submit
-        // and the caller (this path) is already an abandon flow, so
-        // there is nothing further to do.
-        let _ = permit.submit(&self.worker, job);
+        // Every sibling refusal path (`forward_chat` Err, both
+        // `chat_completions` arms, the guard's own Drop) fails the
+        // session closed on submit failure so the dangling attempt
+        // cannot silently strand. Mirror that here: without it,
+        // defusing the guard first would lose the safety net this whole
+        // guard machinery exists to provide.
+        if permit.submit(&self.worker, job).is_err() {
+            prepared.session.mark_capture_failed();
+        }
     }
 
     /// Forward a prepared OpenAI-compatible request to the configured provider.
-    pub async fn forward_chat(&self, request: PreparedRequest) -> Result<ForwardedResponse, PipelineError> {
-        let PreparedRequest {
-            session,
-            identity,
-            payload,
-            lease,
-            response_permit,
-            response_attempt_id,
-            client_authorization,
-            ..
-        } = request;
-        let url = format!(
-            "{}{}",
-            self.config.upstream_url.trim_end_matches('/'),
-            self.config.upstream_chat_path
-        );
+    pub async fn forward_chat(
+        &self,
+        mut request: PreparedRequest,
+    ) -> Result<ForwardedResponse, PipelineError> {
         // Digest the request payload so the in-flight marker can be
         // matched to the observed response bytes at recovery time.
         //
@@ -871,28 +1033,64 @@ impl AppState {
         // one-to-one-with-request invariant. Fall back to a
         // session-id-derived digest so a hypothetical failure at
         // least keeps distinct sessions distinct.
-        let request_digest = match serde_json::to_vec(&payload) {
+        let request_digest = match serde_json::to_vec(&request.payload) {
             Ok(bytes) => av_core::digest::sha256_hex(&bytes),
             Err(error) => {
                 tracing::error!(
                     %error,
-                    session = %session.id,
+                    session = %request.session.id,
                     "failed to serialise chat payload for request digest; falling back to session-derived digest"
                 );
-                av_core::digest::sha256_hex(session.id.as_bytes())
+                av_core::digest::sha256_hex(request.session.id.as_bytes())
             }
         };
-        let response_marker = crate::worker::create_response_marker(
+        match crate::worker::create_response_marker(
             std::path::Path::new(&self.config.atif_spool_dir),
             &self.journal_key,
-            &session.id,
+            &request.session.id,
             request_digest,
         )
         .await
-        .map_err(|error| {
-            tracing::warn!(%error, session = %session.id, "could not write in-flight response marker");
-        })
-        .ok();
+        {
+            // The guard owns the marker from here: a cancelled request
+            // future (client disconnect during `send()` below or in the
+            // handler before `AbortFinalizingStream` takes over) retires
+            // it via the guard's terminal failure job.
+            Ok(marker) => request.capture_guard.set_marker(marker),
+            Err(error) => {
+                // Fail closed: the marker is what lets a restart-time scan
+                // (`inflight_response_sessions`) quarantine sessions whose
+                // provider response may have been observed but never
+                // captured. Dispatching without it would silently drop that
+                // crash-durability guarantee, so refuse before upstream I/O
+                // — terminating the journaled response attempt like every
+                // other post-admission abort (see `abandon_prepared`).
+                tracing::warn!(
+                    %error,
+                    session = %request.session.id,
+                    "could not write in-flight response marker; refusing upstream dispatch"
+                );
+                let client_error =
+                    PipelineError::Unavailable("in-flight response marker could not be persisted".to_owned());
+                self.abandon_prepared(&mut request, StopReason::Other, &client_error.to_string());
+                return Err(client_error);
+            }
+        };
+        let PreparedRequest {
+            session,
+            identity,
+            payload,
+            lease,
+            response_permit,
+            capture_guard,
+            client_authorization,
+            ..
+        } = request;
+        let url = format!(
+            "{}{}",
+            self.config.upstream_url.trim_end_matches('/'),
+            self.config.upstream_chat_path
+        );
         let mut upstream_request = self.client.post(url).json(&payload);
         if let Some((name, value)) = &self.upstream_auth {
             upstream_request = upstream_request.header(name.clone(), value.clone());
@@ -907,8 +1105,7 @@ impl AppState {
                 response,
                 lease,
                 response_permit,
-                response_marker,
-                response_attempt_id,
+                capture_guard,
             }),
             Err(error) => {
                 // Round-35 F1: `reqwest::Error::Display` embeds the
@@ -944,6 +1141,8 @@ impl AppState {
                 let client_error = PipelineError::Upstream(client_reason.to_owned());
                 let persisted_reason = format!("upstream_{client_reason}");
                 if let Some(permit) = response_permit {
+                    let (response_marker, response_attempt_id) = capture_guard.disarm();
+                    let capture_session = Arc::clone(&session);
                     let mut job =
                         self.failure_job(session, identity, StopReason::Other, persisted_reason.clone());
                     job.response_marker = response_marker;
@@ -951,14 +1150,22 @@ impl AppState {
                         id: response_attempt_id,
                         terminal: true,
                     });
-                    // Best-effort: shard may be momentarily full, in
-                    // which case the terminal failure event is dropped
-                    // and only av_events_dropped_total{stage=
-                    // "response_slot"} records it (no retry mechanism
-                    // exists here; the else branch below runs only when
-                    // no response permit was reserved at all).
-                    let _ = permit.submit(&self.worker, job);
+                    // This terminal failure capture is the only thing that
+                    // retires the durable in-flight marker and the
+                    // journalled response attempt. If the shard is full,
+                    // fail the session closed instead of dropping the
+                    // capture silently: otherwise the marker strands, no
+                    // terminal response event exists, and the session can
+                    // still close "cleanly" with a receipt over an
+                    // unresolved response attempt.
+                    if permit.submit(&self.worker, job).is_err() {
+                        capture_session.mark_capture_failed();
+                    }
                 } else {
+                    // Defensive (a permit always exists here): keep the
+                    // guard armed so its drop retires the marker and
+                    // closes the attempt through the plain worker queue.
+                    drop(capture_guard);
                     self.enqueue_failure(session, identity, StopReason::Other, persisted_reason)?;
                 }
                 Err(client_error)
@@ -1321,7 +1528,13 @@ impl AppState {
                 if self.config.enforce_identity_scopes {
                     if let Some(required) = required_scope {
                         if !scope_allows(&validated.claims.scopes, required) {
-                            return Err(PipelineError::Unauthorized(format!(
+                            // RFC 6750 §3.1: a syntactically valid, correctly
+                            // signed token that lacks the required scope is an
+                            // AUTHORIZATION failure — 403 insufficient_scope —
+                            // not a 401. Returning 401 (the old behavior) told
+                            // SDK token-refreshers to re-authenticate, which
+                            // cannot help: the grant itself lacks the scope.
+                            return Err(PipelineError::Blocked(format!(
                                 "identity scope {required:?} is required"
                             )));
                         }
@@ -1551,14 +1764,75 @@ fn workflow(headers: &HeaderMap, default: &str) -> Result<Workflow, PipelineErro
 }
 
 fn last_message_text(payload: &Value) -> String {
-    payload
+    let Some(message) = payload
         .get("messages")
         .and_then(Value::as_array)
         .and_then(|messages| messages.last())
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned()
+    else {
+        return String::new();
+    };
+    // Primary source: string `content`.
+    if let Some(text) = message.get("content").and_then(Value::as_str) {
+        if !text.is_empty() {
+            return text.to_owned();
+        }
+    }
+    // Round-19 F1 (mirror of round-13's response-side fix): a
+    // tool-call-only assistant message carries `content: null` and a
+    // `tool_calls` array. `last_message_text` returning "" here would
+    // feed a zero-vector embedding into the breaker in worker.rs and
+    // false-trip legitimate tool-driven agents on the request side.
+    // Synthesize `tool_name(arguments)` for each tool call, in
+    // wire-order — same shape as the response-side synthesis in
+    // routes.rs::AbortFinalizingStream::submit_response_capture.
+    //
+    // Round-20 F3 (self-audit fix): `function.arguments` reaches the
+    // wire in TWO shapes: a JSON-encoded string (OpenAI reference)
+    // OR a bare JSON object (some clients / most Anthropic-shaped
+    // gateways). `.as_str()` on the object variant returned None and
+    // the synthesis collapsed to `tool_name()` — worse than the
+    // pre-fix behavior, because now two different-argument calls to
+    // the same tool produced IDENTICAL synthesized text, causing
+    // false loop trips. Match the tolerant pattern from
+    // `atif_capture_from_request` in the same file: render the raw
+    // Value directly when it isn't a stringified JSON. Empty and
+    // missing collapse to "" and get gated off analyze_loop
+    // downstream.
+    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+        let synthesized: Vec<String> = tool_calls
+            .iter()
+            .filter_map(|call| {
+                let name = call
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)?;
+                let arguments = call.get("function").and_then(|f| f.get("arguments"));
+                let args_rendered = match arguments {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(other) => serde_json::to_string(other).unwrap_or_default(),
+                    None => String::new(),
+                };
+                Some(format!("{name}({args_rendered})"))
+            })
+            .collect();
+        if !synthesized.is_empty() {
+            return synthesized.join("\n");
+        }
+    }
+    // Content-parts array (multimodal). Concatenate every text part
+    // so an assistant reply built from mixed text+image parts still
+    // feeds a non-zero vector to the breaker rather than "".
+    if let Some(parts) = message.get("content").and_then(Value::as_array) {
+        let text: String = parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            return text;
+        }
+    }
+    String::new()
 }
 
 /// Human-readable JSON type name for diagnostics — mirrors `typeof` in
@@ -1735,6 +2009,84 @@ mod tests {
     use axum::http::HeaderValue;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
+    /// Round-19 F1 + round-20 F3 (self-audit): `last_message_text`
+    /// must produce distinct output for two different tool-call
+    /// argument shapes so the loop breaker's embedding varies.
+    /// Both string-shaped and object-shaped arguments MUST reach the
+    /// synthesized text — round-19's first take collapsed
+    /// object-shaped arguments to `tool_name()`.
+    #[test]
+    fn last_message_text_tool_call_synthesis_varies_with_object_arguments() {
+        let payload_string_args = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{\"path\":\"a\"}"}
+                }]
+            }]
+        });
+        let payload_object_args_a = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": {"path": "a"}}
+                }]
+            }]
+        });
+        let payload_object_args_b = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": {"path": "b"}}
+                }]
+            }]
+        });
+        let t_string = last_message_text(&payload_string_args);
+        let t_obj_a = last_message_text(&payload_object_args_a);
+        let t_obj_b = last_message_text(&payload_object_args_b);
+        assert!(!t_string.is_empty(), "string-arg synthesis must not be empty");
+        assert!(!t_obj_a.is_empty(), "object-arg synthesis must not be empty");
+        assert_ne!(
+            t_obj_a, t_obj_b,
+            "object-shape args with different content must produce different text; \
+             got identical {t_obj_a:?}"
+        );
+        assert!(
+            t_obj_a.contains("\"path\":\"a\"") || t_obj_a.contains("path"),
+            "object-arg synthesis must include the argument content, got {t_obj_a:?}"
+        );
+    }
+
+    /// A tool-call message with EMPTY arguments still synthesizes to
+    /// `tool_name()` and reaches the breaker as a non-empty string
+    /// — otherwise every tool call with no arguments would false-trip
+    /// the breaker via zero-vector embedding.
+    #[test]
+    fn last_message_text_tool_call_with_empty_arguments_still_synthesizes() {
+        let payload = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "ping"}
+                }]
+            }]
+        });
+        let text = last_message_text(&payload);
+        assert_eq!(text, "ping()");
+    }
+
     struct NullBus;
 
     struct BlockingSink {
@@ -1809,7 +2161,13 @@ mod tests {
 
     async fn trip_loop(state: &AppState, headers: &HeaderMap, repeated: &Value) {
         for expected in 1..=4u64 {
-            state.prepare_chat(headers, repeated.clone()).unwrap();
+            let mut prepared = state.prepare_chat(headers, repeated.clone()).unwrap();
+            // This helper abandons the prepared request without forwarding.
+            // Defuse the capture guard so its terminal failure job does not
+            // pad the chain — the chain-count waits below must count only
+            // the admission jobs, or the analyze jobs race the assertion.
+            prepared.capture_guard.defuse();
+            drop(prepared);
             let session = state.sessions.get("loop-session").unwrap();
             // Generous budget: the chain append rides an async worker job and
             // must survive heavily loaded parallel test runs.
@@ -2153,14 +2511,15 @@ mod tests {
                 "content": "I should check the database again for pending orders"
             }],
         });
-        // Attempts the test itself abandons after a successful prepare: they
-        // are expected to stay non-terminal because no forward happens here.
+        // Attempts the test itself abandons after a successful prepare: the
+        // capture guard terminates them on drop (same as a client
+        // disconnect), so the journal must end with NO dangling attempts.
         let mut abandoned_by_test = std::collections::HashSet::new();
         let mut refusal = None;
         for _ in 0..8 {
             match state.prepare_chat_durable(&headers, repeated.clone()).await {
                 Ok(prepared) => {
-                    abandoned_by_test.insert(prepared.response_attempt_id.clone());
+                    abandoned_by_test.insert(prepared.capture_guard.attempt_id().to_owned());
                 }
                 Err(error) => {
                     refusal = Some(error);
@@ -2205,10 +2564,76 @@ mod tests {
                 }
             }
         }
-        assert_eq!(
-            dangling, abandoned_by_test,
-            "the refused request's response attempt must be terminated in the journal; \
-             only attempts the test itself dropped may remain open",
+        assert!(
+            dangling.is_empty(),
+            "every response attempt must be terminated: the refusal terminates its own \
+             attempt, and dropping a PreparedRequest (client disconnect) terminates via \
+             the capture guard; still dangling: {dangling:?} (test dropped: {abandoned_by_test:?})",
+        );
+    }
+
+    /// `forward_chat` must fail closed when the in-flight response marker
+    /// cannot be persisted: the marker is what lets the restart-time scan
+    /// (`inflight_response_sessions`) quarantine sessions whose provider
+    /// response may have been observed but never captured. Dispatching
+    /// without it would silently drop that crash-durability guarantee.
+    /// The refusal must also terminate the journaled response attempt so
+    /// no dangling non-terminal record quarantines the session later.
+    #[tokio::test]
+    async fn forward_chat_fails_closed_when_marker_cannot_persist() {
+        let config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        let state = state(config);
+        let mut headers = HeaderMap::new();
+        headers.insert(SESSION_HEADER, HeaderValue::from_static("marker-outage"));
+        let prepared = state.prepare_chat(&headers, payload()).unwrap();
+        let attempt_id = prepared.capture_guard.attempt_id().to_owned();
+        // Sabotage the marker directory: a regular file at
+        // <spool>/inflight-responses makes `create_dir_all` inside
+        // `write_atomic` fail for every marker write.
+        std::fs::write(
+            std::path::Path::new(&state.config.atif_spool_dir).join(crate::spool::INFLIGHT_RESPONSES),
+            b"",
+        )
+        .unwrap();
+        let error = state.forward_chat(prepared).await.err().unwrap();
+        // Unavailable (not Upstream) proves the refusal happened BEFORE
+        // any upstream dispatch was attempted.
+        assert!(
+            matches!(error, PipelineError::Unavailable(_)),
+            "marker persist failure must map to Unavailable, got {error:?}",
+        );
+
+        let session = state.sessions.get("marker-outage").unwrap();
+        session.wait_for_worker_jobs().await;
+        let digest = av_core::digest::sha256_hex("marker-outage".as_bytes());
+        let stem = digest.get(..32).unwrap();
+        let journal_path =
+            std::path::Path::new(&state.config.atif_spool_dir).join(format!("{stem}.events.ndjson"));
+        let journal = std::fs::read_to_string(&journal_path).unwrap();
+        let mut saw_admission = false;
+        let mut saw_terminal = false;
+        for (index, line) in journal.lines().enumerate() {
+            let record: crate::worker::ActiveJournalRecord = crate::journal::open(
+                &state.journal_key,
+                "marker-outage:active",
+                index as u64,
+                line.as_bytes(),
+            )
+            .unwrap();
+            if let Some(attempt) = record.response_attempt {
+                if attempt.id == attempt_id {
+                    if attempt.terminal {
+                        saw_terminal = true;
+                    } else {
+                        saw_admission = true;
+                    }
+                }
+            }
+        }
+        assert!(saw_admission, "admission must have journaled the attempt");
+        assert!(
+            saw_terminal,
+            "the refused request's response attempt must be terminated in the journal",
         );
     }
 
@@ -2344,7 +2769,12 @@ mod tests {
         headers.insert(WORKFLOW_HEADER, HeaderValue::from_static("signed"));
         let mut agent_payload = payload();
         agent_payload["messages"][0]["role"] = Value::String("assistant".to_owned());
-        state.prepare_chat(&headers, agent_payload.clone()).unwrap();
+        let mut first = state.prepare_chat(&headers, agent_payload.clone()).unwrap();
+        // Abandoning without forwarding: defuse the guard, or its terminal
+        // job (refused by the size-1 queue) marks the session
+        // capture-failed and the worker skips the sink this test blocks on.
+        first.capture_guard.defuse();
+        drop(first);
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while !sink.entered.load(AtomicOrdering::Acquire) {
                 tokio::task::yield_now().await;
@@ -2617,9 +3047,13 @@ mod tests {
             HeaderValue::from_str(&format!("Bearer {}", scoped_token(&["chat:write"]))).unwrap(),
         );
         let prepared = state.prepare_chat(&headers, payload()).unwrap();
+        // RFC 6750 §3.1: missing scope on a valid token is 403
+        // insufficient_scope (Blocked), NOT 401 — a refreshed token would
+        // carry the same grant, so telling the SDK to re-authenticate
+        // (401's semantic) is wrong and loops.
         assert!(matches!(
             state.authorize_session(&headers, &prepared.session, "session:close"),
-            Err(PipelineError::Unauthorized(_))
+            Err(PipelineError::Blocked(_))
         ));
         headers.insert(
             axum::http::header::AUTHORIZATION,

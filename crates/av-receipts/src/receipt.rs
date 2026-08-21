@@ -438,11 +438,35 @@ impl<'de> serde::de::Visitor<'de> for NoDupVisitor {
     fn visit_string<E>(self, _: String) -> Result<(), E> {
         Ok(())
     }
+    /// Serde may invoke `visit_none` for `Option` layers that are
+    /// already Nothing; `deserialize_any` on JSON never routes there
+    /// (JSON null goes through `visit_unit`), so this remains a
+    /// no-op fallback that only fires if a future caller layers a
+    /// typed deserializer on top.
     fn visit_none<E>(self) -> Result<(), E> {
         Ok(())
     }
-    fn visit_unit<E>(self) -> Result<(), E> {
-        Ok(())
+
+    /// Round-15 F3 (av-receipts): reject explicit JSON `null` anywhere
+    /// in the receipt wire form. Every optional field on `ReceiptBody`
+    /// / `AgentIdentity` / `EventMetrics` / … carries
+    /// `#[serde(skip_serializing_if = "Option::is_none")]`, so
+    /// `Option::None` is emitted as *field absence*. But
+    /// `serde_json::from_slice` also accepts `"field": null` for those
+    /// same Options — and `Receipt::verify` re-canonicalises via
+    /// `serde_json::to_value(&self.body)`, which drops the `None`
+    /// again. The consequence: an intermediary can flip `"…": null`
+    /// on/off in the raw bytes without invalidating the signature,
+    /// violating the "same signature ⇔ same bytes" auditor
+    /// invariant. Refuse explicit null across the whole payload
+    /// (receipts contain no legitimate JSON null anywhere — top level
+    /// is an object; every field is either a value type, a container
+    /// with omit-on-none, or a bounded set-of-strings enum).
+    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+        Err(E::custom(format!(
+            "{DUP_KEY_SENTINEL}explicit JSON null is not permitted (a signed absent-Option \
+             cannot be re-serialised as null without breaking canonicalisation invariance)"
+        )))
     }
     fn visit_seq<S: serde::de::SeqAccess<'de>>(self, mut seq: S) -> Result<(), S::Error> {
         use serde::de::Error as _;
@@ -615,8 +639,13 @@ mod tests {
     /// map arms.
     #[test]
     fn nesting_depth_boundary_is_exact_for_arrays_and_maps() {
-        let nested_arrays = |depth: usize| format!("{}null{}", "[".repeat(depth), "]".repeat(depth));
-        let nested_maps = |depth: usize| format!("{}null{}", "{\"k\":".repeat(depth), "}".repeat(depth));
+        // Round-15 F3: the leaf is `0` (not `null`) because the
+        // strict receipt scanner now refuses explicit JSON null
+        // everywhere. A number at the leaf preserves the boundary
+        // test's intent (depth mechanics only) without exercising
+        // the unrelated null-rejection path.
+        let nested_arrays = |depth: usize| format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+        let nested_maps = |depth: usize| format!("{}0{}", "{\"k\":".repeat(depth), "}".repeat(depth));
         for build in [&nested_arrays as &dyn Fn(usize) -> String, &nested_maps] {
             // serde_json's own recursion cap fires at 128 containers, so
             // the deepest reachable input is 127; the visitor's own
@@ -645,6 +674,25 @@ mod tests {
     /// closes the last-wins vs first-wins auditor split-brain that
     /// would otherwise let a hostile issuer sign under one
     /// interpretation while an external audit tool showed the other.
+    #[test]
+    fn from_json_slice_rejects_explicit_null_option_field() {
+        // Round-15 F3: `AgentIdentity.ttl_remaining_s` is
+        // `Option<u64>` with `skip_serializing_if = Option::is_none`,
+        // so an honest issuer omits the field. `serde_json::from_slice`
+        // would then accept an explicit `null` for the same field,
+        // and `Receipt::verify` would re-canonicalise via
+        // `serde_json::to_value(&self.body)`, dropping the null. The
+        // consequence was a valid signature over TWO different wire
+        // encodings — a "same signature ⇔ same bytes" violation.
+        // `from_json_slice` must now refuse the null variant.
+        let bytes = br#"{"ai_agent":{"instance_uid":"a","ttl_remaining_s":null}}"#;
+        let outcome = Receipt::from_json_slice(bytes);
+        assert!(
+            matches!(outcome, Err(ReceiptError::DuplicateKey(ref msg)) if msg.contains("null")),
+            "expected null-rejection (DuplicateKey family), got {outcome:?}"
+        );
+    }
+
     #[test]
     fn from_json_slice_rejects_duplicate_top_level_key() {
         let bytes = br#"{"receipt_version":1,"receipt_version":2,"receipt_id":"x"}"#;
@@ -748,6 +796,44 @@ mod tests {
                     if msg.contains("nesting exceeds") || msg.contains("recursion limit")
             ),
             "expected nesting-cap error, got {outcome:?}",
+        );
+    }
+
+    /// Mutation-run hardening: nothing pinned the *pass* side of the
+    /// nesting guard. The observable boundary today is serde_json's own
+    /// recursion limit (fires entering level 128, before our
+    /// `MAX_NESTED_DEPTH` walk — which is deliberate defense-in-depth
+    /// behind it): 127 levels must clear the gate (rejection is the
+    /// schema/parse `Serde` error, not the nesting cap), 128 must be
+    /// refused by the recursion/nesting guard class.
+    #[test]
+    fn nesting_gate_boundary_is_exactly_the_recursion_limit() {
+        let nested = |levels: usize| {
+            let mut doc = String::new();
+            for _ in 0..levels {
+                doc.push('[');
+            }
+            for _ in 0..levels {
+                doc.push(']');
+            }
+            doc
+        };
+        // Just under the limit: the gate passes; the failure is the
+        // schema mismatch (an array is not a Receipt), NOT the cap.
+        let under_cap = Receipt::from_json_slice(nested(127).as_bytes());
+        assert!(
+            matches!(under_cap, Err(ReceiptError::Serde(_))),
+            "127 levels must clear the nesting gate, got {under_cap:?}",
+        );
+        // At the limit: refused by the nesting/recursion guard.
+        let at_cap = Receipt::from_json_slice(nested(128).as_bytes());
+        assert!(
+            matches!(
+                at_cap,
+                Err(ReceiptError::DuplicateKey(ref msg))
+                    if msg.contains("nesting exceeds") || msg.contains("recursion limit")
+            ),
+            "128 levels must hit the nesting cap, got {at_cap:?}",
         );
     }
 

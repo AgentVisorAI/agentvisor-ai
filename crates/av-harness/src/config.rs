@@ -430,7 +430,28 @@ pub fn resolve_config_source() -> Result<ConfigSource, String> {
 
 /// Load, apply environment overrides, and validate the effective config.
 pub fn load_config() -> Result<(HarnessConfig, ConfigSource), String> {
-    let source = resolve_config_source()?;
+    load_config_with_override(None)
+}
+
+/// [`load_config`] with an explicit config path (e.g. from `--config`)
+/// taking precedence over `$AV_CONFIG` and the search paths. The explicit
+/// path must exist — a dangling operator-supplied path is a hard error,
+/// never a silent fallback to a different config.
+pub fn load_config_with_override(
+    explicit: Option<std::path::PathBuf>,
+) -> Result<(HarnessConfig, ConfigSource), String> {
+    let source = match explicit {
+        Some(path) => {
+            if !path.is_file() {
+                return Err(format!(
+                    "--config points to {} which does not exist or is not a file",
+                    path.display()
+                ));
+            }
+            ConfigSource::File(path)
+        }
+        None => resolve_config_source()?,
+    };
     let mut config = match &source {
         ConfigSource::File(path) => {
             let text = std::fs::read_to_string(path)
@@ -699,6 +720,30 @@ impl HarnessConfig {
                     .into(),
             );
         }
+        // Round-29 F1 (av-harness config): parity with the
+        // `upstream_api_key_env`/`_file` non-empty checks above.
+        // The prior code refused ambiguity (both set) and refused
+        // dangling (bearer without tool URL), but a caller supplying
+        // an explicit empty string would fail only at first tool
+        // call — at which point `resolve_upstream_bearer` returns
+        // the same "environment variable {name} is not set (or
+        // empty)" error the harness surfaces for a missing key.
+        // Catch it here so the actionable message reaches the
+        // operator at config load.
+        if self
+            .tool_upstream_bearer_env
+            .as_deref()
+            .is_some_and(str::is_empty)
+        {
+            return Err("tool_upstream_bearer_env must not be empty when set".into());
+        }
+        if self
+            .tool_upstream_bearer_file
+            .as_deref()
+            .is_some_and(str::is_empty)
+        {
+            return Err("tool_upstream_bearer_file must not be empty when set".into());
+        }
         if (self.tool_upstream_bearer_env.is_some() || self.tool_upstream_bearer_file.is_some())
             && self.tool_upstream_url.as_deref().is_none_or(str::is_empty)
         {
@@ -871,6 +916,13 @@ impl HarnessConfig {
                 self.worker_channel_capacity, MAX_WORKER_CHANNEL_CAPACITY
             ));
         }
+        if self.max_request_bytes == 0 {
+            return Err(
+                "max_request_bytes must be > 0 — a 0 cap forwards to DefaultBodyLimit::max(0), \
+                 rejecting every non-empty POST body silently"
+                    .into(),
+            );
+        }
         if self.max_request_bytes > MAX_REQUEST_BYTES_CAP {
             return Err(format!(
                 "max_request_bytes {} exceeds the safety cap of {} (512 MiB) — a single request should never legitimately need more, and lifting this defeats the sandbox payload guard",
@@ -892,6 +944,14 @@ impl HarnessConfig {
             ("identity_jwks_refresh_s", self.identity_jwks_refresh_s),
         ];
         if let Some(read_timeout) = self.upstream_read_timeout_s {
+            // 0 passes the cap check below but makes reqwest's
+            // read_timeout fire immediately — every upstream request
+            // fails before the first byte arrives.
+            if read_timeout == 0 {
+                return Err(
+                    "upstream_read_timeout_s = 0 would time out every upstream read immediately — omit the key to use the built-in 60 s default".into(),
+                );
+            }
             interval_fields.push(("upstream_read_timeout_s", read_timeout));
         }
         for (field, value) in interval_fields {
@@ -924,9 +984,18 @@ impl HarnessConfig {
             ));
         }
         if let Some(tool_upstream) = &self.tool_upstream_url {
-            if !tool_upstream.is_empty()
-                && !(tool_upstream.starts_with("http://") || tool_upstream.starts_with("https://"))
-            {
+            // Empty is rejected rather than treated as unset: routing gates
+            // tool forwarding on `is_some()` (routes.rs), so an empty string
+            // would silently enable the tool-upstream branches and only fail
+            // at the first request with a reqwest URL error. Fail loudly at
+            // startup like every other config-shape problem.
+            if tool_upstream.is_empty() {
+                return Err(
+                    "tool_upstream_url must not be empty; omit the field to disable tool forwarding"
+                        .to_owned(),
+                );
+            }
+            if !(tool_upstream.starts_with("http://") || tool_upstream.starts_with("https://")) {
                 return Err(format!(
                     "tool_upstream_url must be http:// or https://, got {tool_upstream:?}"
                 ));
@@ -963,11 +1032,29 @@ impl HarnessConfig {
         }
         if self.state_backend == "redis" {
             if let Some(url) = self.state_endpoint.as_deref().filter(|value| !value.is_empty()) {
-                if !(url.starts_with("redis://") || url.starts_with("rediss://") || url.starts_with("unix:"))
-                {
-                    return Err(format!(
-                        "state_endpoint (redis backend) must be redis://, rediss:// or unix:, got {url:?}"
-                    ));
+                // Round-20 F2 (av-harness config): the state_endpoint
+                // field is docstring-documented as a comma-separated
+                // list of URLs for Redis Cluster mode (see the field
+                // doc above). The scheme allowlist used to be a
+                // prefix check on the WHOLE string, so
+                // `redis://a:6379,http://b` passed validate (the
+                // check saw the `redis://` prefix) and only failed
+                // at connect. `redis+unix:` was also rejected here
+                // even though it's a legitimate Unix-socket form the
+                // redis crate accepts and the round-14 doctor
+                // `probe_endpoint_any` already recognizes. Split on
+                // ',' and validate each member independently.
+                for member in url.split(',').map(str::trim).filter(|m| !m.is_empty()) {
+                    let ok = member.starts_with("redis://")
+                        || member.starts_with("rediss://")
+                        || member.starts_with("unix:")
+                        || member.starts_with("redis+unix:");
+                    if !ok {
+                        return Err(format!(
+                            "state_endpoint (redis backend) member {member:?} must be \
+                             redis://, rediss://, unix:, or redis+unix: (got {member:?} in {url:?})"
+                        ));
+                    }
                 }
             }
         }
@@ -1402,6 +1489,22 @@ mod tests {
         assert!(HarnessConfig::from_toml(r#"upstream_url = "http://gw.local""#).is_ok());
     }
 
+    /// `tool_upstream_url = ""` used to pass validation while runtime
+    /// routing gates tool forwarding on `is_some()` — the empty string
+    /// silently enabled the tool-upstream branches and only failed at the
+    /// first request with a reqwest URL error. Reject it at startup.
+    #[test]
+    fn empty_tool_upstream_url_is_rejected() {
+        let err =
+            HarnessConfig::from_toml("upstream_url = \"https://api\"\ntool_upstream_url = \"\"").unwrap_err();
+        assert!(err.contains("tool_upstream_url"), "{err}");
+        assert!(err.contains("omit"), "should point at omitting the field: {err}");
+        assert!(HarnessConfig::from_toml(
+            "upstream_url = \"https://api\"\ntool_upstream_url = \"http://tools/mcp\"",
+        )
+        .is_ok());
+    }
+
     /// A seconds interval > 1 day is almost certainly a unit-conversion
     /// error (someone thought the field was in milliseconds).
     #[test]
@@ -1416,6 +1519,29 @@ mod tests {
             "err should name the offending field: {err}"
         );
         assert!(err.contains("milliseconds"), "hint should mention ms: {err}");
+    }
+
+    /// `upstream_read_timeout_s = 0` would make every upstream request
+    /// time out before its first byte; reject it with a pointer at the
+    /// omit-for-default posture.
+    #[test]
+    fn upstream_read_timeout_rejects_zero() {
+        let err = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               upstream_read_timeout_s = 0"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("upstream_read_timeout_s"),
+            "err should name the offending field: {err}"
+        );
+        assert!(err.contains("omit"), "err should point at the default: {err}");
+        // Any positive value under the 1-day cap remains valid.
+        assert!(HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               upstream_read_timeout_s = 1"#,
+        )
+        .is_ok());
     }
 
     /// Round-30 F1: refuse `enforce_identity_scopes = true` while
@@ -1475,6 +1601,41 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("state_endpoint"), "{err}");
+        // Round-20 F2: Redis state_endpoint cluster list — one bad
+        // member must fail validation even if the FIRST member has
+        // an allowed scheme (the prior prefix-on-whole-string check
+        // passed on any list beginning with `redis://`).
+        let err = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               state_backend = "redis"
+               state_endpoint = "redis://a:6379,http://b:6379""#,
+        )
+        .unwrap_err();
+        assert!(err.contains("state_endpoint"), "{err}");
+        // Round-20 F2: valid cluster list of two Redis URLs passes.
+        HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               state_backend = "redis"
+               state_endpoint = "redis://a:6379,rediss://b:6380""#,
+        )
+        .unwrap();
+        // Round-20 F2: redis+unix: is a legitimate Unix-socket form
+        // the redis crate accepts; validate must not reject it.
+        HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               state_backend = "redis"
+               state_endpoint = "redis+unix:/tmp/redis.sock""#,
+        )
+        .unwrap();
+        // Round-20 F1: max_request_bytes = 0 is a silent-breakage
+        // config (DefaultBodyLimit::max(0) rejects every non-empty
+        // POST body); validate must refuse it.
+        let err = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               max_request_bytes = 0"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("max_request_bytes"), "{err}");
         // NATS bridge_endpoint: bad scheme.
         let err = HarnessConfig::from_toml(
             r#"upstream_url = "https://api"

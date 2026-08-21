@@ -51,6 +51,53 @@ pub enum ValidationError {
     /// stop_reason caption present without id (or vice versa).
     #[error("stop_reason and stop_reason_id must be present together")]
     StopReasonPairMismatch,
+    /// Round-17 F1: stop_reason_id maps to a KNOWN `StopReason` variant,
+    /// but the accompanying caption does not match that variant's
+    /// canonical caption. The two fields split downstream analytics
+    /// (SIEM pipelines that group by id disagree with dashboards that
+    /// group by caption) — reject the disagreement so both fields
+    /// mean the same thing.
+    #[error("stop_reason_id {id} maps to {expected_caption:?} but stop_reason is {actual_caption:?}")]
+    StopReasonCaptionMismatch {
+        /// Stated stop reason id.
+        id: u8,
+        /// Canonical caption for that id.
+        expected_caption: &'static str,
+        /// Actual caption that was emitted with the id.
+        actual_caption: String,
+    },
+    /// Round-17 F2: a numeric field exceeds `av_core::error::JCS_SAFE_MAX`
+    /// (2^53) on the deserialize path. `OcsfEventBuilder::build`
+    /// already refuses values above the JCS-safe integer range, but
+    /// wire deserialization (`serde_json::from_slice::<OcsfEvent>`)
+    /// bypassed the guard — an issuer sending `prompt_tokens = 2^53+1`
+    /// would round-trip through JS-based auditors (JSON.parse) as a
+    /// silently-truncated value, losing 1 or more low bits and
+    /// breaking any receipt hash computed by JS consumers.
+    #[error("field {field} = {value} exceeds JCS-safe integer range 2^53")]
+    JcsUnsafeInteger {
+        /// Field name.
+        field: &'static str,
+        /// Offending value.
+        value: u64,
+    },
+    /// Round-26 F1 (self-fix): a numeric field is out of its
+    /// schema-declared range. Currently only `pruning_ratio_millis`
+    /// (permille ratio, capped at 1000) enforces this, but the
+    /// variant is variant-generic so future range-bound fields can
+    /// reuse it. Parallel to `JcsUnsafeInteger` — build() and
+    /// `validate_event` (the deserialize backstop) both enforce the
+    /// bound, closing the emitter/validator drift the wire-side path
+    /// used to have.
+    #[error("field {field} = {value} exceeds schema max {max}")]
+    OutOfSchemaRange {
+        /// Field name.
+        field: &'static str,
+        /// Offending value.
+        value: u64,
+        /// Declared inclusive max.
+        max: u64,
+    },
     /// Timestamp is zero.
     #[error("time is zero")]
     ZeroTime,
@@ -123,8 +170,104 @@ pub fn validate_event(ev: &OcsfEvent) -> Result<(), Vec<ValidationError>> {
     if ev.stop_reason_id.is_some() != ev.stop_reason.is_some() {
         errors.push(ValidationError::StopReasonPairMismatch);
     }
+    // Round-17 F1 (revised in round-18 after self-audit): the initial
+    // fix required `StopReason::from_id(id).caption() == stop_reason`
+    // whenever id was known. That's WRONG — the field docstring at
+    // `model.rs::OcsfEvent::stop_reason` and the builder API
+    // `OcsfEventBuilder::stop_reason_native` both document
+    // `stop_reason` as "the provider's native value when captured".
+    // So `id=1, caption="stop"` (OpenAI native), `id=1,
+    // caption="end_turn"` (Anthropic native), `id=99, caption="Custom
+    // Free Text"` (Other) are ALL legitimate emissions from the
+    // official builder. The over-strict check would have rejected the
+    // vast majority of production events.
+    //
+    // Narrow to the specific cross-wiring case that started this
+    // finding: the caption is ITSELF a canonical caption for a
+    // DIFFERENT known variant. `id=93 (PolicyBlocked)` +
+    // `caption="Loop Detected"` (canonical caption of variant 91) is
+    // an unambiguous mistake — the two fields disagree on which
+    // enforcement fired. Provider-native captions like `"stop"` or
+    // `"tool_calls"` are not canonical captions of any variant, so
+    // they pass. Round-33's `map_finish_reason` in routes.rs uses the
+    // lowercase provider tokens; none of those coincide with a
+    // canonical caption (which are Title-cased: `"Stop"`, `"Tool
+    // Use"`, `"Length"`, `"Content Filter"`, …).
+    if let (Some(id), Some(caption)) = (ev.stop_reason_id, ev.stop_reason.as_deref()) {
+        let expected = crate::StopReason::from_id(id).caption();
+        let is_known_id = matches!(id, 0..=4 | 90..=94 | 99);
+        let caption_is_canonical_of_other_variant = is_known_id
+            && expected != caption
+            && [
+                crate::StopReason::Unknown,
+                crate::StopReason::Stop,
+                crate::StopReason::MaxTokens,
+                crate::StopReason::ToolUse,
+                crate::StopReason::SessionClosed,
+                crate::StopReason::ContentFilter,
+                crate::StopReason::LoopDetected,
+                crate::StopReason::BudgetExceeded,
+                crate::StopReason::PolicyBlocked,
+                crate::StopReason::IdentityRejected,
+                crate::StopReason::Other,
+            ]
+            .iter()
+            .any(|other| other.caption() == caption);
+        if caption_is_canonical_of_other_variant {
+            errors.push(ValidationError::StopReasonCaptionMismatch {
+                id,
+                expected_caption: expected,
+                actual_caption: caption.to_owned(),
+            });
+        }
+    }
     if ev.time == 0 {
         errors.push(ValidationError::ZeroTime);
+    }
+    // Round-17 F2: JCS-safe integer guard on deserialize path.
+    // `OcsfEventBuilder::build` already enforces this for its own
+    // outputs, but a wire event bypasses build(). Values above
+    // `av_core::error::JCS_SAFE_MAX` (2^53) round-trip through
+    // JS-based JSON parsers as silently-truncated values,
+    // breaking any receipt hash a JS auditor computes over the
+    // event. Cover the fields build() covers: `time`, `seq`, and
+    // every `EventMetrics` counter.
+    for (field, value) in [("time", ev.time), ("metadata.sequence", ev.metadata.sequence)] {
+        if av_core::error::check_jcs_safe(value).is_err() {
+            errors.push(ValidationError::JcsUnsafeInteger { field, value });
+        }
+    }
+    if let Some(m) = &ev.metrics {
+        for (field, value) in [
+            ("metrics.prompt_tokens", m.prompt_tokens),
+            ("metrics.completion_tokens", m.completion_tokens),
+            ("metrics.cached_tokens", m.cached_tokens),
+            ("metrics.pruned_tokens", m.pruned_tokens),
+            ("metrics.pruning_ratio_millis", m.pruning_ratio_millis),
+        ] {
+            if let Some(v) = value {
+                if av_core::error::check_jcs_safe(v).is_err() {
+                    errors.push(ValidationError::JcsUnsafeInteger { field, value: v });
+                }
+            }
+        }
+        // Round-26 F1 (self-fix): mirror the `> 1000` guard from
+        // `OcsfEventBuilder::build`. The schema declares
+        // `pruning_ratio_millis` in `[0, 1000]`; round-17 F2 already
+        // introduced this validator as the wire-side backstop for
+        // build's checks, and round-26 F1 added the range check to
+        // build. Adding it here closes the emitter/validator drift
+        // — an event with `pruning_ratio_millis = 5000` now fails
+        // both paths, not just build.
+        if let Some(v) = m.pruning_ratio_millis {
+            if v > 1000 {
+                errors.push(ValidationError::OutOfSchemaRange {
+                    field: "metrics.pruning_ratio_millis",
+                    value: v,
+                    max: 1000,
+                });
+            }
+        }
     }
     if errors.is_empty() {
         Ok(())
@@ -197,6 +340,58 @@ mod tests {
             .contains(&ValidationError::StopReasonPairMismatch));
     }
 
+    /// Round-18 F1 self-fix: `stop_reason` carries the provider's
+    /// NATIVE finish_reason token (documented at
+    /// `model.rs::OcsfEvent::stop_reason` and the builder API
+    /// `OcsfEventBuilder::stop_reason_native`). Provider-native
+    /// captions (OpenAI `"stop"`, Anthropic `"end_turn"`, `"length"`,
+    /// `"tool_calls"`, `"content_filter"`, `"function_call"`) plus
+    /// `Other`-family free text MUST NOT be flagged as a caption
+    /// mismatch even though they differ from the canonical caption.
+    #[test]
+    fn stop_reason_provider_native_captions_are_accepted() {
+        for (id, native) in [
+            (1u8, "stop"),
+            (1, "end_turn"),
+            (1, "stop_sequence"),
+            (2, "length"),
+            (2, "max_tokens"),
+            (3, "tool_calls"),
+            (3, "function_call"),
+            (3, "tool_use"),
+            (90, "content_filter"),
+            (99, "provider_specific_free_text"),
+        ] {
+            let mut ev = valid_event();
+            ev.stop_reason_id = Some(id);
+            ev.stop_reason = Some(native.to_owned());
+            let errs = validate_event(&ev).map(|_| Vec::new()).unwrap_or_else(|e| e);
+            assert!(
+                !errs
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::StopReasonCaptionMismatch { .. })),
+                "provider-native caption ({id}, {native:?}) must not be flagged, got {errs:?}"
+            );
+        }
+    }
+
+    /// The one shape the check DOES flag: the caption is itself a
+    /// canonical caption for a DIFFERENT known variant. `id=93` +
+    /// `caption="Loop Detected"` (canonical for id=91) is the
+    /// unambiguous cross-wiring case.
+    #[test]
+    fn stop_reason_cross_wired_captions_are_flagged() {
+        let mut ev = valid_event();
+        ev.stop_reason_id = Some(93);
+        ev.stop_reason = Some("Loop Detected".into());
+        let errs = validate_event(&ev).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::StopReasonCaptionMismatch { id: 93, .. })),
+            "cross-wired caption must be flagged: {errs:?}"
+        );
+    }
+
     #[test]
     fn bad_severity_detected() {
         let mut ev = valid_event();
@@ -227,6 +422,114 @@ mod tests {
         assert!(validate_event(&ev)
             .unwrap_err()
             .contains(&ValidationError::BadStatus(3)));
+    }
+
+    /// Round-17 F2 regression: the deserialize path bypasses
+    /// `OcsfEventBuilder::build`'s JCS-safe integer check, so a
+    /// wire event with a token counter above 2^53 would round-trip
+    /// through JS-based JSON parsers as silently-truncated,
+    /// breaking any receipt hash JS consumers compute over the
+    /// event. `validate_event` must flag it on every JCS-safe
+    /// carrier field: `time`, `metadata.sequence`, and every
+    /// `EventMetrics.*_tokens`.
+    #[test]
+    fn jcs_unsafe_integer_flagged_on_every_deserialize_carrier() {
+        let unsafe_value = av_core::error::JCS_SAFE_MAX + 1;
+
+        // time
+        let mut ev = valid_event();
+        ev.time = unsafe_value;
+        let errs = validate_event(&ev).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::JcsUnsafeInteger { field: "time", .. })),
+            "time above JCS_SAFE_MAX must be flagged, got {errs:?}"
+        );
+
+        // metadata.sequence
+        let mut ev = valid_event();
+        ev.metadata.sequence = unsafe_value;
+        let errs = validate_event(&ev).unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::JcsUnsafeInteger {
+                    field: "metadata.sequence",
+                    ..
+                }
+            )),
+            "sequence above JCS_SAFE_MAX must be flagged, got {errs:?}"
+        );
+
+        // EventMetrics counters
+        for field in [
+            "metrics.prompt_tokens",
+            "metrics.completion_tokens",
+            "metrics.cached_tokens",
+            "metrics.pruned_tokens",
+            "metrics.pruning_ratio_millis",
+        ] {
+            let mut ev = valid_event();
+            let mut metrics = crate::model::EventMetrics::default();
+            match field {
+                "metrics.prompt_tokens" => metrics.prompt_tokens = Some(unsafe_value),
+                "metrics.completion_tokens" => metrics.completion_tokens = Some(unsafe_value),
+                "metrics.cached_tokens" => metrics.cached_tokens = Some(unsafe_value),
+                "metrics.pruned_tokens" => metrics.pruned_tokens = Some(unsafe_value),
+                "metrics.pruning_ratio_millis" => metrics.pruning_ratio_millis = Some(unsafe_value),
+                _ => unreachable!(),
+            }
+            ev.metrics = Some(metrics);
+            let errs = validate_event(&ev).unwrap_err();
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    ValidationError::JcsUnsafeInteger { field: f, .. } if *f == field
+                )),
+                "{field} above JCS_SAFE_MAX must be flagged, got {errs:?}"
+            );
+        }
+    }
+
+    /// Round-26 F1 (self-fix from round-27): `validate_event` must
+    /// mirror `OcsfEventBuilder::build`'s `pruning_ratio_millis <=
+    /// 1000` guard. Round-17 F2 introduced this validator
+    /// specifically as the wire-side backstop for build's guards;
+    /// leaving the range check only on build left an
+    /// emitter/validator drift where an event with a 500%
+    /// compression ratio would parse-and-validate but fail the
+    /// external JSON schema check downstream.
+    #[test]
+    fn out_of_schema_pruning_ratio_is_flagged_on_validate() {
+        let mut ev = valid_event();
+        ev.metrics = Some(crate::model::EventMetrics {
+            pruning_ratio_millis: Some(5000),
+            ..crate::model::EventMetrics::default()
+        });
+        let errs = validate_event(&ev).unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::OutOfSchemaRange {
+                    field: "metrics.pruning_ratio_millis",
+                    value: 5000,
+                    max: 1000,
+                }
+            )),
+            "pruning_ratio_millis=5000 must be flagged, got {errs:?}"
+        );
+        // Boundary: 1000 is accepted.
+        ev.metrics = Some(crate::model::EventMetrics {
+            pruning_ratio_millis: Some(1000),
+            ..crate::model::EventMetrics::default()
+        });
+        let errs = validate_event(&ev).map(|_| Vec::new()).unwrap_or_else(|e| e);
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e, ValidationError::OutOfSchemaRange { .. })),
+            "boundary 1000 must not be flagged, got {errs:?}"
+        );
     }
 
     /// Round-38 F3: activity_id must be < 100 so

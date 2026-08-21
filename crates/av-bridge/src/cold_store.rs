@@ -17,7 +17,26 @@ pub(crate) struct ColdArchive {
     executor: crate::bus::ConnectorExecutor,
     pending_dir: std::path::PathBuf,
     control_key: parking_lot::RwLock<[u8; 32]>,
+    /// Serializes pending-intent file read/modify/remove between
+    /// publishers (`stage`/`commit`) and the maintenance retry scan, so
+    /// neither side observes (or clobbers) an intent mid-update. Never
+    /// held across a remote put or a broker resolve: those run up to the
+    /// 10 s `ConnectorExecutor` timeout, and the embedded resolver takes
+    /// a partition lock that retention holds while staging (ABBA).
+    intent_lock: parking_lot::Mutex<()>,
 }
+
+/// Grace age below which an offset-None intent is presumed to be a
+/// publisher's in-flight stage → produce → commit window and is skipped
+/// by the maintenance retry scan. Publishers set `stored_at` to "now"
+/// immediately before staging and the `ConnectorExecutor` caps the
+/// produce at 10 s, so 60 s comfortably exceeds the longest possible
+/// stage→commit window. Resolving a younger intent would re-publish the
+/// event mid-produce (duplicate) and make the racing `commit()` fail
+/// with NotFound or a conflicting offset (typically triggering a caller
+/// retry — a third copy). A genuine crash leftover ages past the grace
+/// and is resolved on a later scan.
+const RETRY_GRACE_MS: u64 = 60_000;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PendingColdEvent {
@@ -81,6 +100,7 @@ impl ColdArchive {
             executor: crate::bus::ConnectorExecutor::new("agentvisor-ai-cold-store")?,
             pending_dir,
             control_key: parking_lot::RwLock::new([0; 32]),
+            intent_lock: parking_lot::Mutex::new(()),
         }))
     }
 
@@ -137,6 +157,9 @@ impl ColdArchive {
             offset: None,
         };
         let pending_path = self.pending_path(topic, event_uid);
+        // Existence-check + persist is a read-modify-write on the intent
+        // file; hold the intent lock so the retry scan cannot interleave.
+        let _guard = self.intent_lock.lock();
         if pending_path.exists() {
             let existing = read_pending(&pending_path, &self.control_key.read())?;
             validate_same_intent(&existing, &pending)?;
@@ -150,19 +173,41 @@ impl ColdArchive {
             return Ok(());
         }
         let pending_path = self.pending_path(topic, event_uid);
-        let mut pending = read_pending(&pending_path, &self.control_key.read())?;
-        if pending.topic != topic || pending.event_uid != event_uid {
-            return Err(BusError::Backend(
-                "cold intent does not match broker acknowledgment".to_owned(),
-            ));
-        }
-        if pending.offset.is_some_and(|existing| existing != offset) {
-            return Err(BusError::Backend(
-                "cold intent received conflicting broker offsets".to_owned(),
-            ));
-        }
-        pending.offset = Some(offset);
-        persist_pending(&pending_path, &pending, &self.control_key.read())?;
+        // Read-check-persist under the intent lock so the maintenance
+        // retry scan can never observe (or rewrite) the intent mid-update;
+        // the remote put runs outside the lock (it is idempotent — a
+        // concurrent retry of the same resolved intent writes identical
+        // bytes and both removals tolerate NotFound).
+        let pending = {
+            let _guard = self.intent_lock.lock();
+            let mut pending = match read_pending(&pending_path, &self.control_key.read()) {
+                Ok(pending) => pending,
+                // A racing maintenance pass may have resolved, exported, and
+                // removed this intent while the publisher sat between
+                // `stage` and `commit` (stalled thread or wall-clock jump
+                // past RETRY_GRACE_MS). The export already happened, so the
+                // publish as a whole succeeded — mirror the NotFound
+                // tolerance of `retry_pending_with` instead of failing a
+                // fully-successful publish.
+                Err(BusError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            if pending.topic != topic || pending.event_uid != event_uid {
+                return Err(BusError::Backend(
+                    "cold intent does not match broker acknowledgment".to_owned(),
+                ));
+            }
+            if pending.offset.is_some_and(|existing| existing != offset) {
+                return Err(BusError::Backend(
+                    "cold intent received conflicting broker offsets".to_owned(),
+                ));
+            }
+            pending.offset = Some(offset);
+            persist_pending(&pending_path, &pending, &self.control_key.read())?;
+            pending
+        };
         match self.put_remote(&pending) {
             Ok(()) => remove_pending(&pending_path),
             Err(error) => {
@@ -193,21 +238,49 @@ impl ColdArchive {
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
                 continue;
             }
-            let mut pending = read_pending(&path, &self.control_key.read())?;
+            // Read under the intent lock so a concurrent stage/commit
+            // rewrite is never observed mid-swap; NotFound means a racing
+            // commit already exported and removed the intent.
+            let mut pending = {
+                let _guard = self.intent_lock.lock();
+                match read_pending(&path, &self.control_key.read()) {
+                    Ok(pending) => pending,
+                    Err(BusError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                }
+            };
             if path != self.pending_path(&pending.topic, &pending.event_uid) {
                 return Err(BusError::Backend(
                     "cold outbox path does not match its payload".to_owned(),
                 ));
             }
             if pending.offset.is_none() {
+                // In-flight publisher window: skip young offset-None
+                // intents entirely (see RETRY_GRACE_MS). `stored_at` is
+                // MAC-authenticated, so a filesystem tamperer cannot park
+                // an intent in the grace window forever.
+                if av_core::time::now_ms().saturating_sub(pending.stored_at) < RETRY_GRACE_MS {
+                    continue;
+                }
                 let ack = resolve(&pending)?;
                 if ack.topic != pending.topic || ack.partition != pending.partition {
                     return Err(BusError::Backend(
                         "broker resolver returned an acknowledgment for another cold intent".to_owned(),
                     ));
                 }
-                pending.offset = Some(ack.offset);
-                persist_pending(&path, &pending, &self.control_key.read())?;
+                // Re-read after the (unlocked) resolve: a racing commit may
+                // have exported+removed the intent (skip it) or persisted
+                // the broker-acked offset (which wins over ours).
+                let _guard = self.intent_lock.lock();
+                match read_pending(&path, &self.control_key.read()) {
+                    Ok(current) if current.offset.is_some() => pending = current,
+                    Ok(_) => {
+                        pending.offset = Some(ack.offset);
+                        persist_pending(&path, &pending, &self.control_key.read())?;
+                    }
+                    Err(BusError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                }
             }
             self.put_remote(&pending)?;
             remove_pending(&path)?;
@@ -292,7 +365,10 @@ fn persist_pending(
     let parent = path
         .parent()
         .ok_or_else(|| BusError::Backend("cold outbox has no parent".to_owned()))?;
-    std::fs::create_dir_all(parent)?;
+    // Sync newly created ancestors too: the intent this file records is
+    // the only durable trace of a staged cold export, and an unsynced
+    // ancestor dirent can drop the whole outbox subtree on power loss.
+    av_core::fsutil::create_dir_all_synced(parent)?;
     let temporary = path.with_extension(format!("{}.tmp", av_core::new_event_uid()));
     // Round-22 F3: arm the RAII guard immediately after choosing the
     // temp path so that any Err on mac/serialize/write/sync/rename
@@ -332,7 +408,7 @@ fn pending_mac(control_key: &[u8; 32], pending: &PendingColdEvent) -> Result<Str
             "cold-outbox control key is uninitialized/known-weak; refusing to sign".to_owned(),
         ));
     }
-    use hmac::{Hmac, Mac as _};
+    use hmac::{Hmac, KeyInit as _, Mac as _};
     use sha2::Sha256;
     let value = serde_json::to_value(pending)?;
     let canonical =
@@ -360,7 +436,7 @@ fn verify_pending_mac(
     if control_key == &[0u8; 32] || control_key == &[0xFFu8; 32] {
         return Err(BusError::Backend("cold outbox authentication failed".to_owned()));
     }
-    use hmac::{Hmac, Mac as _};
+    use hmac::{Hmac, KeyInit as _, Mac as _};
     use sha2::Sha256;
     let value = serde_json::to_value(pending)?;
     let canonical =
@@ -478,7 +554,7 @@ mod tests {
     /// envelope and require rejection.
     #[test]
     fn envelope_forged_with_the_weak_default_key_is_refused_on_read() {
-        use hmac::{Hmac, Mac as _};
+        use hmac::{Hmac, KeyInit as _, Mac as _};
         use sha2::Sha256;
         let directory = tempfile::tempdir().unwrap();
         let uri = url::Url::from_directory_path(directory.path())
@@ -524,6 +600,42 @@ mod tests {
             matches!(outcome, Err(BusError::Backend(ref m)) if m.contains("authentication failed")),
             "weak-key forged envelope must be refused, got {outcome:?}"
         );
+    }
+
+    /// A racing maintenance pass can resolve, export, and remove an intent
+    /// while the publisher sits between `stage` and `commit` (stalled
+    /// thread or wall-clock jump past the retry grace). The export already
+    /// happened, so `commit` must treat the missing intent as success —
+    /// mirroring `retry_pending_with`'s NotFound tolerance — instead of
+    /// failing a fully-successful publish (which would push callers into a
+    /// retry that duplicates the event on backends without local dedup).
+    #[test]
+    fn commit_tolerates_an_intent_already_exported_by_maintenance() {
+        let directory = tempfile::tempdir().unwrap();
+        let uri = url::Url::from_directory_path(directory.path())
+            .unwrap()
+            .to_string();
+        let outbox = tempfile::tempdir().unwrap();
+        let mut manifest = BridgeManifest::default_for("cold-race");
+        let topic = &mut manifest.topics[0];
+        topic.retention.cold_uri = Some(uri);
+        let topic_name = topic.name.clone();
+        let archive =
+            ColdArchive::from_manifest_with_pending_default(&manifest, Some(outbox.path().to_path_buf()))
+                .unwrap()
+                .unwrap();
+        archive.set_control_key([17u8; 32]).unwrap();
+        let event = StoredEvent {
+            partition: 0,
+            offset: 5,
+            key: "instance".to_owned(),
+            value: serde_json::json!({"metadata": {"uid": "uid-race"}}),
+            stored_at: 1,
+        };
+        archive.stage(&topic_name, &event, "uid-race").unwrap();
+        // Simulate the racing maintenance export+removal.
+        std::fs::remove_file(archive.pending_path(&topic_name, "uid-race")).unwrap();
+        archive.commit(&topic_name, "uid-race", 5).unwrap(); // commit after a racing export must succeed
     }
 
     /// Mutation-run hardening (round 14): `validate_same_intent` binds a
@@ -725,6 +837,69 @@ mod tests {
         let stored: StoredEvent = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(stored.offset, 7);
         assert_eq!(stored.value["metadata"]["uid"], "cold-event-1");
+    }
+
+    /// The maintenance retry scan runs concurrently with publishers, which
+    /// stage an offset-None intent, produce to the broker (up to the 10 s
+    /// executor timeout), then commit. A scan that resolved such an
+    /// in-flight intent would re-publish the event (duplicate), persist its
+    /// own offset, and make the racing commit fail with
+    /// NotFound/conflicting-offset. Fresh offset-None intents must be
+    /// skipped; only intents older than RETRY_GRACE_MS reach the resolver.
+    #[test]
+    fn retry_scan_skips_in_flight_offset_none_intents_within_the_grace_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = tempfile::tempdir().unwrap();
+        let uri = url::Url::from_directory_path(directory.path())
+            .unwrap()
+            .to_string();
+        let mut manifest = BridgeManifest::default_for("cold-grace");
+        let topic = &mut manifest.topics[0];
+        topic.retention.cold_uri = Some(uri);
+        let topic_name = topic.name.clone();
+        let archive =
+            ColdArchive::from_manifest_with_pending_default(&manifest, Some(outbox.path().to_path_buf()))
+                .unwrap()
+                .unwrap();
+        archive.set_control_key([7u8; 32]).unwrap();
+        // In-flight shape: stored_at is "now", exactly what publish_with_uid
+        // stamps immediately before staging.
+        let in_flight = StoredEvent {
+            partition: 0,
+            offset: 0,
+            key: "instance".to_owned(),
+            value: serde_json::json!({"metadata": {"uid": "uid-in-flight"}}),
+            stored_at: av_core::time::now_ms(),
+        };
+        archive.stage(&topic_name, &in_flight, "uid-in-flight").unwrap();
+        // Crash-leftover shape: an ancient stored_at, well past the grace.
+        let leftover = StoredEvent {
+            partition: 0,
+            offset: 0,
+            key: "instance".to_owned(),
+            value: serde_json::json!({"metadata": {"uid": "uid-leftover"}}),
+            stored_at: 1,
+        };
+        archive.stage(&topic_name, &leftover, "uid-leftover").unwrap();
+        let resolved = archive
+            .retry_pending_with(|pending| {
+                assert_eq!(
+                    pending.event_uid, "uid-leftover",
+                    "the resolver must never see an in-flight (young offset-None) intent"
+                );
+                Ok(crate::PublishAck {
+                    topic: pending.topic.clone(),
+                    partition: pending.partition,
+                    offset: 9,
+                })
+            })
+            .unwrap();
+        assert_eq!(resolved, 1, "only the aged leftover intent is exported");
+        assert_eq!(
+            std::fs::read_dir(outbox.path()).unwrap().count(),
+            1,
+            "the in-flight intent must stay queued for its publisher's commit"
+        );
     }
 
     #[test]

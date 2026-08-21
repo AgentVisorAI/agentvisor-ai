@@ -12,26 +12,43 @@
 ///
 /// Includes the bidirectional formatting/override/isolate family (U+202A..E,
 /// U+2066..9), the LTR/RTL/Arabic marks (U+061C, U+200E..F), the zero-width
-/// glyphs (U+200B..D, U+2060, U+FEFF), and the word joiner. Kept as a small
-/// hand-curated set so this stays a std-only helper — a full Unicode-Cf gate
+/// glyphs (U+200B..D, U+2060, U+FEFF), the invisible operators (U+2061..4),
+/// the deprecated shaping controls (U+206A..F), the soft hyphen, the
+/// Mongolian vowel separator, and the line/paragraph separators (which
+/// inject fake line breaks into log views). Kept as a small hand-curated
+/// set so this stays a std-only helper — a full Unicode-Cf gate
 /// would need an extra crate for a benefit no legitimate identifier needs.
 const DANGEROUS_CODEPOINTS: &[char] = &[
+    '\u{00AD}', // SOFT HYPHEN (renders invisibly outside line breaks)
     '\u{061C}', // ARABIC LETTER MARK
+    '\u{180E}', // MONGOLIAN VOWEL SEPARATOR (invisible, Cf in older Unicode)
     '\u{200B}', // ZERO WIDTH SPACE
     '\u{200C}', // ZERO WIDTH NON-JOINER
     '\u{200D}', // ZERO WIDTH JOINER
     '\u{200E}', // LEFT-TO-RIGHT MARK
     '\u{200F}', // RIGHT-TO-LEFT MARK
+    '\u{2028}', // LINE SEPARATOR (injects fake line breaks into log views)
+    '\u{2029}', // PARAGRAPH SEPARATOR
     '\u{202A}', // LEFT-TO-RIGHT EMBEDDING
     '\u{202B}', // RIGHT-TO-LEFT EMBEDDING
     '\u{202C}', // POP DIRECTIONAL FORMATTING
     '\u{202D}', // LEFT-TO-RIGHT OVERRIDE
     '\u{202E}', // RIGHT-TO-LEFT OVERRIDE (the classic "reverse the string" glyph)
     '\u{2060}', // WORD JOINER
+    '\u{2061}', // FUNCTION APPLICATION (invisible operator)
+    '\u{2062}', // INVISIBLE TIMES
+    '\u{2063}', // INVISIBLE SEPARATOR
+    '\u{2064}', // INVISIBLE PLUS
     '\u{2066}', // LEFT-TO-RIGHT ISOLATE
     '\u{2067}', // RIGHT-TO-LEFT ISOLATE
     '\u{2068}', // FIRST STRONG ISOLATE
     '\u{2069}', // POP DIRECTIONAL ISOLATE
+    '\u{206A}', // INHIBIT SYMMETRIC SWAPPING (deprecated format control)
+    '\u{206B}', // ACTIVATE SYMMETRIC SWAPPING
+    '\u{206C}', // INHIBIT ARABIC FORM SHAPING
+    '\u{206D}', // ACTIVATE ARABIC FORM SHAPING
+    '\u{206E}', // NATIONAL DIGIT SHAPES
+    '\u{206F}', // NOMINAL DIGIT SHAPES
     '\u{FEFF}', // ZERO WIDTH NO-BREAK SPACE / BOM
 ];
 

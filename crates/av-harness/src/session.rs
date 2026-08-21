@@ -7,6 +7,7 @@ use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Workflow kind (brief Modules G/H).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +41,21 @@ impl Workflow {
 pub struct Session {
     /// Session id.
     pub id: String,
+    /// Round-32 F1 (av-loopdetect): a per-open UUID that disambiguates
+    /// recycled session ids in the off-path vector store. Client
+    /// callers may reuse the same `id` after a finalize; the
+    /// `SessionRegistry::get_or_open` path historically returned a
+    /// fresh `Session` under the same key. A Qdrant vector search
+    /// filtered ONLY on `session_id` would then return the prior
+    /// incarnation's vectors, causing false semantic-loop signals
+    /// from an unrelated past session. Every vector record and
+    /// query is now scoped by
+    /// `session_scope = "{id}#{generation_uid}"` — the UUID is
+    /// fresh for every `Session::new`, so a recycled id lands in
+    /// a distinct scope. The bare `id` remains the primary key for
+    /// on-disk artifacts (spool paths, journal filenames), which
+    /// use crash-safe generation logic of their own.
+    pub session_scope: String,
     /// Workflow kind.
     pub workflow: Workflow,
     /// Agent identity bound at open (from NHI validation).
@@ -58,8 +74,16 @@ pub struct Session {
     pub atif: Mutex<av_atif::TrajectoryBuilder>,
     /// Aggregates for the receipt.
     pub totals: Totals,
-    /// Last-activity timestamp (idle sweeping), epoch ms.
+    /// Last-activity timestamp (dashboard/display only), epoch ms.
+    /// Wall-clock time subject to VM/NTP jumps; not safe to use for
+    /// idle-eviction decisions — the private `last_activity_instant`
+    /// field carries a monotonic anchor the idle sweeper uses instead.
     pub last_activity_ms: AtomicU64,
+    /// Monotonic last-activity instant. Used by the idle sweeper so a
+    /// forward wall-clock jump (VM resume, NTP correction) cannot make
+    /// active sessions look premature-idle: `Instant` is bounded by
+    /// real elapsed time on the system's monotonic clock.
+    last_activity_instant: Mutex<Instant>,
     /// Last normalized provider or enforcement stop reason id.
     last_stop_reason_id: AtomicU64,
     /// Set once closed (idempotent close).
@@ -133,6 +157,9 @@ impl Session {
         Self {
             chain: Mutex::new(EventChain::new(&id)),
             atif: Mutex::new(av_atif::TrajectoryBuilder::new(agent, Some(id.clone()))),
+            // Round-32 F1: fresh generation UUID per Session::new so
+            // recycled ids get a distinct vector-sink scope.
+            session_scope: format!("{id}#{}", av_core::new_event_uid()),
             id,
             workflow,
             identity: identity.clone(),
@@ -142,6 +169,7 @@ impl Session {
             loop_state: av_loopdetect::SessionLoopState::new(breaker),
             totals: Totals::default(),
             last_activity_ms: AtomicU64::new(av_core::time::now_ms()),
+            last_activity_instant: Mutex::new(Instant::now()),
             last_stop_reason_id: AtomicU64::new(0),
             closed: AtomicU64::new(0),
             artifact_committed: AtomicU64::new(0),
@@ -201,10 +229,37 @@ impl Session {
         self.journal_index.store(next, Ordering::Release);
     }
 
-    /// Touch the activity clock.
+    /// Touch the activity clock. Both the wall-clock and the monotonic
+    /// anchors are updated: the wall-clock feeds dashboard display, the
+    /// monotonic feeds the idle sweeper.
     pub fn touch(&self) {
         self.last_activity_ms
             .store(av_core::time::now_ms(), Ordering::Release);
+        *self.last_activity_instant.lock() = Instant::now();
+    }
+
+    /// Duration elapsed since this session's last touch, measured on
+    /// the monotonic clock. Safe against wall-clock jumps.
+    pub(crate) fn idle_duration(&self) -> Duration {
+        self.last_activity_instant.lock().elapsed()
+    }
+
+    /// Test-only: age a session so the idle sweeper (which uses the
+    /// monotonic clock) treats it as idle by `ago_seconds`. Production
+    /// code refreshes both anchors via `touch()`.
+    #[cfg(test)]
+    pub(crate) fn set_idle_for_testing(&self, ago_seconds: u64) {
+        let ago = Duration::from_secs(ago_seconds);
+        self.last_activity_ms.store(
+            av_core::time::now_ms().saturating_sub(ago_seconds.saturating_mul(av_core::units::MS_PER_SEC)),
+            Ordering::Release,
+        );
+        // `Instant::checked_sub` fails if the resulting Instant would
+        // predate the platform monotonic zero — in that case, fall back
+        // to the earliest available Instant so the test still expresses
+        // "as idle as possible".
+        let now = Instant::now();
+        *self.last_activity_instant.lock() = now.checked_sub(ago).unwrap_or(now);
     }
 
     /// Attempt to claim the close transition. Only one caller can hold the
@@ -313,14 +368,25 @@ impl Session {
     }
 
     /// Recreate a closed unsigned session from a persisted ATIF trajectory.
+    ///
+    /// `next_seq` is the number of per-session events already published to
+    /// the bridge for this session (steps ↔ journal records are 1:1, so the
+    /// step count is exact). Without restoring it, an adopted session
+    /// reports `peek_seq() == 0` and a post-crash SESSION_CLOSE or
+    /// retroactive-receipt event is minted with `metadata.sequence = 0`,
+    /// colliding with the session's first step event already on the bridge
+    /// (both sibling recovery paths call `restore_next_seq`; this one used
+    /// to be the exception).
     pub fn recover_unsigned(
         id: String,
         identity: AgentIdentity,
         breaker: av_loopdetect::BreakerConfig,
         path: PathBuf,
         metrics: Option<&av_atif::FinalMetrics>,
+        next_seq: u64,
     ) -> Result<Self, String> {
         let session = Self::new(id, Workflow::Unsigned, identity, breaker);
+        session.restore_next_seq(next_seq);
         session.closed.store(1, Ordering::Release);
         session.mark_artifact_committed();
         *session.atif_path.lock() = Some(path);
@@ -710,8 +776,11 @@ impl SessionRegistry {
     /// refusal cheap. Without eviction the registry grows by one entry per
     /// client-chosen session id for the process lifetime.
     pub fn evict_finalized(&self, idle_s: u64) -> Vec<Arc<Session>> {
-        let cutoff =
-            av_core::time::now_ms().saturating_sub(idle_s.saturating_mul(av_core::units::MS_PER_SEC));
+        // Round-49 F1: idle comparison uses the monotonic clock so a
+        // forward wall-clock jump (VM resume, NTP correction) cannot
+        // make finalized sessions look premature-idle. Wall-clock
+        // `last_activity_ms` stays available for dashboard display.
+        let idle_duration = Duration::from_secs(idle_s);
         let mut evicted = Vec::new();
         self.sessions.retain(|_, session| {
             let evict = session.workflow == Workflow::Signed
@@ -719,7 +788,7 @@ impl SessionRegistry {
                 && !session.capture_failed()
                 && session.active_streams.load(Ordering::Acquire) == 0
                 && session.pending_jobs.load(Ordering::Acquire) == 0
-                && session.last_activity_ms.load(Ordering::Acquire) < cutoff;
+                && session.idle_duration() >= idle_duration;
             if evict {
                 evicted.push(Arc::clone(session));
             }
@@ -762,20 +831,21 @@ impl SessionRegistry {
 
     /// Sessions idle longer than `idle_s` (for the sweeper).
     pub fn idle_sessions(&self, idle_s: u64) -> Vec<Arc<Session>> {
-        let cutoff =
-            av_core::time::now_ms().saturating_sub(idle_s.saturating_mul(av_core::units::MS_PER_SEC));
+        // Round-49 F1: monotonic idle math — see `evict_finalized`.
+        let idle_duration = Duration::from_secs(idle_s);
         self.sessions
             .iter()
             .filter(|e| {
-                e.last_activity_ms.load(Ordering::Acquire) < cutoff
+                e.idle_duration() >= idle_duration
                     && !e.is_closed()
                     // A session with a live forwarded response is not idle even
-                    // when its admission clock is stale: `last_activity_ms` is
-                    // refreshed only at request admission, so a stream that
-                    // outlives the idle window would otherwise let the sweeper
-                    // claim the close (sealing the session mid-conversation)
-                    // and then park inside `wait_for_streams` while holding
-                    // the shared lifecycle lock until the client's stream ends.
+                    // when its admission clock is stale: the last-activity
+                    // clock is refreshed only at request admission, so a
+                    // stream that outlives the idle window would otherwise
+                    // let the sweeper claim the close (sealing the session
+                    // mid-conversation) and then park inside `wait_for_streams`
+                    // while holding the shared lifecycle lock until the
+                    // client's stream ends.
                     && e.active_streams.load(Ordering::Acquire) == 0
             })
             .map(|e| e.clone())
@@ -952,8 +1022,7 @@ mod tests {
     fn idle_detection() {
         let r = SessionRegistry::new();
         let s = r.get_or_open("idle", Workflow::Unsigned, &identity(), &Default::default());
-        s.last_activity_ms
-            .store(av_core::time::now_ms() - 10_000, Ordering::Release);
+        s.set_idle_for_testing(10);
         assert_eq!(r.idle_sessions(5).len(), 1);
         assert!(r.idle_sessions(60).is_empty());
         s.try_close();
@@ -974,8 +1043,7 @@ mod tests {
     fn idle_sweep_skips_sessions_with_active_streams() {
         let r = SessionRegistry::new();
         let s = r.get_or_open("streaming", Workflow::Unsigned, &identity(), &Default::default());
-        s.last_activity_ms
-            .store(av_core::time::now_ms() - 10_000, Ordering::Release);
+        s.set_idle_for_testing(10);
         let lease = SessionLease::new(Arc::clone(&s));
         assert!(
             r.idle_sessions(5).is_empty(),
@@ -989,25 +1057,28 @@ mod tests {
         );
     }
 
-    /// If the wall clock jumps backward (NTP correction, VM pause/resume,
-    /// unsynchronized replicas), `now_ms()` may return a value below a
-    /// session's stored `last_activity_ms`. `idle_sessions` must never
-    /// flag the session as idle in that case — a saturating_sub in the
-    /// cutoff calculation keeps the comparison well-defined and the
-    /// session survives until the clock catches back up.
+    /// Idle sweeping now uses the monotonic anchor
+    /// (`monotonic_ns_since_start`), so wall-clock jumps in EITHER
+    /// direction — backward (NTP correction, VM pause/resume) or
+    /// forward (VM resume after a long pause) — cannot flip a fresh
+    /// session into the idle set. The monotonic elapsed time is
+    /// bounded by real wall time since process start and is immune
+    /// to `SystemTime` jumps.
     #[test]
-    fn idle_reap_is_safe_when_clock_runs_backward() {
+    fn idle_reap_is_safe_across_wall_clock_jumps() {
         let r = SessionRegistry::new();
-        let s = r.get_or_open("backward", Workflow::Unsigned, &identity(), &Default::default());
-        // Simulate: session's activity stamp is FUTURE relative to `now_ms()`.
+        let s = r.get_or_open("clock-jump", Workflow::Unsigned, &identity(), &Default::default());
+        // Simulate wall-clock chaos in BOTH directions on the display
+        // clock — the monotonic anchor is untouched and the sweeper
+        // reads only the monotonic side.
         s.last_activity_ms.store(
             av_core::time::now_ms() + av_core::units::MS_PER_HOUR,
             Ordering::Release,
         );
-        for idle_s in [0u64, 1, 60, 3_600, av_core::units::SECS_PER_DAY] {
+        for idle_s in [1u64, 60, 3_600, av_core::units::SECS_PER_DAY] {
             assert!(
                 r.idle_sessions(idle_s).is_empty(),
-                "session with future last_activity must not be reaped at idle_s={idle_s}",
+                "fresh session must not be reaped after a wall-clock jump at idle_s={idle_s}",
             );
         }
     }
@@ -1039,13 +1110,12 @@ mod tests {
     #[test]
     fn evict_finalized_removes_only_quiescent_committed_signed_sessions() {
         let r = SessionRegistry::new();
-        let stale = av_core::time::now_ms() - 10_000;
 
         let eligible = r.get_or_open("evict-me", Workflow::Signed, &identity(), &Default::default());
         eligible.try_close();
         eligible.mark_artifact_committed();
         eligible.mark_close_complete();
-        eligible.last_activity_ms.store(stale, Ordering::Release);
+        eligible.set_idle_for_testing(10);
 
         // Artifact committed but the close never completed (bridge emit or
         // journal removal failed): the journal may still be on disk, so a
@@ -1058,7 +1128,7 @@ mod tests {
         );
         incomplete.try_close();
         incomplete.mark_artifact_committed();
-        incomplete.last_activity_ms.store(stale, Ordering::Release);
+        incomplete.set_idle_for_testing(10);
 
         let unsigned = r.get_or_open(
             "keep-unsigned",
@@ -1069,14 +1139,14 @@ mod tests {
         unsigned.try_close();
         unsigned.mark_artifact_committed();
         unsigned.mark_close_complete();
-        unsigned.last_activity_ms.store(stale, Ordering::Release);
+        unsigned.set_idle_for_testing(10);
 
         let failed = r.get_or_open("keep-failed", Workflow::Signed, &identity(), &Default::default());
         failed.try_close();
         failed.mark_artifact_committed();
         failed.mark_close_complete();
         failed.mark_capture_failed();
-        failed.last_activity_ms.store(stale, Ordering::Release);
+        failed.set_idle_for_testing(10);
 
         let streaming = r.get_or_open(
             "keep-streaming",
@@ -1087,7 +1157,7 @@ mod tests {
         streaming.try_close();
         streaming.mark_artifact_committed();
         streaming.mark_close_complete();
-        streaming.last_activity_ms.store(stale, Ordering::Release);
+        streaming.set_idle_for_testing(10);
         let lease = SessionLease::new(Arc::clone(&streaming));
 
         let fresh = r.get_or_open("keep-fresh", Workflow::Signed, &identity(), &Default::default());
@@ -1096,7 +1166,7 @@ mod tests {
         fresh.mark_close_complete();
 
         let open = r.get_or_open("keep-open", Workflow::Signed, &identity(), &Default::default());
-        open.last_activity_ms.store(stale, Ordering::Release);
+        open.set_idle_for_testing(10);
 
         let evicted = r.evict_finalized(5);
         assert_eq!(
