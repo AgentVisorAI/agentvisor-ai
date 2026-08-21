@@ -549,10 +549,15 @@ fn offsets_stay_monotone_across_retention_boundaries() {
             &json!({"metadata": {"uid": "post"}, "n": 99}),
         )
         .unwrap();
-    assert!(
-        ack.offset >= 4,
-        "post-retention publish reused an expired offset: {}",
-        ack.offset
+    // Round-6 (hunt3 tests F2): the invariant is DENSE offsets — every
+    // other test in this suite pins them exactly, and the retention
+    // crossing is the one place the watermark is re-persisted and could
+    // drift. `>= 4` would let a watermark jump (permanent fetch gaps,
+    // misaligned cold-object names) pass; all 4 pre-events share the
+    // "inst-1" partition key, so the post-retention offset is exactly 4.
+    assert_eq!(
+        ack.offset, 4,
+        "post-retention publish drifted from the dense-offset invariant"
     );
 }
 

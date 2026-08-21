@@ -119,6 +119,9 @@ pub struct Finalizer {
     /// enabled under a rotating-timestamp attacker.
     warned_artifacts: Arc<parking_lot::Mutex<WarnedArtifacts>>,
     journal_key: [u8; 32],
+    /// Round-6 (hunt4 R-F4): best-effort vector-store cleanup at close.
+    /// Optional because lifecycle tests construct a Finalizer without one.
+    vector_sink: Option<Arc<dyn av_loopdetect::VectorSink>>,
 }
 
 /// FIFO-evicting set used by `warn_once`. Round-18 F6: replaces the
@@ -357,6 +360,7 @@ impl Finalizer {
                 WARNED_ARTIFACTS_CAP,
             ))),
             journal_key,
+            vector_sink: None,
         }
     }
 
@@ -381,6 +385,7 @@ impl Finalizer {
                 WARNED_ARTIFACTS_CAP,
             ))),
             journal_key,
+            vector_sink: None,
         }
     }
 
@@ -422,6 +427,14 @@ impl Finalizer {
     #[must_use]
     pub fn with_state_store(mut self, store: Arc<dyn av_state::StateStore>) -> Self {
         self.state_store = Some(store);
+        self
+    }
+
+    /// Round-6 (hunt4 R-F4): attach the vector sink so a session close
+    /// can delete its Qdrant points (best-effort — errors are logged,
+    /// never surfaced into the close outcome).
+    pub fn with_vector_sink(mut self, sink: Arc<dyn av_loopdetect::VectorSink>) -> Self {
+        self.vector_sink = Some(sink);
         self
     }
 
@@ -484,6 +497,11 @@ impl Finalizer {
             session.mark_artifact_committed();
             claim.committed = true;
             self.clear_budget_state(&session.id);
+            // Round-6 (hunt4 R-F3): move this session's tool-execution
+            // triples out of the scanned namespace — they can never
+            // resolve now, and leaving them meant every reconciler tick
+            // re-read + re-MAC-verified them forever.
+            self.quarantine_tool_executions(&session.id).await;
             return Err(FinalizeError::CaptureIncomplete);
         }
         let started = Instant::now();
@@ -524,11 +542,39 @@ impl Finalizer {
                 };
                 let persisted_receipt = { session.receipt.lock().clone() };
                 let receipt = if let Some(receipt) = persisted_receipt {
-                    self.verify_configured_receipt(&receipt)?;
-                    if receipt.body.subject != subject {
-                        return Err(FinalizeError::Receipt(
-                            "persisted receipt subject does not match reconstructed chain".to_owned(),
-                        ));
+                    // Round-6 (hunt4 R-F5): a persisted receipt that no
+                    // longer verifies (signer/key rotation) or whose
+                    // subject mismatches the chain is a PERMANENT
+                    // condition — the in-memory receipt will never
+                    // change. Treating it as transient made the idle
+                    // sweeper re-enter this close every tick forever
+                    // (full re-verify + warn loop, fleet-wide after a
+                    // key rotation). Seal terminally like the
+                    // capture-failed branch: evidence quarantined, no
+                    // per-tick retry.
+                    let verified = self.verify_configured_receipt(&receipt).and_then(|()| {
+                        if receipt.body.subject == subject {
+                            Ok(())
+                        } else {
+                            Err(FinalizeError::Receipt(
+                                "persisted receipt subject does not match reconstructed chain".to_owned(),
+                            ))
+                        }
+                    });
+                    if let Err(error) = verified {
+                        tracing::warn!(
+                            session = %session.id,
+                            %error,
+                            "persisted receipt does not verify; sealing session terminally \
+                             (evidence quarantined, no per-tick retry)"
+                        );
+                        session.mark_capture_failed();
+                        session.mark_artifact_committed();
+                        claim.committed = true;
+                        self.clear_budget_state(&session.id);
+                        self.quarantine_tool_executions(&session.id).await;
+                        self.quarantined_sessions.lock().insert(session.id.clone());
+                        return Err(error);
                     }
                     receipt
                 } else {
@@ -684,6 +730,20 @@ impl Finalizer {
         // Only now — with lifecycle events published and the on-disk journal
         // removed — may the registry evict this session.
         session.mark_close_complete();
+        // Round-6 (hunt4 R-F4): best-effort vector-store cleanup. The
+        // scoped points are dead weight after close (the generation-uid
+        // scope makes them unreachable for any future incarnation) and
+        // an external Qdrant would otherwise grow without bound. Errors
+        // must never affect the close outcome.
+        if let Some(sink) = &self.vector_sink {
+            if let Err(error) = sink.delete_scope(&session.session_scope).await {
+                tracing::warn!(
+                    session = %session.id,
+                    %error,
+                    "vector-store scope cleanup failed at close (points remain as dead weight)"
+                );
+            }
+        }
         // Round-6 (hunt4 R2): reclaim the trajectory builder's RAM.
         // Signed sessions are handled by evict_finalized; unsigned
         // sessions live in the registry forever, so their builders
@@ -957,6 +1017,23 @@ impl Finalizer {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(error) => return Err(FinalizeError::Atif(error.to_string())),
         };
+        // Round-6 (hunt4 R-F2): precompute the filename stems of every
+        // registry-known session. Artifact filenames are
+        // `{sha256(session_id)[..32]}.json`, so a stem match means the
+        // adoption below would skip anyway ("session already active" at
+        // try_insert_recovered) — but only AFTER a full 64 MiB read +
+        // parse + double strict-validation. The per-tick scan cost was
+        // O(total historical artifacts × 2 × artifact size), every
+        // tick, forever; this makes the steady-state cost one stat +
+        // one set-lookup per already-adopted artifact.
+        let known_stems: std::collections::HashSet<String> = sessions
+            .open_sessions_including_closed()
+            .iter()
+            .map(|session| {
+                let digest = av_core::digest::sha256_hex(session.id.as_bytes());
+                digest.get(..32).unwrap_or(&digest).to_owned()
+            })
+            .collect();
         let mut recovered = 0usize;
         while let Some(entry) = entries
             .next_entry()
@@ -975,6 +1052,16 @@ impl Finalizer {
                 .file_name()
                 .and_then(std::ffi::OsStr::to_str)
                 .is_some_and(|name| name.ends_with(".session.json"))
+            {
+                continue;
+            }
+            // Round-6 (hunt4 R-F2): the session is already in the
+            // registry — adoption would skip it after an expensive
+            // read+parse+validate; skip on the stem match instead.
+            if path
+                .file_stem()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|stem| known_stems.contains(stem))
             {
                 continue;
             }
@@ -1165,7 +1252,10 @@ impl Finalizer {
             // (before the read+parse+validate) at the top of this
             // loop iteration, so orphan sidecar-less files no longer
             // reach this point.
-            if let Err(error) = self.ensure_atif_provenance(&path, &session_id).await {
+            if let Err(error) = self
+                .ensure_atif_provenance_from_bytes(&path, &session_id, &bytes)
+                .await
+            {
                 self.metrics
                     .counter(
                         "av_atif_recovery_skipped_total{reason=\"provenance\"}",
@@ -2234,7 +2324,26 @@ impl Finalizer {
                 )
                 .map_err(|error| FinalizeError::Atif(error.to_string()))?;
                 trajectory.trajectory_id.clone_from(&existing.trajectory_id);
-                if trajectory != existing {
+                // Round-6 (hunt2 crosscrate F1): `ttl_remaining_s` is
+                // recomputed at every token validation, so close-time
+                // ATIF (last REFRESHED identity) and recovery-rebuilt
+                // ATIF (last JOURNALED identity) legitimately disagree
+                // whenever the final admitted request was rejected
+                // eventlessly (breaker-open 403, queue exhaustion).
+                // The identity-consistency check upstream deliberately
+                // compares version/charter/instance_uid only — mirror
+                // that here by normalizing the ttl on comparison COPIES
+                // (never the artifact we might persist), same
+                // normalization class as the trajectory_id clone_from
+                // above and the round-43 F2 stop_reason fix.
+                let differs = {
+                    let mut lhs = trajectory.clone();
+                    let mut rhs = existing.clone();
+                    normalize_extra_ttl(&mut lhs);
+                    normalize_extra_ttl(&mut rhs);
+                    lhs != rhs
+                };
+                if differs {
                     // Round-6 (hunt3 F4): a recycled session id whose
                     // prior incarnation finalized an unsigned artifact
                     // will land its follow-up incarnation here — the
@@ -2443,6 +2552,92 @@ impl Finalizer {
         .map_err(|error| FinalizeError::Task(error.to_string()))?
     }
 
+    /// Round-6 (hunt4 R-F3): move a capture-failed session's
+    /// tool-execution triples out of the scanned namespace. These
+    /// executions can never resolve (the session is sealed), but
+    /// leaving them at their primary names meant
+    /// `unresolved_tool_sessions` re-read and re-MAC-verified them
+    /// every reconciler tick FOREVER, and every close of any other
+    /// session paid the read+MAC cost for them too. Rename (not
+    /// delete): the outcome hex may be the only copy of what the tool
+    /// returned, so the triple is preserved as incident evidence under
+    /// a `.capturefailed-<uid>` suffix that no scan globs.
+    async fn quarantine_tool_executions(&self, session_id: &str) {
+        let spool_dir = self.spool_dir.clone();
+        let session_id = session_id.to_owned();
+        let control_key = self.journal_key;
+        let outcome = tokio::task::spawn_blocking(move || {
+            let directory = spool_dir.join(crate::spool::TOOL_EXECUTIONS);
+            let entries = match std::fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error.to_string()),
+            };
+            for entry in entries {
+                let Ok(entry) = entry else { continue };
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+                    continue;
+                };
+                let Some(key) = name.strip_suffix(crate::spool::TOOL_INTENT_SUFFIX) else {
+                    continue;
+                };
+                let intent_bytes = match std::fs::read(&path) {
+                    Ok(bytes) => bytes,
+                    Err(_) => continue,
+                };
+                let intent_session_id = crate::journal::open::<serde_json::Value>(
+                    &control_key,
+                    &format!("{}:{key}", crate::journal::TOOL_INTENT_DOMAIN),
+                    0,
+                    &intent_bytes,
+                )
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("session_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                });
+                if intent_session_id.as_deref() != Some(session_id.as_str()) {
+                    continue;
+                }
+                let uid = av_core::new_event_uid();
+                // Audited first, outcome next, intent last — mirrors the
+                // remove path's crash-ordering rationale (outcome must
+                // never exist without its intent at the primary names).
+                for suffix in [
+                    crate::spool::TOOL_AUDITED_SUFFIX,
+                    crate::spool::TOOL_OUTCOME_SUFFIX,
+                    crate::spool::TOOL_INTENT_SUFFIX,
+                ] {
+                    let file = directory.join(format!("{key}{suffix}"));
+                    let quarantine = directory.join(format!("{key}{suffix}.capturefailed-{uid}"));
+                    match std::fs::rename(&file, &quarantine) {
+                        Ok(()) | Err(_) => {}
+                    }
+                }
+                tracing::warn!(
+                    session = %session_id,
+                    key = %key,
+                    "tool-execution triple quarantined as capture-failed incident evidence"
+                );
+            }
+            let _ = av_core::fsutil::sync_directory(&directory);
+            Ok(())
+        })
+        .await;
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "failed to quarantine capture-failed tool executions")
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to quarantine capture-failed tool executions")
+            }
+        }
+    }
+
     /// Retry every durable promotion marker whose session can be recovered.
     pub async fn retry_marked_promotions(&self, sessions: &SessionRegistry) -> Result<usize, FinalizeError> {
         let mut entries = match tokio::fs::read_dir(&self.spool_dir).await {
@@ -2535,9 +2730,21 @@ impl Finalizer {
         let bytes = read_capped_async(path.to_path_buf(), av_core::fsutil::MAX_ATIF_BYTES)
             .await
             .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+        self.ensure_atif_provenance_from_bytes(path, session_id, &bytes)
+            .await
+    }
+
+    /// Round-6 (hunt4 R-F2): variant taking already-read artifact bytes
+    /// so the recovery scan doesn't read every artifact twice per tick.
+    async fn ensure_atif_provenance_from_bytes(
+        &self,
+        path: &std::path::Path,
+        session_id: &str,
+        bytes: &[u8],
+    ) -> Result<AtifProvenance, FinalizeError> {
         let expected = AtifProvenance {
             session_id: session_id.to_owned(),
-            digest: av_core::digest::sha256_hex(&bytes),
+            digest: av_core::digest::sha256_hex(bytes),
         };
         let provenance_path = path.with_extension("atif-auth");
         if provenance_path.exists() {
@@ -3175,6 +3382,20 @@ impl Finalizer {
 /// drop the `.json` extension (same convention as the recovery scan's
 /// `.corrupt-<uid>` quarantine) so the recovery scan never re-adopts a
 /// superseded incarnation.
+/// Round-6 (hunt2 crosscrate F1): normalize `agent.extra.ttl_remaining_s`
+/// to null before an equality comparison between a close-time and a
+/// recovery-rebuilt trajectory. The field carries a per-validation
+/// wall-clock recomputation, not an identity fact.
+fn normalize_extra_ttl(trajectory: &mut av_atif::Trajectory) {
+    if let Some(extra) = trajectory.agent.extra.as_mut() {
+        if let Some(object) = extra.as_object_mut() {
+            if object.contains_key("ttl_remaining_s") {
+                object.insert("ttl_remaining_s".to_owned(), serde_json::Value::Null);
+            }
+        }
+    }
+}
+
 fn archive_conflicting_atif(
     path: &std::path::Path,
     new_trajectory_id: Option<&str>,

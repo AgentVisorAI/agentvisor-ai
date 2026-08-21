@@ -10,6 +10,15 @@ pub enum ValidationError {
     /// A required string field was empty.
     #[error("required field `{0}` is empty")]
     EmptyField(&'static str),
+    /// Round-6 (hunt2 F11): `unmapped` carries inbound-tolerance fields
+    /// that re-serialize to the top level, but the shipped schema
+    /// declares `additionalProperties: false` — such an event passes the
+    /// Rust validator yet fails the broker's schema gate at publish
+    /// (which fail-closes the session). The tolerance is INBOUND-ONLY;
+    /// republishing an event that carries unmapped fields is refused
+    /// here so both validators agree.
+    #[error("event carries {0} unmapped field(s); inbound tolerance is not publishable")]
+    UnmappedNotPublishable(usize),
     /// `type_uid` doesn't match `class_uid * 100 + activity_id`.
     #[error("type_uid {type_uid} != class_uid {class_uid} * 100 + activity_id {activity_id}")]
     TypeUidMismatch {
@@ -107,6 +116,10 @@ pub enum ValidationError {
 /// (collect-all-errors, matching the Harbor validator philosophy).
 pub fn validate_event(ev: &OcsfEvent) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
+    // Round-6 (hunt2 F11): see UnmappedNotPublishable.
+    if !ev.unmapped.is_empty() {
+        errors.push(ValidationError::UnmappedNotPublishable(ev.unmapped.len()));
+    }
     if ev.metadata.uid.is_empty() {
         errors.push(ValidationError::EmptyField("metadata.uid"));
     }

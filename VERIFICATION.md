@@ -51,3 +51,58 @@ Closed on 2026-08-15 (previously listed here as untested):
 - **Redis Cluster topology** — a live 3-master cluster (redis 8, ports 7000-7002) passed the `AV_REDIS_URL` contract suite, including a new multi-key `try_spend_many` test using the production `budget:{hash-tag}:` key shape (proves CROSSSLOT safety on a real slot map, plus cross-key atomicity of a refused spend).
 - **S3-compatible cold tier** — the two-phase cold export (staged intent → conditional `PutMode::Create` put → idempotent re-put) passed live against MinIO via the new `AV_COLD_S3_URL`-gated contract; the object landed with the deterministic `topic/pN/offset.json` key. Standard `AWS_*` env credentials are now honored (keys are lowercased before `object_store::parse_url_opts`, which only parses lowercase config names).
 - **Broker TLS/SASL** — the Kafka connector now reads `AV_KAFKA_CA_FILE` + `AV_KAFKA_SASL_USERNAME`/`AV_KAFKA_SASL_PASSWORD` (mechanism via `AV_KAFKA_SASL_MECHANISM`: `SCRAM-SHA-256` default, `SCRAM-SHA-512`, or `PLAIN` — upgraded from PLAIN-only on 2026-08-16 with rskafka 0.6/rustls 0.23; credentials refused without TLS) on both the rskafka event path and the librdkafka admin path; the live contract passed against Redpanda with a `sasl`-authenticated TLS listener (private CA) for SCRAM-SHA-256 and PLAIN, an unauthenticated client was rejected by the broker, credentials-without-CA was refused client-side, and the plaintext path is regression-tested unchanged. The NATS connector reads `AV_NATS_CA_FILE` + `AV_NATS_USER`/`AV_NATS_PASSWORD`; the live contract passed over `tls://` against nats-server with TLS + user/password required.
+
+## Receipt Verification Protocol (independent implementation)
+
+README and the project site link here for "verifying a receipt from
+scratch". The following is the complete, normative recipe an
+independent verifier must implement — no AgentVisor code required. A
+receipt is a single JSON object; the reference implementation is
+`crates/av-receipts/src/receipt.rs` (`Receipt::verify`) and the CLI
+wrapper is `avctl receipt-verify <file> --public-key-hex <64-hex>`.
+
+### Inputs
+
+- The receipt bytes (UTF-8 JSON).
+- The trusted Ed25519 public key (32 bytes), obtained out of band —
+  e.g. from the operator's key distribution, NOT from the receipt
+  itself (the embedded copy is cross-checked, never trusted alone).
+
+### Steps
+
+1. **Strict parse.** Reject the document if any JSON object at ANY
+   nesting level contains a duplicate key (serde/JS parsers silently
+   keep one — a signed duplicate is evidence-splitting), if nesting
+   exceeds depth 128, or if the top level contains any key outside
+   this exact set: `receipt_version`, `receipt_id`, `session_id`,
+   `issued_at`, `issued_at_iso`, `ai_agent`, `subject`, `tool_calls`,
+   `cost`, `stop_reason_id`, `stop_reason`, `key_id`,
+   `public_key_b64`, `signature_b64`.
+2. **Semantic invariants.** `receipt_version` must be `1`. When
+   `subject.type == "atif_trajectory"`, `subject.retroactive` must be
+   `true`. `issued_at_iso` must equal the RFC 3339 UTC rendering of
+   `issued_at` (epoch milliseconds) with exactly millisecond precision
+   and a `Z` suffix (e.g. `1970-01-01T00:00:00.000Z`).
+3. **Key binding.** Base64-decode `public_key_b64` (standard alphabet,
+   padded); it must be exactly 32 bytes and a valid Ed25519 point.
+   Compute `SHA-256(public_key_bytes)`; the first 32 lowercase hex
+   characters must equal `key_id`. The key bytes must ALSO equal your
+   independently trusted public key — a receipt that binds
+   consistently to an attacker's key is consistent, not trustworthy.
+4. **Canonical bytes.** Remove `signature_b64` from the object. The
+   remaining 13 fields are the signed body. Serialize it with
+   RFC 8785 (JCS): objects sorted by UTF-16 code units, no
+   whitespace, shortest-round-trip number rendering, integers
+   restricted to |n| ≤ 2^53. The signed message is the UTF-8 bytes of
+   that canonical form.
+5. **Signature.** Base64-decode `signature_b64` (64 bytes) and verify
+   with Ed25519 in **strict** mode (reject small-order components and
+   non-canonical scalars — RFC 8032 `verify` alone admits malleable
+   encodings; the reference uses ed25519-dalek `verify_strict`).
+
+Any step failing means the receipt does not attest anything. For
+`subject.type == "atif_trajectory"`, additionally compare
+`subject.trajectory_digest` against `SHA-256(file bytes)` of the ATIF
+artifact you hold; for `subject.type == "event_chain"`, the
+`chain_head`/`event_count` bind the OCSF event-chain replay (see
+ARCHITECTURE.md for the chain hash construction).

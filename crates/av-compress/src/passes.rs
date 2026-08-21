@@ -231,15 +231,28 @@ fn stub_middle_to_target(
         if tokens < 32 {
             continue;
         }
+        // Round-6 (hunt5 F5): the running counter was seeded from the
+        // SERIALIZED payload (JSON-escaped: `\n` → two chars, `"` →
+        // `\"`), but decrements used raw-content tokens. Raw ≤ escaped
+        // always, so the loop over-stated remaining tokens and kept
+        // stubbing past the target — destroying messages that should
+        // have survived on code/JSON-heavy content. Measure both the
+        // removed content and the added stub in serialized units.
+        let serialized_tokens =
+            approx_tokens(&serde_json::to_string(&Value::String(content.to_owned())).unwrap_or_default());
         let digest = av_core::digest::sha256_hex(content.as_bytes());
         let stub_content = format!("[pruned: {tokens} tokens, sha256:{digest}, reason: middle history]");
-        let stub_tokens = approx_tokens(&stub_content);
+        let stub_serialized_tokens =
+            approx_tokens(&serde_json::to_string(&Value::String(stub_content.clone())).unwrap_or_default());
         if let Some(object) = message.as_object_mut() {
             object.insert("content".to_owned(), Value::String(stub_content));
             // Update the running counter: original message content
-            // contributed `tokens`, new stub contributes `stub_tokens`.
-            // Everything else in the payload envelope is unchanged.
-            current_tokens = current_tokens.saturating_sub(tokens).saturating_add(stub_tokens);
+            // contributed `serialized_tokens`, new stub contributes
+            // `stub_serialized_tokens`. Everything else in the payload
+            // envelope is unchanged.
+            current_tokens = current_tokens
+                .saturating_sub(serialized_tokens)
+                .saturating_add(stub_serialized_tokens);
             changed = true;
         }
     }
@@ -277,9 +290,17 @@ fn collapse_duplicate_system(messages: &mut [Value], tail_start: usize) -> bool 
         }
         if msg_role(m) == "system" && *m == reference {
             let tokens = approx_tokens(&reference.to_string());
+            let stub = audit_stub("duplicate system message", tokens, &reference);
+            // Round-6 (hunt5 F4): stub only when it shrinks the
+            // message — a short duplicate would otherwise GROW the
+            // payload and trip the outer revert-guard into cancelling
+            // the whole compression outcome.
+            if approx_tokens(&stub) >= tokens {
+                continue;
+            }
             *m = json!({
                 "role": "system",
-                "content": audit_stub("duplicate system message", tokens, &reference),
+                "content": stub,
             });
             changed = true;
         }
@@ -290,31 +311,46 @@ fn collapse_duplicate_system(messages: &mut [Value], tail_start: usize) -> bool 
 /// Collapse exact-duplicate user/assistant messages outside the tail
 /// (identical retries / framework echoes).
 ///
-/// Round-32 F2 (av-compress): the prior implementation used
-/// `Vec<Value>` + `Vec::contains` (linear per-lookup, O(n²) total)
-/// AND cloned every non-duplicate message into the seen-list on push.
-/// On a 4 MiB payload with hundreds of messages this dominated
-/// compression latency and could momentarily hold ~2× the payload
-/// in RAM. Now uses a `HashSet<u64>` keyed by a stable content hash
-/// derived from `(role, content_str)` — the ONLY two components
-/// `contains` used to compare, since the guards above already
-/// exclude tool_calls-carrying and pre-stubbed messages. O(1)
-/// average lookup, and no message clone.
+/// Round-32 F2 (av-compress): `HashSet` keyed by content hash replaced
+/// the O(n²) `Vec::contains`. Round-6 (hunt1 F2) hardened it twofold:
+///
+/// 1. **Eligibility**: only messages whose ONLY fields are `role` and
+///    `content` participate. The previous `(role, content)` key
+///    collapsed messages that differed in `name` (multi-participant),
+///    `refusal`, legacy `function_call`, or `audio` — permanently
+///    destroying the distinguishing field (e.g. WHICH named user said
+///    "approve"), violating the crate's "never semantically
+///    destructive" invariant.
+/// 2. **Verification**: the 64-bit hash is a fast filter only; a hash
+///    hit is confirmed with full `Value` equality against the first
+///    occurrence before stubbing. `DefaultHasher` is unkeyed, so a
+///    collision is offline-searchable by anyone who controls message
+///    content — treating a collision as equality silently destroyed a
+///    non-duplicate.
+///
+/// Also applies the round-6 (hunt5 F4) stub-size floor: a duplicate is
+/// only stubbed when the stub is actually smaller, so collapsing many
+/// short duplicates can no longer GROW the payload and trip the outer
+/// revert-guard into cancelling all compression for the conversation.
 fn collapse_duplicate_messages(messages: &mut [Value], tail_start: usize) -> bool {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
     use std::hash::{DefaultHasher, Hash, Hasher};
-    let mut seen: HashSet<u64> = HashSet::new();
+    // hash → index of first occurrence, for equality confirmation.
+    let mut seen: HashMap<u64, usize> = HashMap::new();
     let mut changed = false;
-    for (i, m) in messages.iter_mut().enumerate() {
-        if i >= tail_start {
-            break;
-        }
-        let role = msg_role(m);
+    for i in 0..tail_start.min(messages.len()) {
+        let Some(m) = messages.get(i) else { continue };
+        let role = msg_role(m).to_owned();
         if role != "user" && role != "assistant" {
             continue;
         }
-        // Only collapse pure-content messages — never anything carrying tool_calls.
-        if m.get("tool_calls").is_some() {
+        // Only collapse messages carrying NOTHING beyond role+content —
+        // any extra field (name, refusal, function_call, audio, …) is
+        // semantically distinguishing and must survive verbatim.
+        let only_role_and_content = m
+            .as_object()
+            .is_some_and(|obj| obj.len() == 2 && obj.contains_key("role") && obj.contains_key("content"));
+        if !only_role_and_content {
             continue;
         }
         let Some(content) = msg_content_str(m) else {
@@ -324,22 +360,42 @@ fn collapse_duplicate_messages(messages: &mut [Value], tail_start: usize) -> boo
         if content.starts_with("[pruned:") {
             continue;
         }
-        // Composite hash of (role, content) — the two fields the
-        // prior `Vec::contains` on Value compared. Guards above
-        // exclude every other field that could vary between
-        // otherwise-identical duplicates.
         let mut hasher = DefaultHasher::new();
         role.hash(&mut hasher);
         content.hash(&mut hasher);
         let key = hasher.finish();
-        if !seen.insert(key) {
-            let tokens = approx_tokens(content);
-            let stub = audit_stub("duplicate message", tokens, m);
-            *m = json!({ "role": role, "content": stub });
-            changed = true;
+        match seen.get(&key) {
+            None => {
+                seen.insert(key, i);
+            }
+            Some(&first_index) => {
+                // Confirm with real equality — a hash collision must
+                // never destroy a non-duplicate.
+                let is_true_duplicate = messages
+                    .get(first_index)
+                    .is_some_and(|first| messages.get(i).is_some_and(|current| first == current));
+                if !is_true_duplicate {
+                    continue;
+                }
+                let Some(m) = messages.get_mut(i) else { continue };
+                let tokens = approx_tokens(content_of(m).unwrap_or_default());
+                let stub = audit_stub("duplicate message", tokens, m);
+                // Stub-size floor: replacing a 1-token "ok" with a
+                // ~30-token stub grows the payload.
+                if approx_tokens(&stub) >= tokens {
+                    continue;
+                }
+                *m = json!({ "role": role, "content": stub });
+                changed = true;
+            }
         }
     }
     changed
+}
+
+/// Owned-content helper for the post-borrow stub construction above.
+fn content_of(m: &Value) -> Option<&str> {
+    m.get("content").and_then(Value::as_str)
 }
 
 /// Replace large, stale tool outputs with audit stubs (the brief's "stale tool
@@ -399,6 +455,24 @@ fn normalize_json_content(messages: &mut [Value], tail_start: usize) -> bool {
         let Ok(minified) = serde_json::to_string(&parsed) else {
             continue;
         };
+        // Round-6 (hunt1 F9): the round-trip through `Value` is
+        // lossy for (a) integers outside i64/u64 range — parsed as
+        // f64 and re-serialized with precision loss (128-bit IDs,
+        // large monetary integers common in tool outputs) — and (b)
+        // duplicate keys, collapsed last-wins. Both silently corrupt
+        // tool data the model then reasons over, violating the
+        // "never semantically destructive" invariant. Detect by
+        // re-parsing the minified form and requiring Value-equality
+        // AND matching numeric-literal token streams; skip the pass
+        // for content that does not round-trip exactly.
+        let round_trips = serde_json::from_str::<Value>(&minified)
+            .map(|reparsed| reparsed == parsed)
+            .unwrap_or(false)
+            && numeric_literals(content) == numeric_literals(&minified)
+            && !has_duplicate_keys(content);
+        if !round_trips {
+            continue;
+        }
         if minified.len() < content.len() {
             if let Some(obj) = m.as_object_mut() {
                 obj.insert("content".to_owned(), Value::String(minified));
@@ -412,6 +486,76 @@ fn normalize_json_content(messages: &mut [Value], tail_start: usize) -> bool {
 fn audit_stub(reason: &str, tokens: u64, original: &Value) -> String {
     let digest = av_core::digest::sha256_hex(original.to_string().as_bytes());
     format!("[pruned: {tokens} tokens ({reason}), sha256:{digest}]")
+}
+
+/// Round-6 (hunt1 F9) helpers: a single-pass JSON lexer extracting the
+/// ordered numeric-literal tokens and the object-key count from RAW
+/// text (no Value round-trip). Used to prove a minification did not
+/// mutate numeric representations (bigint precision loss) or collapse
+/// duplicate keys.
+fn numeric_literals(raw: &str) -> Vec<String> {
+    lex_json(raw).0
+}
+
+fn has_duplicate_keys(raw: &str) -> bool {
+    // If minification would drop keys, the raw text's key count exceeds
+    // the reparse's. Compare against the canonical no-dup serialization.
+    let Ok(parsed) = serde_json::from_str::<Value>(raw) else {
+        return true; // unparseable — treat conservatively
+    };
+    let Ok(minified) = serde_json::to_string(&parsed) else {
+        return true;
+    };
+    lex_json(raw).1 != lex_json(&minified).1
+}
+
+/// Returns (ordered numeric literals, object-key count).
+fn lex_json(raw: &str) -> (Vec<String>, usize) {
+    let mut numbers = Vec::new();
+    let mut key_count = 0usize;
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while let Some(&byte) = bytes.get(i) {
+        match byte {
+            b'"' => {
+                // Skip string, handling escapes; then check for a
+                // following ':' (object key).
+                i += 1;
+                while let Some(&inner) = bytes.get(i) {
+                    match inner {
+                        b'\\' => i += 2,
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                let mut j = i;
+                while bytes.get(j).is_some_and(u8::is_ascii_whitespace) {
+                    j += 1;
+                }
+                if bytes.get(j) == Some(&b':') {
+                    key_count += 1;
+                }
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                i += 1;
+                while bytes
+                    .get(i)
+                    .is_some_and(|b| matches!(b, b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-'))
+                {
+                    i += 1;
+                }
+                if let Some(token) = raw.get(start..i) {
+                    numbers.push(token.to_owned());
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    (numbers, key_count)
 }
 
 #[cfg(test)]
@@ -449,6 +593,103 @@ mod tests {
         let v = payload(vec![json!({"role": "user", "content": "hi"})]);
         let out = compress(&v, &CompressionConfig::default());
         assert!(!out.changed, "512-token floor must skip tiny payloads");
+    }
+
+    /// Round-6 (hunt1 F2): messages carrying fields beyond role+content
+    /// (`name`, `refusal`, `function_call`, …) are semantically distinct
+    /// even when role+content match — they must never be collapsed.
+    #[test]
+    fn named_messages_are_never_collapsed_as_duplicates() {
+        let text = "approve ".repeat(80);
+        let mut messages = vec![
+            json!({"role": "user", "name": "alice", "content": text}),
+            json!({"role": "user", "name": "bob", "content": text}),
+            json!({"role": "user", "content": text}),
+            json!({"role": "user", "content": text}),
+        ];
+        // Pad past keep_tail (default 8) so the head messages are
+        // outside the protected tail and dedupe scans them.
+        for _ in 0..9 {
+            messages.push(json!({"role": "assistant", "content": "tail ".repeat(50)}));
+        }
+        let out = compress(&payload(messages), &engage_all());
+        let out_messages = out.payload["messages"].as_array().unwrap();
+        assert_eq!(out_messages[0]["name"], "alice");
+        assert_eq!(out_messages[1]["name"], "bob");
+        assert!(
+            !out_messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("[pruned:"),
+            "named message collapsed despite distinguishing field"
+        );
+        assert!(
+            out_messages[3]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("[pruned:"),
+            "plain role+content duplicate should still collapse"
+        );
+    }
+
+    /// Round-6 (hunt5 F4): collapsing a short duplicate must not grow
+    /// the payload — the stub floor skips them.
+    #[test]
+    fn short_duplicates_are_not_stubbed_into_growth() {
+        let mut messages = vec![
+            json!({"role": "user", "content": "ok"}),
+            json!({"role": "user", "content": "ok"}),
+        ];
+        for _ in 0..9 {
+            messages.push(json!({"role": "assistant", "content": "tail ".repeat(60)}));
+        }
+        let out = compress(&payload(messages), &engage_all());
+        let out_messages = out.payload["messages"].as_array().unwrap();
+        assert_eq!(
+            out_messages[1]["content"], "ok",
+            "a 1-token duplicate must survive (stub would be ~30 tokens)"
+        );
+    }
+
+    /// Round-6 (hunt1 F9): minification must not mutate numeric
+    /// representations (bigint precision loss) or collapse duplicate
+    /// keys inside tool output.
+    #[test]
+    fn normalize_json_preserves_bigints_and_duplicate_keys() {
+        let bigint_content = format!(
+            "{{\n  \"id\": 123456789012345678901234567890,\n  \"note\": \"{}\"\n}}",
+            "x".repeat(200)
+        );
+        let dup_content = format!(
+            "{{\n  \"k\": 1,\n  \"k\": 2,\n  \"note\": \"{}\"\n}}",
+            "y".repeat(200)
+        );
+        let plain_content = format!("{{\n  \"count\": 42,\n  \"note\": \"{}\"\n}}", "z".repeat(200));
+        let mut messages = vec![
+            json!({"role": "tool", "tool_call_id": "1", "content": bigint_content}),
+            json!({"role": "tool", "tool_call_id": "2", "content": dup_content}),
+            json!({"role": "tool", "tool_call_id": "3", "content": plain_content}),
+        ];
+        for _ in 0..9 {
+            messages.push(json!({"role": "assistant", "content": "tail ".repeat(60)}));
+        }
+        let out = compress(&payload(messages), &engage_all());
+        let out_messages = out.payload["messages"].as_array().unwrap();
+        let first = out_messages[0]["content"].as_str().unwrap();
+        assert!(
+            first.contains("123456789012345678901234567890"),
+            "bigint must survive verbatim, got: {first}"
+        );
+        let second = out_messages[1]["content"].as_str().unwrap();
+        assert!(
+            second.matches("\"k\"").count() == 2,
+            "duplicate keys must survive verbatim, got: {second}"
+        );
+        let third = out_messages[2]["content"].as_str().unwrap();
+        assert!(
+            !third.contains('\n'),
+            "cleanly-roundtripping JSON should still be minified, got: {third}"
+        );
     }
 
     #[test]

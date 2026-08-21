@@ -198,18 +198,13 @@ impl BridgeManifest {
         // offsets, and idempotency state. Reject case-insensitive
         // collisions everywhere so a manifest behaves identically on
         // macOS and Linux (Kafka refuses the same collision).
-        let mut folded: Vec<String> = self
-            .topics
-            .iter()
-            .map(|t| t.name.to_ascii_lowercase())
-            .collect();
+        let mut folded: Vec<String> = self.topics.iter().map(|t| t.name.to_ascii_lowercase()).collect();
         folded.sort_unstable();
         let before = folded.len();
         folded.dedup();
         if folded.len() != before {
             return Err(ManifestError::Invalid(
-                "topic names collide case-insensitively (unsafe on case-insensitive filesystems)"
-                    .into(),
+                "topic names collide case-insensitively (unsafe on case-insensitive filesystems)".into(),
             ));
         }
         // Round-6 (hunt1 F2): the NATS backend maps topics to stream
@@ -349,7 +344,9 @@ pub(crate) fn compile_topic_validators(
             continue;
         };
         let schema = schema_document(reference)?;
-        let validator = jsonschema::validator_for(&schema)
+        let validator = jsonschema::options()
+            .should_validate_formats(true)
+            .build(&schema)
             .map_err(|error| crate::BusError::Backend(format!("invalid schema {reference:?}: {error}")))?;
         validators.insert(topic.name.clone(), validator);
     }

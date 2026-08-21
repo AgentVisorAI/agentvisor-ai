@@ -8,7 +8,7 @@ AgentVisor AI follows inbound-tolerant, outbound-current behavior:
 - ATIF accepts v1.0 through v1.7 and always writes v1.7.
 - Receipts carry `receipt_version`.
 - Bridge manifests carry `manifest_version`.
-- Harness configuration carries `config_version` and tolerates additive unknown fields.
+- Harness configuration carries `config_version` and **rejects unknown keys** (`deny_unknown_fields` — a typo must fail at boot, not silently disable a control). Forward compatibility is handled by `config_version` gating, not by tolerating unrecognized keys.
 
 Breaking wire-format changes require a major version or a new explicit format version. Additive fields remain optional for older readers.
 

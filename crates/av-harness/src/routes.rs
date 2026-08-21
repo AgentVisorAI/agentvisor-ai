@@ -1285,18 +1285,8 @@ pub(crate) async fn unresolved_tool_sessions(
                     // and every tick thereafter, permanently stalling
                     // recovery — the exact brick this quarantine
                     // discipline exists to prevent.
-                    quarantine_orphan_sibling(
-                        &directory,
-                        key,
-                        crate::spool::TOOL_OUTCOME_SUFFIX,
-                        "outcome",
-                    );
-                    quarantine_orphan_sibling(
-                        &directory,
-                        key,
-                        crate::spool::TOOL_AUDITED_SUFFIX,
-                        "audited",
-                    );
+                    quarantine_orphan_sibling(&directory, key, crate::spool::TOOL_OUTCOME_SUFFIX, "outcome");
+                    quarantine_orphan_sibling(&directory, key, crate::spool::TOOL_AUDITED_SUFFIX, "audited");
                     intent_keys.remove(key);
                     continue;
                 }
@@ -1334,18 +1324,8 @@ pub(crate) async fn unresolved_tool_sessions(
                         key = %key,
                         "torn tool-execution outcome quarantined so recovery can proceed"
                     );
-                    quarantine_orphan_sibling(
-                        &directory,
-                        key,
-                        crate::spool::TOOL_OUTCOME_SUFFIX,
-                        "outcome",
-                    );
-                    quarantine_orphan_sibling(
-                        &directory,
-                        key,
-                        crate::spool::TOOL_AUDITED_SUFFIX,
-                        "audited",
-                    );
+                    quarantine_orphan_sibling(&directory, key, crate::spool::TOOL_OUTCOME_SUFFIX, "outcome");
+                    quarantine_orphan_sibling(&directory, key, crate::spool::TOOL_AUDITED_SUFFIX, "audited");
                     unresolved_sessions.insert(intent.session_id);
                     continue;
                 }
@@ -1372,12 +1352,7 @@ pub(crate) async fn unresolved_tool_sessions(
                         key = %key,
                         "torn tool-execution audited record quarantined so recovery can proceed"
                     );
-                    quarantine_orphan_sibling(
-                        &directory,
-                        key,
-                        crate::spool::TOOL_AUDITED_SUFFIX,
-                        "audited",
-                    );
+                    quarantine_orphan_sibling(&directory, key, crate::spool::TOOL_AUDITED_SUFFIX, "audited");
                     unresolved_sessions.insert(intent.session_id);
                     continue;
                 }
@@ -1400,18 +1375,8 @@ pub(crate) async fn unresolved_tool_sessions(
                         key = %key,
                         "orphan tool outcome without authenticated intent quarantined"
                     );
-                    quarantine_orphan_sibling(
-                        &directory,
-                        key,
-                        crate::spool::TOOL_OUTCOME_SUFFIX,
-                        "outcome",
-                    );
-                    quarantine_orphan_sibling(
-                        &directory,
-                        key,
-                        crate::spool::TOOL_AUDITED_SUFFIX,
-                        "audited",
-                    );
+                    quarantine_orphan_sibling(&directory, key, crate::spool::TOOL_OUTCOME_SUFFIX, "outcome");
+                    quarantine_orphan_sibling(&directory, key, crate::spool::TOOL_AUDITED_SUFFIX, "audited");
                 }
             }
         }
@@ -1424,12 +1389,7 @@ pub(crate) async fn unresolved_tool_sessions(
 /// Rename `<directory>/<key><suffix>` to a `.corrupt-<uid>` name so
 /// nothing else scans it. Silent-ok when the sibling doesn't exist
 /// (the common case). See round-5 hunt3 F2.
-fn quarantine_orphan_sibling(
-    directory: &std::path::Path,
-    key: &str,
-    suffix: &str,
-    role: &str,
-) {
+fn quarantine_orphan_sibling(directory: &std::path::Path, key: &str, suffix: &str, role: &str) {
     let path = directory.join(format!("{key}{suffix}"));
     if !path.exists() {
         return;
@@ -1982,6 +1942,20 @@ impl AbortFinalizingStream {
         if parsed.finish_reason.is_some() {
             self.response_finish_reason = parsed.finish_reason;
         }
+        // Cumulative-cost contract (round-6 hunt3 math F2): providers
+        // that report `cost_usd` are expected to report it CUMULATIVELY
+        // (OpenRouter-style final/rolling usage frames) — `max()` folds
+        // that correctly and tolerates repeated identical frames. A
+        // provider emitting per-chunk INCREMENTAL costs is mostly
+        // caught by `reject_metric_regression` (any decrease fails the
+        // stream), but a monotone non-decreasing incremental sequence
+        // (e.g. equal per-chunk costs) passes the guard and attests
+        // only the LAST chunk's amount. That shape is indistinguishable
+        // from legitimate repeated cumulative frames on the wire, so it
+        // cannot be rejected without breaking conformant providers —
+        // recorded here as the documented accepted limitation
+        // (undercount is bounded by the true total; never an
+        // overcharge).
         self.response_cost_usd_micros = self.response_cost_usd_micros.max(parsed.cost_usd_micros);
         for delta in parsed.tool_call_deltas {
             if delta.index >= MAX_PROVIDER_TOOL_CALLS as u64 {

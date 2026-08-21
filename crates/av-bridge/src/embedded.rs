@@ -403,141 +403,141 @@ impl EmbeddedBroker {
                     continue;
                 }
                 let outcome: Result<u64, BusError> = (|| {
-                let (kept, expired) = split_by_time(&part.path, cutoff)?;
-                if expired.is_empty() {
-                    return Ok(0);
-                }
-                let expired_count = expired.len() as u64;
-                // Cold export first (never destroy before the copy lands).
-                if let Some(cold) = &t.retention.cold_uri {
-                    if cold.contains("://") {
-                        #[cfg(feature = "cold-store")]
-                        {
-                            let archive = self.cold_archive.as_ref().ok_or_else(|| {
-                                BusError::Backend(format!("cold archive for {:?} is unavailable", t.name))
-                            })?;
+                    let (kept, expired) = split_by_time(&part.path, cutoff)?;
+                    if expired.is_empty() {
+                        return Ok(0);
+                    }
+                    let expired_count = expired.len() as u64;
+                    // Cold export first (never destroy before the copy lands).
+                    if let Some(cold) = &t.retention.cold_uri {
+                        if cold.contains("://") {
+                            #[cfg(feature = "cold-store")]
+                            {
+                                let archive = self.cold_archive.as_ref().ok_or_else(|| {
+                                    BusError::Backend(format!("cold archive for {:?} is unavailable", t.name))
+                                })?;
+                                for line in &expired {
+                                    let event: StoredEvent = serde_json::from_str(line)?;
+                                    archive.put(&t.name, &event)?;
+                                }
+                            }
+                            #[cfg(not(feature = "cold-store"))]
+                            return Err(BusError::Backend(format!(
+                                "cold_uri {cold:?} requires feature cold-store"
+                            )));
+                        } else {
+                            let partition = part
+                                .path
+                                .file_stem()
+                                .and_then(std::ffi::OsStr::to_str)
+                                .unwrap_or("partition");
+                            let cold_dir = Path::new(cold).join(&t.name).join(partition);
+                            // Sync newly created ancestors too: the hot rewrite
+                            // below destroys the only other copy, so the cold
+                            // subtree's dirents must be durable before it runs.
+                            av_core::fsutil::create_dir_all_synced(&cold_dir)?;
                             for line in &expired {
                                 let event: StoredEvent = serde_json::from_str(line)?;
-                                archive.put(&t.name, &event)?;
+                                write_cold_event_once(&cold_dir, &event)?;
                             }
+                            av_core::fsutil::sync_directory(&cold_dir)?;
                         }
-                        #[cfg(not(feature = "cold-store"))]
-                        return Err(BusError::Backend(format!(
-                            "cold_uri {cold:?} requires feature cold-store"
-                        )));
-                    } else {
-                        let partition = part
-                            .path
-                            .file_stem()
-                            .and_then(std::ffi::OsStr::to_str)
-                            .unwrap_or("partition");
-                        let cold_dir = Path::new(cold).join(&t.name).join(partition);
-                        // Sync newly created ancestors too: the hot rewrite
-                        // below destroys the only other copy, so the cold
-                        // subtree's dirents must be durable before it runs.
-                        av_core::fsutil::create_dir_all_synced(&cold_dir)?;
-                        for line in &expired {
-                            let event: StoredEvent = serde_json::from_str(line)?;
-                            write_cold_event_once(&cold_dir, &event)?;
+                    }
+                    persist_high_water(&part.watermark_path, part.next_offset)?;
+                    // Atomic hot rewrite. Use a UUID-suffixed tmp name so a
+                    // stale tmp from a prior crashed pass isn't reused (and
+                    // an external backup/rsync tool can't grab an
+                    // in-progress file thinking it's stable data).
+                    let tmp = part
+                        .path
+                        .with_extension(format!("jsonl.{}.tmp", av_core::new_event_uid()));
+                    // Round-22 F3: RAII guard cleans up the tmp on any early
+                    // Err in the write/sync/rename path so a repeatedly-
+                    // failing rewrite (ENOSPC/EIO) does not fill the inode
+                    // table with UUID-suffixed orphan .tmp files.
+                    let mut guard = av_core::fsutil::TempPathGuard::new(tmp.clone());
+                    {
+                        let mut f = fs::File::create(&tmp)?;
+                        for line in &kept {
+                            f.write_all(line.as_bytes())?;
+                            f.write_all(b"\n")?;
                         }
-                        av_core::fsutil::sync_directory(&cold_dir)?;
+                        f.sync_all()?;
                     }
-                }
-                persist_high_water(&part.watermark_path, part.next_offset)?;
-                // Atomic hot rewrite. Use a UUID-suffixed tmp name so a
-                // stale tmp from a prior crashed pass isn't reused (and
-                // an external backup/rsync tool can't grab an
-                // in-progress file thinking it's stable data).
-                let tmp = part
-                    .path
-                    .with_extension(format!("jsonl.{}.tmp", av_core::new_event_uid()));
-                // Round-22 F3: RAII guard cleans up the tmp on any early
-                // Err in the write/sync/rename path so a repeatedly-
-                // failing rewrite (ENOSPC/EIO) does not fill the inode
-                // table with UUID-suffixed orphan .tmp files.
-                let mut guard = av_core::fsutil::TempPathGuard::new(tmp.clone());
-                {
-                    let mut f = fs::File::create(&tmp)?;
-                    for line in &kept {
-                        f.write_all(line.as_bytes())?;
-                        f.write_all(b"\n")?;
-                    }
-                    f.sync_all()?;
-                }
-                fs::rename(&tmp, &part.path)?;
-                guard.disarm();
-                // Everything between the rename above and a successful
-                // writer reopen below runs while `part.writer` still holds
-                // the fd of the pre-rewrite (now unlinked) inode. If any of
-                // it fails, propagating the error WITHOUT poisoning the
-                // partition would leave that stale handle live: every
-                // subsequent publish would append to the unlinked inode —
-                // acked as durable, invisible to `fetch`, and irrecoverably
-                // freed at process exit. Poison the partition on any
-                // post-rename failure so appends fail closed until a
-                // restart reopens the renamed segment (same fail-closed
-                // posture as an unrepaired append truncation).
-                let post_rename: Result<(), BusError> = (|| {
-                    if let Some(parent) = part.path.parent() {
-                        av_core::fsutil::sync_directory(parent)?;
-                    }
-                    // Prune the idempotency map + sidecar of any UID whose offset
-                    // was expired: without this, a subsequent `publish_idempotent`
-                    // with a still-cached UID returns an ack pointing at data that
-                    // no longer exists, and the caller's follow-up `fetch(offset)`
-                    // silently returns the wrong event or nothing.
-                    //
-                    // Round-6 (hunt5 broker F3): expired lines are parseable
-                    // BY CONSTRUCTION (`split_by_time` never expires an
-                    // unparseable line), so we can remove exactly the
-                    // expired offsets. The previous survivors+[min,max]
-                    // range heuristic was unsound at both edges: a
-                    // wall-clock regression could expire a MIDDLE-offset
-                    // record whose UID then survived pruning (stale ack →
-                    // wrong-record fetch), and a trailing unparseable
-                    // kept line's offset fell OUTSIDE the range so its
-                    // UID was dropped (duplicate re-append on the next
-                    // publish_idempotent).
-                    let expired_offsets: std::collections::HashSet<u64> = expired
-                        .iter()
-                        .filter_map(|line| serde_json::from_str::<StoredEvent>(line).ok())
-                        .map(|event| event.offset)
-                        .collect();
-                    let before = part.seen_event_uids.len();
-                    part.seen_event_uids
-                        .retain(|_, offset| !expired_offsets.contains(offset));
-                    if part.seen_event_uids.len() != before {
-                        // Sidecar is now stale — rewrite it atomically with only
-                        // the surviving mappings so recovery cannot resurrect a
-                        // just-expired UID.
-                        let mut lines: Vec<(String, u64)> = part
-                            .seen_event_uids
+                    fs::rename(&tmp, &part.path)?;
+                    guard.disarm();
+                    // Everything between the rename above and a successful
+                    // writer reopen below runs while `part.writer` still holds
+                    // the fd of the pre-rewrite (now unlinked) inode. If any of
+                    // it fails, propagating the error WITHOUT poisoning the
+                    // partition would leave that stale handle live: every
+                    // subsequent publish would append to the unlinked inode —
+                    // acked as durable, invisible to `fetch`, and irrecoverably
+                    // freed at process exit. Poison the partition on any
+                    // post-rename failure so appends fail closed until a
+                    // restart reopens the renamed segment (same fail-closed
+                    // posture as an unrepaired append truncation).
+                    let post_rename: Result<(), BusError> = (|| {
+                        if let Some(parent) = part.path.parent() {
+                            av_core::fsutil::sync_directory(parent)?;
+                        }
+                        // Prune the idempotency map + sidecar of any UID whose offset
+                        // was expired: without this, a subsequent `publish_idempotent`
+                        // with a still-cached UID returns an ack pointing at data that
+                        // no longer exists, and the caller's follow-up `fetch(offset)`
+                        // silently returns the wrong event or nothing.
+                        //
+                        // Round-6 (hunt5 broker F3): expired lines are parseable
+                        // BY CONSTRUCTION (`split_by_time` never expires an
+                        // unparseable line), so we can remove exactly the
+                        // expired offsets. The previous survivors+[min,max]
+                        // range heuristic was unsound at both edges: a
+                        // wall-clock regression could expire a MIDDLE-offset
+                        // record whose UID then survived pruning (stale ack →
+                        // wrong-record fetch), and a trailing unparseable
+                        // kept line's offset fell OUTSIDE the range so its
+                        // UID was dropped (duplicate re-append on the next
+                        // publish_idempotent).
+                        let expired_offsets: std::collections::HashSet<u64> = expired
                             .iter()
-                            .map(|(uid, offset)| (uid.clone(), *offset))
+                            .filter_map(|line| serde_json::from_str::<StoredEvent>(line).ok())
+                            .map(|event| event.offset)
                             .collect();
-                        lines.sort_by_key(|(_, offset)| *offset);
-                        let mut sidecar = Vec::new();
-                        for (uid, offset) in lines {
-                            let mapping = serde_json::to_string(&EventUidOffset {
-                                event_uid: uid,
-                                offset,
-                            })?;
-                            sidecar.extend_from_slice(mapping.as_bytes());
-                            sidecar.push(b'\n');
+                        let before = part.seen_event_uids.len();
+                        part.seen_event_uids
+                            .retain(|_, offset| !expired_offsets.contains(offset));
+                        if part.seen_event_uids.len() != before {
+                            // Sidecar is now stale — rewrite it atomically with only
+                            // the surviving mappings so recovery cannot resurrect a
+                            // just-expired UID.
+                            let mut lines: Vec<(String, u64)> = part
+                                .seen_event_uids
+                                .iter()
+                                .map(|(uid, offset)| (uid.clone(), *offset))
+                                .collect();
+                            lines.sort_by_key(|(_, offset)| *offset);
+                            let mut sidecar = Vec::new();
+                            for (uid, offset) in lines {
+                                let mapping = serde_json::to_string(&EventUidOffset {
+                                    event_uid: uid,
+                                    offset,
+                                })?;
+                                sidecar.extend_from_slice(mapping.as_bytes());
+                                sidecar.push(b'\n');
+                            }
+                            rewrite_atomic(&part.idempotency_path, &sidecar)?;
                         }
-                        rewrite_atomic(&part.idempotency_path, &sidecar)?;
-                    }
-                    part.writer = fs::OpenOptions::new().append(true).open(&part.path)?;
-                    Ok(())
-                })();
-                if let Err(error) = post_rename {
-                    part.poisoned = Some(format!(
-                        "retention post-rename failure ({error}); the append handle may still \
+                        part.writer = fs::OpenOptions::new().append(true).open(&part.path)?;
+                        Ok(())
+                    })();
+                    if let Err(error) = post_rename {
+                        part.poisoned = Some(format!(
+                            "retention post-rename failure ({error}); the append handle may still \
                          reference the replaced segment inode (restart to recover)"
-                    ));
-                    return Err(error);
-                }
-                Ok(expired_count)
+                        ));
+                        return Err(error);
+                    }
+                    Ok(expired_count)
                 })();
                 match outcome {
                     Ok(count) => expired_total += count,
@@ -613,7 +613,9 @@ fn copy_referenced_schemas(data_dir: &Path, manifest: &BridgeManifest) -> Result
             continue;
         };
         let value = crate::manifest::schema_document(reference)?;
-        jsonschema::validator_for(&value)
+        jsonschema::options()
+            .should_validate_formats(true)
+            .build(&value)
             .map_err(|error| BusError::Backend(format!("invalid schema {reference:?}: {error}")))?;
         let destination = data_dir.join(reference);
         if let Some(parent) = destination.parent() {
@@ -642,7 +644,9 @@ fn load_validators(
                 av_core::fsutil::read_capped(&data_dir.join(reference), av_core::fsutil::MAX_CONTROL_BYTES)?;
             serde_json::from_slice(&bytes).map_err(BusError::from)
         })?;
-        let validator = jsonschema::validator_for(&schema)
+        let validator = jsonschema::options()
+            .should_validate_formats(true)
+            .build(&schema)
             .map_err(|error| BusError::Backend(format!("invalid schema {reference:?}: {error}")))?;
         validators.insert(topic.name.clone(), validator);
     }
@@ -756,9 +760,7 @@ fn recover_event_uids(path: &Path) -> Result<HashMap<String, u64>, BusError> {
             continue;
         }
         valid_bytes = valid_bytes.saturating_add(bytes_read as u64);
-        let payload = line_buffer
-            .strip_suffix(b"\n")
-            .unwrap_or(&line_buffer);
+        let payload = line_buffer.strip_suffix(b"\n").unwrap_or(&line_buffer);
         if payload.is_empty() {
             continue;
         }
@@ -798,10 +800,7 @@ fn recover_event_uids(path: &Path) -> Result<HashMap<String, u64>, BusError> {
     if has_torn_tail {
         // Truncate to the last complete line so future appends land
         // cleanly (the on-disk record set is unchanged).
-        rewrite_atomic(
-            path,
-            &read_valid_prefix(path, valid_bytes).unwrap_or_default(),
-        )?;
+        rewrite_atomic(path, &read_valid_prefix(path, valid_bytes).unwrap_or_default())?;
     }
     Ok(seen)
 }

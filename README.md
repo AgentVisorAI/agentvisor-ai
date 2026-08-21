@@ -13,9 +13,12 @@
 
 AgentVisor AI is a small Rust server you drop in front of your agent's
 LLM and tool calls. Every request is recorded, every limit you set is
-enforced before the call goes out, and every session ends with a signed
-receipt anyone can verify offline with just a public key. Change one
-line in your OpenAI client. Nothing else in your app moves.
+enforced before the call goes out, and every session can end with a
+signed receipt anyone can verify offline with just a public key
+(out of the box sessions record unsigned trajectories; set
+`default_workflow = "signed"` or promote a session via `/promote` to
+mint the receipt). Change one line in your OpenAI client. Nothing else
+in your app moves.
 
 ```python
 client = OpenAI(
@@ -72,7 +75,7 @@ export OPENAI_API_KEY=sk-...
 agentvisord                   # http://127.0.0.1:8484
 ```
 
-Point any OpenAI-compatible SDK at `http://127.0.0.1:8484/v1` and use it as normal. Receipts, events, and trajectories appear under `data/`.
+Point any OpenAI-compatible SDK at `http://127.0.0.1:8484/v1` and use it as normal. Trajectories and receipts land under `spool/atif/` (receipts in `spool/atif/receipts/`); bridge events land under `data/bridge`.
 
 No config file at all also works — built-in defaults plus one env var:
 

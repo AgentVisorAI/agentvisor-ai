@@ -318,10 +318,19 @@ fn subagent_references_must_be_resolvable() {
 
 #[test]
 fn torn_file_rejected_not_miscounted() {
-    // Simulates a truncated write (silent-error D13.16): parse fails, so the
-    // reconciler counts it as an error, never a valid-but-shorter trajectory.
+    // Simulates a truncated write (silent-error D13.16). Round-6 (hunt3
+    // tests F3): drive the torn bytes through `validate_bytes` — the
+    // documented ingest entry point the reconciler and CLI actually use
+    // — not bare serde_json. Any future leniency in the real ingest
+    // path (partial-parse salvage, trailing-content tolerance — the
+    // exact class round-25 hardened) must fail THIS assertion.
     let full = serde_json::to_string(&golden()).unwrap();
     let torn = &full[..full.len() / 2];
+    assert!(
+        av_atif::validate_bytes(torn.as_bytes(), Mode::Strict).is_err(),
+        "torn bytes must be rejected by the real ingest path"
+    );
+    // The raw parse also fails (defense-in-depth sanity).
     assert!(serde_json::from_str::<Value>(torn).is_err());
 }
 

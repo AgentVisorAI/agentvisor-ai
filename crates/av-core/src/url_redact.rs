@@ -62,11 +62,7 @@ pub fn redact_userinfo(input: &str) -> String {
     // inside a password).
     let scheme_count = input.matches("://").count();
     if scheme_count > 1 {
-        return input
-            .split(',')
-            .map(redact_single)
-            .collect::<Vec<_>>()
-            .join(",");
+        return input.split(',').map(redact_single).collect::<Vec<_>>().join(",");
     }
     redact_single(input)
 }
