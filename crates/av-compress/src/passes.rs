@@ -578,6 +578,27 @@ mod tests {
 
     use super::*;
 
+    /// The duplicate-key minification-skip guard is the semantic-
+    /// destruction protection of `normalize_json_content`: minifying
+    /// through `Value` collapses duplicate keys last-wins, so content
+    /// with duplicates must be left VERBATIM. Pin both the guard and
+    /// the end-to-end effect (a mutant forcing `has_duplicate_keys`
+    /// to `false` previously survived).
+    #[test]
+    fn duplicate_key_json_content_is_never_minified() {
+        assert!(has_duplicate_keys(r#"{"a": 1, "a": 2}"#));
+        assert!(has_duplicate_keys(r#"{"outer": {"k": 1, "k": 2}}"#));
+        assert!(!has_duplicate_keys(r#"{"a": 1, "b": {"a": 2}}"#));
+        let dup = "{\"a\":  1,   \"a\":  2,   \"pad\": \"padding padding padding\"}";
+        let mut messages = vec![
+            serde_json::json!({"role": "assistant", "content": dup}),
+            serde_json::json!({"role": "user", "content": "tail"}),
+        ];
+        let changed = normalize_json_content(&mut messages, 1);
+        assert!(!changed, "duplicate-key JSON must be left verbatim");
+        assert_eq!(messages[0]["content"].as_str().unwrap(), dup);
+    }
+
     fn engage_all() -> CompressionConfig {
         CompressionConfig {
             min_tokens_to_engage: 0,

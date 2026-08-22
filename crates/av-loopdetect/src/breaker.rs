@@ -3,7 +3,6 @@
 use crate::embed::{cosine, Embedder};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
 
 /// Breaker tuning (config-file surface). Defaults implement the brief's rule:
 /// Δ≈0 across 3 consecutive steps while consuming N+ tokens.
@@ -107,7 +106,6 @@ pub struct SessionLoopState {
 
 struct Inner {
     prev_embedding: Option<Vec<f32>>,
-    deltas: VecDeque<f32>,
     streak: usize,
     tokens_consumed: u64,
     state: BreakerState,
@@ -120,7 +118,6 @@ impl SessionLoopState {
             cfg,
             inner: Mutex::new(Inner {
                 prev_embedding: None,
-                deltas: VecDeque::with_capacity(16),
                 streak: 0,
                 tokens_consumed: 0,
                 state: BreakerState::Closed,
@@ -194,11 +191,6 @@ impl SessionLoopState {
         if !embedding_is_hostile {
             inner.prev_embedding = Some(embedding);
         }
-        inner.deltas.push_back(delta);
-        if inner.deltas.len() > 32 {
-            inner.deltas.pop_front();
-        }
-
         if delta < self.cfg.delta_epsilon {
             inner.streak += 1;
         } else {
@@ -230,7 +222,6 @@ impl SessionLoopState {
         inner.streak = 0;
         inner.state = BreakerState::Closed;
         inner.prev_embedding = None;
-        inner.deltas.clear();
         inner.tokens_consumed = 0;
     }
 }
@@ -246,6 +237,49 @@ mod tests {
         BreakerConfig {
             min_tokens: 1000,
             ..BreakerConfig::default()
+        }
+    }
+
+    /// Pin the streak comparison at the exact `delta_epsilon` boundary:
+    /// `delta < epsilon` counts toward the streak, `delta == epsilon`
+    /// does not (a `<`→`<=` mutant previously survived). Orthogonal
+    /// unit vectors make cosine EXACTLY 0.0 and delta EXACTLY 1.0 in
+    /// float arithmetic, so `delta_epsilon = 1.0` sits precisely on
+    /// the boundary with no rounding fragility.
+    #[test]
+    fn delta_at_epsilon_boundary_does_not_count_toward_streak() {
+        struct Orthogonal;
+        impl crate::Embedder for Orthogonal {
+            fn dim(&self) -> usize {
+                2
+            }
+            fn embed(&self, text: &str) -> Vec<f32> {
+                if text == "a" {
+                    vec![1.0, 0.0]
+                } else {
+                    vec![0.0, 1.0]
+                }
+            }
+        }
+        let config = BreakerConfig {
+            min_tokens: 0,
+            delta_epsilon: 1.0,
+            ..BreakerConfig::default()
+        };
+        let s = SessionLoopState::new(config);
+        let e = Orthogonal;
+        for _ in 0..16 {
+            // Every step's delta is exactly 1.0 == epsilon: never
+            // BELOW it, so the streak must never build and the breaker
+            // must stay closed.
+            match s.observe(&e, "a", 1) {
+                BreakerVerdict::Progressing { .. } => {}
+                other => panic!("delta == epsilon must not trip the breaker: {other:?}"),
+            }
+            match s.observe(&e, "b", 1) {
+                BreakerVerdict::Progressing { .. } => {}
+                other => panic!("delta == epsilon must not trip the breaker: {other:?}"),
+            }
         }
     }
 

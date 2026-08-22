@@ -1411,6 +1411,35 @@ mod tests {
         assert!(!is_iso8601("2025-01-15T10:30:00", true));
     }
 
+    /// End-to-end pin of the per-mode timestamp-offset requirement (a
+    /// mutant swapping the Strict/Compat gate previously survived):
+    /// the same naive-timestamp document is compat-valid and
+    /// strict-invalid.
+    #[test]
+    fn naive_step_timestamp_is_compat_valid_and_strict_invalid() {
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": "s",
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{
+                "step_id": 1,
+                "source": "user",
+                "message": "hi",
+                "timestamp": "2025-01-15T10:30:00",
+            }],
+        });
+        assert!(
+            validate_value(&value, Mode::Compat).is_empty(),
+            "compat must accept naive timestamps"
+        );
+        assert!(
+            validate_value(&value, Mode::Strict)
+                .iter()
+                .any(|issue| issue.path.ends_with(".timestamp")),
+            "strict must refuse naive timestamps"
+        );
+    }
+
     #[test]
     fn iso8601_rejects_invalid_forms() {
         for ts in [

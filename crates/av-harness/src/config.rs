@@ -990,6 +990,21 @@ impl HarnessConfig {
                 self.upstream_url
             ));
         }
+        // A scheme with no host (`http://`, `https:///path`) passed the
+        // prefix check above, booted, and validated cleanly, failing
+        // only at request time with a 502 — exactly the class the
+        // round-38 preflight exists to catch at startup.
+        {
+            let rest = self
+                .upstream_url
+                .split_once("://")
+                .map(|(_, rest)| rest)
+                .unwrap_or_default();
+            let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+            if host.is_empty() {
+                return Err(format!("upstream_url has no host, got {:?}", self.upstream_url));
+            }
+        }
         if let Some(tool_upstream) = &self.tool_upstream_url {
             // Empty is rejected rather than treated as unset: routing gates
             // tool forwarding on `is_some()` (routes.rs), so an empty string
@@ -1494,6 +1509,18 @@ mod tests {
         // http and https are the only accepted schemes.
         assert!(HarnessConfig::from_toml(r#"upstream_url = "https://api.openai.com""#).is_ok());
         assert!(HarnessConfig::from_toml(r#"upstream_url = "http://gw.local""#).is_ok());
+    }
+
+    /// A scheme with no host (`http://`, `https:///v1`) passed the
+    /// prefix preflight, booted, and validated cleanly, failing only at
+    /// request time with a 502. Refuse it at startup like every other
+    /// URL-shape defect.
+    #[test]
+    fn upstream_url_without_host_is_rejected() {
+        for url in [r#"upstream_url = "http://""#, r#"upstream_url = "https:///v1""#] {
+            let err = HarnessConfig::from_toml(url).unwrap_err();
+            assert!(err.contains("no host"), "{err}");
+        }
     }
 
     /// `tool_upstream_url = ""` used to pass validation while runtime

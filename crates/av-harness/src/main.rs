@@ -87,6 +87,22 @@ async fn main() -> Result<()> {
         Ok(removed) => tracing::info!(removed, "removed crash-orphaned temp files from the spool"),
         Err(error) => tracing::warn!(%error, "orphaned-temp sweep failed; stale .tmp files may remain"),
     }
+    // Fail-closed boot probe: an unwritable or full spool volume used
+    // to boot silently — /health answered 200 while every chat 503'd
+    // and nothing was capturable. Refuse to start instead: the spool
+    // is the audit store; a server that cannot record must not serve.
+    {
+        let probe = std::path::Path::new(&config.atif_spool_dir)
+            .join(format!(".writability-probe-{}.tmp", av_core::new_event_uid()));
+        av_core::fsutil::write_atomic(&probe, b"probe")
+            .and_then(|()| std::fs::remove_file(&probe))
+            .with_context(|| {
+                format!(
+                    "spool directory {:?} is not writable; refusing to serve without a working audit store",
+                    config.atif_spool_dir
+                )
+            })?;
+    }
     state
         .finalizer
         .recover_spooled_sessions(&state.sessions, &config.breaker)
@@ -940,6 +956,25 @@ fn build_bridge(config: &HarnessConfig, manifest: &BridgeManifest) -> Result<Arc
                 );
             }
             let path = PathBuf::from(&config.bridge_data_dir);
+            // Boot-time only, and only in the DAEMON (the single
+            // writer): sweep temps orphaned by a crash between
+            // `create_new` and `rename`. This must NOT live inside
+            // `EmbeddedBroker::open` — `avctl event-tail` also opens
+            // the broker read-only while a live daemon runs, and a
+            // sweep there could delete a temp the daemon is about to
+            // rename.
+            match av_core::fsutil::sweep_orphaned_tmp(&path) {
+                Ok(0) => {}
+                Ok(removed) => {
+                    tracing::info!(
+                        removed,
+                        "removed crash-orphaned temp files from the bridge data dir"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "bridge orphaned-temp sweep failed; stale .tmp files may remain");
+                }
+            }
             let bridge = if path.join("manifest.yaml").exists() {
                 EmbeddedBroker::open(&path)
             } else {
