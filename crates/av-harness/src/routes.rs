@@ -1680,6 +1680,17 @@ async fn close_session(
     headers: HeaderMap,
 ) -> Response {
     let Some(session) = state.sessions.get(&id) else {
+        // Authenticate BEFORE revealing whether the session exists.
+        // Returning 404 straight from the registry miss gave
+        // unauthenticated callers a response-differential oracle
+        // (404 = free, 401 = live) to enumerate active session ids
+        // without ever presenting a token. Run the same identity +
+        // scope resolution the found-path runs, so the status split
+        // is identical whether or not the id is live.
+        if let Err(error) = state.resolve_identity(&headers, Some(state.config.session_close_scope.as_str()))
+        {
+            return pipeline_error(error);
+        }
         return (StatusCode::NOT_FOUND, Json(json!({"error": "unknown session"}))).into_response();
     };
     if let Err(error) = state.authorize_session(&headers, &session, &state.config.session_close_scope) {
@@ -1701,6 +1712,13 @@ async fn promote_session(
     headers: HeaderMap,
 ) -> Response {
     let Some(session) = state.sessions.get(&id) else {
+        // Same authenticate-before-404 discipline as `close_session`:
+        // no session-existence oracle for unauthenticated callers.
+        if let Err(error) =
+            state.resolve_identity(&headers, Some(state.config.session_promote_scope.as_str()))
+        {
+            return pipeline_error(error);
+        }
         return (StatusCode::NOT_FOUND, Json(json!({"error": "unknown session"}))).into_response();
     };
     if let Err(error) = state.authorize_session(&headers, &session, &state.config.session_promote_scope) {

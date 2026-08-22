@@ -417,6 +417,12 @@ impl EventBus for NatsBus {
         if !self.topics.contains_key(topic) {
             return Err(BusError::UnknownTopic(topic.to_owned()));
         }
+        // Contract: "read up to `max` events". `max_messages(0)` has
+        // server-defined semantics and the loop below checks the cap only
+        // after pushing; return the embedded broker's answer directly.
+        if max == 0 {
+            return Ok(Vec::new());
+        }
         let stream_name = stream_name(topic);
         let subject = format!("{topic}.p{partition}");
         let context = self.js.clone();

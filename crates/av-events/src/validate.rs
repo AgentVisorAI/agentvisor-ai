@@ -110,6 +110,20 @@ pub enum ValidationError {
     /// Timestamp is zero.
     #[error("time is zero")]
     ZeroTime,
+    /// `time_iso` does not match the canonical ISO-8601 rendering of
+    /// `time`. The two fields are dual representations of one instant;
+    /// a mismatch means a signed/chained event names different times to
+    /// human auditors (caption) and machine tooling (epoch-ms). Same
+    /// class as the receipt's `issued_at`/`issued_at_iso` cross-check.
+    #[error("time_iso {time_iso:?} does not match time ({time}); expected {expected_iso:?}")]
+    TimeIsoMismatch {
+        /// Epoch-milliseconds timestamp.
+        time: u64,
+        /// Caption that was actually emitted.
+        time_iso: String,
+        /// Canonical rendering of `time`.
+        expected_iso: String,
+    },
 }
 
 /// Validate structural invariants of an event. Returns *all* violations
@@ -248,6 +262,27 @@ pub fn validate_event(ev: &OcsfEvent) -> Result<(), Vec<ValidationError>> {
     }
     if ev.time == 0 {
         errors.push(ValidationError::ZeroTime);
+    }
+    // `time_iso` is the second representation of the event's timestamp;
+    // the schema pins its exact format and `OcsfEventBuilder::build`
+    // derives it from `time`. But the wire/deserialize path never
+    // checked the two agree, so a signed/chained event could carry a
+    // `time` and a `time_iso` naming different instants (or a garbage
+    // caption) and still validate — auditors reading the caption and
+    // tooling reading the epoch field would extract contradictory facts
+    // from the same event. Same dual-representation class as the
+    // receipt's issued_at/issued_at_iso cross-check; strict equality
+    // against the canonical rendering enforces format and consistency
+    // in one step.
+    {
+        let expected_iso = av_core::time::iso8601_ms(ev.time);
+        if ev.time_iso != expected_iso {
+            errors.push(ValidationError::TimeIsoMismatch {
+                time: ev.time,
+                time_iso: ev.time_iso.clone(),
+                expected_iso,
+            });
+        }
     }
     // Round-17 F2: JCS-safe integer guard on deserialize path.
     // `OcsfEventBuilder::build` already enforces this for its own

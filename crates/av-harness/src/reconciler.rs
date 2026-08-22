@@ -1458,6 +1458,20 @@ impl Finalizer {
             // previously fold into "no prior receipt" and mint a
             // fresh one — silently erasing evidence of the
             // original.
+            //
+            // The restore is wrapped so its failure can UNDO the
+            // adoption (see below): the session was already installed
+            // by `try_insert_recovered`, and leaving it registered
+            // with `closed=1`, `artifact_committed=1`, and no receipt
+            // would (a) make every later tick return Skipped — the
+            // round-40 F4 error surfaces exactly once and then becomes
+            // permanent silent state, never retried — and (b) let a
+            // `.promote` marker or an operator `/promote` find
+            // `persisted_receipt = None` and MINT A FRESH RECEIPT,
+            // the precise silent re-mint round-40 F4 exists to
+            // prevent. The signed twin removes its half-committed
+            // session on transient error (round-42 F3); mirror it.
+            let receipt_restore: Result<(), FinalizeError> = async {
             match tokio::fs::metadata(&receipt_path).await {
                 Ok(_) => {
                     let bytes_receipt = read_capped_async(
@@ -1516,6 +1530,16 @@ impl Finalizer {
                         "existing receipt stat failed: {error}"
                     )));
                 }
+            }
+            Ok(())
+            }.await;
+            if let Err(error) = receipt_restore {
+                // Remove the half-adopted session so the next tick
+                // re-reads the still-present ATIF artifact and
+                // re-attempts the receipt restore cleanly, instead of
+                // stranding a receipt-less closed session forever.
+                sessions.remove(&recovered_session.id);
+                return Err(error);
             }
             Ok(AtifCandidateOutcome::Recovered)
             }.await;
