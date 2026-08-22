@@ -181,13 +181,23 @@ fn redis_contract_poisoned_negative_counter_is_refused() {
     let Ok(url) = std::env::var("AV_REDIS_URL") else {
         return;
     };
-    let Some(first) = url.split(',').next() else {
-        return;
-    };
-    let client = redis::Client::open(first.trim()).expect("raw client");
-    let mut raw = client.get_connection().expect("raw conn");
     let key = format!("av-test-poison:{{{}}}", av_core::new_event_uid());
-    let _: i64 = redis::cmd("DECRBY").arg(&key).arg(5).query(&mut raw).unwrap();
+    // Route the out-of-band poison write through a cluster-aware client
+    // when the URL lists multiple nodes: against a real multi-master
+    // slot map, a raw single-node connection to the first member
+    // answers `MOVED` for ~2/3 of keys and the write (not the guard
+    // under test) fails.
+    let members: Vec<&str> = url.split(',').map(str::trim).collect();
+    if members.len() > 1 {
+        let cluster = redis::cluster::ClusterClient::new(members.clone()).expect("cluster client");
+        let mut raw = cluster.get_connection().expect("cluster conn");
+        let _: i64 = redis::cmd("DECRBY").arg(&key).arg(5).query(&mut raw).unwrap();
+    } else {
+        let Some(member) = members.first() else { return };
+        let client = redis::Client::open(*member).expect("raw client");
+        let mut raw = client.get_connection().expect("raw conn");
+        let _: i64 = redis::cmd("DECRBY").arg(&key).arg(5).query(&mut raw).unwrap();
+    }
     let got = s.get(&key);
     assert!(
         matches!(got, Err(StateError::Overflow(_))),

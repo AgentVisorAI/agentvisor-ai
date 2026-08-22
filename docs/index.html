@@ -9,7 +9,7 @@
   <link rel="icon" type="image/png" href="logo.png">
   <link rel="canonical" href="https://agentvisorai.me/">
   <meta property="og:title" content="AgentVisor AI — AI agents you can hand to an auditor">
-  <meta property="og:description" content="One line of code. Every session recorded, capped, and signed.">
+  <meta property="og:description" content="One line of code. Every session recorded, capped, and verifiable.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://agentvisorai.me/">
   <meta property="og:image" content="https://agentvisorai.me/social-preview.png">
@@ -36,7 +36,7 @@
       <p class="lede">
         AgentVisor AI is a small server you drop in front of your agent&rsquo;s LLM
         and tool calls. Every request is recorded. Every limit you set is
-        enforced before the call goes out. Every session ends with a signed
+        enforced before the call goes out. Every session can end with a signed
         receipt anyone can verify offline &mdash; without asking you or us for
         anything except a public key.
       </p>
@@ -111,7 +111,7 @@
 <pre class="code-json"><code>{
   <span class="k">"receipt_id"</span>: <span class="s">"01924f8b-1f0c-7c31&hellip;"</span>,
   <span class="k">"session_id"</span>: <span class="s">"sess-2024-08-14-42"</span>,
-  <span class="k">"issued_at_iso"</span>: <span class="s">"2024-08-14T21:07:14Z"</span>,
+  <span class="k">"issued_at_iso"</span>: <span class="s">"2024-08-14T21:07:14.000Z"</span>,
   <span class="k">"subject"</span>: {
     <span class="k">"kind"</span>: <span class="s">"event_chain"</span>,
     <span class="k">"chain_head"</span>: <span class="s">"b2b7c9d8&hellip;"</span>,
@@ -123,9 +123,10 @@
   <span class="k">"cost"</span>: {
     <span class="k">"prompt_tokens"</span>: <span class="n">12408</span>,
     <span class="k">"completion_tokens"</span>: <span class="n">3819</span>,
+    <span class="k">"cached_tokens"</span>: <span class="n">0</span>,
     <span class="k">"cost_usd_micros"</span>: <span class="n">84340</span>
   },
-  <span class="k">"stop_reason"</span>: <span class="s">"budget_exceeded"</span>,
+  <span class="k">"stop_reason"</span>: <span class="s">"Budget Exceeded"</span>,
   <span class="k">"key_id"</span>: <span class="s">"c8f2&hellip;"</span>,
   <span class="k">"signature_b64"</span>: <span class="s">"wg7A0Kx3&hellip;"</span>
 }</code></pre>
@@ -158,7 +159,6 @@ Content-Type: application/json
     <span class="k">"code"</span>: -32001,
     <span class="k">"message"</span>: <span class="s">"tool call blocked by AgentVisor AI policy"</span>,
     <span class="k">"data"</span>: {
-      <span class="k">"stage"</span>: <span class="s">"budget"</span>,
       <span class="k">"reason"</span>: <span class="s">"max_payout_usd_micros (cap 50000000)"</span>
     }
   }
@@ -173,8 +173,8 @@ Content-Type: application/json
               Every event is written as OCSF-shaped JSON &mdash; the same
               schema your SIEM already speaks. Every session that never
               finishes becomes an ATIF trajectory file compatible with the
-              Harbor validator. Every artifact is just a file under
-              <code>data/</code>.
+              Harbor validator. Every artifact is just a file on
+              disk.
             </p>
             <p>
               Ship the files to S3, feed them into Vector, hand them to
@@ -183,17 +183,17 @@ Content-Type: application/json
             </p>
           </div>
           <div class="feature-visual">
-<pre class="filename">$ ls -R data/</pre>
-<pre class="code-shell"><code>data/
+<pre class="filename">$ ls -R spool/ data/</pre>
+<pre class="code-shell"><code>spool/atif/
+&#x251C;&#x2500; 84a3f01c&hellip;.json        <span class="c"># ATIF v1.7 trajectory (hashed session id)</span>
 &#x251C;&#x2500; receipts/
-&#x2502;   &#x2514;&#x2500; 84a3&hellip;.json         <span class="c"># signed session receipt</span>
-&#x251C;&#x2500; sess-2024-08-14-42.json  <span class="c"># ATIF v1.7 trajectory</span>
-&#x251C;&#x2500; outbox/
-&#x2502;   &#x2514;&#x2500; 84a3&hellip;.receipt.json <span class="c"># pending broker publish</span>
-&#x2514;&#x2500; bridge/
-    &#x2514;&#x2500; topics/
-        &#x2514;&#x2500; agent.tool_call/
-            &#x2514;&#x2500; p0.jsonl         <span class="c"># OCSF event stream</span></code></pre>
+&#x2502;   &#x2514;&#x2500; 84a3f01c&hellip;.json    <span class="c"># signed session receipt</span>
+&#x2514;&#x2500; outbox/
+    &#x2514;&#x2500; 84a3f01c&hellip;.receipt.json <span class="c"># pending broker publish</span>
+data/bridge/
+&#x2514;&#x2500; topics/
+    &#x2514;&#x2500; agent.tool_call/
+        &#x2514;&#x2500; p0.jsonl           <span class="c"># OCSF event stream</span></code></pre>
           </div>
         </div>
       </div>
@@ -342,11 +342,14 @@ Content-Type: application/json
 <pre class="code-shell"><code><span class="prompt">$</span> cargo install av-harness av-cli
 <span class="prompt">$</span> avctl
 
-  <span class="c">1) OpenAI</span>
-  <span class="c">2) Anthropic</span>
-  <span class="c">3) Azure OpenAI</span>
-  <span class="c">4) Ollama (local)</span>
-  <span class="c">5) LM Studio (local)</span>
+  <span class="c">1) OpenAI (GPT models)</span>
+  <span class="c">2) Anthropic (Claude)</span>
+  <span class="c">3) Google (Gemini)</span>
+  <span class="c">4) Azure OpenAI</span>
+  <span class="c">&hellip;</span>
+  <span class="c">11) Ollama on this computer (free, no key needed)</span>
+  <span class="c">12) LM Studio on this computer (free, no key needed)</span>
+  <span class="c">13) Somewhere else (I have a URL)</span>
   Pick a provider <span class="c">[1]</span>: <span class="in">1</span>
 
   Paste your OpenAI API key: <span class="in">&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;</span>
@@ -373,8 +376,9 @@ Content-Type: application/json
           <div>
             <h3>Runs anywhere Rust runs</h3>
             <p>
-              Single static binary or two-container compose (harness &amp;
-              Redpanda). Also ships a hardened Kubernetes manifest and
+              Single static binary, or Docker Compose with the full
+              stack (broker, state store, vector DB, cold storage).
+              Also ships a hardened Kubernetes manifest and
               a systemd unit with sensible defaults.
             </p>
           </div>

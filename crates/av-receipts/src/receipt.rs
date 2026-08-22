@@ -228,7 +228,14 @@ pub enum ReceiptError {
     /// first-wins auditor split-brain that would otherwise let a
     /// hostile issuer sign under one interpretation while an
     /// external audit tool displayed the other.
-    #[error("duplicate JSON key `{0}` at nesting; strict receipt parsers refuse this")]
+    ///
+    /// The payload is a complete scanner message (duplicate key,
+    /// nesting-depth, or explicit-null refusal), so the template
+    /// must not re-wrap it in a `key`-shaped slot — the old
+    /// "duplicate JSON key `{0}` at nesting" produced garbled
+    /// double-wrapped diagnostics like ``duplicate JSON key
+    /// `duplicate key `x` in JSON object …` at nesting``.
+    #[error("{0}; strict receipt parsers refuse this")]
     DuplicateKey(String),
     /// Round-16 F8: a receipt carries a semantically-invalid field
     /// (currently: `AtifTrajectory.retroactive == false`). Distinct
@@ -353,6 +360,17 @@ impl Receipt {
             return Err(ReceiptError::SemanticInvariant(format!(
                 "receipt_version {} is not the supported version {RECEIPT_VERSION}",
                 self.body.receipt_version
+            )));
+        }
+        // Schema parity: the receipt schema (and the events validator)
+        // pin `ai_agent.charter.type_id` to the OCSF Regular File
+        // const 1; in-tree issuers always set it, so this only rejects
+        // inbound documents that external schema verifiers already
+        // refuse — keeping the two verification paths in agreement.
+        if self.body.ai_agent.charter.type_id != 1 {
+            return Err(ReceiptError::SemanticInvariant(format!(
+                "ai_agent.charter.type_id {} is not Regular File (1)",
+                self.body.ai_agent.charter.type_id
             )));
         }
         let digest_ok = |digest: &str| {

@@ -48,6 +48,11 @@ this containment invariant:
 - `crates/av-sandbox/src/wasm_policy.rs::tests::memory_bomb_policy_fails_closed_via_store_limits` (new)
 - `crates/av-sandbox/src/wasm_policy.rs::tests::hostile_return_codes_all_deny` (new)
 
+*Resolved after this audit:* the workspace now pins wasmtime 47.x
+(`Cargo.lock`), which post-dates every wasmtime 27 advisory analyzed
+above; the containment invariants and their pinned regression tests
+are unchanged.
+
 **wasmtime 2026-0222 (stores mix type indices between engines) NOT reachable.**
 Each `WasmPolicy` owns exactly one `Engine`; stores are never shared across
 engines.

@@ -18,7 +18,7 @@
         "additionalProperties": false,
         "required": ["name", "partitions", "retention"],
         "properties": {
-          "name": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[A-Za-z0-9._-]+$" },
+          "name": { "type": "string", "minLength": 1, "maxLength": 249, "pattern": "^[A-Za-z0-9._-]+$" },
           "partitions": { "type": "integer", "minimum": 1, "maximum": 1024 },
           "schema_ref": { "type": "string", "minLength": 1, "maxLength": 4096 },
           "retention": {

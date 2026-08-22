@@ -108,7 +108,14 @@ missing_panics_doc = "allow"
 module_name_repetitions = "allow"
 
 [profile.release]
-lto = "thin"
+# LTO is deliberately OFF: with `lto = "thin"` (and even `fat` for the
+# harness SLA binary) the librdkafka admin path deterministically hit
+# the 10 s connector timeout against a live broker — every release-mode
+# `KafkaBus::provision` failed while debug builds passed, so the defect
+# was invisible to unit tests and static review (found by the live
+# backend campaign; rustc 1.97.1, aarch64). Release SLA numbers with
+# LTO off remain well inside the documented gates (hot p95 31 µs).
+lto = false
 codegen-units = 1
 
 [profile.bench]

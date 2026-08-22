@@ -66,6 +66,35 @@ impl TrajectoryBuilder {
     /// aggregate metrics.
     pub fn push_step(&mut self, mut step: Step) -> Result<(), av_core::CoreError> {
         step.step_id = self.steps.len() as u64 + 1;
+        // Strict-validator parity (same rationale as the round-6 hunt2
+        // F2 cost cap below: the builder must never accept a step that
+        // makes the trajectory permanently un-writable at
+        // `write_atomic`, which strict-validates before persisting):
+        // agent steps couple `llm_call_count` and `metrics` —
+        // `llm_call_count == 0` forbids metrics/reasoning_content, any
+        // other agent step requires metrics with all three token
+        // fields present.
+        if step.source == crate::model::Source::Agent {
+            if step.llm_call_count == Some(0) {
+                if step.metrics.is_some() || step.reasoning_content.is_some() {
+                    return Err(av_core::CoreError::InvalidId(
+                        "agent step with llm_call_count 0 must not carry metrics or reasoning_content"
+                            .to_owned(),
+                    ));
+                }
+            } else {
+                let complete = step.metrics.as_ref().is_some_and(|m| {
+                    m.prompt_tokens.is_some() && m.completion_tokens.is_some() && m.cached_tokens.is_some()
+                });
+                if !complete {
+                    return Err(av_core::CoreError::InvalidId(
+                        "agent step requires metrics with prompt/completion/cached token counts \
+                         (strict ATIF-v1.7 agent-step fidelity)"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
         // Compute the proposed totals into locals so an overflow on the
         // second/third field cannot leave the builder with partially-updated
         // totals ahead of a step that never got pushed.

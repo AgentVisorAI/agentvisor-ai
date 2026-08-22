@@ -74,11 +74,42 @@ fn redact_single(input: &str) -> String {
     let auth_start = scheme_end + 3;
     let scheme_prefix = &input[..auth_start];
     let rest = &input[auth_start..];
+    // RFC-correct case first: the authority ends at the first `/`,
+    // `?`, or `#`, and the last `@` within it splits userinfo from
+    // host (a password may legally contain `,` — sub-delims). This
+    // also keeps `@` characters later in the path/query (mailto-style
+    // tokens) out of the decision.
     let auth_end_off = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..auth_end_off];
-    let trailing = &rest[auth_end_off..];
-    match authority.rsplit_once('@') {
-        Some((_, host_segment)) => format!("{scheme_prefix}***@{host_segment}{trailing}"),
+    let authority = rest.get(..auth_end_off).unwrap_or_default();
+    let trailing = rest.get(auth_end_off..).unwrap_or_default();
+    if let Some((_, host_segment)) = authority.rsplit_once('@') {
+        return format!("{scheme_prefix}***@{host_segment}{trailing}");
+    }
+    // No `@` inside the RFC authority, but one later in the string:
+    // either a password containing a raw `/`, `?`, or `#` (routine in
+    // base64-style secrets — a shape that used to be returned
+    // VERBATIM, defeating redaction) or a credential-less URL with an
+    // `@` in its path (`http://h/p@th`), which must stay untouched.
+    // Discriminate by the naive authority's shape: a truncated
+    // `user:password` leaves a `:` followed by non-digit characters,
+    // while a legitimate credential-less authority is `host` or
+    // `host:port` (digits only after the colon). Known residual gap: a
+    // password whose pre-`/` prefix is all digits still leaks — the
+    // mixed-character secrets this defends against are covered.
+    let truncated_userinfo = authority
+        .rsplit_once(':')
+        .is_some_and(|(_, suffix)| !suffix.is_empty() && !suffix.bytes().all(|b| b.is_ascii_digit()));
+    if !truncated_userinfo {
+        return input.to_owned();
+    }
+    match rest.rfind('@') {
+        Some(at) => {
+            let after_at = rest.get(at + 1..).unwrap_or_default();
+            let host_end = after_at.find(['/', '?', '#']).unwrap_or(after_at.len());
+            let host_segment = after_at.get(..host_end).unwrap_or_default();
+            let tail = after_at.get(host_end..).unwrap_or_default();
+            format!("{scheme_prefix}***@{host_segment}{tail}")
+        }
         None => input.to_owned(),
     }
 }
@@ -132,5 +163,28 @@ mod tests {
             redact_userinfo("https://u:p@host/x?token=@abc#frag"),
             "https://***@host/x?token=@abc#frag",
         );
+    }
+
+    #[test]
+    fn password_with_path_query_fragment_chars_still_redacts() {
+        // Base64-style secrets routinely contain `/`; `?` and `#` are
+        // also possible in operator-pasted passwords. These shapes used
+        // to be returned verbatim (the first path/query/fragment byte
+        // truncated the authority before the `@` was found).
+        for (input, expected) in [
+            ("redis://user:AB/CDEF@host:6379", "redis://***@host:6379"),
+            ("redis://user:AB?CD@host:6379", "redis://***@host:6379"),
+            ("redis://user:AB#CD@host:6379", "redis://***@host:6379"),
+            (
+                "https://user:AB/CD@api.example.com/v1",
+                "https://***@api.example.com/v1",
+            ),
+            // Credential-less shapes with a raw `@` in the path stay
+            // untouched (the naive authority is host / host:port).
+            ("http://h/p@th", "http://h/p@th"),
+            ("http://host:8080/p@th", "http://host:8080/p@th"),
+        ] {
+            assert_eq!(redact_userinfo(input), expected, "input: {input}");
+        }
     }
 }
