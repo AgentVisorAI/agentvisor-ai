@@ -16,7 +16,10 @@ use av_events::{
 fn schema() -> jsonschema::Validator {
     let raw = include_str!("../../../schemas/ocsf-agent-event.schema.json");
     let doc: serde_json::Value = serde_json::from_str(raw).expect("schema file parses");
-    jsonschema::validator_for(&doc).expect("schema compiles")
+    jsonschema::options()
+        .should_validate_formats(true)
+        .build(&doc)
+        .expect("schema compiles")
 }
 
 fn identity() -> AgentIdentity {

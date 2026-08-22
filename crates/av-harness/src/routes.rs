@@ -340,7 +340,38 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
         completed: false,
     };
     let mut response = if is_sse {
-        Response::new(Body::from_stream(stream))
+        // Peek the FIRST item before committing the response head: when
+        // the first poll fails (empty 200 body, first frame invalid
+        // JSON, hostile usage fields), returning `Body::from_stream`
+        // directly made hyper abort the connection before flushing the
+        // status line — the client saw a raw empty reply (curl exit 52,
+        // http_code 000) instead of the clean 502/403 this file's own
+        // policy mandates. SDKs classify that as a network error and
+        // auto-retry, and each retry burns admission budget and seals
+        // another artifact-less session. Mid-stream failures (bytes
+        // already relayed) remain severed — unavoidable once the head
+        // is committed — but the pre-first-byte case surfaces as a real
+        // HTTP error exactly like the buffered non-SSE branch.
+        let mut relay = Box::pin(stream);
+        match relay.next().await {
+            Some(Err(error)) => {
+                let mapped = if error.kind() == std::io::ErrorKind::QuotaExceeded {
+                    crate::pipeline::PipelineError::Blocked(error.to_string())
+                } else {
+                    crate::pipeline::PipelineError::Upstream(error.to_string())
+                };
+                // Dropping the relay runs its finalization Drop
+                // (evidence capture + session seal).
+                return pipeline_error(mapped);
+            }
+            Some(Ok(first)) => {
+                let head = futures::stream::once(async move { Ok::<_, std::io::Error>(first) });
+                Response::new(Body::from_stream(head.chain(relay)))
+            }
+            // Clean zero-item stream: every capture gate already ran
+            // inside the relay's EOF arm and succeeded.
+            None => Response::new(Body::empty()),
+        }
     } else {
         // A non-SSE body is fully buffered inside the relay before any byte
         // is released: worker capture and the completion-token budget gate
@@ -4801,9 +4832,14 @@ mod tests {
             ))
             .await
             .unwrap();
+        // The capture failure hits the FIRST frame, before any byte was
+        // relayed — the peek-before-commit path now surfaces it as a
+        // clean upstream error response instead of a severed body
+        // (which SDKs treated as a retryable network error).
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert!(axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
-            .is_err());
+            .is_ok());
         assert!(state.sessions.get("tool-oob-index").unwrap().capture_failed());
         provider.abort();
     }
@@ -4822,9 +4858,13 @@ mod tests {
             .oneshot(chat_request_with_payload("tool-no-usage", payload))
             .await
             .unwrap();
+        // The budget refusal fires on the FIRST frame; peek-before-commit
+        // surfaces it as the deliberate 403 (not-429) refusal instead of
+        // a severed stream.
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
-            .is_err());
+            .is_ok());
         provider.abort();
     }
 

@@ -159,6 +159,28 @@ services:
       timeout: 3s
       retries: 12
 
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    # Internal-only S3-compatible object store for the cold tier
+    # (`cold_uri = "s3://..."`). Used by CI's live cold-store contract
+    # test (`AV_COLD_S3_URL`); the entrypoint pre-creates the bucket so
+    # the conditional-put export path needs no client-side setup.
+    ports:
+      # Host 9100: port 9000 is commonly occupied on dev hosts.
+      - "127.0.0.1:9100:9000"
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: agentvisor
+      MINIO_ROOT_PASSWORD: agentvisor-ci-secret
+    entrypoint: ["/bin/sh", "-c", "mkdir -p /data/agentvisor-cold && exec minio server /data"]
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
   nats:
     image: nats:2.11-alpine
     # Internal-only JetStream bus.
@@ -204,6 +226,7 @@ volumes:
   atif-spool:
   qdrant-data:
   redis-data:
+  minio-data:
   # Round-24 F3: persistent home for the audit-trail buses.
   redpanda-data:
   nats-data:

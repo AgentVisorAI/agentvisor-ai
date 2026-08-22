@@ -178,6 +178,17 @@ impl BridgeManifest {
         if self.topics.is_empty() {
             return Err(ManifestError::Invalid("no topics declared".into()));
         }
+        // Schema parity: the shipped bridge-manifest schema pins
+        // `topics.maxItems: 256`; without the same cap here a manifest
+        // that external schema tooling rejects passed `avctl
+        // manifest-validate` (split offline verdicts), and the count
+        // was otherwise bounded only indirectly by the YAML byte cap.
+        if self.topics.len() > 256 {
+            return Err(ManifestError::Invalid(format!(
+                "{} topics declared, above the schema maximum of 256",
+                self.topics.len()
+            )));
+        }
         if !(1..=5).contains(&self.replication_factor) {
             return Err(ManifestError::Invalid(
                 "replication_factor must be between 1 and 5".to_owned(),

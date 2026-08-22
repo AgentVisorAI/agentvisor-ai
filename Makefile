@@ -35,7 +35,7 @@ doc:
 	RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D warnings" cargo doc --workspace --all-features --no-deps
 
 schema-check:
-	for schema in schemas/*.json; do node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$$schema"; done
+	for schema in schemas/*.json; do node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$$schema" || exit 1; done
 	cargo run -q -p av-cli -- manifest-validate manifests/bridge.example.yaml
 	cargo run -q -p av-cli -- config-validate config/harness.example.toml
 	cargo run -q -p av-cli -- config-validate config/harness.docker.toml

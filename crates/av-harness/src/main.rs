@@ -1369,6 +1369,25 @@ mod tests {
 
     use super::*;
 
+    /// The crate-local embedded default policy must stay byte-identical
+    /// to the workspace-level copy operators deploy from `config/`
+    /// (same discipline as av-bridge's vendored-OCSF-schema drift
+    /// test). Reads the workspace copy at runtime so packaged-crate
+    /// builds skip cleanly when it is absent.
+    #[test]
+    fn builtin_policy_matches_workspace_copy() {
+        let workspace =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/policies/payload_limit.wat");
+        let Ok(canonical) = std::fs::read_to_string(&workspace) else {
+            return;
+        };
+        assert_eq!(
+            BUILTIN_POLICY_WAT, canonical,
+            "crates/av-harness/policies/payload_limit.wat has drifted from \
+             config/policies/payload_limit.wat — copy the canonical file over"
+        );
+    }
+
     /// Fail-closed CLI contract: agentvisord used to ignore ALL arguments,
     /// so `agentvisord --config /etc/prod.toml` silently booted from the
     /// env/search-path config instead, and `--help` started a server.

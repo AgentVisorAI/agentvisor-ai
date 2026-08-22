@@ -110,6 +110,23 @@ pub enum ValidationError {
     /// Timestamp is zero.
     #[error("time is zero")]
     ZeroTime,
+    /// Schema parity: `stop_reason_id` outside the schema enum
+    /// {0..=4, 90..=94, 99}.
+    #[error("stop_reason_id {0} is not a known reason id")]
+    UnknownStopReasonId(u8),
+    /// Schema parity: `metadata.version` must be the const "1.10.0".
+    #[error("metadata.version {0:?} is not the pinned OCSF version")]
+    BadOcsfVersion(String),
+    /// Schema parity: fingerprint constants (SHA-256/JCS/64-hex value).
+    #[error("{0} fingerprint violates the SHA-256/JCS/hex-64 shape")]
+    BadFingerprint(&'static str),
+    /// Schema parity: `payload` maxProperties 512.
+    #[error("payload carries {0} properties, above the schema max of 512")]
+    PayloadTooManyProperties(usize),
+    /// Schema parity: `time_iso`'s pattern requires a 4-digit year, so
+    /// epoch-ms beyond 9999-12-31 renders a caption the schema rejects.
+    #[error("time {0} is beyond 9999-12-31 (time_iso year would exceed 4 digits)")]
+    TimeBeyondSchemaRange(u64),
     /// `time_iso` does not match the canonical ISO-8601 rendering of
     /// `time`. The two fields are dual representations of one instant;
     /// a mismatch means a signed/chained event names different times to
@@ -197,6 +214,47 @@ pub fn validate_event(ev: &OcsfEvent) -> Result<(), Vec<ValidationError>> {
     if ev.stop_reason_id.is_some() != ev.stop_reason.is_some() {
         errors.push(ValidationError::StopReasonPairMismatch);
     }
+    // Schema parity (validator/schema agreement is this module's stated
+    // purpose — see the module doc): the shipped schema pins
+    // `stop_reason_id` to the enum {0..=4, 90..=94, 99}; an id like 50
+    // previously passed here yet failed the broker's schema gate.
+    if let Some(id) = ev.stop_reason_id {
+        if !matches!(id, 0..=4 | 90..=94 | 99) {
+            errors.push(ValidationError::UnknownStopReasonId(id));
+        }
+    }
+    // Schema parity: `metadata.version` is `const "1.10.0"`.
+    if ev.metadata.version != crate::model::OCSF_VERSION {
+        errors.push(ValidationError::BadOcsfVersion(ev.metadata.version.clone()));
+    }
+    // Schema parity: fingerprint constants (algorithm 3/"SHA-256",
+    // serialization 2/"JCS", 64-hex value) — previously entirely
+    // unvalidated on the wire path.
+    for (field, fingerprint) in [
+        ("inventory", ev.inventory.as_ref()),
+        ("prev_inventory", ev.prev_inventory.as_ref()),
+    ] {
+        let Some(fp) = fingerprint else { continue };
+        let hex64 = fp.value.len() == 64
+            && fp
+                .value
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+        if fp.algorithm_id != 3
+            || fp.algorithm != "SHA-256"
+            || fp.serialization_id != 2
+            || fp.serialization != "JCS"
+            || !hex64
+        {
+            errors.push(ValidationError::BadFingerprint(field));
+        }
+    }
+    // Schema parity: `payload` maxProperties 512.
+    if let Some(map) = ev.payload.as_object() {
+        if map.len() > 512 {
+            errors.push(ValidationError::PayloadTooManyProperties(map.len()));
+        }
+    }
     // Round-6 (hunt2 F4): match the shipped JSON schema's
     // `"stop_reason": {"type": "string", "minLength": 1}`. Some
     // OpenAI-compatible shims emit `finish_reason: ""` mid-stream; the
@@ -262,6 +320,13 @@ pub fn validate_event(ev: &OcsfEvent) -> Result<(), Vec<ValidationError>> {
     }
     if ev.time == 0 {
         errors.push(ValidationError::ZeroTime);
+    }
+    // Schema parity: the `time_iso` pattern pins a 4-digit year. A
+    // `time` near 2^53 is JCS-safe and consistent with its own caption
+    // (the cross-check below), but renders a 6-digit year the schema
+    // pattern rejects. 253402300799999 = 9999-12-31T23:59:59.999Z.
+    if ev.time > 253_402_300_799_999 {
+        errors.push(ValidationError::TimeBeyondSchemaRange(ev.time));
     }
     // `time_iso` is the second representation of the event's timestamp;
     // the schema pins its exact format and `OcsfEventBuilder::build`

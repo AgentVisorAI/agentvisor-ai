@@ -279,7 +279,93 @@ pub fn validate_value(root: &Value, mode: Mode) -> Vec<ValidationIssue> {
     // recursive call.
     let mut ancestors: std::collections::HashSet<String> = std::collections::HashSet::new();
     validate_trajectory_obj(root, "trajectory", mode, &mut issues, true, 0, &mut ancestors);
+    // Strict mode additionally enforces the two schema semantics the
+    // field-wise walker's null-tolerant type checks (`!v.is_null()`
+    // escapes, mirroring serde `Option`) could not express, and whose
+    // absence let strict-valid documents fail the shipped schema:
+    //   1. explicit `null` is not schema-valid for any typed field
+    //      (JSON Schema types never include null here);
+    //   2. `extra` is pinned `{"type":"object"}` everywhere EXCEPT the
+    //      free-form root/agent/step/tool-call positions (`"extra": {}`).
+    if mode == Mode::Strict {
+        strict_null_and_extra_conformance(root, "", "trajectory", &mut issues, 0);
+    }
     truncate_issues_with_marker(issues)
+}
+
+/// See the call site in [`validate_value`]: strict-mode schema-parity
+/// pass for explicit nulls and object-typed `extra` fields. `parent_key`
+/// is the property name of the containing object with array indices
+/// skipped ("" for the document root; nested subagent trajectory roots
+/// carry "subagent_trajectories", whose rules match the root's).
+fn strict_null_and_extra_conformance(
+    value: &Value,
+    parent_key: &str,
+    path: &str,
+    issues: &mut Vec<ValidationIssue>,
+    depth: usize,
+) {
+    if depth > MAX_NESTED_DEPTH || issues.len() > MAX_VALIDATION_ISSUES {
+        return;
+    }
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let child_path = format!("{path}.{key}");
+                if key == "extra" {
+                    // Free-form (`"extra": {}`) positions accept any
+                    // value, null included; every other `extra` is
+                    // schema-pinned `{"type":"object"}`.
+                    let free_form = matches!(
+                        parent_key,
+                        "" | "agent" | "steps" | "subagent_trajectories" | "tool_calls"
+                    );
+                    if !free_form && !child.is_object() {
+                        issue!(issues, child_path, "must be an object (schema type)");
+                    }
+                    // Interiors of `extra` are unconstrained either way.
+                    continue;
+                }
+                // Unconstrained interiors (bare `array` / string-or-array
+                // `oneOf`): the container value itself must not be null,
+                // but its contents are schema-free.
+                if key == "tool_calls" || key == "message" || (key == "content" && parent_key == "results") {
+                    if child.is_null() {
+                        issue!(
+                            issues,
+                            child_path,
+                            "explicit null is not schema-valid; omit the field instead"
+                        );
+                    }
+                    continue;
+                }
+                if child.is_null() {
+                    issue!(
+                        issues,
+                        child_path,
+                        "explicit null is not schema-valid; omit the field instead"
+                    );
+                    continue;
+                }
+                strict_null_and_extra_conformance(child, key, &child_path, issues, depth + 1);
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                let child_path = format!("{path}[{index}]");
+                if child.is_null() {
+                    issue!(
+                        issues,
+                        child_path,
+                        "explicit null is not schema-valid inside this array"
+                    );
+                    continue;
+                }
+                strict_null_and_extra_conformance(child, parent_key, &child_path, issues, depth + 1);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Round-20: after a validation pass, cap the number of issues
@@ -476,13 +562,31 @@ fn validate_trajectory_obj(
             if let Some(defs) = agent.get("tool_definitions") {
                 match defs.as_array() {
                     Some(items) => {
+                        // Schema: `maxItems: 512`, items `maxProperties:
+                        // 128`. Without these the strict validator
+                        // accepted documents the shipped schema rejects,
+                        // breaking the declared strict-valid ⇒
+                        // schema-valid invariant (golden.rs).
+                        if items.len() > 512 {
+                            issue!(
+                                issues,
+                                format!("{path}.agent.tool_definitions"),
+                                "must not contain more than 512 definitions (schema maxItems)"
+                            );
+                        }
                         for (index, item) in items.iter().enumerate() {
-                            if !item.is_object() {
-                                issue!(
+                            match item.as_object() {
+                                Some(map) if map.len() > 128 => issue!(
+                                    issues,
+                                    format!("{path}.agent.tool_definitions[{index}]"),
+                                    "must not carry more than 128 properties (schema maxProperties)"
+                                ),
+                                Some(_) => {}
+                                None => issue!(
                                     issues,
                                     format!("{path}.agent.tool_definitions[{index}]"),
                                     "must be an object"
-                                );
+                                ),
                             }
                         }
                     }
@@ -1197,7 +1301,12 @@ fn is_iso8601(s: &str) -> bool {
         }
     }
     match b.get(i) {
-        None => true, // naive timestamps accepted (Harbor examples use Z, but naive is valid ISO)
+        // Naive timestamps (no timezone) are valid bare ISO-8601, but
+        // the shipped schema pins `format: date-time` (RFC 3339), which
+        // REQUIRES an offset — a naive timestamp passing strict here
+        // while failing external schema tooling broke the strict-valid
+        // ⇒ schema-valid invariant.
+        None => false,
         Some(b'Z' | b'z') => i + 1 == b.len(),
         Some(b'+' | b'-') => {
             let (Some(oh), Some(om)) = (digits(i + 1..i + 3), digits(i + 4..i + 6)) else {
@@ -1269,7 +1378,6 @@ mod tests {
             "2025-06-30T23:59:60Z",
             "2025-01-15T10:30:00+05:30",
             "2025-01-15T10:30:00.999999-08:00",
-            "2025-01-15T10:30:00",
         ] {
             assert!(is_iso8601(ts), "should accept {ts}");
         }
@@ -1283,6 +1391,10 @@ mod tests {
             "2025-13-01T00:00:00Z",
             "2025-02-29T00:00:00Z",
             "2025-01-32T00:00:00Z",
+            // Naive (offset-less) timestamps are valid bare ISO-8601 but
+            // NOT RFC 3339 — the shipped schema's `format: date-time`
+            // rejects them, so strict must too (strict ⇒ schema-valid).
+            "2025-01-15T10:30:00",
             "2025-01-15T24:00:00Z",
             "2025-01-15T10:61:00Z",
             "2025-01-15T10:30:00.Z",
@@ -1377,7 +1489,9 @@ mod tests {
                 "expected {message:?} at {path}: {issues:?}"
             );
         }
-        // Null still means absent for all three.
+        // Null means absent for the typed model and for compat mode;
+        // strict mode rejects it for schema parity (strict ⇒
+        // schema-valid).
         let value = serde_json::json!({
             "schema_version": "ATIF-v1.7",
             "session_id": "s",
@@ -1394,8 +1508,10 @@ mod tests {
                 }]},
             }],
         });
+        let issues = validate_value(&value, Mode::Compat);
+        assert!(issues.is_empty(), "compat must tolerate nulls: {issues:?}");
         let issues = validate_value(&value, Mode::Strict);
-        assert!(issues.is_empty(), "nulls must stay valid: {issues:?}");
+        assert_eq!(issues.len(), 3, "strict must reject the nulls: {issues:?}");
     }
 
     /// Mutation-run hardening: the `llm_call_count == 0` consistency
@@ -1450,8 +1566,17 @@ mod tests {
             "agent": {"name": "a", "version": "1"},
             "steps": [{"step_id": 1, "source": "user", "message": "hi"}],
         });
+        // Compat mode keeps the serde-Option tolerance (null ≡ absent);
+        // strict mode now rejects explicit nulls because the shipped
+        // schema does (strict ⇒ schema-valid, pinned by golden.rs).
+        let issues = validate_value(&value, Mode::Compat);
+        assert!(issues.is_empty(), "compat must tolerate nulls: {issues:?}");
         let issues = validate_value(&value, Mode::Strict);
-        assert!(issues.is_empty(), "nulls must stay valid: {issues:?}");
+        assert_eq!(
+            issues.len(),
+            4,
+            "strict must reject each explicit null: {issues:?}"
+        );
         assert!(serde_json::from_value::<crate::model::Trajectory>(value).is_ok());
     }
 

@@ -24,7 +24,10 @@ fn golden_v17_is_valid_strict() {
 #[test]
 fn golden_v17_matches_shipped_json_schema() {
     let schema: Value = serde_json::from_str(include_str!("../../../schemas/atif-v1.7.schema.json")).unwrap();
-    let validator = jsonschema::validator_for(&schema).unwrap();
+    let validator = jsonschema::options()
+        .should_validate_formats(true)
+        .build(&schema)
+        .unwrap();
     let value = golden();
     let errors: Vec<_> = validator.iter_errors(&value).collect();
     assert!(errors.is_empty(), "{errors:?}");
@@ -781,7 +784,10 @@ fn rust_strict_valid_v17_documents_always_pass_the_shipped_schema() {
     use serde_json::json;
     let schema: serde_json::Value =
         serde_json::from_str(include_str!("../../../schemas/atif-v1.7.schema.json")).unwrap();
-    let validator = jsonschema::validator_for(&schema).unwrap();
+    let validator = jsonschema::options()
+        .should_validate_formats(true)
+        .build(&schema)
+        .unwrap();
     // Strict v1.7 requires complete token metrics on agent-sourced steps.
     let metrics = json!({"metrics": {
         "prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0
@@ -868,7 +874,10 @@ fn unicode_tag_characters_survive_the_typed_round_trip_byte_exactly() {
     );
     let schema: serde_json::Value =
         serde_json::from_str(include_str!("../../../schemas/atif-v1.7.schema.json")).unwrap();
-    let validator = jsonschema::validator_for(&schema).unwrap();
+    let validator = jsonschema::options()
+        .should_validate_formats(true)
+        .build(&schema)
+        .unwrap();
     let errors: Vec<String> = validator.iter_errors(&v).map(|e| e.to_string()).collect();
     assert!(
         errors.is_empty(),

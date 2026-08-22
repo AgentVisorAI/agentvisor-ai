@@ -343,6 +343,42 @@ impl Receipt {
     /// `verify` and `verify_embedded` so no verification path can
     /// skip it.
     fn verify_semantic_invariants(&self) -> Result<(), ReceiptError> {
+        // Schema parity: `receipt_version` is `const 1` and the subject
+        // digests are pinned `^[0-9a-f]{64}$` in the shipped schema, but
+        // verification never checked either — a keyholder could issue
+        // `receipt_version: 999` or free-text digests that
+        // `avctl receipt-verify` accepted while schema-based external
+        // verifiers rejected (split offline-verification verdicts).
+        if self.body.receipt_version != RECEIPT_VERSION {
+            return Err(ReceiptError::SemanticInvariant(format!(
+                "receipt_version {} is not the supported version {RECEIPT_VERSION}",
+                self.body.receipt_version
+            )));
+        }
+        let digest_ok = |digest: &str| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        match &self.body.subject {
+            ReceiptSubject::EventChain { chain_head, .. } => {
+                if !digest_ok(chain_head) {
+                    return Err(ReceiptError::SemanticInvariant(
+                        "chain_head is not a lowercase 64-hex digest".to_owned(),
+                    ));
+                }
+            }
+            ReceiptSubject::AtifTrajectory {
+                trajectory_digest, ..
+            } => {
+                if !digest_ok(trajectory_digest) {
+                    return Err(ReceiptError::SemanticInvariant(
+                        "trajectory_digest is not a lowercase 64-hex digest".to_owned(),
+                    ));
+                }
+            }
+        }
         if let ReceiptSubject::AtifTrajectory { retroactive, .. } = &self.body.subject {
             if !retroactive {
                 return Err(ReceiptError::SemanticInvariant(

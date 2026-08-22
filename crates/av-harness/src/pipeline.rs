@@ -743,15 +743,19 @@ impl AppState {
         // produced — and the ATIF step, receipt, and loop-detector
         // embedding would attest it (the tool-call accumulator is keyed
         // by choice index for exactly this reason). Refuse up front,
-        // before any budget debit.
-        if payload
-            .get("n")
-            .and_then(serde_json::Value::as_u64)
-            .is_some_and(|n| n > 1)
-        {
-            return Err(PipelineError::BadRequest(
-                "multi-choice completions (n > 1) are not supported: the audit capture attests a single response message per request".to_owned(),
-            ));
+        // before any budget debit. Fail closed on ANY present `n` that
+        // is not exactly the integer 1: upstream OpenAI-compatible
+        // servers lax-coerce `2.0` / `"2"` to a real multi-choice
+        // request, so an as_u64-only check was bypassable by float or
+        // string encodings.
+        match payload.get("n") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(n) if n.as_u64() == Some(1) => {}
+            Some(_) => {
+                return Err(PipelineError::BadRequest(
+                    "multi-choice completions (n != 1) are not supported: the audit capture attests a single response message per request".to_owned(),
+                ));
+            }
         }
 
         let stage = Instant::now();
