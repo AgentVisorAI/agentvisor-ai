@@ -36,6 +36,8 @@ client = OpenAI(
   [advisory form](https://github.com/AgentVisorAI/agentvisor-ai/security/advisories/new).
 - **[Architecture](ARCHITECTURE.md)** · **[Benchmarks](BENCHMARKS.md)** ·
   **[Verification protocol](VERIFICATION.md)** — going deeper.
+- **[Reference docs](docs/reference/)** — configuration, operations,
+  OpenAI compatibility, limits, and offline receipt verification.
 - **[API docs](https://agentvisorai.github.io/agentvisor-ai/api/)** — Rust crate
   reference. Skip unless you're embedding AgentVisor AI as a library.
 
