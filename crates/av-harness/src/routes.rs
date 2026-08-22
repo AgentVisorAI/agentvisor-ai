@@ -51,6 +51,10 @@ pub fn build_router(state: AppState) -> Router {
             );
     }
     router
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            request_metrics,
+        ))
         .layer(axum::middleware::from_fn(trace_request))
         // axum's default body limit is 2 MiB, which silently rejects large
         // chat contexts (Claude 200k, GPT-4 128k) before the sandbox even
@@ -59,6 +63,63 @@ pub fn build_router(state: AppState) -> Router {
         // control.
         .layer(axum::extract::DefaultBodyLimit::max(max_body))
         .with_state(state)
+}
+
+/// Round-51 §8.7: data-plane request metrics. Every HTTP request —
+/// including the early-4xx returns the review flagged as unaudited —
+/// lands in `av_requests_total{route,status_class}` and
+/// `av_request_duration_seconds{route}`. The route label is drawn
+/// from a FIXED set (no client-controlled values) so metric
+/// cardinality is bounded; unknown paths collapse to `other`.
+async fn request_metrics(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let route = route_label(request.uri().path());
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    let status_class = match response.status().as_u16() {
+        100..=199 => "1xx",
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        _ => "5xx",
+    };
+    state
+        .metrics
+        .counter(
+            &format!("av_requests_total{{route=\"{route}\",status_class=\"{status_class}\"}}"),
+            "HTTP requests by route and status class",
+        )
+        .inc();
+    state
+        .metrics
+        .histogram_with_bounds(
+            &format!("av_request_duration_seconds{{route=\"{route}\"}}"),
+            "End-to-end HTTP request latency by route",
+            av_core::metrics::WIDE_LATENCY_BOUNDS_US,
+        )
+        .observe_us(elapsed_us(started));
+    response
+}
+
+/// Fixed route-label set for `av_requests_total`. NEVER interpolate a
+/// client-controlled value here — Prometheus cardinality is bounded
+/// only because this set is closed.
+fn route_label(path: &str) -> &'static str {
+    match path {
+        "/v1/chat/completions" => "chat",
+        "/v1/mcp" | "/mcp" => "mcp",
+        "/health" => "health",
+        "/livez" => "livez",
+        "/readyz" => "readyz",
+        "/metrics" => "metrics",
+        _ if path.starts_with("/v1/sessions/") && path.ends_with("/close") => "session_close",
+        _ if path.starts_with("/v1/sessions/") && path.ends_with("/promote") => "session_promote",
+        _ if path.starts_with("/dashboard") || path.starts_with("/api/v1/dashboard") => "dashboard",
+        _ => "other",
+    }
 }
 
 async fn trace_request(request: Request<Body>, next: Next) -> Response {
@@ -212,12 +273,54 @@ async fn metrics(State(state): State<AppState>) -> Response {
             "Currently-open sessions in the in-memory registry",
         )
         .set(state.sessions.len() as u64);
+    // Round-51 §8.7: worker backlog + spool footprint, sampled per
+    // scrape. Queue depth is one atomic load; the spool walk is a
+    // single-level read_dir summing entry sizes (a few ms even at
+    // tens of thousands of files, amortized across the scrape
+    // interval).
+    state
+        .metrics
+        .gauge(
+            "av_worker_queue_depth",
+            "Accepted-but-not-yet-completed worker jobs",
+        )
+        .set(state.worker.queue_depth());
+    let (spool_bytes, spool_files) = spool_footprint(std::path::Path::new(&state.config.atif_spool_dir));
+    state
+        .metrics
+        .gauge("av_spool_bytes", "Total bytes in the top-level ATIF spool directory")
+        .set(spool_bytes);
+    state
+        .metrics
+        .gauge("av_spool_files", "File count in the top-level ATIF spool directory")
+        .set(spool_files);
     let mut response = Response::new(Body::from(state.metrics.render()));
     response.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
     );
     response
+}
+
+/// Sum size and count of regular files in the top level of the spool
+/// directory. Non-recursive on purpose: subdirectories (broker-acks/,
+/// receipts/) have bounded per-session cost and a recursive walk per
+/// scrape would reintroduce the §8.1 O(spool) tax on another path.
+fn spool_footprint(dir: &std::path::Path) -> (u64, u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    let mut bytes = 0u64;
+    let mut files = 0u64;
+    for entry in entries.flatten() {
+        if let Ok(metadata) = entry.metadata() {
+            if metadata.is_file() {
+                bytes = bytes.saturating_add(metadata.len());
+                files = files.saturating_add(1);
+            }
+        }
+    }
+    (bytes, files)
 }
 
 async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -5619,6 +5722,19 @@ mod tests {
         .into_owned();
         assert!(body.contains("# TYPE av_open_sessions gauge"), "{body}");
         assert!(body.contains("av_open_sessions 0"), "{body}");
+        // Round-51 §8.7: data-plane series must exist from boot.
+        assert!(body.contains("# TYPE av_worker_queue_depth gauge"), "{body}");
+        assert!(body.contains("# TYPE av_spool_bytes gauge"), "{body}");
+        assert!(body.contains("# TYPE av_requests_total counter"), "{body}");
+        assert!(
+            body.contains("av_requests_total{route=\"chat\",status_class=\"2xx\"}"),
+            "{body}"
+        );
+        assert!(
+            body.contains("av_upstream_errors_total{kind=\"timeout\"}"),
+            "{body}"
+        );
+        assert!(body.contains("av_upstream_latency_seconds"), "{body}");
         assert!(
             body.contains(&format!("av_signing_key_info{{key_id=\"{key_id}\"")),
             "signing-key info gauge missing from scrape: {body}"
