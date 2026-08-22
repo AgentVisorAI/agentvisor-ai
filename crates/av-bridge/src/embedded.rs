@@ -79,7 +79,6 @@ impl EmbeddedBroker {
         reject_cold_uri_without_feature(manifest)?;
         let manifest_path = data_dir.join("manifest.yaml");
         fs::create_dir_all(data_dir)?;
-        copy_referenced_schemas(data_dir, manifest)?;
         let yaml = manifest.to_yaml().map_err(|e| BusError::Backend(e.to_string()))?;
         // Atomic single-winner claim on a fresh provision: the
         // `hard_link(2)` below fails with EEXIST if the target already
@@ -144,6 +143,17 @@ impl EmbeddedBroker {
             }
         }
         av_core::fsutil::sync_directory(data_dir).map_err(BusError::Io)?;
+        // Schema copies and topic directories are written only AFTER the
+        // hard-link claim above declared this provision the single
+        // winner. Writing them before the claim (the old order) meant a
+        // provision attempt against an ALREADY-provisioned bridge
+        // overwrote the live bridge's schema files under
+        // `data_dir/<schema_ref>` before erroring "bridge already
+        // provisioned" — and `load_validators` falls back to those
+        // copies for non-builtin refs, so the next open() silently
+        // validated against the loser's schemas. It also let two racing
+        // provisions cross-pollute each other's directories.
+        copy_referenced_schemas(data_dir, manifest)?;
         for t in &manifest.topics {
             fs::create_dir_all(data_dir.join("topics").join(&t.name))?;
         }
@@ -621,7 +631,10 @@ fn copy_referenced_schemas(data_dir: &Path, manifest: &BridgeManifest) -> Result
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(destination, serde_json::to_vec_pretty(&value)?)?;
+        // Fsync-safe atomic replace: a crash mid-`fs::write` (the old
+        // shape) left torn JSON that made the `load_validators` disk
+        // fallback fail `open()` permanently for non-builtin refs.
+        rewrite_atomic(&destination, &serde_json::to_vec_pretty(&value)?)?;
     }
     Ok(())
 }

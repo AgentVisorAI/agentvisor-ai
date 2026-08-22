@@ -36,6 +36,34 @@ fn cfg() -> CompressionConfig {
     }
 }
 
+/// Regression: two assistant messages carrying semantically identical
+/// JSON — one pretty-printed, one minified — become byte-identical only
+/// after `normalize_json_content`. With dedupe ordered before normalize,
+/// run 1 kept both and run 2 collapsed the copy, violating invariant #4
+/// (`compress(compress(x)) == compress(x)`). The generator below never
+/// produces this shape, so the proptest missed it.
+#[test]
+fn idempotent_when_normalization_creates_duplicates() {
+    let pretty = "{\n  \"status\": \"ok\",\n  \"items\": [1, 2, 3],\n  \"note\": \"padding padding padding padding padding\"\n}";
+    let minified =
+        "{\"status\":\"ok\",\"items\":[1,2,3],\"note\":\"padding padding padding padding padding\"}";
+    let mut messages = vec![
+        json!({"role": "assistant", "content": pretty}),
+        json!({"role": "assistant", "content": minified}),
+    ];
+    // Enough tail fillers that both JSON messages sit before tail_start.
+    for i in 0..10 {
+        messages.push(json!({"role": "user", "content": format!("tail filler {i}")}));
+    }
+    let payload = json!({"model": "m", "messages": messages});
+    let once = compress(&payload, &cfg());
+    let twice = compress(&once.payload, &cfg());
+    assert_eq!(
+        twice.payload, once.payload,
+        "compress must be idempotent when normalization makes messages byte-identical"
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 

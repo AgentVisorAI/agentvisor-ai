@@ -168,6 +168,19 @@ impl<'a> ActionBudget<'a> {
         }
     }
 
+    /// Compensating refund for a previously-successful [`Self::try_tokens`]
+    /// on a request that provably never reached the provider (sanitize
+    /// block, capture failure, in-flight-marker write failure, connect
+    /// failure). Same rationale and best-effort contract as
+    /// [`Self::refund_tool_call`]: without it, each client retry against
+    /// a flaky-but-unreachable upstream re-debits `max_tokens` with zero
+    /// LLM work performed, draining the session budget.
+    pub fn refund_tokens(&self, tokens: u64) {
+        if tokens > 0 && self.spec.max_tokens.is_some() {
+            self.store.refund(&self.key("tokens"), tokens);
+        }
+    }
+
     /// Check-and-spend `tokens` against `max_tokens`.
     pub fn try_tokens(&self, tokens: u64) -> Result<BudgetDecision, StateError> {
         match self.spec.max_tokens {
@@ -398,6 +411,33 @@ mod tests {
         // The same call now succeeds — proving all three dimensions
         // were compensated.
         assert!(b.try_tool_call("db_write", 500_000).unwrap().is_allowed());
+    }
+
+    /// `refund_tokens` compensates a `try_tokens` debit exactly, for
+    /// requests that provably never reached the provider (sanitize
+    /// block, capture failure, marker-write failure, connect failure).
+    #[test]
+    fn refund_tokens_reverses_the_spend_exactly() {
+        let store = InMemoryStore::new();
+        let s = BudgetSpec {
+            max_tokens: Some(100),
+            ..BudgetSpec::default()
+        };
+        let b = ActionBudget::new(&store, "sess-token-refund", &s);
+        assert!(b.try_tokens(80).unwrap().is_allowed());
+        // Without refund the next debit trips the cap.
+        assert!(matches!(
+            b.try_tokens(80).unwrap(),
+            BudgetDecision::Refused { .. }
+        ));
+        b.refund_tokens(80);
+        // The same debit now succeeds — the refund compensated exactly.
+        assert!(b.try_tokens(80).unwrap().is_allowed());
+        // With no cap configured, refund is a no-op (never panics or
+        // creates counters).
+        let uncapped_spec = BudgetSpec::default();
+        let uncapped = ActionBudget::new(&store, "sess-uncapped", &uncapped_spec);
+        uncapped.refund_tokens(50);
     }
 
     /// Round-33 F1: refund saturates at 0 under a concurrent clear.

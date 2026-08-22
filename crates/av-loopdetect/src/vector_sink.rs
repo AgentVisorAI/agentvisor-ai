@@ -83,13 +83,10 @@ impl QdrantVectorSink {
             .get(&url)
             .send()
             .await
-            .map_err(|error| classify_qdrant_error(error))?;
+            .map_err(classify_qdrant_error)?;
         let status = get_response.status();
         if status.is_success() {
-            let body: serde_json::Value = get_response
-                .json()
-                .await
-                .map_err(|error| classify_qdrant_error(error))?;
+            let body: serde_json::Value = get_response.json().await.map_err(classify_qdrant_error)?;
             let params = body.pointer("/result/config/params/vectors");
             let existing_size = params
                 .and_then(|value| value.get("size"))
@@ -99,7 +96,7 @@ impl QdrantVectorSink {
                 .and_then(serde_json::Value::as_str);
             match (existing_size, existing_distance) {
                 (Some(size), Some(distance))
-                    if size as usize == dimension && distance.eq_ignore_ascii_case("Cosine") =>
+                    if usize::try_from(size) == Ok(dimension) && distance.eq_ignore_ascii_case("Cosine") =>
                 {
                     return Ok(());
                 }
@@ -140,9 +137,9 @@ impl QdrantVectorSink {
             }))
             .send()
             .await
-            .map_err(|error| classify_qdrant_error(error))?
+            .map_err(classify_qdrant_error)?
             .error_for_status()
-            .map_err(|error| classify_qdrant_error(error))?;
+            .map_err(classify_qdrant_error)?;
         Ok(())
     }
 }
@@ -180,12 +177,12 @@ impl VectorSink for QdrantVectorSink {
                 }))
                 .send()
                 .await
-                .map_err(|error| classify_qdrant_error(error))?
+                .map_err(classify_qdrant_error)?
                 .error_for_status()
-                .map_err(|error| classify_qdrant_error(error))?
+                .map_err(classify_qdrant_error)?
                 .json()
                 .await
-                .map_err(|error| classify_qdrant_error(error))?;
+                .map_err(classify_qdrant_error)?;
             let Some(score) = response
                 .pointer("/result/0/score")
                 .and_then(serde_json::Value::as_f64)
@@ -223,9 +220,9 @@ impl VectorSink for QdrantVectorSink {
                 }))
                 .send()
                 .await
-                .map_err(|error| classify_qdrant_error(error))?
+                .map_err(classify_qdrant_error)?
                 .error_for_status()
-                .map_err(|error| classify_qdrant_error(error))?;
+                .map_err(classify_qdrant_error)?;
             Ok(())
         })
     }
@@ -248,9 +245,9 @@ impl VectorSink for QdrantVectorSink {
                 }))
                 .send()
                 .await
-                .map_err(|error| classify_qdrant_error(error))?
+                .map_err(classify_qdrant_error)?
                 .error_for_status()
-                .map_err(|error| classify_qdrant_error(error))?;
+                .map_err(classify_qdrant_error)?;
             Ok(())
         })
     }

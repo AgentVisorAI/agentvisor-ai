@@ -687,10 +687,28 @@ impl Finalizer {
                     .await
                     .map_err(|error| FinalizeError::Task(error.to_string()))?
                     .map_err(|error| FinalizeError::Atif(error.to_string()))?;
-                    *session.atif_path.lock() = Some(path.clone());
                     path
                 };
                 self.ensure_atif_provenance(&path, &session.id).await?;
+                // Cache the path only AFTER the provenance seal succeeded.
+                // Caching it right after `write_atomic` (the old order)
+                // meant a transient `ensure_atif_provenance` failure left
+                // `atif_path` set while `CloseClaim::drop` reopened the
+                // session — the client kept chatting, appending steps
+                // n..n+m, and the NEXT close hit the `existing_path`
+                // fast path above, sealing provenance over the STALE
+                // n-step artifact and then destroying the step journal:
+                // silent, permanent loss of every step captured between
+                // the two close attempts. With the assignment here, a
+                // provenance failure leaves `atif_path` unset, so the
+                // retry re-snapshots the (still intact) builder and
+                // rewrites the artifact with the full step set. The
+                // `existing_path` fast path remains load-bearing for
+                // RECOVERED sessions (whose builder is empty and whose
+                // on-disk artifact is authoritative) — those set
+                // `atif_path` in `recover_unsigned` with the artifact
+                // already durable.
+                *session.atif_path.lock() = Some(path.clone());
                 session.mark_artifact_committed();
                 FinalizeOutcome::Atif { path }
             }
@@ -2066,6 +2084,7 @@ impl Finalizer {
             // consolidation scan. A single poisoned sidecar or a
             // torn events journal used to head-of-line-block
             // every OTHER unsigned session on the tick.
+            let mut claimed_session: Option<String> = None;
             let outcome: Result<(), FinalizeError> = async {
             let final_path = self.spool_dir.join(format!("{stem}.json"));
             let journal_path = self.spool_dir.join(format!("{stem}.events.ndjson"));
@@ -2115,6 +2134,36 @@ impl Finalizer {
                     .ok_or_else(|| FinalizeError::Atif("journal metadata has no identity".into()))?,
             )
             .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+            // Claim the id in the registry BEFORE any destructive step.
+            // The `sessions.get` check above races client admission:
+            // `get_or_open` inserts without touching the lifecycle-lock
+            // table, so a client could re-open this id after the check
+            // and start appending to the very journal files this
+            // consolidation is consuming — and `remove_step_journal`
+            // below would then destroy the live session's records
+            // (position-vs-seq mismatch, unrecoverable audit trail).
+            // Every sibling recovery path claims via
+            // `try_insert_recovered` before destructive work; this was
+            // the only one that didn't. The placeholder is closed (so
+            // admission refuses the id while consolidation runs) but
+            // NOT artifact-committed/capture-failed/close-complete, so
+            // the pending-close sweep, the idle sweeper, and
+            // `get_or_open`'s reopen-recycling all skip it; it is
+            // removed again right after the candidate body finishes.
+            let placeholder = Session::new(
+                session_id.to_owned(),
+                Workflow::Unsigned,
+                identity.clone(),
+                breaker.clone(),
+            );
+            placeholder.closed.store(1, std::sync::atomic::Ordering::Release);
+            if sessions.try_insert_recovered(placeholder).is_err() {
+                // A client re-opened the id between the check above and
+                // this claim — the session is live; leave its journal
+                // alone and skip, exactly like the pre-lock check.
+                return Ok(());
+            }
+            claimed_session = Some(session_id.to_owned());
             let journal = if journal_path.exists() {
                 read_complete_journal(&journal_path).await?
             } else {
@@ -2138,7 +2187,13 @@ impl Finalizer {
                 // close_session_locked, hits the capture_failed guard, and
                 // CloseClaim resets `closed` — an unbounded churn loop.
                 quarantined.mark_artifact_committed();
+                // Replace the consolidation placeholder with the
+                // quarantined session (the placeholder's claim is what
+                // makes this replacement race-free: no client can
+                // recycle a closed, non-close-complete entry).
+                sessions.remove(session_id);
                 sessions.insert_recovered(quarantined);
+                claimed_session = None;
                 return Ok(());
             }
             if journal.is_empty() {
@@ -2418,6 +2473,12 @@ impl Finalizer {
             self.remove_step_journal(session_id).await?;
             Ok(())
             }.await;
+            // Release the consolidation claim regardless of outcome: on
+            // success the ATIF adoption scan re-adopts the artifact
+            // properly; on error the next tick re-claims and retries.
+            if let Some(id) = claimed_session {
+                sessions.remove(&id);
+            }
             if let Err(error) = outcome {
                 self.metrics
                     .counter(
@@ -3262,6 +3323,14 @@ impl Finalizer {
                 // the stale counters → spurious BudgetExceeded on the
                 // fresh incarnation.
                 self.clear_budget_state(&session.id);
+                // Also mirror the round-6 (hunt4 R2) builder drain:
+                // an unsigned session whose close committed the artifact
+                // but failed in the tail reaches close-complete through
+                // THIS sweep, not close_session_locked — without the
+                // drain here its full step builder stayed resident for
+                // the life of the process (unsigned sessions are never
+                // evicted from the registry).
+                session.drain_trajectory_builder();
                 Ok(())
             }
             .await;

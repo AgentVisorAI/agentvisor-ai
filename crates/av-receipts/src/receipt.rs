@@ -366,6 +366,43 @@ impl Receipt {
                 self.body.issued_at_iso, self.body.issued_at, expected_iso
             )));
         }
+        // Cross-check the stop-reason dual representation — the same
+        // split-brain class as issued_at/issued_at_iso above, but with
+        // the same tolerance the events validator settled on (round-17
+        // F1 revised in round-18): `stop_reason` may legitimately carry
+        // a provider-native or free-text caption, so equality with the
+        // canonical caption cannot be required. Refuse only the
+        // unambiguous cross-wiring where the caption IS the canonical
+        // caption of a DIFFERENT known variant than `stop_reason_id`
+        // names (e.g. id 92 "Budget Exceeded" paired with caption
+        // "Stop") — the two signed fields then assert contradictory
+        // outcomes to auditors reading the caption vs tooling reading
+        // the id.
+        let expected_caption = av_events::StopReason::from_id(self.body.stop_reason_id).caption();
+        let id_is_known = matches!(self.body.stop_reason_id, 0..=4 | 90..=94 | 99);
+        let caption_is_canonical_of_other_variant = id_is_known
+            && self.body.stop_reason != expected_caption
+            && [
+                av_events::StopReason::Unknown,
+                av_events::StopReason::Stop,
+                av_events::StopReason::MaxTokens,
+                av_events::StopReason::ToolUse,
+                av_events::StopReason::SessionClosed,
+                av_events::StopReason::ContentFilter,
+                av_events::StopReason::LoopDetected,
+                av_events::StopReason::BudgetExceeded,
+                av_events::StopReason::PolicyBlocked,
+                av_events::StopReason::IdentityRejected,
+                av_events::StopReason::Other,
+            ]
+            .iter()
+            .any(|variant| variant.caption() == self.body.stop_reason);
+        if caption_is_canonical_of_other_variant {
+            return Err(ReceiptError::SemanticInvariant(format!(
+                "stop_reason {:?} is the canonical caption of a different variant than stop_reason_id ({}); expected {:?} or a non-canonical native caption",
+                self.body.stop_reason, self.body.stop_reason_id, expected_caption
+            )));
+        }
         Ok(())
     }
 }
@@ -1043,6 +1080,40 @@ mod tests {
                 receipt.body.issued_at, receipt.body.issued_at_iso,
             );
         }
+    }
+
+    /// A keyholding issuer must not be able to sign a receipt whose
+    /// `stop_reason` caption names a DIFFERENT known variant than
+    /// `stop_reason_id` — auditors reading the caption and tooling
+    /// reading the id would extract contradictory outcomes from one
+    /// verified receipt. Provider-native / free-text captions (which
+    /// coincide with no canonical caption) remain accepted, matching
+    /// the events validator's round-18 tolerance.
+    #[test]
+    fn cross_wired_stop_reason_caption_is_refused_but_native_captions_pass() {
+        let signer = Ed25519Signer::generate();
+        let mut ring = Keyring::new();
+        ring.add_signer(&signer).unwrap();
+        // Cross-wired: id 92 (Budget Exceeded) with the canonical
+        // caption of variant 1 (Stop).
+        let mut wired = body();
+        wired.stop_reason_id = 92;
+        wired.stop_reason = "Stop".to_owned();
+        let error = Receipt::issue(wired, &signer).unwrap().verify(&ring).unwrap_err();
+        assert!(
+            matches!(error, ReceiptError::SemanticInvariant(ref m) if m.contains("canonical caption")),
+            "cross-wired caption must fail verify: {error:?}"
+        );
+        // Native caption: id 1 (Stop) with OpenAI's native "stop".
+        let mut native = body();
+        native.stop_reason_id = 1;
+        native.stop_reason = "stop".to_owned();
+        Receipt::issue(native, &signer).unwrap().verify(&ring).unwrap();
+        // Canonical pairing passes.
+        let mut canonical = body();
+        canonical.stop_reason_id = 1;
+        canonical.stop_reason = "Stop".to_owned();
+        Receipt::issue(canonical, &signer).unwrap().verify(&ring).unwrap();
     }
 
     /// Cross-machine stress: two independently-issued receipts (simulating

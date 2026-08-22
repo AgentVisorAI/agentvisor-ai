@@ -622,6 +622,26 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                     }
                     Ok(ToolExecutionState::Missing) => (Some(execution), None),
                     Err(error) if error == TOOL_REQUEST_MISMATCH => {
+                        // Same session-binding discipline as every other
+                        // `load()` arm above: without it, any holder of a
+                        // valid `tool:<name>`-scoped token could probe
+                        // whether an execution key exists under a DIFFERENT
+                        // request/principal (409 vs the Missing path) for
+                        // sessions it is not bound to — a session-content
+                        // oracle of the same shape as the fixed
+                        // close/promote existence oracle.
+                        let Some(session) = state.sessions.get(&execution.session_id) else {
+                            return pipeline_error(crate::pipeline::PipelineError::BadRequest(
+                                "unknown session for tool execution".to_owned(),
+                            ));
+                        };
+                        if let Err(error) = state.authorize_session(
+                            &headers,
+                            &session,
+                            &crate::pipeline::tool_scope(&execution.tool),
+                        ) {
+                            return pipeline_error(error);
+                        }
                         return (
                             StatusCode::CONFLICT,
                             Json(json!({"error": TOOL_REQUEST_MISMATCH})),
