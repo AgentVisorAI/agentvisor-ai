@@ -2417,6 +2417,11 @@ impl Stream for AbortFinalizingStream {
                 }
             };
             if let Some(reason) = failure {
+                // Genuine mid-stream cap exhaustion: latch the sticky
+                // enforcement marker so the id does not recycle into a
+                // fresh budget after the ensuing close.
+                self.session
+                    .latch_enforcement(av_events::StopReason::BudgetExceeded);
                 if let Err(error) = self.submit_response_capture(Some(reason.clone())) {
                     self.session.mark_capture_failed();
                     self.pending_output.clear();

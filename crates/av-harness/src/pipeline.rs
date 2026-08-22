@@ -815,16 +815,14 @@ impl AppState {
                     "session is quarantined (closed with no captured steps); use a new session id".to_owned(),
                 ));
             }
-            // Enforcement-triggered closes are terminal for the id:
+            // Enforcement-latched sessions are terminal for the id:
             // `get_or_open` deliberately refuses to recycle them (a
             // fresh incarnation would carry a fresh budget/breaker on
             // the same id). 403, matching the deliberate not-429/not-
-            // transient policy for budget and breaker refusals.
-            let stop = session.recorded_stop_reason_id();
-            if session.close_complete_flag()
-                && (stop == u64::from(StopReason::BudgetExceeded.id())
-                    || stop == u64::from(StopReason::LoopDetected.id()))
-            {
+            // transient policy for budget and breaker refusals. Keyed
+            // on the sticky latch, not the overwritable last stop
+            // reason.
+            if session.close_complete_flag() && session.enforcement_tripped() {
                 return Err(PipelineError::Blocked(
                     "session was closed by budget or loop enforcement; use a new session id".to_owned(),
                 ));
@@ -842,11 +840,13 @@ impl AppState {
         if session.loop_state.state() == BreakerState::Open {
             match session.loop_state.action() {
                 BreakerAction::Reject => {
+                    session.latch_enforcement(StopReason::LoopDetected);
                     return Err(PipelineError::Blocked(
                         "semantic loop circuit breaker is open".to_owned(),
                     ));
                 }
                 BreakerAction::Abort => {
+                    session.latch_enforcement(StopReason::LoopDetected);
                     return Err(PipelineError::Abort(
                         "semantic loop circuit breaker requested connection close".to_owned(),
                     ));
@@ -895,6 +895,11 @@ impl AppState {
             }
         };
         if let BudgetDecision::Refused { limit, cap } = quota {
+            // Genuine cap exhaustion — latch (the backend-ERROR arm
+            // above deliberately does not: a store outage is not
+            // enforcement, and latching it converted a transient blip
+            // into a permanent id lockout).
+            session.latch_enforcement(StopReason::BudgetExceeded);
             let error = PipelineError::Blocked(format!("{limit} exceeded (cap {cap})"));
             worker_permit.submit(self.failure_job(
                 Arc::clone(&session),
