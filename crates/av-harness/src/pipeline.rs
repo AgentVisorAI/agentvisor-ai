@@ -258,6 +258,11 @@ pub struct PreparedRequest {
     lease: SessionLease,
     /// Client `Authorization` header captured for passthrough mode only.
     client_authorization: Option<HeaderValue>,
+    /// Provider-semantic client headers relayed upstream verbatim, from
+    /// a strict allowlist only (org/project routing and beta gating —
+    /// dropping them broke org-scoped keys and beta features for
+    /// otherwise drop-in SDK clients). Never auth-bearing.
+    upstream_passthrough_headers: Vec<(axum::http::HeaderName, HeaderValue)>,
 }
 
 /// Provider response paired with its active session lease.
@@ -575,6 +580,10 @@ impl AppState {
             "Signed sessions skipped during recovery due to per-session errors (round-41 F1)",
         );
         metrics.counter(
+            "av_signed_recovery_quarantined_total",
+            "Signed sessions re-adopted as capture-failed quarantines during recovery",
+        );
+        metrics.counter(
             "av_unsigned_recovery_skipped_total",
             "Unsigned step-journal consolidations skipped during recovery due to per-session errors (round-41 F1)",
         );
@@ -775,7 +784,25 @@ impl AppState {
         validate_session_binding(&session, workflow, &identity)?;
         session.refresh_identity(&identity);
         if session.is_closed() {
-            return Err(PipelineError::BadRequest("session is already closed".to_owned()));
+            // Distinguish the PERMANENT quarantine (empty-unsigned close
+            // refusal — deliberately never recycled) from the TRANSIENT
+            // closing window. `get_or_open` recycles completed-close
+            // entries, so a session observed here as closed-but-not-
+            // complete is mid-close: an SDK auto-retry (e.g. after a
+            // read-timeout disconnect triggered the background close)
+            // used to hit a terminal 400 "already closed" — misleading
+            // (the client closed nothing) and never retried by SDKs,
+            // even though the very next attempt would have succeeded
+            // against the recycled id. 503 + Retry-After lets standard
+            // retry policies ride out the window.
+            if session.is_empty_unsigned_quarantine() {
+                return Err(PipelineError::BadRequest(
+                    "session is quarantined (closed with no captured steps); use a new session id".to_owned(),
+                ));
+            }
+            return Err(PipelineError::Unavailable(
+                "session close is completing; retry shortly or use a new session id".to_owned(),
+            ));
         }
         if session.capture_failed() {
             return Err(PipelineError::Unavailable(
@@ -961,6 +988,20 @@ impl AppState {
                 single_header(headers, "authorization")?.cloned()
             } else {
                 None
+            },
+            upstream_passthrough_headers: {
+                // Strict allowlist of provider-semantic headers. Same
+                // single-value discipline as every other relayed header
+                // (a multi-valued occurrence is refused at ingress).
+                const UPSTREAM_HEADER_ALLOWLIST: [&str; 3] =
+                    ["openai-organization", "openai-project", "openai-beta"];
+                let mut relayed = Vec::new();
+                for name in UPSTREAM_HEADER_ALLOWLIST {
+                    if let Some(value) = single_header(headers, name)? {
+                        relayed.push((axum::http::HeaderName::from_static(name), value.clone()));
+                    }
+                }
+                relayed
             },
         })
     }
@@ -1152,6 +1193,7 @@ impl AppState {
             response_permit,
             capture_guard,
             client_authorization,
+            upstream_passthrough_headers,
             debited_tokens,
             ..
         } = request;
@@ -1161,6 +1203,12 @@ impl AppState {
             self.config.upstream_chat_path
         );
         let mut upstream_request = self.client.post(url).json(&payload);
+        // Allowlisted provider-semantic headers (org/project/beta) relay
+        // verbatim so org-scoped keys and beta-gated features keep
+        // working through the proxy.
+        for (name, value) in upstream_passthrough_headers {
+            upstream_request = upstream_request.header(name, value);
+        }
         if let Some((name, value)) = &self.upstream_auth {
             upstream_request = upstream_request.header(name.clone(), value.clone());
         } else if let Some(authorization) = client_authorization {
@@ -1648,7 +1696,34 @@ impl AppState {
             // required (i.e. the client presenting a bearer to a
             // no-op harness).
             (Some(_), None) => {
+                let has_static_key =
+                    self.config.upstream_api_key_env.is_some() || self.config.upstream_api_key_file.is_some();
                 if self.config.upstream_authorization_passthrough {
+                    Ok(AgentIdentity {
+                        version: "dev".to_owned(),
+                        charter: "anonymous".into(),
+                        instance_uid: "anonymous".to_owned(),
+                        ttl_remaining_s: None,
+                    })
+                } else if has_static_key {
+                    // Static-key posture (the wizard's default): the
+                    // operator has declared that THIS PROXY owns the
+                    // upstream credential, and OpenAI-compatible SDKs
+                    // unconditionally send a placeholder bearer (the
+                    // client library refuses to start without one).
+                    // Rejecting here made the flagship onboarding fail
+                    // on request 1 with the official SDK. The
+                    // repudiation rationale for the rejection below
+                    // does not apply: exactly like the passthrough arm
+                    // above, the config itself assigns the client
+                    // bearer a non-identity meaning (a placeholder to
+                    // be REPLACED by the static key — it is never
+                    // forwarded). Accept anonymous; the placeholder
+                    // never reaches the provider.
+                    tracing::debug!(
+                        "client bearer ignored: static upstream key posture (placeholder \
+                         SDK credential, not an identity claim)"
+                    );
                     Ok(AgentIdentity {
                         version: "dev".to_owned(),
                         charter: "anonymous".into(),
