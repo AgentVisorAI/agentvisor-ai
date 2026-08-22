@@ -239,6 +239,10 @@ pub struct PreparedRequest {
     pub payload: Value,
     /// Total local middleware time before upstream I/O.
     pub middleware_us: u64,
+    /// Prompt tokens debited from the session budget at admission
+    /// (`ActionBudget::try_tokens`), kept so a provably-not-forwarded
+    /// abort can refund exactly what was debited. Zeroed after refund.
+    debited_tokens: u64,
     // Fields drop in declaration order. `capture_guard` MUST drop before
     // `lease` on a cancelled request future — the lease's Drop notifies
     // `wait_for_streams`, unblocking `close_session_locked`, which then
@@ -829,6 +833,12 @@ impl AppState {
         let stage = Instant::now();
         if let Err(reason) = self.sandbox.sanitize("chat/completions", &payload) {
             let error = PipelineError::Blocked(reason);
+            // The request provably never reaches the provider: refund the
+            // admission token debit (same compensating-refund policy as
+            // round-33's `refund_tool_call`) so client retries against a
+            // policy block do not drain `max_tokens` with zero LLM work.
+            ActionBudget::new(self.store.as_ref(), &session_id, &self.config.budget)
+                .refund_tokens(prompt_tokens);
             worker_permit.submit(self.failure_job(
                 Arc::clone(&session),
                 identity.clone(),
@@ -857,6 +867,10 @@ impl AppState {
         let atif = match atif_capture_from_request(&compression.payload) {
             Ok(atif) => atif,
             Err(error) => {
+                // Never forwarded — refund the admission debit (see the
+                // sanitize edge above).
+                ActionBudget::new(self.store.as_ref(), &session_id, &self.config.budget)
+                    .refund_tokens(prompt_tokens);
                 worker_permit.submit(self.failure_job(
                     Arc::clone(&session),
                     identity.clone(),
@@ -919,6 +933,7 @@ impl AppState {
             identity,
             payload: compression.payload,
             middleware_us: elapsed_us(total_started),
+            debited_tokens: prompt_tokens,
             lease,
             response_permit: Some(response_permit),
             capture_guard,
@@ -1005,6 +1020,14 @@ impl AppState {
     /// attempt and a later crash-recovery scan quarantines the whole session
     /// over a request the client already saw fail.
     fn abandon_prepared(&self, prepared: &mut PreparedRequest, stop_reason: StopReason, reason: &str) {
+        // Every abandon site runs strictly before upstream dispatch
+        // (durable-capture failure, breaker-open, marker-write failure),
+        // so the admission token debit provably bought no LLM work —
+        // refund it exactly once (zeroed so a hypothetical double
+        // abandon cannot double-refund).
+        let debited = std::mem::take(&mut prepared.debited_tokens);
+        ActionBudget::new(self.store.as_ref(), &prepared.session.id, &self.config.budget)
+            .refund_tokens(debited);
         let Some(permit) = prepared.response_permit.take() else {
             // Defensive: no permit means the guard's Drop is the only
             // resolver left. Leave it armed so the terminal record lands
@@ -1109,6 +1132,7 @@ impl AppState {
             response_permit,
             capture_guard,
             client_authorization,
+            debited_tokens,
             ..
         } = request;
         let url = format!(
@@ -1154,6 +1178,16 @@ impl AppState {
                 // journal or in the Bridge-published failure
                 // record either.
                 let client_reason = classify_upstream_error(&error);
+                // `is_connect()` proves the request never left this
+                // process (TCP/TLS establishment failed) — the admission
+                // token debit bought no LLM work; refund it. Any other
+                // send error (timeout, body, reset mid-response) may have
+                // reached the provider, so the debit conservatively
+                // stands.
+                if error.is_connect() {
+                    ActionBudget::new(self.store.as_ref(), &session.id, &self.config.budget)
+                        .refund_tokens(debited_tokens);
+                }
                 tracing::warn!(
                     session = %session.id,
                     category = client_reason,

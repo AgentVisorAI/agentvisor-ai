@@ -95,14 +95,23 @@ pub fn compress(payload: &Value, cfg: &CompressionConfig) -> CompressionOutcome 
     let tail_start = out.len().saturating_sub(cfg.keep_tail);
 
     let mut changed = false;
+    // Normalization must run BEFORE the duplicate-collapse passes:
+    // it rewrites assistant/tool content (JSON minification), so two
+    // semantically identical messages that differ only in formatting
+    // become byte-identical only AFTER this pass. With dedupe first,
+    // run 1 kept both, normalized them equal, and run 2 then collapsed
+    // one — violating invariant #4, `compress(compress(x)) ==
+    // compress(x)` (lib.rs). Normalize-first is stable: run 2's
+    // normalize is a no-op on already-minified content, so every later
+    // pass sees the same input it saw in run 1's output.
+    if cfg.normalize_json {
+        changed |= normalize_json_content(&mut out, tail_start);
+    }
     changed |= collapse_duplicate_system(&mut out, tail_start);
     if cfg.collapse_duplicates {
         changed |= collapse_duplicate_messages(&mut out, tail_start);
     }
     changed |= stub_stale_tool_outputs(&mut out, tail_start, cfg.tool_output_stub_threshold);
-    if cfg.normalize_json {
-        changed |= normalize_json_content(&mut out, tail_start);
-    }
     if cfg.summarize_middle && tokens_before >= 50_000 {
         changed |= stub_middle_to_target(
             payload,

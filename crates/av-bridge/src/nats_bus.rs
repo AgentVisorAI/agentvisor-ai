@@ -352,6 +352,22 @@ impl EventBus for NatsBus {
                                 "uid lookup info: {error}"
                             )))
                         })?;
+                        // `publish_broker_only` stamps the (possibly freshly
+                        // generated) uid only as the `Nats-Msg-Id` header;
+                        // for events without `metadata.uid` the payload scan
+                        // below can never find the record this bus produced,
+                        // so crash recovery re-published a duplicate once
+                        // outside the JetStream dedup window. Consult the
+                        // header first — same parity fix as KafkaBus's
+                        // `agentvisor-event-uid` header check.
+                        if msg
+                            .headers
+                            .as_ref()
+                            .and_then(|headers| headers.get("Nats-Msg-Id"))
+                            .is_some_and(|value| value.as_str() == page_uid.as_str())
+                        {
+                            return Ok(Page::Found(info.stream_sequence));
+                        }
                         let stored: StoredEvent = serde_json::from_slice(&msg.payload).map_err(|error| {
                             async_nats::Error::from(std::io::Error::other(format!(
                                 "uid lookup decode at sequence {}: {error}",

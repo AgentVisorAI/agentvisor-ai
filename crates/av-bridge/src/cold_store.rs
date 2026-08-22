@@ -249,28 +249,54 @@ impl ColdArchive {
             Err(error) => return Err(BusError::Io(error)),
         };
         let mut completed = 0u64;
+        let mut first_error: Option<BusError> = None;
         for entry in entries {
             let path = entry?.path();
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
                 continue;
             }
-            // Round-6 (hunt3 F6): isolate per-file failures so ONE
-            // corrupt intent does not head-of-line-block cold export
-            // for every other durable intent forever. Any error class
-            // that would abort the loop (unverifiable MAC, decode
-            // failure, filename↔payload mismatch, unavailable target,
-            // remote put failure) is now downgraded to warn + quarantine
-            // + continue.
-            if let Err(error) = self.retry_pending_one(&path, &mut resolve) {
-                self.quarantine_cold_intent(&path, &error);
-                continue;
+            // Round-6 (hunt3 F6, revised): isolate per-intent failures so
+            // ONE poisoned intent does not head-of-line-block cold export
+            // for every other durable intent — but WITHOUT the quarantine
+            // rename the first revision used. Renaming to `.corrupt-*`
+            // destroyed the durability contract for transient classes (a
+            // plain network failure during an outage removed the intent
+            // from the retry queue forever — the only remaining copy of
+            // the event once retention rewrote the hot segment) and
+            // silenced the loud-refusal contract for integrity classes
+            // (MAC tamper, content conflict) that the outbox tests pin.
+            // Instead: keep scanning past the failure so healthy intents
+            // still export this pass, leave the failed intent in place
+            // for the next pass, and surface the first error to the
+            // maintenance caller so `av_bridge_maintenance_errors_total`
+            // fires.
+            match self.retry_pending_one(&path, &mut resolve) {
+                Ok(true) => completed = completed.saturating_add(1),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        path = %av_core::fsutil::basename(&path),
+                        "cold outbox intent failed; left in place for the next retry pass"
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
             }
-            completed = completed.saturating_add(1);
         }
-        Ok(completed)
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(completed),
+        }
     }
 
-    fn retry_pending_one<F>(&self, path: &std::path::Path, resolve: &mut F) -> Result<(), BusError>
+    /// Returns `Ok(true)` when the intent was exported and removed,
+    /// `Ok(false)` for the benign skip cases (racing commit already
+    /// exported it; young in-flight offset-None intent inside the
+    /// publisher's grace window) so the caller does not count a skip as
+    /// a completed export in the maintenance action metric.
+    fn retry_pending_one<F>(&self, path: &std::path::Path, resolve: &mut F) -> Result<bool, BusError>
     where
         F: FnMut(&PendingColdEvent) -> Result<crate::PublishAck, BusError>,
     {
@@ -282,7 +308,7 @@ impl ColdArchive {
             match read_pending(path, &self.control_key.read()) {
                 Ok(pending) => pending,
                 Err(BusError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(());
+                    return Ok(false);
                 }
                 Err(error) => return Err(error),
             }
@@ -298,7 +324,7 @@ impl ColdArchive {
             // MAC-authenticated, so a filesystem tamperer cannot park
             // an intent in the grace window forever.
             if av_core::time::now_ms().saturating_sub(pending.stored_at) < RETRY_GRACE_MS {
-                return Ok(());
+                return Ok(false);
             }
             let ack = resolve(&pending)?;
             if ack.topic != pending.topic || ack.partition != pending.partition {
@@ -317,34 +343,14 @@ impl ColdArchive {
                     persist_pending(path, &pending, &self.control_key.read())?;
                 }
                 Err(BusError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(());
+                    return Ok(false);
                 }
                 Err(error) => return Err(error),
             }
         }
         self.put_remote(&pending)?;
         remove_pending(path)?;
-        Ok(())
-    }
-
-    fn quarantine_cold_intent(&self, path: &std::path::Path, error: &BusError) {
-        let uid = av_core::new_event_uid();
-        let quarantine = path.with_extension(format!("json.corrupt-{uid}"));
-        if let Err(rename_err) = std::fs::rename(path, &quarantine) {
-            tracing::warn!(
-                %error,
-                %rename_err,
-                path = %av_core::fsutil::basename(path),
-                "cold outbox intent failed and could not be quarantined — leaving in place"
-            );
-        } else {
-            tracing::warn!(
-                %error,
-                path = %av_core::fsutil::basename(path),
-                quarantine = %av_core::fsutil::basename(&quarantine),
-                "cold outbox intent quarantined so remaining exports can proceed"
-            );
-        }
+        Ok(true)
     }
 
     fn put_remote(&self, pending: &PendingColdEvent) -> Result<(), BusError> {
