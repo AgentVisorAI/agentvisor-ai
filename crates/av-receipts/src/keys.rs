@@ -145,6 +145,12 @@ pub enum KeyError {
     /// Public key bytes malformed.
     #[error("invalid public key: {0}")]
     InvalidKey(String),
+    /// Public key is a small-order Curve25519 point (identity or a torsion
+    /// element). Such keys let any 64-byte value verify as a signature over
+    /// almost every message — always refused at add time so a compromised
+    /// keyring cannot be constructed.
+    #[error("public key is small-order (weak); refused to add to keyring")]
+    WeakKey,
     /// Signature bytes malformed.
     #[error("invalid signature encoding")]
     InvalidSignature,
@@ -171,8 +177,19 @@ impl Keyring {
     /// silently overwriting it and returns `KeyMismatch` — otherwise an
     /// attacker who found a 128-bit collision could substitute their key for
     /// an honest signer's.
+    ///
+    /// Refuses small-order (weak) public keys — the identity point and the
+    /// order-2/order-4 torsion elements. `Keyring::verify` already routes
+    /// through `verify_strict`, which denies them at verification time; this
+    /// is defense-in-depth so a poisoned ring cannot even be constructed
+    /// and so no other consumer of the ring (e.g. `Receipt::verify_embedded`)
+    /// can be tricked by relying on a non-strict verify. See ed25519-dalek
+    /// 3.0 `VerifyingKey::is_weak` / `verify_strict`.
     pub fn add_key_bytes(&mut self, bytes: &[u8; 32]) -> Result<String, KeyError> {
         let vk = VerifyingKey::from_bytes(bytes).map_err(|e| KeyError::InvalidKey(e.to_string()))?;
+        if vk.is_weak() {
+            return Err(KeyError::WeakKey);
+        }
         let id = derive_key_id(&vk);
         if let Some(existing) = self.keys.get(&id) {
             if existing.as_bytes() != vk.as_bytes() {

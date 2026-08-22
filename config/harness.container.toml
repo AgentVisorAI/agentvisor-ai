@@ -25,6 +25,11 @@ upstream_read_timeout_s = 300
 # require_identity = true and configure identity_jwks_url or
 # identity_hmac_secret_file (see config/harness.docker.toml).
 require_identity = false
+# Container's outer network layer (docker-compose port map, K8s Service +
+# NetworkPolicy) controls who reaches the listener; the 0.0.0.0 bind above
+# is the *container-internal* interface, not host-visible. See
+# config/harness.example.toml for the bare-metal / laptop posture.
+allow_wildcard_bind = true
 
 default_workflow = "unsigned"
 consequential_tools = ["db_write", "payout", "merge", "deploy"]

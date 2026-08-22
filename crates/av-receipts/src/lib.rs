@@ -13,7 +13,7 @@ pub mod receipt;
 
 pub use chain::EventChain;
 pub use jcs::{canonicalize, JcsError};
-pub use keys::{Ed25519Signer, Keyring, Signer};
+pub use keys::{Ed25519Signer, KeyError, Keyring, Signer};
 pub use receipt::{
     CostSummary, Receipt, ReceiptBody, ReceiptError, ReceiptSubject, ToolCallSummary, RECEIPT_VERSION,
 };

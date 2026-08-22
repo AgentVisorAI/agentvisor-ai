@@ -112,6 +112,27 @@ impl Sandbox {
 
     /// Evaluate a raw MCP payload for `session`.
     pub fn check(&self, store: &dyn StateStore, session: &str, raw: &[u8]) -> ToolVerdict {
+        self.check_with_principal(store, session, None, raw)
+    }
+
+    /// Same as [`Self::check`] but layers a principal-scoped budget check
+    /// on top of the session-scoped one. When `principal` is `Some(spec)`,
+    /// the tool call is refused unless BOTH ledgers admit the spend; the
+    /// principal ledger persists across every session belonging to the
+    /// same identity, which is what makes header-rotation attacks
+    /// (§3.2 of the engineering review) visible.
+    ///
+    /// The two ledgers commit independently: if the principal check
+    /// passes and the session check fails, the principal debit is
+    /// refunded on the same dimensions before returning. Both budgets
+    /// must use identical `BudgetSpec` shapes so the refund is exact.
+    pub fn check_with_principal(
+        &self,
+        store: &dyn StateStore,
+        session: &str,
+        principal: Option<(&str, &BudgetSpec)>,
+        raw: &[u8],
+    ) -> ToolVerdict {
         let started = std::time::Instant::now();
         let elapsed = |s: std::time::Instant| u64::try_from(s.elapsed().as_micros()).unwrap_or(u64::MAX);
 
@@ -198,6 +219,76 @@ impl Sandbox {
             }
         };
         let budget = ActionBudget::new(store, session, &self.config.budget);
+        // Principal-scoped pre-check (§3.2 fix). Debit the principal ledger
+        // first — a header-rotation attack that resets the session bucket
+        // still charges the same principal. If the principal ledger admits
+        // the spend but the session ledger refuses, we refund the principal
+        // debit before returning so the failed call consumed no quota
+        // anywhere.
+        if let Some((principal_id, principal_spec)) = principal {
+            let principal_budget =
+                ActionBudget::for_principal(store, principal_id, principal_spec);
+            match principal_budget.try_tool_call(&req.tool, payout_micros) {
+                Ok(BudgetDecision::Allowed { .. }) => {}
+                Ok(BudgetDecision::Refused { limit, cap }) => {
+                    let reason = format!(
+                        "principal action budget exceeded: {limit} (cap {cap})"
+                    );
+                    return ToolVerdict::Blocked {
+                        tool: req.tool.clone(),
+                        stage: "budget",
+                        reason: reason.clone(),
+                        response: authorization_error(req.id.as_ref(), &reason),
+                        elapsed_us: elapsed(started),
+                    };
+                }
+                Err(e) => {
+                    let reason =
+                        format!("principal budget check failed closed: {e}");
+                    return ToolVerdict::Blocked {
+                        tool: req.tool.clone(),
+                        stage: "budget",
+                        reason: reason.clone(),
+                        response: authorization_error(req.id.as_ref(), &reason),
+                        elapsed_us: elapsed(started),
+                    };
+                }
+            }
+            match budget.try_tool_call(&req.tool, payout_micros) {
+                Ok(BudgetDecision::Allowed { remaining }) => {
+                    return ToolVerdict::Allowed {
+                        tool: req.tool,
+                        budget_remaining: remaining,
+                        elapsed_us: elapsed(started),
+                        payout_micros,
+                    };
+                }
+                Ok(BudgetDecision::Refused { limit, cap }) => {
+                    // Session refused; unwind the principal debit so a
+                    // failed call is fully non-consumptive.
+                    principal_budget.refund_tool_call(&req.tool, payout_micros);
+                    let reason = format!("action budget exceeded: {limit} (cap {cap})");
+                    return ToolVerdict::Blocked {
+                        tool: req.tool.clone(),
+                        stage: "budget",
+                        reason: reason.clone(),
+                        response: authorization_error(req.id.as_ref(), &reason),
+                        elapsed_us: elapsed(started),
+                    };
+                }
+                Err(e) => {
+                    principal_budget.refund_tool_call(&req.tool, payout_micros);
+                    let reason = format!("budget check failed closed: {e}");
+                    return ToolVerdict::Blocked {
+                        tool: req.tool.clone(),
+                        stage: "budget",
+                        reason: reason.clone(),
+                        response: authorization_error(req.id.as_ref(), &reason),
+                        elapsed_us: elapsed(started),
+                    };
+                }
+            }
+        }
         match budget.try_tool_call(&req.tool, payout_micros) {
             Ok(BudgetDecision::Allowed { remaining }) => ToolVerdict::Allowed {
                 tool: req.tool,

@@ -878,48 +878,24 @@ impl AppState {
         let response_permit = permits.response;
 
         let stage = Instant::now();
-        let prompt_tokens = av_core::tokens::approx_tokens_json(&payload);
-        let quota = match ActionBudget::new(self.store.as_ref(), &session_id, &self.config.budget)
-            .try_tokens(prompt_tokens)
-        {
-            Ok(quota) => quota,
-            Err(error) => {
-                let error = PipelineError::Blocked(format!("quota backend failed closed: {error}"));
-                worker_permit.submit(self.failure_job(
-                    Arc::clone(&session),
-                    identity.clone(),
-                    StopReason::BudgetExceeded,
-                    error.to_string(),
-                ));
-                return Err(error);
-            }
-        };
-        if let BudgetDecision::Refused { limit, cap } = quota {
-            // Genuine cap exhaustion — latch (the backend-ERROR arm
-            // above deliberately does not: a store outage is not
-            // enforcement, and latching it converted a transient blip
-            // into a permanent id lockout).
-            session.latch_enforcement(StopReason::BudgetExceeded);
-            let error = PipelineError::Blocked(format!("{limit} exceeded (cap {cap})"));
-            worker_permit.submit(self.failure_job(
-                Arc::clone(&session),
-                identity.clone(),
-                StopReason::BudgetExceeded,
-                error.to_string(),
-            ));
-            return Err(error);
-        }
+        let raw_prompt_tokens = av_core::tokens::approx_tokens_json(&payload);
+        // Budget is charged AFTER compression on `compression.tokens_after`
+        // (below). Deferring the debit closes the enforcement/attestation
+        // gap the review flagged in §6.3: previously the ledger was debited
+        // on the uncompressed payload while the receipt attested the
+        // post-compression count, over-charging clients by ~40% on any
+        // compressible history and making compression's savings invisible
+        // to `max_tokens`. The genuine-cap-refusal latch (upstream's
+        // enforcement-latch rounds 11-13) is applied at the deferred
+        // charge site below.
         self.observe_stage("quota", stage);
 
         let stage = Instant::now();
         if let Err(reason) = self.sandbox.sanitize("chat/completions", &payload) {
             let error = PipelineError::Blocked(reason);
-            // The request provably never reaches the provider: refund the
-            // admission token debit (same compensating-refund policy as
-            // round-33's `refund_tool_call`) so client retries against a
-            // policy block do not drain `max_tokens` with zero LLM work.
-            ActionBudget::new(self.store.as_ref(), &session_id, &self.config.budget)
-                .refund_tokens(prompt_tokens);
+            // No token refund needed: the budget debit happens AFTER
+            // compression (below), so a sanitize block exits before
+            // anything was charged.
             worker_permit.submit(self.failure_job(
                 Arc::clone(&session),
                 identity.clone(),
@@ -936,22 +912,123 @@ impl AppState {
         } else {
             av_compress::CompressionOutcome {
                 payload,
-                tokens_before: prompt_tokens,
-                tokens_after: prompt_tokens,
+                tokens_before: raw_prompt_tokens,
+                tokens_after: raw_prompt_tokens,
                 changed: false,
             }
         };
         self.observe_stage("compression", stage);
+
+        // Post-compression budget charge. Both the principal and session
+        // ledgers spend `compression.tokens_after` — the same number
+        // the signed receipt attests, so budget refusals and the audit
+        // artifact always agree. On refusal, if the principal debit
+        // landed but the session cap refuses, the principal amount is
+        // refunded to keep failed requests non-consumptive.
+        let stage = Instant::now();
+        let billed_tokens = compression.tokens_after;
+        let principal_billing_id =
+            self.config
+                .principal_budget
+                .as_ref()
+                .map(|_| principal_id_for_budget(&identity));
+        if let (Some(spec), Some(principal_id)) = (
+            self.config.principal_budget.as_ref(),
+            principal_billing_id.as_deref(),
+        ) {
+            let quota = match ActionBudget::for_principal(self.store.as_ref(), principal_id, spec)
+                .try_tokens(billed_tokens)
+            {
+                Ok(quota) => quota,
+                Err(error) => {
+                    let error = PipelineError::Blocked(format!(
+                        "quota backend failed closed (principal): {error}"
+                    ));
+                    worker_permit.submit(self.failure_job(
+                        Arc::clone(&session),
+                        identity.clone(),
+                        StopReason::BudgetExceeded,
+                        error.to_string(),
+                    ));
+                    return Err(error);
+                }
+            };
+            if let BudgetDecision::Refused { limit, cap } = quota {
+                // Genuine cap exhaustion — latch (upstream rounds 11-13;
+                // the backend-ERROR arms deliberately do not: a store
+                // outage is not enforcement).
+                session.latch_enforcement(StopReason::BudgetExceeded);
+                let error = PipelineError::Blocked(format!(
+                    "principal.{limit} exceeded (cap {cap})"
+                ));
+                worker_permit.submit(self.failure_job(
+                    Arc::clone(&session),
+                    identity.clone(),
+                    StopReason::BudgetExceeded,
+                    error.to_string(),
+                ));
+                return Err(error);
+            }
+        }
+        let quota = match ActionBudget::new(self.store.as_ref(), &session_id, &self.config.budget)
+            .try_tokens(billed_tokens)
+        {
+            Ok(quota) => quota,
+            Err(error) => {
+                if let (Some(spec), Some(principal_id)) = (
+                    self.config.principal_budget.as_ref(),
+                    principal_billing_id.as_deref(),
+                ) {
+                    ActionBudget::for_principal(self.store.as_ref(), principal_id, spec)
+                        .refund_tokens(billed_tokens);
+                }
+                let error = PipelineError::Blocked(format!("quota backend failed closed: {error}"));
+                worker_permit.submit(self.failure_job(
+                    Arc::clone(&session),
+                    identity.clone(),
+                    StopReason::BudgetExceeded,
+                    error.to_string(),
+                ));
+                return Err(error);
+            }
+        };
+        if let BudgetDecision::Refused { limit, cap } = quota {
+            if let (Some(spec), Some(principal_id)) = (
+                self.config.principal_budget.as_ref(),
+                principal_billing_id.as_deref(),
+            ) {
+                ActionBudget::for_principal(self.store.as_ref(), principal_id, spec)
+                    .refund_tokens(billed_tokens);
+            }
+            // Genuine cap exhaustion — latch (upstream rounds 11-13).
+            session.latch_enforcement(StopReason::BudgetExceeded);
+            let error = PipelineError::Blocked(format!("{limit} exceeded (cap {cap})"));
+            worker_permit.submit(self.failure_job(
+                Arc::clone(&session),
+                identity.clone(),
+                StopReason::BudgetExceeded,
+                error.to_string(),
+            ));
+            return Err(error);
+        }
+        self.observe_stage("quota_post_compression", stage);
 
         let stage = Instant::now();
         let text = last_message_text(&compression.payload);
         let atif = match atif_capture_from_request(&compression.payload) {
             Ok(atif) => atif,
             Err(error) => {
-                // Never forwarded — refund the admission debit (see the
-                // sanitize edge above).
+                // Never forwarded — refund the post-compression debit on
+                // BOTH ledgers (see the refusal arms above).
                 ActionBudget::new(self.store.as_ref(), &session_id, &self.config.budget)
-                    .refund_tokens(prompt_tokens);
+                    .refund_tokens(billed_tokens);
+                if let (Some(spec), Some(principal_id)) = (
+                    self.config.principal_budget.as_ref(),
+                    principal_billing_id.as_deref(),
+                ) {
+                    ActionBudget::for_principal(self.store.as_ref(), principal_id, spec)
+                        .refund_tokens(billed_tokens);
+                }
                 worker_permit.submit(self.failure_job(
                     Arc::clone(&session),
                     identity.clone(),
@@ -1014,7 +1091,7 @@ impl AppState {
             identity,
             payload: compression.payload,
             middleware_us: elapsed_us(total_started),
-            debited_tokens: prompt_tokens,
+            debited_tokens: billed_tokens,
             lease,
             response_permit: Some(response_permit),
             capture_guard,
@@ -1293,13 +1370,20 @@ impl AppState {
                 let client_reason = classify_upstream_error(&error);
                 // `is_connect()` proves the request never left this
                 // process (TCP/TLS establishment failed) — the admission
-                // token debit bought no LLM work; refund it. Any other
+                // token debit bought no LLM work; refund it on BOTH
+                // ledgers, in the same order they were spent. Any other
                 // send error (timeout, body, reset mid-response) may have
                 // reached the provider, so the debit conservatively
-                // stands.
+                // stands. Best-effort; a store blip must never turn a
+                // 502 into a 5xx cascade.
                 if error.is_connect() {
                     ActionBudget::new(self.store.as_ref(), &session.id, &self.config.budget)
                         .refund_tokens(debited_tokens);
+                    if let Some(spec) = self.config.principal_budget.as_ref() {
+                        let principal_id = principal_id_for_budget(&identity);
+                        ActionBudget::for_principal(self.store.as_ref(), &principal_id, spec)
+                            .refund_tokens(debited_tokens);
+                    }
                 }
                 tracing::warn!(
                     session = %session.id,
@@ -1423,7 +1507,18 @@ impl AppState {
                     elapsed_us: 0,
                 }
             }
-            _ => self.sandbox.check(self.store.as_ref(), &session_id, raw),
+            _ => {
+                let principal_binding = self
+                    .config
+                    .principal_budget
+                    .as_ref()
+                    .map(|spec| (principal_id_for_budget(&identity), spec));
+                let principal_ref = principal_binding
+                    .as_ref()
+                    .map(|(id, spec)| (id.as_str(), *spec));
+                self.sandbox
+                    .check_with_principal(self.store.as_ref(), &session_id, principal_ref, raw)
+            }
         };
         let (status, payload) = match &verdict {
             ToolVerdict::Allowed {
@@ -1948,6 +2043,24 @@ fn session_id(headers: &HeaderMap) -> Result<String, PipelineError> {
     }
 }
 
+/// Stable id used as the principal-scoped budget key.
+///
+/// For authenticated requests this is the JWT's `instance_uid` (the
+/// per-instance principal name — a single agent workload can hold several
+/// concurrent tokens under one uid). For requests without a validator
+/// (dev mode / passthrough) the identity's `instance_uid` is already the
+/// literal `"anonymous"` sentinel, so this function is a straight
+/// pass-through; the shipping default is a single shared bucket and the
+/// config validator refuses `principal_budget` while `require_identity =
+/// false` unless the operator explicitly acknowledges that shape.
+pub(crate) fn principal_id_for_budget(identity: &AgentIdentity) -> String {
+    if identity.instance_uid.is_empty() {
+        "anonymous".to_owned()
+    } else {
+        identity.instance_uid.clone()
+    }
+}
+
 fn workflow(headers: &HeaderMap, default: &str) -> Result<Workflow, PipelineError> {
     let value = single_header(headers, WORKFLOW_HEADER)?
         .map(|header| {
@@ -2432,6 +2545,56 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// The principal-scoped budget (§3.2 fix) binds across rotating
+    /// X-AV-Session headers: sessions A and B pointed at the same
+    /// principal share one ledger. Without the principal budget, a
+    /// caller could reset the session bucket per request and never
+    /// hit `max_tokens`.
+    #[tokio::test]
+    async fn principal_budget_binds_across_rotated_session_headers() {
+        let mut config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        // Wide session budget so it never binds — we're proving the
+        // *principal* ledger is what refuses the second request.
+        config.budget.max_tokens = Some(1_000_000);
+        // The test payload approximates to ~30 tokens (roughly 2 tokens per
+        // ASCII word + one per punctuation glyph, on the ~60-char JSON body).
+        // A cap of 40 admits the first request and refuses the second under
+        // the same principal — the anti-rotation property in one assertion.
+        config.principal_budget = Some(av_state::BudgetSpec {
+            max_tokens: Some(40),
+            ..av_state::BudgetSpec::default()
+        });
+        let state = state(config);
+
+        // First request under session A: fits the principal budget.
+        let mut headers_a = HeaderMap::new();
+        headers_a.insert(SESSION_HEADER, HeaderValue::from_static("rotated-a"));
+        let first = state.prepare_chat(&headers_a, payload());
+        assert!(first.is_ok(), "first principal request must be admitted");
+        // Cancel the admission so the worker permit drops cleanly.
+        drop(first);
+
+        // Second request under a DIFFERENT session id but the same
+        // principal (anonymous — both requests unauthenticated). The
+        // session ledger for `rotated-b` is virgin; only the principal
+        // ledger can refuse. Refusal proves the header-rotation attack
+        // is closed.
+        let mut headers_b = HeaderMap::new();
+        headers_b.insert(SESSION_HEADER, HeaderValue::from_static("rotated-b"));
+        match state.prepare_chat(&headers_b, payload()) {
+            Ok(_) => panic!(
+                "header rotation defeated principal budget — the fix from §3.2 has regressed"
+            ),
+            Err(PipelineError::Blocked(msg)) => {
+                assert!(
+                    msg.contains("principal."),
+                    "refusal must name the principal-scoped limit, got {msg:?}"
+                );
+            }
+            Err(other) => panic!("unexpected refusal shape {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -104,21 +104,16 @@ fn jcs_rejects_integers_beyond_ieee754_safe_range() {
 #[test]
 fn embedded_all_zero_public_key_is_refused_by_ring() {
     let mut r = Keyring::new();
-    // ed25519_dalek accepts the identity point as a valid encoding but any
-    // signature verification against it is refused; here we prove that
-    // *adding* the all-zero public key either fails (invalid encoding) or
-    // yields a ring that cannot verify a real signature.
-    let added = r.add_key_bytes(&[0u8; 32]);
-    match added {
-        Err(_) => {} // preferred outcome: rejected at add time
-        Ok(id) => {
-            // Otherwise: any signature must fail. Sign something with a real
-            // key and try to verify against the id of the identity key.
-            let s = signer();
-            let sig = s.sign(b"msg");
-            assert!(r.verify(&id, b"msg", &sig).is_err());
-        }
-    }
+    // ed25519_dalek accepts the all-zero encoding (y = 0, x-recovery
+    // succeeds) as a valid point, but it is a small-order Curve25519
+    // element. `add_key_bytes` must refuse it up-front with
+    // `KeyError::WeakKey` so a poisoned ring can never be constructed.
+    let outcome = r.add_key_bytes(&[0u8; 32]);
+    let err = outcome.expect_err("all-zero small-order pubkey must be refused at add time");
+    assert!(
+        matches!(err, av_receipts::KeyError::WeakKey),
+        "expected WeakKey, got {err:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -424,17 +419,29 @@ fn small_order_embedded_public_key_cannot_authenticate_a_receipt() {
             p
         },
     ];
+    // Use a signature byte pattern the strict verifier must reject even if a
+    // future dalek release regressed on small-order pubkey handling: R = the
+    // identity point (canonical encoding 01 00…00) and s = 0 satisfies the
+    // Ed25519 verification equation `s·B = R + h·A` for A a small-order
+    // element, so this is precisely the "universal forgery" shape the review
+    // warned about. A ring/receipt using such a key MUST refuse it.
+    let mut forged_sig = [0u8; 64];
+    forged_sig[0] = 1;
     for (i, point) in small_order_points.iter().enumerate() {
         let mut receipt = Receipt::issue(body("sess-torsion"), &honest).unwrap();
         receipt.body.public_key_b64 = base64::engine::general_purpose::STANDARD.encode(point);
-        // Forged all-zero signature under the small-order key.
-        receipt.signature_b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
+        receipt.signature_b64 = base64::engine::general_purpose::STANDARD.encode(forged_sig);
+        // Both paths route the embedded key through `Keyring::add_key_bytes`,
+        // which now refuses small-order elements with `WeakKey`. The receipt
+        // error surface maps that to `ReceiptError::Key`.
+        let via_ring = receipt.verify(&ring);
         assert!(
-            receipt.verify(&ring).is_err(),
-            "small-order point {i} authenticated a receipt"
+            via_ring.is_err(),
+            "small-order point {i} authenticated a receipt via ring"
         );
+        let via_embedded = receipt.verify_embedded();
         assert!(
-            receipt.verify_embedded().is_err(),
+            via_embedded.is_err(),
             "small-order point {i} authenticated via verify_embedded"
         );
     }
@@ -634,19 +641,14 @@ fn ed25519_point_encoding_with_y_geq_p_is_refused_by_ring() {
     invalid[0] = 0xee;
     invalid[31] = 0x7f;
     let outcome = r.add_key_bytes(&invalid);
-    // Either the ring rejects at add time, or a subsequent verify against
-    // it must fail — both are acceptable outcomes for a malformed point.
-    match outcome {
-        Err(_) => {}
-        Ok(id) => {
-            let s = signer();
-            let sig = s.sign(b"msg");
-            assert!(
-                r.verify(&id, b"msg", &sig).is_err(),
-                "verify succeeded under an invalid (y ≥ p) public key"
-            );
-        }
-    }
+    let err = outcome.expect_err("out-of-range / weak encoding must be refused at add time");
+    // dalek 3.0's `VerifyingKey::from_bytes` may reject this outright
+    // (`InvalidKey`) or reduce it into a small-order point (`WeakKey`);
+    // both outcomes prove the ring cannot be poisoned with the encoding.
+    assert!(
+        matches!(err, av_receipts::KeyError::InvalidKey(_) | av_receipts::KeyError::WeakKey),
+        "expected InvalidKey or WeakKey, got {err:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

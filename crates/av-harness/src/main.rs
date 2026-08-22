@@ -62,7 +62,32 @@ async fn main() -> Result<()> {
     let signer_path = std::env::var_os("AV_SIGNING_SEED_FILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("config/signing.seed"));
-    let signer: Arc<dyn Signer> = Arc::new(load_or_create_signer(&signer_path)?);
+    let (raw_signer, signer_newly_generated) = load_or_create_signer(&signer_path)?;
+    // Capture the identifying material BEFORE moving into an `Arc<dyn Signer>`
+    // so the startup banner can name the exact trust anchor the process
+    // will sign under. Omitting this line is how a silent-new-anchor failure
+    // (missing/emptied seed file → freshly generated seed → every receipt
+    // signed by an untrusted key) can go undetected: without the id in the
+    // log, only an external verifier days later notices, at which point the
+    // audit chain for that window is unrecoverable.
+    let signer_key_id = raw_signer.key_id().to_owned();
+    let signer_public_key_hex = hex::encode(raw_signer.public_key_bytes());
+    if signer_newly_generated {
+        // A fresh anchor is only correct at genuine first boot. Every other
+        // occurrence (Secret failed to mount, emptyDir vanished, seed file
+        // deleted) is a compliance incident: audit consumers that trusted
+        // the previous key will reject every receipt issued from here on.
+        // Emit at WARN so the log pipeline surfaces it without needing a
+        // Prometheus gauge (the metrics registry has no gauge type yet;
+        // see the operability review §8.4).
+        tracing::warn!(
+            signer_key_id = %signer_key_id,
+            signer_public_key_hex = %signer_public_key_hex,
+            signer_seed_path = %signer_path.display(),
+            "signing seed was freshly generated at startup — an operator that had trusted a previous key must re-pin this one before any receipt from this instance verifies"
+        );
+    }
+    let signer: Arc<dyn Signer> = Arc::new(raw_signer);
     bridge
         .set_control_key(av_harness::control_key_from_signer(signer.as_ref()))
         .context("configure Bridge control authentication")?;
@@ -149,6 +174,14 @@ async fn main() -> Result<()> {
         bridge = %config.bridge_backend,
         state = %config.state_backend,
         identity = if config.require_identity { "required" } else { "optional" },
+        // Always surface the exact receipt-signing trust anchor. This is the
+        // simplest observable signal that a Secret mount, an emptyDir volume,
+        // or a hand-managed seed file survived the boot — an operator or an
+        // audit-log consumer can compare it against the previously-published
+        // public key without waiting for the first receipt to fail
+        // downstream. See operability review §8.4.
+        signer_key_id = %signer_key_id,
+        signer_public_key_hex = %signer_public_key_hex,
         "AgentVisor AI started"
     );
     let (shutdown_started_tx, shutdown_started_rx) = tokio::sync::oneshot::channel();
@@ -1124,9 +1157,9 @@ async fn build_vector_sink(config: &HarnessConfig, _dimension: usize) -> Result<
     }
 }
 
-fn load_or_create_signer(path: &Path) -> Result<Ed25519Signer> {
+fn load_or_create_signer(path: &Path) -> Result<(Ed25519Signer, bool)> {
     match read_signer(path) {
-        Ok(signer) => return Ok(signer),
+        Ok(signer) => return Ok((signer, false)),
         Err(error)
             if error
                 .downcast_ref::<std::io::Error>()
@@ -1147,9 +1180,14 @@ fn load_or_create_signer(path: &Path) -> Result<Ed25519Signer> {
     #[allow(clippy::needless_borrows_for_generic_args)]
     let encoded_seed = zeroize::Zeroizing::new(hex::encode(&*seed));
     if install_seed_exclusive(path, &encoded_seed)? {
-        Ok(signer)
+        Ok((signer, true))
     } else {
-        read_signer(path).context("load signing seed installed by another process")
+        // A concurrent process installed a seed while we generated ours;
+        // pick up its key — but this is NOT a fresh-anchor event from our
+        // point of view, so mark newly_generated = false.
+        let existing =
+            read_signer(path).context("load signing seed installed by another process")?;
+        Ok((existing, false))
     }
 }
 
@@ -1495,9 +1533,11 @@ mod tests {
     fn signing_seed_is_persisted_and_reused() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("key.seed");
-        let first = load_or_create_signer(&path).unwrap();
-        let second = load_or_create_signer(&path).unwrap();
+        let (first, first_generated) = load_or_create_signer(&path).unwrap();
+        let (second, second_generated) = load_or_create_signer(&path).unwrap();
         assert_eq!(first.key_id(), second.key_id());
+        assert!(first_generated, "first call must report the seed was freshly generated");
+        assert!(!second_generated, "second call must observe the persisted seed");
         assert_eq!(std::fs::read_to_string(path).unwrap().trim().len(), 64);
     }
 
@@ -1545,7 +1585,7 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    load_or_create_signer(&path).unwrap().key_id().to_owned()
+                    load_or_create_signer(&path).unwrap().0.key_id().to_owned()
                 })
             })
             .collect();
