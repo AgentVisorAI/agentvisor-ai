@@ -83,10 +83,14 @@ impl<'a> ActionBudget<'a> {
     /// Check-and-spend one invocation of `tool`, with an optional payout
     /// amount in micro-USD carried by this call.
     ///
-    /// Dimensions are checked in a fixed order (total calls → per-tool →
-    /// payout) and committed atomically via `try_spend_many`: every
-    /// dimension is validated first and either all spends commit or none
-    /// do, so a refused call consumes nothing.
+    /// A non-zero payout with NO configured `max_payout_usd_micros`
+    /// refuses first (fail-closed: an unbounded payout dimension must
+    /// never spend), citing `max_payout_usd_micros(unset)` — even when
+    /// another dimension is also at cap. The remaining dimensions are
+    /// then checked in a fixed order (total calls → per-tool → payout)
+    /// and committed atomically via `try_spend_many`: every dimension
+    /// is validated first and either all spends commit or none do, so
+    /// a refused call consumes nothing.
     pub fn try_tool_call(&self, tool: &str, payout_usd_micros: u64) -> Result<BudgetDecision, StateError> {
         // Parallel arrays keep spends and limit-names together without paying
         // for a joined-tuple clone before hitting the state store. There are

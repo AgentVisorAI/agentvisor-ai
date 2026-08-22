@@ -13,7 +13,7 @@ async fn qdrant_collection_and_record_contract() {
         return;
     };
     let collection = format!("agentvisor_test_{}", av_core::new_event_uid().replace('-', ""));
-    let sink = QdrantVectorSink::new(url, collection).unwrap();
+    let sink = QdrantVectorSink::new(url.clone(), collection.clone()).unwrap();
     #[cfg(feature = "onnx")]
     let vector = match (
         std::env::var("AV_ONNX_MODEL_PATH"),
@@ -39,4 +39,11 @@ async fn qdrant_collection_and_record_contract() {
         .unwrap()
         .unwrap();
     assert!(score > 0.999, "unexpected nearest-neighbor score {score}");
+    // Clean up the per-run collection: without this every run left an
+    // `agentvisor_test_*` collection behind, growing the live server
+    // without bound across CI reruns.
+    let endpoint = format!("{}/collections/{collection}", url.trim_end_matches('/'));
+    if let Err(error) = reqwest::Client::new().delete(&endpoint).send().await {
+        eprintln!("test-collection cleanup failed (server keeps one stray collection): {error}");
+    }
 }

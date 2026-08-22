@@ -101,10 +101,10 @@ cargo install --path crates/av-cli       # installs `avctl`
 | `openai` | api.openai.com | `OPENAI_API_KEY` |
 | `azure` | your-resource.openai.azure.com | `AZURE_OPENAI_API_KEY` |
 | `anthropic` | api.anthropic.com | `ANTHROPIC_API_KEY` |
-| `gemini` | generativelanguage.googleapis.com | `GEMINI_API_KEY` |
-| `groq` | api.groq.com | `GROQ_API_KEY` |
+| `gemini` | generativelanguage.googleapis.com/v1beta/openai | `GEMINI_API_KEY` |
+| `groq` | api.groq.com/openai | `GROQ_API_KEY` |
 | `mistral` | api.mistral.ai | `MISTRAL_API_KEY` |
-| `openrouter` | openrouter.ai | `OPENROUTER_API_KEY` |
+| `openrouter` | openrouter.ai/api | `OPENROUTER_API_KEY` |
 | `together` | api.together.xyz | `TOGETHER_API_KEY` |
 | `deepseek` | api.deepseek.com | `DEEPSEEK_API_KEY` |
 | `xai` | api.x.ai | `XAI_API_KEY` |

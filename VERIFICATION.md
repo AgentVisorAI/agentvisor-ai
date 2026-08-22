@@ -72,17 +72,26 @@ wrapper is `avctl receipt-verify <file> --public-key-hex <64-hex>`.
 
 1. **Strict parse.** Reject the document if any JSON object at ANY
    nesting level contains a duplicate key (serde/JS parsers silently
-   keep one — a signed duplicate is evidence-splitting), if nesting
-   exceeds depth 128, or if the top level contains any key outside
+   keep one — a signed duplicate is evidence-splitting), if any field
+   carries an explicit JSON `null` (absent options are omitted, never
+   null), if nesting reaches depth 128 (127 levels parse; 128 is
+   refused), or if the top level contains any key outside
    this exact set: `receipt_version`, `receipt_id`, `session_id`,
    `issued_at`, `issued_at_iso`, `ai_agent`, `subject`, `tool_calls`,
    `cost`, `stop_reason_id`, `stop_reason`, `key_id`,
    `public_key_b64`, `signature_b64`.
 2. **Semantic invariants.** `receipt_version` must be `1`. When
-   `subject.type == "atif_trajectory"`, `subject.retroactive` must be
-   `true`. `issued_at_iso` must equal the RFC 3339 UTC rendering of
+   `subject.kind == "atif_trajectory"`, `subject.retroactive` must be
+   `true` and `subject.trajectory_digest` must be exactly 64 lowercase
+   hex characters; when `subject.kind == "event_chain"`,
+   `subject.chain_head` must be exactly 64 lowercase hex characters.
+   `issued_at_iso` must equal the RFC 3339 UTC rendering of
    `issued_at` (epoch milliseconds) with exactly millisecond precision
-   and a `Z` suffix (e.g. `1970-01-01T00:00:00.000Z`).
+   and a `Z` suffix (e.g. `1970-01-01T00:00:00.000Z`). When
+   `stop_reason_id` names a known reason, `stop_reason` must not be
+   the canonical caption of a *different* known reason (provider-native
+   free-text captions are permitted; cross-wired canonical captions
+   are refused).
 3. **Key binding.** Base64-decode `public_key_b64` (standard alphabet,
    padded); it must be exactly 32 bytes and a valid Ed25519 point.
    Compute `SHA-256(public_key_bytes)`; the first 32 lowercase hex
@@ -101,8 +110,11 @@ wrapper is `avctl receipt-verify <file> --public-key-hex <64-hex>`.
    encodings; the reference uses ed25519-dalek `verify_strict`).
 
 Any step failing means the receipt does not attest anything. For
-`subject.type == "atif_trajectory"`, additionally compare
+`subject.kind == "atif_trajectory"`, additionally compare
 `subject.trajectory_digest` against `SHA-256(file bytes)` of the ATIF
-artifact you hold; for `subject.type == "event_chain"`, the
-`chain_head`/`event_count` bind the OCSF event-chain replay (see
-ARCHITECTURE.md for the chain hash construction).
+artifact you hold; for `subject.kind == "event_chain"`, the
+`chain_head`/`event_count` bind the OCSF event-chain replay. The chain
+construction is: `h0 = SHA-256("av-genesis" || session_id)`,
+`h(i) = SHA-256(h(i-1) || JCS(event_i))` with events ordered by
+`metadata.sequence`; `chain_head` is the final hash rendered as
+lowercase hex and `event_count` the number of events folded in.

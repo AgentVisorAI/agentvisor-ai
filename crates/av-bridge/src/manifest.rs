@@ -249,6 +249,21 @@ impl BridgeManifest {
             {
                 return Err(ManifestError::Invalid(format!("unsafe topic name {:?}", t.name)));
             }
+            // Length parity with the schema's `maxLength: 249`. 249 is
+            // Kafka's documented topic-name limit — the tightest real
+            // backend bound, and safely below filesystem NAME_MAX (255)
+            // for the embedded broker's per-topic directory and NATS's
+            // `av_`-prefixed stream name. Without a Rust-side bound, a
+            // longer name passed `avctl manifest-validate` while
+            // external schema tooling rejected it (split verdicts) and
+            // only failed at provision time.
+            if t.name.len() > 249 {
+                return Err(ManifestError::Invalid(format!(
+                    "topic name {:?}... is {} bytes, above the 249-byte limit",
+                    t.name.get(..24).unwrap_or(&t.name),
+                    t.name.len()
+                )));
+            }
             if t.partitions == 0 {
                 return Err(ManifestError::Invalid(format!(
                     "topic {:?} has 0 partitions",

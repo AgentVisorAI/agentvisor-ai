@@ -327,9 +327,19 @@ fn strict_null_and_extra_conformance(
                     continue;
                 }
                 // Unconstrained interiors (bare `array` / string-or-array
-                // `oneOf`): the container value itself must not be null,
-                // but its contents are schema-free.
-                if key == "tool_calls" || key == "message" || (key == "content" && parent_key == "results") {
+                // `oneOf` / object-only tool-definition items): the
+                // container value itself must not be null, but its
+                // contents are schema-free. `tool_definitions` interiors
+                // in particular routinely carry legitimate explicit
+                // nulls (OpenAI function schemas: `"default": null`,
+                // `"enum": [null, ...]`) and nested keys named `extra` —
+                // the shipped schema pins the items only as
+                // `{"type":"object","maxProperties":128}`.
+                if key == "tool_calls"
+                    || key == "message"
+                    || (key == "tool_definitions" && parent_key == "agent")
+                    || (key == "content" && parent_key == "results")
+                {
                     if child.is_null() {
                         issue!(
                             issues,
@@ -782,7 +792,7 @@ fn validate_step(
     // timestamp: optional ISO 8601.
     if let Some(timestamp) = obj.get("timestamp") {
         match timestamp.as_str() {
-            Some(ts) if is_iso8601(ts) => {}
+            Some(ts) if is_iso8601(ts, mode == Mode::Strict) => {}
             Some(ts) => issue!(
                 issues,
                 format!("{path}.timestamp"),
@@ -893,6 +903,16 @@ fn validate_step(
             format!("{path}.llm_call_count"),
             "must be a non-negative integer"
         );
+    }
+    // Same wrong-type class as the round-16 F2 (`model_name`) and
+    // round-6 hunt2 F1 (`is_copied_context`) fixes: the typed model is
+    // `Option<String>`, and a non-string here passed strict validation
+    // while every typed consumer failed to load the document.
+    if obj
+        .get("reasoning_content")
+        .is_some_and(|v| !v.is_string() && !v.is_null())
+    {
+        issue!(issues, format!("{path}.reasoning_content"), "must be a string");
     }
     if source == Some("agent") && obj.get("llm_call_count").and_then(Value::as_u64) == Some(0) {
         for field in ["metrics", "reasoning_content"] {
@@ -1241,7 +1261,7 @@ fn validate_step(
 }
 
 /// Minimal-but-strict ISO-8601 validation: `YYYY-MM-DDTHH:MM:SS[.fff...][Z|±HH:MM]`.
-fn is_iso8601(s: &str) -> bool {
+fn is_iso8601(s: &str, require_offset: bool) -> bool {
     let b = s.as_bytes();
     if b.len() < 19 {
         return false;
@@ -1301,12 +1321,13 @@ fn is_iso8601(s: &str) -> bool {
         }
     }
     match b.get(i) {
-        // Naive timestamps (no timezone) are valid bare ISO-8601, but
-        // the shipped schema pins `format: date-time` (RFC 3339), which
-        // REQUIRES an offset — a naive timestamp passing strict here
-        // while failing external schema tooling broke the strict-valid
-        // ⇒ schema-valid invariant.
-        None => false,
+        // Naive timestamps (no offset) are valid bare ISO-8601, so
+        // Compat mode — the designated tolerance path for foreign
+        // writers (Python's `datetime.isoformat()` emits exactly this
+        // shape) — accepts them. The shipped schema pins
+        // `format: date-time` (RFC 3339), which REQUIRES an offset, so
+        // Strict mode refuses them (strict-valid ⇒ schema-valid).
+        None => !require_offset,
         Some(b'Z' | b'z') => i + 1 == b.len(),
         Some(b'+' | b'-') => {
             let (Some(oh), Some(om)) = (digits(i + 1..i + 3), digits(i + 4..i + 6)) else {
@@ -1379,8 +1400,15 @@ mod tests {
             "2025-01-15T10:30:00+05:30",
             "2025-01-15T10:30:00.999999-08:00",
         ] {
-            assert!(is_iso8601(ts), "should accept {ts}");
+            assert!(is_iso8601(ts, true), "strict should accept {ts}");
+            assert!(is_iso8601(ts, false), "compat should accept {ts}");
         }
+        // Naive (offset-less) timestamps: valid bare ISO-8601 (compat
+        // tolerates foreign writers like Python's isoformat()) but NOT
+        // RFC 3339 — the shipped schema's `format: date-time` rejects
+        // them, so strict must too (strict ⇒ schema-valid).
+        assert!(is_iso8601("2025-01-15T10:30:00", false));
+        assert!(!is_iso8601("2025-01-15T10:30:00", true));
     }
 
     #[test]
@@ -1391,10 +1419,6 @@ mod tests {
             "2025-13-01T00:00:00Z",
             "2025-02-29T00:00:00Z",
             "2025-01-32T00:00:00Z",
-            // Naive (offset-less) timestamps are valid bare ISO-8601 but
-            // NOT RFC 3339 — the shipped schema's `format: date-time`
-            // rejects them, so strict must too (strict ⇒ schema-valid).
-            "2025-01-15T10:30:00",
             "2025-01-15T24:00:00Z",
             "2025-01-15T10:61:00Z",
             "2025-01-15T10:30:00.Z",
@@ -1402,7 +1426,8 @@ mod tests {
             "2025-01-15T10:30:00+5:30",
             "not-a-date",
         ] {
-            assert!(!is_iso8601(ts), "should reject {ts}");
+            assert!(!is_iso8601(ts, true), "should reject {ts}");
+            assert!(!is_iso8601(ts, false), "should reject {ts}");
         }
     }
 
