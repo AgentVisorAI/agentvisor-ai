@@ -203,21 +203,41 @@ spec:
           # readiness/liveness afterwards.
           startupProbe:
             httpGet:
-              path: /health
+              path: /livez
               port: http
             periodSeconds: 5
             failureThreshold: 60 # 5 minutes total (5 s * 60)
+          # Readiness answers "should this pod receive traffic RIGHT NOW".
+          # Points at /readyz so an in-progress shutdown drain (the pod
+          # sets `draining = true` before axum stops accepting) or a
+          # missing spool volume immediately steers new connections
+          # elsewhere. See engineering review §8.3.
           readinessProbe:
             httpGet:
-              path: /health
+              path: /readyz
               port: http
             periodSeconds: 5
+          # Liveness answers "is the process wedged". Points at /livez
+          # which is a constant reply — never coupled to backend health,
+          # so a transient state-store outage does not cause a pod-restart
+          # cascade.
           livenessProbe:
             httpGet:
-              path: /health
+              path: /livez
               port: http
             periodSeconds: 10
             failureThreshold: 3
+          # preStop gives the LB / Service the readiness-controlled drain
+          # window BEFORE SIGTERM. Without this, deleting a pod races
+          # kubelet's SIGTERM against the Service endpoint update — an
+          # in-flight request can arrive after the harness has stopped
+          # accepting. 5 s is enough for one Service reconciliation
+          # cycle; tune with `terminationGracePeriodSeconds` if the
+          # cluster's endpoint controller runs slower.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"]
           resources:
             requests:
               cpu: 250m

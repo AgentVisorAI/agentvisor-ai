@@ -262,6 +262,16 @@ pub struct HarnessConfig {
     /// Reconciler tick interval (seconds).
     #[serde(default = "default_reconcile_tick")]
     pub reconcile_tick_s: u64,
+    /// Days after which sealed ATIF trajectories and their `.atif-auth`
+    /// provenance sidecars are pruned from the spool. `None` (the shipping
+    /// default) preserves prior behaviour — the ATIF spool grows without
+    /// bound, matching an on-prem deployment that manages retention with
+    /// an external cron. Setting a positive value enables a periodic
+    /// prune sweep that removes pairs older than the window, keeping the
+    /// reconciler's per-tick scan cost bounded even for high-throughput
+    /// deployments. See engineering review §8.1 and §8.2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atif_retention_days: Option<u32>,
     /// Maximum request body size accepted on `/v1/chat/completions` and
     /// `/mcp`. Defaults to 4 MiB, matching the sandbox's `MAX_PAYLOAD_BYTES`
     /// so both routes carry the same effective limit — axum's own
@@ -1255,6 +1265,7 @@ impl HarnessConfig {
             principal_budget: None,
             allow_anonymous_principal_budget: false,
             reconcile_tick_s: 1,
+            atif_retention_days: None,
             max_request_bytes: default_max_request_bytes(),
             dashboard_enabled: default_dashboard_enabled(),
         }
