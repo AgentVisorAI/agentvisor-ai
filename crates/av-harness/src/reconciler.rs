@@ -1161,12 +1161,12 @@ impl Finalizer {
             })
             .collect();
         let mut recovered = 0usize;
-        // Snapshot the live-session hash-stems so the orphan quarantine
-        // sweep can skip an in-flight close before it renames the
-        // freshly-written atif/atif-auth pair. See §8.5 of the review;
-        // the MIN_ORPHAN_AGE guard below is defense-in-depth for
-        // sessions that opened after this snapshot.
-        let live_stems = sessions.live_atif_stems();
+        // `known_stems` above doubles as the §8.5 orphan-quarantine
+        // guard set: the sweep must not quarantine a sidecar-less
+        // `{stem}.json` whose stem belongs to a live session (an
+        // in-progress close between write_atomic and the sidecar
+        // seal). The MIN_ORPHAN_AGE guard below is defense-in-depth
+        // for sessions opened after this snapshot.
         while let Some(entry) = entries
             .next_entry()
             .await
@@ -1234,7 +1234,7 @@ impl Finalizer {
                     .map(str::to_owned);
                 if stem_owned
                     .as_deref()
-                    .is_some_and(|stem| live_stems.contains(stem))
+                    .is_some_and(|stem| known_stems.contains(stem))
                 {
                     continue;
                 }
@@ -5280,6 +5280,59 @@ mod tests {
         assert!(
             !quarantined,
             "no `.corrupt-*` sibling may be produced when the stem belongs to a live session"
+        );
+    }
+
+    /// Round-51 §8.1/§8.2: a sealed pair whose session is already in
+    /// the registry must be skipped in O(1) — WITHOUT re-reading,
+    /// re-parsing, or re-validating the trajectory bytes on every
+    /// tick. Proven by planting deliberately INVALID JSON under a
+    /// live session's stem with a sidecar present: pre-fix the scan
+    /// would read + fail-parse it every tick (incrementing the
+    /// invalid_json skip counter); post-fix the registry hit skips
+    /// before the read, so the counter stays at zero.
+    #[tokio::test]
+    async fn registered_session_pair_is_skipped_without_reading_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let finalizer = finalizer(directory.path());
+
+        let live = session(Workflow::Unsigned);
+        let stem = av_core::digest::sha256_hex(live.id.as_bytes())[..32].to_owned();
+        std::fs::write(
+            directory.path().join(format!("{stem}.json")),
+            b"{this is not json and must never be parsed on a steady-state tick",
+        )
+        .unwrap();
+        std::fs::write(directory.path().join(format!("{stem}.atif-auth")), b"sidecar").unwrap();
+
+        let registry = SessionRegistry::new();
+        registry.insert_recovered(Session::new(
+            live.id.clone(),
+            Workflow::Unsigned,
+            AgentIdentity {
+                version: "1".to_owned(),
+                charter: "test".into(),
+                instance_uid: "instance-1".to_owned(),
+                ttl_remaining_s: Some(600),
+            },
+            Default::default(),
+        ));
+
+        finalizer
+            .recover_spooled_sessions(&registry, &Default::default())
+            .await
+            .unwrap();
+
+        let invalid_json_skips = finalizer
+            .metrics
+            .counter(
+                "av_atif_recovery_skipped_total{reason=\"invalid_json\"}",
+                "ATIF spool files skipped during recovery",
+            )
+            .get();
+        assert_eq!(
+            invalid_json_skips, 0,
+            "a registered session's sealed pair must be skipped before the bytes are read — steady-state ticks must not pay O(file) per recovered session"
         );
     }
 

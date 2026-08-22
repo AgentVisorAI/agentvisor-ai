@@ -98,6 +98,11 @@ pub struct AppState {
 pub(crate) struct HotMetrics {
     pub(crate) stage_histograms: [Arc<av_core::metrics::Histogram>; 5],
     pub(crate) stage_strict_budget_counters: [Arc<av_core::metrics::Counter>; 5],
+    /// Round-51 §7.3: `config.strict_stage_budget || AV_STRICT_BUDGET`
+    /// resolved ONCE at construction. `std::env::var` was previously
+    /// called per stage per request because `||` cannot short-circuit
+    /// a false config default.
+    pub(crate) strict_stage_budget: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -144,7 +149,7 @@ impl Stage {
 }
 
 impl HotMetrics {
-    fn new(metrics: &Registry) -> Self {
+    fn new(metrics: &Registry, config_strict_stage_budget: bool) -> Self {
         // Registrations here mirror the boot loop below. Using the
         // same `metrics.histogram_with_bounds` / `metrics.counter`
         // getters means these entries are shared with the lazy path
@@ -170,6 +175,7 @@ impl HotMetrics {
         Self {
             stage_histograms,
             stage_strict_budget_counters,
+            strict_stage_budget: config_strict_stage_budget || truthy_env("AV_STRICT_BUDGET"),
         }
     }
 }
@@ -693,6 +699,36 @@ impl AppState {
             "av_pending_close_completion_failed_total",
             "Pending-close completions that failed to finish their tail (round-43 F1)",
         );
+        // Round-51 §8.7: pre-register data-plane series so dashboards
+        // render flat-zero from boot instead of "No data", and
+        // `rate() > 0` alerts can fire the first time the bad thing
+        // happens.
+        for kind in ["timeout", "connect", "send", "http_5xx"] {
+            metrics.counter(
+                &format!("av_upstream_errors_total{{kind=\"{kind}\"}}"),
+                "Upstream failures by kind",
+            );
+        }
+        metrics.histogram_with_bounds(
+            "av_upstream_latency_seconds",
+            "Time to upstream response headers",
+            av_core::metrics::WIDE_LATENCY_BOUNDS_US,
+        );
+        for route in ["chat", "mcp", "session_close", "session_promote"] {
+            for status_class in ["2xx", "4xx", "5xx"] {
+                metrics.counter(
+                    &format!(
+                        "av_requests_total{{route=\"{route}\",status_class=\"{status_class}\"}}"
+                    ),
+                    "HTTP requests by route and status class",
+                );
+            }
+            metrics.histogram_with_bounds(
+                &format!("av_request_duration_seconds{{route=\"{route}\"}}"),
+                "End-to-end HTTP request latency by route",
+                av_core::metrics::WIDE_LATENCY_BOUNDS_US,
+            );
+        }
         for reason in [
             "too_large",
             "read_error",
@@ -815,6 +851,7 @@ impl AppState {
             .map_err(|error| PipelineError::Upstream(error.to_string()))?;
         let upstream_auth = resolve_upstream_auth(&config)?;
         let tool_auth = resolve_tool_auth(&config)?;
+        let hot_metrics = Arc::new(HotMetrics::new(&metrics, config.strict_stage_budget));
         Ok(Self {
             config,
             store,
@@ -823,7 +860,7 @@ impl AppState {
             sessions,
             worker,
             identity,
-            hot_metrics: Arc::new(HotMetrics::new(&metrics)),
+            hot_metrics,
             metrics,
             client,
             upstream_auth,
@@ -1358,16 +1395,25 @@ impl AppState {
         // one-to-one-with-request invariant. Fall back to a
         // session-id-derived digest so a hypothetical failure at
         // least keeps distinct sessions distinct.
-        let request_digest = match serde_json::to_vec(&request.payload) {
-            Ok(bytes) => av_core::digest::sha256_hex(&bytes),
+        // Round-51 §7.2 (W4): serialize the payload exactly ONCE — the
+        // bytes feed both the request digest and the upstream body.
+        // Previously `serde_json::to_vec` here and reqwest's
+        // `.json(&payload)` one screen apart produced identical bytes
+        // twice per request.
+        let payload_bytes = match serde_json::to_vec(&request.payload) {
+            Ok(bytes) => Some(bytes),
             Err(error) => {
                 tracing::error!(
                     %error,
                     session = %request.session.id,
                     "failed to serialise chat payload for request digest; falling back to session-derived digest"
                 );
-                av_core::digest::sha256_hex(request.session.id.as_bytes())
+                None
             }
+        };
+        let request_digest = match &payload_bytes {
+            Some(bytes) => av_core::digest::sha256_hex(bytes),
+            None => av_core::digest::sha256_hex(request.session.id.as_bytes()),
         };
         // Round-6 cancellation fix: arm the guard with the marker id
         // BEFORE the awaited disk write. If the client disconnects
@@ -1424,7 +1470,17 @@ impl AppState {
             self.config.upstream_url.trim_end_matches('/'),
             self.config.upstream_chat_path
         );
-        let mut upstream_request = self.client.post(url).json(&payload);
+        // Reuse the digest's serialization for the upstream body; the
+        // theoretical to_vec failure above falls back to reqwest's
+        // own `.json()` serialization (same bytes, second attempt).
+        let mut upstream_request = match payload_bytes {
+            Some(bytes) => self
+                .client
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(bytes),
+            None => self.client.post(url).json(&payload),
+        };
         // Allowlisted provider-semantic headers (org/project/beta) relay
         // verbatim so org-scoped keys and beta-gated features keep
         // working through the proxy.
@@ -1439,14 +1495,48 @@ impl AppState {
             // with static keys and with NHI identity enforcement.
             upstream_request = upstream_request.header(reqwest::header::AUTHORIZATION, authorization);
         }
+        // Round-51 §8.7: upstream latency (time-to-response-headers)
+        // and error counters — the two failure-mode-table rows the
+        // review marked "logs only, no metric".
+        let upstream_started = Instant::now();
         match upstream_request.send().await {
-            Ok(response) => Ok(ForwardedResponse {
-                response,
-                lease,
-                response_permit,
-                capture_guard,
-            }),
+            Ok(response) => {
+                self.metrics
+                    .histogram_with_bounds(
+                        "av_upstream_latency_seconds",
+                        "Time to upstream response headers",
+                        av_core::metrics::WIDE_LATENCY_BOUNDS_US,
+                    )
+                    .observe_us(elapsed_us(upstream_started));
+                if response.status().is_server_error() {
+                    self.metrics
+                        .counter(
+                            "av_upstream_errors_total{kind=\"http_5xx\"}",
+                            "Upstream failures by kind",
+                        )
+                        .inc();
+                }
+                Ok(ForwardedResponse {
+                    response,
+                    lease,
+                    response_permit,
+                    capture_guard,
+                })
+            }
             Err(error) => {
+                let kind = if error.is_timeout() {
+                    "timeout"
+                } else if error.is_connect() {
+                    "connect"
+                } else {
+                    "send"
+                };
+                self.metrics
+                    .counter(
+                        &format!("av_upstream_errors_total{{kind=\"{kind}\"}}"),
+                        "Upstream failures by kind",
+                    )
+                    .inc();
                 // Round-35 F1: `reqwest::Error::Display` embeds the
                 // request URL (see the round-34 F4 rule at
                 // routes.rs::read_limited_tool_response — the same
@@ -2013,8 +2103,7 @@ impl AppState {
         // to for known stages).
         if let Some(known) = Stage::from_label(stage) {
             self.hot_metrics.stage_histograms[known.index()].observe_us(elapsed);
-            if (self.config.strict_stage_budget || truthy_env("AV_STRICT_BUDGET")) && elapsed > 2_000
-            {
+            if self.hot_metrics.strict_stage_budget && elapsed > 2_000 {
                 self.hot_metrics.stage_strict_budget_counters[known.index()].inc();
                 tracing::warn!(stage, elapsed_us = elapsed, "strict stage budget exceeded");
             }
@@ -2026,7 +2115,7 @@ impl AppState {
                 "Harness stage latency",
             )
             .observe_us(elapsed);
-        if (self.config.strict_stage_budget || truthy_env("AV_STRICT_BUDGET")) && elapsed > 2_000 {
+        if self.hot_metrics.strict_stage_budget && elapsed > 2_000 {
             self.metrics
                 .counter(
                     &format!("av_strict_budget_breaches_total{{stage=\"{stage}\"}}"),

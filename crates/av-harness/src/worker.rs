@@ -429,6 +429,13 @@ impl WorkerHandle {
         }
     }
 
+    /// Number of accepted-but-not-yet-completed jobs. Sampled by the
+    /// `/metrics` scrape into the `av_worker_queue_depth` gauge
+    /// (round-51 §8.7).
+    pub fn queue_depth(&self) -> u64 {
+        self.pending.load(Ordering::Acquire)
+    }
+
     fn worker_job_finished(&self) {
         if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.drained.notify_waiters();
