@@ -64,6 +64,15 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Print the public key (hex + key_id) derived from an Ed25519 seed
+    /// file. Use this to pin a trusted public key for
+    /// `avctl receipt-verify` without ever exposing the seed.
+    Pubkey {
+        /// Seed file (64 hexadecimal characters of raw 32-byte seed,
+        /// as produced by `avctl keygen`).
+        #[arg(long)]
+        seed: PathBuf,
+    },
     /// Verify a receipt offline using an independently trusted public key.
     ReceiptVerify {
         /// Receipt JSON file.
@@ -179,6 +188,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Doctor { offline } => setup::doctor(offline).await,
         Command::Health { url } => setup::health(&url).await,
         Command::Keygen { output } => keygen(&output),
+        Command::Pubkey { seed } => pubkey(&seed),
         Command::ReceiptVerify { path, public_key_hex } => receipt_verify(&path, &public_key_hex),
         Command::AtifValidate { path, mode } => atif_validate(&path, mode),
         Command::ManifestValidate { path } => manifest_validate(&path),
@@ -247,6 +257,45 @@ fn keygen(path: &Path) -> Result<()> {
     if !install_seed_exclusive(path, &encoded)? {
         anyhow::bail!("refusing to overwrite existing key {}", path.display());
     }
+    println!(
+        "{}",
+        serde_json::json!({
+            "key_id": signer.key_id(),
+            "public_key_hex": hex::encode(signer.public_key_bytes()),
+            "seed_file": path,
+        })
+    );
+    Ok(())
+}
+
+/// Load an Ed25519 seed file and print the derived public key + key_id.
+/// This exists so operators can pin a trusted public key for
+/// `avctl receipt-verify` without ever exposing seed material — the
+/// only bytes read from disk are the hex-encoded seed, and only the
+/// derived public key is printed.
+fn pubkey(path: &Path) -> Result<()> {
+    use zeroize::Zeroizing;
+    let encoded = Zeroizing::new(
+        av_core::fsutil::read_capped_string(path, av_core::fsutil::MAX_CONTROL_BYTES)
+            .with_context(|| format!("read signing seed {}", path.display()))?,
+    );
+    let bytes = Zeroizing::new(
+        hex::decode(encoded.trim()).context("decode signing seed as hex")?,
+    );
+    let seed: Zeroizing<[u8; 32]> = Zeroizing::new(
+        <[u8; 32]>::try_from(bytes.as_slice())
+            .map_err(|_| anyhow::anyhow!("signing seed must contain exactly 32 bytes"))?,
+    );
+    // Mirror the startup-guard refusal — printing the public key of a
+    // known-weak seed would give an operator false confidence that
+    // their pinned key is unique to this deployment.
+    if *seed == [0u8; 32] || *seed == [0xFFu8; 32] {
+        anyhow::bail!(
+            "signing seed at {} is a known-weak seed with a globally predictable public key; refusing to print",
+            path.display()
+        );
+    }
+    let signer = Ed25519Signer::from_seed(&seed);
     println!(
         "{}",
         serde_json::json!({
