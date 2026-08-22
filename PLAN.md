@@ -1,5 +1,10 @@
 # AgentVisor AI — Engineering Plan
 
+> **Historical planning document.** This captured the pre-implementation
+> plan and its environment snapshot; details like the toolchain version,
+> binary names, and directory layout have since changed. For the current
+> state see `README.md`, `ARCHITECTURE.md`, and `VERIFICATION.md`.
+
 Source of truth: `AgentBridge.docx` v2.0 ("Technical Architecture Brief: The Agent Event Bridge & Harness (MVP)").
 External specs verified against primary sources on 2026-08-10:
 
