@@ -1,0 +1,45 @@
+[package]
+name = "av-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+# Not in the workspace: cargo-fuzz manages its own dependency tree and
+# needs a nightly toolchain, so keeping it out of the default workspace
+# means `cargo build --workspace` stays on stable.
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+
+av-harness = { path = "../crates/av-harness" }
+av-receipts = { path = "../crates/av-receipts" }
+av-sandbox = { path = "../crates/av-sandbox" }
+
+[[bin]]
+name = "canonicalize_receipt_subject"
+path = "fuzz_targets/canonicalize_receipt_subject.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "parse_provider_chunk"
+path = "fuzz_targets/parse_provider_chunk.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sse_frame_end"
+path = "fuzz_targets/sse_frame_end.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "parse_tool_call"
+path = "fuzz_targets/parse_tool_call.rs"
+test = false
+doc = false

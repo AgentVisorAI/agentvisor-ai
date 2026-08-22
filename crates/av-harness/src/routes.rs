@@ -2405,6 +2405,25 @@ fn push_bounded(target: &mut String, value: &str, field: &str) -> Result<(), Str
     Ok(())
 }
 
+/// Fuzz-only shim over the internal `parse_provider_chunk` — accepts
+/// arbitrary bytes and returns nothing (the fuzz harness just cares
+/// that the parser is total under Unicode / SSE malformation). Not
+/// part of the stable API; see [`crate::fuzz`] for the documented
+/// re-export path.
+#[doc(hidden)]
+pub fn __fuzz_parse_provider_chunk(raw: &[u8]) {
+    if let Ok(s) = std::str::from_utf8(raw) {
+        let _ = parse_provider_chunk(s);
+    }
+}
+
+/// Fuzz-only shim over the internal `sse_frame_end` framing scanner.
+/// See [`__fuzz_parse_provider_chunk`] for rationale.
+#[doc(hidden)]
+pub fn __fuzz_sse_frame_end(raw: &[u8]) {
+    let _ = sse_frame_end(raw);
+}
+
 fn sse_frame_end(buffer: &[u8]) -> Option<usize> {
     let mut line_start = 0usize;
     let mut index = 0usize;

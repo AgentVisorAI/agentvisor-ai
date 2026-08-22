@@ -15,6 +15,9 @@ the latter, start with `ARCHITECTURE.md` at the repo root.
   semantics.
 * [`OPERATIONS.md`](OPERATIONS.md) — boot, health probes, key
   rotation, spool recovery, and the metrics you should alert on.
+* [`SPOOL-AND-RECOVERY.md`](SPOOL-AND-RECOVERY.md) — file-by-file
+  inventory of the ATIF spool, what the reconciler does on every
+  tick, and the three tight races the current fixes address.
 * [`LIMITS.md`](LIMITS.md) — hard ceilings enforced by the harness and
   the refusal points on request size, budgets, loops, and
   compression.

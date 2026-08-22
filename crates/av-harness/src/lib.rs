@@ -28,3 +28,12 @@ pub use config::HarnessConfig;
 pub use journal::key_from_signer as control_key_from_signer;
 pub use pipeline::AppState;
 pub use routes::build_router;
+
+/// Internal-only re-exports for coverage-guided fuzzing. Not part of
+/// the stable API; do not depend on these outside `fuzz/`. The
+/// `#[doc(hidden)]` attribute keeps rustdoc from listing them.
+#[doc(hidden)]
+pub mod fuzz {
+    pub use crate::routes::__fuzz_parse_provider_chunk as parse_provider_chunk;
+    pub use crate::routes::__fuzz_sse_frame_end as sse_frame_end;
+}
