@@ -720,6 +720,23 @@ impl SessionRegistry {
         match self.sessions.entry(id.to_owned()) {
             Entry::Occupied(mut occupied) => {
                 if reopen_after_close && occupied.get().close_complete_flag() {
+                    // Enforcement-triggered closes must NOT silently
+                    // recycle: a session closed because its token budget
+                    // was exhausted (or its loop breaker aborted) would
+                    // otherwise reopen under the SAME id with a fresh
+                    // budget and fresh breaker — verified live as a
+                    // strict 200/403/200/403 alternation that rides the
+                    // per-session cap at ~50% duty forever. Per-session
+                    // budgets cannot stop a client spreading across NEW
+                    // ids (inherent to per-session semantics), but the
+                    // same id must stay terminally refused so each
+                    // incarnation is an explicit, distinct audit entity.
+                    let stop = occupied.get().recorded_stop_reason_id();
+                    let enforcement_close = stop == u64::from(av_events::StopReason::BudgetExceeded.id())
+                        || stop == u64::from(av_events::StopReason::LoopDetected.id());
+                    if enforcement_close {
+                        return occupied.get().clone();
+                    }
                     let fresh = Arc::new(Session::new(
                         id.to_owned(),
                         workflow,
@@ -984,6 +1001,38 @@ mod tests {
         );
         assert!(!second.is_closed(), "reopened session must accept new work");
         assert_eq!(registry.len(), 1, "id remains a single registry entry");
+    }
+
+    /// Enforcement-triggered closes are terminal for the session id:
+    /// recycling would hand the SAME id a fresh budget and fresh
+    /// breaker — verified live as a 200/403 alternation riding the
+    /// per-session token cap at ~50% duty forever.
+    #[test]
+    fn get_or_open_refuses_to_recycle_enforcement_closed_sessions() {
+        let registry = SessionRegistry::new();
+        let breaker = av_loopdetect::BreakerConfig::default();
+        for reason in [StopReason::BudgetExceeded, StopReason::LoopDetected] {
+            let id = format!("enforced-{}", reason.id());
+            let first = registry.get_or_open(&id, Workflow::Unsigned, &identity(), &breaker);
+            first.record_stop_reason(reason);
+            assert!(first.try_close());
+            first.mark_artifact_committed();
+            first.mark_close_complete();
+            let second = registry.get_or_open(&id, Workflow::Unsigned, &identity(), &breaker);
+            assert!(
+                Arc::ptr_eq(&first, &second),
+                "enforcement-closed session must NOT be recycled ({reason:?})"
+            );
+            assert!(second.is_closed(), "the id must stay refused ({reason:?})");
+        }
+        // A natural close (SessionClosed) still recycles.
+        let first = registry.get_or_open("natural", Workflow::Unsigned, &identity(), &breaker);
+        first.record_stop_reason(StopReason::SessionClosed);
+        assert!(first.try_close());
+        first.mark_artifact_committed();
+        first.mark_close_complete();
+        let second = registry.get_or_open("natural", Workflow::Unsigned, &identity(), &breaker);
+        assert!(!Arc::ptr_eq(&first, &second), "natural closes keep recycling");
     }
 
     /// A session that has *started* close but has not completed it
