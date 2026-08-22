@@ -83,6 +83,11 @@ pub struct AppState {
     /// stops routing new traffic to a draining pod before axum's
     /// graceful drain begins. See operability review §8.3.
     pub draining: Arc<std::sync::atomic::AtomicBool>,
+    /// Round-51 §3.4: sliding one-minute budget for FULL identity-
+    /// rejection audit records (window start, records written).
+    /// Rejections beyond the budget are counted only — see
+    /// `enqueue_transient_failure`.
+    pub(crate) identity_rejection_window: Arc<parking_lot::Mutex<(Instant, u32)>>,
     pub(crate) journal_key: [u8; 32],
 }
 
@@ -869,6 +874,7 @@ impl AppState {
             tool_audits_emitted: Arc::default(),
             finalizer,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            identity_rejection_window: Arc::new(parking_lot::Mutex::new((Instant::now(), 0))),
             journal_key,
         })
     }
@@ -1852,6 +1858,41 @@ impl AppState {
         stop_reason: StopReason,
         reason: String,
     ) -> Result<(), PipelineError> {
+        // Engineering-review §3.4 (round-51): every identity rejection
+        // used to mint a DISTINCT signed audit session — two fsynced
+        // spool files, a bridge publish, a reconciler adoption and an
+        // Ed25519 signature per credential-free 401 probe. A curl loop
+        // against a hardened deployment turned each rejection into
+        // durable server-side work that nothing ever coalesced. Keep
+        // the full per-rejection audit record for a bounded number of
+        // rejections per minute (enough for forensic sampling), and
+        // beyond that budget count-only: the metric and a rate-limited
+        // WARN preserve the signal while the signed-receipt lifecycle
+        // is no longer attacker-drivable.
+        self.metrics
+            .counter(
+                "av_identity_rejections_total",
+                "Requests refused by identity validation",
+            )
+            .inc();
+        const MAX_AUDITED_REJECTIONS_PER_MINUTE: u32 = 60;
+        {
+            let now = Instant::now();
+            let mut window = self.identity_rejection_window.lock();
+            if now.duration_since(window.0) >= std::time::Duration::from_secs(60) {
+                *window = (now, 0);
+            }
+            if window.1 >= MAX_AUDITED_REJECTIONS_PER_MINUTE {
+                self.metrics
+                    .counter(
+                        "av_identity_rejections_unaudited_total",
+                        "Identity rejections beyond the per-minute audit-record budget (counted only)",
+                    )
+                    .inc();
+                return Ok(());
+            }
+            window.1 += 1;
+        }
         let audit_session_id = format!("identity-rejected-{}", av_core::new_event_uid());
         let identity = AgentIdentity {
             version: "unknown".to_owned(),
@@ -3569,6 +3610,44 @@ mod tests {
         let err = with_passthrough.validate().unwrap_err();
         assert!(err.contains("ignore_client_authorization"), "{err}");
         assert!(err.contains("passthrough"), "{err}");
+    }
+
+    /// Round-51 §3.4: a credential-free 401 flood must not mint an
+    /// unbounded stream of durable signed audit sessions. The first
+    /// 60 rejections per minute get full audit records; the rest are
+    /// counted only. Proven by driving 100 rejections and asserting
+    /// the overflow counter carries the surplus.
+    #[tokio::test]
+    async fn identity_rejection_audit_records_are_bounded_per_minute() {
+        let state = null_state();
+        for i in 0..100u32 {
+            state
+                .enqueue_transient_failure(
+                    &format!("probe-{i}"),
+                    StopReason::IdentityRejected,
+                    "missing bearer token".to_owned(),
+                )
+                .unwrap();
+        }
+        let total = state
+            .metrics
+            .counter(
+                "av_identity_rejections_total",
+                "Requests refused by identity validation",
+            )
+            .get();
+        let unaudited = state
+            .metrics
+            .counter(
+                "av_identity_rejections_unaudited_total",
+                "Identity rejections beyond the per-minute audit-record budget (counted only)",
+            )
+            .get();
+        assert_eq!(total, 100, "every rejection must be counted");
+        assert_eq!(
+            unaudited, 40,
+            "rejections beyond the 60/min budget must be count-only, not signed audit sessions"
+        );
     }
 
     /// Round-15 F3: RFC 7235 §2.1 auth-scheme is case-insensitive.
