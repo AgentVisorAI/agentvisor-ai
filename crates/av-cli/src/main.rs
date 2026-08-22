@@ -636,8 +636,9 @@ async fn loadgen(
     let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
     let token = bearer_token(token_file)?.map(Arc::<str>::from);
     // Unique per run: reusing ids like `load-0` across runs would bind to
-    // sessions a previous run left behind — sealed ones refuse reuse with
-    // 400 "session is already closed".
+    // sessions a previous run left behind — mid-close ones refuse reuse
+    // with 503 "session close is completing" and quarantined ones with a
+    // 400.
     let run_id = av_core::new_event_uid();
     let started = Instant::now();
     let results: Vec<Result<u64, String>> = stream::iter(0..connections)

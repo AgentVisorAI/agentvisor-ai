@@ -773,6 +773,10 @@ impl Finalizer {
         if session.workflow == Workflow::Unsigned {
             session.drain_trajectory_builder();
         }
+        // Release the loop-detector's retained embedding: closed
+        // sessions never observe() again, and retained unsigned
+        // sessions otherwise pin ~2 KB of dead vector each, forever.
+        session.loop_state.release_embedding();
         self.clear_budget_state(&session.id);
         Ok(outcome)
     }
@@ -3362,6 +3366,9 @@ impl Finalizer {
                 // the life of the process (unsigned sessions are never
                 // evicted from the registry).
                 session.drain_trajectory_builder();
+                // Mirror the close-tail embedding release (see
+                // close_session_locked).
+                session.loop_state.release_embedding();
                 Ok(())
             }
             .await;
@@ -3796,7 +3803,25 @@ pub fn spawn_reconciler(
                         .counter("av_reconcile_errors_total", "Reconciliation errors")
                         .inc();
                 }
-                for session in sessions.idle_sessions(idle_s) {
+                // Bounded batch: idle closes run serially inside the
+                // tick (each is a full finalize with journal + broker
+                // I/O), and an unbounded batch collapsed tick cadence
+                // under churn — soak-measured single ticks of ~150 s
+                // while thousands of aborted sessions went idle at
+                // once, starving close/promote calls and pending-close
+                // completion for minutes. Cap the per-tick batch; the
+                // remainder is still idle next tick and closes then.
+                const MAX_IDLE_CLOSES_PER_TICK: usize = 64;
+                let idle = sessions.idle_sessions(idle_s);
+                let deferred = idle.len().saturating_sub(MAX_IDLE_CLOSES_PER_TICK);
+                if deferred > 0 {
+                    tracing::info!(
+                        closing = MAX_IDLE_CLOSES_PER_TICK,
+                        deferred,
+                        "idle-close batch capped; remaining sessions close on later ticks"
+                    );
+                }
+                for session in idle.into_iter().take(MAX_IDLE_CLOSES_PER_TICK) {
                     let session_id = session.id.clone();
                     if let Err(error) = finalizer.close_session(session, StopReason::SessionClosed).await {
                         tracing::warn!(session = %session_id, %error, "idle session finalization failed");

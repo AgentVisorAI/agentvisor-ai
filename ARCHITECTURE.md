@@ -53,6 +53,16 @@ A session is opened on first use and assigned `signed` or `unsigned` once. Close
 
 Tool forwarding holds a session lease through bounded response capture and completion auditing. JSON-RPC ids back durable execution claims; uncertain crash outcomes are never re-executed automatically. Shutdown bounds HTTP drain, worker drain, and OTLP flush independently.
 
+**Spool retention:** the ATIF spool (`atif_spool_dir`) has no built-in
+retention — every unsigned artifact (plus its provenance sidecar and
+close marker), every archived prior incarnation of a recycled session
+id, and every receipt is kept indefinitely as audit evidence. Operators
+own its lifecycle: archive and prune it externally (it is plain files;
+receipts and trajectories remain verifiable offline after being moved).
+Unbounded spool growth also grows the reconciler's periodic scan cost,
+so pruning is an operational requirement for long-lived, high-churn
+deployments, not merely a disk-space concern.
+
 ## Portability
 
 The manifest declares topics, partitions, retention, cold storage, and JSON Schema references. Embedded provisioning copies and compiles referenced schemas. Kafka verifies partitions and `retention.ms`; NATS configures stream age. Secured endpoints are environment-driven: `AV_KAFKA_CA_FILE` plus `AV_KAFKA_SASL_USERNAME`/`AV_KAFKA_SASL_PASSWORD` (mechanism from `AV_KAFKA_SASL_MECHANISM`: `SCRAM-SHA-256` default, `SCRAM-SHA-512`, or `PLAIN`; credentials are refused without TLS) for Kafka/Redpanda, `AV_NATS_CA_FILE` plus `AV_NATS_USER`/`AV_NATS_PASSWORD` for NATS. Cold writes use deterministic object keys plus a local durable retry outbox (`AV_COLD_OUTBOX_DIR` overrides its location; network backends default to the CWD-relative `data/cold-outbox`, the embedded broker to `<bridge_data_dir>/cold-outbox`), independently of broker acknowledgment; `s3://` targets (feature `cold-store-aws`) take standard `AWS_*` credentials.

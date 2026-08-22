@@ -224,6 +224,18 @@ impl SessionLoopState {
         inner.prev_embedding = None;
         inner.tokens_consumed = 0;
     }
+
+    /// Release the retained embedding buffer.
+    ///
+    /// Unsigned sessions stay registered for the process lifetime by
+    /// design, and each one otherwise pins its last response embedding
+    /// (dim × f32, ~2 KB at 512 dims) forever — dead weight after
+    /// close, since a closed session never calls `observe` again
+    /// (soak-measured at ~20 % of the per-retained-session footprint).
+    /// Unlike [`Self::reset`], the breaker verdict state is preserved.
+    pub fn release_embedding(&self) {
+        self.inner.lock().prev_embedding = None;
+    }
 }
 
 #[cfg(test)]
