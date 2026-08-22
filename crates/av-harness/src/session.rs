@@ -452,21 +452,23 @@ impl Session {
                         return Err("recovered stop reason exceeds u8".to_owned());
                     }
                     session.last_stop_reason_id.store(id, Ordering::Release);
-                    // Best-effort latch restoration across restart: the
-                    // sticky enforcement flag is in-memory only. Seed it
-                    // ONLY from a persisted LoopDetected — the single
-                    // stop reason with exactly one recording source (the
-                    // worker's breaker-trip verdict, which also latches
-                    // live). BudgetExceeded is deliberately NOT seeded:
-                    // it has three recording sources (genuine refusal,
-                    // quota-backend outage, blocked tool call) and only
-                    // the first latches live, so seeding it would lock
-                    // out ids the live process never locked. Cost: a
-                    // budget-latched unsigned id forgets its refusal
-                    // across a restart — the same bounded degradation
-                    // already accepted for signed workflows.
-                    if id == u64::from(StopReason::LoopDetected.id()) {
-                        session.enforcement_tripped.store(id, Ordering::Release);
+                }
+                // Latch restoration across restart, from the EXPLICITLY
+                // persisted latch value — never inferred from the stop
+                // reason, which Inject-action breaker trips also record
+                // without latching live (a restart used to upgrade such
+                // deliberately non-terminal trips into permanent id
+                // lockouts). Absent key (pre-latch artifacts,
+                // consolidation-rebuilt artifacts) means no latch.
+                if let Some(latched) = extra
+                    .get("enforcement_latched")
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    if latched > u64::from(u8::MAX) {
+                        return Err("recovered enforcement latch exceeds u8".to_owned());
+                    }
+                    if latched != 0 {
+                        session.enforcement_tripped.store(latched, Ordering::Release);
                     }
                 }
             } else if let Some(cost) = metrics.total_cost_usd {
@@ -623,6 +625,14 @@ impl Session {
     /// True when an enforcement refusal was latched on this session.
     pub(crate) fn enforcement_tripped(&self) -> bool {
         self.enforcement_tripped.load(Ordering::Acquire) != 0
+    }
+
+    /// Raw latched enforcement id (0 = never latched) — persisted into
+    /// the unsigned artifact's final-metrics extra at close so the
+    /// refusal survives restarts without inferring it from the
+    /// overwritable, action-ambiguous stop reason.
+    pub(crate) fn enforcement_latched_id(&self) -> u64 {
+        self.enforcement_tripped.load(Ordering::Acquire)
     }
 
     /// Build the receipt body for this session (signed close or promotion).
@@ -1085,6 +1095,66 @@ mod tests {
         );
         assert!(!second.is_closed(), "reopened session must accept new work");
         assert_eq!(registry.len(), 1, "id remains a single registry entry");
+    }
+
+    /// The latch is restored across restarts ONLY from the explicitly
+    /// persisted `enforcement_latched` field — never inferred from
+    /// `stop_reason_id`, which Inject-action breaker trips also record
+    /// without latching live.
+    #[test]
+    fn recover_unsigned_restores_only_the_persisted_latch() {
+        let breaker = av_loopdetect::BreakerConfig::default();
+        let metrics = |extra: serde_json::Value| av_atif::FinalMetrics {
+            total_prompt_tokens: Some(1),
+            total_completion_tokens: Some(1),
+            total_cached_tokens: Some(0),
+            total_cost_usd: Some(0.0),
+            total_steps: Some(1),
+            extra: Some(extra),
+        };
+        // Persisted latch restores the refusal.
+        let latched = Session::recover_unsigned(
+            "latched".into(),
+            identity(),
+            breaker.clone(),
+            PathBuf::from("latched.json"),
+            Some(&metrics(serde_json::json!({
+                "stop_reason_id": 92u64,
+                "enforcement_latched": 92u64,
+            }))),
+            1,
+        )
+        .unwrap();
+        assert!(latched.enforcement_tripped(), "persisted latch must restore");
+        // A LoopDetected stop reason WITHOUT the latch key (Inject trip,
+        // or a legacy pre-latch artifact) must NOT lock the id.
+        let inject = Session::recover_unsigned(
+            "inject".into(),
+            identity(),
+            breaker.clone(),
+            PathBuf::from("inject.json"),
+            Some(&metrics(serde_json::json!({"stop_reason_id": 91u64}))),
+            1,
+        )
+        .unwrap();
+        assert!(
+            !inject.enforcement_tripped(),
+            "stop reason alone must not restore the latch"
+        );
+        // Explicit zero means unlatched.
+        let natural = Session::recover_unsigned(
+            "natural".into(),
+            identity(),
+            breaker,
+            PathBuf::from("natural.json"),
+            Some(&metrics(serde_json::json!({
+                "stop_reason_id": 1u64,
+                "enforcement_latched": 0u64,
+            }))),
+            1,
+        )
+        .unwrap();
+        assert!(!natural.enforcement_tripped());
     }
 
     /// Enforcement-latched sessions are terminal for the session id:
