@@ -20,8 +20,13 @@ thiserror = { workspace = true }
 jsonschema = { workspace = true }
 
 [features]
-default = ["wasm"]
+default = []
 # WebAssembly policy modules via wasmtime (brief §8 sandboxing engine).
+# NOT default: wasmtime is a large dependency (~10 MB compiled) and
+# many consumers of av-sandbox only need the schema / policy / budget
+# gates. Enable explicitly with `features = ["wasm"]` when needed;
+# `av-harness` opts in unconditionally because its `Sandbox::new`
+# path exercises WASM policies against every MCP tool call.
 wasm = ["dep:wasmtime"]
 
 [dependencies.wasmtime]
