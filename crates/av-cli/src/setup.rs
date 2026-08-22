@@ -228,6 +228,16 @@ fn render_config(plan: &ConfigPlan) -> String {
         out.push_str("# Empty scheme sends the key raw (no \"Bearer \" prefix).\n");
         out.push_str(&format!("upstream_auth_scheme = \"{scheme}\"\n"));
     }
+    out.push_str("\n# OpenAI SDKs require an api_key and always send an Authorization header.\n");
+    out.push_str("# This dev-mode flag accepts and DISCARDS that header (it is never\n");
+    out.push_str("# forwarded upstream; the key above is injected instead), so the\n");
+    out.push_str("# one-line quickstart works with any stock SDK. Remove it when you\n");
+    out.push_str("# turn on require_identity.\n");
+    out.push_str("ignore_client_authorization = true\n\n");
+    out.push_str("# Sign every session close with an Ed25519 receipt (the product's\n");
+    out.push_str("# core promise). \"unsigned\" produces ATIF trajectories without\n");
+    out.push_str("# signatures; clients can override per request via X-AV-Workflow.\n");
+    out.push_str("default_workflow = \"signed\"\n");
     out.push_str("\n# Signed receipts, OCSF events, and ATIF trajectories are written here.\n");
     match &plan.data_root {
         Some(root) => {

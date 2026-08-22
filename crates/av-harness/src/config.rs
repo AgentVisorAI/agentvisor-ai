@@ -85,6 +85,22 @@ pub struct HarnessConfig {
     /// the static key options above.
     #[serde(default)]
     pub upstream_authorization_passthrough: bool,
+    /// Accept and DISCARD a client `Authorization` header when no identity
+    /// validator is configured. This is the "hero snippet" mode: every
+    /// stock OpenAI SDK requires an `api_key` and sends
+    /// `Authorization: Bearer <it>` unconditionally, but a dev harness
+    /// with no validator used to hard-401 that request — making the
+    /// documented one-line quickstart fail on request one. With this
+    /// flag the header is treated as if absent: the request proceeds
+    /// anonymously, the header is NEVER forwarded upstream (the
+    /// server-side key is injected instead), and nothing is recorded
+    /// from it. Refused in combination with `require_identity = true`
+    /// (the validator must see the header) and with
+    /// `upstream_authorization_passthrough = true` (contradictory:
+    /// cannot both discard and forward). `avctl init` writes this for
+    /// dev presets so the README quickstart works out of the box.
+    #[serde(default)]
+    pub ignore_client_authorization: bool,
     /// Name of an environment variable holding a bearer token for
     /// `tool_upstream_url` requests.
     #[serde(default)]
@@ -783,6 +799,20 @@ impl HarnessConfig {
                     .into(),
             );
         }
+        if self.ignore_client_authorization && self.require_identity {
+            return Err(
+                "ignore_client_authorization cannot be combined with require_identity: the \
+                 identity validator must see the Authorization header, not discard it"
+                    .into(),
+            );
+        }
+        if self.ignore_client_authorization && self.upstream_authorization_passthrough {
+            return Err(
+                "ignore_client_authorization conflicts with upstream_authorization_passthrough: \
+                 a client Authorization header cannot be both discarded and forwarded upstream"
+                    .into(),
+            );
+        }
         if axum::http::HeaderName::try_from(self.upstream_auth_header.as_str()).is_err() {
             return Err(format!(
                 "upstream_auth_header {:?} is not a valid HTTP header name",
@@ -1223,6 +1253,7 @@ impl HarnessConfig {
             upstream_auth_header: default_auth_header(),
             upstream_auth_scheme: default_auth_scheme(),
             upstream_authorization_passthrough: false,
+            ignore_client_authorization: false,
             tool_upstream_bearer_env: None,
             tool_upstream_bearer_file: None,
             require_identity: false,
