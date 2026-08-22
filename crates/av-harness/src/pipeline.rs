@@ -795,9 +795,38 @@ impl AppState {
             // even though the very next attempt would have succeeded
             // against the recycled id. 503 + Retry-After lets standard
             // retry policies ride out the window.
+            // Sealed capture-failed quarantines are ALSO closed-but-
+            // never-complete — permanently (never recycled, never
+            // evicted). They keep the terminal 400 (round-28 F1:
+            // permanent refusals route to 400 with no Retry-After);
+            // the transient 503 below would otherwise instruct SDK
+            // retry policies to poll forever against a session that
+            // will refuse forever. Checked BEFORE the empty-quarantine
+            // predicate, which capture-failed conversions can also
+            // match — the "no captured steps" message was inaccurate
+            // for sessions that DID capture steps before failing.
+            if session.capture_failed() {
+                return Err(PipelineError::BadRequest(
+                    "session is quarantined (audit capture failed); use a new session id".to_owned(),
+                ));
+            }
             if session.is_empty_unsigned_quarantine() {
                 return Err(PipelineError::BadRequest(
                     "session is quarantined (closed with no captured steps); use a new session id".to_owned(),
+                ));
+            }
+            // Enforcement-triggered closes are terminal for the id:
+            // `get_or_open` deliberately refuses to recycle them (a
+            // fresh incarnation would carry a fresh budget/breaker on
+            // the same id). 403, matching the deliberate not-429/not-
+            // transient policy for budget and breaker refusals.
+            let stop = session.recorded_stop_reason_id();
+            if session.close_complete_flag()
+                && (stop == u64::from(StopReason::BudgetExceeded.id())
+                    || stop == u64::from(StopReason::LoopDetected.id()))
+            {
+                return Err(PipelineError::Blocked(
+                    "session was closed by budget or loop enforcement; use a new session id".to_owned(),
                 ));
             }
             return Err(PipelineError::Unavailable(
