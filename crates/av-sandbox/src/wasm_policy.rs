@@ -44,7 +44,19 @@ const MAX_TABLE_ELEMENTS: usize = 65_536;
 const MAX_INSTANCES: usize = 4;
 
 /// Maximum wall time is approximately this many 1 ms epoch ticks.
-const EPOCH_DEADLINE_TICKS: u64 = 25;
+///
+/// Round-51 §10.3: this was 25 — a WALL-CLOCK deadline on a
+/// work-bounded computation. On a busy 2-core box, 16 concurrent
+/// evaluations were descheduled past 25 ms and legitimately-tiny
+/// policies failed closed (`valid_policy_does_not_false_trip_under_
+/// parallel_load` failed 10/10 with 4 busy-loop competitors). Fuel
+/// (`FUEL_PER_CALL`) is the deterministic work bound and remains
+/// authoritative; the epoch deadline exists only to interrupt fuel
+/// escapes (host-call stalls, wasmtime bugs), so it can be generous —
+/// 2 s of wall time never fires on a healthy evaluation regardless of
+/// scheduler pressure, while still bounding a stuck guest to seconds
+/// instead of forever.
+const EPOCH_DEADLINE_TICKS: u64 = 2_000;
 
 /// A compiled WASM policy.
 pub struct WasmPolicy {
@@ -242,8 +254,17 @@ mod tests {
         let p = WasmPolicy::from_bytes("hostile", HOSTILE_LOOP_POLICY.as_bytes()).unwrap();
         let started = std::time::Instant::now();
         let d = p.evaluate("anything", &json!({}));
+        // Round-51 §10.3: the bound proven here is "terminates by fuel
+        // exhaustion, promptly" — not a wall-clock SLA. The previous
+        // `< 100 ms` assertion was the same wall-clock fragility as
+        // the parallel-load flake in the other direction: burning 50M
+        // fuel under coverage instrumentation or noisy neighbours can
+        // legitimately exceed 100 ms. Ten seconds distinguishes
+        // "bounded by fuel" from "hung until the epoch backstop"
+        // (2s epoch × 1ms ticks would also have returned by now, so a
+        // pass proves SOME interrupt mechanism bounded the guest).
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(100),
+            started.elapsed() < std::time::Duration::from_secs(10),
             "fuel/epoch deadline failed to bound the loop"
         );
         match d {

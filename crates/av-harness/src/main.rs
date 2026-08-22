@@ -274,7 +274,7 @@ async fn main() -> Result<()> {
     let result = tokio::select! {
         result = &mut server => result.context("serve AgentVisor AI"),
         _ = shutdown_started_rx => {
-            match tokio::time::timeout(std::time::Duration::from_secs(30), &mut server).await {
+            match tokio::time::timeout(config.effective_drain_timeout(), &mut server).await {
                 Ok(result) => result.context("serve AgentVisor AI"),
                 Err(_) => {
                     drain_timeouts.inc();

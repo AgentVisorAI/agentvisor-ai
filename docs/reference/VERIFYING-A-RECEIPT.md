@@ -113,6 +113,10 @@ refuses known-weak keys (`is_weak()` — a defence in depth added after
 * **WeakKey** — the trusted-key material you passed in is one of the
   small-order Curve25519 points ed25519-dalek refuses; check that
   you didn't paste `0x00…00` or `0xff…ff` by accident.
+* **Unsupported receipt_version** — the verifier refuses any
+  `receipt_version` other than the one it implements (currently 1),
+  so a future-format receipt is never silently interpreted under
+  old semantics. Upgrade `avctl` to verify newer receipts.
 
 ## 6. Continuous verification
 

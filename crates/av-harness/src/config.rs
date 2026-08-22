@@ -58,6 +58,16 @@ pub struct HarnessConfig {
     /// (capped at one day like every `_s` interval).
     #[serde(default)]
     pub upstream_read_timeout_s: Option<u64>,
+    /// Graceful-shutdown drain budget in seconds. When unset the
+    /// effective budget is `max(30, upstream_read_timeout_s + 5)` so a
+    /// single legitimate in-flight request cannot outlive the drain
+    /// window by construction (engineering review §8.8: the budget was
+    /// a hardcoded 30 s while shipped configs set a 300 s read timeout
+    /// — every rollout with one live long request exited 1 and paged).
+    /// Kubernetes users must keep `terminationGracePeriodSeconds`
+    /// above this value or the kubelet SIGKILLs mid-drain.
+    #[serde(default)]
+    pub shutdown_drain_timeout_s: Option<u64>,
     /// Chat-completions path appended to `upstream_url`. Override for
     /// providers with non-standard layouts (Azure deployments, Gemini's
     /// OpenAI-compatible surface).
@@ -609,6 +619,18 @@ impl HarnessConfig {
         default_wasm_policies().iter().any(|entry| entry == path)
     }
 
+    /// Effective graceful-shutdown drain budget. Explicit
+    /// `shutdown_drain_timeout_s` wins; otherwise derive
+    /// `max(30, upstream_read_timeout_s + 5)` so one legitimate
+    /// in-flight request cannot exceed the drain window (§8.8).
+    pub fn effective_drain_timeout(&self) -> std::time::Duration {
+        let seconds = self.shutdown_drain_timeout_s.unwrap_or_else(|| {
+            self.upstream_read_timeout_s
+                .map_or(30, |read| read.saturating_add(5).max(30))
+        });
+        std::time::Duration::from_secs(seconds)
+    }
+
     /// Detect the classic footgun of `upstream_url` already ending with the
     /// first segment of `upstream_chat_path` (for example a base URL of
     /// `https://api.openai.com/v1` joined with `/v1/chat/completions`
@@ -1089,6 +1111,14 @@ impl HarnessConfig {
             }
             interval_fields.push(("upstream_read_timeout_s", read_timeout));
         }
+        if let Some(drain) = self.shutdown_drain_timeout_s {
+            if drain == 0 {
+                return Err(
+                    "shutdown_drain_timeout_s = 0 would abandon every in-flight request at shutdown — omit the key to derive it from upstream_read_timeout_s".into(),
+                );
+            }
+            interval_fields.push(("shutdown_drain_timeout_s", drain));
+        }
         for (field, value) in interval_fields {
             if value > MAX_SECONDS_INTERVAL {
                 return Err(format!(
@@ -1247,6 +1277,7 @@ impl HarnessConfig {
             tool_upstream_url: None,
             upstream_http2_prior_knowledge: false,
             upstream_read_timeout_s: None,
+            shutdown_drain_timeout_s: None,
             upstream_chat_path: default_chat_path(),
             upstream_api_key_env: None,
             upstream_api_key_file: None,
@@ -1738,6 +1769,29 @@ mod tests {
                enforce_identity_scopes = false"#,
         )
         .is_ok());
+    }
+
+    /// §8.8: the graceful-drain budget must key off the longest
+    /// legitimate in-flight request instead of a hardcoded 30 s.
+    #[test]
+    fn drain_timeout_derives_from_upstream_read_timeout() {
+        // §8.8: unset drain + unset read timeout → 30 s floor.
+        let base = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        assert_eq!(base.effective_drain_timeout().as_secs(), 30);
+        // Unset drain + 300 s read timeout → 305 s (one in-flight
+        // request can never legitimately outlive the drain window).
+        let mut derived = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        derived.upstream_read_timeout_s = Some(300);
+        assert_eq!(derived.effective_drain_timeout().as_secs(), 305);
+        // Explicit value always wins.
+        let mut explicit = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        explicit.upstream_read_timeout_s = Some(300);
+        explicit.shutdown_drain_timeout_s = Some(110);
+        assert_eq!(explicit.effective_drain_timeout().as_secs(), 110);
+        // Zero is refused at validate.
+        let mut zero = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        zero.shutdown_drain_timeout_s = Some(0);
+        assert!(zero.validate().unwrap_err().contains("shutdown_drain_timeout_s"));
     }
 
     /// Refuse a wildcard bind (`0.0.0.0` / `[::]`) when identity is off

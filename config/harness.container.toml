@@ -20,6 +20,11 @@ listen = "0.0.0.0:8484"
 # AV_UPSTREAM_API_KEY=sk-... for a cloud provider.
 upstream_url = "http://host.docker.internal:11434"
 upstream_read_timeout_s = 300
+# Keep the drain budget under the pod's terminationGracePeriodSeconds
+# (120 in deploy/kubernetes/agentvisor-ai.yaml) — otherwise the kubelet
+# SIGKILLs mid-drain. Unset, the budget derives as
+# upstream_read_timeout_s + 5 = 305 s, which exceeds the grace period.
+shutdown_drain_timeout_s = 110
 
 # Dev-mode identity: any client may talk to the proxy. In production set
 # require_identity = true and configure identity_jwks_url or

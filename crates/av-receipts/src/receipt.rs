@@ -1116,6 +1116,30 @@ mod tests {
         assert!(receipt.verify_embedded().is_err());
     }
 
+    /// Round-51 §3.5: an unknown `receipt_version` must be refused by
+    /// BOTH verification paths — a future v2 receipt that
+    /// reinterprets a field must not verify under v1 semantics on a
+    /// shipped v1 verifier. `receipt_version` sits outside `body`
+    /// so a version tamper ALSO fails the signature — but the semantic
+    /// gate must fire first with an actionable message (and protects
+    /// against a legitimately-signed future-version receipt).
+    #[test]
+    fn unknown_receipt_version_is_refused_by_both_verify_paths() {
+        let signer = Ed25519Signer::generate();
+        let mut receipt = Receipt::issue(body(), &signer).unwrap();
+        receipt.body.receipt_version = 2;
+        let mut ring = Keyring::new();
+        ring.add_key_bytes(&signer.public_key_bytes()).unwrap();
+        assert!(
+            matches!(receipt.verify(&ring), Err(ReceiptError::SemanticInvariant(ref msg)) if msg.contains("receipt_version 2")),
+            "ring verify must refuse an unknown receipt_version"
+        );
+        assert!(
+            matches!(receipt.verify_embedded(), Err(ReceiptError::SemanticInvariant(_))),
+            "embedded verify must refuse an unknown receipt_version"
+        );
+    }
+
     /// Stress: for every wall-clock instant sampled during issuance, the
     /// integer `issued_at` and the human-readable `issued_at_iso` must be
     /// mutually consistent. If they ever drift, downstream consumers that

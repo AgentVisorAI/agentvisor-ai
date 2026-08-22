@@ -374,11 +374,19 @@ fn config_validate_never_crashes_on_random_garbage() {
             "case #{i} exit was a signal (crash): status={:?}",
             out.status
         );
-        // No crash-leak in stderr.
+        // No crash-leak in stderr. Round-51 §10.3: only `panicked at`
+        // marks a real crash. The old additional `backtrace` probe
+        // conflated "the process crashed" with "the word backtrace
+        // appears in stderr" — anyhow's error Display legitimately
+        // prints a captured backtrace note for a well-formed TOML
+        // parse error whenever the invoking shell exports
+        // RUST_BACKTRACE=1, turning an environment variable into a
+        // test failure. The exit-code check above is the real
+        // crash assertion.
         let se = stderr(&out).to_lowercase();
         assert!(
-            !se.contains("panicked at") && !se.contains("backtrace"),
-            "case #{i} leaked panic/backtrace: {se}"
+            !se.contains("panicked at"),
+            "case #{i} leaked panic: {se}"
         );
     }
 }
