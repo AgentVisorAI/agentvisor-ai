@@ -818,6 +818,22 @@ impl SessionRegistry {
         self.sessions.get(id).map(|s| s.clone())
     }
 
+    /// Collect the SHA-256[..32] hex stem of every currently-registered
+    /// session id — the same encoding the ATIF/journal spool uses. The
+    /// reconciler's orphan sweep uses this to skip files whose stem
+    /// belongs to a live session, closing the race window where an
+    /// in-progress close's atif+atif-auth pair is quarantined mid-write
+    /// (engineering review §8.5).
+    pub fn live_atif_stems(&self) -> std::collections::HashSet<String> {
+        self.sessions
+            .iter()
+            .map(|entry| {
+                let digest = av_core::digest::sha256_hex(entry.key().as_bytes());
+                digest.get(..32).unwrap_or(&digest).to_owned()
+            })
+            .collect()
+    }
+
     /// Insert a session reconstructed from durable spool state.
     pub fn insert_recovered(&self, session: Session) -> Arc<Session> {
         let id = session.id.clone();

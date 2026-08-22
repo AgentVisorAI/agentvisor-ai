@@ -152,6 +152,47 @@ async fn main() -> Result<()> {
         config.breaker.clone(),
         Arc::clone(&state.metrics),
     );
+    // Retention: prune sealed ATIF trajectories + sidecars older than
+    // `atif_retention_days` on an hourly cadence. Only sealed pairs are
+    // touched; unpaired remnants stay for the reconciler quarantine
+    // sweep. `None` (the ship default) preserves the historical
+    // "manage-with-external-cron" behaviour. See engineering review
+    // §8.1 / §8.2.
+    let retention = config.atif_retention_days.map(|days| {
+        let finalizer = state.finalizer.clone();
+        let metrics = Arc::clone(&state.metrics);
+        let pruned_total = metrics.counter(
+            "av_atif_retention_pruned_total",
+            "Sealed ATIF+sidecar pairs deleted by the retention sweep",
+        );
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(60 * 60);
+            let max_age = std::time::Duration::from_secs(u64::from(days) * 24 * 60 * 60);
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match finalizer.prune_sealed_atif(max_age).await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        pruned_total.add(n as u64);
+                        tracing::info!(
+                            pruned = n,
+                            retention_days = days,
+                            "ATIF retention sweep removed sealed evidence pairs"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            retention_days = days,
+                            "ATIF retention sweep failed; will retry next hour"
+                        );
+                    }
+                }
+            }
+        })
+    });
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("bind {}", config.listen))?;
@@ -199,9 +240,15 @@ async fn main() -> Result<()> {
         "av_http_shutdown_drain_timeouts_total",
         "HTTP graceful-drain phase exceeded budget; per-connection tasks may still be live",
     );
+    let draining_flag = Arc::clone(&state.draining);
     let server = std::future::IntoFuture::into_future(
-        axum::serve(listener, build_router(state.clone())).with_graceful_shutdown(async {
+        axum::serve(listener, build_router(state.clone())).with_graceful_shutdown(async move {
             shutdown_signal().await;
+            // Flip the draining flag BEFORE the graceful drain begins so
+            // `/readyz` starts returning 503 immediately. This gives the
+            // load balancer / K8s Service the full drain window to stop
+            // routing new traffic before axum stops accepting. See §8.3.
+            draining_flag.store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = shutdown_started_tx.send(());
         }),
     );
@@ -230,6 +277,9 @@ async fn main() -> Result<()> {
         }
     };
     reconciler.abort();
+    if let Some(handle) = retention.as_ref() {
+        handle.abort();
+    }
     // Round-24 F5: signal maintenance to stop instead of aborting.
     // JoinHandle::abort() only cancels the outer async task; a
     // spawn_blocking closure that's already running keeps rewriting
@@ -261,6 +311,13 @@ async fn main() -> Result<()> {
         if let Err(error) = handle.await {
             if !error.is_cancelled() {
                 tracing::warn!(%error, "JWKS refresh task exited with an error before shutdown abort");
+            }
+        }
+    }
+    if let Some(handle) = retention {
+        if let Err(error) = handle.await {
+            if !error.is_cancelled() {
+                tracing::warn!(%error, "ATIF retention task exited with an error before shutdown abort");
             }
         }
     }

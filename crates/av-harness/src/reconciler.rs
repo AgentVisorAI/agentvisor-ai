@@ -403,6 +403,103 @@ impl Finalizer {
         }
     }
 
+    /// Remove sealed ATIF trajectories (and their `.atif-auth` provenance
+    /// sidecars) whose mtime is older than `max_age`. Idempotent; a
+    /// missing file (already pruned) is silently skipped. Returns the
+    /// number of `(atif, sidecar)` pairs removed so callers can log or
+    /// bump a metric.
+    ///
+    /// Live sessions are protected by two properties:
+    ///   * an in-flight session's per-session lifecycle lock is held
+    ///     across close, and prune touches only files whose mtime
+    ///     satisfies `age > max_age` — a session that just closed still
+    ///     has fresh mtimes and is far outside the retention window;
+    ///   * unpaired `.json` (no `.atif-auth`) files are LEFT ALONE — those
+    ///     are either the crash-torn transient state of an in-progress
+    ///     close or attacker-planted trajectories the reconciler's own
+    ///     quarantine sweep handles. Retention is only for *sealed*
+    ///     evidence pairs; unsealed remnants stay for the reconciler.
+    ///
+    /// See engineering review §8.1 (spool is append-only forever) and
+    /// §8.2 (restart re-adopts every closed session).
+    pub async fn prune_sealed_atif(&self, max_age: std::time::Duration) -> Result<usize, FinalizeError> {
+        let spool_dir = self.spool_dir.clone();
+        tokio::task::spawn_blocking(move || -> Result<usize, FinalizeError> {
+            let entries = match std::fs::read_dir(&spool_dir) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+                Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+            };
+            let mut pruned = 0usize;
+            let now = std::time::SystemTime::now();
+            let mut dir_changed = false;
+            for entry in entries {
+                let entry = entry.map_err(|error| FinalizeError::Atif(error.to_string()))?;
+                let path = entry.path();
+                // We only prune paired sealed evidence: `<stem>.json` with
+                // its matching `<stem>.atif-auth`. Anything else — the
+                // step journals, corrupt-quarantine files, tool-execution
+                // markers — belongs to code paths that own their own
+                // deletion logic.
+                if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
+                    continue;
+                }
+                if path
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|name| name.ends_with(".session.json"))
+                {
+                    continue;
+                }
+                let sidecar = path.with_extension("atif-auth");
+                if !sidecar.exists() {
+                    continue;
+                }
+                let metadata = match entry.metadata() {
+                    Ok(m) => m,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+                };
+                let modified = match metadata.modified() {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                let age = now
+                    .duration_since(modified)
+                    .unwrap_or(std::time::Duration::ZERO);
+                if age < max_age {
+                    continue;
+                }
+                // Remove the sidecar first so a concurrent recovery scan
+                // sees the sidecar-less window (which quarantines rather
+                // than replays), never the reverse (which would replay
+                // an already-pruned artifact).
+                let mut removed_any = false;
+                match std::fs::remove_file(&sidecar) {
+                    Ok(()) => removed_any = true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+                }
+                match std::fs::remove_file(&path) {
+                    Ok(()) => removed_any = true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+                }
+                if removed_any {
+                    pruned += 1;
+                    dir_changed = true;
+                }
+            }
+            if dir_changed {
+                av_core::fsutil::sync_directory(&spool_dir)
+                    .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+            }
+            Ok(pruned)
+        })
+        .await
+        .map_err(|error| FinalizeError::Task(error.to_string()))?
+    }
+
     #[cfg(test)]
     pub(crate) fn lifecycle_locks(&self) -> Arc<SessionLockTable> {
         Arc::clone(&self.lifecycle_locks)
@@ -1064,6 +1161,12 @@ impl Finalizer {
             })
             .collect();
         let mut recovered = 0usize;
+        // Snapshot the live-session hash-stems so the orphan quarantine
+        // sweep can skip an in-flight close before it renames the
+        // freshly-written atif/atif-auth pair. See §8.5 of the review;
+        // the MIN_ORPHAN_AGE guard below is defense-in-depth for
+        // sessions that opened after this snapshot.
+        let live_stems = sessions.live_atif_stems();
         while let Some(entry) = entries
             .next_entry()
             .await
@@ -1118,6 +1221,23 @@ impl Finalizer {
             // renamed file) while preserving
             // the bytes for operator forensic inspection.
             if !path.with_extension("atif-auth").exists() {
+                // Round-51: skip files whose stem belongs to a live
+                // session — an in-progress close writes `{stem}.json`
+                // and then seals `.atif-auth` moments later; the
+                // reconciler must not race that close by quarantining
+                // the fresh artifact. Defense in depth with the
+                // MIN_ORPHAN_AGE guard below (which handles sessions
+                // opened after the snapshot).
+                let stem_owned = path
+                    .file_stem()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .map(str::to_owned);
+                if stem_owned
+                    .as_deref()
+                    .is_some_and(|stem| live_stems.contains(stem))
+                {
+                    continue;
+                }
                 // Live-race guard (round-16 stress finding): a sidecar-less
                 // `{stem}.json` is ALSO the normal transient state of an
                 // in-flight close — `close_session_locked` writes the ATIF
@@ -5101,6 +5221,68 @@ mod tests {
         );
     }
 
+    /// Engineering-review §8.5: even if a sidecar-less `{stem}.json` is
+    /// old enough to trip the MIN_ORPHAN_AGE guard, the orphan sweep
+    /// must still refuse to quarantine it when its stem belongs to a
+    /// live session — that shape is the exact on-disk footprint of an
+    /// in-progress close between `write_atomic` and
+    /// `ensure_atif_provenance`. Renaming it out would cause the
+    /// close's provenance step to fail, race promotes to return 500,
+    /// and drop the evidence into `.corrupt-*` forensics.
+    #[tokio::test]
+    async fn live_session_stem_survives_orphan_quarantine_even_when_aged() {
+        let directory = tempfile::tempdir().unwrap();
+        let finalizer = finalizer(directory.path());
+
+        let live = session(Workflow::Unsigned);
+        let stem = av_core::digest::sha256_hex(live.id.as_bytes())[..32].to_owned();
+        let inflight = directory.path().join(format!("{stem}.json"));
+        std::fs::write(&inflight, b"{}").unwrap();
+        // Age past MIN_ORPHAN_AGE so the only remaining guard is the
+        // live-session-stem check we're validating here.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        let file = std::fs::OpenOptions::new().append(true).open(&inflight).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        drop(file);
+
+        let registry = SessionRegistry::new();
+        registry.insert_recovered(Session::new(
+            live.id.clone(),
+            Workflow::Unsigned,
+            AgentIdentity {
+                version: "1".to_owned(),
+                charter: "test".into(),
+                instance_uid: "instance-1".to_owned(),
+                ttl_remaining_s: Some(600),
+            },
+            Default::default(),
+        ));
+
+        finalizer
+            .recover_spooled_sessions(&registry, &Default::default())
+            .await
+            .unwrap();
+
+        assert!(
+            inflight.exists(),
+            "an in-progress close's fresh `.json` must not be quarantined even after crossing the age threshold, when the stem belongs to a live session"
+        );
+        let quarantined = std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.contains(".corrupt-"))
+            });
+        assert!(
+            !quarantined,
+            "no `.corrupt-*` sibling may be produced when the stem belongs to a live session"
+        );
+    }
+
     /// Round-44 F2: the pending-close sweep must NOT touch the
     /// empty-unsigned quarantine. That reject path
     /// (reconciler.rs:442-449) sets `artifact_committed = 1` but
@@ -6850,5 +7032,62 @@ mod tests {
             total < budget,
             "16 contended closes took {total:?}, budget {budget:?} (baseline {baseline:?})",
         );
+    }
+
+    /// The retention sweep must remove sealed `<stem>.json` +
+    /// `<stem>.atif-auth` pairs older than the configured window and
+    /// leave younger pairs alone. Unpaired remnants (crash-torn or
+    /// attacker-planted) belong to the reconciler quarantine sweep and
+    /// must not be touched by retention. See engineering review §8.1.
+    #[tokio::test(flavor = "current_thread")]
+    async fn retention_prunes_only_old_paired_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().to_path_buf();
+        let signer = Arc::new(Ed25519Signer::from_seed(&[7u8; 32])) as Arc<dyn Signer>;
+        let metrics = Arc::new(Registry::new());
+        let finalizer = Finalizer::new(signer, spool.clone(), metrics);
+
+        // "Old" evidence: written now, but we'll use a zero retention
+        // window on the first prune so anything already on disk qualifies.
+        let old_json = spool.join("bbb.json");
+        let old_sc = spool.join("bbb.atif-auth");
+        std::fs::write(&old_json, b"{}").unwrap();
+        std::fs::write(&old_sc, b"provenance").unwrap();
+
+        // Unpaired old JSON (no sidecar): retention must NOT touch it —
+        // that is the reconciler quarantine sweep's job.
+        let orphan_json = spool.join("ccc.json");
+        std::fs::write(&orphan_json, b"{}").unwrap();
+
+        // Live step-journal `.session.json` sibling (never in scope).
+        let live_session = spool.join("ddd.session.json");
+        std::fs::write(&live_session, b"{}").unwrap();
+
+        // With max_age = 0 every existing file is "past retention".
+        let removed = finalizer
+            .prune_sealed_atif(std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(removed, 1, "exactly one sealed pair must be pruned");
+
+        assert!(!old_json.exists(), "aged sealed evidence must be pruned");
+        assert!(!old_sc.exists(), "aged sidecar must be pruned");
+        assert!(orphan_json.exists(), "unpaired remnants belong to quarantine, not retention");
+        assert!(live_session.exists(), ".session.json is never a retention target");
+
+        // Freshly written sealed pair with an hour-scale retention window
+        // must remain untouched.
+        let fresh_json = spool.join("aaa.json");
+        let fresh_sc = spool.join("aaa.atif-auth");
+        std::fs::write(&fresh_json, b"{}").unwrap();
+        std::fs::write(&fresh_sc, b"provenance").unwrap();
+
+        let removed = finalizer
+            .prune_sealed_atif(std::time::Duration::from_secs(60 * 60))
+            .await
+            .unwrap();
+        assert_eq!(removed, 0, "fresh evidence must be preserved");
+        assert!(fresh_json.exists());
+        assert!(fresh_sc.exists());
     }
 }

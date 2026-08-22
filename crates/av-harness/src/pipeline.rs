@@ -73,6 +73,11 @@ pub struct AppState {
     pub(crate) tool_audits_emitted: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     /// Asynchronous session close and promotion service.
     pub finalizer: Finalizer,
+    /// Flips to `true` when shutdown starts. `/readyz` reads this and
+    /// reports 503 so a Kubernetes readinessProbe (or any external LB)
+    /// stops routing new traffic to a draining pod before axum's
+    /// graceful drain begins. See operability review §8.3.
+    pub draining: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) journal_key: [u8; 32],
 }
 
@@ -732,6 +737,7 @@ impl AppState {
             tool_audit_gates: Arc::default(),
             tool_audits_emitted: Arc::default(),
             finalizer,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             journal_key,
         })
     }

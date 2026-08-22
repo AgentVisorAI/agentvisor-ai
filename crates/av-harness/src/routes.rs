@@ -26,6 +26,8 @@ pub fn build_router(state: AppState) -> Router {
     let dashboard_enabled = state.config.dashboard_enabled;
     let mut router = Router::new()
         .route("/health", get(health))
+        .route("/livez", get(livez))
+        .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .route("/v1/chat/completions", post(chat_completions).options(cors_deny))
         .route("/v1/mcp", post(mcp_call).options(cors_deny))
@@ -120,6 +122,56 @@ async fn health() -> impl IntoResponse {
         // vulnerability-relevant information.
         "service": "agentvisor",
     }))
+}
+
+/// Kubernetes-style liveness probe.
+///
+/// Constant response: liveness answers "is the process alive at all?"
+/// and must NOT couple to backend health — otherwise a transient state
+/// backend outage triggers a pod restart cascade instead of a
+/// readiness-based traffic drain. This mirrors `/health` (kept for
+/// backward compatibility) but with a name that reads as its intent.
+/// Point `livenessProbe` at `/livez`; point `readinessProbe` at
+/// `/readyz`. See engineering review §8.3.
+async fn livez() -> impl IntoResponse {
+    Json(json!({
+        "status": "alive",
+        "service": "agentvisor",
+    }))
+}
+
+/// Kubernetes-style readiness probe.
+///
+/// 200 when the harness can serve a request end-to-end; 503 while
+/// draining or when a required backend is unavailable. Checks:
+///   * `draining` — set by the SIGTERM handler before axum's graceful
+///     drain begins, so the LB stops sending new traffic first.
+///   * `atif_spool_dir` — attempts a metadata read so a missing / read-only
+///     spool (the shape that produces `503 audit capture unavailable`
+///     for every chat request) is reflected in readiness rather than
+///     hidden behind a hardcoded `/health` 200.
+/// Returns the JSON body regardless of status so operators can diff
+/// which check failed without opening a shell.
+async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
+    let draining = state.draining.load(std::sync::atomic::Ordering::SeqCst);
+    let spool_ok =
+        std::fs::metadata(std::path::Path::new(&state.config.atif_spool_dir))
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+    let ready = !draining && spool_ok;
+    let body = Json(json!({
+        "status": if ready { "ready" } else { "not_ready" },
+        "service": "agentvisor",
+        "checks": {
+            "draining": draining,
+            "spool_dir_readable": spool_ok,
+        },
+    }));
+    if ready {
+        (StatusCode::OK, body).into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
+    }
 }
 
 /// Round-31 F5: explicit deny-CORS OPTIONS handler.
@@ -5265,5 +5317,74 @@ mod tests {
         let legacy = r#"{"status":200,"body_hex":"7b7d"}"#;
         let outcome: ToolOutcome = serde_json::from_str(legacy).unwrap();
         assert!(outcome.content_type.is_none());
+    }
+
+    /// `/livez` and `/readyz` are the Kubernetes-style split of the
+    /// legacy `/health` constant. Liveness stays a constant; readiness
+    /// couples to the draining flag and to a spool-directory
+    /// readability check so a full or missing spool volume immediately
+    /// steers new traffic elsewhere. See engineering review §8.3.
+    #[tokio::test]
+    async fn livez_and_readyz_reflect_service_readiness() {
+        let scratch = tempfile::tempdir().unwrap();
+        let spool = scratch.path().join("spool");
+        std::fs::create_dir_all(&spool).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = Router::new().route("/v1/chat/completions", post(mock_chat));
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, provider).await.unwrap();
+        });
+        let config = crate::config::HarnessConfig::for_tests(
+            &format!("http://{address}"),
+            &spool.to_string_lossy(),
+            &spool.to_string_lossy(),
+        );
+        let state = AppState::new(
+            config,
+            Arc::new(InMemoryStore::new()),
+            Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
+            Arc::new(NullBus),
+            None,
+            Arc::new(Ed25519Signer::from_seed(&[19; 32])),
+        )
+        .unwrap();
+        let app = crate::build_router(state.clone());
+
+        // /livez must always respond 200 with a constant body — it is
+        // decoupled from backend health by design.
+        let live = app
+            .clone()
+            .oneshot(Request::builder().uri("/livez").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(live.status(), StatusCode::OK);
+
+        // /readyz on a healthy pod: spool exists, not draining → 200.
+        let ready = app
+            .clone()
+            .oneshot(Request::builder().uri("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::OK);
+
+        // Draining flag flipped: /readyz must return 503 immediately.
+        state
+            .draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let not_ready = app
+            .clone()
+            .oneshot(Request::builder().uri("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(not_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // /livez remains 200 while draining — restart-cascade guard.
+        let still_live = app
+            .clone()
+            .oneshot(Request::builder().uri("/livez").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(still_live.status(), StatusCode::OK);
     }
 }
