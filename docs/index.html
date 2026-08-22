@@ -63,9 +63,11 @@
             Nothing else in your app moves.
           </p>
           <p class="muted">
-            Works the same way for Anthropic-compatible clients, Ollama,
-            LM&nbsp;Studio, Azure OpenAI, and anything else that speaks the
-            same wire format.
+            Works the same way for Ollama, LM&nbsp;Studio, Azure OpenAI,
+            vLLM, LiteLLM, and anything else that speaks the OpenAI
+            <code>chat/completions</code> wire format. (Anthropic&rsquo;s
+            native API is not OpenAI-shaped &mdash; front it with a
+            LiteLLM-style shim.)
           </p>
         </div>
         <div>
@@ -126,6 +128,7 @@
     <span class="k">"cached_tokens"</span>: <span class="n">0</span>,
     <span class="k">"cost_usd_micros"</span>: <span class="n">84340</span>
   },
+  <span class="k">"stop_reason_id"</span>: <span class="n">92</span>,
   <span class="k">"stop_reason"</span>: <span class="s">"Budget Exceeded"</span>,
   <span class="k">"key_id"</span>: <span class="s">"c8f2&hellip;"</span>,
   <span class="k">"signature_b64"</span>: <span class="s">"wg7A0Kx3&hellip;"</span>

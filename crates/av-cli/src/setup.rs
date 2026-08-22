@@ -333,7 +333,15 @@ pub fn init(
     if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).with_context(|| format!("create directory {}", parent.display()))?;
     }
-    std::fs::write(output, &rendered).with_context(|| format!("write {}", output.display()))?;
+    // Round-51 §3.5: `std::fs::write` after the symlink check above was
+    // a TOCTOU — an attacker replanting the symlink in the
+    // check→write window redirected the TOML into the target (and
+    // created it 0666&~umask before the post-hoc chmod).
+    // `write_atomic`'s rename-over semantics replace the link ITSELF
+    // rather than following it, closing the race the same way the
+    // wizard path does.
+    av_core::fsutil::write_atomic(output, rendered.as_bytes())
+        .with_context(|| format!("write {}", output.display()))?;
     // Round-43 F3: match the key-file installer
     // (`write_private_key_file`) which explicitly opens with
     // mode(0o600). The rendered config carries

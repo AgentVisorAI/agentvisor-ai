@@ -100,6 +100,36 @@ The reconciler runs every `reconcile_tick_s` seconds and handles:
 Recovery is idempotent — a killed-then-restarted-then-killed pod
 does the same work each tick without duplicating events.
 
+### Releasing a quarantined session id
+
+A SIGKILL / OOMKill / node loss mid-request leaves a sealed marker
+under `<atif_spool_dir>/inflight-responses/`. On restart the
+reconciler quarantines that session ("quarantining sessions with
+incomplete effects") and the id returns
+`400 session is already closed` from then on — by design, because
+the provider may have observed a request whose response was never
+captured, and silently resuming would put an unattested turn in the
+audit chain.
+
+If an agent derives its session id from a stable conversation id,
+that conversation is locked out until an operator intervenes. The
+manual release procedure:
+
+1. Confirm the turn's outcome out of band (provider dashboard,
+   upstream logs). You are asserting the uncaptured response either
+   never happened or is acceptable to lose from the trail.
+2. Stop routing traffic for that session id (or drain the pod).
+3. Delete the session's marker file under
+   `<atif_spool_dir>/inflight-responses/` — the filename embeds the
+   session-id hash (`sha256(session_id)[..32]`). Keep a copy if your
+   compliance posture requires evidence of the intervention.
+4. Restart the harness (or wait one reconcile tick). The quarantine
+   set is rebuilt from the markers, so the id admits traffic again.
+
+Do NOT delete markers as routine hygiene — each one is the only
+evidence that a crash window may contain an unaudited provider
+interaction.
+
 ## Metrics you should alert on
 
 | Metric | Alert condition | What it means |
