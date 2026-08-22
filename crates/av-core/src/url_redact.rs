@@ -92,13 +92,18 @@ fn redact_single(input: &str) -> String {
     // `@` in its path (`http://h/p@th`), which must stay untouched.
     // Discriminate by the naive authority's shape: a truncated
     // `user:password` leaves a `:` followed by non-digit characters,
-    // while a legitimate credential-less authority is `host` or
-    // `host:port` (digits only after the colon). Known residual gap: a
-    // password whose pre-`/` prefix is all digits still leaks — the
-    // mixed-character secrets this defends against are covered.
-    let truncated_userinfo = authority
-        .rsplit_once(':')
-        .is_some_and(|(_, suffix)| !suffix.is_empty() && !suffix.bytes().all(|b| b.is_ascii_digit()));
+    // while a legitimate credential-less authority is `host`,
+    // `host:port` (digits only after the colon), or a bracketed IPv6
+    // literal (whose colons are address syntax, never a userinfo
+    // separator — RFC 3986 requires the brackets precisely so `:` in
+    // the address cannot be confused with the port delimiter). Known
+    // residual gaps: a password whose pre-`/` prefix is all digits or
+    // contains `[`/`]` still leaks — the mixed-character secrets this
+    // defends against are covered.
+    let truncated_userinfo = !authority.contains('[')
+        && authority
+            .rsplit_once(':')
+            .is_some_and(|(_, suffix)| !suffix.is_empty() && !suffix.bytes().all(|b| b.is_ascii_digit()));
     if !truncated_userinfo {
         return input.to_owned();
     }
@@ -183,6 +188,13 @@ mod tests {
             // untouched (the naive authority is host / host:port).
             ("http://h/p@th", "http://h/p@th"),
             ("http://host:8080/p@th", "http://host:8080/p@th"),
+            // Bracketed IPv6 literals: address colons are never a
+            // userinfo separator.
+            ("http://[::1]/p@th", "http://[::1]/p@th"),
+            (
+                "https://[2001:db8::1]:8443/p@th",
+                "https://[2001:db8::1]:8443/p@th",
+            ),
         ] {
             assert_eq!(redact_userinfo(input), expected, "input: {input}");
         }

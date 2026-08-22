@@ -1144,6 +1144,32 @@ mod tests {
     /// coincide with no canonical caption) remain accepted, matching
     /// the events validator's round-18 tolerance.
     #[test]
+    fn subject_digest_conjuncts_are_each_enforced() {
+        // Pin BOTH conjuncts of the digest shape check (length == 64
+        // AND lowercase hex): a mutant flipping && to || previously
+        // survived because no test failed exactly one conjunct.
+        let signer = Ed25519Signer::generate();
+        let mut ring = Keyring::new();
+        ring.add_signer(&signer).unwrap();
+        for bad_head in [
+            "zz".repeat(32), // 64 chars, not hex
+            "ab".repeat(31), // hex, wrong length
+            "AB".repeat(32), // uppercase hex refused
+        ] {
+            let mut body = body();
+            body.subject = ReceiptSubject::EventChain {
+                chain_head: bad_head.clone(),
+                event_count: 1,
+            };
+            let error = Receipt::issue(body, &signer).unwrap().verify(&ring).unwrap_err();
+            assert!(
+                matches!(error, ReceiptError::SemanticInvariant(ref m) if m.contains("chain_head")),
+                "chain_head {bad_head:?} must fail: {error:?}"
+            );
+        }
+    }
+
+    #[test]
     fn cross_wired_stop_reason_caption_is_refused_but_native_captions_pass() {
         let signer = Ed25519Signer::generate();
         let mut ring = Keyring::new();

@@ -471,6 +471,32 @@ mod tests {
         assert_eq!(m.topics[0].retention.hot_hours, 720, "default 30 days per brief");
     }
 
+    /// Pin the two schema-parity caps at their exact boundaries: 256
+    /// topics is the inclusive max (schema maxItems) and 249 bytes is
+    /// the inclusive topic-name max (Kafka's limit, below NAME_MAX).
+    #[test]
+    fn topic_count_and_name_length_boundaries() {
+        let mut m = BridgeManifest::default_for("caps");
+        let template = m.topics[0].clone();
+        while m.topics.len() < 256 {
+            let mut extra = template.clone();
+            extra.name = format!("agent.extra_{}", m.topics.len());
+            m.topics.push(extra);
+        }
+        m.validate().expect("256 topics is the inclusive max");
+        let mut over = m.clone();
+        let mut extra = template.clone();
+        extra.name = "agent.extra_overflow".to_owned();
+        over.topics.push(extra);
+        assert!(over.validate().is_err(), "257 topics must be refused");
+
+        let mut m = BridgeManifest::default_for("names");
+        m.topics[0].name = format!("agent.{}", "a".repeat(243)); // 249 bytes total
+        m.validate().expect("249-byte topic name is the inclusive max");
+        m.topics[0].name = format!("agent.{}", "a".repeat(244)); // 250 bytes
+        assert!(m.validate().is_err(), "250-byte topic name must be refused");
+    }
+
     #[test]
     fn yaml_roundtrip() {
         let m = BridgeManifest::default_for("enclave-1");
