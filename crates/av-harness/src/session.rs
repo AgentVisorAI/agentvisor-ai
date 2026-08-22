@@ -86,6 +86,16 @@ pub struct Session {
     last_activity_instant: Mutex<Instant>,
     /// Last normalized provider or enforcement stop reason id.
     last_stop_reason_id: AtomicU64,
+    /// Sticky enforcement latch (0 = never tripped, else the enforcement
+    /// stop-reason id). Set ONLY at genuine enforcement-refusal sites
+    /// (chat token-budget refusal, mid-stream budget refusal, loop-
+    /// breaker open refusal) — never by the last-write-wins
+    /// `last_stop_reason_id`, which later successful responses
+    /// overwrite and which quota-BACKEND failures and blocked tool
+    /// calls also write, making it an unreliable proxy for "enforcement
+    /// caused this session's end" (false lockouts and losable refusals,
+    /// both verified). Gates same-id recycling after close.
+    enforcement_tripped: AtomicU64,
     /// Set once closed (idempotent close).
     pub closed: AtomicU64,
     /// Set once a receipt or ATIF artifact is durably committed.
@@ -171,6 +181,7 @@ impl Session {
             last_activity_ms: AtomicU64::new(av_core::time::now_ms()),
             last_activity_instant: Mutex::new(Instant::now()),
             last_stop_reason_id: AtomicU64::new(0),
+            enforcement_tripped: AtomicU64::new(0),
             closed: AtomicU64::new(0),
             artifact_committed: AtomicU64::new(0),
             close_complete: AtomicU64::new(0),
@@ -441,6 +452,20 @@ impl Session {
                         return Err("recovered stop reason exceeds u8".to_owned());
                     }
                     session.last_stop_reason_id.store(id, Ordering::Release);
+                    // Best-effort latch restoration across restart: the
+                    // sticky enforcement flag is in-memory only, so seed
+                    // it from the persisted final stop reason when that
+                    // reason IS an enforcement id. Imperfect (the
+                    // persisted value is the last-recorded reason, the
+                    // known-imprecise proxy), but fail-closed in the
+                    // useful direction: an enforcement-refused id keeps
+                    // refusing after a restart instead of silently
+                    // recycling into a fresh budget.
+                    if id == u64::from(StopReason::BudgetExceeded.id())
+                        || id == u64::from(StopReason::LoopDetected.id())
+                    {
+                        session.enforcement_tripped.store(id, Ordering::Release);
+                    }
                 }
             } else if let Some(cost) = metrics.total_cost_usd {
                 if !cost.is_finite() || cost < 0.0 {
@@ -587,6 +612,17 @@ impl Session {
         self.last_stop_reason_id.load(Ordering::Acquire)
     }
 
+    /// Latch an enforcement refusal (sticky; see the field doc).
+    pub(crate) fn latch_enforcement(&self, reason: StopReason) {
+        self.enforcement_tripped
+            .store(u64::from(reason.id()), Ordering::Release);
+    }
+
+    /// True when an enforcement refusal was latched on this session.
+    pub(crate) fn enforcement_tripped(&self) -> bool {
+        self.enforcement_tripped.load(Ordering::Acquire) != 0
+    }
+
     /// Build the receipt body for this session (signed close or promotion).
     pub fn receipt_body(
         &self,
@@ -731,10 +767,13 @@ impl SessionRegistry {
                     // ids (inherent to per-session semantics), but the
                     // same id must stay terminally refused so each
                     // incarnation is an explicit, distinct audit entity.
-                    let stop = occupied.get().recorded_stop_reason_id();
-                    let enforcement_close = stop == u64::from(av_events::StopReason::BudgetExceeded.id())
-                        || stop == u64::from(av_events::StopReason::LoopDetected.id());
-                    if enforcement_close {
+                    // Keyed on the sticky enforcement latch, not the
+                    // last-write-wins stop reason — later responses
+                    // overwrite that record, and non-enforcement
+                    // failures (quota-backend errors, blocked tool
+                    // calls) also write it, making it an unreliable
+                    // proxy in both directions.
+                    if occupied.get().enforcement_tripped() {
                         return occupied.get().clone();
                     }
                     let fresh = Arc::new(Session::new(
@@ -827,6 +866,13 @@ impl SessionRegistry {
             let evict = session.workflow == Workflow::Signed
                 && session.close_complete.load(Ordering::Acquire) != 0
                 && !session.capture_failed()
+                // Enforcement-latched sessions are retained like
+                // capture-failed ones: evicting them vacated the id, and
+                // the next get_or_open built a fresh session with a
+                // fresh budget/breaker — the same-id refusal silently
+                // expired after idle_s for signed workflows (bounded
+                // growth accepted, same tradeoff as capture_failed).
+                && !session.enforcement_tripped()
                 && session.active_streams.load(Ordering::Acquire) == 0
                 && session.pending_jobs.load(Ordering::Acquire) == 0
                 && session.idle_duration() >= idle_duration;
@@ -1003,36 +1049,60 @@ mod tests {
         assert_eq!(registry.len(), 1, "id remains a single registry entry");
     }
 
-    /// Enforcement-triggered closes are terminal for the session id:
+    /// Enforcement-latched sessions are terminal for the session id:
     /// recycling would hand the SAME id a fresh budget and fresh
     /// breaker — verified live as a 200/403 alternation riding the
-    /// per-session token cap at ~50% duty forever.
+    /// per-session token cap at ~50% duty forever. Keyed on the sticky
+    /// latch: a LATER recorded stop reason (post-refusal success, a
+    /// concurrent stream's provider finish) must not reclassify the
+    /// close as natural, and a recorded-but-unlatched enforcement
+    /// reason (blocked tool call, quota-backend outage) must not lock
+    /// out a naturally-closed id.
     #[test]
-    fn get_or_open_refuses_to_recycle_enforcement_closed_sessions() {
+    fn get_or_open_refuses_to_recycle_enforcement_latched_sessions() {
         let registry = SessionRegistry::new();
         let breaker = av_loopdetect::BreakerConfig::default();
-        for reason in [StopReason::BudgetExceeded, StopReason::LoopDetected] {
-            let id = format!("enforced-{}", reason.id());
-            let first = registry.get_or_open(&id, Workflow::Unsigned, &identity(), &breaker);
-            first.record_stop_reason(reason);
+        for (reason, workflow) in [
+            (StopReason::BudgetExceeded, Workflow::Unsigned),
+            (StopReason::LoopDetected, Workflow::Unsigned),
+            // Signed sessions must refuse identically (they also must
+            // not be evicted out of the refusal — covered below).
+            (StopReason::BudgetExceeded, Workflow::Signed),
+        ] {
+            let id = format!("enforced-{}-{}", reason.id(), workflow.as_str());
+            let first = registry.get_or_open(&id, workflow, &identity(), &breaker);
+            first.latch_enforcement(reason);
+            // A later provider stop reason must NOT un-latch.
+            first.record_stop_reason(StopReason::Stop);
             assert!(first.try_close());
             first.mark_artifact_committed();
             first.mark_close_complete();
-            let second = registry.get_or_open(&id, Workflow::Unsigned, &identity(), &breaker);
+            let second = registry.get_or_open(&id, workflow, &identity(), &breaker);
             assert!(
                 Arc::ptr_eq(&first, &second),
-                "enforcement-closed session must NOT be recycled ({reason:?})"
+                "enforcement-latched session must NOT be recycled ({reason:?}/{workflow:?})"
             );
             assert!(second.is_closed(), "the id must stay refused ({reason:?})");
         }
-        // A natural close (SessionClosed) still recycles.
+        // Latched signed sessions are excluded from eviction — evicting
+        // vacated the id and the refusal silently expired after idle_s.
+        assert!(
+            registry.evict_finalized(0).is_empty(),
+            "latched sessions must not be evicted"
+        );
+        // A RECORDED enforcement reason without the latch (blocked tool
+        // call, quota-backend outage) must not lock out a naturally
+        // closed id.
         let first = registry.get_or_open("natural", Workflow::Unsigned, &identity(), &breaker);
-        first.record_stop_reason(StopReason::SessionClosed);
+        first.record_stop_reason(StopReason::BudgetExceeded);
         assert!(first.try_close());
         first.mark_artifact_committed();
         first.mark_close_complete();
         let second = registry.get_or_open("natural", Workflow::Unsigned, &identity(), &breaker);
-        assert!(!Arc::ptr_eq(&first, &second), "natural closes keep recycling");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "recorded-but-unlatched reasons must keep recycling"
+        );
     }
 
     /// A session that has *started* close but has not completed it
