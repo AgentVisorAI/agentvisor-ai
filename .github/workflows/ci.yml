@@ -62,7 +62,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Start live contract services
-        run: docker compose -f docker/docker-compose.yml up -d --wait redpanda redis qdrant nats
+        run: docker compose -f docker/docker-compose.yml up -d --wait redpanda redis qdrant nats minio
       - name: Fetch pinned MiniLM artifacts
         run: |
           mkdir -p /tmp/agentvisor-minilm
@@ -76,6 +76,13 @@ jobs:
           AV_KAFKA_BROKER: 127.0.0.1:19092
           AV_NATS_URL: nats://127.0.0.1:4222
           AV_QDRANT_URL: http://127.0.0.1:6333
+          # Live S3 cold-tier contract (cold_store_live.rs) — the one
+          # env-gated live test that previously never ran in CI.
+          AV_COLD_S3_URL: s3://agentvisor-cold/ci
+          AWS_ACCESS_KEY_ID: agentvisor
+          AWS_SECRET_ACCESS_KEY: agentvisor-ci-secret
+          AWS_ENDPOINT: http://127.0.0.1:9100
+          AWS_ALLOW_HTTP: "true"
           AV_ONNX_MODEL_PATH: /tmp/agentvisor-minilm/model.onnx
           AV_ONNX_TOKENIZER_PATH: /tmp/agentvisor-minilm/tokenizer.json
         run: |
