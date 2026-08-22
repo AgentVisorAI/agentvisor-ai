@@ -100,10 +100,23 @@ impl OnnxEmbedder {
             .to_plain_array_view::<f32>()
             .map_err(|error| error.to_string())?;
         let mut vector = pool_output(view, &mask_values, self.dim)?;
-        let norm: f32 = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+        // f64 accumulation: an f32 sum-of-squares underflows to 0.0 for
+        // tiny finite activations, which skipped normalization and
+        // emitted the exact vector shape that used to defeat `cosine`
+        // (see embed.rs::cosine). Keep the two computations consistent.
+        let norm = vector
+            .iter()
+            .map(|value| f64::from(*value) * f64::from(*value))
+            .sum::<f64>()
+            .sqrt();
         if norm > 0.0 {
             for value in &mut vector {
-                *value /= norm;
+                // Intentional f64→f32 rounding: unit-normalized
+                // components are in [-1, 1].
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    *value = (f64::from(*value) / norm) as f32;
+                }
             }
         }
         Ok(vector)

@@ -63,6 +63,15 @@ impl Embedder for HashEmbedder {
                     last_ws = false;
                 }
             }
+            // The loop pushes the collapsed separator eagerly, so a
+            // trailing whitespace run leaves a dangling ' ' — making
+            // embed("abc") != embed("abc ") and breaking the documented
+            // whitespace-collapse invariance (a large delta for short
+            // steps). Trim it so trailing runs collapse to nothing,
+            // symmetric with the leading-run suppression above.
+            if out.ends_with(' ') {
+                out.pop();
+            }
             out
         };
         let chars: Vec<char> = normalized.chars().collect();
@@ -106,17 +115,37 @@ fn bump(v: &mut [f32], gram: &str, dim: usize) {
 }
 
 /// Cosine similarity of two equal-length vectors (0 when either is zero).
+///
+/// Accumulates in f64: an f32 sum-of-squares underflows to exactly 0.0
+/// for vectors of tiny finite components (all ≲ 5e-23), which made
+/// `cosine(v, v)` return 0 for such vectors — maximum "novelty" for a
+/// byte-identical repeat, defeating the loop breaker whenever a
+/// degenerate embedder emitted tiny activations. The breaker's hostile-
+/// embedding gate only catches exact zeros and non-finite values, so
+/// the underflow case must be correct here.
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
         return 0.0;
     }
-    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let dot: f64 = a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum();
+    let na: f64 = a
+        .iter()
+        .map(|x| f64::from(*x) * f64::from(*x))
+        .sum::<f64>()
+        .sqrt();
+    let nb: f64 = b
+        .iter()
+        .map(|x| f64::from(*x) * f64::from(*x))
+        .sum::<f64>()
+        .sqrt();
     if na == 0.0 || nb == 0.0 {
         return 0.0;
     }
-    (dot / (na * nb)).clamp(-1.0, 1.0)
+    // Truncating f64→f32 is intentional: the ratio is in [-1, 1] where
+    // the conversion only rounds, never overflows.
+    #[allow(clippy::cast_possible_truncation)]
+    let similarity = (dot / (na * nb)) as f32;
+    similarity.clamp(-1.0, 1.0)
 }
 
 #[cfg(test)]

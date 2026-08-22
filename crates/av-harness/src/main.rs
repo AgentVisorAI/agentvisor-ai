@@ -436,7 +436,10 @@ fn load_sandbox(config: &HarnessConfig) -> Result<Sandbox> {
                         .filter(|name| !name.is_empty())
                         .ok_or_else(|| anyhow::anyhow!("invalid tool schema filename {}", path.display()))?;
                     let schema: serde_json::Value = serde_json::from_slice(
-                        &std::fs::read(&path)
+                        // Same MAX_CONTROL_BYTES cap and rationale as the
+                        // bridge's `load_validators` (round-22 F4): bound
+                        // the allocation before the JSON parser can reject.
+                        &av_core::fsutil::read_capped(&path, av_core::fsutil::MAX_CONTROL_BYTES)
                             .with_context(|| format!("read tool schema {}", path.display()))?,
                     )
                     .with_context(|| format!("parse tool schema {}", path.display()))?;
@@ -463,7 +466,12 @@ fn load_sandbox(config: &HarnessConfig) -> Result<Sandbox> {
         // payload-limit policy when the default path is absent on disk.
         // Explicitly configured paths must exist (typo = hard error).
         let is_default_policy = HarnessConfig::is_default_policy_path(path);
-        let bytes = match std::fs::read(path) {
+        // Bounded read (same discipline as every other boot-time file):
+        // real policies are tiny (the builtin is a few KiB of WAT), so
+        // 16 MiB is generous for any legitimate compiled module while
+        // bounding the allocation before wasmtime can reject the bytes.
+        const MAX_WASM_POLICY_BYTES: u64 = 16 * 1024 * 1024;
+        let bytes = match av_core::fsutil::read_capped(std::path::Path::new(path), MAX_WASM_POLICY_BYTES) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && is_default_policy => {
                 tracing::info!(path, "policy file not found; using embedded built-in copy");
@@ -556,7 +564,14 @@ topics:
 /// the *default* path is absent (zero-config). An explicitly configured
 /// path that is missing stays a hard error.
 fn load_manifest(config: &HarnessConfig) -> Result<BridgeManifest> {
-    match std::fs::read_to_string(&config.bridge_manifest_path) {
+    // Capped read: `avctl manifest-validate` already refuses manifests
+    // above MAX_CONTROL_BYTES, and `BridgeManifest::from_yaml` enforces
+    // its own 256 KiB cap — an uncapped read here only buys the daemon
+    // an unbounded allocation before that parse-side cap can reject.
+    match av_core::fsutil::read_capped_string(
+        std::path::Path::new(&config.bridge_manifest_path),
+        av_core::fsutil::MAX_CONTROL_BYTES,
+    ) {
         Ok(text) => BridgeManifest::from_yaml(&text).map_err(anyhow::Error::new),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && config.uses_default_manifest_path() => {
             tracing::info!(

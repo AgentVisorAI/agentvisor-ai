@@ -2394,9 +2394,12 @@ impl Stream for AbortFinalizingStream {
                     )))));
                 }
                 self.pending_output.clear();
-                // QuotaExceeded is an in-process marker: the non-SSE drain in
-                // `chat_completions` maps it to HTTP 429 so budget refusals
-                // reach the client as a real error instead of a severed body.
+                // QuotaExceeded is an in-process marker: the non-SSE
+                // drain in `chat_completions` maps it to
+                // `PipelineError::Blocked` → HTTP 403 (the same
+                // deliberately-not-429 policy as the breaker path)
+                // so budget refusals reach the client as a real
+                // error instead of a severed body.
                 return Poll::Ready(Some(Err(std::io::Error::new(
                     std::io::ErrorKind::QuotaExceeded,
                     format!("response blocked by token budget: {reason}"),
@@ -2474,6 +2477,21 @@ impl Stream for AbortFinalizingStream {
                             context.waker().wake_by_ref();
                             return Poll::Pending;
                         }
+                        // A 200 with a completely EMPTY body produced no
+                        // frame, so `absorb_frame`'s "successful provider
+                        // response has no choices array" guard never ran —
+                        // without this check the session would attest a
+                        // clean assistant turn that never happened (while
+                        // the strictly-less-broken `200 {}` body fails
+                        // capture). `saw_chunk` exists precisely to gate
+                        // this.
+                        if self.upstream_status.is_success() && !self.saw_chunk {
+                            self.session.mark_capture_failed();
+                            self.pending_output.clear();
+                            let error =
+                                self.abort_error("successful provider response has an empty body".to_owned());
+                            return Poll::Ready(Some(Err(error)));
+                        }
                         if let Err(error) = self.submit_response_capture(None) {
                             self.session.mark_capture_failed();
                             self.pending_output.clear();
@@ -2521,6 +2539,14 @@ impl Stream for AbortFinalizingStream {
                     self.begin_budget_check(delta, BudgetContinuation::FinishSse);
                     context.waker().wake_by_ref();
                     return Poll::Pending;
+                }
+                // Same empty-body fail-closed guard as the non-SSE arm
+                // above: a 200 SSE response that delivered zero bytes
+                // must not be attested as a clean assistant turn.
+                if self.upstream_status.is_success() && !self.saw_chunk {
+                    self.session.mark_capture_failed();
+                    let error = self.abort_error("successful provider response has an empty body".to_owned());
+                    return Poll::Ready(Some(Err(error)));
                 }
                 if let Err(error) = self.submit_response_capture(None) {
                     self.session.mark_capture_failed();
