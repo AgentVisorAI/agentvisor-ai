@@ -199,6 +199,19 @@ async fn cors_deny() -> Response {
 }
 
 async fn metrics(State(state): State<AppState>) -> Response {
+    // Refresh gauges immediately before rendering so the scrape
+    // reflects the live registry state (round-51 W2). A gauge held
+    // as `Arc<Gauge>` in AppState would also work, but sampling
+    // once per scrape avoids inc/dec bookkeeping on every session
+    // insert/remove and cannot drift out of sync with the actual
+    // dashmap state.
+    state
+        .metrics
+        .gauge(
+            "av_open_sessions",
+            "Currently-open sessions in the in-memory registry",
+        )
+        .set(state.sessions.len() as u64);
     let mut response = Response::new(Body::from(state.metrics.render()));
     response.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
@@ -5450,5 +5463,96 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(still_live.status(), StatusCode::OK);
+    }
+
+    /// Round-51 W2: `/metrics` scrape must emit both a live
+    /// `av_open_sessions` gauge (sampled at scrape time from the
+    /// registry) and a labelled `av_signing_key_info` gauge whose
+    /// value is 1 whenever the process holds the signer.
+    #[tokio::test]
+    async fn metrics_scrape_emits_open_sessions_gauge_and_signing_key_info() {
+        let scratch = tempfile::tempdir().unwrap();
+        let spool = scratch.path().join("spool");
+        std::fs::create_dir_all(&spool).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = Router::new().route("/v1/chat/completions", post(mock_chat));
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, provider).await.unwrap();
+        });
+        let config = crate::config::HarnessConfig::for_tests(
+            &format!("http://{address}"),
+            &spool.to_string_lossy(),
+            &spool.to_string_lossy(),
+        );
+        let signer = Ed25519Signer::from_seed(&[31; 32]);
+        use av_receipts::Signer as _;
+        let key_id = signer.key_id().to_owned();
+        let public_key_hex = hex::encode(signer.public_key_bytes());
+        let state = AppState::new(
+            config,
+            Arc::new(InMemoryStore::new()),
+            Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
+            Arc::new(NullBus),
+            None,
+            Arc::new(signer),
+        )
+        .unwrap();
+        // Mirror main.rs's startup registration so the gauge is
+        // reachable from the same route.
+        state
+            .metrics
+            .gauge(
+                &format!(
+                    "av_signing_key_info{{key_id=\"{key_id}\",public_key_hex=\"{public_key_hex}\"}}"
+                ),
+                "test signing key info",
+            )
+            .set(1);
+        let app = crate::build_router(state.clone());
+
+        // Scrape with an empty registry — gauge sample must be 0.
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(
+            &axum::body::to_bytes(response.into_body(), 256 * 1024)
+                .await
+                .unwrap(),
+        )
+        .into_owned();
+        assert!(body.contains("# TYPE av_open_sessions gauge"), "{body}");
+        assert!(body.contains("av_open_sessions 0"), "{body}");
+        assert!(
+            body.contains(&format!("av_signing_key_info{{key_id=\"{key_id}\"")),
+            "signing-key info gauge missing from scrape: {body}"
+        );
+
+        // Register a session and scrape again — gauge must reflect 1.
+        state.sessions.insert_recovered(crate::session::Session::new(
+            "gauge-test".to_owned(),
+            crate::session::Workflow::Unsigned,
+            av_events::AgentIdentity {
+                version: "1".to_owned(),
+                charter: "test".into(),
+                instance_uid: "instance-1".to_owned(),
+                ttl_remaining_s: Some(600),
+            },
+            Default::default(),
+        ));
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(
+            &axum::body::to_bytes(response.into_body(), 256 * 1024)
+                .await
+                .unwrap(),
+        )
+        .into_owned();
+        assert!(body.contains("av_open_sessions 1"), "{body}");
     }
 }

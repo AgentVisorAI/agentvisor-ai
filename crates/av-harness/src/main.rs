@@ -225,6 +225,24 @@ async fn main() -> Result<()> {
         signer_public_key_hex = %signer_public_key_hex,
         "AgentVisor AI started"
     );
+    // Round-51 W2: publish the signing-key fingerprint as a labelled
+    // gauge whose value is always 1 (Prometheus's convention for
+    // `*_info` metrics). Downstream verifiers can alert on a
+    // key-id change between scrapes even when nothing signed a
+    // receipt in the window — the log-only signal above misses
+    // that if operators only look at metrics dashboards. The
+    // gauge is per-key-id (not just the fingerprint prefix) so a
+    // key rotation shows up as a distinct series rather than a
+    // silent value flip.
+    state
+        .metrics
+        .gauge(
+            &format!(
+                "av_signing_key_info{{key_id=\"{signer_key_id}\",public_key_hex=\"{signer_public_key_hex}\"}}"
+            ),
+            "Signing-key fingerprint — 1 while the current process holds this key",
+        )
+        .set(1);
     let (shutdown_started_tx, shutdown_started_rx) = tokio::sync::oneshot::channel();
     // Register the drain-timeout counter up front so alerts can wire
     // onto it at boot. This surfaces the round-11 F2 hazard: axum's

@@ -30,6 +30,89 @@ impl Counter {
     }
 }
 
+/// A signed gauge whose value may go up, down, or be `set` to an
+/// absolute number. Backed by `AtomicI64` because Prometheus gauges
+/// are unrestricted-sign floats; we clamp to i64 here because every
+/// data-plane gauge in the workspace (open sessions, queue depth,
+/// spool bytes) is a non-negative count that fits comfortably in
+/// 63 bits, and the signed representation lets `sub_saturating`
+/// bottom out at 0 rather than wrap.
+#[derive(Debug, Default)]
+pub struct Gauge {
+    value: std::sync::atomic::AtomicI64,
+}
+
+impl Gauge {
+    /// Set the gauge to an absolute value. Truncates to `i64::MAX`
+    /// on overflow — no data-plane count in the workspace is even
+    /// close to that ceiling, and silently overflowing to a
+    /// negative value would produce misleading dashboards.
+    pub fn set(&self, value: u64) {
+        let clamped = i64::try_from(value).unwrap_or(i64::MAX);
+        self.value.store(clamped, Ordering::Relaxed);
+    }
+
+    /// Increment by 1. Saturates at `i64::MAX`.
+    pub fn inc(&self) {
+        self.add(1);
+    }
+
+    /// Decrement by 1. Saturates at 0 — a gauge going negative is
+    /// almost always a lifecycle bookkeeping bug (dec called twice
+    /// for one inc), and rendering `-1 open_sessions` would confuse
+    /// every dashboard downstream.
+    pub fn dec(&self) {
+        self.sub(1);
+    }
+
+    /// Increment by `n`. Saturates at `i64::MAX`.
+    pub fn add(&self, n: u64) {
+        let delta = i64::try_from(n).unwrap_or(i64::MAX);
+        // A signed `fetch_add` with a positive delta saturates
+        // silently to `i64::MIN` on overflow (two's complement
+        // wrap). Loop-CAS to a saturated add so overflow lands at
+        // `i64::MAX` — never negative.
+        let mut current = self.value.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_add(delta);
+            match self.value.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Decrement by `n`. Saturates at 0.
+    pub fn sub(&self, n: u64) {
+        let delta = i64::try_from(n).unwrap_or(i64::MAX);
+        let mut current = self.value.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(delta).max(0);
+            match self.value.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Current value as an unsigned integer — the saturating math
+    /// above guarantees non-negativity so the cast never truncates
+    /// a real observation.
+    pub fn get(&self) -> u64 {
+        self.value.load(Ordering::Relaxed).max(0) as u64
+    }
+}
+
 /// Fixed-bucket latency histogram (microsecond samples).
 ///
 /// Buckets are cumulative on render, per Prometheus convention.
@@ -154,6 +237,7 @@ impl Histogram {
 
 enum Metric {
     Counter(Arc<Counter>),
+    Gauge(Arc<Gauge>),
     Histogram(Arc<Histogram>),
 }
 
@@ -176,6 +260,7 @@ pub struct Registry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetricKind {
     Counter,
+    Gauge,
     Histogram,
 }
 
@@ -183,6 +268,7 @@ impl MetricKind {
     fn label(self) -> &'static str {
         match self {
             Self::Counter => "counter",
+            Self::Gauge => "gauge",
             Self::Histogram => "histogram",
         }
     }
@@ -213,6 +299,10 @@ impl Registry {
         let mut m = self.metrics.lock();
         match m.get(key) {
             Some((_, Metric::Counter(c))) => Arc::clone(c),
+            Some((_, Metric::Gauge(_))) => panic!(
+                "metric name conflict: {key:?} is already registered as a gauge, \
+                 cannot register as a counter",
+            ),
             Some((_, Metric::Histogram(_))) => panic!(
                 "metric name conflict: {key:?} is already registered as a histogram, \
                  cannot register as a counter",
@@ -221,6 +311,33 @@ impl Registry {
                 let c = Arc::new(Counter::default());
                 m.insert(key.to_owned(), (help.to_owned(), Metric::Counter(Arc::clone(&c))));
                 c
+            }
+        }
+    }
+
+    /// Register (or fetch) a gauge. Same key/label conventions as
+    /// [`Self::counter`]; gauges may go up, down, and be reset via
+    /// [`Gauge::set`]. Panics on kind conflict with an existing
+    /// counter or histogram registered under the same base name.
+    #[allow(clippy::panic)]
+    pub fn gauge(&self, key: &str, help: &str) -> Arc<Gauge> {
+        validate_metric_key(key);
+        self.reserve_base_kind(key, MetricKind::Gauge);
+        let mut m = self.metrics.lock();
+        match m.get(key) {
+            Some((_, Metric::Gauge(g))) => Arc::clone(g),
+            Some((_, Metric::Counter(_))) => panic!(
+                "metric name conflict: {key:?} is already registered as a counter, \
+                 cannot register as a gauge",
+            ),
+            Some((_, Metric::Histogram(_))) => panic!(
+                "metric name conflict: {key:?} is already registered as a histogram, \
+                 cannot register as a gauge",
+            ),
+            None => {
+                let g = Arc::new(Gauge::default());
+                m.insert(key.to_owned(), (help.to_owned(), Metric::Gauge(Arc::clone(&g))));
+                g
             }
         }
     }
@@ -256,6 +373,10 @@ impl Registry {
             Some((_, Metric::Histogram(h))) => Arc::clone(h),
             Some((_, Metric::Counter(_))) => panic!(
                 "metric name conflict: {key:?} is already registered as a counter, \
+                 cannot register as a histogram",
+            ),
+            Some((_, Metric::Gauge(_))) => panic!(
+                "metric name conflict: {key:?} is already registered as a gauge, \
                  cannot register as a histogram",
             ),
             None => {
@@ -317,6 +438,12 @@ impl Registry {
                         out.push_str(&format!("# HELP {base} {help}\n# TYPE {base} counter\n"));
                     }
                     out.push_str(&format!("{key} {}\n", c.get()));
+                }
+                Metric::Gauge(g) => {
+                    if declared.insert(base.to_owned()) {
+                        out.push_str(&format!("# HELP {base} {help}\n# TYPE {base} gauge\n"));
+                    }
+                    out.push_str(&format!("{key} {}\n", g.get()));
                 }
                 Metric::Histogram(h) => {
                     if declared.insert(base.to_owned()) {
@@ -483,6 +610,59 @@ mod tests {
         let text = r.render();
         assert!(text.contains("# TYPE av_test_total counter"), "{text}");
         assert!(text.contains("av_test_total 5"), "{text}");
+    }
+
+    #[test]
+    fn gauge_add_sub_set_and_render() {
+        let r = Registry::new();
+        let g = r.gauge("av_test_gauge", "test gauge");
+        g.set(10);
+        g.inc();
+        g.add(3);
+        g.dec();
+        g.sub(2);
+        assert_eq!(g.get(), 11);
+        let text = r.render();
+        assert!(text.contains("# TYPE av_test_gauge gauge"), "{text}");
+        assert!(text.contains("av_test_gauge 11"), "{text}");
+    }
+
+    #[test]
+    fn gauge_saturates_at_zero_not_negative() {
+        let g = Gauge::default();
+        g.set(3);
+        g.sub(100);
+        assert_eq!(
+            g.get(),
+            0,
+            "gauge went negative — dashboards would be misleading and the review's data-plane counters would report bogus values"
+        );
+    }
+
+    #[test]
+    fn gauge_saturates_at_i64_max_not_wrap() {
+        let g = Gauge::default();
+        g.add(u64::MAX);
+        g.add(u64::MAX);
+        // Any positive number is a passing signal (proves no wrap);
+        // the specific ceiling is i64::MAX under the current impl.
+        assert!(g.get() > 0, "gauge wrapped through overflow");
+    }
+
+    #[test]
+    #[should_panic(expected = "already registered as `counter`")]
+    fn gauge_refuses_conflict_with_counter() {
+        let r = Registry::new();
+        let _c = r.counter("av_conflict", "conflict");
+        let _g = r.gauge("av_conflict", "conflict");
+    }
+
+    #[test]
+    #[should_panic(expected = "already registered as `gauge`")]
+    fn counter_refuses_conflict_with_gauge() {
+        let r = Registry::new();
+        let _g = r.gauge("av_conflict2", "conflict");
+        let _c = r.counter("av_conflict2", "conflict");
     }
 
     /// Round-19: HELP text with an embedded newline must be escaped
