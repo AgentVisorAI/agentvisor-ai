@@ -666,6 +666,13 @@ impl Finalizer {
                             "tool_blocked": session.totals.tool_blocked.load(std::sync::atomic::Ordering::Acquire),
                             "cost_usd_micros": session.totals.cost_usd_micros.load(std::sync::atomic::Ordering::Acquire),
                             "stop_reason_id": session.recorded_stop_reason_id(),
+                            // The sticky enforcement latch, persisted so the
+                            // same-id refusal survives restarts. Inferring it
+                            // from stop_reason_id was wrong: Inject-action
+                            // breaker trips record LoopDetected without
+                            // latching, so a restart upgraded a deliberately
+                            // non-terminal trip into a permanent lockout.
+                            "enforcement_latched": session.enforcement_latched_id(),
                         }));
                     }
                     let name = format!(
@@ -2418,6 +2425,14 @@ impl Finalizer {
                     // left the step-journal on disk uncleaned, and
                     // repeated every restart.
                     "stop_reason_id": stop_reason_id.map_or(0u64, u64::from),
+                    // The journal cannot reconstruct the enforcement
+                    // latch; write 0 and normalize the key away in the
+                    // comparison below (same class as ttl_remaining_s).
+                    // A crash-mid-close latched session therefore keeps
+                    // its close-written latch when the artifacts
+                    // otherwise agree, and forgets it when the journal
+                    // genuinely wins — a bounded degradation.
+                    "enforcement_latched": 0u64,
                 }));
             }
             if final_path.exists() {
@@ -2445,6 +2460,8 @@ impl Finalizer {
                     let mut rhs = existing.clone();
                     normalize_extra_ttl(&mut lhs);
                     normalize_extra_ttl(&mut rhs);
+                    normalize_extra_enforcement(&mut lhs);
+                    normalize_extra_enforcement(&mut rhs);
                     lhs != rhs
                 };
                 if differs {
@@ -3522,6 +3539,22 @@ fn normalize_extra_ttl(trajectory: &mut av_atif::Trajectory) {
         if let Some(object) = extra.as_object_mut() {
             if object.contains_key("ttl_remaining_s") {
                 object.insert("ttl_remaining_s".to_owned(), serde_json::Value::Null);
+            }
+        }
+    }
+}
+
+/// Same comparison-copy normalization class as [`normalize_extra_ttl`]:
+/// the enforcement latch is close-time in-memory state the journal
+/// cannot reconstruct, so the consolidation rebuild writes 0 and the
+/// rebuilt-vs-existing equality must not fire on that key alone.
+fn normalize_extra_enforcement(trajectory: &mut av_atif::Trajectory) {
+    if let Some(metrics) = trajectory.final_metrics.as_mut() {
+        if let Some(extra) = metrics.extra.as_mut() {
+            if let Some(object) = extra.as_object_mut() {
+                if object.contains_key("enforcement_latched") {
+                    object.insert("enforcement_latched".to_owned(), serde_json::Value::Null);
+                }
             }
         }
     }
