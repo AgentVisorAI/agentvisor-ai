@@ -1,0 +1,265 @@
+# Structural Refactor Design Notes
+
+This document captures the three structural changes flagged in
+engineering review round 51 (§5.1-§5.3) that are correctness-neutral
+and value-positive but too large to land in a single incident-scale
+sprint. Each entry names the current state, the target state, the
+migration path, and the tests that must remain green throughout.
+
+These notes exist so a future implementer can pick up the work
+without re-deriving the trade-offs.
+
+## S1 — Reconciler decomposition
+
+### Current state
+
+`crates/av-harness/src/reconciler.rs` is ~6500 lines and does:
+
+* Recovery scans (5 phases per tick, single method
+  `recover_spooled_sessions`)
+* Session close and promote (`close_session_locked`,
+  `promote_session`)
+* Retention pruning (`prune_sealed_atif`)
+* Orphan quarantine (`archive_conflicting_atif`,
+  `archive_conflicting_receipt`)
+* Per-session lifecycle locking (`acquire_lifecycle`, lock table
+  pruning)
+* Finalize observer (metrics + drop-guard)
+* Bridge emit + retry
+* Receipt sign + verify
+
+Each concern is currently a method on the `Finalizer` struct. There
+is no interface boundary between them, so a bug in one silently
+affects the others (see round-42 F3 for the seal-before-insert race
+that spanned recovery + close).
+
+### Target state
+
+A `RecoveryPass` trait:
+
+```rust
+trait RecoveryPass: Sync + Send {
+    fn name(&self) -> &'static str;
+    async fn run(&self, ctx: &ReconcilerContext) -> Result<PassOutcome, FinalizeError>;
+}
+```
+
+with concrete implementations:
+
+* `ConsolidateStepJournalsPass`
+* `ReapSignedCandidatesPass`
+* `RetryMarkedPromotionsPass`
+* `QuarantineOrphanJsonPass`
+* `EmitPendingCloseSweepPass`
+
+A unified `ActionJournalRecord::apply(&mut Session)` method that
+each of the three current accounting folds (recovery, close,
+promote) call. Today the folds are hand-rolled and diverge on
+edge cases (round-32 F2 fixed one such divergence in token
+accounting).
+
+The `Finalizer` struct keeps its public API (close_session,
+promote_session, recover_spooled_sessions) but delegates to the
+pass registry internally.
+
+### Migration path
+
+1. **Extract `ActionJournalRecord::apply` first.** Grep for the
+   three folds; write a `#[cfg(test)]` proof harness that runs each
+   fold and the new apply over the same input and asserts identical
+   Session state. Land the new apply behind a feature flag; flip
+   the flag; delete the old folds.
+2. **Extract the QuarantineOrphanJsonPass second.** This one is
+   the simplest (§8.5 fix is a self-contained snapshot + gate), has
+   clear success criteria (existing tests keep passing), and is
+   independent of the accounting folds.
+3. **Extract each other pass one at a time**, keeping the
+   `recover_spooled_sessions` method as a thin loop over the pass
+   registry. Do NOT combine steps: each pass extraction is one PR
+   with its own regression tests.
+4. **Once the pass registry is stable**, move the retention sweep
+   from main.rs into the same registry (it's currently spawned
+   separately because the reconciler didn't have a home for it).
+
+### Tests that must remain green
+
+* All reconciler unit tests (currently 45 in reconciler::tests)
+* All e2e_workflows integration tests (currently 7)
+* The Round-44/44/49/51 seal-before-insert races
+  (`recovery_tick_does_not_quarantine_live_sessions_with_inflight_markers`
+  and friends)
+* The live crash-recovery gate documented in `VERIFICATION.md`
+
+### Estimated scope
+
+Two engineer-months. Not a single PR — 8-12 PRs, each with its own
+tests and rollout window.
+
+---
+
+## S2 — Session lifecycle state machine
+
+### Current state
+
+`Session` carries six independent atomic flags:
+
+| Flag | Set by | Read by |
+| --- | --- | --- |
+| `closed` | `try_close` at close entry | `is_closed` on the request hot path |
+| `artifact_committed` | close success (or capture-failed seal) | pending_close_sessions, evict_finalized |
+| `close_complete` | close-tail success | evict_finalized, get_or_open |
+| `capture_failed` | many hot-path sites | close_session_locked, evict_finalized, pending_close_sessions |
+| `receipt_verified` (unsigned) | promote path | promote-idempotency |
+| `admission_open` | admission_guard RAII | admission validation |
+
+Correctness rests on operators knowing that certain transitions
+must happen in a specific order (artifact_committed BEFORE
+close_complete, capture_failed at any time, admission_open only
+before try_close, etc.). Every new call site has to consult the
+Round-N history to know which flag to touch.
+
+### Target state
+
+A single `SessionState` enum:
+
+```rust
+enum SessionState {
+    Open,
+    Draining,          // try_close ran; streams still active
+    Sealed,            // artifact_committed = true; close-tail pending
+    Complete,          // close_complete = true
+    CaptureFailed,     // any-time terminal
+    Quarantined,       // recovery-adopted with inconsistencies
+}
+```
+
+held in a single `AtomicU8` on `Session`. Every transition is a CAS
+that names the expected source state; illegal transitions return an
+error rather than silently corrupting.
+
+Keep `admission_open` as a separate flag — it's a lease counter,
+not a lifecycle marker.
+
+### Migration path
+
+1. Introduce the enum + AtomicU8 field alongside the six existing
+   flags. Every setter of the flags also updates the enum. Every
+   test that reads a flag also asserts the enum matches. Land this
+   as one PR — it changes no observable behavior.
+2. Migrate one flag at a time: `capture_failed → SessionState::CaptureFailed`
+   is the simplest since it's a terminal state, then
+   `close_complete → SessionState::Complete`, etc. Each migration
+   is a PR; the old flag stays until the new enum is authoritative.
+3. Delete the flags in reverse order once every reader/writer uses
+   the enum.
+
+### Tests that must remain green
+
+* All session unit tests
+* The Round-44 F2 empty-unsigned-quarantine gate
+  (`is_empty_unsigned_quarantine`) — this is a special case that
+  needs `SessionState::Quarantined` with a discriminant on
+  workflow. Watch it.
+* The Round-42 F3 seal-before-insert order
+  (`try_insert_recovered` sequence). Reordering here is bug bait.
+* Every capture_failed-related test — D7 explicitly narrows the
+  hot-path callers of `mark_capture_failed` but doesn't change the
+  reader semantics.
+
+### Estimated scope
+
+Three engineer-weeks. High-risk because the flags are read on the
+request hot path (pipeline.rs:750 `capture_failed()` check) — a
+subtle atomic-ordering change would surface only under load.
+
+---
+
+## S3 — Provider adapter trait
+
+### Current state
+
+The upstream is treated as OpenAI-shaped. Most of the shape is
+already externalized via config:
+
+* `upstream_chat_path` (route)
+* `upstream_auth_header` and `upstream_auth_scheme`
+  (Anthropic-friendly)
+* `parse_provider_chunk` handles OpenAI + vLLM + LiteLLM SSE
+  variants heuristically (BOM, `[DONE]`, `usage: null`)
+
+Direct OpenAI coupling that would break on a different provider:
+
+* Response body shape (`choices[0].message.content` vs Anthropic's
+  `content[].text` blocks)
+* Tool-call schema (OpenAI's `tool_calls` array vs Anthropic's
+  `tool_use` block vs Google's `functionCall` object)
+* Usage accounting field names (`prompt_tokens` vs `input_tokens`
+  vs `promptTokenCount`)
+* Streaming delta shape (OpenAI's `delta` vs Anthropic's
+  `content_block_delta` vs Google's `candidates[].content.parts`)
+
+### Target state
+
+A `ProviderAdapter` trait:
+
+```rust
+trait ProviderAdapter: Send + Sync {
+    fn parse_response_body(&self, bytes: &[u8]) -> Result<ParsedResponse, AdapterError>;
+    fn parse_sse_chunk(&self, raw: &str) -> Result<Option<ParsedProviderChunk>, AdapterError>;
+    fn usage_from_response(&self, resp: &ParsedResponse) -> UsageAccounting;
+    fn tool_calls_from_response(&self, resp: &ParsedResponse) -> Vec<ToolCall>;
+}
+```
+
+with concrete implementations:
+
+* `OpenAiAdapter` (also fits vLLM, LiteLLM, Groq, Together,
+  DeepSeek, OpenRouter, Ollama, LMStudio, llamacpp, xAI, Mistral,
+  Azure OpenAI)
+* `AnthropicAdapter`
+* `GoogleGeminiAdapter`
+
+Selected via a new `provider` config key (default `"openai"` for
+back-compat). The `parse_provider_chunk` module keeps the OpenAI
+adapter's implementation verbatim.
+
+### Migration path
+
+1. Extract the trait with only the OpenAI adapter. All callers of
+   `parse_provider_chunk` go through
+   `state.provider_adapter.parse_sse_chunk`. This is a pure
+   refactor — no behavior change.
+2. Add `AnthropicAdapter`. Gate under `provider = "anthropic"` in
+   config. Land integration tests that hit a mock Anthropic server
+   and prove the audit chain records the same shape as an OpenAI
+   session (down to `event_uid` and `subject.event_count`).
+3. Add `GoogleGeminiAdapter`. Same pattern.
+4. Update `docs/reference/OPENAI-COMPATIBILITY.md` to a broader
+   "provider compatibility" doc.
+
+### Tests that must remain green
+
+* All routes::tests parser tests (they exercise the OpenAI shape
+  and must continue to pass verbatim through the OpenAI adapter)
+* All e2e_workflows tests (they cover the full audit chain and
+  must round-trip receipts and ATIF trajectories against the
+  OpenAI adapter unchanged)
+* fuzz/parse_provider_chunk (must remain total after the trait
+  extraction)
+
+### Estimated scope
+
+One engineer-month for the trait extraction + OpenAI adapter (the
+correctness-neutral refactor). Then one engineer-week per additional
+provider. Total: two engineer-months to ship Anthropic and Google.
+
+---
+
+## Deferred: W3 group-commit
+
+Documented in the todo tracker for completeness. Not a correctness
+gap; the current per-event `sync_data()` delivers p95 33 µs at 10k
+connections (`BENCHMARKS.md`). Group-commit trades audit-chain
+durability granularity for latency and needs a careful design
+before implementation. Revisit when profiling shows fsync is the
+top-of-flame-graph cost.
