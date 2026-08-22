@@ -1091,7 +1091,18 @@ impl AppState {
             return Err(error);
         }
         if prepared.session.loop_state.state() == BreakerState::Open {
-            let error = match prepared.session.loop_state.action() {
+            let action = prepared.session.loop_state.action();
+            // Latch the terminal enforcement actions only: Inject's
+            // refusal here is genuinely transient (the client retry
+            // re-enters prepare_chat, which injects the corrective
+            // message and proceeds), so it must not make the id
+            // terminal. Without this latch, a breaker trip delivered
+            // from THIS site (opened during the audit wait) left the
+            // id recyclable with a fresh breaker.
+            if matches!(action, BreakerAction::Abort | BreakerAction::Reject) {
+                prepared.session.latch_enforcement(StopReason::LoopDetected);
+            }
+            let error = match action {
                 BreakerAction::Abort => {
                     PipelineError::Abort("semantic loop circuit breaker opened during audit".to_owned())
                 }

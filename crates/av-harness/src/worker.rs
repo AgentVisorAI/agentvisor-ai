@@ -930,6 +930,20 @@ async fn process_job(
             metrics
                 .counter("av_breaker_trips_total", "Semantic loop breaker trips")
                 .inc();
+            // Latch at the trip itself — not only at the NEXT
+            // admission's breaker-open refusal: a session whose breaker
+            // trips and is then closed without another admission
+            // attempt (explicit /close, idle sweep) would otherwise
+            // recycle its id with a fresh breaker. Terminal actions
+            // only, matching the admission arms: an Inject-configured
+            // breaker resolves the trip by rewriting the next request,
+            // so its trip must not make the id terminal.
+            if matches!(
+                action,
+                av_loopdetect::BreakerAction::Abort | av_loopdetect::BreakerAction::Reject
+            ) {
+                job.session.latch_enforcement(StopReason::LoopDetected);
+            }
             (
                 EventClass::StopReason,
                 StatusId::Failure,

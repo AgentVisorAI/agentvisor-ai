@@ -453,17 +453,19 @@ impl Session {
                     }
                     session.last_stop_reason_id.store(id, Ordering::Release);
                     // Best-effort latch restoration across restart: the
-                    // sticky enforcement flag is in-memory only, so seed
-                    // it from the persisted final stop reason when that
-                    // reason IS an enforcement id. Imperfect (the
-                    // persisted value is the last-recorded reason, the
-                    // known-imprecise proxy), but fail-closed in the
-                    // useful direction: an enforcement-refused id keeps
-                    // refusing after a restart instead of silently
-                    // recycling into a fresh budget.
-                    if id == u64::from(StopReason::BudgetExceeded.id())
-                        || id == u64::from(StopReason::LoopDetected.id())
-                    {
+                    // sticky enforcement flag is in-memory only. Seed it
+                    // ONLY from a persisted LoopDetected — the single
+                    // stop reason with exactly one recording source (the
+                    // worker's breaker-trip verdict, which also latches
+                    // live). BudgetExceeded is deliberately NOT seeded:
+                    // it has three recording sources (genuine refusal,
+                    // quota-backend outage, blocked tool call) and only
+                    // the first latches live, so seeding it would lock
+                    // out ids the live process never locked. Cost: a
+                    // budget-latched unsigned id forgets its refusal
+                    // across a restart — the same bounded degradation
+                    // already accepted for signed workflows.
+                    if id == u64::from(StopReason::LoopDetected.id()) {
                         session.enforcement_tripped.store(id, Ordering::Release);
                     }
                 }
@@ -870,8 +872,10 @@ impl SessionRegistry {
                 // capture-failed ones: evicting them vacated the id, and
                 // the next get_or_open built a fresh session with a
                 // fresh budget/breaker — the same-id refusal silently
-                // expired after idle_s for signed workflows (bounded
-                // growth accepted, same tradeoff as capture_failed).
+                // expired after idle_s for signed workflows. Bounded by
+                // the overflow pass below (unlike capture_failed, the
+                // latch is client-mintable at line rate — one over-cap
+                // request per fresh id — so retention needs a cap).
                 && !session.enforcement_tripped()
                 && session.active_streams.load(Ordering::Acquire) == 0
                 && session.pending_jobs.load(Ordering::Acquire) == 0
@@ -881,6 +885,40 @@ impl SessionRegistry {
             }
             !evict
         });
+        // Overflow pass: cap latched-retained signed sessions. Beyond the
+        // cap, evict oldest-first — the same-id refusal expires for the
+        // evicted ids (degraded to the pre-latch idle-bounded behavior),
+        // which is the accepted cost of bounding client-mintable registry
+        // growth. Unsigned latched sessions are governed by the existing
+        // unsigned retention posture and are not evicted here.
+        const MAX_LATCHED_RETAINED: usize = 4096;
+        let mut latched: Vec<Arc<Session>> = self
+            .sessions
+            .iter()
+            .filter(|entry| {
+                entry.workflow == Workflow::Signed
+                    && entry.close_complete.load(Ordering::Acquire) != 0
+                    && entry.enforcement_tripped()
+                    && !entry.capture_failed()
+                    && entry.active_streams.load(Ordering::Acquire) == 0
+                    && entry.pending_jobs.load(Ordering::Acquire) == 0
+            })
+            .map(|entry| Arc::clone(&entry))
+            .collect();
+        if latched.len() > MAX_LATCHED_RETAINED {
+            latched.sort_by_key(|session| std::cmp::Reverse(session.idle_duration()));
+            let excess = latched.len() - MAX_LATCHED_RETAINED;
+            tracing::warn!(
+                excess,
+                cap = MAX_LATCHED_RETAINED,
+                "latched-retained signed sessions exceed the cap; evicting oldest \
+                 (their same-id enforcement refusal expires)"
+            );
+            for session in latched.into_iter().take(excess) {
+                self.sessions.remove(&session.id);
+                evicted.push(session);
+            }
+        }
         evicted
     }
 
