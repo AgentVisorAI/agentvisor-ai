@@ -2461,6 +2461,27 @@ impl AbortFinalizingStream {
         );
         std::io::Error::other(reason)
     }
+
+    /// Engineering-review §6.2 (round-51): scope a mid-stream capture
+    /// failure to THIS response instead of sealing the whole session.
+    /// The failure reason is recorded into the audit trail via
+    /// `submit_response_capture(Some(_))` (at-most-once), so the turn
+    /// is attested as failed and the session stays usable for future
+    /// turns — a transient provider framing quirk no longer costs the
+    /// operator every previously-captured turn. Only when the audit
+    /// worker itself cannot accept the capture do we fall back to
+    /// sealing the session: without the failure record the audit chain
+    /// has a hole no later close could explain.
+    fn record_response_failure(&mut self, reason: &str) {
+        if let Err(error) = self.submit_response_capture(Some(reason.to_owned())) {
+            tracing::warn!(
+                %error,
+                session = %self.session.id,
+                "response-failure capture submit failed; sealing session capture"
+            );
+            self.session.mark_capture_failed();
+        }
+    }
 }
 
 impl Stream for AbortFinalizingStream {
@@ -2566,7 +2587,7 @@ impl Stream for AbortFinalizingStream {
                         let delta = match self.absorb_network_chunk(&bytes) {
                             Ok(delta) => delta,
                             Err(error) => {
-                                self.session.mark_capture_failed();
+                                self.record_response_failure(&error);
                                 self.pending_output.clear();
                                 let error = self.abort_error(error);
                                 return Poll::Ready(Some(Err(error)));
@@ -2580,9 +2601,10 @@ impl Stream for AbortFinalizingStream {
                         }
                     }
                     Poll::Ready(Some(Err(error))) => {
-                        self.session.mark_capture_failed();
+                        let reason = error.to_string();
+                        self.record_response_failure(&reason);
                         self.pending_output.clear();
-                        let error = self.abort_error(error.to_string());
+                        let error = self.abort_error(reason);
                         return Poll::Ready(Some(Err(error)));
                     }
                     Poll::Pending => return Poll::Pending,
@@ -2590,7 +2612,7 @@ impl Stream for AbortFinalizingStream {
                         let delta = match self.flush_protocol_buffer() {
                             Ok(delta) => delta,
                             Err(error) => {
-                                self.session.mark_capture_failed();
+                                self.record_response_failure(&error);
                                 self.pending_output.clear();
                                 let error = self.abort_error(error);
                                 return Poll::Ready(Some(Err(error)));
@@ -2639,14 +2661,15 @@ impl Stream for AbortFinalizingStream {
                     Poll::Pending
                 }
                 Err(error) => {
-                    self.session.mark_capture_failed();
+                    self.record_response_failure(&error);
                     let error = self.abort_error(error);
                     Poll::Ready(Some(Err(error)))
                 }
             },
             Poll::Ready(Some(Err(error))) => {
-                self.session.mark_capture_failed();
-                let error = self.abort_error(error.to_string());
+                let reason = error.to_string();
+                self.record_response_failure(&reason);
+                let error = self.abort_error(reason);
                 Poll::Ready(Some(Err(error)))
             }
             Poll::Pending => Poll::Pending,
@@ -2654,7 +2677,7 @@ impl Stream for AbortFinalizingStream {
                 let delta = match self.flush_protocol_buffer() {
                     Ok(delta) => delta,
                     Err(error) => {
-                        self.session.mark_capture_failed();
+                        self.record_response_failure(&error);
                         let error = self.abort_error(error);
                         return Poll::Ready(Some(Err(error)));
                     }
@@ -3044,7 +3067,23 @@ impl Drop for AbortFinalizingStream {
                 self.session.mark_capture_failed();
             }
         }
-        if !is_closed {
+        // Engineering-review §6.4 (round-51): a client disconnect must
+        // not seal the whole conversation. Spawn the background close
+        // ONLY when this abort left nothing capturable AND no
+        // concurrent stream is in flight — the ephemeral one-shot
+        // case where the session would otherwise linger as an empty
+        // husk until the idle sweeper. In every other case the
+        // session stays OPEN: the truncated turn was recorded above
+        // via response capture, a client retrying with the same
+        // session id keeps working, and the idle sweeper finalizes
+        // if the client never comes back. This was the direct
+        // trigger for the §6.1 recycled-id artifact destruction.
+        // NB: our own SessionLease is still held during this body
+        // (fields drop after Drop::drop), so `> 1` means "another
+        // stream besides ours".
+        let nothing_captured = !self.saw_chunk && self.captured_bytes == 0;
+        let other_streams = self.session.active_streams_count() > 1;
+        if !is_closed && nothing_captured && !other_streams {
             let session = Arc::clone(&self.session);
             let finalizer = self.finalizer.clone();
             let session_id = session.id.clone();
@@ -3678,20 +3717,28 @@ mod tests {
 
         let aborted = app.clone().oneshot(chat_request("abort-flow")).await.unwrap();
         drop(aborted);
-        tokio::time::timeout(Duration::from_secs(1), async {
+        // Round-51 §6.4: a client abort AFTER content was captured (the
+        // SSE peek already consumed the first frame) must NOT force-close
+        // the conversation — the turn is recorded and the session stays
+        // open for the client's next request; the idle sweeper owns
+        // eventual finalization. Only a nothing-captured one-shot abort
+        // spawns the background close.
+        let session = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if state
-                    .sessions
-                    .get("abort-flow")
-                    .is_some_and(|session| session.is_closed())
-                {
-                    break;
+                if let Some(session) = state.sessions.get("abort-flow") {
+                    if session.active_streams_count() == 0 {
+                        break session;
+                    }
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("abort finalization timed out");
+        .expect("abort stream never drained");
+        assert!(
+            !session.is_closed(),
+            "an abort after captured content must leave the conversation open"
+        );
         provider.abort();
     }
 
@@ -4769,7 +4816,14 @@ mod tests {
             .unwrap();
         assert!(serde_json::from_slice::<Value>(&body).unwrap()["error"].is_string());
         let session = state.sessions.get("malformed-json").unwrap();
-        assert!(session.capture_failed());
+        // Round-51 §6.2: the malformed frame is scoped to THIS
+        // response — recorded as a failed capture — instead of
+        // sealing the whole session. The session must stay usable
+        // for the client's next turn.
+        assert!(
+            !session.capture_failed(),
+            "a single malformed provider frame must not brick the session"
+        );
         provider.abort();
     }
 
@@ -4908,14 +4962,22 @@ mod tests {
             .await
             .is_err());
         let session = state.sessions.get("regressive-usage").unwrap();
-        assert!(session.capture_failed());
+        // Round-51 §6.2: the regressive-usage frame fails THIS
+        // response's capture (recorded with a failure reason via
+        // submit_response_capture) — it must not seal the session.
+        assert!(
+            !session.capture_failed(),
+            "a regressive usage frame must be scoped to the response, not the session"
+        );
         session.wait_for_worker_jobs().await;
         let records = active_records(directory.path(), &state, "regressive-usage");
-        assert_eq!(records.len(), 1);
-        assert!(records[0]
-            .response_attempt
-            .as_ref()
-            .is_some_and(|attempt| !attempt.terminal));
+        // Two records: the request capture and the terminally-failed
+        // response capture — the failure record IS the audit trail
+        // entry for this turn.
+        assert_eq!(records.len(), 2);
+        assert!(records
+            .iter()
+            .any(|record| record.response_attempt.is_some()));
         provider.abort();
     }
 
@@ -4941,7 +5003,12 @@ mod tests {
             .await
             .unwrap();
         assert!(serde_json::from_slice::<Value>(&body).unwrap()["error"].is_string());
-        assert!(state.sessions.get("empty-success").unwrap().capture_failed());
+        // Round-51 §6.2: choices-less success is a per-response
+        // capture failure, not a session seal.
+        assert!(
+            !state.sessions.get("empty-success").unwrap().capture_failed(),
+            "a choices-less response must not brick the session"
+        );
         provider.abort();
     }
 
@@ -4997,7 +5064,13 @@ mod tests {
         assert!(axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
             .is_ok());
-        assert!(state.sessions.get("tool-oob-index").unwrap().capture_failed());
+        // Round-51 §6.2: an out-of-range tool-call index fails the
+        // response capture (surfaced as the clean 502 above via the
+        // peek-before-commit path) but leaves the session usable.
+        assert!(
+            !state.sessions.get("tool-oob-index").unwrap().capture_failed(),
+            "an out-of-range tool-call index must be scoped to the response"
+        );
         provider.abort();
     }
 
@@ -5063,23 +5136,25 @@ mod tests {
         let app = build_router(state.clone());
         let response = app.oneshot(chat_request("completion-budget")).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        // The completion-side budget refusal severs the body mid-stream.
         assert!(axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
             .is_err());
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if state
-                    .sessions
-                    .get("completion-budget")
-                    .is_some_and(|session| session.is_closed())
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        // Round-51 §6.4: a budget-refused turn is recorded as a failed
+        // response capture but must NOT seal or force-close the
+        // session — per-minute windows refill, and the client's next
+        // turn under the same id must be admissible. The idle sweeper
+        // owns eventual finalization.
+        let session = state.sessions.get("completion-budget").unwrap();
+        session.wait_for_streams().await;
+        assert!(
+            !session.capture_failed(),
+            "budget refusal must be scoped to the response, not the session"
+        );
+        assert!(
+            !session.is_closed(),
+            "budget refusal must not force-close the conversation"
+        );
         provider.abort();
     }
 

@@ -1945,7 +1945,7 @@ impl AppState {
                         instance_uid: "anonymous".to_owned(),
                         ttl_remaining_s: None,
                     })
-                } else if has_static_key {
+                } else if has_static_key || self.config.ignore_client_authorization {
                     // Static-key posture (the wizard's default): the
                     // operator has declared that THIS PROXY owns the
                     // upstream credential, and OpenAI-compatible SDKs
@@ -1960,6 +1960,15 @@ impl AppState {
                     // be REPLACED by the static key — it is never
                     // forwarded). Accept anonymous; the placeholder
                     // never reaches the provider.
+                    //
+                    // Round-51 §9.1: `ignore_client_authorization` is the
+                    // explicit opt-in covering the same posture for
+                    // KEYLESS upstreams (Ollama, LM Studio, vLLM — no
+                    // static key configured, so the implicit rule above
+                    // cannot fire). validate() refuses the flag in
+                    // combination with require_identity (the validator
+                    // must see the header) and with passthrough (cannot
+                    // both discard and forward).
                     tracing::debug!(
                         "client bearer ignored: static upstream key posture (placeholder \
                          SDK credential, not an identity claim)"
@@ -3415,6 +3424,62 @@ mod tests {
             !matches!(&outcome, Err(PipelineError::BadRequest(msg)) if msg.contains("more than one")),
             "single Authorization header must not be refused as duplicate; got {outcome:?}"
         );
+    }
+
+    /// Round-51 §9.1 (hero snippet): with `ignore_client_authorization`
+    /// opted in and no validator configured, a stock OpenAI SDK's
+    /// mandatory `Authorization` header must be accepted-and-discarded
+    /// — the request proceeds anonymously instead of hard-401ing on
+    /// request one. Without the opt-in, the diagnostic 401 stays.
+    #[tokio::test]
+    async fn ignore_client_authorization_accepts_and_discards_sdk_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-test-openai-sdk-key"),
+        );
+
+        // Default (flag off): diagnostic 401.
+        let refused = null_state().resolve_identity(&headers, None);
+        assert!(
+            matches!(&refused, Err(PipelineError::Unauthorized(_))),
+            "bearer with no validator and no opt-in must stay 401; got {refused:?}"
+        );
+
+        // Flag on: accepted as anonymous.
+        let mut config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        config.require_identity = false;
+        config.ignore_client_authorization = true;
+        let accepted = state(config).resolve_identity(&headers, None);
+        match accepted {
+            Ok(identity) => {
+                assert_eq!(identity.instance_uid, "anonymous");
+            }
+            Err(error) => panic!(
+                "ignore_client_authorization must accept the SDK bearer anonymously; got {error:?}"
+            ),
+        }
+    }
+
+    /// The two contradictory combinations must be refused at
+    /// validate(): require_identity needs the header, passthrough
+    /// forwards it — neither can coexist with discarding it.
+    #[test]
+    fn ignore_client_authorization_is_refused_with_identity_or_passthrough() {
+        let mut with_identity = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        with_identity.ignore_client_authorization = true;
+        with_identity.require_identity = true;
+        with_identity.identity_hmac_secret_file = Some("/tmp/hmac".into());
+        let err = with_identity.validate().unwrap_err();
+        assert!(err.contains("ignore_client_authorization"), "{err}");
+        assert!(err.contains("require_identity"), "{err}");
+
+        let mut with_passthrough = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        with_passthrough.ignore_client_authorization = true;
+        with_passthrough.upstream_authorization_passthrough = true;
+        let err = with_passthrough.validate().unwrap_err();
+        assert!(err.contains("ignore_client_authorization"), "{err}");
+        assert!(err.contains("passthrough"), "{err}");
     }
 
     /// Round-15 F3: RFC 7235 §2.1 auth-scheme is case-insensitive.
