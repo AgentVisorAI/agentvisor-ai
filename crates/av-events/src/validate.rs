@@ -452,6 +452,94 @@ mod tests {
         assert!(validate_event(&valid_event()).is_ok());
     }
 
+    /// Pin the fingerprint schema-parity block (previously entirely
+    /// unexercised — every mutation of it survived): a canonical
+    /// SHA-256/JCS fingerprint passes, and each individual violation
+    /// (wrong algorithm id/caption, wrong serialization id/caption,
+    /// non-64-hex value, uppercase hex) is refused on both the
+    /// `inventory` and `prev_inventory` fields.
+    #[test]
+    fn fingerprint_constants_are_enforced_per_field() {
+        use crate::model::Fingerprint;
+        let good = || Fingerprint::sha256_jcs("ab".repeat(32));
+        let mut ev = valid_event();
+        ev.inventory = Some(good());
+        ev.prev_inventory = Some(good());
+        assert!(validate_event(&ev).is_ok(), "canonical fingerprints must pass");
+
+        type Violation = Box<dyn Fn(&mut Fingerprint)>;
+        let violations: Vec<Violation> = vec![
+            Box::new(|f| f.algorithm_id = 2),
+            Box::new(|f| f.algorithm = "SHA-512".into()),
+            Box::new(|f| f.serialization_id = 1),
+            Box::new(|f| f.serialization = "CBOR".into()),
+            Box::new(|f| f.value = "ab".repeat(31)),
+            Box::new(|f| f.value = "zz".repeat(32)),
+            Box::new(|f| f.value = "AB".repeat(32)),
+        ];
+        for (index, violate) in violations.iter().enumerate() {
+            let mut ev = valid_event();
+            let mut fp = good();
+            violate(&mut fp);
+            ev.inventory = Some(fp);
+            let errors = validate_event(&ev).unwrap_err();
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::BadFingerprint("inventory"))),
+                "violation #{index} on inventory must be refused: {errors:?}"
+            );
+            let mut ev = valid_event();
+            let mut fp = good();
+            violate(&mut fp);
+            ev.prev_inventory = Some(fp);
+            let errors = validate_event(&ev).unwrap_err();
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::BadFingerprint("prev_inventory"))),
+                "violation #{index} on prev_inventory must be refused: {errors:?}"
+            );
+        }
+    }
+
+    /// Pin the payload maxProperties and time-range schema-parity caps
+    /// at their exact boundaries.
+    #[test]
+    fn payload_property_and_time_range_boundaries() {
+        let mut ev = valid_event();
+        let mut payload = serde_json::Map::new();
+        for index in 0..512 {
+            payload.insert(format!("k{index}"), serde_json::Value::Null);
+        }
+        ev.payload = serde_json::Value::Object(payload.clone());
+        assert!(validate_event(&ev).is_ok(), "512 properties is the inclusive max");
+        payload.insert("k512".into(), serde_json::Value::Null);
+        ev.payload = serde_json::Value::Object(payload);
+        assert!(
+            validate_event(&ev)
+                .unwrap_err()
+                .iter()
+                .any(|e| matches!(e, ValidationError::PayloadTooManyProperties(513))),
+            "513 properties must be refused"
+        );
+
+        let mut ev = valid_event();
+        ev.time = 253_402_300_799_999; // 9999-12-31T23:59:59.999Z
+        ev.time_iso = av_core::time::iso8601_ms(ev.time);
+        assert!(validate_event(&ev).is_ok(), "last 4-digit-year instant must pass");
+        let mut ev = valid_event();
+        ev.time = 253_402_300_800_000; // year 10000
+        ev.time_iso = av_core::time::iso8601_ms(ev.time);
+        assert!(
+            validate_event(&ev)
+                .unwrap_err()
+                .iter()
+                .any(|e| matches!(e, ValidationError::TimeBeyondSchemaRange(_))),
+            "5-digit-year instants must be refused"
+        );
+    }
+
     #[test]
     fn empty_identity_fields_all_reported() {
         let mut ev = valid_event();

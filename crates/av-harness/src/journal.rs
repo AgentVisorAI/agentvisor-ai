@@ -112,6 +112,43 @@ mod tests {
 
     use super::*;
 
+    /// The journal HMAC key must be a per-deployment derivation from
+    /// the signer — a constant key would give every deployment one
+    /// shared forgery key, and NO round-trip test can catch that
+    /// (seal and open would agree on the wrong constant). Pin the
+    /// uniqueness property directly: distinct signers derive distinct
+    /// keys, the same signer derives the same key, and the key is
+    /// never a degenerate constant.
+    #[test]
+    fn journal_key_is_derived_per_signer() {
+        let a = av_receipts::Ed25519Signer::from_seed(&[3; 32]);
+        let b = av_receipts::Ed25519Signer::from_seed(&[4; 32]);
+        let key_a = key_from_signer(&a);
+        let key_b = key_from_signer(&b);
+        assert_ne!(key_a, key_b, "distinct signers must derive distinct journal keys");
+        assert_eq!(key_a, key_from_signer(&a), "derivation must be deterministic");
+        assert_ne!(key_a, [0u8; 32]);
+        assert_ne!(key_a, [1u8; 32]);
+        assert_ne!(key_b, [0u8; 32]);
+        assert_ne!(key_b, [1u8; 32]);
+    }
+
+    /// The mac field length cap (128 chars) refuses oversized values
+    /// before hex-decode allocates; exactly 128 still verifies the MAC
+    /// path (and fails authentication, since it's not a real MAC).
+    #[test]
+    fn oversized_mac_field_is_refused_at_the_cap() {
+        let key = [7; 32];
+        let sealed = seal(&key, "session:signed", 0, &serde_json::json!({"v": 1})).unwrap();
+        let mut envelope: serde_json::Value = serde_json::from_slice(&sealed).unwrap();
+        envelope["mac"] = serde_json::json!("a".repeat(129));
+        let oversized = serde_json::to_vec(&envelope).unwrap();
+        assert!(open::<serde_json::Value>(&key, "session:signed", 0, &oversized).is_err());
+        envelope["mac"] = serde_json::json!("a".repeat(128));
+        let at_cap = serde_json::to_vec(&envelope).unwrap();
+        assert!(open::<serde_json::Value>(&key, "session:signed", 0, &at_cap).is_err());
+    }
+
     #[test]
     fn mutation_and_reordering_fail_authentication() {
         let key = [7; 32];

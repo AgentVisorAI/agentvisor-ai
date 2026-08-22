@@ -80,7 +80,8 @@ wrapper is `avctl receipt-verify <file> --public-key-hex <64-hex>`.
    `issued_at`, `issued_at_iso`, `ai_agent`, `subject`, `tool_calls`,
    `cost`, `stop_reason_id`, `stop_reason`, `key_id`,
    `public_key_b64`, `signature_b64`.
-2. **Semantic invariants.** `receipt_version` must be `1`. When
+2. **Semantic invariants.** `receipt_version` must be `1`.
+   `ai_agent.charter.type_id` must be `1` (OCSF Regular File). When
    `subject.kind == "atif_trajectory"`, `subject.retroactive` must be
    `true` and `subject.trajectory_digest` must be exactly 64 lowercase
    hex characters; when `subject.kind == "event_chain"`,

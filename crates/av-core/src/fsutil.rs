@@ -266,6 +266,58 @@ impl Drop for TempPathGuard {
     }
 }
 
+/// Remove crash-orphaned `*.tmp` files under `root`, recursively.
+///
+/// The RAII unlink in [`write_atomic`]/[`TempPathGuard`] cannot run when
+/// the process is SIGKILLed between `create_new` and `rename`, so crash
+/// loops accumulate orphaned temp files linearly forever (empirically:
+/// 16 stranded temps across a 19-SIGKILL stress run, surviving every
+/// recovery pass) — the exact inode-exhaustion class the module doc
+/// promises to prevent. Callers MUST invoke this only at boot, before
+/// any concurrent writer exists, because a live writer's in-flight temp
+/// is indistinguishable from an orphan. UUIDv7 suffixes guarantee a
+/// name deleted here can never be re-created by a later writer.
+///
+/// Returns the number of files removed. Errors on individual entries
+/// are skipped (a temp that cannot be removed is the pre-existing
+/// condition, not a boot failure); only the root read errors surface.
+pub fn sweep_orphaned_tmp(root: &Path) -> io::Result<u64> {
+    const MAX_SWEEP_DEPTH: usize = 8;
+    fn walk(dir: &Path, depth: usize, removed: &mut u64) {
+        if depth > MAX_SWEEP_DEPTH {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                walk(&path, depth + 1, removed);
+            } else if file_type.is_file()
+                && path
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|name| name.ends_with(".tmp"))
+                && std::fs::remove_file(&path).is_ok()
+            {
+                *removed += 1;
+            }
+        }
+    }
+    match std::fs::metadata(root) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    }
+    let mut removed = 0u64;
+    walk(root, 0, &mut removed);
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -395,5 +447,24 @@ mod read_capped_tests {
         assert_eq!(MAX_RECEIPT_BYTES, 16 * 1024 * 1024);
         assert_eq!(MAX_ATIF_BYTES, 64 * 1024 * 1024);
         assert_eq!(MAX_CONTROL_BYTES, 1024 * 1024);
+    }
+
+    #[test]
+    fn sweep_orphaned_tmp_removes_only_tmp_files_recursively() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("receipts").join("deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(dir.path().join("a.json.0198.tmp"), b"orphan").unwrap();
+        std::fs::write(nested.join("b.receipt.0199.tmp"), b"").unwrap();
+        std::fs::write(dir.path().join("keep.json"), b"real").unwrap();
+        std::fs::write(nested.join("keep.ndjson"), b"real").unwrap();
+        let removed = sweep_orphaned_tmp(dir.path()).unwrap();
+        assert_eq!(removed, 2, "exactly the two .tmp orphans");
+        assert!(dir.path().join("keep.json").exists());
+        assert!(nested.join("keep.ndjson").exists());
+        assert!(!dir.path().join("a.json.0198.tmp").exists());
+        assert!(!nested.join("b.receipt.0199.tmp").exists());
+        // Missing root is a clean no-op (fresh install).
+        assert_eq!(sweep_orphaned_tmp(&dir.path().join("absent")).unwrap(), 0);
     }
 }

@@ -78,6 +78,15 @@ async fn main() -> Result<()> {
         Arc::clone(&metrics),
     )
     .map_err(anyhow::Error::new)?;
+    // Boot-time only (no concurrent writer exists yet): sweep temp
+    // files orphaned by a SIGKILL between `create_new` and `rename` —
+    // the RAII unlink cannot run across a crash, so crash loops
+    // accumulate them linearly forever otherwise.
+    match av_core::fsutil::sweep_orphaned_tmp(std::path::Path::new(&config.atif_spool_dir)) {
+        Ok(0) => {}
+        Ok(removed) => tracing::info!(removed, "removed crash-orphaned temp files from the spool"),
+        Err(error) => tracing::warn!(%error, "orphaned-temp sweep failed; stale .tmp files may remain"),
+    }
     state
         .finalizer
         .recover_spooled_sessions(&state.sessions, &config.breaker)
