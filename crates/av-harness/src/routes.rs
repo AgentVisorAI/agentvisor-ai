@@ -2405,6 +2405,15 @@ impl Stream for AbortFinalizingStream {
             let failure = match result {
                 Ok(Ok(av_state::BudgetDecision::Allowed { .. })) => None,
                 Ok(Ok(av_state::BudgetDecision::Refused { limit, cap })) => {
+                    // Genuine mid-stream cap exhaustion — the ONLY arm
+                    // that latches. The Ok(Err(..)) arm below is the
+                    // quota-backend outage (fail-closed refusal, not
+                    // enforcement): latching it converted a transient
+                    // store blip into a permanent id lockout, the exact
+                    // defect the chat path's backend-error arm
+                    // deliberately avoids.
+                    self.session
+                        .latch_enforcement(av_events::StopReason::BudgetExceeded);
                     Some(format!("{limit} exceeded (cap {cap})"))
                 }
                 Ok(Err(reason)) => Some(reason),
@@ -2417,11 +2426,6 @@ impl Stream for AbortFinalizingStream {
                 }
             };
             if let Some(reason) = failure {
-                // Genuine mid-stream cap exhaustion: latch the sticky
-                // enforcement marker so the id does not recycle into a
-                // fresh budget after the ensuing close.
-                self.session
-                    .latch_enforcement(av_events::StopReason::BudgetExceeded);
                 if let Err(error) = self.submit_response_capture(Some(reason.clone())) {
                     self.session.mark_capture_failed();
                     self.pending_output.clear();
