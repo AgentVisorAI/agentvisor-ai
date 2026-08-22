@@ -1,5 +1,9 @@
 config_version = 1
-listen = "0.0.0.0:8484"
+# Bind to loopback by default. Override to a routable interface only when
+# you also enable `require_identity = true` OR keep the whole harness
+# behind an authenticated ingress. Compose/K8s manifests can flip this via
+# `AV_LISTEN` or the config override chain.
+listen = "127.0.0.1:8484"
 upstream_url = "http://host.docker.internal:4000"
 upstream_http2_prior_knowledge = false
 upstream_read_timeout_s = 300
@@ -36,7 +40,9 @@ reconcile_tick_s = 5
 
 # Read-only operator dashboard served at /dashboard. Unauthenticated —
 # front the harness with the same ingress control you use for /metrics.
-dashboard_enabled = true
+# Off in the example so a fresh checkout does not expose it to anyone
+# reachable on the listen interface.
+dashboard_enabled = false
 
 [breaker]
 delta_epsilon = 0.30

@@ -53,21 +53,67 @@ impl BudgetDecision {
     }
 }
 
-/// Budget enforcement bound to a session id and a state store.
+/// Budget enforcement bound to an accounting scope (a session id, or a
+/// stable principal id) and a state store.
+///
+/// Historically this type was hard-coded to a session-scoped view. The
+/// engineering review (§3.2) showed that a session-only budget can be
+/// bypassed by any caller that rotates the caller-chosen `X-AV-Session`
+/// header — every request would land on a virgin counter. Callers that
+/// want to catch that vector layer a principal-scoped `ActionBudget` on
+/// top of the session-scoped one; the anti-rotation property lives in the
+/// key prefix, not in the check logic.
 pub struct ActionBudget<'a> {
     store: &'a dyn StateStore,
-    session: &'a str,
+    scope: Scope<'a>,
     spec: &'a BudgetSpec,
 }
 
+/// Which accounting bucket a budget check writes to.
+///
+/// Two identical `try_spend_many` calls made under different scopes hit
+/// entirely disjoint keys in the state store; a session budget cannot
+/// exhaust a principal budget or vice versa.
+#[derive(Debug, Clone, Copy)]
+enum Scope<'a> {
+    Session(&'a str),
+    Principal(&'a str),
+}
+
 impl<'a> ActionBudget<'a> {
-    /// Bind a spec to a session.
+    /// Bind a spec to a session id.
     pub fn new(store: &'a dyn StateStore, session: &'a str, spec: &'a BudgetSpec) -> Self {
-        Self { store, session, spec }
+        Self {
+            store,
+            scope: Scope::Session(session),
+            spec,
+        }
+    }
+
+    /// Bind a spec to a principal id (JWT `sub`/`instance_uid`, HMAC-KID,
+    /// or the sentinel `"anonymous"` when `require_identity = false`).
+    /// The resulting counters aggregate across every session belonging to
+    /// the same principal, which is what makes a header-rotation attack
+    /// visible — the token debit persists even after the client mints a
+    /// fresh `X-AV-Session`.
+    pub fn for_principal(
+        store: &'a dyn StateStore,
+        principal: &'a str,
+        spec: &'a BudgetSpec,
+    ) -> Self {
+        Self {
+            store,
+            scope: Scope::Principal(principal),
+            spec,
+        }
     }
 
     fn key(&self, dim: &str) -> String {
-        format!("{}{dim}", Self::session_prefix(self.session))
+        let prefix = match self.scope {
+            Scope::Session(id) => Self::session_prefix(id),
+            Scope::Principal(id) => Self::principal_prefix(id),
+        };
+        format!("{prefix}{dim}")
     }
 
     /// Common key prefix for every budget counter of `session`. Callers use
@@ -78,6 +124,15 @@ impl<'a> ActionBudget<'a> {
         let digest = av_core::digest::sha256_hex(session.as_bytes());
         // 32 hex chars = 128 bits: collision-safe well beyond realistic session counts.
         format!("budget:{{{}}}:", digest.get(..32).unwrap_or(&digest))
+    }
+
+    /// Common key prefix for every principal-scoped budget counter. Distinct
+    /// namespace from [`session_prefix`] so a session cleanup on close does
+    /// not touch the principal ledger — the principal ledger persists across
+    /// session boundaries by design.
+    pub fn principal_prefix(principal: &str) -> String {
+        let digest = av_core::digest::sha256_hex(principal.as_bytes());
+        format!("budget:principal:{{{}}}:", digest.get(..32).unwrap_or(&digest))
     }
 
     /// Check-and-spend one invocation of `tool`, with an optional payout

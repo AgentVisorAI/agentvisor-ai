@@ -97,6 +97,15 @@ pub struct HarnessConfig {
     /// an anonymous identity; when `true`, unauthenticated requests are 401s.
     #[serde(default)]
     pub require_identity: bool,
+    /// Explicit opt-in for binding to a wildcard address (`0.0.0.0` / `[::]`)
+    /// while `require_identity = false`. Set this only when a network layer
+    /// outside the harness — a container port map, a service mesh, an
+    /// ingress ACL — controls who can reach the listener. Startup validation
+    /// otherwise refuses the combination so a bare-metal `cargo run` on a
+    /// developer laptop cannot silently expose an anonymous provider proxy
+    /// to a corporate LAN.
+    #[serde(default)]
+    pub allow_wildcard_bind: bool,
     /// Deployment audience for NHI tokens.
     #[serde(default = "default_audience")]
     pub audience: String,
@@ -227,6 +236,29 @@ pub struct HarnessConfig {
     /// Token budget per session (compression/velocity accounting).
     #[serde(default)]
     pub budget: av_state::BudgetSpec,
+    /// Optional principal-scoped budget layered on top of [`budget`].
+    ///
+    /// The default `[budget]` counters are keyed on the request's session
+    /// id — a header the caller chooses (see [`Self::require_identity`]).
+    /// A client that rotates `X-AV-Session` per request lands on a virgin
+    /// counter every time, so `budget.max_tokens` and friends never bind.
+    /// Setting `[principal_budget]` layers a second budget keyed on the
+    /// authenticated principal (the JWT `sub` / `instance_uid`, or the
+    /// HMAC key id); the counters accumulate across every session belonging
+    /// to that principal, so header rotation debits the same ledger.
+    ///
+    /// Startup validation refuses this section when
+    /// `require_identity = false` unless `allow_anonymous_principal_budget
+    /// = true` is also set: without a stable principal every request folds
+    /// into a single `"anonymous"` bucket, which is only useful in a
+    /// single-tenant appliance deployment where that is the desired
+    /// behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_budget: Option<av_state::BudgetSpec>,
+    /// Opt-in for `[principal_budget]` while `require_identity = false`.
+    /// See the field-level doc on [`Self::principal_budget`].
+    #[serde(default)]
+    pub allow_anonymous_principal_budget: bool,
     /// Reconciler tick interval (seconds).
     #[serde(default = "default_reconcile_tick")]
     pub reconcile_tick_s: u64,
@@ -375,10 +407,17 @@ impl std::fmt::Display for ConfigSource {
 /// Well-known config locations probed in order when `AV_CONFIG` is unset.
 /// Project-local files (current directory) beat the per-user file the
 /// `avctl` setup wizard writes (see [`user_config_path`]).
-pub const CONFIG_SEARCH_PATHS: [&str; 3] = [
+///
+/// Note: `config/harness.example.toml` is deliberately NOT in this list.
+/// The example config is a template intended to be *copied* to a real
+/// `agentvisor.toml` or `config/harness.toml`; auto-discovering it from
+/// a working checkout silently defeats the wizard-written per-user file
+/// (developers who ran `avctl init` still saw the example's settings
+/// because the example outranked the wizard file — see engineering
+/// review §9.4).
+pub const CONFIG_SEARCH_PATHS: [&str; 2] = [
     "agentvisor.toml",
     "config/harness.toml",
-    "config/harness.example.toml",
 ];
 
 /// Per-user config file inside `home`, as written by the `avctl` wizard.
@@ -662,6 +701,35 @@ impl HarnessConfig {
                 ));
             }
         }
+        // Refuse an all-interfaces bind with no authentication. `0.0.0.0` /
+        // `[::]` / `*` on a machine reachable by anyone but the operator
+        // gives every peer a fully-authenticated proxy against the operator's
+        // provider key, plus the unauthenticated dashboard when it is on.
+        // The escape hatch is explicit: set `require_identity = true` (and
+        // configure a JWKS/HMAC source), pin `listen` to a loopback address,
+        // or set `allow_wildcard_bind = true` — the last is for container /
+        // service-mesh deployments where an outer network layer already
+        // controls who reaches the listener.
+        if !self.require_identity && !self.allow_wildcard_bind {
+            let host = self
+                .listen
+                .rsplit_once(':')
+                .map(|(h, _)| h.trim_start_matches('[').trim_end_matches(']'))
+                .unwrap_or("");
+            let is_wildcard = matches!(host, "0.0.0.0" | "::" | "*" | "");
+            if is_wildcard {
+                return Err(format!(
+                    "listen {:?} binds every interface while require_identity = false: any \
+                     peer reaching this host would speak to the proxy anonymously with the \
+                     operator's provider credentials. Either pin listen to a loopback / \
+                     private-network address, set require_identity = true with an \
+                     identity_jwks_url / identity_hmac_secret_file, or set \
+                     allow_wildcard_bind = true if an outer network layer (container port \
+                     map, service mesh, ingress ACL) controls who reaches the listener.",
+                    self.listen
+                ));
+            }
+        }
         if self.reconcile_tick_s == 0 {
             return Err("reconcile_tick_s must be greater than zero".into());
         }
@@ -761,6 +829,26 @@ impl HarnessConfig {
                 "default_workflow must be signed|unsigned, got {:?}",
                 self.default_workflow
             ));
+        }
+        // Refuse a principal-scoped budget while identity is optional. Without
+        // require_identity=true, every unauthenticated request folds into a
+        // single `"anonymous"` principal and the principal ledger becomes a
+        // fleet-shared bucket that any caller can drain — the opposite of the
+        // anti-rotation property the section is meant to provide. Operators
+        // running a single-tenant appliance can flip
+        // `allow_anonymous_principal_budget = true` to acknowledge the shape.
+        if self.principal_budget.is_some()
+            && !self.require_identity
+            && !self.allow_anonymous_principal_budget
+        {
+            return Err(
+                "principal_budget was set but require_identity = false: every unauthenticated \
+                 request would share a single `anonymous` principal ledger, making the budget \
+                 a fleet-wide bucket instead of the per-principal cap it appears to be. Either \
+                 set require_identity = true, or set allow_anonymous_principal_budget = true to \
+                 acknowledge single-tenant / trusted-network semantics."
+                    .into(),
+            );
         }
         if self.require_identity
             && self.identity_jwks_url.as_deref().is_none_or(str::is_empty)
@@ -1128,6 +1216,7 @@ impl HarnessConfig {
             tool_upstream_bearer_env: None,
             tool_upstream_bearer_file: None,
             require_identity: false,
+            allow_wildcard_bind: false,
             audience: default_audience(),
             identity_jwks_url: None,
             identity_jwks_refresh_s: default_jwks_refresh(),
@@ -1163,6 +1252,8 @@ impl HarnessConfig {
             breaker: av_loopdetect::BreakerConfig::default(),
             compression_enabled: true,
             budget: av_state::BudgetSpec::default(),
+            principal_budget: None,
+            allow_anonymous_principal_budget: false,
             reconcile_tick_s: 1,
             max_request_bytes: default_max_request_bytes(),
             dashboard_enabled: default_dashboard_enabled(),
@@ -1605,6 +1696,66 @@ mod tests {
                enforce_identity_scopes = false"#,
         )
         .is_ok());
+    }
+
+    /// Refuse a wildcard bind (`0.0.0.0` / `[::]`) when identity is off
+    /// unless an operator has explicitly acknowledged that an outer network
+    /// layer controls exposure via `allow_wildcard_bind = true`. This
+    /// prevents an unauthenticated proxy from silently reaching a
+    /// developer's corporate LAN because a checked-in example config
+    /// happened to bind wildcards.
+    #[test]
+    fn wildcard_bind_without_identity_is_refused_unless_explicitly_allowed() {
+        // 0.0.0.0 with require_identity=false and no opt-in → refuse.
+        let err = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api.openai.com"
+               listen = "0.0.0.0:8484"
+               require_identity = false"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("every interface"), "err should name the risk: {err}");
+        assert!(err.contains("allow_wildcard_bind"), "err should name the escape hatch: {err}");
+
+        // IPv6 wildcard likewise refused.
+        let err = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api.openai.com"
+               listen = "[::]:8484"
+               require_identity = false"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("every interface"), "IPv6 wildcard: {err}");
+
+        // Loopback remains legal.
+        HarnessConfig::from_toml(
+            r#"upstream_url = "https://api.openai.com"
+               listen = "127.0.0.1:8484"
+               require_identity = false"#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
+
+        // Explicit opt-in (container / service-mesh deployments) passes.
+        HarnessConfig::from_toml(
+            r#"upstream_url = "https://api.openai.com"
+               listen = "0.0.0.0:8484"
+               require_identity = false
+               allow_wildcard_bind = true"#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
+
+        // require_identity=true with a JWKS / HMAC source likewise passes.
+        HarnessConfig::from_toml(
+            r#"upstream_url = "https://api.openai.com"
+               listen = "0.0.0.0:8484"
+               require_identity = true
+               identity_jwks_url = "https://idp/keys.json""#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
     }
 
     /// Round-30 F2: refuse URL fields that omit the scheme or use a
