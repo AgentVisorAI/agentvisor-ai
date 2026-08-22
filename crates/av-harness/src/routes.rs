@@ -2711,6 +2711,17 @@ fn parse_provider_chunk(raw: &str) -> Result<Option<ParsedProviderChunk>, String
         }
     }
     if is_sse && !event_type.is_empty() && event_type != "message" {
+        // Engineering-review §6.2: narrow the named-event refusal to
+        // frames that actually carry captured data. A named-event
+        // keepalive with an empty `data:` field (`event: ping\n\n`,
+        // `event: heartbeat\n\n`) can't taint the audit surface — no
+        // bytes are attributed to the receipt — so treat it as a
+        // skipped frame rather than aborting the whole stream and
+        // sealing the session. Only refuse when non-empty `data:`
+        // lines would otherwise be attributed to the model output.
+        if data.iter().all(|entry| entry.trim().is_empty()) {
+            return Ok(None);
+        }
         return Err(format!(
             "provider SSE frame carries unsupported event type {event_type:?}; \
              AgentVisor AI only captures the default `message` event because non-message \
@@ -2941,18 +2952,23 @@ impl Drop for AbortFinalizingStream {
         // `capture_failed` guard seals the session (`mark_artifact_committed`
         // + committed claim) and returns `CaptureIncomplete`: the close is
         // never retried and the session finalizes with no artifact at all.
-        // On a normal abort (no concurrent close) the fail-closed marks
-        // still fire, so a mid-flight budget verdict or garbled trailing
-        // frame still refuses the capture on the client's next request.
+        //
+        // Engineering-review §6.2 (D7): a client disconnect mid-budget-check
+        // or a garbled trailing frame is a per-RESPONSE failure — the
+        // audit chain is still consistent because we can record the
+        // truncation reason via `submit_response_capture(Some(_))`.
+        // Sealing the whole session (which the previous fail-closed logic
+        // did) bricked every future turn of the agent conversation for
+        // any transient network hiccup. `mark_capture_failed()` is now
+        // reserved for the one genuinely fatal drop path: the audit
+        // worker itself is unreachable, so no future response could be
+        // safely captured either.
         let is_closed = self.session.is_closed();
-        if !is_closed && self.pending_budget.is_some() {
-            self.session.mark_capture_failed();
-        }
+        let budget_incomplete = self.pending_budget.is_some();
         // Round-29 F5: abort the pending budget task. `spawn_blocking`
         // returns a JoinHandle whose Drop does NOT cancel the queued
         // closure; the blocking pool would otherwise run
-        // `ActionBudget::try_tokens(delta)` AFTER the session was
-        // sealed by the preceding `mark_capture_failed`, silently
+        // `ActionBudget::try_tokens(delta)` AFTER the drop, silently
         // debiting the session's budget key for a request the client
         // never received. `abort()` is best-effort for a closure
         // already picked up by the blocking pool (blocking tasks
@@ -2963,22 +2979,36 @@ impl Drop for AbortFinalizingStream {
         if let Some(pending) = self.pending_budget.take() {
             pending.task.abort();
         }
-        let budget_delta = match self.flush_protocol_buffer() {
-            Ok(delta) => delta,
+        let (flush_reason, budget_delta) = match self.flush_protocol_buffer() {
+            Ok(delta) => (None, delta),
             Err(error) => {
                 tracing::warn!(%error, "provider stream flush failed on drop");
-                if !is_closed {
-                    self.session.mark_capture_failed();
-                }
-                0
+                (Some(format!("provider stream flush failed: {error}")), 0u64)
             }
         };
-        if !is_closed && budget_delta > 0 {
-            self.session.mark_capture_failed();
-        }
-        if !self.session.capture_failed() {
-            if let Err(error) = self.submit_response_capture(None) {
-                tracing::warn!(%error, "response-capture submit failed on drop");
+        // Compose a per-response failure reason. `budget_incomplete`
+        // dominates because it always implies the client disconnected
+        // before the last chunk was billed; a garbled frame is next
+        // most specific; an unbilled tail (delta > 0 with no
+        // per-chunk error) means the connection dropped between the
+        // last successful budget check and the flush.
+        let response_failure: Option<String> = if budget_incomplete {
+            Some("client disconnected before response budget check completed".to_owned())
+        } else if let Some(reason) = flush_reason {
+            Some(reason)
+        } else if budget_delta > 0 {
+            Some(format!(
+                "client disconnected with {budget_delta} unbilled response bytes"
+            ))
+        } else {
+            None
+        };
+        if let Err(error) = self.submit_response_capture(response_failure) {
+            tracing::warn!(%error, "response-capture submit failed on drop");
+            if !is_closed {
+                // The audit worker is unreachable — no future response
+                // on this session could be captured either. This is
+                // the one genuinely session-fatal drop path.
                 self.session.mark_capture_failed();
             }
         }
@@ -4539,6 +4569,40 @@ mod tests {
             Err(error) => panic!("explicit event: message must be accepted, got: {error}"),
         };
         assert_eq!(parsed.message, "hi");
+    }
+
+    /// Engineering-review §6.2 (D7): a named SSE event with EMPTY
+    /// `data:` (or no `data:` at all) is a keepalive/heartbeat that
+    /// carries no audit surface — refusing it (and thereby aborting
+    /// the whole client stream + sealing the session) was
+    /// over-restrictive. Such frames must be treated as skip
+    /// (returning `Ok(None)`), leaving the full-refusal semantics
+    /// intact for frames whose `data:` field would otherwise be
+    /// attributed to the model output under the wrong event name.
+    #[test]
+    fn parse_provider_chunk_treats_dataless_named_events_as_keepalives() {
+        for raw in [
+            "event: ping\n\n",
+            "event: heartbeat\n\n",
+            "event: keep-alive\ndata:\n\n",
+            "event: status\ndata:   \n\n",
+        ] {
+            match parse_provider_chunk(raw) {
+                Ok(None) => {}
+                Ok(Some(_)) => panic!("dataless named event must not yield a chunk: {raw:?}"),
+                Err(error) => panic!(
+                    "dataless named event {raw:?} must not fail the stream (D7): {error}"
+                ),
+            }
+        }
+        // A named event that DOES carry attributable data must still
+        // be refused — the security posture the original guard exists
+        // for is preserved.
+        let poison = "event: error\ndata: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n";
+        assert!(
+            parse_provider_chunk(poison).is_err(),
+            "named event with non-empty data must still be refused"
+        );
     }
 
     #[test]
