@@ -524,6 +524,22 @@ impl EventBus for KafkaBus {
                         return Ok::<_, String>(Page::Empty);
                     }
                     for record in &records {
+                        // `publish_with_uid` stamps the (possibly freshly
+                        // generated) uid into the `agentvisor-event-uid`
+                        // header even when the payload lacks
+                        // `metadata.uid`. Crash recovery for such an
+                        // event previously scanned only the payload
+                        // field, could never find the record it had in
+                        // fact produced, and re-published a duplicate.
+                        // Consult the header first, then the payload.
+                        if record
+                            .record
+                            .headers
+                            .get("agentvisor-event-uid")
+                            .is_some_and(|uid| uid.as_slice() == page_uid.as_bytes())
+                        {
+                            return Ok(Page::Found(record.offset));
+                        }
                         if let Some(payload) = record.record.value.as_deref() {
                             let stored: StoredEvent =
                                 serde_json::from_slice(payload).map_err(|error| error.to_string())?;
@@ -612,6 +628,12 @@ impl EventBus for KafkaBus {
                  sentinel; refusing the fetch"
             ))
         })?;
+        // Contract: "read up to `max` events". The loop below checks the
+        // cap only AFTER pushing, so `max == 0` returned one event —
+        // diverging from the embedded broker, which returns an empty vec.
+        if max == 0 {
+            return Ok(Vec::new());
+        }
         self.executor
             .run(move || async move {
                 let (records, _high_watermark) = pc

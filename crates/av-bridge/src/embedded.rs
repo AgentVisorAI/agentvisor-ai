@@ -898,19 +898,23 @@ fn read_high_water(path: &Path) -> Result<u64, BusError> {
     match av_core::fsutil::read_capped_string(path, av_core::fsutil::MAX_CONTROL_BYTES) {
         Ok(value) => match value.trim().parse::<u64>() {
             Ok(offset) => Ok(offset),
-            // A corrupt watermark file is not fatal: `next_offset` is
-            // recomputed as `segment_offset.max(persisted_offset)` in
-            // `open()`, so falling back to 0 lets the segment be
-            // authoritative. The next successful publish rewrites the
-            // watermark via `persist_high_water` and self-heals.
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    path = %av_core::fsutil::basename(path),
-                    "high-watermark file is corrupt; falling back to segment-derived next_offset",
-                );
-                Ok(0)
-            }
+            // A corrupt watermark file IS fatal. The old fail-open
+            // fallback (`Ok(0)`) claimed the segment is authoritative
+            // and "the next successful publish rewrites the watermark
+            // and self-heals" — both false: `persist_high_water` runs
+            // only from `enforce_retention`, and the watermark exists
+            // precisely for the case where retention has emptied the
+            // segment. Falling back to 0 there restarts `next_offset`
+            // at 0, reusing offsets of already-cold-exported records
+            // (offset collisions in the audit stream, permanent
+            // "cold object … already exists with different content"
+            // conflicts). Fail closed like every other corrupt
+            // control file in this crate; NotFound below stays Ok(0)
+            // because a missing watermark is a legitimate fresh state.
+            Err(error) => Err(BusError::Backend(format!(
+                "high-watermark file {} is corrupt ({error}); refusing to open the partition",
+                av_core::fsutil::basename(path)
+            ))),
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
         Err(error) => Err(BusError::Io(error)),

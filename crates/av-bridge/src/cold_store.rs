@@ -447,8 +447,18 @@ fn persist_pending(
     Ok(())
 }
 
+/// Pending intents embed one full event value; the harness caps request
+/// bodies at 16 MiB, so no legitimate intent approaches this bound.
+const MAX_PENDING_INTENT_BYTES: u64 = 16 * 1024 * 1024;
+
 fn read_pending(path: &std::path::Path, control_key: &[u8; 32]) -> Result<PendingColdEvent, BusError> {
-    let envelope: PendingEnvelope = serde_json::from_slice(&std::fs::read(path)?)?;
+    // Cap the read BEFORE the MAC is verified: every other control-plane
+    // read in this crate is size-capped because filesystem tampering is
+    // in-model here, but the MAC can only reject a planted file after it
+    // has been fully buffered — a multi-GiB plant would OOM the broker
+    // on the very next stage/commit/maintenance pass.
+    let bytes = av_core::fsutil::read_capped(path, MAX_PENDING_INTENT_BYTES)?;
+    let envelope: PendingEnvelope = serde_json::from_slice(&bytes)?;
     verify_pending_mac(control_key, &envelope.payload, &envelope.mac)?;
     Ok(envelope.payload)
 }
