@@ -191,17 +191,11 @@ impl EmbeddedBroker {
         )?;
         let manifest =
             BridgeManifest::from_yaml(&manifest_yaml).map_err(|e| BusError::Backend(e.to_string()))?;
-        // Boot-time only (no writer exists before open() returns): sweep
-        // temp files orphaned by a crash between `create_new` and
-        // `rename` in the segment/watermark/schema atomic-write paths —
-        // the RAII unlink cannot run across a SIGKILL, and nothing else
-        // ever removes them.
-        if let Ok(removed @ 1..) = av_core::fsutil::sweep_orphaned_tmp(data_dir) {
-            tracing::info!(
-                removed,
-                "removed crash-orphaned temp files from the bridge data dir"
-            );
-        }
+        // NOTE: no orphaned-temp sweep here — `open()` is also called by
+        // read-only CLI paths (`avctl event-tail`) while a live daemon
+        // may be writing; sweeping from a second process could delete a
+        // temp the daemon is about to rename. The daemon performs the
+        // sweep itself at boot (main.rs), where it is the single writer.
         let mut partitions = HashMap::new();
         let mut torn_total = 0u64;
         for t in &manifest.topics {

@@ -305,6 +305,51 @@ mod tests {
         }
     }
 
+    /// Pin the agent-step coupling guards individually (mutants
+    /// flipping the conjunctions previously survived): partially
+    /// populated metrics are refused, and `llm_call_count == 0` with
+    /// exactly one of metrics/reasoning_content present is refused.
+    #[test]
+    fn partial_metrics_and_zero_call_couplings_are_refused() {
+        // Each missing token field alone must refuse the step.
+        for missing in ["prompt", "completion", "cached"] {
+            let mut s = step(Source::Agent);
+            let mut m = metrics(100, 20, 60, 0.001);
+            match missing {
+                "prompt" => m.prompt_tokens = None,
+                "completion" => m.completion_tokens = None,
+                _ => m.cached_tokens = None,
+            }
+            s.metrics = Some(m);
+            let mut b = TrajectoryBuilder::new(agent(), None);
+            assert!(
+                b.push_step(s).is_err(),
+                "agent step missing {missing}_tokens must be refused"
+            );
+        }
+        // llm_call_count == 0 with metrics only.
+        let mut s = step(Source::Agent);
+        s.llm_call_count = Some(0);
+        let mut b = TrajectoryBuilder::new(agent(), None);
+        assert!(b.push_step(s).is_err(), "metrics with zero calls must be refused");
+        // llm_call_count == 0 with reasoning_content only.
+        let mut s = step(Source::Agent);
+        s.llm_call_count = Some(0);
+        s.metrics = None;
+        s.reasoning_content = Some("thinking".into());
+        let mut b = TrajectoryBuilder::new(agent(), None);
+        assert!(
+            b.push_step(s).is_err(),
+            "reasoning_content with zero calls must be refused"
+        );
+        // llm_call_count == 0 bare is accepted.
+        let mut s = step(Source::Agent);
+        s.llm_call_count = Some(0);
+        s.metrics = None;
+        let mut b = TrajectoryBuilder::new(agent(), None);
+        assert!(b.push_step(s).is_ok());
+    }
+
     #[test]
     fn builder_assigns_sequential_ids_and_aggregates() {
         let mut b = TrajectoryBuilder::new(agent(), Some("sess-1".into()));

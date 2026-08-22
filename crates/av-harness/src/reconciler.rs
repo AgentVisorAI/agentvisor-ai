@@ -1939,6 +1939,25 @@ impl Finalizer {
                 // otherwise a live session with the same id would inherit the capture-failed verdict.
                 self.quarantined_sessions.lock().insert(session.id.clone());
                 session.mark_capture_failed();
+                // Loud, per-boot telemetry: without this the branch
+                // re-adopted the wedged session at EVERY restart with
+                // no log line and no metric — the only signal was one
+                // WARN at the original failure, long lost to rotation.
+                // The spool files are retained deliberately (evidence),
+                // but the operator must be able to see the session is
+                // permanently quarantined and clean it up.
+                self.metrics
+                    .counter(
+                        "av_signed_recovery_quarantined_total",
+                        "Signed sessions re-adopted as capture-failed quarantines during recovery",
+                    )
+                    .inc();
+                tracing::warn!(
+                    session = %session.id,
+                    "signed recovery re-adopted a capture-failed session (inconsistent response \
+                     journal); it will refuse all requests and its spool files are retained as \
+                     evidence until removed by an operator"
+                );
                 return Ok(SignedCandidateOutcome::Recovered);
             }
             if self.quarantined_sessions.lock().contains(&session.id) {

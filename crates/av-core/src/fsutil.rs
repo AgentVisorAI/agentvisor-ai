@@ -101,6 +101,23 @@ pub const MAX_CONTROL_BYTES: u64 = 1024 * 1024;
 /// enforce identical resource bounds against on-disk tampering.
 pub fn read_capped(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
     use std::io::Read as _;
+    // Pre-open type check: `File::open` on a FIFO blocks until a writer
+    // appears, so a special-file path hung the caller forever before
+    // the post-open handle check below could refuse it (observed:
+    // `avctl receipt-verify <fifo>` hanging indefinitely). `stat` does
+    // not open the file, so it cannot block; the post-open handle check
+    // remains the TOCTOU-safe authority.
+    let pre = std::fs::metadata(path)?;
+    if !pre.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not a regular file (type: {:?})",
+                basename(path),
+                pre.file_type()
+            ),
+        ));
+    }
     let mut file = std::fs::File::open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
