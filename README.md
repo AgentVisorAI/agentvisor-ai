@@ -124,9 +124,11 @@ cargo install --path crates/av-cli       # installs `avctl`
 1. `AV_CONFIG=/path/to.toml` (error if missing)
 2. `./agentvisor.toml`
 3. `./config/harness.toml`
-4. `./config/harness.example.toml`
-5. `~/.agentvisor/agentvisor.toml` (written by the `avctl` guided setup)
-6. built-in defaults (requires `AV_UPSTREAM_URL`)
+4. `~/.agentvisor/agentvisor.toml` (written by the `avctl` guided setup)
+5. built-in defaults (requires `AV_UPSTREAM_URL`)
+
+`config/harness.example.toml` is documentation only — it is NOT
+searched. Copy it to one of the paths above to use it.
 
 Environment overrides beat file values: `AV_LISTEN`, `AV_UPSTREAM_URL`, `AV_UPSTREAM_CHAT_PATH`, `AV_UPSTREAM_AUTH_HEADER`, `AV_UPSTREAM_AUTH_SCHEME`, `AV_STATE_ENDPOINT`, `AV_BRIDGE_ENDPOINT`, `AV_QDRANT_URL`. Exporting `AV_UPSTREAM_API_KEY` selects itself as the key source when the file doesn't name one; `AV_UPSTREAM_KEY_FILE=/run/secrets/api_key` points at a mounted secret file (Docker/Kubernetes secrets) instead. Key *values* are only ever read from the environment or `0600` files — never from the command line.
 
@@ -217,6 +219,34 @@ The production image checksum-pins `sentence-transformers/all-MiniLM-L6-v2` at r
 
 - `deploy/kubernetes/agentvisor-ai.yaml`: single-replica starter (ConfigMap + PVC + probes + Secret-mounted key). Scale horizontally by switching to kafka/nats + redis backends.
 - `deploy/systemd/agentvisor-ai.service`: hardened unit with `EnvironmentFile` for the key; install steps in the file header.
+
+### Running multiple instances
+
+A single AgentVisor AI process is the default and the tested-at-scale
+configuration (10k concurrent streams, p95 0.865 ms — see
+`BENCHMARKS.md`). Running two or more replicas is safe **only** when
+every backend below is external — the embedded defaults are strictly
+single-instance:
+
+| Subsystem | Single-instance default | Multi-instance requirement |
+| --- | --- | --- |
+| Signer seed | file on disk | same seed mounted at each replica (or a rotation you accept per replica) |
+| State store (budgets, ratelimits) | `state_backend = "memory"` | `state_backend = "redis"` with `state_endpoint = "redis://..."` and identical `AV_STATE_ENDPOINT` at each replica |
+| Bridge (event bus) | `bridge_backend = "embedded"` (per-pod data-dir) | `bridge_backend = "kafka"` or `"nats"` with shared endpoints |
+| ATIF spool | pod-local `atif_spool_dir` | RWX PVC OR one replica per spool volume (the reconciler's per-file lifecycle lock is process-local; two replicas sharing a spool would race on close) |
+| Session registry | in-memory only | client stickiness (LB session affinity on `X-AV-Session`) OR accept that a session's audit chain lives on one pod for its lifetime and doesn't survive that pod's eviction |
+
+Concretely: a two-replica deployment with `state_backend = "memory"`
+lets a client rotate through both pods and effectively bypass every
+per-session budget. A two-replica deployment sharing an ATIF spool
+without session affinity will race on session close and land one
+audit event on the broker twice. If you're not sure which subsystem
+is on which side of the line, run one replica.
+
+See [docs/reference/OPERATIONS.md](docs/reference/OPERATIONS.md) for
+the full per-subsystem checklist and
+[docs/reference/CONFIGURATION.md](docs/reference/CONFIGURATION.md) for
+the exact TOML keys.
 
 ## Development gates
 

@@ -53,6 +53,11 @@ pub struct AppState {
     pub identity: Option<Arc<IdentityValidator>>,
     /// Prometheus-compatible metrics registry.
     pub metrics: Arc<Registry>,
+    /// Round-51 W4: pre-resolved metric handles for the request hot
+    /// path so `observe_stage` doesn't take the registry mutex once
+    /// per stage per request. Same series names as the lazy path;
+    /// pre-registered at boot in `new_with_backends_and_metrics`.
+    pub(crate) hot_metrics: Arc<HotMetrics>,
     /// Reused upstream HTTP client.
     pub client: reqwest::Client,
     /// Static credential injected into every chat-completions forward
@@ -79,6 +84,94 @@ pub struct AppState {
     /// graceful drain begins. See operability review §8.3.
     pub draining: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) journal_key: [u8; 32],
+}
+
+/// Pre-resolved metric handles for the request hot path so the
+/// per-stage histogram observation doesn't take the registry mutex.
+/// Same series names as the lazy path — the label suffix matches
+/// `av_stage_duration_seconds{stage="…"}` exactly.
+///
+/// Ordering of the `[Stage; 5]` arrays mirrors the boot registration
+/// in `new_with_backends_and_metrics`: identity, quota, sanitize,
+/// compression, dispatch. `Stage::index()` returns the offset so
+/// `observe_stage` is O(1) with no string alloc on the hot path.
+pub(crate) struct HotMetrics {
+    pub(crate) stage_histograms: [Arc<av_core::metrics::Histogram>; 5],
+    pub(crate) stage_strict_budget_counters: [Arc<av_core::metrics::Counter>; 5],
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum Stage {
+    Identity,
+    Quota,
+    Sanitize,
+    Compression,
+    Dispatch,
+}
+
+impl Stage {
+    pub(crate) const ORDER: [Stage; 5] = [
+        Stage::Identity,
+        Stage::Quota,
+        Stage::Sanitize,
+        Stage::Compression,
+        Stage::Dispatch,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Stage::Identity => "identity",
+            Stage::Quota => "quota",
+            Stage::Sanitize => "sanitize",
+            Stage::Compression => "compression",
+            Stage::Dispatch => "dispatch",
+        }
+    }
+
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Stage::Identity => 0,
+            Stage::Quota => 1,
+            Stage::Sanitize => 2,
+            Stage::Compression => 3,
+            Stage::Dispatch => 4,
+        }
+    }
+
+    fn from_label(label: &str) -> Option<Self> {
+        Stage::ORDER.into_iter().find(|s| s.label() == label)
+    }
+}
+
+impl HotMetrics {
+    fn new(metrics: &Registry) -> Self {
+        // Registrations here mirror the boot loop below. Using the
+        // same `metrics.histogram_with_bounds` / `metrics.counter`
+        // getters means these entries are shared with the lazy path
+        // — a caller that still uses `metrics.counter(name).inc()`
+        // hits the exact same Arc<Counter> we cache here.
+        let stage_histograms: [Arc<av_core::metrics::Histogram>; 5] = Stage::ORDER.map(|stage| {
+            metrics.histogram_with_bounds(
+                &format!("av_stage_duration_seconds{{stage=\"{}\"}}", stage.label()),
+                "Harness stage latency",
+                av_core::metrics::WIDE_LATENCY_BOUNDS_US,
+            )
+        });
+        let stage_strict_budget_counters: [Arc<av_core::metrics::Counter>; 5] =
+            Stage::ORDER.map(|stage| {
+                metrics.counter(
+                    &format!(
+                        "av_strict_budget_breaches_total{{stage=\"{}\"}}",
+                        stage.label()
+                    ),
+                    "Middleware stages that exceeded the strict per-stage budget",
+                )
+            });
+        Self {
+            stage_histograms,
+            stage_strict_budget_counters,
+        }
+    }
 }
 
 /// How the harness authenticates to the chat upstream, for startup logs
@@ -730,6 +823,7 @@ impl AppState {
             sessions,
             worker,
             identity,
+            hot_metrics: Arc::new(HotMetrics::new(&metrics)),
             metrics,
             client,
             upstream_auth,
@@ -1901,6 +1995,22 @@ impl AppState {
 
     fn observe_stage(&self, stage: &str, started: Instant) {
         let elapsed = elapsed_us(started);
+        // Prefer the pre-resolved handle when the caller's stage name
+        // maps to a known Stage variant — that path is O(1) with no
+        // mutex or allocation. Callers still passing legacy or
+        // unrecognized labels fall through to the lazy registry path
+        // so the metric remains discoverable (the lazy Registry call
+        // uses the same shared Arc<Histogram> the hot cache points
+        // to for known stages).
+        if let Some(known) = Stage::from_label(stage) {
+            self.hot_metrics.stage_histograms[known.index()].observe_us(elapsed);
+            if (self.config.strict_stage_budget || truthy_env("AV_STRICT_BUDGET")) && elapsed > 2_000
+            {
+                self.hot_metrics.stage_strict_budget_counters[known.index()].inc();
+                tracing::warn!(stage, elapsed_us = elapsed, "strict stage budget exceeded");
+            }
+            return;
+        }
         self.metrics
             .histogram(
                 &format!("av_stage_duration_seconds{{stage=\"{stage}\"}}"),

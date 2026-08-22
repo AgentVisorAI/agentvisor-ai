@@ -41,7 +41,7 @@ av-bridge = { workspace = true }
 av-identity = { workspace = true }
 av-compress = { workspace = true }
 av-loopdetect = { workspace = true }
-av-sandbox = { workspace = true }
+av-sandbox = { workspace = true, features = ["wasm"] }
 tokio = { workspace = true }
 axum = { workspace = true }
 hyper = { workspace = true }
