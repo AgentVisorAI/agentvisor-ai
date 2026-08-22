@@ -77,6 +77,12 @@ impl EmbeddedBroker {
         // data_dir untouched and retry-clean.
         #[cfg(not(feature = "cold-store"))]
         reject_cold_uri_without_feature(manifest)?;
+        // Resolve and schema-validate every referenced schema BEFORE the
+        // single-winner claim below: `manifest.validate()` does not check
+        // schema refs, so an unresolvable/invalid ref must fail here —
+        // side-effect-free and retry-clean — not after the claim has
+        // already been taken (see the rollback note further down).
+        let resolved_schemas = resolve_referenced_schemas(manifest)?;
         let manifest_path = data_dir.join("manifest.yaml");
         fs::create_dir_all(data_dir)?;
         let yaml = manifest.to_yaml().map_err(|e| BusError::Backend(e.to_string()))?;
@@ -153,9 +159,22 @@ impl EmbeddedBroker {
         // copies for non-builtin refs, so the next open() silently
         // validated against the loser's schemas. It also let two racing
         // provisions cross-pollute each other's directories.
-        copy_referenced_schemas(data_dir, manifest)?;
-        for t in &manifest.topics {
-            fs::create_dir_all(data_dir.join("topics").join(&t.name))?;
+        //
+        // The refs themselves were resolved and validated pre-claim, so
+        // only environmental I/O errors (ENOSPC, permissions) can fail
+        // here — and those must roll the claim back, or every retry
+        // fails "bridge already provisioned" against a half-provisioned
+        // directory (the round-17 F3 retry-clean invariant).
+        let post_claim = write_referenced_schemas(data_dir, &resolved_schemas).and_then(|()| {
+            for t in &manifest.topics {
+                fs::create_dir_all(data_dir.join("topics").join(&t.name))?;
+            }
+            Ok(())
+        });
+        if let Err(error) = post_claim {
+            let _ = fs::remove_file(&manifest_path);
+            let _ = av_core::fsutil::sync_directory(data_dir);
+            return Err(error);
         }
         Self::open(data_dir)
     }
@@ -617,7 +636,13 @@ fn write_cold_event_once(directory: &Path, event: &StoredEvent) -> Result<(), Bu
     Ok(())
 }
 
-fn copy_referenced_schemas(data_dir: &Path, manifest: &BridgeManifest) -> Result<(), BusError> {
+/// Pre-claim phase: resolve and schema-validate every referenced schema
+/// without touching the filesystem, so a bad `schema_ref` fails provision
+/// retry-clean (before the single-winner claim).
+fn resolve_referenced_schemas(
+    manifest: &BridgeManifest,
+) -> Result<Vec<(String, serde_json::Value)>, BusError> {
+    let mut resolved = Vec::new();
     for topic in &manifest.topics {
         let Some(reference) = &topic.schema_ref else {
             continue;
@@ -627,6 +652,17 @@ fn copy_referenced_schemas(data_dir: &Path, manifest: &BridgeManifest) -> Result
             .should_validate_formats(true)
             .build(&value)
             .map_err(|error| BusError::Backend(format!("invalid schema {reference:?}: {error}")))?;
+        resolved.push((reference.clone(), value));
+    }
+    Ok(resolved)
+}
+
+/// Post-claim phase: persist the pre-resolved schema copies.
+fn write_referenced_schemas(
+    data_dir: &Path,
+    resolved: &[(String, serde_json::Value)],
+) -> Result<(), BusError> {
+    for (reference, value) in resolved {
         let destination = data_dir.join(reference);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
@@ -634,7 +670,7 @@ fn copy_referenced_schemas(data_dir: &Path, manifest: &BridgeManifest) -> Result
         // Fsync-safe atomic replace: a crash mid-`fs::write` (the old
         // shape) left torn JSON that made the `load_validators` disk
         // fallback fail `open()` permanently for non-builtin refs.
-        rewrite_atomic(&destination, &serde_json::to_vec_pretty(&value)?)?;
+        rewrite_atomic(&destination, &serde_json::to_vec_pretty(value)?)?;
     }
     Ok(())
 }
@@ -667,32 +703,56 @@ fn load_validators(
 }
 
 /// Count complete lines; truncate a torn trailing line if present.
+///
+/// Streams the segment (Round-6 hunt5 F4 pattern, same as
+/// `recover_event_uids`) instead of `fs::read`-ing it whole: segments
+/// grow with accepted event traffic and are only time-bounded by
+/// retention, so recovery of a large partition otherwise loaded an
+/// arbitrarily large file fully into memory — the one unbounded
+/// allocation left in startup recovery. Each line is capped; a line
+/// above the cap fails the open loudly (fail closed, like a corrupt
+/// watermark) rather than risking the allocation.
 fn recover_segment(path: &Path) -> Result<(u64, u64), BusError> {
-    if !path.exists() {
-        return Ok((0, 0));
-    }
-    let bytes = fs::read(path)?;
-    if bytes.is_empty() {
-        return Ok((0, 0));
-    }
-    let complete_len = match bytes.iter().rposition(|b| *b == b'\n') {
-        Some(pos) => pos + 1,
-        None => 0, // single torn line, no newline at all
+    /// Generous per-record bound: the harness caps request bodies at
+    /// 16 MiB, so no legitimately published event line approaches this.
+    const MAX_SEGMENT_LINE_BYTES: u64 = 16 * 1024 * 1024;
+    use std::io::BufRead as _;
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(error) => return Err(BusError::Io(error)),
     };
-    let torn = usize::from(complete_len < bytes.len());
-    if torn == 1 {
-        // Same fsync-safe rewrite pattern as `persist_high_water`: without
-        // sync_all()+sync_directory a crash during recovery could turn a
-        // torn-tail single-record loss into total-segment loss on
-        // non-ext4 filesystems.
-        rewrite_atomic(path, bytes.get(..complete_len).unwrap_or_default())?;
-    }
-    let complete = bytes.get(..complete_len).unwrap_or_default();
+    let mut reader = std::io::BufReader::new(file);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut complete_len: u64 = 0;
     let mut next_offset = 0u64;
-    for line in complete
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-    {
+    let mut torn = false;
+    loop {
+        buf.clear();
+        let read = {
+            use std::io::Read as _;
+            let mut limited = (&mut reader).take(MAX_SEGMENT_LINE_BYTES);
+            limited.read_until(b'\n', &mut buf)?
+        };
+        if read == 0 {
+            break;
+        }
+        if buf.last() != Some(&b'\n') {
+            if read as u64 == MAX_SEGMENT_LINE_BYTES {
+                return Err(BusError::Backend(format!(
+                    "segment {} contains a record above {MAX_SEGMENT_LINE_BYTES} bytes; refusing to open the partition",
+                    av_core::fsutil::basename(path)
+                )));
+            }
+            // Torn trailing line (crash mid-append).
+            torn = true;
+            break;
+        }
+        complete_len = complete_len.saturating_add(read as u64);
+        let line = buf.get(..buf.len().saturating_sub(1)).unwrap_or_default();
+        if line.is_empty() {
+            continue;
+        }
         match serde_json::from_slice::<StoredEvent>(line) {
             Ok(event) => next_offset = next_offset.max(event.offset.saturating_add(1)),
             // A single unparseable middle line must not brick the broker.
@@ -714,7 +774,18 @@ fn recover_segment(path: &Path) -> Result<(u64, u64), BusError> {
             }
         }
     }
-    Ok((next_offset, torn as u64))
+    if torn {
+        // In-place truncate + fsync: unlike the old whole-file
+        // `rewrite_atomic` (which required buffering the entire segment),
+        // `set_len` touches only file metadata — a crash mid-truncate
+        // leaves either the torn or the truncated length, never an
+        // empty/renamed-away segment, so the total-segment-loss hazard
+        // the old comment guarded against cannot occur.
+        let file = fs::OpenOptions::new().write(true).open(path)?;
+        file.set_len(complete_len)?;
+        file.sync_all()?;
+    }
+    Ok((next_offset, u64::from(torn)))
 }
 
 fn recover_event_uids(path: &Path) -> Result<HashMap<String, u64>, BusError> {

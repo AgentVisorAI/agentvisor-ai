@@ -1273,15 +1273,20 @@ async fn clear_response_marker(
 
 /// Rename an unverifiable in-flight-response marker out of the way and
 /// log a single warn. Keeps the file as evidence at a stable
-/// `.corrupt-<uid>` name so operators can retrieve it; nothing else
-/// scans that suffix. See round-5 hunt3 F1.
+/// `.corrupt-<uid>` name so operators can retrieve it. The quarantine
+/// name must NOT end in `.json`: the recovery scan filters on that
+/// extension, so a `.json`-suffixed quarantine would be re-read,
+/// MAC-fail, and re-quarantine on every reconciler tick — compounding
+/// the name until ENAMETOOLONG and warning twice per tick forever
+/// (same rule as the reconciler's round-44 F4 quarantine rename).
+/// See round-5 hunt3 F1.
 fn quarantine_inflight_marker(path: &std::path::Path, error: impl std::fmt::Display) {
     let uid = av_core::new_event_uid();
     let name = path
         .file_stem()
         .and_then(std::ffi::OsStr::to_str)
-        .map(|stem| format!("{stem}.corrupt-{uid}.json"))
-        .unwrap_or_else(|| format!("corrupt-{uid}.json"));
+        .map(|stem| format!("{stem}.corrupt-{uid}"))
+        .unwrap_or_else(|| format!("corrupt-{uid}"));
     let quarantine = path.with_file_name(name);
     tracing::warn!(
         %error,

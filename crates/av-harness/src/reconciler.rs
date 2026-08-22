@@ -2157,12 +2157,16 @@ impl Finalizer {
                 breaker.clone(),
             );
             placeholder.closed.store(1, std::sync::atomic::Ordering::Release);
-            if sessions.try_insert_recovered(placeholder).is_err() {
-                // A client re-opened the id between the check above and
-                // this claim — the session is live; leave its journal
-                // alone and skip, exactly like the pre-lock check.
-                return Ok(());
-            }
+            let claimed = match sessions.try_insert_recovered(placeholder) {
+                Ok(claimed) => claimed,
+                Err(_active) => {
+                    // A client re-opened the id between the check above
+                    // and this claim — the session is live; leave its
+                    // journal alone and skip, exactly like the pre-lock
+                    // check.
+                    return Ok(());
+                }
+            };
             claimed_session = Some(session_id.to_owned());
             let journal = if journal_path.exists() {
                 read_complete_journal(&journal_path).await?
@@ -2170,29 +2174,27 @@ impl Finalizer {
                 Vec::new()
             };
             if self.quarantined_sessions.lock().contains(session_id) {
-                let quarantined = Session::new(
-                    session_id.to_owned(),
-                    Workflow::Unsigned,
-                    identity.clone(),
-                    breaker.clone(),
-                );
-                quarantined.restore_journal_index(
+                // Convert the already-claimed placeholder into the
+                // quarantined session IN PLACE. A remove-then-insert swap
+                // would vacate the registry entry for a moment, letting
+                // `get_or_open` insert a fresh live session whose journal
+                // index starts at 0 on top of the N on-disk records —
+                // exactly the position-vs-seq corruption the claim exists
+                // to prevent (and `insert_recovered`'s or_insert would
+                // then silently discard the quarantine seal).
+                claimed.restore_journal_index(
                     u64::try_from(journal.len())
                         .map_err(|_| FinalizeError::Atif("active journal length overflow".to_owned()))?,
                 );
-                quarantined.mark_capture_failed();
+                claimed.mark_capture_failed();
                 // Also seal the session finalized (like the signed-journal
                 // capture-failed path) so the idle sweeper's `!is_closed()` filter
                 // skips it. Otherwise every idle tick re-enters
                 // close_session_locked, hits the capture_failed guard, and
                 // CloseClaim resets `closed` — an unbounded churn loop.
-                quarantined.mark_artifact_committed();
-                // Replace the consolidation placeholder with the
-                // quarantined session (the placeholder's claim is what
-                // makes this replacement race-free: no client can
-                // recycle a closed, non-close-complete entry).
-                sessions.remove(session_id);
-                sessions.insert_recovered(quarantined);
+                claimed.mark_artifact_committed();
+                // The converted session must stay registered — do not
+                // release the claim on this path.
                 claimed_session = None;
                 return Ok(());
             }
@@ -2506,7 +2508,17 @@ impl Finalizer {
         let spool_dir = self.spool_dir.clone();
         tokio::task::spawn_blocking(move || -> Result<(), FinalizeError> {
             let mut spool_changed = false;
-            for suffix in ["session.json", "steps.ndjson", "events.ndjson"] {
+            // Deletion order matters: the `.session.json` sidecar is the
+            // ONLY name the recovery scans iterate, so it must go LAST.
+            // The old sidecar-first order had a crash window that left an
+            // events journal invisible to every recovery path; a later
+            // reuse of the session id then recreated fresh metadata and
+            // appended a record MAC-sealed at index 0 at file position N
+            // — permanently breaking the position==sequence invariant.
+            // With journal-first order, a crash leaves sidecar-without-
+            // journal, which recovery already self-heals (treats the
+            // journal as empty and removes the metadata).
+            for suffix in ["events.ndjson", "steps.ndjson", "session.json"] {
                 let path = spool_dir.join(format!("{stem}.{suffix}"));
                 match std::fs::remove_file(&path) {
                     Ok(()) => spool_changed = true,

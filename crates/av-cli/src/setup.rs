@@ -931,8 +931,33 @@ fn find_server_binary() -> PathBuf {
 /// the raw-line fallback through the same terminal sanitizer used
 /// everywhere else in this crate.
 fn print_log_tail(path: &Path, count: usize) {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    // Bounded read: the log is opened append-only with no rotation, so
+    // it grows without bound across runs; slurping the whole file (the
+    // old `read_to_string`) risked a multi-GB allocation at exactly the
+    // moment the operator is diagnosing a failure. Read only a fixed
+    // suffix — generous for `count` lines of tracing JSON.
+    const TAIL_BYTES: u64 = 256 * 1024;
+    let Ok(mut file) = std::fs::File::open(path) else {
         return;
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return;
+    };
+    use std::io::{Read as _, Seek as _};
+    let start = len.saturating_sub(TAIL_BYTES);
+    if start > 0 && file.seek(std::io::SeekFrom::Start(start)).is_err() {
+        return;
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(len - start).unwrap_or(0));
+    if file.take(TAIL_BYTES).read_to_end(&mut bytes).is_err() {
+        return;
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    // Drop the first (possibly truncated) line when we started mid-file.
+    let text = if start > 0 {
+        text.split_once('\n').map_or("", |(_, rest)| rest)
+    } else {
+        &text
     };
     let mut tail: Vec<&str> = text.lines().rev().take(count).collect();
     tail.reverse();
@@ -1327,8 +1352,13 @@ pub async fn doctor(offline: bool) -> Result<()> {
             }
         }
 
-        // 5. Bridge manifest.
-        match std::fs::read_to_string(&config.bridge_manifest_path) {
+        // 5. Bridge manifest. Same MAX_CONTROL_BYTES cap as
+        // `manifest-validate` and the daemon's own load, so all three
+        // reach the same verdict on the same file.
+        match av_core::fsutil::read_capped_string(
+            Path::new(&config.bridge_manifest_path),
+            av_core::fsutil::MAX_CONTROL_BYTES,
+        ) {
             Ok(text) => match av_bridge::BridgeManifest::from_yaml(&text) {
                 Ok(manifest) => checks.push(Check::Pass(format!(
                     "manifest: {} ({} topics)",
@@ -1733,9 +1763,15 @@ fn probe_target(endpoint: &str) -> Result<String> {
         }
     };
     let default_port: u16 = match scheme {
-        Some("https") | Some("wss") | Some("rediss") | Some("qdrant+https") => 443,
+        Some("https") | Some("wss") | Some("qdrant+https") => 443,
         Some("nats") | Some("tls+nats") | Some("nats+tls") => 4222,
-        Some("redis") => 6379,
+        // `rediss://` is TLS Redis, not HTTPS: redis-rs applies
+        // `port().unwrap_or(6379)` for BOTH redis:// and rediss://, so
+        // the daemon connects to :6379 on a portless endpoint. Probing
+        // :443 (the old mapping) reported FAIL "unreachable" for a
+        // working production config — or a false PASS if an unrelated
+        // HTTPS service listened there.
+        Some("redis") | Some("rediss") => 6379,
         _ => 80,
     };
     let port = port_opt.unwrap_or(default_port);
@@ -2238,7 +2274,11 @@ mod tests {
         );
         assert_eq!(
             probe_target("rediss://cache.example.com").unwrap(),
-            "cache.example.com:443"
+            // TLS Redis defaults to 6379 like plain redis:// — redis-rs
+            // (which the daemon uses) applies port().unwrap_or(6379)
+            // for both schemes, and doctor must probe what the daemon
+            // dials.
+            "cache.example.com:6379"
         );
         assert_eq!(
             probe_target("nats://bus.example.com").unwrap(),

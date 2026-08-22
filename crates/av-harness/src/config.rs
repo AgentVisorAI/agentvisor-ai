@@ -454,8 +454,15 @@ pub fn load_config_with_override(
     };
     let mut config = match &source {
         ConfigSource::File(path) => {
-            let text = std::fs::read_to_string(path)
-                .map_err(|error| format!("read harness config {}: {error}", path.display()))?;
+            // Same MAX_CONTROL_BYTES cap as `avctl config-validate`, so
+            // the offline validator and the daemon reach the same verdict
+            // on the same file (and a mispointed path at a huge file
+            // cannot balloon boot memory).
+            let text = av_core::fsutil::read_capped_string(
+                std::path::Path::new(path),
+                av_core::fsutil::MAX_CONTROL_BYTES,
+            )
+            .map_err(|error| format!("read harness config {}: {error}", path.display()))?;
             HarnessConfig::from_toml_unvalidated(&text)
                 .map_err(|error| format!("{}: {error}", path.display()))?
         }

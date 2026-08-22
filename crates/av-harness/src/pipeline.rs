@@ -737,6 +737,22 @@ impl AppState {
         let total_started = Instant::now();
         let session_id = session_id(headers)?;
         let workflow = workflow(headers, &self.config.default_workflow)?;
+        // Multi-choice completions are not attestable: the capture path
+        // accumulates ONE response message per step, so `n > 1` deltas
+        // from different choices would interleave into a text no model
+        // produced — and the ATIF step, receipt, and loop-detector
+        // embedding would attest it (the tool-call accumulator is keyed
+        // by choice index for exactly this reason). Refuse up front,
+        // before any budget debit.
+        if payload
+            .get("n")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|n| n > 1)
+        {
+            return Err(PipelineError::BadRequest(
+                "multi-choice completions (n > 1) are not supported: the audit capture attests a single response message per request".to_owned(),
+            ));
+        }
 
         let stage = Instant::now();
         let identity = match self.resolve_identity(headers, Some(&self.config.chat_scope)) {
