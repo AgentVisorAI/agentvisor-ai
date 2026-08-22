@@ -1621,7 +1621,26 @@ async fn probe_endpoint_any(endpoint: &str) -> Result<()> {
             anyhow::bail!("unix endpoint has empty path");
         }
         match std::fs::metadata(path) {
-            Ok(_) => return Ok(()),
+            // Existence alone is not reachability: a regular file at
+            // the socket path passed doctor while the runtime's Redis
+            // client requires an actual Unix domain socket — a false
+            // "reachable" verdict on exactly the misconfiguration
+            // doctor exists to catch.
+            Ok(metadata) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileTypeExt as _;
+                    if !metadata.file_type().is_socket() {
+                        anyhow::bail!(
+                            "unix socket {path}: exists but is not a socket (type: {:?})",
+                            metadata.file_type()
+                        );
+                    }
+                }
+                #[cfg(not(unix))]
+                let _ = metadata;
+                return Ok(());
+            }
             Err(error) => anyhow::bail!("unix socket {path}: {error}"),
         }
     }
@@ -1764,7 +1783,7 @@ fn probe_target(endpoint: &str) -> Result<String> {
     };
     let default_port: u16 = match scheme {
         Some("https") | Some("wss") | Some("qdrant+https") => 443,
-        Some("nats") | Some("tls+nats") | Some("nats+tls") => 4222,
+        Some("nats") | Some("tls+nats") | Some("nats+tls") | Some("tls") => 4222,
         // `rediss://` is TLS Redis, not HTTPS: redis-rs applies
         // `port().unwrap_or(6379)` for BOTH redis:// and rediss://, so
         // the daemon connects to :6379 on a portless endpoint. Probing

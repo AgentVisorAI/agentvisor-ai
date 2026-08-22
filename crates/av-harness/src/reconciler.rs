@@ -3547,16 +3547,61 @@ fn normalize_extra_ttl(trajectory: &mut av_atif::Trajectory) {
 /// Same comparison-copy normalization class as [`normalize_extra_ttl`]:
 /// the enforcement latch is close-time in-memory state the journal
 /// cannot reconstruct, so the consolidation rebuild writes 0 and the
-/// rebuilt-vs-existing equality must not fire on that key alone.
+/// rebuilt-vs-existing equality must not fire on that key alone. The
+/// key is REMOVED (not nulled): pre-latch artifacts carry no key at
+/// all, and a present-key-only nulling compared `null` against absent
+/// as unequal — deterministically flagging every legacy crash-mid-close
+/// artifact as differing, whose rewrite then invalidated its sealed
+/// provenance sidecar and drove an unbounded quarantine loop.
 fn normalize_extra_enforcement(trajectory: &mut av_atif::Trajectory) {
     if let Some(metrics) = trajectory.final_metrics.as_mut() {
         if let Some(extra) = metrics.extra.as_mut() {
             if let Some(object) = extra.as_object_mut() {
-                if object.contains_key("enforcement_latched") {
-                    object.insert("enforcement_latched".to_owned(), serde_json::Value::Null);
-                }
+                object.remove("enforcement_latched");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    /// A rebuilt trajectory (which always writes `enforcement_latched:
+    /// 0`) must compare EQUAL to a pre-latch legacy artifact that has
+    /// no such key, after normalization — a present-key-only nulling
+    /// compared `null` vs absent as unequal, deterministically
+    /// rewriting every legacy crash-mid-close artifact, invalidating
+    /// its sealed provenance sidecar, and looping it through
+    /// quarantine forever.
+    #[test]
+    fn enforcement_normalization_is_symmetric_for_absent_keys() {
+        let base = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": "s",
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{"step_id": 1, "source": "user", "message": "hi"}],
+            "final_metrics": {
+                "total_steps": 1,
+                "extra": {"stop_reason_id": 1u64, "enforcement_latched": 0u64},
+            },
+        });
+        let mut rebuilt: av_atif::Trajectory = serde_json::from_value(base).unwrap();
+        let mut legacy = rebuilt.clone();
+        if let Some(metrics) = legacy.final_metrics.as_mut() {
+            if let Some(extra) = metrics.extra.as_mut() {
+                extra.as_object_mut().unwrap().remove("enforcement_latched");
+            }
+        }
+        assert_ne!(rebuilt, legacy, "precondition: raw copies differ on the key");
+        normalize_extra_enforcement(&mut rebuilt);
+        normalize_extra_enforcement(&mut legacy);
+        assert_eq!(
+            rebuilt, legacy,
+            "normalized copies must be equal regardless of key presence"
+        );
     }
 }
 
