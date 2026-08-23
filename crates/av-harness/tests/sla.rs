@@ -1,7 +1,7 @@
 //! Release-mode MVP SLA gates. Run with `make sla`.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use av_bridge::{BridgeManifest, BusError, EmbeddedBroker, EventBus, PublishAck, StoredEvent};
+use av_bridge::{BridgeManifest, EmbeddedBroker, EventBus};
 use av_events::{AgentIdentity, EventClass, EventMetrics, StatusId, StopReason};
 use av_harness::reconciler::Finalizer;
 use av_harness::session::{Session, Workflow};
@@ -23,38 +23,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt as _;
 
-struct NullBus;
-
-impl EventBus for NullBus {
-    fn publish(&self, topic: &str, _key: &str, _value: &Value) -> Result<PublishAck, BusError> {
-        Ok(PublishAck {
-            topic: topic.to_owned(),
-            partition: 0,
-            offset: 0,
-        })
-    }
-
-    fn fetch(
-        &self,
-        _topic: &str,
-        _partition: u32,
-        _offset: u64,
-        _max: usize,
-    ) -> Result<Vec<StoredEvent>, BusError> {
-        Ok(Vec::new())
-    }
-
-    fn partitions(&self, _topic: &str) -> Result<u32, BusError> {
-        Ok(1)
-    }
-
-    fn topics(&self) -> Vec<String> {
-        EventClass::all()
-            .iter()
-            .map(|class| class.topic().to_owned())
-            .collect()
-    }
-}
+mod common;
+use common::NullBus;
 
 fn production_sandbox() -> Sandbox {
     let mut schemas = std::collections::HashMap::new();
@@ -392,7 +362,7 @@ async fn sla_10k_streaming_connections() {
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(900),
     );
-    // Round-45: allow CI to loosen the p95/p99 gates without patching
+    // Allow CI to loosen the p95/p99 gates without patching
     // the test. Shared GitHub Actions runners have noisy neighbours;
     // observed CI p95 sits at ~4.5-5.1 ms which trips the 5 ms
     // hard-coded threshold roughly half the time (60 consecutive

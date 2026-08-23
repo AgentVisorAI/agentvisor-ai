@@ -23,84 +23,25 @@
     clippy::too_many_lines
 )]
 
-use av_bridge::{BusError, EventBus, PublishAck, StoredEvent};
-use av_events::EventClass;
-use av_harness::{AppState, HarnessConfig};
-use av_receipts::Ed25519Signer;
+use av_harness::AppState;
 use av_sandbox::{NativePolicy, PolicyDecision, PolicyEngine, Sandbox, SandboxConfig, ToolVerdict};
 use av_state::{BudgetSpec, InMemoryStore};
-use axum::http::{HeaderMap, HeaderValue};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+mod common;
+use common::{signed_headers, tools_call};
 
 // ---------------------------------------------------------------------------
 // Scaffolding.
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
-struct NoopBus {
-    n: AtomicU64,
-}
-impl EventBus for NoopBus {
-    fn publish(&self, topic: &str, _key: &str, _value: &Value) -> Result<PublishAck, BusError> {
-        let offset = self.n.fetch_add(1, Ordering::AcqRel);
-        Ok(PublishAck {
-            topic: topic.to_owned(),
-            partition: 0,
-            offset,
-        })
-    }
-    fn fetch(&self, _t: &str, _p: u32, _o: u64, _m: usize) -> Result<Vec<StoredEvent>, BusError> {
-        Ok(Vec::new())
-    }
-    fn partitions(&self, _t: &str) -> Result<u32, BusError> {
-        Ok(1)
-    }
-    fn topics(&self) -> Vec<String> {
-        EventClass::all().iter().map(|c| c.topic().to_owned()).collect()
-    }
-}
-
 fn make_state(sandbox: Sandbox, budget: BudgetSpec) -> Arc<AppState> {
-    let dir = tempfile::tempdir().unwrap();
-    let mut config = HarnessConfig::for_tests(
-        "http://127.0.0.1:9",
-        &dir.path().to_string_lossy(),
-        &dir.path().to_string_lossy(),
-    );
+    let mut config = common::leaked_test_config();
     config.breaker.min_tokens = u64::MAX;
     config.budget = budget;
-    std::mem::forget(dir);
-    Arc::new(
-        AppState::new(
-            config,
-            Arc::new(InMemoryStore::new()),
-            Arc::new(sandbox),
-            Arc::new(NoopBus::default()),
-            None,
-            Arc::new(Ed25519Signer::from_seed(&[77; 32])),
-        )
-        .unwrap(),
-    )
-}
-
-fn signed_headers(session: &str) -> HeaderMap {
-    let mut h = HeaderMap::new();
-    h.insert("x-av-session", HeaderValue::from_str(session).unwrap());
-    h.insert("x-av-workflow", HeaderValue::from_static("signed"));
-    h
-}
-
-fn tools_call(tool: &str, args: Value) -> Vec<u8> {
-    serde_json::to_vec(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {"name": tool, "arguments": args}
-    }))
-    .unwrap()
+    common::app_state(config, sandbox, Arc::new(common::CountingBus::default()), 77)
 }
 
 // ---------------------------------------------------------------------------

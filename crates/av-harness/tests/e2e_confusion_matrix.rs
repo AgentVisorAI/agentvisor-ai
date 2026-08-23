@@ -22,51 +22,16 @@
     clippy::too_many_lines
 )]
 
-use av_bridge::{BusError, EventBus, PublishAck, StoredEvent};
-use av_events::EventClass;
-use av_harness::{AppState, HarnessConfig};
-use av_receipts::Ed25519Signer;
+use av_harness::AppState;
 use av_sandbox::{NativePolicy, Sandbox, SandboxConfig, ToolVerdict};
-use av_state::{BudgetSpec, InMemoryStore};
+use av_state::BudgetSpec;
 use axum::http::{HeaderMap, HeaderValue};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-#[derive(Default)]
-struct CountingBus {
-    published: AtomicU64,
-}
-
-impl EventBus for CountingBus {
-    fn publish(&self, topic: &str, _key: &str, _value: &Value) -> Result<PublishAck, BusError> {
-        let offset = self.published.fetch_add(1, Ordering::AcqRel);
-        Ok(PublishAck {
-            topic: topic.to_owned(),
-            partition: 0,
-            offset,
-        })
-    }
-    fn fetch(
-        &self,
-        _topic: &str,
-        _partition: u32,
-        _offset: u64,
-        _max: usize,
-    ) -> Result<Vec<StoredEvent>, BusError> {
-        Ok(Vec::new())
-    }
-    fn partitions(&self, _topic: &str) -> Result<u32, BusError> {
-        Ok(1)
-    }
-    fn topics(&self) -> Vec<String> {
-        EventClass::all()
-            .iter()
-            .map(|class| class.topic().to_owned())
-            .collect()
-    }
-}
+mod common;
+use common::{signed_headers, tools_call};
 
 /// Whether a well-behaved harness must block or allow the observed action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,45 +64,11 @@ fn classify(expected: Expected, observed: Observed) -> Class {
 }
 
 fn build_state(sandbox: Sandbox, budget: BudgetSpec) -> Arc<AppState> {
-    let directory = tempfile::tempdir().unwrap();
-    let mut config = HarnessConfig::for_tests(
-        "http://127.0.0.1:9",
-        &directory.path().to_string_lossy(),
-        &directory.path().to_string_lossy(),
-    );
+    let mut config = common::leaked_test_config();
     // Keep the loop-detector out of the way of these gate tests.
     config.breaker.min_tokens = u64::MAX;
     config.budget = budget;
-    // Leak the tempdir so it stays alive as long as the AppState does.
-    std::mem::forget(directory);
-    Arc::new(
-        AppState::new(
-            config,
-            Arc::new(InMemoryStore::new()),
-            Arc::new(sandbox),
-            Arc::new(CountingBus::default()),
-            None,
-            Arc::new(Ed25519Signer::from_seed(&[7; 32])),
-        )
-        .unwrap(),
-    )
-}
-
-fn signed_headers(session: &str) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    headers.insert("x-av-session", HeaderValue::from_str(session).unwrap());
-    headers.insert("x-av-workflow", HeaderValue::from_static("signed"));
-    headers
-}
-
-fn tools_call(tool: &str, args: Value) -> Vec<u8> {
-    serde_json::to_vec(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {"name": tool, "arguments": args}
-    }))
-    .unwrap()
+    common::app_state(config, sandbox, Arc::new(common::CountingBus::default()), 7)
 }
 
 fn observed_from_verdict(v: &ToolVerdict) -> Observed {

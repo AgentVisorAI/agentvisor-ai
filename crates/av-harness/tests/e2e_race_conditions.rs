@@ -18,21 +18,21 @@
 use av_events::{AgentIdentity, CharterFile};
 use av_receipts::{
     canonicalize, CostSummary, Ed25519Signer, EventChain, Keyring, Receipt, ReceiptBody, ReceiptSubject,
-    Signer, ToolCallSummary,
+    ToolCallSummary,
 };
 use parking_lot::Mutex;
 use serde_json::json;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
+mod common;
+
 fn signer() -> Ed25519Signer {
-    Ed25519Signer::from_seed(&[44; 32])
+    common::signer(44)
 }
 
 fn ring(s: &Ed25519Signer) -> Keyring {
-    let mut r = Keyring::new();
-    r.add_key_bytes(&Signer::public_key_bytes(s)).unwrap();
-    r
+    common::ring(&[s])
 }
 
 fn body(session: &str, count: u64) -> ReceiptBody {

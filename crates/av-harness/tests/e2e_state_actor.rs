@@ -27,12 +27,14 @@ use av_receipts::{
     CostSummary, Ed25519Signer, Keyring, Receipt, ReceiptBody, ReceiptSubject, Signer, ToolCallSummary,
 };
 
+mod common;
+
 fn signer() -> Ed25519Signer {
-    Ed25519Signer::from_seed(&[200; 32])
+    common::signer(200)
 }
 
 fn attacker_signer() -> Ed25519Signer {
-    Ed25519Signer::from_seed(&[1; 32])
+    common::signer(1)
 }
 
 fn body(session: &str, event_count: u64) -> ReceiptBody {
@@ -62,9 +64,7 @@ fn body(session: &str, event_count: u64) -> ReceiptBody {
 }
 
 fn trusted_ring(s: &Ed25519Signer) -> Keyring {
-    let mut ring = Keyring::new();
-    ring.add_key_bytes(&Signer::public_key_bytes(s)).unwrap();
-    ring
+    common::ring(&[s])
 }
 
 // ---------------------------------------------------------------------------

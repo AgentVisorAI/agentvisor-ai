@@ -14,8 +14,8 @@
     clippy::too_many_lines
 )]
 
-use av_bridge::{BridgeManifest, BusError, EmbeddedBroker, EventBus, PublishAck, StoredEvent};
-use av_events::{AgentIdentity, CharterFile, EventClass};
+use av_bridge::{BridgeManifest, EmbeddedBroker, EventBus};
+use av_events::{AgentIdentity, CharterFile};
 use av_harness::{AppState, HarnessConfig};
 use av_receipts::{
     canonicalize, CostSummary, Ed25519Signer, JcsError, Keyring, Receipt, ReceiptBody, ReceiptError,
@@ -24,10 +24,12 @@ use av_receipts::{
 use av_sandbox::{Sandbox, SandboxConfig};
 use av_state::{ActionBudget, BudgetDecision, BudgetSpec, InMemoryStore};
 use axum::http::{HeaderMap, HeaderValue};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+mod common;
+use common::chat_payload;
 
 // ------------------------------------------------------------------
 // 1. JCS boundary: exactly 2^53 accepted, 2^53+1 refused.
@@ -88,7 +90,7 @@ fn receipt_signs_at_jcs_boundary_and_refuses_above() {
     let signer = Ed25519Signer::from_seed(&[1; 32]);
     let ok = Receipt::issue(body_with_event_count(1u64 << 53), &signer);
     assert!(ok.is_ok(), "event_count = 2^53 must sign");
-    // Round 36: the header promises "signs+verifies" — prove the verify half.
+    // The header promises "signs+verifies" — prove the verify half.
     let receipt = ok.unwrap();
     let mut ring = Keyring::new();
     ring.add_key_bytes(&Signer::public_key_bytes(&signer)).unwrap();
@@ -157,44 +159,17 @@ fn zero_seed_ed25519_signs_and_verifies() {
 // ------------------------------------------------------------------
 
 fn state(config: HarnessConfig) -> Arc<AppState> {
-    #[derive(Default)]
-    struct Bus {
-        n: AtomicU64,
-    }
-    impl EventBus for Bus {
-        fn publish(&self, topic: &str, _key: &str, _value: &Value) -> Result<PublishAck, BusError> {
-            let offset = self.n.fetch_add(1, Ordering::AcqRel);
-            Ok(PublishAck {
-                topic: topic.to_owned(),
-                partition: 0,
-                offset,
-            })
-        }
-        fn fetch(&self, _t: &str, _p: u32, _o: u64, _m: usize) -> Result<Vec<StoredEvent>, BusError> {
-            Ok(Vec::new())
-        }
-        fn partitions(&self, _t: &str) -> Result<u32, BusError> {
-            Ok(1)
-        }
-        fn topics(&self) -> Vec<String> {
-            EventClass::all().iter().map(|c| c.topic().to_owned()).collect()
-        }
-    }
     Arc::new(
         AppState::new(
             config,
             Arc::new(InMemoryStore::new()),
             Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
-            Arc::new(Bus::default()),
+            Arc::new(common::CountingBus::default()),
             None,
             Arc::new(Ed25519Signer::from_seed(&[3; 32])),
         )
         .unwrap(),
     )
-}
-
-fn chat_payload() -> Value {
-    json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]})
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

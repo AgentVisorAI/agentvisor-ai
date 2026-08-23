@@ -21,14 +21,14 @@ use av_receipts::{
 use base64::Engine as _;
 use serde_json::json;
 
+mod common;
+
 fn signer() -> Ed25519Signer {
-    Ed25519Signer::from_seed(&[73; 32])
+    common::signer(73)
 }
 
 fn ring(s: &Ed25519Signer) -> Keyring {
-    let mut r = Keyring::new();
-    r.add_key_bytes(&Signer::public_key_bytes(s)).unwrap();
-    r
+    common::ring(&[s])
 }
 
 fn body(session: &str) -> ReceiptBody {
@@ -672,7 +672,7 @@ fn chain_is_not_idempotent_under_duplicate_events() {
 }
 
 // ---------------------------------------------------------------------------
-// 23. Receipt signature domain separation (§3.5): the signing Ed25519 key
+// 23. Receipt signature domain separation: the signing Ed25519 key
 //     also feeds the journal-MAC KDF, so a signature over un-tagged bytes
 //     is a cross-protocol confusion surface. v2 receipts sign
 //     `b"agentvisor-receipt-v2\0" || len(JCS) as u64 BE || JCS(body)`;

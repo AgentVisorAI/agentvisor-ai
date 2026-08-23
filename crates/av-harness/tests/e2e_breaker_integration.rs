@@ -15,17 +15,13 @@
     clippy::too_many_lines
 )]
 
-use av_bridge::{BusError, EventBus, PublishAck, StoredEvent};
-use av_events::EventClass;
-use av_harness::{AppState, HarnessConfig};
+use av_harness::AppState;
 use av_loopdetect::{cosine, BreakerConfig, Embedder, HashEmbedder, NoopVectorSink, VectorSink};
-use av_receipts::Ed25519Signer;
 use av_sandbox::{Sandbox, SandboxConfig};
-use av_state::InMemoryStore;
-use axum::http::{HeaderMap, HeaderValue};
-use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+mod common;
+use common::{chat, signed_headers, CountingBus};
 
 /// Default delta_epsilon from BreakerConfig::default() — must match the source.
 const EPSILON: f32 = 0.30;
@@ -38,58 +34,15 @@ const COS_TOL: f32 = 1e-5;
 /// Tolerance for L2-norm unit-vector checks.
 const NORM_TOL: f32 = 1e-4;
 
-#[derive(Default)]
-struct CountingBus(AtomicU64);
-impl EventBus for CountingBus {
-    fn publish(&self, topic: &str, _k: &str, _v: &Value) -> Result<PublishAck, BusError> {
-        Ok(PublishAck {
-            topic: topic.to_owned(),
-            partition: 0,
-            offset: self.0.fetch_add(1, Ordering::AcqRel),
-        })
-    }
-    fn fetch(&self, _t: &str, _p: u32, _o: u64, _m: usize) -> Result<Vec<StoredEvent>, BusError> {
-        Ok(Vec::new())
-    }
-    fn partitions(&self, _t: &str) -> Result<u32, BusError> {
-        Ok(1)
-    }
-    fn topics(&self) -> Vec<String> {
-        EventClass::all().iter().map(|c| c.topic().to_owned()).collect()
-    }
-}
-
 fn app_with_breaker(cfg: BreakerConfig) -> Arc<AppState> {
-    let dir = tempfile::tempdir().unwrap();
-    let mut config = HarnessConfig::for_tests(
-        "http://127.0.0.1:9",
-        &dir.path().to_string_lossy(),
-        &dir.path().to_string_lossy(),
-    );
+    let mut config = common::leaked_test_config();
     config.breaker = cfg;
-    std::mem::forget(dir);
-    Arc::new(
-        AppState::new(
-            config,
-            Arc::new(InMemoryStore::new()),
-            Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
-            Arc::new(CountingBus::default()),
-            None,
-            Arc::new(Ed25519Signer::from_seed(&[55; 32])),
-        )
-        .unwrap(),
+    common::app_state(
+        config,
+        Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap(),
+        Arc::new(CountingBus::default()),
+        55,
     )
-}
-
-fn signed_headers(session: &str) -> HeaderMap {
-    let mut h = HeaderMap::new();
-    h.insert("x-av-session", HeaderValue::from_str(session).unwrap());
-    h.insert("x-av-workflow", HeaderValue::from_static("signed"));
-    h
-}
-
-fn chat(content: &str) -> Value {
-    json!({"model": "m", "messages": [{"role": "user", "content": content}]})
 }
 
 // ---------------------------------------------------------------------------
