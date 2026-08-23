@@ -192,6 +192,24 @@ not a lifecycle marker.
    flags. Every setter of the flags also updates the enum. Every
    test that reads a flag also asserts the enum matches. Land this
    as one PR — it changes no observable behavior.
+   * ✅ LANDED (round-51 pass 18): `SessionState { Open, Draining,
+     Sealed, Complete }` in one `AtomicU8`, advanced only by
+     `shadow_transition` CAS calls inside `try_close`/`reset_close`/
+     `mark_artifact_committed`/`mark_close_complete` (and the two
+     recovery constructors, which now claim the close instead of
+     storing the flag). Illegal transitions panic in debug builds,
+     so the whole suite validates the model — and it already caught
+     three refinements to this document's original enum: (a) the
+     `closed` flag is a CLAIM that legitimately toggles after seal
+     (failed close-tail retries) while the chain stays Sealed, so
+     transitions at-or-past their target are no-ops; (b) signed
+     recovery seals adopted sessions without a prior claim
+     (Open→Sealed is legal); (c) `capture_failed` is NOT a chain
+     state — capture-failed sessions still seal and complete (the
+     capture-failed seal path), so it stays an orthogonal property
+     alongside `promoted` and `admission_open`. `Quarantined` is
+     registry-level (the reconciler's quarantine set), not a
+     Session state.
 2. Migrate one flag at a time: `capture_failed → SessionState::CaptureFailed`
    is the simplest since it's a terminal state, then
    `close_complete → SessionState::Complete`, etc. Each migration

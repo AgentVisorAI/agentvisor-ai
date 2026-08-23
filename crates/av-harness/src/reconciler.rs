@@ -2213,7 +2213,11 @@ impl Finalizer {
                 identity.clone(),
                 breaker.clone(),
             );
-            placeholder.closed.store(1, std::sync::atomic::Ordering::Release);
+            // Claim the close on the fresh placeholder (cannot fail)
+            // rather than storing the flag directly, so the S2 shadow
+            // state machine tracks the placeholder as Draining.
+            let placeholder_claimed = placeholder.try_close();
+            debug_assert!(placeholder_claimed, "placeholder is freshly constructed");
             let claimed = match sessions.try_insert_recovered(placeholder) {
                 Ok(claimed) => claimed,
                 Err(_active) => {
