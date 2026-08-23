@@ -76,3 +76,9 @@ node_modules/
 
 # CWD-relative cold-outbox residue from crate-local test runs
 crates/*/data/
+
+# libFuzzer working state (regenerated per run; seeds/ is the committed input set)
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
+fuzz/target/
