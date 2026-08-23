@@ -124,6 +124,51 @@ pub struct Session {
     jobs_drained: tokio::sync::Notify,
     /// Set when an upstream action could not be captured completely.
     capture_failed: AtomicU64,
+    /// Round-51 §4.2 (S2 step 1): the lifecycle state machine that
+    /// replaces the flag set, shadow-tracked while the flags remain
+    /// authoritative. Every flag setter also advances this via a CAS
+    /// transition; illegal transitions panic in debug builds, so the
+    /// whole test suite validates the model before any reader
+    /// migrates (S2 step 2).
+    lifecycle: std::sync::atomic::AtomicU8,
+}
+
+/// Round-51 §4.2 (S2): the session lifecycle chain, held in one
+/// `AtomicU8` and advanced only through CAS transitions that name
+/// their expected source state — illegal transitions become
+/// impossible rather than untested.
+///
+/// Two flags deliberately stay OUTSIDE the chain (mirroring the S2
+/// plan's `admission_open` exception): `capture_failed` and
+/// `promoted` are orthogonal *properties*, not chain positions — a
+/// capture-failed session still seals and completes (the
+/// capture-failed seal path), and promotion happens to already-
+/// complete sessions. Folding them in would multiply states for
+/// combinations that all remain reachable.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionState {
+    /// Admitting requests.
+    Open = 0,
+    /// `try_close` claimed the close; streams may still be draining.
+    /// A failed finalize returns to `Open` via `reset_close`.
+    Draining = 1,
+    /// The receipt/ATIF artifact is durably committed; the fallible
+    /// close tail (bridge emit + journal removal) is still pending.
+    Sealed = 2,
+    /// The close ran to full completion; the registry may evict.
+    Complete = 3,
+}
+
+impl SessionState {
+    fn decode(raw: u8) -> Self {
+        match raw {
+            1 => Self::Draining,
+            2 => Self::Sealed,
+            3 => Self::Complete,
+            _ => Self::Open,
+        }
+    }
 }
 
 /// Aggregate counters for receipts (atomics: workers update concurrently).
@@ -194,6 +239,7 @@ impl Session {
             pending_jobs: AtomicU64::new(0),
             jobs_drained: tokio::sync::Notify::new(),
             capture_failed: AtomicU64::new(0),
+            lifecycle: std::sync::atomic::AtomicU8::new(SessionState::Open as u8),
         }
     }
 
@@ -277,9 +323,64 @@ impl Session {
     /// claim at a time; a failed finalize resets it (`reset_close`) so the
     /// close can be retried.
     pub fn try_close(&self) -> bool {
-        self.closed
+        let claimed = self
+            .closed
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .is_ok();
+        if claimed {
+            self.shadow_transition(&[SessionState::Open], SessionState::Draining);
+        }
+        claimed
+    }
+
+    /// The lifecycle chain position (S2 shadow; the flags remain
+    /// authoritative until step 2 migrates readers one at a time).
+    pub fn lifecycle_state(&self) -> SessionState {
+        SessionState::decode(self.lifecycle.load(Ordering::Acquire))
+    }
+
+    /// One CAS transition of the shadow state machine, tolerant of
+    /// two documented behaviors of the authoritative flags:
+    ///
+    /// * **Idempotent/late re-marks** — a current state at or past
+    ///   `to` in the chain is a no-op. This covers idempotent flag
+    ///   stores AND the `closed` claim flag's post-seal semantics:
+    ///   `reset_close`/`try_close` toggle the claim after an
+    ///   artifact is already committed (failed close-tail retries),
+    ///   where `is_closed()` stays true via `artifact_committed`
+    ///   and the chain must stay Sealed.
+    /// * **Multiple legal sources** — signed recovery seals adopted
+    ///   sessions without a prior claim (Open→Sealed); a live close
+    ///   seals under its claim (Draining→Sealed).
+    ///
+    /// Any other source state is a model violation: debug builds
+    /// (the entire test suite) panic naming the transition; release
+    /// builds leave the flags — still authoritative in step 1 —
+    /// unaffected.
+    fn shadow_transition(&self, from: &[SessionState], to: SessionState) {
+        let mut current = self.lifecycle.load(Ordering::Acquire);
+        loop {
+            let state = SessionState::decode(current);
+            if from.contains(&state) {
+                match self.lifecycle.compare_exchange_weak(
+                    current,
+                    to as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => current = actual,
+                }
+            } else if state == to || (state as u8) > (to as u8) {
+                break;
+            } else {
+                debug_assert!(
+                    false,
+                    "illegal lifecycle transition {state:?}->{to:?} (expected from {from:?})"
+                );
+                break;
+            }
+        }
     }
 
     /// True when closed.
@@ -307,6 +408,7 @@ impl Session {
 
     pub(crate) fn reset_close(&self) {
         self.closed.store(0, Ordering::Release);
+        self.shadow_transition(&[SessionState::Draining], SessionState::Open);
     }
 
     /// True once the receipt/ATIF artifact is durably persisted.
@@ -321,12 +423,17 @@ impl Session {
 
     pub(crate) fn mark_artifact_committed(&self) {
         self.artifact_committed.store(1, Ordering::Release);
+        self.shadow_transition(
+            &[SessionState::Open, SessionState::Draining],
+            SessionState::Sealed,
+        );
     }
 
     /// Record that a close ran to full completion (journal and outboxes
     /// removed). Only such sessions may be evicted from the registry.
     pub(crate) fn mark_close_complete(&self) {
         self.close_complete.store(1, Ordering::Release);
+        self.shadow_transition(&[SessionState::Sealed], SessionState::Complete);
     }
 
     pub(crate) async fn wait_for_streams(&self) {
@@ -398,7 +505,12 @@ impl Session {
     ) -> Result<Self, String> {
         let session = Self::new(id, Workflow::Unsigned, identity, breaker);
         session.restore_next_seq(next_seq);
-        session.closed.store(1, Ordering::Release);
+        // A recovered artifact is by definition past close: claim the
+        // close (fresh session — the claim cannot fail) and seal, so
+        // the S2 shadow walks the same Open→Draining→Sealed chain a
+        // live close does.
+        let claimed = session.try_close();
+        debug_assert!(claimed, "recover_unsigned starts from a fresh session");
         session.mark_artifact_committed();
         *session.atif_path.lock() = Some(path);
         if let Some(metrics) = metrics {
@@ -1043,6 +1155,70 @@ mod tests {
             instance_uid: "i".into(),
             ttl_remaining_s: None,
         }
+    }
+
+    /// Round-51 §4.2 (S2 step 1): the shadow state machine walks the
+    /// close chain in lockstep with the authoritative flags, and a
+    /// failed finalize returns to Open. The debug asserts inside
+    /// `shadow_transition` extend this check to every test in the
+    /// suite; this test pins the happy chain explicitly.
+    #[test]
+    fn lifecycle_shadow_walks_the_close_chain() {
+        let session = Session::new(
+            "s2".into(),
+            Workflow::Unsigned,
+            identity(),
+            av_loopdetect::BreakerConfig::default(),
+        );
+        assert_eq!(session.lifecycle_state(), SessionState::Open);
+        assert!(session.try_close());
+        assert_eq!(session.lifecycle_state(), SessionState::Draining);
+        // Failed finalize: the claim drops unarmed and the session
+        // reopens.
+        session.reset_close();
+        assert_eq!(session.lifecycle_state(), SessionState::Open);
+        // Retry to completion.
+        assert!(session.try_close());
+        session.mark_artifact_committed();
+        assert_eq!(session.lifecycle_state(), SessionState::Sealed);
+        session.mark_close_complete();
+        assert_eq!(session.lifecycle_state(), SessionState::Complete);
+        // Idempotent re-marks are tolerated (the flag stores are).
+        session.mark_artifact_committed();
+        session.mark_close_complete();
+        assert_eq!(session.lifecycle_state(), SessionState::Complete);
+    }
+
+    /// A second `try_close` must not double-claim, and must leave the
+    /// state untouched.
+    #[test]
+    fn lifecycle_shadow_refuses_double_close_claim() {
+        let session = Session::new(
+            "s2b".into(),
+            Workflow::Unsigned,
+            identity(),
+            av_loopdetect::BreakerConfig::default(),
+        );
+        assert!(session.try_close());
+        assert!(!session.try_close());
+        assert_eq!(session.lifecycle_state(), SessionState::Draining);
+    }
+
+    /// Recovery-constructed sessions walk the same chain as a live
+    /// close: `recover_unsigned` lands Sealed, never Complete (the
+    /// close tail still owes bridge emits + journal removal).
+    #[test]
+    fn recovered_unsigned_session_is_sealed() {
+        let session = Session::recover_unsigned(
+            "s2c".into(),
+            identity(),
+            av_loopdetect::BreakerConfig::default(),
+            std::path::PathBuf::from("x.json"),
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(session.lifecycle_state(), SessionState::Sealed);
     }
 
     #[test]
