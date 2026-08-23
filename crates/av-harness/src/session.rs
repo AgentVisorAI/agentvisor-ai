@@ -383,9 +383,16 @@ impl Session {
         }
     }
 
-    /// True when closed.
+    /// True when closed: the close claim is held (`closed` — a claim
+    /// flag, not a chain position; see `shadow_transition`) or the
+    /// lifecycle chain is at/past Sealed (S2 step 2: the enum is
+    /// authoritative for chain positions).
     pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Acquire) != 0 || self.artifact_committed.load(Ordering::Acquire) != 0
+        self.closed.load(Ordering::Acquire) != 0
+            || matches!(
+                self.lifecycle_state(),
+                SessionState::Sealed | SessionState::Complete
+            )
     }
 
     pub(crate) fn admission_guard(&self) -> RwLockReadGuard<'_, ()> {
@@ -411,29 +418,39 @@ impl Session {
         self.shadow_transition(&[SessionState::Draining], SessionState::Open);
     }
 
-    /// True once the receipt/ATIF artifact is durably persisted.
+    /// True once the receipt/ATIF artifact is durably persisted
+    /// (S2 step 2: read from the lifecycle enum; the legacy flag is a
+    /// write-only mirror until step 3).
     pub fn artifact_committed_flag(&self) -> bool {
-        self.artifact_committed.load(Ordering::Acquire) != 0
+        matches!(
+            self.lifecycle_state(),
+            SessionState::Sealed | SessionState::Complete
+        )
     }
 
     /// True once the close ran to full completion (journal removed).
+    /// (S2 step 2: read from the lifecycle enum.)
     pub fn close_complete_flag(&self) -> bool {
-        self.close_complete.load(Ordering::Acquire) != 0
+        self.lifecycle_state() == SessionState::Complete
     }
 
     pub(crate) fn mark_artifact_committed(&self) {
-        self.artifact_committed.store(1, Ordering::Release);
+        // S2 step 2: the enum advances FIRST — readers are on the
+        // enum now, so they must never observe the mirror flag ahead
+        // of the state. The flag is a write-only mirror kept until
+        // step 3 deletes it.
         self.shadow_transition(
             &[SessionState::Open, SessionState::Draining],
             SessionState::Sealed,
         );
+        self.artifact_committed.store(1, Ordering::Release);
     }
 
     /// Record that a close ran to full completion (journal and outboxes
     /// removed). Only such sessions may be evicted from the registry.
     pub(crate) fn mark_close_complete(&self) {
-        self.close_complete.store(1, Ordering::Release);
         self.shadow_transition(&[SessionState::Sealed], SessionState::Complete);
+        self.close_complete.store(1, Ordering::Release);
     }
 
     pub(crate) async fn wait_for_streams(&self) {
@@ -697,7 +714,7 @@ impl Session {
     /// the next chat request, losing the incident evidence.
     pub(crate) fn is_empty_unsigned_quarantine(&self) -> bool {
         self.workflow == Workflow::Unsigned
-            && self.artifact_committed.load(Ordering::Acquire) != 0
+            && self.artifact_committed_flag()
             && self.atif_path.lock().is_none()
     }
 
@@ -1004,7 +1021,7 @@ impl SessionRegistry {
         let mut evicted = Vec::new();
         self.sessions.retain(|_, session| {
             let evict = session.workflow == Workflow::Signed
-                && session.close_complete.load(Ordering::Acquire) != 0
+                && session.close_complete_flag()
                 && !session.capture_failed()
                 // Enforcement-latched sessions are retained like
                 // capture-failed ones: evicting them vacated the id, and
@@ -1035,7 +1052,7 @@ impl SessionRegistry {
             .iter()
             .filter(|entry| {
                 entry.workflow == Workflow::Signed
-                    && entry.close_complete.load(Ordering::Acquire) != 0
+                    && entry.close_complete_flag()
                     && entry.enforcement_tripped()
                     && !entry.capture_failed()
                     && entry.active_streams.load(Ordering::Acquire) == 0
@@ -1083,8 +1100,8 @@ impl SessionRegistry {
         self.sessions
             .iter()
             .filter(|entry| {
-                entry.artifact_committed.load(Ordering::Acquire) != 0
-                    && entry.close_complete.load(Ordering::Acquire) == 0
+                entry.artifact_committed_flag()
+                    && !entry.close_complete_flag()
                     && !entry.capture_failed()
                     && !entry.is_empty_unsigned_quarantine()
             })
