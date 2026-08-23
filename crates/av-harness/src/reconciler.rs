@@ -1120,10 +1120,11 @@ impl Finalizer {
             sessions,
             journal_key: &self.journal_key,
             quarantined_sessions: &self.quarantined_sessions,
+            bridge: self.bridge.as_ref(),
             warn_once: &warn_once,
         };
         crate::recovery::run_pass(&crate::recovery::QuarantineIncompleteEffectsPass, &ctx).await?;
-        self.replay_lifecycle_outboxes().await?;
+        crate::recovery::run_pass(&crate::recovery::ReplayLifecycleOutboxesPass, &ctx).await?;
         let signed_recovered = self.recover_signed_journals(sessions, breaker).await?;
         self.consolidate_step_journals(sessions, breaker).await?;
         crate::recovery::run_pass(&crate::recovery::QuarantineOrphanJsonPass, &ctx).await?;
@@ -3108,92 +3109,15 @@ impl Finalizer {
         persist_outbox(&path, &outbox, &self.journal_key).await
     }
 
+    /// Test-support delegate: production replays outboxes via
+    /// `recovery::ReplayLifecycleOutboxesPass`; reconciler unit tests
+    /// drive the same body directly through this method.
+    #[cfg(test)]
     async fn replay_lifecycle_outboxes(&self) -> Result<usize, FinalizeError> {
         let Some(bridge) = self.bridge.as_ref().map(Arc::clone) else {
             return Ok(0);
         };
-        let directory = self.spool_dir.join(crate::spool::OUTBOX);
-        let mut entries = match tokio::fs::read_dir(&directory).await {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(error) => return Err(FinalizeError::Bridge(error.to_string())),
-        };
-        let mut replayed = 0usize;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|error| FinalizeError::Bridge(error.to_string()))?
-        {
-            let path = entry.path();
-            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
-                continue;
-            }
-            let sealed = match read_capped_async(path.clone(), av_core::fsutil::MAX_CONTROL_BYTES).await {
-                Ok(bytes) => bytes,
-                // A concurrent close legitimately removes its outbox between
-                // the directory listing and this read — normal operation.
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => {
-                    tracing::warn!(%error, path = %av_core::fsutil::basename(&path), "skipping unreadable outbox file");
-                    continue;
-                }
-            };
-            let mut outbox: LifecycleOutbox = match crate::journal::open(
-                &self.journal_key,
-                crate::journal::LIFECYCLE_OUTBOX_DOMAIN,
-                0,
-                &sealed,
-            ) {
-                Ok(outbox) => outbox,
-                // A single corrupt or MAC-failing outbox file must not abort
-                // the entire scan and stop us from replaying the other
-                // sessions' outboxes. The bad file stays on disk as
-                // forensic evidence (`open` does not delete on failure).
-                Err(error) => {
-                    tracing::warn!(%error, path = %av_core::fsutil::basename(&path), "skipping malformed outbox");
-                    continue;
-                }
-            };
-            if path != self.lifecycle_outbox_path(&outbox.session_id, &outbox.kind) {
-                tracing::warn!(
-                    path = %av_core::fsutil::basename(&path),
-                    "skipping outbox whose filename does not match its authenticated session_id/kind"
-                );
-                continue;
-            }
-            if outbox.ack.is_none() {
-                let topic = outbox.topic.clone();
-                let key = outbox.key.clone();
-                let value = outbox.value.clone();
-                // Per-outbox error isolation (round-16 stress finding): a
-                // publish/ack-persist failure for ONE outbox — e.g. the
-                // broker-ack write racing a concurrent client close whose
-                // `remove_step_journal` just deleted the session's
-                // broker-acks directory (ENOENT), or a transiently
-                // unreachable broker — used to abort the entire recovery
-                // pass via `?`, starving every other session's recovery
-                // for the tick. Warn and continue; the outbox stays
-                // unacked on disk and is retried next tick.
-                let outcome: Result<(), FinalizeError> = async {
-                    let event_uid = lifecycle_event_uid(&value)?;
-                    outbox.ack =
-                        Some(resolve_lifecycle_ack(Arc::clone(&bridge), topic, key, value, event_uid).await?);
-                    persist_outbox(&path, &outbox, &self.journal_key).await
-                }
-                .await;
-                match outcome {
-                    Ok(()) => replayed = replayed.saturating_add(1),
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            path = %av_core::fsutil::basename(&path),
-                            "outbox replay failed for this session; will retry next tick"
-                        );
-                    }
-                }
-            }
-        }
-        Ok(replayed)
+        replay_lifecycle_outboxes_in(&self.spool_dir, &self.journal_key, bridge).await
     }
 
     /// Round-43 F1: complete the finalization tail for sessions
@@ -3454,10 +3378,7 @@ impl Finalizer {
     }
 
     fn lifecycle_outbox_path(&self, session_id: &str, kind: &str) -> PathBuf {
-        let session_hash = &av_core::digest::sha256_hex(session_id.as_bytes())[..32];
-        self.spool_dir
-            .join(crate::spool::OUTBOX)
-            .join(format!("{session_hash}.{kind}.json"))
+        lifecycle_outbox_path_in(&self.spool_dir, session_id, kind)
     }
 
     async fn remove_lifecycle_outbox(&self, session_id: &str, kind: &str) -> Result<(), FinalizeError> {
@@ -3705,6 +3626,109 @@ fn archive_conflicting_receipt(
     std::fs::rename(path, &archived)
 }
 
+/// Body of the `ReplayLifecycleOutboxesPass` (S1 step 3): scan the
+/// outbox directory and publish + ack every unacked lifecycle event.
+/// Lives here rather than in `recovery.rs` because it shares the
+/// outbox subsystem (`LifecycleOutbox`, `persist_outbox`,
+/// `resolve_lifecycle_ack`) with the close/emit paths — the pass in
+/// `recovery.rs` owns the identity, ordering and observability.
+pub(crate) async fn replay_lifecycle_outboxes_in(
+    spool_dir: &std::path::Path,
+    journal_key: &[u8; 32],
+    bridge: Arc<dyn EventBus>,
+) -> Result<usize, FinalizeError> {
+    let directory = spool_dir.join(crate::spool::OUTBOX);
+    let mut entries = match tokio::fs::read_dir(&directory).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(FinalizeError::Bridge(error.to_string())),
+    };
+    let mut replayed = 0usize;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| FinalizeError::Bridge(error.to_string()))?
+    {
+        let path = entry.path();
+        if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
+            continue;
+        }
+        let sealed = match read_capped_async(path.clone(), av_core::fsutil::MAX_CONTROL_BYTES).await {
+            Ok(bytes) => bytes,
+            // A concurrent close legitimately removes its outbox between
+            // the directory listing and this read — normal operation.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                tracing::warn!(%error, path = %av_core::fsutil::basename(&path), "skipping unreadable outbox file");
+                continue;
+            }
+        };
+        let mut outbox: LifecycleOutbox = match crate::journal::open(
+            journal_key,
+            crate::journal::LIFECYCLE_OUTBOX_DOMAIN,
+            0,
+            &sealed,
+        ) {
+            Ok(outbox) => outbox,
+            // A single corrupt or MAC-failing outbox file must not abort
+            // the entire scan and stop us from replaying the other
+            // sessions' outboxes. The bad file stays on disk as
+            // forensic evidence (`open` does not delete on failure).
+            Err(error) => {
+                tracing::warn!(%error, path = %av_core::fsutil::basename(&path), "skipping malformed outbox");
+                continue;
+            }
+        };
+        if path != lifecycle_outbox_path_in(spool_dir, &outbox.session_id, &outbox.kind) {
+            tracing::warn!(
+                path = %av_core::fsutil::basename(&path),
+                "skipping outbox whose filename does not match its authenticated session_id/kind"
+            );
+            continue;
+        }
+        if outbox.ack.is_none() {
+            let topic = outbox.topic.clone();
+            let key = outbox.key.clone();
+            let value = outbox.value.clone();
+            // Per-outbox error isolation (round-16 stress finding): a
+            // publish/ack-persist failure for ONE outbox — e.g. the
+            // broker-ack write racing a concurrent client close whose
+            // `remove_step_journal` just deleted the session's
+            // broker-acks directory (ENOENT), or a transiently
+            // unreachable broker — used to abort the entire recovery
+            // pass via `?`, starving every other session's recovery
+            // for the tick. Warn and continue; the outbox stays
+            // unacked on disk and is retried next tick.
+            let outcome: Result<(), FinalizeError> = async {
+                let event_uid = lifecycle_event_uid(&value)?;
+                outbox.ack =
+                    Some(resolve_lifecycle_ack(Arc::clone(&bridge), topic, key, value, event_uid).await?);
+                persist_outbox(&path, &outbox, journal_key).await
+            }
+            .await;
+            match outcome {
+                Ok(()) => replayed = replayed.saturating_add(1),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        path = %av_core::fsutil::basename(&path),
+                        "outbox replay failed for this session; will retry next tick"
+                    );
+                }
+            }
+        }
+    }
+    Ok(replayed)
+}
+
+/// Free-function form of `Finalizer::lifecycle_outbox_path` so the
+/// extracted outbox replay does not need a `Finalizer`.
+fn lifecycle_outbox_path_in(spool_dir: &std::path::Path, session_id: &str, kind: &str) -> PathBuf {
+    let session_hash = &av_core::digest::sha256_hex(session_id.as_bytes())[..32];
+    spool_dir
+        .join(crate::spool::OUTBOX)
+        .join(format!("{session_hash}.{kind}.json"))
+}
 async fn persist_outbox(
     path: &std::path::Path,
     outbox: &LifecycleOutbox,

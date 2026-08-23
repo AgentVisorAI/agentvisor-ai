@@ -101,9 +101,17 @@ pass registry internally.
      journal_key / quarantined_sessions; `known_stems` moved from a
      caller-provided snapshot to a run-time snapshot inside the
      orphan pass (fresher, and the context is narrower).
-   * Remaining: `ReplayLifecycleOutboxesPass`,
-     `RecoverSignedJournalsPass`, `ConsolidateStepJournalsPass`,
-     `AdoptStrictAtifPass` (the tail of the current method).
+   * ✅ `ReplayLifecycleOutboxesPass` (round-51 pass 16): publish +
+     ack of unacked lifecycle outboxes. The loop body stays in
+     `reconciler.rs` as `replay_lifecycle_outboxes_in` next to the
+     rest of the outbox subsystem (`LifecycleOutbox`,
+     `persist_outbox`, `resolve_lifecycle_ack`, shared with the
+     close/emit paths); the pass owns identity, ordering and
+     observability. `ReconcilerContext` gained the optional bridge
+     handle; bridge-less contexts make the pass a no-op.
+   * Remaining: `RecoverSignedJournalsPass`,
+     `ConsolidateStepJournalsPass`, `AdoptStrictAtifPass` (the tail
+     of the current method).
 4. **Once the pass registry is stable**, move the retention sweep
    from main.rs into the same registry (it's currently spawned
    separately because the reconciler didn't have a home for it).
