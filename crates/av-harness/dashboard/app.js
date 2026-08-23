@@ -192,7 +192,11 @@ function stopReasonCaption(s) {
   // just the running default, so showing it (e.g. "Stop" on a Live row)
   // reads as a contradiction.
   if (s.open) return '—';
-  if (!s.stop_reason || s.stop_reason === 'unknown') return '—';
+  // Key off the numeric id (0 = Unknown): the caption is "Unknown"
+  // (Title-case), so a string compare against 'unknown' never matched
+  // and closed sessions without a recorded stop rendered the literal
+  // sentinel instead of the em dash.
+  if (!s.stop_reason || s.stop_reason_id === 0) return '—';
   return s.stop_reason;
 }
 

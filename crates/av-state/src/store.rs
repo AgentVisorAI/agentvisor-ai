@@ -307,6 +307,15 @@ mod tests {
         crate::state_store_contract(&store, "contract-tag");
     }
 
+    /// Mutation-run hardening: the in-memory backend reports NO native
+    /// counter expiry — startup logging and the ops docs cite this value
+    /// to explain the prod/dev budget-window divergence, so a mutant
+    /// answering `Some(0)`/`Some(1)` must not survive.
+    #[test]
+    fn in_memory_counters_report_no_native_ttl() {
+        assert_eq!(InMemoryStore::new().counter_ttl_secs(), None);
+    }
+
     #[test]
     fn remove_prefix_drops_only_matching_keys() {
         let store = InMemoryStore::new();

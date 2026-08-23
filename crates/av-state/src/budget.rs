@@ -291,6 +291,32 @@ mod tests {
         }
     }
 
+    /// Mutation-run hardening: nothing previously pinned the ledger
+    /// prefix shapes, so a mutant replacing `principal_prefix` with an
+    /// arbitrary string survived the suite. The shapes are load-bearing
+    /// twice over: the `{hash-tag}` keeps every key of one ledger in a
+    /// single Redis Cluster slot (remove_prefix routes SCAN/DEL to the
+    /// slot derived from the prefix), and the distinct `budget:` vs
+    /// `budget:principal:` namespaces are what keep a session cleanup on
+    /// close from touching the principal ledger.
+    #[test]
+    fn ledger_prefixes_are_namespaced_and_cluster_hash_tagged() {
+        let session = ActionBudget::session_prefix("same-id");
+        let principal = ActionBudget::principal_prefix("same-id");
+        assert!(session.starts_with("budget:{"), "{session}");
+        assert!(principal.starts_with("budget:principal:{"), "{principal}");
+        for prefix in [&session, &principal] {
+            let open = prefix.find('{').unwrap();
+            let close = prefix.find('}').unwrap();
+            assert!(close > open + 1, "empty hash tag in {prefix}");
+            assert!(prefix.ends_with("}:"), "{prefix}");
+        }
+        // The SAME id in both scopes must land in disjoint key spaces —
+        // neither prefix may be a prefix of the other, or remove_prefix
+        // on one ledger would sweep the other's counters.
+        assert!(!session.starts_with(&principal) && !principal.starts_with(&session));
+    }
+
     #[test]
     fn db_write_capped_at_three() {
         let store = InMemoryStore::new();
