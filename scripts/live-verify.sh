@@ -28,8 +28,20 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 AGENTVISORD="${AGENTVISORD:-$REPO_ROOT/target/release/agentvisord}"
 AVCTL="${AVCTL:-$REPO_ROOT/target/release/avctl}"
-LISTEN_PORT="${LISTEN_PORT:-18484}"
-UPSTREAM_PORT="${UPSTREAM_PORT:-18099}"
+
+# Ephemeral ports so a stranded prior run cannot block this one.
+# `LISTEN_PORT` / `UPSTREAM_PORT` may still be pinned for debugging.
+pick_free_port() {
+    python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(('127.0.0.1', 0))
+print(s.getsockname()[1])
+s.close()
+PY
+}
+LISTEN_PORT="${LISTEN_PORT:-$(pick_free_port)}"
+UPSTREAM_PORT="${UPSTREAM_PORT:-$(pick_free_port)}"
 BASE="http://127.0.0.1:${LISTEN_PORT}"
 
 if [[ ! -x "$AGENTVISORD" || ! -x "$AVCTL" ]]; then
