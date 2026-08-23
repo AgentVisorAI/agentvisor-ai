@@ -102,7 +102,7 @@ fn paraphrase_rotation_is_correctly_not_detected_by_the_hash_embedder() {
     // The hash embedder sees distinct n-grams across these 6 variants; a
     // single pass (all distinct surface forms) must not trip. NB: this
     // deliberately does NOT cycle the same 6 strings 20 times — a
-    // verbatim period-6 cycle IS a loop, and the round-51 recent-
+    // verbatim period-6 cycle IS a loop, and the recent-
     // embedding window correctly catches it; what the hash embedder
     // must NOT do is equate distinct paraphrase surface forms.
     let mut trips = 0;
@@ -344,7 +344,7 @@ fn progressing_content_never_falsely_trips() {
     let s = SessionLoopState::new(std_cfg());
     let e = embedder();
     // Twenty genuinely-distinct high-entropy steps (should always score
-    // Δ > 0.30 on the hash embedder). NB round-51: these are all
+    // Δ > 0.30 on the hash embedder). NB: these are all
     // substantively DISTINCT — cycling a fixed set verbatim (or with
     // only a step-number suffix, which the number-incrementing test
     // pins as insufficient evasion) is a period-N loop the

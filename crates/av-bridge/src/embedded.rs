@@ -66,7 +66,7 @@ impl EmbeddedBroker {
         manifest
             .validate()
             .map_err(|e| BusError::Backend(e.to_string()))?;
-        // Round-17 F3 (av-bridge): reject a scheme-URI cold_uri BEFORE
+        // Reject a scheme-URI cold_uri BEFORE
         // any filesystem side effect. The prior check lived in
         // `open()` (after provision had already written manifest.yaml,
         // per-topic dirs, and schema copies to disk); when
@@ -136,7 +136,7 @@ impl EmbeddedBroker {
             Err(error) => {
                 if error.kind() == std::io::ErrorKind::AlreadyExists {
                     // Loser arm: tmp is auto-removed by TmpGuard on Err.
-                    // Round-37 F1/F2 class: basename to avoid leaking
+                    // Use the basename to avoid leaking
                     // the absolute deployment dir if this BusError
                     // ever flows through a tracing::warn!(%error)
                     // path.
@@ -164,7 +164,7 @@ impl EmbeddedBroker {
         // only environmental I/O errors (ENOSPC, permissions) can fail
         // here — and those must roll the claim back, or every retry
         // fails "bridge already provisioned" against a half-provisioned
-        // directory (the round-17 F3 retry-clean invariant).
+        // directory (the retry-clean invariant).
         let post_claim = write_referenced_schemas(data_dir, &resolved_schemas).and_then(|()| {
             for t in &manifest.topics {
                 fs::create_dir_all(data_dir.join("topics").join(&t.name))?;
@@ -182,7 +182,7 @@ impl EmbeddedBroker {
     /// Open an existing bridge, recovering offsets (and truncating at most one
     /// torn trailing line per partition) from the segment files.
     pub fn open(data_dir: &Path) -> Result<Self, BusError> {
-        // Round-22 F4: cap the bridge manifest read. A hostile plant of a
+        // Cap the bridge manifest read. A hostile plant of a
         // multi-GiB manifest.yaml would OOM the broker at startup before
         // the YAML parser could complain.
         let manifest_yaml = av_core::fsutil::read_capped_string(
@@ -256,7 +256,7 @@ impl EmbeddedBroker {
                             }
                         }
                     }
-                    // Round-6 (hunt5 broker F3): a TRAILING unparseable
+                    // A TRAILING unparseable
                     // complete line occupies an offset ABOVE the max
                     // parseable one, so the previous [min, max]-of-
                     // parseable range dropped its UID — the exact
@@ -404,7 +404,7 @@ impl EmbeddedBroker {
     /// records expired.
     pub fn enforce_retention(&self, now_ms: u64) -> Result<u64, BusError> {
         let mut expired_total = 0u64;
-        // Round-6 (hunt5 broker F4): contain per-partition failures. A
+        // Contain per-partition failures. A
         // persistent error class (divergent cold intent, cold-dir
         // permission error, content-mismatch) used to `?`-propagate out
         // of the whole two-level loop — starving retention for that
@@ -485,7 +485,7 @@ impl EmbeddedBroker {
                     let tmp = part
                         .path
                         .with_extension(format!("jsonl.{}.tmp", av_core::new_event_uid()));
-                    // Round-22 F3: RAII guard cleans up the tmp on any early
+                    // RAII guard cleans up the tmp on any early
                     // Err in the write/sync/rename path so a repeatedly-
                     // failing rewrite (ENOSPC/EIO) does not fill the inode
                     // table with UUID-suffixed orphan .tmp files.
@@ -521,7 +521,7 @@ impl EmbeddedBroker {
                         // no longer exists, and the caller's follow-up `fetch(offset)`
                         // silently returns the wrong event or nothing.
                         //
-                        // Round-6 (hunt5 broker F3): expired lines are parseable
+                        // Expired lines are parseable
                         // BY CONSTRUCTION (`split_by_time` never expires an
                         // unparseable line), so we can remove exactly the
                         // expired offsets. The previous survivors+[min,max]
@@ -607,7 +607,7 @@ fn write_cold_event_once(directory: &Path, event: &StoredEvent) -> Result<(), Bu
             // after the cold copy landed but before the hot rewrite).
             Ok(())
         } else {
-            // Round-37 F1/F2 class: `write_cold_event_once`
+            // Path-leak hazard: `write_cold_event_once`
             // errors bubble up through `enforce_retention` and can
             // reach a
             // tracing::warn!(%error) on the maintenance path.
@@ -690,7 +690,7 @@ fn load_validators(
             continue;
         };
         let schema = crate::manifest::schema_document(reference).or_else(|_| {
-            // Round-22 F4: cap the schema file read. Schemas are control-
+            // Cap the schema file read. Schemas are control-
             // plane data (bounded well below 1 MiB in practice); a hostile
             // plant of a multi-GiB schema file would OOM the broker before
             // the JSON parser could complain.
@@ -709,7 +709,7 @@ fn load_validators(
 
 /// Count complete lines; truncate a torn trailing line if present.
 ///
-/// Streams the segment (Round-6 hunt5 F4 pattern, same as
+/// Streams the segment (same pattern as
 /// `recover_event_uids`) instead of `fs::read`-ing it whole: segments
 /// grow with accepted event traffic and are only time-bounded by
 /// retention, so recovery of a large partition otherwise loaded an
@@ -797,7 +797,7 @@ fn recover_event_uids(path: &Path) -> Result<HashMap<String, u64>, BusError> {
     if !path.exists() {
         return Ok(HashMap::new());
     }
-    // Round-6 (hunt5 F4): stream the sidecar with BufReader rather than
+    // Stream the sidecar with BufReader rather than
     // reading it whole and capping at MAX_ATIF_BYTES. The sidecar grows
     // one line per idempotent publish, compacted only when retention
     // expires UIDs — at 30-day default hot retention, ~1M live events
@@ -948,8 +948,8 @@ fn recover_segment_event_uids(path: &Path, seen: &mut HashMap<String, u64>) -> R
     Ok(())
 }
 
-/// Fsync-safe replace. Round-51 §5.4: this used to be the fourth
-/// hand-rolled copy of the atomic-write recipe, diverging from the
+/// Fsync-safe replace. Do not hand-roll the atomic-write recipe here:
+/// a hand-rolled copy diverged from the
 /// canonical helper by using `File::create` instead of `create_new`.
 /// Delegate to `av_core::fsutil::write_atomic` — one recipe, one set
 /// of durability invariants (create_new tmp, sync_all, rename,
@@ -966,7 +966,7 @@ fn event_uid_from_value(value: &serde_json::Value) -> Option<&str> {
 }
 
 fn read_high_water(path: &Path) -> Result<u64, BusError> {
-    // Round-22 F4: a watermark is at most u64 in decimal (~20 chars). Cap
+    // A watermark is at most u64 in decimal (~20 chars). Cap
     // the read so a hostile plant of a giant p<N>.next-offset cannot OOM
     // the broker at startup. Use MAX_CONTROL_BYTES (1 MiB) for the
     // shared trust boundary; a real watermark is orders of magnitude
@@ -1002,7 +1002,7 @@ fn persist_high_water(path: &Path, next_offset: u64) -> Result<(), BusError> {
         .parent()
         .ok_or_else(|| BusError::Backend("high-watermark has no parent".to_owned()))?;
     let temporary = path.with_extension(format!("{}.tmp", av_core::new_event_uid()));
-    // Round-22 F3: RAII cleanup on any early Err — same discipline as
+    // RAII cleanup on any early Err — same discipline as
     // `rewrite_atomic` above. On a bad-disk day, watermark writes fire
     // on every publish; orphan tmp accumulation would be fastest here.
     let mut guard = av_core::fsutil::TempPathGuard::new(temporary.clone());

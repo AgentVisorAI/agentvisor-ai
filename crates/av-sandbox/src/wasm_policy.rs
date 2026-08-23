@@ -1,4 +1,4 @@
-//! WebAssembly policy modules via wasmtime (brief §8 sandboxing engine).
+//! WebAssembly policy modules via wasmtime (the sandboxing engine).
 //!
 //! ABI (documented for policy authors):
 //! - export `memory` (linear memory) and `alloc(len: i32) -> ptr: i32`;
@@ -24,7 +24,7 @@ const FUEL_PER_CALL: u64 = 50_000_000;
 /// Linear memory cap per evaluation.
 const MAX_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 
-/// Round-15 F1 (av-sandbox): host-memory DoS caps for guest-visible
+/// Host-memory DoS caps for guest-visible
 /// resource growth. `StoreLimitsBuilder::memory_size` bounds one
 /// `Memory`, but a hostile policy could:
 ///
@@ -45,7 +45,7 @@ const MAX_INSTANCES: usize = 4;
 
 /// Maximum wall time is approximately this many 1 ms epoch ticks.
 ///
-/// Round-51 §10.3: this was 25 — a WALL-CLOCK deadline on a
+/// This was 25 — a WALL-CLOCK deadline on a
 /// work-bounded computation. On a busy 2-core box, 16 concurrent
 /// evaluations were descheduled past 25 ms and legitimately-tiny
 /// policies failed closed (`valid_policy_does_not_false_trip_under_
@@ -254,7 +254,7 @@ mod tests {
         let p = WasmPolicy::from_bytes("hostile", HOSTILE_LOOP_POLICY.as_bytes()).unwrap();
         let started = std::time::Instant::now();
         let d = p.evaluate("anything", &json!({}));
-        // Round-51 §10.3: the bound proven here is "terminates by fuel
+        // The bound proven here is "terminates by fuel
         // exhaustion, promptly" — not a wall-clock SLA. The previous
         // `< 100 ms` assertion was the same wall-clock fragility as
         // the parallel-load flake in the other direction: burning 50M
@@ -346,7 +346,7 @@ mod tests {
         }
     }
 
-    /// Round 41 (fourth-model QC): the companion proof the memory-bomb
+    /// The companion proof the memory-bomb
     /// test's Allow arm defers to. After a beyond-cap `memory.grow`, the
     /// guest tries to STORE at an address inside the would-be grown
     /// region (page 512 = 32 MiB, past the 16 MiB cap). StoreLimits must

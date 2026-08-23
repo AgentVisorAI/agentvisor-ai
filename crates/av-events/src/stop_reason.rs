@@ -32,7 +32,7 @@ pub enum StopReason {
     SessionClosed,
     /// Other (see `stop_reason` free text).
     ///
-    /// Round-29 F7: `#[serde(other)]` makes this the deserialize
+    /// `#[serde(other)]` makes this the deserialize
     /// fallback for any unrecognised variant. Heterogeneous
     /// cluster upgrades (harness-N publishing a new stop reason
     /// variant, harness-N-1 reading it back from the bridge
@@ -141,7 +141,7 @@ mod tests {
         assert_eq!(StopReason::from_id(255), StopReason::Unknown);
     }
 
-    /// Round-29 F7: `#[serde(other)]` makes `Other` the deserialize
+    /// `#[serde(other)]` makes `Other` the deserialize
     /// fallback for any unrecognised discriminant. Heterogeneous
     /// cluster upgrades (harness-N publishing a new variant,
     /// harness-N-1 reading it back from the bridge during recovery)

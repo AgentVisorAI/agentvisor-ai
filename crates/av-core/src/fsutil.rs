@@ -11,7 +11,7 @@
 use std::io;
 use std::path::Path;
 
-/// Round-36 F1: return just the file name of `path` as a `&str`,
+/// Return just the file name of `path` as a `&str`,
 /// suitable for `path = %basename(&path)` in tracing macros.
 ///
 /// The concern is downstream OTLP export. Every `tracing::warn!(path
@@ -19,8 +19,8 @@ use std::path::Path;
 /// `tracing_opentelemetry::layer` when the `otel` feature is on, so
 /// absolute deployment paths (`/var/lib/agentvisor-ai/spool/...`,
 /// custom outbox layouts, quarantine locations) land in whatever SIEM
-/// ingests OTLP — same class of leak round-27 F6 closed on the
-/// dashboard and round-35 F1/F2 closed on `%error` on `reqwest::Error`,
+/// ingests OTLP — the same path-leak class already closed on the
+/// dashboard and on `%error` formatting of `reqwest::Error`,
 /// with a different producer / same sink. `basename` keeps enough
 /// context for operator triage (the file name usually encodes the
 /// session id or offset) without leaking the deployment topology.
@@ -58,7 +58,7 @@ pub fn create_dir_all_synced(path: &Path) -> io::Result<()> {
     while let Some(dir) = current {
         // `is_dir` (not `exists`): a regular FILE squatting on the path
         // must fall through to `create_dir_all`, which reports the
-        // collision as an error — the round-51 fast path below must
+        // collision as an error — the existing-directory fast path below must
         // only skip the mkdir when the path truly is a directory.
         if dir.as_os_str().is_empty() || dir.is_dir() {
             break;
@@ -66,7 +66,7 @@ pub fn create_dir_all_synced(path: &Path) -> io::Result<()> {
         missing.push(dir.to_path_buf());
         current = dir.parent();
     }
-    // Round-51 §7.3: steady state is "every directory already exists" —
+    // Steady state is "every directory already exists" —
     // the walk above proved it with one stat, so skip the mkdir
     // entirely. `create_dir_all` on an existing path still issues an
     // mkdir syscall that returns EEXIST; at 5 call sites per request
@@ -89,7 +89,7 @@ pub fn create_dir_all_synced(path: &Path) -> io::Result<()> {
 
 /// Receipts JCS-canonicalize to a few hundred bytes; even a huge
 /// tool-call summary stays well under 16 MiB. Shared between the CLI
-/// (`avctl receipt-verify`) and the harness reconciler (round-17 F3).
+/// (`avctl receipt-verify`) and the harness reconciler.
 pub const MAX_RECEIPT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// ATIF trajectories can carry long transcripts; 64 MiB is generous
@@ -109,8 +109,8 @@ pub const MAX_CONTROL_BYTES: u64 = 1024 * 1024;
 /// uses `Read::take` so a target that grows after the metadata
 /// check still cannot exceed the cap.
 ///
-/// Shared between the CLI (round-16 F5) and the harness reconciler
-/// (round-17 F3) so both audit tools and the long-running server
+/// Shared between the CLI and the harness reconciler
+/// so both audit tools and the long-running server
 /// enforce identical resource bounds against on-disk tampering.
 pub fn read_capped(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
     use std::io::Read as _;
@@ -134,8 +134,8 @@ pub fn read_capped(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
     let mut file = std::fs::File::open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
-        // Round-6 (hunt4 F13): error messages must not embed the full
-        // absolute path — they surface into logs (defeating the round-36
+        // Error messages must not embed the full
+        // absolute path — they surface into logs (defeating the
         // basename discipline) and into HTTP close/promote error bodies.
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -174,7 +174,7 @@ pub fn read_capped(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
 
 /// UTF-8 variant of [`read_capped`]. Used by the CLI for
 /// operator-supplied config / manifest / bearer token files where
-/// content is textual (round-17 F6).
+/// content is textual.
 pub fn read_capped_string(path: &Path, max_bytes: u64) -> io::Result<String> {
     let bytes = read_capped(path, max_bytes)?;
     String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
@@ -200,7 +200,7 @@ pub fn read_capped_string(path: &Path, max_bytes: u64) -> io::Result<String> {
 /// dirent may not survive an *immediate* power loss on POSIX-conformant
 /// filesystems (xfs, btrfs, ext4 with `data=ordered`), but the file is
 /// present and readable for every observer running now. Historically this
-/// function still returned `Err` in that case (round-12 F5), which
+/// function still returned `Err` in that case, which
 /// misled callers whose retry logic assumes "Err → not present": they
 /// would either double-write (harmless but wasted IO) or, worse, treat
 /// the write as failed and skip session-state advancement while the
@@ -225,7 +225,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    // Round-23 F1 (av-core fsutil): use `create_dir_all_synced` (not
+    // Use `create_dir_all_synced` (not
     // `create_dir_all`) so the FIRST write into a new spool subtree
     // (`spool/outbox/`, `spool/receipts/`, `spool/tool-executions/`,
     // …) also fsyncs the newly-created ancestor entries. A bare
@@ -233,8 +233,8 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     // line 206 left the ancestor dirents volatile — a power loss
     // between the initial `mkdir` and any ambient dirent sync
     // could drop the entire subtree, losing the marker even though
-    // its bytes were fsynced. This is the durability gap round-21
-    // flagged and deferred; the helper's fast path (skip when the
+    // its bytes were fsynced. This durability gap was known and
+    // deferred; the helper's fast path (skip when the
     // directory already exists) means the cost is only paid on
     // FIRST writes into a fresh directory tree.
     create_dir_all_synced(parent)?;
@@ -370,7 +370,7 @@ mod tests {
         assert!(read_capped_string(&path, 4).is_err(), "over-cap read must refuse");
     }
 
-    /// Round-36 F1: `basename` is a canonical name for the fix to
+    /// `basename` is a canonical name for the fix to
     /// the "path.display() in tracing → OTLP → SIEM leak" class.
     /// Assert the property callers rely on: never returns the
     /// parent directory, always the last segment.
@@ -396,7 +396,7 @@ mod tests {
         }
     }
 
-    /// Round-51 §7.3 fast path: an existing directory short-circuits
+    /// Fast path: an existing directory short-circuits
     /// before the mkdir, and — the regression the `is_dir` check
     /// guards — a regular FILE squatting on the path must still
     /// surface as an error, not silently "succeed".
@@ -490,7 +490,7 @@ mod read_capped_tests {
 
     use super::*;
 
-    /// Mutation-run hardening (round 12): `read_capped -> Ok(vec![])`
+    /// Mutation-run hardening: `read_capped -> Ok(vec![])`
     /// survived — nothing asserted the reader actually returns the file
     /// bytes or enforces its cap at the exact boundary.
     #[test]

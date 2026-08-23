@@ -611,7 +611,7 @@ impl EventBus for KafkaBus {
             return Err(BusError::UnknownTopic(topic.to_owned()));
         }
         let pc = self.partition_client(topic, partition)?;
-        // Round-30 F1 (av-bridge kafka): reject offsets above
+        // Reject offsets above
         // `i64::MAX` explicitly rather than let `as i64` sign-wrap
         // into a negative Kafka offset. The Kafka wire protocol
         // treats -1 as "latest" and -2 as "earliest" (its own
@@ -642,7 +642,7 @@ impl EventBus for KafkaBus {
                     .map_err(|e| e.to_string())?;
                 let mut out = Vec::new();
                 for r in records {
-                    // Round-22 F1: surface the error instead of silently
+                    // Surface the error instead of silently
                     // dropping a corrupt record. Parity with NatsBus and
                     // EmbeddedBroker. An auditor or reconciler that sees a
                     // shorter list than expected — with no error and no

@@ -171,7 +171,7 @@ fn stub_middle_to_target(
     // (HMAC over prior content) or an out-of-band per-payload
     // flag — both are larger refactors.
     //
-    // Round-19 F8: tracked as a known limitation (see the
+    // Tracked as a known limitation (see the
     // compression-marker entry in SECURITY-AUDIT.md). Attack requires
     // an already-compromised prior turn (either an operator who
     // pasted attacker content verbatim, or a system prompt
@@ -180,7 +180,7 @@ fn stub_middle_to_target(
     // compression pass to skip." A keyed-marker
     // scheme remains future work, currently unscheduled.
     let scan_end = tail_start.min(messages.len());
-    // Round-18 F1 (av-compress): the prior check refused to run a
+    // The prior check refused to run a
     // second pass if ANY pre-tail message content contained the
     // literal substring "reason: middle history]" — but a
     // user/assistant message that legitimately quotes that phrase
@@ -190,7 +190,7 @@ fn stub_middle_to_target(
     // "[pruned:" AND contain the marker tail. A user quoting the
     // phrase in free text no longer matches (their content will
     // start with their own words, not "[pruned:"). This is not
-    // the full keyed-marker fix (round-19 F8 known limitation) —
+    // the full keyed-marker fix (a known limitation) —
     // but the spoofing surface shrinks from "any message contains
     // the substring" to "any message perfectly mimics the marker
     // prefix + tail." Realistic user text does not shape like a
@@ -206,7 +206,7 @@ fn stub_middle_to_target(
     let target_tokens =
         tokens_before.saturating_mul(1000u64.saturating_sub(target_reduction_millis.min(1000))) / 1000;
     let mut changed = false;
-    // Round-32 F3 (av-compress): the prior loop called
+    // The prior loop called
     // `payload_tokens_with_messages(payload, messages)` on every
     // iteration — each call clones the entire payload AND the
     // entire messages Vec, then serializes to string. For a 4 MiB
@@ -240,7 +240,7 @@ fn stub_middle_to_target(
         if tokens < 32 {
             continue;
         }
-        // Round-6 (hunt5 F5): the running counter was seeded from the
+        // The running counter was seeded from the
         // SERIALIZED payload (JSON-escaped: `\n` → two chars, `"` →
         // `\"`), but decrements used raw-content tokens. Raw ≤ escaped
         // always, so the loop over-stated remaining tokens and kept
@@ -300,7 +300,7 @@ fn collapse_duplicate_system(messages: &mut [Value], tail_start: usize) -> bool 
         if msg_role(m) == "system" && *m == reference {
             let tokens = approx_tokens(&reference.to_string());
             let stub = audit_stub("duplicate system message", tokens, &reference);
-            // Round-6 (hunt5 F4): stub only when it shrinks the
+            // Stub only when it shrinks the
             // message — a short duplicate would otherwise GROW the
             // payload and trip the outer revert-guard into cancelling
             // the whole compression outcome.
@@ -320,8 +320,8 @@ fn collapse_duplicate_system(messages: &mut [Value], tail_start: usize) -> bool 
 /// Collapse exact-duplicate user/assistant messages outside the tail
 /// (identical retries / framework echoes).
 ///
-/// Round-32 F2 (av-compress): `HashSet` keyed by content hash replaced
-/// the O(n²) `Vec::contains`. Round-6 (hunt1 F2) hardened it twofold:
+/// A `HashSet` keyed by content hash replaced
+/// the O(n²) `Vec::contains`, hardened twofold:
 ///
 /// 1. **Eligibility**: only messages whose ONLY fields are `role` and
 ///    `content` participate. The previous `(role, content)` key
@@ -337,7 +337,7 @@ fn collapse_duplicate_system(messages: &mut [Value], tail_start: usize) -> bool 
 ///    content — treating a collision as equality silently destroyed a
 ///    non-duplicate.
 ///
-/// Also applies the round-6 (hunt5 F4) stub-size floor: a duplicate is
+/// Also applies the stub-size floor: a duplicate is
 /// only stubbed when the stub is actually smaller, so collapsing many
 /// short duplicates can no longer GROW the payload and trip the outer
 /// revert-guard into cancelling all compression for the conversation.
@@ -464,7 +464,7 @@ fn normalize_json_content(messages: &mut [Value], tail_start: usize) -> bool {
         let Ok(minified) = serde_json::to_string(&parsed) else {
             continue;
         };
-        // Round-6 (hunt1 F9): the round-trip through `Value` is
+        // The round-trip through `Value` is
         // lossy for (a) integers outside i64/u64 range — parsed as
         // f64 and re-serialized with precision loss (128-bit IDs,
         // large monetary integers common in tool outputs) — and (b)
@@ -497,7 +497,7 @@ fn audit_stub(reason: &str, tokens: u64, original: &Value) -> String {
     format!("[pruned: {tokens} tokens ({reason}), sha256:{digest}]")
 }
 
-/// Round-6 (hunt1 F9) helpers: a single-pass JSON lexer extracting the
+/// Minification-proof helpers: a single-pass JSON lexer extracting the
 /// ordered numeric-literal tokens and the object-key count from RAW
 /// text (no Value round-trip). Used to prove a minification did not
 /// mutate numeric representations (bigint precision loss) or collapse
@@ -625,7 +625,7 @@ mod tests {
         assert!(!out.changed, "512-token floor must skip tiny payloads");
     }
 
-    /// Round-6 (hunt1 F2): messages carrying fields beyond role+content
+    /// Messages carrying fields beyond role+content
     /// (`name`, `refusal`, `function_call`, …) are semantically distinct
     /// even when role+content match — they must never be collapsed.
     #[test]
@@ -662,7 +662,7 @@ mod tests {
         );
     }
 
-    /// Round-6 (hunt5 F4): collapsing a short duplicate must not grow
+    /// Collapsing a short duplicate must not grow
     /// the payload — the stub floor skips them.
     #[test]
     fn short_duplicates_are_not_stubbed_into_growth() {
@@ -681,7 +681,7 @@ mod tests {
         );
     }
 
-    /// Round-6 (hunt1 F9): minification must not mutate numeric
+    /// Minification must not mutate numeric
     /// representations (bigint precision loss) or collapse duplicate
     /// keys inside tool output.
     #[test]
@@ -897,10 +897,10 @@ mod tests {
         );
     }
 
-    /// Round-18 F1 regression: a message that legitimately QUOTES the
+    /// Regression guard: a message that legitimately QUOTES the
     /// marker tail phrase in free text must NOT disable the middle
-    /// pass. The prior check refused to run if any pre-tail message
-    /// content contained the literal substring; the round-18 fix
+    /// pass. An earlier check refused to run if any pre-tail message
+    /// content contained the literal substring; the fix
     /// narrowed the check to require the message to also START WITH
     /// `[pruned:`. A user turn that says `"the log said 'reason:
     /// middle history]'"` is normal text; compression must still run.
@@ -1082,7 +1082,7 @@ mod tests {
 
 #[cfg(test)]
 mod ratio_tests {
-    /// Mutation-run hardening (round 12): pin the R7 metric arithmetic —
+    /// Mutation-run hardening: pin the R7 metric arithmetic —
     /// `/` -> `%`/`*` in `pruning_ratio_millis` would corrupt the
     /// pruning-ratio field that mirrors ATIF metrics.
     #[test]

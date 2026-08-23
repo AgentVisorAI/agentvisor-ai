@@ -321,12 +321,12 @@ fn subagent_references_must_be_resolvable() {
 
 #[test]
 fn torn_file_rejected_not_miscounted() {
-    // Simulates a truncated write (silent-error D13.16). Round-6 (hunt3
-    // tests F3): drive the torn bytes through `validate_bytes` — the
+    // Simulates a truncated write (silent-error class). Drive the torn
+    // bytes through `validate_bytes` — the
     // documented ingest entry point the reconciler and CLI actually use
     // — not bare serde_json. Any future leniency in the real ingest
-    // path (partial-parse salvage, trailing-content tolerance — the
-    // exact class round-25 hardened) must fail THIS assertion.
+    // path (partial-parse salvage, trailing-content tolerance — an
+    // exact class hardened before) must fail THIS assertion.
     let full = serde_json::to_string(&golden()).unwrap();
     let torn = &full[..full.len() / 2];
     assert!(
@@ -345,7 +345,7 @@ fn non_object_roots_rejected() {
     }
 }
 
-/// Round-25 F4: adversarial deeply-nested subagent_trajectories
+/// Adversarial deeply-nested subagent_trajectories
 /// cannot stack-overflow the validator. Build a chain of 2_000
 /// nested `subagent_trajectories` (well past the 128-frame
 /// depth cap and past serde_json's own parser ceiling), pass it
@@ -385,7 +385,7 @@ fn subagent_recursion_is_depth_capped() {
     );
 }
 
-/// Round-33 F3: `subagent_trajectory_ref` inside `observation.results[]`
+/// `subagent_trajectory_ref` inside `observation.results[]`
 /// is v1.7-only. The sibling root-level `subagent_trajectories` is
 /// already gated (the v1.7 root-field gate in `validate.rs`); the observation ref field was
 /// missed and silently accepted on v1.0 files. This test locks in
@@ -446,7 +446,7 @@ fn subagent_trajectory_ref_requires_v17() {
     );
 }
 
-/// Round-38 F4: total_cost_usd is capped at 1e12 (one trillion USD)
+/// Total_cost_usd is capped at 1e12 (one trillion USD)
 /// in strict mode. Without a ceiling, a hostile trajectory carrying
 /// `total_cost_usd: 1.7e308` used to pass strict validation and
 /// flow into promotion / dashboards / receipt subject payloads —
@@ -493,7 +493,7 @@ fn total_cost_usd_capped_in_strict_mode() {
     );
 }
 
-/// Round-38 F4: per-step `cost_usd` is capped at the same 1e12 in
+/// Per-step `cost_usd` is capped at the same 1e12 in
 /// strict mode.
 #[test]
 fn per_step_cost_usd_capped_in_strict_mode() {
@@ -522,7 +522,7 @@ fn per_step_cost_usd_capped_in_strict_mode() {
     );
 }
 
-/// Round-40 F3: subagent_trajectories now detects cycles across
+/// Subagent_trajectories now detects cycles across
 /// ANY ancestor (A -> B -> A), not just among direct siblings.
 /// Before, a bogus trajectory could claim to be a re-invocation
 /// of its root and downstream analysis would treat the tree as
@@ -570,7 +570,7 @@ fn subagent_trajectory_cycle_across_ancestors_is_flagged() {
     );
 }
 
-/// Round-40 F3: sibling branches sharing a trajectory_id are fine
+/// Sibling branches sharing a trajectory_id are fine
 /// — the ancestor cleanup on frame exit means A -> [B, B] is
 /// only flagged by the direct-sibling dedup, and A -> [B -> C,
 /// D -> C] is legitimate (C appears twice in the tree but never
@@ -642,7 +642,7 @@ fn subagent_trajectory_sibling_reuse_is_not_a_false_positive() {
     );
 }
 
-// ---- Mutation-run hardening (round 12): version gates and calendar
+// ---- Mutation-run hardening: version gates and calendar
 // logic in the strict validator were only tested on one side, so
 // boundary mutants (`< (1,N)` -> `<=`, `&&` -> `||`, leap-year
 // arithmetic) survived. Each version-gated feature is checked at the
@@ -841,7 +841,7 @@ fn rust_strict_valid_v17_documents_always_pass_the_shipped_schema() {
     }
 }
 
-/// Round 31: e2e_sota_attacks defers "invisible Unicode tag bytes survive
+/// The e2e_sota_attacks suite defers "invisible Unicode tag bytes survive
 /// export byte-exactly" to this suite — pin it. U+E0000–U+E007F tag
 /// characters (Goodside-style prompt smuggling) hidden in a message must
 /// survive the typed round trip bit-exactly, validate strict, and pass

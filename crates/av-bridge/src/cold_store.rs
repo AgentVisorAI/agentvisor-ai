@@ -82,7 +82,7 @@ impl ColdArchive {
             let url = cold_url(uri)?;
             let options = aws_env_options(std::env::vars());
             let (store, prefix) = object_store::parse_url_opts(&url, options).map_err(|error| {
-                // Round-6 (hunt5 portability F3): object_store's
+                // Object_store's
                 // "feature for AmazonS3 not enabled" names an internal
                 // feature the operator cannot act on; map it to the
                 // cargo feature that actually fixes the build.
@@ -121,9 +121,9 @@ impl ColdArchive {
     }
 
     pub(crate) fn set_control_key(&self, key: [u8; 32]) -> Result<(), BusError> {
-        // Round-21 F3: refuse known-weak keys. The default init at
-        // construction is `[0; 32]` (round-14 and round-20 F5
-        // banned both patterns for the primary signing seed;
+        // Refuse known-weak keys. The default init at
+        // construction is `[0; 32]` (both weak patterns are already
+        // banned for the primary signing seed;
         // parity here closes the last legal surface for the
         // pattern). Silently accepting a weak key would let a
         // startup-order wiring bug (bus impl forgets to plumb
@@ -269,7 +269,7 @@ impl ColdArchive {
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
                 continue;
             }
-            // Round-6 (hunt3 F6, revised): isolate per-intent failures so
+            // Isolate per-intent failures so
             // ONE poisoned intent does not head-of-line-block cold export
             // for every other durable intent — but WITHOUT the quarantine
             // rename the first revision used. Renaming to `.corrupt-*`
@@ -448,7 +448,7 @@ fn persist_pending(
     // ancestor dirent can drop the whole outbox subtree on power loss.
     av_core::fsutil::create_dir_all_synced(parent)?;
     let temporary = path.with_extension(format!("{}.tmp", av_core::new_event_uid()));
-    // Round-22 F3: arm the RAII guard immediately after choosing the
+    // Arm the RAII guard immediately after choosing the
     // temp path so that any Err on mac/serialize/write/sync/rename
     // cleans up the tmp instead of leaving an orphan. Repeated
     // ENOSPC/EIO on a bad-disk day would otherwise unboundedly
@@ -484,8 +484,8 @@ fn read_pending(path: &std::path::Path, control_key: &[u8; 32]) -> Result<Pendin
 }
 
 fn pending_mac(control_key: &[u8; 32], pending: &PendingColdEvent) -> Result<String, BusError> {
-    // Round-22 F2: refuse to sign under a known-weak key. Round-21 F3
-    // blocked *installing* [0; 32] / [0xFF; 32] through set_control_key,
+    // Refuse to sign under a known-weak key. `set_control_key`
+    // blocks *installing* [0; 32] / [0xFF; 32],
     // but the archive is *constructed* with [0; 32] and a bus impl that
     // publishes before an operator installs a real key (or that forgets
     // set_control_key entirely) would sign under the weak default. Fail
@@ -516,7 +516,7 @@ fn verify_pending_mac(
     pending: &PendingColdEvent,
     presented_hex: &str,
 ) -> Result<(), BusError> {
-    // Round-22 F2: refuse to verify under a known-weak key. Mirrors the
+    // Refuse to verify under a known-weak key. Mirrors the
     // sign-time check in `pending_mac`. If the archive is still holding
     // its default [0; 32] key when a stale envelope is read back on
     // startup, we do NOT want to accept it as authentic — a
@@ -533,7 +533,7 @@ fn verify_pending_mac(
         Hmac::<Sha256>::new_from_slice(control_key).map_err(|error| BusError::Backend(error.to_string()))?;
     mac.update(b"agentvisor-cold-outbox-v1\0");
     mac.update(canonical.as_bytes());
-    // Round-17 F9: same 128-char cap as journal.rs — HMAC-SHA256 is
+    // Same 128-char cap as journal.rs — HMAC-SHA256 is
     // 64 hex chars; refuse a giant `presented_hex` so a fs-tamper
     // attacker cannot force a huge hex::decode allocation before
     // verify_slice fails.
@@ -632,7 +632,7 @@ mod tests {
         );
     }
 
-    /// Mutation-run hardening (round 14): the READ-side twin of the
+    /// Mutation-run hardening: the READ-side twin of the
     /// weak-key sign guard. `verify_pending_mac` refuses envelopes while
     /// the archive still holds a known-weak key ([0;32]/[0xFF;32]); the
     /// surviving `||` -> `&&` mutant only refuses a key that is BOTH
@@ -726,7 +726,7 @@ mod tests {
         archive.commit(&topic_name, "uid-race", 5).unwrap(); // commit after a racing export must succeed
     }
 
-    /// Mutation-run hardening (round 14): `validate_same_intent` binds a
+    /// Mutation-run hardening: `validate_same_intent` binds a
     /// cold-outbox UID to one exact event — nine surviving mutants could
     /// each let a UID be re-staged over a DIFFERENT event's payload
     /// (silent audit-trail substitution). Pin every field of the identity
@@ -784,7 +784,7 @@ mod tests {
         archive.stage(&topic_b, &base, "uid-bind").unwrap();
     }
 
-    /// Mutation-run hardening (round 13): the AlreadyExists tolerance in
+    /// Mutation-run hardening: the AlreadyExists tolerance in
     /// `put_remote` compares existing object bytes against the new payload —
     /// an `==` -> `!=` mutant would silently accept a DIFFERENT object at
     /// the same deterministic key (an integrity violation) and reject
@@ -1187,8 +1187,8 @@ mod tests {
         );
     }
 
-    /// Round-21 F3: refuse known-weak control keys — parity with
-    /// round-14 and round-20 F5 for the primary signing seed.
+    /// Refuse known-weak control keys — parity with
+    /// the weak-key ban on the primary signing seed.
     /// Silently accepting [0; 32] or [0xFF; 32] would let a
     /// startup-order wiring bug produce a cold-outbox whose
     /// authentication tag is forgeable by anyone who guessed
@@ -1218,8 +1218,8 @@ mod tests {
         archive.set_control_key([7u8; 32]).unwrap();
     }
 
-    /// Round-22 F2: sign-time refusal of known-weak keys. Round-21 F3
-    /// only guarded `set_control_key`. If a bus impl publishes before
+    /// Sign-time refusal of known-weak keys. The install-time guard
+    /// only covers `set_control_key`. If a bus impl publishes before
     /// (or without) installing a real key, the archive is still holding
     /// its default `[0; 32]` — and would previously have signed
     /// envelopes under an all-zero MAC key any attacker could forge.
@@ -1253,7 +1253,7 @@ mod tests {
             "expected weak-key rejection at sign time, got {err:?}"
         );
         // The pending dir must remain empty — a rejected sign attempt
-        // must not leave orphan `.tmp` (round-22 F3 guard) or a
+        // must not leave orphan `.tmp` or a
         // committed pending file.
         let leftover = std::fs::read_dir(outbox.path())
             .unwrap()

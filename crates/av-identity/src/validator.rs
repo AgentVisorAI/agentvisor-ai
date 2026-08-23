@@ -162,7 +162,7 @@ impl IdentityValidator {
 
     /// Register key material under a `kid`.
     ///
-    /// Round-25 F2: refuse to shadow a JWKS-tracked kid. Without
+    /// Refuse to shadow a JWKS-tracked kid. Without
     /// this guard, an ordering hazard silently discarded operator
     /// intent: if `add_key("X", …)` was called for a kid `X` that
     /// a prior `add_jwks` had installed, the manual entry would
@@ -197,12 +197,12 @@ impl IdentityValidator {
     /// entry whose `kid` collides with a manually-registered key is
     /// refused so the manual key stays authoritative.
     pub fn add_jwks(&self, document: &serde_json::Value) -> Result<usize, IdentityError> {
-        // Round-12 F11 + round-15 F5: cap the total number of
+        // Cap the total number of
         // entries iterated (parsed OR skipped), so a hostile JWKS
         // full of RSA/EC decoys with a handful of legitimate OKP
         // keys cannot stall the parse loop just by inflating the
-        // `keys` array to tens of thousands of entries. The
-        // round-12 fix only capped parsed OKP entries, so a JWKS
+        // `keys` array to tens of thousands of entries. An
+        // earlier fix only capped parsed OKP entries, so a JWKS
         // with 40k `kty=RSA` decoys still walked the whole array.
         // Cap the outer array up front at the same threshold, and
         // keep the inner cap as defense-in-depth against a future
@@ -214,12 +214,12 @@ impl IdentityValidator {
             .ok_or_else(|| IdentityError::Jwks("missing keys array".to_owned()))?;
         if keys.len() > MAX_JWKS_KEYS {
             return Err(IdentityError::Jwks(format!(
-                "JWKS keys array carries {} entries; refusing to walk more than {MAX_JWKS_KEYS} (round-15 F5: fires before the inner parser regardless of `kty`)",
+                "JWKS keys array carries {} entries; refusing to walk more than {MAX_JWKS_KEYS} (this cap fires before the inner parser regardless of `kty`)",
                 keys.len()
             )));
         }
         let mut parsed = Vec::new();
-        // Round-12 F6: refuse duplicate `kid` within a single JWKS.
+        // Refuse duplicate `kid` within a single JWKS.
         // HashMap's insert-with-overwrite semantics would otherwise
         // silently accept a poisoned refresh where an attacker mixes
         // an alien public key with the same kid as a legitimate one —
@@ -232,7 +232,7 @@ impl IdentityValidator {
             {
                 continue;
             }
-            // Round-25 F1: respect RFC 7517 §4.2/§4.4. A JWK's
+            // Respect RFC 7517 §4.2/§4.4. A JWK's
             // `use` (public key use) member — when present — MUST
             // be "sig" for verification material; "enc" keys are
             // encryption-only and MUST NOT be installed for
@@ -281,7 +281,7 @@ impl IdentityValidator {
                 .and_then(serde_json::Value::as_str)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| IdentityError::Jwks(format!("key {kid:?} missing x")))?;
-            // Round-52 F2: shape-check the key at load time. Without
+            // Shape-check the key at load time. Without
             // this, a malformed base64url `x` (e.g., "!!!") or a
             // wrong-length pubkey installs successfully, then every
             // JWT with that kid fails at verify time with a confusing
@@ -300,7 +300,7 @@ impl IdentityValidator {
                 )));
             }
             parsed.push((kid.to_owned(), KeyMaterial::Ed25519Jwk(x.to_owned())));
-            // Round-16 F9: the outer `keys.len() > MAX_JWKS_KEYS`
+            // The outer `keys.len() > MAX_JWKS_KEYS`
             // guard at the top of the function already bounds
             // `parsed.len()` (parsed is a subset of the outer
             // array). This inner check is therefore unreachable in
@@ -373,8 +373,8 @@ impl IdentityValidator {
             let parent = self.validate_single(&pt)?;
             // Scope inheritance: child ⊆ parent, with the SAME wildcard
             // semantics the harness's runtime authorization uses
-            // (`av-harness::pipeline::scope_allows`). Round-52 F1:
-            // exact-string equality here rejected legitimately-delegated
+            // (`av-harness::pipeline::scope_allows`). Do not use
+            // exact-string equality here: it rejected legitimately-delegated
             // narrower scopes when the parent held a wildcard — e.g.,
             // parent `["tool:*"]`, child `["tool:db_write"]` was refused
             // as `ScopeEscalation("tool:db_write")` even though the
@@ -539,8 +539,9 @@ impl IdentityValidator {
 /// authorization. Duplicating (rather than re-exporting) the check
 /// keeps `av-identity` free of an `av-harness` dependency; if these
 /// two ever diverge, the delegation gate becomes strictly stricter or
-/// looser than the runtime gate — Round-52 F1 documents the class of
-/// bug that produced.
+/// looser than the runtime gate — exact-string matching here once
+/// rejected legitimately-delegated narrower scopes under a wildcard
+/// parent, which is the class of bug such divergence produces.
 fn scope_covered_by(scope: &str, parent_scopes: &[String]) -> bool {
     parent_scopes.iter().any(|parent| {
         parent == "*"

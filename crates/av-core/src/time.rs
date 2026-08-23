@@ -264,7 +264,7 @@ mod tests {
 
 #[cfg(test)]
 mod calendar_tests {
-    /// Mutation-run hardening (round 12): pin Hinnant's calendar math
+    /// Mutation-run hardening: pin Hinnant's calendar math
     /// through the public formatter at epoch, a 400-rule leap day, and
     /// a century non-leap boundary — kills the `z + 719_468` arithmetic
     /// mutants that would shift every rendered audit timestamp.

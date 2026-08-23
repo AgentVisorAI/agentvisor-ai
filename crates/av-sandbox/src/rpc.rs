@@ -193,7 +193,7 @@ fn depth_of(v: &Value, current: usize) -> usize {
     }
 }
 
-/// Round-22 F1 (av-sandbox): the general-purpose duplicate-key
+/// The general-purpose duplicate-key
 /// rejection primitive, exposed for callers outside this crate (chat
 /// completions ingress, admin body parsers) that want the same
 /// trust-boundary "refuse ambiguous JSON" semantics without pulling in
@@ -211,16 +211,16 @@ pub fn refuse_duplicate_json_keys(raw: &[u8]) -> Result<(), String> {
 /// The trust-boundary policy is "refuse ambiguity" — see the call-site
 /// comment in `parse_tool_call`.
 ///
-/// Round-25 F2 (av-sandbox): distinguish scanner-created "duplicate key"
+/// Distinguish scanner-created "duplicate key"
 /// errors from underlying `serde_json` parse errors (EOF, unbalanced
 /// braces, invalid escape, recursion limit). The prior blanket
 /// `.map_err(|e| RpcError::Json(format!("duplicate JSON key rejected:
 /// {e}")))` gave EVERY scanner error the same misleading
 /// "duplicate JSON key rejected" prefix, so operator triage on
-/// dup-key alerts fired on any malformed JSON. Mirrors the round-16
-/// F6 sentinel fix in `av_receipts::check_no_duplicate_keys`.
+/// dup-key alerts fired on any malformed JSON. Mirrors the
+/// sentinel fix in `av_receipts::check_no_duplicate_keys`.
 ///
-/// Round-25 F3 (av-sandbox): also refuse trailing garbage AFTER a
+/// Also refuse trailing garbage AFTER a
 /// valid JSON value. `deserialize_any` returns after the first
 /// complete value, so an input like `{"ok":1}garbage` was silently
 /// accepted. `Deserializer::end()` returns Err if any non-whitespace
@@ -325,7 +325,7 @@ fn reject_duplicate_keys(raw: &[u8]) -> Result<(), RpcError> {
             Err(RpcError::Json(msg))
         };
     }
-    // Round-25 F3: refuse trailing content after the first complete
+    // Refuse trailing content after the first complete
     // JSON value. `de.end()` returns Err on any non-whitespace
     // trailing bytes.
     de.end()
@@ -347,7 +347,7 @@ pub fn authorization_error(id: Option<&Value>, reason: &str) -> Value {
     })
 }
 
-/// Round-6 (hunt4 protocol F5): JSON-RPC 2.0 reserves -32700 (parse
+/// JSON-RPC 2.0 reserves -32700 (parse
 /// error), -32600 (invalid request), and -32602 (invalid params) for
 /// requests that never reached application logic. Reporting those as
 /// -32001 "blocked by policy" (with HTTP 403) falsely told clients an
@@ -705,12 +705,12 @@ mod tests {
             );
         }
     }
-    /// Round-25 F2 (self-fix from round-24 audit): `reject_duplicate_keys`
+    /// `reject_duplicate_keys`
     /// used to wrap EVERY scanner error with the "duplicate JSON key
     /// rejected: ..." prefix — misleading operator triage on
     /// dup-key alerts because malformed JSON, EOF, and recursion
     /// limits were all reported as if they were duplicate-key
-    /// rejections. Mirror the round-16 F6 sentinel fix from
+    /// rejections. Mirror the sentinel fix from
     /// `av_receipts`: real duplicate-key errors still get the
     /// dup-key prefix; parse errors surface their own class.
     #[test]
@@ -760,7 +760,7 @@ mod tests {
         }
     }
 
-    /// Round-25 F3 (self-fix from round-24 audit): the scanner used
+    /// The scanner used
     /// `deserialize_any`, which returns after the first complete JSON
     /// value — so `{"ok":1}garbage` was silently accepted. A proxy
     /// that inspected only the first value could disagree with a
@@ -801,7 +801,7 @@ mod depth_boundary_tests {
 
     use super::*;
 
-    /// Mutation-run hardening (round 11): the depth cap was only proven far
+    /// Mutation-run hardening: the depth cap was only proven far
     /// past the limit, so boundary mutants (`current + 1` -> `current * 1`,
     /// deleting the Array arm) survived. Pin the exact boundary through the
     /// public parser for BOTH container kinds. Depth accounting: the

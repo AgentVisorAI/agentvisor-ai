@@ -1,4 +1,4 @@
-//! ONNX embedder via tract (pure Rust, no PyTorch/Python runtime — brief §8).
+//! ONNX embedder via tract (pure Rust, no PyTorch/Python runtime).
 //!
 //! Loads a MiniLM-class sentence-embedding ONNX model from a configured path.
 //! Deployment note: model files are customer-supplied artifacts (air-gapped
@@ -181,10 +181,10 @@ impl Embedder for OnnxEmbedder {
     }
 
     fn try_embed(&self, text: &str) -> Result<Vec<f32>, String> {
-        // Round-6 (hunt5 F3): production callers go through
+        // Production callers go through
         // `try_embed`, so a fallback that lived only in `embed()` was
         // dead code — every ONNX inference failure bricked the session
-        // upstream (round-6 hunt5 F2 pairs with this). Apply the same
+        // upstream. Apply the same
         // HashEmbedder fallback here so we always return Ok. The sink
         // path is now warn+continue anyway, but this preserves breaker
         // observations on transient ONNX errors.
@@ -194,7 +194,7 @@ impl Embedder for OnnxEmbedder {
     }
 }
 
-/// Round-31 F1: the prior fallback returned a zero vector on ONNX
+/// The prior fallback returned a zero vector on ONNX
 /// inference failure, which the breaker interprets as an
 /// empty/degenerate input signal (`delta ≈ 0`) — so an outage could
 /// trip the loop-breaker mid-flight. HashEmbedder returns a non-zero

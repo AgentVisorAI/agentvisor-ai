@@ -53,7 +53,7 @@ mod tests {
 
 #[cfg(test)]
 mod const_tests {
-    /// Mutation-run hardening (round 12): `1 << 53` -> `1 >> 53` would
+    /// Mutation-run hardening: `1 << 53` -> `1 >> 53` would
     /// silently turn every overflow guard in the workspace into
     /// "reject everything above 0". Pin the exact value.
     #[test]
