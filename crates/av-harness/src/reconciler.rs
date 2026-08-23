@@ -1104,38 +1104,29 @@ impl Finalizer {
         // mutated. Without this change, a large ATIF spool at restart
         // would block every /v1/close client call for the duration of
         // the scan.
-        let mut quarantined = crate::worker::inflight_response_sessions(&self.spool_dir, &self.journal_key)
-            .await
-            .map_err(FinalizeError::Atif)?;
-        quarantined.extend(
-            crate::routes::unresolved_tool_sessions(&self.spool_dir, &self.journal_key)
-                .await
-                .map_err(FinalizeError::Atif)?,
-        );
-        // A marker only proves an *abandoned* effect when its session is
-        // not currently active: live sessions legitimately hold markers
-        // for the duration of an upstream call, and a request that merely
-        // straddles a periodic tick must not poison its session as
-        // capture-failed forever.
-        quarantined.retain(|id| sessions.get(id).is_none());
-        if !quarantined.is_empty() {
-            // The markers stay on disk as evidence, so every periodic tick
-            // rediscovers the same set. Warn only about ids not already in
-            // the quarantine — otherwise a single crash would repeat this
-            // warning every tick forever.
-            let mut known = self.quarantined_sessions.lock();
-            let new: Vec<&String> = quarantined.iter().filter(|id| !known.contains(*id)).collect();
-            if !new.is_empty() {
-                tracing::warn!(
-                    sessions = new.len(),
-                    "quarantining sessions with incomplete effects"
-                );
-            }
-            known.extend(quarantined.iter().cloned());
-        }
+        //
+        // S1 steps 2-3 (round-51 §4.2): concerns extracted from this
+        // method run as `RecoveryPass`es over a narrow context,
+        // invoked explicitly at their historical positions — ordering
+        // between passes and the not-yet-extracted phases is
+        // load-bearing (the incomplete-effects scan must see the
+        // registry BEFORE journal recovery adopts sessions; the
+        // orphan-JSON quarantine must snapshot stems AFTER). The flat
+        // registry loop arrives once every phase is a pass (step 4).
+        let warn_once = |path: PathBuf| self.warn_once(path);
+        let ctx = crate::recovery::ReconcilerContext {
+            spool_dir: &self.spool_dir,
+            metrics: &self.metrics,
+            sessions,
+            journal_key: &self.journal_key,
+            quarantined_sessions: &self.quarantined_sessions,
+            warn_once: &warn_once,
+        };
+        crate::recovery::run_pass(&crate::recovery::QuarantineIncompleteEffectsPass, &ctx).await?;
         self.replay_lifecycle_outboxes().await?;
         let signed_recovered = self.recover_signed_journals(sessions, breaker).await?;
         self.consolidate_step_journals(sessions, breaker).await?;
+        crate::recovery::run_pass(&crate::recovery::QuarantineOrphanJsonPass, &ctx).await?;
         let mut entries = match tokio::fs::read_dir(&self.spool_dir).await {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -1159,35 +1150,6 @@ impl Finalizer {
             })
             .collect();
         let mut recovered = 0usize;
-        // `known_stems` above doubles as the §8.5 orphan-quarantine
-        // guard set: the sweep must not quarantine a sidecar-less
-        // `{stem}.json` whose stem belongs to a live session (an
-        // in-progress close between write_atomic and the sidecar
-        // seal). The MIN_ORPHAN_AGE guard inside the quarantine pass
-        // is defense-in-depth for sessions opened after this snapshot.
-        //
-        // S1 step 2 (round-51 §4.2): concerns extracted from this
-        // method run as `RecoveryPass`es over a narrow context; the
-        // orphan-JSON quarantine (§8.5 / round-44 F4) is the first.
-        // Each future extraction appends to `recovery::passes()`
-        // until this method is a thin loop over the registry.
-        let warn_once = |path: PathBuf| self.warn_once(path);
-        let ctx = crate::recovery::ReconcilerContext {
-            spool_dir: &self.spool_dir,
-            metrics: &self.metrics,
-            known_stems: &known_stems,
-            warn_once: &warn_once,
-        };
-        for pass in crate::recovery::passes() {
-            let outcome = pass.run(&ctx).await?;
-            if outcome.quarantined > 0 {
-                tracing::info!(
-                    pass = pass.name(),
-                    quarantined = outcome.quarantined,
-                    "recovery pass quarantined spool files"
-                );
-            }
-        }
         while let Some(entry) = entries
             .next_entry()
             .await
