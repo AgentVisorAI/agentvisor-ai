@@ -24,7 +24,8 @@ inventory:
 | `{stem}.promote-archived` | Archived-on-collision promote intent | finalizer collision path | retention sweep |
 | `{stem}.session.close-complete` | Marker for signed-workflow closes | close_session_locked | retention sweep |
 | `{stem}.session.lifecycle-outbox.ndjson` | Bridge events queued when the bus was unavailable at close time | close_session_locked | outbox drain after successful bridge emit |
-| `broker-acks/{stem}/{event_uid}.json` | Sealed broker ack: proves an event we tried to publish actually landed | worker after successful emit | never (small; used for restart-time dedup) |
+| `{stem}.acks.ndjson` | Sealed broker acks, one line per published event: proves an event we tried to publish actually landed | worker after successful emit (appended; one `sync_data` per ack — round-51 §7.3) | `remove_step_journal` at close, with the other journals |
+| `broker-acks/{stem}/{event_uid}.json` | Legacy pre-round-51 per-event ack layout; still read as a fallback so mid-session upgrades see their earlier acks | (no longer written) | `remove_step_journal` at close |
 
 Every one of these files carries a `{stem}` derived as
 `sha256_hex(session_id.as_bytes())[..32]` — a 128-bit fixed-width
@@ -56,7 +57,8 @@ For every `{stem}.session.json` + `{stem}.events.ndjson` pair whose
 session id is NOT already registered, decrypt the session-metadata,
 re-hydrate a Session, and insert it into the registry. Events from
 `.events.ndjson` are replayed to reconstruct token counts, budget
-debits, and provenance. Broker acks under `broker-acks/{stem}/` are
+debits, and provenance. Broker acks from `{stem}.acks.ndjson` (and
+the legacy `broker-acks/{stem}/` fallback) are
 folded in to skip re-emitting events the previous incarnation
 already published.
 
@@ -137,8 +139,9 @@ A worker appends to `{stem}.events.ndjson` and then attempts to
 emit the corresponding event to the broker. If the process crashes
 between append and emit, the event is durable on disk but not on
 the wire. Recovery step 1 detects this by comparing the journal's
-last event to the `broker-acks/{stem}/` inventory, re-emits any
-event missing an ack, and writes a fresh ack.
+last event to the `{stem}.acks.ndjson` inventory (legacy
+`broker-acks/{stem}/` files are consulted as a fallback), re-emits
+any event missing an ack, and appends a fresh ack.
 
 There is one race here: a broker that fully accepted an event but
 crashed before delivering the ack causes the recovered process to
