@@ -123,6 +123,24 @@ pub trait StateStore: Send + Sync {
     }
 }
 
+/// Reject duplicate keys in one multi-spend batch (round-51 §5.4:
+/// previously written verbatim in both backends). Every backend's
+/// check phase reads the pre-commit value once per entry — two spends
+/// on the same key would each pass their independent limit checks and
+/// the commit phase would sum them, silently blowing through the cap.
+pub(crate) fn refuse_duplicate_spend_keys(spends: &[Spend]) -> Result<(), StateError> {
+    let mut seen = std::collections::HashSet::with_capacity(spends.len());
+    for spend in spends {
+        if !seen.insert(spend.key.as_str()) {
+            return Err(StateError::Backend(format!(
+                "try_spend_many received duplicate key {:?}",
+                spend.key,
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Single-node in-memory store: atomic counters behind a short transaction
 /// mutex that serializes check-and-spend so multi-key spends stay atomic.
 #[derive(Debug, Default)]
@@ -199,19 +217,7 @@ impl StateStore for InMemoryStore {
 
     fn try_spend_many(&self, spends: &[Spend]) -> Result<Option<usize>, StateError> {
         let _transaction = self.transaction_lock.lock();
-        // Reject duplicate keys: check phase reads current + adds amount per entry.
-        // Two spends on the same key would each see the pre-commit value and pass
-        // their independent limit checks, then the commit phase would sum them
-        // and silently blow through the cap.
-        let mut seen = std::collections::HashSet::with_capacity(spends.len());
-        for spend in spends {
-            if !seen.insert(spend.key.as_str()) {
-                return Err(StateError::Backend(format!(
-                    "try_spend_many received duplicate key {:?}",
-                    spend.key,
-                )));
-            }
-        }
+        refuse_duplicate_spend_keys(spends)?;
         let mut prepared = Vec::with_capacity(spends.len());
         for (index, spend) in spends.iter().enumerate() {
             // Round-21 F1: match RedisStore's Overflow-reject

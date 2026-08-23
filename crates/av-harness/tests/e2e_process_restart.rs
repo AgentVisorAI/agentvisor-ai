@@ -303,3 +303,95 @@ vector_backend = "memory"
     assert_eq!(status, 200);
     drop(daemon);
 }
+
+/// Round-51 §10.2: every ENOSPC/EIO durability path was reasoned about
+/// in comments and tested nowhere. This is the reproducible variant of
+/// the failure-mode table's "disk full" row, driven end-to-end through
+/// the real daemon: with the spool filesystem unwritable, chat requests
+/// must FAIL CLOSED (5xx, no unaudited traffic reaches the upstream)
+/// while the process itself stays alive and recovers the moment the
+/// spool is writable again.
+#[cfg(unix)]
+#[test]
+fn unwritable_spool_fails_closed_and_recovers() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path();
+    let upstream_port = spawn_mock_upstream();
+    let listen_port = free_port();
+    let spool = root.join("spool/atif");
+    let config_path = root.join("agentvisor.toml");
+    let seed_path = root.join("signing.seed");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"config_version = 1
+listen = "127.0.0.1:{listen_port}"
+upstream_url = "http://127.0.0.1:{upstream_port}"
+require_identity = false
+default_workflow = "unsigned"
+compression_enabled = false
+dashboard_enabled = false
+atif_spool_dir = "{spool}"
+bridge_data_dir = "{bridge}"
+tool_schema_dir = "{schemas}"
+state_backend = "memory"
+embedder_backend = "hash"
+vector_backend = "memory"
+"#,
+            spool = spool.display(),
+            bridge = root.join("data/bridge").display(),
+            schemas = root.join("tool-schemas").display(),
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("tool-schemas")).unwrap();
+
+    let mut daemon = start_daemon(&config_path, &seed_path);
+    wait_healthy(listen_port, &mut daemon);
+    // Healthy baseline turn (also forces the spool tree to exist).
+    let (status, _) = http_post_chat(listen_port, "pre-outage").expect("baseline chat");
+    assert_eq!(status, 200);
+
+    // Simulate the outage: the WHOLE spool tree becomes unwritable —
+    // the observable shape of a full or read-only filesystem for every
+    // create/rename the audit path performs (a top-level-only chmod
+    // would miss the inflight-responses/ subdirectory the sync marker
+    // write targets).
+    fn chmod_tree(dir: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            if entry.path().is_dir() {
+                chmod_tree(&entry.path(), mode);
+            }
+        }
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    chmod_tree(&spool, 0o555);
+
+    let (status, body) = http_post_chat(listen_port, "during-outage").expect("chat during outage");
+    // Restore permissions FIRST so a failed assertion cannot leave the
+    // tempdir undeletable.
+    chmod_tree(&spool, 0o755);
+    assert!(
+        (500..600).contains(&status),
+        "an unwritable spool must fail closed with a 5xx, got {status}: {body}"
+    );
+    assert!(
+        !body.contains("hello from mock"),
+        "no unaudited traffic may reach the upstream during a spool outage: {body}"
+    );
+
+    // Liveness must NOT flap on a spool outage (§8.3: /livez is
+    // constant; a restart cannot fix a full disk).
+    let (live, _) = http_get(listen_port, "/livez").expect("livez");
+    assert_eq!(live, 200);
+
+    // Recovery: the moment the spool is writable, traffic flows again
+    // with no restart required.
+    let (status, body) = http_post_chat(listen_port, "post-outage").expect("chat after recovery");
+    assert_eq!(
+        status, 200,
+        "traffic must recover once the spool is writable: {body}"
+    );
+    drop(daemon);
+}

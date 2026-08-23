@@ -211,19 +211,11 @@ fn spend_many_on<C: redis::ConnectionLike>(
     conn: &mut C,
     spends: &[Spend],
 ) -> Result<Option<usize>, StateError> {
-    // Same duplicate-key guard as `InMemoryStore::try_spend_many`: the Lua
-    // script reads GET(key) once per iteration in the check phase, so two
-    // spends on the same key each see the pre-commit value and pass their
-    // independent limit checks, then the commit phase INCRBYs both.
-    let mut seen = std::collections::HashSet::with_capacity(spends.len());
-    for spend in spends {
-        if !seen.insert(spend.key.as_str()) {
-            return Err(StateError::Backend(format!(
-                "try_spend_many received duplicate key {:?}",
-                spend.key,
-            )));
-        }
-    }
+    // Shared duplicate-key guard (round-51 §5.4): the Lua script reads
+    // GET(key) once per iteration in the check phase, so two spends on
+    // the same key each see the pre-commit value — same hazard as the
+    // in-memory backend, one implementation.
+    crate::store::refuse_duplicate_spend_keys(spends)?;
     for spend in spends {
         if spend.amount > av_core::error::JCS_SAFE_MAX || spend.limit > av_core::error::JCS_SAFE_MAX {
             return Err(StateError::Overflow(spend.key.clone()));
