@@ -1884,7 +1884,12 @@ impl ToolExecution {
             .intent_path
             .parent()
             .ok_or_else(|| ClaimError::Backend("tool execution directory is missing".to_owned()))?;
-        std::fs::create_dir_all(directory).map_err(|error| ClaimError::Backend(error.to_string()))?;
+        // Round-51 §7.3: skip the mkdir on the (steady-state) existing
+        // directory — `create_dir_all` on an existing path still issues
+        // an EEXIST mkdir syscall on the tool-claim hot path.
+        if !directory.is_dir() {
+            std::fs::create_dir_all(directory).map_err(|error| ClaimError::Backend(error.to_string()))?;
+        }
         // `create_new(true)` is atomic on the underlying filesystem —
         // its only reason to return `AlreadyExists` is that another
         // in-flight request has already claimed this execution key

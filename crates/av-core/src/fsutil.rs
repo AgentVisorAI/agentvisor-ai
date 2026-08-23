@@ -56,11 +56,24 @@ pub fn create_dir_all_synced(path: &Path) -> io::Result<()> {
     let mut missing: Vec<std::path::PathBuf> = Vec::new();
     let mut current = Some(path);
     while let Some(dir) = current {
-        if dir.as_os_str().is_empty() || dir.exists() {
+        // `is_dir` (not `exists`): a regular FILE squatting on the path
+        // must fall through to `create_dir_all`, which reports the
+        // collision as an error — the round-51 fast path below must
+        // only skip the mkdir when the path truly is a directory.
+        if dir.as_os_str().is_empty() || dir.is_dir() {
             break;
         }
         missing.push(dir.to_path_buf());
         current = dir.parent();
+    }
+    // Round-51 §7.3: steady state is "every directory already exists" —
+    // the walk above proved it with one stat, so skip the mkdir
+    // entirely. `create_dir_all` on an existing path still issues an
+    // mkdir syscall that returns EEXIST; at 5 call sites per request
+    // that was ~500 pointless mkdirs/s at 100 req/s, a measurable slice
+    // of the per-request metadata-op bill on network filesystems.
+    if missing.is_empty() {
+        return Ok(());
     }
     std::fs::create_dir_all(path)?;
     // Highest new ancestor first, so each synced parent already exists.
@@ -365,6 +378,31 @@ mod tests {
             let raw = std::path::PathBuf::from(OsStr::from_bytes(b"/x/\xff\xfe"));
             assert_eq!(basename(&raw), "?");
         }
+    }
+
+    /// Round-51 §7.3 fast path: an existing directory short-circuits
+    /// before the mkdir, and — the regression the `is_dir` check
+    /// guards — a regular FILE squatting on the path must still
+    /// surface as an error, not silently "succeed".
+    #[test]
+    fn create_dir_all_synced_existing_dir_is_ok_but_file_collision_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a/b");
+        create_dir_all_synced(&target).unwrap();
+        // Second call: the steady-state fast path.
+        create_dir_all_synced(&target).unwrap();
+        assert!(target.is_dir());
+
+        let file = dir.path().join("occupied");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(
+            create_dir_all_synced(&file).is_err(),
+            "a file squatting on the directory path must error"
+        );
+        assert!(
+            create_dir_all_synced(&file.join("child")).is_err(),
+            "a file squatting on an ANCESTOR must error"
+        );
     }
 
     #[test]

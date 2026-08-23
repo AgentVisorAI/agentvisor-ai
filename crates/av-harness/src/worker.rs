@@ -1503,7 +1503,11 @@ async fn append_journal(
     let workflow = session.workflow.as_str();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         use std::io::Write as _;
-        std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        // Round-51 §7.3: skip the mkdir when the spool dir already
+        // exists (every request after the first).
+        if !directory.is_dir() {
+            std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        }
         let digest = av_core::digest::sha256_hex(session_id.as_bytes());
         let stem = digest.get(..32).unwrap_or(&digest);
         let metadata_path = directory.join(format!("{stem}.session.json"));
