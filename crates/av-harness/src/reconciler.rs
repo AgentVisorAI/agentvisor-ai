@@ -711,7 +711,19 @@ impl Finalizer {
                     // to reclaim RAM. The prior code kept the builder
                     // populated forever because evict_finalized only
                     // evicts Signed sessions.
-                    let mut trajectory = session.snapshot_trajectory();
+                    // Round-51 §7.3 (RAM cliff): steps live in the
+                    // events journal, not in RAM — rebuild the
+                    // trajectory from the journal ("deduplication,
+                    // not new I/O"). The in-RAM builder remains the
+                    // fallback for sessions that never journaled
+                    // (test-constructed sessions, direct push_step).
+                    // A failed atomic write retries against the
+                    // still-on-disk journal, which `remove_step_journal`
+                    // deletes only in the close tail.
+                    let mut trajectory = match self.rebuild_unsigned_trajectory(&session).await? {
+                        Some(trajectory) => trajectory,
+                        None => session.snapshot_trajectory(),
+                    };
                     // An unsigned session that captured no steps cannot ever produce a strict-valid
                     // ATIF; seal it here so the idle sweeper skips it instead of churning forever.
                     if trajectory.steps.is_empty() {
@@ -2529,6 +2541,54 @@ impl Finalizer {
             }
         }
         Ok(())
+    }
+
+    /// Round-51 §7.3 (RAM cliff): reconstruct an unsigned session's
+    /// trajectory from its events journal at close time. Every
+    /// unsigned journal record carries its ATIF step, so the journal
+    /// is the authoritative step store and RAM holds only a counter.
+    /// Returns `Ok(None)` when no journal exists or it is empty (the
+    /// caller falls back to the in-RAM builder); a corrupt or
+    /// step-less record is an error — fail the close and retry rather
+    /// than sign an artifact missing captured effects.
+    async fn rebuild_unsigned_trajectory(
+        &self,
+        session: &Session,
+    ) -> Result<Option<av_atif::Trajectory>, FinalizeError> {
+        let digest = av_core::digest::sha256_hex(session.id.as_bytes());
+        let stem = digest.get(..32).unwrap_or(&digest);
+        let journal_path = self.spool_dir.join(format!("{stem}.events.ndjson"));
+        if !journal_path.exists() {
+            return Ok(None);
+        }
+        let journal = read_complete_journal(&journal_path).await?;
+        if journal.is_empty() {
+            return Ok(None);
+        }
+        let identity = session.current_identity();
+        let agent = av_atif::Agent {
+            name: "agentvisor-ai-harness".into(),
+            version: identity.version.clone(),
+            model_name: None,
+            tool_definitions: None,
+            extra: None,
+        };
+        let mut builder = av_atif::TrajectoryBuilder::new(agent, Some(session.id.clone()));
+        let domain = format!("{}:active", session.id);
+        for (index, line) in journal.into_iter().enumerate() {
+            let index = u64::try_from(index)
+                .map_err(|_| FinalizeError::Atif("active journal index overflow".to_owned()))?;
+            let record: crate::worker::ActiveJournalRecord =
+                crate::journal::open(&self.journal_key, &domain, index, line.as_bytes())
+                    .map_err(FinalizeError::Atif)?;
+            let step = record
+                .atif_step
+                .ok_or_else(|| FinalizeError::Atif("unsigned active record has no ATIF step".to_owned()))?;
+            builder
+                .push_step(step)
+                .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+        }
+        Ok(Some(builder.finish()))
     }
 
     async fn remove_step_journal(&self, session_id: &str) -> Result<(), FinalizeError> {

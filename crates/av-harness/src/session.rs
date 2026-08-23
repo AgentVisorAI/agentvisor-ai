@@ -116,6 +116,10 @@ pub struct Session {
     jobs_drained: tokio::sync::Notify,
     /// Set when an upstream action could not be captured completely.
     capture_failed: AtomicU64,
+    /// Round-51 §7.3 (RAM cliff): count of unsigned ATIF steps
+    /// journaled by the worker. The steps themselves live ONLY in the
+    /// events journal; close rebuilds the trajectory from disk.
+    atif_steps: AtomicU64,
     /// Round-51 §4.2 (S2): the lifecycle chain state — the single
     /// holder of Open/Draining/Sealed/Complete, advanced only via
     /// CAS `transition` calls that name their legal source states.
@@ -229,6 +233,7 @@ impl Session {
             pending_jobs: AtomicU64::new(0),
             jobs_drained: tokio::sync::Notify::new(),
             capture_failed: AtomicU64::new(0),
+            atif_steps: AtomicU64::new(0),
             lifecycle: std::sync::atomic::AtomicU8::new(SessionState::Open as u8),
         }
     }
@@ -653,6 +658,18 @@ impl Session {
 
     pub(crate) fn worker_job_started(&self) {
         self.pending_jobs.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Round-51 §7.3 (RAM cliff): count a journaled unsigned ATIF
+    /// step. The step content lives in the events journal only;
+    /// close rebuilds the trajectory from there.
+    pub(crate) fn note_atif_step(&self) {
+        self.atif_steps.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Number of unsigned ATIF steps journaled for this session.
+    pub fn atif_steps_count(&self) -> u64 {
+        self.atif_steps.load(Ordering::Acquire)
     }
 
     pub(crate) fn worker_job_finished(&self) {

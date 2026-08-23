@@ -2837,7 +2837,7 @@ mod tests {
         assert_eq!(state.sessions.len(), 1);
         let session = state.sessions.get("quota-failure").unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while session.atif.lock().is_empty() {
+            while session.atif_steps_count() == 0 {
                 tokio::task::yield_now().await;
             }
         })
