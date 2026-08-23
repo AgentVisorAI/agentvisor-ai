@@ -282,7 +282,7 @@ fn cross_key_multi_spend_pairs_do_not_deadlock_or_double_spend() {
     assert!(store.get("B").unwrap() <= LIMIT, "double-spend on B");
 }
 
-/// Mutation-run hardening (round 11): the JCS_SAFE_MAX overflow guards in
+/// Mutation-run hardening: the JCS_SAFE_MAX overflow guards in
 /// `InMemoryStore::try_spend_many` were only exercised past the limit, so
 /// `>` -> `>=` boundary mutants survived. Mirror the redis contract's
 /// boundary discipline: amount/limit exactly at JCS_SAFE_MAX succeed,
@@ -316,7 +316,7 @@ fn in_memory_spend_boundary_is_exact_at_jcs_safe_max() {
     }
 }
 
-/// Mutation-run hardening (round 11): `refund_tool_call`'s payout arm was
+/// Mutation-run hardening: `refund_tool_call`'s payout arm was
 /// untested — a mutant inverting `payout_usd_micros > 0` never refunded
 /// payout at all. Round-trip: spend with payout, refund, spend again to
 /// prove headroom returned.

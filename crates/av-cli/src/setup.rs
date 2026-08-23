@@ -313,7 +313,7 @@ pub fn init(
     if output.exists() && !force {
         anyhow::bail!("{} already exists; pass --force to overwrite", output.display());
     }
-    // Round-15 F2: refuse to follow a pre-planted symlink at
+    // Refuse to follow a pre-planted symlink at
     // `output`. The wizard path is protected by `write_atomic`'s
     // rename-over semantics
     // (see `wizard_replaces_config_symlink_instead_of_following_it`);
@@ -333,7 +333,7 @@ pub fn init(
     if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).with_context(|| format!("create directory {}", parent.display()))?;
     }
-    // Round-51 §3.5: `std::fs::write` after the symlink check above was
+    // `std::fs::write` after the symlink check above was
     // a TOCTOU — an attacker replanting the symlink in the
     // check→write window redirected the TOML into the target (and
     // created it 0666&~umask before the post-hoc chmod).
@@ -342,7 +342,7 @@ pub fn init(
     // wizard path does.
     av_core::fsutil::write_atomic(output, rendered.as_bytes())
         .with_context(|| format!("write {}", output.display()))?;
-    // Round-43 F3: match the key-file installer
+    // Match the key-file installer
     // (`write_private_key_file`) which explicitly opens with
     // mode(0o600). The rendered config carries
     // upstream_url / upstream_api_key_env / upstream_auth_header hints
@@ -481,13 +481,13 @@ fn ask_line(prompt: &str, input: &mut dyn std::io::BufRead) -> Result<String> {
     Ok(line.trim().to_owned())
 }
 
-/// Round-39 F1: read one line into a `Zeroizing<String>` from the
+/// Read one line into a `Zeroizing<String>` from the
 /// very first allocation, so the pasted secret + trailing `\n` are
 /// zeroed on drop. `ask_line` above stores the line in a plain
 /// `String` and returns a fresh `.trim().to_owned()` — both the
 /// original buffer and the trimmed copy sit un-zeroed in the
 /// allocator when the piped-stdin (non-TTY) Plain path fed the
-/// wizard a real API key. Round-38 F2 wrapped only the outer
+/// wizard a real API key. An earlier fix wrapped only the outer
 /// return; this closes the intermediate copies. The caller trims
 /// via `line.trim()` (a `&str` borrow into the Zeroizing buffer),
 /// so no additional un-zeroed intermediate is created.
@@ -502,7 +502,7 @@ fn ask_secret_line(prompt: &str, input: &mut dyn std::io::BufRead) -> Result<zer
     Ok(line)
 }
 
-/// Round-38 F2 + round-39 F1: `Zeroizing<String>` end-to-end so
+/// `Zeroizing<String>` end-to-end so
 /// every intermediate copy of the pasted secret zeroes its heap
 /// allocation on drop.
 ///
@@ -598,7 +598,7 @@ fn write_private_key_file(path: &Path, key: &str) -> Result<()> {
         let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
     }
     let temporary = parent.join(format!(".agentvisor-key-{}.tmp", av_core::new_event_uid()));
-    // Round-13: sibling of round-12 F4 (harness `install_seed_exclusive`).
+    // Sibling of the harness's `install_seed_exclusive`.
     // Without the RAII guard, an early `?` return from write_all /
     // sync_all leaves a zero-byte `.agentvisor-key-*.tmp` behind
     // that only cargoes up on next boot as a confused operator
@@ -631,8 +631,8 @@ fn write_private_key_file(path: &Path, key: &str) -> Result<()> {
     // unlinks the tmp.
     std::fs::rename(&temporary, path).with_context(|| format!("install key file {}", path.display()))?;
     guard.disarm();
-    // Round-14 F4: mirror of round-13 F4 (harness install_seed_
-    // exclusive) and round-12 F5 (fsutil::write_atomic). Once
+    // Mirror of the harness's install_seed_exclusive
+    // and fsutil::write_atomic. Once
     // rename commits, the key IS at `path` — a subsequent
     // sync_directory failure means the dirent may not survive an
     // immediate power loss, but every observer running now sees the
@@ -755,7 +755,7 @@ pub fn wizard(home: &Path, input: &mut dyn std::io::BufRead, secrets: &SecretInp
     }
     let key_file = if needs_key {
         let name = friendly_name(preset);
-        // Round-38 F2: `key` holds the accepted secret wrapped in
+        // `key` holds the accepted secret wrapped in
         // Zeroizing so the heap allocation is zeroed on drop. Each
         // failed retry's `pasted` binding drops-zeros before the
         // next iteration reaches the reader.
@@ -791,7 +791,7 @@ pub fn wizard(home: &Path, input: &mut dyn std::io::BufRead, secrets: &SecretInp
                 );
                 continue;
             }
-            // Round-38 F2: build the accepted-key buffer directly
+            // Build the accepted-key buffer directly
             // from the trimmed slice into a fresh Zeroizing so the
             // stored copy is minimal and zero-on-drop.
             key = Some(zeroize::Zeroizing::new(trimmed.to_owned()));
@@ -801,7 +801,7 @@ pub fn wizard(home: &Path, input: &mut dyn std::io::BufRead, secrets: &SecretInp
             anyhow::bail!("no API key provided");
         };
         let path = root.join("keys").join(format!("{}.key", slug(preset)));
-        // Round-38 F2: pass by `&str` borrow so the write path
+        // Pass by `&str` borrow so the write path
         // never allocates a plain String copy of the secret.
         write_private_key_file(&path, key.as_str())?;
         Some(path)
@@ -837,7 +837,7 @@ pub fn wizard(home: &Path, input: &mut dyn std::io::BufRead, secrets: &SecretInp
     // destination without following it.
     av_core::fsutil::write_atomic(&config_path, rendered.as_bytes())
         .with_context(|| format!("install {}", config_path.display()))?;
-    // Round-43 F3: chmod 0600 to match the key-file installer
+    // Chmod 0600 to match the key-file installer
     // (`write_private_key_file`) and prevent co-tenants on a shared
     // workstation from reading
     // upstream_url / upstream_api_key_env metadata via default umask
@@ -933,7 +933,7 @@ fn find_server_binary() -> PathBuf {
 /// Print the last `count` log lines, unwrapping the JSON envelope when
 /// possible so failures read like sentences instead of telemetry.
 ///
-/// Round-6 (hunt4 F15): JSON-decoding the tracing envelope RESURRECTS
+/// JSON-decoding the tracing envelope RESURRECTS
 /// escaped control bytes (tracing writes `\u001b`; `serde_json` decodes
 /// it back to live ESC). An attacker who can influence a logged string
 /// (any upstream/tool response payload that got captured into an error
@@ -1010,7 +1010,7 @@ pub async fn start() -> Result<()> {
     let (config, source) = av_harness::config::load_config().map_err(|error| {
         anyhow::anyhow!("configuration problem: {error}\nRun `avctl doctor` for a full diagnosis.")
     })?;
-    // Round-21 F6 + round-40 F2: rewrite the listen address to a
+    // Rewrite the listen address to a
     // loopback probe URL. The prior implementation was a pair of
     // string replacements (`0.0.0.0`->`127.0.0.1`, `[::]`->`[::1]`)
     // which missed three real forms:
@@ -1194,7 +1194,7 @@ fn forward_signal(_child: &tokio::process::Child, _signal: &str) {}
 /// Wait for the server's four-phase graceful shutdown, then force-kill
 /// only if it truly hangs.
 ///
-/// Round-6 (hunt4 ops F6): the harness's documented shutdown budget is
+/// The harness's documented shutdown budget is
 /// up to 95 s (30 s HTTP drain + 30 s worker wait_idle + 30 s
 /// finalize_sessions + 5 s telemetry flush) — the systemd unit and
 /// compose files are tuned to 120–125 s for exactly this reason. The
@@ -1292,7 +1292,7 @@ pub async fn doctor(offline: bool) -> Result<()> {
                 ))),
             }
         } else if let Some(file) = &config.upstream_api_key_file {
-            // Round-42 F1: mirror `av_harness::pipeline::require_owner_only_secret`
+            // Mirror `av_harness::pipeline::require_owner_only_secret`
             // exactly — the runtime refuses symlinks, non-regular files,
             // group/other-readable modes, and empty content. Doctor used to
             // only `metadata(file).ok()`-check existence, so an operator
@@ -1306,7 +1306,7 @@ pub async fn doctor(offline: bool) -> Result<()> {
             checks.push(Check::Pass(format!("upstream auth: {auth}")));
         }
 
-        // Round-29 F1 (avctl doctor): parity with the upstream API key
+        // Parity with the upstream API key
         // check above. `tool_upstream_bearer_env/_file` is the MCP
         // path's bearer token; the runtime applies the SAME
         // `require_owner_only_secret` posture at first tool call,
@@ -1350,8 +1350,8 @@ pub async fn doctor(offline: bool) -> Result<()> {
                     response.status().as_u16()
                 ))),
                 Err(error) => {
-                    // Round-34 S1: redact userinfo here too — this failure
-                    // line was the missing half of the round-28 F5 pair.
+                    // Redact userinfo here too — this failure
+                    // line used to leak what the success line redacted.
                     // `without_url()` strips reqwest's own embedded copy of
                     // the URL from the error Display as well.
                     checks.push(Check::Fail(format!(
@@ -1438,8 +1438,8 @@ pub async fn doctor(offline: bool) -> Result<()> {
             ))),
         }
 
-        // 8. Signing seed (created on first run if absent). Round-42 F2:
-        // pick the same path `avctl start` will actually pass to the
+        // 8. Signing seed (created on first run if absent). Pick
+        // the same path `avctl start` will actually pass to the
         // harness — when the user config is at `user_config_path()`,
         // start overrides `AV_SIGNING_SEED_FILE` to
         // `<user_config_dir>/signing.seed` (see main.rs
@@ -1518,8 +1518,8 @@ pub async fn doctor(offline: bool) -> Result<()> {
                 ancestor
             };
             // A real create+delete probe: permission bits alone lie about
-            // ownership, ACLs, and read-only mounts. Round-51 §8.10:
-            // write actual DATA bytes, not just a dirent — a filesystem
+            // ownership, ACLs, and read-only mounts. Write
+            // actual DATA bytes, not just a dirent — a filesystem
             // out of data blocks (the most likely spool outage) can
             // still create zero-byte files from reserved inode space,
             // so a bare create_new passed while every request 503'd.
@@ -1568,7 +1568,7 @@ pub async fn doctor(offline: bool) -> Result<()> {
             }
         }
 
-        // 9b. Round-51 §8.10: backends the config selects that THIS
+        // 9b. Backends the config selects that THIS
         // build cannot run. Previously doctor passed every check while
         // the daemon was guaranteed to hard-fail at boot on a
         // compiled-out backend.
@@ -1576,7 +1576,7 @@ pub async fn doctor(offline: bool) -> Result<()> {
             checks.push(Check::Fail(problem));
         }
 
-        // 9c. Round-51 §9.4: the three checkout-path footguns doctor
+        // 9c. The three checkout-path footguns doctor
         // used to miss entirely.
         let loopback = listen_is_loopback(&config.listen);
         if !loopback {
@@ -1616,13 +1616,13 @@ pub async fn doctor(offline: bool) -> Result<()> {
                 };
                 match probe_endpoint_any(endpoint).await {
                     Ok(()) => checks.push(Check::Pass(format!(
-                        // Round-28 F5 partner fix: the success line must
+                        // The success line must
                         // redact userinfo too, not just the failure line.
                         "{label}: {} reachable",
                         redact_userinfo(endpoint)
                     ))),
                     Err(error) => {
-                        // Round-28 F5: DO NOT echo `endpoint` verbatim
+                        // DO NOT echo `endpoint` verbatim
                         // in the failure line — a redis/qdrant URL may
                         // embed userinfo (`redis://user:pass@host/0`)
                         // and this text lands on stderr, which CI
@@ -1658,7 +1658,7 @@ pub async fn doctor(offline: bool) -> Result<()> {
 /// comma-separated endpoint lists (Redis Cluster) AND passwords
 /// containing `,`. Display-only — never used for connecting.
 ///
-/// Round-6: delegate to `av_core::url_redact::redact_userinfo` so the
+/// Delegate to `av_core::url_redact::redact_userinfo` so the
 /// harness startup logs and the CLI doctor use identical semantics.
 fn redact_userinfo(endpoints: &str) -> String {
     av_core::url_redact::redact_userinfo(endpoints)
@@ -1674,7 +1674,7 @@ async fn probe_endpoint(endpoint: &str) -> Result<()> {
         .map_err(anyhow::Error::from)
 }
 
-/// Round-42 F3: probe a config-shaped endpoint. Two forms that
+/// Probe a config-shaped endpoint. Two forms that
 /// `probe_endpoint` alone cannot handle without emitting a spurious
 /// "unreachable" for a perfectly valid config:
 ///
@@ -1736,7 +1736,7 @@ async fn probe_endpoint_any(endpoint: &str) -> Result<()> {
     probe_endpoint(endpoint).await
 }
 
-/// Round-42 F1: mirror `av_harness::pipeline::require_owner_only_secret`
+/// Mirror `av_harness::pipeline::require_owner_only_secret`
 /// posture so `avctl doctor` cannot falsely PASS a key file the
 /// harness would refuse: symlinks, non-regular files,
 /// group/other-readable modes on Unix, and empty content.
@@ -1780,7 +1780,7 @@ fn check_owner_only_secret(path: &Path) -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// Round-42 F2: return the same signing-seed path `avctl start`
+/// Return the same signing-seed path `avctl start`
 /// will actually hand to the harness. Precedence:
 ///
 /// 1. `AV_SIGNING_SEED_FILE` — explicit operator override, always wins.
@@ -1804,7 +1804,7 @@ fn seed_path_for(source: Option<&av_harness::config::ConfigSource>) -> PathBuf {
     PathBuf::from("config/signing.seed")
 }
 
-/// Round-42 F2 partner: validate signing-seed contents the way
+/// Validate signing-seed contents the way
 /// `av_harness::main::read_signer` will at startup — hex-decoded,
 /// exactly 32 bytes, and not a known-weak seed (all-zero or all-0xFF).
 /// A doctor that only checks file mode / symlink status lets a
@@ -1826,10 +1826,10 @@ fn check_signing_seed_content(path: &Path) -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// Round-28 F1 + F5: extract the `host:port` from a URL or bare
+/// Extract the `host:port` from a URL or bare
 /// `host:port` string. Split out as a pure helper so tests can lock
-/// in three formerly-buggy behaviours: (F1) scheme-driven default
-/// ports for HTTPS/redis/nats/rediss, (F5) userinfo stripping so
+/// in three formerly-buggy behaviours: scheme-driven default
+/// ports for HTTPS/redis/nats/rediss, userinfo stripping so
 /// credentials never leak into the connect target or into error text,
 /// and IPv6 bracketed literals staying intact.
 fn probe_target(endpoint: &str) -> Result<String> {
@@ -1896,7 +1896,7 @@ fn listen_is_loopback(listen: &str) -> bool {
         .unwrap_or_else(|_| listen.starts_with("localhost"))
 }
 
-/// Round-40 F2: parse the operator-configured listen address into a
+/// Parse the operator-configured listen address into a
 /// loopback probe URL. Handles four forms explicitly:
 ///
 /// * IPv4/IPv6 unspecified addresses map to loopback (matches the
@@ -1908,8 +1908,8 @@ fn listen_is_loopback(listen: &str) -> bool {
 ///   the zone id — loopback connects don't need it and the raw `%`
 ///   in an unencoded URL breaks RFC 3986 parsers.
 /// * Anything unparsable (hostname, `*:port`, mangled config) falls
-///   back to the pre-round-40 string-replace behaviour so the
-///   change is strictly additive vs. round-21 F6.
+///   back to the original string-replace behaviour so the
+///   change is strictly additive.
 fn build_probe_base(listen: &str) -> String {
     if let Ok(sa) = listen.parse::<std::net::SocketAddr>() {
         let host = if sa.ip().is_unspecified() {
@@ -1930,7 +1930,7 @@ fn build_probe_base(listen: &str) -> String {
         };
         format!("http://{host}:{}", sa.port())
     } else {
-        // Fallback: preserve the round-21 F6 behaviour when parse
+        // Fallback: preserve the string-replace behaviour when parse
         // fails (bare hostname, `*:port`, IPv6 with an interface-NAME
         // zone id like `%eth0` — numeric ids such as `%1` parse fine
         // on stable and take the branch above, where `sa.ip()` drops
@@ -1974,7 +1974,7 @@ pub async fn health(base_url: &str) -> Result<()> {
         .context("build health client")?;
     let response = match client.get(&url).send().await {
         Ok(response) => response,
-        // Round-51 §9.4: this is the container-healthcheck path — the
+        // This is the container-healthcheck path — the
         // raw reqwest transport error ("error sending request") tells
         // an operator nothing. A connect failure means nothing is
         // listening; name the likely fix instead of the transport.
@@ -2007,7 +2007,7 @@ mod tests {
 
     use super::*;
 
-    /// QC round 28: the doctor promise is "never prints secret values or
+    /// The doctor promise is "never prints secret values or
     /// URL userinfo" — the redactor must strip credentials from every
     /// display shape doctor prints (single URLs, cluster lists, bare
     /// host:port) without corrupting credential-free endpoints.
@@ -2027,7 +2027,7 @@ mod tests {
         assert_eq!(redact_userinfo("http://h/p@th"), "http://h/p@th");
     }
 
-    /// Round-39 F1: the piped-stdin (Plain) secret-reading path uses
+    /// The piped-stdin (Plain) secret-reading path uses
     /// a `Zeroizing<String>` buffer from the first allocation.
     /// A compile-time type check on the return type is the tightest
     /// property test — if a future refactor accidentally unwraps
@@ -2044,7 +2044,7 @@ mod tests {
         // Type is Zeroizing<String>.
         let _explicit: zeroize::Zeroizing<String> = line;
         // Content is exactly what stdin fed us — the trailing '\n'
-        // is preserved so the caller (round-38 F2 flow) trims via
+        // is preserved so the caller trims via
         // `.trim()` (a &str borrow into the Zeroizing buffer)
         // instead of `.trim().to_owned()` which would spawn a fresh
         // un-zeroed allocation.
@@ -2448,7 +2448,7 @@ mod tests {
         );
     }
 
-    /// Round-28 F1 + F5: probe_target parses URLs correctly across
+    /// probe_target parses URLs correctly across
     /// scheme-driven default ports, userinfo stripping, and IPv6
     /// literals.
     #[test]
@@ -2530,8 +2530,8 @@ mod tests {
         assert!(!listen_is_loopback("mycorp.internal:8484"));
     }
 
-    /// Round-40 F2: `build_probe_base` handles the four listen-form
-    /// variants round-21 F6 missed. The prior string-replace pair
+    /// `build_probe_base` handles the four listen-form
+    /// variants the string-replace pair missed. That pair
     /// left every `[fe80::1%eth0]:8484` config broken; the parse-
     /// based rewrite recovers correctly.
     #[test]

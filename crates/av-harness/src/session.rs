@@ -41,7 +41,7 @@ impl Workflow {
 pub struct Session {
     /// Session id.
     pub id: String,
-    /// Round-32 F1 (av-loopdetect): a per-open UUID that disambiguates
+    /// A per-open UUID that disambiguates
     /// recycled session ids in the off-path vector store. Client
     /// callers may reuse the same `id` after a finalize; the
     /// `SessionRegistry::get_or_open` path historically returned a
@@ -116,11 +116,11 @@ pub struct Session {
     jobs_drained: tokio::sync::Notify,
     /// Set when an upstream action could not be captured completely.
     capture_failed: AtomicU64,
-    /// Round-51 §7.3 (RAM cliff): count of unsigned ATIF steps
+    /// RAM-cliff guard: count of unsigned ATIF steps
     /// journaled by the worker. The steps themselves live ONLY in the
     /// events journal; close rebuilds the trajectory from disk.
     atif_steps: AtomicU64,
-    /// Round-51 §4.2 (S2): the lifecycle chain state — the single
+    /// The lifecycle chain state — the single
     /// holder of Open/Draining/Sealed/Complete, advanced only via
     /// CAS `transition` calls that name their legal source states.
     /// The `closed` claim flag above and the orthogonal properties
@@ -129,7 +129,7 @@ pub struct Session {
     lifecycle: std::sync::atomic::AtomicU8,
 }
 
-/// Round-51 §4.2 (S2, landed): the session lifecycle chain, held in
+/// The session lifecycle chain, held in
 /// one `AtomicU8` and advanced only through CAS transitions that
 /// name their expected source state — illegal transitions become
 /// impossible rather than untested.
@@ -208,7 +208,7 @@ impl Session {
         Self {
             chain: Mutex::new(EventChain::new(&id)),
             atif: Mutex::new(av_atif::TrajectoryBuilder::new(agent, Some(id.clone()))),
-            // Round-32 F1: fresh generation UUID per Session::new so
+            // Fresh generation UUID per Session::new so
             // recycled ids get a distinct vector-sink scope.
             session_scope: format!("{id}#{}", av_core::new_event_uid()),
             id,
@@ -633,7 +633,7 @@ impl Session {
     }
 
     /// Release the trajectory builder's memory after a durable close.
-    /// Round-6 (hunt4 R2): SUCCESSFUL unsigned closes previously kept
+    /// SUCCESSFUL unsigned closes previously kept
     /// the full trajectory (every captured Step, up to 8 MiB each) in
     /// RAM for the process lifetime because `evict_finalized` only
     /// evicts Signed sessions. Drain the builder AFTER the artifact +
@@ -660,7 +660,7 @@ impl Session {
         self.pending_jobs.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Round-51 §7.3 (RAM cliff): count a journaled unsigned ATIF
+    /// RAM-cliff guard: count a journaled unsigned ATIF
     /// step. The step content lives in the events journal only;
     /// close rebuilds the trajectory from there.
     pub(crate) fn note_atif_step(&self) {
@@ -705,14 +705,14 @@ impl Session {
         self.pending_jobs.load(Ordering::Acquire)
     }
 
-    /// Round-44 F2: distinguish the "empty unsigned session close
+    /// Distinguish the "empty unsigned session close
     /// was rejected" quarantine (the reconciler's "no captured steps"
     /// refusal) from a
     /// successfully-persisted unsigned session. The reject path sets
     /// `artifact_committed = 1` (so `is_closed()` stays true) but
     /// never writes an ATIF file, never sets `atif_path`, and never
     /// calls `mark_capture_failed`. Without this predicate the
-    /// round-43 F1 `pending_close_sessions()` filter picks it up and
+    /// `pending_close_sessions()` filter picks it up and
     /// drives the finalization tail — which emits a spurious
     /// SESSION_CLOSE bridge event for a session that has no receipt
     /// and no ATIF, breaking downstream OCSF consumers' invariant
@@ -959,8 +959,7 @@ impl SessionRegistry {
     /// session id — the same encoding the ATIF/journal spool uses. The
     /// reconciler's orphan sweep uses this to skip files whose stem
     /// belongs to a live session, closing the race window where an
-    /// in-progress close's atif+atif-auth pair is quarantined mid-write
-    /// (engineering review §8.5).
+    /// in-progress close's atif+atif-auth pair is quarantined mid-write.
     pub fn live_atif_stems(&self) -> std::collections::HashSet<String> {
         self.sessions
             .iter()
@@ -1021,7 +1020,7 @@ impl SessionRegistry {
     /// refusal cheap. Without eviction the registry grows by one entry per
     /// client-chosen session id for the process lifetime.
     pub fn evict_finalized(&self, idle_s: u64) -> Vec<Arc<Session>> {
-        // Round-49 F1: idle comparison uses the monotonic clock so a
+        // Idle comparison uses the monotonic clock so a
         // forward wall-clock jump (VM resume, NTP correction) cannot
         // make finalized sessions look premature-idle. Wall-clock
         // `last_activity_ms` stays available for dashboard display.
@@ -1085,7 +1084,7 @@ impl SessionRegistry {
         evicted
     }
 
-    /// Round-43 F1: sessions where `close_session_locked` marked
+    /// Sessions where `close_session_locked` marked
     /// `artifact_committed = 1` but crashed / failed before running
     /// the finalization tail (`emit_bridge_event(SESSION_CLOSE)` +
     /// `remove_step_journal` + `remove_lifecycle_outbox` +
@@ -1097,7 +1096,7 @@ impl SessionRegistry {
     /// empty-unsigned quarantines are excluded — they intentionally
     /// stay in the registry as evidence of the incident.
     ///
-    /// Round-44 F2: the empty-unsigned quarantine (the reconciler's
+    /// The empty-unsigned quarantine (the reconciler's
     /// "no captured steps" refusal) does NOT set `capture_failed = 1` (it
     /// is a distinct semantic — "no work was captured" rather than
     /// "capture was lost mid-flight"), so `!capture_failed()` alone
@@ -1119,7 +1118,7 @@ impl SessionRegistry {
 
     /// Sessions idle longer than `idle_s` (for the sweeper).
     pub fn idle_sessions(&self, idle_s: u64) -> Vec<Arc<Session>> {
-        // Round-49 F1: monotonic idle math — see `evict_finalized`.
+        // Monotonic idle math — see `evict_finalized`.
         let idle_duration = Duration::from_secs(idle_s);
         self.sessions
             .iter()
@@ -1182,7 +1181,7 @@ mod tests {
         }
     }
 
-    /// Round-51 §4.2 (S2): the lifecycle state machine walks the
+    /// The lifecycle state machine walks the
     /// close chain, and a failed finalize returns to Open. The debug
     /// asserts inside `transition` extend this check to every test
     /// in the suite; this test pins the happy chain explicitly.

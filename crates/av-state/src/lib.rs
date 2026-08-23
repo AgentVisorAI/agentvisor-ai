@@ -22,7 +22,7 @@ pub use velocity::TokenVelocity;
 #[cfg(feature = "redis")]
 pub mod redis_store;
 
-/// Shared backend-agnostic `StateStore` contract (round-51 §4.2).
+/// Shared backend-agnostic `StateStore` contract.
 ///
 /// EVOLUTION.md promises "new connectors must satisfy the same contract
 /// tests" — previously the in-memory and Redis suites asserted different

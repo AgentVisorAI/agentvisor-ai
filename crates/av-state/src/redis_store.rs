@@ -1,4 +1,5 @@
-//! Redis-backed `StateStore` (brief §8 "Redis Cluster" layer).
+//! Redis-backed `StateStore` — the distributed budget/state layer for
+//! multi-replica deployments.
 //!
 //! Check-and-spend runs as a server-side Lua script so it is atomic across
 //! distributed clients — same contract as `InMemoryStore::try_spend`.
@@ -28,7 +29,7 @@ for i, key in ipairs(KEYS) do
     local amount = tonumber(ARGV[(i - 1) * 2 + 1])
     local limit = tonumber(ARGV[(i - 1) * 2 + 2])
     if current > limit or amount > limit - current then
-        -- Round-6 (hunt5 broker F2): refresh TTL on every EXISTING key
+        -- Refresh TTL on every EXISTING key
         -- in this invocation before returning the refusal. Without
         -- this, a session that hit its cap and keeps retrying (every
         -- attempt refused, commit loop never reached) has its counter
@@ -61,7 +62,7 @@ local current = tonumber(redis.call('GET', KEYS[1]) or '0')
 local amount = tonumber(ARGV[1])
 local limit = tonumber(ARGV[2])
 if current > limit or amount > limit - current then
-    -- Round-6 (hunt5 broker F2): keep an actively-refused counter
+    -- Keep an actively-refused counter
     -- alive — see the twin comment in TRY_SPEND_LUA.
     if redis.call('EXISTS', KEYS[1]) == 1 then
         redis.call('EXPIRE', KEYS[1], {BUDGET_COUNTER_TTL_SECS})
@@ -142,7 +143,7 @@ impl RedisStore {
             .map(str::to_owned)
             .collect();
         if nodes.len() > 1 {
-            // Round-45: previously one `ClusterConnection` behind a mutex —
+            // Previously one `ClusterConnection` behind a mutex —
             // every quota/budget operation across all sessions serialized on
             // a single socket, which under 10k-connection load stalled
             // admission long enough to blow upstream timeouts (observed as
@@ -211,7 +212,7 @@ fn spend_many_on<C: redis::ConnectionLike>(
     conn: &mut C,
     spends: &[Spend],
 ) -> Result<Option<usize>, StateError> {
-    // Shared duplicate-key guard (round-51 §5.4): the Lua script reads
+    // Shared duplicate-key guard: the Lua script reads
     // GET(key) once per iteration in the check phase, so two spends on
     // the same key each see the pre-commit value — same hazard as the
     // in-memory backend, one implementation.
@@ -295,7 +296,7 @@ impl StateStore for RedisStore {
     }
 
     fn remove(&self, key: &str) {
-        // Round-15 F2 (av-state): mirror the round-10 `refund` treatment
+        // Mirror the `refund` treatment
         // — best-effort by contract, but a completely-silent Redis
         // failure on the cleanup path leaves an operator with no
         // signal that a session's stale key wasn't removed. The next
@@ -332,17 +333,17 @@ impl StateStore for RedisStore {
         }
     }
 
-    /// Round-33 F1: saturating refund via `DECRBY` + a MAX(0) clamp.
+    /// Saturating refund via `DECRBY` + a MAX(0) clamp.
     /// Best-effort — errors are silently swallowed so a Redis blip on
     /// the compensation path can never turn a lost-race response into
     /// a 5xx.
     ///
-    /// Round-34 F1: NEVER resurrect a key that was already `DEL`'d
+    /// NEVER resurrect a key that was already `DEL`'d
     /// by a concurrent `remove_prefix`. The prior implementation
     /// called `DECRBY` on the raw key: Redis initialises a missing
     /// key to 0 first, so `DECRBY` returned `-amount` and the
     /// `MAX(0)` clamp branch did `SET key 0` (no `EX`), producing
-    /// a permanent TTL-less key. Under the round-33 lost-claim-
+    /// a permanent TTL-less key. Under the lost-claim-
     /// plus-idle-close ordering (mcp_call sandbox-gate debit
     /// races with the reconciler's clear_budget_state), the
     /// refund path leaked one-to-three TTL-less keys per session
@@ -372,7 +373,7 @@ impl StateStore for RedisStore {
             return new
         "
         );
-        // Round-50 F1: refund is best-effort by the trait contract, but
+        // Refund is best-effort by the trait contract, but
         // its silent-swallow used to be COMPLETELY invisible — no log,
         // no metric — so an operator seeing budget depletion during a
         // Redis outage had no signal that compensation had been
@@ -417,7 +418,7 @@ impl StateStore for RedisStore {
         }
     }
 
-    /// Whole-session counter cleanup. Round-46: previously left as the
+    /// Whole-session counter cleanup. Previously left as the
     /// trait's default no-op on the assumption that the 24 h TTL made it
     /// pure hygiene — but `SessionRegistry::get_or_open` recycles a
     /// finalized session id into a fresh open session, which then spends
@@ -425,8 +426,8 @@ impl StateStore for RedisStore {
     /// CI, and every budget test) the recycled incarnation starts from
     /// zero; against Redis it silently inherited up to 24 h of the prior
     /// incarnation's `tokens`/`total_calls`/`tool:*`/`payout` counters —
-    /// the exact cross-backend divergence class rounds 20/21 aligned
-    /// `add`/`try_spend_many` for.
+    /// the exact cross-backend divergence class the
+    /// `add`/`try_spend_many` alignment closed.
     ///
     /// All of a session's keys share one cluster slot by construction
     /// (`ActionBudget::session_prefix` wraps the digest in a `{hash-tag}`),
@@ -434,7 +435,7 @@ impl StateStore for RedisStore {
     /// pattern's hash-tag to the owning master in cluster mode — reach
     /// every key on both single-node and cluster backends.
     ///
-    /// Round-47: SCAN, not KEYS. The first take used
+    /// SCAN, not KEYS. The first take used
     /// `redis.call('KEYS', pattern)` inside a Lua script, which is
     /// O(entire keyspace per node) AND blocks the Redis event loop
     /// atomically for the whole scan+delete. On a shared Redis with high
@@ -444,8 +445,8 @@ impl StateStore for RedisStore {
     /// batches, so per-session cleanup no longer blocks concurrent
     /// traffic.
     ///
-    /// Round-48: `route_command` with an explicit slot for cluster
-    /// mode. The intermediate round-47 revision used
+    /// `route_command` with an explicit slot for cluster
+    /// mode. An intermediate revision used
     /// `Commands::scan_match` on the cluster connection, but bare
     /// `SCAN` has no key argument — `RoutingInfo::for_routable` returns
     /// `None`, and `ClusterConnection::request` treats that as an
@@ -499,7 +500,7 @@ fn scan_and_delete_single(conn: &mut redis::Connection, pattern: &str) {
         let (next, batch) = match scan {
             Ok(pair) => pair,
             Err(error) => {
-                // Round-15 F2 (av-state): SCAN failing means we bail
+                // SCAN failing means we bail
                 // out mid-cleanup — the remaining keys survive with
                 // their TTLs, and a future session recycling this id
                 // (within 24 h) would inherit the leftover counters
@@ -545,7 +546,7 @@ fn scan_and_delete_single(conn: &mut redis::Connection, pattern: &str) {
 /// Cluster variant: bare `SCAN` has no key argument so
 /// `redis::cluster_routing::RoutingInfo::for_routable` returns `None`
 /// on it (the sync ClusterConnection then fails with
-/// `UNROUTABLE_ERROR`, silently deleting nothing — the round-3
+/// `UNROUTABLE_ERROR`, silently deleting nothing — the
 /// regression this replaces). All matches share one hash-slot by
 /// construction (`ActionBudget::session_prefix` wraps the digest in
 /// `{hash-tag}`), so compute the slot from the prefix and route both
@@ -577,7 +578,7 @@ fn scan_and_delete_cluster(conn: &mut redis::cluster::ClusterConnection, pattern
         let value = match conn.route_command(&scan_cmd, routing.clone()) {
             Ok(value) => value,
             Err(error) => {
-                // Round-15 F2 (av-state): parity with
+                // Parity with
                 // `scan_and_delete_single`. Cluster-mode SCAN failure
                 // was completely silent, so an operator watching
                 // `av_state::redis::warn` for cleanup problems saw

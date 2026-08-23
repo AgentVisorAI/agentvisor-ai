@@ -53,7 +53,7 @@ pub struct HarnessConfig {
     #[serde(default)]
     pub upstream_http2_prior_knowledge: bool,
     /// Optional provider read-idle timeout override. When unset the
-    /// pipeline applies its 60 s default unconditionally (round-32 F4)
+    /// pipeline applies its 60 s default unconditionally
     /// — streams cannot be held indefinitely; widen this to extend it
     /// (capped at one day like every `_s` interval).
     #[serde(default)]
@@ -61,7 +61,7 @@ pub struct HarnessConfig {
     /// Graceful-shutdown drain budget in seconds. When unset the
     /// effective budget is `max(30, upstream_read_timeout_s + 5)` so a
     /// single legitimate in-flight request cannot outlive the drain
-    /// window by construction (engineering review §8.8: the budget was
+    /// window by construction (this budget was once
     /// a hardcoded 30 s while shipped configs set a 300 s read timeout
     /// — every rollout with one live long request exited 1 and paged).
     /// Kubernetes users must keep `terminationGracePeriodSeconds`
@@ -73,7 +73,7 @@ pub struct HarnessConfig {
     /// OpenAI-compatible surface).
     #[serde(default = "default_chat_path")]
     pub upstream_chat_path: String,
-    /// Round-51 §4.2 (S3): the upstream provider's wire dialect.
+    /// The upstream provider's wire dialect.
     /// Selects the `ProviderAdapter` that parses response bodies and
     /// SSE chunks. `"openai"` (the default) also fits vLLM, LiteLLM,
     /// Groq, Together, DeepSeek, OpenRouter, Ollama, LM Studio,
@@ -159,7 +159,7 @@ pub struct HarnessConfig {
     pub identity_hmac_kid: String,
     /// Enforce operation scopes on validated identities.
     ///
-    /// Round-30 F1: default flipped from `true` to `false` so it
+    /// Default flipped from `true` to `false` so it
     /// matches the also-default-`false` posture of
     /// [`Self::require_identity`]. When `require_identity = false`,
     /// unauthenticated requests short-circuit to the anonymous
@@ -200,7 +200,7 @@ pub struct HarnessConfig {
     #[serde(default = "default_true")]
     pub require_tool_schema: bool,
     /// Tool-call argument field carrying a payout amount in USD, charged
-    /// against `budget.max_payout_usd_micros`. Round-51 §9.1: this was a
+    /// against `budget.max_payout_usd_micros`. This was a
     /// hardcoded `"amount_usd"` buried in the sandbox constructor — a
     /// tool using `amount`, `value`, or `total_usd` silently bypassed
     /// the payout cap with no warning. Set this to match YOUR tool
@@ -310,7 +310,7 @@ pub struct HarnessConfig {
     /// an external cron. Setting a positive value enables a periodic
     /// prune sweep that removes pairs older than the window, keeping the
     /// reconciler's per-tick scan cost bounded even for high-throughput
-    /// deployments. See engineering review §8.1 and §8.2.
+    /// deployments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub atif_retention_days: Option<u32>,
     /// Maximum request body size accepted on `/v1/chat/completions` and
@@ -339,7 +339,7 @@ pub struct HarnessConfig {
     #[serde(default = "default_dashboard_enabled")]
     pub dashboard_enabled: bool,
 
-    /// Host-header allowlist (round-51 §3.5, DNS-rebinding defense).
+    /// Host-header allowlist (DNS-rebinding defense).
     ///
     /// Empty (the default) disables the check — correct for
     /// loopback-only binds and for deployments whose ingress already
@@ -470,7 +470,7 @@ fn default_dashboard_enabled() -> bool {
 /// ([`HarnessConfig::bridge`] and friends) are the SINGLE site that
 /// owns the legal-value vocabulary and the required-companion rules;
 /// `validate()` and the daemon's backend factories both delegate to
-/// them (engineering review: the four selectors were `String`s whose
+/// them (previously the four selectors were `String`s whose
 /// legal values were enumerated twice, with companion rules spread
 /// across four more sites).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -570,8 +570,7 @@ impl std::fmt::Display for ConfigSource {
 /// `agentvisor.toml` or `config/harness.toml`; auto-discovering it from
 /// a working checkout silently defeats the wizard-written per-user file
 /// (developers who ran `avctl init` still saw the example's settings
-/// because the example outranked the wizard file — see engineering
-/// review §9.4).
+/// because the example outranked the wizard file).
 pub const CONFIG_SEARCH_PATHS: [&str; 2] = ["agentvisor.toml", "config/harness.toml"];
 
 /// Per-user config file inside `home`, as written by the `avctl` wizard.
@@ -949,7 +948,7 @@ impl HarnessConfig {
 
     /// Backends this configuration selects that the *current build*
     /// cannot run because the required cargo feature was compiled out
-    /// (round-51 §8.10: `avctl config-validate` reported "valid" for
+    /// (`avctl config-validate` once reported "valid" for
     /// `bridge_backend = "kafka"` on a default-features binary; the
     /// daemon then hard-failed at boot — neither pre-flight tool knew
     /// what the binary could actually run). Returns one message per
@@ -996,7 +995,7 @@ impl HarnessConfig {
 
     /// Structural validation. Returns the single violation verbatim
     /// (historical error shape) or, for multiple violations, a
-    /// numbered aggregate naming all of them (round-51 §5.4).
+    /// numbered aggregate naming all of them.
     pub fn validate(&self) -> Result<(), String> {
         if self.config_version != CONFIG_VERSION {
             // Short-circuit: a config written for a different format
@@ -1021,7 +1020,7 @@ impl HarnessConfig {
         }
     }
 
-    /// Structural validation, one push per violation. Round-51 §5.4:
+    /// Structural validation, one push per violation:
     /// every check reports independently so a single `avctl
     /// config-validate` run surfaces the complete list — previously
     /// only the first of 60+ checks was reported per round-trip.
@@ -1152,7 +1151,7 @@ impl HarnessConfig {
                     .into(),
             );
         }
-        // Round-29 F1 (av-harness config): parity with the
+        // Parity with the
         // `upstream_api_key_env`/`_file` non-empty checks above.
         // The prior code refused ambiguity (both set) and refused
         // dangling (bearer without tool URL), but a caller supplying
@@ -1214,7 +1213,7 @@ impl HarnessConfig {
         {
             errors.push("require_identity=true needs identity_jwks_url or identity_hmac_secret_file".into());
         }
-        // Round-30 F1: reject the silent-anonymous-bypass posture.
+        // Reject the silent-anonymous-bypass posture.
         // `enforce_identity_scopes = true` looks like it's guarding
         // routes with `chat_scope` / `session_close_scope` / `tool:*`
         // — but the scope check lives INSIDE the `(Some bearer, Some
@@ -1226,7 +1225,7 @@ impl HarnessConfig {
         // `agentvisor.toml` and reasonably concludes "you need the
         // chat scope to reach /v1/chat/completions" — in fact curl
         // with no header proceeds as `anonymous`, producing the
-        // exact repudiation vector round-15 F3's Bearer-case fix
+        // exact repudiation vector the Bearer-case fix
         // documented. Refuse the combo so operators either turn
         // enforcement off (making the posture explicit) or turn
         // identity on.
@@ -1257,7 +1256,7 @@ impl HarnessConfig {
         if self.identity_hmac_kid.is_empty() {
             errors.push("identity_hmac_kid must not be empty".into());
         }
-        // Round-31 F2: scope names must be visible-ASCII non-empty
+        // Scope names must be visible-ASCII non-empty
         // tokens. An empty `chat_scope = ""` under
         // `enforce_identity_scopes = true` + `require_identity =
         // true` used to silently reduce the check to
@@ -1285,7 +1284,7 @@ impl HarnessConfig {
         }
         if crate::provider::adapter_for(&self.provider).is_none() {
             errors.push(format!(
-                "provider must be one of {:?}, got {:?} (S3: Anthropic/Gemini adapters are planned; see docs/reference/STRUCTURAL-REFACTORS.md)",
+                "provider must be one of {:?}, got {:?} (Anthropic/Gemini adapters are planned)",
                 crate::provider::SUPPORTED_PROVIDERS,
                 self.provider
             ));
@@ -1293,7 +1292,7 @@ impl HarnessConfig {
         if self.bridge_manifest_path.is_empty() {
             errors.push("bridge_manifest_path is required".into());
         }
-        // Round-31 F1: refuse empty local-fs path fields. If an
+        // Refuse empty local-fs path fields. If an
         // operator overrides `atif_spool_dir = ""` in TOML (e.g. by
         // accidentally interpolating an unset env variable through a
         // template), every ATIF spool op used to run on Path::new("")
@@ -1310,8 +1309,8 @@ impl HarnessConfig {
         // Backend selectors: the typed accessors (`bridge()`, `state()`,
         // `embedder()`, `vector()`) are the single site owning the
         // legal-value vocabulary and the required-companion rules —
-        // the engineering-review finding about the four String
-        // selectors being enumerated twice. The round-30 F2 scheme
+        // previously the four String
+        // selectors were enumerated twice. The scheme
         // allowlists below run against the *resolved* companion, so
         // they can never fire on a missing value. The TOML wire
         // format is unchanged: shipped flat-key configs keep parsing.
@@ -1332,7 +1331,7 @@ impl HarnessConfig {
         match self.state() {
             Err(error) => errors.push(error),
             Ok(StateBackend::Redis { endpoint }) => {
-                // Round-20 F2 (av-harness config): the state_endpoint
+                // The state_endpoint
                 // field is docstring-documented as a comma-separated
                 // list of URLs for Redis Cluster mode (see the field
                 // doc above). The scheme allowlist used to be a
@@ -1341,7 +1340,7 @@ impl HarnessConfig {
                 // check saw the `redis://` prefix) and only failed
                 // at connect. `redis+unix:` was also rejected here
                 // even though it's a legitimate Unix-socket form the
-                // redis crate accepts and the round-14 doctor
+                // redis crate accepts and the doctor's
                 // `probe_endpoint_any` already recognizes. Split on
                 // ',' and validate each member independently.
                 for member in endpoint.split(',').map(str::trim).filter(|m| !m.is_empty()) {
@@ -1457,8 +1456,8 @@ impl HarnessConfig {
         // concatenate into a broken url. Full url::Url::parse is
         // deferred to reqwest at request time.
         //
-        // Round-38 F1: tighten to a strict http/https allowlist so
-        // this matches the round-30 F2 posture applied to
+        // Tighten to a strict http/https allowlist so
+        // this matches the posture applied to
         // `identity_jwks_url`, `qdrant_url`, etc. The old
         // `contains("://")` check accepted `file:///etc/passwd`,
         // `gopher://…`, and other schemes even though the error text
@@ -1475,8 +1474,8 @@ impl HarnessConfig {
         }
         // A scheme with no host (`http://`, `https:///path`) passed the
         // prefix check above, booted, and validated cleanly, failing
-        // only at request time with a 502 — exactly the class the
-        // round-38 preflight exists to catch at startup.
+        // only at request time with a 502 — exactly the class this
+        // preflight exists to catch at startup.
         {
             let rest = self
                 .upstream_url
@@ -1506,7 +1505,7 @@ impl HarnessConfig {
                 ));
             }
         }
-        // Round-30 F2: extend the scheme allowlist to every URL
+        // Extend the scheme allowlist to every URL
         // field. `identity_jwks_url`, `qdrant_url`, `bridge_endpoint`
         // (when NATS), and `state_endpoint` (when Redis) all used to
         // be handed to their respective clients without preflight.
@@ -1554,7 +1553,7 @@ mod tests {
         assert!(!cfg.upstream_authorization_passthrough);
     }
 
-    /// Round-51 §5.4: validation must surface EVERY violation in one
+    /// Validation must surface EVERY violation in one
     /// run, not one per `avctl config-validate` round-trip.
     #[test]
     fn validate_reports_all_errors_at_once() {
@@ -1587,7 +1586,7 @@ mod tests {
         assert!(error.contains("state_backend"), "must name the field: {error}");
     }
 
-    /// Round-51 §4.2 (S3): an unsupported provider dialect fails
+    /// An unsupported provider dialect fails
     /// pre-flight, naming the supported set — never mid-stream.
     #[test]
     fn unsupported_provider_is_refused_at_validation() {
@@ -1604,7 +1603,7 @@ mod tests {
         );
     }
 
-    /// Round-51 §8.10: the default backends (embedded/memory/hash/
+    /// The default backends (embedded/memory/hash/
     /// memory) require no cargo feature and must always be runnable.
     #[test]
     fn default_backends_never_report_unsupported_requirements() {
@@ -1612,7 +1611,7 @@ mod tests {
         assert!(cfg.unsupported_backend_requirements().is_empty());
     }
 
-    /// Round-51 §8.10: each feature-gated backend is reported exactly
+    /// Each feature-gated backend is reported exactly
     /// when its cargo feature is compiled out — written against
     /// `cfg!` so the same assertion holds under default features AND
     /// `--all-features` CI runs. Companions are set because feature
@@ -2060,9 +2059,9 @@ mod tests {
 
     /// `upstream_url` without a scheme is rejected at load — otherwise
     /// the request-time concat would silently misroute to a bogus host.
-    /// Round-38 F1 tightened the shape check from `contains("://")` to
+    /// The shape check was tightened from `contains("://")` to
     /// the strict `http://` / `https://` allowlist, matching the
-    /// round-30 F2 posture on every other URL field.
+    /// posture on every other URL field.
     #[test]
     fn upstream_url_without_scheme_is_rejected() {
         let err = HarnessConfig::from_toml(r#"upstream_url = "openai.internal""#).unwrap_err();
@@ -2070,7 +2069,7 @@ mod tests {
         assert!(err.contains("http"), "{err}");
     }
 
-    /// Round-38 F1: schemes other than http/https are rejected. The
+    /// Schemes other than http/https are rejected. The
     /// prior `contains("://")` shape check accepted `file:///…` and
     /// other schemes even though the error text claimed http/https;
     /// a config-injection primitive could have pointed the harness
@@ -2153,7 +2152,7 @@ mod tests {
         .is_ok());
     }
 
-    /// Round-30 F1: refuse `enforce_identity_scopes = true` while
+    /// Refuse `enforce_identity_scopes = true` while
     /// `require_identity = false`. The combo silently falls through
     /// to the anonymous identity on unauthenticated requests,
     /// making the scope config a fig leaf.
@@ -2268,7 +2267,7 @@ mod tests {
         .unwrap();
     }
 
-    /// Round-30 F2: refuse URL fields that omit the scheme or use a
+    /// Refuse URL fields that omit the scheme or use a
     /// scheme the client library will not accept. Preflight beats a
     /// runtime failure after the process is already serving traffic.
     #[test]
@@ -2296,7 +2295,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("state_endpoint"), "{err}");
-        // Round-20 F2: Redis state_endpoint cluster list — one bad
+        // Redis state_endpoint cluster list — one bad
         // member must fail validation even if the FIRST member has
         // an allowed scheme (the prior prefix-on-whole-string check
         // passed on any list beginning with `redis://`).
@@ -2307,14 +2306,14 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("state_endpoint"), "{err}");
-        // Round-20 F2: valid cluster list of two Redis URLs passes.
+        // Valid cluster list of two Redis URLs passes.
         HarnessConfig::from_toml(
             r#"upstream_url = "https://api"
                state_backend = "redis"
                state_endpoint = "redis://a:6379,rediss://b:6380""#,
         )
         .unwrap();
-        // Round-20 F2: redis+unix: is a legitimate Unix-socket form
+        // redis+unix: is a legitimate Unix-socket form
         // the redis crate accepts; validate must not reject it.
         HarnessConfig::from_toml(
             r#"upstream_url = "https://api"
@@ -2322,7 +2321,7 @@ mod tests {
                state_endpoint = "redis+unix:/tmp/redis.sock""#,
         )
         .unwrap();
-        // Round-20 F1: max_request_bytes = 0 is a silent-breakage
+        // max_request_bytes = 0 is a silent-breakage
         // config (DefaultBodyLimit::max(0) rejects every non-empty
         // POST body); validate must refuse it.
         let err = HarnessConfig::from_toml(
@@ -2361,7 +2360,7 @@ mod tests {
         .is_ok());
     }
 
-    /// Round-31 F1: empty `atif_spool_dir` / `bridge_data_dir` are
+    /// Empty `atif_spool_dir` / `bridge_data_dir` are
     /// rejected. Without the check they default to `Path::new("")`,
     /// making every spool op write to the process CWD instead of the
     /// expected volume.
@@ -2381,7 +2380,7 @@ mod tests {
         assert!(err.contains("bridge_data_dir"), "{err}");
     }
 
-    /// Round-31 F2: identity scope names must be visible ASCII, no
+    /// Identity scope names must be visible ASCII, no
     /// whitespace, no empty strings. Some IdPs tokenize an empty
     /// "scope" claim into an empty string; without this check the
     /// gate becomes `scopes.contains("")` and any token satisfies it.
@@ -2431,7 +2430,7 @@ mod tests {
     }
 }
 
-// Round-51 §11: the permissive test constructor lives in its own
+// The permissive test constructor lives in its own
 // FILE so a grep through config.rs finds only production defaults —
 // `for_tests`'s test values fooled three independent reviewers. A
 // child module (not a sibling) so it can reach the private

@@ -58,7 +58,7 @@ pub trait StateStore: Send + Sync {
 
     /// Backend counter TTL in seconds, if the backend expires counters
     /// natively. `None` means counters live for the process lifetime
-    /// (in-memory). Round-51 §4.2: this makes the prod/dev divergence
+    /// (in-memory). Exposing it makes the prod/dev divergence
     /// a VALUE callers can inspect (startup logs it; ops docs cite it)
     /// instead of a doc comment — a session active longer than this
     /// window has its budget counters silently reset against the
@@ -99,7 +99,7 @@ pub trait StateStore: Send + Sync {
     /// semantics apply: backends with native TTL expiry may fold this
     /// into their own cleanup if they prefer.
     ///
-    /// Round-33 F1: introduced to close the round-32 F3 concurrent-MCP
+    /// Introduced to close a concurrent-MCP
     /// budget double-spend. When two identical MCP requests race and
     /// one loses the atomic `execution.claim()`, the sandbox-gate
     /// spend is refunded so the budget counters reflect only the
@@ -116,7 +116,7 @@ pub trait StateStore: Send + Sync {
     /// additionally need it or session-keyed counters accumulate for the
     /// process lifetime.
     ///
-    /// Round-15 F2 (av-state): CLUSTER-MODE HAZARD FOR FUTURE CALLERS.
+    /// CLUSTER-MODE HAZARD FOR FUTURE CALLERS.
     /// The Redis Cluster implementation of `remove_prefix` routes SCAN
     /// and DEL to a SINGLE hash slot — the one derived from the prefix.
     /// This works only when every key under the prefix shares that
@@ -133,8 +133,8 @@ pub trait StateStore: Send + Sync {
     }
 }
 
-/// Reject duplicate keys in one multi-spend batch (round-51 §5.4:
-/// previously written verbatim in both backends). Every backend's
+/// Reject duplicate keys in one multi-spend batch (shared here so the
+/// check is not written verbatim in both backends). Every backend's
 /// check phase reads the pre-commit value once per entry — two spends
 /// on the same key would each pass their independent limit checks and
 /// the commit phase would sum them, silently blowing through the cap.
@@ -173,7 +173,7 @@ impl InMemoryStore {
     }
 }
 
-/// Shared counter ceiling. Round-20 F1/F7: both `InMemoryStore` and
+/// Shared counter ceiling. Both `InMemoryStore` and
 /// `RedisStore::add_on` MUST use this exact value, otherwise the
 /// same trait call succeeds on the in-memory dev/test backend and
 /// silently fails with `StateError::Overflow` in production against
@@ -230,13 +230,13 @@ impl StateStore for InMemoryStore {
         refuse_duplicate_spend_keys(spends)?;
         let mut prepared = Vec::with_capacity(spends.len());
         for (index, spend) in spends.iter().enumerate() {
-            // Round-21 F1: match RedisStore's Overflow-reject
+            // Match RedisStore's Overflow-reject
             // discipline instead of silently clamping `limit` down
             // to COUNTER_MAX. A caller with a config typo
             // (`max_payout_usd_micros` with one extra zero) would
             // otherwise succeed on the InMemoryStore dev/test path
             // and fail with `Overflow` in Redis prod — the exact
-            // cross-backend divergence class round-20 F1 closed
+            // cross-backend divergence class already closed
             // for `add`.
             if spend.amount > av_core::error::JCS_SAFE_MAX {
                 return Err(StateError::Overflow(spend.key.clone()));
@@ -267,17 +267,17 @@ impl StateStore for InMemoryStore {
         self.counters.remove(key);
     }
 
-    /// Round-33 F1: saturating refund. `saturating_sub` on i64 keeps
+    /// Saturating refund. `saturating_sub` on i64 keeps
     /// the value non-negative even under concurrent `remove_prefix`
     /// or a duplicate refund; the transaction lock keeps the
     /// load/store pair atomic with respect to other spend / add
     /// operations on the same key.
     ///
-    /// Round-34 F1: NEVER resurrect a cell that a concurrent
+    /// NEVER resurrect a cell that a concurrent
     /// `remove_prefix` already dropped. The prior implementation
     /// used `self.cell(key)` which materialises a fresh `0`
     /// AtomicI64 in the DashMap via `entry().or_insert_with(...)`.
-    /// Under the round-33 lost-claim-plus-idle-close ordering
+    /// Under the lost-claim-plus-idle-close ordering
     /// (mcp_call's sandbox-gate debit races with the reconciler's
     /// clear_budget_state), the refund path would create a
     /// permanent 0-cell for a sealed session that no future
@@ -308,7 +308,7 @@ mod tests {
 
     use super::*;
 
-    /// Round-51 §4.2: the ONE shared backend contract, mirrored by
+    /// The ONE shared backend contract, mirrored by
     /// `redis_contract.rs::redis_satisfies_the_shared_state_store_contract`
     /// so the two backends cannot silently drift on semantics again.
     #[test]
@@ -488,7 +488,7 @@ mod tests {
         assert_eq!(s.get("cap").unwrap(), total);
     }
 
-    /// Vicious bug caught in review round 16: `try_spend_many` used to
+    /// Vicious double-spend bug: `try_spend_many` used to
     /// validate each Spend against the pre-commit cell value and then commit
     /// them all sequentially. When two Spends referenced the same key, both
     /// passed their independent limit checks (each saw `current = 0`), then
@@ -547,7 +547,7 @@ mod tests {
         assert_eq!(s.get("b").unwrap(), 4);
     }
 
-    /// Round-21 F1: cross-backend divergence closed for
+    /// cross-backend divergence closed for
     /// `try_spend_many`. Historically InMemoryStore silently
     /// clamped `limit` down to COUNTER_MAX while Redis rejected
     /// the same call with `Overflow`. A caller with a config typo
@@ -582,8 +582,8 @@ mod tests {
         );
     }
 
-    /// Round-34 F1: refund must NEVER resurrect a cell that a prior
-    /// remove_prefix cleared. The round-33 F1 refund path used
+    /// Refund must NEVER resurrect a cell that a prior
+    /// remove_prefix cleared. The original refund path used
     /// `self.cell(key)` which materialises a fresh 0-entry via
     /// `entry().or_insert_with(...)`. Under the lost-claim-plus-
     /// idle-close ordering (mcp_call sandbox-gate debit races
@@ -614,7 +614,7 @@ mod tests {
         );
     }
 
-    /// Round-34 F1: refund on a live session (not swept) still
+    /// Refund on a live session (not swept) still
     /// compensates the debit exactly. Ensures the no-resurrect
     /// guard didn't break the happy path.
     #[test]

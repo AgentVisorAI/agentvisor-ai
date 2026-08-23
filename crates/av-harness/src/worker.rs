@@ -52,7 +52,7 @@ pub struct WorkerJob {
     pub native_stop_reason: Option<String>,
     /// Token and compression metrics.
     pub metrics: EventMetrics,
-    /// Round-51 §6.4: provider-vs-heuristic prompt-token correction
+    /// provider-vs-heuristic prompt-token correction
     /// (see `ActiveJournalRecord::prompt_token_correction`). Zero for
     /// every job class except terminal response captures whose
     /// provider reported `usage.prompt_tokens`.
@@ -95,7 +95,7 @@ pub(crate) struct ActiveJournalRecord {
     pub(crate) completion_tokens: u64,
     pub(crate) cached_tokens: u64,
     pub(crate) cost_usd_micros: u64,
-    /// Round-51 §6.4: signed reconciliation of the admission-time
+    /// Signed reconciliation of the admission-time
     /// prompt-token HEURISTIC against the provider's reported
     /// `usage.prompt_tokens` (provider − heuristic; negative for the
     /// common CJK 3-4× over-estimate). Carried on terminal response
@@ -110,7 +110,7 @@ pub(crate) struct ActiveJournalRecord {
 
 /// Accounting totals folded from journal records during recovery.
 ///
-/// Round-51 §4.2/S1 (step 1 of the reconciler decomposition): the same
+/// The same
 /// accounting fold used to be implemented THREE times — the live path
 /// in `process_job`, signed recovery in `recover_signed_journals`, and
 /// unsigned consolidation in `consolidate_step_journals`. Any change to
@@ -579,8 +579,7 @@ impl WorkerHandle {
     }
 
     /// Number of accepted-but-not-yet-completed jobs. Sampled by the
-    /// `/metrics` scrape into the `av_worker_queue_depth` gauge
-    /// (round-51 §8.7).
+    /// `/metrics` scrape into the `av_worker_queue_depth` gauge.
     pub fn queue_depth(&self) -> u64 {
         self.pending.load(Ordering::Acquire)
     }
@@ -681,7 +680,7 @@ pub fn spawn_worker_with_spool_authenticated(
     // the caller's admission cap so total in-flight work is still
     // bounded by `capacity`.
     //
-    // Round-51 §7.3: the count was hardcoded at 16 regardless of core
+    // The count was hardcoded at 16 regardless of core
     // count, so the throughput ceiling (~24k events/s measured, and
     // 1/16th of the id space frozen behind any one stalled session)
     // did not improve with more cores. Scale with available
@@ -738,7 +737,7 @@ pub fn spawn_worker_with_spool_authenticated(
     }
 }
 
-/// Round-51 §7.3: sessions a shard may process concurrently. One
+/// Sessions a shard may process concurrently. One
 /// stalled session (slow journal fsync, hung broker publish) used to
 /// freeze its entire shard — 31× measured head-of-line blocking for
 /// every other session hashed there. Eight slots bound the
@@ -746,7 +745,7 @@ pub fn spawn_worker_with_spool_authenticated(
 /// a shard while keeping per-shard task fan-out small.
 const MAX_ACTIVE_SESSIONS_PER_SHARD: usize = 8;
 
-/// Round-51 §7.3 group commit: how many backlogged envelopes of ONE
+/// Group commit: how many backlogged envelopes of ONE
 /// session a single dispatch drains into a batch (one journal
 /// fdatasync per batch instead of one per event). Sized to cap both
 /// the added completion latency of the batch's first job and the
@@ -766,7 +765,7 @@ fn spawn_worker_shard(
     worker_pending: Arc<std::sync::atomic::AtomicU64>,
     worker_drained: Arc<tokio::sync::Notify>,
 ) {
-    // Round-51 §7.3 (intra-shard head-of-line blocking): the shard is
+    // To avoid intra-shard head-of-line blocking, the shard is
     // a DISPATCHER over per-session FIFO queues, not a serial loop.
     // Invariants:
     //   * Per-session ordering: at most ONE envelope per session is in
@@ -964,7 +963,7 @@ fn spawn_worker_shard(
     });
 }
 
-/// Round-51 §7.3 group commit: fdatasync a session's events journal
+/// Group commit: fdatasync a session's events journal
 /// once, covering every deferred append a batch wrote before it.
 async fn sync_session_journal(directory: &std::path::Path, session: &Session) -> Result<(), String> {
     let digest = av_core::digest::sha256_hex(session.id.as_bytes());
@@ -981,7 +980,7 @@ async fn sync_session_journal(directory: &std::path::Path, session: &Session) ->
     .map_err(|error| error.to_string())?
 }
 
-/// Round-51 §7.3 group commit: process a SAME-SESSION batch of
+/// Group commit: process a SAME-SESSION batch of
 /// envelopes with one journal fdatasync.
 ///
 /// Phase A appends every job's record with the per-append sync
@@ -1176,7 +1175,7 @@ async fn process_envelope(
     worker_pending: Arc<std::sync::atomic::AtomicU64>,
     worker_drained: Arc<tokio::sync::Notify>,
 ) {
-    // Round-12 F3: `worker_pending` was previously decremented at the
+    // `worker_pending` was previously decremented at the
     // bottom of this function. Any panic between here and that line
     // (tokio::spawn(...).await JoinError construction under runtime
     // shutdown races, or a panic inside tracing::warn's Display
@@ -1195,15 +1194,16 @@ async fn process_envelope(
         _capacity_permit: capacity_permit,
     } = envelope;
     let session = Arc::clone(&job.session);
-    // Round-33 F2: guard the session-level pending-jobs decrement in
-    // the same RAII shape as `PendingGuard` (round-12 F3). The bare
+    // Guard the session-level pending-jobs decrement in
+    // the same RAII shape as `PendingGuard`. The bare
     // `session.worker_job_finished()` after `tokio::spawn(...).await`
     // used to leak the session-level counter on any panic or drop
     // between here and line ~712. A stuck `session.pending_jobs` means
     // `close_session_locked -> wait_for_worker_jobs().await` blocks
     // forever on `jobs_drained.notified()`, holding the session's
     // lifecycle lock and starving every subsequent close / promote /
-    // recovery-adopt on that id. Class round-12 F3 closed, one call
+    // recovery-adopt on that id. Same leak class as the worker-level
+    // counter, closed one call
     // frame up.
     let _session_pending_guard = SessionPendingGuard {
         session: Arc::clone(&session),
@@ -1250,7 +1250,7 @@ async fn process_envelope(
             .counter("av_worker_errors_total", "Worker jobs that failed")
             .inc();
     }
-    // Round-33 F2: `_session_pending_guard`'s Drop calls
+    // `_session_pending_guard`'s Drop calls
     // `worker_job_finished()` — replaces the bare call previously
     // here so a panic between `spawn.await` and this point cannot
     // leak the session pending counter.
@@ -1288,7 +1288,7 @@ impl Drop for PendingGuard {
     }
 }
 
-/// Round-33 F2: RAII pair to [`PendingGuard`] for the session-level
+/// RAII pair to [`PendingGuard`] for the session-level
 /// pending-jobs counter. `Session::worker_job_finished()` was
 /// previously called as a bare method after `tokio::spawn(...).await`,
 /// but a panic in the routing-side epilogue (Display-side allocator
@@ -1296,7 +1296,7 @@ impl Drop for PendingGuard {
 /// mid-envelope) between `.await` and that call left
 /// `session.pending_jobs` stuck. `close_session_locked` then blocked
 /// forever on `wait_for_worker_jobs().await`, holding the session's
-/// lifecycle lock — the exact class round-12 F3 closed on the
+/// lifecycle lock — the exact leak class already closed on the
 /// worker-level counter.
 struct SessionPendingGuard {
     session: Arc<crate::session::Session>,
@@ -1318,8 +1318,8 @@ fn worker_span(job: &WorkerJob) -> tracing::Span {
 }
 
 #[allow(clippy::too_many_arguments)]
-/// A job whose journal record is appended (Phase A of the round-51
-/// §7.3 group commit) and which still owes its post-persist tail:
+/// A job whose journal record is appended (Phase A of the
+/// group commit) and which still owes its post-persist tail:
 /// chain/step accounting, bridge publish, broker ack, totals, marker
 /// clear. Carried between `persist_job` and `finish_job` so a
 /// same-session batch can append N records under ONE fdatasync
@@ -1393,7 +1393,7 @@ async fn persist_job(
         .saturating_add(job.metrics.completion_tokens.unwrap_or(0));
     let breaker = if job.analyze_loop {
         let text = job.text.clone();
-        // Round-6 (hunt5 F2): vector-sink and embedder errors must not
+        // vector-sink and embedder errors must not
         // brick the session — the sink's trait doc-comment describes it
         // as "off-path observability, not participating in the hot
         // path". A single 2 s Qdrant timeout or one transient
@@ -1423,7 +1423,7 @@ async fn persist_job(
                         metrics
                             .counter(
                                 "av_vector_sink_errors_total",
-                                "Vector-sink errors demoted to warn (round-6 hunt5 F2)",
+                                "Vector-sink errors demoted to warn",
                             )
                             .inc();
                         None
@@ -1443,7 +1443,7 @@ async fn persist_job(
                     metrics
                         .counter(
                             "av_vector_sink_errors_total",
-                            "Vector-sink errors demoted to warn (round-6 hunt5 F2)",
+                            "Vector-sink errors demoted to warn",
                         )
                         .inc();
                 }
@@ -1456,10 +1456,7 @@ async fn persist_job(
                     "embedder try_embed failed; skipping breaker for this step"
                 );
                 metrics
-                    .counter(
-                        "av_embedder_errors_total",
-                        "Embedder errors demoted to warn (round-6 hunt5 F2/F3)",
-                    )
+                    .counter("av_embedder_errors_total", "Embedder errors demoted to warn")
                     .inc();
                 None
             }
@@ -1663,7 +1660,7 @@ async fn finish_job(
             .append(&value)
             .map_err(|error| error.to_string())?,
         Workflow::Unsigned => {
-            // Round-51 §7.3 (RAM cliff): the step was already
+            // RAM-cliff guard: the step was already
             // journaled durably in `record.atif_step` — do NOT
             // retain a second copy in the in-RAM builder (50 turns ×
             // 2 KB × 10k sessions was 1.35 GB held for the idle
@@ -1688,7 +1685,7 @@ async fn finish_job(
     if let Some(directory) = spool_dir {
         persist_broker_ack(directory, &session.id, &event_uid, &ack, &journal_key).await?;
     }
-    // Round-51 §4.2/S1: the record IS the accounting rule. Its fields
+    // The record IS the accounting rule. Its fields
     // were conditionalized once at construction above; apply them
     // through the same impl the recovery folds replay, so the live
     // path and a crash-recovered session can never attest different
@@ -1716,7 +1713,7 @@ fn checked_atomic_add(counter: &std::sync::atomic::AtomicU64, value: u64, field:
 /// Reserve a fresh attempt id without touching the disk. The guard
 /// **must** be armed with this id before the `write_response_marker`
 /// await below, so a client cancellation between the two doesn't leave
-/// a durable marker no in-memory guard owns (round-6 cancellation fix).
+/// a durable marker no in-memory guard owns.
 pub(crate) fn reserve_response_attempt_id() -> String {
     av_core::new_event_uid()
 }
@@ -1742,7 +1739,8 @@ pub(crate) async fn write_response_marker(
 }
 
 // Retained for tests + backwards compat — reserves id, writes marker,
-// returns the id. Do not use on cancellable paths (see round-6 fix).
+// returns the id. Do not use on cancellable paths (see
+// `reserve_response_attempt_id`).
 #[allow(dead_code)]
 pub(crate) async fn create_response_marker(
     spool_dir: &std::path::Path,
@@ -1804,7 +1802,7 @@ pub(crate) async fn inflight_response_sessions(
             // recovery — which is fatal at boot in main.rs. Mirror the
             // tool-intent quarantine discipline: warn, rename to
             // `.corrupt-<uid>`, skip. The signed chain never referenced
-            // this file; nothing else claims it. See round-5 hunt3 F1.
+            // this file; nothing else claims it.
             let marker: InFlightResponse =
                 match crate::journal::open(&journal_key, "in-flight-response", 0, &marker_bytes) {
                     Ok(marker) => marker,
@@ -1841,7 +1839,7 @@ async fn clear_response_marker(
     let session_id = session_id.to_owned();
     let attempt_id = attempt_id.to_owned();
     tokio::task::spawn_blocking(move || {
-        // Round-6 cancellation fix: the caller may race a write that
+        // Cancellation tolerance: the caller may race a write that
         // never landed (cancellation between spawn_blocking and
         // set_marker), or a marker that recovery already quarantined.
         // Absent marker means "already cleared" — do not surface as an
@@ -1878,8 +1876,7 @@ async fn clear_response_marker(
 /// extension, so a `.json`-suffixed quarantine would be re-read,
 /// MAC-fail, and re-quarantine on every reconciler tick — compounding
 /// the name until ENAMETOOLONG and warning twice per tick forever
-/// (same rule as the reconciler's round-44 F4 quarantine rename).
-/// See round-5 hunt3 F1.
+/// (same rule as the reconciler's quarantine rename).
 fn quarantine_inflight_marker(path: &std::path::Path, error: impl std::fmt::Display) {
     let uid = av_core::new_event_uid();
     let name = path
@@ -1945,7 +1942,7 @@ async fn append_journal(
     let workflow = session.workflow.as_str();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         use std::io::Write as _;
-        // Round-51 §7.3: skip the mkdir when the spool dir already
+        // Skip the mkdir when the spool dir already
         // exists (every request after the first).
         if !directory.is_dir() {
             std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
@@ -1967,7 +1964,7 @@ async fn append_journal(
             // repeatedly-failing journal writer used to be able to
             // exhaust the ext4 inode table long before disk-full.
             //
-            // Round-37 F2: basename the paths in error strings. These
+            // Basename the paths in error strings. These
             // errors bubble to `tracing::warn!(session = %session.id,
             // %error, "capture job failed; session is fail-closed")`
             // at process_envelope; that warn exports through
@@ -1987,7 +1984,7 @@ async fn append_journal(
                 &journal_key,
                 "metadata",
                 0,
-                // Round-18: cap sealed journal-metadata read at
+                // Cap sealed journal-metadata read at
                 // MAX_CONTROL_BYTES.
                 &av_core::fsutil::read_capped(&metadata_path, av_core::fsutil::MAX_CONTROL_BYTES)
                     .map_err(|error| error.to_string())?,
@@ -2019,7 +2016,7 @@ async fn append_journal(
             })?;
         journal.write_all(&line).map_err(|error| error.to_string())?;
         journal.write_all(b"\n").map_err(|error| error.to_string())?;
-        // Round-51 §7.3 group commit: a same-session batch defers
+        // Group commit: a same-session batch defers
         // this to ONE fdatasync issued by its LAST append —
         // `sync_data` flushes all of the file's dirty pages
         // regardless of which fd wrote them, so the final synced
@@ -2032,7 +2029,7 @@ async fn append_journal(
             std::fs::File::open(&directory)
                 .and_then(|dir| dir.sync_all())
                 .map_err(|error| {
-                    // Round-37 F2: drop the full path entirely; the
+                    // Drop the full path entirely; the
                     // sibling `session = %session.id` field on the
                     // downstream warn already scopes this to a
                     // specific session, and the containing directory
@@ -2047,7 +2044,7 @@ async fn append_journal(
     .map_err(|error| error.to_string())?
 }
 
-/// Round-51 §7.3: broker acks append to ONE per-session NDJSON
+/// Broker acks append to ONE per-session NDJSON
 /// journal (`{stem}.acks.ndjson` in the spool root) instead of one
 /// `write_atomic` file per event under `broker-acks/<hash>/`. Per
 /// ack this replaces two durable syncs (tmp `sync_all` + parent-dir
@@ -2140,7 +2137,7 @@ pub(crate) async fn read_broker_ack(
             }
         }
     }
-    // Legacy layout fallback (pre-round-51 per-event files), so a
+    // Legacy layout fallback (older per-event files), so a
     // deployment upgraded mid-session still sees its earlier acks.
     let path = broker_ack_path(directory, session_id, event_uid);
     // Bounded read — same policy as every other sealed marker in the
@@ -2170,13 +2167,13 @@ pub(crate) async fn read_broker_ack(
     Ok(Some(record.ack))
 }
 
-/// Round-51 §7.3 layout: one append-only ack journal per session.
+/// Group-commit layout: one append-only ack journal per session.
 fn ack_journal_path(directory: &std::path::Path, session_id: &str) -> std::path::PathBuf {
     let digest = av_core::digest::sha256_hex(session_id.as_bytes());
     directory.join(format!("{}.acks.ndjson", digest.get(..32).unwrap_or(&digest)))
 }
 
-/// Legacy pre-round-51 layout, read-only fallback.
+/// Legacy per-event layout, read-only fallback.
 fn broker_ack_path(directory: &std::path::Path, session_id: &str, event_uid: &str) -> std::path::PathBuf {
     let session_digest = av_core::digest::sha256_hex(session_id.as_bytes());
     let event_digest = av_core::digest::sha256_hex(event_uid.as_bytes());
@@ -2224,7 +2221,7 @@ mod tests {
         }
     }
 
-    /// Round-51 §7.3: a bus that BLOCKS publishes whose value names
+    /// A bus that BLOCKS publishes whose value names
     /// the gated session until released — deterministic stand-in for
     /// a hung broker/journal on one session.
     struct GatedBus {
@@ -2501,7 +2498,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_marker_rejects_payload_mutation() {
-        // Round-6 (hunt3 F1) behavior change: an unverifiable marker is
+        // Behavior contract: an unverifiable marker is
         // now quarantined (renamed to `.corrupt-<uid>`) instead of
         // bricking the recovery scan. Verify (a) the tampered file is
         // moved out of the way, so it no longer counts as "in-flight",
@@ -2871,7 +2868,7 @@ mod tests {
             directory.path().to_path_buf(),
             Arc::new(Registry::new()),
         );
-        // Round-41 F1: per-session errors during signed recovery no
+        // per-session errors during signed recovery no
         // longer propagate to the outer `recover_spooled_sessions`
         // Err (which used to head-of-line-block every other session
         // for the reconciler tick). They now warn+continue. The
@@ -2886,7 +2883,7 @@ mod tests {
             .await;
         assert!(
             outcome.is_ok(),
-            "round-41 F1: per-session HMAC failures warn+continue instead of propagating, got {outcome:?}"
+            "per-session HMAC failures warn+continue instead of propagating, got {outcome:?}"
         );
         // The corrupted session must NOT be installed into the
         // registry — the security property this test was written to
@@ -2956,7 +2953,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsigned_job_preserves_required_atif_metrics() {
-        // Round-51 §7.3 (RAM cliff): the step now lives ONLY in the
+        // RAM-cliff guard: the step now lives ONLY in the
         // events journal; RAM keeps a counter. Use a spooled worker
         // and assert the journaled step carries the metrics.
         let bridge = Arc::new(RecordingBus::default());
@@ -2977,7 +2974,7 @@ mod tests {
         assert_eq!(session.atif_steps_count(), 1);
         assert!(
             session.atif.lock().is_empty(),
-            "steps must not be retained in RAM (round-51 §7.3)"
+            "steps must not be retained in RAM (RAM-cliff guard)"
         );
         let digest = av_core::digest::sha256_hex(session.id.as_bytes());
         let stem = digest.get(..32).unwrap();
@@ -3499,7 +3496,7 @@ mod tests {
             .expect("wait_idle deadlocked — a canceled submit_and_wait leaked pending");
     }
 
-    /// Round-51 §7.3 group commit: a backlog that accumulates behind
+    /// Group commit: a backlog that accumulates behind
     /// a gated first job drains as one same-session batch (Phase A
     /// appends + ONE fdatasync + per-job tails). Every job must
     /// complete successfully, the journal must carry every record in
@@ -3604,7 +3601,7 @@ mod tests {
             .unwrap()
     }
 
-    /// Round-51 §7.3: one stalled session must not freeze its shard.
+    /// One stalled session must not freeze its shard.
     /// Pre-dispatcher, the victim (same shard) sat behind the stalled
     /// session's envelope forever (31× measured HOL blocking); now it
     /// completes while the stalled session occupies one slot.
@@ -3713,7 +3710,7 @@ mod unified_fold_tests {
         }
     }
 
-    /// Round-51 §4.2/S1 proof harness: the live-path atomic
+    /// Shared-fold proof harness: the live-path atomic
     /// application and the recovery fold MUST produce identical
     /// totals over the same record stream — this is the property the
     /// three hand-rolled folds could silently violate ('a
@@ -3787,7 +3784,7 @@ mod unified_fold_tests {
         );
     }
 
-    /// Round-51 §6.4: a terminal record carrying a provider
+    /// A terminal record carrying a provider
     /// reconciliation (`prompt_token_correction`) must adjust the
     /// prompt total identically on the live path and in recovery — a
     /// crash between charge and close must not resurrect the
@@ -3835,7 +3832,7 @@ mod ack_journal_tests {
 
     use super::*;
 
-    /// Round-51 §7.3: acks round-trip through the per-session journal,
+    /// Acks round-trip through the per-session journal,
     /// tolerate a torn tail line, and the legacy per-event file layout
     /// is still readable (a deployment upgraded mid-session must see
     /// its earlier acks).
@@ -3872,7 +3869,7 @@ mod ack_journal_tests {
             "an unknown event has no ack (torn tail must not error the scan)"
         );
 
-        // Legacy layout: a pre-round-51 per-event file is still found.
+        // Legacy layout: an older per-event file is still found.
         let legacy = broker_ack_path(directory.path(), "s2", "evt-9");
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         let record = BrokerAckRecord {

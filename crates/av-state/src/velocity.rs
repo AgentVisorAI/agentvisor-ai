@@ -2,7 +2,7 @@
 //! rate limiting. (The loop-breaker's `N+ tokens` arm uses its own
 //! cumulative per-session counter, not this window.)
 //!
-//! # Round-31 F4 — NOT WIRED INTO ENFORCEMENT
+//! # NOT WIRED INTO ENFORCEMENT
 //!
 //! There are currently zero production callers of [`TokenVelocity`]; the
 //! only users outside this crate are the integration tests in
@@ -21,7 +21,7 @@
 //! The type is kept public for now (rather than deleted) because the
 //! sliding-window arithmetic is exercised by the
 //! `e2e_race_velocity` adversarial tests that lock in the
-//! round-26 F5 `saturating_add` discipline — reusable ground for the
+//! `saturating_add` discipline — reusable ground for the
 //! future breaker-integrated window when someone builds it.
 
 use parking_lot::Mutex;
@@ -51,7 +51,7 @@ impl TokenVelocity {
         while samples.front().is_some_and(|(t, _)| *t < cutoff) {
             samples.pop_front();
         }
-        // Round-26 F5: `Iterator::sum` on `u64` panics in debug and
+        // `Iterator::sum` on `u64` panics in debug and
         // silently wraps in release on overflow. Every other counter
         // and spend site in av_state uses `checked_add` or
         // `saturating_add` — velocity was the last inconsistent
@@ -71,7 +71,7 @@ impl TokenVelocity {
     pub fn current_at(&self, now_ms: u64) -> u64 {
         let samples = self.samples.lock();
         let cutoff = now_ms.saturating_sub(self.window_ms);
-        // Round-26 F5: mirror record_at's saturating_add discipline.
+        // Mirror record_at's saturating_add discipline.
         samples
             .iter()
             .filter(|(t, _)| *t >= cutoff)
@@ -128,7 +128,7 @@ mod tests {
         );
     }
 
-    /// Round-26 F5: `Iterator::sum` on `u64` panics in debug and
+    /// `Iterator::sum` on `u64` panics in debug and
     /// wraps in release on overflow. Every other counter/spend
     /// site in av_state uses checked/saturating arithmetic;
     /// velocity now does too. Two u64::MAX samples inside the

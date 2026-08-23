@@ -183,7 +183,7 @@ enum ValidationMode {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    // Round-51 §3.5: returning `Result<()>` relied on the default
+    // Returning `Result<()>` relied on the default
     // Termination impl printing anyhow's DEBUG format — which appends
     // a full captured backtrace whenever RUST_BACKTRACE is exported,
     // leaking 12 lines of internal frames on every well-formed user
@@ -278,14 +278,14 @@ async fn wizard_then_maybe_start() -> Result<()> {
 }
 
 fn keygen(path: &Path) -> Result<()> {
-    // Round-19 F2/F3: `signer.seed()` returns `Zeroizing<[u8; 32]>`
+    // `signer.seed()` returns `Zeroizing<[u8; 32]>`
     // directly, and the hex encoding is separately wrapped so both
     // stack and heap copies zero on drop rather than lingering in
     // freed memory recoverable from a core dump.
     use zeroize::Zeroizing;
     let signer = Ed25519Signer::generate();
     let seed = signer.seed();
-    // Round-19 F3: `&*seed` avoids clippy's needless_borrows lint
+    // `&*seed` avoids clippy's needless_borrows lint
     // suggestion (`*seed`) which would move 32 bytes out of the
     // Zeroizing wrapper into a fresh un-zeroized temp slot.
     #[allow(clippy::needless_borrows_for_generic_args)]
@@ -349,7 +349,7 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
         .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent).with_context(|| format!("create key directory {}", parent.display()))?;
     let temporary = parent.join(format!(".avctl-key-{}.tmp", av_core::new_event_uid()));
-    // Round-23 F1: parity with setup.rs, harness main.rs, and
+    // Parity with setup.rs, harness main.rs, and
     // cold_store.rs — arm an RAII guard so a transient IO failure
     // (ENOSPC on write, EIO on sync, EROFS after hard_link, etc.)
     // cannot leave a `.avctl-key-<uuidv7>.tmp` containing live
@@ -380,13 +380,13 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
             // no-op (unlinking a non-existent path would race with a
             // fresh keygen that happened to reuse the UUIDv7 tail).
             guard.disarm();
-            // Round-23 F1: downgrade post-hard-link sync_directory
+            // Downgrade post-hard-link sync_directory
             // failures to a warn. The seed is already installed at
             // `path`; returning Err misleads the operator into
             // thinking keygen failed and can prompt them to delete
             // the "half-installed" file, which is actually the live
             // seed. Same discipline as `write_atomic` in
-            // av_core::fsutil (round-12 F4 rationale).
+            // av_core::fsutil.
             if let Err(error) = av_core::fsutil::sync_directory(parent) {
                 eprintln!(
                     "warning: post-install directory fsync failed at {}: {error}; the seed is visible but its dirent may not survive an immediate power loss",
@@ -403,7 +403,7 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
     }
 }
 
-/// Round-16 F5 → round-17 F3: read caps now live in `av_core::fsutil`
+/// Read caps live in `av_core::fsutil`
 /// so both the CLI and the harness reconciler enforce identical
 /// bounds. Kept as thin wrappers here for clearer local error text.
 fn read_capped(path: &Path, max_bytes: u64, label: &str) -> Result<Vec<u8>> {
@@ -415,7 +415,7 @@ fn read_capped_str(path: &Path, max_bytes: u64, label: &str) -> Result<String> {
         .with_context(|| format!("{label} at {}", path.display()))
 }
 
-/// Round-28 F3: neutralise terminal-escape injection when printing
+/// Neutralise terminal-escape injection when printing
 /// attacker-influenced strings.
 ///
 /// Anything reachable through a trusted third party — a signed receipt
@@ -467,7 +467,7 @@ const MAX_ATIF_BYTES: u64 = av_core::fsutil::MAX_ATIF_BYTES;
 /// token files.
 const MAX_CONFIG_BYTES: u64 = av_core::fsutil::MAX_CONTROL_BYTES;
 
-/// Round-51 §9.1: "the filename is `sha256(session_id)[..32]` with no
+/// "the filename is `sha256(session_id)[..32]` with no
 /// lookup command" — the offline-verification workflow had no way to
 /// go from a session id to its receipt. Compute the stem and report
 /// every artifact class for it, including `archived-*` prior
@@ -522,7 +522,7 @@ fn receipt_locate(session_id: &str, spool: &Path) -> Result<()> {
 }
 
 fn receipt_verify(path: &Path, public_keys_hex: &[String]) -> Result<()> {
-    // Round-16: use the strict deserializer that refuses duplicate
+    // Use the strict deserializer that refuses duplicate
     // JSON keys at any nesting level. `avctl receipt-verify` is the
     // primary offline audit tool — a receipt that verified here but
     // showed different content in `jq` (first-wins) would defeat
@@ -531,7 +531,7 @@ fn receipt_verify(path: &Path, public_keys_hex: &[String]) -> Result<()> {
     let bytes = read_capped(path, MAX_RECEIPT_BYTES, "receipt")?;
     let receipt =
         Receipt::from_json_slice(&bytes).with_context(|| format!("parse receipt {}", path.display()))?;
-    // Round-51 §8.10: accept multiple trusted keys so a key-rotation
+    // Accept multiple trusted keys so a key-rotation
     // window is operable — av_receipts::Keyring was always
     // multi-key (selected by the receipt's key_id); only this CLI
     // flag was single-valued.
@@ -539,7 +539,7 @@ fn receipt_verify(path: &Path, public_keys_hex: &[String]) -> Result<()> {
     for (index, key_hex) in public_keys_hex.iter().enumerate() {
         // Accept hex (what `avctl pubkey` and the startup banner print)
         // AND standard base64 (what the receipt's `public_key_b64`
-        // field carries) — round-51 §9.1: auditors were hand-converting
+        // field carries) — auditors were hand-converting
         // between the two encodings of the same 32 bytes.
         let decoded = hex::decode(key_hex.trim()).or_else(|_| {
             use base64::Engine as _;
@@ -563,7 +563,7 @@ fn receipt_verify(path: &Path, public_keys_hex: &[String]) -> Result<()> {
             .with_context(|| format!("trusted public key #{} is invalid", index + 1))?;
     }
     receipt.verify(&keyring).context("receipt verification failed")?;
-    // Round-28 F3: sanitise the receipt_id before printing. A signer
+    // Sanitise the receipt_id before printing. A signer
     // trusted by the operator could otherwise mint a receipt whose
     // receipt_id contains ESC/CSI bytes, reprogramming the auditor's
     // terminal after the "verified" line.
@@ -577,8 +577,8 @@ fn atif_validate(path: &Path, mode: ValidationMode) -> Result<()> {
         ValidationMode::Strict => av_atif::Mode::Strict,
         ValidationMode::Compat => av_atif::Mode::Compat,
     };
-    // Round-23 F2: `validate_bytes` refuses duplicate keys before
-    // parsing (parallel to `Receipt::from_json_slice`'s round-16
+    // `validate_bytes` refuses duplicate keys before
+    // parsing (parallel to `Receipt::from_json_slice`'s
     // strict scanner) and runs `validate_value` on the untyped
     // form, which exercises unknown-field checks that the typed
     // `Trajectory` (no `deny_unknown_fields`) silently drops.
@@ -587,9 +587,9 @@ fn atif_validate(path: &Path, mode: ValidationMode) -> Result<()> {
         Err(reason) => anyhow::bail!("parse {}: {reason}", path.display()),
     };
     if !issues.is_empty() {
-        // Round-20 F2/F8 + round-21 F5: the reconciler already
+        // The reconciler already
         // caps its render at first 16 + total; the CLI mirrors
-        // that. Round-21 also detects the av_atif truncation
+        // that, and also detects the av_atif truncation
         // marker (message contains "issue cap") so the summary
         // says "at least N" rather than reporting the capped
         // count as if it were exact.
@@ -601,7 +601,7 @@ fn atif_validate(path: &Path, mode: ValidationMode) -> Result<()> {
         let real_total = if truncated { issues.len() - 1 } else { issues.len() };
         let shown = issues.iter().take(ATIF_HEAD);
         for issue in shown {
-            // Round-28 F3: sanitise every field of the issue since
+            // Sanitise every field of the issue since
             // both `path` (a JSON pointer built from user JSON keys)
             // and `message` (may embed a value snippet) come from
             // attacker-supplied ATIF content.
@@ -628,12 +628,12 @@ fn atif_validate(path: &Path, mode: ValidationMode) -> Result<()> {
 fn manifest_validate(path: &Path) -> Result<()> {
     let yaml = read_capped_str(path, MAX_CONFIG_BYTES, "manifest")?;
     let manifest = BridgeManifest::from_yaml(&yaml).map_err(anyhow::Error::new)?;
-    // Round-42 F4: `manifest.name` is operator-supplied text with no
+    // `manifest.name` is operator-supplied text with no
     // control-byte restriction (see av-bridge/src/manifest.rs::validate,
     // which only refuses YAML anchor markers). A crafted manifest with
     // an ANSI CSI sequence in `name:` would reach the operator terminal
     // unfiltered — same CVE-2003-0063 class as the receipt/atif prints
-    // fixed in round-28 F3.
+    // already fixed.
     println!(
         "valid {} topics={}",
         sanitize_for_terminal(&manifest.name),
@@ -657,7 +657,7 @@ fn bridge_provision(manifest_path: &Path, data_dir: &Path) -> Result<()> {
 }
 
 fn event_tail(data_dir: &Path, topic: &str, partition: u32, offset: u64, max: usize) -> Result<()> {
-    // Round-24 F7: cap `--max`. Every neighbouring CLI flag has a
+    // Cap `--max`. Every neighbouring CLI flag has a
     // documented cap (loadgen --connections <= 10_000, dashboard
     // limit <= 500, receipt/atif/config file caps); event-tail did
     // not, so `avctl event-tail --max 4000000000` allocates a Vec
@@ -700,7 +700,7 @@ async fn session_promote(base_url: &str, id: &str, token_file: Option<&Path>) ->
     }
     let response = request.send().await.context("promote session")?;
     let status = response.status();
-    // Round-28 F4: cap the response body read. reqwest's
+    // Cap the response body read. reqwest's
     // `response.text()` buffers the whole body with no built-in
     // limit; a misbehaving harness (or a stalled proxy) could keep
     // the CLI holding unbounded RAM waiting for EOF. Stream chunks
@@ -708,12 +708,12 @@ async fn session_promote(base_url: &str, id: &str, token_file: Option<&Path>) ->
     // receipt is a few hundred bytes).
     let body = read_capped_response(response, av_core::fsutil::MAX_CONTROL_BYTES).await?;
     if !status.is_success() {
-        // Round-28 F3: harness error body is attacker-influencable
+        // Harness error body is attacker-influencable
         // via header echoing / error messages — sanitise before
         // it lands on the operator's terminal.
         anyhow::bail!("promotion failed ({status}): {}", sanitize_for_terminal(&body));
     }
-    // Round-28 F3: the promoted receipt is JSON — printing it
+    // The promoted receipt is JSON — printing it
     // through serde_json::to_string is not attacker-controllable at
     // this layer, but the raw body could carry stray control bytes
     // if a proxy adulterates the response. Sanitise to be safe.
@@ -737,7 +737,7 @@ fn promote_url(base_url: &str, id: &str) -> Result<reqwest::Url> {
     Ok(url)
 }
 
-/// Round-28 F4: capped, streaming replacement for
+/// Capped, streaming replacement for
 /// `response.text().await`. Refuses to buffer more than `max_bytes`
 /// before an EOF and surfaces the cap in the error text.
 async fn read_capped_response(response: reqwest::Response, max_bytes: u64) -> Result<String> {
@@ -758,7 +758,7 @@ async fn read_capped_response(response: reqwest::Response, max_bytes: u64) -> Re
 fn config_validate(path: &Path, structural_only: bool) -> Result<()> {
     let text = read_capped_str(path, MAX_CONFIG_BYTES, "config")?;
     let config = av_harness::HarnessConfig::from_toml(&text).map_err(anyhow::Error::msg)?;
-    // Round-51 §8.10: a shape-valid config is useless if it selects
+    // A shape-valid config is useless if it selects
     // backends the binary cannot run — previously this reported
     // "valid" for `bridge_backend = "kafka"` on a default-features
     // build and the daemon then hard-failed at boot. avctl and
@@ -797,7 +797,7 @@ async fn loadgen(
     // connections the loadgen exhausts source ports / FDs / RAM on the
     // operator's own host before any latency numbers land, and the load
     // *test* becomes the very thing it was supposed to measure. 10k is
-    // the stated SLA gate (round-11 F6) — the previous 100k cap
+    // the stated SLA gate — the previous 100k cap
     // encouraged runs that a single host cannot sustain: default Linux
     // `net.ipv4.ip_local_port_range` (~28k) exhausts before hyper can
     // dial, and `RLIMIT_NOFILE` (1024–65536) trips producing thousands
@@ -861,7 +861,7 @@ async fn loadgen(
                 }
                 let response = request.send().await.map_err(|error| error.to_string())?;
                 let status = response.status();
-                // Round-28 F4: cap loadgen response body reads. With
+                // Cap loadgen response body reads. With
                 // `stream: true`, an SSE response accumulates whole
                 // via `.bytes()` — a stalled server could pin each
                 // of `--connections 10_000` tasks to unbounded RAM,
@@ -920,13 +920,13 @@ async fn loadgen(
 /// credential at least as sensitive as an API key — every allocation
 /// that holds it (the raw read and the trimmed copy) is zero-on-drop so
 /// a post-run core dump or heap scan does not expose it verbatim.
-/// Mirrors the wizard's `ask_secret_line` discipline (round-38/39).
+/// Mirrors the wizard's `ask_secret_line` discipline.
 fn bearer_token(path: Option<&Path>) -> Result<Option<zeroize::Zeroizing<String>>> {
     let path = path
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("AV_BEARER_TOKEN_FILE").map(PathBuf::from));
     path.map(|path| {
-        // Round-13: refuse a bearer token file that any other local
+        // Refuse a bearer token file that any other local
         // user can read. On a shared-tenant host, a 0o644 token file
         // in ~/.avctl/ leaks the operator's credentials to every
         // process running as another uid. Mirrors the harness's own
@@ -1050,7 +1050,7 @@ mod tests {
         assert_eq!(sanitize_for_terminal("réseau 支付 ✓"), "réseau 支付 ✓");
     }
 
-    /// Round-23 F1: `install_seed_exclusive` must not leave a tmp
+    /// `install_seed_exclusive` must not leave a tmp
     /// containing seed material on disk when installation does not
     /// complete. Exercised here on the AlreadyExists branch: the SEED
     /// path is pre-occupied, install returns `Ok(false)`, and the
@@ -1088,7 +1088,7 @@ mod tests {
         assert_eq!(std::fs::read(&seed_path).unwrap(), b"pre-existing");
     }
 
-    /// Round-24 F7: `event_tail` refuses --max above the safety cap
+    /// `event_tail` refuses --max above the safety cap
     /// so a typo (`--max 999999999`) cannot OOM the CLI by
     /// preallocating a proportional Vec inside bridge.fetch. The
     /// tempdir passed in doesn't need a real manifest — the cap
@@ -1104,7 +1104,7 @@ mod tests {
         );
     }
 
-    /// Round-28 F3: `sanitize_for_terminal` neutralises every control
+    /// `sanitize_for_terminal` neutralises every control
     /// byte that could reprogram the operator's terminal. A signer
     /// trusted by the operator could otherwise mint a receipt whose
     /// receipt_id contains ESC/CSI/DEL/C1 bytes and hijack the

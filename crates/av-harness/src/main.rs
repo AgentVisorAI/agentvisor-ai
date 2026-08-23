@@ -41,7 +41,7 @@ async fn main() {
     };
 
     if let Err(error) = run(config_override).await {
-        // Round-51 §8.10: the daemon logs structured JSON, but a fatal
+        // The daemon logs structured JSON, but a fatal
         // startup/shutdown error used to return through anyhow and
         // print as a bare `Error:` line plus a backtrace — unparseable
         // to the log pipeline at exactly the moment it matters most.
@@ -65,7 +65,7 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
 
     let (config, config_source) =
         av_harness::config::load_config_with_override(config_override).map_err(anyhow::Error::msg)?;
-    // Round-51 §8.10: refuse the whole configuration up front, with the
+    // Refuse the whole configuration up front, with the
     // complete list, when it selects backends this binary was compiled
     // without. The individual build_* sites keep their own bails as
     // defense in depth, but they fail one at a time and only when
@@ -88,7 +88,7 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     // refresh loop can bump `av_jwks_refresh_errors_total` on the same
     // registry that `AppState` will hand to `/metrics`. Otherwise the
     // JWKS counters would live on a phantom registry no scraper sees,
-    // and a silently-stale key set (see F1/F3 in round-11 audit) would
+    // and a silently-stale key set would
     // remain unalertable.
     let metrics = Arc::new(av_core::metrics::Registry::new());
     let (identity, jwks_refresh) = build_identity(&config, Arc::clone(&metrics)).await?;
@@ -111,8 +111,8 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
         // deleted) is a compliance incident: audit consumers that trusted
         // the previous key will reject every receipt issued from here on.
         // Emit at WARN so the log pipeline surfaces it without needing a
-        // Prometheus gauge (the metrics registry has no gauge type yet;
-        // see the operability review §8.4).
+        // Prometheus gauge (the metrics registry has no gauge type for
+        // this yet).
         tracing::warn!(
             signer_key_id = %signer_key_id,
             signer_public_key_hex = %signer_public_key_hex,
@@ -136,7 +136,7 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
         Arc::clone(&metrics),
     )
     .map_err(anyhow::Error::new)?;
-    // Round-51 §8.6: two daemons on one spool silently split the audit
+    // Two daemons on one spool silently split the audit
     // trail (interleaved journals, racing reconcilers, torn ATIF
     // artifacts). The README documents single-instance; nothing
     // enforced it. Hold an exclusive advisory lock on a well-known
@@ -198,8 +198,7 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     // `atif_retention_days` on an hourly cadence. Only sealed pairs are
     // touched; unpaired remnants stay for the reconciler quarantine
     // sweep. `None` (the ship default) preserves the historical
-    // "manage-with-external-cron" behaviour. See engineering review
-    // §8.1 / §8.2.
+    // "manage-with-external-cron" behaviour.
     let retention = config.atif_retention_days.map(|days| {
         let finalizer = state.finalizer.clone();
         let metrics = Arc::clone(&state.metrics);
@@ -256,7 +255,7 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
         upstream_auth = %av_harness::pipeline::describe_upstream_auth(&config),
         bridge = %config.bridge_backend,
         state = %config.state_backend,
-        // Round-51 §4.2: budget counters on an expiring backend
+        // Budget counters on an expiring backend
         // (Redis: 24 h) silently reset for sessions active past the
         // TTL; in-memory never expires. Surface the value so an
         // operator diagnosing "my week-long agent's budget reset"
@@ -268,12 +267,12 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
         // or a hand-managed seed file survived the boot — an operator or an
         // audit-log consumer can compare it against the previously-published
         // public key without waiting for the first receipt to fail
-        // downstream. See operability review §8.4.
+        // downstream.
         signer_key_id = %signer_key_id,
         signer_public_key_hex = %signer_public_key_hex,
         "AgentVisor AI started"
     );
-    // Round-51 W2: publish the signing-key fingerprint as a labelled
+    // Publish the signing-key fingerprint as a labelled
     // gauge whose value is always 1 (Prometheus's convention for
     // `*_info` metrics). Downstream verifiers can alert on a
     // key-id change between scrapes even when nothing signed a
@@ -293,7 +292,7 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
         .set(1);
     let (shutdown_started_tx, shutdown_started_rx) = tokio::sync::oneshot::channel();
     // Register the drain-timeout counter up front so alerts can wire
-    // onto it at boot. This surfaces the round-11 F2 hazard: axum's
+    // onto it at boot. This surfaces a real hazard: axum's
     // per-connection tasks are detached `tokio::spawn`s, so dropping
     // the `Serve` future does NOT cancel in-flight streams. If a
     // long-lived streaming client outlives the graceful drain budget,
@@ -346,14 +345,14 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     if let Some(handle) = retention.as_ref() {
         handle.abort();
     }
-    // Round-24 F5: signal maintenance to stop instead of aborting.
+    // Signal maintenance to stop instead of aborting.
     // JoinHandle::abort() only cancels the outer async task; a
     // spawn_blocking closure that's already running keeps rewriting
     // Bridge segments to completion and races the process exit.
     // Notify makes the loop return between ticks so the shutdown
     // .await below actually waits for the blocking work to finish.
     bridge_maintenance_shutdown.notify_one();
-    // Round-12 F1: abort the JWKS refresh task on shutdown so the
+    // Abort the JWKS refresh task on shutdown so the
     // infinite `loop { interval.tick() ... }` cannot outlive the
     // harness's outbound HTTP hygiene. Previously the JoinHandle was
     // dropped at spawn time, letting the refresher fire another
@@ -443,7 +442,7 @@ enum CliAction {
     Version,
 }
 
-/// Round-51 §8.6: exclusive advisory lock proving this daemon is the
+/// Exclusive advisory lock proving this daemon is the
 /// spool's only writer (see the call site in `run`). The returned
 /// handle must stay alive for the process lifetime; dropping it — or
 /// any process exit, including SIGKILL — releases the lock.
@@ -555,7 +554,7 @@ fn init_tracing() -> Result<()> {
         .with(tracing_subscriber::fmt::layer().json())
         .try_init()
         .map_err(|error| anyhow::anyhow!("initialize tracing: {error}"))?;
-    // Round-6 (hunt5 portability F5): every other feature-gated
+    // Every other feature-gated
     // capability refuses loudly when configured but compiled out; the
     // OTLP env vars were the one silent no-op. An operator pointing a
     // default-features binary at a collector got no traces and no
@@ -647,7 +646,7 @@ fn load_sandbox(config: &HarnessConfig) -> Result<Sandbox> {
                         .ok_or_else(|| anyhow::anyhow!("invalid tool schema filename {}", path.display()))?;
                     let schema: serde_json::Value = serde_json::from_slice(
                         // Same MAX_CONTROL_BYTES cap and rationale as the
-                        // bridge's `load_validators` (round-22 F4): bound
+                        // bridge's `load_validators`: bound
                         // the allocation before the JSON parser can reject.
                         &av_core::fsutil::read_capped(&path, av_core::fsutil::MAX_CONTROL_BYTES)
                             .with_context(|| format!("read tool schema {}", path.display()))?,
@@ -689,7 +688,7 @@ fn load_sandbox(config: &HarnessConfig) -> Result<Sandbox> {
             }
             Err(error) => return Err(error).with_context(|| format!("read WASM policy {path}")),
         };
-        // Round-6 (hunt5 config F1): the default payload-limit policy
+        // The default payload-limit policy
         // denies bodies above 4 MiB. If the operator raised
         // `max_request_bytes` past that, chat requests the HTTP body
         // limit admits get 403 PolicyBlocked — misattributed as a
@@ -724,7 +723,7 @@ fn load_sandbox(config: &HarnessConfig) -> Result<Sandbox> {
 
 /// Embedded copy of the default payload-limit policy, compiled into the
 /// binary so `cargo install av-harness && agentvisord` works from an
-/// empty directory. Round-45: relocated INTO the crate at
+/// empty directory. Deliberately located INSIDE the crate at
 /// `crates/av-harness/policies/payload_limit.wat` so `cargo publish`
 /// packages it — `include_str!` cannot reach outside the crate root on
 /// a crates.io consumer build. The operator-facing copy at
@@ -795,7 +794,7 @@ fn load_manifest(config: &HarnessConfig) -> Result<BridgeManifest> {
                 .with_context(|| format!("read Bridge manifest {}", config.bridge_manifest_path));
         }
     };
-    // Round-51 §8.10: a topic with no cold_uri DROPS records past
+    // A topic with no cold_uri DROPS records past
     // hot_hours — the audit stream half of the system of record
     // silently self-deletes (default 720 h = 30 days) while the ATIF
     // spool half retains forever. Surface the divergence at boot so
@@ -825,7 +824,7 @@ fn spawn_bridge_maintenance(
         // once per hour even if the previous run took 30 minutes.
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            // Round-24 F5: previously `bridge_maintenance.abort()`
+            // Previously `bridge_maintenance.abort()`
             // was used at shutdown, but JoinHandle::abort() cancels
             // only the outer async task — the `spawn_blocking`
             // closure below cannot be cancelled, so the OS thread
@@ -858,7 +857,7 @@ fn spawn_bridge_maintenance(
                         )
                         .add(actions),
                     Ok(Err(error)) => {
-                        // Round-12 F2: previously only tracing::warn.
+                        // Previously only tracing::warn.
                         // A silent 1-hour cadence made this class of
                         // failure invisible to alerts — Bridge hot
                         // retention could grow unbounded until disk
@@ -960,7 +959,7 @@ async fn build_identity(
         // that accept the TCP handshake but never send response bytes
         // (or send them one byte per minute). Without it, a single
         // stuck fetch pins the refresh loop's `tick()` forever and
-        // subsequent scheduled refreshes never fire (see round-11 F1).
+        // subsequent scheduled refreshes never fire.
         // Result: revoked keys stay honored until the next process
         // restart, with no scheduled recovery.
         let client = reqwest::Client::builder()
@@ -1020,7 +1019,7 @@ async fn build_identity(
                         Ok(_) => {}
                         Err(error) => {
                             refresh_errors.inc();
-                            // Round-35 F2: do NOT `%error` here. The
+                            // Do NOT `%error` here. The
                             // anyhow chain in `refresh_jwks` used to
                             // embed the JWKS URL in every `.with_context`
                             // and every `anyhow::bail!` message; anyhow's
@@ -1067,8 +1066,8 @@ async fn refresh_jwks(client: &reqwest::Client, url: &str, validator: &IdentityV
     // (1 Gbit/s) 1 second is enough to deliver >100 MB, so the timeout
     // alone is not a sufficient defense.
     //
-    // Round-35 F2 + round-36 F2: every error return must be URL-free.
-    // The prior fix removed the URL from `.with_context()` prepends,
+    // Every error return must be URL-free.
+    // An earlier fix removed the URL from `.with_context()` prepends,
     // but `.context("fetch JWKS")` still wraps a `reqwest::Error`
     // whose Display embeds the URL (`error sending request for url
     // (...)`) — anyhow's Display walks the whole chain and prints
@@ -1119,7 +1118,7 @@ async fn refresh_jwks(client: &reqwest::Client, url: &str, validator: &IdentityV
     validator.add_jwks(&document).map_err(anyhow::Error::new)
 }
 
-/// Round-35 F2: stable string classifier for JWKS refresh failures
+/// Stable string classifier for JWKS refresh failures
 /// suitable for structured logging without echoing the URL.
 fn classify_jwks_error(error: &anyhow::Error) -> &'static str {
     if let Some(reqwest_err) = error.downcast_ref::<reqwest::Error>() {
@@ -1151,7 +1150,7 @@ fn build_bridge(config: &HarnessConfig, manifest: &BridgeManifest) -> Result<Arc
     // construction.
     match config.bridge().map_err(anyhow::Error::msg)? {
         BridgeBackend::Embedded => {
-            // Round-6 (hunt5 config F2): an endpoint without the
+            // An endpoint without the
             // backend that consumes it is a silent misconfiguration —
             // e.g. `docker run -e AV_BRIDGE_ENDPOINT=…` against the
             // shipped embedded-backend config does nothing. Warn so
@@ -1230,7 +1229,7 @@ fn build_bridge(config: &HarnessConfig, manifest: &BridgeManifest) -> Result<Arc
 fn build_store(config: &HarnessConfig) -> Result<Arc<dyn StateStore>> {
     match config.state().map_err(anyhow::Error::msg)? {
         StateBackend::Memory => {
-            // Round-6 (hunt5 config F2): warn on an inert endpoint —
+            // Warn on an inert endpoint —
             // budget/velocity counters stay process-local (neither
             // shared nor durable), exactly what setting a Redis
             // endpoint was meant to fix.
@@ -1291,7 +1290,7 @@ fn build_embedder(config: &HarnessConfig) -> Result<Arc<dyn Embedder>> {
 async fn build_vector_sink(config: &HarnessConfig, _dimension: usize) -> Result<Arc<dyn VectorSink>> {
     match config.vector().map_err(anyhow::Error::msg)? {
         VectorBackend::Memory => {
-            // Round-6 (hunt5 config F2): warn on an inert Qdrant URL.
+            // Warn on an inert Qdrant URL.
             if config.qdrant_url.is_some() {
                 tracing::warn!(
                     "qdrant_url (or AV_QDRANT_URL) is set but vector_backend=\"memory\" ignores \
@@ -1331,12 +1330,12 @@ fn load_or_create_signer(path: &Path) -> Result<(Ed25519Signer, bool)> {
         Err(error) => return Err(error),
     }
     let signer = Ed25519Signer::generate();
-    // Round-18 F5 + round-19 F2/F3: `signer.seed()` now returns
+    // `signer.seed()` returns
     // `Zeroizing<[u8; 32]>` directly, so no temp slot lingers on
     // the caller's stack. The hex encoding is separately wrapped
     // in Zeroizing so its heap buffer is zeroed on drop too.
     let seed = signer.seed();
-    // Round-19 F3: `&*seed` (not `*seed`) is required to avoid
+    // `&*seed` (not `*seed`) is required to avoid
     // copying the seed bytes onto a fresh un-zeroized temp slot
     // for hex::encode. clippy's `needless_borrows_for_generic_args`
     // lint is a false positive here — it would suggest `*seed`,
@@ -1403,13 +1402,13 @@ fn require_owner_only_mode(path: &Path) -> Result<()> {
 
 fn read_signer(path: &Path) -> Result<Ed25519Signer> {
     require_owner_only_mode(path)?;
-    // Round-18 F4: consistent posture with the CLI's round-17 F6
+    // Consistent posture with the CLI's
     // read_capped_str — the harness should not use uncapped
     // read_to_string on a security-sensitive file just because
     // require_owner_only_mode already refused the group/other-
     // readable case. A hex-encoded 32-byte seed is 65 bytes with
     // newline; MAX_CONTROL_BYTES (1 MiB) is a generous ceiling.
-    // Round-18 F5: wrap the seed intermediates in `Zeroizing<...>`
+    // Wrap the seed intermediates in `Zeroizing<...>`
     // so their memory is zeroed on drop rather than leaking a
     // recoverable copy in freed heap / stack slots (visible to a
     // core dump, minidump upload, or kdump crashkernel image).
@@ -1421,7 +1420,7 @@ fn read_signer(path: &Path) -> Result<Ed25519Signer> {
             .with_context(|| format!("read signing seed {}", path.display()))?,
     );
     let bytes = Zeroizing::new(hex::decode(encoded.trim()).context("decode signing seed as hex")?);
-    // Round-19 F1: copy directly from the Zeroizing<Vec<u8>> slice
+    // Copy directly from the Zeroizing<Vec<u8>> slice
     // into a fresh Zeroizing<[u8; 32]>. Historically we did
     // `(*bytes).clone().try_into()` which materialized a bare
     // `Vec<u8>` intermediate and (on `try_into` failure) an
@@ -1433,7 +1432,7 @@ fn read_signer(path: &Path) -> Result<Ed25519Signer> {
         <[u8; 32]>::try_from(bytes.as_slice())
             .map_err(|_| anyhow::anyhow!("signing seed must contain exactly 32 bytes"))?,
     );
-    // Round-14: refuse known-weak Ed25519 seeds. An all-zero seed
+    // Refuse known-weak Ed25519 seeds. An all-zero seed
     // produces a valid keypair with a globally-known public key — any
     // attacker who knows we accepted `[0; 32]` can forge receipts
     // that verify against our key id. Same for the all-`0xFF` seed
@@ -1464,11 +1463,11 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
     std::fs::create_dir_all(parent)
         .with_context(|| format!("create signing seed directory {}", parent.display()))?;
     let temporary = parent.join(format!(".signing-seed-{}.tmp", av_core::new_event_uid()));
-    // Round-12 F4: previously an early `?` return from write_all or
+    // Previously an early `?` return from write_all or
     // sync_all would orphan the temp file. The two `Err(...)` match
     // arms of `hard_link` explicitly removed it, but the earlier
-    // failure paths did not. Use the same TempPathGuard RAII the
-    // round-11 fix landed for `write_atomic` so every failure path
+    // failure paths did not. Use the same TempPathGuard RAII
+    // that `write_atomic` uses so every failure path
     // unlinks — this is a startup-only code path, but leaving an
     // orphan means every subsequent boot leaves another zero-byte
     // `.signing-seed-*.tmp` alongside the real seed, and a nervous
@@ -1491,7 +1490,7 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
         .with_context(|| format!("sync signing seed temporary file {}", temporary.display()))?;
     match std::fs::hard_link(&temporary, path) {
         Ok(()) => {
-            // Round-13 F4: the seed IS installed at `path` at this
+            // The seed IS installed at `path` at this
             // point (hard_link committed). Degrade the remaining
             // best-effort ops (tmp unlink, parent fsync) to warn
             // rather than returning Err — otherwise a spurious EIO on
@@ -1567,7 +1566,7 @@ async fn shutdown_signal() {
             }
             _ = terminate.recv() => {}
         }
-        // Round-34 F2: force-exit on a second signal. Once the first
+        // force-exit on a second signal. Once the first
         // signal fires and this fn returns, the tokio handlers stay
         // registered process-wide — the OS default action never runs
         // and subsequent SIGTERM / SIGINT are silently consumed by
@@ -1707,7 +1706,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(path).unwrap().trim().len(), 64);
     }
 
-    /// Round-14: a signing seed of all zeros produces a valid Ed25519
+    /// A signing seed of all zeros produces a valid Ed25519
     /// keypair with a globally-known public key. Any attacker who
     /// realized we accepted `[0; 32]` could forge receipts that verify
     /// under the resulting key id. Fail closed at startup rather than
@@ -1938,7 +1937,7 @@ mod tests {
         );
     }
 
-    /// Round-12: a compromised or misconfigured JWKS host that returns a
+    /// A compromised or misconfigured JWKS host that returns a
     /// gigantic body must not OOM the harness. Serve 8 MiB (double the
     /// 4 MiB cap) and assert the refresh returns an error whose text
     /// mentions the cap so ops can identify the failure mode.
@@ -1978,7 +1977,7 @@ mod tests {
             text.contains("4194304"),
             "expected cap size in error, got: {text}"
         );
-        // Round-35 F2: the returned error MUST NOT contain the URL.
+        // The returned error MUST NOT contain the URL.
         // anyhow's Display walks the whole context chain; if any
         // `.with_context(|| format!("... {url}"))` or
         // `anyhow::bail!("... {url} ...")` slipped back into
@@ -1986,8 +1985,7 @@ mod tests {
         // sequence "://" is the tightest proxy for "any URL leaked".
         assert!(
             !text.contains("://"),
-            "refresh_jwks error must be URL-free (JWKS URL is enterprise-topology-sensitive; \
-             see round-35 F2). Got: {text}"
+            "refresh_jwks error must be URL-free (JWKS URL is enterprise-topology-sensitive). Got: {text}"
         );
         assert!(
             !text.contains(&addr.to_string()),
@@ -2003,13 +2001,13 @@ mod tests {
         server.abort();
     }
 
-    /// Round-36 F2: assert the URL-free posture on the reqwest-error
+    /// Assert the URL-free posture on the reqwest-error
     /// branches (`.send()` connect failure, `.error_for_status()`
-    /// non-2xx). Round-35 F2's tests only covered
+    /// non-2xx). Earlier tests only covered
     /// `anyhow::bail!("... exceeded ...")` — the two paths above
     /// wrapped a `reqwest::Error` whose Display embeds the URL,
-    /// and the round-35 `.context("...")` prepend did NOT strip it.
-    /// The round-36 fix converts via `reqwest::Error::without_url`
+    /// and a `.context("...")` prepend did NOT strip it.
+    /// The fix converts via `reqwest::Error::without_url`
     /// before the anyhow wrap; this test locks it in for both
     /// branches by pointing refresh_jwks at:
     ///   (a) a socket that immediately closes (send failure), and
@@ -2218,7 +2216,7 @@ mod tests {
         }))
         .unwrap();
         assert!(!sandbox.check(&store, "session", &unknown).is_allowed());
-        // Round-6 (hunt5 config F1): the default policy threshold now
+        // The default policy threshold now
         // matches the default max_request_bytes (4 MiB). A payload in
         // the 1–4 MiB band — which the HTTP body limit admits — must
         // NOT be policy-blocked anymore.
