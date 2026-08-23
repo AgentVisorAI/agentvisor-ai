@@ -55,7 +55,13 @@ const DANGEROUS_CODEPOINTS: &[char] = &[
 /// True if `s` carries any character that visually reorders or hides
 /// surrounding text (Trojan-Source-class spoofing).
 pub fn contains_bidi_or_zero_width(s: &str) -> bool {
-    s.chars().any(|c| DANGEROUS_CODEPOINTS.contains(&c))
+    s.chars().any(is_bidi_or_zero_width)
+}
+
+/// True if `c` is one of the [`DANGEROUS_CODEPOINTS`] — the per-character
+/// form for callers that sanitize (replace) rather than refuse.
+pub fn is_bidi_or_zero_width(c: char) -> bool {
+    DANGEROUS_CODEPOINTS.contains(&c)
 }
 
 #[cfg(test)]

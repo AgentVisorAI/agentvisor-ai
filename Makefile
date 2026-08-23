@@ -1,4 +1,4 @@
-.PHONY: fmt fmt-check lint lint-all-features test test-fast test-all bench sla schema-check compose-check ci doc clean run doctor
+.PHONY: fmt fmt-check lint lint-all-features test test-fast test-all bench fuzz-smoke sla schema-check compose-check ci doc clean run doctor
 
 run:
 	cargo run -p av-harness --bin agentvisord
@@ -36,6 +36,13 @@ sla:
 
 bench:
 	cargo bench --workspace
+
+# Fuzz smoke: 60 s per libFuzzer target (see fuzz/README.md). Needs a
+# nightly toolchain and cargo-fuzz; deliberately not part of `make ci`.
+fuzz-smoke:
+	cd fuzz && for target in canonicalize_receipt_subject parse_provider_chunk sse_frame_end parse_tool_call; do \
+		cargo +nightly fuzz run $$target -- -max_total_time=60 || exit 1; \
+	done
 
 doc:
 	RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D warnings" cargo doc --workspace --all-features --no-deps

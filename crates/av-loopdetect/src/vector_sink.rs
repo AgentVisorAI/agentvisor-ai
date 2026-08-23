@@ -189,7 +189,13 @@ impl VectorSink for QdrantVectorSink {
             else {
                 return Ok(None);
             };
-            if !score.is_finite() || !(-1.0..=1.000_001).contains(&score) {
+            // Cosine similarity is mathematically bounded to [-1, 1];
+            // Qdrant's f64 dot products of unit-normalized f32 vectors
+            // drift by ~1e-6 in EITHER direction, so the slop must be
+            // symmetric: a legitimate antipodal score of -1.0000003 is
+            // as valid as an identical-vector score of +1.0000003.
+            // Truly wild values (a compromised Qdrant) still error out.
+            if !score.is_finite() || !(-1.000_001..=1.000_001).contains(&score) {
                 return Err(format!("Qdrant returned invalid cosine score {score}"));
             }
             #[allow(clippy::cast_possible_truncation)]

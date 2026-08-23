@@ -426,7 +426,12 @@ fn read_capped_str(path: &Path, max_bytes: u64, label: &str) -> Result<String> {
 /// window title, or poison paste buffers on vulnerable emulators —
 /// CVE-2003-0063 class). Replace every control byte (C0 except TAB,
 /// DEL, and every C1) with U+FFFD before it flows into
-/// println!/eprintln!.
+/// println!/eprintln!. Also replace the Trojan-Source family
+/// (CVE-2021-42574: bidi overrides/isolates, zero-width glyphs, and
+/// the U+2028/U+2029 line separators — av-core's shared dangerous
+/// set): a receipt id like "safe\u{202E}suoicilam" would otherwise
+/// render reversed, letting two visually identical ids differ on
+/// the wire.
 fn sanitize_for_terminal(input: &str) -> String {
     input
         .chars()
@@ -437,7 +442,11 @@ fn sanitize_for_terminal(input: &str) -> String {
             // themselves before this function sees the string.
             if cp == 0x09 {
                 c
-            } else if cp < 0x20 || cp == 0x7f || (0x80..=0x9f).contains(&cp) {
+            } else if cp < 0x20
+                || cp == 0x7f
+                || (0x80..=0x9f).contains(&cp)
+                || av_core::text::is_bidi_or_zero_width(c)
+            {
                 '\u{FFFD}'
             } else {
                 c
@@ -678,11 +687,16 @@ async fn session_promote(base_url: &str, id: &str, token_file: Option<&Path>) ->
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .connect_timeout(std::time::Duration::from_secs(5))
+        // Never follow redirects: the request carries bearer_auth, and a
+        // 3xx from an in-path proxy would silently re-send the NHI token
+        // to whatever the Location header names. Matches every other
+        // credential-bearing client in this crate (doctor, health).
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("build promotion client")?;
     let mut request = client.post(url);
-    if let Some(token) = token {
-        request = request.bearer_auth(token);
+    if let Some(token) = token.as_ref() {
+        request = request.bearer_auth(token.as_str());
     }
     let response = request.send().await.context("promote session")?;
     let status = response.status();
@@ -810,10 +824,14 @@ async fn loadgen(
         .pool_max_idle_per_host(connections.min(1024))
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(5))
+        // No redirects: requests may carry bearer_auth (token leak on a
+        // proxy-injected 3xx), and following one would silently measure
+        // the redirect target instead of the configured endpoint.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("build loadgen client")?;
     let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
-    let token = bearer_token(token_file)?.map(Arc::<str>::from);
+    let token = bearer_token(token_file)?.map(Arc::new);
     // Unique per run: reusing ids like `load-0` across runs would bind to
     // sessions a previous run left behind — mid-close ones refuse reuse
     // with 503 "session close is completing" and quarantined ones with a
@@ -838,8 +856,8 @@ async fn loadgen(
                         "stream": true,
                         "messages": [{"role": "user", "content": "health check"}],
                     }));
-                if let Some(token) = token {
-                    request = request.bearer_auth(token);
+                if let Some(token) = token.as_ref() {
+                    request = request.bearer_auth(token.as_str());
                 }
                 let response = request.send().await.map_err(|error| error.to_string())?;
                 let status = response.status();
@@ -898,7 +916,12 @@ async fn loadgen(
     Ok(())
 }
 
-fn bearer_token(path: Option<&Path>) -> Result<Option<String>> {
+/// Read the NHI bearer token into a `Zeroizing` buffer. The token is a
+/// credential at least as sensitive as an API key — every allocation
+/// that holds it (the raw read and the trimmed copy) is zero-on-drop so
+/// a post-run core dump or heap scan does not expose it verbatim.
+/// Mirrors the wizard's `ask_secret_line` discipline (round-38/39).
+fn bearer_token(path: Option<&Path>) -> Result<Option<zeroize::Zeroizing<String>>> {
     let path = path
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("AV_BEARER_TOKEN_FILE").map(PathBuf::from));
@@ -929,8 +952,8 @@ fn bearer_token(path: Option<&Path>) -> Result<Option<String>> {
                 );
             }
         }
-        let token = read_capped_str(&path, MAX_CONFIG_BYTES, "bearer token")?;
-        let token = token.trim().to_owned();
+        let raw = zeroize::Zeroizing::new(read_capped_str(&path, MAX_CONFIG_BYTES, "bearer token")?);
+        let token = zeroize::Zeroizing::new(raw.trim().to_owned());
         if token.is_empty() {
             anyhow::bail!("bearer token file {} is empty", path.display());
         }
@@ -1001,6 +1024,30 @@ mod tests {
         assert_eq!(percentile(&values, 95), 95);
         assert_eq!(percentile(&values, 99), 99);
         assert_eq!(percentile(&[], 99), 0);
+    }
+
+    /// Terminal sanitizer covers both escape classes: CVE-2003-0063
+    /// (C0/C1/DEL control bytes) and CVE-2021-42574 (Trojan-Source bidi
+    /// overrides/isolates + U+2028/U+2029). A receipt id minted by a
+    /// compromised signer must not render reversed or reprogram the
+    /// operator's terminal when echoed by receipt-verify / promote.
+    #[test]
+    fn sanitize_for_terminal_neutralises_controls_and_bidi() {
+        // Control bytes (old coverage, must keep working).
+        assert_eq!(sanitize_for_terminal("a\u{1b}[2Jb"), "a\u{FFFD}[2Jb");
+        assert_eq!(sanitize_for_terminal("a\u{9d}b\u{7f}c"), "a\u{FFFD}b\u{FFFD}c");
+        assert_eq!(sanitize_for_terminal("keep\ttab"), "keep\ttab");
+        // Trojan-Source family: every bidi override/isolate and the
+        // line/paragraph separators are replaced.
+        for c in [
+            '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}',
+            '\u{2069}', '\u{2028}', '\u{2029}', '\u{200B}', '\u{FEFF}',
+        ] {
+            let sanitized = sanitize_for_terminal(&format!("safe{c}payload"));
+            assert_eq!(sanitized, "safe\u{FFFD}payload", "unsanitised {c:?}");
+        }
+        // Legitimate non-ASCII text passes through untouched.
+        assert_eq!(sanitize_for_terminal("réseau 支付 ✓"), "réseau 支付 ✓");
     }
 
     /// Round-23 F1: `install_seed_exclusive` must not leave a tmp
