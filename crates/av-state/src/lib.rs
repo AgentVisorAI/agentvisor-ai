@@ -21,3 +21,136 @@ pub use velocity::TokenVelocity;
 
 #[cfg(feature = "redis")]
 pub mod redis_store;
+
+/// Shared backend-agnostic `StateStore` contract (round-51 §4.2).
+///
+/// EVOLUTION.md promises "new connectors must satisfy the same contract
+/// tests" — previously the in-memory and Redis suites asserted different
+/// things (none of the concurrency-adjacent semantics ran against Redis
+/// at all), so the implementations drifted (TTL, `remove_prefix`).
+/// Every backend's test suite MUST call this one function; backend-
+/// specific behavior (cluster slots, TTL) stays in the backend's own
+/// suite ON TOP of this contract, never instead of it.
+///
+/// `hash_tag` is interpolated into every key inside `{…}` so Redis
+/// Cluster callers keep all contract keys in one slot; in-memory
+/// callers can pass anything unique.
+#[doc(hidden)]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::missing_panics_doc)]
+pub fn state_store_contract(store: &dyn StateStore, hash_tag: &str) {
+    let key = |name: &str| format!("contract:{{{hash_tag}}}:{name}");
+
+    // -- add / get roundtrip; absent key reads 0.
+    let counter = key("counter");
+    assert_eq!(store.get(&counter).unwrap(), 0, "absent key must read 0");
+    assert_eq!(store.add(&counter, 5).unwrap(), 5);
+    assert_eq!(store.add(&counter, 2).unwrap(), 7);
+    assert_eq!(store.get(&counter).unwrap(), 7);
+
+    // -- try_spend: exact-fit passes, one-over refuses, nothing partial.
+    let spend = key("spend");
+    assert!(store.try_spend(&spend, 6, 10).unwrap());
+    assert!(store.try_spend(&spend, 4, 10).unwrap(), "exact fit must pass");
+    assert!(!store.try_spend(&spend, 1, 10).unwrap(), "over-cap must refuse");
+    assert_eq!(
+        store.get(&spend).unwrap(),
+        10,
+        "refused spend must record nothing"
+    );
+
+    // -- try_spend_many: all-or-nothing across dimensions.
+    let dim_a = key("dim-a");
+    let dim_b = key("dim-b");
+    assert_eq!(
+        store
+            .try_spend_many(&[
+                Spend {
+                    key: dim_a.clone(),
+                    amount: 3,
+                    limit: 10
+                },
+                Spend {
+                    key: dim_b.clone(),
+                    amount: 20,
+                    limit: 10
+                },
+            ])
+            .unwrap(),
+        Some(1),
+        "second dimension over-cap must be reported by index"
+    );
+    assert_eq!(
+        store.get(&dim_a).unwrap(),
+        0,
+        "failed multi-spend must commit NOTHING"
+    );
+    assert_eq!(
+        store
+            .try_spend_many(&[
+                Spend {
+                    key: dim_a.clone(),
+                    amount: 3,
+                    limit: 10
+                },
+                Spend {
+                    key: dim_b.clone(),
+                    amount: 4,
+                    limit: 10
+                },
+            ])
+            .unwrap(),
+        None
+    );
+    assert_eq!(store.get(&dim_a).unwrap(), 3);
+    assert_eq!(store.get(&dim_b).unwrap(), 4);
+
+    // -- try_spend_many refuses duplicate keys (API-misuse class).
+    assert!(
+        store
+            .try_spend_many(&[
+                Spend {
+                    key: dim_a.clone(),
+                    amount: 1,
+                    limit: 10
+                },
+                Spend {
+                    key: dim_a.clone(),
+                    amount: 1,
+                    limit: 10
+                },
+            ])
+            .is_err(),
+        "duplicate keys in one multi-spend must be refused, not double-counted"
+    );
+
+    // -- refund: subtracts, saturates at 0, never resurrects a removed key.
+    let refund = key("refund");
+    assert!(store.try_spend(&refund, 7, 10).unwrap());
+    store.refund(&refund, 3);
+    assert_eq!(store.get(&refund).unwrap(), 4, "refund must subtract");
+    store.refund(&refund, 100);
+    assert_eq!(
+        store.get(&refund).unwrap(),
+        0,
+        "refund must clamp at 0, never underflow"
+    );
+    store.remove(&refund);
+    store.refund(&refund, 5);
+    assert_eq!(
+        store.get(&refund).unwrap(),
+        0,
+        "refund after remove must not resurrect the counter"
+    );
+
+    // -- remove / remove_prefix: whole-session cleanup.
+    store.remove(&counter);
+    assert_eq!(store.get(&counter).unwrap(), 0);
+    store.remove_prefix(&key(""));
+    assert_eq!(
+        store.get(&spend).unwrap(),
+        0,
+        "remove_prefix must clear every key under the prefix (native TTL is NOT a substitute: a recycled session id would inherit the prior incarnation's counters)"
+    );
+    assert_eq!(store.get(&dim_a).unwrap(), 0);
+    assert_eq!(store.get(&dim_b).unwrap(), 0);
+}
