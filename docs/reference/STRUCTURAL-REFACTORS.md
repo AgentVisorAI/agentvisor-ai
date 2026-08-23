@@ -229,6 +229,16 @@ not a lifecycle marker.
      step 3.
 3. Delete the flags in reverse order once every reader/writer uses
    the enum.
+   * ✅ LANDED (round-51 pass 20): the `artifact_committed` and
+     `close_complete` fields are deleted; the enum is the single
+     holder of chain state, `transition` (no longer a shadow)
+     REFUSES illegal transitions in release and panics in debug.
+     S2 is complete. Kept outside the chain, per the step-1
+     findings: the `closed` claim flag (a claim lock that toggles
+     after seal during failed close-tail retries — analogous to the
+     plan's `admission_open` exception), `capture_failed` and
+     `promoted` (orthogonal properties, all combinations
+     reachable).
 
 ### Tests that must remain green
 

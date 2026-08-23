@@ -98,14 +98,6 @@ pub struct Session {
     enforcement_tripped: AtomicU64,
     /// Set once closed (idempotent close).
     pub closed: AtomicU64,
-    /// Set once a receipt or ATIF artifact is durably committed.
-    artifact_committed: AtomicU64,
-    /// Set only when a close ran to full completion: artifact committed,
-    /// lifecycle events published, and the on-disk journal removed. Gates
-    /// registry eviction — `artifact_committed` alone is set *before* the
-    /// fallible bridge emits and journal removal, so a failed or in-flight
-    /// close must not look evictable.
-    close_complete: AtomicU64,
     /// Serializes close against request admission.
     admission: RwLock<()>,
     /// Forwarded chat responses that have not completed or aborted.
@@ -124,18 +116,18 @@ pub struct Session {
     jobs_drained: tokio::sync::Notify,
     /// Set when an upstream action could not be captured completely.
     capture_failed: AtomicU64,
-    /// Round-51 §4.2 (S2 step 1): the lifecycle state machine that
-    /// replaces the flag set, shadow-tracked while the flags remain
-    /// authoritative. Every flag setter also advances this via a CAS
-    /// transition; illegal transitions panic in debug builds, so the
-    /// whole test suite validates the model before any reader
-    /// migrates (S2 step 2).
+    /// Round-51 §4.2 (S2): the lifecycle chain state — the single
+    /// holder of Open/Draining/Sealed/Complete, advanced only via
+    /// CAS `transition` calls that name their legal source states.
+    /// The `closed` claim flag above and the orthogonal properties
+    /// (`capture_failed`, `promoted`, admission) deliberately stay
+    /// outside the chain (see `SessionState` docs).
     lifecycle: std::sync::atomic::AtomicU8,
 }
 
-/// Round-51 §4.2 (S2): the session lifecycle chain, held in one
-/// `AtomicU8` and advanced only through CAS transitions that name
-/// their expected source state — illegal transitions become
+/// Round-51 §4.2 (S2, landed): the session lifecycle chain, held in
+/// one `AtomicU8` and advanced only through CAS transitions that
+/// name their expected source state — illegal transitions become
 /// impossible rather than untested.
 ///
 /// Two flags deliberately stay OUTSIDE the chain (mirroring the S2
@@ -228,8 +220,6 @@ impl Session {
             last_stop_reason_id: AtomicU64::new(0),
             enforcement_tripped: AtomicU64::new(0),
             closed: AtomicU64::new(0),
-            artifact_committed: AtomicU64::new(0),
-            close_complete: AtomicU64::new(0),
             admission: RwLock::new(()),
             active_streams: AtomicU64::new(0),
             streams_drained: tokio::sync::Notify::new(),
@@ -328,19 +318,19 @@ impl Session {
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
         if claimed {
-            self.shadow_transition(&[SessionState::Open], SessionState::Draining);
+            self.transition(&[SessionState::Open], SessionState::Draining);
         }
         claimed
     }
 
-    /// The lifecycle chain position (S2 shadow; the flags remain
-    /// authoritative until step 2 migrates readers one at a time).
+    /// The lifecycle chain position.
     pub fn lifecycle_state(&self) -> SessionState {
         SessionState::decode(self.lifecycle.load(Ordering::Acquire))
     }
 
-    /// One CAS transition of the shadow state machine, tolerant of
-    /// two documented behaviors of the authoritative flags:
+    /// One CAS transition of the lifecycle state machine (S2 step 3:
+    /// the enum IS the state; the mirror flags are deleted), tolerant
+    /// of two documented behaviors of the close machinery:
     ///
     /// * **Idempotent/late re-marks** — a current state at or past
     ///   `to` in the chain is a no-op. This covers idempotent flag
@@ -353,11 +343,11 @@ impl Session {
     ///   sessions without a prior claim (Open→Sealed); a live close
     ///   seals under its claim (Draining→Sealed).
     ///
-    /// Any other source state is a model violation: debug builds
-    /// (the entire test suite) panic naming the transition; release
-    /// builds leave the flags — still authoritative in step 1 —
-    /// unaffected.
-    fn shadow_transition(&self, from: &[SessionState], to: SessionState) {
+    /// Any other source state is a model violation: the transition
+    /// is REFUSED (the CAS never fires — illegal transitions are
+    /// impossible, not merely untested), and debug builds (the
+    /// entire test suite) additionally panic naming the transition.
+    fn transition(&self, from: &[SessionState], to: SessionState) {
         let mut current = self.lifecycle.load(Ordering::Acquire);
         loop {
             let state = SessionState::decode(current);
@@ -384,9 +374,8 @@ impl Session {
     }
 
     /// True when closed: the close claim is held (`closed` — a claim
-    /// flag, not a chain position; see `shadow_transition`) or the
-    /// lifecycle chain is at/past Sealed (S2 step 2: the enum is
-    /// authoritative for chain positions).
+    /// flag, not a chain position; see `transition`) or the
+    /// lifecycle chain is at/past Sealed.
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire) != 0
             || matches!(
@@ -415,12 +404,10 @@ impl Session {
 
     pub(crate) fn reset_close(&self) {
         self.closed.store(0, Ordering::Release);
-        self.shadow_transition(&[SessionState::Draining], SessionState::Open);
+        self.transition(&[SessionState::Draining], SessionState::Open);
     }
 
-    /// True once the receipt/ATIF artifact is durably persisted
-    /// (S2 step 2: read from the lifecycle enum; the legacy flag is a
-    /// write-only mirror until step 3).
+    /// True once the receipt/ATIF artifact is durably persisted.
     pub fn artifact_committed_flag(&self) -> bool {
         matches!(
             self.lifecycle_state(),
@@ -429,28 +416,27 @@ impl Session {
     }
 
     /// True once the close ran to full completion (journal removed).
-    /// (S2 step 2: read from the lifecycle enum.)
     pub fn close_complete_flag(&self) -> bool {
         self.lifecycle_state() == SessionState::Complete
     }
 
+    /// Mark the receipt/ATIF artifact durably committed (S2 step 3:
+    /// the lifecycle enum is the only holder of this state; note the
+    /// Sealed→Complete split exists because the artifact commits
+    /// BEFORE the fallible close tail — bridge emits + journal
+    /// removal — so a failed or in-flight close must not look
+    /// evictable).
     pub(crate) fn mark_artifact_committed(&self) {
-        // S2 step 2: the enum advances FIRST — readers are on the
-        // enum now, so they must never observe the mirror flag ahead
-        // of the state. The flag is a write-only mirror kept until
-        // step 3 deletes it.
-        self.shadow_transition(
+        self.transition(
             &[SessionState::Open, SessionState::Draining],
             SessionState::Sealed,
         );
-        self.artifact_committed.store(1, Ordering::Release);
     }
 
     /// Record that a close ran to full completion (journal and outboxes
     /// removed). Only such sessions may be evicted from the registry.
     pub(crate) fn mark_close_complete(&self) {
-        self.shadow_transition(&[SessionState::Sealed], SessionState::Complete);
-        self.close_complete.store(1, Ordering::Release);
+        self.transition(&[SessionState::Sealed], SessionState::Complete);
     }
 
     pub(crate) async fn wait_for_streams(&self) {
@@ -524,8 +510,8 @@ impl Session {
         session.restore_next_seq(next_seq);
         // A recovered artifact is by definition past close: claim the
         // close (fresh session — the claim cannot fail) and seal, so
-        // the S2 shadow walks the same Open→Draining→Sealed chain a
-        // live close does.
+        // the lifecycle chain walks the same Open→Draining→Sealed
+        // path a live close does.
         let claimed = session.try_close();
         debug_assert!(claimed, "recover_unsigned starts from a fresh session");
         session.mark_artifact_committed();
@@ -1174,13 +1160,12 @@ mod tests {
         }
     }
 
-    /// Round-51 §4.2 (S2 step 1): the shadow state machine walks the
-    /// close chain in lockstep with the authoritative flags, and a
-    /// failed finalize returns to Open. The debug asserts inside
-    /// `shadow_transition` extend this check to every test in the
-    /// suite; this test pins the happy chain explicitly.
+    /// Round-51 §4.2 (S2): the lifecycle state machine walks the
+    /// close chain, and a failed finalize returns to Open. The debug
+    /// asserts inside `transition` extend this check to every test
+    /// in the suite; this test pins the happy chain explicitly.
     #[test]
-    fn lifecycle_shadow_walks_the_close_chain() {
+    fn lifecycle_walks_the_close_chain() {
         let session = Session::new(
             "s2".into(),
             Workflow::Unsigned,
@@ -1209,7 +1194,7 @@ mod tests {
     /// A second `try_close` must not double-claim, and must leave the
     /// state untouched.
     #[test]
-    fn lifecycle_shadow_refuses_double_close_claim() {
+    fn lifecycle_refuses_double_close_claim() {
         let session = Session::new(
             "s2b".into(),
             Workflow::Unsigned,
