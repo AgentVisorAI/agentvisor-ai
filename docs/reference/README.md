@@ -19,9 +19,13 @@ the latter, start with `ARCHITECTURE.md` at the repo root.
   inventory of the ATIF spool, what the reconciler does on every
   tick, and the three tight races the current fixes address.
 * [`STRUCTURAL-REFACTORS.md`](STRUCTURAL-REFACTORS.md) — design
-  notes for the three round-51 structural asks (reconciler
-  decomposition, lifecycle state machine, provider adapter trait)
-  that are deferred but should be picked up in future cycles.
+  notes and landed-status for the three round-51 structural asks
+  (reconciler decomposition, lifecycle state machine, provider
+  adapter trait — all three are now landed; each entry records how).
+* [`REVIEW-51-REMEDIATION.md`](REVIEW-51-REMEDIATION.md) —
+  finding-by-finding closure map for the round-51 external
+  engineering review: every finding's fix mechanism, and the two
+  deliberately deferred items with their rationale.
 * [`LIMITS.md`](LIMITS.md) — hard ceilings enforced by the harness and
   the refusal points on request size, budgets, loops, and
   compression.
