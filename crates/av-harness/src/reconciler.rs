@@ -2365,33 +2365,31 @@ impl Finalizer {
                 .validate_tool_accounting()
                 .map_err(|reason| FinalizeError::Atif(format!("unsigned {reason}")))?;
             if !pending_responses.is_empty() {
-                let quarantined = Session::new(
-                    session_id.to_owned(),
-                    Workflow::Unsigned,
-                    latest_identity,
-                    breaker.clone(),
-                );
-                quarantined.restore_journal_index(journal_len);
-                quarantined.restore_next_seq(journal_len);
-                folded.store_on(&quarantined.totals);
-                quarantined.mark_capture_failed();
+                // Convert the already-claimed placeholder into the
+                // quarantined session IN PLACE — same discipline as the
+                // quarantined-already branch above. The old shape built a
+                // fresh `Session::new` and `try_insert_recovered` it,
+                // which ALWAYS collided with our own placeholder (claimed
+                // at the top of this candidate before any destructive
+                // step): the Err arm logged "session already active",
+                // skipped the `quarantined_sessions` insert, and the
+                // guard-release below then removed the placeholder — so
+                // the session never converged, the step journal was never
+                // consumed, and every reconciler tick repeated the same
+                // silent skip forever.
+                claimed.refresh_identity(&latest_identity);
+                claimed.restore_journal_index(journal_len);
+                claimed.restore_next_seq(journal_len);
+                folded.store_on(&claimed.totals);
+                claimed.mark_capture_failed();
                 // Also seal the session finalized so the idle sweeper's
                 // `!is_closed()` filter skips it — same reasoning as the
                 // quarantined-already branch above.
-                quarantined.mark_artifact_committed();
-                // Quarantine only after we know a fresh session was actually installed —
-                // a live session with the same id must not inherit this capture-failed verdict.
-                match sessions.try_insert_recovered(quarantined) {
-                    Ok(_) => {
-                        self.quarantined_sessions.lock().insert(session_id.to_owned());
-                    }
-                    Err(_active) => {
-                        tracing::info!(
-                            session = %session_id,
-                            "unsigned quarantine skipped: session already active",
-                        );
-                    }
-                }
+                claimed.mark_artifact_committed();
+                self.quarantined_sessions.lock().insert(session_id.to_owned());
+                // The converted session must stay registered — do not
+                // release the claim on this path.
+                claimed_session = None;
                 return Ok(());
             }
             let mut trajectory = builder.finish();
