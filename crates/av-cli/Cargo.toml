@@ -15,6 +15,22 @@ categories.workspace = true
 name = "avctl"
 path = "src/main.rs"
 
+# Round-51 §8.10: passthrough features so `--features full` (and the
+# per-backend features) apply to avctl exactly as they do to
+# agentvisord — avctl's pre-flight checks (config-validate, doctor)
+# report what its own build can run, so the two binaries must be
+# buildable with matching feature sets in one invocation.
+[features]
+default = []
+redis = ["av-harness/redis"]
+nats = ["av-harness/nats"]
+kafka = ["av-harness/kafka"]
+onnx = ["av-harness/onnx"]
+qdrant = ["av-harness/qdrant"]
+cold-store-aws = ["av-harness/cold-store-aws"]
+otel = ["av-harness/otel"]
+full = ["redis", "nats", "kafka", "onnx", "qdrant", "cold-store-aws", "otel"]
+
 [dependencies]
 av-core = { workspace = true }
 av-events = { workspace = true }

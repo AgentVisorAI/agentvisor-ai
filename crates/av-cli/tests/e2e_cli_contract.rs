@@ -317,6 +317,39 @@ fn config_validate_success_reports_config_version_and_listen() {
     assert!(s.contains("listen="), "expected listen=, got {s}");
 }
 
+/// Round-51 §8.10: a shape-valid config selecting a backend this
+/// build was compiled without must FAIL pre-flight — previously
+/// `config-validate` printed "valid" and the daemon then hard-failed
+/// at boot. Gated on the build actually lacking kafka (under
+/// `--all-features` the backend genuinely runs, so the refusal —
+/// and this test — do not apply).
+#[cfg(not(feature = "kafka"))]
+#[test]
+fn config_validate_refuses_backends_this_build_cannot_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kafka.toml");
+    std::fs::write(
+        &path,
+        concat!(
+            "upstream_url = \"http://127.0.0.1:9\"\n",
+            "bridge_backend = \"kafka\"\n",
+            "bridge_endpoint = \"localhost:9092\"\n",
+        ),
+    )
+    .unwrap();
+    let out = run(&["config-validate", path.to_str().unwrap()]);
+    assert!(
+        !out.status.success(),
+        "config-validate must refuse a backend this build cannot run; stdout: {}",
+        stdout(&out)
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("kafka") && err.contains("cargo feature"),
+        "refusal must name the backend and the missing cargo feature, got: {err}"
+    );
+}
+
 #[test]
 fn manifest_validate_success_reports_name_and_topic_count() {
     let dir = tempfile::tempdir().unwrap();
