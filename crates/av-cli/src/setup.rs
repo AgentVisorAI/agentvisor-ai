@@ -1578,7 +1578,8 @@ pub async fn doctor(offline: bool) -> Result<()> {
 
         // 9c. Round-51 §9.4: the three checkout-path footguns doctor
         // used to miss entirely.
-        if !config.listen.starts_with("127.0.0.1") && !config.listen.starts_with("localhost") {
+        let loopback = listen_is_loopback(&config.listen);
+        if !loopback {
             checks.push(Check::Warn(format!(
                 "listen = {:?} is not loopback: anyone who can reach this address gets a \
                  fully-authenticated proxy to your provider account (the key is injected \
@@ -1594,10 +1595,7 @@ pub async fn doctor(offline: bool) -> Result<()> {
                     .to_owned(),
             ));
         }
-        if config.dashboard_enabled
-            && !config.listen.starts_with("127.0.0.1")
-            && !config.listen.starts_with("localhost")
-        {
+        if config.dashboard_enabled && !loopback {
             checks.push(Check::Warn(format!(
                 "dashboard_enabled = true with non-loopback listen {:?}: /dashboard and \
                  /api/v1/dashboard/* are UNAUTHENTICATED and expose per-session identity, \
@@ -1854,7 +1852,11 @@ fn probe_target(endpoint: &str) -> Result<String> {
                 let port = tail.strip_prefix(':').and_then(|p| p.parse::<u16>().ok());
                 (format!("[{h}]"), port)
             }
-            None => (host_and_port.to_owned(), None),
+            // An opening bracket with no close is a config typo; falling
+            // through used to hand "[::1:6379" to TcpStream::connect,
+            // whose deep parse error misled the operator about the real
+            // defect (the unbalanced bracket in the endpoint).
+            None => anyhow::bail!("malformed IPv6 authority (missing ']') in {host_and_port:?}"),
         }
     } else {
         match host_and_port.rsplit_once(':') {
@@ -1879,6 +1881,19 @@ fn probe_target(endpoint: &str) -> Result<String> {
         anyhow::bail!("no host in endpoint");
     }
     Ok(format!("{host}:{port}"))
+}
+
+/// "Is this listen address reachable off-host?" — answered by parsing
+/// the address, not by string prefix: `[::1]:8484` IS loopback (the old
+/// `starts_with("127.0.0.1")` test warned on it, training operators to
+/// ignore that warning class and miss the real one on `[::]:8484`).
+/// The `localhost` prefix heuristic is kept only for the
+/// unparsable-hostname form.
+fn listen_is_loopback(listen: &str) -> bool {
+    listen
+        .parse::<std::net::SocketAddr>()
+        .map(|addr| addr.ip().is_loopback())
+        .unwrap_or_else(|_| listen.starts_with("localhost"))
 }
 
 /// Round-40 F2: parse the operator-configured listen address into a
@@ -2492,6 +2507,27 @@ mod tests {
         // Userinfo combined with a path containing '@' still strips
         // only the real credentials.
         assert_eq!(probe_target("http://u:p@h:8080/p@th").unwrap(), "h:8080");
+        // An unbalanced IPv6 bracket is a config typo: refuse loudly
+        // instead of handing "[::1:6379" to TcpStream::connect, whose
+        // deep parse error misleads the operator about the real defect.
+        assert!(probe_target("redis://[::1").is_err());
+        assert!(probe_target("[2001:db8::5").is_err());
+    }
+
+    /// Doctor's off-host-reachability warnings must classify by parsing
+    /// the address, not by string prefix: `[::1]:8484` is loopback (the
+    /// old prefix test false-positived on it), `[::]`/`0.0.0.0` binds
+    /// and concrete interface addresses are not.
+    #[test]
+    fn listen_is_loopback_classifies_by_address_not_prefix() {
+        assert!(listen_is_loopback("127.0.0.1:8484"));
+        assert!(listen_is_loopback("[::1]:8484"));
+        assert!(listen_is_loopback("localhost:8484"));
+        assert!(!listen_is_loopback("0.0.0.0:8484"));
+        assert!(!listen_is_loopback("[::]:8484"));
+        assert!(!listen_is_loopback("[2001:db8::5]:8484"));
+        assert!(!listen_is_loopback("10.1.2.3:8484"));
+        assert!(!listen_is_loopback("mycorp.internal:8484"));
     }
 
     /// Round-40 F2: `build_probe_base` handles the four listen-form

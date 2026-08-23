@@ -37,7 +37,7 @@ cargo +nightly fuzz run parse_provider_chunk fuzz/artifacts/parse_provider_chunk
 ## CI
 
 The fuzz suite is NOT part of the default `make ci` target — it needs
-a nightly toolchain and time. Run the smoke variant (10 minutes per
+a nightly toolchain and time. Run the smoke variant (60 seconds per
 target) with:
 
 ```
