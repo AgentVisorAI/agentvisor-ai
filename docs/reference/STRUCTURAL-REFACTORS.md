@@ -73,10 +73,17 @@ pass registry internally.
    applications to identical results. This also unblocks the
    provider prompt-token reconciliation (a correction record now has
    ONE fold to teach).
-2. **Extract the QuarantineOrphanJsonPass second.** This one is
-   the simplest (§8.5 fix is a self-contained snapshot + gate), has
-   clear success criteria (existing tests keep passing), and is
-   independent of the accounting folds.
+2. **Extract the QuarantineOrphanJsonPass second.** ✅ LANDED
+   (round-51 pass 12): `crates/av-harness/src/recovery.rs` hosts the
+   `RecoveryPass` trait, the narrow `ReconcilerContext` (spool dir,
+   metrics, known-stems snapshot, warn-once dedupe — passes cannot
+   reach locks/signer/bridge unless a field is deliberately added),
+   the `passes()` registry, and the first extracted pass: the §8.5
+   orphan-JSON quarantine with its live-stem and MIN_ORPHAN_AGE
+   guards. `recover_spooled_sessions` runs the registry before its
+   adoption scan; the adoption loop keeps only the cheap
+   "never parse unauthenticated bytes" skip. Pass-level unit tests
+   pin the contract independently of the Finalizer wiring.
 3. **Extract each other pass one at a time**, keeping the
    `recover_spooled_sessions` method as a thin loop over the pass
    registry. Do NOT combine steps: each pass extraction is one PR

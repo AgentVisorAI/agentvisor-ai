@@ -1163,8 +1163,31 @@ impl Finalizer {
         // guard set: the sweep must not quarantine a sidecar-less
         // `{stem}.json` whose stem belongs to a live session (an
         // in-progress close between write_atomic and the sidecar
-        // seal). The MIN_ORPHAN_AGE guard below is defense-in-depth
-        // for sessions opened after this snapshot.
+        // seal). The MIN_ORPHAN_AGE guard inside the quarantine pass
+        // is defense-in-depth for sessions opened after this snapshot.
+        //
+        // S1 step 2 (round-51 §4.2): concerns extracted from this
+        // method run as `RecoveryPass`es over a narrow context; the
+        // orphan-JSON quarantine (§8.5 / round-44 F4) is the first.
+        // Each future extraction appends to `recovery::passes()`
+        // until this method is a thin loop over the registry.
+        let warn_once = |path: PathBuf| self.warn_once(path);
+        let ctx = crate::recovery::ReconcilerContext {
+            spool_dir: &self.spool_dir,
+            metrics: &self.metrics,
+            known_stems: &known_stems,
+            warn_once: &warn_once,
+        };
+        for pass in crate::recovery::passes() {
+            let outcome = pass.run(&ctx).await?;
+            if outcome.quarantined > 0 {
+                tracing::info!(
+                    pass = pass.name(),
+                    quarantined = outcome.quarantined,
+                    "recovery pass quarantined spool files"
+                );
+            }
+        }
         while let Some(entry) = entries
             .next_entry()
             .await
@@ -1205,99 +1228,12 @@ impl Finalizer {
             // starving lifecycle-outbox replay, close completion,
             // promotion retry, and idle eviction.
             //
-            // Round-44 F4: quarantine sidecar-less files after the warn
-            // so per-tick cost is bounded to a single stat+rename per
-            // file, regardless of how many the attacker plants or how
-            // long a crash-torn orphan persists. Data cannot be
-            // authenticated without a `journal_key`-signed sidecar (an
-            // attacker-planted trajectory would forge a session's
-            // audit trail if we generated a sidecar from bytes on
-            // recovery), so orphaned trajectories are unrecoverable by
-            // design; renaming to `<name>.corrupt-<uid>` moves them
-            // out of the recovery scan glob (the `.json` extension
-            // filter at the top of this scan loop rejects the
-            // renamed file) while preserving
-            // the bytes for operator forensic inspection.
+            // S1 step 2: the quarantine of aged orphans (round-44 F4 /
+            // §8.5, with the live-stem + MIN_ORPHAN_AGE guards) now
+            // lives in `recovery::QuarantineOrphanJsonPass`, run above.
+            // The adoption scan only enforces the invariant that
+            // unauthenticated bytes are never read or parsed.
             if !path.with_extension("atif-auth").exists() {
-                // Round-51: skip files whose stem belongs to a live
-                // session — an in-progress close writes `{stem}.json`
-                // and then seals `.atif-auth` moments later; the
-                // reconciler must not race that close by quarantining
-                // the fresh artifact. Defense in depth with the
-                // MIN_ORPHAN_AGE guard below (which handles sessions
-                // opened after the snapshot).
-                let stem_owned = path
-                    .file_stem()
-                    .and_then(std::ffi::OsStr::to_str)
-                    .map(str::to_owned);
-                if stem_owned
-                    .as_deref()
-                    .is_some_and(|stem| known_stems.contains(stem))
-                {
-                    continue;
-                }
-                // Live-race guard (round-16 stress finding): a sidecar-less
-                // `{stem}.json` is ALSO the normal transient state of an
-                // in-flight close — `close_session_locked` writes the ATIF
-                // via `write_atomic` and seals `.atif-auth` moments later.
-                // A reconciler tick landing in that window used to rename
-                // the fresh artifact to `.corrupt-<uid>`, ripping it out
-                // from under the close (its provenance step then fails,
-                // racing promotes 500, and the artifact is orphaned as
-                // "corrupt" forensics). Only quarantine files old enough
-                // that no live close can still be mid-window; young files
-                // are skipped this tick at the cost of a single stat, so
-                // the round-44 F1/F4 per-tick cost bounds are preserved.
-                const MIN_ORPHAN_AGE: std::time::Duration = std::time::Duration::from_secs(60);
-                let age = tokio::fs::metadata(&path)
-                    .await
-                    .ok()
-                    .and_then(|meta| meta.modified().ok())
-                    .and_then(|mtime| std::time::SystemTime::now().duration_since(mtime).ok());
-                // Only quarantine when the age is DETERMINATELY past the
-                // threshold. An indeterminate age (stat error, or a future
-                // mtime after a backward clock step — NTP correction, VM
-                // resume) must count as young: treating it as old would
-                // quarantine a fresh in-flight-close artifact and recreate
-                // the exact race this guard exists to prevent. The skip
-                // costs one stat per tick — the same bound accepted above.
-                if !age.is_some_and(|age| age >= MIN_ORPHAN_AGE) {
-                    continue;
-                }
-                self.metrics
-                    .counter(
-                        "av_atif_recovery_skipped_total{reason=\"unauthenticated\"}",
-                        "ATIF spool files skipped during recovery",
-                    )
-                    .inc();
-                let mut quarantine = path.clone();
-                let stem = quarantine
-                    .file_name()
-                    .and_then(std::ffi::OsStr::to_str)
-                    .unwrap_or("orphan-atif")
-                    .to_owned();
-                let new_name = format!("{stem}.corrupt-{}", av_core::new_event_uid());
-                quarantine.set_file_name(new_name);
-                match tokio::fs::rename(&path, &quarantine).await {
-                    Ok(()) => {
-                        if self.warn_once(quarantine.clone()) {
-                            tracing::warn!(
-                                original = %av_core::fsutil::basename(&path),
-                                quarantine = %av_core::fsutil::basename(&quarantine),
-                                "quarantined ATIF spool file with no authenticated provenance"
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        if self.warn_once(path.clone()) {
-                            tracing::warn!(
-                                %error,
-                                path = %av_core::fsutil::basename(&path),
-                                "failed to quarantine ATIF spool file with no authenticated provenance; will retry next tick"
-                            );
-                        }
-                    }
-                }
                 continue;
             }
             // Bounded read: a hostile ATIF file cannot force recovery to
