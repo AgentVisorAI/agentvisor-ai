@@ -40,6 +40,9 @@ pub(crate) struct ReconcilerContext<'a> {
     /// quarantines: markers stay on disk as evidence, so every tick
     /// rediscovers the same set and must not repeat the warning.
     pub quarantined_sessions: &'a parking_lot::Mutex<HashSet<String>>,
+    /// The lifecycle event bus, when configured. `None` (tests,
+    /// bridge-less deployments) makes bus-dependent passes no-ops.
+    pub bridge: Option<&'a std::sync::Arc<dyn av_bridge::EventBus>>,
     /// Per-artifact warning dedupe (`Finalizer::warn_once`): a file
     /// left on disk as evidence must not repeat its warning every
     /// tick. Returns true when this is the first warn for the path
@@ -71,6 +74,8 @@ impl ReconcilerContext<'_> {
 pub(crate) struct PassOutcome {
     /// Items (files or sessions) newly quarantined this run.
     pub quarantined: usize,
+    /// Lifecycle outboxes published + acked this run.
+    pub replayed: usize,
 }
 
 /// One self-contained concern of the recovery scan. Implementations
@@ -106,6 +111,13 @@ pub(crate) async fn run_pass(
             pass = pass.name(),
             quarantined = outcome.quarantined,
             "recovery pass quarantined items"
+        );
+    }
+    if outcome.replayed > 0 {
+        tracing::info!(
+            pass = pass.name(),
+            replayed = outcome.replayed,
+            "recovery pass replayed lifecycle outboxes"
         );
     }
     Ok(outcome)
@@ -158,6 +170,42 @@ impl RecoveryPass for QuarantineIncompleteEffectsPass {
                 }
                 known.extend(quarantined.iter().cloned());
             }
+            Ok(outcome)
+        })
+    }
+}
+
+/// Second phase of the recovery order: publish + ack every unacked
+/// lifecycle outbox (durable intents persisted by close/promote
+/// before their bus publish). Runs after the incomplete-effects scan
+/// and before journal recovery, matching the historical order: a
+/// replayed close event must precede re-adoption of its session so
+/// downstream consumers observe close-then-recover, not the reverse.
+/// The loop body lives in `reconciler::replay_lifecycle_outboxes_in`
+/// with the rest of the outbox subsystem; this pass owns identity,
+/// ordering and observability. Bridge-less deployments are a no-op.
+pub(crate) struct ReplayLifecycleOutboxesPass;
+
+impl RecoveryPass for ReplayLifecycleOutboxesPass {
+    fn name(&self) -> &'static str {
+        "replay_lifecycle_outboxes"
+    }
+
+    fn run<'a>(
+        &'a self,
+        ctx: &'a ReconcilerContext<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<PassOutcome, FinalizeError>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut outcome = PassOutcome::default();
+            let Some(bridge) = ctx.bridge else {
+                return Ok(outcome);
+            };
+            outcome.replayed = crate::reconciler::replay_lifecycle_outboxes_in(
+                ctx.spool_dir,
+                ctx.journal_key,
+                std::sync::Arc::clone(bridge),
+            )
+            .await?;
             Ok(outcome)
         })
     }
@@ -327,6 +375,7 @@ mod tests {
                 sessions: &self.sessions,
                 journal_key: &self.journal_key,
                 quarantined_sessions: &self.quarantined_sessions,
+                bridge: None,
                 warn_once,
             }
         }
@@ -414,6 +463,9 @@ mod tests {
         let outcome = QuarantineOrphanJsonPass.run(&ctx).await.unwrap();
         assert_eq!(outcome, PassOutcome::default());
         let outcome = QuarantineIncompleteEffectsPass.run(&ctx).await.unwrap();
+        assert_eq!(outcome, PassOutcome::default());
+        // Bridge-less context: the outbox replay pass is a no-op.
+        let outcome = ReplayLifecycleOutboxesPass.run(&ctx).await.unwrap();
         assert_eq!(outcome, PassOutcome::default());
     }
 
