@@ -45,3 +45,9 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check
+          # `--all-features` so bans/advisories cover the vendored
+          # librdkafka admin path (kafka feature) — under default
+          # features the `openssl-sys` wrapper allowlist looks unused
+          # and cargo-deny WARNs, which is noise. With --all-features
+          # the wrapper is actually exercised.
+          arguments: --all-features
