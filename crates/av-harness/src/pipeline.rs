@@ -53,7 +53,7 @@ pub struct AppState {
     pub identity: Option<Arc<IdentityValidator>>,
     /// Prometheus-compatible metrics registry.
     pub metrics: Arc<Registry>,
-    /// Round-51 W4: pre-resolved metric handles for the request hot
+    /// Pre-resolved metric handles for the request hot
     /// path so `observe_stage` doesn't take the registry mutex once
     /// per stage per request. Same series names as the lazy path;
     /// pre-registered at boot in `new_with_backends_and_metrics`.
@@ -76,7 +76,7 @@ pub struct AppState {
     /// journaled in this process but whose `.audited` marker write failed;
     /// a retry must re-attempt the marker without re-emitting the event.
     pub(crate) tool_audits_emitted: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
-    /// Round-51 §4.2 (S3): the upstream provider's wire dialect,
+    /// The upstream provider's wire dialect,
     /// selected by `config.provider` at boot. All SSE/body parsing on
     /// the response path routes through this adapter.
     pub(crate) provider_adapter: Arc<dyn crate::provider::ProviderAdapter>,
@@ -85,9 +85,9 @@ pub struct AppState {
     /// Flips to `true` when shutdown starts. `/readyz` reads this and
     /// reports 503 so a Kubernetes readinessProbe (or any external LB)
     /// stops routing new traffic to a draining pod before axum's
-    /// graceful drain begins. See operability review §8.3.
+    /// graceful drain begins.
     pub draining: Arc<std::sync::atomic::AtomicBool>,
-    /// Round-51 §3.4: sliding one-minute budget for FULL identity-
+    /// Sliding one-minute budget for FULL identity-
     /// rejection audit records (window start, records written).
     /// Rejections beyond the budget are counted only — see
     /// `enqueue_transient_failure`.
@@ -107,7 +107,7 @@ pub struct AppState {
 pub(crate) struct HotMetrics {
     pub(crate) stage_histograms: [Arc<av_core::metrics::Histogram>; 5],
     pub(crate) stage_strict_budget_counters: [Arc<av_core::metrics::Counter>; 5],
-    /// Round-51 §7.3: `config.strict_stage_budget || AV_STRICT_BUDGET`
+    /// `config.strict_stage_budget || AV_STRICT_BUDGET`
     /// resolved ONCE at construction. `std::env::var` was previously
     /// called per stage per request because `||` cannot short-circuit
     /// a false config default.
@@ -381,7 +381,7 @@ pub struct ForwardedResponse {
     /// Provider HTTP response.
     pub response: reqwest::Response,
     /// Prompt tokens debited at admission (post-compression heuristic).
-    /// Round-51 §6.4: the response relay reconciles this against the
+    /// The response relay reconciles this against the
     /// provider's reported `usage.prompt_tokens` — correcting the
     /// session totals and refunding the over-charge.
     pub(crate) billed_prompt_tokens: u64,
@@ -807,7 +807,7 @@ impl AppState {
         metrics.counter("av_sessions_finalized_total", "Sessions finalized");
         metrics.counter("av_sessions_promoted_total", "Unsigned sessions promoted");
         metrics.counter("av_reconcile_errors_total", "Reconciliation errors");
-        // Round-42 F2: pre-register recovery-skipped counters so
+        // pre-register recovery-skipped counters so
         // Prometheus `absent()` alerts do not fire on healthy nodes
         // that have never hit a per-session recovery error, and so
         // dashboards render flat-zero instead of "No data". Each
@@ -815,7 +815,7 @@ impl AppState {
         // is otherwise lazy and only inserts on first `.inc()`.
         metrics.counter(
             "av_signed_recovery_skipped_total",
-            "Signed sessions skipped during recovery due to per-session errors (round-41 F1)",
+            "Signed sessions skipped during recovery due to per-session errors",
         );
         metrics.counter(
             "av_signed_recovery_quarantined_total",
@@ -823,17 +823,17 @@ impl AppState {
         );
         metrics.counter(
             "av_unsigned_recovery_skipped_total",
-            "Unsigned step-journal consolidations skipped during recovery due to per-session errors (round-41 F1)",
+            "Unsigned step-journal consolidations skipped during recovery due to per-session errors",
         );
         metrics.counter(
             "av_atif_trajectory_recovery_skipped_total",
-            "ATIF trajectories skipped during recovery due to per-session errors (round-42 F1)",
+            "ATIF trajectories skipped during recovery due to per-session errors",
         );
         metrics.counter(
             "av_pending_close_completion_failed_total",
-            "Pending-close completions that failed to finish their tail (round-43 F1)",
+            "Pending-close completions that failed to finish their tail",
         );
-        // Round-51 §8.7: pre-register data-plane series so dashboards
+        // pre-register data-plane series so dashboards
         // render flat-zero from boot instead of "No data", and
         // `rate() > 0` alerts can fire the first time the bad thing
         // happens.
@@ -920,7 +920,7 @@ impl AppState {
             Arc::clone(&bridge),
         )
         .with_state_store(Arc::clone(&store))
-        // Round-6 (hunt4 R-F4): closes delete the session's vector-store
+        // Closes delete the session's vector-store
         // points (best-effort).
         .with_vector_sink(Arc::clone(&vector_sink));
         let mut client_builder = reqwest::Client::builder()
@@ -943,13 +943,13 @@ impl AppState {
             // the pool memory footprint and forces frequent-enough
             // TLS refresh under a rolling cert rotation.
             .pool_idle_timeout(std::time::Duration::from_secs(60));
-        // Round-6 (hunt4 protocol F2): reqwest 0.12 is built here
+        // Reqwest 0.12 is built here
         // without decompression features, so the proxy cannot decode any
         // content-coding an origin might apply. RFC 9110 §12.5.3 says
         // an ABSENT Accept-Encoding permits any coding, so a CDN in
         // front of the upstream may legally gzip the response — which
         // the chat path then 502's on and the tool path (with the
-        // round-6 guard applied above) would also refuse. Advertise
+        // decompression guard applied above) would also refuse. Advertise
         // `Accept-Encoding: identity` so the routine outcome is
         // "identity as requested" and the refusal guards are pure
         // defense-in-depth.
@@ -959,7 +959,7 @@ impl AppState {
             reqwest::header::HeaderValue::from_static("identity"),
         );
         client_builder = client_builder.default_headers(default_headers);
-        // Round-32 F4: apply a read-timeout floor unconditionally so an
+        // Apply a read-timeout floor unconditionally so an
         // adversarial or merely broken upstream (chat OR tool) cannot pin
         // a session lease + WorkerPermit + tool-intent claim
         // indefinitely by accepting the request and then never
@@ -1073,8 +1073,8 @@ impl AppState {
             // retry policies ride out the window.
             // Sealed capture-failed quarantines are ALSO closed-but-
             // never-complete — permanently (never recycled, never
-            // evicted). They keep the terminal 400 (round-28 F1:
-            // permanent refusals route to 400 with no Retry-After);
+            // evicted). They keep the terminal 400 (permanent
+            // refusals route to 400 with no Retry-After);
             // the transient 503 below would otherwise instruct SDK
             // retry policies to poll forever against a session that
             // will refuse forever. Checked BEFORE the empty-quarantine
@@ -1399,7 +1399,7 @@ impl AppState {
     /// Run synchronous local gates without waiting for off-path journal,
     /// embedding, or broker work.
     ///
-    /// Round-51 §7.3: the inline/blocking decision keys off PAYLOAD
+    /// The inline/blocking decision keys off PAYLOAD
     /// SIZE, not off whether a token budget happens to be configured.
     /// The cost of `prepare_chat` (parse-adjacent token scanning,
     /// sanitize, compression) is a function of body size — measured
@@ -1556,7 +1556,7 @@ impl AppState {
         // one-to-one-with-request invariant. Fall back to a
         // session-id-derived digest so a hypothetical failure at
         // least keeps distinct sessions distinct.
-        // Round-51 §7.2 (W4): serialize the payload exactly ONCE — the
+        // Serialize the payload exactly ONCE — the
         // bytes feed both the request digest and the upstream body.
         // Previously `serde_json::to_vec` here and reqwest's
         // `.json(&payload)` one screen apart produced identical bytes
@@ -1576,7 +1576,7 @@ impl AppState {
             Some(bytes) => av_core::digest::sha256_hex(bytes),
             None => av_core::digest::sha256_hex(request.session.id.as_bytes()),
         };
-        // Round-6 cancellation fix: arm the guard with the marker id
+        // Cancellation fix: arm the guard with the marker id
         // BEFORE the awaited disk write. If the client disconnects
         // between here and the write completing, `spawn_blocking` still
         // runs the write to durability; the guard's terminal-failure
@@ -1656,7 +1656,7 @@ impl AppState {
             // with static keys and with NHI identity enforcement.
             upstream_request = upstream_request.header(reqwest::header::AUTHORIZATION, authorization);
         }
-        // Round-51 §8.7: upstream latency (time-to-response-headers)
+        // Upstream latency (time-to-response-headers)
         // and error counters — the two failure-mode-table rows the
         // review marked "logs only, no metric".
         let upstream_started = Instant::now();
@@ -1699,8 +1699,8 @@ impl AppState {
                         "Upstream failures by kind",
                     )
                     .inc();
-                // Round-35 F1: `reqwest::Error::Display` embeds the
-                // request URL (see the round-34 F4 rule at
+                // `reqwest::Error::Display` embeds the
+                // request URL (see the redaction rule at
                 // routes.rs::read_limited_tool_response — the same
                 // rule applies here). `%error` on `reqwest::Error`
                 // would render `error sending request for url
@@ -2013,7 +2013,7 @@ impl AppState {
         stop_reason: StopReason,
         reason: String,
     ) -> Result<(), PipelineError> {
-        // Engineering-review §3.4 (round-51): every identity rejection
+        // Every identity rejection
         // used to mint a DISTINCT signed audit session — two fsynced
         // spool files, a bridge publish, a reconciler adoption and an
         // Ed25519 signature per credential-free 401 probe. A curl loop
@@ -2146,7 +2146,7 @@ impl AppState {
         headers: &HeaderMap,
         required_scope: Option<&str>,
     ) -> Result<AgentIdentity, PipelineError> {
-        // Round-14 F1: reuse the round-13 duplicate-header refusal
+        // Reuse the duplicate-header refusal
         // pattern for `Authorization` on the identity hot path.
         // Previously `HeaderMap::get(AUTHORIZATION)` returned the
         // first value while the `PreparedRequest.client_authorization`
@@ -2156,7 +2156,7 @@ impl AppState {
         // exporters attribute the request to B. Refuse the multi-
         // value case at ingress, symmetric with the X-AV-Session /
         // X-AV-Workflow guards.
-        // Round-15 F3: RFC 7235 §2.1 declares the auth-scheme token
+        // RFC 7235 §2.1 declares the auth-scheme token
         // case-insensitive. Historically `strip_prefix("Bearer ")`
         // silently dropped `bearer eyJ...` / `BEARER eyJ...` /
         // `Bearer\teyJ...` to `None`, then the outer match arm
@@ -2248,7 +2248,7 @@ impl AppState {
                     // forwarded). Accept anonymous; the placeholder
                     // never reaches the provider.
                     //
-                    // Round-51 §9.1: `ignore_client_authorization` is the
+                    // `ignore_client_authorization` is the
                     // explicit opt-in covering the same posture for
                     // KEYLESS upstreams (Ollama, LM Studio, vLLM — no
                     // static key configured, so the implicit rule above
@@ -2423,7 +2423,7 @@ pub(crate) fn single_header<'a>(
 /// whitespace characters (`SP` / `HTAB`) between the scheme token and
 /// the credential (per `token1` production in §2.1).
 ///
-/// Round-15 F3: `str::strip_prefix("Bearer ")` used to be the sole
+/// `str::strip_prefix("Bearer ")` used to be the sole
 /// parser. It missed `bearer`, `BEARER`, and (per the RFC's own
 /// grammar) `Bearer\t...`, silently dropping to `None` and — when
 /// `require_identity = false` — letting the request execute as
@@ -2508,7 +2508,7 @@ fn last_message_text(payload: &Value) -> String {
             return text.to_owned();
         }
     }
-    // Round-19 F1 (mirror of round-13's response-side fix): a
+    // Mirror of the response-side fix: a
     // tool-call-only assistant message carries `content: null` and a
     // `tool_calls` array. `last_message_text` returning "" here would
     // feed a zero-vector embedding into the breaker in worker.rs and
@@ -2517,7 +2517,7 @@ fn last_message_text(payload: &Value) -> String {
     // wire-order — same shape as the response-side synthesis in
     // routes.rs::AbortFinalizingStream::submit_response_capture.
     //
-    // Round-20 F3 (self-audit fix): `function.arguments` reaches the
+    // Beware: `function.arguments` reaches the
     // wire in TWO shapes: a JSON-encoded string (OpenAI reference)
     // OR a bare JSON object (some clients / most Anthropic-shaped
     // gateways). `.as_str()` on the object variant returned None and
@@ -2585,8 +2585,8 @@ fn atif_capture_from_request(payload: &Value) -> Result<AtifCapture, PipelineErr
     // Split the two failure classes so support engineers can tell
     // "field missing" from "field is the wrong shape" — chasing a
     // phantom "no messages" ticket for a caller who typed
-    // `"messages": {}` used to be the top diagnostic-quality complaint
-    // (round-11 F7). The OpenAI Responses API also uses `input`
+    // `"messages": {}` used to be the top diagnostic-quality
+    // complaint. The OpenAI Responses API also uses `input`
     // instead of `messages`; the missing-field message now points
     // directly at the correct fix.
     let messages_value = payload
@@ -2606,7 +2606,7 @@ fn atif_capture_from_request(payload: &Value) -> Result<AtifCapture, PipelineErr
         // "function" is the legacy OpenAI function-calling spelling of
         // "tool" (a tool result fed back to the model) — still emitted
         // by older LangChain, AutoGen and llama-index versions.
-        // Refusing it 400'd legitimate agent traffic (round-51 §9.3).
+        // Refusing it 400'd legitimate agent traffic.
         Some("system" | "developer" | "tool" | "function") => av_atif::Source::System,
         Some("user") => av_atif::Source::User,
         Some("assistant") => av_atif::Source::Agent,
@@ -2709,7 +2709,7 @@ fn scope_allows(scopes: &[String], required: &str) -> bool {
     scopes.iter().any(|scope| {
         scope == "*"
             || scope == required
-            // Round-51 §5.4: allocation-free prefix match. The old
+            // allocation-free prefix match. The old
             // `required.starts_with(&format!("{prefix}:"))` allocated a
             // String per granted scope per request on the identity hot
             // path. `strip_prefix(prefix)` + a `:` head check is the
@@ -2751,11 +2751,11 @@ mod tests {
     use axum::http::HeaderValue;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
-    /// Round-19 F1 + round-20 F3 (self-audit): `last_message_text`
+    /// `last_message_text`
     /// must produce distinct output for two different tool-call
     /// argument shapes so the loop breaker's embedding varies.
     /// Both string-shaped and object-shaped arguments MUST reach the
-    /// synthesized text — round-19's first take collapsed
+    /// synthesized text — the first take collapsed
     /// object-shaped arguments to `tool_name()`.
     #[test]
     fn last_message_text_tool_call_synthesis_varies_with_object_arguments() {
@@ -3605,7 +3605,7 @@ mod tests {
         }
     }
 
-    /// Round-11 F7: `messages` field with the wrong type used to return
+    /// `messages` field with the wrong type used to return
     /// the same "chat payload has no messages" as an absent field,
     /// steering support tickets at a phantom bug. Verify each class
     /// now returns a discriminating error message.
@@ -3635,7 +3635,7 @@ mod tests {
         assert!(msg.contains("empty"), "got {msg}");
     }
 
-    /// Round-13: multiple X-AV-Session (or X-AV-Workflow) headers on
+    /// Multiple X-AV-Session (or X-AV-Workflow) headers on
     /// a single request must be refused. HeaderMap::get() returns
     /// only the first, so an intermediary that merges duplicates on
     /// the wire and downstream code that reads them separately can
@@ -3680,13 +3680,13 @@ mod tests {
         assert_eq!(session_id(&headers).unwrap(), "only-one");
     }
 
-    /// Round-14 F1: identity hot path (`resolve_identity`) must refuse
+    /// Identity hot path (`resolve_identity`) must refuse
     /// duplicate `Authorization` headers, symmetric with X-AV-Session.
     /// Previously `HeaderMap::get(AUTHORIZATION)` returned the first
     /// value only — the harness would authenticate as `A` while
     /// log aggregators / WAFs seeing a merged `A, B` form would
-    /// attribute the request to `B`. This is the identity split-brain
-    /// round-13 tried to close for session headers.
+    /// attribute the request to `B`. This is the same identity split-brain
+    /// already closed for session headers.
     #[tokio::test]
     async fn resolve_identity_refuses_duplicate_authorization_header() {
         let state = null_state();
@@ -3719,7 +3719,7 @@ mod tests {
             axum::http::header::AUTHORIZATION,
             HeaderValue::from_static("Bearer aaaa"),
         );
-        // No validator configured → refuse-401 fires per round-10 F3.
+        // No validator configured → the refuse-401 posture fires.
         // The important assertion is that we did NOT get a
         // BadRequest("more than one") on a single header.
         let outcome = state.resolve_identity(&headers, None);
@@ -3729,7 +3729,7 @@ mod tests {
         );
     }
 
-    /// Round-51 §9.1 (hero snippet): with `ignore_client_authorization`
+    /// With `ignore_client_authorization`
     /// opted in and no validator configured, a stock OpenAI SDK's
     /// mandatory `Authorization` header must be accepted-and-discarded
     /// — the request proceeds anonymously instead of hard-401ing on
@@ -3785,7 +3785,7 @@ mod tests {
         assert!(err.contains("passthrough"), "{err}");
     }
 
-    /// Round-51 §3.4: a credential-free 401 flood must not mint an
+    /// A credential-free 401 flood must not mint an
     /// unbounded stream of durable signed audit sessions. The first
     /// 60 rejections per minute get full audit records; the rest are
     /// counted only. Proven by driving 100 rejections and asserting
@@ -3823,7 +3823,7 @@ mod tests {
         );
     }
 
-    /// Round-15 F3: RFC 7235 §2.1 auth-scheme is case-insensitive.
+    /// RFC 7235 §2.1 auth-scheme is case-insensitive.
     /// A caller sending `Authorization: bearer eyJ...` or `BEARER`
     /// used to be silently downgraded to anonymous (when
     /// require_identity=false, the shipped default) — repudiation

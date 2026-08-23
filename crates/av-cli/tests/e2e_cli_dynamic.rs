@@ -374,7 +374,7 @@ fn config_validate_never_crashes_on_random_garbage() {
             "case #{i} exit was a signal (crash): status={:?}",
             out.status
         );
-        // No crash-leak in stderr. Round-51 §10.3: only `panicked at`
+        // No crash-leak in stderr. Only `panicked at`
         // marks a real crash. The old additional `backtrace` probe
         // conflated "the process crashed" with "the word backtrace
         // appears in stderr" — anyhow's error Display legitimately
@@ -540,7 +540,7 @@ fn bridge_lifecycle_end_to_end() {
 }
 
 // ------------------------------------------------------------------
-// Round-51 §9.1: `receipt-locate` — session id → artifact paths.
+// `receipt-locate` — session id → artifact paths.
 // ------------------------------------------------------------------
 
 /// The stem must be `sha256(session_id)[..32]`, artifacts must report

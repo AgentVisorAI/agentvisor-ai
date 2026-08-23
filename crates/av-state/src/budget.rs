@@ -56,8 +56,8 @@ impl BudgetDecision {
 /// Budget enforcement bound to an accounting scope (a session id, or a
 /// stable principal id) and a state store.
 ///
-/// Historically this type was hard-coded to a session-scoped view. The
-/// engineering review (§3.2) showed that a session-only budget can be
+/// Historically this type was hard-coded to a session-scoped view, but a
+/// session-only budget can be
 /// bypassed by any caller that rotates the caller-chosen `X-AV-Session`
 /// header — every request would land on a virgin counter. Callers that
 /// want to catch that vector layer a principal-scoped `ActionBudget` on
@@ -201,7 +201,7 @@ impl<'a> ActionBudget<'a> {
         Ok(BudgetDecision::Allowed { remaining })
     }
 
-    /// Round-33 F1: compensating refund for a previously-successful
+    /// Compensating refund for a previously-successful
     /// [`Self::try_tool_call`]. Reverses the spend on exactly the same
     /// dimensions that were debited (total_calls, per-tool, payout) so
     /// a lost-race path in the caller (concurrent identical MCP
@@ -466,7 +466,7 @@ mod tests {
         }
     }
 
-    /// Round-33 F1: refund_tool_call compensates the exact dimensions
+    /// refund_tool_call compensates the exact dimensions
     /// try_tool_call debited. Locks in the primary invariant needed
     /// by the harness's lost-claim path — after refund, the same
     /// call succeeds again against the same caps.
@@ -521,7 +521,7 @@ mod tests {
         uncapped.refund_tokens(50);
     }
 
-    /// Round-33 F1: refund saturates at 0 under a concurrent clear.
+    /// Refund saturates at 0 under a concurrent clear.
     /// The compensating refund must never leave a negative "budget
     /// spent" counter — that would give the next legit call a free
     /// ride relative to its cap.

@@ -167,7 +167,7 @@ fn static_asset(body: &'static str, content_type: &'static str) -> Response {
         HeaderName::from_static("x-content-type-options"),
         HeaderValue::from_static("nosniff"),
     );
-    // Round-28 F2: defense-in-depth against a future XSS regression
+    // defense-in-depth against a future XSS regression
     // in `highlightJson` or any innerHTML-writing dashboard code.
     // The dashboard is a same-origin single-page app that only
     // needs its own JS/CSS/img and its own /api/v1/dashboard/*
@@ -196,7 +196,7 @@ fn static_asset(body: &'static str, content_type: &'static str) -> Response {
     response
 }
 
-/// Round-17 F4: wrap dashboard JSON responses with headers that
+/// Wrap dashboard JSON responses with headers that
 /// forbid any intermediary shared cache from re-serving one caller's
 /// session detail to another. The static HTML/CSS/JS assets already
 /// set these; the JSON handlers didn't. Also sets `Vary:
@@ -217,7 +217,7 @@ fn no_store_json_response(value: impl serde::Serialize) -> Response {
         HeaderName::from_static("x-content-type-options"),
         HeaderValue::from_static("nosniff"),
     );
-    // Round-28 F2: mirror the same anti-XSS / anti-clickjacking /
+    // Mirror the same anti-XSS / anti-clickjacking /
     // anti-referrer-leak headers on JSON responses. A future
     // dashboard client that navigates directly to
     // /api/v1/dashboard/sessions/{id} in a top-level window must
@@ -291,7 +291,7 @@ pub async fn session_detail(State(state): State<AppState>, Path(id): Path<String
     // Clone out under the lock and drop it before serialization so the
     // reconciler / worker never blocks on a slow serde_json step.
     let receipt_clone: Option<av_receipts::Receipt> = session.receipt.lock().clone();
-    // Round-27 F6: previously returned `path.display().to_string()`,
+    // Previously returned `path.display().to_string()`,
     // which disclosed the absolute spool directory (e.g.
     // `/var/lib/agentvisor-ai/spool/<uid>.json`) to any unauthenticated
     // caller of the dashboard. The dashboard's design intent (see

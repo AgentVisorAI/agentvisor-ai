@@ -60,7 +60,7 @@ pub fn build_router(state: AppState) -> Router {
             request_metrics,
         ))
         .layer(axum::middleware::from_fn(trace_request))
-        // Round-51 §9.4: axum's DefaultBodyLimit rejection is a bare
+        // axum's DefaultBodyLimit rejection is a bare
         // text/plain "length limit exceeded" — it names neither the
         // knob nor the limit, breaks the JSON error contract every
         // other response honours, and is the first error a
@@ -118,7 +118,7 @@ async fn explain_body_limit(
         .into_response()
 }
 
-/// Round-51 §3.5 (DNS rebinding): when `allowed_hosts` is non-empty,
+/// DNS-rebinding defense: when `allowed_hosts` is non-empty,
 /// refuse any request whose `Host` header (port stripped,
 /// case-insensitive) is not listed — BEFORE any handler runs. A
 /// hostile page's JavaScript can reach this service under an
@@ -178,7 +178,7 @@ async fn enforce_allowed_hosts(
     next.run(request).await
 }
 
-/// Round-51 §8.7: data-plane request metrics. Every HTTP request —
+/// data-plane request metrics. Every HTTP request —
 /// including the early-4xx returns the review flagged as unaudited —
 /// lands in `av_requests_total{route,status_class}` and
 /// `av_request_duration_seconds{route}`. The route label is drawn
@@ -234,20 +234,20 @@ fn route_label(path: &str) -> &'static str {
 async fn trace_request(request: Request<Body>, next: Next) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
-    // Round-13 F5: sanitize the session id BEFORE binding it into the
+    // Sanitize the session id BEFORE binding it into the
     // span. Previously the raw header value went in verbatim, which
     // (1) risked unbounded label cardinality on OTLP exporters that
     // map span attributes to metric labels — every distinct
     // client-supplied session id (including hostile garbage) became
     // its own series; (2) created a split-brain when a client sent
     // two `X-AV-Session` headers — `HeaderMap::get` returned the
-    // first while `pipeline::single_header` (round-13) refused the
+    // first while `pipeline::single_header` refused the
     // whole request, so traces named a "friendly" id for a hard-400;
     // (3) accepted values that pass `HeaderValue::to_str` but fail
     // `SessionId::parse` (too long, control chars in disguise). Use
     // `single_header` + `SessionId::parse` to bind ONE consistent
     // value or the sentinel `"invalid"`.
-    // Round-14 F7: use a sentinel that CANNOT pass `SessionId::parse`
+    // Use a sentinel that CANNOT pass `SessionId::parse`
     // (0x21..=0x7e visible-ASCII only), so a client cannot legitimately
     // send `X-AV-Session: invalid` and share a trace label with a
     // rejected request. The leading space (0x20) is outside the
@@ -277,7 +277,7 @@ async fn trace_request(request: Request<Body>, next: Next) -> Response {
 }
 
 async fn health() -> impl IntoResponse {
-    // Round-29 F6: DO NOT expose the CARGO_PKG_VERSION on this
+    // DO NOT expose the CARGO_PKG_VERSION on this
     // unauthenticated endpoint. Version disclosure lets a LAN
     // attacker correlate an agentvisor deployment to a specific
     // known-vulnerable release without needing a chat probe. No
@@ -302,7 +302,7 @@ async fn health() -> impl IntoResponse {
 /// readiness-based traffic drain. This mirrors `/health` (kept for
 /// backward compatibility) but with a name that reads as its intent.
 /// Point `livenessProbe` at `/livez`; point `readinessProbe` at
-/// `/readyz`. See engineering review §8.3.
+/// `/readyz`.
 async fn livez() -> impl IntoResponse {
     Json(json!({
         "status": "alive",
@@ -344,13 +344,13 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-/// Round-31 F5: explicit deny-CORS OPTIONS handler.
+/// Explicit deny-CORS OPTIONS handler.
 ///
 /// The harness is a same-origin proxy; no cross-origin client is
 /// expected or supported. Without this route, axum's default reply to
 /// a preflight (`OPTIONS /v1/chat/completions`) is `405 Method Not
 /// Allowed` with an `Allow: POST` header — inconsistent with the
-/// round-29 F6 "no discoverable posture" hygiene, and confusing to any
+/// "no discoverable posture" hygiene, and confusing to any
 /// operator whose LAN browser client accidentally triggers a preflight.
 /// Reply with `204 No Content` and NO `Access-Control-Allow-Origin`
 /// header: browsers correctly treat this as "cross-origin denied" and
@@ -370,7 +370,7 @@ async fn cors_deny() -> Response {
 
 async fn metrics(State(state): State<AppState>) -> Response {
     // Refresh gauges immediately before rendering so the scrape
-    // reflects the live registry state (round-51 W2). A gauge held
+    // reflects the live registry state. A gauge held
     // as `Arc<Gauge>` in AppState would also work, but sampling
     // once per scrape avoids inc/dec bookkeeping on every session
     // insert/remove and cannot drift out of sync with the actual
@@ -382,7 +382,7 @@ async fn metrics(State(state): State<AppState>) -> Response {
             "Currently-open sessions in the in-memory registry",
         )
         .set(state.sessions.len() as u64);
-    // Round-51 §8.7: worker backlog + spool footprint, sampled per
+    // Worker backlog + spool footprint, sampled per
     // scrape. Queue depth is one atomic load; the spool walk is a
     // single-level read_dir summing entry sizes (a few ms even at
     // tens of thousands of files, amortized across the scrape
@@ -439,7 +439,7 @@ fn spool_footprint(dir: &std::path::Path) -> (u64, u64) {
 }
 
 async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    // Round-22 F1 (av-harness routes): refuse duplicate top-level or
+    // Refuse duplicate top-level or
     // nested JSON keys before parsing. `Json<Value>` used
     // `serde_json` default "last-wins" semantics, so a hostile client
     // could send `{"messages":[safe],"messages":[hostile]}` — the
@@ -447,7 +447,7 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
     // reading the raw request bytes (e.g. via
     // `av_events::atif_capture_from_request` chain input) sees an
     // ambiguous document, breaking the "same signature ⇔ same
-    // bytes" auditor invariant that round-15 F3 pinned for receipts.
+    // bytes" auditor invariant pinned for receipts.
     // Same fix as `parse_tool_call` on the MCP path — use the shared
     // primitive.
     if let Err(reason) = av_sandbox::refuse_duplicate_json_keys(&body) {
@@ -574,7 +574,7 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
              with the reqwest `gzip` feature"
         )));
     }
-    // Round-25 F3: RFC 7231 §3.1.1.1 says media type/subtype are
+    // RFC 7231 §3.1.1.1 says media type/subtype are
     // case-insensitive and the header value may carry parameters
     // (`; charset=utf-8`). Byte-exact `starts_with("text/event-stream")`
     // misses `Text/Event-Stream` (some CDNs re-title-case) and can also
@@ -675,7 +675,7 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
             match relay.next().await {
                 Some(Ok(bytes)) => buffered.extend_from_slice(&bytes),
                 Some(Err(error)) => {
-                    // Round-6 (hunt4 protocol F3): route through
+                    // Route through
                     // `pipeline_error` so the status class matches the
                     // admission-time decision for the SAME condition
                     // and the advisory headers are attached. The prior
@@ -718,7 +718,7 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
             .headers_mut()
             .insert(crate::pipeline::MIDDLEWARE_US_HEADER, value);
     }
-    // Round-29 F4: pin `X-Content-Type-Options: nosniff` on every
+    // Pin `X-Content-Type-Options: nosniff` on every
     // upstream-relayed response. The relay forwards the upstream's
     // Content-Type verbatim (validated by our `is_sse_content_type`
     // for framing decisions, but not sanitised for the client).
@@ -755,7 +755,7 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
 /// classical HTTP request smuggling. Hop-by-hop headers are forbidden by
 /// RFC 7230 §6.1 from crossing a proxy.
 ///
-/// Round-16 F1 (routes): the denylist covered `Authorization` (RFC 7235)
+/// The denylist once covered `Authorization` (RFC 7235)
 /// but NOT any custom-name auth header the harness itself uses to
 /// authenticate to the upstream. Every LLM provider uses a distinct
 /// custom header — `api-key` (Azure), `x-api-key` (Amazon Bedrock,
@@ -793,7 +793,7 @@ fn is_forwardable_upstream_header(name: &axum::http::HeaderName, upstream_auth_h
         || name.as_str().eq_ignore_ascii_case("keep-alive")
         || name.as_str().eq_ignore_ascii_case("x-powered-by")
         || name.as_str().eq_ignore_ascii_case("x-request-id")
-        // Well-known provider API-key header names (round-16 F1).
+        // Well-known provider API-key header names.
         // Verified against public docs of Azure OpenAI, AWS Bedrock,
         // Google Vertex, Anthropic, Cohere, DeepSeek, Together AI,
         // Groq, Mistral, and Fireworks.
@@ -810,7 +810,7 @@ fn is_forwardable_upstream_header(name: &axum::http::HeaderName, upstream_auth_h
     !is_denied
 }
 
-/// Round-25 F3: detect `text/event-stream` in `Content-Type`
+/// Detect `text/event-stream` in `Content-Type`
 /// case-insensitively, accepting parameters like `; charset=utf-8`.
 /// RFC 7231 §3.1.1.1 says media type/subtype are case-insensitive.
 /// Byte-exact matching missed `Text/Event-Stream` (some CDNs
@@ -838,7 +838,7 @@ fn tool_audit_gate(state: &AppState, key: &str) -> Arc<tokio::sync::Mutex<()>> {
 }
 
 async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    // Round-18 F2 (routes): reject an inbound request whose declared
+    // Reject an inbound request whose declared
     // `Content-Type` is not `application/json`. MCP is JSON-RPC 2.0
     // (spec: MUST be `application/json`), and a client sending e.g.
     // `Content-Type: multipart/form-data` with a JSON body would
@@ -890,7 +890,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                 if let Err(error) = execution.bind_principal(&identity) {
                     return pipeline_error(error);
                 }
-                // Round-51 §5.1: the three cached-state arms below used
+                // The three cached-state arms below used
                 // to repeat this lookup+authorize block verbatim,
                 // differing only in the error string, and recomputed
                 // `tool_scope` per arm. One helper, one scope.
@@ -996,7 +996,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
         };
         return complete_tool_audit(&state, execution, outcome, completion_permit, session).await;
     }
-    // Round-33 F1: closes the round-32 F3 concurrent-MCP budget
+    // Closes the concurrent-MCP budget
     // double-spend by threading the debited `payout_micros` out of
     // `ToolVerdict::Allowed` and calling `ActionBudget::refund_
     // tool_call` on the lost-claim branch. `refund` is best-effort
@@ -1063,7 +1063,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                             session = %execution.session_id,
                             "concurrent tool execution claim lost; refunding budget"
                         );
-                        // Round-33 F1: refund the exact amount debited so
+                        // Refund the exact amount debited so
                         // the budget counters reflect only admitted work,
                         // not the lost race.
                         refund_admission();
@@ -1101,7 +1101,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                 match tool_request.send().await {
                     Ok(upstream) => {
                         let status = upstream.status();
-                        // Round-6 (hunt4 protocol F1): reject non-identity
+                        // Reject non-identity
                         // Content-Encoding on the tool relay for the same
                         // reason the chat path does (reqwest 0.12 has no
                         // decompression features enabled). Without this
@@ -1230,7 +1230,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                         // whichever client called `/mcp`. Report a stable category
                         // and preserve the raw detail server-side for operators.
                         //
-                        // Round-34 F4: also do not log the raw error to
+                        // Also do not log the raw error to
                         // tracing::warn — `reqwest::Error::Display` embeds
                         // the same URL, and the tracing subscriber flows
                         // to Vector -> OTLP -> SIEM per the deploy
@@ -1276,7 +1276,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                     }
                 }
             } else {
-                // Round-6 (hunt4 protocol F4): verdict-only mode must
+                // verdict-only mode must
                 // return a conformant JSON-RPC response — the Blocked
                 // arm already does (id echo + error object), so a
                 // client could correlate failures but not successes.
@@ -1302,7 +1302,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
             }
         }
         Ok(ToolVerdict::Blocked { response, stage, .. }) => {
-            // Round-6 (hunt4 protocol F5): a request that never parsed
+            // A request that never parsed
             // (stage "parse") gets 400, not 403 — no authorization
             // decision was made. Policy/schema/budget refusals keep 403.
             let status = if stage == "parse" {
@@ -1318,7 +1318,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
 
 const MAX_TOOL_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
-/// Round-32 F2: capture and preserve the upstream tool response's
+/// Capture and preserve the upstream tool response's
 /// `Content-Type` so the MCP client sees exactly what the tool
 /// upstream sent. Without this, `Bytes: IntoResponse` stamps
 /// `application/octet-stream`, which strict JSON-RPC 2.0 clients
@@ -1338,7 +1338,7 @@ async fn read_limited_tool_response(response: reqwest::Response) -> Result<(Byte
         // CWE-209: `reqwest::Error::Display` embeds the request URL — leaking
         // the operator-configured tool-upstream URL to the client if we
         // returned it verbatim. Use the stable classifier and log
-        // structured fields for operators (round-34 F4: never `%error`
+        // structured fields for operators (never `%error`
         // — that renders the URL into any downstream OTLP sink).
         let chunk = chunk.map_err(|error| {
             let category = crate::pipeline::classify_upstream_error(&error);
@@ -1364,7 +1364,7 @@ async fn read_limited_tool_response(response: reqwest::Response) -> Result<(Byte
     Ok((Bytes::from(body), content_type))
 }
 
-/// Build a tool-response with the round-32 F2 Content-Type
+/// Build a tool-response with the upstream Content-Type
 /// preserved. Defaults to `application/json` — MCP is JSON-RPC 2.0
 /// by convention — when the upstream did not set one or set an
 /// unrepresentable value.
@@ -1376,9 +1376,9 @@ fn tool_response(status: StatusCode, bytes: Bytes, content_type: Option<&str>) -
     response
         .headers_mut()
         .insert(axum::http::header::CONTENT_TYPE, value);
-    // Round-51 §3.5: the MCP relay forwards the tool upstream's
+    // The MCP relay forwards the tool upstream's
     // Content-Type verbatim; pin nosniff exactly like the chat relay
-    // (round-29 F4) so a rogue tool upstream flipping the type to
+    // so a rogue tool upstream flipping the type to
     // text/html cannot get attacker-echoed bytes rendered by a
     // browser-side MIME sniff.
     response.headers_mut().insert(
@@ -1453,7 +1453,7 @@ async fn complete_tool_audit(
         return lifecycle_error(error);
     }
     state.tool_audits_emitted.lock().remove(&execution.key);
-    // Round-32 F2: preserve the upstream Content-Type so a spec-
+    // Preserve the upstream Content-Type so a spec-
     // conforming JSON-RPC 2.0 client sees `application/json`
     // (default) or whatever the tool upstream declared, not axum's
     // `application/octet-stream`.
@@ -1464,7 +1464,7 @@ async fn complete_tool_audit(
 struct ToolOutcome {
     status: u16,
     body_hex: String,
-    /// Round-32 F2: MCP client requires the upstream tool response's
+    /// MCP client requires the upstream tool response's
     /// `Content-Type` to round-trip on cached-outcome replay too, so
     /// strict JSON-RPC 2.0 clients see `application/json` on replay
     /// just as they did on the fresh forward. `#[serde(default)]` so
@@ -1492,7 +1492,7 @@ enum ToolExecutionState {
 }
 
 /// Two distinct failure modes for `ToolExecution::claim` that must
-/// produce different client responses. Round-49 F3: previously
+/// produce different client responses. Previously
 /// `claim_sync` mapped ALL failures to a `String` and the caller in
 /// `mcp_call_inner` answered every one with `409 TOOL_OUTCOME_UNCERTAIN`
 /// — reporting infrastructure faults (StorageFull, PermissionDenied,
@@ -1592,7 +1592,7 @@ pub(crate) async fn unresolved_tool_sessions(
             ) {
                 Ok(intent) => intent,
                 Err(error) => {
-                    // Round-22 F2 (self-fix of round-21 F4): build
+                    // Build
                     // the quarantine name EXPLICITLY. The prior use
                     // of `path.with_extension("intent.torn")` on a
                     // `<key>.intent.json` path replaces only the
@@ -1620,7 +1620,7 @@ pub(crate) async fn unresolved_tool_sessions(
                     if let Err(rename_err) = std::fs::rename(&path, &quarantine) {
                         tracing::warn!(%rename_err, "failed to quarantine torn intent — leaving in place");
                     }
-                    // Round-6 (hunt3 F2): also quarantine the outcome
+                    // Also quarantine the outcome
                     // and audited siblings. Leaving them behind trips
                     // the orphan-outcome check below in the same tick
                     // and every tick thereafter, permanently stalling
@@ -1656,7 +1656,7 @@ pub(crate) async fn unresolved_tool_sessions(
             ) {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    // Round-6 (hunt3 F2): warn+quarantine the unverifiable
+                    // warn+quarantine the unverifiable
                     // outcome (and any sibling audited file) instead of
                     // aborting the whole recovery pass and bricking the
                     // startup.
@@ -1706,7 +1706,7 @@ pub(crate) async fn unresolved_tool_sessions(
             };
             if let Some(key) = name.strip_suffix(crate::spool::TOOL_OUTCOME_SUFFIX) {
                 if !intent_keys.contains(key) {
-                    // Round-6 (hunt3 F2): an orphan outcome must not
+                    // An orphan outcome must not
                     // return Err — that turns the recovery tick into a
                     // permanent brick, especially at boot where
                     // recover_spooled_sessions is fatal. Rename the
@@ -1729,7 +1729,7 @@ pub(crate) async fn unresolved_tool_sessions(
 
 /// Rename `<directory>/<key><suffix>` to a `.corrupt-<uid>` name so
 /// nothing else scans it. Silent-ok when the sibling doesn't exist
-/// (the common case). See round-5 hunt3 F2.
+/// (the common case).
 fn quarantine_orphan_sibling(directory: &std::path::Path, key: &str, suffix: &str, role: &str) {
     let path = directory.join(format!("{key}{suffix}"));
     if !path.exists() {
@@ -1894,7 +1894,7 @@ impl ToolExecution {
     /// NotFound is tolerated — the claim was ours, so a missing file only
     /// means a prior release already ran.
     ///
-    /// Round-49 F2: the post-remove directory fsync is best-effort.
+    /// The post-remove directory fsync is best-effort.
     /// `remove_file` returning Ok is durable-enough for the release
     /// semantics — a crash before the dir fsync makes the intent file
     /// resurrect on recovery, at which point `unresolved_tool_sessions`
@@ -1933,7 +1933,7 @@ impl ToolExecution {
             .intent_path
             .parent()
             .ok_or_else(|| ClaimError::Backend("tool execution directory is missing".to_owned()))?;
-        // Round-51 §7.3: skip the mkdir on the (steady-state) existing
+        // Skip the mkdir on the (steady-state) existing
         // directory — `create_dir_all` on an existing path still issues
         // an EEXIST mkdir syscall on the tool-claim hot path.
         if !directory.is_dir() {
@@ -2070,7 +2070,7 @@ async fn promote_session(
     if let Err(error) = state.authorize_session(&headers, &session, &state.config.session_promote_scope) {
         return pipeline_error(error);
     }
-    // Round-27 F4: `promote()` silently drives `close_session_locked`
+    // `promote()` silently drives `close_session_locked`
     // on any still-open session. If an operator split the two scopes
     // (compliance auditor gets `session:promote`, on-call gets
     // `session:close`), a `session:promote`-only bearer could
@@ -2103,7 +2103,7 @@ fn finalize_error_response(error: &crate::reconciler::FinalizeError) -> Response
         // (quarantined capture, no artifact to promote, promotion already
         // in progress).
         FinalizeError::CaptureIncomplete | FinalizeError::Promotion(_) => StatusCode::CONFLICT,
-        // Round-28 F1: permanent bridge misconfiguration (unknown
+        // Permanent bridge misconfiguration (unknown
         // topic, unresolvable schema) — retrying without operator
         // action cannot succeed. Map to 400 so SDKs stop retrying
         // and pagers fire on operator config errors, not on
@@ -2129,7 +2129,7 @@ fn pipeline_error(error: crate::pipeline::PipelineError) -> Response {
     use crate::pipeline::PipelineError;
     let close = matches!(error, PipelineError::Abort(_));
     let status = error.status();
-    // Round-51 §9.3: OpenAI-shaped error body. SDKs dispatch on
+    // OpenAI-shaped error body. SDKs dispatch on
     // `error.type` / `error.code` (`openai.APIError.code`), and the
     // previous bare `{"error": "<string>"}` left that handling dead —
     // five inconsistent shapes across sibling routes. `message` keeps
@@ -2191,7 +2191,7 @@ fn pipeline_error(error: crate::pipeline::PipelineError) -> Response {
 }
 
 fn lifecycle_error(error: String) -> Response {
-    // Same OpenAI-shaped body as `pipeline_error` (round-51 §9.3) so
+    // Same OpenAI-shaped body as `pipeline_error` so
     // the two sibling routes agree on one error contract.
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -2250,7 +2250,7 @@ struct AbortFinalizingStream {
     pending_output: std::collections::VecDeque<Bytes>,
     pending_budget: Option<PendingBudget>,
     captured_bytes: usize,
-    /// Round-51 §6.4: admission-time prompt-token heuristic, reconciled
+    /// admission-time prompt-token heuristic, reconciled
     /// against the provider's `usage.prompt_tokens` at terminal capture.
     billed_prompt_tokens: u64,
     /// S3: the provider wire dialect this stream parses with.
@@ -2278,7 +2278,7 @@ impl AbortFinalizingStream {
         if !self.is_sse {
             return Ok(0);
         }
-        // Round-29 F1: non-success upstream bodies are relayed
+        // non-success upstream bodies are relayed
         // verbatim; do NOT try to parse them as chat-completion SSE
         // frames. An `event: error` / `data: {"error":...}` frame
         // from a 4xx/5xx stream would otherwise fail the strict
@@ -2309,7 +2309,7 @@ impl AbortFinalizingStream {
         if self.protocol_buffer.is_empty() {
             return Ok(0);
         }
-        // Round-29 F1: never fail-closed on a non-success upstream body.
+        // Never fail-closed on a non-success upstream body.
         // Providers ship text/plain and HTML error pages on 4xx/5xx
         // (OpenAI's Cloudflare frontend returns text/html on 429;
         // Anthropic ships 503 HTML from AWS ALBs during backend
@@ -2348,7 +2348,7 @@ impl AbortFinalizingStream {
         if parsed.finish_reason.is_some() {
             self.response_finish_reason = parsed.finish_reason;
         }
-        // Cumulative-cost contract (round-6 hunt3 math F2): providers
+        // Cumulative-cost contract: providers
         // that report `cost_usd` are expected to report it CUMULATIVELY
         // (OpenRouter-style final/rolling usage frames) — `max()` folds
         // that correctly and tolerates repeated identical frames. A
@@ -2484,7 +2484,7 @@ impl AbortFinalizingStream {
             (!self.response_reasoning.is_empty()).then(|| std::mem::take(&mut self.response_reasoning));
         // Materialize the tool-call list up front so we can fall back to
         // its content when the response body has neither an assistant
-        // message nor reasoning. Round-53 F1: without this, tool-only
+        // message nor reasoning. Without this, tool-only
         // responses (a legitimate agent mode: "return only tool_calls,
         // no assistant text") collapsed to an all-zero embedding at
         // `av_loopdetect::embed`, which the breaker treats as a hostile
@@ -2551,7 +2551,7 @@ impl AbortFinalizingStream {
                 }),
             )
         } else if self.is_sse {
-            // Engineering-review §6.4 (round-51): an SSE stream that
+            // An SSE stream that
             // ended without ANY finish_reason chunk is a truncated
             // generation — provider crash, LB idle-timeout, worker
             // OOM. OpenAI-protocol streams always carry a
@@ -2583,7 +2583,7 @@ impl AbortFinalizingStream {
                 }),
             )
         };
-        // Round-51 §6.4 (enforcement side): refund the heuristic
+        // Enforcement side of the correction: refund the heuristic
         // over-charge to the session ledger — an SDK retry loop on a
         // CJK-heavy conversation otherwise drains max_tokens 3-4×
         // faster than the provider actually bills. Only the
@@ -2618,7 +2618,7 @@ impl AbortFinalizingStream {
                 native_stop_reason: native_finish_reason,
                 metrics: self.response_metrics,
                 cost_usd_micros: self.response_cost_usd_micros,
-                // Round-51 §6.4: reconcile the admission-time heuristic
+                // Reconcile the admission-time heuristic
                 // against the provider's reported usage. The correction
                 // rides the terminal record so ALL folds (live + both
                 // recovery paths, via the unified
@@ -2788,7 +2788,7 @@ impl AbortFinalizingStream {
         std::io::Error::other(reason)
     }
 
-    /// Engineering-review §6.2 (round-51): scope a mid-stream capture
+    /// Scope a mid-stream capture
     /// failure to THIS response instead of sealing the whole session.
     /// The failure reason is recorded into the audit trail via
     /// `submit_response_capture(Some(_))` (at-most-once), so the turn
@@ -3092,7 +3092,7 @@ pub(crate) fn parse_provider_chunk(raw: &str) -> Result<Option<ParsedProviderChu
         }
     }
     if is_sse && !event_type.is_empty() && event_type != "message" {
-        // Engineering-review §6.2: narrow the named-event refusal to
+        // Narrow the named-event refusal to
         // frames that actually carry captured data. A named-event
         // keepalive with an empty `data:` field (`event: ping\n\n`,
         // `event: heartbeat\n\n`) can't taint the audit surface — no
@@ -3196,7 +3196,7 @@ pub(crate) fn parse_provider_chunk(raw: &str) -> Result<Option<ParsedProviderChu
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
             {
-                // Round-6 (hunt2 F4): empty-string finish_reason from
+                // empty-string finish_reason from
                 // OpenAI-compatible shims used to enter the audit
                 // chain as `Some("")`, which the JSON schema then
                 // rejects at publish (`minLength: 1`) — permanently
@@ -3334,7 +3334,7 @@ impl Drop for AbortFinalizingStream {
         // + committed claim) and returns `CaptureIncomplete`: the close is
         // never retried and the session finalizes with no artifact at all.
         //
-        // Engineering-review §6.2 (D7): a client disconnect mid-budget-check
+        // A client disconnect mid-budget-check
         // or a garbled trailing frame is a per-RESPONSE failure — the
         // audit chain is still consistent because we can record the
         // truncation reason via `submit_response_capture(Some(_))`.
@@ -3346,7 +3346,7 @@ impl Drop for AbortFinalizingStream {
         // safely captured either.
         let is_closed = self.session.is_closed();
         let budget_incomplete = self.pending_budget.is_some();
-        // Round-29 F5: abort the pending budget task. `spawn_blocking`
+        // Abort the pending budget task. `spawn_blocking`
         // returns a JoinHandle whose Drop does NOT cancel the queued
         // closure; the blocking pool would otherwise run
         // `ActionBudget::try_tokens(delta)` AFTER the drop, silently
@@ -3393,7 +3393,7 @@ impl Drop for AbortFinalizingStream {
                 self.session.mark_capture_failed();
             }
         }
-        // Engineering-review §6.4 (round-51): a client disconnect must
+        // A client disconnect must
         // not seal the whole conversation. Spawn the background close
         // ONLY when this abort left nothing capturable AND no
         // concurrent stream is in flight — the ephemeral one-shot
@@ -3564,7 +3564,7 @@ mod tests {
             // One SSE frame split across two TCP chunks, cut mid-way
             // through the é's UTF-8 encoding (0xc3 0xa9). Exercises the
             // protocol_buffer reassembly path that no other SSE mock
-            // reaches (round-51 §10.2: every SSE mock emitted whole
+            // reaches (every other SSE mock emits whole
             // frames per chunk).
             let frame = "data: {\"choices\":[{\"delta\":{\"content\":\"héllo\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
                 .as_bytes()
@@ -3796,7 +3796,7 @@ mod tests {
         (state, server)
     }
 
-    /// Round-51 §9.4: the body-limit rejection must honour the JSON
+    /// The body-limit rejection must honour the JSON
     /// error contract and name the knob + limit — axum's default is a
     /// bare text/plain "length limit exceeded".
     #[tokio::test]
@@ -3883,7 +3883,7 @@ mod tests {
         (state, server)
     }
 
-    /// S3 step 3 (round-51 §4.2): a session against a mock Gemini
+    /// S3 step 3: a session against a mock Gemini
     /// upstream produces the same audit-chain shape as an OpenAI one —
     /// provider-true usage, SCREAMING_CASE stop reason folded into the
     /// stop taxonomy, verbatim relay.
@@ -3946,7 +3946,7 @@ mod tests {
         provider.abort();
     }
 
-    /// S3 step 2 (round-51 §4.2): a session against a mock Anthropic
+    /// S3 step 2: a session against a mock Anthropic
     /// upstream produces the same audit-chain shape as an OpenAI one —
     /// provider-true usage in the totals, the native stop reason folded
     /// into the stop taxonomy, and the streamed bytes relayed verbatim.
@@ -4045,7 +4045,7 @@ mod tests {
         chat_request_with_payload(session, chat_payload())
     }
 
-    /// Round-17 live-stress finding: deterministic fail-closed lifecycle
+    /// Live-stress finding: deterministic fail-closed lifecycle
     /// refusals (quarantined capture, unfulfillable promotion) used to
     /// surface as HTTP 500 — SDKs retried them pointlessly and 5xx-rate
     /// pagers fired on working policy. They must map to 409 Conflict,
@@ -4118,14 +4118,14 @@ mod tests {
         })
     }
 
-    /// Round-22 F1 (av-harness routes): `/v1/chat/completions` must
+    /// `/v1/chat/completions` must
     /// refuse duplicate top-level or nested JSON keys, mirroring the
     /// MCP path's `parse_tool_call` policy. `serde_json`'s default
     /// last-wins semantics would otherwise let a hostile client
     /// send `{"messages":[safe],"messages":[hostile]}` and the
     /// harness would see the hostile array while any auditor reading
     /// the raw request bytes sees the ambiguous document. Same
-    /// class as round-15 F3's receipt-null malleability, applied at
+    /// class as the receipt-null malleability, applied at
     /// chat ingress.
     #[tokio::test]
     async fn chat_completions_refuses_duplicate_json_keys() {
@@ -4302,7 +4302,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        // Round-6 (hunt4 protocol F4): the ack is a conformant JSON-RPC
+        // The ack is a conformant JSON-RPC
         // response now — id echoed, result envelope present.
         assert_eq!(allowed_body["jsonrpc"], "2.0");
         assert_eq!(allowed_body["id"], 1);
@@ -4320,7 +4320,7 @@ mod tests {
             )
             .await
             .unwrap();
-        // Round-6 (hunt4 protocol F5): invalid JSON is a protocol
+        // Invalid JSON is a protocol
         // failure (-32700 / HTTP 400), not a policy decision (403).
         assert_eq!(blocked.status(), StatusCode::BAD_REQUEST);
         let blocked_body: Value = serde_json::from_slice(
@@ -4346,7 +4346,7 @@ mod tests {
 
         let aborted = app.clone().oneshot(chat_request("abort-flow")).await.unwrap();
         drop(aborted);
-        // Round-51 §6.4: a client abort AFTER content was captured (the
+        // A client abort AFTER content was captured (the
         // SSE peek already consumed the first frame) must NOT force-close
         // the conversation — the turn is recorded and the session stays
         // open for the client's next request; the idle sweeper owns
@@ -5281,7 +5281,7 @@ mod tests {
         assert_eq!(parsed.message, "hi");
     }
 
-    /// Engineering-review §6.2 (D7): a named SSE event with EMPTY
+    /// A named SSE event with EMPTY
     /// `data:` (or no `data:` at all) is a keepalive/heartbeat that
     /// carries no audit surface — refusing it (and thereby aborting
     /// the whole client stream + sealing the session) was
@@ -5444,7 +5444,7 @@ mod tests {
             .await
             .unwrap();
         {
-            // Round-51 §9.3: OpenAI-shaped error object — SDK
+            // OpenAI-shaped error object — SDK
             // `e.code` / `e.type` dispatch must have material.
             let parsed = serde_json::from_slice::<Value>(&body).unwrap();
             assert!(parsed["error"]["message"].is_string(), "{parsed}");
@@ -5452,7 +5452,7 @@ mod tests {
             assert!(parsed["error"]["code"].is_number(), "{parsed}");
         }
         let session = state.sessions.get("malformed-json").unwrap();
-        // Round-51 §6.2: the malformed frame is scoped to THIS
+        // The malformed frame is scoped to THIS
         // response — recorded as a failed capture — instead of
         // sealing the whole session. The session must stay usable
         // for the client's next turn.
@@ -5598,7 +5598,7 @@ mod tests {
             .await
             .is_err());
         let session = state.sessions.get("regressive-usage").unwrap();
-        // Round-51 §6.2: the regressive-usage frame fails THIS
+        // The regressive-usage frame fails THIS
         // response's capture (recorded with a failure reason via
         // submit_response_capture) — it must not seal the session.
         assert!(
@@ -5637,14 +5637,14 @@ mod tests {
             .await
             .unwrap();
         {
-            // Round-51 §9.3: OpenAI-shaped error object — SDK
+            // OpenAI-shaped error object — SDK
             // `e.code` / `e.type` dispatch must have material.
             let parsed = serde_json::from_slice::<Value>(&body).unwrap();
             assert!(parsed["error"]["message"].is_string(), "{parsed}");
             assert!(parsed["error"]["type"].is_string(), "{parsed}");
             assert!(parsed["error"]["code"].is_number(), "{parsed}");
         }
-        // Round-51 §6.2: choices-less success is a per-response
+        // choices-less success is a per-response
         // capture failure, not a session seal.
         assert!(
             !state.sessions.get("empty-success").unwrap().capture_failed(),
@@ -5705,7 +5705,7 @@ mod tests {
         assert!(axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
             .is_ok());
-        // Round-51 §6.2: an out-of-range tool-call index fails the
+        // An out-of-range tool-call index fails the
         // response capture (surfaced as the clean 502 above via the
         // peek-before-commit path) but leaves the session usable.
         assert!(
@@ -5715,7 +5715,7 @@ mod tests {
         provider.abort();
     }
 
-    /// Round-51 §10.2: no SSE mock ever split a frame across a stream
+    /// No SSE mock ever split a frame across a stream
     /// chunk, though `protocol_buffer` exists precisely to reassemble
     /// one. Split a frame mid-way through a multi-byte UTF-8 scalar
     /// and prove the reassembled message reaches the audit trail
@@ -5766,7 +5766,7 @@ mod tests {
         provider.abort();
     }
 
-    /// Engineering-review §6.4 (round-51): an SSE stream that ends
+    /// An SSE stream that ends
     /// cleanly but never carries a finish_reason chunk (provider
     /// crash, LB idle-timeout, worker OOM) is a TRUNCATED generation
     /// and must not be attested as a complete success — previously it
@@ -5879,7 +5879,7 @@ mod tests {
         assert!(axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
             .is_err());
-        // Round-51 §6.4: a budget-refused turn is recorded as a failed
+        // A budget-refused turn is recorded as a failed
         // response capture but must NOT seal or force-close the
         // session — per-minute windows refill, and the client's next
         // turn under the same id must be admissible. The idle sweeper
@@ -5917,7 +5917,7 @@ mod tests {
     #[test]
     fn upstream_response_headers_do_not_cross_proxy_trust_boundary() {
         use axum::http::HeaderName;
-        // Round-16 F1: also include every well-known API-key header
+        // Also include every well-known API-key header
         // name and both directions of the configured upstream_auth_header
         // check. `authorization` is the runtime default.
         let dangerous = [
@@ -5941,7 +5941,7 @@ mod tests {
             "via",
             "x-powered-by",
             "x-request-id",
-            // Round-16 F1: provider API-key headers must never echo
+            // Provider API-key headers must never echo
             // back from an upstream — they carry the operator's
             // outbound credential.
             "authorization",
@@ -5961,7 +5961,7 @@ mod tests {
             );
         }
 
-        // Round-16 F1: the currently-configured upstream_auth_header
+        // The currently-configured upstream_auth_header
         // MUST be refused even for operator-picked odd names. Simulate
         // an operator using an exotic header (e.g. `x-my-secret`).
         let exotic = HeaderName::from_static("x-my-secret");
@@ -6091,7 +6091,7 @@ mod tests {
         assert!(abort.headers().get(axum::http::header::RETRY_AFTER).is_none());
     }
 
-    /// Round-25 F3: SSE detection is case-insensitive and tolerates
+    /// SSE detection is case-insensitive and tolerates
     /// media-type parameters. Byte-exact `starts_with` previously
     /// misclassified `Text/Event-Stream` (some CDNs re-title-case)
     /// and any `text/event-stream; charset=utf-8` with a leading
@@ -6120,7 +6120,7 @@ mod tests {
         assert!(!is_sse_content_type(&HeaderMap::new()));
     }
 
-    /// Round-31 F5: OPTIONS to every mutating route replies with
+    /// OPTIONS to every mutating route replies with
     /// `204 No Content` and NO Access-Control-Allow-* headers.
     /// Browsers must interpret this as "cross-origin denied" and
     /// refuse the actual request — making the same-origin-only
@@ -6171,7 +6171,7 @@ mod tests {
         provider.abort();
     }
 
-    /// Round-32 F2: cached MCP tool-outcome replays preserve the
+    /// Cached MCP tool-outcome replays preserve the
     /// upstream Content-Type end-to-end (including through the
     /// on-disk journal roundtrip). Strict JSON-RPC 2.0 clients
     /// (spec: MUST be `application/json`) would previously receive
@@ -6233,7 +6233,7 @@ mod tests {
     /// legacy `/health` constant. Liveness stays a constant; readiness
     /// couples to the draining flag and to a spool-directory
     /// readability check so a full or missing spool volume immediately
-    /// steers new traffic elsewhere. See engineering review §8.3.
+    /// steers new traffic elsewhere.
     #[tokio::test]
     async fn livez_and_readyz_reflect_service_readiness() {
         let scratch = tempfile::tempdir().unwrap();
@@ -6296,7 +6296,7 @@ mod tests {
         assert_eq!(still_live.status(), StatusCode::OK);
     }
 
-    /// Round-51 §3.5 (DNS rebinding): a non-empty `allowed_hosts` must
+    /// DNS-rebinding defense: a non-empty `allowed_hosts` must
     /// refuse a Host header outside the list with 403 before any
     /// handler runs, accept listed hosts (with or without a port,
     /// case-insensitively, IPv6 brackets included), and refuse an
@@ -6352,7 +6352,7 @@ mod tests {
         }
     }
 
-    /// Round-51 W2: `/metrics` scrape must emit both a live
+    /// A `/metrics` scrape must emit both a live
     /// `av_open_sessions` gauge (sampled at scrape time from the
     /// registry) and a labelled `av_signing_key_info` gauge whose
     /// value is 1 whenever the process holds the signer.
@@ -6410,7 +6410,7 @@ mod tests {
         .into_owned();
         assert!(body.contains("# TYPE av_open_sessions gauge"), "{body}");
         assert!(body.contains("av_open_sessions 0"), "{body}");
-        // Round-51 §8.7: data-plane series must exist from boot.
+        // data-plane series must exist from boot.
         assert!(body.contains("# TYPE av_worker_queue_depth gauge"), "{body}");
         assert!(body.contains("# TYPE av_spool_bytes gauge"), "{body}");
         assert!(body.contains("# TYPE av_requests_total counter"), "{body}");

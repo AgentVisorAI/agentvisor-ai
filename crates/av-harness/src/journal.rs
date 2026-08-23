@@ -57,7 +57,7 @@ pub(crate) fn open<T: DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<T, String> {
     let envelope: Envelope = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
-    // Round-17 F9: HMAC-SHA256 renders as exactly 64 hex chars. A
+    // HMAC-SHA256 renders as exactly 64 hex chars. A
     // fs-tamper attacker with a multi-MB mac field would otherwise
     // force `hex::decode` to allocate half the string length on
     // every recovery-scan tick. Cap at 128 (twice the legitimate
@@ -69,7 +69,7 @@ pub(crate) fn open<T: DeserializeOwned>(
         ));
     }
     let claimed = hex::decode(&envelope.mac).map_err(|error| error.to_string())?;
-    // Round-26 F3: verify the MAC BEFORE any index-mismatch branch.
+    // Verify the MAC BEFORE any index-mismatch branch.
     // The old order (index check first, MAC last) meant that an
     // fs-tamper attacker with read access to the journal directory
     // could probe `expected_index` for every position and learn the
@@ -216,7 +216,7 @@ mod tests {
         );
     }
 
-    /// Round-26 F3: an fs-tamper attacker with read access to the
+    /// An fs-tamper attacker with read access to the
     /// journal directory used to be able to probe `expected_index`
     /// by feeding any envelope with a wrong index and reading both
     /// values out of the disclosed error text — a position oracle

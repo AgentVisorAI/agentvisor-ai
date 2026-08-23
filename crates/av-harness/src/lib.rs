@@ -1,12 +1,10 @@
-//! The Agent Harness: the drop-in inline proxy wrapping agent → LLM traffic
-//! (brief §9 data flow).
+//! The Agent Harness: the drop-in inline proxy wrapping agent → LLM traffic.
 //!
 //! Hot path (per request): validate identity → check token quota → sanitize →
 //! compress → dispatch a copy to the async workers (non-blocking `try_send`,
 //! bounded channels) → forward upstream → stream chunks back. Workers do the
 //! heavy work: embeddings, loop delta, OCSF emission, bridge publish, ATIF
-//! appends. Receipts are signed once, at session close, asynchronously
-//! (brief §2 signing rule).
+//! appends. Receipts are signed once, at session close, asynchronously.
 //!
 //! Silent-error posture: every dropped worker message increments
 //! `av_events_dropped_total`; audited chat/tool work reserves worker capacity

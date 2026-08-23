@@ -77,7 +77,7 @@ fn benchmark(c: &mut Criterion) {
     });
 
     c.bench_function("hot_path_prepare", |bench| {
-        // Round-51 §7.1: this warm-up used to panic — admission at
+        // This warm-up used to panic — admission at
         // ~5 µs/call outruns the worker shards' durable captures by
         // ~20×, so an unbounded iter() filled the 100k-slot queue
         // inside the 3 s warm-up, try_submit failed, the session

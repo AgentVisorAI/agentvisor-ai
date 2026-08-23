@@ -1,16 +1,15 @@
-//! Provider adapter seam (round-51 §4.2, S3 step 1).
+//! Provider adapter seam.
 //!
 //! The upstream was treated as OpenAI-shaped throughout the response
-//! path; the review's cost-of-change analysis names "a second
-//! provider" as the change this design makes painful. This module
-//! introduces the `ProviderAdapter` trait from the S3 migration plan
-//! (`docs/reference/STRUCTURAL-REFACTORS.md`) with the OpenAI
+//! path, which made "a second provider" the most painful change for
+//! this design to absorb. This module
+//! introduces the `ProviderAdapter` trait with the OpenAI
 //! adapter as its only implementation — a pure refactor. The SSE
 //! parser keeps its battle-tested implementation in `routes.rs`
 //! verbatim (BOM handling, `[DONE]`, `usage: null`, named-event
 //! refusal, metric-regression rejection); the adapter owns
-//! *selection*, so `AnthropicAdapter` / `GoogleGeminiAdapter` (S3
-//! steps 2-3) become additive.
+//! *selection*, so `AnthropicAdapter` / `GoogleGeminiAdapter`
+//! become additive.
 
 use std::sync::Arc;
 

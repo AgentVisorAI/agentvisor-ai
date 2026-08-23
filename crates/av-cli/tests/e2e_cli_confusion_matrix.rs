@@ -98,9 +98,9 @@ fn sign_receipt(dir: &Path) -> (PathBuf, String) {
         receipt_id: av_core::new_event_uid(),
         session_id: "cli-e2e-tn".to_owned(),
         issued_at: 0,
-        // Round-6 (hunt2 F3): must match `av_core::time::iso8601_ms(0)`
+        // Must match `av_core::time::iso8601_ms(0)`
         // exactly (millisecond precision, Zulu suffix) so the receipt
-        // passes the round-6 issued_at ↔ issued_at_iso cross-check.
+        // passes the issued_at ↔ issued_at_iso cross-check.
         issued_at_iso: "1970-01-01T00:00:00.000Z".to_owned(),
         ai_agent: AgentIdentity {
             version: "1".to_owned(),

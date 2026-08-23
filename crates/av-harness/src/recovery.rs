@@ -1,13 +1,12 @@
-//! Recovery-pass seam for the reconciler (round-51 §4.2, S1 step 2).
+//! Recovery-pass seam for the reconciler.
 //!
 //! `recover_spooled_sessions` historically interleaved five recovery
 //! concerns in one method on `Finalizer`; a bug in one silently
-//! affected the others (the round-42/44/51 seal-before-insert races
-//! all spanned two concerns). This module introduces the
-//! `RecoveryPass` interface from the S1 migration plan
-//! (`docs/reference/STRUCTURAL-REFACTORS.md`) and hosts the first
-//! extracted pass, the §8.5 orphan-JSON quarantine. Subsequent
-//! extractions (step 3 of the plan) move one concern at a time until
+//! affected the others (several seal-before-insert races each
+//! spanned two concerns). This module introduces the
+//! `RecoveryPass` interface and hosts the first
+//! extracted pass, the orphan-JSON quarantine. Subsequent
+//! extractions move one concern at a time until
 //! `recover_spooled_sessions` is a thin loop over `passes()`.
 
 use std::collections::HashSet;
@@ -300,7 +299,7 @@ impl RecoveryPass for AdoptStrictAtifPass<'_> {
     }
 }
 
-/// Round-16 stress finding: a fresh sidecar-less `{stem}.json` is
+/// A fresh sidecar-less `{stem}.json` is
 /// the normal transient state of an in-flight close (`write_atomic`
 /// runs moments before `ensure_atif_provenance` seals `.atif-auth`).
 /// Only files determinately older than this window are treated as
@@ -308,7 +307,7 @@ impl RecoveryPass for AdoptStrictAtifPass<'_> {
 /// tick at the cost of a single stat.
 pub(crate) const MIN_ORPHAN_AGE: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// §8.5 / round-44 F4: quarantine sidecar-less `.json` spool files.
+/// Quarantine sidecar-less `.json` spool files.
 ///
 /// Data cannot be authenticated without a `journal_key`-signed
 /// `.atif-auth` sidecar (generating one from bytes found on disk
@@ -474,7 +473,7 @@ mod tests {
     }
 
     /// The pass-level contract, independent of the Finalizer wiring
-    /// (which the reconciler round-44/16 regression tests pin):
+    /// (which the reconciler regression tests pin):
     /// aged orphans are renamed, live-stem / young / sidecar'd /
     /// non-json files survive untouched.
     #[tokio::test]
@@ -531,8 +530,8 @@ mod tests {
 
         assert_eq!(outcome.quarantined, 1, "exactly the aged orphan is renamed");
         assert!(!aged_orphan.exists(), "aged orphan must be renamed");
-        assert!(live_stem.exists(), "live-close stem must survive (§8.5)");
-        assert!(young_orphan.exists(), "young file must survive (round-16)");
+        assert!(live_stem.exists(), "live-close stem must survive");
+        assert!(young_orphan.exists(), "young file must survive (age gate)");
         assert!(sealed.exists(), "sealed artifact must survive");
         assert!(journal.exists(), "step journal must survive");
         assert_eq!(warned.lock().len(), 1, "one warn for the one rename");

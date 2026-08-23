@@ -95,10 +95,10 @@ fn redis_never_rounds_a_spend_past_jcs_max() {
     s.remove(&key);
 }
 
-/// Mutation-run hardening (round 11): `RedisStore::refund` had no live
+/// Mutation-run hardening: `RedisStore::refund` had no live
 /// contract test at all — a mutant deleting its body survived. Round-trip
 /// a spend + refund and prove the headroom returns; also prove the
-/// round-34 no-resurrect rule holds against a live server (refund on a
+/// no-resurrect rule holds against a live server (refund on a
 /// removed key must not recreate it).
 #[test]
 fn redis_contract_refund_roundtrip_and_no_resurrect() {
@@ -117,7 +117,7 @@ fn redis_contract_refund_roundtrip_and_no_resurrect() {
     assert_eq!(s.get(&key).unwrap(), 0, "refund must not resurrect a removed key");
 }
 
-/// Mutation-run hardening (round 11): the JCS_SAFE_MAX guard in
+/// Mutation-run hardening: the JCS_SAFE_MAX guard in
 /// `spend_many_on` and the duplicate-key rejection lacked exact live
 /// coverage (`>` -> `>=`, `||` -> `&&` survived).
 #[test]
@@ -168,7 +168,7 @@ fn redis_contract_spend_many_guards_are_exact() {
     );
 }
 
-/// Mutation-run hardening (round 11): the negative-counter defenses in
+/// Mutation-run hardening: the negative-counter defenses in
 /// `add_on`/`get_on` were unreachable through the store's own API (it
 /// never writes negatives), so their guards survived mutation. Poison a
 /// counter out-of-band — an operator's raw DECRBY or a hostile writer —
@@ -211,7 +211,7 @@ fn redis_contract_poisoned_negative_counter_is_refused() {
     s.remove(&key);
 }
 
-/// Round-51 §4.2: the ONE shared backend contract. Runs the identical
+/// The ONE shared backend contract. Runs the identical
 /// assertions the in-memory suite runs (store.rs unit test) so the two
 /// backends cannot silently drift on semantics again.
 #[test]

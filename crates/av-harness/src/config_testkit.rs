@@ -1,5 +1,5 @@
 //! Test-support constructors for [`HarnessConfig`], kept OUT of
-//! `config.rs` on purpose (round-51 §11): the permissive test
+//! `config.rs` on purpose: the permissive test
 //! defaults in `for_tests` fooled three independent reviewers,
 //! because a grep for a config default finds the test value in the
 //! same file as the production one. With this file, the production
@@ -10,7 +10,7 @@ use super::*;
 impl HarnessConfig {
     /// A config suitable for tests (temp dirs supplied by the caller).
     ///
-    /// # Round-35 F3 — TESTS AND BENCHES ONLY
+    /// # TESTS AND BENCHES ONLY
     ///
     /// The defaults here are DELIBERATELY permissive: `require_identity
     /// = false`, `require_tool_schema = false`, `enforce_identity_

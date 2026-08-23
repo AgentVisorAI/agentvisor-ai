@@ -317,7 +317,7 @@ fn config_validate_success_reports_config_version_and_listen() {
     assert!(s.contains("listen="), "expected listen=, got {s}");
 }
 
-/// Round-51 §8.10: a shape-valid config selecting a backend this
+/// A shape-valid config selecting a backend this
 /// build was compiled without must FAIL pre-flight — previously
 /// `config-validate` printed "valid" and the daemon then hard-failed
 /// at boot. Gated on the build actually lacking kafka (under
