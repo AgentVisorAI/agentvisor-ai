@@ -241,7 +241,7 @@ single-instance:
 | Signer seed | file on disk | same seed mounted at each replica (or a rotation you accept per replica) |
 | State store (budgets, ratelimits) | `state_backend = "memory"` | `state_backend = "redis"` with `state_endpoint = "redis://..."` and identical `AV_STATE_ENDPOINT` at each replica |
 | Bridge (event bus) | `bridge_backend = "embedded"` (per-pod data-dir) | `bridge_backend = "kafka"` or `"nats"` with shared endpoints |
-| ATIF spool | pod-local `atif_spool_dir` | RWX PVC OR one replica per spool volume (the reconciler's per-file lifecycle lock is process-local; two replicas sharing a spool would race on close) |
+| ATIF spool | pod-local `atif_spool_dir` (enforced: the daemon holds an exclusive lock on `.agentvisord.lock` in the spool and a second instance refuses to boot) | one replica per spool volume — sharing a spool is refused at startup because the reconciler's per-file lifecycle lock is process-local and two replicas would race on close |
 | Session registry | in-memory only | client stickiness (LB session affinity on `X-AV-Session`) OR accept that a session's audit chain lives on one pod for its lifetime and doesn't survive that pod's eviction |
 
 Concretely: a two-replica deployment with `state_backend = "memory"`

@@ -135,6 +135,15 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
         Arc::clone(&metrics),
     )
     .map_err(anyhow::Error::new)?;
+    // Round-51 §8.6: two daemons on one spool silently split the audit
+    // trail (interleaved journals, racing reconcilers, torn ATIF
+    // artifacts). The README documents single-instance; nothing
+    // enforced it. Hold an exclusive advisory lock on a well-known
+    // spool file for the whole process lifetime — the OS releases it
+    // on ANY exit including SIGKILL, so there is no stale-lock
+    // recovery to get wrong. Everything below (orphaned-temp sweep,
+    // spool recovery, the reconciler) assumes it is the only writer.
+    let _spool_lock = acquire_spool_lock(std::path::Path::new(&config.atif_spool_dir))?;
     // Boot-time only (no concurrent writer exists yet): sweep temp
     // files orphaned by a SIGKILL between `create_new` and `rename` —
     // the RAII unlink cannot run across a crash, so crash loops
@@ -431,6 +440,35 @@ enum CliAction {
     Run(Option<PathBuf>),
     Help,
     Version,
+}
+
+/// Round-51 §8.6: exclusive advisory lock proving this daemon is the
+/// spool's only writer (see the call site in `run`). The returned
+/// handle must stay alive for the process lifetime; dropping it — or
+/// any process exit, including SIGKILL — releases the lock.
+fn acquire_spool_lock(spool_dir: &Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(spool_dir)
+        .with_context(|| format!("create spool directory {}", spool_dir.display()))?;
+    let path = spool_dir.join(".agentvisord.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open spool lock file {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+            "another agentvisord instance already holds the spool lock at {}; \
+             two daemons sharing one spool would silently split the audit trail \
+             (interleaved journals, racing reconcilers, torn artifacts). Run one \
+             instance per spool directory",
+            path.display()
+        ),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(anyhow::Error::new(error).context(format!("acquire exclusive spool lock {}", path.display())))
+        }
+    }
 }
 
 /// Fail-closed argument parsing: anything unrecognized refuses startup

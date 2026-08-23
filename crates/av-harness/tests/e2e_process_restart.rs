@@ -395,3 +395,84 @@ vector_backend = "memory"
     );
     drop(daemon);
 }
+
+/// Round-51 §8.6: two daemons sharing one spool silently split the
+/// audit trail (interleaved journals, racing reconcilers, torn
+/// artifacts). The daemon holds an exclusive advisory lock on
+/// `.agentvisord.lock` for its whole lifetime; a second instance
+/// must refuse to boot while the first lives, and must boot cleanly
+/// once the first is gone (the OS releases the lock on ANY exit,
+/// including SIGKILL — no stale-lock recovery to get wrong).
+#[test]
+fn second_daemon_on_same_spool_refuses_to_boot() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path();
+    let upstream_port = spawn_mock_upstream();
+    let spool = root.join("spool/atif");
+    let seed_path = root.join("signing.seed");
+
+    let write_config = |listen_port: u16| {
+        let config_path = root.join(format!("agentvisor-{listen_port}.toml"));
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"config_version = 1
+listen = "127.0.0.1:{listen_port}"
+upstream_url = "http://127.0.0.1:{upstream_port}"
+require_identity = false
+default_workflow = "unsigned"
+compression_enabled = false
+dashboard_enabled = false
+atif_spool_dir = "{spool}"
+bridge_data_dir = "{bridge}"
+tool_schema_dir = "{schemas}"
+state_backend = "memory"
+embedder_backend = "hash"
+vector_backend = "memory"
+"#,
+                spool = spool.display(),
+                bridge = root.join(format!("data/bridge-{listen_port}")).display(),
+                schemas = root.join("tool-schemas").display(),
+            ),
+        )
+        .unwrap();
+        config_path
+    };
+    std::fs::create_dir_all(root.join("tool-schemas")).unwrap();
+
+    let first_port = free_port();
+    let mut first = start_daemon(&write_config(first_port), &seed_path);
+    wait_healthy(first_port, &mut first);
+
+    // A second instance pointed at the SAME spool must exit non-zero
+    // without ever serving.
+    let second_port = free_port();
+    let second_config = write_config(second_port);
+    let mut second = start_daemon(&second_config, &seed_path);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let second_status = loop {
+        if let Ok(Some(status)) = second.0.try_wait() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "second daemon on the same spool must refuse to boot, but it kept running"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(
+        !second_status.success(),
+        "second daemon must exit non-zero on a held spool lock, got {second_status}"
+    );
+    // The winner must be unaffected.
+    let (status, _) = http_get(first_port, "/health").expect("first daemon still serving");
+    assert_eq!(status, 200, "the lock-holding daemon must keep serving");
+
+    // SIGKILL the holder: the OS releases the advisory lock with no
+    // cleanup, so a replacement instance must boot successfully.
+    first.0.kill().unwrap();
+    let _ = first.0.wait();
+    let mut replacement = start_daemon(&second_config, &seed_path);
+    wait_healthy(second_port, &mut replacement);
+    drop(replacement);
+}
