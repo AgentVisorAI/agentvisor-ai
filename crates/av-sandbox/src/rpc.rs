@@ -396,6 +396,42 @@ mod tests {
         .unwrap()
     }
 
+    /// Mutation-run hardening: the public wrapper `refuse_duplicate_json_keys`
+    /// — the exact gate the harness chat ingress calls before serde ever sees
+    /// a request body — had no direct test, so a mutant replacing its body
+    /// with `Ok(())` survived this crate's suite. Pin: duplicates refused at
+    /// every nesting position, trailing garbage refused, clean bodies pass.
+    #[test]
+    fn refuse_duplicate_json_keys_covers_nesting_and_trailing_garbage() {
+        assert!(refuse_duplicate_json_keys(br#"{"a":1,"a":2}"#).is_err());
+        assert!(refuse_duplicate_json_keys(br#"{"outer":{"a":1,"a":2}}"#).is_err());
+        assert!(refuse_duplicate_json_keys(br#"{"arr":[{"a":1,"a":2}]}"#).is_err());
+        assert!(refuse_duplicate_json_keys(br#"{"ok":1}garbage"#).is_err());
+        assert!(refuse_duplicate_json_keys(br#"{"a":1,"b":{"a":1},"c":[1,"a"]}"#).is_ok());
+        assert!(refuse_duplicate_json_keys(b"[1,2,3]").is_ok());
+    }
+
+    /// Mutation-run hardening: the reserved JSON-RPC error codes are wire
+    /// contract (-32700 parse / -32600 invalid request / -32602 invalid
+    /// params); a mutant deleting the sign survived. Also pin that a
+    /// non-`tools/call` method routes to the application-level
+    /// authorization error rather than a protocol code.
+    #[test]
+    fn protocol_error_pins_reserved_jsonrpc_codes() {
+        let cases = [
+            (RpcError::Json("x".into()), -32700),
+            (RpcError::NotJsonRpc("x".into()), -32600),
+            (RpcError::TooLarge(9, 1), -32600),
+            (RpcError::BadParams("x".into()), -32602),
+        ];
+        for (error, expected) in cases {
+            let response = protocol_error(None, &error);
+            assert_eq!(response["error"]["code"].as_i64(), Some(expected), "{error:?}");
+        }
+        let passthrough = protocol_error(None, &RpcError::NotToolCall("initialize".into()));
+        assert_eq!(passthrough["error"]["code"].as_i64(), Some(-32001));
+    }
+
     #[test]
     fn parses_valid_call() {
         let req = parse_tool_call(&call("db_write", json!({"table": "users"}))).unwrap();

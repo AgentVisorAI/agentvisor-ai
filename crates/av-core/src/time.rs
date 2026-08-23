@@ -61,6 +61,16 @@ mod tests {
 
     use super::*;
 
+    /// Mutation-run hardening: `elapsed_us` feeds SLA metrics and verdict
+    /// latency fields; mutants returning 0/1 survived. 10 ms of real sleep
+    /// must measure as at least 2 000 µs on any scheduler.
+    #[test]
+    fn elapsed_us_measures_real_time() {
+        let started = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(elapsed_us(started) >= 2_000);
+    }
+
     #[test]
     fn epoch_zero() {
         assert_eq!(iso8601_ms(0), "1970-01-01T00:00:00.000Z");

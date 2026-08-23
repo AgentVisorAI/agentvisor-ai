@@ -314,6 +314,29 @@ mod tests {
         assert_eq!(s.state(), BreakerState::Open);
     }
 
+    /// Mutation-run hardening: `release_embedding` must actually clear the
+    /// retained window (a no-op mutant survived). Observable behavior: an
+    /// identical step right after a release compares against an EMPTY
+    /// history — maximum novelty, streak reset — where the un-released
+    /// window would have scored it a near-zero delta and kept the streak.
+    #[test]
+    fn release_embedding_clears_the_comparison_window() {
+        let s = SessionLoopState::new(cfg());
+        let e = HashEmbedder::default();
+        let text = "repeat the same reasoning step about pending orders";
+        s.observe(&e, text, 100);
+        assert!(matches!(
+            s.observe(&e, text, 100),
+            BreakerVerdict::Suspicious { streak: 1, .. }
+        ));
+        s.release_embedding();
+        let v = s.observe(&e, text, 100);
+        assert!(
+            matches!(v, BreakerVerdict::Progressing { .. }),
+            "released window must not remember prior steps: {v:?}"
+        );
+    }
+
     #[test]
     fn token_gate_defers_tripping() {
         let s = SessionLoopState::new(cfg());

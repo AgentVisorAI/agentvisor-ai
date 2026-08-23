@@ -160,6 +160,47 @@ mod tests {
         assert_eq!(e.embed("the same text"), e.embed("the same text"));
     }
 
+    /// Mutation-run hardening: pin the embedder's shape contract — the
+    /// default dimension, `embed()` output length == `dim()`, and the
+    /// `try_embed` default forwarding to `embed` (the production worker
+    /// path). Mutants returning fixed dims/vectors survived without these.
+    #[test]
+    fn dim_len_and_try_embed_contract() {
+        let e = HashEmbedder::default();
+        assert_eq!(e.dim(), 512);
+        assert_eq!(e.embed("x").len(), e.dim());
+        assert_eq!(e.try_embed("some step text").unwrap(), e.embed("some step text"));
+        let small = HashEmbedder::new(64);
+        assert_eq!(small.dim(), 64);
+        assert_eq!(small.embed("x").len(), 64);
+    }
+
+    /// The documented whitespace-collapse invariance covers LEADING runs
+    /// too — a mutant dropping the `!out.is_empty()` guard kept a leading
+    /// space and made `embed("  abc def")` diverge from `embed("abc def")`.
+    #[test]
+    fn whitespace_invariance_covers_leading_runs() {
+        let e = HashEmbedder::default();
+        assert_eq!(e.embed("  abc def"), e.embed("abc def"));
+        assert_eq!(e.embed("\t\nabc def \n"), e.embed("abc def"));
+    }
+
+    /// `cosine` must divide by the norm product — verified on NON-unit
+    /// vectors where the correct value is strictly inside (-1, 1), so a
+    /// `/`→`*` (or `*`→`/`) mutant cannot hide behind the final clamp.
+    /// Also pin the zero-vector arm for EACH side independently (the
+    /// `||`→`&&` mutant produced NaN when only one side was zero).
+    #[test]
+    fn cosine_normalizes_unnormalized_vectors_and_handles_one_sided_zero() {
+        let value = cosine(&[2.0, 0.0], &[1.0, 1.0]);
+        assert!(
+            (value - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6,
+            "expected ~0.7071, got {value}"
+        );
+        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
+        assert_eq!(cosine(&[1.0, 0.0], &[0.0, 0.0]), 0.0);
+    }
+
     #[test]
     fn normalized_output() {
         let e = HashEmbedder::default();
