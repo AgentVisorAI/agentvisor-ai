@@ -77,13 +77,39 @@ fn benchmark(c: &mut Criterion) {
     });
 
     c.bench_function("hot_path_prepare", |bench| {
-        bench.iter(|| {
-            black_box(
-                state
-                    .prepare_chat(&headers, payload.clone())
-                    .unwrap()
-                    .middleware_us,
-            )
+        // Round-51 §7.1: this warm-up used to panic — admission at
+        // ~5 µs/call outruns the worker shards' durable captures by
+        // ~20×, so an unbounded iter() filled the 100k-slot queue
+        // inside the 3 s warm-up, try_submit failed, the session
+        // latched capture-failed, and every later prepare_chat
+        // returned Unavailable. Time bounded batches with
+        // iter_custom and drain the audit queue OUTSIDE the timed
+        // window so the measurement stays "middleware cost per
+        // admission", not "queue backpressure".
+        bench.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            let mut remaining = iters;
+            while remaining > 0 {
+                let batch = remaining.min(20_000);
+                let started = std::time::Instant::now();
+                for _ in 0..batch {
+                    black_box(
+                        state
+                            .prepare_chat(&headers, payload.clone())
+                            .unwrap()
+                            .middleware_us,
+                    );
+                }
+                total += started.elapsed();
+                remaining -= batch;
+                // Untimed drain: wait for the shards to durably
+                // capture the batch's audit jobs before admitting
+                // the next one.
+                if let Some(session) = state.sessions.get("bench-session") {
+                    runtime.block_on(session.wait_for_worker_jobs());
+                }
+            }
+            total
         });
     });
 
@@ -99,24 +125,41 @@ fn benchmark(c: &mut Criterion) {
             },
             Default::default(),
         ));
-        bench.iter(|| {
-            black_box(state.worker.try_submit(WorkerJob {
-                session: Arc::clone(&session),
-                identity: session.current_identity(),
-                class: EventClass::Session,
-                payload: json!({}),
-                text: "bench".to_owned(),
-                analyze_loop: false,
-                status: StatusId::Success,
-                stop_reason: None,
-                native_stop_reason: None,
-                metrics: EventMetrics::default(),
-                cost_usd_micros: 0,
-                prompt_token_correction: 0,
-                atif: None,
-                response_marker: None,
-                response_attempt: None,
-            }))
+        bench.iter_custom(|iters| {
+            // Same queue-fill hazard as hot_path_prepare above: an
+            // unbounded enqueue loop fills the queue and silently
+            // measures the CHEAPER failure path afterwards. Bounded
+            // batches + untimed drain keep this a success-path number.
+            let mut total = std::time::Duration::ZERO;
+            let mut remaining = iters;
+            while remaining > 0 {
+                let batch = remaining.min(20_000);
+                let started = std::time::Instant::now();
+                for _ in 0..batch {
+                    black_box(state.worker.try_submit(WorkerJob {
+                        session: Arc::clone(&session),
+                        identity: session.current_identity(),
+                        class: EventClass::Session,
+                        payload: json!({}),
+                        text: "bench".to_owned(),
+                        analyze_loop: false,
+                        status: StatusId::Success,
+                        stop_reason: None,
+                        native_stop_reason: None,
+                        metrics: EventMetrics::default(),
+                        cost_usd_micros: 0,
+                        prompt_token_correction: 0,
+                        atif: None,
+                        response_marker: None,
+                        response_attempt: None,
+                    }))
+                    .expect("worker queue must not fill inside a drained batch");
+                }
+                total += started.elapsed();
+                remaining -= batch;
+                runtime.block_on(session.wait_for_worker_jobs());
+            }
+            total
         });
     });
 
