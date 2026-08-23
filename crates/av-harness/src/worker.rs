@@ -738,6 +738,14 @@ pub fn spawn_worker_with_spool_authenticated(
     }
 }
 
+/// Round-51 §7.3: sessions a shard may process concurrently. One
+/// stalled session (slow journal fsync, hung broker publish) used to
+/// freeze its entire shard — 31× measured head-of-line blocking for
+/// every other session hashed there. Eight slots bound the
+/// wasted-capacity blast radius of pathological neighbors to 1/8 of
+/// a shard while keeping per-shard task fan-out small.
+const MAX_ACTIVE_SESSIONS_PER_SHARD: usize = 8;
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_worker_shard(
     mut receiver: mpsc::Receiver<Envelope>,
@@ -750,59 +758,193 @@ fn spawn_worker_shard(
     worker_pending: Arc<std::sync::atomic::AtomicU64>,
     worker_drained: Arc<tokio::sync::Notify>,
 ) {
-    use futures::future::FutureExt as _;
+    // Round-51 §7.3 (intra-shard head-of-line blocking): the shard is
+    // a DISPATCHER over per-session FIFO queues, not a serial loop.
+    // Invariants:
+    //   * Per-session ordering: at most ONE envelope per session is in
+    //     flight; the next spawns only after its predecessor's task
+    //     joins. Arrival order per session is preserved (mpsc order →
+    //     VecDeque order).
+    //   * Cross-session progress: up to MAX_ACTIVE_SESSIONS_PER_SHARD
+    //     sessions run concurrently, so one stalled session occupies
+    //     one slot instead of the whole shard.
+    //   * Memory stays bounded by the GLOBAL capacity semaphore: every
+    //     queued envelope still holds its `_capacity_permit`, so
+    //     draining the channel into local queues does not raise the
+    //     in-flight ceiling.
+    //   * Shutdown: the loop exits only when the channel is closed AND
+    //     every local queue and in-flight task has drained, preserving
+    //     the drain contract (`worker_pending` accounting is inside
+    //     `process_envelope`, unchanged).
     tokio::spawn(async move {
+        let mut queues: std::collections::HashMap<String, std::collections::VecDeque<Envelope>> =
+            std::collections::HashMap::new();
+        // Sessions with an envelope IN FLIGHT. Tracked separately from
+        // `queues`: a session can be active AND have a backlog queued
+        // behind its in-flight envelope, and the slot-release scan
+        // must never dispatch from an active session's backlog — that
+        // would run two envelopes of one session concurrently and
+        // corrupt the per-session journal index sequence.
+        let mut active: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut tasks: tokio::task::JoinSet<String> = tokio::task::JoinSet::new();
+        let mut receiver_open = true;
+
+        let spawn_envelope = |tasks: &mut tokio::task::JoinSet<String>, envelope: Envelope| {
+            let session_id = envelope.job.session.id.clone();
+            let bridge = Arc::clone(&bridge);
+            let embedder = Arc::clone(&embedder);
+            let vector_sink = Arc::clone(&vector_sink);
+            let spool_dir = spool_dir.clone();
+            let worker_metrics = Arc::clone(&worker_metrics);
+            let worker_pending = Arc::clone(&worker_pending);
+            let worker_drained = Arc::clone(&worker_drained);
+            tasks.spawn(async move {
+                use futures::future::FutureExt as _;
+                // Supervise the whole envelope (routing + process_job)
+                // exactly like the pre-dispatcher shard loop did: the
+                // INNER tokio::spawn(process_job) already catches job
+                // panics; this catch_unwind covers the outer routing so
+                // a panic cannot lose the session's dispatch slot. The
+                // task cannot panic between here and returning the id.
+                let outcome = std::panic::AssertUnwindSafe(async {
+                    let metrics = Arc::clone(&worker_metrics);
+                    let outcome = std::panic::AssertUnwindSafe(process_envelope(
+                        envelope,
+                        bridge,
+                        embedder,
+                        vector_sink,
+                        spool_dir,
+                        journal_key,
+                        worker_metrics,
+                        worker_pending,
+                        worker_drained,
+                    ))
+                    .catch_unwind()
+                    .await;
+                    if let Err(panic) = outcome {
+                        let msg = panic
+                            .downcast_ref::<&'static str>()
+                            .copied()
+                            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                            .unwrap_or("panic payload was not a string");
+                        metrics
+                            .counter(
+                                "av_worker_shard_panics_total",
+                                "Worker shard driver panicked outside a job; supervised via catch_unwind",
+                            )
+                            .inc();
+                        tracing::error!(
+                            panic = %msg,
+                            "worker envelope routing panicked; continuing"
+                        );
+                    }
+                })
+                .catch_unwind()
+                .await;
+                drop(outcome);
+                session_id
+            });
+        };
+
         loop {
-            let Some(envelope) = receiver.recv().await else {
+            if !receiver_open && tasks.is_empty() && queues.is_empty() {
                 break;
-            };
-            // Supervise the per-envelope routing code (Arc::clones,
-            // span instrumentation, capacity_permit drop, drained
-            // notify, worker_pending accounting). The INNER
-            // `tokio::spawn(process_job).await` already catches
-            // process_job panics via JoinError → av_worker_panics_total,
-            // but a panic in the OUTER routing (allocator failure
-            // inside a tracing::warn Display, `worker_pending
-            // .fetch_sub` accounting bug) would kill the whole shard
-            // driver task, and every future envelope routed to this
-            // shard would pile up forever — jamming 1/MAX_SHARDS of
-            // the session id space until process restart.
-            let bridge_ref = Arc::clone(&bridge);
-            let embedder_ref = Arc::clone(&embedder);
-            let vector_sink_ref = Arc::clone(&vector_sink);
-            let spool_dir_ref = spool_dir.clone();
-            let worker_metrics_ref = Arc::clone(&worker_metrics);
-            let worker_pending_ref = Arc::clone(&worker_pending);
-            let worker_drained_ref = Arc::clone(&worker_drained);
-            let outcome = std::panic::AssertUnwindSafe(process_envelope(
-                envelope,
-                bridge_ref,
-                embedder_ref,
-                vector_sink_ref,
-                spool_dir_ref,
-                journal_key,
-                worker_metrics_ref,
-                worker_pending_ref,
-                worker_drained_ref,
-            ))
-            .catch_unwind()
-            .await;
-            if let Err(panic) = outcome {
-                let msg = panic
-                    .downcast_ref::<&'static str>()
-                    .copied()
-                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-                    .unwrap_or("panic payload was not a string");
-                worker_metrics
-                    .counter(
-                        "av_worker_shard_panics_total",
-                        "Worker shard driver panicked outside a job; supervised via catch_unwind",
-                    )
-                    .inc();
-                tracing::error!(
-                    panic = %msg,
-                    "worker shard driver panicked during envelope routing; continuing"
-                );
+            }
+            tokio::select! {
+                maybe_envelope = receiver.recv(), if receiver_open => {
+                    match maybe_envelope {
+                        Some(envelope) => {
+                            let session_id = envelope.job.session.id.clone();
+                            if !active.contains(&session_id)
+                                // Defense in depth: a WAITING backlog
+                                // (queued while at cap) must drain
+                                // first or this envelope would jump
+                                // its predecessors. Unreachable today
+                                // (every join refills slots from the
+                                // waiting set before the next recv),
+                                // but cheap to make impossible.
+                                && !queues.contains_key(&session_id)
+                                && active.len() < MAX_ACTIVE_SESSIONS_PER_SHARD
+                            {
+                                // Idle session, free slot: dispatch now.
+                                active.insert(session_id);
+                                spawn_envelope(&mut tasks, envelope);
+                            } else {
+                                // Active (order! behind the in-flight
+                                // envelope) or no free slot: queue.
+                                queues.entry(session_id).or_default().push_back(envelope);
+                            }
+                        }
+                        None => receiver_open = false,
+                    }
+                }
+                Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
+                    match joined {
+                        Ok(session_id) => {
+                            if let Some(envelope) = queues
+                                .get_mut(&session_id)
+                                .and_then(std::collections::VecDeque::pop_front)
+                            {
+                                // Same session next-in-line keeps its
+                                // slot: per-session order is preserved
+                                // because dispatch for an ACTIVE session
+                                // happens only here, after its
+                                // predecessor joined.
+                                if queues.get(&session_id).is_some_and(std::collections::VecDeque::is_empty) {
+                                    queues.remove(&session_id);
+                                }
+                                spawn_envelope(&mut tasks, envelope);
+                            } else {
+                                queues.remove(&session_id);
+                                active.remove(&session_id);
+                                // Slot freed: activate WAITING sessions
+                                // (queued work, not active — enqueued
+                                // while the shard was at cap).
+                                let waiting = queues
+                                    .keys()
+                                    .filter(|id| !active.contains(*id))
+                                    .take(
+                                        MAX_ACTIVE_SESSIONS_PER_SHARD.saturating_sub(active.len()),
+                                    )
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                for id in waiting {
+                                    let Some(envelope) = queues
+                                        .get_mut(&id)
+                                        .and_then(std::collections::VecDeque::pop_front)
+                                    else {
+                                        continue;
+                                    };
+                                    if queues.get(&id).is_some_and(std::collections::VecDeque::is_empty) {
+                                        queues.remove(&id);
+                                    }
+                                    active.insert(id);
+                                    spawn_envelope(&mut tasks, envelope);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            // Only runtime teardown/abort can land here
+                            // (the task body is panic-supervised and
+                            // infallible). The session's queue entry
+                            // stays; it re-activates on the next slot
+                            // release via the waiting scan above.
+                            tracing::error!(%error, "worker envelope task failed to join");
+                        }
+                    }
+                }
+                else => {
+                    // Receiver closed and no tasks in flight. Queues can
+                    // only be non-empty here after a JoinError leak
+                    // (runtime teardown); surface it rather than hang.
+                    if !queues.is_empty() {
+                        tracing::error!(
+                            sessions = queues.len(),
+                            "worker shard exiting with undispatched envelopes after task join failure"
+                        );
+                    }
+                    break;
+                }
             }
         }
     });
@@ -1774,6 +1916,63 @@ mod tests {
         fn embed(&self, _text: &str) -> Vec<f32> {
             std::thread::sleep(std::time::Duration::from_millis(100));
             vec![1.0]
+        }
+    }
+
+    /// Round-51 §7.3: a bus that BLOCKS publishes whose value names
+    /// the gated session until released — deterministic stand-in for
+    /// a hung broker/journal on one session.
+    struct GatedBus {
+        gated_session: String,
+        release: AtomicBool,
+        published: Mutex<Vec<String>>,
+    }
+
+    impl GatedBus {
+        fn new(gated_session: &str) -> Self {
+            Self {
+                gated_session: gated_session.to_owned(),
+                release: AtomicBool::new(false),
+                published: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl EventBus for GatedBus {
+        fn publish(&self, topic: &str, _key: &str, value: &Value) -> Result<PublishAck, BusError> {
+            let text = value.to_string();
+            if text.contains(&self.gated_session) {
+                while !self.release.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            self.published.lock().push(text);
+            Ok(PublishAck {
+                topic: topic.to_owned(),
+                partition: 0,
+                offset: 0,
+            })
+        }
+
+        fn fetch(
+            &self,
+            _topic: &str,
+            _partition: u32,
+            _offset: u64,
+            _max: usize,
+        ) -> Result<Vec<StoredEvent>, BusError> {
+            Ok(Vec::new())
+        }
+
+        fn partitions(&self, _topic: &str) -> Result<u32, BusError> {
+            Ok(1)
+        }
+
+        fn topics(&self) -> Vec<String> {
+            EventClass::all()
+                .iter()
+                .map(|class| class.topic().to_owned())
+                .collect()
         }
     }
 
@@ -2924,6 +3123,112 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(2), worker.wait_idle())
             .await
             .expect("wait_idle deadlocked — a canceled submit_and_wait leaked pending");
+    }
+
+    fn session_with_id(id: &str) -> Arc<Session> {
+        Arc::new(Session::new(
+            id.to_owned(),
+            Workflow::Signed,
+            AgentIdentity {
+                version: "1".to_owned(),
+                charter: "test".into(),
+                instance_uid: "instance-1".to_owned(),
+                ttl_remaining_s: Some(600),
+            },
+            BreakerConfig {
+                min_tokens: u64::MAX,
+                ..BreakerConfig::default()
+            },
+        ))
+    }
+
+    /// Find a session id that shares `reference`'s shard, so the test
+    /// provably exercises INTRA-shard scheduling.
+    fn colliding_session_id(reference: &str, shard_count: usize) -> String {
+        let target = av_bridge::bus::partition_for(reference, u32::try_from(shard_count).unwrap());
+        (0..)
+            .map(|n| format!("victim-{n}"))
+            .find(|candidate| {
+                candidate != reference
+                    && av_bridge::bus::partition_for(candidate, u32::try_from(shard_count).unwrap()) == target
+            })
+            .unwrap()
+    }
+
+    /// Round-51 §7.3: one stalled session must not freeze its shard.
+    /// Pre-dispatcher, the victim (same shard) sat behind the stalled
+    /// session's envelope forever (31× measured HOL blocking); now it
+    /// completes while the stalled session occupies one slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stalled_session_does_not_block_shard_neighbors() {
+        let shard_count = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(16)
+            .max(16);
+        let stalled_id = "stalled-session".to_owned();
+        let victim_id = colliding_session_id(&stalled_id, shard_count);
+        let bus = Arc::new(GatedBus::new(&stalled_id));
+        let worker = spawn_worker(
+            64,
+            Arc::clone(&bus) as Arc<dyn EventBus>,
+            Arc::new(HashEmbedder::default()),
+            Arc::new(Registry::new()),
+        );
+        let stalled = session_with_id(&stalled_id);
+        let victim = session_with_id(&victim_id);
+
+        let stalled_wait = {
+            let worker = worker.clone();
+            let job = job(Arc::clone(&stalled));
+            tokio::spawn(async move { worker.submit_and_wait(job).await })
+        };
+        // The victim must complete while the stalled session is gated.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            worker.submit_and_wait(job(Arc::clone(&victim))),
+        )
+        .await
+        .expect("victim session must not be head-of-line blocked by a stalled shard neighbor")
+        .unwrap();
+        assert!(
+            !stalled_wait.is_finished(),
+            "the stalled session must still be gated (the victim did not just win a race)"
+        );
+        bus.release.store(true, Ordering::Release);
+        stalled_wait.await.unwrap().unwrap();
+    }
+
+    /// Per-session ordering survives the dispatcher: two jobs for one
+    /// session publish in submission order even though the shard runs
+    /// sessions concurrently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn per_session_ordering_is_preserved() {
+        let bus = Arc::new(RecordingBus::default());
+        let worker = spawn_worker(
+            64,
+            Arc::clone(&bus) as Arc<dyn EventBus>,
+            Arc::new(HashEmbedder::default()),
+            Arc::new(Registry::new()),
+        );
+        let session = session_with_id("ordered-session");
+        for n in 0..8 {
+            let mut ordered = job(Arc::clone(&session));
+            ordered.text = format!("step-{n}");
+            worker.submit_and_wait(ordered).await.unwrap();
+        }
+        let events = bus.events.lock();
+        let texts: Vec<String> = events
+            .iter()
+            .filter_map(|(_, _, value)| value.get("message").and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        let steps: Vec<&String> = texts.iter().filter(|text| text.starts_with("step-")).collect();
+        for (index, text) in steps.iter().enumerate() {
+            assert_eq!(
+                text.as_str(),
+                &format!("step-{index}"),
+                "per-session publish order must match submission order: {texts:?}"
+            );
+        }
     }
 }
 

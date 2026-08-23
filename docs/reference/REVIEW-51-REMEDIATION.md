@@ -55,7 +55,7 @@ Status legend: ✅ fixed · 🔶 deferred with documented rationale.
 | 7.1 `cargo bench` does not run (queue overflow in warm-up) | ✅ | `iter_custom` bounded batches with untimed drains; suite completes; BENCHMARKS.md states figure provenance |
 | 7.1 Benchmarked config disables three stages | ✅ | BENCHMARKS.md scope column names exactly what each figure covers |
 | 7.3 ~9 durable syncs, ~30 IOPS/request | 🔶/✅ | EEXIST mkdirs eliminated (~5/request → 0); broker acks folded into per-session `{stem}.acks.ndjson` (2 fsyncs → 1, no per-request dir, no leftover file). **Deferred:** the batching writer (below) |
-| 7.3 One session monopolises 1/16 capacity; shards hardcoded at 16 | 🔶/✅ | Shard count now `max(16, available_parallelism)`. **Deferred:** intra-shard cross-session concurrency (below) |
+| 7.3 One session monopolises 1/16 capacity; shards hardcoded at 16 | ✅ | Shard count `max(16, available_parallelism)`; shards are now dispatchers over per-session FIFO queues — up to 8 sessions per shard run concurrently with strict per-session ordering, so a stalled session occupies one slot, not the shard |
 | 7.3 CPU-bound work inline, switch keys off the wrong thing | ✅ | Body-size-keyed blocking switch (16 KiB), not budget presence |
 | 7.3 Unsigned sessions retain every turn in RAM (1.35 GB @ 10k) | ✅ | Steps spilled to the events journal (which already carried them); RAM keeps a counter; close rebuilds from disk |
 | 7.3 Metric observations take two global mutexes | ✅ | `HotMetrics` pre-resolved handles; `AV_STRICT_BUDGET` read once at construction |
@@ -115,4 +115,3 @@ Status legend: ✅ fixed · 🔶 deferred with documented rationale.
 | Item | Rationale |
 | --- | --- |
 | §7.3 group-commit batching writer (one fdatasync per batch per shard) | Per-event fsync measures p95 33 µs at 10k connections — well inside SLA. Batching couples unrelated sessions' completion latency and demands a crash-consistency proof over the batch window (which jobs' effects may be visible when). Revisit when profiling on production storage shows fsync at the top of the flame graph. The free halves are landed (mkdir elimination, ack-journal fold). |
-| §7.3 intra-shard head-of-line blocking (one session stalls 1/16 of the id space) | Requires a per-session sub-queue scheduler inside each shard while preserving per-session ordering, drain semantics, and the shutdown budget. Aggregate throughput is CPU-bound long before this binds (§7.4); single-tenant latency under a pathological neighbor is the real cost. Design sketch belongs in STRUCTURAL-REFACTORS.md if multi-tenant latency SLOs arrive. |
