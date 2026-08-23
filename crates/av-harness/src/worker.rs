@@ -1226,11 +1226,14 @@ async fn process_job(
             .append(&value)
             .map_err(|error| error.to_string())?,
         Workflow::Unsigned => {
-            job.session
-                .atif
-                .lock()
-                .push_step(atif_step.ok_or_else(|| "unsigned ATIF step disappeared".to_owned())?)
-                .map_err(|error| error.to_string())?;
+            // Round-51 §7.3 (RAM cliff): the step was already
+            // journaled durably in `record.atif_step` above — do NOT
+            // retain a second copy in the in-RAM builder (50 turns ×
+            // 2 KB × 10k sessions was 1.35 GB held for the idle
+            // window). Close rebuilds the trajectory from the
+            // journal; RAM keeps only the count.
+            atif_step.ok_or_else(|| "unsigned ATIF step disappeared".to_owned())?;
+            job.session.note_atif_step();
         }
     }
 
@@ -2380,22 +2383,43 @@ mod tests {
 
     #[tokio::test]
     async fn unsigned_job_preserves_required_atif_metrics() {
+        // Round-51 §7.3 (RAM cliff): the step now lives ONLY in the
+        // events journal; RAM keeps a counter. Use a spooled worker
+        // and assert the journaled step carries the metrics.
         let bridge = Arc::new(RecordingBus::default());
-        let worker = spawn_worker(
+        let directory = tempfile::tempdir().unwrap();
+        let journal_key = [4u8; 32];
+        let worker = spawn_worker_with_spool_authenticated(
             4,
             bridge,
             Arc::new(HashEmbedder::default()),
+            Arc::new(NoopVectorSink),
+            Some(directory.path().to_path_buf()),
+            journal_key,
             Arc::new(Registry::new()),
         );
         let session = session(Workflow::Unsigned);
         worker.submit_and_wait(job(Arc::clone(&session))).await.unwrap();
 
-        let trajectory = session.take_trajectory();
-        assert_eq!(trajectory.steps.len(), 1);
-        assert_eq!(
-            trajectory.steps[0].metrics.as_ref().unwrap().cached_tokens,
-            Some(40)
+        assert_eq!(session.atif_steps_count(), 1);
+        assert!(
+            session.atif.lock().is_empty(),
+            "steps must not be retained in RAM (round-51 §7.3)"
         );
+        let digest = av_core::digest::sha256_hex(session.id.as_bytes());
+        let stem = digest.get(..32).unwrap();
+        let journal =
+            std::fs::read_to_string(directory.path().join(format!("{stem}.events.ndjson"))).unwrap();
+        let line = journal.lines().next().unwrap();
+        let record: ActiveJournalRecord = crate::journal::open(
+            &journal_key,
+            &format!("{}:active", session.id),
+            0,
+            line.as_bytes(),
+        )
+        .unwrap();
+        let step = record.atif_step.unwrap();
+        assert_eq!(step.metrics.as_ref().unwrap().cached_tokens, Some(40));
         assert_eq!(session.totals.cached_tokens.load(Ordering::Acquire), 0);
     }
 
