@@ -148,11 +148,11 @@ impl RecoveryPass for QuarantineIncompleteEffectsPass {
         Box::pin(async move {
             let mut quarantined = crate::worker::inflight_response_sessions(ctx.spool_dir, ctx.journal_key)
                 .await
-                .map_err(FinalizeError::Atif)?;
+                .map_err(FinalizeError::atif)?;
             quarantined.extend(
                 crate::routes::unresolved_tool_sessions(ctx.spool_dir, ctx.journal_key)
                     .await
-                    .map_err(FinalizeError::Atif)?,
+                    .map_err(FinalizeError::atif)?,
             );
             quarantined.retain(|id| ctx.sessions.get(id).is_none());
             let mut outcome = PassOutcome::default();
@@ -342,13 +342,9 @@ impl RecoveryPass for QuarantineOrphanJsonPass {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     return Ok(outcome);
                 }
-                Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+                Err(error) => return Err(FinalizeError::atif_source(error)),
             };
-            while let Some(entry) = entries
-                .next_entry()
-                .await
-                .map_err(|error| FinalizeError::Atif(error.to_string()))?
-            {
+            while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::atif_source)? {
                 let path = entry.path();
                 if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
                     continue;

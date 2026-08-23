@@ -120,7 +120,7 @@ async fn session_binding_refuses_workflow_change_after_open() {
         panic!("workflow change must be refused");
     };
     assert!(
-        matches!(err, PipelineError::BadRequest(_)),
+        matches!(err, PipelineError::BadRequest { .. }),
         "expected BadRequest for workflow change, got {err:?}"
     );
 }
@@ -427,7 +427,7 @@ async fn tool_intercept_after_session_close_refuses() {
         panic!("intercept after close must fail");
     };
     assert!(
-        matches!(err, PipelineError::BadRequest(_)),
+        matches!(err, PipelineError::BadRequest { .. }),
         "expected BadRequest after close, got {err:?}"
     );
 }

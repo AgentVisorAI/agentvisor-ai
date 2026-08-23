@@ -134,7 +134,7 @@ async fn many_shot_prompt_is_refused_at_token_budget_before_upstream_dispatch() 
         panic!("many-shot request must be blocked at the token budget");
     };
     assert!(
-        matches!(err, PipelineError::Blocked(_)),
+        matches!(err, PipelineError::Blocked { .. }),
         "expected Blocked, got {err:?}"
     );
     // No provider call was made — bus received a stop-reason event but not a
