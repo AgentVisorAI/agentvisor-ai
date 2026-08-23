@@ -133,6 +133,15 @@ window during which `av_atif_recovery_skipped_total{reason="unauthenticated"}`
 ticks by 60s per orphan (the MIN_ORPHAN_AGE gate). This is
 intentional (round 51 §8.5).
 
+## Audit-fidelity notes
+
+* **`n > 1` responses concatenate.** Multi-choice completions relay
+  verbatim to the client, and tool-call deltas are keyed per choice
+  in the audit record — but the recorded response *text* is the
+  concatenation of every choice's content (round-51 §9.3). If your
+  compliance story requires per-choice message attribution, use
+  `n = 1` (the near-universal default).
+
 ## What the harness will NEVER limit
 
 * Number of turns in a session — sessions are RAM-cost bounded but

@@ -50,6 +50,30 @@ Every other route on the harness (`/promote`, `/close`, `/health`,
 territory and is documented separately. Only the chat route is
 "OpenAI-compatible" in the strict sense.
 
+### The `/v1` vs `/api/v1` split (round-51 §9.3)
+
+The prefix split is deliberate, not accidental:
+
+* **`/v1/*`** is the client-facing **agent API** — the surface an
+  agent or SDK touches during a conversation: `/v1/chat/completions`
+  (OpenAI-shaped), `/v1/mcp` (JSON-RPC tool gate), and the two
+  session lifecycle verbs `/v1/sessions/{id}/close` and
+  `/v1/sessions/{id}/promote`. Errors on this surface use the
+  OpenAI error body (`{"error":{"message","type","param","code"}}`)
+  so SDK `e.code` handling works — including the 413 body-limit
+  rejection.
+* **`/api/v1/*`** is the **operator API** behind the dashboard
+  (`stats`, `sessions`, `sessions/{id}`), plus the unprefixed
+  operational probes (`/health`, `/livez`, `/readyz`, `/metrics`).
+  These return operator-shaped JSON, not OpenAI error bodies.
+
+Success shapes on the lifecycle verbs are versioned operator
+contracts, intentionally NOT OpenAI-shaped: `close` returns
+`{"kind":"receipt",...}` / `{"kind":"atif",...}` /
+`{"kind":"already_closed"}` and `promote` returns the bare signed
+receipt object (the artifact itself, suitable for piping to
+`avctl receipt-verify`).
+
 ## Supported request fields
 
 Passed through verbatim to the upstream:
