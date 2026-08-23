@@ -237,46 +237,55 @@ fn state_store_survives_100k_key_bomb_without_poisoning() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Signer bomb: 5000 receipt issuances in a tight loop, each verified.
-//    Detects any per-op leak in signer or in the receipt struct.
+// 7. Signer bomb: repeated receipt issuances in a tight loop, each verified.
+//    Round-51 §10.1: this used to run 5,000 iterations (75 s — 38% of the
+//    suite wall clock) with `elapsed < 120 s` as its only assertion, which
+//    measured nothing (no memory reading, per-iteration bodies not
+//    comparable). Trimmed to a functional-signal size with a REAL
+//    divergence assertion: RFC 8032 Ed25519 is deterministic, so issuing
+//    the same body twice must produce byte-identical signatures — any
+//    divergence indicates nonce-generation misbehavior in the signer,
+//    which is the class of bug worth catching here.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn five_thousand_receipt_issuances_never_leak_or_diverge() {
+fn repeated_receipt_issuances_verify_and_never_diverge() {
     let s = signer();
     let ring = ring(&s);
-    let start = Instant::now();
-    for i in 0..5_000_u64 {
-        let body = ReceiptBody {
-            receipt_version: 1,
-            receipt_id: format!("r{i}"),
-            session_id: format!("s{i}"),
-            issued_at: i,
-            // Round-6 (hunt2 F3): derive ISO from the ms field so the
-            // fixture spans i>=1000 without the old `{i:03}` overflow.
+    let body = |i: u64| ReceiptBody {
+        receipt_version: 1,
+        receipt_id: format!("r{i}"),
+        session_id: format!("s{i}"),
+        issued_at: i,
             issued_at_iso: av_core::time::iso8601_ms(i),
-            ai_agent: av_events::AgentIdentity {
-                version: "1".to_owned(),
-                charter: av_events::CharterFile::from("c"),
-                instance_uid: "i".to_owned(),
-                ttl_remaining_s: None,
-            },
-            subject: ReceiptSubject::EventChain {
-                chain_head: "00".repeat(32),
-                event_count: i,
-            },
-            tool_calls: ToolCallSummary::default(),
-            cost: CostSummary::default(),
-            stop_reason_id: 1,
-            stop_reason: "SessionClosed".to_owned(),
-            key_id: String::new(),
-            public_key_b64: String::new(),
-        };
-        let receipt = Receipt::issue(body, &s).unwrap();
+        ai_agent: av_events::AgentIdentity {
+            version: "1".to_owned(),
+            charter: av_events::CharterFile::from("c"),
+            instance_uid: "i".to_owned(),
+            ttl_remaining_s: None,
+        },
+        subject: ReceiptSubject::EventChain {
+            chain_head: "00".repeat(32),
+            event_count: i,
+        },
+        tool_calls: ToolCallSummary::default(),
+        cost: CostSummary::default(),
+        stop_reason_id: 1,
+        stop_reason: "SessionClosed".to_owned(),
+        key_id: String::new(),
+        public_key_b64: String::new(),
+    };
+    for i in 0..200_u64 {
+        let receipt = Receipt::issue(body(i), &s).unwrap();
         receipt.verify(&ring).unwrap();
+        // Determinism: re-issuing the identical body must reproduce the
+        // identical signature (deterministic Ed25519 nonce).
+        let again = Receipt::issue(body(i), &s).unwrap();
+        assert_eq!(
+            receipt.signature_b64, again.signature_b64,
+            "issuance #{i} diverged across identical inputs"
+        );
     }
-    let elapsed = start.elapsed();
-    assert!(elapsed.as_secs() < 120, "5k receipts took {elapsed:?}");
 }
 
 // ---------------------------------------------------------------------------

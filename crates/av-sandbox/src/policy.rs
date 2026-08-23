@@ -44,9 +44,13 @@ impl NativePolicy {
 
     /// Deny-list policy: block the named tools outright.
     pub fn deny_tools(tools: &[&str]) -> Self {
-        let denied: Vec<String> = tools.iter().map(|s| (*s).to_owned()).collect();
+        // Round-51 §5.4: HashSet lookup instead of a per-call linear
+        // scan of a Vec<String> — deny lists grow with deployment age
+        // and this closure runs on every tool call.
+        let denied: std::collections::HashSet<String> =
+            tools.iter().map(|s| (*s).to_owned()).collect();
         Self::new("deny_tools", move |tool, _| {
-            if denied.iter().any(|d| d == tool) {
+            if denied.contains(tool) {
                 PolicyDecision::Deny {
                     reason: format!("tool {tool:?} is deny-listed"),
                 }
@@ -58,9 +62,10 @@ impl NativePolicy {
 
     /// Allow-list policy: only the named tools may run.
     pub fn allow_only(tools: &[&str]) -> Self {
-        let allowed: Vec<String> = tools.iter().map(|s| (*s).to_owned()).collect();
+        let allowed: std::collections::HashSet<String> =
+            tools.iter().map(|s| (*s).to_owned()).collect();
         Self::new("allow_only", move |tool, _| {
-            if allowed.iter().any(|a| a == tool) {
+            if allowed.contains(tool) {
                 PolicyDecision::Allow
             } else {
                 PolicyDecision::Deny {

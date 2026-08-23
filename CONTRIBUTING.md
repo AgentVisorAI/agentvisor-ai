@@ -22,11 +22,18 @@ tools throughout. The following runs the same gates as CI:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --lib                      # fast inner loop (~4 s)
 cargo test --workspace                            # in-process suites
 cargo test --workspace --all-features             # feature matrix
 RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D warnings" \
   cargo doc --workspace --all-features --no-deps
 ```
+
+> `--all-features` builds `rdkafka-sys`, which needs libcurl headers:
+> `apt install libcurl4-openssl-dev` (Debian/Ubuntu) or
+> `brew install curl` (macOS). Without them, `make test-all`,
+> `make ci`, and `make lint-all-features` fail with
+> `fatal error: curl/curl.h: No such file or directory`.
 
 Some suites depend on live backends (Redis, Kafka/Redpanda, NATS, Qdrant).
 Bring them up with the compose file used by CI:

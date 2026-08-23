@@ -791,3 +791,50 @@ fn iat_at_exact_leeway_edge_is_accepted() {
     c.exp = c.iat + 600;
     v.validate(&mint(&keys, &c)).unwrap();
 }
+
+/// Round-51 §10.2: the JWKS-bomb DoS guard (`MAX_JWKS_KEYS = 256`)
+/// was reasoned about in comments and tested nowhere. A hostile or
+/// compromised IdP inflating the `keys` array to tens of thousands
+/// of entries must be refused BEFORE the per-key parser walks it —
+/// regardless of `kty` (the round-15 F5 fix specifically covers
+/// non-OKP decoy entries that the inner parser would skip-scan).
+#[test]
+fn jwks_bomb_is_refused_before_the_key_walk() {
+    let validator = IdentityValidator::new("harness-prod");
+    // 257 RSA decoys: each would be skipped by the OKP filter, so
+    // only the outer cap can bound the walk.
+    let bomb: Vec<serde_json::Value> = (0..257)
+        .map(|i| {
+            serde_json::json!({
+                "kid": format!("decoy-{i}"),
+                "kty": "RSA",
+                "n": "AQAB",
+                "e": "AQAB",
+            })
+        })
+        .collect();
+    let outcome = validator.add_jwks(&serde_json::json!({ "keys": bomb }));
+    assert!(
+        matches!(outcome, Err(IdentityError::Jwks(ref m)) if m.contains("257")),
+        "oversized JWKS must be refused with the entry count named; got {outcome:?}"
+    );
+    assert_eq!(validator.key_count(), 0, "no key may be installed from a refused JWKS");
+
+    // Exactly at the cap: accepted (the guard is >, not >=).
+    let mut at_cap: Vec<serde_json::Value> = (0..255)
+        .map(|i| serde_json::json!({"kid": format!("d-{i}"), "kty": "RSA"}))
+        .collect();
+    let real = ed25519_keys("real-key");
+    at_cap.push(serde_json::json!({
+        "kid": real.kid,
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "alg": "EdDSA",
+        "use": "sig",
+        "x": real.public_x,
+    }));
+    let added = validator
+        .add_jwks(&serde_json::json!({ "keys": at_cap }))
+        .unwrap();
+    assert_eq!(added, 1, "the single real key among 255 decoys must install");
+}

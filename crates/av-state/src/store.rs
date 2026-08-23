@@ -81,8 +81,8 @@ pub trait StateStore: Send + Sync {
     /// Round-33 F1: introduced to close the round-32 F3 concurrent-MCP
     /// budget double-spend. When two identical MCP requests race and
     /// one loses the atomic `execution.claim()`, the sandbox-gate
-    /// spend is refunded so `payout_remaining` and per-tool counters
-    /// reflect only the admitted work.
+    /// spend is refunded so the budget counters reflect only the
+    /// admitted work.
     fn refund(&self, key: &str, amount: u64) {
         let _ = (key, amount);
     }

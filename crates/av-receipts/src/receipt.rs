@@ -809,6 +809,28 @@ mod tests {
         );
     }
 
+    /// Round-51 §10.2: `from_json_str` is public API and previously
+    /// had no caller in any test. Prove the roundtrip (an issued
+    /// receipt re-parses and still verifies) AND that the strict
+    /// duplicate-key gate applies on the &str path too — a regression
+    /// that routed it around `check_no_duplicate_keys` would reopen
+    /// the split-brain the slice path closes.
+    #[test]
+    fn from_json_str_roundtrips_and_applies_the_duplicate_key_gate() {
+        let signer = Ed25519Signer::generate();
+        let issued = Receipt::issue(body(), &signer).unwrap();
+        let text = serde_json::to_string(&issued).unwrap();
+        let reparsed = Receipt::from_json_str(&text).unwrap();
+        assert_eq!(reparsed, issued);
+        reparsed.verify_embedded().unwrap();
+
+        let outcome = Receipt::from_json_str(r#"{"receipt_version":1,"receipt_version":2}"#);
+        assert!(
+            matches!(outcome, Err(ReceiptError::DuplicateKey(_))),
+            "the &str path must apply the same duplicate-key gate; got {outcome:?}"
+        );
+    }
+
     #[test]
     fn from_json_slice_rejects_duplicate_key_inside_ai_agent() {
         let bytes = br#"{"ai_agent":{"instance_uid":"a","instance_uid":"b"}}"#;
