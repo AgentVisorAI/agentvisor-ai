@@ -354,6 +354,22 @@ mod tests {
 
     use super::*;
 
+    /// Mutation-run hardening: `read_capped_string` (the manifest /
+    /// watermark / key-file read used at every control-plane trust
+    /// boundary) had no direct test — mutants returning a fixed string
+    /// survived. Pin content round-trip and the over-cap refusal.
+    #[test]
+    fn read_capped_string_round_trips_and_refuses_over_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("value.txt");
+        std::fs::write(&path, "expected-content").unwrap();
+        assert_eq!(
+            read_capped_string(&path, MAX_CONTROL_BYTES).unwrap(),
+            "expected-content"
+        );
+        assert!(read_capped_string(&path, 4).is_err(), "over-cap read must refuse");
+    }
+
     /// Round-36 F1: `basename` is a canonical name for the fix to
     /// the "path.display() in tracing → OTLP → SIEM leak" class.
     /// Assert the property callers rely on: never returns the

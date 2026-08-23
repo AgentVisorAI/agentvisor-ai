@@ -608,6 +608,44 @@ mod tests {
         assert!(text.contains("av_test_total 5"), "{text}");
     }
 
+    /// Mutation-run hardening: `validate_metric_key` replaced with a no-op
+    /// survived — nothing pinned that a base name carrying a scrape-
+    /// corrupting byte actually panics at registration.
+    #[test]
+    #[should_panic(expected = "corrupt")]
+    fn metric_key_with_newline_panics_at_registration() {
+        let r = Registry::new();
+        let _ = r.counter("av_bad\nname_total", "bad");
+    }
+
+    /// Mutation-run hardening: `escape_prom_help`'s C0/DEL/C1 replacement
+    /// boundary was untested beyond `\n` — ESC (terminal injection via
+    /// piped /metrics), NUL (promtool lint), CR and CSI must all become
+    /// spaces, while printable ASCII from 0x20 up passes through.
+    #[test]
+    fn help_text_scrubs_all_control_bytes_to_spaces() {
+        let scrubbed = escape_prom_help("a\u{1b}[2Jb\u{0}c\rd\u{9b}e");
+        assert_eq!(scrubbed, "a [2Jb c d e");
+        assert_eq!(escape_prom_help(" printable ~"), " printable ~");
+        assert_eq!(escape_prom_help("line\nbreak\\slash"), "line\\nbreak\\\\slash");
+    }
+
+    /// Mutation-run hardening: the `_sum` line converts accumulated
+    /// microseconds to SECONDS via division; a `/`→`*` mutant survived
+    /// because no test pinned the rendered sum value.
+    #[test]
+    fn histogram_sum_renders_in_seconds() {
+        let r = Registry::new();
+        let h = r.histogram("av_test_lat_seconds", "test latency");
+        h.observe_us(1_500_000);
+        h.observe_us(500_000);
+        let text = r.render();
+        assert!(
+            text.contains("av_test_lat_seconds_sum 2\n"),
+            "2_000_000 us must render as 2 seconds: {text}"
+        );
+    }
+
     #[test]
     fn gauge_add_sub_set_and_render() {
         let r = Registry::new();
