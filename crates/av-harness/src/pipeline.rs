@@ -219,7 +219,7 @@ pub(crate) fn resolve_upstream_auth(
         None => return Ok(None),
     };
     let name = HeaderName::try_from(config.upstream_auth_header.as_str()).map_err(|_| {
-        PipelineError::Upstream(format!(
+        PipelineError::upstream(format!(
             "upstream_auth_header {:?} is not a valid header name",
             config.upstream_auth_header
         ))
@@ -230,7 +230,7 @@ pub(crate) fn resolve_upstream_auth(
         format!("{} {key}", config.upstream_auth_scheme)
     };
     let mut value = HeaderValue::from_str(&rendered).map_err(|_| {
-        PipelineError::Upstream(
+        PipelineError::upstream(
             "upstream API key contains bytes that cannot appear in an HTTP header".to_owned(),
         )
     })?;
@@ -249,7 +249,7 @@ pub(crate) fn resolve_tool_auth(config: &HarnessConfig) -> Result<Option<HeaderV
         None => return Ok(None),
     };
     let mut value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
-        PipelineError::Upstream(
+        PipelineError::upstream(
             "tool upstream bearer token contains bytes that cannot appear in an HTTP header".to_owned(),
         )
     })?;
@@ -277,13 +277,13 @@ fn read_secret_from(
 ) -> Result<Option<String>, PipelineError> {
     if let Some(name) = env_name {
         let value = get_env(name).ok_or_else(|| {
-            PipelineError::Upstream(format!(
+            PipelineError::upstream(format!(
                 "{what}: environment variable {name} is not set (export it or update the config)"
             ))
         })?;
         let value = value.trim().to_owned();
         if value.is_empty() {
-            return Err(PipelineError::Upstream(format!(
+            return Err(PipelineError::upstream(format!(
                 "{what}: environment variable {name} is set but empty"
             )));
         }
@@ -291,12 +291,14 @@ fn read_secret_from(
     }
     if let Some(path) = file_path {
         require_owner_only_secret(std::path::Path::new(path))
-            .map_err(|error| PipelineError::Upstream(format!("{what}: {error}")))?;
-        let value = std::fs::read_to_string(path)
-            .map_err(|error| PipelineError::Upstream(format!("{what}: read {path}: {error}")))?;
+            .map_err(|error| PipelineError::upstream(format!("{what}: {error}")))?;
+        let value = std::fs::read_to_string(path).map_err(|error| PipelineError::Upstream {
+            context: format!("{what}: read {path}: {error}"),
+            source: Some(Box::new(error)),
+        })?;
         let value = value.trim().to_owned();
         if value.is_empty() {
-            return Err(PipelineError::Upstream(format!("{what}: file {path} is empty")));
+            return Err(PipelineError::upstream(format!("{what}: file {path} is empty")));
         }
         return Ok(Some(value));
     }
@@ -519,31 +521,152 @@ pub(crate) fn refused_response_failure_job(
     }
 }
 
+/// Boxed dynamic error source for harness error variants whose
+/// underlying cause can be any of several concrete types (`io::Error`,
+/// `serde_json::Error`, `av_receipts::ReceiptError`, ...). Kept dynamic
+/// so one variant covers heterogeneous call sites while still exposing
+/// the typed error through [`std::error::Error::source`] — callers can
+/// `source().downcast_ref::<std::io::Error>()` to branch on e.g.
+/// `io::ErrorKind`, and tracing subscribers receive the full chain.
+pub type ErrorSource = Box<dyn std::error::Error + Send + Sync + 'static>;
+
 /// Hot-path failures, each carrying an HTTP status mapping.
+///
+/// Variants that wrap an underlying failure carry it as a typed
+/// `#[source]` instead of a pre-rendered `String`; `context` keeps the
+/// exact text the old `String` payloads rendered, so Display output
+/// (embedded verbatim in the OpenAI-shaped HTTP error bodies) is
+/// unchanged. `Unauthorized` and `Abort` stay plain strings: their
+/// messages are deliberately classified policy verdicts (the raw
+/// identity error is logged separately and must not travel with the
+/// client-facing value).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum PipelineError {
     /// A request header was malformed or inconsistent.
-    #[error("bad request: {0}")]
-    BadRequest(String),
+    #[error("bad request: {context}")]
+    BadRequest {
+        /// Human-readable description.
+        context: String,
+        /// Underlying typed error, when one exists.
+        #[source]
+        source: Option<ErrorSource>,
+    },
     /// Identity was missing or invalid.
     #[error("unauthorized: {0}")]
     Unauthorized(String),
     /// A stateful quota or loop breaker blocked execution.
-    #[error("request blocked: {0}")]
-    Blocked(String),
+    #[error("request blocked: {context}")]
+    Blocked {
+        /// Human-readable description.
+        context: String,
+        /// Underlying typed error, when one exists.
+        #[source]
+        source: Option<ErrorSource>,
+    },
     /// The upstream provider request failed.
-    #[error("upstream request failed: {0}")]
-    Upstream(String),
+    #[error("upstream request failed: {context}")]
+    Upstream {
+        /// Human-readable description.
+        context: String,
+        /// Underlying typed error, when one exists.
+        #[source]
+        source: Option<ErrorSource>,
+    },
     /// The breaker requested immediate connection closure.
     #[error("connection aborted: {0}")]
     Abort(String),
     /// Required audit capture infrastructure is unavailable.
-    #[error("audit capture unavailable: {0}")]
-    Unavailable(String),
+    #[error("audit capture unavailable: {context}")]
+    Unavailable {
+        /// Human-readable description.
+        context: String,
+        /// Underlying typed error, when one exists.
+        #[source]
+        source: Option<ErrorSource>,
+    },
 }
 
 impl PipelineError {
+    /// Semantic bad-request refusal with no underlying typed error.
+    pub fn bad_request(context: impl Into<String>) -> Self {
+        Self::BadRequest {
+            context: context.into(),
+            source: None,
+        }
+    }
+
+    /// Bad request caused by a typed error. The error text is kept in
+    /// `context` so Display matches the old stringified payload, while
+    /// the value itself stays reachable via `Error::source()`.
+    pub fn bad_request_source<E>(error: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::BadRequest {
+            context: error.to_string(),
+            source: Some(Box::new(error)),
+        }
+    }
+
+    /// Semantic policy block with no underlying typed error.
+    pub fn blocked(context: impl Into<String>) -> Self {
+        Self::Blocked {
+            context: context.into(),
+            source: None,
+        }
+    }
+
+    /// Block caused by a typed error (see [`Self::bad_request_source`]).
+    pub fn blocked_source<E>(error: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::Blocked {
+            context: error.to_string(),
+            source: Some(Box::new(error)),
+        }
+    }
+
+    /// Semantic upstream failure with no underlying typed error.
+    pub fn upstream(context: impl Into<String>) -> Self {
+        Self::Upstream {
+            context: context.into(),
+            source: None,
+        }
+    }
+
+    /// Upstream failure caused by a typed error (see
+    /// [`Self::bad_request_source`]).
+    pub fn upstream_source<E>(error: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::Upstream {
+            context: error.to_string(),
+            source: Some(Box::new(error)),
+        }
+    }
+
+    /// Semantic unavailability with no underlying typed error.
+    pub fn unavailable(context: impl Into<String>) -> Self {
+        Self::Unavailable {
+            context: context.into(),
+            source: None,
+        }
+    }
+
+    /// Unavailability caused by a typed error (see
+    /// [`Self::bad_request_source`]).
+    pub fn unavailable_source<E>(error: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::Unavailable {
+            context: error.to_string(),
+            source: Some(Box::new(error)),
+        }
+    }
     /// HTTP status code corresponding to this failure.
     ///
     /// * `Blocked` / `Abort` are permanent policy verdicts for the current
@@ -557,12 +680,12 @@ impl PipelineError {
     ///   response layer (RFC 7235 §3.1).
     pub fn status(&self) -> axum::http::StatusCode {
         match self {
-            Self::BadRequest(_) => axum::http::StatusCode::BAD_REQUEST,
+            Self::BadRequest { .. } => axum::http::StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => axum::http::StatusCode::UNAUTHORIZED,
-            Self::Blocked(_) => axum::http::StatusCode::FORBIDDEN,
-            Self::Upstream(_) => axum::http::StatusCode::BAD_GATEWAY,
+            Self::Blocked { .. } => axum::http::StatusCode::FORBIDDEN,
+            Self::Upstream { .. } => axum::http::StatusCode::BAD_GATEWAY,
             Self::Abort(_) => axum::http::StatusCode::CONFLICT,
-            Self::Unavailable(_) => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Self::Unavailable { .. } => axum::http::StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 }
@@ -855,9 +978,7 @@ impl AppState {
         if config.upstream_http2_prior_knowledge {
             client_builder = client_builder.http2_prior_knowledge();
         }
-        let client = client_builder
-            .build()
-            .map_err(|error| PipelineError::Upstream(error.to_string()))?;
+        let client = client_builder.build().map_err(PipelineError::upstream_source)?;
         let upstream_auth = resolve_upstream_auth(&config)?;
         let tool_auth = resolve_tool_auth(&config)?;
         let hot_metrics = Arc::new(HotMetrics::new(&metrics, config.strict_stage_budget));
@@ -865,7 +986,7 @@ impl AppState {
         // this defense-in-depth error covers direct constructors that
         // bypassed validate() (test builders).
         let provider_adapter = crate::provider::adapter_for(&config.provider).ok_or_else(|| {
-            PipelineError::BadRequest(format!("unsupported provider {:?}", config.provider))
+            PipelineError::bad_request(format!("unsupported provider {:?}", config.provider))
         })?;
         tracing::info!(provider = provider_adapter.name(), "provider adapter selected");
         Ok(Self {
@@ -916,7 +1037,7 @@ impl AppState {
             None | Some(serde_json::Value::Null) => {}
             Some(n) if n.as_u64() == Some(1) => {}
             Some(_) => {
-                return Err(PipelineError::BadRequest(
+                return Err(PipelineError::bad_request(
                     "multi-choice completions (n != 1) are not supported: the audit capture attests a single response message per request".to_owned(),
                 ));
             }
@@ -961,12 +1082,12 @@ impl AppState {
             // match — the "no captured steps" message was inaccurate
             // for sessions that DID capture steps before failing.
             if session.capture_failed() {
-                return Err(PipelineError::BadRequest(
+                return Err(PipelineError::bad_request(
                     "session is quarantined (audit capture failed); use a new session id".to_owned(),
                 ));
             }
             if session.is_empty_unsigned_quarantine() {
-                return Err(PipelineError::BadRequest(
+                return Err(PipelineError::bad_request(
                     "session is quarantined (closed with no captured steps); use a new session id".to_owned(),
                 ));
             }
@@ -978,16 +1099,16 @@ impl AppState {
             // on the sticky latch, not the overwritable last stop
             // reason.
             if session.close_complete_flag() && session.enforcement_tripped() {
-                return Err(PipelineError::Blocked(
+                return Err(PipelineError::blocked(
                     "session was closed by budget or loop enforcement; use a new session id".to_owned(),
                 ));
             }
-            return Err(PipelineError::Unavailable(
+            return Err(PipelineError::unavailable(
                 "session close is completing; retry shortly or use a new session id".to_owned(),
             ));
         }
         if session.capture_failed() {
-            return Err(PipelineError::Unavailable(
+            return Err(PipelineError::unavailable(
                 "session audit capture is incomplete".to_owned(),
             ));
         }
@@ -996,7 +1117,7 @@ impl AppState {
             match session.loop_state.action() {
                 BreakerAction::Reject => {
                     session.latch_enforcement(StopReason::LoopDetected);
-                    return Err(PipelineError::Blocked(
+                    return Err(PipelineError::blocked(
                         "semantic loop circuit breaker is open".to_owned(),
                     ));
                 }
@@ -1011,7 +1132,7 @@ impl AppState {
                     session.loop_state.reset();
                 }
                 _ => {
-                    return Err(PipelineError::Blocked(
+                    return Err(PipelineError::blocked(
                         "unsupported semantic loop enforcement action".to_owned(),
                     ));
                 }
@@ -1028,7 +1149,7 @@ impl AppState {
         let permits = self
             .worker
             .try_reserve_pair(&session_id)
-            .map_err(|error| PipelineError::Unavailable(error.to_string()))?;
+            .map_err(PipelineError::unavailable_source)?;
         let worker_permit = permits.worker;
         let response_permit = permits.response;
 
@@ -1047,7 +1168,7 @@ impl AppState {
 
         let stage = Instant::now();
         if let Err(reason) = self.sandbox.sanitize("chat/completions", &payload) {
-            let error = PipelineError::Blocked(reason);
+            let error = PipelineError::blocked(reason);
             // No token refund needed: the budget debit happens AFTER
             // compression (below), so a sanitize block exits before
             // anything was charged.
@@ -1096,8 +1217,10 @@ impl AppState {
             {
                 Ok(quota) => quota,
                 Err(error) => {
-                    let error =
-                        PipelineError::Blocked(format!("quota backend failed closed (principal): {error}"));
+                    let error = PipelineError::Blocked {
+                        context: format!("quota backend failed closed (principal): {error}"),
+                        source: Some(Box::new(error)),
+                    };
                     worker_permit.submit(self.failure_job(
                         Arc::clone(&session),
                         identity.clone(),
@@ -1112,7 +1235,7 @@ impl AppState {
                 // the backend-ERROR arms deliberately do not: a store
                 // outage is not enforcement).
                 session.latch_enforcement(StopReason::BudgetExceeded);
-                let error = PipelineError::Blocked(format!("principal.{limit} exceeded (cap {cap})"));
+                let error = PipelineError::blocked(format!("principal.{limit} exceeded (cap {cap})"));
                 worker_permit.submit(self.failure_job(
                     Arc::clone(&session),
                     identity.clone(),
@@ -1134,7 +1257,10 @@ impl AppState {
                     ActionBudget::for_principal(self.store.as_ref(), principal_id, spec)
                         .refund_tokens(billed_tokens);
                 }
-                let error = PipelineError::Blocked(format!("quota backend failed closed: {error}"));
+                let error = PipelineError::Blocked {
+                    context: format!("quota backend failed closed: {error}"),
+                    source: Some(Box::new(error)),
+                };
                 worker_permit.submit(self.failure_job(
                     Arc::clone(&session),
                     identity.clone(),
@@ -1154,7 +1280,7 @@ impl AppState {
             }
             // Genuine cap exhaustion — latch (upstream rounds 11-13).
             session.latch_enforcement(StopReason::BudgetExceeded);
-            let error = PipelineError::Blocked(format!("{limit} exceeded (cap {cap})"));
+            let error = PipelineError::blocked(format!("{limit} exceeded (cap {cap})"));
             worker_permit.submit(self.failure_job(
                 Arc::clone(&session),
                 identity.clone(),
@@ -1306,7 +1432,7 @@ impl AppState {
         let headers = headers.clone();
         tokio::task::spawn_blocking(move || state.prepare_chat(&headers, payload))
             .await
-            .map_err(|error| PipelineError::Unavailable(error.to_string()))?
+            .map_err(PipelineError::unavailable_source)?
     }
 
     /// Prepare a request and wait until its audit record is durably captured
@@ -1320,7 +1446,7 @@ impl AppState {
             if let Some(session) = self.sessions.get(&id) {
                 session.wait_for_worker_jobs().await;
                 if session.capture_failed() {
-                    return Err(PipelineError::Unavailable(
+                    return Err(PipelineError::unavailable(
                         "session audit capture is incomplete".to_owned(),
                     ));
                 }
@@ -1330,10 +1456,10 @@ impl AppState {
         let headers = headers.clone();
         let mut prepared = tokio::task::spawn_blocking(move || state.prepare_chat(&headers, payload))
             .await
-            .map_err(|error| PipelineError::Unavailable(error.to_string()))??;
+            .map_err(PipelineError::unavailable_source)??;
         prepared.session.wait_for_worker_jobs().await;
         if prepared.session.capture_failed() {
-            let error = PipelineError::Unavailable(
+            let error = PipelineError::unavailable(
                 "request audit capture failed before provider dispatch".to_owned(),
             );
             self.abandon_prepared(&mut prepared, StopReason::Other, &error.to_string());
@@ -1355,7 +1481,7 @@ impl AppState {
                 BreakerAction::Abort => {
                     PipelineError::Abort("semantic loop circuit breaker opened during audit".to_owned())
                 }
-                _ => PipelineError::Blocked(
+                _ => PipelineError::blocked(
                     "semantic loop circuit breaker opened during audit; retry required".to_owned(),
                 ),
             };
@@ -1484,7 +1610,7 @@ impl AppState {
                 "could not write in-flight response marker; refusing upstream dispatch"
             );
             let client_error =
-                PipelineError::Unavailable("in-flight response marker could not be persisted".to_owned());
+                PipelineError::unavailable("in-flight response marker could not be persisted".to_owned());
             self.abandon_prepared(&mut request, StopReason::Other, &client_error.to_string());
             return Err(client_error);
         }
@@ -1620,7 +1746,7 @@ impl AppState {
                     error.is_body = error.is_body(),
                     "upstream forwarding failed"
                 );
-                let client_error = PipelineError::Upstream(client_reason.to_owned());
+                let client_error = PipelineError::upstream(client_reason.to_owned());
                 let persisted_reason = format!("upstream_{client_reason}");
                 if let Some(permit) = response_permit {
                     let (response_marker, response_attempt_id) = capture_guard.disarm();
@@ -1701,10 +1827,10 @@ impl AppState {
         validate_session_binding(&session, workflow, &identity)?;
         session.refresh_identity(&identity);
         if session.is_closed() {
-            return Err(PipelineError::BadRequest("session is already closed".to_owned()));
+            return Err(PipelineError::bad_request("session is already closed".to_owned()));
         }
         if session.capture_failed() {
-            return Err(PipelineError::Unavailable(
+            return Err(PipelineError::unavailable(
                 "session audit capture is incomplete".to_owned(),
             ));
         }
@@ -1712,7 +1838,7 @@ impl AppState {
         let worker_permit = self
             .worker
             .try_reserve(&session_id)
-            .map_err(|error| PipelineError::Unavailable(error.to_string()))?;
+            .map_err(PipelineError::unavailable_source)?;
         let verdict = match parsed_call.as_ref() {
             // `sandbox.check`'s budget gate spends before we return, so we must
             // veto workflow-mismatched consequential tools before it runs.
@@ -1845,10 +1971,10 @@ impl AppState {
         let (verdict, session) =
             tokio::task::spawn_blocking(move || state.intercept_tool_with_session(&owned_headers, &raw))
                 .await
-                .map_err(|error| PipelineError::Unavailable(error.to_string()))??;
+                .map_err(PipelineError::unavailable_source)??;
         session.wait_for_worker_jobs().await;
         if session.capture_failed() {
-            return Err(PipelineError::Unavailable(
+            return Err(PipelineError::unavailable(
                 "tool authorization audit capture failed".to_owned(),
             ));
         }
@@ -1867,7 +1993,7 @@ impl AppState {
         let raw = raw.to_vec();
         tokio::task::spawn_blocking(move || state.intercept_tool(&owned_headers, &raw))
             .await
-            .map_err(|error| PipelineError::Unavailable(error.to_string()))?
+            .map_err(PipelineError::unavailable_source)?
     }
 
     pub(crate) fn lease_session(&self, headers: &HeaderMap) -> Result<SessionLease, PipelineError> {
@@ -1875,10 +2001,10 @@ impl AppState {
         let session = self
             .sessions
             .get(&id)
-            .ok_or_else(|| PipelineError::BadRequest("unknown session".to_owned()))?;
+            .ok_or_else(|| PipelineError::bad_request("unknown session".to_owned()))?;
         session
             .try_lease()
-            .ok_or_else(|| PipelineError::BadRequest("session is already closed".to_owned()))
+            .ok_or_else(|| PipelineError::bad_request("session is already closed".to_owned()))
     }
 
     fn enqueue_transient_failure(
@@ -1965,7 +2091,7 @@ impl AppState {
     ) -> Result<(), PipelineError> {
         self.worker
             .try_submit(self.failure_job(session, identity, stop_reason, reason))
-            .map_err(|error| PipelineError::Unavailable(error.to_string()))
+            .map_err(PipelineError::unavailable_source)
     }
 
     fn failure_job(
@@ -2062,7 +2188,7 @@ impl AppState {
                             // not a 401. Returning 401 (the old behavior) told
                             // SDK token-refreshers to re-authenticate, which
                             // cannot help: the grant itself lacks the scope.
-                            return Err(PipelineError::Blocked(format!(
+                            return Err(PipelineError::blocked(format!(
                                 "identity scope {required:?} is required"
                             )));
                         }
@@ -2285,7 +2411,7 @@ pub(crate) fn single_header<'a>(
     let mut iter = headers.get_all(name).into_iter();
     let first = iter.next();
     if iter.next().is_some() {
-        return Err(PipelineError::BadRequest(format!(
+        return Err(PipelineError::bad_request(format!(
             "request carries more than one {name} header; provide exactly one"
         )));
     }
@@ -2327,10 +2453,10 @@ fn session_id(headers: &HeaderMap) -> Result<String, PipelineError> {
         Some(value) => {
             let value = value
                 .to_str()
-                .map_err(|_| PipelineError::BadRequest("X-AV-Session is not valid text".to_owned()))?;
+                .map_err(|_| PipelineError::bad_request("X-AV-Session is not valid text".to_owned()))?;
             av_core::SessionId::parse(value)
                 .map(|id| id.to_string())
-                .map_err(|error| PipelineError::BadRequest(error.to_string()))
+                .map_err(PipelineError::bad_request_source)
         }
         None => Ok(av_core::new_session_id().to_string()),
     }
@@ -2359,12 +2485,12 @@ fn workflow(headers: &HeaderMap, default: &str) -> Result<Workflow, PipelineErro
         .map(|header| {
             header
                 .to_str()
-                .map_err(|_| PipelineError::BadRequest("X-AV-Workflow is not valid text".to_owned()))
+                .map_err(|_| PipelineError::bad_request("X-AV-Workflow is not valid text".to_owned()))
         })
         .transpose()?
         .unwrap_or(default);
     Workflow::parse(value).ok_or_else(|| {
-        PipelineError::BadRequest(format!("X-AV-Workflow must be signed or unsigned, got {value:?}"))
+        PipelineError::bad_request(format!("X-AV-Workflow must be signed or unsigned, got {value:?}"))
     })
 }
 
@@ -2465,16 +2591,16 @@ fn atif_capture_from_request(payload: &Value) -> Result<AtifCapture, PipelineErr
     // directly at the correct fix.
     let messages_value = payload
         .get("messages")
-        .ok_or_else(|| PipelineError::BadRequest("chat payload is missing 'messages'".to_owned()))?;
+        .ok_or_else(|| PipelineError::bad_request("chat payload is missing 'messages'".to_owned()))?;
     let messages = messages_value.as_array().ok_or_else(|| {
-        PipelineError::BadRequest(format!(
+        PipelineError::bad_request(format!(
             "'messages' must be a JSON array, got {}",
             json_type_name(messages_value)
         ))
     })?;
     let message = messages
         .last()
-        .ok_or_else(|| PipelineError::BadRequest("chat payload 'messages' is empty".to_owned()))?;
+        .ok_or_else(|| PipelineError::bad_request("chat payload 'messages' is empty".to_owned()))?;
     let role = message.get("role").and_then(Value::as_str);
     let source = match role {
         // "function" is the legacy OpenAI function-calling spelling of
@@ -2485,11 +2611,11 @@ fn atif_capture_from_request(payload: &Value) -> Result<AtifCapture, PipelineErr
         Some("user") => av_atif::Source::User,
         Some("assistant") => av_atif::Source::Agent,
         Some(other) => {
-            return Err(PipelineError::BadRequest(format!(
+            return Err(PipelineError::bad_request(format!(
                 "unsupported chat role {other:?}"
             )))
         }
-        None => return Err(PipelineError::BadRequest("chat message has no role".to_owned())),
+        None => return Err(PipelineError::bad_request("chat message has no role".to_owned())),
     };
     let content = message
         .get("content")
@@ -2564,7 +2690,7 @@ fn validate_session_binding(
     identity: &AgentIdentity,
 ) -> Result<(), PipelineError> {
     if session.workflow != workflow {
-        return Err(PipelineError::BadRequest(
+        return Err(PipelineError::bad_request(
             "session workflow cannot change after open".to_owned(),
         ));
     }
@@ -2600,7 +2726,7 @@ fn inject_corrective_message(payload: &mut Value) -> Result<(), PipelineError> {
     let messages = payload
         .get_mut("messages")
         .and_then(Value::as_array_mut)
-        .ok_or_else(|| PipelineError::BadRequest("chat payload has no messages array".to_owned()))?;
+        .ok_or_else(|| PipelineError::bad_request("chat payload has no messages array".to_owned()))?;
     messages.push(serde_json::json!({
         "role": "system",
         "content": "AgentVisor AI detected a semantic loop. Stop repeating the previous approach, identify new evidence, and choose a materially different next action."
@@ -2839,7 +2965,7 @@ mod tests {
             Ok(_) => panic!("over-budget request was accepted"),
             Err(error) => error,
         };
-        assert!(matches!(error, PipelineError::Blocked(_)));
+        assert!(matches!(error, PipelineError::Blocked { .. }));
         assert_eq!(state.sessions.len(), 1);
         let session = state.sessions.get("quota-failure").unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -2889,7 +3015,7 @@ mod tests {
         headers_b.insert(SESSION_HEADER, HeaderValue::from_static("rotated-b"));
         match state.prepare_chat(&headers_b, payload()) {
             Ok(_) => panic!("header rotation defeated principal budget — the fix from §3.2 has regressed"),
-            Err(PipelineError::Blocked(msg)) => {
+            Err(PipelineError::Blocked { context: msg, .. }) => {
                 assert!(
                     msg.contains("principal."),
                     "refusal must name the principal-scoped limit, got {msg:?}"
@@ -2907,7 +3033,7 @@ mod tests {
         headers.insert(WORKFLOW_HEADER, HeaderValue::from_static("sometimes"));
         assert!(matches!(
             state.prepare_chat(&headers, payload()),
-            Err(PipelineError::BadRequest(_))
+            Err(PipelineError::BadRequest { .. })
         ));
     }
 
@@ -2922,7 +3048,7 @@ mod tests {
         headers.insert(WORKFLOW_HEADER, HeaderValue::from_static("unsigned"));
         assert!(matches!(
             state.prepare_chat(&headers, payload()),
-            Err(PipelineError::BadRequest(_))
+            Err(PipelineError::BadRequest { .. })
         ));
     }
 
@@ -2944,7 +3070,7 @@ mod tests {
         trip_loop(&state, &headers, &repeated).await;
         assert!(matches!(
             state.prepare_chat(&headers, repeated),
-            Err(PipelineError::Blocked(_))
+            Err(PipelineError::Blocked { .. })
         ));
     }
 
@@ -3192,7 +3318,7 @@ mod tests {
             }
         }
         assert!(
-            matches!(refusal, Some(PipelineError::Blocked(_))),
+            matches!(refusal, Some(PipelineError::Blocked { .. })),
             "the breaker must refuse during the audit wait, got {refusal:?}",
         );
         assert!(
@@ -3263,7 +3389,7 @@ mod tests {
         // Unavailable (not Upstream) proves the refusal happened BEFORE
         // any upstream dispatch was attempted.
         assert!(
-            matches!(error, PipelineError::Unavailable(_)),
+            matches!(error, PipelineError::Unavailable { .. }),
             "marker persist failure must map to Unavailable, got {error:?}",
         );
 
@@ -3448,7 +3574,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             state.prepare_chat(&headers, agent_payload),
-            Err(PipelineError::Unavailable(_))
+            Err(PipelineError::Unavailable { .. })
         ));
         sink.release.notify_waiters();
     }
@@ -3488,7 +3614,7 @@ mod tests {
         fn bad_request_message(payload: serde_json::Value) -> String {
             match atif_capture_from_request(&payload) {
                 Ok(_) => panic!("expected BadRequest, got Ok"),
-                Err(PipelineError::BadRequest(msg)) => msg,
+                Err(PipelineError::BadRequest { context: msg, .. }) => msg,
                 Err(other) => panic!("expected BadRequest, got {other:?}"),
             }
         }
@@ -3522,7 +3648,7 @@ mod tests {
         headers.append(SESSION_HEADER, HeaderValue::from_static("sessB"));
         match session_id(&headers) {
             Ok(id) => panic!("expected duplicate-header refusal, got session_id {id:?}"),
-            Err(PipelineError::BadRequest(msg)) => {
+            Err(PipelineError::BadRequest { context: msg, .. }) => {
                 assert!(msg.contains("more than one"), "got {msg}");
                 assert!(msg.contains("x-av-session"), "got {msg}");
             }
@@ -3537,7 +3663,7 @@ mod tests {
         headers.append(WORKFLOW_HEADER, HeaderValue::from_static("unsigned"));
         match workflow(&headers, "signed") {
             Ok(w) => panic!("expected duplicate-header refusal, got workflow {w:?}"),
-            Err(PipelineError::BadRequest(msg)) => {
+            Err(PipelineError::BadRequest { context: msg, .. }) => {
                 assert!(msg.contains("more than one"), "got {msg}");
                 assert!(msg.contains("x-av-workflow"), "got {msg}");
             }
@@ -3575,7 +3701,7 @@ mod tests {
         );
         match state.resolve_identity(&headers, None) {
             Ok(_) => panic!("expected duplicate-header refusal, got Ok"),
-            Err(PipelineError::BadRequest(msg)) => {
+            Err(PipelineError::BadRequest { context: msg, .. }) => {
                 assert!(msg.contains("more than one"), "got {msg}");
                 assert!(msg.contains("authorization"), "got {msg}");
             }
@@ -3598,7 +3724,7 @@ mod tests {
         // BadRequest("more than one") on a single header.
         let outcome = state.resolve_identity(&headers, None);
         assert!(
-            !matches!(&outcome, Err(PipelineError::BadRequest(msg)) if msg.contains("more than one")),
+            !matches!(&outcome, Err(PipelineError::BadRequest { context: msg, .. }) if msg.contains("more than one")),
             "single Authorization header must not be refused as duplicate; got {outcome:?}"
         );
     }
@@ -3811,7 +3937,7 @@ mod tests {
         // (401's semantic) is wrong and loops.
         assert!(matches!(
             state.authorize_session(&headers, &prepared.session, "session:close"),
-            Err(PipelineError::Blocked(_))
+            Err(PipelineError::Blocked { .. })
         ));
         headers.insert(
             axum::http::header::AUTHORIZATION,
@@ -3837,7 +3963,7 @@ mod tests {
         let session = Arc::clone(&prepared.session);
         assert!(matches!(
             state.forward_chat(prepared).await,
-            Err(PipelineError::Upstream(_))
+            Err(PipelineError::Upstream { .. })
         ));
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while session.chain.lock().count() < 2 {
@@ -3849,7 +3975,7 @@ mod tests {
     }
 
     /// Regression lock for CWE-209 information exposure. Before the fix,
-    /// `PipelineError::Upstream(reqwest_err.to_string())` embedded the
+    /// `PipelineError::upstream(reqwest_err.to_string())` embedded the
     /// operator-configured upstream URL in the JSON error body — any client
     /// that triggered an upstream failure could discover the URL, potentially
     /// leaking an internal hostname. The client-facing message must now be a

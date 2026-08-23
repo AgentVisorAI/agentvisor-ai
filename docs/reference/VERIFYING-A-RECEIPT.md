@@ -1,10 +1,11 @@
 # Verifying an AgentVisor AI Receipt Offline
 
 An AgentVisor AI receipt is a JSON document containing an audit chain
-subject and an Ed25519 signature over the canonical (RFC 8785 JCS) form
-of that subject. Anyone with the harness's public key can verify a
-receipt without contacting the harness — this is the cryptographic
-audit posture the deployment is built around.
+subject and an Ed25519 signature over a canonical (RFC 8785 JCS) form
+of the receipt body (framed per `receipt_version` — see §5a). Anyone
+with the harness's public key can verify a receipt without contacting
+the harness — this is the cryptographic audit posture the deployment
+is built around.
 
 This guide walks through the offline verification path end to end.
 
@@ -76,8 +77,11 @@ The command:
 * parses the receipt JSON
 * extracts the `signature` and `subject` fields
 * canonicalises `subject` with RFC 8785 JCS
-* runs `ed25519_dalek::VerifyingKey::verify_strict` against the
-  canonical bytes with the trusted key you passed
+* builds the signing message for the receipt's `receipt_version`
+  (bare JCS bytes for v1; domain tag + length + JCS bytes for v2 —
+  see §5a for the exact framing)
+* runs `ed25519_dalek::VerifyingKey::verify_strict` against that
+  message with the trusted key you passed
 * prints `verified <receipt_id>` on success (inspect the receipt JSON
   itself for key_id, stop_reason, and event_count — see step 4)
 * exits non-zero with a diagnostic on any failure
@@ -128,6 +132,43 @@ The `Keyring::verify` path calls `verify_strict` under the hood and
 refuses known-weak keys (`is_weak()` — a defence in depth added after
 `av_receipts::keys::KeyError::WeakKey` review round 51).
 
+## 5a. Reimplementing verification in another language
+
+The full protocol, precise enough to reimplement in ~30 lines with any
+Ed25519 + JCS library. The **signed body** is the receipt JSON object
+with the `signature_b64` member removed (all 13 remaining top-level
+fields, including `receipt_version` itself, are signature-covered).
+
+1. Parse the receipt JSON. Refuse duplicate keys at any nesting depth
+   and any unknown top-level field.
+2. Remove `signature_b64`; base64-decode it (standard alphabet, with
+   padding) into a 64-byte signature.
+3. Canonicalise the remaining object with RFC 8785 JCS; call the
+   resulting UTF-8 bytes `canon`.
+4. Build the signed message according to `receipt_version`:
+   * **`receipt_version: 1`** (legacy) — the message is `canon`
+     itself, with no prefix or framing.
+   * **`receipt_version: 2`** (current) — the message is the
+     concatenation of:
+     1. the 22-byte domain tag: the ASCII bytes of
+        `agentvisor-receipt-v2` followed by a single NUL byte
+        (`b"agentvisor-receipt-v2\0"`, hex
+        `6167656e747669736f722d726563656970742d763200`),
+     2. the length of `canon` in bytes as an unsigned 64-bit
+        **big-endian** integer (8 bytes),
+     3. `canon`.
+   * any other version — refuse; no signing message is defined.
+5. Verify the signature over that message with strict Ed25519
+   verification (cofactorless equation, canonical `s`, small-order
+   points refused) against the out-of-band trusted public key, after
+   checking that the receipt's embedded `public_key_b64` decodes to
+   the same 32 bytes.
+
+The v2 domain tag exists because the same Ed25519 key also derives the
+harness's journal-MAC key (`agentvisor-journal-v1\0` framing in
+`journal.rs`): tagging and length-framing every signed protocol
+message makes a signature from one protocol unusable in any other.
+
 ## 6. Common failure modes
 
 * **Signature verification failed** — the receipt was signed by a
@@ -142,9 +183,15 @@ refuses known-weak keys (`is_weak()` — a defence in depth added after
   small-order Curve25519 points ed25519-dalek refuses; check that
   you didn't paste `0x00…00` or `0xff…ff` by accident.
 * **Unsupported receipt_version** — the verifier refuses any
-  `receipt_version` other than the one it implements (currently 1),
-  so a future-format receipt is never silently interpreted under
-  old semantics. Upgrade `avctl` to verify newer receipts.
+  `receipt_version` other than the ones it implements (currently 1
+  and 2), so a future-format receipt is never silently interpreted
+  under old semantics. Upgrade `avctl` to verify newer receipts.
+* **Signature framing mismatch** — a receipt labeled
+  `receipt_version: 2` whose signature was computed over the bare JCS
+  bytes (or a v1 receipt relabeled as v2, and vice versa) fails with
+  a signature-verification error: the version field selects the
+  signing-message framing AND is itself signature-covered, so
+  cross-version relabeling can never verify.
 
 ## 7. Continuous verification
 

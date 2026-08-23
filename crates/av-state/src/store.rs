@@ -6,6 +6,16 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 /// State-layer errors.
+///
+/// Deliberately NOT restructured to carry typed `#[source]` errors
+/// (unlike `FinalizeError`/`PipelineError` in av-harness): the derived
+/// `PartialEq`/`Eq` is a load-bearing public contract — the store
+/// contract tests (`redis_contract.rs`, `e2e_race_conditions.rs`) and
+/// budget rollback logic compare error values, and typed sources such
+/// as `std::io::Error`/`redis::RedisError` implement neither. Backends
+/// that swallow a typed error (e.g. `RedisStore`) must render it into
+/// the `Backend` payload at the failure site, where connection context
+/// is still available.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StateError {

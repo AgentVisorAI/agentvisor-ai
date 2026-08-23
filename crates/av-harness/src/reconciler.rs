@@ -40,27 +40,64 @@ pub enum FinalizeOutcome {
 }
 
 /// Lifecycle errors.
+///
+/// Variants that wrap an underlying failure carry it as a typed
+/// [`std::error::Error::source`] instead of a pre-rendered `String`, so
+/// callers can branch on the concrete cause (e.g. `io::ErrorKind`) via
+/// `source().downcast_ref::<std::io::Error>()` and tracing subscribers
+/// receive the full chain. `context` keeps the exact text the old
+/// `String` payloads rendered, so Display output (which operators grep
+/// and HTTP error bodies embed) is unchanged.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum FinalizeError {
     /// Blocking task failed or panicked.
     #[error("finalization task failed: {0}")]
-    Task(String),
+    Task(#[from] tokio::task::JoinError),
+    /// Internal finalization invariant violated (no underlying error
+    /// exists to attach, e.g. a recovery path found the session still
+    /// referenced elsewhere). Shares the `Task` Display prefix so
+    /// operator log greps for "finalization task failed:" keep
+    /// matching the messages this variant absorbed from `Task`.
+    #[error("finalization task failed: {0}")]
+    Invariant(String),
     /// Receipt issuance failed.
-    #[error("receipt issuance failed: {0}")]
-    Receipt(String),
+    #[error("receipt issuance failed: {context}")]
+    Receipt {
+        /// Human-readable description (Display-compatible with the old
+        /// `Receipt(String)` payload).
+        context: String,
+        /// Underlying typed error, when one exists.
+        #[source]
+        source: Option<crate::pipeline::ErrorSource>,
+    },
     /// ATIF persistence or parsing failed.
-    #[error("ATIF finalization failed: {0}")]
-    Atif(String),
-    /// Promotion is invalid for this session.
+    #[error("ATIF finalization failed: {context}")]
+    Atif {
+        /// Human-readable description (Display-compatible with the old
+        /// `Atif(String)` payload).
+        context: String,
+        /// Underlying typed error, when one exists.
+        #[source]
+        source: Option<crate::pipeline::ErrorSource>,
+    },
+    /// Promotion is invalid for this session. Genuinely semantic
+    /// refusals — there is never an underlying error to attach.
     #[error("promotion refused: {0}")]
     Promotion(String),
     /// One or more upstream actions were not captured.
     #[error("session capture is incomplete; refusing final artifact")]
     CaptureIncomplete,
     /// Lifecycle event could not be durably published.
-    #[error("lifecycle event publication failed: {0}")]
-    Bridge(String),
+    #[error("lifecycle event publication failed: {context}")]
+    Bridge {
+        /// Human-readable description (Display-compatible with the old
+        /// `Bridge(String)` payload).
+        context: String,
+        /// Underlying typed error, when one exists.
+        #[source]
+        source: Option<crate::pipeline::ErrorSource>,
+    },
     /// Round-28 F1: lifecycle bridge failed due to a PERMANENT
     /// misconfiguration (e.g. `BusError::UnknownTopic` — the topic
     /// was not provisioned via the manifest). SDKs should NOT
@@ -70,8 +107,76 @@ pub enum FinalizeError {
     /// distinct variant so `finalize_error_response` can route it
     /// to 400 (no Retry-After) while genuine transient failures
     /// keep 503 semantics.
-    #[error("lifecycle event publication failed (permanent): {0}")]
-    BridgeConfig(String),
+    #[error("lifecycle event publication failed (permanent): {context}")]
+    BridgeConfig {
+        /// Human-readable description (Display-compatible with the old
+        /// `BridgeConfig(String)` payload).
+        context: String,
+        /// Underlying typed error, when one exists.
+        #[source]
+        source: Option<crate::pipeline::ErrorSource>,
+    },
+}
+
+impl FinalizeError {
+    /// Semantic receipt failure with no underlying typed error.
+    pub fn receipt(context: impl Into<String>) -> Self {
+        Self::Receipt {
+            context: context.into(),
+            source: None,
+        }
+    }
+
+    /// Receipt failure caused by a typed error. The error text is kept
+    /// in `context` so Display matches the old stringified payload,
+    /// while the value itself stays reachable via `Error::source()`.
+    pub fn receipt_source<E>(error: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::Receipt {
+            context: error.to_string(),
+            source: Some(Box::new(error)),
+        }
+    }
+
+    /// Semantic ATIF failure with no underlying typed error.
+    pub fn atif(context: impl Into<String>) -> Self {
+        Self::Atif {
+            context: context.into(),
+            source: None,
+        }
+    }
+
+    /// ATIF failure caused by a typed error (see [`Self::receipt_source`]).
+    pub fn atif_source<E>(error: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::Atif {
+            context: error.to_string(),
+            source: Some(Box::new(error)),
+        }
+    }
+
+    /// Semantic bridge failure with no underlying typed error.
+    pub fn bridge(context: impl Into<String>) -> Self {
+        Self::Bridge {
+            context: context.into(),
+            source: None,
+        }
+    }
+
+    /// Bridge failure caused by a typed error (see [`Self::receipt_source`]).
+    pub fn bridge_source<E>(error: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::Bridge {
+            context: error.to_string(),
+            source: Some(Box::new(error)),
+        }
+    }
 }
 
 impl From<av_bridge::BusError> for FinalizeError {
@@ -80,12 +185,20 @@ impl From<av_bridge::BusError> for FinalizeError {
     /// causes (unknown topic, serde) route to `BridgeConfig` so
     /// clients see a 4xx status without `Retry-After`; transient
     /// causes (I/O, backend outage) stay `Bridge` and keep 503
-    /// with `Retry-After`.
+    /// with `Retry-After`. The `BusError` itself is retained as the
+    /// typed `source` so its own chain (e.g. `io::Error`) survives.
     fn from(error: av_bridge::BusError) -> Self {
+        let context = error.to_string();
         if error.is_permanent() {
-            Self::BridgeConfig(error.to_string())
+            Self::BridgeConfig {
+                context,
+                source: Some(Box::new(error)),
+            }
         } else {
-            Self::Bridge(error.to_string())
+            Self::Bridge {
+                context,
+                source: Some(Box::new(error)),
+            }
         }
     }
 }
@@ -428,13 +541,13 @@ impl Finalizer {
             let entries = match std::fs::read_dir(&spool_dir) {
                 Ok(entries) => entries,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-                Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+                Err(error) => return Err(FinalizeError::atif_source(error)),
             };
             let mut pruned = 0usize;
             let now = std::time::SystemTime::now();
             let mut dir_changed = false;
             for entry in entries {
-                let entry = entry.map_err(|error| FinalizeError::Atif(error.to_string()))?;
+                let entry = entry.map_err(FinalizeError::atif_source)?;
                 let path = entry.path();
                 // We only prune paired sealed evidence: `<stem>.json` with
                 // its matching `<stem>.atif-auth`. Anything else — the
@@ -458,7 +571,7 @@ impl Finalizer {
                 let metadata = match entry.metadata() {
                     Ok(m) => m,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+                    Err(error) => return Err(FinalizeError::atif_source(error)),
                 };
                 let modified = match metadata.modified() {
                     Ok(t) => t,
@@ -476,12 +589,12 @@ impl Finalizer {
                 match std::fs::remove_file(&sidecar) {
                     Ok(()) => removed_any = true,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+                    Err(error) => return Err(FinalizeError::atif_source(error)),
                 }
                 match std::fs::remove_file(&path) {
                     Ok(()) => removed_any = true,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+                    Err(error) => return Err(FinalizeError::atif_source(error)),
                 }
                 if removed_any {
                     pruned += 1;
@@ -489,13 +602,12 @@ impl Finalizer {
                 }
             }
             if dir_changed {
-                av_core::fsutil::sync_directory(&spool_dir)
-                    .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+                av_core::fsutil::sync_directory(&spool_dir).map_err(FinalizeError::atif_source)?;
             }
             Ok(pruned)
         })
         .await
-        .map_err(|error| FinalizeError::Task(error.to_string()))?
+        .map_err(FinalizeError::Task)?
     }
 
     #[cfg(test)]
@@ -651,7 +763,7 @@ impl Finalizer {
                         if receipt.body.subject == subject {
                             Ok(())
                         } else {
-                            Err(FinalizeError::Receipt(
+                            Err(FinalizeError::receipt(
                                 "persisted receipt subject does not match reconstructed chain".to_owned(),
                             ))
                         }
@@ -659,7 +771,7 @@ impl Finalizer {
                     if let Err(error) = verified {
                         tracing::warn!(
                             session = %session.id,
-                            %error,
+                            error = &error as &dyn std::error::Error,
                             "persisted receipt does not verify; sealing session terminally \
                              (evidence quarantined, no per-tick retry)"
                         );
@@ -687,8 +799,7 @@ impl Finalizer {
                     self.metrics
                         .histogram("av_receipt_sign_duration_seconds", "Receipt signing latency")
                         .observe_us(elapsed_us(sign_started));
-                    let receipt =
-                        receipt_result.map_err(|error| FinalizeError::Receipt(error.to_string()))?;
+                    let receipt = receipt_result.map_err(FinalizeError::receipt_source)?;
                     self.persist_receipt(&session.id, &receipt).await?;
                     *session.receipt.lock() = Some(receipt.clone());
                     receipt
@@ -730,7 +841,7 @@ impl Finalizer {
                         session.mark_artifact_committed();
                         claim.committed = true;
                         self.clear_budget_state(&session.id);
-                        return Err(FinalizeError::Atif(
+                        return Err(FinalizeError::atif(
                             "cannot finalize an unsigned session with no captured steps".to_owned(),
                         ));
                     }
@@ -799,8 +910,8 @@ impl Finalizer {
                         av_atif::write_atomic(&trajectory, &write_path)
                     })
                     .await
-                    .map_err(|error| FinalizeError::Task(error.to_string()))?
-                    .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+                    .map_err(FinalizeError::Task)?
+                    .map_err(FinalizeError::atif_source)?;
                     path
                 };
                 self.ensure_atif_provenance(&path, &session.id).await?;
@@ -977,16 +1088,16 @@ impl Finalizer {
             })?;
         let marker = path.with_extension("promote");
         if !path.with_extension("atif-auth").exists() {
-            return Err(FinalizeError::Atif(
+            return Err(FinalizeError::atif(
                 "ATIF artifact has no authenticated provenance".to_owned(),
             ));
         }
         self.ensure_atif_provenance(&path, &session.id).await?;
         let bytes = read_capped_async(path.clone(), av_core::fsutil::MAX_ATIF_BYTES)
             .await
-            .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+            .map_err(FinalizeError::atif_source)?;
         let trajectory: av_atif::Trajectory =
-            serde_json::from_slice(&bytes).map_err(|error| FinalizeError::Atif(error.to_string()))?;
+            serde_json::from_slice(&bytes).map_err(FinalizeError::atif_source)?;
         // Round-23 F2: also strict-validate the raw bytes so
         // duplicate JSON keys and unknown-fields (both silently
         // accepted by the typed `serde_json::from_slice::<Trajectory>`
@@ -996,7 +1107,7 @@ impl Finalizer {
         let issues = match av_atif::validate_bytes(&bytes, av_atif::Mode::Strict) {
             Ok(issues) => issues,
             Err(reason) => {
-                return Err(FinalizeError::Atif(format!(
+                return Err(FinalizeError::atif(format!(
                     "strict validation failed (bytes-level): {reason}"
                 )))
             }
@@ -1005,13 +1116,13 @@ impl Finalizer {
             // Round-19 F6: cap the rendered head. An attacker-planted
             // trajectory can legitimately fit millions of issues
             // inside MAX_ATIF_BYTES; Debug-formatting all of them
-            // into a `FinalizeError::Atif(String)` amplified
+            // into a `FinalizeError::Atif` context amplified
             // attacker input through every downstream log sink
             // (tracing::warn → Vector → OTLP → …).
             const RENDER_ISSUE_HEAD: usize = 16;
             let total = issues.len();
             let head: Vec<_> = issues.iter().take(RENDER_ISSUE_HEAD).collect();
-            return Err(FinalizeError::Atif(format!(
+            return Err(FinalizeError::atif(format!(
                 "strict validation failed ({total} issues, showing first {}): {head:?}",
                 head.len()
             )));
@@ -1029,20 +1140,20 @@ impl Finalizer {
         if marker.exists() {
             let sealed = read_capped_async(marker.clone(), av_core::fsutil::MAX_CONTROL_BYTES)
                 .await
-                .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+                .map_err(FinalizeError::atif_source)?;
             let actual: PromotionMarker =
                 crate::journal::open(&self.journal_key, "promotion-marker", 0, &sealed)
-                    .map_err(FinalizeError::Atif)?;
+                    .map_err(FinalizeError::atif)?;
             if actual.session_id != marker_payload.session_id
                 || actual.trajectory_digest != marker_payload.trajectory_digest
             {
-                return Err(FinalizeError::Atif(
+                return Err(FinalizeError::atif(
                     "promotion marker does not match session and trajectory".to_owned(),
                 ));
             }
         } else {
             let sealed = crate::journal::seal(&self.journal_key, "promotion-marker", 0, &marker_payload)
-                .map_err(FinalizeError::Atif)?;
+                .map_err(FinalizeError::atif)?;
             persist_marker(&marker, &sealed).await?;
         }
         if !session.try_promote() {
@@ -1060,7 +1171,7 @@ impl Finalizer {
         let receipt = if let Some(receipt) = persisted_receipt {
             self.verify_configured_receipt(&receipt)?;
             if receipt.body.subject != subject {
-                return Err(FinalizeError::Receipt(
+                return Err(FinalizeError::receipt(
                     "persisted promotion receipt does not match ATIF artifact".to_owned(),
                 ));
             }
@@ -1082,7 +1193,7 @@ impl Finalizer {
             self.metrics
                 .histogram("av_receipt_sign_duration_seconds", "Receipt signing latency")
                 .observe_us(elapsed_us(sign_started));
-            let receipt = receipt_result.map_err(|error| FinalizeError::Receipt(error.to_string()))?;
+            let receipt = receipt_result.map_err(FinalizeError::receipt_source)?;
             self.persist_receipt(&session.id, &receipt).await?;
             *session.receipt.lock() = Some(receipt.clone());
             receipt
@@ -1178,7 +1289,7 @@ impl Finalizer {
         let mut entries = match tokio::fs::read_dir(&self.spool_dir).await {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+            Err(error) => return Err(FinalizeError::atif_source(error)),
         };
         // Round-6 (hunt4 R-F2): precompute the filename stems of every
         // registry-known session. Artifact filenames are
@@ -1198,11 +1309,7 @@ impl Finalizer {
             })
             .collect();
         let mut recovered = 0usize;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|error| FinalizeError::Atif(error.to_string()))?
-        {
+        while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::atif_source)? {
             let path = entry.path();
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
                 continue;
@@ -1467,7 +1574,7 @@ impl Finalizer {
                     // published SESSION_CLOSE.
                     trajectory.steps.len() as u64,
                 )
-                .map_err(FinalizeError::Atif)?,
+                .map_err(FinalizeError::atif)?,
             ) {
                 Ok(inserted) => inserted,
                 Err(_active) => {
@@ -1573,7 +1680,10 @@ impl Finalizer {
                     )
                     .await
                     .map_err(|error| {
-                        FinalizeError::Receipt(format!("existing receipt unreadable: {error}"))
+                        FinalizeError::Receipt {
+                            context: format!("existing receipt unreadable: {error}"),
+                            source: Some(Box::new(error)),
+                        }
                     })?;
                     // Round-16: use the strict deserializer that
                     // refuses duplicate keys at any nesting level. A
@@ -1586,7 +1696,7 @@ impl Finalizer {
                     // so a hostile plant can no longer OOM the
                     // recovery scan on this session.
                     let receipt = Receipt::from_json_slice(&bytes_receipt)
-                        .map_err(|error| FinalizeError::Receipt(error.to_string()))?;
+                        .map_err(FinalizeError::receipt_source)?;
                     self.verify_configured_receipt(&receipt)?;
                     // Round-6 (hunt3 F3): also bind the persisted
                     // receipt to THIS artifact by its digest before
@@ -1619,9 +1729,10 @@ impl Finalizer {
                     // Fresh recovery — no prior receipt.
                 }
                 Err(error) => {
-                    return Err(FinalizeError::Receipt(format!(
-                        "existing receipt stat failed: {error}"
-                    )));
+                    return Err(FinalizeError::Receipt {
+                        context: format!("existing receipt stat failed: {error}"),
+                        source: Some(Box::new(error)),
+                    });
                 }
             }
             Ok(())
@@ -1693,14 +1804,10 @@ impl Finalizer {
         let mut entries = match tokio::fs::read_dir(&self.spool_dir).await {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+            Err(error) => return Err(FinalizeError::atif_source(error)),
         };
         let mut recovered = 0usize;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|error| FinalizeError::Atif(error.to_string()))?
-        {
+        while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::atif_source)? {
             let metadata_path = entry.path();
             let Some(name) = metadata_path.file_name().and_then(std::ffi::OsStr::to_str) else {
                 continue;
@@ -1768,7 +1875,7 @@ impl Finalizer {
             let session_id = metadata
                 .get("session_id")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| FinalizeError::Atif("journal metadata has no session_id".into()))?;
+                .ok_or_else(|| FinalizeError::atif("journal metadata has no session_id"))?;
             if sessions.get(session_id).is_some() {
                 return Ok(SignedCandidateOutcome::Skipped);
             }
@@ -1781,9 +1888,9 @@ impl Finalizer {
                 metadata
                     .get("identity")
                     .cloned()
-                    .ok_or_else(|| FinalizeError::Atif("journal metadata has no identity".into()))?,
+                    .ok_or_else(|| FinalizeError::atif("journal metadata has no identity"))?,
             )
-            .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+            .map_err(FinalizeError::atif_source)?;
             let journal_path = self.spool_dir.join(format!("{stem}.events.ndjson"));
             let journal = if journal_path.exists() {
                 read_complete_journal(&journal_path).await?
@@ -1817,7 +1924,7 @@ impl Finalizer {
                 }
                 tokio::fs::remove_file(metadata_path.clone())
                     .await
-                    .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+                    .map_err(FinalizeError::atif_source)?;
                 return Ok(SignedCandidateOutcome::Skipped);
             }
             let session = Arc::new(Session::new(
@@ -1832,26 +1939,26 @@ impl Finalizer {
             let domain = format!("{}:active", session.id);
             for (index, line) in journal.into_iter().enumerate() {
                 let index = u64::try_from(index)
-                    .map_err(|_| FinalizeError::Atif("active journal index overflow".to_owned()))?;
+                    .map_err(|_| FinalizeError::atif("active journal index overflow".to_owned()))?;
                 let record: crate::worker::ActiveJournalRecord =
                     crate::journal::open(&self.journal_key, &domain, index, line.as_bytes())
-                        .map_err(FinalizeError::Atif)?;
+                        .map_err(FinalizeError::atif)?;
                 let event: av_events::OcsfEvent = serde_json::from_value(record.event.clone())
-                    .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+                    .map_err(FinalizeError::atif_source)?;
                 if event.session_uid != session.id {
-                    return Err(FinalizeError::Atif(format!(
+                    return Err(FinalizeError::atif(format!(
                         "signed journal event belongs to session {:?}, expected {:?}",
                         event.session_uid, session.id
                     )));
                 }
                 if record.atif_step.is_some() || record.identity != event.ai_agent {
-                    return Err(FinalizeError::Atif(
+                    return Err(FinalizeError::atif(
                         "signed active record has inconsistent workflow or identity".to_owned(),
                     ));
                 }
                 track_response_attempt(&mut pending_responses, record.response_attempt.as_ref())?;
                 if event.metadata.sequence != index {
-                    return Err(FinalizeError::Atif(
+                    return Err(FinalizeError::atif(
                         "signed event sequence does not match active journal index".to_owned(),
                     ));
                 }
@@ -1859,22 +1966,22 @@ impl Finalizer {
                     || record.identity.charter != session.identity.charter
                     || record.identity.instance_uid != session.identity.instance_uid
                 {
-                    return Err(FinalizeError::Atif(
+                    return Err(FinalizeError::atif(
                         "active journal changed the session identity".to_owned(),
                     ));
                 }
                 session.refresh_identity(&record.identity);
                 next_sequence = index
                     .checked_add(1)
-                    .ok_or_else(|| FinalizeError::Atif("event sequence overflow".to_owned()))?;
+                    .ok_or_else(|| FinalizeError::atif("event sequence overflow".to_owned()))?;
                 session
                     .chain
                     .lock()
                     .append(&record.event)
-                    .map_err(|error| FinalizeError::Receipt(error.to_string()))?;
+                    .map_err(FinalizeError::receipt_source)?;
                 // Round-51 §4.2/S1: THE accounting fold — shared with the
                 // live path and the unsigned consolidation.
-                record.fold_into(&mut folded).map_err(FinalizeError::Atif)?;
+                record.fold_into(&mut folded).map_err(FinalizeError::atif)?;
                 if let Some(id) = record.stop_reason_id {
                     let reason = av_events::StopReason::from_id(id);
                     if reason != av_events::StopReason::Unknown {
@@ -1886,7 +1993,7 @@ impl Finalizer {
             }
             folded
                 .validate_tool_accounting()
-                .map_err(|reason| FinalizeError::Atif(format!("signed {reason}")))?;
+                .map_err(|reason| FinalizeError::atif(format!("signed {reason}")))?;
             folded.store_on(&session.totals);
             let inconsistent_responses = !pending_responses.is_empty();
             session.restore_next_seq(next_sequence);
@@ -1920,18 +2027,19 @@ impl Finalizer {
                     )
                     .await
                     .map_err(|error| {
-                        FinalizeError::Receipt(format!(
-                            "existing receipt unreadable: {error}"
-                        ))
+                        FinalizeError::Receipt {
+                            context: format!("existing receipt unreadable: {error}"),
+                            source: Some(Box::new(error)),
+                        }
                     })?;
                     // Round-16: strict deserializer (see the twin call
                     // in the unsigned recovery path above).
                     // Round-17 F3: bounded read.
                     let receipt = Receipt::from_json_slice(&bytes)
-                        .map_err(|error| FinalizeError::Receipt(error.to_string()))?;
+                        .map_err(FinalizeError::receipt_source)?;
                     self.verify_configured_receipt(&receipt)?;
                     if receipt.body.subject != expected_subject {
-                        return Err(FinalizeError::Receipt(
+                        return Err(FinalizeError::receipt(
                             "persisted receipt does not attest the recovered signed journal".to_owned(),
                         ));
                     }
@@ -1947,13 +2055,14 @@ impl Finalizer {
                     // path" from the receipt's point of view).
                 }
                 Err(error) => {
-                    return Err(FinalizeError::Receipt(format!(
-                        "existing receipt stat failed: {error}"
-                    )));
+                    return Err(FinalizeError::Receipt {
+                        context: format!("existing receipt stat failed: {error}"),
+                        source: Some(Box::new(error)),
+                    });
                 }
             }
             let unwrapped = Arc::try_unwrap(session)
-                .map_err(|_| FinalizeError::Task("signed recovery retained session".to_owned()))?;
+                .map_err(|_| FinalizeError::Invariant("signed recovery retained session".to_owned()))?;
             // Seal the session to new leases before it is ever reachable via
             // `sessions.get(id)`. Between `try_insert_recovered` and the
             // finalize path's `try_close`, a client request for the same id
@@ -2071,17 +2180,17 @@ impl Finalizer {
         if let Some(ack) =
             crate::worker::read_broker_ack(&self.spool_dir, session_id, event_uid, &self.journal_key)
                 .await
-                .map_err(FinalizeError::Bridge)?
+                .map_err(FinalizeError::bridge)?
         {
             if ack.topic != topic {
-                return Err(FinalizeError::Bridge(
+                return Err(FinalizeError::bridge(
                     "broker acknowledgment topic does not match active event".to_owned(),
                 ));
             }
             return Ok(());
         }
         let bridge = self.bridge.as_ref().map(Arc::clone).ok_or_else(|| {
-            FinalizeError::Bridge("unacknowledged active event has no configured broker".to_owned())
+            FinalizeError::bridge("unacknowledged active event has no configured broker".to_owned())
         })?;
         let topic = topic.to_owned();
         let key = event.ai_agent.instance_uid.clone();
@@ -2095,7 +2204,7 @@ impl Finalizer {
             lookup_bridge.find_event_by_uid(&lookup_topic, &lookup_key, &lookup_uid)
         })
         .await
-        .map_err(|error| FinalizeError::Task(error.to_string()))?
+        .map_err(FinalizeError::Task)?
         .map_err(FinalizeError::from)?
         {
             crate::worker::persist_broker_ack(
@@ -2106,16 +2215,16 @@ impl Finalizer {
                 &self.journal_key,
             )
             .await
-            .map_err(FinalizeError::Bridge)?;
+            .map_err(FinalizeError::bridge)?;
             return Ok(());
         }
         let ack = tokio::task::spawn_blocking(move || bridge.publish_idempotent(&topic, &key, &value, &uid))
             .await
-            .map_err(|error| FinalizeError::Task(error.to_string()))?
+            .map_err(FinalizeError::Task)?
             .map_err(FinalizeError::from)?;
         crate::worker::persist_broker_ack(&self.spool_dir, session_id, event_uid, &ack, &self.journal_key)
             .await
-            .map_err(FinalizeError::Bridge)
+            .map_err(FinalizeError::bridge)
     }
 
     pub(crate) async fn consolidate_step_journals(
@@ -2126,13 +2235,9 @@ impl Finalizer {
         let mut entries = match tokio::fs::read_dir(&self.spool_dir).await {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+            Err(error) => return Err(FinalizeError::atif_source(error)),
         };
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|error| FinalizeError::Atif(error.to_string()))?
-        {
+        while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::atif_source)? {
             let metadata_path = entry.path();
             let Some(name) = metadata_path.file_name().and_then(std::ffi::OsStr::to_str) else {
                 continue;
@@ -2187,7 +2292,7 @@ impl Finalizer {
             let session_id = metadata
                 .get("session_id")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| FinalizeError::Atif("journal metadata has no session_id".into()))?;
+                .ok_or_else(|| FinalizeError::atif("journal metadata has no session_id"))?;
             if sessions.get(session_id).is_some() {
                 return Ok(());
             }
@@ -2200,9 +2305,9 @@ impl Finalizer {
                 metadata
                     .get("identity")
                     .cloned()
-                    .ok_or_else(|| FinalizeError::Atif("journal metadata has no identity".into()))?,
+                    .ok_or_else(|| FinalizeError::atif("journal metadata has no identity"))?,
             )
-            .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+            .map_err(FinalizeError::atif_source)?;
             // Claim the id in the registry BEFORE any destructive step.
             // The `sessions.get` check above races client admission:
             // `get_or_open` inserts without touching the lifecycle-lock
@@ -2257,7 +2362,7 @@ impl Finalizer {
                 // then silently discard the quarantine seal).
                 claimed.restore_journal_index(
                     u64::try_from(journal.len())
-                        .map_err(|_| FinalizeError::Atif("active journal length overflow".to_owned()))?,
+                        .map_err(|_| FinalizeError::atif("active journal length overflow".to_owned()))?,
                 );
                 // Mirror the pending-response quarantine branch below (and
                 // the `recover_unsigned` invariant): if any future path
@@ -2267,7 +2372,7 @@ impl Finalizer {
                 // session's first event already on the bridge.
                 claimed.restore_next_seq(
                     u64::try_from(journal.len())
-                        .map_err(|_| FinalizeError::Atif("active journal length overflow".to_owned()))?,
+                        .map_err(|_| FinalizeError::atif("active journal length overflow".to_owned()))?,
                 );
                 claimed.mark_capture_failed();
                 // Also seal the session finalized (like the signed-journal
@@ -2306,11 +2411,11 @@ impl Finalizer {
                 }
                 tokio::fs::remove_file(metadata_path.clone())
                     .await
-                    .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+                    .map_err(FinalizeError::atif_source)?;
                 return Ok(());
             }
             let journal_len = u64::try_from(journal.len())
-                .map_err(|_| FinalizeError::Atif("active journal length overflow".to_owned()))?;
+                .map_err(|_| FinalizeError::atif("active journal length overflow".to_owned()))?;
             let agent = av_atif::Agent {
                 name: "agentvisor-ai-harness".into(),
                 version: identity.version.clone(),
@@ -2329,20 +2434,20 @@ impl Finalizer {
             let mut pending_responses = std::collections::HashSet::new();
             for (index, line) in journal.into_iter().enumerate() {
                 let index = u64::try_from(index)
-                    .map_err(|_| FinalizeError::Atif("active journal index overflow".to_owned()))?;
+                    .map_err(|_| FinalizeError::atif("active journal index overflow".to_owned()))?;
                 let record: crate::worker::ActiveJournalRecord =
                     crate::journal::open(&self.journal_key, &domain, index, line.as_bytes())
-                        .map_err(FinalizeError::Atif)?;
+                        .map_err(FinalizeError::atif)?;
                 let event: av_events::OcsfEvent = serde_json::from_value(record.event.clone())
-                    .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+                    .map_err(FinalizeError::atif_source)?;
                 if event.session_uid != session_id || event.ai_agent != record.identity {
-                    return Err(FinalizeError::Atif(
+                    return Err(FinalizeError::atif(
                         "unsigned active record has inconsistent session or identity".to_owned(),
                     ));
                 }
                 track_response_attempt(&mut pending_responses, record.response_attempt.as_ref())?;
                 if event.metadata.sequence != index {
-                    return Err(FinalizeError::Atif(
+                    return Err(FinalizeError::atif(
                         "unsigned event sequence does not match active journal index".to_owned(),
                     ));
                 }
@@ -2350,7 +2455,7 @@ impl Finalizer {
                     || record.identity.charter != identity.charter
                     || record.identity.instance_uid != identity.instance_uid
                 {
-                    return Err(FinalizeError::Atif(
+                    return Err(FinalizeError::atif(
                         "active journal changed the unsigned session identity".to_owned(),
                     ));
                 }
@@ -2359,13 +2464,13 @@ impl Finalizer {
                 // Round-51 §4.2/S1: THE accounting fold — shared with the
                 // live path and the signed recovery. Fold BEFORE the
                 // struct is torn apart by the moves below.
-                record.fold_into(&mut folded).map_err(FinalizeError::Atif)?;
+                record.fold_into(&mut folded).map_err(FinalizeError::atif)?;
                 let step = record.atif_step.ok_or_else(|| {
-                    FinalizeError::Atif("unsigned active record has no ATIF step".to_owned())
+                    FinalizeError::atif("unsigned active record has no ATIF step".to_owned())
                 })?;
                 builder
                     .push_step(step)
-                    .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+                    .map_err(FinalizeError::atif_source)?;
                 latest_identity = record.identity;
                 if record.stop_reason_id.is_some() {
                     stop_reason_id = record.stop_reason_id;
@@ -2373,7 +2478,7 @@ impl Finalizer {
             }
             folded
                 .validate_tool_accounting()
-                .map_err(|reason| FinalizeError::Atif(format!("unsigned {reason}")))?;
+                .map_err(|reason| FinalizeError::atif(format!("unsigned {reason}")))?;
             if !pending_responses.is_empty() {
                 // Convert the already-claimed placeholder into the
                 // quarantined session IN PLACE — same discipline as the
@@ -2448,9 +2553,9 @@ impl Finalizer {
                 let existing: av_atif::Trajectory = serde_json::from_slice(
                     &read_capped_async(final_path.clone(), av_core::fsutil::MAX_ATIF_BYTES)
                         .await
-                        .map_err(|error| FinalizeError::Atif(error.to_string()))?,
+                        .map_err(FinalizeError::atif_source)?,
                 )
-                .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+                .map_err(FinalizeError::atif_source)?;
                 trajectory.trajectory_id.clone_from(&existing.trajectory_id);
                 // Round-6 (hunt2 crosscrate F1): `ttl_remaining_s` is
                 // recomputed at every token validation, so close-time
@@ -2501,24 +2606,27 @@ impl Finalizer {
                         )
                     })
                     .await
-                    .map_err(|error| FinalizeError::Task(error.to_string()))?;
+                    .map_err(FinalizeError::Task)?;
                     if let Err(error) = archive_result {
-                        return Err(FinalizeError::Atif(format!(
-                            "failed to archive prior-incarnation ATIF during recovery: {error}"
-                        )));
+                        return Err(FinalizeError::Atif {
+                            context: format!(
+                                "failed to archive prior-incarnation ATIF during recovery: {error}"
+                            ),
+                            source: Some(Box::new(error)),
+                        });
                     }
                     let write_path = final_path.clone();
                     tokio::task::spawn_blocking(move || av_atif::write_atomic(&trajectory, &write_path))
                         .await
-                        .map_err(|error| FinalizeError::Task(error.to_string()))?
-                        .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+                        .map_err(FinalizeError::Task)?
+                        .map_err(FinalizeError::atif_source)?;
                 }
             } else {
                 let write_path = final_path.clone();
                 tokio::task::spawn_blocking(move || av_atif::write_atomic(&trajectory, &write_path))
                     .await
-                    .map_err(|error| FinalizeError::Task(error.to_string()))?
-                    .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+                    .map_err(FinalizeError::Task)?
+                    .map_err(FinalizeError::atif_source)?;
             }
             self.ensure_atif_provenance(&final_path, session_id).await?;
             self.remove_step_journal(session_id).await?;
@@ -2585,16 +2693,14 @@ impl Finalizer {
         let domain = format!("{}:active", session.id);
         for (index, line) in journal.into_iter().enumerate() {
             let index = u64::try_from(index)
-                .map_err(|_| FinalizeError::Atif("active journal index overflow".to_owned()))?;
+                .map_err(|_| FinalizeError::atif("active journal index overflow".to_owned()))?;
             let record: crate::worker::ActiveJournalRecord =
                 crate::journal::open(&self.journal_key, &domain, index, line.as_bytes())
-                    .map_err(FinalizeError::Atif)?;
+                    .map_err(FinalizeError::atif)?;
             let step = record
                 .atif_step
-                .ok_or_else(|| FinalizeError::Atif("unsigned active record has no ATIF step".to_owned()))?;
-            builder
-                .push_step(step)
-                .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+                .ok_or_else(|| FinalizeError::atif("unsigned active record has no ATIF step".to_owned()))?;
+            builder.push_step(step).map_err(FinalizeError::atif_source)?;
         }
         Ok(Some(builder.finish()))
     }
@@ -2620,25 +2726,23 @@ impl Finalizer {
                 match std::fs::remove_file(&path) {
                     Ok(()) => spool_changed = true,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+                    Err(error) => return Err(FinalizeError::atif_source(error)),
                 }
             }
             if spool_changed {
-                av_core::fsutil::sync_directory(&spool_dir)
-                    .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+                av_core::fsutil::sync_directory(&spool_dir).map_err(FinalizeError::atif_source)?;
             }
             let ack_parent = spool_dir.join("broker-acks");
             let ack_path = ack_parent.join(&stem);
             match std::fs::remove_dir_all(&ack_path) {
-                Ok(()) => av_core::fsutil::sync_directory(&ack_parent)
-                    .map_err(|error| FinalizeError::Atif(error.to_string()))?,
+                Ok(()) => av_core::fsutil::sync_directory(&ack_parent).map_err(FinalizeError::atif_source)?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+                Err(error) => return Err(FinalizeError::atif_source(error)),
             }
             Ok(())
         })
         .await
-        .map_err(|error| FinalizeError::Task(error.to_string()))?
+        .map_err(FinalizeError::Task)?
     }
 
     /// Remove all forwarded MCP tool-execution intent/outcome/audited
@@ -2667,11 +2771,11 @@ impl Finalizer {
             let entries = match std::fs::read_dir(&directory) {
                 Ok(entries) => entries,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+                Err(error) => return Err(FinalizeError::atif_source(error)),
             };
             let mut removed_any = false;
             for entry in entries {
-                let entry = entry.map_err(|error| FinalizeError::Atif(error.to_string()))?;
+                let entry = entry.map_err(FinalizeError::atif_source)?;
                 let path = entry.path();
                 let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
                     continue;
@@ -2686,7 +2790,7 @@ impl Finalizer {
                     // continue rather than aborting the cleanup pass
                     // over unrelated files.
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+                    Err(error) => return Err(FinalizeError::atif_source(error)),
                 };
                 let intent_session_id = crate::journal::open::<serde_json::Value>(
                     &control_key,
@@ -2732,18 +2836,17 @@ impl Finalizer {
                     match std::fs::remove_file(&file) {
                         Ok(()) => removed_any = true,
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+                        Err(error) => return Err(FinalizeError::atif_source(error)),
                     }
                 }
             }
             if removed_any {
-                av_core::fsutil::sync_directory(&directory)
-                    .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+                av_core::fsutil::sync_directory(&directory).map_err(FinalizeError::atif_source)?;
             }
             Ok(())
         })
         .await
-        .map_err(|error| FinalizeError::Task(error.to_string()))?
+        .map_err(FinalizeError::Task)?
     }
 
     /// Round-6 (hunt4 R-F3): move a capture-failed session's
@@ -2824,10 +2927,15 @@ impl Finalizer {
         match outcome {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
+                // Inner error is a pre-rendered `String` (journal seal
+                // machinery), so there is no chain to record.
                 tracing::warn!(%error, "failed to quarantine capture-failed tool executions")
             }
             Err(error) => {
-                tracing::warn!(%error, "failed to quarantine capture-failed tool executions")
+                tracing::warn!(
+                    error = &error as &dyn std::error::Error,
+                    "failed to quarantine capture-failed tool executions"
+                )
             }
         }
     }
@@ -2837,14 +2945,10 @@ impl Finalizer {
         let mut entries = match tokio::fs::read_dir(&self.spool_dir).await {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+            Err(error) => return Err(FinalizeError::atif_source(error)),
         };
         let mut promoted = 0usize;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|error| FinalizeError::Atif(error.to_string()))?
-        {
+        while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::atif_source)? {
             let path = entry.path();
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("promote") {
                 continue;
@@ -2900,7 +3004,11 @@ impl Finalizer {
             match self.promote(session).await {
                 Ok(_) => promoted += 1,
                 Err(error) => {
-                    tracing::warn!(%error, path = %av_core::fsutil::basename(&path), "promotion retry failed");
+                    tracing::warn!(
+                        error = &error as &dyn std::error::Error,
+                        path = %av_core::fsutil::basename(&path),
+                        "promotion retry failed"
+                    );
                 }
             }
         }
@@ -2923,7 +3031,7 @@ impl Finalizer {
         // Sibling of round-17 F3 that missed this internal caller.
         let bytes = read_capped_async(path.to_path_buf(), av_core::fsutil::MAX_ATIF_BYTES)
             .await
-            .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+            .map_err(FinalizeError::atif_source)?;
         self.ensure_atif_provenance_from_bytes(path, session_id, &bytes)
             .await
     }
@@ -2944,19 +3052,19 @@ impl Finalizer {
         if provenance_path.exists() {
             let sealed = read_capped_async(provenance_path.clone(), av_core::fsutil::MAX_CONTROL_BYTES)
                 .await
-                .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+                .map_err(FinalizeError::atif_source)?;
             let actual: AtifProvenance =
                 crate::journal::open(&self.journal_key, "atif-provenance", 0, &sealed)
-                    .map_err(FinalizeError::Atif)?;
+                    .map_err(FinalizeError::atif)?;
             if actual.session_id != expected.session_id || actual.digest != expected.digest {
-                return Err(FinalizeError::Atif(
+                return Err(FinalizeError::atif(
                     "ATIF provenance does not match artifact bytes and session".to_owned(),
                 ));
             }
             return Ok(actual);
         }
         let sealed = crate::journal::seal(&self.journal_key, "atif-provenance", 0, &expected)
-            .map_err(FinalizeError::Atif)?;
+            .map_err(FinalizeError::atif)?;
         persist_marker(&provenance_path, &sealed).await?;
         Ok(expected)
     }
@@ -3019,16 +3127,16 @@ impl Finalizer {
         let bytes = match read_capped_async(path.to_path_buf(), av_core::fsutil::MAX_CONTROL_BYTES).await {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+            Err(error) => return Err(FinalizeError::atif_source(error)),
         };
         crate::journal::open(&self.journal_key, "metadata", 0, &bytes)
             .map(Some)
-            .map_err(FinalizeError::Atif)
+            .map_err(FinalizeError::atif)
     }
 
     fn verify_configured_receipt(&self, receipt: &Receipt) -> Result<(), FinalizeError> {
         if receipt.body.key_id != self.signer.key_id() {
-            return Err(FinalizeError::Receipt(format!(
+            return Err(FinalizeError::receipt(format!(
                 "receipt key {:?} does not match configured key {:?}",
                 receipt.body.key_id,
                 self.signer.key_id()
@@ -3037,16 +3145,13 @@ impl Finalizer {
         let mut keyring = av_receipts::Keyring::new();
         keyring
             .add_signer(self.signer.as_ref())
-            .map_err(|error| FinalizeError::Receipt(error.to_string()))?;
-        receipt
-            .verify(&keyring)
-            .map_err(|error| FinalizeError::Receipt(error.to_string()))
+            .map_err(FinalizeError::receipt_source)?;
+        receipt.verify(&keyring).map_err(FinalizeError::receipt_source)
     }
 
     async fn persist_receipt(&self, session_id: &str, receipt: &Receipt) -> Result<(), FinalizeError> {
         let path = self.receipt_path(session_id);
-        let bytes =
-            serde_json::to_vec_pretty(receipt).map_err(|error| FinalizeError::Receipt(error.to_string()))?;
+        let bytes = serde_json::to_vec_pretty(receipt).map_err(FinalizeError::receipt_source)?;
         let receipt_id = receipt.body.receipt_id.clone();
         let session = session_id.to_owned();
         tokio::task::spawn_blocking(move || {
@@ -3054,8 +3159,8 @@ impl Finalizer {
             av_core::fsutil::write_atomic(&path, &bytes)
         })
         .await
-        .map_err(|error| FinalizeError::Task(error.to_string()))?
-        .map_err(|error| FinalizeError::Receipt(error.to_string()))
+        .map_err(FinalizeError::Task)?
+        .map_err(FinalizeError::receipt_source)
     }
 
     async fn emit_receipt_event(&self, session: &Session, receipt: &Receipt) -> Result<(), FinalizeError> {
@@ -3087,16 +3192,16 @@ impl Finalizer {
         let mut outbox = if path.exists() {
             let sealed = read_capped_async(path.clone(), av_core::fsutil::MAX_CONTROL_BYTES)
                 .await
-                .map_err(|error| FinalizeError::Bridge(error.to_string()))?;
+                .map_err(FinalizeError::bridge_source)?;
             let outbox: LifecycleOutbox = crate::journal::open(
                 &self.journal_key,
                 crate::journal::LIFECYCLE_OUTBOX_DOMAIN,
                 0,
                 &sealed,
             )
-            .map_err(FinalizeError::Bridge)?;
+            .map_err(FinalizeError::bridge)?;
             if outbox.session_id != session.id || outbox.kind != kind {
-                return Err(FinalizeError::Bridge(
+                return Err(FinalizeError::bridge(
                     "lifecycle outbox does not match its session and kind".to_owned(),
                 ));
             }
@@ -3130,14 +3235,13 @@ impl Finalizer {
             )
             .payload(payload)
             .build()
-            .map_err(|error| FinalizeError::Bridge(error.to_string()))?;
+            .map_err(FinalizeError::bridge_source)?;
             let outbox = LifecycleOutbox {
                 session_id: session.id.clone(),
                 kind: kind.to_owned(),
                 topic: class.topic().to_owned(),
                 key: session.current_identity().instance_uid,
-                value: serde_json::to_value(event)
-                    .map_err(|error| FinalizeError::Bridge(error.to_string()))?,
+                value: serde_json::to_value(event).map_err(FinalizeError::bridge_source)?,
                 ack: None,
             };
             persist_outbox(&path, &outbox, &self.journal_key).await?;
@@ -3186,7 +3290,7 @@ impl Finalizer {
         let sealed = match read_capped_async(path.clone(), av_core::fsutil::MAX_CONTROL_BYTES).await {
             Ok(sealed) => sealed,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(FinalizeError::Bridge(error.to_string())),
+            Err(error) => return Err(FinalizeError::bridge_source(error)),
         };
         let mut outbox: LifecycleOutbox = crate::journal::open(
             &self.journal_key,
@@ -3194,9 +3298,9 @@ impl Finalizer {
             0,
             &sealed,
         )
-        .map_err(FinalizeError::Bridge)?;
+        .map_err(FinalizeError::bridge)?;
         if outbox.session_id != session.id || outbox.kind != kind {
-            return Err(FinalizeError::Bridge(
+            return Err(FinalizeError::bridge(
                 "lifecycle outbox does not match its session and kind".to_owned(),
             ));
         }
@@ -3397,13 +3501,9 @@ impl Finalizer {
         let mut entries = match tokio::fs::read_dir(&directory).await {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(FinalizeError::Bridge(error.to_string())),
+            Err(error) => return Err(FinalizeError::bridge_source(error)),
         };
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|error| FinalizeError::Bridge(error.to_string()))?
-        {
+        while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::bridge_source)? {
             let path = entry.path();
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
                 continue;
@@ -3748,14 +3848,10 @@ pub(crate) async fn replay_lifecycle_outboxes_in(
     let mut entries = match tokio::fs::read_dir(&directory).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(FinalizeError::Bridge(error.to_string())),
+        Err(error) => return Err(FinalizeError::bridge_source(error)),
     };
     let mut replayed = 0usize;
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|error| FinalizeError::Bridge(error.to_string()))?
-    {
+    while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::bridge_source)? {
         let path = entry.path();
         if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
             continue;
@@ -3843,11 +3939,11 @@ async fn persist_outbox(
 ) -> Result<(), FinalizeError> {
     let path = path.to_path_buf();
     let bytes = crate::journal::seal(journal_key, crate::journal::LIFECYCLE_OUTBOX_DOMAIN, 0, outbox)
-        .map_err(FinalizeError::Bridge)?;
+        .map_err(FinalizeError::bridge)?;
     tokio::task::spawn_blocking(move || av_core::fsutil::write_atomic(&path, &bytes))
         .await
-        .map_err(|error| FinalizeError::Task(error.to_string()))?
-        .map_err(|error| FinalizeError::Bridge(error.to_string()))
+        .map_err(FinalizeError::Task)?
+        .map_err(FinalizeError::bridge_source)
 }
 
 async fn persist_marker(path: &std::path::Path, bytes: &[u8]) -> Result<(), FinalizeError> {
@@ -3855,8 +3951,8 @@ async fn persist_marker(path: &std::path::Path, bytes: &[u8]) -> Result<(), Fina
     let bytes = bytes.to_vec();
     tokio::task::spawn_blocking(move || av_core::fsutil::write_atomic(&path, &bytes))
         .await
-        .map_err(|error| FinalizeError::Task(error.to_string()))?
-        .map_err(|error| FinalizeError::Atif(error.to_string()))
+        .map_err(FinalizeError::Task)?
+        .map_err(FinalizeError::atif_source)
 }
 
 async fn remove_outbox(path: &std::path::Path) -> Result<(), FinalizeError> {
@@ -3864,7 +3960,7 @@ async fn remove_outbox(path: &std::path::Path) -> Result<(), FinalizeError> {
     tokio::task::spawn_blocking(move || -> Result<(), FinalizeError> {
         let parent = path
             .parent()
-            .ok_or_else(|| FinalizeError::Bridge("outbox has no parent".to_owned()))?;
+            .ok_or_else(|| FinalizeError::bridge("outbox has no parent".to_owned()))?;
         match std::fs::remove_file(&path) {
             Ok(()) => {
                 // Round-19 F2 (av-harness reconciler): the file is
@@ -3900,11 +3996,11 @@ async fn remove_outbox(path: &std::path::Path) -> Result<(), FinalizeError> {
                 Ok(())
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(FinalizeError::Bridge(error.to_string())),
+            Err(error) => Err(FinalizeError::bridge_source(error)),
         }
     })
     .await
-    .map_err(|error| FinalizeError::Task(error.to_string()))?
+    .map_err(FinalizeError::Task)?
 }
 
 /// Start the periodic reconciler tick: spool recovery, promotion retry,
@@ -3938,13 +4034,13 @@ pub fn spawn_reconciler(
             // same shape (main.rs).
             let outcome = std::panic::AssertUnwindSafe(async {
                 if let Err(error) = finalizer.recover_spooled_sessions(&sessions, &breaker).await {
-                    tracing::warn!(%error, "ATIF spool recovery failed");
+                    tracing::warn!(error = &error as &dyn std::error::Error, "ATIF spool recovery failed");
                     metrics
                         .counter("av_reconcile_errors_total", "Reconciliation errors")
                         .inc();
                 }
                 if let Err(error) = finalizer.retry_marked_promotions(&sessions).await {
-                    tracing::warn!(%error, "durable promotion retry failed");
+                    tracing::warn!(error = &error as &dyn std::error::Error, "durable promotion retry failed");
                     metrics
                         .counter("av_reconcile_errors_total", "Reconciliation errors")
                         .inc();
@@ -3956,7 +4052,7 @@ pub fn spawn_reconciler(
                 // sweep those sessions accumulate in the registry
                 // forever and their step journals never get removed.
                 if let Err(error) = finalizer.complete_pending_closes(&sessions).await {
-                    tracing::warn!(%error, "pending-close completion sweep failed");
+                    tracing::warn!(error = &error as &dyn std::error::Error, "pending-close completion sweep failed");
                     metrics
                         .counter("av_reconcile_errors_total", "Reconciliation errors")
                         .inc();
@@ -3982,7 +4078,7 @@ pub fn spawn_reconciler(
                 for session in idle.into_iter().take(MAX_IDLE_CLOSES_PER_TICK) {
                     let session_id = session.id.clone();
                     if let Err(error) = finalizer.close_session(session, StopReason::SessionClosed).await {
-                        tracing::warn!(session = %session_id, %error, "idle session finalization failed");
+                        tracing::warn!(session = %session_id, error = &error as &dyn std::error::Error, "idle session finalization failed");
                         metrics
                             .counter("av_reconcile_errors_total", "Reconciliation errors")
                             .inc();
@@ -4031,7 +4127,7 @@ fn track_response_attempt(
             pending.insert(format!("orphan-terminal:{}", attempt.id));
         }
     } else if !pending.insert(attempt.id.clone()) {
-        return Err(FinalizeError::Atif(
+        return Err(FinalizeError::atif(
             "active journal repeats a response attempt id".to_owned(),
         ));
     }
@@ -4044,7 +4140,7 @@ fn lifecycle_event_uid(value: &serde_json::Value) -> Result<String, FinalizeErro
         .and_then(|metadata| metadata.get("uid"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| FinalizeError::Bridge("lifecycle event has no metadata UID".to_owned()))
+        .ok_or_else(|| FinalizeError::bridge("lifecycle event has no metadata UID".to_owned()))
 }
 
 async fn resolve_lifecycle_ack(
@@ -4062,14 +4158,14 @@ async fn resolve_lifecycle_ack(
         lookup_bridge.find_event_by_uid(&lookup_topic, &lookup_key, &lookup_uid)
     })
     .await
-    .map_err(|error| FinalizeError::Task(error.to_string()))?
+    .map_err(FinalizeError::Task)?
     .map_err(FinalizeError::from)?
     {
         return Ok(ack);
     }
     tokio::task::spawn_blocking(move || bridge.publish_idempotent(&topic, &key, &value, &event_uid))
         .await
-        .map_err(|error| FinalizeError::Task(error.to_string()))?
+        .map_err(FinalizeError::Task)?
         .map_err(FinalizeError::from)
 }
 
@@ -4088,10 +4184,10 @@ async fn quarantine_sibling_exists(spool_dir: &std::path::Path, stem: &str) -> R
         let entries = match std::fs::read_dir(&spool_dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(FinalizeError::Atif(error.to_string())),
+            Err(error) => return Err(FinalizeError::atif_source(error)),
         };
         for entry in entries {
-            let entry = entry.map_err(|error| FinalizeError::Atif(error.to_string()))?;
+            let entry = entry.map_err(FinalizeError::atif_source)?;
             let name = entry.file_name();
             if let Some(name) = name.to_str() {
                 if name.starts_with(&prefix) {
@@ -4102,7 +4198,7 @@ async fn quarantine_sibling_exists(spool_dir: &std::path::Path, stem: &str) -> R
         Ok(false)
     })
     .await
-    .map_err(|error| FinalizeError::Task(error.to_string()))?
+    .map_err(FinalizeError::Task)?
 }
 
 /// Round-17 F3: async wrapper around `av_core::fsutil::read_capped`
@@ -4125,7 +4221,7 @@ async fn read_complete_journal(path: &std::path::Path) -> Result<Vec<String>, Fi
         // attacker cannot plant a multi-GB journal and OOM the
         // recovery scan.
         let bytes = av_core::fsutil::read_capped(&path, av_core::fsutil::MAX_ATIF_BYTES)
-            .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+            .map_err(FinalizeError::atif_source)?;
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
@@ -4191,7 +4287,7 @@ async fn read_complete_journal(path: &std::path::Path) -> Result<Vec<String>, Fi
             // where `#[error("...{0}")]` re-emits the full string.
             let name = av_core::fsutil::basename(&path);
             let qname = av_core::fsutil::basename(&quarantine);
-            return Err(FinalizeError::Atif(match rename_error_message {
+            return Err(FinalizeError::atif(match rename_error_message {
                 None => format!(
                     "journal {name} contained no complete lines ({} bytes); quarantined at {qname}",
                     bytes.len()
@@ -4213,14 +4309,14 @@ async fn read_complete_journal(path: &std::path::Path) -> Result<Vec<String>, Fi
             let file = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&path)
-                .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+                .map_err(FinalizeError::atif_source)?;
             file.set_len(complete_len as u64)
-                .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+                .map_err(FinalizeError::atif_source)?;
             file.sync_all()
-                .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+                .map_err(FinalizeError::atif_source)?;
         }
         let complete = String::from_utf8(bytes.get(..complete_len).unwrap_or_default().to_vec())
-            .map_err(|error| FinalizeError::Atif(error.to_string()))?;
+            .map_err(FinalizeError::atif_source)?;
         Ok(complete
             .lines()
             .filter(|line| !line.trim().is_empty())
@@ -4228,7 +4324,7 @@ async fn read_complete_journal(path: &std::path::Path) -> Result<Vec<String>, Fi
             .collect())
     })
     .await
-    .map_err(|error| FinalizeError::Task(error.to_string()))?
+    .map_err(FinalizeError::Task)?
 }
 
 #[cfg(test)]
@@ -4248,6 +4344,55 @@ mod tests {
     struct FailFirstReceiptBus {
         fail: std::sync::atomic::AtomicBool,
         attempts: parking_lot::Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    /// The deferred-work item this refactor closes: an `io::Error`
+    /// wrapped by `FinalizeError` must keep its `ErrorKind` reachable
+    /// through `Error::source()`, so callers can branch on e.g.
+    /// `NotFound` vs `PermissionDenied` instead of parsing Display
+    /// text, and tracing subscribers receive the full chain.
+    #[test]
+    fn finalize_error_preserves_io_error_kind_through_source() {
+        let error = FinalizeError::atif_source(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "spool file vanished",
+        ));
+        // Display stays byte-compatible with the old stringified payload.
+        assert_eq!(error.to_string(), "ATIF finalization failed: spool file vanished");
+        let source = std::error::Error::source(&error).expect("typed source must survive");
+        let io = source
+            .downcast_ref::<std::io::Error>()
+            .expect("source must downcast to io::Error");
+        assert_eq!(io.kind(), std::io::ErrorKind::NotFound);
+        // Semantic constructors carry no source.
+        assert!(std::error::Error::source(&FinalizeError::atif("no step")).is_none());
+    }
+
+    /// Round-28 F1 regression guard for the typed-source refactor: the
+    /// permanent/transient classification in `From<BusError>` must be
+    /// preserved AND the `BusError` itself must survive as the source
+    /// (including its own chain, e.g. the wrapped `io::Error`).
+    #[test]
+    fn bus_error_conversion_keeps_classification_and_typed_source() {
+        let permanent = FinalizeError::from(BusError::UnknownTopic("agent.receipt".to_owned()));
+        assert!(matches!(permanent, FinalizeError::BridgeConfig { .. }));
+        assert!(std::error::Error::source(&permanent)
+            .and_then(|source| source.downcast_ref::<BusError>())
+            .is_some());
+
+        let transient = FinalizeError::from(BusError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "broker socket",
+        )));
+        assert!(matches!(transient, FinalizeError::Bridge { .. }));
+        let bus = std::error::Error::source(&transient)
+            .and_then(|source| source.downcast_ref::<BusError>())
+            .expect("BusError source");
+        // The io::ErrorKind is still reachable one level deeper.
+        let io = std::error::Error::source(bus)
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .expect("io::Error inside BusError");
+        assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     impl EventBus for FailFirstReceiptBus {
@@ -4675,7 +4820,7 @@ mod tests {
             finalizer
                 .close_session(Arc::clone(&session), StopReason::SessionClosed)
                 .await,
-            Err(FinalizeError::Bridge(_))
+            Err(FinalizeError::Bridge { .. })
         ));
         assert!(session.is_closed());
         assert!(
@@ -4750,7 +4895,7 @@ mod tests {
             finalizer
                 .close_session(Arc::clone(&registered), StopReason::SessionClosed)
                 .await,
-            Err(FinalizeError::Bridge(_))
+            Err(FinalizeError::Bridge { .. })
         ));
         assert!(
             registered.artifact_committed_flag(),
@@ -4831,7 +4976,7 @@ mod tests {
             finalizer
                 .close_session(Arc::clone(&registered), StopReason::SessionClosed)
                 .await,
-            Err(FinalizeError::Bridge(_))
+            Err(FinalizeError::Bridge { .. })
         ));
         assert_eq!(
             store.get(&budget_key).unwrap(),
@@ -5329,7 +5474,7 @@ mod tests {
             .close_session(Arc::clone(&registered), StopReason::SessionClosed)
             .await;
         assert!(
-            matches!(result, Err(FinalizeError::Atif(_))),
+            matches!(result, Err(FinalizeError::Atif { .. })),
             "empty unsigned close must reject; got {result:?}",
         );
         assert!(
@@ -5386,7 +5531,7 @@ mod tests {
         tokio::task::yield_now().await;
         let second = finalizer.close_session(session, StopReason::SessionClosed).await;
         let first = first.await.unwrap();
-        assert!(matches!(first, Err(FinalizeError::Bridge(_))));
+        assert!(matches!(first, Err(FinalizeError::Bridge { .. })));
         assert!(matches!(second, Ok(FinalizeOutcome::Receipt { .. })));
     }
 
@@ -5406,7 +5551,7 @@ mod tests {
         let session = session(Workflow::Signed);
         assert!(matches!(
             finalizer.close_session(session, StopReason::SessionClosed).await,
-            Err(FinalizeError::Bridge(_))
+            Err(FinalizeError::Bridge { .. })
         ));
         assert!(finalizer
             .lifecycle_outbox_path("lifecycle-session", "receipt")
@@ -5794,7 +5939,7 @@ mod tests {
             .close_session(Arc::clone(&session), StopReason::SessionClosed)
             .await;
         assert!(
-            matches!(result, Err(FinalizeError::Atif(_))),
+            matches!(result, Err(FinalizeError::Atif { .. })),
             "empty unsigned close must surface an ATIF error to the caller: {result:?}",
         );
         assert!(

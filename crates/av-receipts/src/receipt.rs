@@ -14,7 +14,54 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 /// Version of the receipt format itself (evolution surface).
-pub const RECEIPT_VERSION: u32 = 1;
+///
+/// Version history:
+/// * **1** — the signature covers the bare JCS canonicalization of the
+///   body. Legacy; still verifiable (see [`signing_message`]) but never
+///   issued anymore.
+/// * **2** — the signature covers a domain-separated message:
+///   [`RECEIPT_DOMAIN_TAG_V2`] + the u64 big-endian byte length of the
+///   JCS canonical body + the JCS canonical body bytes. This closes a
+///   cross-protocol confusion risk: the same Ed25519 key also
+///   feeds the journal-MAC KDF (`journal.rs`), and a signature over
+///   un-tagged bytes could in principle be replayed as a signature over
+///   some other protocol's message. Mirrors the framing style of
+///   `journal.rs` (`b"agentvisor-journal-v1\0"` + BE length prefixes).
+pub const RECEIPT_VERSION: u32 = 2;
+
+/// Domain-separation tag prepended to every version-2 receipt signing
+/// message. The trailing NUL makes the tag self-delimiting so no JCS
+/// body could extend it into a different tag.
+pub const RECEIPT_DOMAIN_TAG_V2: &[u8] = b"agentvisor-receipt-v2\0";
+
+/// Build the exact byte message the receipt signature covers for a
+/// given `receipt_version`, from the JCS canonical form of the body.
+///
+/// * version 1: the bare canonical bytes (legacy wire format);
+/// * version 2: `RECEIPT_DOMAIN_TAG_V2 || len(canonical) as u64 BE ||
+///   canonical` — domain-separated and length-framed, mirroring
+///   `journal.rs`;
+/// * any other version: refused with
+///   [`ReceiptError::SemanticInvariant`] (there is no defined framing,
+///   so neither signing nor verifying may proceed).
+///
+/// Public so external tooling and tests can reproduce the signing
+/// message byte-for-byte.
+pub fn signing_message(receipt_version: u32, canonical_body: &str) -> Result<Vec<u8>, ReceiptError> {
+    match receipt_version {
+        1 => Ok(canonical_body.as_bytes().to_vec()),
+        2 => {
+            let mut message = Vec::with_capacity(RECEIPT_DOMAIN_TAG_V2.len() + 8 + canonical_body.len());
+            message.extend_from_slice(RECEIPT_DOMAIN_TAG_V2);
+            message.extend_from_slice(&(canonical_body.len() as u64).to_be_bytes());
+            message.extend_from_slice(canonical_body.as_bytes());
+            Ok(message)
+        }
+        other => Err(ReceiptError::SemanticInvariant(format!(
+            "receipt_version {other} has no defined signature framing (supported: 1, 2)"
+        ))),
+    }
+}
 
 /// What this receipt attests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,12 +144,15 @@ pub struct ReceiptBody {
     pub public_key_b64: String,
 }
 
-/// A complete receipt: body + detached signature over `JCS(body)`.
+/// A complete receipt: body + detached signature over the version's
+/// signing message (see [`signing_message`] — bare `JCS(body)` for v1,
+/// domain-tagged and length-framed `JCS(body)` for v2).
 ///
 /// The wire shape is intentionally flat (13 body fields + `signature_b64`
-/// at the top level) — the schema at `schemas/receipt-v1.schema.json`
-/// commits to it and downstream verifiers (`avctl receipt-verify`,
-/// external tools) consume it that way.
+/// at the top level) — the schemas at `schemas/receipt-v1.schema.json`
+/// and `schemas/receipt-v2.schema.json` commit to it (they differ only
+/// in the pinned `receipt_version`) and downstream verifiers
+/// (`avctl receipt-verify`, external tools) consume it that way.
 ///
 /// `#[serde(flatten)]` normally silently disables `deny_unknown_fields`
 /// on the inner struct, which would let a hostile issuer add extra
@@ -119,7 +169,9 @@ pub struct Receipt {
     /// Signed body.
     #[serde(flatten)]
     pub body: ReceiptBody,
-    /// Ed25519 signature over the JCS canonicalization of the body, base64.
+    /// Ed25519 signature, base64. Covers the version's signing message:
+    /// bare `JCS(body)` for v1, [`RECEIPT_DOMAIN_TAG_V2`] + u64-BE
+    /// length + `JCS(body)` for v2.
     pub signature_b64: String,
 }
 
@@ -223,7 +275,7 @@ pub enum ReceiptError {
     /// its key id (substitution attempt).
     #[error("embedded public key mismatches keyring entry for {0:?}")]
     KeyMismatch(String),
-    /// Round-15 F4: a JSON object at some nesting level carried a
+    /// A JSON object at some nesting level carried a
     /// duplicate key. Rejecting these closes the last-wins vs
     /// first-wins auditor split-brain that would otherwise let a
     /// hostile issuer sign under one interpretation while an
@@ -231,13 +283,13 @@ pub enum ReceiptError {
     ///
     /// The payload is a complete scanner message (duplicate key,
     /// nesting-depth, or explicit-null refusal), so the template
-    /// must not re-wrap it in a `key`-shaped slot — the old
-    /// "duplicate JSON key `{0}` at nesting" produced garbled
+    /// must not re-wrap it in a `key`-shaped slot — a
+    /// "duplicate JSON key `{0}` at nesting" template produced garbled
     /// double-wrapped diagnostics like ``duplicate JSON key
     /// `duplicate key `x` in JSON object …` at nesting``.
     #[error("{0}; strict receipt parsers refuse this")]
     DuplicateKey(String),
-    /// Round-16 F8: a receipt carries a semantically-invalid field
+    /// A receipt carries a semantically-invalid field
     /// (currently: `AtifTrajectory.retroactive == false`). Distinct
     /// from `Serde` and `DuplicateKey` so ops triage can name the
     /// class.
@@ -262,7 +314,7 @@ impl Receipt {
     /// split-brain the top-level guard was written to prevent, one
     /// level deeper.
     ///
-    /// Round-15 F4: pre-scan the JSON with a strict duplicate-key
+    /// Pre-scans the JSON with a strict duplicate-key
     /// checker (`check_no_duplicate_keys`) before deserialising into
     /// `Receipt`. Callers verifying a receipt off the wire should
     /// prefer this over `serde_json::from_slice::<Receipt>`.
@@ -280,11 +332,17 @@ impl Receipt {
     ///
     /// The `key_id` and `public_key_b64` fields of the body are overwritten
     /// from the signer — a caller can never claim someone else's key identity.
+    /// `receipt_version` is likewise overwritten to [`RECEIPT_VERSION`]:
+    /// every freshly issued receipt uses the current (domain-separated)
+    /// signing format, so no issuance path can produce a legacy v1
+    /// signature.
     pub fn issue(mut body: ReceiptBody, signer: &dyn Signer) -> Result<Self, ReceiptError> {
+        body.receipt_version = RECEIPT_VERSION;
         body.key_id = signer.key_id().to_owned();
         body.public_key_b64 = base64::engine::general_purpose::STANDARD.encode(signer.public_key_bytes());
         let canon = canonicalize(&serde_json::to_value(&body)?)?;
-        let sig = signer.sign(canon.as_bytes());
+        let message = signing_message(body.receipt_version, &canon)?;
+        let sig = signer.sign(&message);
         Ok(Self {
             body,
             signature_b64: base64::engine::general_purpose::STANDARD.encode(sig),
@@ -292,14 +350,16 @@ impl Receipt {
     }
 
     /// Verify offline against a keyring. Checks, in execution order:
-    /// 1. `AtifTrajectory.retroactive == true` (round-16 F8 —
+    /// 1. `AtifTrajectory.retroactive == true` (
     ///    `retroactive: false` on an ATIF-promoted receipt is
     ///    semantically nonsense; the schema pins it to `const: true`
     ///    but the Rust type still accepts `false`; refuse it here so
     ///    the two agree);
     /// 2. the embedded public key matches the ring's key for `key_id`
     ///    (anti-substitution);
-    /// 3. the signature verifies over `JCS(body)`.
+    /// 3. the signature verifies over the version's signing message
+    ///    (bare `JCS(body)` for v1; domain-tagged, length-framed
+    ///    `JCS(body)` for v2 — see [`signing_message`]).
     pub fn verify(&self, ring: &Keyring) -> Result<(), ReceiptError> {
         self.verify_semantic_invariants()?;
         let embedded = base64::engine::general_purpose::STANDARD
@@ -314,10 +374,11 @@ impl Receipt {
             return Err(ReceiptError::KeyMismatch(self.body.key_id.clone()));
         }
         let canon = canonicalize(&serde_json::to_value(&self.body)?)?;
+        let message = signing_message(self.body.receipt_version, &canon)?;
         let sig = base64::engine::general_purpose::STANDARD
             .decode(&self.signature_b64)
             .map_err(|_| ReceiptError::Base64)?;
-        ring.verify(&self.body.key_id, canon.as_bytes(), &sig)?;
+        ring.verify(&self.body.key_id, &message, &sig)?;
         Ok(())
     }
 
@@ -336,29 +397,35 @@ impl Receipt {
             return Err(ReceiptError::KeyMismatch(self.body.key_id.clone()));
         }
         let canon = canonicalize(&serde_json::to_value(&self.body)?)?;
+        let message = signing_message(self.body.receipt_version, &canon)?;
         let sig = base64::engine::general_purpose::STANDARD
             .decode(&self.signature_b64)
             .map_err(|_| ReceiptError::Base64)?;
-        ring.verify(&id, canon.as_bytes(), &sig)?;
+        ring.verify(&id, &message, &sig)?;
         Ok(())
     }
 
-    /// Round-16 F8: check semantic invariants that the type system
+    /// Check semantic invariants that the type system
     /// cannot express. Currently: `AtifTrajectory.retroactive` must
     /// be `true` (the schema pins it via `const: true`; the Rust
     /// type is `bool` for auditability). Called from both
     /// `verify` and `verify_embedded` so no verification path can
     /// skip it.
     fn verify_semantic_invariants(&self) -> Result<(), ReceiptError> {
-        // Schema parity: `receipt_version` is `const 1` and the subject
-        // digests are pinned `^[0-9a-f]{64}$` in the shipped schema, but
-        // verification never checked either — a keyholder could issue
-        // `receipt_version: 999` or free-text digests that
-        // `avctl receipt-verify` accepted while schema-based external
-        // verifiers rejected (split offline-verification verdicts).
-        if self.body.receipt_version != RECEIPT_VERSION {
+        // Schema parity: `receipt_version` is pinned per-version in the
+        // shipped schemas (`const: 1` in receipt-v1, `const: 2` in
+        // receipt-v2) and the subject digests are pinned
+        // `^[0-9a-f]{64}$`, but verification never checked either — a
+        // keyholder could issue `receipt_version: 999` or free-text
+        // digests that `avctl receipt-verify` accepted while
+        // schema-based external verifiers rejected (split
+        // offline-verification verdicts). Versions 1 (bare-JCS
+        // signature) and 2 (domain-separated signature) are the only
+        // ones with a defined signing message; anything else is
+        // refused before a signature check could misinterpret it.
+        if !matches!(self.body.receipt_version, 1 | 2) {
             return Err(ReceiptError::SemanticInvariant(format!(
-                "receipt_version {} is not the supported version {RECEIPT_VERSION}",
+                "receipt_version {} is not a supported version (1 or 2)",
                 self.body.receipt_version
             )));
         }
@@ -426,12 +493,12 @@ impl Receipt {
                 ));
             }
         }
-        // Round-6 (hunt2 F3): cross-check `issued_at_iso` against the
-        // authoritative epoch-ms `issued_at`. Verification previously
-        // only checked shapes plus the retroactive invariant, so a
-        // hostile-but-keyholding issuer could sign a receipt whose ISO
+        // Cross-check `issued_at_iso` against the
+        // authoritative epoch-ms `issued_at`. Checking
+        // only shapes plus the retroactive invariant would let a
+        // hostile-but-keyholding issuer sign a receipt whose ISO
         // caption and epoch-ms disagreed — auditors reading ISO and
-        // tooling reading ms saw different facts from the same
+        // tooling reading ms would see different facts from the same
         // verified receipt. Derive the ISO deterministically and
         // require equality.
         let expected_iso = av_core::time::iso8601_ms(self.body.issued_at);
@@ -443,8 +510,8 @@ impl Receipt {
         }
         // Cross-check the stop-reason dual representation — the same
         // split-brain class as issued_at/issued_at_iso above, but with
-        // the same tolerance the events validator settled on (round-17
-        // F1 revised in round-18): `stop_reason` may legitimately carry
+        // the same tolerance the events validator uses:
+        // `stop_reason` may legitimately carry
         // a provider-native or free-text caption, so equality with the
         // canonical caption cannot be required. Refuse only the
         // unambiguous cross-wiring where the caption IS the canonical
@@ -493,7 +560,7 @@ impl Receipt {
 /// key and a first-wins auditor would see the earlier one. This
 /// walk runs upfront so the collapse never happens.
 ///
-/// Round-16 hardening: enforce a hard depth cap so a hostile issuer
+/// Also enforce a hard depth cap so a hostile issuer
 /// cannot use a deeply-nested `[[[[…]]]]` payload to blow the walker's
 /// stack. serde_json's own limit is 128 by default, but the cost of
 /// a per-level check is a single integer increment.
@@ -502,7 +569,7 @@ const MAX_NESTED_DEPTH: usize = 128;
 /// Sentinel prefix that lets `check_no_duplicate_keys` distinguish a
 /// duplicate-key rejection (mapped to `ReceiptError::DuplicateKey`)
 /// from a general parse failure (mapped to `ReceiptError::Serde`).
-/// Round-16 F6: the previous blanket `.map_err(DuplicateKey)` folded
+/// A blanket `.map_err(DuplicateKey)` would fold
 /// serde_json's own EOF / recursion / expected-value errors into the
 /// DuplicateKey variant, actively misleading ops.
 const DUP_KEY_SENTINEL: &str = "__av_dup:";
@@ -574,7 +641,7 @@ impl<'de> serde::de::Visitor<'de> for NoDupVisitor {
         Ok(())
     }
 
-    /// Round-15 F3 (av-receipts): reject explicit JSON `null` anywhere
+    /// Reject explicit JSON `null` anywhere
     /// in the receipt wire form. Every optional field on `ReceiptBody`
     /// / `AgentIdentity` / `EventMetrics` / … carries
     /// `#[serde(skip_serializing_if = "Option::is_none")]`, so
@@ -617,7 +684,7 @@ impl<'de> serde::de::Visitor<'de> for NoDupVisitor {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         while let Some(key) = map.next_key::<String>()? {
             if !seen.insert(key.clone()) {
-                // Round-16 F6: escape the key so a hostile spelling
+                // Escape the key so a hostile spelling
                 // containing `\n` or ANSI escapes cannot inject a
                 // fake extra log line at every tracing site that
                 // logs the resulting error via `%error`.
@@ -717,12 +784,161 @@ mod tests {
         let mut ring = Keyring::new();
         ring.add_signer(&signer).unwrap();
         let receipt = Receipt::issue(body(), &signer).unwrap();
+        assert_eq!(
+            receipt.body.receipt_version, 2,
+            "freshly issued receipts must use the domain-separated v2 format"
+        );
         receipt.verify(&ring).unwrap();
         receipt.verify_embedded().unwrap();
     }
 
-    /// Round-16 F8 shipped the `AtifTrajectory.retroactive == true`
-    /// semantic invariant without a test — the mutation run caught
+    /// `issue` must overwrite a caller-supplied `receipt_version` the
+    /// same way it overwrites `key_id`/`public_key_b64` — otherwise a
+    /// caller passing a stale body could still mint bare-JCS (v1)
+    /// signatures, reopening the cross-protocol confusion the v2
+    /// domain tag closes.
+    #[test]
+    fn issue_overwrites_caller_supplied_receipt_version() {
+        let signer = Ed25519Signer::generate();
+        let mut b = body();
+        b.receipt_version = 1;
+        let receipt = Receipt::issue(b, &signer).unwrap();
+        assert_eq!(receipt.body.receipt_version, RECEIPT_VERSION);
+        receipt.verify_embedded().unwrap();
+    }
+
+    /// Sign `body` under the LEGACY v1 wire format: `receipt_version: 1`
+    /// and a signature over the bare JCS canonical bytes (no domain tag,
+    /// no length framing). This is what every pre-v2 deployment wrote
+    /// to disk; the verifier must keep accepting it.
+    fn issue_v1(mut body: ReceiptBody, signer: &Ed25519Signer) -> Receipt {
+        body.receipt_version = 1;
+        body.key_id = signer.key_id().to_owned();
+        body.public_key_b64 = base64::engine::general_purpose::STANDARD.encode(signer.public_key_bytes());
+        let canon = canonicalize(&serde_json::to_value(&body).unwrap()).unwrap();
+        let sig = signer.sign(canon.as_bytes());
+        Receipt {
+            body,
+            signature_b64: base64::engine::general_purpose::STANDARD.encode(sig),
+        }
+    }
+
+    /// Migration window: a v1 receipt (bare-JCS signature) issued by an
+    /// old deployment must still verify on both paths.
+    #[test]
+    fn legacy_v1_receipt_still_verifies_on_both_paths() {
+        let signer = Ed25519Signer::generate();
+        let mut ring = Keyring::new();
+        ring.add_signer(&signer).unwrap();
+        let receipt = issue_v1(body(), &signer);
+        assert_eq!(receipt.body.receipt_version, 1);
+        receipt.verify(&ring).unwrap();
+        receipt.verify_embedded().unwrap();
+    }
+
+    /// Cross-version confusion: a receipt labeled `receipt_version:
+    /// 2` whose signature was computed WITHOUT the domain prefix (i.e. a
+    /// v1-style bare-JCS signature) must be refused as `BadSignature` —
+    /// the domain tag is not decorative, it is signature-covered.
+    #[test]
+    fn v2_receipt_with_bare_jcs_signature_is_refused() {
+        let signer = Ed25519Signer::generate();
+        let mut ring = Keyring::new();
+        ring.add_signer(&signer).unwrap();
+        let mut b = body();
+        b.receipt_version = 2;
+        b.key_id = signer.key_id().to_owned();
+        b.public_key_b64 = base64::engine::general_purpose::STANDARD.encode(signer.public_key_bytes());
+        let canon = canonicalize(&serde_json::to_value(&b).unwrap()).unwrap();
+        // Bare-JCS signature (no tag, no length prefix) over a body
+        // that CLAIMS the domain-separated format.
+        let sig = signer.sign(canon.as_bytes());
+        let confused = Receipt {
+            body: b,
+            signature_b64: base64::engine::general_purpose::STANDARD.encode(sig),
+        };
+        assert!(
+            matches!(
+                confused.verify(&ring),
+                Err(ReceiptError::Key(KeyError::BadSignature(_)))
+            ),
+            "v2 receipt with an un-tagged signature must fail as BadSignature"
+        );
+        assert!(
+            matches!(
+                confused.verify_embedded(),
+                Err(ReceiptError::Key(KeyError::BadSignature(_)))
+            ),
+            "embedded path must refuse the un-tagged v2 signature too"
+        );
+    }
+
+    /// Relabeling both ways: a body honestly signed under one
+    /// version must not verify when its `receipt_version` label claims
+    /// the other version. The version field is inside the signed body,
+    /// so relabeling changes the canonical bytes AND selects a
+    /// different signing message — both paths must land in
+    /// `BadSignature`, never in silent acceptance.
+    #[test]
+    fn version_relabeling_is_refused_in_both_directions() {
+        let signer = Ed25519Signer::generate();
+        let mut ring = Keyring::new();
+        ring.add_signer(&signer).unwrap();
+
+        // v1-signed body relabeled as v2.
+        let mut up = issue_v1(body(), &signer);
+        up.body.receipt_version = 2;
+        assert!(
+            matches!(
+                up.verify(&ring),
+                Err(ReceiptError::Key(KeyError::BadSignature(_)))
+            ),
+            "v1 signature relabeled as v2 must fail as BadSignature"
+        );
+        assert!(matches!(
+            up.verify_embedded(),
+            Err(ReceiptError::Key(KeyError::BadSignature(_)))
+        ));
+
+        // v2-signed body relabeled as v1.
+        let mut down = Receipt::issue(body(), &signer).unwrap();
+        down.body.receipt_version = 1;
+        assert!(
+            matches!(
+                down.verify(&ring),
+                Err(ReceiptError::Key(KeyError::BadSignature(_)))
+            ),
+            "v2 signature relabeled as v1 must fail as BadSignature"
+        );
+        assert!(matches!(
+            down.verify_embedded(),
+            Err(ReceiptError::Key(KeyError::BadSignature(_)))
+        ));
+    }
+
+    /// The v2 signing message framing is pinned byte-for-byte: tag,
+    /// u64 big-endian length of the canonical bytes, canonical bytes.
+    /// An external reimplementation (VERIFYING-A-RECEIPT.md §5) relies
+    /// on exactly this layout.
+    #[test]
+    fn v2_signing_message_framing_is_tag_belen_canon() {
+        let canon = r#"{"a":1}"#;
+        let message = signing_message(2, canon).unwrap();
+        let mut expected = b"agentvisor-receipt-v2\0".to_vec();
+        expected.extend_from_slice(&(canon.len() as u64).to_be_bytes());
+        expected.extend_from_slice(canon.as_bytes());
+        assert_eq!(message, expected);
+        // v1 is the bare canonical bytes.
+        assert_eq!(signing_message(1, canon).unwrap(), canon.as_bytes());
+        // Undefined versions have no framing.
+        assert!(matches!(
+            signing_message(3, canon),
+            Err(ReceiptError::SemanticInvariant(_))
+        ));
+    }
+
+    /// The `AtifTrajectory.retroactive == true`
+    /// semantic invariant needs a test — a mutation run caught
     /// `verify_semantic_invariants -> Ok(())` surviving, meaning a
     /// forged non-retroactive promotion receipt verified fine. Pin
     /// both verification paths: a `retroactive: false` receipt must
@@ -766,8 +982,8 @@ mod tests {
     /// map arms.
     #[test]
     fn nesting_depth_boundary_is_exact_for_arrays_and_maps() {
-        // Round-15 F3: the leaf is `0` (not `null`) because the
-        // strict receipt scanner now refuses explicit JSON null
+        // The leaf is `0` (not `null`) because the
+        // strict receipt scanner refuses explicit JSON null
         // everywhere. A number at the leaf preserves the boundary
         // test's intent (depth mechanics only) without exercising
         // the unrelated null-rejection path.
@@ -795,7 +1011,7 @@ mod tests {
         }
     }
 
-    /// Round-15 F4: `Receipt::from_json_slice` rejects duplicate keys
+    /// `Receipt::from_json_slice` rejects duplicate keys
     /// at ANY nesting level (top-level, nested inside `ai_agent`,
     /// nested inside `subject`, deep inside an array element). This
     /// closes the last-wins vs first-wins auditor split-brain that
@@ -803,15 +1019,15 @@ mod tests {
     /// interpretation while an external audit tool showed the other.
     #[test]
     fn from_json_slice_rejects_explicit_null_option_field() {
-        // Round-15 F3: `AgentIdentity.ttl_remaining_s` is
+        // `AgentIdentity.ttl_remaining_s` is
         // `Option<u64>` with `skip_serializing_if = Option::is_none`,
         // so an honest issuer omits the field. `serde_json::from_slice`
         // would then accept an explicit `null` for the same field,
         // and `Receipt::verify` would re-canonicalise via
         // `serde_json::to_value(&self.body)`, dropping the null. The
-        // consequence was a valid signature over TWO different wire
+        // consequence: a valid signature over TWO different wire
         // encodings — a "same signature ⇔ same bytes" violation.
-        // `from_json_slice` must now refuse the null variant.
+        // `from_json_slice` must refuse the null variant.
         let bytes = br#"{"ai_agent":{"instance_uid":"a","ttl_remaining_s":null}}"#;
         let outcome = Receipt::from_json_slice(bytes);
         assert!(
@@ -830,8 +1046,8 @@ mod tests {
         );
     }
 
-    /// Round-51 §10.2: `from_json_str` is public API and previously
-    /// had no caller in any test. Prove the roundtrip (an issued
+    /// `from_json_str` is public API and must not go
+    /// untested. Prove the roundtrip (an issued
     /// receipt re-parses and still verifies) AND that the strict
     /// duplicate-key gate applies on the &str path too — a regression
     /// that routed it around `check_no_duplicate_keys` would reopen
@@ -874,10 +1090,10 @@ mod tests {
         );
     }
 
-    /// Round-16 F6: `check_no_duplicate_keys` must distinguish
+    /// `check_no_duplicate_keys` must distinguish
     /// duplicate-key rejections (mapped to `ReceiptError::DuplicateKey`)
     /// from ordinary parse failures (mapped to `ReceiptError::Serde`).
-    /// Previously the blanket `.map_err(DuplicateKey)` folded EOF,
+    /// A blanket `.map_err(DuplicateKey)` folds EOF,
     /// "expected value", and recursion-limit hits into the DuplicateKey
     /// variant, actively misleading ops during triage.
     #[test]
@@ -919,7 +1135,7 @@ mod tests {
         assert!(msg.contains(r"\n"), "expected escaped newline, got {msg:?}");
     }
 
-    /// Round-16: defense-in-depth against stack overflow via
+    /// Defense-in-depth against stack overflow via
     /// deeply-nested JSON payload. serde_json's own recursion limit
     /// is 128 (fires first with "recursion limit exceeded"); our
     /// walker enforces the same bound explicitly so a future
@@ -1016,11 +1232,38 @@ mod tests {
         let signer = Ed25519Signer::from_seed(&[13; 32]);
         let receipt = Receipt::issue(body(), &signer).unwrap();
         let schema: serde_json::Value =
-            serde_json::from_str(include_str!("../../../schemas/receipt-v1.schema.json")).unwrap();
+            serde_json::from_str(include_str!("../../../schemas/receipt-v2.schema.json")).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
         let value = serde_json::to_value(receipt).unwrap();
         let errors: Vec<_> = validator.iter_errors(&value).collect();
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// The v1 schema stays shipped so existing v1 artifacts keep
+    /// validating: a legacy-signed v1 receipt matches receipt-v1, and
+    /// the two schemas partition by `receipt_version` (a v2 receipt is
+    /// refused by the v1 schema and vice versa).
+    #[test]
+    fn legacy_v1_receipt_matches_the_shipped_v1_schema() {
+        let signer = Ed25519Signer::from_seed(&[13; 32]);
+        let v1_receipt = serde_json::to_value(issue_v1(body(), &signer)).unwrap();
+        let v2_receipt = serde_json::to_value(Receipt::issue(body(), &signer).unwrap()).unwrap();
+        let v1_schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/receipt-v1.schema.json")).unwrap();
+        let v2_schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/receipt-v2.schema.json")).unwrap();
+        let v1_validator = jsonschema::validator_for(&v1_schema).unwrap();
+        let v2_validator = jsonschema::validator_for(&v2_schema).unwrap();
+        let errors: Vec<_> = v1_validator.iter_errors(&v1_receipt).collect();
+        assert!(errors.is_empty(), "v1 receipt vs v1 schema: {errors:?}");
+        assert!(
+            !v1_validator.is_valid(&v2_receipt),
+            "v2 receipt must not satisfy the v1 schema (receipt_version const)"
+        );
+        assert!(
+            !v2_validator.is_valid(&v1_receipt),
+            "v1 receipt must not satisfy the v2 schema (receipt_version const)"
+        );
     }
 
     #[test]
@@ -1193,10 +1436,10 @@ mod tests {
         }
     }
 
-    /// Round-51 §3.5: an unknown `receipt_version` must be refused by
-    /// BOTH verification paths — a future v2 receipt that
-    /// reinterprets a field must not verify under v1 semantics on a
-    /// shipped v1 verifier. `receipt_version` sits outside `body`
+    /// An unknown `receipt_version` must be refused by
+    /// BOTH verification paths — a future v3 receipt that
+    /// reinterprets a field must not verify under v1/v2 semantics on a
+    /// shipped verifier. `receipt_version` sits inside `body`
     /// so a version tamper ALSO fails the signature — but the semantic
     /// gate must fire first with an actionable message (and protects
     /// against a legitimately-signed future-version receipt).
@@ -1204,11 +1447,11 @@ mod tests {
     fn unknown_receipt_version_is_refused_by_both_verify_paths() {
         let signer = Ed25519Signer::generate();
         let mut receipt = Receipt::issue(body(), &signer).unwrap();
-        receipt.body.receipt_version = 2;
+        receipt.body.receipt_version = 3;
         let mut ring = Keyring::new();
         ring.add_key_bytes(&signer.public_key_bytes()).unwrap();
         assert!(
-            matches!(receipt.verify(&ring), Err(ReceiptError::SemanticInvariant(ref msg)) if msg.contains("receipt_version 2")),
+            matches!(receipt.verify(&ring), Err(ReceiptError::SemanticInvariant(ref msg)) if msg.contains("receipt_version 3")),
             "ring verify must refuse an unknown receipt_version"
         );
         assert!(
@@ -1243,7 +1486,7 @@ mod tests {
     /// reading the id would extract contradictory outcomes from one
     /// verified receipt. Provider-native / free-text captions (which
     /// coincide with no canonical caption) remain accepted, matching
-    /// the events validator's round-18 tolerance.
+    /// the events validator's native-caption tolerance.
     #[test]
     fn subject_digest_conjuncts_are_each_enforced() {
         // Pin BOTH conjuncts of the digest shape check (length == 64

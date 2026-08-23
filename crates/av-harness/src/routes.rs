@@ -451,13 +451,13 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
     // Same fix as `parse_tool_call` on the MCP path — use the shared
     // primitive.
     if let Err(reason) = av_sandbox::refuse_duplicate_json_keys(&body) {
-        return pipeline_error(crate::pipeline::PipelineError::BadRequest(format!(
+        return pipeline_error(crate::pipeline::PipelineError::bad_request(format!(
             "chat request rejected: {reason}"
         )));
     }
     let payload: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
-        Err(error) => return pipeline_error(crate::pipeline::PipelineError::BadRequest(error.to_string())),
+        Err(error) => return pipeline_error(crate::pipeline::PipelineError::bad_request_source(error)),
     };
     let admission_started = std::time::Instant::now();
     let mut prepared = match state
@@ -567,7 +567,7 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
         {
             capture_session.mark_capture_failed();
         }
-        return pipeline_error(crate::pipeline::PipelineError::Upstream(format!(
+        return pipeline_error(crate::pipeline::PipelineError::upstream(format!(
             "upstream responded with unsupported Content-Encoding token {token:?} \
              (full header: {raw:?}) — the proxy is built without decompression \
              support; enable it upstream (Accept-Encoding: identity) or rebuild \
@@ -645,9 +645,9 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
         match relay.next().await {
             Some(Err(error)) => {
                 let mapped = if error.kind() == std::io::ErrorKind::QuotaExceeded {
-                    crate::pipeline::PipelineError::Blocked(error.to_string())
+                    crate::pipeline::PipelineError::blocked_source(error)
                 } else {
-                    crate::pipeline::PipelineError::Upstream(error.to_string())
+                    crate::pipeline::PipelineError::upstream_source(error)
                 };
                 // Dropping the relay runs its finalization Drop
                 // (evidence capture + session seal).
@@ -685,9 +685,9 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
                     // and omitted the Retry-After that this file's own
                     // policy mandates on every 502.
                     let mapped = if error.kind() == std::io::ErrorKind::QuotaExceeded {
-                        crate::pipeline::PipelineError::Blocked(error.to_string())
+                        crate::pipeline::PipelineError::blocked_source(error)
                     } else {
-                        crate::pipeline::PipelineError::Upstream(error.to_string())
+                        crate::pipeline::PipelineError::upstream_source(error)
                     };
                     // Dropping the relay here runs its finalization Drop
                     // (evidence capture + session seal), same as when a
@@ -855,7 +855,7 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             .unwrap_or(false);
         if !is_json {
             let display = value.to_str().unwrap_or("<non-ascii>");
-            return pipeline_error(crate::pipeline::PipelineError::BadRequest(format!(
+            return pipeline_error(crate::pipeline::PipelineError::bad_request(format!(
                 "MCP requires Content-Type: application/json (spec: JSON-RPC 2.0), got {display:?}"
             )));
         }
@@ -899,7 +899,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                 let authorized_session = |missing_context: &str| -> Result<(), Box<Response>> {
                     let Some(session) = state.sessions.get(&execution.session_id) else {
                         return Err(Box::new(pipeline_error(
-                            crate::pipeline::PipelineError::BadRequest(format!(
+                            crate::pipeline::PipelineError::bad_request(format!(
                                 "unknown session for {missing_context}"
                             )),
                         )));
@@ -942,7 +942,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                         // oracle of the same shape as the fixed
                         // close/promote existence oracle.
                         let Some(session) = state.sessions.get(&execution.session_id) else {
-                            return pipeline_error(crate::pipeline::PipelineError::BadRequest(
+                            return pipeline_error(crate::pipeline::PipelineError::bad_request(
                                 "unknown session for tool execution".to_owned(),
                             ));
                         };
@@ -988,7 +988,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
         let completion_permit = match state.worker.try_reserve(&execution.session_id) {
             Ok(permit) => permit,
             Err(error) => {
-                return pipeline_error(crate::pipeline::PipelineError::Unavailable(error.to_string()));
+                return pipeline_error(crate::pipeline::PipelineError::unavailable_source(error));
             }
         };
         let Some(session) = state.sessions.get(&execution.session_id) else {
@@ -1048,7 +1048,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                     Ok(permit) => permit,
                     Err(error) => {
                         refund_admission();
-                        return pipeline_error(crate::pipeline::PipelineError::Unavailable(
+                        return pipeline_error(crate::pipeline::PipelineError::unavailable(
                             error.to_string(),
                         ));
                     }
@@ -1085,7 +1085,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                             "tool execution claim failed; refunding budget"
                         );
                         refund_admission();
-                        return pipeline_error(crate::pipeline::PipelineError::Unavailable(
+                        return pipeline_error(crate::pipeline::PipelineError::unavailable(
                             "tool execution intent could not be persisted".to_owned(),
                         ));
                     }
@@ -1217,7 +1217,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                                         .await;
                                     }
                                 }
-                                pipeline_error(crate::pipeline::PipelineError::Upstream(format!(
+                                pipeline_error(crate::pipeline::PipelineError::upstream(format!(
                                     "read tool response: {error}"
                                 )))
                             }
@@ -1270,7 +1270,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                         // Upstream faults must surface as 502 (as the chat
                         // relay does), not 500: a 500 blames the harness and
                         // misroutes operator alerting/retry policy.
-                        pipeline_error(crate::pipeline::PipelineError::Upstream(format!(
+                        pipeline_error(crate::pipeline::PipelineError::upstream(format!(
                             "forward tool call: {category}"
                         )))
                     }
@@ -1781,28 +1781,28 @@ impl ToolExecution {
         // client-desync into audit).
         let session_id = crate::pipeline::single_header(headers, crate::pipeline::SESSION_HEADER)?
             .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| crate::pipeline::PipelineError::BadRequest("missing x-av-session".to_owned()))?;
+            .ok_or_else(|| crate::pipeline::PipelineError::bad_request("missing x-av-session".to_owned()))?;
         // Same validation as the pipeline's `session_id`: an id the intercept
         // path would reject must not key a tool-execution intent either.
         let session_id = av_core::SessionId::parse(session_id)
             .map(|id| id.to_string())
-            .map_err(|error| crate::pipeline::PipelineError::BadRequest(error.to_string()))?;
-        let call = av_sandbox::parse_tool_call(body)
-            .map_err(|error| crate::pipeline::PipelineError::BadRequest(error.to_string()))?;
+            .map_err(crate::pipeline::PipelineError::bad_request_source)?;
+        let call =
+            av_sandbox::parse_tool_call(body).map_err(crate::pipeline::PipelineError::bad_request_source)?;
         // `parse_tool_call` accepts `"id": null` per JSON-RPC 2.0, but the
         // forwarded-execution key is `sha256("{session}:{id}")` — a null id
         // would collapse every null-id call in a session onto one execution
         // key, replaying the first call's cached outcome for later,
         // different calls. Require a concrete id here.
         let id = call.id.filter(|id| !id.is_null()).ok_or_else(|| {
-            crate::pipeline::PipelineError::BadRequest(
+            crate::pipeline::PipelineError::bad_request(
                 "forwarded tool calls require a non-null JSON-RPC id for idempotency".to_owned(),
             )
         })?;
-        let request: Value = serde_json::from_slice(body)
-            .map_err(|error| crate::pipeline::PipelineError::BadRequest(error.to_string()))?;
+        let request: Value =
+            serde_json::from_slice(body).map_err(crate::pipeline::PipelineError::bad_request_source)?;
         let canonical = av_receipts::canonicalize(&request)
-            .map_err(|error| crate::pipeline::PipelineError::BadRequest(error.to_string()))?;
+            .map_err(crate::pipeline::PipelineError::bad_request_source)?;
         let request_digest = av_core::digest::sha256_hex(canonical.as_bytes());
         let key_material = format!("{session_id}:{}", id);
         let key = av_core::digest::sha256_hex(key_material.as_bytes());
@@ -1830,7 +1830,7 @@ impl ToolExecution {
             "instance_uid": identity.instance_uid,
         });
         let canonical = av_receipts::canonicalize(&stable_identity)
-            .map_err(|error| crate::pipeline::PipelineError::BadRequest(error.to_string()))?;
+            .map_err(crate::pipeline::PipelineError::bad_request_source)?;
         self.principal_digest = av_core::digest::sha256_hex(canonical.as_bytes());
         Ok(())
     }
@@ -2108,10 +2108,10 @@ fn finalize_error_response(error: &crate::reconciler::FinalizeError) -> Response
         // action cannot succeed. Map to 400 so SDKs stop retrying
         // and pagers fire on operator config errors, not on
         // transient outages.
-        FinalizeError::BridgeConfig(_) => StatusCode::BAD_REQUEST,
+        FinalizeError::BridgeConfig { .. } => StatusCode::BAD_REQUEST,
         // Transient infrastructure: the broker is unreachable; the close
         // stays pending and a retry (or the reconciler sweep) completes it.
-        FinalizeError::Bridge(_) => StatusCode::SERVICE_UNAVAILABLE,
+        FinalizeError::Bridge { .. } => StatusCode::SERVICE_UNAVAILABLE,
         // Everything else is a genuine internal fault.
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -2163,7 +2163,7 @@ fn pipeline_error(error: crate::pipeline::PipelineError) -> Response {
     // rather than variant identity. `PipelineError` is
     // `#[non_exhaustive]`, so a future variant (e.g. `Timeout` → 504,
     // `RateLimited` → 429) would silently skip Retry-After under a
-    // `matches!(error, PipelineError::Unavailable(_))` chain — exactly
+    // `matches!(error, PipelineError::Unavailable { .. })` chain — exactly
     // the SDK-hammering regression this arm exists to prevent. Using
     // the status code centralises the semantic once and covers every
     // present and future variant that maps to the same class.
@@ -6055,7 +6055,7 @@ mod tests {
         // and 401 as "broken proxy".
         use crate::pipeline::PipelineError;
 
-        let unavailable = pipeline_error(PipelineError::Unavailable("worker queue full".into()));
+        let unavailable = pipeline_error(PipelineError::unavailable("worker queue full"));
         assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             unavailable
@@ -6065,7 +6065,7 @@ mod tests {
             Some("5")
         );
 
-        let upstream = pipeline_error(PipelineError::Upstream("bad gateway".into()));
+        let upstream = pipeline_error(PipelineError::upstream("bad gateway"));
         assert_eq!(upstream.status(), StatusCode::BAD_GATEWAY);
         assert!(upstream.headers().get(axum::http::header::RETRY_AFTER).is_some());
 
@@ -6083,7 +6083,7 @@ mod tests {
 
         // Permanent verdicts must NOT carry Retry-After — that would
         // encourage the very retry loop we're trying to stop.
-        let blocked = pipeline_error(PipelineError::Blocked("loop breaker".into()));
+        let blocked = pipeline_error(PipelineError::blocked("loop breaker"));
         assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
         assert!(blocked.headers().get(axum::http::header::RETRY_AFTER).is_none());
         let abort = pipeline_error(PipelineError::Abort("stop retrying".into()));

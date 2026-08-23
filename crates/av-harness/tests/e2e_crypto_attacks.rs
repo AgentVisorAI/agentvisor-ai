@@ -670,3 +670,81 @@ fn chain_is_not_idempotent_under_duplicate_events() {
     assert_ne!(once.head_hex(), twice.head_hex());
     assert_eq!(twice.count(), once.count() + 1);
 }
+
+// ---------------------------------------------------------------------------
+// 23. Receipt signature domain separation (§3.5): the signing Ed25519 key
+//     also feeds the journal-MAC KDF, so a signature over un-tagged bytes
+//     is a cross-protocol confusion surface. v2 receipts sign
+//     `b"agentvisor-receipt-v2\0" || len(JCS) as u64 BE || JCS(body)`;
+//     v1 receipts (bare JCS) remain verifiable for the migration window.
+//     The attack shapes: (a) a v2-labeled receipt carrying an un-tagged
+//     signature, and (b) an honestly-signed body relabeled to the other
+//     version. Both must fail with the typed BadSignature error, never
+//     verify.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn receipt_signature_domain_separation_blocks_cross_version_confusion() {
+    use av_receipts::{signing_message, KeyError, ReceiptError};
+    let s = signer();
+    let ring = ring(&s);
+
+    // Freshly issued receipts are v2 and the signature covers the
+    // domain-separated message, byte-for-byte.
+    let honest = Receipt::issue(body("sess-domain"), &s).unwrap();
+    assert_eq!(honest.body.receipt_version, 2);
+    honest.verify(&ring).unwrap();
+    let canon = canonicalize(&serde_json::to_value(&honest.body).unwrap()).unwrap();
+    let expected_sig = s.sign(&signing_message(2, &canon).unwrap());
+    assert_eq!(
+        honest.signature_b64,
+        base64::engine::general_purpose::STANDARD.encode(expected_sig),
+        "v2 signature must cover tag || u64-BE length || JCS(body)"
+    );
+
+    // (a) v2 label, bare-JCS (v1-style) signature: refused.
+    let mut untagged = honest.clone();
+    untagged.signature_b64 = base64::engine::general_purpose::STANDARD.encode(s.sign(canon.as_bytes()));
+    assert!(
+        matches!(
+            untagged.verify(&ring),
+            Err(ReceiptError::Key(KeyError::BadSignature(_)))
+        ),
+        "un-tagged signature on a v2 receipt must be BadSignature"
+    );
+
+    // (b) honest v1 receipt (bare-JCS signature) verifies; relabeling it
+    // v2 — or relabeling the honest v2 receipt v1 — is refused.
+    let mut v1_body = body("sess-domain");
+    v1_body.receipt_version = 1;
+    v1_body.key_id = s.key_id().to_owned();
+    v1_body.public_key_b64 = base64::engine::general_purpose::STANDARD.encode(Signer::public_key_bytes(&s));
+    let v1_canon = canonicalize(&serde_json::to_value(&v1_body).unwrap()).unwrap();
+    let v1_sig = s.sign(v1_canon.as_bytes());
+    let legacy = {
+        let mut value = serde_json::to_value(&v1_body).unwrap();
+        value["signature_b64"] = json!(base64::engine::general_purpose::STANDARD.encode(v1_sig));
+        serde_json::from_value::<Receipt>(value).unwrap()
+    };
+    legacy
+        .verify(&ring)
+        .expect("legacy v1 receipt must keep verifying");
+    let mut relabeled_up = legacy.clone();
+    relabeled_up.body.receipt_version = 2;
+    assert!(
+        matches!(
+            relabeled_up.verify(&ring),
+            Err(ReceiptError::Key(KeyError::BadSignature(_)))
+        ),
+        "v1 signature relabeled v2 must be BadSignature"
+    );
+    let mut relabeled_down = honest.clone();
+    relabeled_down.body.receipt_version = 1;
+    assert!(
+        matches!(
+            relabeled_down.verify(&ring),
+            Err(ReceiptError::Key(KeyError::BadSignature(_)))
+        ),
+        "v2 signature relabeled v1 must be BadSignature"
+    );
+}
