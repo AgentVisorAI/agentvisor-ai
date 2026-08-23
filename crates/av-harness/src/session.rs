@@ -661,7 +661,12 @@ impl Session {
         }
     }
 
-    pub(crate) async fn wait_for_worker_jobs(&self) {
+    /// Wait until every accepted worker job for this session has been
+    /// durably captured (journal fsynced, bridge acked, marker
+    /// cleared). Public so external harnesses — the criterion bench,
+    /// embedders sequencing a close after a burst — can drain the
+    /// audit queue deterministically instead of sleeping.
+    pub async fn wait_for_worker_jobs(&self) {
         loop {
             let notified = self.jobs_drained.notified();
             let mut notified = std::pin::pin!(notified);

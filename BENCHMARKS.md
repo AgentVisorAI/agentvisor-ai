@@ -2,6 +2,15 @@
 
 Measured on 2026-08-11 on Apple Silicon macOS with Rust 1.97.1. Results are release-mode acceptance evidence for this machine, not cross-machine promises.
 
+Provenance (round-51 §7.1): the figures in the table below trace to
+`crates/av-harness/tests/sla.rs`, which exercises the real router.
+The criterion suite (`cargo bench -p av-harness`, `benches/hot_path.rs`)
+runs to completion as of round-51 — its warm-up previously overflowed
+the audit queue and panicked — and provides per-function
+microbenchmarks (`hot_path_prepare`, `worker_try_submit`, `mcp_block`,
+`receipt_sign`) that cross-check the same order of magnitude as the
+SLA-level numbers.
+
 ## Results
 
 | Criterion | Target | Result | Scope |
