@@ -122,6 +122,16 @@ jobs:
           cargo check -p av-sandbox --no-default-features
           # Single-feature arms that no other combination exercises.
           cargo check -p av-bridge --no-default-features --features cold-store
+      - name: MSRV floor (rust-version 1.94)
+        # Round-51 §10.5/§12: `rust-version = "1.94"` was an unverified
+        # claim — nothing built on that toolchain, so a newer-rustc
+        # feature could silently raise the true floor while the
+        # manifest kept advertising 1.94 to downstream `cargo add`
+        # users. Default features only: the floor is a source-language
+        # claim, not a native-deps matrix.
+        run: |
+          rustup toolchain install 1.94 --profile minimal --no-self-update
+          cargo +1.94 check --workspace
       - name: Docs
         run: RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D warnings" cargo doc --workspace --all-features --no-deps
       - name: Schemas and examples

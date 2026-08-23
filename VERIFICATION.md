@@ -37,7 +37,7 @@ The functional MVP is implemented and the executable local correctness gates pas
 - JSON schemas, example TOML, and Bridge manifest: pass.
 - Compose rendering: pass.
 - Harbor pinned reference validator over a real HTTP harness trajectory: pass.
-- Live crash-recovery (2026-08-16): release daemon on live Kafka + Redis SIGKILLed mid-load (300 sessions in flight); restart quarantined all 300 incomplete sessions, served fresh traffic with zero failures, and a second SIGKILL + restart re-quarantined the same set idempotently (no duplication, no re-execution, zero ERROR lines).
+- Live crash-recovery (2026-08-16): release daemon on live Kafka + Redis SIGKILLed mid-load (300 sessions in flight); restart quarantined all 300 incomplete sessions, served fresh traffic with zero failures, and a second SIGKILL + restart re-quarantined the same set idempotently (no duplication, no re-execution, zero ERROR lines). Reproducible artifact (round-51 §11 — attestations need pointers): the same SIGKILL→restart→SIGKILL→restart idempotence property is now pinned in CI by `crates/av-harness/tests/e2e_process_restart.rs` (`sigkill_restart_recovers_and_is_idempotent`, plus the spool-outage and two-daemon-lock siblings), which spawns the real `agentvisord` binary; the live-brokers variant remains an operator attestation.
 - Offline receipt verification (2026-08-16): a receipt produced by the crash-recovered daemon, consumed from the live Kafka `agent.receipt` topic, verified offline via `avctl receipt-verify` with the independently extracted public key; a single-byte tamper was rejected.
 - Release core SLA: pass using production-route and HTTP-level timing; optional durable admission reported separately.
 - Release 10,000-stream production-feature gate with live Kafka/Redis environment: pass.
@@ -47,6 +47,16 @@ The functional MVP is implemented and the executable local correctness gates pas
 Real cloud object-store credentials and an external upstream OCSF conformance service were not available locally. The local production image and live single-node Kafka, Redis, NATS, Qdrant, MiniLM, and Harbor paths were executed.
 
 Closed on 2026-08-15 (previously listed here as untested):
+
+Round-51 §11 (attestations need pointers): the S3 cold-tier row runs
+in CI on every push (`cold_store_live.rs` against the compose MinIO —
+see the CI workflow's contract step), so its evidence is the CI run
+for any given commit. The Redis Cluster and broker TLS/SASL rows
+remain point-in-time operator attestations: their gated contract
+suites (`redis_contract.rs` under a cluster `AV_REDIS_URL`;
+`live_contract.rs` under TLS/SASL env) are in-tree and re-runnable,
+but CI provisions single-node/plaintext services, so re-attestation
+requires the topology described in each row.
 
 - **Redis Cluster topology** — a live 3-master cluster (redis 8, ports 7000-7002) passed the `AV_REDIS_URL` contract suite, including a new multi-key `try_spend_many` test using the production `budget:{hash-tag}:` key shape (proves CROSSSLOT safety on a real slot map, plus cross-key atomicity of a refused spend).
 - **S3-compatible cold tier** — the two-phase cold export (staged intent → conditional `PutMode::Create` put → idempotent re-put) passed live against MinIO via the new `AV_COLD_S3_URL`-gated contract; the object landed with the deterministic `topic/pN/offset.json` key. Standard `AWS_*` env credentials are now honored (keys are lowercased before `object_store::parse_url_opts`, which only parses lowercase config names).
