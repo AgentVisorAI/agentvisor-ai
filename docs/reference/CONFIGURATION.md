@@ -28,6 +28,7 @@ runs at startup and fails with the same diagnostics.
 | `identity_allowed_issuers` | `[]` | If non-empty, only tokens whose `iss` matches one of these are accepted. |
 | `audience` | `agentvisor-ai` | Required token audience. |
 | `enforce_identity_scopes` | `true` | Requires per-route scope claims. Applies only when `require_identity = true`. |
+| `allowed_hosts` | `[]` (disabled) | Host-header allowlist (DNS-rebinding defense). Non-empty: requests whose `Host` (port stripped, case-insensitive) isn't listed are refused 403 before any handler. Leave empty for loopback binds or when the ingress enforces Host. |
 | `chat_scope` / `session_close_scope` / `session_promote_scope` | `chat:write` / `session:close` / `session:promote` | Scope claims required on each route. |
 
 ## Dashboard

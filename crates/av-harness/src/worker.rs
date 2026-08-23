@@ -526,17 +526,26 @@ pub fn spawn_worker_with_spool_authenticated(
     metrics: Arc<Registry>,
 ) -> WorkerHandle {
     // Sharding is decoupled from `capacity`: routing is by
-    // `partition_for(session_id, MAX_SHARDS)`, so if we sized
-    // `senders.len() < MAX_SHARDS`, requests whose id hashes to a
-    // partition >= senders.len() would silently see
-    // `SubmitError::Closed` (via `sender_for` returning `None`).
-    // Under `capacity = 1`, 15/16 partitions were unroutable. Always
-    // spawn all MAX_SHARDS shards; the global semaphore continues to
-    // enforce the caller's admission cap so total in-flight work is
-    // still bounded by `capacity`.
-    const MAX_SHARDS: usize = 16;
+    // `partition_for(session_id, senders.len())`, so every spawned
+    // shard is routable by construction. Under `capacity = 1` all
+    // shards still spawn; the global semaphore continues to enforce
+    // the caller's admission cap so total in-flight work is still
+    // bounded by `capacity`.
+    //
+    // Round-51 §7.3: the count was hardcoded at 16 regardless of core
+    // count, so the throughput ceiling (~24k events/s measured, and
+    // 1/16th of the id space frozen behind any one stalled session)
+    // did not improve with more cores. Scale with available
+    // parallelism, floored at the historical 16 so small machines
+    // keep the old fan-out. Per-session ordering is unaffected: a
+    // session's shard is stable for the process lifetime because
+    // routing derives from the spawned count.
+    const MIN_SHARDS: usize = 16;
     let capacity = capacity.max(1);
-    let shard_count = MAX_SHARDS;
+    let shard_count = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(MIN_SHARDS)
+        .max(MIN_SHARDS);
     // Per-shard channel size: enough that a single shard can absorb
     // the full admission burst if every request happens to hash to it,
     // capped at `capacity` so we never over-allocate the caller's

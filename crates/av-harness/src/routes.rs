@@ -53,6 +53,10 @@ pub fn build_router(state: AppState) -> Router {
     router
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
+            enforce_allowed_hosts,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             request_metrics,
         ))
         .layer(axum::middleware::from_fn(trace_request))
@@ -63,6 +67,66 @@ pub fn build_router(state: AppState) -> Router {
         // control.
         .layer(axum::extract::DefaultBodyLimit::max(max_body))
         .with_state(state)
+}
+
+/// Round-51 §3.5 (DNS rebinding): when `allowed_hosts` is non-empty,
+/// refuse any request whose `Host` header (port stripped,
+/// case-insensitive) is not listed — BEFORE any handler runs. A
+/// hostile page's JavaScript can reach this service under an
+/// attacker-controlled hostname whose DNS was rebound to our IP;
+/// same-origin policy doesn't help because the browser believes the
+/// origin is the attacker's. An absent or unparseable Host is refused
+/// too (every HTTP/1.1 client sends one; HTTP/2 :authority maps to it).
+async fn enforce_allowed_hosts(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if state.config.allowed_hosts.is_empty() {
+        return next.run(request).await;
+    }
+    let host = request
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            // Strip :port — IPv6 literals carry brackets ([::1]:8484).
+            let stripped = value
+                .rsplit_once(':')
+                .filter(|(head, port)| !head.is_empty() && port.chars().all(|c| c.is_ascii_digit()))
+                .map_or(value, |(head, _)| head);
+            stripped.trim_start_matches('[').trim_end_matches(']')
+        });
+    let allowed = host.is_some_and(|host| {
+        state.config.allowed_hosts.iter().any(|entry| {
+            entry
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .eq_ignore_ascii_case(host)
+        })
+    });
+    if !allowed {
+        state
+            .metrics
+            .counter(
+                "av_host_header_refused_total",
+                "Requests refused by the allowed_hosts Host-header allowlist",
+            )
+            .inc();
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": {
+                    "message": "Host header is not in allowed_hosts",
+                    "type": "permission_error",
+                    "param": null,
+                    "code": 403,
+                }
+            })),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 /// Round-51 §8.7: data-plane request metrics. Every HTTP request —
@@ -347,7 +411,10 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
         Err(error) => return pipeline_error(crate::pipeline::PipelineError::BadRequest(error.to_string())),
     };
     let admission_started = std::time::Instant::now();
-    let mut prepared = match state.prepare_chat_nonblocking(&headers, payload).await {
+    let mut prepared = match state
+        .prepare_chat_nonblocking(&headers, payload, body.len())
+        .await
+    {
         Ok(prepared) => prepared,
         Err(error) => return pipeline_error(error),
     };
@@ -5861,6 +5928,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(still_live.status(), StatusCode::OK);
+    }
+
+    /// Round-51 §3.5 (DNS rebinding): a non-empty `allowed_hosts` must
+    /// refuse a Host header outside the list with 403 before any
+    /// handler runs, accept listed hosts (with or without a port,
+    /// case-insensitively, IPv6 brackets included), and refuse an
+    /// absent Host. Empty list = check disabled (loopback/ingress
+    /// deployments).
+    #[tokio::test]
+    async fn allowed_hosts_refuses_rebound_host_headers() {
+        let scratch = tempfile::tempdir().unwrap();
+        let spool = scratch.path().join("spool");
+        std::fs::create_dir_all(&spool).unwrap();
+        let mut config = crate::config::HarnessConfig::for_tests(
+            "http://127.0.0.1:9",
+            &spool.to_string_lossy(),
+            &spool.to_string_lossy(),
+        );
+        config.allowed_hosts = vec!["localhost".to_owned(), "[::1]".to_owned()];
+        let state = AppState::new(
+            config,
+            Arc::new(InMemoryStore::new()),
+            Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
+            Arc::new(NullBus),
+            None,
+            Arc::new(Ed25519Signer::from_seed(&[23; 32])),
+        )
+        .unwrap();
+        let app = crate::build_router(state);
+
+        let probe = |host: Option<&'static str>| {
+            let mut builder = Request::builder().uri("/health");
+            if let Some(host) = host {
+                builder = builder.header("host", host);
+            }
+            builder.body(Body::empty()).unwrap()
+        };
+
+        // Listed host, with port, mixed case, IPv6 bracket form: allowed.
+        for host in ["localhost", "localhost:8484", "LOCALHOST", "[::1]:8484"] {
+            let response = app.clone().oneshot(probe(Some(host))).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "host {host:?} must be allowed");
+        }
+        // Rebound / unlisted host and absent host: refused.
+        for host in [
+            Some("evil.attacker.example"),
+            Some("localhost.attacker.example"),
+            None,
+        ] {
+            let response = app.clone().oneshot(probe(host)).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "host {host:?} must be refused"
+            );
+        }
     }
 
     /// Round-51 W2: `/metrics` scrape must emit both a live

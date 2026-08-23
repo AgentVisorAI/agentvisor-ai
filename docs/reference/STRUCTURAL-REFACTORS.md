@@ -290,7 +290,3 @@ top-of-flame-graph cost.
   so the rollout is at least safe), dual-version verification in
   `avctl`, and a migration window. Do it before any second artifact
   is signed under the same key, not after.
-* **Host/Origin validation (§3.5 DNS rebinding).** Needs an
-  `allowed_hosts` config to avoid breaking LB-fronted deployments.
-  Documented as an ingress responsibility in `SECURITY.md` until
-  then.
