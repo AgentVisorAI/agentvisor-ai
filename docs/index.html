@@ -60,7 +60,9 @@
           <p>
             AgentVisor AI speaks OpenAI&rsquo;s <code>chat/completions</code> and
             MCP over plain HTTP. Change the base URL your client points at.
-            Nothing else in your app moves.
+            Nothing else in your app moves. (Long histories are compacted
+            by default before forwarding &mdash; auditable, and one config
+            line to disable.)
           </p>
           <p class="muted">
             Works the same way for Ollama, LM&nbsp;Studio, Azure OpenAI,

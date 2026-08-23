@@ -707,22 +707,39 @@ fn load_manifest(config: &HarnessConfig) -> Result<BridgeManifest> {
     // above MAX_CONTROL_BYTES, and `BridgeManifest::from_yaml` enforces
     // its own 256 KiB cap — an uncapped read here only buys the daemon
     // an unbounded allocation before that parse-side cap can reject.
-    match av_core::fsutil::read_capped_string(
+    let manifest = match av_core::fsutil::read_capped_string(
         std::path::Path::new(&config.bridge_manifest_path),
         av_core::fsutil::MAX_CONTROL_BYTES,
     ) {
-        Ok(text) => BridgeManifest::from_yaml(&text).map_err(anyhow::Error::new),
+        Ok(text) => BridgeManifest::from_yaml(&text).map_err(anyhow::Error::new)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && config.uses_default_manifest_path() => {
             tracing::info!(
                 path = %config.bridge_manifest_path,
                 "Bridge manifest not found; using embedded built-in manifest"
             );
-            BridgeManifest::from_yaml(BUILTIN_MANIFEST_YAML).map_err(anyhow::Error::new)
+            BridgeManifest::from_yaml(BUILTIN_MANIFEST_YAML).map_err(anyhow::Error::new)?
         }
         Err(error) => {
-            Err(error).with_context(|| format!("read Bridge manifest {}", config.bridge_manifest_path))
+            return Err(error)
+                .with_context(|| format!("read Bridge manifest {}", config.bridge_manifest_path));
+        }
+    };
+    // Round-51 §8.10: a topic with no cold_uri DROPS records past
+    // hot_hours — the audit stream half of the system of record
+    // silently self-deletes (default 720 h = 30 days) while the ATIF
+    // spool half retains forever. Surface the divergence at boot so
+    // an operator who relies on broker replay for compliance knows
+    // the clock is ticking.
+    for topic in &manifest.topics {
+        if topic.retention.cold_uri.is_none() {
+            tracing::warn!(
+                topic = %topic.name,
+                hot_hours = topic.retention.hot_hours,
+                "topic has no cold_uri: records older than hot_hours are DELETED, not archived — configure retention.cold_uri for a durable audit stream"
+            );
         }
     }
+    Ok(manifest)
 }
 
 fn spawn_bridge_maintenance(

@@ -79,6 +79,13 @@ agentvisord                   # http://127.0.0.1:8484
 
 Point any OpenAI-compatible SDK at `http://127.0.0.1:8484/v1` and use it as normal. Trajectories and receipts land under `spool/atif/` (receipts in `spool/atif/receipts/`); bridge events land under `data/bridge`.
 
+> **Note:** context compression is on by default and may rewrite long
+> or repetitive message histories before forwarding (duplicate
+> collapse from ~512 tokens, middle summarization from ~50k). Stubs
+> record the pruned token count and content hash in the audit trail.
+> Set `compression_enabled = false` to forward payloads verbatim —
+> details in [docs/reference/OPENAI-COMPATIBILITY.md](docs/reference/OPENAI-COMPATIBILITY.md).
+
 No config file at all also works — built-in defaults plus one env var:
 
 ```bash

@@ -2004,7 +2004,31 @@ fn pipeline_error(error: crate::pipeline::PipelineError) -> Response {
     use crate::pipeline::PipelineError;
     let close = matches!(error, PipelineError::Abort(_));
     let status = error.status();
-    let mut response = (status, Json(json!({"error": error.to_string()}))).into_response();
+    // Round-51 §9.3: OpenAI-shaped error body. SDKs dispatch on
+    // `error.type` / `error.code` (`openai.APIError.code`), and the
+    // previous bare `{"error": "<string>"}` left that handling dead —
+    // five inconsistent shapes across sibling routes. `message` keeps
+    // the exact text the old shape carried; `type` follows OpenAI's
+    // taxonomy so stock retry/backoff classifiers behave correctly.
+    let error_type = match status.as_u16() {
+        400 | 404 | 409 | 413 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        429 => "rate_limit_error",
+        _ => "api_error",
+    };
+    let mut response = (
+        status,
+        Json(json!({
+            "error": {
+                "message": error.to_string(),
+                "type": error_type,
+                "param": null,
+                "code": status.as_u16(),
+            }
+        })),
+    )
+        .into_response();
     if close {
         response
             .headers_mut()
@@ -2042,7 +2066,20 @@ fn pipeline_error(error: crate::pipeline::PipelineError) -> Response {
 }
 
 fn lifecycle_error(error: String) -> Response {
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": error}))).into_response()
+    // Same OpenAI-shaped body as `pipeline_error` (round-51 §9.3) so
+    // the two sibling routes agree on one error contract.
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": {
+                "message": error,
+                "type": "api_error",
+                "param": null,
+                "code": 500,
+            }
+        })),
+    )
+        .into_response()
 }
 
 struct AbortFinalizingStream {
@@ -4973,7 +5010,14 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
             .unwrap();
-        assert!(serde_json::from_slice::<Value>(&body).unwrap()["error"].is_string());
+        {
+            // Round-51 §9.3: OpenAI-shaped error object — SDK
+            // `e.code` / `e.type` dispatch must have material.
+            let parsed = serde_json::from_slice::<Value>(&body).unwrap();
+            assert!(parsed["error"]["message"].is_string(), "{parsed}");
+            assert!(parsed["error"]["type"].is_string(), "{parsed}");
+            assert!(parsed["error"]["code"].is_number(), "{parsed}");
+        }
         let session = state.sessions.get("malformed-json").unwrap();
         // Round-51 §6.2: the malformed frame is scoped to THIS
         // response — recorded as a failed capture — instead of
@@ -5010,7 +5054,7 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
             .unwrap();
-        let error = serde_json::from_slice::<Value>(&body).unwrap()["error"]
+        let error = serde_json::from_slice::<Value>(&body).unwrap()["error"]["message"]
             .as_str()
             .unwrap()
             .to_owned();
@@ -5159,7 +5203,14 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
             .unwrap();
-        assert!(serde_json::from_slice::<Value>(&body).unwrap()["error"].is_string());
+        {
+            // Round-51 §9.3: OpenAI-shaped error object — SDK
+            // `e.code` / `e.type` dispatch must have material.
+            let parsed = serde_json::from_slice::<Value>(&body).unwrap();
+            assert!(parsed["error"]["message"].is_string(), "{parsed}");
+            assert!(parsed["error"]["type"].is_string(), "{parsed}");
+            assert!(parsed["error"]["code"].is_number(), "{parsed}");
+        }
         // Round-51 §6.2: choices-less success is a per-response
         // capture failure, not a session seal.
         assert!(

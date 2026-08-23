@@ -42,6 +42,11 @@ data:
     require_identity = false
 
     atif_spool_dir = "/app/spool/atif"
+    # Bound the spool so a pod restart's recovery scan stays inside the
+    # 1 Gi memory limit (~25 KB RSS per recovered session — see the PVC
+    # sizing note). Sealed evidence pairs older than this are pruned
+    # hourly; align with the bridge manifest's hot_hours (720 h = 30 d).
+    atif_retention_days = 30
     bridge_data_dir = "/app/data/bridge"
     bridge_backend = "embedded"
     bridge_manifest_path = "/app/manifests/bridge.example.yaml"
@@ -70,6 +75,14 @@ spec:
   accessModes: ["ReadWriteOnce"]
   resources:
     requests:
+      # Sizing derivation (round-51 §8.10 — measured, 2 vCPU / 7 GiB):
+      #   ~10.2 KB spool disk per closed session → 10 Gi ≈ 1M sessions.
+      #   ~25 KB RSS per RESIDENT session → the 1 Gi memory limit below
+      #   caps boot-time recovery at roughly 40k spooled-but-unswept
+      #   sessions. KEEP THESE CONSISTENT: set atif_retention_days so
+      #   the spool the pod can restart from stays under the memory
+      #   limit's session ceiling — an unbounded spool on a large PVC
+      #   OOM-kills at boot long before the PVC fills.
       storage: 10Gi
 ---
 apiVersion: apps/v1

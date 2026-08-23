@@ -1795,6 +1795,17 @@ impl Finalizer {
                 // `warned_artifacts` so a persistent hostile plant
                 // does not produce N warn lines every tick until
                 // process restart, drowning real signal.
+                // Round-51 §8.10: the warn is deduped, so without a
+                // counter a version-stranded session (upgrade to 3, or
+                // rollback from 3) is invisible after the first tick —
+                // never finalized, never producing a receipt, still on
+                // disk. The counter stays non-zero and alertable.
+                self.metrics
+                    .counter(
+                        "av_journal_version_stranded_total",
+                        "Session journals skipped by recovery due to an unsupported journal_version",
+                    )
+                    .inc();
                 if self.warn_once(metadata_path.clone()) {
                     tracing::warn!(
                         path = %av_core::fsutil::basename(&metadata_path),
@@ -2250,6 +2261,13 @@ impl Finalizer {
                 // branch above — one drifted sidecar must not deny
                 // recovery to unrelated sessions.
                 // Round-16 F4: dedup via `warned_artifacts`.
+                // Round-51 §8.10: counter mirrors the signed branch.
+                self.metrics
+                    .counter(
+                        "av_journal_version_stranded_total",
+                        "Session journals skipped by recovery due to an unsupported journal_version",
+                    )
+                    .inc();
                 if self.warn_once(metadata_path.clone()) {
                     tracing::warn!(
                         path = %av_core::fsutil::basename(&metadata_path),

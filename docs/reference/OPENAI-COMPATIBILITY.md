@@ -62,6 +62,39 @@ Both the strict-mode refusal and the keepalive pass-through are
 covered by `parse_provider_chunk_refuses_non_message_sse_event_types`
 and `parse_provider_chunk_treats_dataless_named_events_as_keepalives`.
 
+## Context compression rewrites your payload (on by default)
+
+`compression_enabled` defaults to **true**. Before forwarding, the
+harness runs lossy compression passes over the `messages` array —
+which means the bytes the provider receives are NOT byte-identical
+to the bytes your client sent. This is the one deliberate exception
+to "nothing else in your app moves":
+
+| Pass | Engages at | Effect |
+| --- | --- | --- |
+| duplicate-system collapse | 512 approx tokens | Repeated identical system messages collapse to one |
+| duplicate-message collapse | 512 approx tokens | Byte-identical repeated messages become `[pruned: N tokens (duplicate message), sha256:…]` stubs |
+| middle stubbing | 512 approx tokens | Middle-of-history messages are stubbed toward a target size; the first system message and the tail are preserved byte-identical |
+| middle summarization | 50,000 approx tokens | Aggressive middle-of-history summarization |
+
+Invariants the passes guarantee: message count order and roles are
+preserved, the first system message and the `keep_tail` suffix are
+byte-identical, and `tool_call_id` linkage survives (property-tested
+in `av-compress/tests/invariants.rs`). Every stub names the pruned
+token count and the SHA-256 of the removed content, so the audit
+trail records what was elided.
+
+The signed receipt and the budget both use the **post-compression**
+token count, so enforcement and attestation agree with what the
+provider actually saw.
+
+To forward payloads verbatim, set:
+
+```toml
+compression_enabled = false
+```
+
+
 ## Intentional differences from openai.com
 
 ### 1. HTTP status codes
@@ -77,13 +110,15 @@ and `parse_provider_chunk_treats_dataless_named_events_as_keepalives`.
 | Compression floor exceeded and request oversized | n/a | `413` |
 | Upstream 5xx | 5xx | forwarded, plus refund of pre-debited tokens |
 
-### 2. Errors carry an `X-Agentvisor-*` prefix
+### 2. Error bodies are OpenAI-shaped
 
-Every 4xx/5xx response body includes an `error.metadata` block with
-AgentVisor-specific fields (`session_id`, `event_uid`,
-`stop_reason`). Clients that only read `error.message` see something
-compatible with OpenAI's shape; sophisticated clients get the audit
-handle.
+Every 4xx/5xx from the chat and lifecycle routes carries
+`{"error": {"message", "type", "param", "code"}}` — `type` follows
+OpenAI's taxonomy (`invalid_request_error`, `authentication_error`,
+`permission_error`, `rate_limit_error`, `api_error`) and `code` is
+the numeric HTTP status, so stock SDK `e.type` / `e.code` dispatch
+and retry classifiers behave correctly. 429/502/503/504 responses
+additionally carry `Retry-After`; 401 carries `WWW-Authenticate`.
 
 ### 3. Streaming is a real SSE stream
 
@@ -112,8 +147,8 @@ Chat requests carry two AgentVisor-specific headers:
 
 | Header | Purpose |
 | --- | --- |
-| `X-Agentvisor-Session-Id` | Client-chosen session id. Rotating this restarts the audit chain; the harness treats each `session_id` as an independent conversation. |
-| `X-Agentvisor-Workflow` | `signed` or `unsigned`. Chooses whether the session's audit lands as a signed receipt (Kafka topic `agent.receipt`) or as an ATIF trajectory (spool + broker fold). |
+| `X-AV-Session` | Client-chosen session id. Rotating this restarts the audit chain; the harness treats each `session_id` as an independent conversation. |
+| `X-AV-Workflow` | `signed` or `unsigned`. Chooses whether the session's audit lands as a signed receipt (Kafka topic `agent.receipt`) or as an ATIF trajectory (spool + broker fold). |
 
 If your client speaks OpenAI's protocol out of the box, it will not
 set these. The harness defaults them from config
@@ -122,7 +157,7 @@ The session then closes immediately after the response — one turn,
 one audit event.
 
 For long-lived multi-turn agent conversations, set the same
-`X-Agentvisor-Session-Id` on every request and either explicitly
+`X-AV-Session` on every request and either explicitly
 `POST /close` when done or rely on the idle-close sweeper
 (`session_idle_close_s`).
 

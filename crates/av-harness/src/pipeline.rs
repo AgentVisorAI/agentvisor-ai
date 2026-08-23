@@ -2436,7 +2436,11 @@ fn atif_capture_from_request(payload: &Value) -> Result<AtifCapture, PipelineErr
         .ok_or_else(|| PipelineError::BadRequest("chat payload 'messages' is empty".to_owned()))?;
     let role = message.get("role").and_then(Value::as_str);
     let source = match role {
-        Some("system" | "developer" | "tool") => av_atif::Source::System,
+        // "function" is the legacy OpenAI function-calling spelling of
+        // "tool" (a tool result fed back to the model) — still emitted
+        // by older LangChain, AutoGen and llama-index versions.
+        // Refusing it 400'd legitimate agent traffic (round-51 §9.3).
+        Some("system" | "developer" | "tool" | "function") => av_atif::Source::System,
         Some("user") => av_atif::Source::User,
         Some("assistant") => av_atif::Source::Agent,
         Some(other) => {
