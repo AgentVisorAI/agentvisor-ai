@@ -94,6 +94,119 @@ pub(crate) struct ActiveJournalRecord {
     pub(crate) response_attempt: Option<ResponseAttempt>,
 }
 
+/// Accounting totals folded from journal records during recovery.
+///
+/// Round-51 §4.2/S1 (step 1 of the reconciler decomposition): the same
+/// accounting fold used to be implemented THREE times — the live path
+/// in `process_job`, signed recovery in `recover_signed_journals`, and
+/// unsigned consolidation in `consolidate_step_journals`. Any change to
+/// a counted dimension had to be made in three places or a
+/// crash-recovered receipt attested different numbers than a
+/// clean-close receipt for identical traffic — and no test caught it,
+/// because the paths were asserted separately. `ActiveJournalRecord`'s
+/// fields are now the single source: the live path applies them via
+/// [`ActiveJournalRecord::apply_to_totals`], recovery folds them via
+/// [`ActiveJournalRecord::fold_into`], and the proof-harness test
+/// (`unified_fold_matches_live_path`) pins the two applications to
+/// identical results over representative record shapes.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct RecoveredTotals {
+    pub(crate) tool_calls: u64,
+    pub(crate) tool_allowed: u64,
+    pub(crate) tool_blocked: u64,
+    pub(crate) prompt_tokens: u64,
+    pub(crate) completion_tokens: u64,
+    pub(crate) cached_tokens: u64,
+    pub(crate) cost_usd_micros: u64,
+}
+
+impl RecoveredTotals {
+    /// The tool-accounting invariant every fold must check: classified
+    /// outcomes can never exceed observed calls.
+    pub(crate) fn validate_tool_accounting(&self) -> Result<(), String> {
+        if self
+            .tool_allowed
+            .checked_add(self.tool_blocked)
+            .is_none_or(|classified| classified > self.tool_calls)
+        {
+            return Err("journal has inconsistent tool accounting".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Publish the folded totals onto a session (Release ordering, the
+    /// same discipline both recovery paths used inline).
+    pub(crate) fn store_on(&self, totals: &crate::session::Totals) {
+        use std::sync::atomic::Ordering;
+        totals.tool_calls.store(self.tool_calls, Ordering::Release);
+        totals.tool_allowed.store(self.tool_allowed, Ordering::Release);
+        totals.tool_blocked.store(self.tool_blocked, Ordering::Release);
+        totals.prompt_tokens.store(self.prompt_tokens, Ordering::Release);
+        totals
+            .completion_tokens
+            .store(self.completion_tokens, Ordering::Release);
+        totals.cached_tokens.store(self.cached_tokens, Ordering::Release);
+        totals
+            .cost_usd_micros
+            .store(self.cost_usd_micros, Ordering::Release);
+    }
+}
+
+impl ActiveJournalRecord {
+    /// Fold this record's counted dimensions into recovery totals with
+    /// overflow + JCS-bound checks. THE accounting rule — do not
+    /// re-implement per call site.
+    pub(crate) fn fold_into(&self, totals: &mut RecoveredTotals) -> Result<(), String> {
+        fn checked(current: u64, value: u64, field: &str) -> Result<u64, String> {
+            current
+                .checked_add(value)
+                .filter(|total| *total <= av_core::error::JCS_SAFE_MAX)
+                .ok_or_else(|| format!("recovered {field} overflow"))
+        }
+        totals.tool_calls = checked(totals.tool_calls, self.tool_calls, "tool calls")?;
+        totals.tool_allowed = checked(totals.tool_allowed, self.tool_allowed, "allowed tools")?;
+        totals.tool_blocked = checked(totals.tool_blocked, self.tool_blocked, "blocked tools")?;
+        totals.prompt_tokens = checked(totals.prompt_tokens, self.prompt_tokens, "prompt tokens")?;
+        totals.completion_tokens = checked(
+            totals.completion_tokens,
+            self.completion_tokens,
+            "completion tokens",
+        )?;
+        totals.cached_tokens = checked(totals.cached_tokens, self.cached_tokens, "cached tokens")?;
+        totals.cost_usd_micros = checked(totals.cost_usd_micros, self.cost_usd_micros, "cost")?;
+        Ok(())
+    }
+
+    /// Apply this record's counted dimensions to a live session's
+    /// atomic totals — the live-path twin of [`Self::fold_into`], with
+    /// the same JCS-bound discipline via `checked_atomic_add`. The
+    /// record's fields were conditionalized ONCE at construction
+    /// (compression carries prompt tokens; terminal responses carry
+    /// completion/cached/cost; tool records carry call outcomes), so
+    /// applying them unconditionally here is exactly the old
+    /// per-class branching, without the second copy of the rules.
+    pub(crate) fn apply_to_totals(&self, totals: &crate::session::Totals) -> Result<(), String> {
+        for (counter, value, field) in [
+            (&totals.tool_calls, self.tool_calls, "tool calls"),
+            (&totals.tool_allowed, self.tool_allowed, "allowed tools"),
+            (&totals.tool_blocked, self.tool_blocked, "blocked tools"),
+            (&totals.prompt_tokens, self.prompt_tokens, "prompt tokens"),
+            (
+                &totals.completion_tokens,
+                self.completion_tokens,
+                "completion tokens",
+            ),
+            (&totals.cached_tokens, self.cached_tokens, "cached tokens"),
+            (&totals.cost_usd_micros, self.cost_usd_micros, "cost"),
+        ] {
+            if value > 0 {
+                checked_atomic_add(counter, value, field)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct BrokerAckRecord {
     session_id: String,
@@ -1094,38 +1207,14 @@ async fn process_job(
     if let Some(directory) = spool_dir.as_deref() {
         persist_broker_ack(directory, &job.session.id, &event_uid, &ack, &journal_key).await?;
     }
-    if is_tool_call {
-        checked_atomic_add(&job.session.totals.tool_calls, 1, "tool calls")?;
-        match status {
-            StatusId::Success => {
-                checked_atomic_add(&job.session.totals.tool_allowed, 1, "allowed tools")?;
-            }
-            StatusId::Failure => {
-                checked_atomic_add(&job.session.totals.tool_blocked, 1, "blocked tools")?;
-            }
-            StatusId::Unknown => {}
-            _ => {}
-        }
-    }
-    if submitted_class == EventClass::Compression {
-        checked_atomic_add(
-            &job.session.totals.prompt_tokens,
-            job.metrics.prompt_tokens.unwrap_or(0),
-            "prompt tokens",
-        )?;
-    } else if is_llm_agent_response {
-        checked_atomic_add(
-            &job.session.totals.completion_tokens,
-            job.metrics.completion_tokens.unwrap_or(0),
-            "completion tokens",
-        )?;
-        checked_atomic_add(
-            &job.session.totals.cached_tokens,
-            job.metrics.cached_tokens.unwrap_or(0),
-            "cached tokens",
-        )?;
-        checked_atomic_add(&job.session.totals.cost_usd_micros, job.cost_usd_micros, "cost")?;
-    }
+    // Round-51 §4.2/S1: the record IS the accounting rule. Its fields
+    // were conditionalized once at construction above; apply them
+    // through the same impl the recovery folds replay, so the live
+    // path and a crash-recovered session can never attest different
+    // numbers for identical traffic.
+    record
+        .apply_to_totals(&job.session.totals)
+        .map_err(|error| error.to_string())?;
     if let (Some(directory), Some(attempt_id)) = (spool_dir.as_deref(), response_marker.as_deref()) {
         clear_response_marker(directory, &journal_key, &job.session.id, attempt_id).await?;
     }
@@ -2699,5 +2788,114 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(2), worker.wait_idle())
             .await
             .expect("wait_idle deadlocked — a canceled submit_and_wait leaked pending");
+    }
+}
+
+#[cfg(test)]
+mod unified_fold_tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+
+    use super::*;
+
+    fn record(
+        tool: (u64, u64, u64),
+        prompt: u64,
+        completion: u64,
+        cached: u64,
+        cost: u64,
+    ) -> ActiveJournalRecord {
+        ActiveJournalRecord {
+            event: serde_json::json!({"k": "v"}),
+            identity: av_events::AgentIdentity {
+                version: "1".to_owned(),
+                charter: "test".into(),
+                instance_uid: "i".to_owned(),
+                ttl_remaining_s: None,
+            },
+            atif_step: None,
+            tool_calls: tool.0,
+            tool_allowed: tool.1,
+            tool_blocked: tool.2,
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            cached_tokens: cached,
+            cost_usd_micros: cost,
+            stop_reason_id: None,
+            response_attempt: None,
+        }
+    }
+
+    /// Round-51 §4.2/S1 proof harness: the live-path atomic
+    /// application and the recovery fold MUST produce identical
+    /// totals over the same record stream — this is the property the
+    /// three hand-rolled folds could silently violate ('a
+    /// crash-recovered receipt attests different numbers than a
+    /// clean-close receipt for identical traffic — and no test
+    /// catches it, because both paths are asserted separately').
+    #[test]
+    fn unified_fold_matches_live_path() {
+        // Representative shapes: a compression record (prompt only),
+        // a terminal response (completion/cached/cost), an allowed
+        // tool call, a blocked tool call, an unclassified tool call,
+        // and a stop record (all zeros).
+        let records = [
+            record((0, 0, 0), 4_822, 0, 0, 0),
+            record((0, 0, 0), 0, 319, 12, 84_340),
+            record((1, 1, 0), 0, 0, 0, 0),
+            record((1, 0, 1), 0, 0, 0, 0),
+            record((1, 0, 0), 0, 0, 0, 0),
+            record((0, 0, 0), 0, 0, 0, 0),
+        ];
+
+        // Recovery fold.
+        let mut folded = RecoveredTotals::default();
+        for r in &records {
+            r.fold_into(&mut folded).unwrap();
+        }
+        folded.validate_tool_accounting().unwrap();
+
+        // Live-path fold onto atomics.
+        let live = crate::session::Totals::default();
+        for r in &records {
+            r.apply_to_totals(&live).unwrap();
+        }
+
+        use std::sync::atomic::Ordering;
+        assert_eq!(folded.tool_calls, live.tool_calls.load(Ordering::Acquire));
+        assert_eq!(folded.tool_allowed, live.tool_allowed.load(Ordering::Acquire));
+        assert_eq!(folded.tool_blocked, live.tool_blocked.load(Ordering::Acquire));
+        assert_eq!(folded.prompt_tokens, live.prompt_tokens.load(Ordering::Acquire));
+        assert_eq!(
+            folded.completion_tokens,
+            live.completion_tokens.load(Ordering::Acquire)
+        );
+        assert_eq!(folded.cached_tokens, live.cached_tokens.load(Ordering::Acquire));
+        assert_eq!(
+            folded.cost_usd_micros,
+            live.cost_usd_micros.load(Ordering::Acquire)
+        );
+        assert_eq!(folded.prompt_tokens, 4_822);
+        assert_eq!(folded.tool_calls, 3);
+    }
+
+    /// Both fold directions must refuse a JCS-bound overflow rather
+    /// than wrap or saturate — a receipt attesting a wrapped total is
+    /// worse than a refused close.
+    #[test]
+    fn both_folds_refuse_jcs_overflow() {
+        let poisoned = record((0, 0, 0), av_core::error::JCS_SAFE_MAX, 0, 0, 0);
+        let mut folded = RecoveredTotals::default();
+        poisoned.fold_into(&mut folded).unwrap();
+        assert!(
+            record((0, 0, 0), 1, 0, 0, 0).fold_into(&mut folded).is_err(),
+            "recovery fold must refuse crossing JCS_SAFE_MAX"
+        );
+
+        let live = crate::session::Totals::default();
+        poisoned.apply_to_totals(&live).unwrap();
+        assert!(
+            record((0, 0, 0), 1, 0, 0, 0).apply_to_totals(&live).is_err(),
+            "live fold must refuse crossing JCS_SAFE_MAX"
+        );
     }
 }

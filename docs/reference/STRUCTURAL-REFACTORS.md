@@ -64,11 +64,15 @@ pass registry internally.
 
 ### Migration path
 
-1. **Extract `ActionJournalRecord::apply` first.** Grep for the
-   three folds; write a `#[cfg(test)]` proof harness that runs each
-   fold and the new apply over the same input and asserts identical
-   Session state. Land the new apply behind a feature flag; flip
-   the flag; delete the old folds.
+1. **Extract `ActionJournalRecord::apply` first.** ✅ LANDED
+   (round-51 pass 10): `ActiveJournalRecord::fold_into` /
+   `apply_to_totals` + `RecoveredTotals::{validate_tool_accounting,
+   store_on}` in `worker.rs` are now the single accounting rule; the
+   live path and both recovery folds call them, and the
+   `unified_fold_matches_live_path` proof harness pins the two
+   applications to identical results. This also unblocks the
+   provider prompt-token reconciliation (a correction record now has
+   ONE fold to teach).
 2. **Extract the QuarantineOrphanJsonPass second.** This one is
    the simplest (§8.5 fix is a self-contained snapshot + gate), has
    clear success criteria (existing tests keep passing), and is

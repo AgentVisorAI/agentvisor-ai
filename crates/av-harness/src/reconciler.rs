@@ -1881,13 +1881,7 @@ impl Finalizer {
                 breaker.clone(),
             ));
             let mut next_sequence = 0u64;
-            let mut tool_calls = 0u64;
-            let mut tool_allowed = 0u64;
-            let mut tool_blocked = 0u64;
-            let mut prompt_tokens = 0u64;
-            let mut completion_tokens = 0u64;
-            let mut cached_tokens = 0u64;
-            let mut cost_usd_micros = 0u64;
+            let mut folded = crate::worker::RecoveredTotals::default();
             let mut pending_responses = std::collections::HashSet::new();
             let domain = format!("{}:active", session.id);
             for (index, line) in journal.into_iter().enumerate() {
@@ -1932,14 +1926,9 @@ impl Finalizer {
                     .lock()
                     .append(&record.event)
                     .map_err(|error| FinalizeError::Receipt(error.to_string()))?;
-                tool_calls = checked_recovery_add(tool_calls, record.tool_calls, "tool calls")?;
-                tool_allowed = checked_recovery_add(tool_allowed, record.tool_allowed, "allowed tools")?;
-                tool_blocked = checked_recovery_add(tool_blocked, record.tool_blocked, "blocked tools")?;
-                prompt_tokens = checked_recovery_add(prompt_tokens, record.prompt_tokens, "prompt tokens")?;
-                completion_tokens =
-                    checked_recovery_add(completion_tokens, record.completion_tokens, "completion tokens")?;
-                cached_tokens = checked_recovery_add(cached_tokens, record.cached_tokens, "cached tokens")?;
-                cost_usd_micros = checked_recovery_add(cost_usd_micros, record.cost_usd_micros, "cost")?;
+                // Round-51 §4.2/S1: THE accounting fold — shared with the
+                // live path and the unsigned consolidation.
+                record.fold_into(&mut folded).map_err(FinalizeError::Atif)?;
                 if let Some(id) = record.stop_reason_id {
                     let reason = av_events::StopReason::from_id(id);
                     if reason != av_events::StopReason::Unknown {
@@ -1949,42 +1938,10 @@ impl Finalizer {
                 self.ensure_active_event_published(&session.id, &event, &record.event)
                     .await?;
             }
-            if tool_allowed
-                .checked_add(tool_blocked)
-                .is_none_or(|classified| classified > tool_calls)
-            {
-                return Err(FinalizeError::Atif(
-                    "signed journal has inconsistent tool accounting".to_owned(),
-                ));
-            }
-            session
-                .totals
-                .tool_calls
-                .store(tool_calls, std::sync::atomic::Ordering::Release);
-            session
-                .totals
-                .tool_allowed
-                .store(tool_allowed, std::sync::atomic::Ordering::Release);
-            session
-                .totals
-                .tool_blocked
-                .store(tool_blocked, std::sync::atomic::Ordering::Release);
-            session
-                .totals
-                .prompt_tokens
-                .store(prompt_tokens, std::sync::atomic::Ordering::Release);
-            session
-                .totals
-                .completion_tokens
-                .store(completion_tokens, std::sync::atomic::Ordering::Release);
-            session
-                .totals
-                .cached_tokens
-                .store(cached_tokens, std::sync::atomic::Ordering::Release);
-            session
-                .totals
-                .cost_usd_micros
-                .store(cost_usd_micros, std::sync::atomic::Ordering::Release);
+            folded
+                .validate_tool_accounting()
+                .map_err(|reason| FinalizeError::Atif(format!("signed {reason}")))?;
+            folded.store_on(&session.totals);
             let inconsistent_responses = !pending_responses.is_empty();
             session.restore_next_seq(next_sequence);
             let expected_subject = {
@@ -2407,13 +2364,7 @@ impl Finalizer {
             let mut builder = av_atif::TrajectoryBuilder::new(agent, Some(session_id.to_owned()));
             let domain = format!("{session_id}:active");
             let mut latest_identity = identity.clone();
-            let mut prompt_tokens = 0u64;
-            let mut completion_tokens = 0u64;
-            let mut cached_tokens = 0u64;
-            let mut cost_usd_micros = 0u64;
-            let mut tool_calls = 0u64;
-            let mut tool_allowed = 0u64;
-            let mut tool_blocked = 0u64;
+            let mut folded = crate::worker::RecoveredTotals::default();
             let mut stop_reason_id = None;
             let mut pending_responses = std::collections::HashSet::new();
             for (index, line) in journal.into_iter().enumerate() {
@@ -2445,6 +2396,10 @@ impl Finalizer {
                 }
                 self.ensure_active_event_published(session_id, &event, &record.event)
                     .await?;
+                // Round-51 §4.2/S1: THE accounting fold — shared with the
+                // live path and the signed recovery. Fold BEFORE the
+                // struct is torn apart by the moves below.
+                record.fold_into(&mut folded).map_err(FinalizeError::Atif)?;
                 let step = record.atif_step.ok_or_else(|| {
                     FinalizeError::Atif("unsigned active record has no ATIF step".to_owned())
                 })?;
@@ -2452,26 +2407,13 @@ impl Finalizer {
                     .push_step(step)
                     .map_err(|error| FinalizeError::Atif(error.to_string()))?;
                 latest_identity = record.identity;
-                prompt_tokens = checked_recovery_add(prompt_tokens, record.prompt_tokens, "prompt tokens")?;
-                completion_tokens =
-                    checked_recovery_add(completion_tokens, record.completion_tokens, "completion tokens")?;
-                cached_tokens = checked_recovery_add(cached_tokens, record.cached_tokens, "cached tokens")?;
-                cost_usd_micros = checked_recovery_add(cost_usd_micros, record.cost_usd_micros, "cost")?;
-                tool_calls = checked_recovery_add(tool_calls, record.tool_calls, "tool calls")?;
-                tool_allowed = checked_recovery_add(tool_allowed, record.tool_allowed, "allowed tools")?;
-                tool_blocked = checked_recovery_add(tool_blocked, record.tool_blocked, "blocked tools")?;
                 if record.stop_reason_id.is_some() {
                     stop_reason_id = record.stop_reason_id;
                 }
             }
-            if tool_allowed
-                .checked_add(tool_blocked)
-                .is_none_or(|classified| classified > tool_calls)
-            {
-                return Err(FinalizeError::Atif(
-                    "unsigned journal has inconsistent tool accounting".to_owned(),
-                ));
-            }
+            folded
+                .validate_tool_accounting()
+                .map_err(|reason| FinalizeError::Atif(format!("unsigned {reason}")))?;
             if !pending_responses.is_empty() {
                 let quarantined = Session::new(
                     session_id.to_owned(),
@@ -2481,34 +2423,7 @@ impl Finalizer {
                 );
                 quarantined.restore_journal_index(journal_len);
                 quarantined.restore_next_seq(journal_len);
-                quarantined
-                    .totals
-                    .tool_calls
-                    .store(tool_calls, std::sync::atomic::Ordering::Release);
-                quarantined
-                    .totals
-                    .tool_allowed
-                    .store(tool_allowed, std::sync::atomic::Ordering::Release);
-                quarantined
-                    .totals
-                    .tool_blocked
-                    .store(tool_blocked, std::sync::atomic::Ordering::Release);
-                quarantined
-                    .totals
-                    .prompt_tokens
-                    .store(prompt_tokens, std::sync::atomic::Ordering::Release);
-                quarantined
-                    .totals
-                    .completion_tokens
-                    .store(completion_tokens, std::sync::atomic::Ordering::Release);
-                quarantined
-                    .totals
-                    .cached_tokens
-                    .store(cached_tokens, std::sync::atomic::Ordering::Release);
-                quarantined
-                    .totals
-                    .cost_usd_micros
-                    .store(cost_usd_micros, std::sync::atomic::Ordering::Release);
+                folded.store_on(&quarantined.totals);
                 quarantined.mark_capture_failed();
                 // Also seal the session finalized so the idle sweeper's
                 // `!is_closed()` filter skips it — same reasoning as the
@@ -2536,16 +2451,16 @@ impl Finalizer {
                 "ttl_remaining_s": latest_identity.ttl_remaining_s,
             }));
             if let Some(metrics) = trajectory.final_metrics.as_mut() {
-                metrics.total_prompt_tokens = Some(prompt_tokens);
-                metrics.total_completion_tokens = Some(completion_tokens);
-                metrics.total_cached_tokens = Some(cached_tokens);
+                metrics.total_prompt_tokens = Some(folded.prompt_tokens);
+                metrics.total_completion_tokens = Some(folded.completion_tokens);
+                metrics.total_cached_tokens = Some(folded.cached_tokens);
                 metrics.total_cost_usd =
-                    Some(cost_usd_micros as f64 / av_core::units::USD_MICROS_PER_DOLLAR as f64);
+                    Some(folded.cost_usd_micros as f64 / av_core::units::USD_MICROS_PER_DOLLAR as f64);
                 metrics.extra = Some(serde_json::json!({
-                    "tool_calls": tool_calls,
-                    "tool_allowed": tool_allowed,
-                    "tool_blocked": tool_blocked,
-                    "cost_usd_micros": cost_usd_micros,
+                    "tool_calls": folded.tool_calls,
+                    "tool_allowed": folded.tool_allowed,
+                    "tool_blocked": folded.tool_blocked,
+                    "cost_usd_micros": folded.cost_usd_micros,
                     // Round-43 F2: match the close-time `metrics.extra`
                     // `stop_reason_id` serialization in
                     // `close_session_locked` which writes `u64` (0 when never
@@ -4073,13 +3988,6 @@ pub fn spawn_reconciler(
                 .observe_us(elapsed_us(started));
         }
     })
-}
-
-fn checked_recovery_add(current: u64, value: u64, field: &str) -> Result<u64, FinalizeError> {
-    current
-        .checked_add(value)
-        .filter(|total| *total <= av_core::error::JCS_SAFE_MAX)
-        .ok_or_else(|| FinalizeError::Atif(format!("recovered {field} overflow")))
 }
 
 fn track_response_attempt(
