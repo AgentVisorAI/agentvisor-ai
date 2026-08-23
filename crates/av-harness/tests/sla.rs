@@ -159,7 +159,7 @@ async fn sla_core_metrics() {
         headers.insert("x-av-workflow", HeaderValue::from_static("signed"));
         let started = Instant::now();
         state
-            .prepare_chat_nonblocking(&headers, payload.clone())
+            .prepare_chat_nonblocking(&headers, payload.clone(), 0)
             .await
             .unwrap();
         hot_path.push(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));

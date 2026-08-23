@@ -331,6 +331,21 @@ pub struct HarnessConfig {
     /// this is a concern, or set this to `false` to disable them.
     #[serde(default = "default_dashboard_enabled")]
     pub dashboard_enabled: bool,
+
+    /// Host-header allowlist (round-51 §3.5, DNS-rebinding defense).
+    ///
+    /// Empty (the default) disables the check — correct for
+    /// loopback-only binds and for deployments whose ingress already
+    /// enforces Host. When non-empty, every request whose `Host`
+    /// header (port stripped) is not in this list is refused with 403
+    /// BEFORE any handler runs. DNS rebinding lets a hostile page's
+    /// JavaScript reach a loopback-adjacent service under a hostname
+    /// the attacker controls; browser CSRF protections don't apply
+    /// because the resolved IP is ours while the Host is theirs —
+    /// pinning the expected hostnames closes it. Example:
+    /// `allowed_hosts = ["localhost", "127.0.0.1", "agentvisor.internal"]`.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 fn default_config_version() -> u32 {
@@ -1337,6 +1352,7 @@ impl HarnessConfig {
             atif_retention_days: None,
             max_request_bytes: default_max_request_bytes(),
             dashboard_enabled: default_dashboard_enabled(),
+            allowed_hosts: Vec::new(),
         }
     }
 }

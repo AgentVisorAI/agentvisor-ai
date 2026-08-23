@@ -1252,16 +1252,29 @@ impl AppState {
     }
 
     /// Run synchronous local gates without waiting for off-path journal,
-    /// embedding, or broker work. When a session token budget is
-    /// configured (`budget.max_tokens`, prompt+completion combined) the
-    /// gates run on the blocking pool;
-    /// otherwise they are cheap enough to run inline.
+    /// embedding, or broker work.
+    ///
+    /// Round-51 §7.3: the inline/blocking decision keys off PAYLOAD
+    /// SIZE, not off whether a token budget happens to be configured.
+    /// The cost of `prepare_chat` (parse-adjacent token scanning,
+    /// sanitize, compression) is a function of body size — measured
+    /// 1.9 ms p50 of uninterruptible CPU at a 128 KB body, which
+    /// stalls every in-flight SSE stream's poll on that tokio worker.
+    /// Previously a configured `budget.max_tokens` (the one thing that
+    /// makes quotas work) was what moved the work to `spawn_blocking`,
+    /// which was backwards. Small bodies stay inline (spawn_blocking
+    /// costs ~10-20 µs of handoff — 2× the total gate cost at 75 B).
     pub async fn prepare_chat_nonblocking(
         &self,
         headers: &HeaderMap,
         payload: Value,
+        body_bytes: usize,
     ) -> Result<PreparedRequest, PipelineError> {
-        if self.config.budget.max_tokens.is_none() {
+        /// Above this the CPU-bound gates run on the blocking pool.
+        /// 16 KiB ≈ 250 µs of gate work on the review's 2-vCPU
+        /// reference box — comfortably under a poll-stall budget.
+        const INLINE_BODY_LIMIT: usize = 16 * 1024;
+        if body_bytes <= INLINE_BODY_LIMIT && self.config.budget.max_tokens.is_none() {
             return self.prepare_chat(headers, payload);
         }
         let state = self.clone();
