@@ -330,6 +330,18 @@ adapter's implementation verbatim.
    config. Land integration tests that hit a mock Anthropic server
    and prove the audit chain records the same shape as an OpenAI
    session (down to `event_uid` and `subject.event_count`).
+   * ✅ LANDED (round-51 pass 22): `AnthropicAdapter` in
+     `provider.rs` maps the Messages API dialect (named SSE events,
+     content blocks, `input_json_delta` tool fragments, cumulative
+     `output_tokens`, `cache_read_input_tokens`, native stop
+     reasons — `map_finish_reason` already folded
+     `end_turn`/`tool_use`/etc.) into the provider-neutral chunk.
+     Error events fail capture; event-name/payload-type mismatch is
+     refused (no smuggling an error payload under a content name).
+     `anthropic_session_records_the_same_audit_shape` drives a mock
+     Anthropic upstream through chat→close→promote and pins
+     provider-true totals (25/15), verbatim relay, and the signed
+     receipt's stop taxonomy.
 3. Add `GoogleGeminiAdapter`. Same pattern.
 4. Update `docs/reference/OPENAI-COMPATIBILITY.md` to a broader
    "provider compatibility" doc.

@@ -2615,18 +2615,21 @@ struct PartialToolCall {
     arguments: String,
 }
 
+#[derive(Debug)]
 pub(crate) struct ProviderToolCallDelta {
     /// The `choices[].index` this delta belongs to. Multi-choice
     /// (`n > 1`) responses reuse tool-call index 0 in every choice, so
     /// reassembly must key on (choice, tool index) or distinct calls
-    /// merge into one corrupt audit record.
-    choice_index: u64,
-    index: u64,
-    id: Option<String>,
-    name: Option<String>,
-    arguments: String,
+    /// merge into one corrupt audit record. (Anthropic has no choices;
+    /// its adapter always uses 0.)
+    pub(crate) choice_index: u64,
+    pub(crate) index: u64,
+    pub(crate) id: Option<String>,
+    pub(crate) name: Option<String>,
+    pub(crate) arguments: String,
 }
 
+#[derive(Debug)]
 pub(crate) struct ParsedProviderChunk {
     pub(crate) message: String,
     pub(crate) reasoning: Option<String>,
@@ -3230,7 +3233,7 @@ pub(crate) fn parse_provider_chunk(raw: &str) -> Result<Option<ParsedProviderChu
     }))
 }
 
-fn provider_u64(value: Option<&Value>, field: &str) -> Result<Option<u64>, String> {
+pub(crate) fn provider_u64(value: Option<&Value>, field: &str) -> Result<Option<u64>, String> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -3685,6 +3688,125 @@ mod tests {
 
     async fn test_state(spool: &std::path::Path) -> (AppState, tokio::task::JoinHandle<()>) {
         test_state_with_token_cap(spool, None).await
+    }
+
+    /// Mock Anthropic Messages upstream: named SSE events, content
+    /// blocks, cumulative usage, native stop reasons (S3 step 2).
+    async fn mock_anthropic_chat() -> Response {
+        let frames = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\n",
+            "event: ping\n",
+            "data: {\"type\": \"ping\"}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello from anthropic\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":15}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let mut response = Response::new(Body::from(frames));
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        response
+    }
+
+    async fn test_state_anthropic(spool: &std::path::Path) -> (AppState, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = Router::new().route("/v1/chat/completions", post(mock_anthropic_chat));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, provider).await.unwrap();
+        });
+        let mut config = crate::config::HarnessConfig::for_tests(
+            &format!("http://{address}"),
+            &spool.to_string_lossy(),
+            &spool.to_string_lossy(),
+        );
+        config.provider = "anthropic".to_owned();
+        let state = AppState::new(
+            config,
+            Arc::new(InMemoryStore::new()),
+            Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
+            Arc::new(NullBus),
+            None,
+            Arc::new(Ed25519Signer::from_seed(&[11; 32])),
+        )
+        .unwrap();
+        (state, server)
+    }
+
+    /// S3 step 2 (round-51 §4.2): a session against a mock Anthropic
+    /// upstream produces the same audit-chain shape as an OpenAI one —
+    /// provider-true usage in the totals, the native stop reason folded
+    /// into the stop taxonomy, and the streamed bytes relayed verbatim.
+    #[tokio::test]
+    async fn anthropic_session_records_the_same_audit_shape() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state_anthropic(directory.path()).await;
+        let app = build_router(state.clone());
+        let response = app.clone().oneshot(chat_request("anthropic-flow")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("hello from anthropic"),
+            "streamed bytes must relay verbatim: {body}"
+        );
+
+        let session = state.sessions.get("anthropic-flow").unwrap();
+        session.wait_for_worker_jobs().await;
+        // Provider-true accounting: prompt reconciles to input_tokens
+        // (25), completion is the cumulative output_tokens (15) — not
+        // the heuristic estimates.
+        use std::sync::atomic::Ordering;
+        assert_eq!(session.totals.prompt_tokens.load(Ordering::Acquire), 25);
+        assert_eq!(session.totals.completion_tokens.load(Ordering::Acquire), 15);
+
+        let close = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/anthropic-flow/close")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(close.status(), StatusCode::OK);
+        let promoted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/anthropic-flow/promote")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(promoted.status(), StatusCode::OK);
+        let receipt: av_receipts::Receipt = serde_json::from_slice(
+            &axum::body::to_bytes(promoted.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        receipt.verify_embedded().unwrap();
+        // `end_turn` folds into the same Stop id an OpenAI `stop` does.
+        assert_eq!(receipt.body.stop_reason_id, av_events::StopReason::Stop.id());
+        assert_eq!(receipt.body.cost.prompt_tokens, 25);
+        assert_eq!(receipt.body.cost.completion_tokens, 15);
+        provider.abort();
     }
 
     async fn test_state_with_token_cap(
