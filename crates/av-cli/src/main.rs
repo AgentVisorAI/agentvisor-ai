@@ -293,9 +293,7 @@ fn pubkey(path: &Path) -> Result<()> {
         av_core::fsutil::read_capped_string(path, av_core::fsutil::MAX_CONTROL_BYTES)
             .with_context(|| format!("read signing seed {}", path.display()))?,
     );
-    let bytes = Zeroizing::new(
-        hex::decode(encoded.trim()).context("decode signing seed as hex")?,
-    );
+    let bytes = Zeroizing::new(hex::decode(encoded.trim()).context("decode signing seed as hex")?);
     let seed: Zeroizing<[u8; 32]> = Zeroizing::new(
         <[u8; 32]>::try_from(bytes.as_slice())
             .map_err(|_| anyhow::anyhow!("signing seed must contain exactly 32 bytes"))?,
@@ -466,7 +464,10 @@ fn receipt_verify(path: &Path, public_keys_hex: &[String]) -> Result<()> {
         });
         let public_key: [u8; 32] = decoded
             .with_context(|| {
-                format!("trusted public key #{} is neither hexadecimal nor base64", index + 1)
+                format!(
+                    "trusted public key #{} is neither hexadecimal nor base64",
+                    index + 1
+                )
             })?
             .try_into()
             .map_err(|_| {

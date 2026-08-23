@@ -384,10 +384,7 @@ fn config_validate_never_crashes_on_random_garbage() {
         // test failure. The exit-code check above is the real
         // crash assertion.
         let se = stderr(&out).to_lowercase();
-        assert!(
-            !se.contains("panicked at"),
-            "case #{i} leaked panic: {se}"
-        );
+        assert!(!se.contains("panicked at"), "case #{i} leaked panic: {se}");
     }
 }
 

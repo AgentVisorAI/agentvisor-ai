@@ -96,11 +96,7 @@ impl<'a> ActionBudget<'a> {
     /// the same principal, which is what makes a header-rotation attack
     /// visible — the token debit persists even after the client mints a
     /// fresh `X-AV-Session`.
-    pub fn for_principal(
-        store: &'a dyn StateStore,
-        principal: &'a str,
-        spec: &'a BudgetSpec,
-    ) -> Self {
+    pub fn for_principal(store: &'a dyn StateStore, principal: &'a str, spec: &'a BudgetSpec) -> Self {
         Self {
             store,
             scope: Scope::Principal(principal),

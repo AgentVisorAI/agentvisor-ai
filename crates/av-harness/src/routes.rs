@@ -71,11 +71,7 @@ pub fn build_router(state: AppState) -> Router {
 /// `av_request_duration_seconds{route}`. The route label is drawn
 /// from a FIXED set (no client-controlled values) so metric
 /// cardinality is bounded; unknown paths collapse to `other`.
-async fn request_metrics(
-    State(state): State<AppState>,
-    request: Request<Body>,
-    next: Next,
-) -> Response {
+async fn request_metrics(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
     let route = route_label(request.uri().path());
     let started = std::time::Instant::now();
     let response = next.run(request).await;
@@ -216,10 +212,9 @@ async fn livez() -> impl IntoResponse {
 /// which check failed without opening a shell.
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     let draining = state.draining.load(std::sync::atomic::Ordering::SeqCst);
-    let spool_ok =
-        std::fs::metadata(std::path::Path::new(&state.config.atif_spool_dir))
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
+    let spool_ok = std::fs::metadata(std::path::Path::new(&state.config.atif_spool_dir))
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
     let ready = !draining && spool_ok;
     let body = Json(json!({
         "status": if ready { "ready" } else { "not_ready" },
@@ -289,11 +284,17 @@ async fn metrics(State(state): State<AppState>) -> Response {
     let (spool_bytes, spool_files) = spool_footprint(std::path::Path::new(&state.config.atif_spool_dir));
     state
         .metrics
-        .gauge("av_spool_bytes", "Total bytes in the top-level ATIF spool directory")
+        .gauge(
+            "av_spool_bytes",
+            "Total bytes in the top-level ATIF spool directory",
+        )
         .set(spool_bytes);
     state
         .metrics
-        .gauge("av_spool_files", "File count in the top-level ATIF spool directory")
+        .gauge(
+            "av_spool_files",
+            "File count in the top-level ATIF spool directory",
+        )
         .set(spool_files);
     let mut response = Response::new(Body::from(state.metrics.render()));
     response.headers_mut().insert(
@@ -4829,9 +4830,7 @@ mod tests {
             match parse_provider_chunk(raw) {
                 Ok(None) => {}
                 Ok(Some(_)) => panic!("dataless named event must not yield a chunk: {raw:?}"),
-                Err(error) => panic!(
-                    "dataless named event {raw:?} must not fail the stream (D7): {error}"
-                ),
+                Err(error) => panic!("dataless named event {raw:?} must not fail the stream (D7): {error}"),
             }
         }
         // A named event that DOES carry attributable data must still
@@ -5135,9 +5134,7 @@ mod tests {
         // response capture — the failure record IS the audit trail
         // entry for this turn.
         assert_eq!(records.len(), 2);
-        assert!(records
-            .iter()
-            .any(|record| record.response_attempt.is_some()));
+        assert!(records.iter().any(|record| record.response_attempt.is_some()));
         provider.abort();
     }
 
@@ -5258,7 +5255,10 @@ mod tests {
             .await
             .unwrap();
         // The client sees the full reassembled bytes.
-        assert!(String::from_utf8_lossy(&body).contains("héllo"), "client bytes truncated");
+        assert!(
+            String::from_utf8_lossy(&body).contains("héllo"),
+            "client bytes truncated"
+        );
         let session = state.sessions.get("split-sse").unwrap();
         session.wait_for_worker_jobs().await;
         assert!(
@@ -5273,8 +5273,7 @@ mod tests {
         else {
             panic!("expected ATIF")
         };
-        let trajectory: av_atif::Trajectory =
-            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let trajectory: av_atif::Trajectory = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(
             trajectory.steps[1].message,
             Value::String("héllo".to_owned()),
@@ -5314,9 +5313,10 @@ mod tests {
         session.wait_for_worker_jobs().await;
         let records = active_records(directory.path(), &state, "truncated-stream");
         let truncated = records.iter().any(|record| {
-            record.event.get("payload").is_some_and(|payload| {
-                payload.get("truncated").and_then(Value::as_bool) == Some(true)
-            })
+            record
+                .event
+                .get("payload")
+                .is_some_and(|payload| payload.get("truncated").and_then(Value::as_bool) == Some(true))
         });
         assert!(
             truncated,
@@ -5795,9 +5795,7 @@ mod tests {
         assert_eq!(ready.status(), StatusCode::OK);
 
         // Draining flag flipped: /readyz must return 503 immediately.
-        state
-            .draining
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state.draining.store(true, std::sync::atomic::Ordering::SeqCst);
         let not_ready = app
             .clone()
             .oneshot(Request::builder().uri("/readyz").body(Body::empty()).unwrap())
@@ -5852,9 +5850,7 @@ mod tests {
         state
             .metrics
             .gauge(
-                &format!(
-                    "av_signing_key_info{{key_id=\"{key_id}\",public_key_hex=\"{public_key_hex}\"}}"
-                ),
+                &format!("av_signing_key_info{{key_id=\"{key_id}\",public_key_hex=\"{public_key_hex}\"}}"),
                 "test signing key info",
             )
             .set(1);

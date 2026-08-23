@@ -646,7 +646,10 @@ fn ed25519_point_encoding_with_y_geq_p_is_refused_by_ring() {
     // (`InvalidKey`) or reduce it into a small-order point (`WeakKey`);
     // both outcomes prove the ring cannot be poisoned with the encoding.
     assert!(
-        matches!(err, av_receipts::KeyError::InvalidKey(_) | av_receipts::KeyError::WeakKey),
+        matches!(
+            err,
+            av_receipts::KeyError::InvalidKey(_) | av_receipts::KeyError::WeakKey
+        ),
         "expected InvalidKey or WeakKey, got {err:?}"
     );
 }
