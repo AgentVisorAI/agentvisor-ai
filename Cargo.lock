@@ -262,6 +262,7 @@ dependencies = [
  "av-events",
  "av-harness",
  "av-receipts",
+ "base64 0.23.1",
  "clap",
  "futures",
  "hex",

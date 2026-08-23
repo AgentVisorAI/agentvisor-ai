@@ -78,8 +78,11 @@ enum Command {
         /// Receipt JSON file.
         path: PathBuf,
         /// Trusted Ed25519 public key as 64 hexadecimal characters.
-        #[arg(long)]
-        public_key_hex: String,
+        /// Repeatable: pass once per key you trust (rotation windows
+        /// need both the retiring and the incoming key pinned; the
+        /// receipt's `key_id` selects which one verifies it).
+        #[arg(long, required = true, num_args = 1, action = clap::ArgAction::Append)]
+        public_key_hex: Vec<String>,
     },
     /// Validate an ATIF trajectory.
     AtifValidate {
@@ -435,7 +438,7 @@ const MAX_ATIF_BYTES: u64 = av_core::fsutil::MAX_ATIF_BYTES;
 /// token files.
 const MAX_CONFIG_BYTES: u64 = av_core::fsutil::MAX_CONTROL_BYTES;
 
-fn receipt_verify(path: &Path, public_key_hex: &str) -> Result<()> {
+fn receipt_verify(path: &Path, public_keys_hex: &[String]) -> Result<()> {
     // Round-16: use the strict deserializer that refuses duplicate
     // JSON keys at any nesting level. `avctl receipt-verify` is the
     // primary offline audit tool — a receipt that verified here but
@@ -445,14 +448,34 @@ fn receipt_verify(path: &Path, public_key_hex: &str) -> Result<()> {
     let bytes = read_capped(path, MAX_RECEIPT_BYTES, "receipt")?;
     let receipt =
         Receipt::from_json_slice(&bytes).with_context(|| format!("parse receipt {}", path.display()))?;
-    let public_key: [u8; 32] = hex::decode(public_key_hex)
-        .context("trusted public key is not hexadecimal")?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("trusted public key must contain exactly 32 bytes"))?;
+    // Round-51 §8.10: accept multiple trusted keys so a key-rotation
+    // window is operable — av_receipts::Keyring was always
+    // multi-key (selected by the receipt's key_id); only this CLI
+    // flag was single-valued.
     let mut keyring = Keyring::new();
-    keyring
-        .add_key_bytes(&public_key)
-        .context("trusted public key is invalid")?;
+    for (index, key_hex) in public_keys_hex.iter().enumerate() {
+        // Accept hex (what `avctl pubkey` and the startup banner print)
+        // AND standard base64 (what the receipt's `public_key_b64`
+        // field carries) — round-51 §9.1: auditors were hand-converting
+        // between the two encodings of the same 32 bytes.
+        let decoded = hex::decode(key_hex.trim()).or_else(|_| {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(key_hex.trim())
+                .map_err(|_| hex::FromHexError::InvalidStringLength)
+        });
+        let public_key: [u8; 32] = decoded
+            .with_context(|| {
+                format!("trusted public key #{} is neither hexadecimal nor base64", index + 1)
+            })?
+            .try_into()
+            .map_err(|_| {
+                anyhow::anyhow!("trusted public key #{} must contain exactly 32 bytes", index + 1)
+            })?;
+        keyring
+            .add_key_bytes(&public_key)
+            .with_context(|| format!("trusted public key #{} is invalid", index + 1))?;
+    }
     receipt.verify(&keyring).context("receipt verification failed")?;
     // Round-28 F3: sanitise the receipt_id before printing. A signer
     // trusted by the operator could otherwise mint a receipt whose

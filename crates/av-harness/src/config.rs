@@ -192,6 +192,14 @@ pub struct HarnessConfig {
     /// Reject tool calls when no matching schema was loaded.
     #[serde(default = "default_true")]
     pub require_tool_schema: bool,
+    /// Tool-call argument field carrying a payout amount in USD, charged
+    /// against `budget.max_payout_usd_micros`. Round-51 §9.1: this was a
+    /// hardcoded `"amount_usd"` buried in the sandbox constructor — a
+    /// tool using `amount`, `value`, or `total_usd` silently bypassed
+    /// the payout cap with no warning. Set this to match YOUR tool
+    /// schema; the cap only fires on calls that carry this exact field.
+    #[serde(default = "default_payout_field")]
+    pub payout_field: String,
     /// WASM or WAT policy module paths, evaluated in order.
     #[serde(default = "default_wasm_policies")]
     pub wasm_policy_paths: Vec<String>,
@@ -372,6 +380,9 @@ fn default_tool_schema_dir() -> Option<String> {
 }
 fn default_true() -> bool {
     true
+}
+fn default_payout_field() -> String {
+    "amount_usd".to_owned()
 }
 fn default_wasm_policies() -> Vec<String> {
     vec!["config/policies/payload_limit.wat".to_owned()]
@@ -1303,6 +1314,7 @@ impl HarnessConfig {
             consequential_tools: default_consequential_tools(),
             tool_schema_dir: None,
             require_tool_schema: false,
+            payout_field: default_payout_field(),
             wasm_policy_paths: Vec::new(),
             session_idle_close_s: 900,
             atif_spool_dir: spool.to_owned(),
