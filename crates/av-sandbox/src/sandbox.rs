@@ -226,14 +226,11 @@ impl Sandbox {
         // debit before returning so the failed call consumed no quota
         // anywhere.
         if let Some((principal_id, principal_spec)) = principal {
-            let principal_budget =
-                ActionBudget::for_principal(store, principal_id, principal_spec);
+            let principal_budget = ActionBudget::for_principal(store, principal_id, principal_spec);
             match principal_budget.try_tool_call(&req.tool, payout_micros) {
                 Ok(BudgetDecision::Allowed { .. }) => {}
                 Ok(BudgetDecision::Refused { limit, cap }) => {
-                    let reason = format!(
-                        "principal action budget exceeded: {limit} (cap {cap})"
-                    );
+                    let reason = format!("principal action budget exceeded: {limit} (cap {cap})");
                     return ToolVerdict::Blocked {
                         tool: req.tool.clone(),
                         stage: "budget",
@@ -243,8 +240,7 @@ impl Sandbox {
                     };
                 }
                 Err(e) => {
-                    let reason =
-                        format!("principal budget check failed closed: {e}");
+                    let reason = format!("principal budget check failed closed: {e}");
                     return ToolVerdict::Blocked {
                         tool: req.tool.clone(),
                         stage: "budget",

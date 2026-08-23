@@ -257,7 +257,7 @@ fn repeated_receipt_issuances_verify_and_never_diverge() {
         receipt_id: format!("r{i}"),
         session_id: format!("s{i}"),
         issued_at: i,
-            issued_at_iso: av_core::time::iso8601_ms(i),
+        issued_at_iso: av_core::time::iso8601_ms(i),
         ai_agent: av_events::AgentIdentity {
             version: "1".to_owned(),
             charter: av_events::CharterFile::from("c"),

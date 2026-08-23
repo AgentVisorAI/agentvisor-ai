@@ -1266,8 +1266,7 @@ fn load_or_create_signer(path: &Path) -> Result<(Ed25519Signer, bool)> {
         // A concurrent process installed a seed while we generated ours;
         // pick up its key — but this is NOT a fresh-anchor event from our
         // point of view, so mark newly_generated = false.
-        let existing =
-            read_signer(path).context("load signing seed installed by another process")?;
+        let existing = read_signer(path).context("load signing seed installed by another process")?;
         Ok((existing, false))
     }
 }
@@ -1617,7 +1616,10 @@ mod tests {
         let (first, first_generated) = load_or_create_signer(&path).unwrap();
         let (second, second_generated) = load_or_create_signer(&path).unwrap();
         assert_eq!(first.key_id(), second.key_id());
-        assert!(first_generated, "first call must report the seed was freshly generated");
+        assert!(
+            first_generated,
+            "first call must report the seed was freshly generated"
+        );
         assert!(!second_generated, "second call must observe the persisted seed");
         assert_eq!(std::fs::read_to_string(path).unwrap().trim().len(), 64);
     }

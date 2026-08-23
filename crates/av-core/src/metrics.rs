@@ -75,12 +75,10 @@ impl Gauge {
         let mut current = self.value.load(Ordering::Relaxed);
         loop {
             let next = current.saturating_add(delta);
-            match self.value.compare_exchange_weak(
-                current,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .value
+                .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => return,
                 Err(observed) => current = observed,
             }
@@ -93,12 +91,10 @@ impl Gauge {
         let mut current = self.value.load(Ordering::Relaxed);
         loop {
             let next = current.saturating_sub(delta).max(0);
-            match self.value.compare_exchange_weak(
-                current,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .value
+                .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => return,
                 Err(observed) => current = observed,
             }

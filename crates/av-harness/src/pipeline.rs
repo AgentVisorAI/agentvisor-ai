@@ -167,16 +167,12 @@ impl HotMetrics {
                 av_core::metrics::WIDE_LATENCY_BOUNDS_US,
             )
         });
-        let stage_strict_budget_counters: [Arc<av_core::metrics::Counter>; 5] =
-            Stage::ORDER.map(|stage| {
-                metrics.counter(
-                    &format!(
-                        "av_strict_budget_breaches_total{{stage=\"{}\"}}",
-                        stage.label()
-                    ),
-                    "Middleware stages that exceeded the strict per-stage budget",
-                )
-            });
+        let stage_strict_budget_counters: [Arc<av_core::metrics::Counter>; 5] = Stage::ORDER.map(|stage| {
+            metrics.counter(
+                &format!("av_strict_budget_breaches_total{{stage=\"{}\"}}", stage.label()),
+                "Middleware stages that exceeded the strict per-stage budget",
+            )
+        });
         Self {
             stage_histograms,
             stage_strict_budget_counters,
@@ -722,9 +718,7 @@ impl AppState {
         for route in ["chat", "mcp", "session_close", "session_promote"] {
             for status_class in ["2xx", "4xx", "5xx"] {
                 metrics.counter(
-                    &format!(
-                        "av_requests_total{{route=\"{route}\",status_class=\"{status_class}\"}}"
-                    ),
+                    &format!("av_requests_total{{route=\"{route}\",status_class=\"{status_class}\"}}"),
                     "HTTP requests by route and status class",
                 );
             }
@@ -1070,11 +1064,11 @@ impl AppState {
         // refunded to keep failed requests non-consumptive.
         let stage = Instant::now();
         let billed_tokens = compression.tokens_after;
-        let principal_billing_id =
-            self.config
-                .principal_budget
-                .as_ref()
-                .map(|_| principal_id_for_budget(&identity));
+        let principal_billing_id = self
+            .config
+            .principal_budget
+            .as_ref()
+            .map(|_| principal_id_for_budget(&identity));
         if let (Some(spec), Some(principal_id)) = (
             self.config.principal_budget.as_ref(),
             principal_billing_id.as_deref(),
@@ -1084,9 +1078,8 @@ impl AppState {
             {
                 Ok(quota) => quota,
                 Err(error) => {
-                    let error = PipelineError::Blocked(format!(
-                        "quota backend failed closed (principal): {error}"
-                    ));
+                    let error =
+                        PipelineError::Blocked(format!("quota backend failed closed (principal): {error}"));
                     worker_permit.submit(self.failure_job(
                         Arc::clone(&session),
                         identity.clone(),
@@ -1101,9 +1094,7 @@ impl AppState {
                 // the backend-ERROR arms deliberately do not: a store
                 // outage is not enforcement).
                 session.latch_enforcement(StopReason::BudgetExceeded);
-                let error = PipelineError::Blocked(format!(
-                    "principal.{limit} exceeded (cap {cap})"
-                ));
+                let error = PipelineError::Blocked(format!("principal.{limit} exceeded (cap {cap})"));
                 worker_permit.submit(self.failure_job(
                     Arc::clone(&session),
                     identity.clone(),
@@ -1709,9 +1700,7 @@ impl AppState {
                     .principal_budget
                     .as_ref()
                     .map(|spec| (principal_id_for_budget(&identity), spec));
-                let principal_ref = principal_binding
-                    .as_ref()
-                    .map(|(id, spec)| (id.as_str(), *spec));
+                let principal_ref = principal_binding.as_ref().map(|(id, spec)| (id.as_str(), *spec));
                 self.sandbox
                     .check_with_principal(self.store.as_ref(), &session_id, principal_ref, raw)
             }
@@ -2151,9 +2140,7 @@ impl AppState {
                 histogram.observe_us(elapsed);
             }
             if self.hot_metrics.strict_stage_budget && elapsed > 2_000 {
-                if let Some(counter) =
-                    self.hot_metrics.stage_strict_budget_counters.get(known.index())
-                {
+                if let Some(counter) = self.hot_metrics.stage_strict_budget_counters.get(known.index()) {
                     counter.inc();
                 }
                 tracing::warn!(stage, elapsed_us = elapsed, "strict stage budget exceeded");
@@ -2856,9 +2843,7 @@ mod tests {
         let mut headers_b = HeaderMap::new();
         headers_b.insert(SESSION_HEADER, HeaderValue::from_static("rotated-b"));
         match state.prepare_chat(&headers_b, payload()) {
-            Ok(_) => panic!(
-                "header rotation defeated principal budget — the fix from §3.2 has regressed"
-            ),
+            Ok(_) => panic!("header rotation defeated principal budget — the fix from §3.2 has regressed"),
             Err(PipelineError::Blocked(msg)) => {
                 assert!(
                     msg.contains("principal."),
@@ -3602,9 +3587,9 @@ mod tests {
             Ok(identity) => {
                 assert_eq!(identity.instance_uid, "anonymous");
             }
-            Err(error) => panic!(
-                "ignore_client_authorization must accept the SDK bearer anonymously; got {error:?}"
-            ),
+            Err(error) => {
+                panic!("ignore_client_authorization must accept the SDK bearer anonymously; got {error:?}")
+            }
         }
     }
 

@@ -462,10 +462,7 @@ impl std::fmt::Display for ConfigSource {
 /// (developers who ran `avctl init` still saw the example's settings
 /// because the example outranked the wizard file — see engineering
 /// review §9.4).
-pub const CONFIG_SEARCH_PATHS: [&str; 2] = [
-    "agentvisor.toml",
-    "config/harness.toml",
-];
+pub const CONFIG_SEARCH_PATHS: [&str; 2] = ["agentvisor.toml", "config/harness.toml"];
 
 /// Per-user config file inside `home`, as written by the `avctl` wizard.
 pub fn user_config_path_from(home: &std::path::Path) -> std::path::PathBuf {
@@ -910,9 +907,7 @@ impl HarnessConfig {
         // anti-rotation property the section is meant to provide. Operators
         // running a single-tenant appliance can flip
         // `allow_anonymous_principal_budget = true` to acknowledge the shape.
-        if self.principal_budget.is_some()
-            && !self.require_identity
-            && !self.allow_anonymous_principal_budget
+        if self.principal_budget.is_some() && !self.require_identity && !self.allow_anonymous_principal_budget
         {
             return Err(
                 "principal_budget was set but require_identity = false: every unauthenticated \
@@ -1822,7 +1817,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("every interface"), "err should name the risk: {err}");
-        assert!(err.contains("allow_wildcard_bind"), "err should name the escape hatch: {err}");
+        assert!(
+            err.contains("allow_wildcard_bind"),
+            "err should name the escape hatch: {err}"
+        );
 
         // IPv6 wildcard likewise refused.
         let err = HarnessConfig::from_toml(

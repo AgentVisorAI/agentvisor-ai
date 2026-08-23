@@ -818,7 +818,11 @@ fn jwks_bomb_is_refused_before_the_key_walk() {
         matches!(outcome, Err(IdentityError::Jwks(ref m)) if m.contains("257")),
         "oversized JWKS must be refused with the entry count named; got {outcome:?}"
     );
-    assert_eq!(validator.key_count(), 0, "no key may be installed from a refused JWKS");
+    assert_eq!(
+        validator.key_count(),
+        0,
+        "no key may be installed from a refused JWKS"
+    );
 
     // Exactly at the cap: accepted (the guard is >, not >=).
     let mut at_cap: Vec<serde_json::Value> = (0..255)

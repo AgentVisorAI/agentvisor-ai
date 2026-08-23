@@ -464,9 +464,7 @@ impl Finalizer {
                     Ok(t) => t,
                     Err(_) => continue,
                 };
-                let age = now
-                    .duration_since(modified)
-                    .unwrap_or(std::time::Duration::ZERO);
+                let age = now.duration_since(modified).unwrap_or(std::time::Duration::ZERO);
                 if age < max_age {
                     continue;
                 }
@@ -7125,7 +7123,10 @@ mod tests {
 
         assert!(!old_json.exists(), "aged sealed evidence must be pruned");
         assert!(!old_sc.exists(), "aged sidecar must be pruned");
-        assert!(orphan_json.exists(), "unpaired remnants belong to quarantine, not retention");
+        assert!(
+            orphan_json.exists(),
+            "unpaired remnants belong to quarantine, not retention"
+        );
         assert!(live_session.exists(), ".session.json is never a retention target");
 
         // Freshly written sealed pair with an hour-scale retention window
