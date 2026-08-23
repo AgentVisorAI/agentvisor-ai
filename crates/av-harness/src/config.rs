@@ -789,16 +789,43 @@ impl HarnessConfig {
         missing
     }
 
-    /// Structural validation.
+    /// Structural validation. Returns the single violation verbatim
+    /// (historical error shape) or, for multiple violations, a
+    /// numbered aggregate naming all of them (round-51 §5.4).
     pub fn validate(&self) -> Result<(), String> {
         if self.config_version != CONFIG_VERSION {
+            // Short-circuit: a config written for a different format
+            // version makes every other check meaningless noise.
             return Err(format!(
                 "unsupported config_version {} (this build supports {CONFIG_VERSION})",
                 self.config_version
             ));
         }
+        let mut errors = Vec::new();
+        self.collect_validation_errors(&mut errors);
+        if errors.len() > 1 {
+            return Err(format!(
+                "{} config errors:\n  - {}",
+                errors.len(),
+                errors.join("\n  - ")
+            ));
+        }
+        match errors.pop() {
+            None => Ok(()),
+            Some(error) => Err(error),
+        }
+    }
+
+    /// Structural validation, one push per violation. Round-51 §5.4:
+    /// every check reports independently so a single `avctl
+    /// config-validate` run surfaces the complete list — previously
+    /// only the first of 60+ checks was reported per round-trip.
+    /// Checks after a failed one still run; they operate on owned
+    /// string/number fields, so a prior violation can at worst add a
+    /// redundant message, never a panic.
+    fn collect_validation_errors(&self, errors: &mut Vec<String>) {
         if self.listen.is_empty() {
-            return Err("listen is required (host:port, e.g. 127.0.0.1:8484)".into());
+            errors.push("listen is required (host:port, e.g. 127.0.0.1:8484)".into());
         }
         // Shape-only check: hostnames are resolved at bind time, but a missing
         // or non-numeric port would otherwise pass validation and only fail at
@@ -806,7 +833,7 @@ impl HarnessConfig {
         match self.listen.rsplit_once(':') {
             Some((host, port)) if !host.is_empty() && port.parse::<u16>().is_ok() => {}
             _ => {
-                return Err(format!(
+                errors.push(format!(
                     "listen {:?} must be host:port with a port in 0-65535",
                     self.listen
                 ));
@@ -829,7 +856,7 @@ impl HarnessConfig {
                 .unwrap_or("");
             let is_wildcard = matches!(host, "0.0.0.0" | "::" | "*" | "");
             if is_wildcard {
-                return Err(format!(
+                errors.push(format!(
                     "listen {:?} binds every interface while require_identity = false: any \
                      peer reaching this host would speak to the proxy anonymously with the \
                      operator's provider credentials. Either pin listen to a loopback / \
@@ -842,64 +869,64 @@ impl HarnessConfig {
             }
         }
         if self.reconcile_tick_s == 0 {
-            return Err("reconcile_tick_s must be greater than zero".into());
+            errors.push("reconcile_tick_s must be greater than zero".into());
         }
         if self.session_idle_close_s == 0 {
-            return Err(
+            errors.push(
                 "session_idle_close_s must be greater than zero (0 would close every open session at each reconcile tick)"
                     .into(),
             );
         }
         if self.upstream_url.is_empty() {
-            return Err("upstream_url is required".into());
+            errors.push("upstream_url is required".into());
         }
         if !self.upstream_chat_path.starts_with('/') {
-            return Err(format!(
+            errors.push(format!(
                 "upstream_chat_path must start with '/', got {:?}",
                 self.upstream_chat_path
             ));
         }
         if self.upstream_api_key_env.as_deref().is_some_and(str::is_empty) {
-            return Err("upstream_api_key_env must not be empty when set".into());
+            errors.push("upstream_api_key_env must not be empty when set".into());
         }
         if self.upstream_api_key_file.as_deref().is_some_and(str::is_empty) {
-            return Err("upstream_api_key_file must not be empty when set".into());
+            errors.push("upstream_api_key_file must not be empty when set".into());
         }
         if self.upstream_api_key_env.is_some() && self.upstream_api_key_file.is_some() {
-            return Err(
+            errors.push(
                 "set only one of upstream_api_key_env or upstream_api_key_file (ambiguous key source)".into(),
             );
         }
         let has_static_key = self.upstream_api_key_env.is_some() || self.upstream_api_key_file.is_some();
         if self.upstream_authorization_passthrough && has_static_key {
-            return Err(
+            errors.push(
                 "upstream_authorization_passthrough conflicts with upstream_api_key_env/file: choose one auth mode"
                     .into(),
             );
         }
         if self.upstream_authorization_passthrough && self.require_identity {
-            return Err(
+            errors.push(
                 "upstream_authorization_passthrough cannot be combined with require_identity: the \
                  Authorization header carries the NHI token, which must never be sent upstream"
                     .into(),
             );
         }
         if self.ignore_client_authorization && self.require_identity {
-            return Err(
+            errors.push(
                 "ignore_client_authorization cannot be combined with require_identity: the \
                  identity validator must see the Authorization header, not discard it"
                     .into(),
             );
         }
         if self.ignore_client_authorization && self.upstream_authorization_passthrough {
-            return Err(
+            errors.push(
                 "ignore_client_authorization conflicts with upstream_authorization_passthrough: \
                  a client Authorization header cannot be both discarded and forwarded upstream"
                     .into(),
             );
         }
         if axum::http::HeaderName::try_from(self.upstream_auth_header.as_str()).is_err() {
-            return Err(format!(
+            errors.push(format!(
                 "upstream_auth_header {:?} is not a valid HTTP header name",
                 self.upstream_auth_header
             ));
@@ -909,13 +936,13 @@ impl HarnessConfig {
             .bytes()
             .any(|byte| !(0x21..=0x7e).contains(&byte))
         {
-            return Err(
+            errors.push(
                 "upstream_auth_scheme must contain only visible ASCII with no spaces (use \"\" for a raw key)"
                     .into(),
             );
         }
         if self.tool_upstream_bearer_env.is_some() && self.tool_upstream_bearer_file.is_some() {
-            return Err(
+            errors.push(
                 "set only one of tool_upstream_bearer_env or tool_upstream_bearer_file (ambiguous token source)"
                     .into(),
             );
@@ -935,22 +962,22 @@ impl HarnessConfig {
             .as_deref()
             .is_some_and(str::is_empty)
         {
-            return Err("tool_upstream_bearer_env must not be empty when set".into());
+            errors.push("tool_upstream_bearer_env must not be empty when set".into());
         }
         if self
             .tool_upstream_bearer_file
             .as_deref()
             .is_some_and(str::is_empty)
         {
-            return Err("tool_upstream_bearer_file must not be empty when set".into());
+            errors.push("tool_upstream_bearer_file must not be empty when set".into());
         }
         if (self.tool_upstream_bearer_env.is_some() || self.tool_upstream_bearer_file.is_some())
             && self.tool_upstream_url.as_deref().is_none_or(str::is_empty)
         {
-            return Err("tool_upstream_bearer_env/file requires tool_upstream_url to be set".into());
+            errors.push("tool_upstream_bearer_env/file requires tool_upstream_url to be set".into());
         }
         if crate::session::Workflow::parse(&self.default_workflow).is_none() {
-            return Err(format!(
+            errors.push(format!(
                 "default_workflow must be signed|unsigned, got {:?}",
                 self.default_workflow
             ));
@@ -964,7 +991,7 @@ impl HarnessConfig {
         // `allow_anonymous_principal_budget = true` to acknowledge the shape.
         if self.principal_budget.is_some() && !self.require_identity && !self.allow_anonymous_principal_budget
         {
-            return Err(
+            errors.push(
                 "principal_budget was set but require_identity = false: every unauthenticated \
                  request would share a single `anonymous` principal ledger, making the budget \
                  a fleet-wide bucket instead of the per-principal cap it appears to be. Either \
@@ -980,7 +1007,7 @@ impl HarnessConfig {
                 .as_deref()
                 .is_none_or(str::is_empty)
         {
-            return Err("require_identity=true needs identity_jwks_url or identity_hmac_secret_file".into());
+            errors.push("require_identity=true needs identity_jwks_url or identity_hmac_secret_file".into());
         }
         // Round-30 F1: reject the silent-anonymous-bypass posture.
         // `enforce_identity_scopes = true` looks like it's guarding
@@ -999,7 +1026,7 @@ impl HarnessConfig {
         // enforcement off (making the posture explicit) or turn
         // identity on.
         if self.enforce_identity_scopes && !self.require_identity {
-            return Err(
+            errors.push(
                 "enforce_identity_scopes=true has no effect while require_identity=false: \
                  unauthenticated requests fall through to the anonymous identity and bypass \
                  the scope gate entirely. Either set require_identity=true, or set \
@@ -1008,7 +1035,7 @@ impl HarnessConfig {
             );
         }
         if self.identity_jwks_refresh_s == 0 {
-            return Err("identity_jwks_refresh_s must be greater than zero".into());
+            errors.push("identity_jwks_refresh_s must be greater than zero".into());
         }
         // `tokio::time::interval(Duration::from_secs(0))` panics. Guard
         // against a value that squeaks past the > 0 check via overflow
@@ -1016,14 +1043,14 @@ impl HarnessConfig {
         // — a JWKS refresh below 30 s hammers the IdP and offers no
         // real benefit at NHI TTLs measured in minutes.
         if self.identity_jwks_refresh_s < 30 {
-            return Err(format!(
+            errors.push(format!(
                 "identity_jwks_refresh_s {} is too aggressive; a value below 30 s hammers the IdP \
                  without benefit given NHI TTLs measured in minutes",
                 self.identity_jwks_refresh_s
             ));
         }
         if self.identity_hmac_kid.is_empty() {
-            return Err("identity_hmac_kid must not be empty".into());
+            errors.push("identity_hmac_kid must not be empty".into());
         }
         // Round-31 F2: scope names must be visible-ASCII non-empty
         // tokens. An empty `chat_scope = ""` under
@@ -1040,25 +1067,25 @@ impl HarnessConfig {
             ("session_promote_scope", &self.session_promote_scope),
         ] {
             if value.is_empty() {
-                return Err(format!("{field} must not be empty"));
+                errors.push(format!("{field} must not be empty"));
             }
             if value.bytes().any(|byte| !(0x21..=0x7e).contains(&byte)) {
-                return Err(format!(
+                errors.push(format!(
                     "{field} {value:?} must be visible ASCII with no whitespace or control bytes"
                 ));
             }
         }
         if self.worker_channel_capacity == 0 {
-            return Err("worker_channel_capacity must be > 0".into());
+            errors.push("worker_channel_capacity must be > 0".into());
         }
         if !matches!(self.bridge_backend.as_str(), "embedded" | "kafka" | "nats") {
-            return Err(format!(
+            errors.push(format!(
                 "bridge_backend must be embedded|kafka|nats, got {:?}",
                 self.bridge_backend
             ));
         }
         if self.bridge_manifest_path.is_empty() {
-            return Err("bridge_manifest_path is required".into());
+            errors.push("bridge_manifest_path is required".into());
         }
         // Round-31 F1: refuse empty local-fs path fields. If an
         // operator overrides `atif_spool_dir = ""` in TOML (e.g. by
@@ -1069,25 +1096,25 @@ impl HarnessConfig {
         // scans miss them on the next boot. Same shape for
         // `bridge_data_dir` (embedded broker segments in CWD).
         if self.atif_spool_dir.is_empty() {
-            return Err("atif_spool_dir must not be empty".into());
+            errors.push("atif_spool_dir must not be empty".into());
         }
         if self.bridge_data_dir.is_empty() {
-            return Err("bridge_data_dir must not be empty".into());
+            errors.push("bridge_data_dir must not be empty".into());
         }
         if self.bridge_backend != "embedded" && self.bridge_endpoint.as_deref().is_none_or(str::is_empty) {
-            return Err("bridge_endpoint is required for kafka and nats backends".into());
+            errors.push("bridge_endpoint is required for kafka and nats backends".into());
         }
         if !matches!(self.state_backend.as_str(), "memory" | "redis") {
-            return Err(format!(
+            errors.push(format!(
                 "state_backend must be memory|redis, got {:?}",
                 self.state_backend
             ));
         }
         if self.state_backend == "redis" && self.state_endpoint.as_deref().is_none_or(str::is_empty) {
-            return Err("state_endpoint is required for the redis backend".into());
+            errors.push("state_endpoint is required for the redis backend".into());
         }
         if !matches!(self.embedder_backend.as_str(), "hash" | "onnx") {
-            return Err(format!(
+            errors.push(format!(
                 "embedder_backend must be hash|onnx, got {:?}",
                 self.embedder_backend
             ));
@@ -1096,31 +1123,31 @@ impl HarnessConfig {
             && (self.onnx_model_path.as_deref().is_none_or(str::is_empty)
                 || self.onnx_tokenizer_path.as_deref().is_none_or(str::is_empty))
         {
-            return Err("onnx_model_path and onnx_tokenizer_path are required for the onnx backend".into());
+            errors.push("onnx_model_path and onnx_tokenizer_path are required for the onnx backend".into());
         }
         if self.onnx_dimension == 0 {
-            return Err("onnx_dimension must be greater than zero".into());
+            errors.push("onnx_dimension must be greater than zero".into());
         }
         if !matches!(self.vector_backend.as_str(), "memory" | "qdrant") {
-            return Err(format!(
+            errors.push(format!(
                 "vector_backend must be memory|qdrant, got {:?}",
                 self.vector_backend
             ));
         }
         if self.vector_backend == "qdrant" && self.qdrant_url.as_deref().is_none_or(str::is_empty) {
-            return Err("qdrant_url is required for the qdrant vector backend".into());
+            errors.push("qdrant_url is required for the qdrant vector backend".into());
         }
         if self.qdrant_collection.is_empty() {
-            return Err("qdrant_collection must not be empty".into());
+            errors.push("qdrant_collection must not be empty".into());
         }
         if self.breaker.window == 0 {
-            return Err(
+            errors.push(
                 "breaker.window must be greater than zero (0 trips on token count alone, ignoring semantic similarity)"
                     .into(),
             );
         }
         if !self.breaker.delta_epsilon.is_finite() || self.breaker.delta_epsilon <= 0.0 {
-            return Err(format!(
+            errors.push(format!(
                 "breaker.delta_epsilon must be a finite number greater than zero, got {}",
                 self.breaker.delta_epsilon
             ));
@@ -1129,26 +1156,26 @@ impl HarnessConfig {
         // before the runtime feels the misconfiguration. Values are
         // deliberately loose: they only reject genuinely absurd numbers.
         if self.worker_channel_capacity > MAX_WORKER_CHANNEL_CAPACITY {
-            return Err(format!(
+            errors.push(format!(
                 "worker_channel_capacity {} exceeds the safety cap of {} — oversized channels hide real backpressure and let per-shard buffers grow unboundedly under overload",
                 self.worker_channel_capacity, MAX_WORKER_CHANNEL_CAPACITY
             ));
         }
         if self.max_request_bytes == 0 {
-            return Err(
+            errors.push(
                 "max_request_bytes must be > 0 — a 0 cap forwards to DefaultBodyLimit::max(0), \
                  rejecting every non-empty POST body silently"
                     .into(),
             );
         }
         if self.max_request_bytes > MAX_REQUEST_BYTES_CAP {
-            return Err(format!(
+            errors.push(format!(
                 "max_request_bytes {} exceeds the safety cap of {} (512 MiB) — a single request should never legitimately need more, and lifting this defeats the sandbox payload guard",
                 self.max_request_bytes, MAX_REQUEST_BYTES_CAP
             ));
         }
         if self.onnx_dimension > MAX_ONNX_DIMENSION {
-            return Err(format!(
+            errors.push(format!(
                 "onnx_dimension {} exceeds the safety cap of {} — most sentence-transformer models are <= 4096",
                 self.onnx_dimension, MAX_ONNX_DIMENSION
             ));
@@ -1166,7 +1193,7 @@ impl HarnessConfig {
             // read_timeout fire immediately — every upstream request
             // fails before the first byte arrives.
             if read_timeout == 0 {
-                return Err(
+                errors.push(
                     "upstream_read_timeout_s = 0 would time out every upstream read immediately — omit the key to use the built-in 60 s default".into(),
                 );
             }
@@ -1174,7 +1201,7 @@ impl HarnessConfig {
         }
         if let Some(drain) = self.shutdown_drain_timeout_s {
             if drain == 0 {
-                return Err(
+                errors.push(
                     "shutdown_drain_timeout_s = 0 would abandon every in-flight request at shutdown — omit the key to derive it from upstream_read_timeout_s".into(),
                 );
             }
@@ -1182,7 +1209,7 @@ impl HarnessConfig {
         }
         for (field, value) in interval_fields {
             if value > MAX_SECONDS_INTERVAL {
-                return Err(format!(
+                errors.push(format!(
                     "{field} = {value} exceeds the safety cap of {MAX_SECONDS_INTERVAL} seconds (1 day) — did you mean milliseconds?"
                 ));
             }
@@ -1204,7 +1231,7 @@ impl HarnessConfig {
         // request time. Now every URL field's shape is preflighted
         // by the same rule.
         if !(self.upstream_url.starts_with("http://") || self.upstream_url.starts_with("https://")) {
-            return Err(format!(
+            errors.push(format!(
                 "upstream_url must be http:// or https://, got {:?}",
                 self.upstream_url
             ));
@@ -1221,7 +1248,7 @@ impl HarnessConfig {
                 .unwrap_or_default();
             let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
             if host.is_empty() {
-                return Err(format!("upstream_url has no host, got {:?}", self.upstream_url));
+                errors.push(format!("upstream_url has no host, got {:?}", self.upstream_url));
             }
         }
         if let Some(tool_upstream) = &self.tool_upstream_url {
@@ -1231,13 +1258,13 @@ impl HarnessConfig {
             // at the first request with a reqwest URL error. Fail loudly at
             // startup like every other config-shape problem.
             if tool_upstream.is_empty() {
-                return Err(
+                errors.push(
                     "tool_upstream_url must not be empty; omit the field to disable tool forwarding"
                         .to_owned(),
                 );
             }
             if !(tool_upstream.starts_with("http://") || tool_upstream.starts_with("https://")) {
-                return Err(format!(
+                errors.push(format!(
                     "tool_upstream_url must be http:// or https://, got {tool_upstream:?}"
                 ));
             }
@@ -1259,7 +1286,7 @@ impl HarnessConfig {
             .filter(|value| !value.is_empty())
         {
             if !(url.starts_with("http://") || url.starts_with("https://")) {
-                return Err(format!(
+                errors.push(format!(
                     "identity_jwks_url must be http:// or https://, got {url:?}"
                 ));
             }
@@ -1267,7 +1294,7 @@ impl HarnessConfig {
         if self.vector_backend == "qdrant" {
             if let Some(url) = self.qdrant_url.as_deref().filter(|value| !value.is_empty()) {
                 if !(url.starts_with("http://") || url.starts_with("https://")) {
-                    return Err(format!("qdrant_url must be http:// or https://, got {url:?}"));
+                    errors.push(format!("qdrant_url must be http:// or https://, got {url:?}"));
                 }
             }
         }
@@ -1291,7 +1318,7 @@ impl HarnessConfig {
                         || member.starts_with("unix:")
                         || member.starts_with("redis+unix:");
                     if !ok {
-                        return Err(format!(
+                        errors.push(format!(
                             "state_endpoint (redis backend) member {member:?} must be \
                              redis://, rediss://, unix:, or redis+unix: (got {member:?} in {url:?})"
                         ));
@@ -1302,7 +1329,7 @@ impl HarnessConfig {
         if self.bridge_backend == "nats" {
             if let Some(url) = self.bridge_endpoint.as_deref().filter(|value| !value.is_empty()) {
                 if !(url.starts_with("nats://") || url.starts_with("tls://")) {
-                    return Err(format!(
+                    errors.push(format!(
                         "bridge_endpoint (nats backend) must be nats:// or tls://, got {url:?}"
                     ));
                 }
@@ -1311,7 +1338,6 @@ impl HarnessConfig {
         // Kafka bridge_endpoint is a `host:port[,host:port]` bootstrap
         // list, not a URL — no scheme check applies. rdkafka rejects
         // malformed values on connect.
-        Ok(())
     }
 
     /// A config suitable for tests (temp dirs supplied by the caller).
@@ -1415,6 +1441,39 @@ mod tests {
         assert_eq!(cfg.upstream_auth_scheme, "Bearer");
         assert!(cfg.upstream_api_key_env.is_none());
         assert!(!cfg.upstream_authorization_passthrough);
+    }
+
+    /// Round-51 §5.4: validation must surface EVERY violation in one
+    /// run, not one per `avctl config-validate` round-trip.
+    #[test]
+    fn validate_reports_all_errors_at_once() {
+        let mut cfg = HarnessConfig::from_toml(r#"upstream_url = "https://api.openai.com""#).unwrap();
+        cfg.listen = String::new();
+        cfg.bridge_backend = "carrier-pigeon".to_owned();
+        cfg.state_backend = "abacus".to_owned();
+        let error = cfg.validate().unwrap_err();
+        assert!(
+            error.contains("config errors"),
+            "aggregate header missing: {error}"
+        );
+        for needle in ["listen", "bridge_backend", "state_backend"] {
+            assert!(error.contains(needle), "missing {needle} in: {error}");
+        }
+    }
+
+    /// A single violation keeps the historical bare-message shape
+    /// (no aggregate header) so existing tooling that string-matches
+    /// one error keeps working.
+    #[test]
+    fn validate_single_error_keeps_bare_message() {
+        let mut cfg = HarnessConfig::from_toml(r#"upstream_url = "https://api.openai.com""#).unwrap();
+        cfg.state_backend = "abacus".to_owned();
+        let error = cfg.validate().unwrap_err();
+        assert!(
+            !error.contains("config errors"),
+            "single error must not aggregate: {error}"
+        );
+        assert!(error.contains("state_backend"), "must name the field: {error}");
     }
 
     /// Round-51 §8.10: the default backends (embedded/memory/hash/
