@@ -208,6 +208,7 @@ async fn sla_core_metrics() {
             native_stop_reason: None,
             metrics: EventMetrics::default(),
             cost_usd_micros: 0,
+            prompt_token_correction: 0,
             atif: None,
             response_marker: None,
             response_attempt: None,

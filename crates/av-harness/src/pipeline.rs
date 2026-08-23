@@ -374,6 +374,11 @@ pub struct PreparedRequest {
 pub struct ForwardedResponse {
     /// Provider HTTP response.
     pub response: reqwest::Response,
+    /// Prompt tokens debited at admission (post-compression heuristic).
+    /// Round-51 §6.4: the response relay reconciles this against the
+    /// provider's reported `usage.prompt_tokens` — correcting the
+    /// session totals and refunding the over-charge.
+    pub(crate) billed_prompt_tokens: u64,
     // Same ordering invariant as `PreparedRequest`: guard drops before
     // lease so its terminal job registers `pending_jobs` before the
     // close barrier sees the streams drained.
@@ -500,6 +505,7 @@ pub(crate) fn refused_response_failure_job(
         native_stop_reason: None,
         metrics: EventMetrics::default(),
         cost_usd_micros: 0,
+        prompt_token_correction: 0,
         atif,
         response_marker,
         response_attempt: Some(crate::worker::ResponseAttempt {
@@ -1196,6 +1202,7 @@ impl AppState {
                 pruning_ratio_millis: Some(compression.pruning_ratio_millis()),
             },
             cost_usd_micros: 0,
+            prompt_token_correction: 0,
             atif: Some(atif),
             response_marker: None,
             response_attempt: Some(crate::worker::ResponseAttempt {
@@ -1528,6 +1535,7 @@ impl AppState {
                 }
                 Ok(ForwardedResponse {
                     response,
+                    billed_prompt_tokens: debited_tokens,
                     lease,
                     response_permit,
                     capture_guard,
@@ -1790,6 +1798,7 @@ impl AppState {
             native_stop_reason: None,
             metrics: EventMetrics::default(),
             cost_usd_micros: 0,
+            prompt_token_correction: 0,
             atif: Some(AtifCapture {
                 source: av_atif::Source::Agent,
                 message: Value::String("MCP tool authorization decision".to_owned()),
@@ -1969,6 +1978,7 @@ impl AppState {
             native_stop_reason: None,
             metrics: EventMetrics::default(),
             cost_usd_micros: 0,
+            prompt_token_correction: 0,
             atif,
             response_marker: None,
             response_attempt: None,

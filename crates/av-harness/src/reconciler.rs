@@ -4460,6 +4460,7 @@ mod tests {
             atif_step: None,
             tool_calls: 0,
             tool_allowed: 0,
+            prompt_token_correction: 0,
             tool_blocked: 0,
             prompt_tokens: 0,
             completion_tokens: 0,

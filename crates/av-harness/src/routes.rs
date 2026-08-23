@@ -429,6 +429,7 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
     };
     let crate::pipeline::ForwardedResponse {
         response: upstream,
+        billed_prompt_tokens,
         lease,
         response_permit,
         capture_guard,
@@ -574,6 +575,7 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
         pending_output: std::collections::VecDeque::new(),
         pending_budget: None,
         captured_bytes: 0,
+        billed_prompt_tokens,
         completed: false,
     };
     let mut response = if is_sse {
@@ -1376,6 +1378,7 @@ async fn complete_tool_audit(
             native_stop_reason: None,
             metrics: av_events::EventMetrics::default(),
             cost_usd_micros: 0,
+            prompt_token_correction: 0,
             atif: Some(crate::worker::AtifCapture {
                 source: av_atif::Source::System,
                 message: Value::String(String::from_utf8_lossy(&bytes).into_owned()),
@@ -2192,6 +2195,9 @@ struct AbortFinalizingStream {
     pending_output: std::collections::VecDeque<Bytes>,
     pending_budget: Option<PendingBudget>,
     captured_bytes: usize,
+    /// Round-51 §6.4: admission-time prompt-token heuristic, reconciled
+    /// against the provider's `usage.prompt_tokens` at terminal capture.
+    billed_prompt_tokens: u64,
     completed: bool,
 }
 
@@ -2520,6 +2526,23 @@ impl AbortFinalizingStream {
                 }),
             )
         };
+        // Round-51 §6.4 (enforcement side): refund the heuristic
+        // over-charge to the session ledger — an SDK retry loop on a
+        // CJK-heavy conversation otherwise drains max_tokens 3-4×
+        // faster than the provider actually bills. Only the
+        // over-charge direction is compensated (provider < billed);
+        // an under-estimate conservatively stands (charging more
+        // mid-stream could turn a delivered response into a
+        // retroactive refusal). The principal ledger keeps the
+        // conservative debit — its caps are coarse anti-abuse bounds,
+        // not billing.
+        if let Some(provider) = self.response_metrics.prompt_tokens {
+            let over_charge = self.billed_prompt_tokens.saturating_sub(provider);
+            if over_charge > 0 {
+                av_state::ActionBudget::new(self.store.as_ref(), &self.session.id, &self.budget)
+                    .refund_tokens(over_charge);
+            }
+        }
         let permit = self
             .response_permit
             .take()
@@ -2538,6 +2561,18 @@ impl AbortFinalizingStream {
                 native_stop_reason: native_finish_reason,
                 metrics: self.response_metrics,
                 cost_usd_micros: self.response_cost_usd_micros,
+                // Round-51 §6.4: reconcile the admission-time heuristic
+                // against the provider's reported usage. The correction
+                // rides the terminal record so ALL folds (live + both
+                // recovery paths, via the unified
+                // ActiveJournalRecord fold) attest the provider-true
+                // prompt count; CJK-heavy workloads previously
+                // over-reported 3-4× into the signed receipt.
+                prompt_token_correction: self.response_metrics.prompt_tokens.map_or(0i64, |provider| {
+                    let provider = i64::try_from(provider).unwrap_or(i64::MAX);
+                    let billed = i64::try_from(self.billed_prompt_tokens).unwrap_or(i64::MAX);
+                    provider.saturating_sub(billed)
+                }),
                 atif: Some(crate::worker::AtifCapture {
                     source: av_atif::Source::Agent,
                     message: Value::String(std::mem::take(&mut self.response_message)),
@@ -3905,9 +3940,9 @@ mod tests {
         assert_eq!(receipt.body.cost.cached_tokens, 4);
         assert_eq!(receipt.body.cost.cost_usd_micros, 1_250);
         assert_eq!(
-            receipt.body.cost.prompt_tokens,
-            av_core::tokens::approx_tokens(&chat_payload().to_string()),
-            "provider prompt usage must not be added a second time"
+            receipt.body.cost.prompt_tokens, 10,
+            "prompt total must reconcile to the provider-reported usage, \
+             not the admission-time heuristic (and never both summed)"
         );
         provider.abort();
     }
@@ -4138,6 +4173,7 @@ mod tests {
             worker: state.worker.clone(),
             store: Arc::clone(&state.store),
             budget: state.config.budget.clone(),
+            billed_prompt_tokens: 0,
             finalizer: state.finalizer.clone(),
             _lease: lease,
             response_marker: None,

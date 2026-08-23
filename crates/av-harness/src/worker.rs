@@ -52,6 +52,11 @@ pub struct WorkerJob {
     pub native_stop_reason: Option<String>,
     /// Token and compression metrics.
     pub metrics: EventMetrics,
+    /// Round-51 §6.4: provider-vs-heuristic prompt-token correction
+    /// (see `ActiveJournalRecord::prompt_token_correction`). Zero for
+    /// every job class except terminal response captures whose
+    /// provider reported `usage.prompt_tokens`.
+    pub prompt_token_correction: i64,
     /// Cost attributed to this step, in micro-USD.
     pub cost_usd_micros: u64,
     /// ATIF step representation for unsigned workflows.
@@ -90,6 +95,15 @@ pub(crate) struct ActiveJournalRecord {
     pub(crate) completion_tokens: u64,
     pub(crate) cached_tokens: u64,
     pub(crate) cost_usd_micros: u64,
+    /// Round-51 §6.4: signed reconciliation of the admission-time
+    /// prompt-token HEURISTIC against the provider's reported
+    /// `usage.prompt_tokens` (provider − heuristic; negative for the
+    /// common CJK 3-4× over-estimate). Carried on terminal response
+    /// records; `#[serde(default)]` keeps old journals readable and
+    /// lets a rolled-back binary ignore it (totals then fall back to
+    /// the heuristic — bounded degradation, never corruption).
+    #[serde(default)]
+    pub(crate) prompt_token_correction: i64,
     pub(crate) stop_reason_id: Option<u8>,
     pub(crate) response_attempt: Option<ResponseAttempt>,
 }
@@ -167,6 +181,13 @@ impl ActiveJournalRecord {
         totals.tool_allowed = checked(totals.tool_allowed, self.tool_allowed, "allowed tools")?;
         totals.tool_blocked = checked(totals.tool_blocked, self.tool_blocked, "blocked tools")?;
         totals.prompt_tokens = checked(totals.prompt_tokens, self.prompt_tokens, "prompt tokens")?;
+        if self.prompt_token_correction != 0 {
+            totals.prompt_tokens = totals
+                .prompt_tokens
+                .checked_add_signed(self.prompt_token_correction)
+                .filter(|total| *total <= av_core::error::JCS_SAFE_MAX)
+                .ok_or_else(|| "recovered prompt token correction underflow/overflow".to_owned())?;
+        }
         totals.completion_tokens = checked(
             totals.completion_tokens,
             self.completion_tokens,
@@ -202,6 +223,21 @@ impl ActiveJournalRecord {
             if value > 0 {
                 checked_atomic_add(counter, value, field)?;
             }
+        }
+        if self.prompt_token_correction != 0 {
+            totals
+                .prompt_tokens
+                .fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |current| {
+                        current
+                            .checked_add_signed(self.prompt_token_correction)
+                            .filter(|next| *next <= av_core::error::JCS_SAFE_MAX)
+                    },
+                )
+                .map(|_| ())
+                .map_err(|_| "prompt token correction underflow/overflow".to_owned())?;
         }
         Ok(())
     }
@@ -1170,6 +1206,11 @@ async fn process_job(
         } else {
             0
         },
+        prompt_token_correction: if is_response_accounting {
+            job.prompt_token_correction
+        } else {
+            0
+        },
         stop_reason_id: event.stop_reason_id,
         response_attempt: job.response_attempt.clone(),
     };
@@ -1794,6 +1835,7 @@ mod tests {
                 pruning_ratio_millis: Some(100),
             },
             cost_usd_micros: 250,
+            prompt_token_correction: 0,
             atif: Some(AtifCapture {
                 source: av_atif::Source::Agent,
                 message: Value::String("a useful response".to_owned()),
@@ -2820,6 +2862,7 @@ mod unified_fold_tests {
             completion_tokens: completion,
             cached_tokens: cached,
             cost_usd_micros: cost,
+            prompt_token_correction: 0,
             stop_reason_id: None,
             response_attempt: None,
         }
@@ -2896,6 +2939,47 @@ mod unified_fold_tests {
         assert!(
             record((0, 0, 0), 1, 0, 0, 0).apply_to_totals(&live).is_err(),
             "live fold must refuse crossing JCS_SAFE_MAX"
+        );
+    }
+
+    /// Round-51 §6.4: a terminal record carrying a provider
+    /// reconciliation (`prompt_token_correction`) must adjust the
+    /// prompt total identically on the live path and in recovery — a
+    /// crash between charge and close must not resurrect the
+    /// heuristic over-estimate into the signed receipt.
+    #[test]
+    fn correction_applies_identically_and_refuses_underflow() {
+        // Heuristic charged 30 prompt tokens, provider reported 10.
+        let mut charged = record((0, 0, 0), 30, 0, 0, 0);
+        let mut terminal = record((0, 0, 0), 0, 5, 0, 100);
+        terminal.prompt_token_correction = -20;
+
+        let mut folded = RecoveredTotals::default();
+        charged.fold_into(&mut folded).unwrap();
+        terminal.fold_into(&mut folded).unwrap();
+        assert_eq!(folded.prompt_tokens, 10);
+
+        let live = crate::session::Totals::default();
+        charged.apply_to_totals(&live).unwrap();
+        terminal.apply_to_totals(&live).unwrap();
+        use std::sync::atomic::Ordering;
+        assert_eq!(live.prompt_tokens.load(Ordering::Acquire), 10);
+
+        // A correction larger than the accumulated total is a
+        // tampered/corrupt journal: both folds must refuse, not wrap.
+        charged = record((0, 0, 0), 5, 0, 0, 0);
+        terminal.prompt_token_correction = -20;
+        let mut folded = RecoveredTotals::default();
+        charged.fold_into(&mut folded).unwrap();
+        assert!(
+            terminal.fold_into(&mut folded).is_err(),
+            "recovery fold must refuse correction underflow"
+        );
+        let live = crate::session::Totals::default();
+        charged.apply_to_totals(&live).unwrap();
+        assert!(
+            terminal.apply_to_totals(&live).is_err(),
+            "live fold must refuse correction underflow"
         );
     }
 }
