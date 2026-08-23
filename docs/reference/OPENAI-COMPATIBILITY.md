@@ -14,6 +14,31 @@ supported surface, the intentional differences, and the failure modes
 so you can reason about incidents without reading the full route
 handler.
 
+## Upstream provider dialects
+
+The client-facing surface is always the OpenAI protocol. The
+*upstream* wire dialect is selected by the `provider` config key
+(round-51 §4.2, S3):
+
+| `provider` | Upstream dialect | Also fits |
+| --- | --- | --- |
+| `"openai"` (default) | OpenAI Chat Completions | vLLM, LiteLLM, Groq, Together, DeepSeek, OpenRouter, Ollama, LM Studio, llama.cpp, xAI, Mistral, Azure OpenAI |
+| `"anthropic"` | Anthropic Messages API (named SSE events, content blocks, `input_tokens`/`output_tokens`) | — |
+| `"gemini"` | Google Gemini `generateContent` (candidates/parts, `usageMetadata`, SCREAMING_CASE finish reasons) | — |
+
+All three dialects normalize into one provider-neutral chunk before
+accounting, enforcement, and capture, so the audit chain (receipts,
+ATIF trajectories, stop-reason taxonomy, provider-true token totals)
+records the same shape regardless of the upstream. Pair `provider`
+with the matching `upstream_url`, `upstream_chat_path`,
+`upstream_auth_header` and `upstream_auth_scheme` (e.g. Anthropic's
+`x-api-key` header with an empty scheme). Unsupported `provider`
+values are refused at pre-flight by `avctl config-validate` and at
+boot by the daemon.
+
+The rest of this document describes the client-facing OpenAI surface,
+which does not change with the upstream dialect.
+
 ## Supported route
 
 | Method | Path | Notes |
