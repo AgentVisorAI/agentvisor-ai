@@ -2,9 +2,8 @@
 //! its embedded WAT policy.
 //!
 //! `include_str!` in `src/dashboard.rs` and `src/main.rs` embeds files
-//! from this crate's `dashboard/` and `policies/` directories
-//! (the policy moved in-crate in round-45), but Cargo's automatic
-//! dep-info fingerprinting proved
+//! from this crate's `dashboard/` and `policies/` directories,
+//! but Cargo's automatic dep-info fingerprinting proved
 //! unreliable for these embedded assets in this workspace — the empirical statement is that editing
 //! `dashboard/` files alone did not rebuild the binary until this
 //! script was added. Once one `rerun-if-changed` line exists, Cargo
@@ -20,7 +19,7 @@ fn main() {
     // stale bundling here means the wrong sandbox policy is enforced
     // for every request after the operator edits the .wat.
     //
-    // Round-45: the file lives INSIDE the crate now
+    // The file lives inside the crate
     // (`crates/av-harness/policies/payload_limit.wat`) so `cargo
     // publish` packages it. The out-of-crate copy at
     // `<repo>/config/policies/payload_limit.wat` is still shipped with
