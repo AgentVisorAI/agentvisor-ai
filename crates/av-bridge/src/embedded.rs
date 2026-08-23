@@ -948,27 +948,14 @@ fn recover_segment_event_uids(path: &Path, seen: &mut HashMap<String, u64>) -> R
     Ok(())
 }
 
-/// Fsync-safe replace: `File::create` → `write_all` → `sync_all` → rename
-/// → `sync_directory(parent)`. Same shape as `persist_high_water` and the
-/// hot-segment rewrite in `enforce_retention`.
+/// Fsync-safe replace. Round-51 §5.4: this used to be the fourth
+/// hand-rolled copy of the atomic-write recipe, diverging from the
+/// canonical helper by using `File::create` instead of `create_new`.
+/// Delegate to `av_core::fsutil::write_atomic` — one recipe, one set
+/// of durability invariants (create_new tmp, sync_all, rename,
+/// best-effort parent dirent fsync, RAII orphan cleanup).
 fn rewrite_atomic(path: &Path, bytes: &[u8]) -> Result<(), BusError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| BusError::Backend("atomic rewrite has no parent".to_owned()))?;
-    let tmp = path.with_extension(format!("jsonl.{}.tmp", av_core::new_event_uid()));
-    // Round-22 F3: RAII cleanup on any early Err. Without this, a
-    // failing sync/rename leaves a UUID-suffixed orphan .tmp behind
-    // and repeated retries can exhaust ext4/xfs inodes.
-    let mut guard = av_core::fsutil::TempPathGuard::new(tmp.clone());
-    {
-        let mut file = fs::File::create(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
-    guard.disarm();
-    av_core::fsutil::sync_directory(parent)?;
-    Ok(())
+    av_core::fsutil::write_atomic(path, bytes).map_err(BusError::from)
 }
 
 fn event_uid_from_value(value: &serde_json::Value) -> Option<&str> {

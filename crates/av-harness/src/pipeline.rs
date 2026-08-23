@@ -2541,9 +2541,16 @@ fn scope_allows(scopes: &[String], required: &str) -> bool {
     scopes.iter().any(|scope| {
         scope == "*"
             || scope == required
-            || scope
-                .strip_suffix(":*")
-                .is_some_and(|prefix| required.starts_with(&format!("{prefix}:")))
+            // Round-51 §5.4: allocation-free prefix match. The old
+            // `required.starts_with(&format!("{prefix}:"))` allocated a
+            // String per granted scope per request on the identity hot
+            // path. `strip_prefix(prefix)` + a `:` head check is the
+            // same predicate with zero allocations.
+            || scope.strip_suffix(":*").is_some_and(|prefix| {
+                required
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with(':'))
+            })
     })
 }
 

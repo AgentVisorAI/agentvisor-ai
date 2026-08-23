@@ -769,49 +769,36 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                 if let Err(error) = execution.bind_principal(&identity) {
                     return pipeline_error(error);
                 }
+                // Round-51 §5.1: the three cached-state arms below used
+                // to repeat this lookup+authorize block verbatim,
+                // differing only in the error string, and recomputed
+                // `tool_scope` per arm. One helper, one scope.
+                let authorized_session = |missing_context: &str| -> Result<(), Response> {
+                    let Some(session) = state.sessions.get(&execution.session_id) else {
+                        return Err(pipeline_error(crate::pipeline::PipelineError::BadRequest(
+                            format!("unknown session for {missing_context}"),
+                        )));
+                    };
+                    state
+                        .authorize_session(&headers, &session, &required_scope)
+                        .map_err(pipeline_error)
+                };
                 match execution.load().await {
                     Ok(ToolExecutionState::Completed(outcome)) => {
-                        let Some(session) = state.sessions.get(&execution.session_id) else {
-                            return pipeline_error(crate::pipeline::PipelineError::BadRequest(
-                                "unknown session for cached tool result".to_owned(),
-                            ));
-                        };
-                        if let Err(error) = state.authorize_session(
-                            &headers,
-                            &session,
-                            &crate::pipeline::tool_scope(&execution.tool),
-                        ) {
-                            return pipeline_error(error);
+                        if let Err(response) = authorized_session("cached tool result") {
+                            return response;
                         }
                         return outcome.into_response();
                     }
                     Ok(ToolExecutionState::Unaudited(outcome)) => {
-                        let Some(session) = state.sessions.get(&execution.session_id) else {
-                            return pipeline_error(crate::pipeline::PipelineError::BadRequest(
-                                "unknown session for pending tool audit".to_owned(),
-                            ));
-                        };
-                        if let Err(error) = state.authorize_session(
-                            &headers,
-                            &session,
-                            &crate::pipeline::tool_scope(&execution.tool),
-                        ) {
-                            return pipeline_error(error);
+                        if let Err(response) = authorized_session("pending tool audit") {
+                            return response;
                         }
                         (Some(execution), Some(outcome))
                     }
                     Ok(ToolExecutionState::Pending) => {
-                        let Some(session) = state.sessions.get(&execution.session_id) else {
-                            return pipeline_error(crate::pipeline::PipelineError::BadRequest(
-                                "unknown session for pending tool execution".to_owned(),
-                            ));
-                        };
-                        if let Err(error) = state.authorize_session(
-                            &headers,
-                            &session,
-                            &crate::pipeline::tool_scope(&execution.tool),
-                        ) {
-                            return pipeline_error(error);
+                        if let Err(response) = authorized_session("pending tool execution") {
+                            return response;
                         }
                         return (
                             StatusCode::CONFLICT,
@@ -942,8 +929,8 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                             "concurrent tool execution claim lost; refunding budget"
                         );
                         // Round-33 F1: refund the exact amount debited so
-                        // `payout_remaining` and per-tool counters reflect
-                        // only admitted work, not the lost race.
+                        // the budget counters reflect only admitted work,
+                        // not the lost race.
                         av_state::ActionBudget::new(
                             state.store.as_ref(),
                             &execution.session_id,
@@ -1264,6 +1251,15 @@ fn tool_response(status: StatusCode, bytes: Bytes, content_type: Option<&str>) -
     response
         .headers_mut()
         .insert(axum::http::header::CONTENT_TYPE, value);
+    // Round-51 §3.5: the MCP relay forwards the tool upstream's
+    // Content-Type verbatim; pin nosniff exactly like the chat relay
+    // (round-29 F4) so a rogue tool upstream flipping the type to
+    // text/html cannot get attacker-echoed bytes rendered by a
+    // browser-side MIME sniff.
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
     response
 }
 
@@ -3359,6 +3355,27 @@ mod tests {
         if payload.get("model").and_then(Value::as_str) == Some("empty-success") {
             return Json(json!({})).into_response();
         }
+        if payload.get("model").and_then(Value::as_str) == Some("split-sse") {
+            // One SSE frame split across two TCP chunks, cut mid-way
+            // through the é's UTF-8 encoding (0xc3 0xa9). Exercises the
+            // protocol_buffer reassembly path that no other SSE mock
+            // reaches (round-51 §10.2: every SSE mock emitted whole
+            // frames per chunk).
+            let frame = "data: {\"choices\":[{\"delta\":{\"content\":\"héllo\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                .as_bytes()
+                .to_vec();
+            let split = frame.iter().position(|byte| *byte == 0xc3).unwrap() + 1;
+            let chunks = vec![
+                Ok::<_, std::convert::Infallible>(Bytes::copy_from_slice(&frame[..split])),
+                Ok(Bytes::copy_from_slice(&frame[split..])),
+            ];
+            let mut response = Response::new(Body::from_stream(futures::stream::iter(chunks)));
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            return response;
+        }
         if payload.get("model").and_then(Value::as_str) == Some("truncated-stream") {
             // One delta, then a clean end: no finish_reason, no usage,
             // no [DONE] — the §6.4 truncation shape (provider crash,
@@ -5208,6 +5225,55 @@ mod tests {
         assert!(
             !state.sessions.get("tool-oob-index").unwrap().capture_failed(),
             "an out-of-range tool-call index must be scoped to the response"
+        );
+        provider.abort();
+    }
+
+    /// Round-51 §10.2: no SSE mock ever split a frame across a stream
+    /// chunk, though `protocol_buffer` exists precisely to reassemble
+    /// one. Split a frame mid-way through a multi-byte UTF-8 scalar
+    /// and prove the reassembled message reaches the audit trail
+    /// intact (the non-SSE equivalent lives at `split-json`).
+    #[tokio::test]
+    async fn sse_frame_split_across_chunks_reassembles_before_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state(directory.path()).await;
+        let response = build_router(state.clone())
+            .oneshot(chat_request_with_payload(
+                "split-sse",
+                json!({
+                    "model": "split-sse",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "hello"}]
+                }),
+            ))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        // The client sees the full reassembled bytes.
+        assert!(String::from_utf8_lossy(&body).contains("héllo"), "client bytes truncated");
+        let session = state.sessions.get("split-sse").unwrap();
+        session.wait_for_worker_jobs().await;
+        assert!(
+            !session.capture_failed(),
+            "a chunk-split frame must not fail capture"
+        );
+        let crate::reconciler::FinalizeOutcome::Atif { path } = state
+            .finalizer
+            .close_session(session, StopReason::SessionClosed)
+            .await
+            .unwrap()
+        else {
+            panic!("expected ATIF")
+        };
+        let trajectory: av_atif::Trajectory =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            trajectory.steps[1].message,
+            Value::String("héllo".to_owned()),
+            "the audit trail must carry the reassembled multi-byte content"
         );
         provider.abort();
     }

@@ -173,7 +173,7 @@ pub struct EventMetrics {
 }
 
 /// OCSF Fingerprint observable (id 30) — roadmap: per-forward-pass inventory
-/// fingerprinting of tool schemas + sampling params, chained like `prev_event`.
+/// fingerprinting of tool schemas + sampling params, chained via `prev_inventory`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Fingerprint {
@@ -286,7 +286,7 @@ pub struct OcsfEvent {
     /// Per-forward-pass inventory fingerprint (roadmap, flag-gated).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inventory: Option<Fingerprint>,
-    /// Previous inventory fingerprint (chained like `prev_event`).
+    /// Previous inventory fingerprint in the chain (see `inventory`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prev_inventory: Option<Fingerprint>,
     /// Unknown fields captured on inbound parse (evolution tolerance).

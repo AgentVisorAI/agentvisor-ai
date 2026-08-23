@@ -1,4 +1,4 @@
-.PHONY: fmt fmt-check lint lint-all-features test test-all bench sla schema-check compose-check ci doc clean run doctor
+.PHONY: fmt fmt-check lint lint-all-features test test-fast test-all bench sla schema-check compose-check ci doc clean run doctor
 
 run:
 	cargo run -p av-harness --bin agentvisord
@@ -20,6 +20,12 @@ lint-all-features:
 
 test:
 	cargo test --workspace
+
+# Fast inner loop: unit tests only (~4 s vs ~195 s for the full suite;
+# covers ~54% of tests). Use during development; run `make test` before
+# pushing.
+test-fast:
+	cargo test --workspace --lib
 
 test-all:
 	cargo test --workspace --all-features

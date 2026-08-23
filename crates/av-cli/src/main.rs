@@ -161,8 +161,19 @@ enum ValidationMode {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    run(Cli::parse()).await
+async fn main() -> std::process::ExitCode {
+    // Round-51 §3.5: returning `Result<()>` relied on the default
+    // Termination impl printing anyhow's DEBUG format — which appends
+    // a full captured backtrace whenever RUST_BACKTRACE is exported,
+    // leaking 12 lines of internal frames on every well-formed user
+    // error (bad TOML, missing file). Print the Display chain only.
+    match run(Cli::parse()).await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
 async fn run(cli: Cli) -> Result<()> {
