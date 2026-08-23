@@ -123,7 +123,7 @@ impl<'a> ActionBudget<'a> {
     }
 
     /// Common key prefix for every principal-scoped budget counter. Distinct
-    /// namespace from [`session_prefix`] so a session cleanup on close does
+    /// namespace from [`Self::session_prefix`] so a session cleanup on close does
     /// not touch the principal ledger — the principal ledger persists across
     /// session boundaries by design.
     pub fn principal_prefix(principal: &str) -> String {
