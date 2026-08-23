@@ -343,8 +343,20 @@ adapter's implementation verbatim.
      provider-true totals (25/15), verbatim relay, and the signed
      receipt's stop taxonomy.
 3. Add `GoogleGeminiAdapter`. Same pattern.
+   * ✅ LANDED (round-51 pass 23): `GoogleGeminiAdapter` under
+     `provider = "gemini"` maps candidates/parts (text, `thought`,
+     complete `functionCall` objects), cumulative `usageMetadata`,
+     `promptFeedback.blockReason`, and SCREAMING_CASE finish reasons
+     (safety-class → `content_filter`) into the neutral chunk.
+     Named SSE frames with data are refused (Gemini frames are
+     unnamed). `gemini_session_records_the_same_audit_shape` pins
+     the full chain against a mock Gemini upstream.
 4. Update `docs/reference/OPENAI-COMPATIBILITY.md` to a broader
    "provider compatibility" doc.
+   * ✅ LANDED (round-51 pass 23): the doc opens with the upstream
+     provider-dialect table (`provider` key, three dialects, the
+     normalization guarantee) while keeping its client-facing OpenAI
+     scope. S3 is complete.
 
 ### Tests that must remain green
 

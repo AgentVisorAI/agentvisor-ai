@@ -3742,6 +3742,109 @@ mod tests {
         (state, server)
     }
 
+    /// Mock Gemini streamGenerateContent upstream: unnamed data
+    /// frames, candidates/parts, cumulative usageMetadata (S3 step 3).
+    async fn mock_gemini_chat() -> Response {
+        let frames = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello from gemini\"}],\"role\":\"model\"},\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":25,\"candidatesTokenCount\":1},\"modelVersion\":\"gemini-2.0-flash\"}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"!\"}]},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":25,\"candidatesTokenCount\":15}}\n\n",
+        );
+        let mut response = Response::new(Body::from(frames));
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        response
+    }
+
+    async fn test_state_gemini(spool: &std::path::Path) -> (AppState, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = Router::new().route("/v1/chat/completions", post(mock_gemini_chat));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, provider).await.unwrap();
+        });
+        let mut config = crate::config::HarnessConfig::for_tests(
+            &format!("http://{address}"),
+            &spool.to_string_lossy(),
+            &spool.to_string_lossy(),
+        );
+        config.provider = "gemini".to_owned();
+        let state = AppState::new(
+            config,
+            Arc::new(InMemoryStore::new()),
+            Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
+            Arc::new(NullBus),
+            None,
+            Arc::new(Ed25519Signer::from_seed(&[11; 32])),
+        )
+        .unwrap();
+        (state, server)
+    }
+
+    /// S3 step 3 (round-51 §4.2): a session against a mock Gemini
+    /// upstream produces the same audit-chain shape as an OpenAI one —
+    /// provider-true usage, SCREAMING_CASE stop reason folded into the
+    /// stop taxonomy, verbatim relay.
+    #[tokio::test]
+    async fn gemini_session_records_the_same_audit_shape() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state_gemini(directory.path()).await;
+        let app = build_router(state.clone());
+        let response = app.clone().oneshot(chat_request("gemini-flow")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("hello from gemini"),
+            "streamed bytes must relay verbatim: {body}"
+        );
+
+        let session = state.sessions.get("gemini-flow").unwrap();
+        session.wait_for_worker_jobs().await;
+        use std::sync::atomic::Ordering;
+        assert_eq!(session.totals.prompt_tokens.load(Ordering::Acquire), 25);
+        assert_eq!(session.totals.completion_tokens.load(Ordering::Acquire), 15);
+
+        let close = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/gemini-flow/close")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(close.status(), StatusCode::OK);
+        let promoted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/gemini-flow/promote")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(promoted.status(), StatusCode::OK);
+        let receipt: av_receipts::Receipt = serde_json::from_slice(
+            &axum::body::to_bytes(promoted.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        receipt.verify_embedded().unwrap();
+        assert_eq!(receipt.body.stop_reason_id, av_events::StopReason::Stop.id());
+        assert_eq!(receipt.body.cost.prompt_tokens, 25);
+        assert_eq!(receipt.body.cost.completion_tokens, 15);
+        provider.abort();
+    }
+
     /// S3 step 2 (round-51 §4.2): a session against a mock Anthropic
     /// upstream produces the same audit-chain shape as an OpenAI one —
     /// provider-true usage in the totals, the native stop reason folded
