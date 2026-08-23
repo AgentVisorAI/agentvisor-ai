@@ -1964,11 +1964,28 @@ pub async fn health(base_url: &str) -> Result<()> {
         .timeout(Duration::from_secs(3))
         .build()
         .context("build health client")?;
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?;
+    let response = match client.get(&url).send().await {
+        Ok(response) => response,
+        // Round-51 §9.4: this is the container-healthcheck path — the
+        // raw reqwest transport error ("error sending request") tells
+        // an operator nothing. A connect failure means nothing is
+        // listening; name the likely fix instead of the transport.
+        Err(error) if error.is_connect() => {
+            anyhow::bail!(
+                "nothing is listening at {url} — the harness is not running \
+                 (try `avctl start`, or check `listen` in the config if it \
+                 should already be up)"
+            );
+        }
+        Err(error) if error.is_timeout() => {
+            anyhow::bail!(
+                "no response from {url} within 3s — the harness may be hung \
+                 or the address may be blackholed (check `listen` and any \
+                 firewall between)"
+            );
+        }
+        Err(error) => return Err(anyhow::Error::new(error).context(format!("GET {url}"))),
+    };
     if !response.status().is_success() {
         anyhow::bail!("harness unhealthy: HTTP {}", response.status().as_u16());
     }

@@ -60,6 +60,14 @@ pub fn build_router(state: AppState) -> Router {
             request_metrics,
         ))
         .layer(axum::middleware::from_fn(trace_request))
+        // Round-51 §9.4: axum's DefaultBodyLimit rejection is a bare
+        // text/plain "length limit exceeded" — it names neither the
+        // knob nor the limit, breaks the JSON error contract every
+        // other response honours, and is the first error a
+        // vision-agent user hits. Rewrite it into the OpenAI error
+        // shape naming `max_request_bytes` and its configured value.
+        // Sits OUTSIDE the limit layer so it sees the 413 response.
+        .layer(axum::middleware::from_fn_with_state(state.clone(), explain_body_limit))
         // axum's default body limit is 2 MiB, which silently rejects large
         // chat contexts (Claude 200k, GPT-4 128k) before the sandbox even
         // sees the payload. `max_request_bytes` (default 4 MiB, matching
@@ -67,6 +75,47 @@ pub fn build_router(state: AppState) -> Router {
         // control.
         .layer(axum::extract::DefaultBodyLimit::max(max_body))
         .with_state(state)
+}
+
+/// See the layer comment in [`build_router`]: turn the bare-text 413
+/// from `DefaultBodyLimit` into the OpenAI-shaped JSON error, naming
+/// the config knob and the configured limit.
+async fn explain_body_limit(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let response = next.run(request).await;
+    if response.status() != StatusCode::PAYLOAD_TOO_LARGE {
+        return response;
+    }
+    // Only rewrite the extractor's bare-text rejection; a JSON 413
+    // minted by a handler already honours the contract.
+    let is_json = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    if is_json {
+        return response;
+    }
+    let limit = state.config.max_request_bytes;
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(serde_json::json!({
+            "error": {
+                "message": format!(
+                    "request body exceeds max_request_bytes ({limit} bytes); \
+                     raise `max_request_bytes` in the harness config if larger \
+                     payloads are intended"
+                ),
+                "type": "invalid_request_error",
+                "param": serde_json::Value::Null,
+                "code": "payload_too_large",
+            }
+        })),
+    )
+        .into_response()
 }
 
 /// Round-51 §3.5 (DNS rebinding): when `allowed_hosts` is non-empty,
@@ -3745,6 +3794,53 @@ mod tests {
         )
         .unwrap();
         (state, server)
+    }
+
+    /// Round-51 §9.4: the body-limit rejection must honour the JSON
+    /// error contract and name the knob + limit — axum's default is a
+    /// bare text/plain "length limit exceeded".
+    #[tokio::test]
+    async fn oversize_body_413_is_json_and_names_the_knob() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state(directory.path()).await;
+        let limit = state.config.max_request_bytes;
+        let app = build_router(state);
+        let oversize = "x".repeat(limit + 1);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("x-av-session", "too-big")
+                    .body(Body::from(oversize))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            content_type.starts_with("application/json"),
+            "413 must honour the JSON error contract, got {content_type}"
+        );
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("max_request_bytes") && message.contains(&limit.to_string()),
+            "413 must name the knob and the configured limit: {message}"
+        );
+        provider.abort();
     }
 
     /// Mock Gemini streamGenerateContent upstream: unnamed data
