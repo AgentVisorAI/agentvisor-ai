@@ -3,6 +3,13 @@ listen = "0.0.0.0:8484"
 upstream_url = "http://host.docker.internal:4000"
 upstream_http2_prior_knowledge = false
 upstream_read_timeout_s = 300
+# Without an explicit drain budget the harness derives
+# upstream_read_timeout_s + 5 = 305 s, which exceeds the compose file's
+# stop_grace_period (120 s) — Docker would SIGKILL mid-drain, dropping
+# receipts and truncating ATIF trajectories. 110 s keeps the full
+# shutdown sequence (drain + worker wait_idle + finalize + telemetry)
+# inside the grace period with headroom. Mirrors harness.container.toml.
+shutdown_drain_timeout_s = 110
 # tool_upstream_url = "http://host.docker.internal:3000/mcp"
 require_identity = true
 audience = "agentvisor-ai"

@@ -1283,6 +1283,12 @@ impl AppState {
     /// makes quotas work) was what moved the work to `spawn_blocking`,
     /// which was backwards. Small bodies stay inline (spawn_blocking
     /// costs ~10-20 µs of handoff — 2× the total gate cost at 75 B).
+    ///
+    /// The `budget.max_tokens.is_none()` clause below is load-bearing,
+    /// not a leftover: with a budget configured, `prepare_chat` calls
+    /// `ActionBudget::try_tokens` → `StateStore::try_spend`, which on
+    /// the redis backend is a synchronous network round-trip — that
+    /// must never run inline on a tokio worker, whatever the body size.
     pub async fn prepare_chat_nonblocking(
         &self,
         headers: &HeaderMap,
