@@ -214,6 +214,19 @@ not a lifecycle marker.
    is the simplest since it's a terminal state, then
    `close_complete → SessionState::Complete`, etc. Each migration
    is a PR; the old flag stays until the new enum is authoritative.
+   * ✅ `artifact_committed` + `close_complete` readers (round-51
+     pass 19): every reader of the two chain flags (the accessor
+     pair, `is_empty_unsigned_quarantine`, `evict_finalized`, the
+     latched-retention filter, `pending_close_sessions`, and the
+     artifact half of `is_closed`) now reads the enum; the setters
+     advance the enum FIRST so readers never observe a mirror flag
+     ahead of the state. The two flags are write-only mirrors
+     awaiting step-3 deletion. (`capture_failed` was reclassified
+     in step 1 as an orthogonal property, not a chain state, so it
+     does not migrate.) Remaining: the `closed` claim flag — a
+     claim lock, not a chain position; it either stays (like
+     `admission_open`) or becomes its own two-state claim cell in
+     step 3.
 3. Delete the flags in reverse order once every reader/writer uses
    the enum.
 
