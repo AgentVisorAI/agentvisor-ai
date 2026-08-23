@@ -735,6 +735,20 @@ async fn read_capped_response(response: reqwest::Response, max_bytes: u64) -> Re
 fn config_validate(path: &Path) -> Result<()> {
     let text = read_capped_str(path, MAX_CONFIG_BYTES, "config")?;
     let config = av_harness::HarnessConfig::from_toml(&text).map_err(anyhow::Error::msg)?;
+    // Round-51 §8.10: a shape-valid config is useless if it selects
+    // backends the binary cannot run — previously this reported
+    // "valid" for `bridge_backend = "kafka"` on a default-features
+    // build and the daemon then hard-failed at boot. avctl and
+    // agentvisord are built from the same workspace feature set in
+    // every shipped artifact, so avctl's own features are the best
+    // available proxy for what the daemon can run.
+    let unsupported = config.unsupported_backend_requirements();
+    if !unsupported.is_empty() {
+        anyhow::bail!(
+            "config is structurally valid but this build cannot run it:\n  {}",
+            unsupported.join("\n  ")
+        );
+    }
     println!(
         "valid config_version={} listen={}",
         config.config_version, config.listen

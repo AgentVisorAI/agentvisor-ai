@@ -749,6 +749,46 @@ impl HarnessConfig {
         }
     }
 
+    /// Backends this configuration selects that the *current build*
+    /// cannot run because the required cargo feature was compiled out
+    /// (round-51 §8.10: `avctl config-validate` reported "valid" for
+    /// `bridge_backend = "kafka"` on a default-features binary; the
+    /// daemon then hard-failed at boot — neither pre-flight tool knew
+    /// what the binary could actually run). Returns one message per
+    /// unsatisfiable selection; empty means every configured backend
+    /// is compiled in. `validate()` deliberately does NOT fold this
+    /// in: shape validity and build capability are different
+    /// questions (a config can be valid for a `--features full`
+    /// daemon while the avctl doing the pre-flight was built lean).
+    #[must_use]
+    pub fn unsupported_backend_requirements(&self) -> Vec<String> {
+        let mut missing = Vec::new();
+        let mut require = |enabled: bool, field: &str, value: &str, feature: &str| {
+            if !enabled {
+                missing.push(format!(
+                    "{field} = {value:?} requires the `{feature}` cargo feature, \
+                     which this build was compiled without (rebuild with \
+                     --features {feature} or full)"
+                ));
+            }
+        };
+        match self.bridge_backend.as_str() {
+            "kafka" => require(cfg!(feature = "kafka"), "bridge_backend", "kafka", "kafka"),
+            "nats" => require(cfg!(feature = "nats"), "bridge_backend", "nats", "nats"),
+            _ => {}
+        }
+        if self.state_backend == "redis" {
+            require(cfg!(feature = "redis"), "state_backend", "redis", "redis");
+        }
+        if self.embedder_backend == "onnx" {
+            require(cfg!(feature = "onnx"), "embedder_backend", "onnx", "onnx");
+        }
+        if self.vector_backend == "qdrant" {
+            require(cfg!(feature = "qdrant"), "vector_backend", "qdrant", "qdrant");
+        }
+        missing
+    }
+
     /// Structural validation.
     pub fn validate(&self) -> Result<(), String> {
         if self.config_version != CONFIG_VERSION {
@@ -1375,6 +1415,42 @@ mod tests {
         assert_eq!(cfg.upstream_auth_scheme, "Bearer");
         assert!(cfg.upstream_api_key_env.is_none());
         assert!(!cfg.upstream_authorization_passthrough);
+    }
+
+    /// Round-51 §8.10: the default backends (embedded/memory/hash/
+    /// memory) require no cargo feature and must always be runnable.
+    #[test]
+    fn default_backends_never_report_unsupported_requirements() {
+        let cfg = HarnessConfig::from_toml(r#"upstream_url = "https://api.openai.com""#).unwrap();
+        assert!(cfg.unsupported_backend_requirements().is_empty());
+    }
+
+    /// Round-51 §8.10: each feature-gated backend is reported exactly
+    /// when its cargo feature is compiled out — written against
+    /// `cfg!` so the same assertion holds under default features AND
+    /// `--all-features` CI runs.
+    #[test]
+    fn unsupported_backend_requirements_track_build_features() {
+        let mut cfg = HarnessConfig::from_toml(r#"upstream_url = "https://api.openai.com""#).unwrap();
+        cfg.bridge_backend = "kafka".to_owned();
+        cfg.state_backend = "redis".to_owned();
+        cfg.embedder_backend = "onnx".to_owned();
+        cfg.vector_backend = "qdrant".to_owned();
+        let missing = cfg.unsupported_backend_requirements();
+        for (enabled, feature) in [
+            (cfg!(feature = "kafka"), "kafka"),
+            (cfg!(feature = "redis"), "redis"),
+            (cfg!(feature = "onnx"), "onnx"),
+            (cfg!(feature = "qdrant"), "qdrant"),
+        ] {
+            let reported = missing
+                .iter()
+                .any(|message| message.contains(&format!("`{feature}`")));
+            assert_eq!(
+                reported, !enabled,
+                "feature {feature}: enabled={enabled} but reported={reported} in {missing:?}"
+            );
+        }
     }
 
     /// A typo'd key must fail loudly (naming the offender) instead of being

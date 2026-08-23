@@ -15,21 +15,23 @@ use std::sync::Arc;
 use tracing_subscriber::prelude::*;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     // Fail-closed CLI contract: agentvisord historically ignored ALL
     // arguments, so `agentvisord --config /etc/prod.toml` silently booted
     // from the env/search-path config instead (possibly permissive
     // defaults), and `--help` started a server. For a security proxy,
-    // unrecognized arguments must refuse to start.
+    // unrecognized arguments must refuse to start. CLI/usage output is
+    // deliberately plain text: it is for the human at the terminal and
+    // happens before the structured logger exists.
     let config_override = match parse_cli_args(std::env::args().skip(1)) {
         Ok(CliAction::Run(config_override)) => config_override,
         Ok(CliAction::Help) => {
             println!("{USAGE}");
-            return Ok(());
+            return;
         }
         Ok(CliAction::Version) => {
             println!("agentvisord {}", env!("CARGO_PKG_VERSION"));
-            return Ok(());
+            return;
         }
         Err(error) => {
             eprintln!("{error}\n\n{USAGE}");
@@ -37,6 +39,24 @@ async fn main() -> Result<()> {
         }
     };
 
+    if let Err(error) = run(config_override).await {
+        // Round-51 §8.10: the daemon logs structured JSON, but a fatal
+        // startup/shutdown error used to return through anyhow and
+        // print as a bare `Error:` line plus a backtrace — unparseable
+        // to the log pipeline at exactly the moment it matters most.
+        // Route the fatal reason through the structured logger when it
+        // is up; fall back to stderr only when tracing itself never
+        // initialized (the one failure that cannot be self-reported).
+        if tracing::dispatcher::has_been_set() {
+            tracing::error!(error = format!("{error:#}"), "agentvisord exiting on fatal error");
+        } else {
+            eprintln!("agentvisord exiting on fatal error: {error:#}");
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn run(config_override: Option<PathBuf>) -> Result<()> {
     #[cfg(feature = "otel")]
     let telemetry_provider = init_tracing()?;
     #[cfg(not(feature = "otel"))]
@@ -44,6 +64,18 @@ async fn main() -> Result<()> {
 
     let (config, config_source) =
         av_harness::config::load_config_with_override(config_override).map_err(anyhow::Error::msg)?;
+    // Round-51 §8.10: refuse the whole configuration up front, with the
+    // complete list, when it selects backends this binary was compiled
+    // without. The individual build_* sites keep their own bails as
+    // defense in depth, but they fail one at a time and only when
+    // reached — an operator fixing kafka would then discover onnx.
+    let unsupported = config.unsupported_backend_requirements();
+    if !unsupported.is_empty() {
+        anyhow::bail!(
+            "this build cannot run the resolved configuration: {}",
+            unsupported.join("; ")
+        );
+    }
     let manifest = load_manifest(&config)?;
     let bridge = build_bridge(&config, &manifest)?;
 

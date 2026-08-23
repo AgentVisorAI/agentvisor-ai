@@ -1575,7 +1575,15 @@ pub async fn doctor(offline: bool) -> Result<()> {
             }
         }
 
-        // 9b. Round-51 §9.4: the three checkout-path footguns doctor
+        // 9b. Round-51 §8.10: backends the config selects that THIS
+        // build cannot run. Previously doctor passed every check while
+        // the daemon was guaranteed to hard-fail at boot on a
+        // compiled-out backend.
+        for problem in config.unsupported_backend_requirements() {
+            checks.push(Check::Fail(problem));
+        }
+
+        // 9c. Round-51 §9.4: the three checkout-path footguns doctor
         // used to miss entirely.
         if !config.listen.starts_with("127.0.0.1") && !config.listen.starts_with("localhost") {
             checks.push(Check::Warn(format!(
