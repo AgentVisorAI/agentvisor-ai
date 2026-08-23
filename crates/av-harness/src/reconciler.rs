@@ -1104,15 +1104,6 @@ impl Finalizer {
         // mutated. Without this change, a large ATIF spool at restart
         // would block every /v1/close client call for the duration of
         // the scan.
-        //
-        // S1 steps 2-3 (round-51 §4.2): concerns extracted from this
-        // method run as `RecoveryPass`es over a narrow context,
-        // invoked explicitly at their historical positions — ordering
-        // between passes and the not-yet-extracted phases is
-        // load-bearing (the incomplete-effects scan must see the
-        // registry BEFORE journal recovery adopts sessions; the
-        // orphan-JSON quarantine must snapshot stems AFTER). The flat
-        // registry loop arrives once every phase is a pass (step 4).
         let warn_once = |path: PathBuf| self.warn_once(path);
         let ctx = crate::recovery::ReconcilerContext {
             spool_dir: &self.spool_dir,
@@ -1123,11 +1114,55 @@ impl Finalizer {
             bridge: self.bridge.as_ref(),
             warn_once: &warn_once,
         };
-        crate::recovery::run_pass(&crate::recovery::QuarantineIncompleteEffectsPass, &ctx).await?;
-        crate::recovery::run_pass(&crate::recovery::ReplayLifecycleOutboxesPass, &ctx).await?;
-        let signed_recovered = self.recover_signed_journals(sessions, breaker).await?;
-        self.consolidate_step_journals(sessions, breaker).await?;
-        crate::recovery::run_pass(&crate::recovery::QuarantineOrphanJsonPass, &ctx).await?;
+        // S1 step 4 (round-51 §4.2): the flat ordered pass runner —
+        // every phase of the recovery scan is a `RecoveryPass`. Leaf
+        // passes are unit structs over the narrow context; the
+        // journal/adoption phases carry `&Finalizer` because closing,
+        // promoting and signing ARE the Finalizer's competency (the
+        // S1 plan keeps its public API and delegates internally).
+        // Order is load-bearing, top to bottom:
+        //   1. incomplete-effects markers must see the registry
+        //      BEFORE journal recovery adopts sessions;
+        //   2. outbox replay must publish a crash's close events
+        //      before its session is re-adopted;
+        //   3. signed-journal recovery before step-journal
+        //      consolidation (signed candidates take precedence);
+        //   4. the orphan-JSON quarantine snapshots live stems AFTER
+        //      adoption grew the registry;
+        //   5. strict-ATIF adoption walks whatever survived 1-4.
+        let passes: [&dyn crate::recovery::RecoveryPass; 6] = [
+            &crate::recovery::QuarantineIncompleteEffectsPass,
+            &crate::recovery::ReplayLifecycleOutboxesPass,
+            &crate::recovery::RecoverSignedJournalsPass {
+                finalizer: self,
+                breaker,
+            },
+            &crate::recovery::ConsolidateStepJournalsPass {
+                finalizer: self,
+                breaker,
+            },
+            &crate::recovery::QuarantineOrphanJsonPass,
+            &crate::recovery::AdoptStrictAtifPass {
+                finalizer: self,
+                breaker,
+            },
+        ];
+        let mut recovered = 0usize;
+        for pass in passes {
+            recovered = recovered.saturating_add(crate::recovery::run_pass(pass, &ctx).await?.recovered);
+        }
+        Ok(recovered)
+    }
+
+    /// Strict-ATIF adoption scan (body of `AdoptStrictAtifPass`):
+    /// walk the spool for sealed `{stem}.json` artifacts of closed
+    /// unsigned sessions not yet in the registry, strict-validate,
+    /// and re-adopt them. Returns the number adopted.
+    pub(crate) async fn adopt_strict_atif_artifacts(
+        &self,
+        sessions: &SessionRegistry,
+        breaker: &av_loopdetect::BreakerConfig,
+    ) -> Result<usize, FinalizeError> {
         let mut entries = match tokio::fs::read_dir(&self.spool_dir).await {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -1610,7 +1645,7 @@ impl Finalizer {
             }
         }
         self.remove_acked_lifecycle_outboxes(sessions).await?;
-        Ok(recovered + signed_recovered)
+        Ok(recovered)
     }
 
     // Round-40 F1 -> round-41: extracted the per-candidate body
@@ -1625,7 +1660,7 @@ impl Finalizer {
     // depends on this being uniform across every recovery path;
     // the block's outcome enum makes the "did this candidate
     // actually recover" question type-safe.
-    async fn recover_signed_journals(
+    pub(crate) async fn recover_signed_journals(
         &self,
         sessions: &SessionRegistry,
         breaker: &av_loopdetect::BreakerConfig,
@@ -2071,7 +2106,7 @@ impl Finalizer {
             .map_err(FinalizeError::Bridge)
     }
 
-    async fn consolidate_step_journals(
+    pub(crate) async fn consolidate_step_journals(
         &self,
         sessions: &SessionRegistry,
         breaker: &av_loopdetect::BreakerConfig,

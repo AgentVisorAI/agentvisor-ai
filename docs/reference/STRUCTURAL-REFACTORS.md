@@ -109,12 +109,23 @@ pass registry internally.
      close/emit paths); the pass owns identity, ordering and
      observability. `ReconcilerContext` gained the optional bridge
      handle; bridge-less contexts make the pass a no-op.
-   * Remaining: `RecoverSignedJournalsPass`,
-     `ConsolidateStepJournalsPass`, `AdoptStrictAtifPass` (the tail
-     of the current method).
+   * ✅ `RecoverSignedJournalsPass`, `ConsolidateStepJournalsPass`,
+     `AdoptStrictAtifPass` (round-51 pass 17): the three heavyweight
+     phases are Finalizer-backed passes — closing, promoting and
+     signing are the Finalizer's competency, so these pass structs
+     carry `&Finalizer` while leaf passes stay on the narrow
+     context. The adoption tail left `recover_spooled_sessions` into
+     its own method (`adopt_strict_atif_artifacts`).
 4. **Once the pass registry is stable**, move the retention sweep
    from main.rs into the same registry (it's currently spawned
    separately because the reconciler didn't have a home for it).
+   * ✅ Flat runner (round-51 pass 17): `recover_spooled_sessions`
+     is now a thin ordered loop over six `RecoveryPass`es, with the
+     load-bearing order documented at the runner (markers before
+     adoption, outbox replay before re-adoption, signed before
+     step-journal consolidation, stem snapshot after adoption,
+     strict-ATIF adoption last). Remaining (optional): fold the
+     retention sweep into the same registry.
 
 ### Tests that must remain green
 

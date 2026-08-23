@@ -76,6 +76,8 @@ pub(crate) struct PassOutcome {
     pub quarantined: usize,
     /// Lifecycle outboxes published + acked this run.
     pub replayed: usize,
+    /// Sessions adopted back into the registry this run.
+    pub recovered: usize,
 }
 
 /// One self-contained concern of the recovery scan. Implementations
@@ -94,13 +96,10 @@ pub(crate) trait RecoveryPass: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<PassOutcome, FinalizeError>> + Send + 'a>>;
 }
 
-/// Run one pass with tick-level observability. The reconciler
-/// invokes extracted passes explicitly, in recovery order, at their
-/// historical positions — ordering between passes and the not-yet-
-/// extracted phases is load-bearing (e.g. the incomplete-effects
-/// scan must see the registry BEFORE journal recovery adopts
-/// sessions), so a single flat registry loop only becomes possible
-/// once every phase is a pass (S1 step 4).
+/// Run one pass with tick-level observability.
+/// `recover_spooled_sessions` is a flat ordered runner over these
+/// (S1 step 4); the order encodes load-bearing constraints
+/// documented at the runner.
 pub(crate) async fn run_pass(
     pass: &dyn RecoveryPass,
     ctx: &ReconcilerContext<'_>,
@@ -207,6 +206,96 @@ impl RecoveryPass for ReplayLifecycleOutboxesPass {
             )
             .await?;
             Ok(outcome)
+        })
+    }
+}
+
+/// Signed-journal recovery: adopt crash-interrupted sessions whose
+/// signed journals survived, folding their records through the
+/// unified accounting rule. Carries `&Finalizer` — closing,
+/// promoting and signing are the Finalizer's competency; the S1 plan
+/// keeps its public API and delegates internally. Runs before
+/// step-journal consolidation (signed candidates take precedence).
+pub(crate) struct RecoverSignedJournalsPass<'f> {
+    pub finalizer: &'f crate::reconciler::Finalizer,
+    pub breaker: &'f av_loopdetect::BreakerConfig,
+}
+
+impl RecoveryPass for RecoverSignedJournalsPass<'_> {
+    fn name(&self) -> &'static str {
+        "recover_signed_journals"
+    }
+
+    fn run<'a>(
+        &'a self,
+        ctx: &'a ReconcilerContext<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<PassOutcome, FinalizeError>> + Send + 'a>> {
+        Box::pin(async move {
+            let recovered = self
+                .finalizer
+                .recover_signed_journals(ctx.sessions, self.breaker)
+                .await?;
+            Ok(PassOutcome {
+                recovered,
+                ..PassOutcome::default()
+            })
+        })
+    }
+}
+
+/// Step-journal consolidation: fold unsigned per-step journals of
+/// crash-interrupted sessions into recovered sessions via the
+/// unified accounting rule. Finalizer-backed for the same reason as
+/// `RecoverSignedJournalsPass`.
+pub(crate) struct ConsolidateStepJournalsPass<'f> {
+    pub finalizer: &'f crate::reconciler::Finalizer,
+    pub breaker: &'f av_loopdetect::BreakerConfig,
+}
+
+impl RecoveryPass for ConsolidateStepJournalsPass<'_> {
+    fn name(&self) -> &'static str {
+        "consolidate_step_journals"
+    }
+
+    fn run<'a>(
+        &'a self,
+        ctx: &'a ReconcilerContext<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<PassOutcome, FinalizeError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.finalizer
+                .consolidate_step_journals(ctx.sessions, self.breaker)
+                .await?;
+            Ok(PassOutcome::default())
+        })
+    }
+}
+
+/// Strict-ATIF adoption: the tail of the recovery order — walk the
+/// spool for sealed artifacts of closed unsigned sessions not in the
+/// registry and re-adopt them. Finalizer-backed.
+pub(crate) struct AdoptStrictAtifPass<'f> {
+    pub finalizer: &'f crate::reconciler::Finalizer,
+    pub breaker: &'f av_loopdetect::BreakerConfig,
+}
+
+impl RecoveryPass for AdoptStrictAtifPass<'_> {
+    fn name(&self) -> &'static str {
+        "adopt_strict_atif"
+    }
+
+    fn run<'a>(
+        &'a self,
+        ctx: &'a ReconcilerContext<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<PassOutcome, FinalizeError>> + Send + 'a>> {
+        Box::pin(async move {
+            let recovered = self
+                .finalizer
+                .adopt_strict_atif_artifacts(ctx.sessions, self.breaker)
+                .await?;
+            Ok(PassOutcome {
+                recovered,
+                ..PassOutcome::default()
+            })
         })
     }
 }
