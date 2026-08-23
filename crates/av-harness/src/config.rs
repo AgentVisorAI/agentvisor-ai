@@ -277,7 +277,7 @@ pub struct HarnessConfig {
     /// Token budget per session (compression/velocity accounting).
     #[serde(default)]
     pub budget: av_state::BudgetSpec,
-    /// Optional principal-scoped budget layered on top of [`budget`].
+    /// Optional principal-scoped budget layered on top of [`Self::budget`].
     ///
     /// The default `[budget]` counters are keyed on the request's session
     /// id — a header the caller chooses (see [`Self::require_identity`]).

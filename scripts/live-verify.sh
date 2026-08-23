@@ -101,6 +101,30 @@ TOML
 python3 "$WORK/mock_upstream.py" &
 MOCK_PID=$!
 
+# Wait for the mock upstream to LISTEN before the hero request can race
+# it. The /readyz gate below only proves the daemon is up — the daemon
+# never dials the upstream until the first proxied request, so a python
+# interpreter still cold-starting when the hero request lands turns into
+# a connect refusal and a deterministic `hero snippet returned HTTP 502`
+# on slow CI runners (the mock's GET answer is a 501, which is fine:
+# any HTTP response proves the socket is accepting).
+mock_ready=0
+for _ in $(seq 1 40); do
+    if curl -s -o /dev/null -m 1 "http://127.0.0.1:${UPSTREAM_PORT}/"; then
+        mock_ready=1
+        break
+    fi
+    if ! kill -0 "$MOCK_PID" 2>/dev/null; then
+        echo "FAILED    mock upstream exited early" >&2
+        exit 1
+    fi
+    sleep 0.25
+done
+if [[ "$mock_ready" != 1 ]]; then
+    echo "FAILED    mock upstream never started listening on ${UPSTREAM_PORT}" >&2
+    exit 1
+fi
+
 # `exec` inside the subshell so `$!` is the agentvisord PID directly;
 # a bare `( ... ) &` records the wrapper subshell's PID, and killing
 # that leaves the daemon reparented and still holding the port.
@@ -108,8 +132,10 @@ MOCK_PID=$!
 DAEMON_PID=$!
 
 # Wait for /readyz
-for i in $(seq 1 40); do
+daemon_ready=0
+for _ in $(seq 1 40); do
     if [[ "$(curl -s -o /dev/null -w '%{http_code}' -m 1 "$BASE/readyz")" == "200" ]]; then
+        daemon_ready=1
         break
     fi
     sleep 0.25
@@ -119,6 +145,11 @@ for i in $(seq 1 40); do
         exit 1
     fi
 done
+if [[ "$daemon_ready" != 1 ]]; then
+    echo "FAILED - daemon never became ready:" >&2
+    cat "$WORK/daemon.log" >&2
+    exit 1
+fi
 
 pass() { echo "VERIFIED  $1"; }
 fail() { echo "FAILED    $1" >&2; exit 1; }
