@@ -643,7 +643,7 @@ fn load_sandbox(config: &HarnessConfig) -> Result<Sandbox> {
         SandboxConfig {
             schemas,
             budget: config.budget.clone(),
-            payout_field: "amount_usd".to_owned(),
+            payout_field: config.payout_field.clone(),
             require_schema: config.require_tool_schema,
         },
         policies,

@@ -1525,22 +1525,84 @@ pub async fn doctor(offline: bool) -> Result<()> {
                 ancestor
             };
             // A real create+delete probe: permission bits alone lie about
-            // ownership, ACLs, and read-only mounts.
+            // ownership, ACLs, and read-only mounts. Round-51 §8.10:
+            // write actual DATA bytes, not just a dirent — a filesystem
+            // out of data blocks (the most likely spool outage) can
+            // still create zero-byte files from reserved inode space,
+            // so a bare create_new passed while every request 503'd.
             let probe = probe_parent.join(format!(".avctl-doctor-{}", std::process::id()));
-            match std::fs::OpenOptions::new()
+            let write_outcome = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&probe)
-            {
-                Ok(_) => {
+                .and_then(|mut file| {
+                    use std::io::Write as _;
+                    file.write_all(&[0u8; 4096])?;
+                    file.sync_all()
+                });
+            match write_outcome {
+                Ok(()) => {
                     let _ = std::fs::remove_file(&probe);
                     checks.push(Check::Pass(format!("{label}: {dir}")));
                 }
-                Err(error) => checks.push(Check::Fail(format!(
-                    "{label}: cannot write in {} ({error})",
-                    probe_parent.display()
-                ))),
+                Err(error) => {
+                    let _ = std::fs::remove_file(&probe);
+                    checks.push(Check::Fail(format!(
+                        "{label}: cannot write 4 KiB in {} ({error})",
+                        probe_parent.display()
+                    )));
+                }
             }
+            // Surface the spool's current footprint so an operator can
+            // see growth (there is no automatic pruning without
+            // atif_retention_days).
+            if *label == *"spool dir" && path.exists() {
+                let (bytes, files) = std::fs::read_dir(path)
+                    .map(|entries| {
+                        entries
+                            .flatten()
+                            .filter_map(|entry| entry.metadata().ok())
+                            .filter(std::fs::Metadata::is_file)
+                            .fold((0u64, 0u64), |(bytes, files), metadata| {
+                                (bytes.saturating_add(metadata.len()), files + 1)
+                            })
+                    })
+                    .unwrap_or((0, 0));
+                checks.push(Check::Pass(format!(
+                    "spool footprint: {files} files, {} KiB (top level)",
+                    bytes / 1024
+                )));
+            }
+        }
+
+        // 9b. Round-51 §9.4: the three checkout-path footguns doctor
+        // used to miss entirely.
+        if !config.listen.starts_with("127.0.0.1") && !config.listen.starts_with("localhost") {
+            checks.push(Check::Warn(format!(
+                "listen = {:?} is not loopback: anyone who can reach this address gets a \
+                 fully-authenticated proxy to your provider account (the key is injected \
+                 server-side). Keep 127.0.0.1 unless an outer network layer controls access",
+                config.listen
+            )));
+        }
+        if config.default_workflow == "unsigned" {
+            checks.push(Check::Warn(
+                "default_workflow = \"unsigned\": sessions produce ATIF trajectories but NO \
+                 signed receipts. Set default_workflow = \"signed\" (or send \
+                 X-AV-Workflow: signed per request) if you need verifiable receipts"
+                    .to_owned(),
+            ));
+        }
+        if config.dashboard_enabled
+            && !config.listen.starts_with("127.0.0.1")
+            && !config.listen.starts_with("localhost")
+        {
+            checks.push(Check::Warn(format!(
+                "dashboard_enabled = true with non-loopback listen {:?}: /dashboard and \
+                 /api/v1/dashboard/* are UNAUTHENTICATED and expose per-session identity, \
+                 token and cost metadata to anyone who can reach the port",
+                config.listen
+            )));
         }
 
         // 10. Backend endpoints (TCP probe only; skipped offline).
