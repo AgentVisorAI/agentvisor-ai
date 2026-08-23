@@ -263,3 +263,39 @@ connections (`BENCHMARKS.md`). Group-commit trades audit-chain
 durability granularity for latency and needs a careful design
 before implementation. Revisit when profiling shows fsync is the
 top-of-flame-graph cost.
+
+## Deferred: smaller round-51 items awaiting a natural vehicle
+
+* **`validate()` first-error-only (§5.4).** 64 `return Err` sites in
+  one 381-line function; converting to error accumulation is
+  mechanical but each site needs a judgment call about whether later
+  checks depend on it (URL parse before scheme check, etc.). Best
+  landed as part of the §4.2 config-enum refactor
+  (`#[serde(tag = "kind")]` backend enums), which removes many of
+  the sites outright.
+* **String-payload error enums (§5.2).** 137
+  `Error::Variant(x.to_string())` conversions destroy `ErrorKind`
+  and `source()` chains. The review calls this the single
+  highest-leverage debuggability change; it is also a
+  workspace-wide signature-touching change. Land per-crate, starting
+  with `FinalizeError` (the reconciler's) during S1.
+* **Shared `StateStore` contract test (§4.2).** The TTL divergence is
+  now a trait value (`counter_ttl_secs`) surfaced in the startup
+  banner and `LIMITS.md`; the remaining ask is one generic
+  `fn state_store_contract(store: &dyn StateStore)` invoked by both
+  the in-memory suite and the env-gated Redis suite.
+* **Test scaffolding dedup (§5.4).** 21 `impl EventBus` doubles and
+  6 `fn signer()` definitions across 12 files; a `tests/common/`
+  module is straightforward but touches every integration test.
+* **Receipt signature domain separation (§3.5).** Signing
+  `b"agentvisor-receipt-v1\0" + len + JCS(body)` (mirroring
+  `journal.rs`) is the right long-term shape but is a WIRE FORMAT
+  BREAK: every existing receipt would fail verification. Requires
+  `receipt_version = 2` (the verifier now refuses unknown versions,
+  so the rollout is at least safe), dual-version verification in
+  `avctl`, and a migration window. Do it before any second artifact
+  is signed under the same key, not after.
+* **Host/Origin validation (§3.5 DNS rebinding).** Needs an
+  `allowed_hosts` config to avoid breaking LB-fronted deployments.
+  Documented as an ingress responsibility in `SECURITY.md` until
+  then.
