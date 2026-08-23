@@ -34,11 +34,11 @@ impl Ed25519Signer {
     /// (first 32 hex chars of its SHA-256) so ids are collision-resistant and
     /// never chosen by an attacker.
     ///
-    /// Round-20 F5: defense-in-depth against a compromised
+    /// Defense-in-depth against a compromised
     /// `getrandom` (VM without entropy, cloud image with a broken
     /// `/dev/urandom`) — regenerate rather than accept an
     /// all-zero or all-0xFF seed. Reader-side already refuses
-    /// these known-weak seeds (round-14); this closes the gap
+    /// these known-weak seeds; this closes the gap
     /// for generator-side. Astronomically unlikely from a healthy
     /// OsRng, but the failure mode is silent installation of a
     /// globally-predictable keypair — cheap to guard.
@@ -50,7 +50,7 @@ impl Ed25519Signer {
             // seed through the fallible `SysRng` interface instead and
             // build the key from bytes.
             //
-            // Round-21 F2: wrap the raw seed buffer in `Zeroizing` so the
+            // Wrap the raw seed buffer in `Zeroizing` so the
             // stack slot zeroes on scope exit. A bare `[u8; 32]` has no
             // Drop, so it lingers in freed stack memory (recoverable from
             // a core dump).
@@ -73,10 +73,10 @@ impl Ed25519Signer {
 
     /// Load from a 32-byte secret seed.
     ///
-    /// Round-19 F2: takes `&[u8; 32]` (borrow), not by value. Passing
+    /// Takes `&[u8; 32]` (borrow), not by value. Passing
     /// the seed by value materializes a caller-owned temp slot on
     /// the stack that Rust does not guarantee to zeroize on drop —
-    /// the round-18 F5 `Zeroizing<[u8; 32]>` wrapper only zeroizes
+    /// a `Zeroizing<[u8; 32]>` wrapper only zeroizes
     /// the slot IT owns, not the copy the callee received. By taking
     /// a reference we let the caller keep the seed inside a
     /// `Zeroizing` and never lose control of the memory.
@@ -90,7 +90,7 @@ impl Ed25519Signer {
     /// `[0xFFu8; 32]` guard in `av-harness/src/main.rs`); every OTHER
     /// caller (tests, `avctl keygen`) must apply the same policy or
     /// use [`Ed25519Signer::generate`] which loops until a non-weak
-    /// seed is drawn. Round-51 F2 documents this contract in-signature
+    /// seed is drawn. This contract is documented in-signature
     /// so a future refactor cannot silently drop the pre-validation.
     pub fn from_seed(seed: &[u8; 32]) -> Self {
         let key = SigningKey::from_bytes(seed);
@@ -100,7 +100,7 @@ impl Ed25519Signer {
 
     /// Export the 32-byte secret seed (for `avctl keygen` persistence).
     ///
-    /// Round-19 F2: returns `Zeroizing<[u8; 32]>` so the caller's
+    /// Returns `Zeroizing<[u8; 32]>` so the caller's
     /// receiving slot zeroes on drop — historically the bare
     /// `[u8; 32]` return let a copy linger in freed stack/heap.
     pub fn seed(&self) -> zeroize::Zeroizing<[u8; 32]> {
@@ -208,7 +208,7 @@ impl Keyring {
 
     /// Verify `sig` over `msg` with the key identified by `key_id`.
     ///
-    /// Uses `verify_strict` (ed25519-dalek), NOT `verify`. Round-51 F1:
+    /// Uses `verify_strict` (ed25519-dalek), NOT `verify`:
     /// non-strict `verify` accepts signatures whose R component or the
     /// verifying key itself is a small-order Curve25519 point. In that
     /// regime a single signature can validate against multiple distinct

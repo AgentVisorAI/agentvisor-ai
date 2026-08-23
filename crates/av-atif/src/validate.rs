@@ -55,7 +55,7 @@ pub fn validate_trajectory(t: &crate::model::Trajectory, mode: Mode) -> Vec<Vali
     }
 }
 
-/// Round-23 F2 (av-atif ingest): validate an ATIF trajectory from
+/// Validate an ATIF trajectory from
 /// its RAW BYTES. This is the correct entry point for every path
 /// that receives operator/attacker-supplied ATIF content (CLI
 /// `avctl atif-validate`, reconciler recovery + promotion). Unlike
@@ -64,7 +64,7 @@ pub fn validate_trajectory(t: &crate::model::Trajectory, mode: Mode) -> Vec<Vali
 ///
 ///   1. Refuses duplicate JSON keys anywhere in the payload
 ///      (parallel to `av_receipts::Receipt::from_json_slice`'s
-///      strict pre-scan added in round-16 F5), so the auditor cannot
+///      strict pre-scan), so the auditor cannot
 ///      be shown a document whose "last wins" reading differs from
 ///      the "first wins" reading.
 ///   2. Runs `validate_value` on the parsed `serde_json::Value` — the
@@ -153,7 +153,7 @@ fn refuse_duplicate_json_keys(raw: &[u8]) -> Result<(), String> {
 
 macro_rules! issue {
     ($issues:expr, $path:expr, $($msg:tt)*) => {
-        // Round-20: cap issue collection so a pathological
+        // Cap issue collection so a pathological
         // trajectory cannot allocate millions of ValidationIssue
         // structs. We allow ONE extra slot past MAX so
         // `truncate_issues_with_marker` can detect the overflow
@@ -223,12 +223,12 @@ const FINAL_METRICS_FIELDS: &[&str] = &[
 
 /// Cap on the number of issues collected by `validate_value`.
 ///
-/// Round-20: a maliciously crafted trajectory sitting inside
+/// A maliciously crafted trajectory sitting inside
 /// MAX_ATIF_BYTES (64 MiB) can legitimately trigger millions of
 /// validation issues. Each `ValidationIssue` allocates two owned
 /// Strings (path + message); five million entries → ~500 MiB
 /// Vec, hitting OOM before the caller ever renders a bounded
-/// error message (see reconciler round-19 F6). Cap the collection
+/// error message (as once happened in the reconciler). Cap the collection
 /// so the memory bound is O(cap), independent of the input's
 /// pathological branching.
 ///
@@ -236,8 +236,8 @@ const FINAL_METRICS_FIELDS: &[&str] = &[
 /// downstream consumers know the truncation happened.
 pub const MAX_VALIDATION_ISSUES: usize = 4096;
 
-/// Round-25 F4: mirror the `av_receipts::MAX_NESTED_DEPTH = 128`
-/// bound (round-16). ATIF's public [`validate_value`] accepts any
+/// Mirror the `av_receipts::MAX_NESTED_DEPTH = 128`
+/// bound. ATIF's public [`validate_value`] accepts any
 /// programmatically-constructed `Value` at unbounded depth, and
 /// each recursion frame of [`validate_trajectory_obj`] allocates
 /// heavily (locals + `format!` on `path`), so stack overflow is
@@ -249,7 +249,7 @@ pub const MAX_VALIDATION_ISSUES: usize = 4096;
 /// here so no such caller can reopen it.
 const MAX_NESTED_DEPTH: usize = 128;
 
-/// Round-38 F4: upper bound for USD-denominated cost fields
+/// Upper bound for USD-denominated cost fields
 /// (`total_cost_usd` in `final_metrics`, `cost_usd` per step). Strict
 /// mode's original floor at 0.0 was asymmetric — no ceiling — so a
 /// hostile trajectory carrying `total_cost_usd: 1.7e308` passed
@@ -270,7 +270,7 @@ pub(crate) const MAX_COST_USD: f64 = 1e12;
 /// trailing synthetic entry noting truncation when the cap fires.
 pub fn validate_value(root: &Value, mode: Mode) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
-    // Round-40 F3: track the ancestor `trajectory_id` chain across
+    // Track the ancestor `trajectory_id` chain across
     // recursion frames so a cycle A -> B -> A can be detected even
     // when B is a great-grandchild of A. The prior per-frame
     // HashSet only caught duplicates among direct siblings; a
@@ -378,7 +378,7 @@ fn strict_null_and_extra_conformance(
     }
 }
 
-/// Round-20: after a validation pass, cap the number of issues
+/// After a validation pass, cap the number of issues
 /// returned so downstream consumers never see a >>bounded Vec.
 /// The `issue!` macro allows ONE slot past MAX so this function
 /// can detect the overflow and swap in a synthetic truncation
@@ -422,7 +422,7 @@ fn validate_trajectory_obj(
     depth: usize,
     ancestors: &mut std::collections::HashSet<String>,
 ) {
-    // Round-25 F4: cap recursion depth. `subagent_trajectories`
+    // Cap recursion depth. `subagent_trajectories`
     // recurses; adversarial nesting could otherwise stack-overflow
     // the validator. Return without adding the whole subtree's
     // findings — one clear message beats a stack unwind.
@@ -440,7 +440,7 @@ fn validate_trajectory_obj(
     };
     check_unknown_fields(obj, TRAJECTORY_FIELDS, path, mode, issues);
 
-    // Round-40 F3: ancestor-cycle detection. Insert this frame's
+    // Ancestor-cycle detection. Insert this frame's
     // trajectory_id (if any) into the shared ancestor set BEFORE
     // recursing into `subagent_trajectories`. If the id is already
     // in the set, an ancestor already claimed it — the tree encodes
@@ -541,7 +541,7 @@ fn validate_trajectory_obj(
                     None => issue!(issues, format!("{path}.agent.{req}"), "required field is missing"),
                 }
             }
-            // Round-16 F2: optional-string type check parity with the
+            // Optional-string type check parity with the
             // trajectory-root optional strings above. `Trajectory` types
             // `model_name` as `Option<String>`, so a wrong-typed value
             // (`model_name: 123`) would fail typed deserialization but
@@ -564,7 +564,7 @@ fn validate_trajectory_obj(
                     ver.1
                 );
             }
-            // Round-6 (hunt2 F1): `Agent.tool_definitions` is
+            // `Agent.tool_definitions` is
             // `Option<Vec<Map>>` on the typed model — an array-of-object
             // shape. STEP_FIELDS-style presence gating alone let a
             // wrong-typed value pass the strict validator while
@@ -613,7 +613,7 @@ fn validate_trajectory_obj(
         None => issue!(issues, format!("{path}.agent"), "required field is missing"),
     }
 
-    // Round-24 F1 (av-atif validate): pre-collect embedded
+    // Pre-collect embedded
     // `subagent_trajectories[*].trajectory_id` so we can cross-check
     // step-level `subagent_trajectory_ref` entries against them.
     // Historically the ref shape was only "must have trajectory_id
@@ -748,7 +748,7 @@ fn validate_trajectory_obj(
         _ => {}
     }
 
-    // Round-40 F3: remove this frame's id so sibling branches (a
+    // Remove this frame's id so sibling branches (a
     // different subtree at the same ancestor) can legitimately
     // reuse the id without triggering a false-positive cycle.
     if let Some(id) = inserted_id {
@@ -835,7 +835,7 @@ fn validate_step(
         );
     }
 
-    // Round-16 F2: `Step.model_name` is `Option<String>` on the typed
+    // `Step.model_name` is `Option<String>` on the typed
     // model; a wrong-typed value (`"model_name": 123`) fails typed
     // deserialisation but used to pass Strict.
     if obj
@@ -845,7 +845,7 @@ fn validate_step(
         issue!(issues, format!("{path}.model_name"), "must be a string");
     }
 
-    // Round-6 (hunt2 F1): `Step.is_copied_context` is `Option<bool>`
+    // `Step.is_copied_context` is `Option<bool>`
     // on the typed model. It was only listed in STEP_FIELDS (so
     // check_unknown_fields let it through) but never type-checked, so
     // a wrong-typed value (`"is_copied_context": "yes"`) diverged the
@@ -904,8 +904,8 @@ fn validate_step(
             "must be a non-negative integer"
         );
     }
-    // Same wrong-type class as the round-16 F2 (`model_name`) and
-    // round-6 hunt2 F1 (`is_copied_context`) fixes: the typed model is
+    // Same wrong-type class as the `model_name` and
+    // `is_copied_context` fixes: the typed model is
     // `Option<String>`, and a non-string here passed strict validation
     // while every typed consumer failed to load the document.
     if obj
@@ -1040,7 +1040,7 @@ fn validate_step(
                             if let Some(references) =
                                 res.get("subagent_trajectory_ref").and_then(Value::as_array)
                             {
-                                // Round-33 F3: version gate parity with
+                                // Version gate parity with
                                 // the sibling root-level
                                 // `subagent_trajectories` (v1.7-only).
                                 // Both were introduced in v1.7 per the
@@ -1071,7 +1071,7 @@ fn validate_step(
                                         mode,
                                         issues,
                                     );
-                                    // Round-16 F2: each SubagentTrajectoryRef
+                                    // Each SubagentTrajectoryRef
                                     // typed member is `Option<String>` in
                                     // model.rs. Wrong-typed values would
                                     // fail typed deserialisation but used
@@ -1099,8 +1099,7 @@ fn validate_step(
                                     if !has_id && !has_path {
                                         issue!(issues, ref_path, "must set trajectory_id or trajectory_path");
                                     }
-                                    // Round-24 F1 (av-atif validate):
-                                    // if `trajectory_id` names an
+                                    // If `trajectory_id` names an
                                     // embedded delegation, it MUST
                                     // resolve. A dangling id is
                                     // unverifiable delegation
@@ -1222,8 +1221,8 @@ fn validate_step(
                         "field requires ATIF-v1.4+"
                     );
                 }
-                // Round-6 (hunt2 F1): strict-mode type checks for
-                // fields the round-16 F2 sweep missed. The typed model
+                // Strict-mode type checks for
+                // fields the wrong-type sweep above misses. The typed model
                 // rejects a wrong type at deserialize (e.g. logprobs =
                 // "x"), but validate_bytes/validate_value(Strict)
                 // previously only presence-gated these — so the CLI
@@ -1350,7 +1349,7 @@ mod tests {
 
     use super::*;
 
-    /// Round-20: a maliciously crafted trajectory containing tens of
+    /// A maliciously crafted trajectory containing tens of
     /// thousands of unknown fields must NOT allocate an unbounded
     /// Vec<ValidationIssue>. The cap fires and a synthetic
     /// truncation marker signals the tail.
@@ -1634,7 +1633,7 @@ mod tests {
         assert!(serde_json::from_value::<crate::model::Trajectory>(value).is_ok());
     }
 
-    /// Round-23 F2: `validate_bytes` refuses duplicate JSON keys at
+    /// `validate_bytes` refuses duplicate JSON keys at
     /// any nesting level. Serde-typed parse alone would silently keep
     /// the last value, letting a hostile issuer sign under one
     /// interpretation while an auditor's raw-bytes reader sees the
@@ -1660,7 +1659,7 @@ mod tests {
         );
     }
 
-    /// Round-23 F2 partner: even when the bytes are legit, the
+    /// Partner to the duplicate-key test: even when the bytes are legit, the
     /// `validate_bytes` path also runs `validate_value` on the
     /// untyped form, exercising `check_unknown_fields` — a rejection
     /// class the typed `validate_trajectory` path silently drops.
@@ -1677,7 +1676,7 @@ mod tests {
         );
     }
 
-    /// Round-24 F1: a `subagent_trajectory_ref` with a `trajectory_id`
+    /// A `subagent_trajectory_ref` with a `trajectory_id`
     /// must resolve against the outer trajectory's embedded
     /// `subagent_trajectories` array. A dangling id gives
     /// unverifiable delegation provenance — the auditor is pointed at

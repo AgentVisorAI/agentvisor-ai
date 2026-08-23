@@ -10,7 +10,7 @@ pub enum ValidationError {
     /// A required string field was empty.
     #[error("required field `{0}` is empty")]
     EmptyField(&'static str),
-    /// Round-6 (hunt2 F11): `unmapped` carries inbound-tolerance fields
+    /// `unmapped` carries inbound-tolerance fields
     /// that re-serialize to the top level, but the shipped schema
     /// declares `additionalProperties: false` — such an event passes the
     /// Rust validator yet fails the broker's schema gate at publish
@@ -44,7 +44,7 @@ pub enum ValidationError {
     /// Status outside 0–2.
     #[error("status_id {0} outside 0..=2")]
     BadStatus(u8),
-    /// Round-38 F3: activity_id must be < 100 or the
+    /// Activity_id must be < 100 or the
     /// `class_uid × 100 + activity_id` bijection collapses:
     /// `class_uid=9901, activity_id=100` produces the same
     /// `type_uid = 990200` as `class_uid=9902, activity_id=0`,
@@ -60,7 +60,7 @@ pub enum ValidationError {
     /// stop_reason caption present without id (or vice versa).
     #[error("stop_reason and stop_reason_id must be present together")]
     StopReasonPairMismatch,
-    /// Round-17 F1: stop_reason_id maps to a KNOWN `StopReason` variant,
+    /// Stop_reason_id maps to a KNOWN `StopReason` variant,
     /// but the accompanying caption does not match that variant's
     /// canonical caption. The two fields split downstream analytics
     /// (SIEM pipelines that group by id disagree with dashboards that
@@ -75,7 +75,7 @@ pub enum ValidationError {
         /// Actual caption that was emitted with the id.
         actual_caption: String,
     },
-    /// Round-17 F2: a numeric field exceeds `av_core::error::JCS_SAFE_MAX`
+    /// A numeric field exceeds `av_core::error::JCS_SAFE_MAX`
     /// (2^53) on the deserialize path. `OcsfEventBuilder::build`
     /// already refuses values above the JCS-safe integer range, but
     /// wire deserialization (`serde_json::from_slice::<OcsfEvent>`)
@@ -90,7 +90,7 @@ pub enum ValidationError {
         /// Offending value.
         value: u64,
     },
-    /// Round-26 F1 (self-fix): a numeric field is out of its
+    /// A numeric field is out of its
     /// schema-declared range. Currently only `pruning_ratio_millis`
     /// (permille ratio, capped at 1000) enforces this, but the
     /// variant is variant-generic so future range-bound fields can
@@ -147,7 +147,7 @@ pub enum ValidationError {
 /// (collect-all-errors, matching the Harbor validator philosophy).
 pub fn validate_event(ev: &OcsfEvent) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
-    // Round-6 (hunt2 F11): see UnmappedNotPublishable.
+    // See UnmappedNotPublishable.
     if !ev.unmapped.is_empty() {
         errors.push(ValidationError::UnmappedNotPublishable(ev.unmapped.len()));
     }
@@ -195,7 +195,7 @@ pub fn validate_event(ev: &OcsfEvent) -> Result<(), Vec<ValidationError>> {
             activity_id: ev.activity_id,
         });
     }
-    // Round-38 F3: the `class_uid × 100 + activity_id` invariant
+    // The `class_uid × 100 + activity_id` invariant
     // above is only a bijection when activity_id < 100. Enforce
     // that at validate time so an adversarial event asserting
     // `class_uid=9901, activity_id=100, type_uid=990200` (which
@@ -255,7 +255,7 @@ pub fn validate_event(ev: &OcsfEvent) -> Result<(), Vec<ValidationError>> {
             errors.push(ValidationError::PayloadTooManyProperties(map.len()));
         }
     }
-    // Round-6 (hunt2 F4): match the shipped JSON schema's
+    // Match the shipped JSON schema's
     // `"stop_reason": {"type": "string", "minLength": 1}`. Some
     // OpenAI-compatible shims emit `finish_reason: ""` mid-stream; the
     // parse-site filter in routes.rs::parse_provider_chunk drops that,
@@ -267,7 +267,7 @@ pub fn validate_event(ev: &OcsfEvent) -> Result<(), Vec<ValidationError>> {
     if ev.stop_reason.as_deref() == Some("") {
         errors.push(ValidationError::EmptyField("stop_reason"));
     }
-    // Round-17 F1 (revised in round-18 after self-audit): the initial
+    // The initial
     // fix required `StopReason::from_id(id).caption() == stop_reason`
     // whenever id was known. That's WRONG — the field docstring at
     // `model.rs::OcsfEvent::stop_reason` and the builder API
@@ -286,7 +286,7 @@ pub fn validate_event(ev: &OcsfEvent) -> Result<(), Vec<ValidationError>> {
     // an unambiguous mistake — the two fields disagree on which
     // enforcement fired. Provider-native captions like `"stop"` or
     // `"tool_calls"` are not canonical captions of any variant, so
-    // they pass. Round-33's `map_finish_reason` in routes.rs uses the
+    // they pass. The harness's `map_finish_reason` in routes.rs uses the
     // lowercase provider tokens; none of those coincide with a
     // canonical caption (which are Title-cased: `"Stop"`, `"Tool
     // Use"`, `"Length"`, `"Content Filter"`, …).
@@ -349,7 +349,7 @@ pub fn validate_event(ev: &OcsfEvent) -> Result<(), Vec<ValidationError>> {
             });
         }
     }
-    // Round-17 F2: JCS-safe integer guard on deserialize path.
+    // JCS-safe integer guard on deserialize path.
     // `OcsfEventBuilder::build` already enforces this for its own
     // outputs, but a wire event bypasses build(). Values above
     // `av_core::error::JCS_SAFE_MAX` (2^53) round-trip through
@@ -362,14 +362,14 @@ pub fn validate_event(ev: &OcsfEvent) -> Result<(), Vec<ValidationError>> {
             errors.push(ValidationError::JcsUnsafeInteger { field, value });
         }
     }
-    // Round-6 (hunt2 F1): `ai_agent.ttl_remaining_s` is a schema-typed
+    // `ai_agent.ttl_remaining_s` is a schema-typed
     // u64 with no maximum in the shipped JSON schema. Any value above
     // 2^53 silently truncates in JS-based auditors and hard-fails
     // `av_receipts::canonicalize`. `OcsfEventBuilder::build`'s
     // check_jcs_safe loop already covers the fields listed above; add
     // ttl_remaining_s here so the wire/deserialize path also refuses.
     // (`OcsfEvent.ai_agent.ttl_remaining_s` was omitted from the
-    // original round-17 F2 sweep.)
+    // original JCS-safety sweep.)
     if let Some(ttl) = ev.ai_agent.ttl_remaining_s {
         if av_core::error::check_jcs_safe(ttl).is_err() {
             errors.push(ValidationError::JcsUnsafeInteger {
@@ -392,12 +392,11 @@ pub fn validate_event(ev: &OcsfEvent) -> Result<(), Vec<ValidationError>> {
                 }
             }
         }
-        // Round-26 F1 (self-fix): mirror the `> 1000` guard from
+        // Mirror the `> 1000` guard from
         // `OcsfEventBuilder::build`. The schema declares
-        // `pruning_ratio_millis` in `[0, 1000]`; round-17 F2 already
-        // introduced this validator as the wire-side backstop for
-        // build's checks, and round-26 F1 added the range check to
-        // build. Adding it here closes the emitter/validator drift
+        // `pruning_ratio_millis` in `[0, 1000]`; this validator was
+        // introduced as the wire-side backstop for
+        // build's checks, and build later gained the range check too. Adding it here closes the emitter/validator drift
         // — an event with `pruning_ratio_millis = 5000` now fails
         // both paths, not just build.
         if let Some(v) = m.pruning_ratio_millis {
@@ -569,7 +568,7 @@ mod tests {
             .contains(&ValidationError::StopReasonPairMismatch));
     }
 
-    /// Round-18 F1 self-fix: `stop_reason` carries the provider's
+    /// `stop_reason` carries the provider's
     /// NATIVE finish_reason token (documented at
     /// `model.rs::OcsfEvent::stop_reason` and the builder API
     /// `OcsfEventBuilder::stop_reason_native`). Provider-native
@@ -653,7 +652,7 @@ mod tests {
             .contains(&ValidationError::BadStatus(3)));
     }
 
-    /// Round-17 F2 regression: the deserialize path bypasses
+    /// Regression guard: the deserialize path bypasses
     /// `OcsfEventBuilder::build`'s JCS-safe integer check, so a
     /// wire event with a token counter above 2^53 would round-trip
     /// through JS-based JSON parsers as silently-truncated,
@@ -720,9 +719,9 @@ mod tests {
         }
     }
 
-    /// Round-26 F1 (self-fix from round-27): `validate_event` must
+    /// `validate_event` must
     /// mirror `OcsfEventBuilder::build`'s `pruning_ratio_millis <=
-    /// 1000` guard. Round-17 F2 introduced this validator
+    /// 1000` guard. This validator exists
     /// specifically as the wire-side backstop for build's guards;
     /// leaving the range check only on build left an
     /// emitter/validator drift where an event with a 500%
@@ -761,7 +760,7 @@ mod tests {
         );
     }
 
-    /// Round-38 F3: activity_id must be < 100 so
+    /// Activity_id must be < 100 so
     /// `class_uid × 100 + activity_id` is a bijection. Without this
     /// check, `class_uid=9901, activity_id=100` produces the same
     /// type_uid (990200) as `class_uid=9902, activity_id=0`, so

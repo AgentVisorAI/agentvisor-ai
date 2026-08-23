@@ -549,7 +549,7 @@ fn offsets_stay_monotone_across_retention_boundaries() {
             &json!({"metadata": {"uid": "post"}, "n": 99}),
         )
         .unwrap();
-    // Round-6 (hunt3 tests F2): the invariant is DENSE offsets — every
+    // The invariant is DENSE offsets — every
     // other test in this suite pins them exactly, and the retention
     // crossing is the one place the watermark is re-persisted and could
     // drift. `>= 4` would let a watermark jump (permanent fetch gaps,
@@ -561,7 +561,7 @@ fn offsets_stay_monotone_across_retention_boundaries() {
     );
 }
 
-/// Mutation-run hardening (round 13): the trait-default
+/// Mutation-run hardening: the trait-default
 /// `find_event_by_uid` — the at-most-once primitive crash recovery uses
 /// to decide whether an effect already committed — had no test on any
 /// backend. Ok(None) regressions mean duplicated effects after a crash;
@@ -605,7 +605,7 @@ fn find_event_by_uid_resolves_committed_events_exactly() {
     );
 }
 
-/// Mutation-run hardening (round 14): in-process UID dedupe was tested,
+/// Mutation-run hardening: in-process UID dedupe was tested,
 /// but the `recover_event_uids` restart path wasn't — a mutant returning
 /// an empty map made every crash-restart re-publish acked events
 /// (duplicate records in the audit stream). Publish, reopen, republish

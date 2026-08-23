@@ -22,7 +22,7 @@ pub enum BusError {
 }
 
 impl BusError {
-    /// Round-28 F1 (av-bridge): distinguish permanent config errors
+    /// Distinguish permanent config errors
     /// from transient outages so downstream error mapping can route
     /// them to the right HTTP status. `UnknownTopic` is a
     /// misconfiguration — the topic must be provisioned via the
@@ -288,7 +288,7 @@ mod tests {
         assert_eq!(partition_for("x", 0), 0);
     }
 
-    /// Round-28 F1: permanent vs transient classification is what
+    /// Permanent vs transient classification is what
     /// downstream error mapping (av-harness FinalizeError) uses to
     /// decide between HTTP 400 (permanent misconfig, no retry) and
     /// HTTP 503 (transient outage, Retry-After). Pin the two-way

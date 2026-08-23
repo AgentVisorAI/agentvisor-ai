@@ -41,11 +41,11 @@ pub enum ToolVerdict {
         budget_remaining: u64,
         /// Decision latency in microseconds (SLA surface, R23).
         elapsed_us: u64,
-        /// Round-33 F1: payout amount (USD micros) that
+        /// Payout amount (USD micros) that
         /// `ActionBudget::try_tool_call` debited on this call. Threaded
         /// out so a lost `execution.claim()` race in the harness can
         /// call [`ActionBudget::refund_tool_call`] with the exact same
-        /// amount, closing the round-32 F3 concurrent-MCP budget
+        /// amount, closing the concurrent-MCP budget
         /// double-spend.
         payout_micros: u64,
         /// Principal id whose ledger was ALSO debited (when a
@@ -99,7 +99,7 @@ impl Sandbox {
     pub fn new(config: SandboxConfig, policies: Vec<Box<dyn PolicyEngine>>) -> Result<Self, String> {
         let mut validators = HashMap::new();
         for (tool, schema) in &config.schemas {
-            // Round-6 (hunt3 deps F1): enforce `format` keywords. In
+            // Enforce `format` keywords. In
             // jsonschema 0.49 / draft 2020-12, `format` is
             // annotation-only unless opted in — an operator writing
             // `"format": "uri"` into a tool-argument schema expected an
@@ -127,7 +127,8 @@ impl Sandbox {
     /// the tool call is refused unless BOTH ledgers admit the spend; the
     /// principal ledger persists across every session belonging to the
     /// same identity, which is what makes header-rotation attacks
-    /// (§3.2 of the engineering review) visible.
+    /// (resetting the session bucket by minting a new session id)
+    /// visible.
     ///
     /// The two ledgers commit independently: if the principal check
     /// passes and the session check fails, the principal debit is
@@ -154,7 +155,7 @@ impl Sandbox {
                     RpcError::NotToolCall(_) => ("passthrough", format!("passthrough refused: {e}")),
                     _ => ("parse", e.to_string()),
                 };
-                // Round-6 (hunt4 protocol F5): protocol-level failures
+                // Protocol-level failures
                 // get the reserved JSON-RPC codes (-32700/-32600/
                 // -32602), not the -32001 policy code — the request
                 // never reached an authorization decision.
@@ -226,7 +227,7 @@ impl Sandbox {
             }
         };
         let budget = ActionBudget::new(store, session, &self.config.budget);
-        // Principal-scoped pre-check (§3.2 fix). Debit the principal ledger
+        // Principal-scoped pre-check. Debit the principal ledger
         // first — a header-rotation attack that resets the session bucket
         // still charges the same principal. If the principal ledger admits
         // the spend but the session ledger refuses, we refund the principal
@@ -298,7 +299,7 @@ impl Sandbox {
                 tool: req.tool,
                 budget_remaining: remaining,
                 elapsed_us: elapsed(started),
-                // Round-33 F1: thread the actual debited amount so the
+                // Thread the actual debited amount so the
                 // harness can refund exactly this much on a lost
                 // execution.claim() race.
                 payout_micros,
@@ -666,7 +667,7 @@ mod payout_boundary_tests {
     use super::*;
     use serde_json::json;
 
-    /// Mutation-run hardening (round 11): pin the payout parser's exact
+    /// Mutation-run hardening: pin the payout parser's exact
     /// bounds. `usd < 0.0` -> `<=` would refuse a legitimate zero payout;
     /// `usd > 1.0e12` -> `>=`/`==` shift or invert the sanity ceiling.
     #[test]

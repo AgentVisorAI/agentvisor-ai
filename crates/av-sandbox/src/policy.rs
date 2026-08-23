@@ -44,7 +44,7 @@ impl NativePolicy {
 
     /// Deny-list policy: block the named tools outright.
     pub fn deny_tools(tools: &[&str]) -> Self {
-        // Round-51 §5.4: HashSet lookup instead of a per-call linear
+        // HashSet lookup instead of a per-call linear
         // scan of a Vec<String> — deny lists grow with deployment age
         // and this closure runs on every tool call.
         let denied: std::collections::HashSet<String> = tools.iter().map(|s| (*s).to_owned()).collect();

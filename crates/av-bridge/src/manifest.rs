@@ -124,7 +124,7 @@ impl BridgeManifest {
         // not YAML-context-aware, so a quoted string like `"a &name"`
         // still trips it; failing closed is acceptable for manifests)
         // by checking that the char precedes a valid anchor-name
-        // character. Round 40 (fourth-model QC): libyaml's anchor-name
+        // character. Note libyaml's anchor-name
         // class is alphanumeric | `_` | `-` (unsafe-libyaml IS_ALPHA);
         // the original predicate omitted `-`, so hyphen-led anchors
         // (`&-a`) expanded while evading this guard — empirically
@@ -201,7 +201,7 @@ impl BridgeManifest {
         if names.len() != before {
             return Err(ManifestError::Invalid("duplicate topic names".into()));
         }
-        // Round-6 (hunt5 portability F4): the embedded broker uses topic
+        // The embedded broker uses topic
         // names verbatim as directory names, so on case-insensitive
         // filesystems (macOS APFS/HFS+ — the documented dev platform)
         // two topics differing only by case ("Audit" vs "audit")
@@ -218,7 +218,7 @@ impl BridgeManifest {
                 "topic names collide case-insensitively (unsafe on case-insensitive filesystems)".into(),
             ));
         }
-        // Round-6 (hunt1 F2): the NATS backend maps topics to stream
+        // The NATS backend maps topics to stream
         // names via `.`→`_` (`av_{topic.replace('.', "_")}`), which is
         // not injective: `agent.x` and `agent_x` collide onto stream
         // `av_agent_x`, and the second provision's update_stream
@@ -270,7 +270,7 @@ impl BridgeManifest {
                     t.name
                 )));
             }
-            // Round-27 F5: cap partitions and hot_hours. `partitions` is
+            // Cap partitions and hot_hours. `partitions` is
             // u32, and without a cap `partitions: 4294967295` would
             // pass validate() and drive the embedded broker to create
             // 4 billion partition directories on startup — guaranteed
@@ -333,7 +333,7 @@ impl BridgeManifest {
                         uri.len()
                     )));
                 }
-                // Round-17 F3 (av-bridge): a local (non-scheme) cold_uri
+                // A local (non-scheme) cold_uri
                 // is used directly as a filesystem root at retention
                 // enforcement time (`Path::new(cold).join(...)` in
                 // embedded.rs). A `..` component would let the cold-
@@ -424,7 +424,7 @@ pub(crate) fn validate_topic_event(
 
 pub(crate) fn schema_document(reference: &str) -> Result<serde_json::Value, crate::BusError> {
     if reference == "schemas/ocsf-agent-event.schema.json" {
-        // Round-6 (hunt5 portability F1): the embedded copy lives INSIDE
+        // The embedded copy lives INSIDE
         // the crate (`crates/av-bridge/schemas/`) — an `include_str!`
         // that reaches outside the package root breaks `cargo package`
         // (and therefore every crates.io publish). A sync test in this
@@ -434,7 +434,7 @@ pub(crate) fn schema_document(reference: &str) -> Result<serde_json::Value, crat
     }
     let direct = PathBuf::from(reference);
     if direct.exists() {
-        // Cap the read (parity with Round-22 F4 in embedded.rs): a hostile
+        // Cap the read (parity with the schema-read cap in embedded.rs): a hostile
         // plant of a multi-GiB schema file would OOM the process before
         // the JSON parser could complain.
         let bytes = av_core::fsutil::read_capped(&direct, av_core::fsutil::MAX_CONTROL_BYTES)?;
@@ -464,7 +464,7 @@ mod tests {
 
     use super::*;
 
-    /// Round-6 (hunt5 portability F1): the crate-local embedded schema
+    /// The crate-local embedded schema
     /// copy must stay byte-identical to the canonical workspace-level
     /// artifact external consumers validate against. Reads the
     /// workspace copy at runtime (not include_str!) so the packaged
@@ -572,7 +572,7 @@ mod tests {
         };
         assert!(m.validate().is_err());
 
-        // Round-27 F5: upper caps on partitions and hot_hours. Absurd
+        // Upper caps on partitions and hot_hours. Absurd
         // values (`u32::MAX`) used to pass validate() and would drive
         // EmbeddedBroker::provision to create 4 billion partition
         // directories at startup — guaranteed inode/OOM exhaustion.
@@ -584,7 +584,7 @@ mod tests {
         assert!(matches!(m.validate(), Err(ManifestError::Invalid(_))));
     }
 
-    /// Round-27 F5: `deny_unknown_fields` on `BridgeManifest`,
+    /// `deny_unknown_fields` on `BridgeManifest`,
     /// `TopicSpec`, and `RetentionSpec` catches config-file typos
     /// that would otherwise silently disable features. `cold_url`
     /// (misspelling `cold_uri`) or `hot_days` (misspelling
@@ -630,7 +630,7 @@ topics:
 
     #[test]
     fn validate_refuses_cold_uri_with_parent_directory_escape() {
-        // Round-17 F3 (av-bridge): a local (non-scheme) cold_uri with
+        // A local (non-scheme) cold_uri with
         // `..` components would let retention enforcement write cold
         // objects outside the intended prefix. Verify each shape.
         for uri in [
@@ -727,7 +727,7 @@ mod mutation_boundary_tests {
 
     use super::*;
 
-    /// Mutation-run hardening (round 14): the alias scan's `||` -> `&&`
+    /// Mutation-run hardening: the alias scan's `||` -> `&&`
     /// survivor would only refuse markers followed by BOTH alphanumeric
     /// and `_` (impossible), silently re-opening the YAML anchor-bomb
     /// vector for `_`-named anchors. Pin each marker/name-class combo,
@@ -735,7 +735,7 @@ mod mutation_boundary_tests {
     #[test]
     fn yaml_anchor_and_alias_markers_are_refused_per_name_class() {
         let base = BridgeManifest::default_for("anchors").to_yaml().unwrap();
-        // Round 40: `&-a`/`*-a` included — libyaml's anchor-name class is
+        // `&-a`/`*-a` included — libyaml's anchor-name class is
         // alphanumeric | `_` | `-`, and hyphen-led anchors demonstrably
         // expand in serde_yaml; omitting `-` from the scan re-opens the
         // billion-laughs vector for hyphen-named anchors.

@@ -416,7 +416,7 @@ impl Registry {
     /// rendered in seconds (`le` bounds and `_sum`), per Prometheus base-unit
     /// convention. Histogram metric names should therefore end in `_seconds`.
     ///
-    /// Round-19: HELP text is escaped per the Prometheus text format
+    /// HELP text is escaped per the Prometheus text format
     /// spec (`\` → `\\`, LF → `\n`). A future counter/histogram
     /// registration whose HELP contained a newline would otherwise
     /// silently corrupt the scrape response — Prometheus would parse
@@ -476,7 +476,7 @@ impl Registry {
     }
 }
 
-/// Round-19: escape a HELP text per the Prometheus text exposition
+/// Escape a HELP text per the Prometheus text exposition
 /// format spec. Backslash and line-feed are the only two chars the
 /// format reserves in HELP lines. A future counter/histogram
 /// registration whose HELP contained a newline would otherwise
@@ -488,7 +488,7 @@ fn escape_prom_help(help: &str) -> String {
         match c {
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
-            // Round-20 F3 + round-21 F4 + round-26 F4: replace CR
+            // Replace CR
             // and every other C0 control (0x00–0x1F except LF
             // which we just escaped) with a literal space.
             // `validate_metric_key` already refuses these bytes
@@ -496,8 +496,7 @@ fn escape_prom_help(help: &str) -> String {
             // promtool lint / grafana-agent; ESC (0x1B) lets a
             // caller who controls HELP text inject ANSI codes
             // into operator terminals via `avctl` piped
-            // `/metrics`. Round-26 F4 widens the substitution to
-            // cover DEL (0x7F) and the C1 range (0x80..=0x9F) —
+            // `/metrics`. The substitution also covers DEL (0x7F) and the C1 range (0x80..=0x9F) —
             // CSI (0x9B) is a valid single-byte ANSI escape
             // prefix under 8-bit terminal emulation, so a HELP
             // text carrying a `\u{9b}...` sequence renders the
@@ -523,11 +522,11 @@ fn escape_prom_help(help: &str) -> String {
 /// series name; catch that at registration.
 #[allow(clippy::panic)]
 fn validate_metric_key(key: &str) {
-    // Round-33 F4: split the key into base + labels first, then apply
+    // Split the key into base + labels first, then apply
     // strict byte checks to the base name only. Label values are
     // enclosed in double quotes by convention (`{stage="worker_queue"}`)
     // so a global `"` ban would panic on every labelled counter
-    // registration (see round-14 the labelled-counter tests). The
+    // registration (see the labelled-counter tests). The
     // real hazard is a base-name that carries `"` / `\` / `\n` / `\r`
     // / NUL — those would produce unbalanced quotes or split-line
     // output that Prometheus rejects as invalid text exposition.
@@ -699,7 +698,7 @@ mod tests {
         let _c = r.counter("av_conflict2", "conflict");
     }
 
-    /// Round-19: HELP text with an embedded newline must be escaped
+    /// HELP text with an embedded newline must be escaped
     /// so the Prometheus text-format scraper does not interpret the
     /// second half as a metric sample. Backslash must also be
     /// escaped per the spec.
@@ -816,7 +815,7 @@ mod tests {
         );
     }
 
-    /// Vicious bug caught in review round 18: `counter()` used to silently
+    /// Vicious registry bug: `counter()` used to silently
     /// insert a fresh Counter over an existing Histogram at the same key,
     /// detaching the histogram from the registry and losing every prior
     /// observation. A metric name registered as one type must never be
@@ -865,9 +864,9 @@ mod tests {
         assert_eq!(h2.count(), 1, "must return the same underlying histogram");
     }
 
-    /// Round-26 F4: HELP text escaper substitutes DEL (0x7F) and every
-    /// C1 control (0x80..=0x9F) with a literal space. Round-20/21
-    /// hardened C0 already; C1 was left through and CSI (0x9B) is a
+    /// HELP text escaper substitutes DEL (0x7F) and every
+    /// C1 control (0x80..=0x9F) with a literal space. C0 controls
+    /// were handled first; C1 was left through and CSI (0x9B) is a
     /// valid single-byte ANSI escape prefix under 8-bit terminal
     /// emulation. A future counter registration with operator-
     /// influenced HELP text (charter name / model name / SSE error
@@ -893,7 +892,7 @@ mod histogram_boundary_tests {
 
     use super::*;
 
-    /// Mutation-run hardening (round 12): the overflow-bucket branch of
+    /// Mutation-run hardening: the overflow-bucket branch of
     /// `quantile_us` and the seconds conversion in `_sum` rendering were
     /// unpinned. A sample past the last bound must surface as u64::MAX
     /// (never silently under-report as the last bound), and the rendered

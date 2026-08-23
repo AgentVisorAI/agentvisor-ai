@@ -223,13 +223,13 @@ pub struct Metadata {
 /// [`Self::unmapped`] (never silently dropped); outbound serialization
 /// is always the current schema shape.
 ///
-/// Round-6 (hunt2 F11): the tolerance is **inbound-only** — an event
+/// The tolerance is **inbound-only** — an event
 /// whose `unmapped` is non-empty is refused by `validate_event` (and
 /// would be refused by the broker's schema gate, which declares
 /// `additionalProperties: false`). Consumers may parse newer-node
 /// events; they may not republish them carrying unknown fields.
 ///
-/// # Round-34 F3 — additive tolerance is TOP-LEVEL ONLY
+/// # Additive tolerance is TOP-LEVEL ONLY
 ///
 /// The `deny_unknown_fields` attribute on every nested struct
 /// ([`Metadata`], [`AgentIdentity`], [`Product`], [`CharterFile`],
@@ -392,7 +392,7 @@ impl OcsfEventBuilder {
             {
                 check_jcs_safe(v)?;
             }
-            // Round-26 F1 (av-events builder): schema declares
+            // Schema declares
             // `pruning_ratio_millis` as an integer in `[0, 1000]`
             // (0.0%–100.0%). The prior build path only enforced
             // JCS-safety, so a caller could construct an event
@@ -410,21 +410,21 @@ impl OcsfEventBuilder {
                 }
             }
         }
-        // Round-6 (hunt2 F1): mirror the JCS-safety guard for
+        // Mirror the JCS-safety guard for
         // ai_agent.ttl_remaining_s at build time so signed emits from
         // this crate can never produce an event that the wire-side
         // validator would refuse.
         if let Some(ttl) = self.ai_agent.ttl_remaining_s {
             check_jcs_safe(ttl)?;
         }
-        // Round-6 (hunt1 F5): the JSON schema (`schemas/ocsf-agent-event.schema.json`)
+        // The JSON schema (`schemas/ocsf-agent-event.schema.json`)
         // and the Rust validator both declare `severity_id` in 1..=6.
         // The builder previously accepted any u8, so a caller passing
         // `.severity(0)` or `.severity(7)` produced a signed/journaled
         // event that then failed the embedded broker's schema validator
         // at publish — surfacing as an opaque Backend error and marking
         // the session capture-failed. Refuse at build time, matching
-        // the round-26 pruning_ratio_millis fix pattern above.
+        // the pruning_ratio_millis fix pattern above.
         if !(1..=6).contains(&self.severity_id) {
             return Err(av_core::CoreError::UnsafeInteger(u64::from(self.severity_id)));
         }
@@ -507,9 +507,9 @@ mod tests {
         assert_eq!(ev.metadata.version, OCSF_VERSION);
     }
 
-    /// Round-26 F1: `pruning_ratio_millis` is a permille ratio
-    /// (0..=1000 → 0.0%..=100.0%). Round-15 F3 (schema declares
-    /// the max) but the builder used to only enforce JCS-safety,
+    /// `pruning_ratio_millis` is a permille ratio
+    /// (0..=1000 → 0.0%..=100.0%). The schema declares
+    /// the max, but the builder used to only enforce JCS-safety,
     /// so `Some(5000)` (500%) built successfully and only failed
     /// at strict-validate time downstream. Now caught at build.
     #[test]

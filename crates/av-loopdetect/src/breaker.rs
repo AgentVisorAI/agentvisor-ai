@@ -106,10 +106,11 @@ pub struct SessionLoopState {
 }
 
 struct Inner {
-    /// Ring of the most recent usable embeddings. Round-51 §3.5: the
-    /// breaker previously compared only against the IMMEDIATELY
-    /// preceding embedding, so simple alternation (A, B, A, B, …) —
-    /// the canonical agent-loop shape — never tripped in the default
+    /// Ring of the most recent usable embeddings. A window (not a
+    /// single slot) is required: a breaker that compares only against
+    /// the IMMEDIATELY preceding embedding lets simple alternation
+    /// (A, B, A, B, …) —
+    /// the canonical agent-loop shape — run forever in the default
     /// build (cross-history tightening needed a Qdrant sink). The
     /// delta is now the minimum against any embedding in this window,
     /// so a step that duplicates ANY recent step grows the streak.
@@ -242,7 +243,7 @@ impl SessionLoopState {
     /// direction). Clears the streak and the embedding window and closes the
     /// breaker.
     ///
-    /// Round-51 §3.5: `tokens_consumed` deliberately SURVIVES the reset.
+    /// `tokens_consumed` deliberately SURVIVES the reset.
     /// It implements the documented "minimum session token consumption"
     /// floor — zeroing it on every Inject turned the session-lifetime
     /// floor into a per-cycle floor, letting an agent that ignores the
@@ -262,7 +263,7 @@ impl SessionLoopState {
     /// direction). Clears the streak and the embedding window and closes the
     /// breaker.
     ///
-    /// Round-51 §3.5: `tokens_consumed` deliberately SURVIVES the reset.
+    /// `tokens_consumed` deliberately SURVIVES the reset.
     /// It implements the documented "minimum session token consumption"
     /// floor — zeroing it on every Inject turned the session-lifetime
     /// floor into a per-cycle floor, letting an agent that ignores the
@@ -391,7 +392,7 @@ mod tests {
             800,
         );
         assert!(matches!(v, BreakerVerdict::Progressing { .. }), "{v:?}");
-        // Round-51 §3.5: a looped step after ONE progress interjection
+        // A looped step after ONE progress interjection
         // still matches the earlier repeats in the embedding window —
         // the streak resumes immediately instead of being laundered by
         // an A,A,B,A alternation (the old adjacent-only comparison
@@ -400,7 +401,7 @@ mod tests {
         assert!(matches!(v, BreakerVerdict::Suspicious { streak: 1, .. }), "{v:?}");
     }
 
-    /// Round-51 §3.5: simple alternation — A, B, A, B, … — is the
+    /// Simple alternation — A, B, A, B, … — is the
     /// canonical agent-loop shape and previously NEVER tripped the
     /// breaker in the default build (only the immediately-preceding
     /// embedding was compared; the cross-history path needed a Qdrant
@@ -428,7 +429,7 @@ mod tests {
         );
     }
 
-    /// Round-51 §3.5: `tokens_consumed` is a SESSION floor, not a
+    /// `tokens_consumed` is a SESSION floor, not a
     /// per-cycle floor. After an Inject-triggered reset, an agent that
     /// ignores the corrective message must re-trip without having to
     /// burn `min_tokens` again from zero.
@@ -557,7 +558,7 @@ mod similarity_path_tests {
 
     use super::*;
 
-    /// Mutation-run hardening (round 12): the Qdrant-similarity arm
+    /// Mutation-run hardening: the Qdrant-similarity arm
     /// (`1.0 - similarity`) had no direct test — a mutant deleting the
     /// subtraction turns "nearly identical to history" (similarity ~1,
     /// delta ~0) into "maximum novelty" (delta ~1) and the breaker

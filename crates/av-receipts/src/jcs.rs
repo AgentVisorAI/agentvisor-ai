@@ -27,7 +27,7 @@ pub enum JcsError {
     /// Non-finite number (unreachable via `serde_json::Value`, kept for defense).
     #[error("non-finite number cannot be canonicalized")]
     NonFinite,
-    /// Round-40 F5: value nesting exceeds `MAX_NESTED_DEPTH`.
+    /// Value nesting exceeds `MAX_NESTED_DEPTH`.
     ///
     /// Current call sites all feed `canonicalize` a `Value` that was
     /// parsed by `serde_json::from_slice` (default recursion limit
@@ -42,7 +42,7 @@ pub enum JcsError {
     TooDeep(usize),
 }
 
-/// Round-40 F5: matches `av_receipts::receipt::MAX_NESTED_DEPTH`
+/// Matches `av_receipts::receipt::MAX_NESTED_DEPTH`
 /// (128), which is also the serde_json default parser recursion
 /// limit — anything a legit strict-load receipt could carry.
 const MAX_NESTED_DEPTH: usize = 128;
@@ -425,7 +425,7 @@ mod tests {
         assert_eq!(ecma_number(-0.0), "0");
     }
 
-    /// Round-40 F5: recursion is capped at `MAX_NESTED_DEPTH`. All
+    /// Recursion is capped at `MAX_NESTED_DEPTH`. All
     /// current call sites feed `canonicalize` a `Value` parsed by
     /// serde_json (default limit 128) so this cap is transitively
     /// redundant today, but a future caller that pipes a
@@ -433,7 +433,7 @@ mod tests {
     /// stack-overflow. Build a nested array manually (bypassing
     /// serde_json's parser cap) and assert `TooDeep` is returned
     /// cleanly rather than the process crashing.
-    /// Round-40 F5 (object branch): the array test above leaves the
+    /// The array test above leaves the
     /// `write_value(v, out, depth + 1)` recursion in the *object* arm
     /// unpinned — a mutant that stops incrementing depth there would
     /// canonicalize unbounded object nesting and stack-overflow on

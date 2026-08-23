@@ -196,7 +196,7 @@ fn algorithm_confusion_hs256_signed_with_public_pem_rejected() {
     ));
 }
 
-/// Round-44 F5 / RUSTSEC-2023-0071: our deny.toml ignore of the Marvin
+/// RUSTSEC-2023-0071: our deny.toml ignore of the Marvin
 /// Attack rests on the invariant that the RSA code path in
 /// `jsonwebtoken` is unreachable from our runtime. This test locks that
 /// invariant in against future refactors. A JWT claiming `alg: RS256`
@@ -519,7 +519,7 @@ fn add_jwks_refuses_to_overwrite_a_manually_registered_kid() {
         .unwrap();
 }
 
-/// Round-12 F6: a JWKS array with two entries carrying the same `kid`
+/// A JWKS array with two entries carrying the same `kid`
 /// must be refused rather than silently accepting the *last* one.
 /// A compromised or misconfigured IdP could otherwise ship an alien
 /// public key alongside a legitimate one and have it silently overwrite
@@ -547,7 +547,7 @@ fn add_jwks_refuses_duplicate_kid_within_the_same_document() {
     assert_eq!(validator.key_count(), 0);
 }
 
-/// Round-12 F11: a hostile JWKS with tens of thousands of keys must be
+/// A hostile JWKS with tens of thousands of keys must be
 /// refused so a refresh does not stall every concurrent
 /// `validate_single` call while `keys.write()` is held for a giant
 /// install loop. Real deployments have 5–20 keys; the cap sits at
@@ -626,7 +626,7 @@ fn cve_2026_25537_string_nbf_is_rejected_not_bypassed() {
     );
 }
 
-/// Round-25 F1: JWKS refuses a key that declares `use = "enc"`.
+/// JWKS refuses a key that declares `use = "enc"`.
 /// Signature correctness is still protected by the alg-vs-kty
 /// verify-time check, but silently installing an encryption-only
 /// key as a signing verifier violates the IdP's stated policy —
@@ -653,7 +653,7 @@ fn round_25_f1_jwks_refuses_use_enc_okp_key() {
     );
 }
 
-/// Round-25 F1: JWKS refuses a key that declares alg != "EdDSA".
+/// JWKS refuses a key that declares alg != "EdDSA".
 #[test]
 fn round_25_f1_jwks_refuses_wrong_alg_okp_key() {
     let keys = ed25519_keys("bad-alg-key");
@@ -673,7 +673,7 @@ fn round_25_f1_jwks_refuses_wrong_alg_okp_key() {
     assert!(text.contains("EdDSA"), "expected wrong-alg rejection, got {text}");
 }
 
-/// Round-25 F2: `add_key` refuses to shadow a kid the JWKS drain
+/// `add_key` refuses to shadow a kid the JWKS drain
 /// tracks. Previously a startup or admin `add_key("X", ...)` call
 /// on a kid `X` currently in `jwks_kids` silently overwrote the
 /// JWKS material — and the next `add_jwks` drain silently
@@ -705,7 +705,7 @@ fn round_25_f2_add_key_refuses_jwks_tracked_kid() {
     );
 }
 
-// ---- Mutation-run hardening (round 10): pin the exact security
+// ---- Mutation-run hardening: pin the exact security
 // boundaries. The original suite proved the over-limit rejections but
 // never the accepted-at-boundary twins, so `>` -> `>=` mutants survived
 // in the JWKS cap, chain depth, exp-escalation, size cap, and
@@ -821,11 +821,11 @@ fn iat_at_exact_leeway_edge_is_accepted() {
     v.validate(&mint(&keys, &c)).unwrap();
 }
 
-/// Round-51 §10.2: the JWKS-bomb DoS guard (`MAX_JWKS_KEYS = 256`)
+/// The JWKS-bomb DoS guard (`MAX_JWKS_KEYS = 256`)
 /// was reasoned about in comments and tested nowhere. A hostile or
 /// compromised IdP inflating the `keys` array to tens of thousands
 /// of entries must be refused BEFORE the per-key parser walks it —
-/// regardless of `kty` (the round-15 F5 fix specifically covers
+/// regardless of `kty` (the outer cap specifically covers
 /// non-OKP decoy entries that the inner parser would skip-scan).
 #[test]
 fn jwks_bomb_is_refused_before_the_key_walk() {

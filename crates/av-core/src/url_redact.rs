@@ -1,6 +1,6 @@
 //! Shared URL-userinfo redaction for logs and diagnostics.
 //!
-//! Round-6 (hunt4 F4 + hunt1 F3): the `upstream_url` field is
+//! The `upstream_url` field is
 //! validated to only require an `http(s)://` scheme, so an operator
 //! whose provider requires HTTP Basic auth (a common pattern with
 //! self-hosted litellm/proxy shims) can legitimately put credentials

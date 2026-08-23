@@ -19,9 +19,9 @@ pub trait VectorSink: Send + Sync {
     /// Persist one session vector without participating in the hot path.
     fn record<'a>(&'a self, session_id: &'a str, vector: &'a [f32]) -> VectorSinkFuture<'a>;
 
-    /// Round-6 (hunt4 R-F4): delete every vector recorded under
+    /// Delete every vector recorded under
     /// `session_scope`. Called best-effort when a session finalizes so
-    /// the external store does not grow without bound — the round-32
+    /// the external store does not grow without bound — the
     /// `id#generation` scoping makes prior-generation points
     /// permanently unreachable dead weight otherwise. Default no-op
     /// for sinks without external state.
@@ -68,7 +68,7 @@ impl QdrantVectorSink {
         })
     }
 
-    /// Round-6 (hunt5 F1): idempotent create — GET the collection first,
+    /// Idempotent create — GET the collection first,
     /// verify size + distance if it exists, PUT-create only when
     /// absent. The prior code used PUT unconditionally, but Qdrant's
     /// `PUT /collections/{name}` is CREATE, not create-or-update (see
@@ -144,7 +144,7 @@ impl QdrantVectorSink {
     }
 }
 
-/// Round-6 (hunt4 F14): Qdrant reqwest errors embed the request URL in
+/// Qdrant reqwest errors embed the request URL in
 /// `Display`, leaking the internal vector-store hostname/collection to
 /// every downstream log (worker warn, boot bail). Strip the URL so the
 /// logged text carries only the failure class. `without_url` moves the

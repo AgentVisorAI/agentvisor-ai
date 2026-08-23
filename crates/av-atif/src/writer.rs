@@ -66,8 +66,8 @@ impl TrajectoryBuilder {
     /// aggregate metrics.
     pub fn push_step(&mut self, mut step: Step) -> Result<(), av_core::CoreError> {
         step.step_id = self.steps.len() as u64 + 1;
-        // Strict-validator parity (same rationale as the round-6 hunt2
-        // F2 cost cap below: the builder must never accept a step that
+        // Strict-validator parity (same rationale as the
+        // cost cap below: the builder must never accept a step that
         // makes the trajectory permanently un-writable at
         // `write_atomic`, which strict-validates before persisting):
         // agent steps couple `llm_call_count` and `metrics` —
@@ -132,7 +132,7 @@ impl TrajectoryBuilder {
                     context: "step_cost_usd",
                 });
             }
-            // Round-6 (hunt2 F2): the validator caps step and total
+            // The validator caps step and total
             // cost at MAX_COST_USD (1e12) and refuses to persist
             // anything beyond. The prior writer accepted any finite
             // non-negative step cost, so the reconciler's u64-micros ↔
@@ -225,9 +225,9 @@ pub fn metrics(prompt: u64, completion: u64, cached: u64, cost_usd: f64) -> Metr
 /// `Ok`, the file is atomically visible at `path`. A subsequent
 /// `sync_directory` failure means the dirent may not survive an
 /// immediate power loss on POSIX-conformant filesystems, but every
-/// observer running now sees the file. Round-13 F1 change: log a
+/// observer running now sees the file. Log a
 /// `tracing::warn!` and return `Ok(())` instead of returning `Err`,
-/// matching `av_core::fsutil::write_atomic`'s round-12 F5 semantic.
+/// matching `av_core::fsutil::write_atomic`'s semantic.
 /// Returning `Err` after a successful rename historically confused
 /// caller retry logic: the reconciler would treat this as
 /// "trajectory not persisted" and redo the whole
@@ -248,8 +248,8 @@ pub fn write_atomic(trajectory: &Trajectory, path: &Path) -> Result<(), WriterEr
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    // Round-24 F3 (av-atif writer): parity with `av_core::fsutil::write_atomic`
-    // (round-23) — use `create_dir_all_synced` so a first ATIF write
+    // Parity with `av_core::fsutil::write_atomic` —
+    // use `create_dir_all_synced` so a first ATIF write
     // into a new subtree also fsyncs the newly-created ancestor
     // dirents. `create_dir_all` alone left them volatile until the
     // next ambient sync; a power loss between mkdir and sync could
@@ -444,7 +444,7 @@ mod tests {
         assert!(!path.exists(), "invalid file must not be created");
     }
 
-    /// Vicious bug caught in review round 17: `push_step` used to mutate
+    /// Vicious ordering bug: `push_step` used to mutate
     /// `total_prompt` before checking `total_completion` for overflow, so an
     /// overflow on a later field would leave the builder with totals ahead
     /// of a step that was never pushed. Locks the atomic-commit invariant:

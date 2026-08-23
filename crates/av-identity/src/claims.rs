@@ -13,7 +13,7 @@ pub const MAX_TTL_SECS: u64 = 15 * 60;
 /// `invalid type: sequence, expected string` error deep inside
 /// `jsonwebtoken::decode`, before our validator's aud check runs.
 ///
-/// Round-12 F10 defense-in-depth: reject `"aud": []` at deserialize
+/// Defense-in-depth: reject `"aud": []` at deserialize
 /// time. Without this guard `Multi(vec![])` would still be caught by
 /// `jsonwebtoken`'s `set_audience` intersection check, but a future
 /// refactor that removed the library gate would leave the empty-list
@@ -79,8 +79,8 @@ impl<'de> serde::Deserialize<'de> for Audience {
                         "aud claim must not be an empty array; provide the audience or omit the claim",
                     ));
                 }
-                // Round-14 F3: incomplete symmetry with round-13 F3
-                // (empty-string reject in visit_str). Without this, an
+                // Symmetry with the empty-string reject in
+                // visit_str. Without this, an
                 // `aud: [""]` would deserialize as
                 // `Multi(vec!["".to_owned()])` and pass the "not
                 // empty array" gate while still carrying zero
@@ -244,8 +244,8 @@ mod tests {
         assert!(!value.aud.contains("nope"));
     }
 
-    /// Round-14 F3: incomplete symmetry with round-13 F3
-    /// (empty-string reject in visit_str). An `aud: [""]` would
+    /// Symmetry with the empty-string reject in
+    /// visit_str. An `aud: [""]` would
     /// otherwise deserialize as `Multi(vec!["".to_owned()])` and
     /// pass the "not empty array" gate while still carrying zero
     /// meaningful audience entries.
@@ -264,7 +264,7 @@ mod tests {
         );
     }
 
-    /// Round-13 F3: mirror of F10 for the string half. The docstring
+    /// Mirror of the empty-array rejection for the string half. The docstring
     /// promises "non-empty string or non-empty array". Refuse the
     /// empty string at deserialize time as defense-in-depth against a
     /// misconfigured validator whose expected audience is also `""`.
@@ -283,7 +283,7 @@ mod tests {
         );
     }
 
-    /// Round-12 F10: an empty audience array must be rejected at the
+    /// An empty audience array must be rejected at the
     /// concrete deserialize step, so the audience gate remains sound
     /// even if a future refactor drops `jsonwebtoken`'s
     /// `set_audience` intersection check.
@@ -302,7 +302,7 @@ mod tests {
         );
     }
 
-    /// Round-12: `aud` present but of an unsupported JSON type (number,
+    /// `aud` present but of an unsupported JSON type (number,
     /// bool, null) must be rejected with a clear "expected a JWT
     /// audience" message — the untagged enum variant used to fall
     /// through with a much more confusing message.
