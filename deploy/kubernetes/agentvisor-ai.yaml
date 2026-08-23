@@ -40,6 +40,13 @@ data:
     # Dev posture. In production configure identity_jwks_url and set
     # require_identity = true.
     require_identity = false
+    # Required alongside require_identity = false + the 0.0.0.0 bind:
+    # config validation refuses that combination without this explicit
+    # opt-in (the daemon would CrashLoopBackOff at startup). Safe here
+    # because the pod network is the outer layer — only the Service
+    # below routes to containerPort 8484. Same posture as
+    # config/harness.container.toml.
+    allow_wildcard_bind = true
 
     atif_spool_dir = "/app/spool/atif"
     # Bound the spool so a pod restart's recovery scan stays inside the

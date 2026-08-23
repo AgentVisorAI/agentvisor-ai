@@ -2259,6 +2259,16 @@ impl Finalizer {
                     u64::try_from(journal.len())
                         .map_err(|_| FinalizeError::Atif("active journal length overflow".to_owned()))?,
                 );
+                // Mirror the pending-response quarantine branch below (and
+                // the `recover_unsigned` invariant): if any future path
+                // mints an event against this quarantined placeholder, its
+                // `metadata.sequence` must continue past the on-disk
+                // records rather than restart at 0 and collide with the
+                // session's first event already on the bridge.
+                claimed.restore_next_seq(
+                    u64::try_from(journal.len())
+                        .map_err(|_| FinalizeError::Atif("active journal length overflow".to_owned()))?,
+                );
                 claimed.mark_capture_failed();
                 // Also seal the session finalized (like the signed-journal
                 // capture-failed path) so the idle sweeper's `!is_closed()` filter
