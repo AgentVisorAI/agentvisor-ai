@@ -17,6 +17,21 @@ on that rank swap, copy it to one of the searched paths.
 `validate()` gates, and JSON-schema fidelity checks that `agentvisord`
 runs at startup and fails with the same diagnostics.
 
+## Environment variables
+
+Round-51 §9.4: these were previously documented nowhere outside the
+source. All are optional.
+
+| Variable | Read by | Meaning |
+| --- | --- | --- |
+| `AV_SIGNING_SEED_FILE` | `agentvisord` | Path to the 32-byte Ed25519 signing seed — **the root of the entire trust story**. Default `config/signing.seed` relative to the working directory. If the file is missing, a fresh seed is generated and a WARN names the new key id: every receipt signed after an unintended regeneration verifies only against the NEW key, so mount this from a Secret in production and treat the WARN as a compliance incident outside first boot. |
+| `AV_CONFIG` | `agentvisord`, `avctl` | Absolute path to the config file; rank 1 in the search order above. |
+| `AV_UPSTREAM_URL` | `agentvisord` | Overrides `upstream_url` (useful in containers where the config file is baked). |
+| `AV_BEARER_TOKEN_FILE` | `avctl` | Path to a file holding the NHI bearer used by `avctl loadgen`/probe commands. |
+| `RUST_LOG` | `agentvisord` | Tracing filter (default `info`). A parse failure falls back to `info` with a warning. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | `agentvisord` | OTLP trace export target. Requires a build with `--features otel`; a default-features binary warns loudly instead of silently ignoring them. |
+
+
 ## Networking
 
 | Key | Default | Notes |

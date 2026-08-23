@@ -50,6 +50,15 @@ cargo install av-harness av-cli    # installs `agentvisord` + `avctl` binaries
 avctl
 ```
 
+> `cargo install` builds **default features only**: the embedded
+> bridge, in-memory state, hash embedder and in-memory vector store
+> all work, but `redis`/`kafka`/`nats`/`onnx`/`qdrant`/`otel` are
+> compiled out. To use those backends install with
+> `cargo install av-harness av-cli --features full` (or the specific
+> feature). Both pre-flight tools (`avctl config-validate`,
+> `avctl doctor`) fail loudly when a config selects a backend the
+> build cannot run.
+
 > The two crates land on crates.io from `v0.1.0` onwards; until that
 > release is published, use the `--path` variants shown in
 > [Install from source](#install-from-source) below.
