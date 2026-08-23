@@ -54,12 +54,17 @@ DAEMON_PID=""
 MOCK_PID=""
 cleanup() {
     set +e
-    [[ -n "$DAEMON_PID" ]] && kill "$DAEMON_PID" 2>/dev/null
-    [[ -n "$MOCK_PID"   ]] && kill "$MOCK_PID"   2>/dev/null
+    # SIGKILL, not SIGTERM: agentvisord treats SIGTERM as a graceful
+    # drain start (30s budget), which needlessly blocks this verifier's
+    # cleanup AND leaves the daemon holding the port when the script's
+    # patience runs out. An ephemeral verification daemon has no
+    # in-flight work worth draining.
+    [[ -n "$DAEMON_PID" ]] && kill -KILL "$DAEMON_PID" 2>/dev/null
+    [[ -n "$MOCK_PID"   ]] && kill -KILL "$MOCK_PID"   2>/dev/null
     wait 2>/dev/null
     rm -rf "$WORK"
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 mkdir -p "$WORK/spool" "$WORK/config" "$WORK/tool-schemas"
 
@@ -96,7 +101,10 @@ TOML
 python3 "$WORK/mock_upstream.py" &
 MOCK_PID=$!
 
-(cd "$WORK" && "$AGENTVISORD" --config "$WORK/config/harness.toml" > "$WORK/daemon.log" 2>&1) &
+# `exec` inside the subshell so `$!` is the agentvisord PID directly;
+# a bare `( ... ) &` records the wrapper subshell's PID, and killing
+# that leaves the daemon reparented and still holding the port.
+(cd "$WORK" && exec "$AGENTVISORD" --config "$WORK/config/harness.toml" > "$WORK/daemon.log" 2>&1) &
 DAEMON_PID=$!
 
 # Wait for /readyz

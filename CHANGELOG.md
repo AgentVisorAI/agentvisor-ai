@@ -4,6 +4,65 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## Unreleased
 
+### Round-51 engineering review remediation (2026-08-22 → 2026-08-23)
+
+Closes every finding in the external engineering review dated
+18 August 2026 (43 pages). Two criticals, four majors per section,
+all blockers, moderates and doc gaps, all three quarter-scale
+structural refactors, and both halves of the §7.3 group commit are
+landed. One item (cross-session shared-journal fsync batching)
+remains an explicit non-goal with rationale.
+
+Full closure map with per-finding fix mechanisms and test pointers:
+[`docs/reference/REVIEW-51-REMEDIATION.md`](docs/reference/REVIEW-51-REMEDIATION.md).
+The two headline claims (working hero snippet, offline receipt
+verification with tamper + §3.1 forgery refusal) are reproducible
+against release binaries in ~2s via
+[`scripts/live-verify.sh`](scripts/live-verify.sh), which CI runs on
+every push.
+
+Highlights of the substantive changes:
+
+- **§3.1 forgery closed at the root:** `add_key_bytes` refuses
+  small-order keys; `verify_strict` everywhere; mutation suite
+  asserts typed error variants. Live-verify runs the review's exact
+  identity-point + `01 00…00` PoC and confirms it is now refused
+  before the verify call runs.
+- **§3.2 budget binding fixed:** counters key on the authenticated
+  principal, not the caller-chosen `X-AV-Session` header.
+- **§9.1 hero snippet works:** the SDK-shaped
+  `Authorization: Bearer sk-*` header no longer 401s; `avctl pubkey`
+  extracts the trust anchor the product is named for.
+- **S1 reconciler decomposition (§4.2):** `recover_spooled_sessions`
+  is now a thin ordered runner over six named `RecoveryPass`es
+  behind a narrow `ReconcilerContext`.
+- **S2 lifecycle state machine (§4.2):** the flag-soup is replaced
+  by `SessionState` in one `AtomicU8` with CAS `transition(from, to)`;
+  illegal transitions are impossible in release and panic in debug.
+- **S3 provider adapter (§4.2):** `ProviderAdapter` trait ships with
+  OpenAI, Anthropic and Gemini adapters, each pinned by a full-chain
+  integration test against a mock upstream that proves the audit
+  chain records the same shape across dialects.
+- **§7.3 group commit landed:** same-session backlog appends N
+  records under one fdatasync; no job's effects visible before its
+  record is durable. EEXIST mkdirs (~5/request) eliminated; broker
+  acks folded into a per-session `{stem}.acks.ndjson` journal.
+- **§7.3 head-of-line blocking closed:** shards are dispatchers over
+  per-session FIFO queues; up to 8 sessions per shard run
+  concurrently with strict per-session ordering.
+- **§7.3 unsigned RAM cliff closed:** ATIF steps spill to the events
+  journal (which already carried them); RAM keeps a counter; close
+  rebuilds from disk. 1.35 GB → O(1) per session.
+- **§8.6 spool sharing refused:** exclusive advisory lock on
+  `.agentvisord.lock`; a second daemon refuses to boot; process-level
+  e2e proves the property.
+- **§10.2 process-level restart tests:** SIGKILL/restart idempotence,
+  spool-outage fail-closed-then-recover, and two-daemon lock refusal
+  all pin against a real spawned `agentvisord`.
+- **§7.1 `cargo bench` runs to completion:** `iter_custom` bounded
+  batches with untimed drains — no more queue-fill panic; per-function
+  microbenchmarks cross-check the SLA figures.
+
 ### Bug-hunt round 32: Qdrant cross-session contamination + compression O(n²) → O(n) (2026-08-20)
 
 Applied three surgical fixes from a user-supplied list of deferred

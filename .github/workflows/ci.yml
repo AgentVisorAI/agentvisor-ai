@@ -109,6 +109,17 @@ jobs:
           cargo test -p av-harness --release --features full --test sla sla_core_metrics -- --ignored --nocapture
           ulimit -n 65536
           RUN_HEAVY_PERF=1 AV_SLA_CONNECTIONS=10000 cargo test -p av-harness --release --features full --test sla sla_10k_streaming_connections -- --ignored --nocapture
+      - name: Live-verify (round-51 §11 headline claims end-to-end)
+        # Reproduces the review's two headline claims - hero snippet
+        # succeeds, offline receipt verification refuses tampers and
+        # the §3.1 forgery PoC - against real release binaries with a
+        # scripted mock upstream. No live broker needed. Runs in ~2s;
+        # boot failures print structured JSON via the §8.10 fatal
+        # logger so a red run is triageable from the CI log alone.
+        if: github.event_name == 'push'
+        run: |
+          cargo build --release -p av-harness --bin agentvisord -p av-cli --bin avctl
+          ./scripts/live-verify.sh
       - name: Feature matrix
         run: |
           cargo check --workspace --no-default-features
