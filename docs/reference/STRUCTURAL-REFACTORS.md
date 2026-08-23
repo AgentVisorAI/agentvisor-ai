@@ -88,6 +88,22 @@ pass registry internally.
    `recover_spooled_sessions` method as a thin loop over the pass
    registry. Do NOT combine steps: each pass extraction is one PR
    with its own regression tests.
+   * ✅ `QuarantineIncompleteEffectsPass` (round-51 pass 15): the
+     incomplete-effects marker scan (in-flight responses +
+     unresolved tool executions) moved to `recovery.rs` with its
+     live-session retain and warn-once dedupe. Extracted passes are
+     invoked explicitly at their historical positions via
+     `recovery::run_pass` — ordering against the not-yet-extracted
+     phases is load-bearing (this pass must see the registry BEFORE
+     journal recovery adopts sessions; the orphan-JSON pass
+     snapshots stems AFTER), so the flat registry loop only becomes
+     possible at step 4. `ReconcilerContext` gained sessions /
+     journal_key / quarantined_sessions; `known_stems` moved from a
+     caller-provided snapshot to a run-time snapshot inside the
+     orphan pass (fresher, and the context is narrower).
+   * Remaining: `ReplayLifecycleOutboxesPass`,
+     `RecoverSignedJournalsPass`, `ConsolidateStepJournalsPass`,
+     `AdoptStrictAtifPass` (the tail of the current method).
 4. **Once the pass registry is stable**, move the retention sweep
    from main.rs into the same registry (it's currently spawned
    separately because the reconciler didn't have a home for it).

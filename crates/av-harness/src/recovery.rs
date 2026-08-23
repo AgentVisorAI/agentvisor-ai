@@ -27,13 +27,19 @@ pub(crate) struct ReconcilerContext<'a> {
     /// The ATIF spool directory the recovery scan walks.
     pub spool_dir: &'a Path,
     pub metrics: &'a Registry,
-    /// Filename stems (`sha256(session_id)[..32]`) of every
-    /// registry-known session, snapshotted by the caller. Doubles as
-    /// the §8.5 live-close guard: a sidecar-less `{stem}.json` whose
-    /// stem is known belongs to an in-progress close (between
-    /// `write_atomic` and the `.atif-auth` seal) and must not be
-    /// quarantined out from under it.
-    pub known_stems: &'a HashSet<String>,
+    /// The live session registry. Passes snapshot what they need at
+    /// run time (e.g. filename stems), so a pass observes the
+    /// registry as of ITS position in the recovery order — earlier
+    /// phases may have adopted sessions.
+    pub sessions: &'a crate::session::SessionRegistry,
+    /// Authenticates spool markers (in-flight responses, unresolved
+    /// tool executions) so attacker-planted files cannot poison
+    /// sessions into quarantine.
+    pub journal_key: &'a [u8; 32],
+    /// Session ids already warned about as incomplete-effect
+    /// quarantines: markers stay on disk as evidence, so every tick
+    /// rediscovers the same set and must not repeat the warning.
+    pub quarantined_sessions: &'a parking_lot::Mutex<HashSet<String>>,
     /// Per-artifact warning dedupe (`Finalizer::warn_once`): a file
     /// left on disk as evidence must not repeat its warning every
     /// tick. Returns true when this is the first warn for the path
@@ -41,10 +47,29 @@ pub(crate) struct ReconcilerContext<'a> {
     pub warn_once: &'a (dyn Fn(PathBuf) -> bool + Send + Sync),
 }
 
+impl ReconcilerContext<'_> {
+    /// Filename stems (`sha256(session_id)[..32]`) of every
+    /// registry-known session, snapshotted NOW. Doubles as the §8.5
+    /// live-close guard: a sidecar-less `{stem}.json` whose stem is
+    /// known belongs to an in-progress close (between `write_atomic`
+    /// and the `.atif-auth` seal) and must not be quarantined out
+    /// from under it.
+    fn known_stems(&self) -> HashSet<String> {
+        self.sessions
+            .open_sessions_including_closed()
+            .iter()
+            .map(|session| {
+                let digest = av_core::digest::sha256_hex(session.id.as_bytes());
+                digest.get(..32).unwrap_or(&digest).to_owned()
+            })
+            .collect()
+    }
+}
+
 /// What a pass did this run, for tick-level observability.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct PassOutcome {
-    /// Files renamed out of the recovery scan glob this run.
+    /// Items (files or sessions) newly quarantined this run.
     pub quarantined: usize,
 }
 
@@ -64,11 +89,78 @@ pub(crate) trait RecoveryPass: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<PassOutcome, FinalizeError>> + Send + 'a>>;
 }
 
-/// The ordered registry `recover_spooled_sessions` runs before its
-/// adoption scan. Each S1 step-3 extraction appends one more pass
-/// here instead of growing the god-method.
-pub(crate) fn passes() -> &'static [&'static dyn RecoveryPass] {
-    &[&QuarantineOrphanJsonPass]
+/// Run one pass with tick-level observability. The reconciler
+/// invokes extracted passes explicitly, in recovery order, at their
+/// historical positions — ordering between passes and the not-yet-
+/// extracted phases is load-bearing (e.g. the incomplete-effects
+/// scan must see the registry BEFORE journal recovery adopts
+/// sessions), so a single flat registry loop only becomes possible
+/// once every phase is a pass (S1 step 4).
+pub(crate) async fn run_pass(
+    pass: &dyn RecoveryPass,
+    ctx: &ReconcilerContext<'_>,
+) -> Result<PassOutcome, FinalizeError> {
+    let outcome = pass.run(ctx).await?;
+    if outcome.quarantined > 0 {
+        tracing::info!(
+            pass = pass.name(),
+            quarantined = outcome.quarantined,
+            "recovery pass quarantined items"
+        );
+    }
+    Ok(outcome)
+}
+
+/// First phase of the recovery order: sessions with on-disk markers
+/// proving an *abandoned* effect (an in-flight upstream response or
+/// an unresolved tool execution at crash time) are quarantined by id
+/// — their capture is incomplete, so closing them normally would
+/// attest a trajectory missing effects that actually ran.
+///
+/// A marker only proves abandonment when its session is not
+/// currently active: live sessions legitimately hold markers for
+/// the duration of an upstream call, and a request that merely
+/// straddles a periodic tick must not poison its session as
+/// capture-failed forever. This pass therefore MUST run before the
+/// journal-recovery phases adopt spooled sessions into the registry.
+pub(crate) struct QuarantineIncompleteEffectsPass;
+
+impl RecoveryPass for QuarantineIncompleteEffectsPass {
+    fn name(&self) -> &'static str {
+        "quarantine_incomplete_effects"
+    }
+
+    fn run<'a>(
+        &'a self,
+        ctx: &'a ReconcilerContext<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<PassOutcome, FinalizeError>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut quarantined = crate::worker::inflight_response_sessions(ctx.spool_dir, ctx.journal_key)
+                .await
+                .map_err(FinalizeError::Atif)?;
+            quarantined.extend(
+                crate::routes::unresolved_tool_sessions(ctx.spool_dir, ctx.journal_key)
+                    .await
+                    .map_err(FinalizeError::Atif)?,
+            );
+            quarantined.retain(|id| ctx.sessions.get(id).is_none());
+            let mut outcome = PassOutcome::default();
+            if !quarantined.is_empty() {
+                // The markers stay on disk as evidence, so every
+                // periodic tick rediscovers the same set. Warn only
+                // about ids not already known — otherwise a single
+                // crash would repeat this warning every tick forever.
+                let mut known = ctx.quarantined_sessions.lock();
+                let new = quarantined.iter().filter(|id| !known.contains(*id)).count();
+                if new > 0 {
+                    outcome.quarantined = new;
+                    tracing::warn!(sessions = new, "quarantining sessions with incomplete effects");
+                }
+                known.extend(quarantined.iter().cloned());
+            }
+            Ok(outcome)
+        })
+    }
 }
 
 /// Round-16 stress finding: a fresh sidecar-less `{stem}.json` is
@@ -102,6 +194,12 @@ impl RecoveryPass for QuarantineOrphanJsonPass {
     ) -> Pin<Box<dyn Future<Output = Result<PassOutcome, FinalizeError>> + Send + 'a>> {
         Box::pin(async move {
             let mut outcome = PassOutcome::default();
+            // Snapshot AFTER the journal-recovery phases have adopted
+            // sessions (this pass runs late in the recovery order), so
+            // freshly adopted sessions are covered by the live-close
+            // guard. Sessions opened after this snapshot are handled
+            // by the MIN_ORPHAN_AGE gate below.
+            let known_stems = ctx.known_stems();
             let mut entries = match tokio::fs::read_dir(ctx.spool_dir).await {
                 Ok(entries) => entries,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -132,7 +230,7 @@ impl RecoveryPass for QuarantineOrphanJsonPass {
                 if path
                     .file_stem()
                     .and_then(std::ffi::OsStr::to_str)
-                    .is_some_and(|stem| ctx.known_stems.contains(stem))
+                    .is_some_and(|stem| known_stems.contains(stem))
                 {
                     continue;
                 }
@@ -201,17 +299,36 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    fn context<'a>(
-        spool_dir: &'a Path,
-        metrics: &'a Registry,
-        known_stems: &'a HashSet<String>,
-        warn_once: &'a (dyn Fn(PathBuf) -> bool + Send + Sync),
-    ) -> ReconcilerContext<'a> {
-        ReconcilerContext {
-            spool_dir,
-            metrics,
-            known_stems,
-            warn_once,
+    struct CtxParts {
+        metrics: Registry,
+        sessions: crate::session::SessionRegistry,
+        journal_key: [u8; 32],
+        quarantined_sessions: parking_lot::Mutex<HashSet<String>>,
+    }
+
+    impl CtxParts {
+        fn new() -> Self {
+            Self {
+                metrics: Registry::new(),
+                sessions: crate::session::SessionRegistry::new(),
+                journal_key: [7u8; 32],
+                quarantined_sessions: parking_lot::Mutex::new(HashSet::new()),
+            }
+        }
+
+        fn context<'a>(
+            &'a self,
+            spool_dir: &'a Path,
+            warn_once: &'a (dyn Fn(PathBuf) -> bool + Send + Sync),
+        ) -> ReconcilerContext<'a> {
+            ReconcilerContext {
+                spool_dir,
+                metrics: &self.metrics,
+                sessions: &self.sessions,
+                journal_key: &self.journal_key,
+                quarantined_sessions: &self.quarantined_sessions,
+                warn_once,
+            }
         }
     }
 
@@ -235,10 +352,6 @@ mod tests {
         std::fs::write(&aged_orphan, b"{").unwrap();
         age_past_threshold(&aged_orphan);
 
-        let live_stem = spool.join("livestem.json");
-        std::fs::write(&live_stem, b"{").unwrap();
-        age_past_threshold(&live_stem);
-
         let young_orphan = spool.join("young.json");
         std::fs::write(&young_orphan, b"{").unwrap();
 
@@ -251,15 +364,35 @@ mod tests {
         std::fs::write(&journal, b"{}").unwrap();
         age_past_threshold(&journal);
 
-        let metrics = Registry::new();
-        let known_stems: HashSet<String> = std::iter::once("livestem".to_owned()).collect();
+        let parts = CtxParts::new();
+        // A registered session whose artifact stem matches
+        // `live_stem`'s filename engages the §8.5 live-close guard.
+        // The pass snapshots stems from the registry at run time, so
+        // the file to protect is derived from a REAL session id.
+        let identity = av_events::AgentIdentity {
+            version: "1".to_owned(),
+            charter: "test".into(),
+            instance_uid: "i".to_owned(),
+            ttl_remaining_s: None,
+        };
+        let live = parts.sessions.get_or_open(
+            "live-session",
+            crate::session::Workflow::Unsigned,
+            &identity,
+            &av_loopdetect::BreakerConfig::default(),
+        );
+        let live_digest = av_core::digest::sha256_hex(live.id.as_bytes());
+        let live_stem_name = live_digest.get(..32).unwrap().to_owned();
+        let live_stem = spool.join(format!("{live_stem_name}.json"));
+        std::fs::write(&live_stem, b"{").unwrap();
+        age_past_threshold(&live_stem);
         let warned = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let warned_sink = Arc::clone(&warned);
         let warn_once = move |path: PathBuf| {
             warned_sink.lock().push(path);
             true
         };
-        let ctx = context(spool, &metrics, &known_stems, &warn_once);
+        let ctx = parts.context(spool, &warn_once);
         let outcome = QuarantineOrphanJsonPass.run(&ctx).await.unwrap();
 
         assert_eq!(outcome.quarantined, 1, "exactly the aged orphan is renamed");
@@ -275,16 +408,40 @@ mod tests {
     /// recovery runs before the first session may have spooled.
     #[tokio::test]
     async fn missing_spool_dir_is_a_noop() {
-        let metrics = Registry::new();
-        let known_stems = HashSet::new();
+        let parts = CtxParts::new();
         let warn_once = |_: PathBuf| true;
-        let ctx = context(
-            Path::new("/nonexistent/spool/dir"),
-            &metrics,
-            &known_stems,
-            &warn_once,
-        );
+        let ctx = parts.context(Path::new("/nonexistent/spool/dir"), &warn_once);
         let outcome = QuarantineOrphanJsonPass.run(&ctx).await.unwrap();
         assert_eq!(outcome, PassOutcome::default());
+        let outcome = QuarantineIncompleteEffectsPass.run(&ctx).await.unwrap();
+        assert_eq!(outcome, PassOutcome::default());
+    }
+
+    /// The incomplete-effects pass counts (and warns about) only ids
+    /// not already known from earlier ticks — a single crash must not
+    /// repeat its warning every tick forever. Marker *creation* is
+    /// covered by the reconciler regression tests
+    /// (`recovery_tick_does_not_quarantine_live_sessions_with_inflight_markers`
+    /// and friends); this pins the pass-level dedupe contract on an
+    /// empty spool.
+    #[tokio::test]
+    async fn incomplete_effects_pass_is_idempotent_on_empty_spool() {
+        let directory = tempfile::tempdir().unwrap();
+        let parts = CtxParts::new();
+        parts
+            .quarantined_sessions
+            .lock()
+            .insert("previously-quarantined".to_owned());
+        let warn_once = |_: PathBuf| true;
+        let ctx = parts.context(directory.path(), &warn_once);
+        let outcome = QuarantineIncompleteEffectsPass.run(&ctx).await.unwrap();
+        assert_eq!(outcome.quarantined, 0, "no markers, nothing new to quarantine");
+        assert!(
+            parts
+                .quarantined_sessions
+                .lock()
+                .contains("previously-quarantined"),
+            "prior quarantines must be preserved"
+        );
     }
 }
