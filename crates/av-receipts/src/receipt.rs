@@ -373,6 +373,27 @@ impl Receipt {
                 self.body.ai_agent.charter.type_id
             )));
         }
+        // Schema parity: the shipped schema pins `minLength: 1` on these
+        // string fields. In-tree issuers always populate them, so this
+        // only rejects documents that external schema-based verifiers
+        // already refuse — without it, a keyholder could sign a receipt
+        // with an empty session_id/instance_uid that `avctl
+        // receipt-verify` accepted while schema verifiers rejected
+        // (split offline-verification verdicts, same class as the
+        // receipt_version / issued_at_iso checks around this one).
+        for (field, value) in [
+            ("receipt_id", self.body.receipt_id.as_str()),
+            ("session_id", self.body.session_id.as_str()),
+            ("ai_agent.version", self.body.ai_agent.version.as_str()),
+            ("ai_agent.charter.name", self.body.ai_agent.charter.name.as_str()),
+            ("ai_agent.instance_uid", self.body.ai_agent.instance_uid.as_str()),
+        ] {
+            if value.is_empty() {
+                return Err(ReceiptError::SemanticInvariant(format!(
+                    "{field} is empty (schema requires minLength 1)"
+                )));
+            }
+        }
         let digest_ok = |digest: &str| {
             digest.len() == 64
                 && digest
@@ -1136,6 +1157,40 @@ mod tests {
         receipt.body.public_key_b64 =
             base64::engine::general_purpose::STANDARD.encode(attacker.public_key_bytes());
         assert!(receipt.verify_embedded().is_err());
+    }
+
+    /// Schema parity: the shipped schema pins `minLength: 1` on these
+    /// string fields; a keyholder signing a receipt with an empty
+    /// session_id / instance_uid must be refused by the Rust verifier
+    /// too, or `avctl receipt-verify` and external schema verifiers
+    /// return split verdicts on the same document.
+    #[test]
+    fn empty_min_length_fields_are_refused_by_verify() {
+        let signer = Ed25519Signer::generate();
+        for field in [
+            "receipt_id",
+            "session_id",
+            "ai_agent.version",
+            "ai_agent.charter.name",
+            "ai_agent.instance_uid",
+        ] {
+            let mut b = body();
+            match field {
+                "receipt_id" => b.receipt_id = String::new(),
+                "session_id" => b.session_id = String::new(),
+                "ai_agent.version" => b.ai_agent.version = String::new(),
+                "ai_agent.charter.name" => b.ai_agent.charter.name = String::new(),
+                _ => b.ai_agent.instance_uid = String::new(),
+            }
+            let receipt = Receipt::issue(b, &signer).unwrap();
+            assert!(
+                matches!(
+                    receipt.verify_embedded(),
+                    Err(ReceiptError::SemanticInvariant(ref msg)) if msg.contains(field)
+                ),
+                "signed receipt with empty {field} verified"
+            );
+        }
     }
 
     /// Round-51 §3.5: an unknown `receipt_version` must be refused by

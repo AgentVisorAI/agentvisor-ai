@@ -9,7 +9,8 @@ For the operator's *day-to-day* view (metrics, alerts, backup), see
 
 ## What "the spool" is
 
-`atif_spool_dir` (default `./data/atif`) holds the on-disk state of
+`atif_spool_dir` (default `spool/atif`, relative to the working
+directory) holds the on-disk state of
 every open, closing, and recently-closed session. Its file
 inventory:
 

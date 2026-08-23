@@ -9,7 +9,7 @@ before you know the knob.
 
 | Limit | Default | Enforced at | Refusal |
 | --- | --- | --- | --- |
-| Request body bytes | 1 MiB (`max_request_bytes`) | Axum body limit middleware | `413 Payload Too Large` before parse |
+| Request body bytes | 4 MiB (`max_request_bytes`) | Axum body limit middleware | `413 Payload Too Large` before parse |
 | Provider response bytes captured | 16 MiB (`MAX_PROVIDER_CAPTURE_BYTES`) | `AbortFinalizingStream` | Stream abort + audit chain records truncation |
 | Provider single-field bytes (message/reasoning) | 8 MiB (`MAX_PROVIDER_FIELD_BYTES`) | `absorb_frame` | Stream abort |
 | Tool calls per response | 128 (`MAX_PROVIDER_TOOL_CALLS`) | `absorb_frame` | Stream abort |
@@ -19,12 +19,12 @@ before you know the knob.
 
 | Limit | Default | Notes |
 | --- | --- | --- |
-| Session id length | 128 UTF-8 code points | Longer ids are refused with 400. |
+| Session id length | 128 bytes of visible ASCII (`0x21..=0x7e`) | Longer ids — and any id with whitespace, control bytes, or non-ASCII — are refused with 400. |
 | Bearer TTL | provider-supplied | Tokens whose `exp` has passed are refused with 401 even if the JWKS still has the key. |
-| Identity charter length | 256 UTF-8 code points | Longer are refused with 400. |
+| Identity charter length | 256 UTF-8 code points | Longer are refused with 401 (identity validation failure). |
 | Concurrent sessions per process | unbounded (RAM-limited) | Idle sweeper reaps at `session_idle_close_s`. |
-| Concurrent worker slots | 1024 (16 shards × 64) | Additional concurrency queues in the request pipeline. |
-| Concurrent response slots | 1024 | Backpressure surfaces as `av_events_dropped_total{stage="response_slot"}`. |
+| Concurrent worker slots | `worker_channel_capacity` (default 32768), sharded over `max(16, available_parallelism)` shards | Additional concurrency queues in the request pipeline. |
+| Concurrent response slots | mirrors worker capacity | Backpressure surfaces as `av_events_dropped_total{stage="response_slot"}`. |
 
 ## Budgets
 
@@ -62,10 +62,10 @@ Configured under `[breaker]`. Defaults:
 
 | Knob | Default | Purpose |
 | --- | --- | --- |
-| `min_tokens_to_engage` | 512 | Below this the breaker never trips (avoids false positives on short responses). |
-| `streak_threshold` | 3 | Consecutive duplicate steps to trip. |
-| `open_action` | `Inject` | On trip: inject a corrective message. Alternative actions: `Reject` (429), `Abort` (client disconnect). |
-| `cooldown_s` | 60 | How long the breaker stays open once tripped. |
+| `min_tokens` | 1000 | Below this many consumed tokens the breaker never trips (avoids false positives on short responses). |
+| `window` | 3 | Consecutive low-novelty steps to trip. |
+| `delta_epsilon` | 0.30 | Novelty threshold: a step whose embedding delta is below this counts toward the streak. |
+| `action` | `reject` | On trip: refuse with HTTP 403 (deliberately not 429, which SDKs auto-retry). Alternative: `inject` (corrective system message). |
 
 Tuning these is deployment-specific; the defaults are what round 51's
 tests exercised.
@@ -83,7 +83,7 @@ tests exercised.
 
 | Limit | Default | Notes |
 | --- | --- | --- |
-| Orphan file bytes to read during recovery | 16 MiB (`MAX_ATIF_RECOVERY_BYTES`) | Larger files are refused with `av_atif_recovery_skipped_total{reason="too_large"}` and left in place for operator inspection. |
+| Orphan file bytes to read during recovery | 256 MiB (`MAX_ATIF_RECOVERY_BYTES`) | Larger files are refused with `av_atif_recovery_skipped_total{reason="too_large"}` and left in place for operator inspection. |
 | Orphan age gate | 60s | Files newer than this are skipped this tick (defense against quarantining in-progress closes). |
 | Live-session-stem check | on always | Sidecar-less .json files whose stem matches a currently-open session are skipped even if aged (round 51 §8.5). |
 | Retention max sleep between prunes | 1 hour | Fixed. |

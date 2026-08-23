@@ -279,6 +279,9 @@ impl BridgeManifest {
             // realistic ceiling for a long-lived audit trail.
             const MAX_PARTITIONS: u32 = 1024;
             const MAX_HOT_HOURS: u32 = 24 * 365 * 10;
+            /// Schema parity: bridge-manifest.schema.json's `maxLength`
+            /// for `schema_ref` and `cold_uri`.
+            const MAX_REFERENCE_BYTES: usize = 4096;
             if t.partitions > MAX_PARTITIONS {
                 return Err(ManifestError::Invalid(format!(
                     "topic {:?} partitions {} exceeds cap of {MAX_PARTITIONS}",
@@ -303,6 +306,16 @@ impl BridgeManifest {
                 // restricted to [A-Za-z0-9._-]); same round-trip rationale
                 // as the deployment-name check above.
                 refuse_yaml_marker_chars("schema_ref", reference)?;
+                // Schema parity: bridge-manifest.schema.json pins
+                // maxLength 4096 on schema_ref and cold_uri — a longer
+                // value passing here while external schema validation
+                // refuses it would split the two verification paths.
+                if reference.len() > MAX_REFERENCE_BYTES {
+                    return Err(ManifestError::Invalid(format!(
+                        "schema_ref exceeds the schema maxLength of {MAX_REFERENCE_BYTES} bytes ({})",
+                        reference.len()
+                    )));
+                }
                 let path = Path::new(reference);
                 if path.is_absolute()
                     || path
@@ -314,6 +327,12 @@ impl BridgeManifest {
             }
             if let Some(uri) = &t.retention.cold_uri {
                 refuse_yaml_marker_chars("cold_uri", uri)?;
+                if uri.len() > MAX_REFERENCE_BYTES {
+                    return Err(ManifestError::Invalid(format!(
+                        "cold_uri exceeds the schema maxLength of {MAX_REFERENCE_BYTES} bytes ({})",
+                        uri.len()
+                    )));
+                }
                 // Round-17 F3 (av-bridge): a local (non-scheme) cold_uri
                 // is used directly as a filesystem root at retention
                 // enforcement time (`Path::new(cold).join(...)` in
@@ -526,6 +545,18 @@ mod tests {
 
         let mut m = BridgeManifest::default_for("x");
         m.topics[0].schema_ref = Some("../outside.json".to_owned());
+        assert!(matches!(m.validate(), Err(ManifestError::Invalid(_))));
+
+        // Schema parity: bridge-manifest.schema.json pins maxLength 4096
+        // on schema_ref and cold_uri — boundary: 4096 passes, 4097 refused.
+        let mut m = BridgeManifest::default_for("x");
+        m.topics[0].schema_ref = Some(format!("schemas/{}.json", "a".repeat(4096 - 13)));
+        assert!(m.validate().is_ok(), "4096-byte schema_ref refused");
+        let mut m = BridgeManifest::default_for("x");
+        m.topics[0].schema_ref = Some(format!("schemas/{}.json", "a".repeat(4097 - 13)));
+        assert!(matches!(m.validate(), Err(ManifestError::Invalid(_))));
+        let mut m = BridgeManifest::default_for("x");
+        m.topics[0].retention.cold_uri = Some(format!("/cold/{}", "a".repeat(4091)));
         assert!(matches!(m.validate(), Err(ManifestError::Invalid(_))));
 
         let mut m = BridgeManifest::default_for("x");

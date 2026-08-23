@@ -48,6 +48,13 @@ pub enum ToolVerdict {
         /// amount, closing the round-32 F3 concurrent-MCP budget
         /// double-spend.
         payout_micros: u64,
+        /// Principal id whose ledger was ALSO debited (when a
+        /// principal-scoped budget is bound). Threaded out so every
+        /// harness failure path that refunds the session ledger can
+        /// mirror the refund on the principal ledger — without this,
+        /// each lost claim race / saturated worker permanently consumed
+        /// principal quota with zero tools executed.
+        principal_id: Option<String>,
     },
     /// Block; respond to the agent with `response`.
     Blocked {
@@ -257,6 +264,7 @@ impl Sandbox {
                         budget_remaining: remaining,
                         elapsed_us: elapsed(started),
                         payout_micros,
+                        principal_id: Some(principal_id.to_owned()),
                     };
                 }
                 Ok(BudgetDecision::Refused { limit, cap }) => {
@@ -294,6 +302,7 @@ impl Sandbox {
                 // harness can refund exactly this much on a lost
                 // execution.claim() race.
                 payout_micros,
+                principal_id: None,
             },
             Ok(BudgetDecision::Refused { limit, cap }) => {
                 let reason = format!("action budget exceeded: {limit} (cap {cap})");
@@ -495,6 +504,66 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// An `Allowed` verdict must thread the bound principal id out so the
+    /// harness's failure paths (lost claim race, saturated worker, close
+    /// race) can mirror the session-ledger refund on the principal ledger.
+    /// Without it, every failed claim permanently consumed principal quota
+    /// with zero tools executed — and the principal ledger persists across
+    /// sessions, so that leak never healed. The refund round-trip below is
+    /// exactly the compensation the harness performs.
+    #[test]
+    fn allowed_verdict_threads_principal_id_and_refund_restores_the_ledger() {
+        let store = InMemoryStore::new();
+        let s = sandbox();
+        let args = json!({"amount_usd": 1.0});
+        let principal_spec = BudgetSpec {
+            max_tool_calls: std::collections::BTreeMap::new(),
+            max_payout_usd_micros: Some(50_000_000),
+            max_total_tool_calls: Some(1),
+            max_tokens: None,
+        };
+        // No principal bound: field is None.
+        match s.check(&store, "sess-a", &raw_call("payout", args.clone())) {
+            ToolVerdict::Allowed { principal_id, .. } => assert_eq!(principal_id, None),
+            other => panic!("{other:?}"),
+        }
+        // Principal bound: the verdict carries the id and payout the
+        // harness needs for compensation.
+        let verdict = s.check_with_principal(
+            &store,
+            "sess-b",
+            Some(("principal-1", &principal_spec)),
+            &raw_call("payout", args.clone()),
+        );
+        let (tool, payout_micros, principal_id) = match verdict {
+            ToolVerdict::Allowed {
+                tool,
+                payout_micros,
+                principal_id,
+                ..
+            } => (tool, payout_micros, principal_id),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(principal_id.as_deref(), Some("principal-1"));
+        assert_eq!(payout_micros, 1_000_000);
+        // Simulate the harness failure path: refund BOTH ledgers with the
+        // threaded values. With max_total_tool_calls = 1, the next call
+        // only admits if the principal refund actually landed.
+        ActionBudget::new(&store, "sess-b", &s.config.budget).refund_tool_call(&tool, payout_micros);
+        ActionBudget::for_principal(&store, "principal-1", &principal_spec)
+            .refund_tool_call(&tool, payout_micros);
+        let retry = s.check_with_principal(
+            &store,
+            "sess-b",
+            Some(("principal-1", &principal_spec)),
+            &raw_call("payout", args),
+        );
+        assert!(
+            retry.is_allowed(),
+            "principal ledger did not heal after the compensating refund: {retry:?}"
+        );
     }
 
     #[test]

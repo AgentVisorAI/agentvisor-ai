@@ -295,6 +295,35 @@ fn empty_identity_fields_rejected() {
     }
 }
 
+/// docs/reference/LIMITS.md documents a 256-code-point charter cap.
+/// Exact boundary: 256 accepted, 257 refused — the charter flows
+/// verbatim into logs, receipts, and event chains, so it must not be
+/// an unbounded (8 KiB-token-cap) attacker-chosen string.
+#[test]
+fn charter_length_cap_boundary_is_exact() {
+    let keys = ed25519_keys("k1");
+    let v = validator(&keys);
+    let mut c = claims(&[], 600, None);
+    c.charter = "c".repeat(256);
+    assert!(v.validate(&mint(&keys, &c)).is_ok(), "256-char charter refused");
+    let mut c = claims(&[], 600, None);
+    c.charter = "c".repeat(257);
+    assert!(
+        matches!(
+            v.validate(&mint(&keys, &c)),
+            Err(IdentityError::FieldTooLong { field: "charter", .. })
+        ),
+        "257-char charter accepted"
+    );
+    // The cap counts code points, not bytes: 256 multibyte chars pass.
+    let mut c = claims(&[], 600, None);
+    c.charter = "é".repeat(256);
+    assert!(
+        v.validate(&mint(&keys, &c)).is_ok(),
+        "256 multibyte code points refused (cap must count chars, not bytes)"
+    );
+}
+
 // ---------- Delegation (scope inheritance) ----------
 
 #[test]
