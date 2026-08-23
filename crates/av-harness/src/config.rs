@@ -73,6 +73,13 @@ pub struct HarnessConfig {
     /// OpenAI-compatible surface).
     #[serde(default = "default_chat_path")]
     pub upstream_chat_path: String,
+    /// Round-51 §4.2 (S3): the upstream provider's wire dialect.
+    /// Selects the `ProviderAdapter` that parses response bodies and
+    /// SSE chunks. `"openai"` (the default) also fits vLLM, LiteLLM,
+    /// Groq, Together, DeepSeek, OpenRouter, Ollama, LM Studio,
+    /// llama.cpp, xAI, Mistral and Azure OpenAI.
+    #[serde(default = "default_provider")]
+    pub provider: String,
     /// Name of an environment variable holding the upstream API key. The
     /// key value itself never appears in this file or on the command line.
     #[serde(default)]
@@ -413,6 +420,9 @@ fn default_bridge() -> String {
 }
 fn default_bridge_backend() -> String {
     "embedded".to_owned()
+}
+fn default_provider() -> String {
+    "openai".to_owned()
 }
 fn default_bridge_manifest() -> String {
     "manifests/bridge.example.yaml".to_owned()
@@ -1084,6 +1094,13 @@ impl HarnessConfig {
                 self.bridge_backend
             ));
         }
+        if crate::provider::adapter_for(&self.provider).is_none() {
+            errors.push(format!(
+                "provider must be one of {:?}, got {:?} (S3: Anthropic/Gemini adapters are planned; see docs/reference/STRUCTURAL-REFACTORS.md)",
+                crate::provider::SUPPORTED_PROVIDERS,
+                self.provider
+            ));
+        }
         if self.bridge_manifest_path.is_empty() {
             errors.push("bridge_manifest_path is required".into());
         }
@@ -1366,6 +1383,7 @@ impl HarnessConfig {
             upstream_read_timeout_s: None,
             shutdown_drain_timeout_s: None,
             upstream_chat_path: default_chat_path(),
+            provider: default_provider(),
             upstream_api_key_env: None,
             upstream_api_key_file: None,
             upstream_auth_header: default_auth_header(),
@@ -1474,6 +1492,18 @@ mod tests {
             "single error must not aggregate: {error}"
         );
         assert!(error.contains("state_backend"), "must name the field: {error}");
+    }
+
+    /// Round-51 §4.2 (S3): an unsupported provider dialect fails
+    /// pre-flight, naming the supported set — never mid-stream.
+    #[test]
+    fn unsupported_provider_is_refused_at_validation() {
+        let mut cfg = HarnessConfig::from_toml(r#"upstream_url = "https://api.openai.com""#).unwrap();
+        assert_eq!(cfg.provider, "openai");
+        cfg.provider = "anthropic".to_owned();
+        let error = cfg.validate().unwrap_err();
+        assert!(error.contains("provider"), "must name the field: {error}");
+        assert!(error.contains("openai"), "must name the supported set: {error}");
     }
 
     /// Round-51 §8.10: the default backends (embedded/memory/hash/

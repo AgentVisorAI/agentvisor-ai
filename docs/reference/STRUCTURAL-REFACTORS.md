@@ -316,6 +316,16 @@ adapter's implementation verbatim.
    `parse_provider_chunk` go through
    `state.provider_adapter.parse_sse_chunk`. This is a pure
    refactor — no behavior change.
+   * ✅ LANDED (round-51 pass 21): `crates/av-harness/src/provider.rs`
+     hosts the `ProviderAdapter` trait, `OpenAiAdapter` (a
+     transparent shim over the battle-tested `parse_provider_chunk`,
+     which stays in `routes.rs` verbatim next to its SSE-framing
+     helpers), `adapter_for` and `SUPPORTED_PROVIDERS`. The new
+     `provider` config key (default `"openai"`) selects the adapter
+     at boot; unsupported values fail `validate()` naming the
+     supported set. `AppState.provider_adapter` carries the
+     selection; the response stream parses through it. The fuzz
+     shim keeps pinning parser totality.
 2. Add `AnthropicAdapter`. Gate under `provider = "anthropic"` in
    config. Land integration tests that hit a mock Anthropic server
    and prove the audit chain records the same shape as an OpenAI

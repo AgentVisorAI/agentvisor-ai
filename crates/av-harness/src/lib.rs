@@ -18,6 +18,7 @@ pub mod config;
 pub mod dashboard;
 pub(crate) mod journal;
 pub mod pipeline;
+pub(crate) mod provider;
 pub mod reconciler;
 pub(crate) mod recovery;
 pub mod routes;
