@@ -538,3 +538,37 @@ fn bridge_lifecycle_end_to_end() {
     assert_eq!(persisted_manifest.name, "lifecycle");
     assert_eq!(persisted_manifest.topics.len(), 2);
 }
+
+// ------------------------------------------------------------------
+// Round-51 §9.1: `receipt-locate` — session id → artifact paths.
+// ------------------------------------------------------------------
+
+/// The stem must be `sha256(session_id)[..32]`, artifacts must report
+/// existence truthfully, and archived prior incarnations must be
+/// discovered — this is the "no lookup command" gap in the offline
+/// verification workflow.
+#[test]
+fn receipt_locate_reports_stem_artifacts_and_archived_incarnations() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool = dir.path();
+    std::fs::create_dir_all(spool.join("receipts")).unwrap();
+    // Stem for "locate-me" computed with the same digest the daemon uses.
+    let digest = av_core::digest::sha256_hex(b"locate-me");
+    let stem = &digest[..32];
+    std::fs::write(spool.join("receipts").join(format!("{stem}.json")), b"{}").unwrap();
+    std::fs::write(spool.join(format!("{stem}.archived-atif-x.json")), b"{}").unwrap();
+
+    let out = run(&["receipt-locate", "locate-me", "--spool", spool.to_str().unwrap()]);
+    assert!(out.status.success(), "receipt-locate failed: {}", stderr(&out));
+    let parsed: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(parsed["stem"], stem);
+    assert_eq!(parsed["artifacts"]["receipt"]["exists"], true);
+    assert_eq!(parsed["artifacts"]["atif_trajectory"]["exists"], false);
+    let archived = parsed["archived_prior_incarnations"].as_array().unwrap();
+    assert_eq!(
+        archived.len(),
+        1,
+        "archived incarnation must be discovered: {parsed}"
+    );
+    assert!(archived[0].as_str().unwrap().contains("archived-atif-x"));
+}

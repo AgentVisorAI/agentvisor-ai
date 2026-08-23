@@ -196,7 +196,8 @@ avctl config-validate agentvisor.toml
 avctl manifest-validate manifests/bridge.example.yaml
 avctl bridge-provision --manifest manifests/bridge.example.yaml --data-dir data/bridge
 avctl atif-validate trajectory.json
-avctl receipt-verify receipt.json --public-key-hex "$TRUSTED_ED25519_PUBLIC_KEY_HEX"
+avctl receipt-locate my-session-id --spool spool/atif   # session id -> artifact paths
+avctl receipt-verify receipt.json --public-key-hex "$TRUSTED_ED25519_PUBLIC_KEY_HEX"  # repeatable; hex or base64
 avctl loadgen --connections 500
 ```
 
