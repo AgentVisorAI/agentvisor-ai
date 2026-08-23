@@ -279,11 +279,6 @@ top-of-flame-graph cost.
   highest-leverage debuggability change; it is also a
   workspace-wide signature-touching change. Land per-crate, starting
   with `FinalizeError` (the reconciler's) during S1.
-* **Shared `StateStore` contract test (§4.2).** The TTL divergence is
-  now a trait value (`counter_ttl_secs`) surfaced in the startup
-  banner and `LIMITS.md`; the remaining ask is one generic
-  `fn state_store_contract(store: &dyn StateStore)` invoked by both
-  the in-memory suite and the env-gated Redis suite.
 * **Test scaffolding dedup (§5.4).** 21 `impl EventBus` doubles and
   6 `fn signer()` definitions across 12 files; a `tests/common/`
   module is straightforward but touches every integration test.

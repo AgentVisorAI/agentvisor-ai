@@ -210,3 +210,12 @@ fn redis_contract_poisoned_negative_counter_is_refused() {
     );
     s.remove(&key);
 }
+
+/// Round-51 §4.2: the ONE shared backend contract. Runs the identical
+/// assertions the in-memory suite runs (store.rs unit test) so the two
+/// backends cannot silently drift on semantics again.
+#[test]
+fn redis_satisfies_the_shared_state_store_contract() {
+    let Some(s) = store() else { return };
+    av_state::state_store_contract(&s, &av_core::new_event_uid());
+}

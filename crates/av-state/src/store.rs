@@ -292,6 +292,15 @@ mod tests {
 
     use super::*;
 
+    /// Round-51 §4.2: the ONE shared backend contract, mirrored by
+    /// `redis_contract.rs::redis_satisfies_the_shared_state_store_contract`
+    /// so the two backends cannot silently drift on semantics again.
+    #[test]
+    fn in_memory_satisfies_the_shared_state_store_contract() {
+        let store = InMemoryStore::new();
+        crate::state_store_contract(&store, "contract-tag");
+    }
+
     #[test]
     fn remove_prefix_drops_only_matching_keys() {
         let store = InMemoryStore::new();
