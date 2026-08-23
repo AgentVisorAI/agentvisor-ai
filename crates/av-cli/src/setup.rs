@@ -581,9 +581,10 @@ fn azure_name_error(value: &str) -> Option<String> {
 /// Write `key` to `path` with owner-only permissions, replacing any
 /// previous file (including a symlink, which the server would refuse).
 ///
-/// Atomic install (tmp file + hard-link + parent sync) so a crash between
-/// remove and sync cannot leave the final path empty or truncated. Same
-/// posture as the server's signing-seed installer in av-harness/main.rs.
+/// Atomic install (tmp file + rename + parent sync) so at every instant
+/// the final path holds either the old key or the new one — never empty
+/// or truncated. Same posture as the server's signing-seed installer in
+/// av-harness/main.rs.
 fn write_private_key_file(path: &Path, key: &str) -> Result<()> {
     use std::io::Write as _;
     let parent = path
@@ -618,33 +619,25 @@ fn write_private_key_file(path: &Path, key: &str) -> Result<()> {
         .with_context(|| format!("write key file {}", temporary.display()))?;
     file.sync_all()
         .with_context(|| format!("sync key file {}", temporary.display()))?;
-    // Only unlink the previous key once the replacement is durably on
-    // disk. Removing it before the temp write (the old order) meant a
-    // write/sync failure — ENOSPC, EIO — destroyed the only copy of the
-    // existing key with nothing to install in its place. The old file may
-    // be a symlink; unlink it so hard_link below fails cleanly on a
-    // pre-planted target rather than following the link and overwriting
-    // whatever it points at.
-    let _ = std::fs::remove_file(path);
-    // hard_link installs the final path atomically and refuses to follow a
-    // pre-existing symlink at `path`; none exists at this point because
-    // we removed it above.
-    let result =
-        std::fs::hard_link(&temporary, path).with_context(|| format!("install key file {}", path.display()));
-    // The hard_link created a second inode name for the tmp file;
-    // unlink the tmp name (the final path keeps the data). Guard is
-    // then disarmed so its Drop is a no-op — we already unlinked.
-    let _ = std::fs::remove_file(&temporary);
+    // Install with a single atomic rename. The previous shape
+    // (`remove_file(path)` then `hard_link`) destroyed the ONLY copy of
+    // the existing key whenever the hard_link failed — EPERM on a
+    // re-chmoded parent, EMLINK, ENOSPC on the directory update — because
+    // the old key was already unlinked and the tmp was unconditionally
+    // removed afterwards. `rename` replaces the destination atomically
+    // (POSIX), so at every instant `path` holds either the old key or the
+    // new one, and it replaces (never follows) a pre-planted symlink at
+    // `path`. On failure the old key is untouched and the guard's Drop
+    // unlinks the tmp.
+    std::fs::rename(&temporary, path).with_context(|| format!("install key file {}", path.display()))?;
     guard.disarm();
-    result?;
     // Round-14 F4: mirror of round-13 F4 (harness install_seed_
     // exclusive) and round-12 F5 (fsutil::write_atomic). Once
-    // hard_link commits, the key IS at `path` — a subsequent
+    // rename commits, the key IS at `path` — a subsequent
     // sync_directory failure means the dirent may not survive an
     // immediate power loss, but every observer running now sees the
-    // key. Returning Err here made `avctl init` report failure; the
-    // operator re-runs, the `remove_file` at the top of this function
-    // unlinks the good key, and the whole install cycle retries.
+    // key. Returning Err here made `avctl init` report failure and
+    // the whole install cycle retry needlessly.
     // Downgrade to warn+Ok so this last-stanza fsync is best-effort.
     if let Err(error) = av_core::fsutil::sync_directory(parent) {
         eprintln!(
@@ -2380,6 +2373,64 @@ mod tests {
         // "config" is preserved; the victim itself must not gain our TOML.
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
         assert!(std::fs::read_to_string(&config_path).unwrap().contains("11434"));
+    }
+
+    /// The key installer must never destroy the previous key: the install
+    /// is a single atomic rename, so the final path always holds either
+    /// the old key or the new one. A pre-planted symlink at the final
+    /// path is replaced, never followed, and no `.tmp` residue survives —
+    /// including on a failed install.
+    #[cfg(unix)]
+    #[test]
+    fn write_private_key_file_installs_atomically_without_destroying_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp_residue = |parent: &Path| {
+            std::fs::read_dir(parent)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+                .count()
+        };
+
+        // Replaces an existing key in place.
+        let path = dir.path().join("keys").join("av-server.hex");
+        write_private_key_file(&path, "old-seed").unwrap();
+        write_private_key_file(&path, "new-seed").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new-seed");
+        assert_eq!(
+            tmp_residue(path.parent().unwrap()),
+            0,
+            "tmp residue after install"
+        );
+
+        // A pre-planted symlink is replaced, not followed.
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "untouched").unwrap();
+        let linked = dir.path().join("keys").join("linked.hex");
+        std::os::unix::fs::symlink(&victim, &linked).unwrap();
+        write_private_key_file(&linked, "fresh").unwrap();
+        assert!(
+            !std::fs::symlink_metadata(&linked)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "key must become a real file"
+        );
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+        assert_eq!(std::fs::read_to_string(&linked).unwrap(), "fresh");
+
+        // A failed install (final path is an occupied directory, so the
+        // rename cannot succeed) must leave the pre-existing state
+        // untouched and clean up its tmp file.
+        let blocked = dir.path().join("keys").join("blocked");
+        std::fs::create_dir_all(blocked.join("occupant")).unwrap();
+        assert!(write_private_key_file(&blocked, "doomed").is_err());
+        assert!(blocked.join("occupant").is_dir(), "pre-existing state destroyed");
+        assert_eq!(
+            tmp_residue(blocked.parent().unwrap()),
+            0,
+            "tmp residue after failure"
+        );
     }
 
     /// Round-28 F1 + F5: probe_target parses URLs correctly across

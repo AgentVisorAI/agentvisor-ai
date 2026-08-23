@@ -251,7 +251,21 @@ impl ColdArchive {
         let mut completed = 0u64;
         let mut first_error: Option<BusError> = None;
         for entry in entries {
-            let path = entry?.path();
+            // A single unreadable dirent (broken symlink appearing
+            // mid-scan, racing FS cleanup) must not abort the whole pass —
+            // that would head-of-line-block cold export for every healthy
+            // intent, the exact failure mode the per-intent isolation
+            // below exists to prevent. Skip it, surface the first error.
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(error) => {
+                    tracing::warn!(%error, "cold outbox directory entry unreadable; skipped this pass");
+                    if first_error.is_none() {
+                        first_error = Some(BusError::Io(error));
+                    }
+                    continue;
+                }
+            };
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
                 continue;
             }
