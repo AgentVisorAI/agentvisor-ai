@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use av_bridge::{BridgeManifest, EmbeddedBroker, EventBus};
+use av_harness::config::{BridgeBackend, EmbedderBackend, StateBackend, VectorBackend};
 use av_harness::reconciler::spawn_reconciler;
 use av_harness::{build_router, AppState, HarnessConfig};
 use av_identity::{IdentityValidator, KeyMaterial};
@@ -1143,8 +1144,13 @@ fn classify_jwks_error(error: &anyhow::Error) -> &'static str {
 }
 
 fn build_bridge(config: &HarnessConfig, manifest: &BridgeManifest) -> Result<Arc<dyn EventBus>> {
-    match config.bridge_backend.as_str() {
-        "embedded" => {
+    // `config.bridge()` is the same single parse site `validate()`
+    // delegates to, so the factory can never disagree with pre-flight:
+    // an unknown selector or a missing companion was already refused
+    // at load, and the Kafka/Nats variants carry their endpoint by
+    // construction.
+    match config.bridge().map_err(anyhow::Error::msg)? {
+        BridgeBackend::Embedded => {
             // Round-6 (hunt5 config F2): an endpoint without the
             // backend that consumes it is a silent misconfiguration —
             // e.g. `docker run -e AV_BRIDGE_ENDPOINT=…` against the
@@ -1184,49 +1190,46 @@ fn build_bridge(config: &HarnessConfig, manifest: &BridgeManifest) -> Result<Arc
             .context("initialize embedded Bridge")?;
             Ok(Arc::new(bridge))
         }
-        "kafka" => {
+        BridgeBackend::Kafka { endpoint } => {
             #[cfg(feature = "kafka")]
             {
-                let endpoint = config
-                    .bridge_endpoint
-                    .as_deref()
-                    .context("bridge_endpoint is required for kafka")?;
                 let bus = tokio::task::block_in_place(|| {
-                    av_bridge::kafka_bus::KafkaBus::provision(endpoint, manifest)
+                    av_bridge::kafka_bus::KafkaBus::provision(&endpoint, manifest)
                 })
                 .context("initialize Kafka/Redpanda Bridge")?;
                 Ok(Arc::new(bus))
             }
             #[cfg(not(feature = "kafka"))]
-            anyhow::bail!(
-                "kafka backend requested but this agentvisord binary was built without the `kafka` feature (rebuild av-harness with --features kafka or full)"
-            )
+            {
+                let _ = endpoint;
+                anyhow::bail!(
+                    "kafka backend requested but this agentvisord binary was built without the `kafka` feature (rebuild av-harness with --features kafka or full)"
+                )
+            }
         }
-        "nats" => {
+        BridgeBackend::Nats { endpoint } => {
             #[cfg(feature = "nats")]
             {
-                let endpoint = config
-                    .bridge_endpoint
-                    .as_deref()
-                    .context("bridge_endpoint is required for nats")?;
                 let bus = tokio::task::block_in_place(|| {
-                    av_bridge::nats_bus::NatsBus::provision(endpoint, manifest)
+                    av_bridge::nats_bus::NatsBus::provision(&endpoint, manifest)
                 })
                 .context("initialize NATS JetStream Bridge")?;
                 Ok(Arc::new(bus))
             }
             #[cfg(not(feature = "nats"))]
-            anyhow::bail!(
-                "nats backend requested but this agentvisord binary was built without the `nats` feature (rebuild av-harness with --features nats or full)"
-            )
+            {
+                let _ = endpoint;
+                anyhow::bail!(
+                    "nats backend requested but this agentvisord binary was built without the `nats` feature (rebuild av-harness with --features nats or full)"
+                )
+            }
         }
-        other => anyhow::bail!("unsupported bridge backend {other:?}"),
     }
 }
 
 fn build_store(config: &HarnessConfig) -> Result<Arc<dyn StateStore>> {
-    match config.state_backend.as_str() {
-        "memory" => {
+    match config.state().map_err(anyhow::Error::msg)? {
+        StateBackend::Memory => {
             // Round-6 (hunt5 config F2): warn on an inert endpoint —
             // budget/velocity counters stay process-local (neither
             // shared nor durable), exactly what setting a Redis
@@ -1239,60 +1242,55 @@ fn build_store(config: &HarnessConfig) -> Result<Arc<dyn StateStore>> {
             }
             Ok(Arc::new(InMemoryStore::new()))
         }
-        "redis" => {
+        StateBackend::Redis { endpoint } => {
             #[cfg(feature = "redis")]
             {
-                let endpoint = config
-                    .state_endpoint
-                    .as_deref()
-                    .context("state_endpoint is required for redis")?;
                 let store =
-                    av_state::redis_store::RedisStore::connect(endpoint).map_err(anyhow::Error::new)?;
+                    av_state::redis_store::RedisStore::connect(&endpoint).map_err(anyhow::Error::new)?;
                 Ok(Arc::new(store))
             }
             #[cfg(not(feature = "redis"))]
-            anyhow::bail!(
-                "redis backend requested but this agentvisord binary was built without the `redis` feature (rebuild av-harness with --features redis or full)"
-            )
+            {
+                let _ = endpoint;
+                anyhow::bail!(
+                    "redis backend requested but this agentvisord binary was built without the `redis` feature (rebuild av-harness with --features redis or full)"
+                )
+            }
         }
-        other => anyhow::bail!("unsupported state backend {other:?}"),
     }
 }
 
 fn build_embedder(config: &HarnessConfig) -> Result<Arc<dyn Embedder>> {
-    match config.embedder_backend.as_str() {
-        "hash" => Ok(Arc::new(HashEmbedder::default())),
-        "onnx" => {
+    match config.embedder().map_err(anyhow::Error::msg)? {
+        EmbedderBackend::Hash => Ok(Arc::new(HashEmbedder::default())),
+        EmbedderBackend::Onnx {
+            model_path,
+            tokenizer_path,
+        } => {
             #[cfg(feature = "onnx")]
             {
-                let path = config
-                    .onnx_model_path
-                    .as_deref()
-                    .context("onnx_model_path is required for onnx")?;
-                let tokenizer_path = config
-                    .onnx_tokenizer_path
-                    .as_deref()
-                    .context("onnx_tokenizer_path is required for onnx")?;
                 let embedder = av_loopdetect::OnnxEmbedder::load(
-                    Path::new(path),
-                    Path::new(tokenizer_path),
+                    Path::new(&model_path),
+                    Path::new(&tokenizer_path),
                     config.onnx_dimension,
                 )
                 .map_err(|error| anyhow::anyhow!("load ONNX model: {error}"))?;
                 Ok(Arc::new(embedder))
             }
             #[cfg(not(feature = "onnx"))]
-            anyhow::bail!(
-                "onnx backend requested but this agentvisord binary was built without the `onnx` feature (rebuild av-harness with --features onnx or full)"
-            )
+            {
+                let _ = (model_path, tokenizer_path);
+                anyhow::bail!(
+                    "onnx backend requested but this agentvisord binary was built without the `onnx` feature (rebuild av-harness with --features onnx or full)"
+                )
+            }
         }
-        other => anyhow::bail!("unsupported embedder backend {other:?}"),
     }
 }
 
 async fn build_vector_sink(config: &HarnessConfig, _dimension: usize) -> Result<Arc<dyn VectorSink>> {
-    match config.vector_backend.as_str() {
-        "memory" => {
+    match config.vector().map_err(anyhow::Error::msg)? {
+        VectorBackend::Memory => {
             // Round-6 (hunt5 config F2): warn on an inert Qdrant URL.
             if config.qdrant_url.is_some() {
                 tracing::warn!(
@@ -1302,14 +1300,10 @@ async fn build_vector_sink(config: &HarnessConfig, _dimension: usize) -> Result<
             }
             Ok(Arc::new(NoopVectorSink))
         }
-        "qdrant" => {
+        VectorBackend::Qdrant { url } => {
             #[cfg(feature = "qdrant")]
             {
-                let url = config
-                    .qdrant_url
-                    .as_deref()
-                    .context("qdrant_url is required for qdrant")?;
-                let sink = av_loopdetect::QdrantVectorSink::new(url, &config.qdrant_collection)
+                let sink = av_loopdetect::QdrantVectorSink::new(&url, &config.qdrant_collection)
                     .map_err(|error| anyhow::anyhow!("configure Qdrant client: {error}"))?;
                 sink.ensure_collection(_dimension)
                     .await
@@ -1317,11 +1311,13 @@ async fn build_vector_sink(config: &HarnessConfig, _dimension: usize) -> Result<
                 Ok(Arc::new(sink))
             }
             #[cfg(not(feature = "qdrant"))]
-            anyhow::bail!(
-                "qdrant backend requested but this agentvisord binary was built without the `qdrant` feature (rebuild av-harness with --features qdrant or full)"
-            )
+            {
+                let _ = url;
+                anyhow::bail!(
+                    "qdrant backend requested but this agentvisord binary was built without the `qdrant` feature (rebuild av-harness with --features qdrant or full)"
+                )
+            }
         }
-        other => anyhow::bail!("unsupported vector backend {other:?}"),
     }
 }
 

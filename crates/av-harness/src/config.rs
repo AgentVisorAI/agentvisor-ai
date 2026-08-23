@@ -458,6 +458,91 @@ fn default_dashboard_enabled() -> bool {
     true
 }
 
+/// Typed bridge backend selection, resolved from the flat TOML fields.
+///
+/// The TOML wire format deliberately keeps the shipped flat keys
+/// (`bridge_backend = "kafka"` + `bridge_endpoint = …`): this is a
+/// public tool with configs in the field, and a `config_version` bump
+/// that strands them is a hazard. Everything downstream of parsing
+/// works with these enums instead — each variant carries its required
+/// companions, so "kafka without an endpoint" is unrepresentable once
+/// resolved. The per-selector accessors on [`HarnessConfig`]
+/// ([`HarnessConfig::bridge`] and friends) are the SINGLE site that
+/// owns the legal-value vocabulary and the required-companion rules;
+/// `validate()` and the daemon's backend factories both delegate to
+/// them (engineering review: the four selectors were `String`s whose
+/// legal values were enumerated twice, with companion rules spread
+/// across four more sites).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BridgeBackend {
+    /// Embedded broker persisting under `bridge_data_dir`.
+    Embedded,
+    /// Kafka/Redpanda; `endpoint` is the `host:port[,host:port]`
+    /// bootstrap list (not a URL — no scheme check applies).
+    Kafka {
+        /// Bootstrap list, `host:port[,host:port]`.
+        endpoint: String,
+    },
+    /// NATS JetStream; `endpoint` is a `nats://` or `tls://` URL.
+    Nats {
+        /// `nats://` or `tls://` URL.
+        endpoint: String,
+    },
+}
+
+/// Typed state backend selection. See [`BridgeBackend`] for why the
+/// TOML surface stays flat while the resolved form is an enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateBackend {
+    /// Process-local, non-durable counters.
+    Memory,
+    /// Redis / Redis Cluster; `endpoint` is one URL or a
+    /// comma-separated list (cluster mode).
+    Redis {
+        /// Redis URL, or a comma-separated list for cluster mode.
+        endpoint: String,
+    },
+}
+
+/// Typed embedding backend selection. See [`BridgeBackend`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmbedderBackend {
+    /// Deterministic hash embedder (no model files).
+    Hash,
+    /// Customer-supplied ONNX model plus its Hugging Face tokenizer.
+    Onnx {
+        /// Path to the ONNX model file.
+        model_path: String,
+        /// Path to the paired Hugging Face `tokenizer.json`.
+        tokenizer_path: String,
+    },
+}
+
+/// Typed vector persistence backend selection. See [`BridgeBackend`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VectorBackend {
+    /// No persistence (in-memory no-op sink).
+    Memory,
+    /// Qdrant; `url` is the http(s) base URL.
+    Qdrant {
+        /// Qdrant base URL (http:// or https://).
+        url: String,
+    },
+}
+
+/// All four backend selections resolved into their typed forms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedBackends {
+    /// Resolved bridge (event bus) backend.
+    pub bridge: BridgeBackend,
+    /// Resolved state store backend.
+    pub state: StateBackend,
+    /// Resolved embedding backend.
+    pub embedder: EmbedderBackend,
+    /// Resolved vector persistence backend.
+    pub vector: VectorBackend,
+}
+
 /// Where the effective configuration came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigSource {
@@ -759,6 +844,109 @@ impl HarnessConfig {
         }
     }
 
+    /// A required companion field for a non-default backend: present and
+    /// non-empty, or the caller's named error.
+    fn required_companion<'a>(value: Option<&'a str>, error: &str) -> Result<&'a str, String> {
+        value.filter(|v| !v.is_empty()).ok_or_else(|| error.to_owned())
+    }
+
+    /// Resolve `bridge_backend` + `bridge_endpoint` into the typed
+    /// [`BridgeBackend`]. This is the single site owning the legal-value
+    /// vocabulary and the required-companion rule for the bridge
+    /// selector; `validate()` and the daemon's bridge factory both
+    /// delegate here, so "kafka without an endpoint" cannot survive
+    /// parsing.
+    pub fn bridge(&self) -> Result<BridgeBackend, String> {
+        const ENDPOINT_REQUIRED: &str = "bridge_endpoint is required for kafka and nats backends";
+        match self.bridge_backend.as_str() {
+            "embedded" => Ok(BridgeBackend::Embedded),
+            "kafka" => Ok(BridgeBackend::Kafka {
+                endpoint: Self::required_companion(self.bridge_endpoint.as_deref(), ENDPOINT_REQUIRED)?
+                    .to_owned(),
+            }),
+            "nats" => Ok(BridgeBackend::Nats {
+                endpoint: Self::required_companion(self.bridge_endpoint.as_deref(), ENDPOINT_REQUIRED)?
+                    .to_owned(),
+            }),
+            other => Err(format!(
+                "bridge_backend must be embedded|kafka|nats, got {other:?}"
+            )),
+        }
+    }
+
+    /// Resolve `state_backend` + `state_endpoint` into the typed
+    /// [`StateBackend`] (see [`Self::bridge`] for the single-parse-site
+    /// rationale).
+    pub fn state(&self) -> Result<StateBackend, String> {
+        match self.state_backend.as_str() {
+            "memory" => Ok(StateBackend::Memory),
+            "redis" => Ok(StateBackend::Redis {
+                endpoint: Self::required_companion(
+                    self.state_endpoint.as_deref(),
+                    "state_endpoint is required for the redis backend",
+                )?
+                .to_owned(),
+            }),
+            other => Err(format!("state_backend must be memory|redis, got {other:?}")),
+        }
+    }
+
+    /// Resolve `embedder_backend` + the ONNX companion paths into the
+    /// typed [`EmbedderBackend`] (see [`Self::bridge`]).
+    pub fn embedder(&self) -> Result<EmbedderBackend, String> {
+        const PATHS_REQUIRED: &str =
+            "onnx_model_path and onnx_tokenizer_path are required for the onnx backend";
+        match self.embedder_backend.as_str() {
+            "hash" => Ok(EmbedderBackend::Hash),
+            "onnx" => Ok(EmbedderBackend::Onnx {
+                model_path: Self::required_companion(self.onnx_model_path.as_deref(), PATHS_REQUIRED)?
+                    .to_owned(),
+                tokenizer_path: Self::required_companion(
+                    self.onnx_tokenizer_path.as_deref(),
+                    PATHS_REQUIRED,
+                )?
+                .to_owned(),
+            }),
+            other => Err(format!("embedder_backend must be hash|onnx, got {other:?}")),
+        }
+    }
+
+    /// Resolve `vector_backend` + `qdrant_url` into the typed
+    /// [`VectorBackend`] (see [`Self::bridge`]).
+    pub fn vector(&self) -> Result<VectorBackend, String> {
+        match self.vector_backend.as_str() {
+            "memory" => Ok(VectorBackend::Memory),
+            "qdrant" => Ok(VectorBackend::Qdrant {
+                url: Self::required_companion(
+                    self.qdrant_url.as_deref(),
+                    "qdrant_url is required for the qdrant vector backend",
+                )?
+                .to_owned(),
+            }),
+            other => Err(format!("vector_backend must be memory|qdrant, got {other:?}")),
+        }
+    }
+
+    /// Resolve all four backend selectors at once. Errors accumulate —
+    /// one entry per selector that fails to resolve — matching
+    /// `validate()`'s report-everything behaviour.
+    pub fn backends(&self) -> Result<ResolvedBackends, Vec<String>> {
+        let mut errors = Vec::new();
+        let bridge = self.bridge().map_err(|error| errors.push(error)).ok();
+        let state = self.state().map_err(|error| errors.push(error)).ok();
+        let embedder = self.embedder().map_err(|error| errors.push(error)).ok();
+        let vector = self.vector().map_err(|error| errors.push(error)).ok();
+        match (bridge, state, embedder, vector) {
+            (Some(bridge), Some(state), Some(embedder), Some(vector)) => Ok(ResolvedBackends {
+                bridge,
+                state,
+                embedder,
+                vector,
+            }),
+            _ => Err(errors),
+        }
+    }
+
     /// Backends this configuration selects that the *current build*
     /// cannot run because the required cargo feature was compiled out
     /// (round-51 §8.10: `avctl config-validate` reported "valid" for
@@ -770,6 +958,9 @@ impl HarnessConfig {
     /// in: shape validity and build capability are different
     /// questions (a config can be valid for a `--features full`
     /// daemon while the avctl doing the pre-flight was built lean).
+    /// Selections that fail to resolve into their typed backend are
+    /// skipped here — `validate()` already refuses them, and every
+    /// caller (daemon boot, doctor, config-validate) validates first.
     #[must_use]
     pub fn unsupported_backend_requirements(&self) -> Vec<String> {
         let mut missing = Vec::new();
@@ -782,18 +973,22 @@ impl HarnessConfig {
                 ));
             }
         };
-        match self.bridge_backend.as_str() {
-            "kafka" => require(cfg!(feature = "kafka"), "bridge_backend", "kafka", "kafka"),
-            "nats" => require(cfg!(feature = "nats"), "bridge_backend", "nats", "nats"),
-            _ => {}
+        match self.bridge() {
+            Ok(BridgeBackend::Kafka { .. }) => {
+                require(cfg!(feature = "kafka"), "bridge_backend", "kafka", "kafka");
+            }
+            Ok(BridgeBackend::Nats { .. }) => {
+                require(cfg!(feature = "nats"), "bridge_backend", "nats", "nats");
+            }
+            Ok(BridgeBackend::Embedded) | Err(_) => {}
         }
-        if self.state_backend == "redis" {
+        if matches!(self.state(), Ok(StateBackend::Redis { .. })) {
             require(cfg!(feature = "redis"), "state_backend", "redis", "redis");
         }
-        if self.embedder_backend == "onnx" {
+        if matches!(self.embedder(), Ok(EmbedderBackend::Onnx { .. })) {
             require(cfg!(feature = "onnx"), "embedder_backend", "onnx", "onnx");
         }
-        if self.vector_backend == "qdrant" {
+        if matches!(self.vector(), Ok(VectorBackend::Qdrant { .. })) {
             require(cfg!(feature = "qdrant"), "vector_backend", "qdrant", "qdrant");
         }
         missing
@@ -1088,12 +1283,6 @@ impl HarnessConfig {
         if self.worker_channel_capacity == 0 {
             errors.push("worker_channel_capacity must be > 0".into());
         }
-        if !matches!(self.bridge_backend.as_str(), "embedded" | "kafka" | "nats") {
-            errors.push(format!(
-                "bridge_backend must be embedded|kafka|nats, got {:?}",
-                self.bridge_backend
-            ));
-        }
         if crate::provider::adapter_for(&self.provider).is_none() {
             errors.push(format!(
                 "provider must be one of {:?}, got {:?} (S3: Anthropic/Gemini adapters are planned; see docs/reference/STRUCTURAL-REFACTORS.md)",
@@ -1118,41 +1307,72 @@ impl HarnessConfig {
         if self.bridge_data_dir.is_empty() {
             errors.push("bridge_data_dir must not be empty".into());
         }
-        if self.bridge_backend != "embedded" && self.bridge_endpoint.as_deref().is_none_or(str::is_empty) {
-            errors.push("bridge_endpoint is required for kafka and nats backends".into());
+        // Backend selectors: the typed accessors (`bridge()`, `state()`,
+        // `embedder()`, `vector()`) are the single site owning the
+        // legal-value vocabulary and the required-companion rules —
+        // the engineering-review finding about the four String
+        // selectors being enumerated twice. The round-30 F2 scheme
+        // allowlists below run against the *resolved* companion, so
+        // they can never fire on a missing value. The TOML wire
+        // format is unchanged: shipped flat-key configs keep parsing.
+        match self.bridge() {
+            Err(error) => errors.push(error),
+            Ok(BridgeBackend::Nats { endpoint }) => {
+                if !(endpoint.starts_with("nats://") || endpoint.starts_with("tls://")) {
+                    errors.push(format!(
+                        "bridge_endpoint (nats backend) must be nats:// or tls://, got {endpoint:?}"
+                    ));
+                }
+            }
+            // Kafka bridge_endpoint is a `host:port[,host:port]` bootstrap
+            // list, not a URL — no scheme check applies. rdkafka rejects
+            // malformed values on connect.
+            Ok(BridgeBackend::Embedded | BridgeBackend::Kafka { .. }) => {}
         }
-        if !matches!(self.state_backend.as_str(), "memory" | "redis") {
-            errors.push(format!(
-                "state_backend must be memory|redis, got {:?}",
-                self.state_backend
-            ));
+        match self.state() {
+            Err(error) => errors.push(error),
+            Ok(StateBackend::Redis { endpoint }) => {
+                // Round-20 F2 (av-harness config): the state_endpoint
+                // field is docstring-documented as a comma-separated
+                // list of URLs for Redis Cluster mode (see the field
+                // doc above). The scheme allowlist used to be a
+                // prefix check on the WHOLE string, so
+                // `redis://a:6379,http://b` passed validate (the
+                // check saw the `redis://` prefix) and only failed
+                // at connect. `redis+unix:` was also rejected here
+                // even though it's a legitimate Unix-socket form the
+                // redis crate accepts and the round-14 doctor
+                // `probe_endpoint_any` already recognizes. Split on
+                // ',' and validate each member independently.
+                for member in endpoint.split(',').map(str::trim).filter(|m| !m.is_empty()) {
+                    let ok = member.starts_with("redis://")
+                        || member.starts_with("rediss://")
+                        || member.starts_with("unix:")
+                        || member.starts_with("redis+unix:");
+                    if !ok {
+                        errors.push(format!(
+                            "state_endpoint (redis backend) member {member:?} must be \
+                             redis://, rediss://, unix:, or redis+unix: (got {member:?} in {endpoint:?})"
+                        ));
+                    }
+                }
+            }
+            Ok(StateBackend::Memory) => {}
         }
-        if self.state_backend == "redis" && self.state_endpoint.as_deref().is_none_or(str::is_empty) {
-            errors.push("state_endpoint is required for the redis backend".into());
+        if let Err(error) = self.embedder() {
+            errors.push(error);
         }
-        if !matches!(self.embedder_backend.as_str(), "hash" | "onnx") {
-            errors.push(format!(
-                "embedder_backend must be hash|onnx, got {:?}",
-                self.embedder_backend
-            ));
-        }
-        if self.embedder_backend == "onnx"
-            && (self.onnx_model_path.as_deref().is_none_or(str::is_empty)
-                || self.onnx_tokenizer_path.as_deref().is_none_or(str::is_empty))
-        {
-            errors.push("onnx_model_path and onnx_tokenizer_path are required for the onnx backend".into());
+        match self.vector() {
+            Err(error) => errors.push(error),
+            Ok(VectorBackend::Qdrant { url }) => {
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
+                    errors.push(format!("qdrant_url must be http:// or https://, got {url:?}"));
+                }
+            }
+            Ok(VectorBackend::Memory) => {}
         }
         if self.onnx_dimension == 0 {
             errors.push("onnx_dimension must be greater than zero".into());
-        }
-        if !matches!(self.vector_backend.as_str(), "memory" | "qdrant") {
-            errors.push(format!(
-                "vector_backend must be memory|qdrant, got {:?}",
-                self.vector_backend
-            ));
-        }
-        if self.vector_backend == "qdrant" && self.qdrant_url.as_deref().is_none_or(str::is_empty) {
-            errors.push("qdrant_url is required for the qdrant vector backend".into());
         }
         if self.qdrant_collection.is_empty() {
             errors.push("qdrant_collection must not be empty".into());
@@ -1308,53 +1528,9 @@ impl HarnessConfig {
                 ));
             }
         }
-        if self.vector_backend == "qdrant" {
-            if let Some(url) = self.qdrant_url.as_deref().filter(|value| !value.is_empty()) {
-                if !(url.starts_with("http://") || url.starts_with("https://")) {
-                    errors.push(format!("qdrant_url must be http:// or https://, got {url:?}"));
-                }
-            }
-        }
-        if self.state_backend == "redis" {
-            if let Some(url) = self.state_endpoint.as_deref().filter(|value| !value.is_empty()) {
-                // Round-20 F2 (av-harness config): the state_endpoint
-                // field is docstring-documented as a comma-separated
-                // list of URLs for Redis Cluster mode (see the field
-                // doc above). The scheme allowlist used to be a
-                // prefix check on the WHOLE string, so
-                // `redis://a:6379,http://b` passed validate (the
-                // check saw the `redis://` prefix) and only failed
-                // at connect. `redis+unix:` was also rejected here
-                // even though it's a legitimate Unix-socket form the
-                // redis crate accepts and the round-14 doctor
-                // `probe_endpoint_any` already recognizes. Split on
-                // ',' and validate each member independently.
-                for member in url.split(',').map(str::trim).filter(|m| !m.is_empty()) {
-                    let ok = member.starts_with("redis://")
-                        || member.starts_with("rediss://")
-                        || member.starts_with("unix:")
-                        || member.starts_with("redis+unix:");
-                    if !ok {
-                        errors.push(format!(
-                            "state_endpoint (redis backend) member {member:?} must be \
-                             redis://, rediss://, unix:, or redis+unix: (got {member:?} in {url:?})"
-                        ));
-                    }
-                }
-            }
-        }
-        if self.bridge_backend == "nats" {
-            if let Some(url) = self.bridge_endpoint.as_deref().filter(|value| !value.is_empty()) {
-                if !(url.starts_with("nats://") || url.starts_with("tls://")) {
-                    errors.push(format!(
-                        "bridge_endpoint (nats backend) must be nats:// or tls://, got {url:?}"
-                    ));
-                }
-            }
-        }
-        // Kafka bridge_endpoint is a `host:port[,host:port]` bootstrap
-        // list, not a URL — no scheme check applies. rdkafka rejects
-        // malformed values on connect.
+        // The qdrant_url / state_endpoint / bridge_endpoint scheme
+        // allowlists live in the typed-backend block above, running
+        // against the resolved companion values.
     }
 }
 
@@ -1439,14 +1615,21 @@ mod tests {
     /// Round-51 §8.10: each feature-gated backend is reported exactly
     /// when its cargo feature is compiled out — written against
     /// `cfg!` so the same assertion holds under default features AND
-    /// `--all-features` CI runs.
+    /// `--all-features` CI runs. Companions are set because feature
+    /// detection now runs over the typed backends: a selection that
+    /// cannot resolve is `validate()`'s problem, not this method's.
     #[test]
     fn unsupported_backend_requirements_track_build_features() {
         let mut cfg = HarnessConfig::from_toml(r#"upstream_url = "https://api.openai.com""#).unwrap();
         cfg.bridge_backend = "kafka".to_owned();
+        cfg.bridge_endpoint = Some("broker:9092".to_owned());
         cfg.state_backend = "redis".to_owned();
+        cfg.state_endpoint = Some("redis://cache:6379".to_owned());
         cfg.embedder_backend = "onnx".to_owned();
+        cfg.onnx_model_path = Some("model.onnx".to_owned());
+        cfg.onnx_tokenizer_path = Some("tokenizer.json".to_owned());
         cfg.vector_backend = "qdrant".to_owned();
+        cfg.qdrant_url = Some("http://vectors:6333".to_owned());
         let missing = cfg.unsupported_backend_requirements();
         for (enabled, feature) in [
             (cfg!(feature = "kafka"), "kafka"),
@@ -1461,6 +1644,124 @@ mod tests {
                 reported, !enabled,
                 "feature {feature}: enabled={enabled} but reported={reported} in {missing:?}"
             );
+        }
+    }
+
+    /// Each backend selector with a missing required companion fails
+    /// with an error naming the companion field — the typed accessors
+    /// make the invalid combination unrepresentable past parsing.
+    #[test]
+    fn backend_missing_companion_fails_with_named_error() {
+        for (extra, companion) in [
+            ("bridge_backend = \"kafka\"", "bridge_endpoint"),
+            ("bridge_backend = \"nats\"", "bridge_endpoint"),
+            (
+                "bridge_backend = \"kafka\"\nbridge_endpoint = \"\"",
+                "bridge_endpoint",
+            ),
+            ("state_backend = \"redis\"", "state_endpoint"),
+            ("vector_backend = \"qdrant\"", "qdrant_url"),
+            ("embedder_backend = \"onnx\"", "onnx_model_path"),
+            (
+                // One companion present, the other absent: still refused.
+                "embedder_backend = \"onnx\"\nonnx_model_path = \"model.onnx\"",
+                "onnx_tokenizer_path",
+            ),
+        ] {
+            let err =
+                HarnessConfig::from_toml(&format!("upstream_url = \"https://api\"\n{extra}")).unwrap_err();
+            assert!(
+                err.contains(companion) && err.contains("required"),
+                "{extra}: error must name {companion}: {err}"
+            );
+        }
+    }
+
+    /// An unknown backend value fails naming the exhaustive legal set,
+    /// so a typo in `avctl config-validate` output tells the operator
+    /// exactly what the field accepts.
+    #[test]
+    fn unknown_backend_value_names_legal_set() {
+        for (field, bogus, legal_set) in [
+            ("bridge_backend", "carrier-pigeon", "embedded|kafka|nats"),
+            ("state_backend", "abacus", "memory|redis"),
+            ("embedder_backend", "vibes", "hash|onnx"),
+            ("vector_backend", "faiss", "memory|qdrant"),
+        ] {
+            let err =
+                HarnessConfig::from_toml(&format!("upstream_url = \"https://api\"\n{field} = \"{bogus}\""))
+                    .unwrap_err();
+            assert!(err.contains(field), "must name the field: {err}");
+            assert!(err.contains(legal_set), "must name the legal set: {err}");
+            assert!(err.contains(bogus), "must echo the typo: {err}");
+        }
+    }
+
+    /// A valid full-feature config resolves to the expected typed
+    /// backend values, each variant carrying its companion.
+    #[test]
+    fn full_feature_config_resolves_to_typed_backends() {
+        let cfg = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               bridge_backend = "kafka"
+               bridge_endpoint = "broker-1:9092,broker-2:9092"
+               state_backend = "redis"
+               state_endpoint = "redis://cache:6379"
+               embedder_backend = "onnx"
+               onnx_model_path = "models/model.onnx"
+               onnx_tokenizer_path = "models/tokenizer.json"
+               vector_backend = "qdrant"
+               qdrant_url = "http://vectors:6333""#,
+        )
+        .unwrap();
+        let backends = cfg.backends().unwrap();
+        assert_eq!(
+            backends.bridge,
+            BridgeBackend::Kafka {
+                endpoint: "broker-1:9092,broker-2:9092".to_owned()
+            }
+        );
+        assert_eq!(
+            backends.state,
+            StateBackend::Redis {
+                endpoint: "redis://cache:6379".to_owned()
+            }
+        );
+        assert_eq!(
+            backends.embedder,
+            EmbedderBackend::Onnx {
+                model_path: "models/model.onnx".to_owned(),
+                tokenizer_path: "models/tokenizer.json".to_owned()
+            }
+        );
+        assert_eq!(
+            backends.vector,
+            VectorBackend::Qdrant {
+                url: "http://vectors:6333".to_owned()
+            }
+        );
+        // The defaults resolve to the no-companion variants.
+        let cfg = HarnessConfig::from_toml(r#"upstream_url = "https://api""#).unwrap();
+        let backends = cfg.backends().unwrap();
+        assert_eq!(backends.bridge, BridgeBackend::Embedded);
+        assert_eq!(backends.state, StateBackend::Memory);
+        assert_eq!(backends.embedder, EmbedderBackend::Hash);
+        assert_eq!(backends.vector, VectorBackend::Memory);
+    }
+
+    /// `backends()` accumulates one error per unresolvable selector
+    /// instead of stopping at the first, mirroring `validate()`.
+    #[test]
+    fn backends_accumulates_all_resolution_errors() {
+        let mut cfg = HarnessConfig::from_toml(r#"upstream_url = "https://api""#).unwrap();
+        cfg.bridge_backend = "carrier-pigeon".to_owned();
+        cfg.state_backend = "redis".to_owned(); // missing state_endpoint
+        cfg.vector_backend = "faiss".to_owned();
+        let errors = cfg.backends().unwrap_err();
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        let joined = errors.join("\n");
+        for needle in ["bridge_backend", "state_endpoint", "vector_backend"] {
+            assert!(joined.contains(needle), "missing {needle} in {errors:?}");
         }
     }
 
