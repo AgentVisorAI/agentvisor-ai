@@ -151,6 +151,12 @@ enum Command {
     ConfigValidate {
         /// Configuration file.
         path: PathBuf,
+        /// Skip the feature-capability pre-flight and check structure
+        /// only. For validating a config meant for a DIFFERENT build
+        /// than this avctl (e.g. the full-feature container image)
+        /// where the backend features are compiled in.
+        #[arg(long)]
+        structural_only: bool,
     },
     /// Generate concurrent OpenAI-compatible chat traffic and report latency.
     Loadgen {
@@ -232,7 +238,10 @@ async fn run(cli: Cli) -> Result<()> {
             id,
             bearer_token_file,
         } => session_promote(&url, &id, bearer_token_file.as_deref()).await,
-        Command::ConfigValidate { path } => config_validate(&path),
+        Command::ConfigValidate {
+            path,
+            structural_only,
+        } => config_validate(&path, structural_only),
         Command::Loadgen {
             url,
             connections,
@@ -732,7 +741,7 @@ async fn read_capped_response(response: reqwest::Response, max_bytes: u64) -> Re
     String::from_utf8(buf).context("response body was not valid UTF-8")
 }
 
-fn config_validate(path: &Path) -> Result<()> {
+fn config_validate(path: &Path, structural_only: bool) -> Result<()> {
     let text = read_capped_str(path, MAX_CONFIG_BYTES, "config")?;
     let config = av_harness::HarnessConfig::from_toml(&text).map_err(anyhow::Error::msg)?;
     // Round-51 §8.10: a shape-valid config is useless if it selects
@@ -742,12 +751,17 @@ fn config_validate(path: &Path) -> Result<()> {
     // agentvisord are built from the same workspace feature set in
     // every shipped artifact, so avctl's own features are the best
     // available proxy for what the daemon can run.
-    let unsupported = config.unsupported_backend_requirements();
-    if !unsupported.is_empty() {
-        anyhow::bail!(
-            "config is structurally valid but this build cannot run it:\n  {}",
-            unsupported.join("\n  ")
-        );
+    // `--structural-only` opts out for configs that target a build
+    // with a different feature set (the full-feature container image);
+    // `make schema-check` uses it for harness.docker/container.toml.
+    if !structural_only {
+        let unsupported = config.unsupported_backend_requirements();
+        if !unsupported.is_empty() {
+            anyhow::bail!(
+                "config is structurally valid but this build cannot run it:\n  {}",
+                unsupported.join("\n  ")
+            );
+        }
     }
     println!(
         "valid config_version={} listen={}",

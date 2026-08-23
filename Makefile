@@ -44,8 +44,12 @@ schema-check:
 	for schema in schemas/*.json; do node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$$schema" || exit 1; done
 	cargo run -q -p av-cli -- manifest-validate manifests/bridge.example.yaml
 	cargo run -q -p av-cli -- config-validate config/harness.example.toml
-	cargo run -q -p av-cli -- config-validate config/harness.docker.toml
-	cargo run -q -p av-cli -- config-validate config/harness.container.toml
+	# The docker/container configs select full-feature backends (kafka,
+	# redis, onnx, qdrant) that the default-features avctl deliberately
+	# refuses to claim it can run (round-51 §8.10). They target the
+	# full-feature container image, so check structure only here.
+	cargo run -q -p av-cli -- config-validate config/harness.docker.toml --structural-only
+	cargo run -q -p av-cli -- config-validate config/harness.container.toml --structural-only
 
 compose-check:
 	docker compose -f docker/docker-compose.yml config >/dev/null
