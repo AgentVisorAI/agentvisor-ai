@@ -73,6 +73,18 @@ enum Command {
         #[arg(long)]
         seed: PathBuf,
     },
+    /// Locate the on-disk audit artifacts for a session id. Spool
+    /// filenames are `sha256(session_id)[..32]` — this computes the
+    /// stem and reports which artifacts (receipt, ATIF trajectory,
+    /// provenance sidecar, journals, archived prior incarnations)
+    /// exist for it.
+    ReceiptLocate {
+        /// The session id exactly as the client sent it.
+        session_id: String,
+        /// ATIF spool directory (`atif_spool_dir` in the harness config).
+        #[arg(long, default_value = "spool/atif")]
+        spool: PathBuf,
+    },
     /// Verify a receipt offline using an independently trusted public key.
     ReceiptVerify {
         /// Receipt JSON file.
@@ -203,6 +215,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Health { url } => setup::health(&url).await,
         Command::Keygen { output } => keygen(&output),
         Command::Pubkey { seed } => pubkey(&seed),
+        Command::ReceiptLocate { session_id, spool } => receipt_locate(&session_id, &spool),
         Command::ReceiptVerify { path, public_key_hex } => receipt_verify(&path, &public_key_hex),
         Command::AtifValidate { path, mode } => atif_validate(&path, mode),
         Command::ManifestValidate { path } => manifest_validate(&path),
@@ -435,6 +448,60 @@ const MAX_ATIF_BYTES: u64 = av_core::fsutil::MAX_ATIF_BYTES;
 /// Small-file cap for operator-supplied config / manifest / bearer
 /// token files.
 const MAX_CONFIG_BYTES: u64 = av_core::fsutil::MAX_CONTROL_BYTES;
+
+/// Round-51 §9.1: "the filename is `sha256(session_id)[..32]` with no
+/// lookup command" — the offline-verification workflow had no way to
+/// go from a session id to its receipt. Compute the stem and report
+/// every artifact class for it, including `archived-*` prior
+/// incarnations (a recycled session id archives the previous
+/// incarnation's artifact rather than overwriting it).
+fn receipt_locate(session_id: &str, spool: &Path) -> Result<()> {
+    let digest = av_core::digest::sha256_hex(session_id.as_bytes());
+    let stem = digest.get(..32).unwrap_or(&digest);
+    let mut artifacts = serde_json::Map::new();
+    let candidates: [(&str, PathBuf); 5] = [
+        ("receipt", spool.join("receipts").join(format!("{stem}.json"))),
+        ("atif_trajectory", spool.join(format!("{stem}.json"))),
+        ("atif_provenance", spool.join(format!("{stem}.atif-auth"))),
+        ("event_journal", spool.join(format!("{stem}.events.ndjson"))),
+        ("journal_metadata", spool.join(format!("{stem}.session.json"))),
+    ];
+    for (label, path) in &candidates {
+        artifacts.insert(
+            (*label).to_owned(),
+            serde_json::json!({
+                "path": path,
+                "exists": path.exists(),
+            }),
+        );
+    }
+    // Archived prior incarnations: `{stem}.archived-*` in either the
+    // spool root (ATIF collisions) or receipts/ (receipt collisions).
+    let mut archived: Vec<String> = Vec::new();
+    for dir in [spool.to_path_buf(), spool.join("receipts")] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with(stem) && name.contains("archived-") {
+                archived.push(entry.path().display().to_string());
+            }
+        }
+    }
+    archived.sort();
+    println!(
+        "{}",
+        serde_json::json!({
+            "session_id": session_id,
+            "stem": stem,
+            "artifacts": artifacts,
+            "archived_prior_incarnations": archived,
+        })
+    );
+    Ok(())
+}
 
 fn receipt_verify(path: &Path, public_keys_hex: &[String]) -> Result<()> {
     // Round-16: use the strict deserializer that refuses duplicate

@@ -36,11 +36,39 @@ tampered receipt could carry a public key it forged a signature
 against; the whole point of an out-of-band key exchange is to break
 that loop.
 
-## 2. Run `avctl receipt-verify`
+## 2. Locate the receipt for a session
+
+Spool filenames are `sha256(session_id)[..32]` — not the session id
+itself (ids never touch the filesystem). Use the lookup command:
+
+```
+$ avctl receipt-locate my-session-id --spool /var/lib/agentvisor/spool/atif
+{"session_id":"my-session-id","stem":"34655f…","artifacts":{"receipt":{"path":"…/receipts/34655f….json","exists":true},…},"archived_prior_incarnations":[]}
+```
+
+It reports every artifact class for the stem: the receipt
+(`receipts/{stem}.json`), the ATIF trajectory (`{stem}.json`), its
+provenance sidecar (`{stem}.atif-auth`), and any live journals.
+
+**One session id can have many receipts.** A client reusing a
+completed session's id starts a NEW incarnation; the prior
+incarnation's artifact is renamed to `{stem}.archived-<uid>…` rather
+than overwritten, and `receipt-locate` lists these under
+`archived_prior_incarnations`. When auditing a specific conversation,
+match on the receipt's `issued_at`/`subject.event_count`, not on the
+session id alone.
+
+## 3. Run `avctl receipt-verify`
 
 ```
 $ avctl receipt-verify path/to/receipt.json \
     --public-key-hex 7d2b60851d57106aed8bd9bae69efd35f0c41c56bfd3096d327bbe31c9baa19f
+
+`--public-key-hex` is repeatable — pin both the retiring and the
+incoming key during a rotation window; the receipt's `key_id` selects
+which one verifies it. Keys are accepted in hex (what `avctl pubkey`
+and the startup banner print) or standard base64 (what the receipt's
+`public_key_b64` field carries).
 ```
 
 The command:
@@ -59,7 +87,7 @@ order public keys and refuses signatures whose `s` scalar is not
 canonically encoded — both are prerequisites for a strong unforgeability
 argument.
 
-## 3. Sanity-check the subject
+## 4. Sanity-check the subject
 
 `avctl receipt-verify` succeeding only proves the signature is
 authentic. It does not prove the receipt is *the one you expect*.
@@ -77,7 +105,7 @@ Check at least:
 Any mismatch is a hard failure — the signature verified the
 attackers' subject, not yours.
 
-## 4. Alternative: verify programmatically
+## 5. Alternative: verify programmatically
 
 The exact JCS + Ed25519 sequence `avctl` runs is:
 
@@ -100,7 +128,7 @@ The `Keyring::verify` path calls `verify_strict` under the hood and
 refuses known-weak keys (`is_weak()` — a defence in depth added after
 `av_receipts::keys::KeyError::WeakKey` review round 51).
 
-## 5. Common failure modes
+## 6. Common failure modes
 
 * **Signature verification failed** — the receipt was signed by a
   different key (rotation, an impostor, or the wrong environment).
@@ -118,7 +146,7 @@ refuses known-weak keys (`is_weak()` — a defence in depth added after
   so a future-format receipt is never silently interpreted under
   old semantics. Upgrade `avctl` to verify newer receipts.
 
-## 6. Continuous verification
+## 7. Continuous verification
 
 The recommended pattern for auditors and downstream consumers:
 
