@@ -2769,6 +2769,75 @@ mod tests {
         assert!(registry.get("complete-signed").unwrap().receipt.lock().is_some());
     }
 
+    /// Unsigned twin of the test above. The pending-response quarantine
+    /// branch in `consolidate_step_journals` used to build a fresh
+    /// `Session` and `try_insert_recovered` it — which always collided
+    /// with the recovery placeholder claimed at the top of the candidate
+    /// body, so the insert failed, the guard release evicted the
+    /// placeholder, and the session never converged: no registry entry,
+    /// no quarantine, journal left on disk, one silent skip per
+    /// reconciler tick forever. The branch now converts the claimed
+    /// placeholder in place.
+    #[tokio::test]
+    async fn recovery_quarantines_the_incomplete_unsigned_session_in_place() {
+        let directory = tempfile::tempdir().unwrap();
+        let bridge = Arc::new(RecordingBus::default());
+        let metrics = Arc::new(Registry::new());
+        let signer = Arc::new(av_receipts::Ed25519Signer::from_seed(&[29; 32]));
+        let journal_key = crate::journal::key_from_signer(signer.as_ref());
+        let worker = spawn_worker_with_spool_authenticated(
+            4,
+            bridge.clone(),
+            Arc::new(HashEmbedder::default()),
+            Arc::new(NoopVectorSink),
+            Some(directory.path().to_path_buf()),
+            journal_key,
+            Arc::clone(&metrics),
+        );
+        let active = session(Workflow::Unsigned);
+        let mut incomplete_request = job(Arc::clone(&active));
+        incomplete_request.response_attempt = Some(ResponseAttempt {
+            id: "incomplete-attempt".to_owned(),
+            terminal: false,
+        });
+        worker.submit_and_wait(incomplete_request).await.unwrap();
+
+        let registry = crate::session::SessionRegistry::new();
+        let finalizer = crate::reconciler::Finalizer::with_bridge(
+            signer,
+            directory.path().to_path_buf(),
+            metrics,
+            bridge,
+        );
+        finalizer
+            .recover_spooled_sessions(&registry, &Default::default())
+            .await
+            .unwrap();
+        let quarantined = registry
+            .get(&active.id)
+            .expect("quarantined unsigned session must stay registered");
+        assert!(quarantined.capture_failed());
+        assert!(
+            quarantined.is_closed() && quarantined.artifact_committed_flag(),
+            "quarantine must be sealed so the idle sweeper skips it"
+        );
+        assert_eq!(
+            quarantined.totals.prompt_tokens.load(Ordering::Acquire),
+            100,
+            "folded journal totals must land on the quarantined session"
+        );
+        // A second recovery pass is a no-op: the registered quarantine
+        // short-circuits the candidate, with no placeholder churn.
+        finalizer
+            .recover_spooled_sessions(&registry, &Default::default())
+            .await
+            .unwrap();
+        let still = registry
+            .get(&active.id)
+            .expect("second pass must not evict the quarantined session");
+        assert!(still.capture_failed());
+    }
+
     #[tokio::test]
     async fn tampered_signed_journal_is_never_turned_into_a_receipt() {
         let directory = tempfile::tempdir().unwrap();
