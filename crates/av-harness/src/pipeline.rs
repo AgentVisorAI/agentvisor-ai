@@ -76,6 +76,10 @@ pub struct AppState {
     /// journaled in this process but whose `.audited` marker write failed;
     /// a retry must re-attempt the marker without re-emitting the event.
     pub(crate) tool_audits_emitted: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    /// Round-51 §4.2 (S3): the upstream provider's wire dialect,
+    /// selected by `config.provider` at boot. All SSE/body parsing on
+    /// the response path routes through this adapter.
+    pub(crate) provider_adapter: Arc<dyn crate::provider::ProviderAdapter>,
     /// Asynchronous session close and promotion service.
     pub finalizer: Finalizer,
     /// Flips to `true` when shutdown starts. `/readyz` reads this and
@@ -857,6 +861,13 @@ impl AppState {
         let upstream_auth = resolve_upstream_auth(&config)?;
         let tool_auth = resolve_tool_auth(&config)?;
         let hot_metrics = Arc::new(HotMetrics::new(&metrics, config.strict_stage_budget));
+        // S3: config validation already refused unsupported providers;
+        // this defense-in-depth error covers direct constructors that
+        // bypassed validate() (test builders).
+        let provider_adapter = crate::provider::adapter_for(&config.provider).ok_or_else(|| {
+            PipelineError::BadRequest(format!("unsupported provider {:?}", config.provider))
+        })?;
+        tracing::info!(provider = provider_adapter.name(), "provider adapter selected");
         Ok(Self {
             config,
             store,
@@ -872,6 +883,7 @@ impl AppState {
             tool_auth,
             tool_audit_gates: Arc::default(),
             tool_audits_emitted: Arc::default(),
+            provider_adapter,
             finalizer,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             identity_rejection_window: Arc::new(parking_lot::Mutex::new((Instant::now(), 0))),

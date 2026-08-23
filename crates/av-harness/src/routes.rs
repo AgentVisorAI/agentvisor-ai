@@ -576,6 +576,7 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
         pending_budget: None,
         captured_bytes: 0,
         billed_prompt_tokens,
+        provider_adapter: Arc::clone(&state.provider_adapter),
         completed: false,
     };
     let mut response = if is_sse {
@@ -2198,6 +2199,8 @@ struct AbortFinalizingStream {
     /// Round-51 §6.4: admission-time prompt-token heuristic, reconciled
     /// against the provider's `usage.prompt_tokens` at terminal capture.
     billed_prompt_tokens: u64,
+    /// S3: the provider wire dialect this stream parses with.
+    provider_adapter: Arc<dyn crate::provider::ProviderAdapter>,
     completed: bool,
 }
 
@@ -2275,7 +2278,7 @@ impl AbortFinalizingStream {
     }
 
     fn absorb_frame(&mut self, raw: &str) -> Result<u64, String> {
-        let Some(parsed) = parse_provider_chunk(raw)? else {
+        let Some(parsed) = self.provider_adapter.parse_sse_chunk(raw)? else {
             return Ok(0);
         };
         if self.upstream_status.is_success() && !parsed.has_choices {
@@ -2612,7 +2615,7 @@ struct PartialToolCall {
     arguments: String,
 }
 
-struct ProviderToolCallDelta {
+pub(crate) struct ProviderToolCallDelta {
     /// The `choices[].index` this delta belongs to. Multi-choice
     /// (`n > 1`) responses reuse tool-call index 0 in every choice, so
     /// reassembly must key on (choice, tool index) or distinct calls
@@ -2624,24 +2627,24 @@ struct ProviderToolCallDelta {
     arguments: String,
 }
 
-struct ParsedProviderChunk {
-    message: String,
-    reasoning: Option<String>,
-    model_name: Option<String>,
-    metrics: av_events::EventMetrics,
-    usage_reported: bool,
+pub(crate) struct ParsedProviderChunk {
+    pub(crate) message: String,
+    pub(crate) reasoning: Option<String>,
+    pub(crate) model_name: Option<String>,
+    pub(crate) metrics: av_events::EventMetrics,
+    pub(crate) usage_reported: bool,
     /// True only when the provider itself supplied `completion_tokens`
     /// (as opposed to the per-chunk heuristic estimate filled in below).
     /// `absorb_frame`'s cumulative-usage branch must key on this, not on
     /// `usage_reported` alone: a usage object without a completion count
     /// (`{"prompt_tokens": 7}` or `"completion_tokens": null`) would
     /// otherwise feed a non-cumulative estimate into cumulative math.
-    completion_reported: bool,
-    finish_reason: Option<String>,
-    cost_usd_micros: u64,
-    cost_reported: bool,
-    has_choices: bool,
-    tool_call_deltas: Vec<ProviderToolCallDelta>,
+    pub(crate) completion_reported: bool,
+    pub(crate) finish_reason: Option<String>,
+    pub(crate) cost_usd_micros: u64,
+    pub(crate) cost_reported: bool,
+    pub(crate) has_choices: bool,
+    pub(crate) tool_call_deltas: Vec<ProviderToolCallDelta>,
 }
 
 fn reject_metric_regression(
@@ -2974,7 +2977,7 @@ impl Stream for AbortFinalizingStream {
     }
 }
 
-fn parse_provider_chunk(raw: &str) -> Result<Option<ParsedProviderChunk>, String> {
+pub(crate) fn parse_provider_chunk(raw: &str) -> Result<Option<ParsedProviderChunk>, String> {
     // SSE spec (§9.2.4) requires the leading U+FEFF (BOM) to be
     // discarded once, at the start of the stream. Rust's `.trim()` does
     // not strip U+FEFF (char::is_whitespace() returns false for it), so
@@ -4174,6 +4177,7 @@ mod tests {
             store: Arc::clone(&state.store),
             budget: state.config.budget.clone(),
             billed_prompt_tokens: 0,
+            provider_adapter: Arc::clone(&state.provider_adapter),
             finalizer: state.finalizer.clone(),
             _lease: lease,
             response_marker: None,
