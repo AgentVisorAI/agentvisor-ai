@@ -1500,10 +1500,15 @@ mod tests {
     fn unsupported_provider_is_refused_at_validation() {
         let mut cfg = HarnessConfig::from_toml(r#"upstream_url = "https://api.openai.com""#).unwrap();
         assert_eq!(cfg.provider, "openai");
-        cfg.provider = "anthropic".to_owned();
+        cfg.provider = "google".to_owned();
         let error = cfg.validate().unwrap_err();
         assert!(error.contains("provider"), "must name the field: {error}");
         assert!(error.contains("openai"), "must name the supported set: {error}");
+        cfg.provider = "anthropic".to_owned();
+        assert!(
+            cfg.validate().is_ok(),
+            "anthropic is a supported dialect (S3 step 2)"
+        );
     }
 
     /// Round-51 §8.10: the default backends (embedded/memory/hash/
