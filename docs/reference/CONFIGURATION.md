@@ -38,11 +38,11 @@ source. All are optional.
 | --- | --- | --- |
 | `listen` | `127.0.0.1:8484` | Bind address:port for HTTP. The 127.0.0.1 default is *deliberate*: the harness refuses to boot on a `0.0.0.0` bind when identity is not required (see below). |
 | `allow_wildcard_bind` | `false` | Opt-in for `listen = "0.0.0.0:*"` when `require_identity = false`. Only set this when a network layer above the harness — Kubernetes NetworkPolicy, a service-mesh mTLS gateway, a corporate proxy ACL — controls who can reach the port. The container image sets this to `true`; it is expected that container users provide their own ingress ACL. |
-| `require_identity` | `true` | Refuse any request without a valid NHI bearer. Turning this off is a **development-only** switch and permanently disables audience/scope/TTL checks. |
+| `require_identity` | `false` | Refuse any request without a valid NHI bearer. The **default is off** (development posture): the shipped safety net is the loopback `listen` default plus the wildcard-bind refusal. Set to `true` (with a JWKS/HMAC source) for any deployment reachable by anyone but the operator. |
 | `identity_jwks_url` | none | JWKS URL for validating NHI tokens. Rotated JWKS entries are recognized within `identity_jwks_refresh_s` (default 300). |
 | `identity_allowed_issuers` | `[]` | If non-empty, only tokens whose `iss` matches one of these are accepted. |
 | `audience` | `agentvisor-ai` | Required token audience. |
-| `enforce_identity_scopes` | `true` | Requires per-route scope claims. Applies only when `require_identity = true`. |
+| `enforce_identity_scopes` | `false` | Requires per-route scope claims. Applies only when `require_identity = true`. |
 | `allowed_hosts` | `[]` (disabled) | Host-header allowlist (DNS-rebinding defense). Non-empty: requests whose `Host` (port stripped, case-insensitive) isn't listed are refused 403 before any handler. Leave empty for loopback binds or when the ingress enforces Host. |
 | `chat_scope` / `session_close_scope` / `session_promote_scope` | `chat:write` / `session:close` / `session:promote` | Scope claims required on each route. |
 
@@ -50,7 +50,7 @@ source. All are optional.
 
 | Key | Default | Notes |
 | --- | --- | --- |
-| `dashboard_enabled` | `false` | Serves `/dashboard*` and `/api/v1/dashboard/*`. These endpoints are **unauthenticated** and mirror the in-memory session registry. Front the harness with the same ingress control you use for `/metrics` before turning this on. Was previously default-true; changed to default-false in round 51 §3.3. |
+| `dashboard_enabled` | `true` | Serves `/dashboard*` and `/api/v1/dashboard/*`. These endpoints are **unauthenticated** and mirror the in-memory session registry. The default-on posture is safe only because the `listen` default is loopback and config validation refuses a wildcard bind without identity; front the harness with the same ingress control you use for `/metrics` before exposing it. |
 
 ## Upstream
 
@@ -66,7 +66,8 @@ source. All are optional.
 ## Budgets
 
 There are **two** budget ledgers. Both share the same `av_state::BudgetSpec`
-shape (`{ per_min_tokens, hourly_tokens, per_min_requests, hourly_requests }`).
+shape (`{ max_tokens, max_tool_calls, max_total_tool_calls,
+max_payout_usd_micros }`).
 
 | Key | Default | Notes |
 | --- | --- | --- |
@@ -78,7 +79,7 @@ shape (`{ per_min_tokens, hourly_tokens, per_min_requests, hourly_requests }`).
 
 | Key | Default | Notes |
 | --- | --- | --- |
-| `atif_spool_dir` | `./data/atif` | Where ATIF trajectories and their `.atif-auth` sidecars land. Backup with the same discipline you use for receipts. |
+| `atif_spool_dir` | `spool/atif` (relative to the working directory) | Where ATIF trajectories and their `.atif-auth` sidecars land. Backup with the same discipline you use for receipts. |
 | `atif_retention_days` | unset | When set, an hourly sweep removes **sealed** ATIF pairs (`.json` + `.atif-auth`) whose mtime is older than N days. Unpaired remnants are left for the reconciler's quarantine sweep. See round 51 §8.1. |
 | `bridge_data_dir` / `bridge_backend` / `bridge_endpoint` | see docs | Broker configuration; either the embedded Bridge or an external one. |
 | `state_backend` / `state_endpoint` | see docs | State store: embedded or Redis. |

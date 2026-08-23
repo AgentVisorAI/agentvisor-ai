@@ -151,9 +151,9 @@ compression_enabled = false
 | Situation | OpenAI | AgentVisor AI |
 | --- | --- | --- |
 | Rate limit | `429` | `429` |
-| Post-compression session budget refusal | n/a | `429` |
-| Post-compression principal budget refusal | n/a | `429` |
-| Semantic loop breaker refusal | n/a | `429` |
+| Post-compression session budget refusal | n/a | `403` (deliberately not 429, which SDKs auto-retry — the cap is permanent for the session) |
+| Post-compression principal budget refusal | n/a | `403` |
+| Semantic loop breaker refusal | n/a | `403` |
 | Semantic loop breaker abort | n/a | `499`-ish (severed connection) |
 | Missing/invalid bearer | `401` | `401` (identity required) or `403` (scope missing) |
 | Compression floor exceeded and request oversized | n/a | `413` |

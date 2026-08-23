@@ -58,10 +58,10 @@ the drain window.
 3. Abort background tasks (reconciler tick, retention sweep, etc.).
 4. Flush and close the state store, broker, and Bridge.
 
-Any tail latency in step 2 shows up as
-`av_service_shutdown_duration_seconds`. Alert on p99 > 20s — that
-usually means a request is stuck waiting on the upstream and the
-worker pool can't drain.
+Step-2 tail latency that exhausts the drain budget shows up as
+`av_http_shutdown_drain_timeouts_total`. Alert on any increase — it
+usually means a request was stuck waiting on the upstream and the
+worker pool couldn't drain before the timeout.
 
 ## Key rotation
 
@@ -137,10 +137,9 @@ interaction.
 | `av_atif_retention_pruned_total` | Sudden increase | Retention sweep ran (usually just noise, but confirm the `atif_retention_days` you set). |
 | `av_atif_recovery_skipped_total{reason="unauthenticated"}` | Rate > 0 sustained | Someone/something is planting sidecar-less .json files. Escalate. |
 | `av_atif_recovery_skipped_total{reason="too_large"}` | Rate > 0 | Adversarial ATIF payload attempts. Investigate the spool contents. |
-| `av_receipt_verify_failed_total` | Rate > 0 (any) | A receipt signature check failed downstream. Usually a rotation mismatch, sometimes tampering. |
 | `av_incomplete_sessions_total` | Sudden increase | Sessions where `capture_failed` was set on the audit chain. After round 51 §6.2 (D7) this is genuinely rare and represents unrecoverable pipeline state, not client disconnects. Escalate. |
 | `av_events_dropped_total{stage="response_slot"}` | Rate > 0 sustained | Response capture backpressure — the worker pool is saturated or the state store is slow. Scale up workers or investigate the state backend. |
-| `av_service_shutdown_duration_seconds` p99 | > 20s | A request is stuck during graceful drain; usually upstream latency. |
+| `av_http_shutdown_drain_timeouts_total` | Any increase | A graceful drain hit its timeout with requests still in flight; usually upstream latency. |
 
 ## Backup
 

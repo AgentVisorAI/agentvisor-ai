@@ -75,6 +75,14 @@ pub enum IdentityError {
     /// Required identity field empty.
     #[error("empty identity field {0}")]
     EmptyField(&'static str),
+    /// Identity field longer than its documented cap.
+    #[error("identity field {field} exceeds {max} characters")]
+    FieldTooLong {
+        /// Field name.
+        field: &'static str,
+        /// Documented cap in Unicode code points.
+        max: usize,
+    },
     /// Field carries a bidi override or zero-width character that would
     /// spoof how the identity renders in a log or audit view.
     #[error("identity field {0} carries a bidi/zero-width spoofing character")]
@@ -484,6 +492,18 @@ impl IdentityValidator {
         }
         if claims.charter.is_empty() {
             return Err(IdentityError::EmptyField("charter"));
+        }
+        // docs/reference/LIMITS.md documents a 256-code-point charter cap
+        // ("longer are refused with 400"); the charter flows verbatim into
+        // logs, receipts, and event chains, so an unbounded (up to the
+        // 8 KiB token cap) attacker-chosen string is also log-spam
+        // surface. Enforce the documented limit.
+        const MAX_CHARTER_CHARS: usize = 256;
+        if claims.charter.chars().count() > MAX_CHARTER_CHARS {
+            return Err(IdentityError::FieldTooLong {
+                field: "charter",
+                max: MAX_CHARTER_CHARS,
+            });
         }
         if claims.version.is_empty() {
             return Err(IdentityError::EmptyField("version"));

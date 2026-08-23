@@ -78,8 +78,8 @@ The command:
 * canonicalises `subject` with RFC 8785 JCS
 * runs `ed25519_dalek::VerifyingKey::verify_strict` against the
   canonical bytes with the trusted key you passed
-* prints the subject's `key_id`, `event_uid`, `subject.stop_reason`,
-  and `subject.event_count` on success
+* prints `verified <receipt_id>` on success (inspect the receipt JSON
+  itself for key_id, stop_reason, and event_count — see step 4)
 * exits non-zero with a diagnostic on any failure
 
 `verify_strict` (as opposed to `verify`) refuses low-order and mixed-

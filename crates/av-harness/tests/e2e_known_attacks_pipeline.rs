@@ -185,31 +185,39 @@ fn wasmtime_policy_infinite_loop_is_stopped_by_fuel_or_epoch() {
 // ---------------------------------------------------------------------------
 // 6. wasmtime containment: memory-cap enforcement (attack: policy allocates
 // gigabytes to OOM the host). Wasmtime's StoreLimits caps linear memory at
-// MAX_MEMORY_BYTES; a policy trying to grow past that is contained — the
-// grow fails (or the alloc traps to a Deny); either way the host never OOMs.
+// MAX_MEMORY_BYTES; a `memory.grow` past the cap must FAIL (returning -1 to
+// the guest) rather than reserve 256 MiB. The guest reports the grow result
+// through the evaluate return code: 0 (Allow) iff the grow was refused,
+// 1 (Deny) iff it succeeded — so a removed/loosened StoreLimits cap flips
+// the verdict and fails this test. (The old shape matched both variants
+// with empty arms, which could not fail no matter what the sandbox did.)
 // ---------------------------------------------------------------------------
 
 #[test]
 fn wasmtime_policy_memory_grow_past_cap_is_stopped() {
     // WAT: memory.grow by 4096 pages (256 MiB) — exceeds our 16 MiB cap.
+    // evaluate returns 0 (allow) iff memory.grow returned -1 (refused).
     let wat = r#"
         (module
           (memory (export "memory") 1)
-          (func (export "alloc") (param i32) (result i32)
+          (func (export "alloc") (param i32) (result i32) i32.const 0)
+          (func (export "evaluate") (param i32 i32) (result i32)
             i32.const 4096
             memory.grow
-            drop
-            i32.const 0)
-          (func (export "evaluate") (param i32 i32) (result i32) i32.const 0)
+            i32.const -1
+            i32.eq
+            (if (result i32)
+              (then i32.const 0)
+              (else i32.const 1)))
         )
     "#;
     let policy = WasmPolicy::from_bytes("mem-bomb", wat.as_bytes()).unwrap();
     let decision = policy.evaluate("t", &json!({}));
-    // Deny (from an alloc trap) OR Allow with capped memory — both are
-    // safe. What must not happen: the host process ends.
-    match decision {
-        PolicyDecision::Deny { .. } | PolicyDecision::Allow => {}
-    }
+    assert!(
+        matches!(decision, PolicyDecision::Allow),
+        "StoreLimits did not refuse a 256 MiB memory.grow (the guest saw the \
+         grow succeed): {decision:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

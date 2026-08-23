@@ -1008,17 +1008,21 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
             budget_remaining,
             elapsed_us,
             payout_micros,
+            principal_id,
         }) => {
             if let Some(url) = state.config.tool_upstream_url.as_deref() {
                 let execution = match execution {
                     Some(execution) => execution,
                     None => return lifecycle_error("tool execution state is missing".to_owned()),
                 };
-                // The sandbox debited the budget when it returned Allowed;
-                // every failure between here and a successful `claim()`
-                // must refund it, or a saturated worker / close race
-                // drains `max_total_tool_calls` and payout headroom with
-                // zero tools executed (each client retry re-debits).
+                // The sandbox debited the budget when it returned Allowed —
+                // on BOTH ledgers when a principal budget is bound. Every
+                // failure between here and a successful `claim()` must
+                // refund BOTH, or a saturated worker / close race / lost
+                // claim drains `max_total_tool_calls` and payout headroom
+                // (session AND principal — the principal ledger persists
+                // across sessions, so a leak there never heals) with zero
+                // tools executed; each client retry re-debits.
                 let refund_admission = || {
                     av_state::ActionBudget::new(
                         state.store.as_ref(),
@@ -1026,6 +1030,12 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                         &state.config.budget,
                     )
                     .refund_tool_call(&execution.tool, payout_micros);
+                    if let (Some(principal), Some(spec)) =
+                        (principal_id.as_deref(), state.config.principal_budget.as_ref())
+                    {
+                        av_state::ActionBudget::for_principal(state.store.as_ref(), principal, spec)
+                            .refund_tool_call(&execution.tool, payout_micros);
+                    }
                 };
                 let _lease = match state.lease_session(&headers) {
                     Ok(lease) => lease,
@@ -1056,12 +1066,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                         // Round-33 F1: refund the exact amount debited so
                         // the budget counters reflect only admitted work,
                         // not the lost race.
-                        av_state::ActionBudget::new(
-                            state.store.as_ref(),
-                            &execution.session_id,
-                            &state.config.budget,
-                        )
-                        .refund_tool_call(&execution.tool, payout_micros);
+                        refund_admission();
                         return (
                             StatusCode::CONFLICT,
                             Json(json!({"error": TOOL_OUTCOME_UNCERTAIN})),
@@ -1079,12 +1084,7 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                             %error,
                             "tool execution claim failed; refunding budget"
                         );
-                        av_state::ActionBudget::new(
-                            state.store.as_ref(),
-                            &execution.session_id,
-                            &state.config.budget,
-                        )
-                        .refund_tool_call(&execution.tool, payout_micros);
+                        refund_admission();
                         return pipeline_error(crate::pipeline::PipelineError::Unavailable(
                             "tool execution intent could not be persisted".to_owned(),
                         ));
