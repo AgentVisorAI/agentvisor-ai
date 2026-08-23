@@ -1,10 +1,10 @@
-//! Process-level restart tests (engineering review round-51 §10.2).
+//! Process-level restart tests.
 //!
 //! Every other recovery test drives `recover_spooled_sessions` against a
 //! hand-constructed spool. These spawn the REAL `agentvisord` binary,
 //! serve real HTTP traffic through it, SIGKILL it mid-life, and restart
-//! it on the same spool — the exact experiment that found §8.2 (restart
-//! re-finalizes every closed session) and §8.5 (quarantine races an
+//! it on the same spool — the exact experiment that found two real bugs
+//! (restart re-finalized every closed session; quarantine raced an
 //! in-progress close). `async fn main`'s recovery-then-serve sequencing
 //! and the config/env plumbing get their only end-to-end coverage here.
 
@@ -162,9 +162,9 @@ fn spool_file_count(dir: &std::path::Path) -> usize {
         .unwrap_or(0)
 }
 
-/// The §10.2 experiment: serve → SIGKILL → restart → serve → SIGKILL →
-/// restart. Asserts the daemon survives its own crash artifacts, the
-/// spool recovery is idempotent across repeated restarts (§8.2: no
+/// The kill-and-restart experiment: serve → SIGKILL → restart → serve →
+/// SIGKILL → restart. Asserts the daemon survives its own crash artifacts,
+/// the spool recovery is idempotent across repeated restarts (no
 /// unbounded duplicate work), and fresh traffic flows after each boot.
 #[test]
 fn sigkill_restart_recovers_and_is_idempotent() {
@@ -231,13 +231,14 @@ vector_backend = "memory"
     daemon.0.wait().unwrap();
     drop(daemon);
 
-    // ---- Boot 3: recovery must be idempotent (§8.2). ----
+    // ---- Boot 3: recovery must be idempotent. ----
     let mut daemon = start_daemon(&config_path, &seed_path);
     wait_healthy(listen_port, &mut daemon);
     std::thread::sleep(Duration::from_secs(2));
     let after_third_boot = spool_file_count(&spool);
-    // §8.2's failure shape was unbounded growth: every restart re-adopted
-    // and re-finalized every closed session, emitting duplicate events.
+    // The failure shape to guard against is unbounded growth: a buggy
+    // recovery re-adopted and re-finalized every closed session on each
+    // restart, emitting duplicate events.
     // Recovery work may complete residue from the LAST crash (bounded),
     // but a third boot over the same artifacts must not add more than
     // the second did.
@@ -253,8 +254,8 @@ vector_backend = "memory"
 
 /// A daemon killed BEFORE its response completes must, on restart,
 /// quarantine the interrupted session (its in-flight marker survives
-/// the crash) while still serving fresh sessions — the §8.9 shape,
-/// verifying the quarantine isolates rather than wedges the daemon.
+/// the crash) while still serving fresh sessions — verifying the
+/// quarantine isolates rather than wedges the daemon.
 #[test]
 fn sigkill_before_first_request_leaves_daemon_restartable() {
     let scratch = tempfile::tempdir().unwrap();
@@ -304,7 +305,7 @@ vector_backend = "memory"
     drop(daemon);
 }
 
-/// Round-51 §10.2: every ENOSPC/EIO durability path was reasoned about
+/// Every ENOSPC/EIO durability path was once reasoned about
 /// in comments and tested nowhere. This is the reproducible variant of
 /// the failure-mode table's "disk full" row, driven end-to-end through
 /// the real daemon: with the spool filesystem unwritable, chat requests
@@ -381,7 +382,7 @@ vector_backend = "memory"
         "no unaudited traffic may reach the upstream during a spool outage: {body}"
     );
 
-    // Liveness must NOT flap on a spool outage (§8.3: /livez is
+    // Liveness must NOT flap on a spool outage (/livez is
     // constant; a restart cannot fix a full disk).
     let (live, _) = http_get(listen_port, "/livez").expect("livez");
     assert_eq!(live, 200);
@@ -396,7 +397,7 @@ vector_backend = "memory"
     drop(daemon);
 }
 
-/// Round-51 §8.6: two daemons sharing one spool silently split the
+/// Two daemons sharing one spool would silently split the
 /// audit trail (interleaved journals, racing reconcilers, torn
 /// artifacts). The daemon holds an exclusive advisory lock on
 /// `.agentvisord.lock` for its whole lifetime; a second instance

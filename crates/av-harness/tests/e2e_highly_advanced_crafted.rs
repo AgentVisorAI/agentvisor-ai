@@ -17,24 +17,20 @@ use av_atif::writer::TrajectoryBuilder;
 use av_atif::Agent;
 use av_compress::{compress, CompressionConfig};
 use av_receipts::{
-    canonicalize, CostSummary, Ed25519Signer, EventChain, Keyring, Receipt, ReceiptBody, ReceiptSubject,
-    Signer, ToolCallSummary,
+    canonicalize, CostSummary, Ed25519Signer, EventChain, Receipt, ReceiptBody, ReceiptSubject, Signer,
+    ToolCallSummary,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+mod common;
+use common::ring;
+
 fn signer_a() -> Ed25519Signer {
-    Ed25519Signer::from_seed(&[21; 32])
+    common::signer(21)
 }
 fn signer_b() -> Ed25519Signer {
-    Ed25519Signer::from_seed(&[22; 32])
-}
-fn ring(signers: &[&Ed25519Signer]) -> Keyring {
-    let mut r = Keyring::new();
-    for s in signers {
-        r.add_key_bytes(&Signer::public_key_bytes(*s)).unwrap();
-    }
-    r
+    common::signer(22)
 }
 
 fn body_event_chain(session: &str, chain_head: String, event_count: u64) -> ReceiptBody {

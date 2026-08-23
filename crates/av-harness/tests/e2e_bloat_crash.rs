@@ -23,7 +23,7 @@
 
 use av_receipts::{
     canonicalize, CostSummary, Ed25519Signer, EventChain, Keyring, Receipt, ReceiptBody, ReceiptSubject,
-    Signer, ToolCallSummary,
+    ToolCallSummary,
 };
 use av_sandbox::rpc::{self, RpcError};
 use av_state::{BudgetSpec, InMemoryStore, StateStore};
@@ -32,18 +32,18 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Instant;
 
+mod common;
+
 fn signer() -> Ed25519Signer {
-    Ed25519Signer::from_seed(&[99; 32])
+    common::signer(99)
 }
 fn ring(s: &Ed25519Signer) -> Keyring {
-    let mut r = Keyring::new();
-    r.add_key_bytes(&Signer::public_key_bytes(s)).unwrap();
-    r
+    common::ring(&[s])
 }
 
 // ---------------------------------------------------------------------------
 // 1. Depth bomb: 10 000 levels of nested arrays. JCS canonicalization uses
-//    recursion; round-40 F5's `MAX_NESTED_DEPTH = 128` cap refuses the bomb
+//    recursion; the `MAX_NESTED_DEPTH = 128` cap refuses the bomb
 //    long before the default 8 MiB thread stack is at risk. The
 //    test still runs the canonicalize call on a 64 MiB stack thread so a
 //    regression of the cap cannot take down the process. The call must finish inside
@@ -73,7 +73,7 @@ fn deep_nested_arrays_do_not_stack_overflow_jcs() {
     //   * `Ok(canon)` — canonicalize walked the input to completion
     //     and produced the expected shape.
     //   * `Err(_)` — canonicalize refused the pathological input
-    //     cleanly (the expected current outcome: round-40 F5's
+    //     cleanly (the expected current outcome: the
     //     `MAX_NESTED_DEPTH = 128` recursion cap returns `TooDeep`;
     //     the test's own name only requires "no stack
     //     overflow", not "always Ok").
@@ -238,10 +238,10 @@ fn state_store_survives_100k_key_bomb_without_poisoning() {
 
 // ---------------------------------------------------------------------------
 // 7. Signer bomb: repeated receipt issuances in a tight loop, each verified.
-//    Round-51 §10.1: this used to run 5,000 iterations (75 s — 38% of the
+//    This once ran 5,000 iterations (75 s — 38% of the
 //    suite wall clock) with `elapsed < 120 s` as its only assertion, which
 //    measured nothing (no memory reading, per-iteration bodies not
-//    comparable). Trimmed to a functional-signal size with a REAL
+//    comparable). It is trimmed to a functional-signal size with a REAL
 //    divergence assertion: RFC 8032 Ed25519 is deterministic, so issuing
 //    the same body twice must produce byte-identical signatures — any
 //    divergence indicates nonce-generation misbehavior in the signer,

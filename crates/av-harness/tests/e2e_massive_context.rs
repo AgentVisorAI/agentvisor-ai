@@ -24,18 +24,18 @@ use av_core::tokens::{approx_tokens, approx_tokens_json};
 use av_events::{AgentIdentity, CharterFile};
 use av_receipts::{
     canonicalize, CostSummary, Ed25519Signer, EventChain, JcsError, Keyring, Receipt, ReceiptBody,
-    ReceiptSubject, Signer, ToolCallSummary,
+    ReceiptSubject, ToolCallSummary,
 };
 use serde_json::{json, Value};
 use std::time::Instant;
 
+mod common;
+
 fn signer() -> Ed25519Signer {
-    Ed25519Signer::from_seed(&[17; 32])
+    common::signer(17)
 }
 fn ring(s: &Ed25519Signer) -> Keyring {
-    let mut r = Keyring::new();
-    r.add_key_bytes(&Signer::public_key_bytes(s)).unwrap();
-    r
+    common::ring(&[s])
 }
 
 fn body_with_stop_reason(session: &str, stop_reason: String) -> ReceiptBody {
@@ -89,14 +89,14 @@ fn jcs_handles_wide_object_with_100k_keys() {
 
 // ---------------------------------------------------------------------------
 // 2. Deep nested array: stack-safe canonicalization within the JCS depth cap
-//    (round-40 F5: `MAX_NESTED_DEPTH = 128`), and graceful `TooDeep` refusal
+//    (`MAX_NESTED_DEPTH = 128`), and graceful `TooDeep` refusal
 //    beyond it — no stack overflow either way.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn jcs_handles_deep_nested_arrays_without_stack_overflow() {
     // Within the cap: canonicalize succeeds cleanly (depth 100 is below the
-    // JCS `MAX_NESTED_DEPTH = 128` guard added in round-40 F5).
+    // JCS `MAX_NESTED_DEPTH = 128` guard).
     let mut v = Value::from(42);
     for _ in 0..100 {
         v = Value::Array(vec![v]);
@@ -106,7 +106,7 @@ fn jcs_handles_deep_nested_arrays_without_stack_overflow() {
     assert_eq!(canon.matches(']').count(), 100);
 
     // Beyond the cap: canonicalize refuses with `TooDeep` rather than
-    // recursing into a stack overflow. 1_000 levels was the pre-round-40
+    // recursing into a stack overflow. 1_000 levels was the pre-cap
     // stack-safety target; post-cap it must return the guarded error.
     let mut deep = Value::from(42);
     for _ in 0..1_000 {
@@ -228,7 +228,7 @@ fn receipt_verify_survives_deeply_nested_charter_metadata_in_stop_reason() {
 #[test]
 fn tiny_inputs_are_handled_deterministically() {
     assert_eq!(approx_tokens(""), 0);
-    // Round 36: the header promises the single-char boundary too.
+    // The header promises the single-char boundary too.
     assert_eq!(approx_tokens("a"), 1);
     assert_eq!(canonicalize(&json!("a")).unwrap(), "\"a\"");
     assert_eq!(approx_tokens_json(&Value::Null), approx_tokens("null"));

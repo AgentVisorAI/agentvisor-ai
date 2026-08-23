@@ -37,17 +37,17 @@ use av_core::ids::{InstanceUid, SessionId};
 use av_core::tokens::{approx_tokens, approx_tokens_json};
 use av_receipts::{
     canonicalize, CostSummary, Ed25519Signer, EventChain, JcsError, Keyring, Receipt, ReceiptBody,
-    ReceiptSubject, Signer, ToolCallSummary,
+    ReceiptSubject, ToolCallSummary,
 };
 use serde_json::{json, Value};
 
+mod common;
+
 fn signer() -> Ed25519Signer {
-    Ed25519Signer::from_seed(&[171; 32])
+    common::signer(171)
 }
 fn ring(s: &Ed25519Signer) -> Keyring {
-    let mut r = Keyring::new();
-    r.add_key_bytes(&Signer::public_key_bytes(s)).unwrap();
-    r
+    common::ring(&[s])
 }
 fn body(session: &str, stop_reason: String) -> ReceiptBody {
     ReceiptBody {
