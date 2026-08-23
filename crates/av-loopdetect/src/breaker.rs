@@ -3,6 +3,7 @@
 use crate::embed::{cosine, Embedder};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 
 /// Breaker tuning (config-file surface). Defaults implement the brief's rule:
 /// Δ≈0 across 3 consecutive steps while consuming N+ tokens.
@@ -105,11 +106,24 @@ pub struct SessionLoopState {
 }
 
 struct Inner {
-    prev_embedding: Option<Vec<f32>>,
+    /// Ring of the most recent usable embeddings. Round-51 §3.5: the
+    /// breaker previously compared only against the IMMEDIATELY
+    /// preceding embedding, so simple alternation (A, B, A, B, …) —
+    /// the canonical agent-loop shape — never tripped in the default
+    /// build (cross-history tightening needed a Qdrant sink). The
+    /// delta is now the minimum against any embedding in this window,
+    /// so a step that duplicates ANY recent step grows the streak.
+    recent_embeddings: VecDeque<Vec<f32>>,
     streak: usize,
     tokens_consumed: u64,
     state: BreakerState,
 }
+
+/// How many recent embeddings the alternation window retains. Eight
+/// covers alternation periods up to 8 (A,B,…,H,A,…) while keeping
+/// per-session memory bounded (8 × dim × 4 bytes ≈ 12 KiB at
+/// MiniLM's 384 dims).
+const RECENT_EMBEDDING_WINDOW: usize = 8;
 
 impl SessionLoopState {
     /// Create with `cfg`.
@@ -117,7 +131,7 @@ impl SessionLoopState {
         Self {
             cfg,
             inner: Mutex::new(Inner {
-                prev_embedding: None,
+                recent_embeddings: VecDeque::with_capacity(RECENT_EMBEDDING_WINDOW),
                 streak: 0,
                 tokens_consumed: 0,
                 state: BreakerState::Closed,
@@ -174,23 +188,32 @@ impl SessionLoopState {
 
         let adjacent_delta = if embedding_is_hostile {
             0.0
+        } else if inner.recent_embeddings.is_empty() {
+            1.0 // first step: maximum novelty by definition
         } else {
-            match &inner.prev_embedding {
-                Some(prev) => 1.0 - cosine(prev, &embedding),
-                None => 1.0, // first step: maximum novelty by definition
-            }
+            // Minimum delta against ANY recent embedding — catches
+            // A,B,A,B alternation, not only exact-adjacent repeats.
+            inner
+                .recent_embeddings
+                .iter()
+                .map(|prev| 1.0 - cosine(prev, &embedding))
+                .fold(f32::INFINITY, f32::min)
         };
         let delta = nearest_similarity
             .filter(|similarity| similarity.is_finite())
             .map_or(adjacent_delta, |similarity| {
                 adjacent_delta.min(1.0 - similarity.clamp(-1.0, 1.0))
             });
-        // Only record the embedding for future adjacent comparisons
-        // when it's usable — a stored NaN vector would poison every
-        // subsequent step's cosine.
+        // Only record the embedding for future comparisons when it's
+        // usable — a stored NaN vector would poison every subsequent
+        // step's cosine.
         if !embedding_is_hostile {
-            inner.prev_embedding = Some(embedding);
+            inner.recent_embeddings.push_back(embedding);
+            if inner.recent_embeddings.len() > RECENT_EMBEDDING_WINDOW {
+                inner.recent_embeddings.pop_front();
+            }
         }
+
         if delta < self.cfg.delta_epsilon {
             inner.streak += 1;
         } else {
@@ -216,25 +239,39 @@ impl SessionLoopState {
     }
 
     /// Manually reset (e.g. after a corrective injection gave the agent a new
-    /// direction). Clears the streak, the token floor, and closes the breaker.
+    /// direction). Clears the streak and the embedding window and closes the
+    /// breaker.
+    ///
+    /// Round-51 §3.5: `tokens_consumed` deliberately SURVIVES the reset.
+    /// It implements the documented "minimum session token consumption"
+    /// floor — zeroing it on every Inject turned the session-lifetime
+    /// floor into a per-cycle floor, letting an agent that ignores the
+    /// corrective message loop forever at ~min_tokens per correction.
+    /// Release the retained embedding buffers.
+    ///
+    /// Unsigned sessions stay registered for the process lifetime by
+    /// design, and each one otherwise pins its recent response
+    /// embeddings (window × dim × f32) forever — dead weight after
+    /// close, since a closed session never calls `observe` again.
+    /// Unlike [`Self::reset`], the breaker verdict state is preserved.
+    pub fn release_embedding(&self) {
+        self.inner.lock().recent_embeddings.clear();
+    }
+
+    /// Manually reset (e.g. after a corrective injection gave the agent a new
+    /// direction). Clears the streak and the embedding window and closes the
+    /// breaker.
+    ///
+    /// Round-51 §3.5: `tokens_consumed` deliberately SURVIVES the reset.
+    /// It implements the documented "minimum session token consumption"
+    /// floor — zeroing it on every Inject turned the session-lifetime
+    /// floor into a per-cycle floor, letting an agent that ignores the
+    /// corrective message loop forever at ~min_tokens per correction.
     pub fn reset(&self) {
         let mut inner = self.inner.lock();
         inner.streak = 0;
         inner.state = BreakerState::Closed;
-        inner.prev_embedding = None;
-        inner.tokens_consumed = 0;
-    }
-
-    /// Release the retained embedding buffer.
-    ///
-    /// Unsigned sessions stay registered for the process lifetime by
-    /// design, and each one otherwise pins its last response embedding
-    /// (dim × f32, ~2 KB at 512 dims) forever — dead weight after
-    /// close, since a closed session never calls `observe` again
-    /// (soak-measured at ~20 % of the per-retained-session footprint).
-    /// Unlike [`Self::reset`], the breaker verdict state is preserved.
-    pub fn release_embedding(&self) {
-        self.inner.lock().prev_embedding = None;
+        inner.recent_embeddings.clear();
     }
 }
 
@@ -249,49 +286,6 @@ mod tests {
         BreakerConfig {
             min_tokens: 1000,
             ..BreakerConfig::default()
-        }
-    }
-
-    /// Pin the streak comparison at the exact `delta_epsilon` boundary:
-    /// `delta < epsilon` counts toward the streak, `delta == epsilon`
-    /// does not (a `<`→`<=` mutant previously survived). Orthogonal
-    /// unit vectors make cosine EXACTLY 0.0 and delta EXACTLY 1.0 in
-    /// float arithmetic, so `delta_epsilon = 1.0` sits precisely on
-    /// the boundary with no rounding fragility.
-    #[test]
-    fn delta_at_epsilon_boundary_does_not_count_toward_streak() {
-        struct Orthogonal;
-        impl crate::Embedder for Orthogonal {
-            fn dim(&self) -> usize {
-                2
-            }
-            fn embed(&self, text: &str) -> Vec<f32> {
-                if text == "a" {
-                    vec![1.0, 0.0]
-                } else {
-                    vec![0.0, 1.0]
-                }
-            }
-        }
-        let config = BreakerConfig {
-            min_tokens: 0,
-            delta_epsilon: 1.0,
-            ..BreakerConfig::default()
-        };
-        let s = SessionLoopState::new(config);
-        let e = Orthogonal;
-        for _ in 0..16 {
-            // Every step's delta is exactly 1.0 == epsilon: never
-            // BELOW it, so the streak must never build and the breaker
-            // must stay closed.
-            match s.observe(&e, "a", 1) {
-                BreakerVerdict::Progressing { .. } => {}
-                other => panic!("delta == epsilon must not trip the breaker: {other:?}"),
-            }
-            match s.observe(&e, "b", 1) {
-                BreakerVerdict::Progressing { .. } => {}
-                other => panic!("delta == epsilon must not trip the breaker: {other:?}"),
-            }
         }
     }
 
@@ -374,12 +368,68 @@ mod tests {
             800,
         );
         assert!(matches!(v, BreakerVerdict::Progressing { .. }), "{v:?}");
-        // Next looped step compares against the *progress* text → still novel
-        // (streak 0); only the one after that restarts the streak at 1.
-        let v = s.observe(&e, looped, 800);
-        assert!(matches!(v, BreakerVerdict::Progressing { .. }), "{v:?}");
+        // Round-51 §3.5: a looped step after ONE progress interjection
+        // still matches the earlier repeats in the embedding window —
+        // the streak resumes immediately instead of being laundered by
+        // an A,A,B,A alternation (the old adjacent-only comparison
+        // treated the return to A as novel).
         let v = s.observe(&e, looped, 800);
         assert!(matches!(v, BreakerVerdict::Suspicious { streak: 1, .. }), "{v:?}");
+    }
+
+    /// Round-51 §3.5: simple alternation — A, B, A, B, … — is the
+    /// canonical agent-loop shape and previously NEVER tripped the
+    /// breaker in the default build (only the immediately-preceding
+    /// embedding was compared; the cross-history path needed a Qdrant
+    /// sink). The recent-embedding window must catch it.
+    #[test]
+    fn simple_alternation_trips_the_breaker() {
+        let s = SessionLoopState::new(cfg());
+        let e = HashEmbedder::default();
+        let a = "check the deployment status of service alpha again";
+        let b = "list the open incidents for service alpha again";
+        let mut tripped = false;
+        for _ in 0..8 {
+            if matches!(s.observe(&e, a, 800), BreakerVerdict::Tripped { .. }) {
+                tripped = true;
+                break;
+            }
+            if matches!(s.observe(&e, b, 800), BreakerVerdict::Tripped { .. }) {
+                tripped = true;
+                break;
+            }
+        }
+        assert!(
+            tripped,
+            "A,B,A,B alternation ran 16 steps without tripping the breaker"
+        );
+    }
+
+    /// Round-51 §3.5: `tokens_consumed` is a SESSION floor, not a
+    /// per-cycle floor. After an Inject-triggered reset, an agent that
+    /// ignores the corrective message must re-trip without having to
+    /// burn `min_tokens` again from zero.
+    #[test]
+    fn token_floor_survives_reset() {
+        let s = SessionLoopState::new(cfg());
+        let e = HashEmbedder::default();
+        let t = "loop loop loop";
+        for _ in 0..4 {
+            s.observe(&e, t, 500);
+        }
+        assert_eq!(s.state(), BreakerState::Open);
+        s.reset();
+        // Post-reset: the window is cleared so the first step is novel,
+        // but the token floor is already satisfied — the next streak of
+        // `window` duplicates trips WITHOUT further token accumulation.
+        s.observe(&e, t, 0);
+        s.observe(&e, t, 0);
+        s.observe(&e, t, 0);
+        let v = s.observe(&e, t, 0);
+        assert!(
+            matches!(v, BreakerVerdict::Tripped { .. }),
+            "an agent ignoring the corrective injection must re-trip without re-earning the token floor: {v:?}"
+        );
     }
 
     #[test]

@@ -99,19 +99,22 @@ fn paraphrase_rotation_is_correctly_not_detected_by_the_hash_embedder() {
         "make another attempt at the database query for pending transactions",
         "try the DB query one more time for unresolved items",
     ];
-    // The hash embedder sees distinct n-grams across these 6 variants; they
-    // should all register as Progressing or at most Suspicious (a trip or
-    // two from n-gram coincidence is tolerated by the bound below).
+    // The hash embedder sees distinct n-grams across these 6 variants; a
+    // single pass (all distinct surface forms) must not trip. NB: this
+    // deliberately does NOT cycle the same 6 strings 20 times — a
+    // verbatim period-6 cycle IS a loop, and the round-51 recent-
+    // embedding window correctly catches it; what the hash embedder
+    // must NOT do is equate distinct paraphrase surface forms.
     let mut trips = 0;
-    for t in paraphrases.iter().cycle().take(20) {
+    for t in &paraphrases {
         if let BreakerVerdict::Tripped { .. } = s.observe(&e, t, 600) {
             trips += 1;
         }
     }
-    // Zero or very few trips is CORRECT for the hash embedder; semantic
+    // Zero trips is CORRECT for the hash embedder; semantic
     // paraphrase detection needs the ONNX path.
     assert!(
-        trips <= 2,
+        trips == 0,
         "hash embedder falsely detected semantic paraphrase rotation ({trips} trips)"
     );
 }
@@ -340,15 +343,36 @@ fn wide_window_accumulates_streak_and_trips_exactly_at_threshold() {
 fn progressing_content_never_falsely_trips() {
     let s = SessionLoopState::new(std_cfg());
     let e = embedder();
-    // High-entropy steps (should always score Δ > 0.30 on the hash embedder).
+    // Twenty genuinely-distinct high-entropy steps (should always score
+    // Δ > 0.30 on the hash embedder). NB round-51: these are all
+    // substantively DISTINCT — cycling a fixed set verbatim (or with
+    // only a step-number suffix, which the number-incrementing test
+    // pins as insufficient evasion) is a period-N loop the
+    // recent-embedding window correctly detects. A genuinely
+    // progressing agent produces per-step-unique content like this.
     let high = [
         "parse the user's CSV file and validate header rows against the expected schema",
         "infer column types from the first hundred rows using the statistical model",
         "build the SQL migration script and verify it on a staging clone",
         "run the smoke test suite and collect the results for review",
         "post the artifact URL to the ticketing system and notify the team",
+        "download the vendor price list and normalize currencies to USD",
+        "diff the staging schema against production and flag drift",
+        "compress the archived logs older than ninety days into cold storage",
+        "rotate the API credentials for the payments integration",
+        "generate the quarterly usage report grouped by business unit",
+        "reconcile the invoice ledger against the bank statement export",
+        "profile the slow endpoint and capture a flame graph for review",
+        "upgrade the container base image and rebuild the CI pipeline",
+        "annotate the incident timeline with links to the relevant dashboards",
+        "backfill the missing telemetry for the third week of March",
+        "draft the customer-facing changelog for the upcoming release",
+        "verify the backup restore procedure on an isolated environment",
+        "tune the cache eviction policy based on the observed hit rates",
+        "migrate the remaining cron jobs to the new scheduler service",
+        "summarize open pull requests and assign reviewers by expertise",
     ];
-    for step in high.iter().cycle().take(20) {
+    for step in &high {
         let v = s.observe(&e, step, 1_000);
         assert!(
             !matches!(v, BreakerVerdict::Tripped { .. }),

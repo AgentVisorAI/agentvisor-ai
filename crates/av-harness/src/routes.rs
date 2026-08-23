@@ -2381,6 +2381,28 @@ impl AbortFinalizingStream {
                     "http_status": self.upstream_status.as_u16(),
                 }),
             )
+        } else if self.is_sse {
+            // Engineering-review §6.4 (round-51): an SSE stream that
+            // ended without ANY finish_reason chunk is a truncated
+            // generation — provider crash, LB idle-timeout, worker
+            // OOM. OpenAI-protocol streams always carry a
+            // finish_reason chunk before [DONE], so its absence must
+            // not be attested as a complete success: a compliance
+            // reviewer could not otherwise distinguish a truncated
+            // response from a finished one (previously this shape
+            // recorded StatusId::Success with no stop reason — and a
+            // zero-byte 200 stream looked identical to a real one).
+            (
+                av_events::EventClass::StopReason,
+                av_events::StatusId::Unknown,
+                Some(av_events::StopReason::Other),
+                json!({
+                    "direction": "upstream_response",
+                    "http_status": self.upstream_status.as_u16(),
+                    "truncated": true,
+                    "reason": "stream ended without a finish_reason chunk",
+                }),
+            )
         } else {
             (
                 av_events::EventClass::Session,
@@ -3336,6 +3358,19 @@ mod tests {
         }
         if payload.get("model").and_then(Value::as_str) == Some("empty-success") {
             return Json(json!({})).into_response();
+        }
+        if payload.get("model").and_then(Value::as_str) == Some("truncated-stream") {
+            // One delta, then a clean end: no finish_reason, no usage,
+            // no [DONE] — the §6.4 truncation shape (provider crash,
+            // LB idle-timeout).
+            let mut response = Response::new(Body::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial ans\"}}]}\n\n",
+            ));
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            return response;
         }
         if payload.get("model").and_then(Value::as_str) == Some("provisional-usage") {
             let chunks = vec![
@@ -5173,6 +5208,52 @@ mod tests {
         assert!(
             !state.sessions.get("tool-oob-index").unwrap().capture_failed(),
             "an out-of-range tool-call index must be scoped to the response"
+        );
+        provider.abort();
+    }
+
+    /// Engineering-review §6.4 (round-51): an SSE stream that ends
+    /// cleanly but never carries a finish_reason chunk (provider
+    /// crash, LB idle-timeout, worker OOM) is a TRUNCATED generation
+    /// and must not be attested as a complete success — previously it
+    /// recorded StatusId::Success with no stop reason, so a
+    /// compliance reviewer could not distinguish a truncated
+    /// response from a finished one.
+    #[tokio::test]
+    async fn truncated_stream_is_not_attested_as_a_complete_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state(directory.path()).await;
+        let response = build_router(state.clone())
+            .oneshot(chat_request_with_payload(
+                "truncated-stream",
+                json!({
+                    "model": "truncated-stream",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "hello"}]
+                }),
+            ))
+            .await
+            .unwrap();
+        // The client still receives the partial bytes — truncation is
+        // an audit classification, not a client-facing refusal.
+        assert!(axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .is_ok());
+        let session = state.sessions.get("truncated-stream").unwrap();
+        session.wait_for_worker_jobs().await;
+        let records = active_records(directory.path(), &state, "truncated-stream");
+        let truncated = records.iter().any(|record| {
+            record.event.get("payload").is_some_and(|payload| {
+                payload.get("truncated").and_then(Value::as_bool) == Some(true)
+            })
+        });
+        assert!(
+            truncated,
+            "a finish_reason-less SSE end must be journalled with a truncated marker; records: {:?}",
+            records
+                .iter()
+                .map(|r| r.event.get("payload").cloned())
+                .collect::<Vec<_>>()
         );
         provider.abort();
     }
