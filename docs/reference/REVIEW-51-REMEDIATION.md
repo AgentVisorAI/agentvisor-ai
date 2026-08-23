@@ -2,12 +2,13 @@
 
 Finding-by-finding closure map for the round-51 external engineering
 review (43 pages, 18 August 2026). Each row names the mechanism that
-closed the finding and where it is pinned by tests. Two items are
-deliberately deferred with rationale, listed last — a trust product
-that publishes its own open items is more credible than one that
-doesn't.
+closed the finding and where it is pinned by tests. The two headline
+claims are additionally reproducible end-to-end via
+[`scripts/live-verify.sh`](../../scripts/live-verify.sh) against
+release binaries (hero snippet, offline receipt verification, §3.1
+forgery refusal — six live checks, no live broker required).
 
-Status legend: ✅ fixed · 🔶 deferred with documented rationale.
+Status legend: ✅ fixed.
 
 ## §3 Security
 
@@ -110,7 +111,7 @@ Status legend: ✅ fixed · 🔶 deferred with documented rationale.
 | 10.4 Fuzzing absent | ✅ | Canonicalizer differential fuzz + SSE framer + `parse_provider_chunk` totality targets (idempotence asserted) |
 | 10.5 StateStore contract drift (TTL, remove_prefix) | ✅ | One `state_store_contract()` invoked by both backends; `counter_ttl_secs` in the trait |
 
-## Deferred — with rationale
+## Out of scope
 
 | Item | Rationale |
 | --- | --- |
