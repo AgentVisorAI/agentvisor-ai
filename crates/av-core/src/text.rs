@@ -58,8 +58,9 @@ pub fn contains_bidi_or_zero_width(s: &str) -> bool {
     s.chars().any(is_bidi_or_zero_width)
 }
 
-/// True if `c` is one of the [`DANGEROUS_CODEPOINTS`] — the per-character
-/// form for callers that sanitize (replace) rather than refuse.
+/// True if `c` is one of the dangerous code points above — the
+/// per-character form for callers that sanitize (replace) rather than
+/// refuse.
 pub fn is_bidi_or_zero_width(c: char) -> bool {
     DANGEROUS_CODEPOINTS.contains(&c)
 }
