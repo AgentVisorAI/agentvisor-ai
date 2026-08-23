@@ -415,13 +415,18 @@ pub(crate) fn schema_document(reference: &str) -> Result<serde_json::Value, crat
     }
     let direct = PathBuf::from(reference);
     if direct.exists() {
-        return serde_json::from_slice(&std::fs::read(direct)?).map_err(crate::BusError::from);
+        // Cap the read (parity with Round-22 F4 in embedded.rs): a hostile
+        // plant of a multi-GiB schema file would OOM the process before
+        // the JSON parser could complain.
+        let bytes = av_core::fsutil::read_capped(&direct, av_core::fsutil::MAX_CONTROL_BYTES)?;
+        return serde_json::from_slice(&bytes).map_err(crate::BusError::from);
     }
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join(reference);
     if workspace.exists() {
-        serde_json::from_slice(&std::fs::read(workspace)?).map_err(crate::BusError::from)
+        let bytes = av_core::fsutil::read_capped(&workspace, av_core::fsutil::MAX_CONTROL_BYTES)?;
+        serde_json::from_slice(&bytes).map_err(crate::BusError::from)
     } else {
         Err(crate::BusError::Backend(format!(
             "schema reference {reference:?} could not be resolved"
