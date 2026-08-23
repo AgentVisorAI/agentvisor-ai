@@ -19,6 +19,7 @@ pub mod dashboard;
 pub(crate) mod journal;
 pub mod pipeline;
 pub mod reconciler;
+pub(crate) mod recovery;
 pub mod routes;
 pub mod session;
 pub(crate) mod spool;
