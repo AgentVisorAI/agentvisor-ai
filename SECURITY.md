@@ -27,7 +27,7 @@ AgentVisor AI treats request bodies, JWTs, MCP arguments, upstream responses, ma
 - Restrict `/metrics`, close, promotion, and the dashboard routes (`/dashboard`, `/api/v1/dashboard/*` — enabled by default and unauthenticated, exposing per-session receipts and costs; or set `dashboard_enabled = false`) at the ingress layer.
 - Browser CSRF is blocked by the JSON content-type preflight and denied CORS, but DNS rebinding bypasses both. Set `allowed_hosts` to pin the expected `Host` headers (requests outside the list are refused 403 before any handler), keep the listener on loopback or a private network, or enforce Host allow-listing at the ingress.
 - Configure customer-owned cold storage and SIEM sinks in Vector.
-- Keep old public verification keys available for receipt validation.
+- Keep old public verification keys available for receipt validation. `avctl receipt-verify` takes multiple `--public-key-hex` / `--public-key-b64` values so an auditor can pin every historical key at once; see [`docs/reference/OPERATIONS.md`](docs/reference/OPERATIONS.md#key-rotation) for the seed-rollover runbook and [`docs/reference/VERIFYING-A-RECEIPT.md`](docs/reference/VERIFYING-A-RECEIPT.md) for the offline verification protocol.
 - Keep the configured signing key stable until active journals have drained; rotate only after preserving historical receipt verification keys.
 
 ## Reporting
