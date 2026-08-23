@@ -1597,6 +1597,18 @@ async fn append_journal(
     .map_err(|error| error.to_string())?
 }
 
+/// Round-51 §7.3: broker acks append to ONE per-session NDJSON
+/// journal (`{stem}.acks.ndjson` in the spool root) instead of one
+/// `write_atomic` file per event under `broker-acks/<hash>/`. Per
+/// ack this replaces two durable syncs (tmp `sync_all` + parent-dir
+/// sync) and the tmp-create/rename metadata ops with a single
+/// appended line + `sync_data`, and stops leaving one file per
+/// request on disk. Each line is the SAME sealed record bytes the
+/// per-event file carried (domain "broker-ack", index 0): lines are
+/// self-describing and order-independent, so reordering/duplication
+/// grants nothing, and a truncated tail line simply reads as "no
+/// ack" — the event is re-published, which the bridge tolerates
+/// (same recovery semantics as a lost ack file).
 pub(crate) async fn persist_broker_ack(
     directory: &std::path::Path,
     session_id: &str,
@@ -1604,16 +1616,37 @@ pub(crate) async fn persist_broker_ack(
     ack: &PublishAck,
     journal_key: &[u8; 32],
 ) -> Result<(), String> {
-    let path = broker_ack_path(directory, session_id, event_uid);
+    let path = ack_journal_path(directory, session_id);
     let record = BrokerAckRecord {
         session_id: session_id.to_owned(),
         event_uid: event_uid.to_owned(),
         ack: ack.clone(),
     };
     let sealed = crate::journal::seal(journal_key, "broker-ack", 0, &record)?;
-    tokio::task::spawn_blocking(move || write_atomic_control(&path, &sealed))
-        .await
-        .map_err(|error| error.to_string())?
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        use std::io::Write as _;
+        let created = !path.exists();
+        let mut journal = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|error| format!("open ack journal {}: {error}", av_core::fsutil::basename(&path)))?;
+        journal.write_all(&sealed).map_err(|error| error.to_string())?;
+        journal.write_all(b"\n").map_err(|error| error.to_string())?;
+        journal.sync_data().map_err(|error| error.to_string())?;
+        if created {
+            // First ack for this session: make the dirent durable so a
+            // crash cannot lose the whole journal (same discipline as
+            // the events journal).
+            let parent = path
+                .parent()
+                .ok_or_else(|| "ack journal has no parent".to_owned())?;
+            av_core::fsutil::sync_directory(parent).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 pub(crate) async fn read_broker_ack(
@@ -1622,6 +1655,43 @@ pub(crate) async fn read_broker_ack(
     event_uid: &str,
     journal_key: &[u8; 32],
 ) -> Result<Option<PublishAck>, String> {
+    // New layout first: scan the per-session ack journal. Recovery-only
+    // path, so the linear scan per lookup is acceptable (the journal is
+    // capped at MAX_CONTROL_BYTES ≈ 5k acks).
+    {
+        let path = ack_journal_path(directory, session_id);
+        let bytes = match tokio::task::spawn_blocking({
+            let path = path.clone();
+            move || av_core::fsutil::read_capped(&path, av_core::fsutil::MAX_CONTROL_BYTES)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.to_string()),
+        };
+        if let Some(bytes) = bytes {
+            for line in bytes.split(|byte| *byte == b'\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                // A torn tail line (crash mid-append) or a tampered line
+                // must not poison the earlier, intact acks: skip lines
+                // that fail to open and keep scanning. "No ack found"
+                // degrades to a re-publish, exactly like a lost file.
+                let Ok(record) = crate::journal::open::<BrokerAckRecord>(journal_key, "broker-ack", 0, line)
+                else {
+                    continue;
+                };
+                if record.session_id == session_id && record.event_uid == event_uid {
+                    return Ok(Some(record.ack));
+                }
+            }
+        }
+    }
+    // Legacy layout fallback (pre-round-51 per-event files), so a
+    // deployment upgraded mid-session still sees its earlier acks.
     let path = broker_ack_path(directory, session_id, event_uid);
     // Bounded read — same policy as every other sealed marker in the
     // spool (close-complete marker, promotion marker, response marker,
@@ -1650,6 +1720,13 @@ pub(crate) async fn read_broker_ack(
     Ok(Some(record.ack))
 }
 
+/// Round-51 §7.3 layout: one append-only ack journal per session.
+fn ack_journal_path(directory: &std::path::Path, session_id: &str) -> std::path::PathBuf {
+    let digest = av_core::digest::sha256_hex(session_id.as_bytes());
+    directory.join(format!("{}.acks.ndjson", digest.get(..32).unwrap_or(&digest)))
+}
+
+/// Legacy pre-round-51 layout, read-only fallback.
 fn broker_ack_path(directory: &std::path::Path, session_id: &str, event_uid: &str) -> std::path::PathBuf {
     let session_digest = av_core::digest::sha256_hex(session_id.as_bytes());
     let event_digest = av_core::digest::sha256_hex(event_uid.as_bytes());
@@ -2096,13 +2173,8 @@ mod tests {
         worker.submit_and_wait(job(Arc::clone(&active))).await.unwrap();
         let digest = av_core::digest::sha256_hex(active.id.as_bytes());
         let stem = digest.get(..32).unwrap();
-        let ack_path = std::fs::read_dir(directory.path().join("broker-acks").join(stem))
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        std::fs::remove_file(ack_path).unwrap();
+        let ack_path = directory.path().join(format!("{stem}.acks.ndjson"));
+        std::fs::remove_file(&ack_path).unwrap();
 
         let registry = crate::session::SessionRegistry::new();
         let finalizer = crate::reconciler::Finalizer::with_bridge(
@@ -2268,12 +2340,7 @@ mod tests {
         let journal_path = directory.path().join(format!("{stem}.events.ndjson"));
         let metadata = std::fs::read(&metadata_path).unwrap();
         let journal = std::fs::read(&journal_path).unwrap();
-        let ack_path = std::fs::read_dir(directory.path().join("broker-acks").join(stem))
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
+        let ack_path = directory.path().join(format!("{stem}.acks.ndjson"));
         let ack = std::fs::read(&ack_path).unwrap();
         let first_finalizer = crate::reconciler::Finalizer::new(
             signer.clone(),
@@ -2290,7 +2357,6 @@ mod tests {
 
         std::fs::write(&metadata_path, metadata).unwrap();
         std::fs::write(&journal_path, journal).unwrap();
-        std::fs::create_dir_all(ack_path.parent().unwrap()).unwrap();
         std::fs::write(&ack_path, ack).unwrap();
         let registry = crate::session::SessionRegistry::new();
         let after_restart = crate::reconciler::Finalizer::new(
@@ -2985,5 +3051,65 @@ mod unified_fold_tests {
             terminal.apply_to_totals(&live).is_err(),
             "live fold must refuse correction underflow"
         );
+    }
+}
+
+#[cfg(test)]
+mod ack_journal_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    /// Round-51 §7.3: acks round-trip through the per-session journal,
+    /// tolerate a torn tail line, and the legacy per-event file layout
+    /// is still readable (a deployment upgraded mid-session must see
+    /// its earlier acks).
+    #[tokio::test]
+    async fn ack_journal_roundtrips_tolerates_torn_tail_and_reads_legacy() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = [9u8; 32];
+        let ack = PublishAck {
+            topic: "t".to_owned(),
+            partition: 0,
+            offset: 7,
+        };
+        persist_broker_ack(directory.path(), "s1", "evt-1", &ack, &key)
+            .await
+            .unwrap();
+        persist_broker_ack(directory.path(), "s1", "evt-2", &ack, &key)
+            .await
+            .unwrap();
+        // Torn tail: simulate a crash mid-append.
+        let journal = ack_journal_path(directory.path(), "s1");
+        let mut bytes = std::fs::read(&journal).unwrap();
+        bytes.extend_from_slice(b"{\"torn");
+        std::fs::write(&journal, bytes).unwrap();
+
+        let found = read_broker_ack(directory.path(), "s1", "evt-1", &key)
+            .await
+            .unwrap();
+        assert_eq!(found.map(|ack| ack.offset), Some(7));
+        assert!(
+            read_broker_ack(directory.path(), "s1", "missing", &key)
+                .await
+                .unwrap()
+                .is_none(),
+            "an unknown event has no ack (torn tail must not error the scan)"
+        );
+
+        // Legacy layout: a pre-round-51 per-event file is still found.
+        let legacy = broker_ack_path(directory.path(), "s2", "evt-9");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let record = BrokerAckRecord {
+            session_id: "s2".to_owned(),
+            event_uid: "evt-9".to_owned(),
+            ack: ack.clone(),
+        };
+        let sealed = crate::journal::seal(&key, "broker-ack", 0, &record).unwrap();
+        std::fs::write(&legacy, sealed).unwrap();
+        let found = read_broker_ack(directory.path(), "s2", "evt-9", &key)
+            .await
+            .unwrap();
+        assert_eq!(found.map(|ack| ack.offset), Some(7));
     }
 }

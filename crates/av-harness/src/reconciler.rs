@@ -2547,7 +2547,7 @@ impl Finalizer {
             // With journal-first order, a crash leaves sidecar-without-
             // journal, which recovery already self-heals (treats the
             // journal as empty and removes the metadata).
-            for suffix in ["events.ndjson", "steps.ndjson", "session.json"] {
+            for suffix in ["events.ndjson", "steps.ndjson", "acks.ndjson", "session.json"] {
                 let path = spool_dir.join(format!("{stem}.{suffix}"));
                 match std::fs::remove_file(&path) {
                     Ok(()) => spool_changed = true,
