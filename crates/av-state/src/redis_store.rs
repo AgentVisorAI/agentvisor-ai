@@ -247,6 +247,10 @@ fn spend_many_on<C: redis::ConnectionLike>(
 }
 
 impl StateStore for RedisStore {
+    fn counter_ttl_secs(&self) -> Option<u64> {
+        Some(BUDGET_COUNTER_TTL_SECS)
+    }
+
     fn add(&self, key: &str, delta: u64) -> Result<u64, StateError> {
         match &self.backend {
             RedisBackend::Single(pool) => add_on(

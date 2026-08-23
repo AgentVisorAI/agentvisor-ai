@@ -46,6 +46,17 @@ pub trait StateStore: Send + Sync {
     /// Add `delta` to `key`, returning the new value.
     fn add(&self, key: &str, delta: u64) -> Result<u64, StateError>;
 
+    /// Backend counter TTL in seconds, if the backend expires counters
+    /// natively. `None` means counters live for the process lifetime
+    /// (in-memory). Round-51 §4.2: this makes the prod/dev divergence
+    /// a VALUE callers can inspect (startup logs it; ops docs cite it)
+    /// instead of a doc comment — a session active longer than this
+    /// window has its budget counters silently reset against the
+    /// expiring backend only.
+    fn counter_ttl_secs(&self) -> Option<u64> {
+        None
+    }
+
     /// Read the current value of `key` (0 if absent).
     fn get(&self, key: &str) -> Result<u64, StateError>;
 

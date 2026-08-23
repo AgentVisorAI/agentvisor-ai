@@ -41,6 +41,13 @@ tracks four axes:
 * Both ledgers are checked **after** compression against
   `compression.tokens_after`. Compression runs at 50k prompt tokens
   with a floor of 512 tokens (see round 51 §6.3).
+* **Backend counter TTL**: the Redis backend expires every budget
+  counter after 24 hours of key inactivity (`counter_ttl_secs()` on
+  the `StateStore` trait; logged at startup as
+  `state_counter_ttl_s`). A session ACTIVE past that window has its
+  budget silently reset — against Redis only; the in-memory backend
+  never expires. Bound session lifetimes to the TTL or close/reopen
+  long-running conversations.
 * The principal ledger is checked FIRST; the session ledger is
   checked second. If the session refuses, the principal debit is
   refunded so a client rotating session ids can't drain the

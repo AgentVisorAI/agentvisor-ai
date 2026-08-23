@@ -214,6 +214,12 @@ async fn main() -> Result<()> {
         upstream_auth = %av_harness::pipeline::describe_upstream_auth(&config),
         bridge = %config.bridge_backend,
         state = %config.state_backend,
+        // Round-51 §4.2: budget counters on an expiring backend
+        // (Redis: 24 h) silently reset for sessions active past the
+        // TTL; in-memory never expires. Surface the value so an
+        // operator diagnosing "my week-long agent's budget reset"
+        // can see the window without reading redis_store.rs.
+        state_counter_ttl_s = ?state.store.counter_ttl_secs(),
         identity = if config.require_identity { "required" } else { "optional" },
         // Always surface the exact receipt-signing trust anchor. This is the
         // simplest observable signal that a Secret mount, an emptyDir volume,
