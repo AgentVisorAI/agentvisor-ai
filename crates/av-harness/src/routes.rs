@@ -211,6 +211,7 @@ async fn livez() -> impl IntoResponse {
 ///     spool (the shape that produces `503 audit capture unavailable`
 ///     for every chat request) is reflected in readiness rather than
 ///     hidden behind a hardcoded `/health` 200.
+///
 /// Returns the JSON body regardless of status so operators can diff
 /// which check failed without opening a shell.
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
@@ -773,32 +774,36 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
                 // to repeat this lookup+authorize block verbatim,
                 // differing only in the error string, and recomputed
                 // `tool_scope` per arm. One helper, one scope.
-                let authorized_session = |missing_context: &str| -> Result<(), Response> {
+                // Boxed Err keeps the closure's Result at pointer size
+                // (clippy::result_large_err — Response is 128+ bytes).
+                let authorized_session = |missing_context: &str| -> Result<(), Box<Response>> {
                     let Some(session) = state.sessions.get(&execution.session_id) else {
-                        return Err(pipeline_error(crate::pipeline::PipelineError::BadRequest(
-                            format!("unknown session for {missing_context}"),
+                        return Err(Box::new(pipeline_error(
+                            crate::pipeline::PipelineError::BadRequest(format!(
+                                "unknown session for {missing_context}"
+                            )),
                         )));
                     };
                     state
                         .authorize_session(&headers, &session, &required_scope)
-                        .map_err(pipeline_error)
+                        .map_err(|error| Box::new(pipeline_error(error)))
                 };
                 match execution.load().await {
                     Ok(ToolExecutionState::Completed(outcome)) => {
                         if let Err(response) = authorized_session("cached tool result") {
-                            return response;
+                            return *response;
                         }
                         return outcome.into_response();
                     }
                     Ok(ToolExecutionState::Unaudited(outcome)) => {
                         if let Err(response) = authorized_session("pending tool audit") {
-                            return response;
+                            return *response;
                         }
                         (Some(execution), Some(outcome))
                     }
                     Ok(ToolExecutionState::Pending) => {
                         if let Err(response) = authorized_session("pending tool execution") {
-                            return response;
+                            return *response;
                         }
                         return (
                             StatusCode::CONFLICT,

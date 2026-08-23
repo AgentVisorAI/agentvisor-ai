@@ -2143,9 +2143,19 @@ impl AppState {
         // uses the same shared Arc<Histogram> the hot cache points
         // to for known stages).
         if let Some(known) = Stage::from_label(stage) {
-            self.hot_metrics.stage_histograms[known.index()].observe_us(elapsed);
+            // `Stage::index()` is a closed 0..5 map over the same
+            // `Stage::ORDER` array both HotMetrics arrays are built
+            // from — `.get()` keeps clippy's indexing lint satisfied
+            // without a reachable None arm.
+            if let Some(histogram) = self.hot_metrics.stage_histograms.get(known.index()) {
+                histogram.observe_us(elapsed);
+            }
             if self.hot_metrics.strict_stage_budget && elapsed > 2_000 {
-                self.hot_metrics.stage_strict_budget_counters[known.index()].inc();
+                if let Some(counter) =
+                    self.hot_metrics.stage_strict_budget_counters.get(known.index())
+                {
+                    counter.inc();
+                }
                 tracing::warn!(stage, elapsed_us = elapsed, "strict stage budget exceeded");
             }
             return;
