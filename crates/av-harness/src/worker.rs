@@ -746,6 +746,14 @@ pub fn spawn_worker_with_spool_authenticated(
 /// a shard while keeping per-shard task fan-out small.
 const MAX_ACTIVE_SESSIONS_PER_SHARD: usize = 8;
 
+/// Round-51 §7.3 group commit: how many backlogged envelopes of ONE
+/// session a single dispatch drains into a batch (one journal
+/// fdatasync per batch instead of one per event). Sized to cap both
+/// the added completion latency of the batch's first job and the
+/// replay window a crash-before-sync leaves (nothing acknowledged is
+/// ever lost — Phase B runs only after the batch sync).
+const MAX_BATCH_PER_SESSION: usize = 16;
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_worker_shard(
     mut receiver: mpsc::Receiver<Envelope>,
@@ -789,8 +797,11 @@ fn spawn_worker_shard(
         let mut tasks: tokio::task::JoinSet<String> = tokio::task::JoinSet::new();
         let mut receiver_open = true;
 
-        let spawn_envelope = |tasks: &mut tokio::task::JoinSet<String>, envelope: Envelope| {
-            let session_id = envelope.job.session.id.clone();
+        let spawn_batch = |tasks: &mut tokio::task::JoinSet<String>, batch: Vec<Envelope>| {
+            let session_id = batch
+                .first()
+                .map(|envelope| envelope.job.session.id.clone())
+                .unwrap_or_default();
             let bridge = Arc::clone(&bridge);
             let embedder = Arc::clone(&embedder);
             let vector_sink = Arc::clone(&vector_sink);
@@ -808,8 +819,8 @@ fn spawn_worker_shard(
                 // task cannot panic between here and returning the id.
                 let outcome = std::panic::AssertUnwindSafe(async {
                     let metrics = Arc::clone(&worker_metrics);
-                    let outcome = std::panic::AssertUnwindSafe(process_envelope(
-                        envelope,
+                    let outcome = std::panic::AssertUnwindSafe(process_envelope_batch(
+                        batch,
                         bridge,
                         embedder,
                         vector_sink,
@@ -868,7 +879,7 @@ fn spawn_worker_shard(
                             {
                                 // Idle session, free slot: dispatch now.
                                 active.insert(session_id);
-                                spawn_envelope(&mut tasks, envelope);
+                                spawn_batch(&mut tasks, vec![envelope]);
                             } else {
                                 // Active (order! behind the in-flight
                                 // envelope) or no free slot: queue.
@@ -881,19 +892,21 @@ fn spawn_worker_shard(
                 Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
                     match joined {
                         Ok(session_id) => {
-                            if let Some(envelope) = queues
-                                .get_mut(&session_id)
-                                .and_then(std::collections::VecDeque::pop_front)
-                            {
+                            let backlog = queues.get_mut(&session_id).map_or(Vec::new(), |queue| {
+                                let take = queue.len().min(MAX_BATCH_PER_SESSION);
+                                queue.drain(..take).collect::<Vec<_>>()
+                            });
+                            if !backlog.is_empty() {
                                 // Same session next-in-line keeps its
                                 // slot: per-session order is preserved
                                 // because dispatch for an ACTIVE session
                                 // happens only here, after its
-                                // predecessor joined.
+                                // predecessor joined. The backlog runs
+                                // as ONE group-committed batch (§7.3).
                                 if queues.get(&session_id).is_some_and(std::collections::VecDeque::is_empty) {
                                     queues.remove(&session_id);
                                 }
-                                spawn_envelope(&mut tasks, envelope);
+                                spawn_batch(&mut tasks, backlog);
                             } else {
                                 queues.remove(&session_id);
                                 active.remove(&session_id);
@@ -909,17 +922,18 @@ fn spawn_worker_shard(
                                     .cloned()
                                     .collect::<Vec<_>>();
                                 for id in waiting {
-                                    let Some(envelope) = queues
-                                        .get_mut(&id)
-                                        .and_then(std::collections::VecDeque::pop_front)
-                                    else {
+                                    let batch = queues.get_mut(&id).map_or(Vec::new(), |queue| {
+                                        let take = queue.len().min(MAX_BATCH_PER_SESSION);
+                                        queue.drain(..take).collect::<Vec<_>>()
+                                    });
+                                    if batch.is_empty() {
                                         continue;
-                                    };
+                                    }
                                     if queues.get(&id).is_some_and(std::collections::VecDeque::is_empty) {
                                         queues.remove(&id);
                                     }
                                     active.insert(id);
-                                    spawn_envelope(&mut tasks, envelope);
+                                    spawn_batch(&mut tasks, batch);
                                 }
                             }
                         }
@@ -948,6 +962,204 @@ fn spawn_worker_shard(
             }
         }
     });
+}
+
+/// Round-51 §7.3 group commit: fdatasync a session's events journal
+/// once, covering every deferred append a batch wrote before it.
+async fn sync_session_journal(directory: &std::path::Path, session: &Session) -> Result<(), String> {
+    let digest = av_core::digest::sha256_hex(session.id.as_bytes());
+    let stem = digest.get(..32).unwrap_or(&digest);
+    let path = directory.join(format!("{stem}.events.ndjson"));
+    tokio::task::spawn_blocking(move || match std::fs::File::open(&path) {
+        Ok(journal) => journal.sync_data().map_err(|error| error.to_string()),
+        // No journal file: every job in the batch was skipped by the
+        // capture-failed guard before appending anything.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Round-51 §7.3 group commit: process a SAME-SESSION batch of
+/// envelopes with one journal fdatasync.
+///
+/// Phase A appends every job's record with the per-append sync
+/// deferred; one `sync_session_journal` then makes the whole batch
+/// durable; Phase B (publish, ack, totals, marker clear — everything
+/// externally visible) runs per job strictly afterwards, so no job's
+/// effects can precede its record's durability. A crash before the
+/// batch sync is indistinguishable from crashing before processing:
+/// nothing was published or acked, the response markers are still on
+/// disk, and recovery quarantines exactly as it would have.
+///
+/// Fail-stop semantics match the serial path: a Phase A error marks
+/// the session capture-failed and the remaining jobs resolve as
+/// skipped/failed (their guards would have skipped them serially); a
+/// Phase B error fails the batch's remaining jobs (their durable
+/// records replay through crash recovery's re-publish path).
+#[allow(clippy::too_many_arguments)]
+async fn process_envelope_batch(
+    envelopes: Vec<Envelope>,
+    bridge: Arc<dyn EventBus>,
+    embedder: Arc<dyn Embedder>,
+    vector_sink: Arc<dyn VectorSink>,
+    spool_dir: Option<std::path::PathBuf>,
+    journal_key: [u8; 32],
+    worker_metrics: Arc<Registry>,
+    worker_pending: Arc<std::sync::atomic::AtomicU64>,
+    worker_drained: Arc<tokio::sync::Notify>,
+) {
+    let mut iterator = envelopes.into_iter();
+    let Some(first) = iterator.next() else { return };
+    let rest: Vec<Envelope> = iterator.collect();
+    if rest.is_empty() {
+        return process_envelope(
+            first,
+            bridge,
+            embedder,
+            vector_sink,
+            spool_dir,
+            journal_key,
+            worker_metrics,
+            worker_pending,
+            worker_drained,
+        )
+        .await;
+    }
+    let session = Arc::clone(&first.job.session);
+    // Per-envelope bookkeeping: guards + permits live for the whole
+    // batch; completions resolve individually below.
+    let mut guards = Vec::new();
+    let mut completions = Vec::new();
+    let mut jobs = Vec::new();
+    for envelope in std::iter::once(first).chain(rest) {
+        let Envelope {
+            job,
+            completion,
+            span,
+            _capacity_permit: capacity_permit,
+        } = envelope;
+        guards.push((
+            PendingGuard::new(Arc::clone(&worker_pending), Arc::clone(&worker_drained)),
+            SessionPendingGuard {
+                session: Arc::clone(&job.session),
+            },
+            capacity_permit,
+        ));
+        completions.push(completion);
+        jobs.push((job, span));
+    }
+    let batch_metrics = Arc::clone(&worker_metrics);
+    let batch_session = Arc::clone(&session);
+    let spool = spool_dir.clone();
+    let result = tokio::spawn(async move {
+        let mut outcomes: Vec<Result<(), String>> = Vec::new();
+        let mut persisted: Vec<Option<PersistedJob>> = Vec::new();
+        let mut failed = false;
+        // Phase A: append every record, sync deferred.
+        for (job, span) in jobs {
+            if failed {
+                // Serial semantics: after a sibling failure the
+                // capture-failed guard would have skipped this job.
+                outcomes.push(Ok(()));
+                persisted.push(None);
+                continue;
+            }
+            let outcome = persist_job(
+                job,
+                Arc::clone(&embedder),
+                Arc::clone(&vector_sink),
+                spool.as_deref(),
+                journal_key,
+                &batch_metrics,
+                /* sync_journal */ false,
+            )
+            .instrument(span)
+            .await;
+            match outcome {
+                Ok(slot) => {
+                    persisted.push(slot);
+                    outcomes.push(Ok(()));
+                }
+                Err(error) => {
+                    // Latch NOW so recovery semantics match serial
+                    // processing (later jobs must not consume seqs).
+                    batch_session.mark_capture_failed();
+                    persisted.push(None);
+                    outcomes.push(Err(error));
+                    failed = true;
+                }
+            }
+        }
+        // The batch fsync: everything Phase A appended becomes
+        // durable in one fdatasync.
+        if let Some(directory) = spool.as_deref() {
+            if persisted.iter().any(Option::is_some) {
+                if let Err(error) = sync_session_journal(directory, &batch_session).await {
+                    // None of the batch is provably durable: fail every
+                    // job that had persisted (fail-closed, like a
+                    // failed per-append sync on the serial path).
+                    for (index, slot) in persisted.iter_mut().enumerate() {
+                        if slot.take().is_some() {
+                            if let Some(outcome) = outcomes.get_mut(index) {
+                                *outcome = Err(format!("batch journal sync failed: {error}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Phase B, in order, fail-stop.
+        let mut tail_failed = false;
+        for (index, slot) in persisted.into_iter().enumerate() {
+            let Some(slot) = slot else { continue };
+            if tail_failed {
+                if let Some(outcome) = outcomes.get_mut(index) {
+                    *outcome = Err("skipped after a batch sibling's post-persist failure".to_owned());
+                }
+                continue;
+            }
+            if let Err(error) = finish_job(slot, Arc::clone(&bridge), spool.as_deref(), journal_key).await {
+                if let Some(outcome) = outcomes.get_mut(index) {
+                    *outcome = Err(error);
+                }
+                tail_failed = true;
+            }
+        }
+        outcomes
+    })
+    .await;
+    let outcomes = match result {
+        Ok(outcomes) => outcomes,
+        Err(error) => {
+            worker_metrics
+                .counter(
+                    "av_worker_panics_total",
+                    "Worker job panics isolated by supervisor",
+                )
+                .inc();
+            let failure = format!("worker batch panicked: {error}");
+            vec![Err(failure); completions.len()]
+        }
+    };
+    let mut any_failed = false;
+    for (completion, outcome) in completions.into_iter().zip(outcomes) {
+        if let Err(error) = &outcome {
+            any_failed = true;
+            tracing::warn!(session = %session.id, %error, "capture job failed; session is fail-closed");
+            worker_metrics
+                .counter("av_worker_errors_total", "Worker jobs that failed")
+                .inc();
+        }
+        if let Some(completion) = completion {
+            let _ = completion.send(outcome);
+        }
+    }
+    if any_failed {
+        session.mark_capture_failed();
+    }
+    drop(guards);
 }
 
 /// One envelope's worth of shard-driver work, factored out so
@@ -1106,8 +1318,24 @@ fn worker_span(job: &WorkerJob) -> tracing::Span {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// A job whose journal record is appended (Phase A of the round-51
+/// §7.3 group commit) and which still owes its post-persist tail:
+/// chain/step accounting, bridge publish, broker ack, totals, marker
+/// clear. Carried between `persist_job` and `finish_job` so a
+/// same-session batch can append N records under ONE fdatasync
+/// before any job's effects become externally visible.
+struct PersistedJob {
+    session: Arc<Session>,
+    identity: av_events::AgentIdentity,
+    class: EventClass,
+    value: Value,
+    event_uid: String,
+    record: ActiveJournalRecord,
+    response_marker: Option<String>,
+}
+
 async fn process_job(
-    mut job: WorkerJob,
+    job: WorkerJob,
     bridge: Arc<dyn EventBus>,
     embedder: Arc<dyn Embedder>,
     vector_sink: Arc<dyn VectorSink>,
@@ -1115,13 +1343,43 @@ async fn process_job(
     journal_key: [u8; 32],
     metrics: Arc<Registry>,
 ) -> Result<(), String> {
+    match persist_job(
+        job,
+        embedder,
+        vector_sink,
+        spool_dir.as_deref(),
+        journal_key,
+        &metrics,
+        /* sync_journal */ true,
+    )
+    .await?
+    {
+        None => Ok(()),
+        Some(persisted) => finish_job(persisted, bridge, spool_dir.as_deref(), journal_key).await,
+    }
+}
+
+/// Phase A: analyze, build the event + journal record, and append it
+/// to the session journal (fsynced only when `sync_journal` — a batch
+/// syncs once after its last append). Returns `None` when the session
+/// is poisoned (capture-failed guard) and the job must be skipped
+/// without consuming a sequence number.
+async fn persist_job(
+    mut job: WorkerJob,
+    embedder: Arc<dyn Embedder>,
+    vector_sink: Arc<dyn VectorSink>,
+    spool_dir: Option<&std::path::Path>,
+    journal_key: [u8; 32],
+    metrics: &Arc<Registry>,
+    sync_journal: bool,
+) -> Result<Option<PersistedJob>, String> {
     // A queued envelope for a session that has already been poisoned must not
     // consume a sequence number or write to the journal — otherwise the seq
     // its OcsfEvent carries (from `next_seq`, advanced by the failed prior
     // envelope) would not match the entry's position on disk, breaking
     // recovery's `event.metadata.sequence != index` check.
     if job.session.capture_failed() {
-        return Ok(());
+        return Ok(None);
     }
     let response_marker = job.response_marker.clone();
     let is_llm_agent_response = job
@@ -1356,42 +1614,79 @@ async fn process_job(
         stop_reason_id: event.stop_reason_id,
         response_attempt: job.response_attempt.clone(),
     };
-    if let Some(directory) = spool_dir.as_deref() {
-        append_active_event_journal(directory, &job.session, &job.identity, &record, &journal_key).await?;
+    if let Some(directory) = spool_dir {
+        append_active_event_journal(
+            directory,
+            &job.session,
+            &job.identity,
+            &record,
+            &journal_key,
+            sync_journal,
+        )
+        .await?;
     }
+    Ok(Some(PersistedJob {
+        session: job.session,
+        identity: job.identity,
+        class,
+        value,
+        event_uid,
+        record,
+        response_marker,
+    }))
+}
 
-    match job.session.workflow {
-        Workflow::Signed => job
-            .session
+/// Phase B: everything that makes the job externally visible. MUST
+/// run only after the job's journal record is durable (its own
+/// synced append, or the batch fsync covering it) — publishing an
+/// unsynced event would let a crash leave the bus ahead of the
+/// journal.
+async fn finish_job(
+    persisted: PersistedJob,
+    bridge: Arc<dyn EventBus>,
+    spool_dir: Option<&std::path::Path>,
+    journal_key: [u8; 32],
+) -> Result<(), String> {
+    let PersistedJob {
+        session,
+        identity,
+        class,
+        value,
+        event_uid,
+        record,
+        response_marker,
+    } = persisted;
+    match session.workflow {
+        Workflow::Signed => session
             .chain
             .lock()
             .append(&value)
             .map_err(|error| error.to_string())?,
         Workflow::Unsigned => {
             // Round-51 §7.3 (RAM cliff): the step was already
-            // journaled durably in `record.atif_step` above — do NOT
+            // journaled durably in `record.atif_step` — do NOT
             // retain a second copy in the in-RAM builder (50 turns ×
             // 2 KB × 10k sessions was 1.35 GB held for the idle
             // window). Close rebuilds the trajectory from the
             // journal; RAM keeps only the count.
-            atif_step.ok_or_else(|| "unsigned ATIF step disappeared".to_owned())?;
-            job.session.note_atif_step();
+            if record.atif_step.is_none() {
+                return Err("unsigned ATIF step disappeared".to_owned());
+            }
+            session.note_atif_step();
         }
     }
 
-    let topic = class.topic().to_owned();
-    let key = job.identity.instance_uid.clone();
-    let publish_topic = topic.clone();
-    let publish_key = key.clone();
+    let key = identity.instance_uid.clone();
+    let publish_topic = class.topic().to_owned();
     let publish_uid = event_uid.clone();
     let ack = tokio::task::spawn_blocking(move || {
-        bridge.publish_idempotent(&publish_topic, &publish_key, &value, &publish_uid)
+        bridge.publish_idempotent(&publish_topic, &key, &value, &publish_uid)
     })
     .await
     .map_err(|error| error.to_string())?
     .map_err(|error| error.to_string())?;
-    if let Some(directory) = spool_dir.as_deref() {
-        persist_broker_ack(directory, &job.session.id, &event_uid, &ack, &journal_key).await?;
+    if let Some(directory) = spool_dir {
+        persist_broker_ack(directory, &session.id, &event_uid, &ack, &journal_key).await?;
     }
     // Round-51 §4.2/S1: the record IS the accounting rule. Its fields
     // were conditionalized once at construction above; apply them
@@ -1399,10 +1694,10 @@ async fn process_job(
     // path and a crash-recovered session can never attest different
     // numbers for identical traffic.
     record
-        .apply_to_totals(&job.session.totals)
+        .apply_to_totals(&session.totals)
         .map_err(|error| error.to_string())?;
-    if let (Some(directory), Some(attempt_id)) = (spool_dir.as_deref(), response_marker.as_deref()) {
-        clear_response_marker(directory, &journal_key, &job.session.id, attempt_id).await?;
+    if let (Some(directory), Some(attempt_id)) = (spool_dir, response_marker.as_deref()) {
+        clear_response_marker(directory, &journal_key, &session.id, attempt_id).await?;
     }
     Ok(())
 }
@@ -1628,11 +1923,12 @@ async fn append_active_event_journal(
     _identity: &av_events::AgentIdentity,
     record: &ActiveJournalRecord,
     journal_key: &[u8; 32],
+    sync: bool,
 ) -> Result<(), String> {
     let index = session.journal_index();
     let domain = format!("{}:active", session.id);
     let line = crate::journal::seal(journal_key, &domain, index, record)?;
-    append_journal(directory, session, line, *journal_key).await?;
+    append_journal(directory, session, line, *journal_key, sync).await?;
     session.commit_journal_index(index)
 }
 
@@ -1641,6 +1937,7 @@ async fn append_journal(
     session: &Session,
     line: Vec<u8>,
     journal_key: [u8; 32],
+    sync: bool,
 ) -> Result<(), String> {
     let directory = directory.to_path_buf();
     let session_id = session.id.clone();
@@ -1722,7 +2019,15 @@ async fn append_journal(
             })?;
         journal.write_all(&line).map_err(|error| error.to_string())?;
         journal.write_all(b"\n").map_err(|error| error.to_string())?;
-        journal.sync_data().map_err(|error| error.to_string())?;
+        // Round-51 §7.3 group commit: a same-session batch defers
+        // this to ONE fdatasync issued by its LAST append —
+        // `sync_data` flushes all of the file's dirty pages
+        // regardless of which fd wrote them, so the final synced
+        // append makes every prior deferred line in the batch
+        // durable. No job's Phase B runs before the batch sync.
+        if sync {
+            journal.sync_data().map_err(|error| error.to_string())?;
+        }
         if journal_created {
             std::fs::File::open(&directory)
                 .and_then(|dir| dir.sync_all())
@@ -3125,6 +3430,81 @@ mod tests {
             .expect("wait_idle deadlocked — a canceled submit_and_wait leaked pending");
     }
 
+    /// Round-51 §7.3 group commit: a backlog that accumulates behind
+    /// a gated first job drains as one same-session batch (Phase A
+    /// appends + ONE fdatasync + per-job tails). Every job must
+    /// complete successfully, the journal must carry every record in
+    /// submission order at its sealed index, and publishes must
+    /// follow submission order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_backlog_group_commits_in_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal_key = [6u8; 32];
+        let bus = Arc::new(GatedBus::new("batched-session"));
+        let worker = spawn_worker_with_spool_authenticated(
+            64,
+            Arc::clone(&bus) as Arc<dyn EventBus>,
+            Arc::new(HashEmbedder::default()),
+            Arc::new(NoopVectorSink),
+            Some(directory.path().to_path_buf()),
+            journal_key,
+            Arc::new(Registry::new()),
+        );
+        let session = session_with_id("batched-session");
+        // First job blocks in publish (Phase B), so the next ten
+        // envelopes pile up behind it and dispatch as one batch.
+        // Sequential try_submit pins arrival order (spawned submitters
+        // would race the channel); the gate holds job 0 in Phase B so
+        // jobs 1..10 accumulate and dispatch as one batch.
+        for n in 0..11 {
+            let mut submitted = job(Arc::clone(&session));
+            submitted.payload = serde_json::json!({"kind": "response", "burst": n});
+            worker.try_submit(submitted).unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        bus.release.store(true, std::sync::atomic::Ordering::Release);
+        session.wait_for_worker_jobs().await;
+        assert!(!session.capture_failed(), "a batched burst must not fail capture");
+
+        // Journal: 11 records, each MAC-sealed at its position.
+        let digest = av_core::digest::sha256_hex(session.id.as_bytes());
+        let stem = digest.get(..32).unwrap();
+        let journal =
+            std::fs::read_to_string(directory.path().join(format!("{stem}.events.ndjson"))).unwrap();
+        let lines: Vec<&str> = journal.lines().collect();
+        assert_eq!(lines.len(), 11, "every batched record must be journaled");
+        for (index, line) in lines.iter().enumerate() {
+            let record: ActiveJournalRecord = crate::journal::open(
+                &journal_key,
+                &format!("{}:active", session.id),
+                index as u64,
+                line.as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(
+                record.event.pointer("/payload/burst").and_then(Value::as_u64),
+                Some(index as u64),
+                "journal record {index} must carry the {index}th submitted payload"
+            );
+        }
+        // Publishes followed submission order.
+        let published = bus.published.lock();
+        let bursts: Vec<u64> = published
+            .iter()
+            .filter_map(|text| {
+                serde_json::from_str::<Value>(text)
+                    .ok()?
+                    .pointer("/payload/burst")
+                    .and_then(Value::as_u64)
+            })
+            .collect();
+        assert_eq!(
+            bursts,
+            (0..11).collect::<Vec<_>>(),
+            "publish order must match submission order"
+        );
+    }
+
     fn session_with_id(id: &str) -> Arc<Session> {
         Arc::new(Session::new(
             id.to_owned(),
@@ -3211,24 +3591,21 @@ mod tests {
             Arc::new(Registry::new()),
         );
         let session = session_with_id("ordered-session");
-        for n in 0..8 {
+        for n in 0..8u64 {
             let mut ordered = job(Arc::clone(&session));
-            ordered.text = format!("step-{n}");
+            ordered.payload = serde_json::json!({"kind": "response", "step": n});
             worker.submit_and_wait(ordered).await.unwrap();
         }
         let events = bus.events.lock();
-        let texts: Vec<String> = events
+        let steps: Vec<u64> = events
             .iter()
-            .filter_map(|(_, _, value)| value.get("message").and_then(Value::as_str).map(str::to_owned))
+            .filter_map(|(_, _, value)| value.pointer("/payload/step").and_then(Value::as_u64))
             .collect();
-        let steps: Vec<&String> = texts.iter().filter(|text| text.starts_with("step-")).collect();
-        for (index, text) in steps.iter().enumerate() {
-            assert_eq!(
-                text.as_str(),
-                &format!("step-{index}"),
-                "per-session publish order must match submission order: {texts:?}"
-            );
-        }
+        assert_eq!(
+            steps,
+            (0..8).collect::<Vec<_>>(),
+            "per-session publish order must match submission order"
+        );
     }
 }
 
