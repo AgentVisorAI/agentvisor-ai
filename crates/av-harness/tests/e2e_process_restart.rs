@@ -698,3 +698,70 @@ vector_backend = "memory"
         "steady-state boot must still log the anchor at RUST_LOG=error: {anchor_line}"
     );
 }
+
+/// Every metric the OPERATIONS.md alert table tells operators to wire
+/// alerts onto must exist on `/metrics` from boot (Action Register
+/// item 20: pre-register data-plane series). `Registry::counter` is
+/// lazy — a series created on first increment leaves its alert blind
+/// until the bad thing has already happened once, and `absent()`
+/// alerts false-fire on healthy nodes. This boots the REAL binary and
+/// scrapes a fresh `/metrics`: it caught av_incomplete_sessions_total
+/// (documented "Escalate" alert, created only in the capture-failure
+/// branch) and av_events_dropped_total{stage="response_slot"} (the
+/// alert names response_slot; only worker_queue was pre-registered).
+#[test]
+fn every_documented_alert_series_exists_on_a_fresh_boot() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path();
+    let listen_port = free_port();
+    let config_path = root.join("agentvisor.toml");
+    let seed_path = root.join("signing.seed");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"config_version = 1
+listen = "127.0.0.1:{listen_port}"
+upstream_url = "http://127.0.0.1:9"
+require_identity = false
+default_workflow = "signed"
+compression_enabled = false
+dashboard_enabled = false
+atif_spool_dir = "{spool}"
+bridge_data_dir = "{bridge}"
+tool_schema_dir = "{schemas}"
+state_backend = "memory"
+embedder_backend = "hash"
+vector_backend = "memory"
+"#,
+            spool = root.join("spool/atif").display(),
+            bridge = root.join("data/bridge").display(),
+            schemas = root.join("tool-schemas").display(),
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("tool-schemas")).unwrap();
+
+    let mut daemon = start_daemon(&config_path, &seed_path);
+    wait_healthy(listen_port, &mut daemon);
+    let (status, body) = http_get(listen_port, "/metrics").expect("scrape /metrics");
+    assert_eq!(status, 200, "metrics endpoint must serve on a fresh boot");
+
+    // The exact series named by docs/reference/OPERATIONS.md (alert
+    // table + probe/drain sections). Adding a row there without
+    // pre-registering the series breaks this test — by design.
+    for series in [
+        "av_atif_recovery_skipped_total{reason=\"unauthenticated\"}",
+        "av_atif_recovery_skipped_total{reason=\"too_large\"}",
+        "av_incomplete_sessions_total",
+        "av_events_dropped_total{stage=\"response_slot\"}",
+        "av_events_dropped_total{stage=\"worker_queue\"}",
+        "av_http_shutdown_drain_timeouts_total",
+        "av_reconciler_last_tick_completed_seconds",
+    ] {
+        assert!(
+            body.contains(series),
+            "documented alert series {series} is missing from a fresh boot's /metrics"
+        );
+    }
+    drop(daemon);
+}

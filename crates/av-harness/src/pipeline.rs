@@ -799,6 +799,21 @@ impl AppState {
             "av_events_dropped_total{stage=\"worker_queue\"}",
             "Worker jobs or response-slot reservations dropped, labeled by admission stage",
         );
+        // The OPERATIONS.md alert table names the response_slot stage
+        // specifically ("Rate > 0 sustained ⇒ response capture
+        // backpressure"); a lazily-created series renders that alert
+        // blind until the first drop actually happens.
+        metrics.counter(
+            "av_events_dropped_total{stage=\"response_slot\"}",
+            "Worker jobs or response-slot reservations dropped, labeled by admission stage",
+        );
+        // Documented as an Escalate alert ("sudden increase"); it must
+        // exist from boot for absent()/increase() alerts to arm on
+        // healthy nodes that never had a capture failure.
+        metrics.counter(
+            "av_incomplete_sessions_total",
+            "Sessions refused due to incomplete capture",
+        );
         metrics.counter(
             "av_worker_panics_total",
             "Worker job panics isolated by supervisor",
