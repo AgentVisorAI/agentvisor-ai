@@ -86,7 +86,9 @@ services:
     healthcheck:
       # Round-15 F8-mirror: hardcode the URL rather than relying on
       # `avctl health`'s default matching whatever `listen` says.
-      test: ["CMD", "avctl", "health", "--url", "http://127.0.0.1:8484"]
+      # /readyz (not /health): a full disk keeps the constant green
+      # while every request 503s; readiness's writability probe flips.
+      test: ["CMD", "avctl", "health", "--url", "http://127.0.0.1:8484/readyz"]
       interval: 10s
       timeout: 3s
       retries: 5

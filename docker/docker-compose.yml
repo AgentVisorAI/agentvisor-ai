@@ -81,8 +81,10 @@ services:
       # report *green* against the wrong endpoint (round-11 F8) — the
       # `listen` port changing without the CLI default updating still
       # returned 200 from a stale sidecar or an unrelated in-container
-      # service.
-      test: ["CMD", "avctl", "health", "--url", "http://127.0.0.1:8484"]
+      # service. Probe /readyz, not the /health constant: a full disk
+      # keeps /health green while every request 503s — readiness's
+      # spool WRITABILITY probe is what flips on that incident.
+      test: ["CMD", "avctl", "health", "--url", "http://127.0.0.1:8484/readyz"]
       interval: 10s
       timeout: 3s
       retries: 5

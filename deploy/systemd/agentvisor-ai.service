@@ -28,7 +28,9 @@
 #   sudo cp deploy/systemd/agentvisor-ai.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now agentvisor-ai
 #
-# Check: avctl health --url http://127.0.0.1:8484
+# Check: avctl health --url http://127.0.0.1:8484/readyz
+#   (/readyz probes spool writability — a full disk keeps the plain
+#   /health constant green while every request 503s)
 
 [Unit]
 Description=AgentVisor AI LLM proxy with signed receipts
