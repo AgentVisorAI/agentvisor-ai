@@ -325,16 +325,32 @@ async fn livez() -> impl IntoResponse {
 /// which check failed without opening a shell.
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     let draining = state.draining.load(std::sync::atomic::Ordering::SeqCst);
-    let spool_ok = std::fs::metadata(std::path::Path::new(&state.config.atif_spool_dir))
-        .map(|m| m.is_dir())
-        .unwrap_or(false);
-    let ready = !draining && spool_ok;
+    // Writability probe, not just metadata: the outage this endpoint
+    // exists to surface is a FULL DISK (observed: 100% of traffic
+    // 503-ing while the pod stayed Ready) — and a full disk keeps the
+    // spool directory perfectly readable, so an `is_dir()` check
+    // passes through the whole incident. Create-write-sync-remove a
+    // probe file so ENOSPC/EROFS/EACCES all flip readiness. The name
+    // ends in `.tmp`, matching the boot sweep's orphan pattern, so a
+    // crash between create and remove self-heals on restart; UUIDv7
+    // uniqueness keeps concurrent probes from colliding.
+    let spool_writable = {
+        let probe = std::path::Path::new(&state.config.atif_spool_dir)
+            .join(format!(".readyz-{}.tmp", av_core::new_event_uid()));
+        let outcome = std::fs::write(&probe, b"readyz").and_then(|()| {
+            // fsync would double the probe's IOPS cost for no signal:
+            // ENOSPC surfaces at write() on every mainstream filesystem.
+            std::fs::remove_file(&probe)
+        });
+        outcome.is_ok()
+    };
+    let ready = !draining && spool_writable;
     let body = Json(json!({
         "status": if ready { "ready" } else { "not_ready" },
         "service": "agentvisor",
         "checks": {
             "draining": draining,
-            "spool_dir_readable": spool_ok,
+            "spool_dir_writable": spool_writable,
         },
     }));
     if ready {
@@ -6528,8 +6544,8 @@ mod tests {
 
     /// `/livez` and `/readyz` are the Kubernetes-style split of the
     /// legacy `/health` constant. Liveness stays a constant; readiness
-    /// couples to the draining flag and to a spool-directory
-    /// readability check so a full or missing spool volume immediately
+    /// couples to the draining flag and to a spool WRITABILITY probe
+    /// so a full, read-only, or missing spool volume immediately
     /// steers new traffic elsewhere.
     #[tokio::test]
     async fn livez_and_readyz_reflect_service_readiness() {
@@ -6591,6 +6607,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(still_live.status(), StatusCode::OK);
+    }
+
+    /// The register's observed outage: a FULL DISK keeps the spool
+    /// directory readable, so the previous `is_dir()` readiness check
+    /// passed while every request 503'd on write — the pod stayed
+    /// Ready, in-service, un-restarted through the whole incident.
+    /// `/readyz` must probe WRITABILITY. A read-only spool (the
+    /// closest deterministic stand-in for ENOSPC — both fail the
+    /// probe-file create) must flip readiness to 503, and restoring
+    /// write permission must restore 200 with no restart.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn readyz_fails_when_the_spool_is_not_writable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = tempfile::tempdir().unwrap();
+        let spool = scratch.path().join("spool");
+        std::fs::create_dir_all(&spool).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = Router::new().route("/v1/chat/completions", post(mock_chat));
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, provider).await.unwrap();
+        });
+        let config = crate::config::HarnessConfig::for_tests(
+            &format!("http://{address}"),
+            &spool.to_string_lossy(),
+            &spool.to_string_lossy(),
+        );
+        let state = AppState::new(
+            config,
+            Arc::new(InMemoryStore::new()),
+            Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
+            Arc::new(NullBus),
+            None,
+            Arc::new(Ed25519Signer::from_seed(&[23; 32])),
+        )
+        .unwrap();
+        let app = crate::build_router(state);
+
+        // Read-only spool: directory still readable, probe write fails.
+        std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(spool.join("root-probe"), b"x").is_ok() {
+            // Running as root (CI container): the premise doesn't hold.
+            let _ = std::fs::remove_file(spool.join("root-probe"));
+            std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let not_ready = app
+            .clone()
+            .oneshot(Request::builder().uri("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            not_ready.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an unwritable (readable) spool must flip readiness — the full-disk incident shape"
+        );
+
+        // Restore write permission: readiness recovers without restart.
+        std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ready = app
+            .clone()
+            .oneshot(Request::builder().uri("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::OK);
+        // The probe cleans up after itself: no .readyz-*.tmp residue.
+        let residue = std::fs::read_dir(&spool)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".readyz-"))
+            });
+        assert!(!residue, "probe files must not accumulate in the spool");
     }
 
     /// DNS-rebinding defense: a non-empty `allowed_hosts` must
