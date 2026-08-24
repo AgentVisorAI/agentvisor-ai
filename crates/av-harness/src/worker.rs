@@ -2222,7 +2222,10 @@ mod tests {
             async move { worker.wait_idle().await }
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert!(!waiter.is_finished(), "wait_idle must block while the job is gated");
+        assert!(
+            !waiter.is_finished(),
+            "wait_idle must block while the job is gated"
+        );
         bus.release.store(true, std::sync::atomic::Ordering::Release);
         tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
             .await

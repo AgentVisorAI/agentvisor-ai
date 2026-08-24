@@ -569,17 +569,14 @@ impl Finalizer {
                     let is_plain_stem_marker = path
                         .file_stem()
                         .and_then(std::ffi::OsStr::to_str)
-                        .is_some_and(|stem| {
-                            stem.len() == 32 && stem.chars().all(|c| c.is_ascii_hexdigit())
-                        });
+                        .is_some_and(|stem| stem.len() == 32 && stem.chars().all(|c| c.is_ascii_hexdigit()));
                     if is_plain_stem_marker && !path.with_extension("json").exists() {
                         let old_enough = entry
                             .metadata()
                             .and_then(|m| m.modified())
                             .ok()
                             .map(|modified| {
-                                now.duration_since(modified).unwrap_or(std::time::Duration::ZERO)
-                                    >= max_age
+                                now.duration_since(modified).unwrap_or(std::time::Duration::ZERO) >= max_age
                             })
                             .unwrap_or(false);
                         if old_enough {

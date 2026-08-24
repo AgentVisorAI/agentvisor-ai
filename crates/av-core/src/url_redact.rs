@@ -95,9 +95,7 @@ fn starts_with_scheme(s: &str) -> bool {
         return false;
     };
     let mut bytes = scheme.bytes();
-    bytes
-        .next()
-        .is_some_and(|first| first.is_ascii_alphabetic())
+    bytes.next().is_some_and(|first| first.is_ascii_alphabetic())
         && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
 }
 

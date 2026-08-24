@@ -4301,7 +4301,9 @@ mod tests {
             StatusCode::OK,
             "first rotated request fits the principal budget"
         );
-        axum::body::to_bytes(first.into_body(), 1024 * 1024).await.unwrap();
+        axum::body::to_bytes(first.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
 
         // Different session id, same (anonymous) principal: its virgin
         // session ledger cannot refuse — only the principal ledger,
@@ -4312,7 +4314,9 @@ mod tests {
             .await
             .unwrap();
         let status = second.status();
-        let body = axum::body::to_bytes(second.into_body(), 1024 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(second.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let body = String::from_utf8_lossy(&body);
         assert_eq!(
             status,
@@ -4380,11 +4384,7 @@ mod tests {
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt as _;
-                        std::fs::set_permissions(
-                            &key_path,
-                            std::fs::Permissions::from_mode(0o600),
-                        )
-                        .unwrap();
+                        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
                     }
                     config.upstream_api_key_file = Some(key_path.to_string_lossy().into_owned());
                 }
@@ -4413,11 +4413,14 @@ mod tests {
                 .unwrap();
             let response = build_router(state).oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK, "posture {posture} must serve");
-            axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
             let seen = captured.lock().clone();
-            let (auth, beta, custom) = seen.first().cloned().unwrap_or_else(|| {
-                panic!("posture {posture}: upstream never saw the request")
-            });
+            let (auth, beta, custom) = seen
+                .first()
+                .cloned()
+                .unwrap_or_else(|| panic!("posture {posture}: upstream never saw the request"));
             match posture {
                 "keyless_ignore" => assert_eq!(
                     auth, None,
@@ -6276,8 +6279,11 @@ mod tests {
         // Authoritative usage: prompt 1 + completion 1. Both refunds
         // (prompt and completion) must have settled the ledger to a
         // spend of exactly 2.
-        let ledger =
-            av_state::ActionBudget::new(state.store.as_ref(), "overcharged-completion", &state.config.budget);
+        let ledger = av_state::ActionBudget::new(
+            state.store.as_ref(),
+            "overcharged-completion",
+            &state.config.budget,
+        );
         assert!(
             ledger.try_tokens(cap - 2).unwrap().is_allowed(),
             "the completion-estimate over-charge must be refunded once authoritative usage arrives"

@@ -696,7 +696,12 @@ mod tests {
         let (numbers, keys) = lex_json(r#"{"x":12,"y\":":3.5e2,"n:1":"t","z":[7,-8]}"#);
         assert_eq!(
             numbers,
-            vec!["12".to_owned(), "3.5e2".to_owned(), "7".to_owned(), "-8".to_owned()]
+            vec![
+                "12".to_owned(),
+                "3.5e2".to_owned(),
+                "7".to_owned(),
+                "-8".to_owned()
+            ]
         );
         assert_eq!(keys, 4);
         // Escape NOT adjacent to a quote (`\n` inside a key whose

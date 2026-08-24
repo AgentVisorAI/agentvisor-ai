@@ -693,8 +693,7 @@ vector_backend = "memory"
         .find(|line| line.contains("\"target\":\"trust_anchor\""))
         .unwrap();
     assert!(
-        anchor_line.contains("signer_key_id")
-            && anchor_line.contains("\"freshly_generated\":false"),
+        anchor_line.contains("signer_key_id") && anchor_line.contains("\"freshly_generated\":false"),
         "steady-state boot must still log the anchor at RUST_LOG=error: {anchor_line}"
     );
 }
@@ -857,5 +856,8 @@ shutdown_ready_drain_s = 2
         );
         std::thread::sleep(Duration::from_millis(100));
     };
-    assert!(status.success(), "graceful SIGTERM shutdown must exit 0, got {status}");
+    assert!(
+        status.success(),
+        "graceful SIGTERM shutdown must exit 0, got {status}"
+    );
 }

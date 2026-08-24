@@ -1073,8 +1073,7 @@ impl AppState {
         // Strict allowlist of provider-semantic headers. Same
         // single-value discipline as every other relayed header
         // (a multi-valued occurrence is refused at ingress).
-        const UPSTREAM_HEADER_ALLOWLIST: [&str; 3] =
-            ["openai-organization", "openai-project", "openai-beta"];
+        const UPSTREAM_HEADER_ALLOWLIST: [&str; 3] = ["openai-organization", "openai-project", "openai-beta"];
         let mut upstream_passthrough_headers = Vec::new();
         for name in UPSTREAM_HEADER_ALLOWLIST {
             if let Some(value) = single_header(headers, name)? {
