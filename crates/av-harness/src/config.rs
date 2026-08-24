@@ -1504,6 +1504,19 @@ impl HarnessConfig {
                     "tool_upstream_url must be http:// or https://, got {tool_upstream:?}"
                 ));
             }
+            // Same hostless-URL preflight as `upstream_url` above: a
+            // scheme with no host (`http://`, `https:///mcp`) passed
+            // validation, booted, then failed every tool call at
+            // request-build time — a fail-late shape that also leaves
+            // claimed executions churning TOOL_OUTCOME_UNCERTAIN.
+            let rest = tool_upstream
+                .split_once("://")
+                .map(|(_, rest)| rest)
+                .unwrap_or_default();
+            let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+            if !tool_upstream.is_empty() && host.is_empty() {
+                errors.push(format!("tool_upstream_url has no host, got {tool_upstream:?}"));
+            }
         }
         // Extend the scheme allowlist to every URL
         // field. `identity_jwks_url`, `qdrant_url`, `bridge_endpoint`
@@ -2111,6 +2124,24 @@ mod tests {
             "upstream_url = \"https://api\"\ntool_upstream_url = \"http://tools/mcp\"",
         )
         .is_ok());
+    }
+
+    /// The hostless preflight `upstream_url` gets must cover
+    /// `tool_upstream_url` too: `tool_upstream_url = "http://"` passed
+    /// validation, booted, then failed EVERY tool call at request-build
+    /// time — with claimed executions churning TOOL_OUTCOME_UNCERTAIN.
+    #[test]
+    fn hostless_tool_upstream_url_is_rejected() {
+        for url in ["http://", "https:///mcp", "http://?x=1"] {
+            let err = HarnessConfig::from_toml(&format!(
+                "upstream_url = \"https://api\"\ntool_upstream_url = \"{url}\""
+            ))
+            .unwrap_err();
+            assert!(
+                err.contains("tool_upstream_url") && err.contains("no host"),
+                "{url}: {err}"
+            );
+        }
     }
 
     /// A seconds interval > 1 day is almost certainly a unit-conversion

@@ -778,13 +778,16 @@ impl Session {
         subject: av_receipts::ReceiptSubject,
         stop: StopReason,
     ) -> av_receipts::ReceiptBody {
-        let recorded =
-            StopReason::from_id(u8::try_from(self.last_stop_reason_id.load(Ordering::Acquire)).unwrap_or(0));
-        let stop = if recorded == StopReason::Unknown {
-            stop
-        } else {
-            recorded
-        };
+        let recorded_id = self.last_stop_reason_id.load(Ordering::Acquire);
+        let recorded = StopReason::from_id(u8::try_from(recorded_id).unwrap_or(0));
+        // Distinguish "never recorded" (raw id 0) from "recorded an id
+        // this build cannot map" (nonzero → `from_id` says Unknown —
+        // a NEWER node's stop-reason id recovered from its artifact).
+        // Only the former may fall back to the caller's stop: rewriting
+        // a foreign id into e.g. SessionClosed would forge a specific
+        // reason the session never had into the SIGNED receipt. The
+        // honest representation for a foreign id is Unknown.
+        let stop = if recorded_id == 0 { stop } else { recorded };
         av_receipts::receipt::new_body(
             self.id.clone(),
             self.current_identity(),
@@ -1179,6 +1182,46 @@ mod tests {
             instance_uid: "i".into(),
             ttl_remaining_s: None,
         }
+    }
+
+    /// Receipt stop-reason precedence: a recorded KNOWN reason wins over
+    /// the caller's stop; an UNRECORDED session (raw id 0) takes the
+    /// caller's stop; and a FOREIGN id (a newer node's stop-reason id
+    /// recovered from its artifact — maps to Unknown in this build)
+    /// must stay Unknown. Pre-fix the foreign id was silently rewritten
+    /// to the caller's stop (typically SessionClosed), forging a
+    /// specific reason the session never had into the SIGNED receipt.
+    #[test]
+    fn receipt_body_never_rewrites_a_foreign_stop_reason_id() {
+        let subject = || av_receipts::ReceiptSubject::EventChain {
+            chain_head: "aa".repeat(32),
+            event_count: 0,
+        };
+        let session = Session::new(
+            "stop-precedence".to_owned(),
+            Workflow::Signed,
+            identity(),
+            Default::default(),
+        );
+
+        // Unrecorded (id 0): caller's stop is authoritative.
+        let body = session.receipt_body(subject(), StopReason::SessionClosed);
+        assert_eq!(body.stop_reason_id, StopReason::SessionClosed.id());
+
+        // Recorded known reason wins over the caller's stop.
+        session.record_stop_reason(StopReason::BudgetExceeded);
+        let body = session.receipt_body(subject(), StopReason::SessionClosed);
+        assert_eq!(body.stop_reason_id, StopReason::BudgetExceeded.id());
+
+        // Foreign id (unknown to this build): honest Unknown, never the
+        // caller's stop.
+        session.last_stop_reason_id.store(95, Ordering::Release);
+        let body = session.receipt_body(subject(), StopReason::SessionClosed);
+        assert_eq!(
+            body.stop_reason_id,
+            StopReason::Unknown.id(),
+            "a foreign stop-reason id must not be rewritten to the caller's stop"
+        );
     }
 
     /// The lifecycle state machine walks the
