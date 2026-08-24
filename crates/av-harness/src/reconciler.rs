@@ -967,6 +967,13 @@ impl Finalizer {
         if session.workflow == Workflow::Unsigned {
             self.persist_close_complete_marker(&session).await;
         }
+        // Drop the budget counters BEFORE `mark_close_complete` publishes
+        // the close: `get_or_open` recycles a completed-close id into a
+        // fresh session that spends against the same budget keys, and the
+        // vector-sink cleanup below can await network I/O for seconds —
+        // clearing after the marker let this tail wipe the NEW
+        // incarnation's spend (budget evasion under same-id churn).
+        self.clear_budget_state(&session.id);
         // Only now — with lifecycle events published and the on-disk journal
         // removed — may the registry evict this session.
         session.mark_close_complete();
@@ -999,7 +1006,6 @@ impl Finalizer {
         // sessions never observe() again, and retained unsigned
         // sessions otherwise pin ~2 KB of dead vector each, forever.
         session.loop_state.release_embedding();
-        self.clear_budget_state(&session.id);
         Ok(outcome)
     }
 
@@ -1505,6 +1511,32 @@ impl Finalizer {
                             %rename_error,
                             path = %av_core::fsutil::basename(&path),
                             "failed to quarantine ATIF file with bad provenance; will retry next tick"
+                        );
+                    }
+                    continue;
+                }
+                // Quarantine the `.atif-auth` sidecar alongside the
+                // artifact. Left in place, a stale sidecar (sealed over
+                // the quarantined bytes, or attacker-planted with a bogus
+                // MAC) permanently fails `ensure_atif_provenance` for the
+                // NEXT legitimate close of the same session id —
+                // `archive_conflicting_atif` skips sidecar cleanup when no
+                // primary `.json` exists, so nothing else ever removes it.
+                // The `.atif-auth` suffix keeps the archived pair
+                // associated while its extension stays out of every scan
+                // (they all key on `.json`).
+                let sidecar = path.with_extension("atif-auth");
+                let mut quarantined_sidecar = quarantine.clone();
+                quarantined_sidecar.as_mut_os_string().push(".atif-auth");
+                match tokio::fs::rename(&sidecar, &quarantined_sidecar).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            path = %av_core::fsutil::basename(&sidecar),
+                            "failed to quarantine the stale provenance sidecar; future closes \
+                             of this session id will fail provenance until it is removed"
                         );
                     }
                 }
@@ -3448,14 +3480,16 @@ impl Finalizer {
                 if session.workflow == Workflow::Unsigned {
                     self.persist_close_complete_marker(&session).await;
                 }
-                session.mark_close_complete();
                 // Mirror the normal close tail (close_session_locked):
                 // without this the sweep leaked the session's budget
                 // counters in the state store forever, and a recycled id
                 // (get_or_open reopens completed-close entries) inherited
                 // the stale counters → spurious BudgetExceeded on the
-                // fresh incarnation.
+                // fresh incarnation. Cleared BEFORE `mark_close_complete`
+                // so a recycle racing this sweep cannot have its fresh
+                // spend wiped by the old incarnation's cleanup.
                 self.clear_budget_state(&session.id);
+                session.mark_close_complete();
                 // Also mirror the close-path builder drain:
                 // an unsigned session whose close committed the artifact
                 // but failed in the tail reaches close-complete through
@@ -6219,6 +6253,128 @@ mod tests {
         assert!(
             rendered.contains("av_atif_recovery_skipped_total{reason=\"provenance\"}"),
             "skips must be visible to operators via metrics; got: {rendered}",
+        );
+    }
+
+    /// The provenance-fail quarantine must move the `.atif-auth`
+    /// sidecar out alongside the `.json` it quarantines. Left in
+    /// place, the stale sidecar (sealed over the quarantined bytes)
+    /// permanently failed `ensure_atif_provenance` for the NEXT
+    /// legitimate close of the same session id —
+    /// `archive_conflicting_atif` skips sidecar cleanup when no
+    /// primary `.json` exists, so nothing else ever removed it and
+    /// every future close of the recycled id errored.
+    #[tokio::test]
+    async fn provenance_quarantine_moves_stale_sidecar_so_recycled_id_can_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let metrics = Arc::new(Registry::new());
+        let finalizer = Finalizer::new(
+            Arc::new(Ed25519Signer::from_seed(&[7; 32])),
+            directory.path().to_path_buf(),
+            Arc::clone(&metrics),
+        );
+        let step = av_atif::Step {
+            step_id: 0,
+            timestamp: None,
+            source: av_atif::Source::Agent,
+            message: serde_json::json!("first incarnation response"),
+            reasoning_effort: None,
+            reasoning_content: None,
+            model_name: Some("test-model".into()),
+            tool_calls: None,
+            observation: None,
+            metrics: Some(av_atif::Metrics {
+                prompt_tokens: Some(1),
+                completion_tokens: Some(1),
+                cached_tokens: Some(0),
+                cost_usd: Some(0.0),
+                logprobs: None,
+                completion_token_ids: None,
+                prompt_token_ids: None,
+                extra: None,
+            }),
+            is_copied_context: None,
+            llm_call_count: Some(1),
+            extra: None,
+        };
+        let identity = AgentIdentity {
+            version: "1".to_owned(),
+            charter: "test".into(),
+            instance_uid: "instance-1".to_owned(),
+            ttl_remaining_s: Some(600),
+        };
+        let session = Arc::new(Session::new(
+            "quarantined-then-recycled".to_owned(),
+            Workflow::Unsigned,
+            identity.clone(),
+            Default::default(),
+        ));
+        session.atif.lock().push_step(step.clone()).unwrap();
+        let FinalizeOutcome::Atif { path } = finalizer
+            .close_session(Arc::clone(&session), StopReason::SessionClosed)
+            .await
+            .unwrap()
+        else {
+            panic!("expected FinalizeOutcome::Atif");
+        };
+        // Tamper the artifact so its sealed sidecar digest no longer
+        // matches, then age the pair past MIN_ORPHAN_AGE so the
+        // quarantine path engages.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let position = bytes
+            .windows("first".len())
+            .position(|window| window == b"first")
+            .expect("artifact must contain the step message");
+        bytes[position] = b'X';
+        std::fs::write(&path, &bytes).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        let file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        drop(file);
+
+        let registry = SessionRegistry::new();
+        finalizer
+            .recover_spooled_sessions(&registry, &Default::default())
+            .await
+            .expect("quarantine must not fail the scan");
+
+        let sidecar = path.with_extension("atif-auth");
+        assert!(!path.exists(), "the tampered artifact must be quarantined");
+        assert!(
+            !sidecar.exists(),
+            "the stale provenance sidecar must be quarantined alongside its artifact"
+        );
+        let mut quarantined_pair = 0usize;
+        for entry in std::fs::read_dir(directory.path()).unwrap() {
+            let name = entry.unwrap().file_name();
+            if let Some(name) = name.to_str() {
+                if name.contains(".json.corrupt-") {
+                    quarantined_pair += 1;
+                }
+            }
+        }
+        assert_eq!(
+            quarantined_pair, 2,
+            "both the artifact and its sidecar must survive as an associated forensic pair"
+        );
+
+        // A recycled incarnation of the same session id must be able to
+        // close: pre-fix the stale sidecar failed its
+        // `ensure_atif_provenance` forever.
+        let recycled = Arc::new(Session::new(
+            "quarantined-then-recycled".to_owned(),
+            Workflow::Unsigned,
+            identity,
+            Default::default(),
+        ));
+        recycled.atif.lock().push_step(step).unwrap();
+        let outcome = finalizer
+            .close_session(Arc::clone(&recycled), StopReason::SessionClosed)
+            .await;
+        assert!(
+            matches!(outcome, Ok(FinalizeOutcome::Atif { .. })),
+            "a recycled id must close cleanly after its predecessor was quarantined; got {outcome:?}"
         );
     }
 

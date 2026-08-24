@@ -239,15 +239,6 @@ impl SessionLoopState {
         }
     }
 
-    /// Manually reset (e.g. after a corrective injection gave the agent a new
-    /// direction). Clears the streak and the embedding window and closes the
-    /// breaker.
-    ///
-    /// `tokens_consumed` deliberately SURVIVES the reset.
-    /// It implements the documented "minimum session token consumption"
-    /// floor — zeroing it on every Inject turned the session-lifetime
-    /// floor into a per-cycle floor, letting an agent that ignores the
-    /// corrective message loop forever at ~min_tokens per correction.
     /// Release the retained embedding buffers.
     ///
     /// Unsigned sessions stay registered for the process lifetime by

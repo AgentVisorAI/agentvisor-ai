@@ -2379,6 +2379,29 @@ impl AbortFinalizingStream {
                 ));
             }
             let partial = self.response_tool_calls.entry(key).or_default();
+            // An upstream that reuses an accumulated (choice, index) slot
+            // with a DIFFERENT id or name is emitting a malformed stream:
+            // silently overwriting would merge two distinct calls into one
+            // synthetic record (last id/name + concatenated arguments) in
+            // the attested trajectory. Fail the stream instead, mirroring
+            // `reject_metric_regression`. Late repeats of the SAME values
+            // remain accepted.
+            if let (Some(existing), Some(new)) = (partial.id.as_deref(), delta.id.as_deref()) {
+                if existing != new {
+                    return Err(format!(
+                        "provider reused tool-call index {} with conflicting id",
+                        delta.index
+                    ));
+                }
+            }
+            if let (Some(existing), Some(new)) = (partial.name.as_deref(), delta.name.as_deref()) {
+                if existing != new {
+                    return Err(format!(
+                        "provider reused tool-call index {} with conflicting name",
+                        delta.index
+                    ));
+                }
+            }
             if delta.id.is_some() {
                 partial.id = delta.id;
             }
@@ -2595,6 +2618,21 @@ impl AbortFinalizingStream {
         // not billing.
         if let Some(provider) = self.response_metrics.prompt_tokens {
             let over_charge = self.billed_prompt_tokens.saturating_sub(provider);
+            if over_charge > 0 {
+                av_state::ActionBudget::new(self.store.as_ref(), &self.session.id, &self.budget)
+                    .refund_tokens(over_charge);
+            }
+        }
+        // Same correction for the completion side: per-chunk estimates
+        // (content frames with `"usage": null`) debit the ledger as the
+        // stream progresses, and an authoritative final usage frame LOWER
+        // than the accumulated estimate leaves `charged_completion_tokens`
+        // above the attested count with no refund path — the over-debit
+        // outlives the response and starves the session's remaining
+        // budget. Only the over-charge direction is compensated,
+        // mirroring the prompt-side rationale above.
+        if let Some(provider) = self.response_metrics.completion_tokens {
+            let over_charge = self.charged_completion_tokens.saturating_sub(provider);
             if over_charge > 0 {
                 av_state::ActionBudget::new(self.store.as_ref(), &self.session.id, &self.budget)
                     .refund_tokens(over_charge);
@@ -3625,6 +3663,37 @@ mod tests {
         if payload.get("model").and_then(Value::as_str) == Some("tool-oob-index") {
             let event = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":18446744073709551615,\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]}}]}\n\n";
             let mut response = Response::new(Body::from(event));
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            return response;
+        }
+        if payload.get("model").and_then(Value::as_str) == Some("tool-conflicting-id") {
+            // One frame, two deltas landing on the same accumulator slot
+            // (choice 0, index 0) with DIFFERENT ids — the malformed
+            // shape the id-conflict guard must fail closed on.
+            let event = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"function\":{\"name\":\"read\",\"arguments\":\"{\"}},{\"index\":0,\"id\":\"call-b\",\"function\":{\"arguments\":\"}\"}}]}}]}\n\n";
+            let mut response = Response::new(Body::from(event));
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            return response;
+        }
+        if payload.get("model").and_then(Value::as_str) == Some("overcharged-completion") {
+            // Content chunk with `"usage": null` (estimate-charged), then an
+            // authoritative usage frame LOWER than the estimate — the
+            // completion-side over-charge shape.
+            let chunks = vec![
+                Ok::<_, std::convert::Infallible>(Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"finish_reason\":\"stop\"}]}\n\n",
+                )),
+                Ok(Bytes::from_static(
+                    b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+                )),
+            ];
+            let mut response = Response::new(Body::from_stream(futures::stream::iter(chunks)));
             response.headers_mut().insert(
                 axum::http::header::CONTENT_TYPE,
                 HeaderValue::from_static("text/event-stream"),
@@ -5711,6 +5780,91 @@ mod tests {
         assert!(
             !state.sessions.get("tool-oob-index").unwrap().capture_failed(),
             "an out-of-range tool-call index must be scoped to the response"
+        );
+        provider.abort();
+    }
+
+    /// A provider that reuses an accumulated (choice, index) tool-call
+    /// slot with a DIFFERENT id previously had its id/name silently
+    /// overwritten and its argument fragments concatenated — merging
+    /// two distinct calls into one synthetic record in the attested
+    /// trajectory. The stream must fail closed instead (mirroring
+    /// `reject_metric_regression`), scoped to the response.
+    #[tokio::test]
+    async fn provider_tool_call_id_conflict_fails_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state(directory.path()).await;
+        let response = build_router(state.clone())
+            .oneshot(chat_request_with_payload(
+                "tool-conflicting-id",
+                json!({
+                    "model": "tool-conflicting-id",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "hello"}]
+                }),
+            ))
+            .await
+            .unwrap();
+        // The conflict lands in the first frame, so the
+        // peek-before-commit path surfaces a clean upstream error.
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .is_ok());
+        assert!(
+            !state
+                .sessions
+                .get("tool-conflicting-id")
+                .unwrap()
+                .capture_failed(),
+            "a conflicting tool-call id must be scoped to the response"
+        );
+        provider.abort();
+    }
+
+    /// Completion-side twin of the prompt over-charge refund: content
+    /// chunks arriving with `"usage": null` debit the ledger from
+    /// per-chunk estimates, and an authoritative final usage LOWER than
+    /// the accumulated estimate previously left the difference debited
+    /// forever — the session's remaining budget shrank by tokens the
+    /// provider never billed. The over-charge must be refunded at
+    /// terminal capture.
+    #[tokio::test]
+    async fn completion_estimate_over_charge_is_refunded_after_authoritative_usage() {
+        let directory = tempfile::tempdir().unwrap();
+        let payload = json!({
+            "model": "overcharged-completion",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        // The 32-`a` content chunk estimates well above the
+        // authoritative completion count of 1.
+        let estimate = av_core::tokens::approx_tokens(&"a".repeat(32));
+        assert!(estimate > 1, "test premise: estimate must exceed usage");
+        let prompt_tokens = av_core::tokens::approx_tokens(&payload.to_string());
+        let cap = prompt_tokens + estimate + 8;
+        let (state, provider) = test_state_with_token_cap(directory.path(), Some(cap)).await;
+        let response = build_router(state.clone())
+            .oneshot(chat_request_with_payload("overcharged-completion", payload))
+            .await
+            .unwrap();
+        assert!(axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .is_ok());
+        let session = state.sessions.get("overcharged-completion").unwrap();
+        session.wait_for_worker_jobs().await;
+        // Authoritative usage: prompt 1 + completion 1. Both refunds
+        // (prompt and completion) must have settled the ledger to a
+        // spend of exactly 2.
+        let ledger =
+            av_state::ActionBudget::new(state.store.as_ref(), "overcharged-completion", &state.config.budget);
+        assert!(
+            ledger.try_tokens(cap - 2).unwrap().is_allowed(),
+            "the completion-estimate over-charge must be refunded once authoritative usage arrives"
+        );
+        assert!(
+            !ledger.try_tokens(1).unwrap().is_allowed(),
+            "refunds must settle to the provider-billed spend, not more"
         );
         provider.abort();
     }
