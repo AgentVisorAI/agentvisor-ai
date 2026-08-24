@@ -620,6 +620,17 @@ mod tests {
         assert_eq!(delta.name.as_deref(), Some("get_weather"));
         assert_eq!(delta.arguments, r#"{"city":"Paris"}"#);
         assert_eq!((delta.choice_index, delta.index), (0, 0));
+        // Explicit `args: null` maps to EMPTY arguments, not the string
+        // "null" (mutation-run hardening, round 10 — the null guard was
+        // unpinned and a literal "null" would corrupt the accumulated
+        // tool-call arguments downstream).
+        let null_args = adapter
+            .parse_sse_chunk(
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"noop\",\"args\":null}}]},\"index\":0}]}",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(null_args.tool_call_deltas[0].arguments, "");
         // A candidates-only frame (no usage, no finish reason) must pass
         // the empty-200 guard on candidates alone — pins the first arm
         // of the has_choices disjunction independently of the other two.
@@ -673,6 +684,36 @@ mod tests {
             "named frames with data are not attributable in the Gemini dialect"
         );
         let _ = adapter.parse_sse_chunk("data: {not json");
+    }
+
+    /// Mutation-run hardening (round 10): the Anthropic SSE edge
+    /// frames were unpinned — bare `data` lines and id:/retry:-only
+    /// frames (all valid SSE) must classify as SSE keepalives, a
+    /// data-only frame (no `event:` line) must parse without the
+    /// name/type agreement check misfiring on the EMPTY event name,
+    /// and an unknown frame type must be refused fail-closed rather
+    /// than silently attributed.
+    #[test]
+    fn anthropic_sse_edge_frames_and_unknown_types() {
+        let adapter = adapter_for("anthropic").unwrap();
+        // Bare dataless `data` line: SSE keepalive, not raw JSON.
+        assert!(adapter.parse_sse_chunk("data").unwrap().is_none());
+        // id:/retry:-only frames: same.
+        assert!(adapter.parse_sse_chunk("id: 7\nretry: 250").unwrap().is_none());
+        // Data-only frame without an `event:` name: the name/type
+        // agreement guard must not fire on the empty name.
+        let parsed = adapter
+            .parse_sse_chunk(
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.message, "hi");
+        // Unknown frame types are refused, never silently attributed.
+        let error = adapter
+            .parse_sse_chunk("event: hax\ndata: {\"type\":\"hax\"}")
+            .unwrap_err();
+        assert!(error.contains("unsupported Anthropic type"), "{error}");
     }
 
     /// The full Anthropic streaming dialect maps into the

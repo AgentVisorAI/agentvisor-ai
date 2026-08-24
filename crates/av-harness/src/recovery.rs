@@ -593,6 +593,51 @@ mod tests {
         assert!(!orphan.exists(), "the orphan must be renamed out of the scan");
     }
 
+    /// Mutation-run hardening (round 10): the incomplete-effects pass
+    /// counts only NEWLY quarantined sessions — the dedupe filter and
+    /// the count itself had surviving mutants because no test planted
+    /// a real inflight marker. First tick: one new quarantine.
+    /// Second tick over the same marker: zero new (the marker stays on
+    /// disk as evidence; without the dedupe every tick re-counts and
+    /// re-warns the same crash forever).
+    #[tokio::test]
+    async fn incomplete_effects_pass_counts_only_new_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let parts = CtxParts::new();
+        let marker_dir = directory.path().join(crate::spool::INFLIGHT_RESPONSES);
+        std::fs::create_dir_all(&marker_dir).unwrap();
+        let sealed = crate::journal::seal(
+            &parts.journal_key,
+            "in-flight-response",
+            0,
+            &serde_json::json!({
+                "session_id": "ghost-effects",
+                "attempt_id": "attempt-1",
+                "request_digest": "d",
+            }),
+        )
+        .unwrap();
+        let digest = av_core::digest::sha256_hex(b"ghost-effects:attempt-1");
+        std::fs::write(
+            marker_dir.join(format!("{}.json", &digest[..32])),
+            &sealed,
+        )
+        .unwrap();
+
+        let warn_once = |_: PathBuf| true;
+        let ctx = parts.context(directory.path(), &warn_once);
+        let first = QuarantineIncompleteEffectsPass.run(&ctx).await.unwrap();
+        assert_eq!(first.quarantined, 1, "one NEW session on the first tick");
+        assert!(parts.quarantined_sessions.lock().contains("ghost-effects"));
+
+        let ctx = parts.context(directory.path(), &warn_once);
+        let second = QuarantineIncompleteEffectsPass.run(&ctx).await.unwrap();
+        assert_eq!(
+            second.quarantined, 0,
+            "the same marker must not re-count on subsequent ticks"
+        );
+    }
+
     /// A missing spool directory is a clean no-op, not an error —
     /// recovery runs before the first session may have spooled.
     #[tokio::test]
