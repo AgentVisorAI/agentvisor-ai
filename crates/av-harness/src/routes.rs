@@ -4188,6 +4188,128 @@ mod tests {
         chat_request_with_payload(session, chat_payload())
     }
 
+    /// Pins the upstream Authorization wire contract per posture — the
+    /// README/doctor headline claim "the key is injected server-side".
+    /// Verified first against the real binary with a header-capturing
+    /// upstream (register item 17, pass 15); this test keeps the three
+    /// postures pinned in-tree:
+    ///   * keyless + ignore_client_authorization: the client's
+    ///     placeholder bearer is DISCARDED (no Authorization upstream);
+    ///   * static key file: upstream sees the SERVER key, never the
+    ///     client's junk;
+    ///   * passthrough: the client's own bearer travels verbatim.
+    /// The allowlist relay (openai-beta) and non-allowlisted header
+    /// blocking (x-custom-header) ride along in every posture.
+    #[tokio::test]
+    async fn upstream_authorization_contract_by_posture() {
+        type Captured = Arc<parking_lot::Mutex<Vec<(Option<String>, Option<String>, Option<String>)>>>;
+        for posture in ["keyless_ignore", "static_key_file", "passthrough"] {
+            let directory = tempfile::tempdir().unwrap();
+            let captured: Captured = Arc::default();
+            let sink = Arc::clone(&captured);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let provider = Router::new().route(
+                "/v1/chat/completions",
+                post(
+                    move |headers: axum::http::HeaderMap, Json(payload): Json<Value>| {
+                        let sink = Arc::clone(&sink);
+                        async move {
+                            let get = |name: &str| {
+                                headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_owned)
+                            };
+                            sink.lock().push((
+                                get("authorization"),
+                                get("openai-beta"),
+                                get("x-custom-header"),
+                            ));
+                            mock_chat(Json(payload)).await
+                        }
+                    },
+                ),
+            );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, provider).await.unwrap();
+            });
+            let spool = directory.path().to_string_lossy().into_owned();
+            let mut config =
+                crate::config::HarnessConfig::for_tests(&format!("http://{address}"), &spool, &spool);
+            match posture {
+                "keyless_ignore" => config.ignore_client_authorization = true,
+                "static_key_file" => {
+                    let key_path = directory.path().join("upstream.key");
+                    std::fs::write(&key_path, "sk-SERVER-SECRET").unwrap();
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        std::fs::set_permissions(
+                            &key_path,
+                            std::fs::Permissions::from_mode(0o600),
+                        )
+                        .unwrap();
+                    }
+                    config.upstream_api_key_file = Some(key_path.to_string_lossy().into_owned());
+                }
+                "passthrough" => config.upstream_authorization_passthrough = true,
+                _ => unreachable!(),
+            }
+            let state = AppState::new(
+                config,
+                Arc::new(InMemoryStore::new()),
+                Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
+                Arc::new(NullBus),
+                None,
+                Arc::new(Ed25519Signer::from_seed(&[11; 32])),
+            )
+            .unwrap();
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header("authorization", "Bearer sk-CLIENT-JUNK")
+                .header("openai-beta", "assistants=v2")
+                .header("x-custom-header", "evil")
+                .header("x-av-session", format!("auth-{posture}"))
+                .header("x-av-workflow", "unsigned")
+                .body(Body::from(serde_json::to_vec(&chat_payload()).unwrap()))
+                .unwrap();
+            let response = build_router(state).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "posture {posture} must serve");
+            axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let seen = captured.lock().clone();
+            let (auth, beta, custom) = seen.first().cloned().unwrap_or_else(|| {
+                panic!("posture {posture}: upstream never saw the request")
+            });
+            match posture {
+                "keyless_ignore" => assert_eq!(
+                    auth, None,
+                    "keyless posture must DISCARD the client placeholder bearer"
+                ),
+                "static_key_file" => assert_eq!(
+                    auth.as_deref(),
+                    Some("Bearer sk-SERVER-SECRET"),
+                    "static-key posture must inject the server key, never the client's"
+                ),
+                "passthrough" => assert_eq!(
+                    auth.as_deref(),
+                    Some("Bearer sk-CLIENT-JUNK"),
+                    "passthrough posture must forward the client bearer verbatim"
+                ),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                beta.as_deref(),
+                Some("assistants=v2"),
+                "posture {posture}: allowlisted provider header must relay"
+            );
+            assert_eq!(
+                custom, None,
+                "posture {posture}: non-allowlisted client headers must never reach the upstream"
+            );
+            server.abort();
+        }
+    }
+
     /// Live-stress finding: deterministic fail-closed lifecycle
     /// refusals (quarantined capture, unfulfillable promotion) used to
     /// surface as HTTP 500 — SDKs retried them pointlessly and 5xx-rate
