@@ -133,7 +133,7 @@ cargo install --path crates/av-cli       # installs `avctl`
 | `litellm` | 127.0.0.1:4000 | `LITELLM_MASTER_KEY` |
 | `custom` | `--upstream-url ...` | `--key-env NAME` |
 
-`avctl doctor` diagnoses the environment (config resolution, key presence, upstream reachability, data dirs, backends) without printing secrets. `avctl health` probes a running instance. `avctl start` launches the server for you (logs to `~/.agentvisor/agentvisor-ai.log`) and waits until it answers.
+`avctl doctor` diagnoses the environment (config resolution, key presence, upstream reachability, data dirs, backends, budget posture) without printing secrets. `avctl health` probes a running instance. `avctl start` launches the server for you (logs to `~/.agentvisor/agentvisor-ai.log`) and waits until it answers.
 
 ### Configuration resolution
 

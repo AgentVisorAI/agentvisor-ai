@@ -551,3 +551,76 @@ fn avctl_binary_exists_and_is_executable() {
         );
     }
 }
+
+/// `avctl doctor` must flag the silent-unbounded budget posture. Every
+/// budget dimension is optional, so a config with no `[budget]` block
+/// parses cleanly and enforces NOTHING — unlimited tokens, payout, and
+/// tool calls. Doctor's whole purpose is catching exactly this class of
+/// quiet misposture (it already warns on unsigned workflow, non-loopback
+/// listen, and dashboard exposure); before this check an operator with a
+/// hand-written or pre-`avctl init` config got "all checks passed" while
+/// running with zero binding limits.
+#[test]
+fn doctor_warns_on_missing_budget_and_passes_on_binding_budget() {
+    let base = r#"config_version = 1
+listen = "127.0.0.1:0"
+upstream_url = "http://127.0.0.1:9"
+require_identity = false
+default_workflow = "signed"
+dashboard_enabled = false
+atif_spool_dir = "spool/atif"
+bridge_data_dir = "data/bridge"
+state_backend = "memory"
+embedder_backend = "hash"
+vector_backend = "memory"
+"#;
+    let doctor_in = |config: &str| -> (Output, String) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("agentvisor.toml"), config).unwrap();
+        let out = Command::new(BIN)
+            .args(["doctor", "--offline"])
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn avctl doctor");
+        let text = stdout(&out) + &stderr(&out);
+        (out, text)
+    };
+
+    // No [budget] block: doctor must WARN, naming the consequence.
+    let (out, text) = doctor_in(base);
+    assert!(
+        out.status.success(),
+        "doctor --offline must exit 0 on a valid config: {text}"
+    );
+    assert!(
+        text.contains("warn") && text.contains("UNLIMITED") && text.contains("[budget]"),
+        "doctor must warn that no budget limit binds: {text}"
+    );
+
+    // Empty [budget] block: parses, still binds nothing — same warn.
+    let (_, text) = doctor_in(&format!("{base}\n[budget]\n"));
+    assert!(
+        text.contains("UNLIMITED"),
+        "an empty [budget] block binds nothing and must still warn: {text}"
+    );
+
+    // Binding budget: pass line, no unbounded warn.
+    let (_, text) = doctor_in(&format!("{base}\n[budget]\nmax_tokens = 1000\n"));
+    assert!(
+        text.contains("budget: at least one binding limit"),
+        "a binding budget must be reported as a pass: {text}"
+    );
+    assert!(
+        !text.contains("UNLIMITED"),
+        "no unbounded warn when a limit binds: {text}"
+    );
+
+    // Present-but-empty [principal_budget] enforces nothing — warn.
+    let (_, text) = doctor_in(&format!(
+        "{base}\nallow_anonymous_principal_budget = true\n\n[budget]\nmax_tokens = 1000\n\n[principal_budget]\n"
+    ));
+    assert!(
+        text.contains("principal_budget") && text.contains("enforces nothing"),
+        "an empty principal_budget block must warn: {text}"
+    );
+}
