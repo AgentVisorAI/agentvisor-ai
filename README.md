@@ -35,7 +35,7 @@ client = OpenAI(
   to deploy safely. Report vulnerabilities privately via the
   [advisory form](https://github.com/AgentVisorAI/agentvisor-ai/security/advisories/new).
 - **[Architecture](ARCHITECTURE.md)** · **[Benchmarks](BENCHMARKS.md)** ·
-  **[Verification protocol](VERIFICATION.md)** — going deeper.
+  **[Conformance status](CONFORMANCE-STATUS.md)** — going deeper.
 - **[Reference docs](docs/reference/)** — configuration, operations,
   OpenAI compatibility, limits, and offline receipt verification.
 - **[API docs](https://agentvisorai.github.io/agentvisor-ai/api/)** — Rust crate

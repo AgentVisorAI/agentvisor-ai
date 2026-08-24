@@ -28,7 +28,7 @@ Other repo-root docs:
 * `ARCHITECTURE.md` — high-level structure of the workspace.
 * `SECURITY.md` — vulnerability disclosure.
 * `SECURITY-AUDIT.md` — deferred security posture notes.
-* `VERIFICATION.md` — the compliance / MVP verdict record.
+* [`CONFORMANCE-STATUS.md`](../../CONFORMANCE-STATUS.md) — the compliance / MVP verdict record.
 * `BENCHMARKS.md` — SLA measurements against 10k connections.
 * `CHANGELOG.md` — release history.
 * `EVOLUTION.md` — design decisions and their rationale.

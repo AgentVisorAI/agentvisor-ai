@@ -5,7 +5,7 @@ replication_factor: 1
 # the same disk/PVC as the hot segments, so this "cold tier" only moves
 # bytes sideways. For a real off-box archive point it at an
 # S3-compatible object store (s3://bucket/prefix with AWS_* env
-# credentials; see AV_COLD_S3_URL contract in VERIFICATION.md) or a
+# credentials; see AV_COLD_S3_URL contract in CONFORMANCE-STATUS.md) or a
 # separately-mounted volume. Topics with NO cold_uri delete records
 # past hot_hours outright — the daemon warns at boot.
 topics:

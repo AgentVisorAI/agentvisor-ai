@@ -62,7 +62,7 @@ release-profile SLA and container builds to conserve CI minutes).
 - Architecture and threat model: [`ARCHITECTURE.md`](ARCHITECTURE.md),
   [`SECURITY.md`](SECURITY.md), [`SECURITY-AUDIT.md`](SECURITY-AUDIT.md).
 - Benchmarks and SLAs: [`BENCHMARKS.md`](BENCHMARKS.md).
-- Public verification protocol: [`VERIFICATION.md`](VERIFICATION.md).
+- Conformance / MVP verdict record: [`CONFORMANCE-STATUS.md`](CONFORMANCE-STATUS.md).
 - Design evolution and decisions: [`EVOLUTION.md`](EVOLUTION.md).
 
 ## Licensing
