@@ -499,7 +499,12 @@ mod tests {
         let store = InMemoryStore::new();
         let raw = br#"{"jsonrpc":"2.0","id":42,"method":"initialize","params":{}}"#;
         match sandbox().check(&store, "s", raw) {
-            ToolVerdict::Blocked { response, stage, reason, .. } => {
+            ToolVerdict::Blocked {
+                response,
+                stage,
+                reason,
+                ..
+            } => {
                 assert_eq!(response["id"], json!(42), "{response}");
                 // Mutation-run hardening (round 8): the passthrough
                 // stage label was unpinned — deleting the NotToolCall

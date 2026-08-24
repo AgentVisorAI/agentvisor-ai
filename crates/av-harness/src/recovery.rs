@@ -618,11 +618,7 @@ mod tests {
         )
         .unwrap();
         let digest = av_core::digest::sha256_hex(b"ghost-effects:attempt-1");
-        std::fs::write(
-            marker_dir.join(format!("{}.json", &digest[..32])),
-            &sealed,
-        )
-        .unwrap();
+        std::fs::write(marker_dir.join(format!("{}.json", &digest[..32])), &sealed).unwrap();
 
         let warn_once = |_: PathBuf| true;
         let ctx = parts.context(directory.path(), &warn_once);

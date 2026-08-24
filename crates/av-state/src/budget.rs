@@ -566,9 +566,21 @@ mod tests {
     #[test]
     fn binds_anything_is_false_only_for_the_all_default_spec() {
         assert!(!BudgetSpec::default().binds_anything());
-        assert!(BudgetSpec { max_tokens: Some(1), ..Default::default() }.binds_anything());
-        assert!(BudgetSpec { max_payout_usd_micros: Some(1), ..Default::default() }.binds_anything());
-        assert!(BudgetSpec { max_total_tool_calls: Some(1), ..Default::default() }.binds_anything());
+        assert!(BudgetSpec {
+            max_tokens: Some(1),
+            ..Default::default()
+        }
+        .binds_anything());
+        assert!(BudgetSpec {
+            max_payout_usd_micros: Some(1),
+            ..Default::default()
+        }
+        .binds_anything());
+        assert!(BudgetSpec {
+            max_total_tool_calls: Some(1),
+            ..Default::default()
+        }
+        .binds_anything());
         let mut per_tool = BudgetSpec::default();
         per_tool.max_tool_calls.insert("db_write".to_owned(), 1);
         assert!(per_tool.binds_anything());

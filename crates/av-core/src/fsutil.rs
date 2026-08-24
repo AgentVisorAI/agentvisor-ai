@@ -583,8 +583,7 @@ mod read_capped_tests {
         let root = dir.path().join("locked");
         std::fs::create_dir(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let denied = std::fs::metadata(root.join("probe")).is_err()
-            && std::fs::read_dir(&root).is_err();
+        let denied = std::fs::metadata(root.join("probe")).is_err() && std::fs::read_dir(&root).is_err();
         if denied {
             // metadata(root) itself succeeds (the parent is traversable);
             // the sweep must not mask the unreadable directory as Ok —

@@ -1760,15 +1760,12 @@ async fn probe_endpoint_any(endpoint: &str) -> Result<()> {
                     // runtime's connect will get ECONNREFUSED. Probe
                     // with a real connect, same 3 s bound as the TCP
                     // probe.
-                    tokio::time::timeout(
-                        Duration::from_secs(3),
-                        tokio::net::UnixStream::connect(path),
-                    )
-                    .await
-                    .map_err(|_| anyhow::anyhow!("unix socket {path}: connect timeout"))?
-                    .map_err(|error| {
-                        anyhow::anyhow!("unix socket {path}: exists but refuses connections ({error})")
-                    })?;
+                    tokio::time::timeout(Duration::from_secs(3), tokio::net::UnixStream::connect(path))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("unix socket {path}: connect timeout"))?
+                        .map_err(|error| {
+                            anyhow::anyhow!("unix socket {path}: exists but refuses connections ({error})")
+                        })?;
                 }
                 #[cfg(not(unix))]
                 let _ = metadata;
@@ -2102,9 +2099,7 @@ mod tests {
     #[tokio::test]
     async fn health_output_never_carries_url_credentials() {
         // Port 1 is never listening: deterministic connect failure.
-        let error = health("http://alice:hunter2@127.0.0.1:1")
-            .await
-            .unwrap_err();
+        let error = health("http://alice:hunter2@127.0.0.1:1").await.unwrap_err();
         let message = format!("{error:#}");
         assert!(
             !message.contains("hunter2") && !message.contains("alice:"),
@@ -2140,8 +2135,7 @@ mod tests {
                     let Ok(n) = socket.read(&mut buf).await else {
                         return;
                     };
-                    let request =
-                        String::from_utf8_lossy(buf.get(..n).unwrap_or_default()).into_owned();
+                    let request = String::from_utf8_lossy(buf.get(..n).unwrap_or_default()).into_owned();
                     let path = request.split_whitespace().nth(1).unwrap_or("");
                     let response = if matches!(path, "/readyz" | "/livez" | "/health") {
                         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok"
@@ -2175,9 +2169,7 @@ mod tests {
 
         // Live listener: probe passes.
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
-        probe_endpoint_any(&endpoint)
-            .await
-            .unwrap();
+        probe_endpoint_any(&endpoint).await.unwrap();
 
         // Dead listener, socket file left behind: probe must fail.
         drop(listener);
@@ -2185,13 +2177,8 @@ mod tests {
             path.exists(),
             "test premise: the socket file survives the listener"
         );
-        let error = probe_endpoint_any(&endpoint)
-            .await
-            .unwrap_err();
-        assert!(
-            format!("{error:#}").contains("refuses connections"),
-            "{error:#}"
-        );
+        let error = probe_endpoint_any(&endpoint).await.unwrap_err();
+        assert!(format!("{error:#}").contains("refuses connections"), "{error:#}");
     }
 
     /// The piped-stdin (Plain) secret-reading path uses

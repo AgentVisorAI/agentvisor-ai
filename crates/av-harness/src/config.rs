@@ -2153,7 +2153,10 @@ mod tests {
         );
         assert_eq!(config.default_workflow, "signed");
         for (name, raw) in [
-            ("container", include_str!("../../../config/harness.container.toml")),
+            (
+                "container",
+                include_str!("../../../config/harness.container.toml"),
+            ),
             ("docker", include_str!("../../../config/harness.docker.toml")),
         ] {
             let config = HarnessConfig::from_toml(raw)
