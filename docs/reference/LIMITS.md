@@ -114,9 +114,9 @@ tests exercised.
 | Verification | `verify_strict` — refuses low/mixed-order keys and non-canonical `s` scalars |
 | Weak-seed refusal | `[0u8;32]` and `[0xffu8;32]` refused at seed load AND at `Keyring::add_key_bytes` (round 51 §3.1 H1) |
 | Canonicalization | RFC 8785 JCS |
-| Hash for `key_id` | Blake3, 128-bit truncation (16 bytes → 32 hex chars) |
+| Hash for `key_id` | SHA-256, 128-bit truncation (first 32 hex chars) |
 | Hash for spool stems | SHA-256, 128-bit truncation (16 bytes → 32 hex chars) |
-| Hash for content dedup during compression | Blake3, 64-bit truncation (`HashSet<u64>` keys) |
+| Hash for content dedup during compression | `std::hash::DefaultHasher` (SipHash, unkeyed), 64-bit (`HashMap<u64, _>` keys) |
 
 ## Recovery guarantees
 

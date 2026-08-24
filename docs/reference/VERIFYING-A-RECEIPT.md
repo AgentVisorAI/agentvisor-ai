@@ -104,7 +104,8 @@ Check at least:
   (see `av_events::StopReason`)
 * `subject.identity.charter` is the charter you intended
 * the receipt's `key_id` (top level) matches the trusted key's
-  `key_id` (Blake3-based fingerprint of the raw 32-byte public key)
+  `key_id` (the first 32 hex characters of the SHA-256 digest of the
+  raw 32-byte public key)
 
 Any mismatch is a hard failure — the signature verified the
 attackers' subject, not yours.
