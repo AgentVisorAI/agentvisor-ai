@@ -499,15 +499,23 @@ mod tests {
         let store = InMemoryStore::new();
         let raw = br#"{"jsonrpc":"2.0","id":42,"method":"initialize","params":{}}"#;
         match sandbox().check(&store, "s", raw) {
-            ToolVerdict::Blocked { response, .. } => {
+            ToolVerdict::Blocked { response, stage, reason, .. } => {
                 assert_eq!(response["id"], json!(42), "{response}");
+                // Mutation-run hardening (round 8): the passthrough
+                // stage label was unpinned — deleting the NotToolCall
+                // match arm reclassified passthrough refusals as
+                // "parse" failures, corrupting the stage-keyed metrics
+                // and events operators alert on.
+                assert_eq!(stage, "passthrough");
+                assert!(reason.contains("passthrough refused"), "{reason}");
             }
             other => panic!("{other:?}"),
         }
         // Unparseable JSON: the id is undetectable — null stands.
         match sandbox().check(&store, "s", b"not json") {
-            ToolVerdict::Blocked { response, .. } => {
+            ToolVerdict::Blocked { response, stage, .. } => {
                 assert_eq!(response["id"], serde_json::Value::Null, "{response}");
+                assert_eq!(stage, "parse");
             }
             other => panic!("{other:?}"),
         }

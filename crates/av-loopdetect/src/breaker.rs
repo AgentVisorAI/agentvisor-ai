@@ -329,6 +329,66 @@ mod tests {
         );
     }
 
+    /// Mutation-run hardening (round 8): the streak comparison is
+    /// STRICT (`delta < delta_epsilon`) — a step whose delta lands
+    /// exactly ON the threshold counts as progress, not suspicion. A
+    /// surviving `<`→`<=` mutant showed the boundary unpinned. Driven
+    /// through the distributed-similarity path so the delta is an
+    /// exactly-representable float (1.0 − 0.5).
+    #[test]
+    fn delta_exactly_at_epsilon_counts_as_progress() {
+        let s = SessionLoopState::new(BreakerConfig {
+            delta_epsilon: 0.5,
+            ..cfg()
+        });
+        let e = HashEmbedder::default();
+        let embedding = e.embed("first step establishing history");
+        // First observation: empty history, adjacent delta 1.0; the
+        // sink-supplied similarity 0.5 gives delta exactly 0.5 == ε.
+        let v = s.observe_embedding_with_similarity(embedding, 100, Some(0.5));
+        assert!(
+            matches!(v, BreakerVerdict::Progressing { .. }),
+            "delta == ε must not grow the streak (strict <): {v:?}"
+        );
+    }
+
+    /// Mutation-run hardening (round 8): the alternation window holds
+    /// EXACTLY `RECENT_EMBEDDING_WINDOW` (8) embeddings — surviving
+    /// `>`/`>=`/`==` mutants on the pop condition showed the size
+    /// unpinned in both directions. With one-hot embeddings: after
+    /// nine observations the window holds #2..=#9, so a repeat of #2
+    /// scores delta 0 (suspicious) while a repeat of #1 scores delta
+    /// 1.0 (evicted — progressing).
+    #[test]
+    fn alternation_window_holds_exactly_eight_embeddings() {
+        let one_hot = |i: usize| {
+            let mut v = vec![0.0f32; 16];
+            if let Some(slot) = v.get_mut(i) {
+                *slot = 1.0;
+            }
+            v
+        };
+        // Window edge: after 9 pushes, #1 (index 0) is evicted, #2 kept.
+        let s = SessionLoopState::new(cfg());
+        for i in 0..9 {
+            s.observe_embedding(one_hot(i), 10);
+        }
+        let v = s.observe_embedding(one_hot(1), 10);
+        assert!(
+            matches!(v, BreakerVerdict::Suspicious { .. }),
+            "#2 must still be in the 8-slot window after 9 observations: {v:?}"
+        );
+        let s = SessionLoopState::new(cfg());
+        for i in 0..9 {
+            s.observe_embedding(one_hot(i), 10);
+        }
+        let v = s.observe_embedding(one_hot(0), 10);
+        assert!(
+            matches!(v, BreakerVerdict::Progressing { .. }),
+            "#1 must have been evicted from the 8-slot window: {v:?}"
+        );
+    }
+
     #[test]
     fn token_gate_defers_tripping() {
         let s = SessionLoopState::new(cfg());
