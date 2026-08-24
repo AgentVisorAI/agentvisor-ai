@@ -138,6 +138,8 @@ dependencies = [
 name = "av-fuzz"
 version = "0.0.0"
 dependencies = [
+ "av-compress",
+ "av-core",
  "av-harness",
  "av-receipts",
  "av-sandbox",

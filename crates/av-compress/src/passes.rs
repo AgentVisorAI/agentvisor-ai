@@ -610,6 +610,185 @@ mod tests {
         json!({"model": "gpt-4o", "messages": messages, "stream": true})
     }
 
+    /// Mutation-run hardening (round 7): `collapse_duplicate_system`'s
+    /// role-AND-equality conjunction — an `&&`→`||` mutant survived,
+    /// i.e. no test pinned that a DIFFERENT second system message is
+    /// never stubbed. Stubbing a distinct system message destroys
+    /// instructions the model was meant to see: the exact
+    /// "semantically destructive" class the pass documentation forbids.
+    #[test]
+    fn distinct_system_messages_are_never_stubbed() {
+        let first = "you are a careful assistant ".repeat(40);
+        let second = "different critical instructions entirely ".repeat(40);
+        let mut messages = vec![
+            json!({"role": "system", "content": first}),
+            json!({"role": "system", "content": second}),
+        ];
+        for _ in 0..9 {
+            messages.push(json!({"role": "assistant", "content": "tail ".repeat(50)}));
+        }
+        let out = compress(&payload(messages), &engage_all());
+        let out_messages = out.payload["messages"].as_array().unwrap();
+        assert_eq!(
+            out_messages[1]["content"].as_str().unwrap(),
+            second,
+            "a distinct system message must survive verbatim"
+        );
+    }
+
+    /// Mutation-run hardening (round 7): duplicate USER messages must
+    /// collapse (the `role != \"user\"` guard had a surviving `!=`→`==`
+    /// mutant — the only duplicate-collapse coverage used assistant
+    /// shapes).
+    #[test]
+    fn duplicate_user_messages_collapse_to_a_stub() {
+        let text = "please retry the same command again ".repeat(40);
+        let reply = "acknowledged, retrying the command now ".repeat(40);
+        let mut messages = vec![
+            json!({"role": "user", "content": text}),
+            json!({"role": "user", "content": text}),
+            json!({"role": "assistant", "content": reply}),
+            json!({"role": "assistant", "content": reply}),
+        ];
+        for _ in 0..9 {
+            messages.push(json!({"role": "assistant", "content": "tail ".repeat(50)}));
+        }
+        let out = compress(&payload(messages), &engage_all());
+        let out_messages = out.payload["messages"].as_array().unwrap();
+        assert_eq!(out_messages[0]["content"].as_str().unwrap(), text);
+        assert!(
+            out_messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("[pruned:"),
+            "the duplicate user message must be stubbed"
+        );
+        // The assistant arm of the role filter must collapse too (its
+        // half of the `!=` conjunction had a surviving mutant).
+        assert_eq!(out_messages[2]["content"].as_str().unwrap(), reply);
+        assert!(
+            out_messages[3]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("[pruned:"),
+            "the duplicate assistant message must be stubbed"
+        );
+    }
+
+    /// Mutation-run hardening (round 7): the escape-handling arms of
+    /// `lex_json` had surviving mutants — no test lexed content whose
+    /// strings carry `\"` escapes. The guard must count keys and
+    /// numeric literals correctly through escaped quotes, or dup-key
+    /// content could minify (semantic destruction) and bigint tokens
+    /// could silently mutate.
+    #[test]
+    fn lex_json_handles_escaped_quotes() {
+        // The escaped quote must not terminate the string: the `:9`
+        // inside is string content, not a numeric literal, and the
+        // whole thing is ONE key.
+        let (numbers, keys) = lex_json(r#"{"a\":9":1}"#);
+        assert_eq!(numbers, vec!["1".to_owned()]);
+        assert_eq!(keys, 1);
+        // Structurally rich exact-tuple pin: multiple keys, an escaped
+        // quote inside a key, numbers in values and arrays, and a
+        // digit+colon INSIDE string content — any index-arithmetic slip
+        // in the lexer shifts this tuple.
+        let (numbers, keys) = lex_json(r#"{"x":12,"y\":":3.5e2,"n:1":"t","z":[7,-8]}"#);
+        assert_eq!(
+            numbers,
+            vec!["12".to_owned(), "3.5e2".to_owned(), "7".to_owned(), "-8".to_owned()]
+        );
+        assert_eq!(keys, 4);
+        // Escape NOT adjacent to a quote (`\n` inside a key whose
+        // content carries `:7`): index-arithmetic slips in the escape
+        // arm re-lex this into phantom numeric literals.
+        let (numbers, keys) = lex_json(r#"{"a\nb:7":1}"#);
+        assert_eq!(numbers, vec!["1".to_owned()]);
+        assert_eq!(keys, 1);
+        // Whitespace between the closing quote and the colon exercises
+        // the lookahead scan; a slip there miscounts keys and turns
+        // every spaced object into a phantom duplicate-key verdict.
+        assert!(!has_duplicate_keys(r#"{"k" : 1, "j" : 2}"#));
+        let (_, keys) = lex_json(r#"{"k" : 1, "j" : 2}"#);
+        assert_eq!(keys, 2);
+        // Duplicate keys that contain escaped quotes must still be
+        // detected (and therefore left unminified end-to-end).
+        assert!(has_duplicate_keys(r#"{"k\"":1, "k\"":2}"#));
+        assert!(!has_duplicate_keys(r#"{"k\"":1, "j\"":2}"#));
+        let dup = r#"{"k\"": 1,  "k\"": 2,  "pad": "padding padding padding"}"#;
+        let mut messages = vec![
+            json!({"role": "assistant", "content": dup}),
+            json!({"role": "user", "content": "tail"}),
+        ];
+        assert!(
+            !normalize_json_content(&mut messages, 1),
+            "escaped-quote duplicate keys must be left verbatim"
+        );
+    }
+
+    /// Mutation-run hardening (round 7): a payload whose token count
+    /// is EXACTLY `min_tokens_to_engage` engages (`<` skip, not `<=` —
+    /// a surviving boundary mutant showed the threshold unpinned).
+    #[test]
+    fn payload_exactly_at_engage_threshold_engages() {
+        let text = "identical duplicate content here ".repeat(40);
+        let mut messages = vec![
+            json!({"role": "user", "content": text}),
+            json!({"role": "user", "content": text}),
+        ];
+        for _ in 0..9 {
+            messages.push(json!({"role": "assistant", "content": "tail ".repeat(50)}));
+        }
+        let value = payload(messages);
+        let exact = av_core::tokens::approx_tokens(&value.to_string());
+        let cfg = CompressionConfig {
+            min_tokens_to_engage: exact,
+            ..CompressionConfig::default()
+        };
+        let out = compress(&value, &cfg);
+        assert!(
+            out.changed,
+            "a payload exactly at the engage threshold must be compressed"
+        );
+    }
+
+    /// Mutation-run hardening (round 7): the middle-stub TARGET
+    /// arithmetic (`before * (1000 - millis) / 1000`) had a surviving
+    /// `/`→`%` mutant — nothing pinned that the pass stops at the
+    /// configured reduction instead of stubbing every eligible middle
+    /// message to the floor.
+    #[test]
+    fn middle_stubbing_stops_at_the_configured_target() {
+        // 40 distinct ~1400-token user messages (~56k tokens total,
+        // past the 50k middle-stub engage floor) + tail: the default
+        // 300‰ target needs only a fraction of them stubbed.
+        let mut messages = Vec::new();
+        for i in 0..40 {
+            messages.push(json!({
+                "role": "user",
+                "content": format!("distinct message number {i} {}", "filler ".repeat(700)),
+            }));
+        }
+        for _ in 0..9 {
+            messages.push(json!({"role": "assistant", "content": "tail"}));
+        }
+        let out = compress(&payload(messages), &engage_all());
+        let out_messages = out.payload["messages"].as_array().unwrap();
+        let stubbed = out_messages
+            .iter()
+            .filter(|m| {
+                m["content"]
+                    .as_str()
+                    .is_some_and(|content| content.starts_with("[pruned:"))
+            })
+            .count();
+        assert!(stubbed > 0, "the target requires SOME middle stubbing");
+        assert!(
+            stubbed < 40,
+            "stubbing must stop at the 300 per-mille target, not raze the whole middle ({stubbed}/40 stubbed)"
+        );
+    }
+
     #[test]
     fn non_chat_payload_untouched() {
         let v = json!({"not_messages": [1, 2, 3]});
