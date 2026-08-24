@@ -84,7 +84,7 @@
               "prompt_tokens": { "type": "integer", "minimum": 0 },
               "completion_tokens": { "type": "integer", "minimum": 0 },
               "cached_tokens": { "type": "integer", "minimum": 0 },
-              "cost_usd": { "type": "number", "minimum": 0 },
+              "cost_usd": { "type": "number", "minimum": 0, "maximum": 1e12 },
               "logprobs": {
                 "type": "array",
                 "items": { "type": "number" }
@@ -114,13 +114,13 @@
         "total_prompt_tokens": { "type": "integer", "minimum": 0 },
         "total_completion_tokens": { "type": "integer", "minimum": 0 },
         "total_cached_tokens": { "type": "integer", "minimum": 0 },
-        "total_cost_usd": { "type": "number", "minimum": 0 },
+        "total_cost_usd": { "type": "number", "minimum": 0, "maximum": 1e12 },
         "total_steps": { "type": "integer", "minimum": 0 },
         "extra": { "type": "object" }
       }
     },
     "continued_trajectory_ref": { "type": "string" },
-    "subagent_trajectories": { "type": "array", "items": { "$ref": "#" } },
+    "subagent_trajectories": { "type": "array", "items": { "allOf": [{ "$ref": "#" }, { "required": ["trajectory_id"] }] } },
     "extra": {}
   }
 }

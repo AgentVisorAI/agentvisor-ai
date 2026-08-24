@@ -40,6 +40,12 @@ data:
     # Dev posture. In production configure identity_jwks_url and set
     # require_identity = true.
     require_identity = false
+    # The operator dashboard is UNAUTHENTICATED (see SECURITY.md) and
+    # this pod listens on 0.0.0.0 for the whole cluster network — any
+    # workload that can reach the Service could enumerate sessions,
+    # costs, and receipts. Off in the starter; enable only behind an
+    # authenticating ingress (same posture as harness.example.toml).
+    dashboard_enabled = false
     # Required alongside require_identity = false + the 0.0.0.0 bind:
     # config validation refuses that combination without this explicit
     # opt-in (the daemon would CrashLoopBackOff at startup). Safe here
@@ -144,6 +150,17 @@ spec:
               install -m 0600 -o 65532 -g 65532 \
                 /var/run/agentvisor-ai/signing-seed-source/signing.seed \
                 /etc/agentvisor-ai/signing.seed
+              # The spool is mounted via `subPath: spool` below. When
+              # the subdirectory is missing (first boot on a fresh
+              # PVC), the kubelet creates it as root:root — fsGroup is
+              # applied to the volume BEFORE subPath directories are
+              # materialized (kubernetes#66803), so the harness (uid
+              # 65532, no CAP_DAC_OVERRIDE) cannot create
+              # /app/spool/atif and boot fails. Pre-create + chown it
+              # here; idempotent on every subsequent boot and repairs
+              # PVCs that already carry a root-owned spool dir.
+              mkdir -p /var/run/agentvisor-ai/data/spool
+              chown 65532:65532 /var/run/agentvisor-ai/data/spool
           securityContext:
             runAsUser: 0
             runAsNonRoot: false
@@ -168,6 +185,8 @@ spec:
               readOnly: true
             - name: signing-seed
               mountPath: /etc/agentvisor-ai
+            - name: data
+              mountPath: /var/run/agentvisor-ai/data
       containers:
         - name: agentvisor-ai
           image: agentvisor-ai:local # replace with your registry image
