@@ -36,7 +36,7 @@ Three routes with distinct semantics:
 | --- | --- | --- |
 | `/health` | Legacy composite: 200 while all subsystems are healthy. | Do **not** wire new probes at this; it flaps as subsystems briefly hiccup. |
 | `/livez` | Kubernetes-style liveness. Returns 200 constant. | Only fails when the axum runtime is dead; use as `livenessProbe`. |
-| `/readyz` | Kubernetes-style readiness. 200 while accepting new traffic; 503 during drain. | Fails immediately when SIGTERM is received AND while the spool dir is unreadable. Use as `readinessProbe`. |
+| `/readyz` | Kubernetes-style readiness. 200 while accepting new traffic; 503 during drain. | Fails immediately when SIGTERM is received AND while the spool is not **writable** (probe file create+remove — a full disk or read-only remount flips readiness even though the directory stays readable). Use as `readinessProbe`. |
 
 `readinessProbe` is the one that turns off the tap during pod
 deregistration — flip a request-counter graph and you'll see the
