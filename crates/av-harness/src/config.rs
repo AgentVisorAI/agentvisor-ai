@@ -2503,5 +2503,11 @@ mod tests {
 // `for_tests`'s test values fooled three independent reviewers. A
 // child module (not a sibling) so it can reach the private
 // `default_*` helpers without widening their visibility.
+// Gated OUT of production builds entirely (Action Register item 7):
+// `test` covers this crate's unit tests; the `test-support` feature is
+// enabled only by the self dev-dependency, so integration tests and
+// benches see it while `cargo build`/`--release`/`--features full`
+// artifacts cannot even name it.
+#[cfg(any(test, feature = "test-support"))]
 #[path = "config_testkit.rs"]
 mod testkit;

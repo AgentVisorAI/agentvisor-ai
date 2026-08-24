@@ -30,6 +30,12 @@ qdrant = ["av-loopdetect/qdrant"]
 cold-store-aws = ["av-bridge/cold-store-aws"]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 full = ["redis", "nats", "kafka", "onnx", "qdrant", "cold-store-aws", "otel"]
+# Compiles the permissive `HarnessConfig::for_tests` constructor
+# (config_testkit.rs). NEVER part of `full` or `default`: production
+# artifacts must not carry a config constructor whose posture disables
+# identity, schema, and scope enforcement. Integration tests and
+# benches receive it through the self dev-dependency below.
+test-support = []
 
 [dependencies]
 av-core = { workspace = true }
@@ -87,6 +93,11 @@ optional = true
 default-features = false
 
 [dev-dependencies]
+# Self dev-dependency: enables `test-support` for this crate's own
+# integration tests and benches (they are separate crates compiled
+# WITHOUT cfg(test), so a bare #[cfg(test)] gate would hide
+# `for_tests` from them). Path-only, so it is stripped on publish.
+av-harness = { path = ".", features = ["test-support"] }
 tempfile = { workspace = true }
 criterion = { workspace = true }
 jsonwebtoken = { workspace = true }
