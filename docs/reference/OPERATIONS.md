@@ -11,18 +11,24 @@ you should alert on.
 `$HOME/.agentvisor/agentvisor.toml`. The example file
 (`config/harness.example.toml`) is NOT searched.
 
-On boot the harness logs at INFO:
+On boot the harness logs a dedicated event on the `trust_anchor`
+target:
 
 ```
 signer_key_id=<32-hex fingerprint>
 signer_public_key_hex=<64-hex Ed25519 public key>
+signer_seed_path=<path the seed was loaded from>
+freshly_generated=<true only when the seed was created this boot>
 ```
 
-Every restart re-emits this pair unconditionally. When the seed is
-freshly generated at startup (no seed file was present at the
-configured path), a WARN is added: this is normal for a first-run
-container but is a hard escalation for a persistent deployment —
-you've lost your seed file and the new key won't verify old receipts.
+Every restart re-emits this pair unconditionally: the `trust_anchor`
+target is pinned to INFO inside the process regardless of `RUST_LOG`,
+so it survives `RUST_LOG=warn`, `error`, and even `off`. When the seed
+is freshly generated at startup (no seed file was present at the
+configured path), a WARN is added on the same always-on target: this is
+normal for a first-run container but is a hard escalation for a
+persistent deployment — you've lost your seed file and the new key
+won't verify old receipts.
 
 Pipe these lines into your log store and diff them across restarts;
 any change is a rotation event that must be reflected in the

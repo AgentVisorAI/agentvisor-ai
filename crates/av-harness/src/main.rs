@@ -105,6 +105,21 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     // audit chain for that window is unrecoverable.
     let signer_key_id = raw_signer.key_id().to_owned();
     let signer_public_key_hex = hex::encode(raw_signer.public_key_bytes());
+    // Log the trust anchor UNCONDITIONALLY. The startup banner below is
+    // info-level on the default target, so `RUST_LOG=warn` (the common
+    // production setting — and what our own compose/K8s guidance quiets
+    // logs with) silently drops the only steady-state record of which
+    // key this process signs under. The `trust_anchor` target is pinned
+    // to `info` inside init_tracing regardless of RUST_LOG, so this
+    // line survives `warn`, `error`, and even `off`.
+    tracing::info!(
+        target: "trust_anchor",
+        signer_key_id = %signer_key_id,
+        signer_public_key_hex = %signer_public_key_hex,
+        signer_seed_path = %signer_path.display(),
+        freshly_generated = signer_newly_generated,
+        "receipt-signing trust anchor for this process"
+    );
     if signer_newly_generated {
         // A fresh anchor is only correct at genuine first boot. Every other
         // occurrence (Secret failed to mount, emptyDir vanished, seed file
@@ -112,8 +127,10 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
         // the previous key will reject every receipt issued from here on.
         // Emit at WARN so the log pipeline surfaces it without needing a
         // Prometheus gauge (the metrics registry has no gauge type for
-        // this yet).
+        // this yet). Uses the always-on `trust_anchor` target so even a
+        // `RUST_LOG=error` deployment records the compliance incident.
         tracing::warn!(
+            target: "trust_anchor",
             signer_key_id = %signer_key_id,
             signer_public_key_hex = %signer_public_key_hex,
             signer_seed_path = %signer_path.display(),
@@ -540,16 +557,32 @@ where
     }
 }
 
+/// Always-on filter directive for the `trust_anchor` target: the
+/// receipt-signing key identity must reach the logs regardless of
+/// RUST_LOG (a `warn`/`error` deployment otherwise never records which
+/// key it signs under — the silent-new-anchor failure mode). A
+/// target-specific directive outranks any global level directive, so
+/// `RUST_LOG=error` still admits `trust_anchor` events at info.
+fn trust_anchor_directive() -> tracing_subscriber::filter::Directive {
+    // The literal is static and known-good; the fallback (global INFO)
+    // is unreachable but avoids a panic path.
+    "trust_anchor=info"
+        .parse()
+        .unwrap_or_else(|_| tracing_subscriber::filter::LevelFilter::INFO.into())
+}
+
 #[cfg(not(feature = "otel"))]
 fn init_tracing() -> Result<()> {
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|error| {
-                if std::env::var_os("RUST_LOG").is_some() {
-                    eprintln!("warning: RUST_LOG parse failed ({error}); falling back to 'info'");
-                }
-                tracing_subscriber::EnvFilter::new("info")
-            }),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|error| {
+                    if std::env::var_os("RUST_LOG").is_some() {
+                        eprintln!("warning: RUST_LOG parse failed ({error}); falling back to 'info'");
+                    }
+                    tracing_subscriber::EnvFilter::new("info")
+                })
+                .add_directive(trust_anchor_directive()),
         )
         .with(tracing_subscriber::fmt::layer().json())
         .try_init()
@@ -600,12 +633,14 @@ fn init_tracing() -> Result<Option<opentelemetry_sdk::trace::SdkTracerProvider>>
         .map(|provider| tracing_opentelemetry::layer().with_tracer(provider.tracer("agentvisor-ai")));
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|error| {
-                if std::env::var_os("RUST_LOG").is_some() {
-                    eprintln!("warning: RUST_LOG parse failed ({error}); falling back to 'info'");
-                }
-                tracing_subscriber::EnvFilter::new("info")
-            }),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|error| {
+                    if std::env::var_os("RUST_LOG").is_some() {
+                        eprintln!("warning: RUST_LOG parse failed ({error}); falling back to 'info'");
+                    }
+                    tracing_subscriber::EnvFilter::new("info")
+                })
+                .add_directive(trust_anchor_directive()),
         )
         .with(tracing_subscriber::fmt::layer().json())
         .with(telemetry)

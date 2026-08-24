@@ -25,7 +25,9 @@ Two supported channels, ordered by trust:
    ```
 
 2. **From the harness startup banner.** Every process logs
-   `signer_key_id` and `signer_public_key_hex` at INFO on start. Pull
+   `signer_key_id` and `signer_public_key_hex` on start on the
+   always-on `trust_anchor` target (emitted regardless of `RUST_LOG`).
+   Pull
    these from your log store; check both the `key_id` you're pinning
    *and* the full `public_key_hex` — a `key_id` alone is only a
    32-hex-char fingerprint of the encoded key and would collide under

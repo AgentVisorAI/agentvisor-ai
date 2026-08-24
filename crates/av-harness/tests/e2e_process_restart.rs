@@ -591,3 +591,110 @@ max_total_tool_calls = 100
     );
     drop(daemon);
 }
+
+/// The receipt-signing trust anchor must reach the logs UNCONDITIONALLY
+/// (Action Register item 5: "log signing_key_id at startup
+/// unconditionally"). The startup banner is info-level, so a
+/// `RUST_LOG=error` deployment — and even our own test/compose guidance
+/// of `RUST_LOG=warn` — filtered the only steady-state record of which
+/// key the process signs under, and at `error` even the
+/// freshly-generated-seed WARN vanished: a silent new signing anchor,
+/// the exact failure the register item exists to prevent. The
+/// `trust_anchor` tracing target is pinned to info inside init_tracing
+/// regardless of RUST_LOG; this test boots the real binary twice at
+/// `RUST_LOG=error` (fresh anchor, then steady-state reuse) and asserts
+/// the anchor line appears both times.
+#[test]
+fn trust_anchor_is_logged_even_when_rust_log_silences_info() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path();
+    let upstream_port = spawn_mock_upstream();
+    let listen_port = free_port();
+    let config_path = root.join("agentvisor.toml");
+    let seed_path = root.join("signing.seed");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"config_version = 1
+listen = "127.0.0.1:{listen_port}"
+upstream_url = "http://127.0.0.1:{upstream_port}"
+require_identity = false
+default_workflow = "unsigned"
+compression_enabled = false
+dashboard_enabled = false
+atif_spool_dir = "{spool}"
+bridge_data_dir = "{bridge}"
+tool_schema_dir = "{schemas}"
+state_backend = "memory"
+embedder_backend = "hash"
+vector_backend = "memory"
+"#,
+            spool = root.join("spool/atif").display(),
+            bridge = root.join("data/bridge").display(),
+            schemas = root.join("tool-schemas").display(),
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("tool-schemas")).unwrap();
+
+    let boot = |log_path: &std::path::Path| -> String {
+        let stdout = std::fs::File::create(log_path).unwrap();
+        let child = std::process::Command::new(env!("CARGO_BIN_EXE_agentvisord"))
+            .arg("--config")
+            .arg(&config_path)
+            .current_dir(root)
+            .env("AV_SIGNING_SEED_FILE", &seed_path)
+            // The regression under test: error-level filtering used to
+            // drop the trust anchor entirely.
+            .env("RUST_LOG", "error")
+            .stdout(std::process::Stdio::from(stdout))
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn agentvisord");
+        let mut daemon = Daemon(child);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let contents = std::fs::read_to_string(log_path).unwrap_or_default();
+            if contents.contains("\"target\":\"trust_anchor\"") {
+                drop(daemon);
+                return contents;
+            }
+            if let Ok(Some(status)) = daemon.0.try_wait() {
+                panic!("daemon exited ({status}) before logging the trust anchor: {contents}");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no trust_anchor line within 30s at RUST_LOG=error: {contents}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    // Boot 1: fresh anchor (seed file does not exist yet).
+    let first = boot(&root.join("boot1.log"));
+    let anchor_line = first
+        .lines()
+        .find(|line| line.contains("\"target\":\"trust_anchor\""))
+        .unwrap();
+    assert!(
+        anchor_line.contains("signer_key_id") && anchor_line.contains("signer_public_key_hex"),
+        "anchor line must carry the key identity: {anchor_line}"
+    );
+    assert!(
+        anchor_line.contains("\"freshly_generated\":true"),
+        "first boot generates the seed: {anchor_line}"
+    );
+
+    // Boot 2: steady-state reuse — the case the info-level banner
+    // silently dropped before the fix.
+    let second = boot(&root.join("boot2.log"));
+    let anchor_line = second
+        .lines()
+        .find(|line| line.contains("\"target\":\"trust_anchor\""))
+        .unwrap();
+    assert!(
+        anchor_line.contains("signer_key_id")
+            && anchor_line.contains("\"freshly_generated\":false"),
+        "steady-state boot must still log the anchor at RUST_LOG=error: {anchor_line}"
+    );
+}
