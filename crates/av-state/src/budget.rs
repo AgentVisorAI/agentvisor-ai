@@ -29,6 +29,21 @@ pub struct BudgetSpec {
     pub max_total_tool_calls: Option<u64>,
 }
 
+impl BudgetSpec {
+    /// True when at least one dimension is configured — i.e. this spec
+    /// actually constrains something. A default/omitted `[budget]`
+    /// block parses to all-`None`, which enforces NOTHING: every
+    /// session runs with unlimited tokens, payout, and tool calls.
+    /// Diagnostics (`avctl doctor`) use this to distinguish "budget
+    /// configured" from the silent-unbounded footgun.
+    pub fn binds_anything(&self) -> bool {
+        self.max_tokens.is_some()
+            || self.max_payout_usd_micros.is_some()
+            || self.max_total_tool_calls.is_some()
+            || !self.max_tool_calls.is_empty()
+    }
+}
+
 /// Outcome of a budget check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BudgetDecision {
@@ -546,5 +561,16 @@ mod tests {
             b.try_tool_call("t", 0).unwrap(),
             BudgetDecision::Refused { .. }
         ));
+    }
+
+    #[test]
+    fn binds_anything_is_false_only_for_the_all_default_spec() {
+        assert!(!BudgetSpec::default().binds_anything());
+        assert!(BudgetSpec { max_tokens: Some(1), ..Default::default() }.binds_anything());
+        assert!(BudgetSpec { max_payout_usd_micros: Some(1), ..Default::default() }.binds_anything());
+        assert!(BudgetSpec { max_total_tool_calls: Some(1), ..Default::default() }.binds_anything());
+        let mut per_tool = BudgetSpec::default();
+        per_tool.max_tool_calls.insert("db_write".to_owned(), 1);
+        assert!(per_tool.binds_anything());
     }
 }

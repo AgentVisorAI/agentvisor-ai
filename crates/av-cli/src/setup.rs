@@ -1607,6 +1607,33 @@ pub async fn doctor(offline: bool) -> Result<()> {
                     .to_owned(),
             ));
         }
+        // Budget posture. All dimensions are optional, so a config with
+        // no (or an empty) [budget] block parses cleanly and enforces
+        // NOTHING — unlimited tokens, payout, and tool calls per
+        // session. `avctl init` writes binding limits, but hand-written
+        // and pre-init configs hit this silently; the whole point of
+        // doctor is to catch exactly this class of quiet misposture.
+        if config.budget.binds_anything() {
+            checks.push(Check::Pass("budget: at least one binding limit".to_owned()));
+        } else {
+            checks.push(Check::Warn(
+                "budget: no [budget] limits configured — sessions run with UNLIMITED \
+                 tokens, payout, and tool calls. Add a [budget] block (see `avctl init` \
+                 output) with max_tokens / max_payout_usd_micros / max_total_tool_calls"
+                    .to_owned(),
+            ));
+        }
+        if config
+            .principal_budget
+            .as_ref()
+            .is_some_and(|spec| !spec.binds_anything())
+        {
+            checks.push(Check::Warn(
+                "principal_budget: [principal_budget] block present but no limits set — \
+                 it enforces nothing"
+                    .to_owned(),
+            ));
+        }
         if config.dashboard_enabled && !loopback {
             checks.push(Check::Warn(format!(
                 "dashboard_enabled = true with non-loopback listen {:?}: /dashboard and \
