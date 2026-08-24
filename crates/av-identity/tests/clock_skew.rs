@@ -113,6 +113,22 @@ fn future_iat_just_below_leeway_is_accepted() {
         .expect("iat 25 s ahead must fit inside the 30 s leeway");
 }
 
+/// The EXACT leeway boundary is inclusive: `iat == now + 30` must be
+/// accepted (the guard is `iat > now + leeway`, not `>=` — a
+/// surviving boundary mutant showed this edge unpinned). The test can
+/// only pass more easily if a second ticks between minting and
+/// validation, so it never flakes against correct code.
+#[test]
+fn future_iat_exactly_at_leeway_is_accepted() {
+    let keys = ed25519_keys("k1");
+    let v = validator(&keys);
+    let now = now_s();
+    let claims = claims_with(now + 30, now + 30 + 60);
+    let token = mint(&keys, &claims);
+    v.validate(&token)
+        .expect("iat exactly at the 30 s leeway boundary must be accepted (inclusive)");
+}
+
 /// A machine that is 5 minutes ahead is beyond any reasonable leeway;
 /// the validator must refuse to accept its tokens with `FutureIat`.
 #[test]

@@ -17,6 +17,8 @@ libfuzzer-sys = "0.4"
 serde_json = "1"
 
 av-harness = { path = "../crates/av-harness" }
+av-core = { path = "../crates/av-core" }
+av-compress = { path = "../crates/av-compress" }
 av-receipts = { path = "../crates/av-receipts" }
 av-sandbox = { path = "../crates/av-sandbox" }
 
@@ -41,5 +43,17 @@ doc = false
 [[bin]]
 name = "parse_tool_call"
 path = "fuzz_targets/parse_tool_call.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "compress_invariants"
+path = "fuzz_targets/compress_invariants.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "redact_userinfo"
+path = "fuzz_targets/redact_userinfo.rs"
 test = false
 doc = false
