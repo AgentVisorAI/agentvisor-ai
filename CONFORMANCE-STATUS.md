@@ -1,4 +1,8 @@
-# AgentVisor AI Verification
+# AgentVisor AI Conformance Status
+
+How to verify a receipt yourself lives in
+[`docs/reference/VERIFYING-A-RECEIPT.md`](docs/reference/VERIFYING-A-RECEIPT.md);
+this document is the compliance / MVP **verdict record** against the brief.
 
 Verified against `AgentBridge.docx` v2.0 on 2026-08-11 with Rust 1.97.1 on Apple Silicon macOS.
 
