@@ -608,6 +608,15 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
     // termination from here (including on mid-stream client disconnect,
     // via its own Drop); hand both over and disarm the guard.
     let (response_marker, response_attempt_id) = capture_guard.disarm();
+    // Same gating as admission (`prepare_chat`): a configured
+    // [principal_budget] binds every request, keyed by
+    // `principal_id_for_budget` — anonymous deployments share one
+    // bucket by explicit opt-in.
+    let principal_budget = state
+        .config
+        .principal_budget
+        .as_ref()
+        .map(|spec| (crate::pipeline::principal_id_for_budget(&identity), spec.clone()));
     let stream = AbortFinalizingStream {
         inner: stream.boxed(),
         session,
@@ -639,6 +648,7 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
         protocol_buffer: Vec::new(),
         pending_output: std::collections::VecDeque::new(),
         pending_budget: None,
+        principal_budget,
         captured_bytes: 0,
         billed_prompt_tokens,
         provider_adapter: Arc::clone(&state.provider_adapter),
@@ -2302,6 +2312,15 @@ struct AbortFinalizingStream {
     protocol_buffer: Vec<u8>,
     pending_output: std::collections::VecDeque<Bytes>,
     pending_budget: Option<PendingBudget>,
+    /// Principal-scoped ledger (id + spec) when `[principal_budget]` is
+    /// configured. Mid-stream completion tokens must debit BOTH ledgers:
+    /// the principal ledger is the only one that binds under the
+    /// session-header-rotation attack, and before it was threaded here
+    /// every streamed completion token was invisible to it — a rotating
+    /// caller consumed >10× the principal cap in live testing because
+    /// only the ~admission prompt heuristic ever landed on the
+    /// principal counter.
+    principal_budget: Option<(String, av_state::BudgetSpec)>,
     captured_bytes: usize,
     /// admission-time prompt-token heuristic, reconciled
     /// against the provider's `usage.prompt_tokens` at terminal capture.
@@ -2553,10 +2572,36 @@ impl AbortFinalizingStream {
         let store = Arc::clone(&self.store);
         let session_id = self.session.id.clone();
         let budget = self.budget.clone();
+        let principal = self.principal_budget.clone();
         let task = tokio::task::spawn_blocking(move || {
-            av_state::ActionBudget::new(store.as_ref(), &session_id, &budget)
+            // Principal first, mirroring admission's debit order and its
+            // refund discipline: if the principal debit lands but the
+            // session ledger refuses, the principal amount is refunded so
+            // a refused stream tail is non-consumptive on both ledgers.
+            if let Some((principal_id, spec)) = principal.as_ref() {
+                match av_state::ActionBudget::for_principal(store.as_ref(), principal_id, spec)
+                    .try_tokens(delta)
+                    .map_err(|error| format!("token budget backend failed closed (principal): {error}"))?
+                {
+                    av_state::BudgetDecision::Refused { limit, cap } => {
+                        return Ok(av_state::BudgetDecision::Refused {
+                            limit: format!("principal.{limit}"),
+                            cap,
+                        });
+                    }
+                    av_state::BudgetDecision::Allowed { .. } => {}
+                }
+            }
+            let decision = av_state::ActionBudget::new(store.as_ref(), &session_id, &budget)
                 .try_tokens(delta)
-                .map_err(|error| format!("token budget backend failed closed: {error}"))
+                .map_err(|error| format!("token budget backend failed closed: {error}"))?;
+            if matches!(decision, av_state::BudgetDecision::Refused { .. }) {
+                if let Some((principal_id, spec)) = principal.as_ref() {
+                    av_state::ActionBudget::for_principal(store.as_ref(), principal_id, spec)
+                        .refund_tokens(delta);
+                }
+            }
+            Ok(decision)
         });
         self.pending_budget = Some(PendingBudget { task, continuation });
     }
@@ -4188,6 +4233,99 @@ mod tests {
         chat_request_with_payload(session, chat_payload())
     }
 
+    /// Register item 8 (bind budget to principal), completion side.
+    /// Admission debits both ledgers, but mid-stream/terminal
+    /// completion tokens used to debit ONLY the session ledger — under
+    /// the session-header-rotation attack the principal ledger is the
+    /// only one that binds, so streamed completions were invisible to
+    /// it: measured live, a rotating caller consumed >10× the
+    /// principal token cap (refusal came from the ~30-token admission
+    /// heuristic alone). Two rotated requests whose completions
+    /// (1000 reported tokens each) dwarf their admission estimates:
+    /// the second must be refused by `principal.max_tokens`, which
+    /// only happens if completion tokens land on the principal ledger.
+    #[tokio::test]
+    async fn principal_budget_charges_completion_tokens_across_rotated_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                Json(json!({
+                    "model": "mock",
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "big completion"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 1000}
+                }))
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, provider).await.unwrap();
+        });
+        let spool = directory.path().to_string_lossy().into_owned();
+        let mut config =
+            crate::config::HarnessConfig::for_tests(&format!("http://{address}"), &spool, &spool);
+        // Session ledger wide open: only the principal ledger can refuse.
+        config.budget.max_tokens = Some(1_000_000);
+        // Fits one admission (~30) + one completion (1000) + a second
+        // admission, but NOT the second completion.
+        config.principal_budget = Some(av_state::BudgetSpec {
+            max_tokens: Some(1500),
+            ..av_state::BudgetSpec::default()
+        });
+        let state = AppState::new(
+            config,
+            Arc::new(InMemoryStore::new()),
+            Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
+            Arc::new(NullBus),
+            None,
+            Arc::new(Ed25519Signer::from_seed(&[11; 32])),
+        )
+        .unwrap();
+        let app = build_router(state);
+        let non_streamed = json!({
+            "model": "mock",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+
+        let first = app
+            .clone()
+            .oneshot(chat_request_with_payload("principal-rot-1", non_streamed.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            first.status(),
+            StatusCode::OK,
+            "first rotated request fits the principal budget"
+        );
+        axum::body::to_bytes(first.into_body(), 1024 * 1024).await.unwrap();
+
+        // Different session id, same (anonymous) principal: its virgin
+        // session ledger cannot refuse — only the principal ledger,
+        // and only if the FIRST request's 1000 completion tokens
+        // actually landed there.
+        let second = app
+            .oneshot(chat_request_with_payload("principal-rot-2", non_streamed))
+            .await
+            .unwrap();
+        let status = second.status();
+        let body = axum::body::to_bytes(second.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "rotated completion spend must be refused by the principal ledger; got {status}: {body}"
+        );
+        assert!(
+            body.contains("principal.max_tokens"),
+            "refusal must name the principal-scoped limit: {body}"
+        );
+        server.abort();
+    }
+
     /// Pins the upstream Authorization wire contract per posture — the
     /// README/doctor headline claim "the key is injected server-side".
     /// Verified first against the real binary with a header-capturing
@@ -4768,6 +4906,7 @@ mod tests {
             store: Arc::clone(&state.store),
             budget: state.config.budget.clone(),
             billed_prompt_tokens: 0,
+            principal_budget: None,
             provider_adapter: Arc::clone(&state.provider_adapter),
             finalizer: state.finalizer.clone(),
             _lease: lease,
