@@ -135,6 +135,7 @@ interaction.
 | Metric | Alert condition | What it means |
 | --- | --- | --- |
 | `av_atif_retention_pruned_total` | Sudden increase | Retention sweep ran (usually just noise, but confirm the `atif_retention_days` you set). |
+| `av_reconciler_last_tick_completed_seconds` | `time() - value > 5 × tick interval` | The reconciler tick is stalled (hung filesystem, lifecycle-lock deadlock) or has never completed since boot. Closes, promotion retries, idle finalization and outbox replay are all stopped with it. The series exists from boot and reads 0 until the first tick completes. |
 | `av_atif_recovery_skipped_total{reason="unauthenticated"}` | Rate > 0 sustained | Someone/something is planting sidecar-less .json files. Escalate. |
 | `av_atif_recovery_skipped_total{reason="too_large"}` | Rate > 0 | Adversarial ATIF payload attempts. Investigate the spool contents. |
 | `av_incomplete_sessions_total` | Sudden increase | Sessions where `capture_failed` was set on the audit chain. After round 51 §6.2 (D7) this is genuinely rare and represents unrecoverable pipeline state, not client disconnects. Escalate. |
