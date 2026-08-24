@@ -3728,6 +3728,17 @@ mod tests {
             );
             return response;
         }
+        if payload.get("model").and_then(Value::as_str) == Some("tool-conflicting-name") {
+            // Same slot, same id, DIFFERENT function names — the
+            // name-conflict arm of the reuse guard.
+            let event = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"function\":{\"name\":\"read\",\"arguments\":\"{\"}},{\"index\":0,\"id\":\"call-a\",\"function\":{\"name\":\"db_write\",\"arguments\":\"}\"}}]}}]}\n\n";
+            let mut response = Response::new(Body::from(event));
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            return response;
+        }
         if payload.get("model").and_then(Value::as_str) == Some("overcharged-completion") {
             // Content chunk with `"usage": null` (estimate-charged), then an
             // authoritative usage frame LOWER than the estimate — the
@@ -5058,6 +5069,39 @@ mod tests {
         assert!(quarantined, "quarantined plant must stay on disk as evidence");
     }
 
+    /// The cap-guard quarantine arm must stay scoped to cap-class
+    /// refusals (oversize, non-regular). A GENUINE IO fault — here
+    /// permission-denied — must still abort the scan loudly rather
+    /// than silently quarantining evidence the operator could repair
+    /// (a chmod mistake would otherwise destroy every pending tool
+    /// intent on the next boot).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_tool_intent_aborts_the_scan_not_quarantines() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let control_key = [33; 32];
+        let executions = directory.path().join(crate::spool::TOOL_EXECUTIONS);
+        std::fs::create_dir_all(&executions).unwrap();
+        let unreadable = executions.join("unreadablekey.intent.json");
+        std::fs::write(&unreadable, b"sealed-bytes").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&unreadable).is_ok() {
+            // Running as root (CI containers): the premise doesn't hold.
+            return;
+        }
+
+        let outcome = unresolved_tool_sessions(directory.path(), &control_key).await;
+        assert!(
+            outcome.is_err(),
+            "a permission fault must abort the scan, not quarantine evidence"
+        );
+        assert!(
+            unreadable.exists(),
+            "the unreadable intent must be left in place for the operator"
+        );
+    }
+
     #[tokio::test]
     async fn tool_redirect_is_terminal_and_never_replays_post() {
         let tool_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5903,6 +5947,21 @@ mod tests {
                 .capture_failed(),
             "a conflicting tool-call id must be scoped to the response"
         );
+        // The NAME-conflict arm: same slot, same id, different function
+        // names must also fail closed (a surviving mutant showed this
+        // arm untested — `!=` → `==` passed the suite).
+        let response = build_router(state.clone())
+            .oneshot(chat_request_with_payload(
+                "tool-conflicting-name",
+                json!({
+                    "model": "tool-conflicting-name",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "hello"}]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         provider.abort();
     }
 
