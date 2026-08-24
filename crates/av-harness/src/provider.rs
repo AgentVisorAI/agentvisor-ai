@@ -505,6 +505,15 @@ impl ProviderAdapter for GoogleGeminiAdapter {
             }
             estimated
         });
+        // Candidates or usage-only frames are the dialect's
+        // equivalent of a choices array for the empty-200 guard. A
+        // prompt-safety block (`promptFeedback.blockReason`) is a
+        // terminal refusal that Gemini may emit with NEITHER
+        // candidates nor usageMetadata — the parser maps it to
+        // `content_filter` above, so it must count as a valid frame
+        // or the guard misclassifies a clean refusal as a capture
+        // failure (502 instead of a content-filter stop).
+        let has_choices = has_candidates || usage_reported || finish_reason.is_some();
         Ok(Some(ParsedProviderChunk {
             message,
             reasoning: (!reasoning.is_empty()).then_some(reasoning),
@@ -522,9 +531,7 @@ impl ProviderAdapter for GoogleGeminiAdapter {
             // Gemini does not report request cost on the wire.
             cost_usd_micros: 0,
             cost_reported: false,
-            // Candidates or usage-only frames are the dialect's
-            // equivalent of a choices array for the empty-200 guard.
-            has_choices: has_candidates || usage_reported,
+            has_choices,
             tool_call_deltas,
         }))
     }
@@ -631,6 +638,21 @@ mod tests {
             .unwrap();
         assert_eq!(blocked.finish_reason.as_deref(), Some("content_filter"));
         assert!(blocked.has_choices, "usage-only frames pass the empty-200 guard");
+
+        // A safety block may arrive with NEITHER candidates nor
+        // usageMetadata. It is still a terminal refusal, not an
+        // empty-200 — pre-fix `has_choices` keyed only on
+        // candidates/usage, so this clean content-filter stop was
+        // misclassified as a capture failure (502 to the client).
+        let bare_block = adapter
+            .parse_sse_chunk("data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}")
+            .unwrap()
+            .unwrap();
+        assert_eq!(bare_block.finish_reason.as_deref(), Some("content_filter"));
+        assert!(
+            bare_block.has_choices,
+            "a usage-less safety block must pass the empty-200 guard"
+        );
 
         let max = adapter
             .parse_sse_chunk("data: {\"candidates\":[{\"finishReason\":\"MAX_TOKENS\",\"index\":0}]}")

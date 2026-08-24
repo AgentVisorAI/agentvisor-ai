@@ -347,6 +347,31 @@ pub fn authorization_error(id: Option<&Value>, reason: &str) -> Value {
     })
 }
 
+/// Recover the request `id` for an error response, per JSON-RPC 2.0 §5:
+/// the response `id` MUST echo the request's when it is detectable, and
+/// be `null` only "if there was an error in detecting the id" (parse
+/// error / invalid request). [`RpcError::NotToolCall`] and
+/// [`RpcError::BadParams`] both mean the envelope parsed as a
+/// well-formed JSON-RPC 2.0 object, so the id IS detectable — replying
+/// `null` broke client correlation (a pending `initialize` call hung
+/// until timeout because its error response carried `id: null`).
+/// Parse-class failures (invalid JSON, duplicate keys, oversize,
+/// non-2.0 envelope) keep `null`: the id is absent, ambiguous, or
+/// untrustworthy there.
+#[must_use]
+pub fn detectable_error_id(raw: &[u8], error: &RpcError) -> Option<Value> {
+    if !matches!(error, RpcError::NotToolCall(_) | RpcError::BadParams(_)) {
+        return None;
+    }
+    // Both variants are only produced after the size, duplicate-key and
+    // depth gates passed, so this bounded re-parse cannot do more work
+    // than the original.
+    let value: Value = serde_json::from_slice(raw).ok()?;
+    let id = value.as_object()?.get("id")?;
+    // §4: id must be a string, number, or null — echo nothing else.
+    matches!(id, Value::String(_) | Value::Number(_) | Value::Null).then(|| id.clone())
+}
+
 /// JSON-RPC 2.0 reserves -32700 (parse
 /// error), -32600 (invalid request), and -32602 (invalid params) for
 /// requests that never reached application logic. Reporting those as
@@ -430,6 +455,44 @@ mod tests {
         }
         let passthrough = protocol_error(None, &RpcError::NotToolCall("initialize".into()));
         assert_eq!(passthrough["error"]["code"].as_i64(), Some(-32001));
+    }
+
+    /// JSON-RPC 2.0 §5: an error response MUST echo the request `id`
+    /// whenever it is detectable, and use `null` only when detection
+    /// failed. Pre-fix every parse-gate refusal replied `id: null`,
+    /// including well-formed envelopes (`initialize` passthrough, bad
+    /// params) whose id was plainly readable — SDK correlation tables
+    /// never matched the response, so the pending call hung to timeout.
+    #[test]
+    fn error_responses_echo_a_detectable_request_id() {
+        // Well-formed envelope, non-tools/call method: id 42 detectable.
+        let raw = br#"{"jsonrpc":"2.0","id":42,"method":"initialize","params":{}}"#;
+        let error = parse_tool_call(raw).unwrap_err();
+        assert!(matches!(error, RpcError::NotToolCall(_)));
+        let id = detectable_error_id(raw, &error);
+        assert_eq!(id, Some(json!(42)));
+        let response = protocol_error(id.as_ref(), &error);
+        assert_eq!(response["id"], json!(42));
+
+        // Well-formed envelope, bad params: string id detectable.
+        let raw = br#"{"jsonrpc":"2.0","id":"req-1","method":"tools/call","params":{}}"#;
+        let error = parse_tool_call(raw).unwrap_err();
+        assert!(matches!(error, RpcError::BadParams(_)));
+        assert_eq!(detectable_error_id(raw, &error), Some(json!("req-1")));
+
+        // Structured (spec-invalid) id: refused as BadParams, and the
+        // echo must NOT propagate the invalid shape — null stands.
+        let raw = br#"{"jsonrpc":"2.0","id":{"nested":1},"method":"tools/call","params":{"name":"t"}}"#;
+        let error = parse_tool_call(raw).unwrap_err();
+        assert!(matches!(error, RpcError::BadParams(_)));
+        assert_eq!(detectable_error_id(raw, &error), None);
+
+        // Parse-class failures: id undetectable per spec — null.
+        let raw = b"not json";
+        let error = parse_tool_call(raw).unwrap_err();
+        assert_eq!(detectable_error_id(raw, &error), None);
+        let response = protocol_error(None, &error);
+        assert_eq!(response["id"], Value::Null);
     }
 
     #[test]
