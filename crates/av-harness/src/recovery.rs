@@ -50,16 +50,25 @@ pub(crate) struct ReconcilerContext<'a> {
 }
 
 impl ReconcilerContext<'_> {
-    /// Filename stems (`sha256(session_id)[..32]`) of every
-    /// registry-known session, snapshotted NOW. Doubles as the §8.5
+    /// Filename stems (`sha256(session_id)[..32]`) of sessions that can
+    /// legitimately be inside the §8.5 sidecar race window — the
     /// live-close guard: a sidecar-less `{stem}.json` whose stem is
-    /// known belongs to an in-progress close (between `write_atomic`
+    /// here belongs to an in-progress close (between `write_atomic`
     /// and the `.atif-auth` seal) and must not be quarantined out
-    /// from under it.
+    /// from under it. Only Open/Draining sessions qualify: the close
+    /// flow marks the artifact committed strictly AFTER the provenance
+    /// seal succeeded, so a Sealed/Complete session's artifact always
+    /// has its sidecar — a sidecar-less `.json` under such a stem is a
+    /// genuine orphan (e.g. a pre-provenance write abandoned by a close
+    /// that later sealed terminally via the capture-failed branch).
+    /// The previous every-registered-session guard protected those
+    /// orphans forever: unsigned sessions stay registered for the
+    /// process lifetime, so the file never converged to quarantine.
     fn known_stems(&self) -> HashSet<String> {
         self.sessions
             .open_sessions_including_closed()
             .iter()
+            .filter(|session| !session.artifact_committed_flag())
             .map(|session| {
                 let digest = av_core::digest::sha256_hex(session.id.as_bytes());
                 digest.get(..32).unwrap_or(&digest).to_owned()
@@ -535,6 +544,53 @@ mod tests {
         assert!(sealed.exists(), "sealed artifact must survive");
         assert!(journal.exists(), "step journal must survive");
         assert_eq!(warned.lock().len(), 1, "one warn for the one rename");
+    }
+
+    /// The §8.5 live-close guard must cover ONLY sessions still inside
+    /// the sidecar race window (Open/Draining). A SEALED session's
+    /// artifact always has its provenance sidecar (the close marks the
+    /// artifact committed strictly after the seal succeeded), so an
+    /// aged sidecar-less `.json` under a sealed session's stem is a
+    /// genuine orphan — e.g. a pre-provenance write abandoned by a
+    /// close that later sealed terminally via the capture-failed
+    /// branch. Pre-fix the guard covered EVERY registered session, and
+    /// unsigned sessions stay registered for the process lifetime, so
+    /// such orphans never converged to quarantine.
+    #[tokio::test]
+    async fn sealed_session_stem_orphan_is_quarantined() {
+        let directory = tempfile::tempdir().unwrap();
+        let spool = directory.path();
+        let parts = CtxParts::new();
+        let identity = av_events::AgentIdentity {
+            version: "1".to_owned(),
+            charter: "test".into(),
+            instance_uid: "i".to_owned(),
+            ttl_remaining_s: None,
+        };
+        let sealed = parts.sessions.get_or_open(
+            "sealed-session",
+            crate::session::Workflow::Unsigned,
+            &identity,
+            &av_loopdetect::BreakerConfig::default(),
+        );
+        assert!(sealed.try_close());
+        sealed.mark_artifact_committed();
+
+        let digest = av_core::digest::sha256_hex(sealed.id.as_bytes());
+        let stem = digest.get(..32).unwrap().to_owned();
+        let orphan = spool.join(format!("{stem}.json"));
+        std::fs::write(&orphan, b"{").unwrap();
+        age_past_threshold(&orphan);
+
+        let warn_once = |_: PathBuf| true;
+        let ctx = parts.context(spool, &warn_once);
+        let outcome = QuarantineOrphanJsonPass.run(&ctx).await.unwrap();
+
+        assert_eq!(
+            outcome.quarantined, 1,
+            "an aged sidecar-less orphan under a SEALED session's stem must be quarantined"
+        );
+        assert!(!orphan.exists(), "the orphan must be renamed out of the scan");
     }
 
     /// A missing spool directory is a clean no-op, not an error —

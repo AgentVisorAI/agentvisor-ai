@@ -2481,6 +2481,16 @@ impl AbortFinalizingStream {
             );
         }
         let reported_completion = parsed.metrics.completion_tokens.unwrap_or(0);
+        // Cumulative-usage contract (same accepted limitation as the
+        // `cost_usd` note above): providers reporting `completion_tokens`
+        // in usage frames are expected to report CUMULATIVELY (OpenAI
+        // `stream_options.include_usage`, Anthropic message_delta).
+        // A hostile/broken upstream emitting monotone non-decreasing
+        // INCREMENTAL counts is indistinguishable from repeated
+        // cumulative frames on the wire, so only the LAST frame's value
+        // is charged/attested — an undercount bounded by the true
+        // total, never an overcharge; the regression guard below still
+        // fails the stream on any decrease.
         let delta = if parsed.usage_reported && parsed.completion_reported {
             let previous = self.last_reported_completion_tokens.unwrap_or(0);
             if reported_completion < previous {
