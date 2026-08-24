@@ -55,16 +55,50 @@ pub fn redact_userinfo(input: &str) -> String {
         return input.to_owned();
     }
     // Heuristic split: if the input contains multiple `://` occurrences
-    // AND commas that separate them (i.e. it's a list of full URLs),
-    // process each URL independently. Otherwise treat the input as a
-    // single URI whose authority may contain a comma-separated cluster
-    // host list AFTER an `@` (so any comma before the last `@` is
-    // inside a password).
+    // AND commas that START a new URL (i.e. are immediately followed by
+    // `scheme://`), it's a list of full URLs — process each
+    // independently. A comma inside a password or query never precedes
+    // a scheme, so it stays inside its segment. The prior naive
+    // `split(',')` cut a comma-carrying password in half whenever the
+    // SAME URL's query held a second URL (`https://u:pa,ss@h/cb?u=http://x`):
+    // both halves then failed the userinfo heuristics and the whole
+    // secret was returned verbatim.
     let scheme_count = input.matches("://").count();
     if scheme_count > 1 {
-        return input.split(',').map(redact_single).collect::<Vec<_>>().join(",");
+        return split_url_list(input)
+            .into_iter()
+            .map(redact_single)
+            .collect::<Vec<_>>()
+            .join(",");
     }
     redact_single(input)
+}
+
+/// Split at commas immediately followed by a `scheme://` prefix (RFC
+/// 3986 scheme grammar: ALPHA then ALPHA/DIGIT/`+`/`-`/`.`). Commas
+/// inside passwords, cluster host lists, or queries never match.
+fn split_url_list(input: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    for (index, _) in input.match_indices(',') {
+        if index >= start && starts_with_scheme(&input[index + 1..]) {
+            segments.push(&input[start..index]);
+            start = index + 1;
+        }
+    }
+    segments.push(&input[start..]);
+    segments
+}
+
+fn starts_with_scheme(s: &str) -> bool {
+    let Some(scheme) = s.find("://").map(|end| &s[..end]) else {
+        return false;
+    };
+    let mut bytes = scheme.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
 }
 
 fn redact_single(input: &str) -> String {
@@ -153,6 +187,32 @@ mod tests {
         assert_eq!(
             redact_userinfo("redis://host1:6379,host2:6379"),
             "redis://host1:6379,host2:6379",
+        );
+    }
+
+    /// A comma-carrying password in a URL whose QUERY holds a second
+    /// URL used to leak in full: two `://` occurrences tripped the
+    /// naive `split(',')`, the cut segments failed every userinfo
+    /// heuristic, and both halves of the secret were returned
+    /// verbatim. The list splitter must only split at commas that
+    /// start a new `scheme://`.
+    #[test]
+    fn comma_password_with_nested_url_in_query_still_redacts() {
+        assert_eq!(
+            redact_userinfo("https://alice:se,cret@host/cb?u=http://inner"),
+            "https://***@host/cb?u=http://inner",
+        );
+        // The doctor's comma-joined URL list still splits correctly,
+        // including when a listed URL carries a comma password (the
+        // inner comma is not followed by a scheme, so it stays put).
+        assert_eq!(
+            redact_userinfo("redis://u:p,w@h1:7000,redis://u:pw@h2:7001"),
+            "redis://***@h1:7000,redis://***@h2:7001",
+        );
+        // Comma in a query, multiple schemes, no userinfo: untouched.
+        assert_eq!(
+            redact_userinfo("https://host/a?list=x,http://y"),
+            "https://host/a?list=x,http://y",
         );
     }
 
