@@ -59,15 +59,26 @@ the drain window.
 `agentvisord` shuts down cleanly on SIGTERM. The order is:
 
 1. Set the `draining` flag → `/readyz` starts returning 503.
-2. Await axum's graceful shutdown (in-flight requests complete;
+2. If `shutdown_ready_drain_s > 0` (default 0), keep ACCEPTING
+   connections for that long so an external load balancer polling
+   `/readyz` actually observes the 503 before the listener closes.
+   Without it, step 3 begins immediately and a fresh readiness probe
+   sees connection-refused instead — fine on Kubernetes (the preStop
+   sleep provides this window before SIGTERM is even sent), but
+   docker-compose / systemd / bare-LB deployments have no preStop
+   equivalent, so set this to your LB's poll interval plus one
+   reconciliation.
+3. Await axum's graceful shutdown (in-flight requests complete;
    new TCP accepts are refused).
-3. Abort background tasks (reconciler tick, retention sweep, etc.).
-4. Flush and close the state store, broker, and Bridge.
+4. Abort background tasks (reconciler tick, retention sweep, etc.).
+5. Flush and close the state store, broker, and Bridge.
 
-Step-2 tail latency that exhausts the drain budget shows up as
+Step-3 tail latency that exhausts the drain budget shows up as
 `av_http_shutdown_drain_timeouts_total`. Alert on any increase — it
 usually means a request was stuck waiting on the upstream and the
-worker pool couldn't drain before the timeout.
+worker pool couldn't drain before the timeout. The pre-drain window
+counts against the orchestrator's kill grace period ON TOP of the
+drain budget.
 
 ## Key rotation
 

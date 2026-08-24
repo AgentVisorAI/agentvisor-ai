@@ -765,3 +765,97 @@ vector_backend = "memory"
     }
     drop(daemon);
 }
+
+/// The readiness-controlled pre-drain window (register item 11): on
+/// SIGTERM with `shutdown_ready_drain_s` set, `/readyz` must serve a
+/// real HTTP 503 (draining) while the listener KEEPS ACCEPTING and
+/// `/livez` stays 200, and the process must exit cleanly after the
+/// window. Without the window, axum stops accepting the instant the
+/// signal lands and a fresh probe sees connection-refused, never the
+/// 503 — Kubernetes hides this behind the preStop sleep, but
+/// docker-compose / systemd / bare-LB deployments have no preStop.
+/// Reproduced live before the fix: 0.5 s after SIGTERM both probes
+/// got connection-refused.
+#[cfg(unix)]
+#[test]
+fn sigterm_serves_readyz_503_during_the_pre_drain_window() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path();
+    let listen_port = free_port();
+    let config_path = root.join("agentvisor.toml");
+    let seed_path = root.join("signing.seed");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"config_version = 1
+listen = "127.0.0.1:{listen_port}"
+upstream_url = "http://127.0.0.1:9"
+require_identity = false
+default_workflow = "unsigned"
+compression_enabled = false
+dashboard_enabled = false
+atif_spool_dir = "{spool}"
+bridge_data_dir = "{bridge}"
+tool_schema_dir = "{schemas}"
+state_backend = "memory"
+embedder_backend = "hash"
+vector_backend = "memory"
+shutdown_ready_drain_s = 2
+"#,
+            spool = root.join("spool/atif").display(),
+            bridge = root.join("data/bridge").display(),
+            schemas = root.join("tool-schemas").display(),
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("tool-schemas")).unwrap();
+
+    let mut daemon = start_daemon(&config_path, &seed_path);
+    wait_healthy(listen_port, &mut daemon);
+
+    // SIGTERM (graceful), NOT SIGKILL — /bin/kill avoids a libc dep.
+    let killed = std::process::Command::new("kill")
+        .args(["-TERM", &daemon.0.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(killed.success(), "kill -TERM must succeed");
+
+    // Inside the 2 s window: readyz = REAL 503 (connection accepted),
+    // livez still 200 (no restart cascade).
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    let mut saw_503 = false;
+    while Instant::now() < deadline {
+        if let Some((status, body)) = http_get(listen_port, "/readyz") {
+            if status == 503 {
+                assert!(
+                    body.contains("\"draining\":true"),
+                    "the 503 must name draining as the cause: {body}"
+                );
+                saw_503 = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        saw_503,
+        "readyz must serve HTTP 503 during the pre-drain window (connection-refused means \
+         the listener closed before the LB could observe the drain)"
+    );
+    let (livez_status, _) = http_get(listen_port, "/livez").expect("livez during drain");
+    assert_eq!(livez_status, 200, "livez must stay 200 while draining");
+
+    // After the window the process must exit cleanly on its own.
+    let exit_deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Ok(Some(status)) = daemon.0.try_wait() {
+            break status;
+        }
+        assert!(
+            Instant::now() < exit_deadline,
+            "daemon must exit after the pre-drain window + graceful drain"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(status.success(), "graceful SIGTERM shutdown must exit 0, got {status}");
+}
