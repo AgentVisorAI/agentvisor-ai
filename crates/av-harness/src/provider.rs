@@ -620,6 +620,10 @@ mod tests {
         assert_eq!(delta.name.as_deref(), Some("get_weather"));
         assert_eq!(delta.arguments, r#"{"city":"Paris"}"#);
         assert_eq!((delta.choice_index, delta.index), (0, 0));
+        // A candidates-only frame (no usage, no finish reason) must pass
+        // the empty-200 guard on candidates alone — pins the first arm
+        // of the has_choices disjunction independently of the other two.
+        assert!(tool.has_choices, "a candidates-only frame is a valid frame");
 
         let last = adapter
             .parse_sse_chunk(
