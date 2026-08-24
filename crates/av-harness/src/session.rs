@@ -1184,6 +1184,82 @@ mod tests {
         }
     }
 
+    /// Mutation-run hardening (round 10): `restore_journal_index` had a
+    /// surviving no-op mutant — recovery restores the MAC'd journal
+    /// cursor through it, and a silently-unrestored cursor would make
+    /// every post-recovery append claim index 0 again (MAC index
+    /// mismatch → journal writes refused for the session's lifetime).
+    #[test]
+    fn restore_journal_index_actually_moves_the_cursor() {
+        let session = Session::new(
+            "journal-cursor".to_owned(),
+            Workflow::Unsigned,
+            identity(),
+            Default::default(),
+        );
+        assert_eq!(session.journal_index(), 0);
+        session.restore_journal_index(7);
+        assert_eq!(session.journal_index(), 7);
+        // The restored cursor is what the next append claims.
+        session.commit_journal_index(7).unwrap();
+        assert_eq!(session.journal_index(), 8);
+        assert!(
+            session.commit_journal_index(7).is_err(),
+            "a stale index must be refused after the commit advanced it"
+        );
+    }
+
+    /// Mutation-run hardening (round 10): `wait_for_streams` had a
+    /// surviving no-op mutant — a close that stops waiting for active
+    /// streams races the in-flight response capture (the exact lost-
+    /// capture class the wait exists to prevent). Pin both directions:
+    /// blocked while a lease is live, released when it drops.
+    #[tokio::test]
+    async fn wait_for_streams_blocks_until_the_last_lease_drops() {
+        let session = Arc::new(Session::new(
+            "stream-wait".to_owned(),
+            Workflow::Unsigned,
+            identity(),
+            Default::default(),
+        ));
+        let lease = SessionLease::new(Arc::clone(&session));
+        assert_eq!(
+            session.active_streams_count(),
+            1,
+            "the live lease must be visible in the stream gauge"
+        );
+        let mut waiter = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move { session.wait_for_streams().await }
+        });
+        // The waiter must still be pending while the lease is alive.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut waiter)
+                .await
+                .is_err(),
+            "wait_for_streams returned while a stream lease was still held"
+        );
+        drop(lease);
+        // After the drop the wait must resolve promptly.
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("wait_for_streams must resolve once the last lease dropped")
+            .unwrap();
+    }
+
+    /// Mutation-run hardening (round 10): the JCS bound on recovered
+    /// counters is STRICT-greater — the bound itself is a legal value,
+    /// one past it is refused. Both mutation directions survived.
+    #[test]
+    fn recovered_counter_bound_is_exact() {
+        assert_eq!(
+            recovered_counter(Some(av_core::error::JCS_SAFE_MAX), "tokens").unwrap(),
+            av_core::error::JCS_SAFE_MAX
+        );
+        assert!(recovered_counter(Some(av_core::error::JCS_SAFE_MAX + 1), "tokens").is_err());
+        assert_eq!(recovered_counter(None, "tokens").unwrap(), 0);
+    }
+
     /// Receipt stop-reason precedence: a recorded KNOWN reason wins over
     /// the caller's stop; an UNRECORDED session (raw id 0) takes the
     /// caller's stop; and a FOREIGN id (a newer node's stop-reason id
@@ -1413,6 +1489,72 @@ mod tests {
         )
         .unwrap();
         assert!(!natural.enforcement_tripped());
+        // Mutation-run hardening (round 10): the u8 bound on the
+        // recovered latch value had a surviving `>`→`==` mutant —
+        // 257+ was admitted, persisted, and would fail every FUTURE
+        // recovery of the same artifact. Any out-of-range value is a
+        // typed error, not a partial restore.
+        let oversized = Session::recover_unsigned(
+            "oversized-latch".into(),
+            identity(),
+            av_loopdetect::BreakerConfig::default(),
+            PathBuf::from("oversized.json"),
+            Some(&metrics(serde_json::json!({
+                "stop_reason_id": 92u64,
+                "enforcement_latched": 300u64,
+            }))),
+            1,
+        );
+        assert!(
+            oversized.is_err(),
+            "an enforcement latch beyond u8 must refuse recovery, got {:?}",
+            oversized.err()
+        );
+    }
+
+    /// Mutation-run hardening (round 10): `drain_trajectory_builder`
+    /// had a surviving no-op mutant — the post-close RAM reclamation
+    /// for never-evicted unsigned sessions. Pin the observable: after
+    /// the drain, the builder holds zero steps.
+    #[test]
+    fn drain_trajectory_builder_empties_the_builder() {
+        let session = Session::new(
+            "drain-builder".to_owned(),
+            Workflow::Unsigned,
+            identity(),
+            Default::default(),
+        );
+        session
+            .atif
+            .lock()
+            .push_step(av_atif::Step {
+                step_id: 0,
+                timestamp: None,
+                source: av_atif::Source::User,
+                message: serde_json::json!("hello"),
+                reasoning_effort: None,
+                reasoning_content: None,
+                model_name: None,
+                tool_calls: None,
+                observation: None,
+                metrics: None,
+                is_copied_context: None,
+                llm_call_count: None,
+                extra: None,
+            })
+            .unwrap();
+        assert_eq!(session.snapshot_trajectory().steps.len(), 1);
+        // Getter pins (constant-return mutants survived): the step
+        // counter and stream gauge feed the dashboard.
+        session.note_atif_step();
+        session.note_atif_step();
+        assert_eq!(session.atif_steps_count(), 2);
+        session.drain_trajectory_builder();
+        assert_eq!(
+            session.snapshot_trajectory().steps.len(),
+            0,
+            "the drained builder must hold no steps (RAM reclamation)"
+        );
     }
 
     /// Enforcement-latched sessions are terminal for the session id:
