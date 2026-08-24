@@ -55,6 +55,11 @@ data:
     allow_wildcard_bind = true
 
     atif_spool_dir = "/app/spool/atif"
+    # "signed" is the product's core promise (every session close mints
+    # an Ed25519 receipt); matches avctl init and every other shipped
+    # config. Omitting it inherits the zero-config serde default of
+    # "unsigned" — clean traffic then produces zero signed receipts.
+    default_workflow = "signed"
     # Bound the spool so a pod restart's recovery scan stays inside the
     # 1 Gi memory limit (~25 KB RSS per recovered session — see the PVC
     # sizing note). Sealed evidence pairs older than this are pruned
