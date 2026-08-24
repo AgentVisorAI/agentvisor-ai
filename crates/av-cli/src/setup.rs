@@ -1988,12 +1988,20 @@ fn build_probe_base(listen: &str) -> String {
 
 /// `avctl health` — probe a running harness; exit 0 only on an HTTP 2xx.
 pub async fn health(base_url: &str) -> Result<()> {
-    // Accept both the base URL (documented) and a pasted full /health URL:
-    // silently appending a second /health would probe a nonexistent path and
-    // report a healthy harness as unhealthy.
+    // Accept the base URL (documented), a pasted full /health URL, and
+    // pasted /livez//readyz probe URLs — container healthchecks probe
+    // READINESS (a full disk keeps /health and /livez green while every
+    // request 503s; /readyz's writability probe is the one that flips).
+    // Passing those paths through verbatim lets compose healthchecks
+    // say `avctl health --url http://127.0.0.1:8484/readyz`; silently
+    // appending a second path segment would probe a nonexistent route
+    // and report a healthy harness as unhealthy.
     let base = base_url.trim_end_matches('/');
-    let base = base.strip_suffix("/health").unwrap_or(base);
-    let url = format!("{base}/health");
+    let url = if base.ends_with("/livez") || base.ends_with("/readyz") || base.ends_with("/health") {
+        base.to_owned()
+    } else {
+        format!("{base}/health")
+    };
     // A base URL carrying HTTP Basic userinfo (self-hosted shims) must
     // never surface verbatim: every message below lands on stdout/stderr
     // and container healthcheck logs. Request with the raw URL, print
@@ -2079,6 +2087,51 @@ mod tests {
             message.contains("http://***@127.0.0.1:1/health"),
             "redacted URL must still name the host for triage: {message}"
         );
+    }
+
+    /// `avctl health` must pass probe paths through verbatim — the
+    /// compose healthchecks probe /readyz (a full disk keeps /health
+    /// green while every request 503s; readiness's writability probe
+    /// is what flips). Pre-fix, `--url .../readyz` was mangled to
+    /// `/readyz/health`, a nonexistent route: the healthcheck would
+    /// have reported a HEALTHY harness as unhealthy forever.
+    #[tokio::test]
+    async fn health_probes_the_exact_path_for_livez_readyz_and_health() {
+        // Minimal HTTP server (no axum dep in av-cli): 200 only on the
+        // three real probe routes, 404 otherwise — so a mangled path
+        // like /readyz/health fails loudly.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let mut buf = [0u8; 1024];
+                    let Ok(n) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    let request =
+                        String::from_utf8_lossy(buf.get(..n).unwrap_or_default()).into_owned();
+                    let path = request.split_whitespace().nth(1).unwrap_or("");
+                    let response = if matches!(path, "/readyz" | "/livez" | "/health") {
+                        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok"
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    };
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        for path in ["/readyz", "/livez", "/health", ""] {
+            health(&format!("http://{address}{path}"))
+                .await
+                .unwrap_or_else(|error| panic!("{path:?} must probe verbatim: {error:#}"));
+        }
+        // A trailing slash still normalizes.
+        health(&format!("http://{address}/readyz/")).await.unwrap();
     }
 
     /// A socket FILE with no listener behind it (stale socket left by
