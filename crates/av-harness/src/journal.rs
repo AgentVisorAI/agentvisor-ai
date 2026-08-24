@@ -133,6 +133,50 @@ mod tests {
         assert_ne!(key_b, [1u8; 32]);
     }
 
+    /// Mutation-run hardening (round 9): the mac-length DoS cap was
+    /// unpinned — a `>`→`==` mutant admitted a multi-MB `mac` field
+    /// into `hex::decode`, re-opening the allocation-per-tick attack
+    /// the cap exists to close. Pin both sides of the exact boundary:
+    /// 128 hex chars still reaches MAC verification (rejected as a
+    /// bad MAC, not as oversize), 129 is refused up front with the
+    /// oversize message.
+    #[test]
+    fn mac_length_cap_boundary_is_exact() {
+        let key = [7u8; 32];
+        let at_cap = serde_json::to_vec(&Envelope {
+            index: 0,
+            payload: serde_json::json!({"x": 1}),
+            mac: "ab".repeat(64), // 128 chars: allowed through to verification
+        })
+        .unwrap();
+        let error = open::<serde_json::Value>(&key, "test-domain", 0, &at_cap).unwrap_err();
+        assert!(
+            !error.contains("refusing (HMAC-SHA256"),
+            "128 chars must pass the size gate (and fail MAC verification instead): {error}"
+        );
+        let past_cap = serde_json::to_vec(&Envelope {
+            index: 0,
+            payload: serde_json::json!({"x": 1}),
+            mac: "a".repeat(129),
+        })
+        .unwrap();
+        let error = open::<serde_json::Value>(&key, "test-domain", 0, &past_cap).unwrap_err();
+        assert!(
+            error.contains("refusing (HMAC-SHA256"),
+            "129 chars must be refused by the size gate before any decode: {error}"
+        );
+        // Far past the cap (the actual attack shape): still the size
+        // gate, never an allocation-heavy decode.
+        let huge = serde_json::to_vec(&Envelope {
+            index: 0,
+            payload: serde_json::json!({"x": 1}),
+            mac: "a".repeat(1024 * 1024),
+        })
+        .unwrap();
+        let error = open::<serde_json::Value>(&key, "test-domain", 0, &huge).unwrap_err();
+        assert!(error.contains("refusing (HMAC-SHA256"), "{error}");
+    }
+
     /// The mac field length cap (128 chars) refuses oversized values
     /// before hex-decode allocates; exactly 128 still verifies the MAC
     /// path (and fails authentication, since it's not a real MAC).
