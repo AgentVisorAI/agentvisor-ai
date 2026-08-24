@@ -16,8 +16,11 @@ impl HarnessConfig {
     /// = false`, `require_tool_schema = false`, `enforce_identity_
     /// scopes = false`, `strict_stage_budget = false`. That posture is
     /// safe for a test harness but MUST NOT be shipped into a
-    /// production boot path. This function is `#[doc(hidden)]` so it
-    /// does not appear in the public API surface (rustdoc, editor
+    /// production boot path. This module only compiles under
+    /// `cfg(test)` or the `test-support` cargo feature (enabled solely
+    /// by the self dev-dependency), so production artifacts cannot
+    /// even name this function. It is additionally `#[doc(hidden)]` so
+    /// it does not appear in the public API surface (rustdoc, editor
     /// completion) and cannot be discovered by a future "smoke boot"
     /// helper looking for a quick config constructor. Any production
     /// caller must build a `HarnessConfig` explicitly from
