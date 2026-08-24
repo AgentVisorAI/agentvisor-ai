@@ -300,6 +300,27 @@ mod tests {
         assert_eq!(a.public_key_bytes(), b.public_key_bytes());
     }
 
+    /// Pins the key_id derivation algorithm to the documented recipe:
+    /// the first 32 hex characters of the SHA-256 digest of the raw
+    /// 32-byte public key (VERIFYING-A-RECEIPT.md §4, LIMITS.md).
+    /// External verifiers recompute this fingerprint independently, so
+    /// silently changing the hash or the truncation would break every
+    /// out-of-tree audit pipeline. Fixed vector: seed = [0x01; 32].
+    #[test]
+    fn key_id_is_truncated_sha256_of_public_key() {
+        let signer = Ed25519Signer::from_seed(&[0x01; 32]);
+        assert_eq!(
+            hex::encode(signer.public_key_bytes()),
+            "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
+        );
+        assert_eq!(signer.key_id(), "34750f98bd59fcfc946da45aaabe933b");
+        let recomputed: String = av_core::digest::sha256_hex(&signer.public_key_bytes())
+            .chars()
+            .take(32)
+            .collect();
+        assert_eq!(signer.key_id(), recomputed);
+    }
+
     #[test]
     fn rotation_keeps_old_receipts_verifiable() {
         let old = Ed25519Signer::generate();
