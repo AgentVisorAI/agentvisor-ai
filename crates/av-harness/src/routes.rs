@@ -1574,22 +1574,38 @@ pub(crate) async fn unresolved_tool_sessions(
             // progress on the rest of the spool; the tool execution
             // itself is still uncertain — a subsequent retry by the
             // client will get TOOL_OUTCOME_UNCERTAIN and can decide.
-            let intent_bytes = match std::fs::read(&path) {
-                Ok(bytes) => bytes,
-                // The session's close legitimately removes its tool-execution
-                // files between the directory listing and this read.
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    intent_keys.remove(key);
-                    continue;
-                }
-                Err(error) => return Err(error.to_string()),
-            };
-            let intent: ToolIntent = match crate::journal::open(
-                &control_key,
-                &format!("{}:{key}", crate::journal::TOOL_INTENT_DOMAIN),
-                0,
-                &intent_bytes,
-            ) {
+            // Bounded read: every other recovery scan reads spool files
+            // through `read_capped` — these three reads were the
+            // unbounded stragglers, so one planted multi-GB file under
+            // `tool_executions/` could stall or OOM startup recovery.
+            // Cap-class failures (oversize, non-regular file) route to
+            // the same quarantine arm as a torn MAC so the scan keeps
+            // making progress; only genuine IO faults abort.
+            let intent_check: Result<ToolIntent, String> =
+                match av_core::fsutil::read_capped(&path, av_core::fsutil::MAX_CONTROL_BYTES) {
+                    Ok(intent_bytes) => crate::journal::open(
+                        &control_key,
+                        &format!("{}:{key}", crate::journal::TOOL_INTENT_DOMAIN),
+                        0,
+                        &intent_bytes,
+                    ),
+                    // The session's close legitimately removes its tool-execution
+                    // files between the directory listing and this read.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        intent_keys.remove(key);
+                        continue;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput
+                        ) =>
+                    {
+                        Err(error.to_string())
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
+            let intent: ToolIntent = match intent_check {
                 Ok(intent) => intent,
                 Err(error) => {
                     // Build
@@ -1639,21 +1655,33 @@ pub(crate) async fn unresolved_tool_sessions(
             // NotFound between the exists-style check and the read: the
             // outcome is genuinely absent (or was GC'd with its session's
             // close mid-scan) — record unresolved and move on rather than
-            // aborting the whole recovery pass.
-            let outcome_bytes = match std::fs::read(&outcome_path) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    unresolved_sessions.insert(intent.session_id);
-                    continue;
-                }
-                Err(error) => return Err(error.to_string()),
-            };
-            let _: ToolOutcome = match crate::journal::open(
-                &control_key,
-                &format!("{}:{key}", crate::journal::TOOL_OUTCOME_DOMAIN),
-                0,
-                &outcome_bytes,
-            ) {
+            // aborting the whole recovery pass. Cap: a legitimate outcome
+            // carries up to MAX_TOOL_RESPONSE_BYTES hex-encoded (~2×), so
+            // MAX_ATIF_BYTES (64 MiB) clears every legal blob while still
+            // refusing a planted multi-GB file (routed to quarantine).
+            let outcome_check: Result<ToolOutcome, String> =
+                match av_core::fsutil::read_capped(&outcome_path, av_core::fsutil::MAX_ATIF_BYTES) {
+                    Ok(outcome_bytes) => crate::journal::open(
+                        &control_key,
+                        &format!("{}:{key}", crate::journal::TOOL_OUTCOME_DOMAIN),
+                        0,
+                        &outcome_bytes,
+                    ),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        unresolved_sessions.insert(intent.session_id);
+                        continue;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput
+                        ) =>
+                    {
+                        Err(error.to_string())
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
+            let _: ToolOutcome = match outcome_check {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     // warn+quarantine the unverifiable
@@ -1672,20 +1700,29 @@ pub(crate) async fn unresolved_tool_sessions(
                 }
             };
             let audited_path = directory.join(format!("{key}{}", crate::spool::TOOL_AUDITED_SUFFIX));
-            let audited_bytes = match std::fs::read(&audited_path) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    unresolved_sessions.insert(intent.session_id);
-                    continue;
-                }
-                Err(error) => return Err(error.to_string()),
-            };
-            let _: serde_json::Value = match crate::journal::open(
-                &control_key,
-                &format!("{}:{key}", crate::journal::TOOL_AUDITED_DOMAIN),
-                0,
-                &audited_bytes,
-            ) {
+            let audited_check: Result<serde_json::Value, String> =
+                match av_core::fsutil::read_capped(&audited_path, av_core::fsutil::MAX_CONTROL_BYTES) {
+                    Ok(audited_bytes) => crate::journal::open(
+                        &control_key,
+                        &format!("{}:{key}", crate::journal::TOOL_AUDITED_DOMAIN),
+                        0,
+                        &audited_bytes,
+                    ),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        unresolved_sessions.insert(intent.session_id);
+                        continue;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput
+                        ) =>
+                    {
+                        Err(error.to_string())
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
+            let _: serde_json::Value = match audited_check {
                 Ok(value) => value,
                 Err(error) => {
                     tracing::warn!(
@@ -4972,6 +5009,43 @@ mod tests {
         ensure_no_unresolved_tool_executions(directory.path(), &control_key)
             .await
             .unwrap();
+    }
+
+    /// A planted oversize file in `tool-executions/` must not stall or
+    /// OOM the recovery scan. Pre-fix the three recovery reads were
+    /// unbounded `std::fs::read` (every other spool scan uses
+    /// `read_capped`), and a multi-GB plant loaded fully into RAM on
+    /// every boot. The cap-refused file must be quarantined like a torn
+    /// intent — renamed out of the `.intent.json` glob — so the scan
+    /// completes and never re-reads it.
+    #[tokio::test]
+    async fn oversize_tool_intent_is_quarantined_not_loaded() {
+        let directory = tempfile::tempdir().unwrap();
+        let control_key = [32; 32];
+        let executions = directory.path().join(crate::spool::TOOL_EXECUTIONS);
+        std::fs::create_dir_all(&executions).unwrap();
+        let plant = executions.join("oversizekey.intent.json");
+        // Just past the MAX_CONTROL_BYTES cap.
+        std::fs::write(&plant, vec![b'x'; 1024 * 1024 + 1]).unwrap();
+
+        let unresolved = unresolved_tool_sessions(directory.path(), &control_key)
+            .await
+            .expect("an oversize plant must not abort the recovery scan");
+        assert!(unresolved.is_empty(), "{unresolved:?}");
+        assert!(
+            !plant.exists(),
+            "the oversize intent must be quarantined out of the scan glob"
+        );
+        let quarantined = std::fs::read_dir(&executions)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".intent.torn"))
+            });
+        assert!(quarantined, "quarantined plant must stay on disk as evidence");
     }
 
     #[tokio::test]

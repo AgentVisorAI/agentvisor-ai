@@ -1715,6 +1715,21 @@ async fn probe_endpoint_any(endpoint: &str) -> Result<()> {
                             metadata.file_type()
                         );
                     }
+                    // A socket FILE with no listener behind it (stale
+                    // socket left by a dead daemon) is the second false-
+                    // PASS shape: metadata says "socket", but the
+                    // runtime's connect will get ECONNREFUSED. Probe
+                    // with a real connect, same 3 s bound as the TCP
+                    // probe.
+                    tokio::time::timeout(
+                        Duration::from_secs(3),
+                        tokio::net::UnixStream::connect(path),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("unix socket {path}: connect timeout"))?
+                    .map_err(|error| {
+                        anyhow::anyhow!("unix socket {path}: exists but refuses connections ({error})")
+                    })?;
                 }
                 #[cfg(not(unix))]
                 let _ = metadata;
@@ -1967,6 +1982,11 @@ pub async fn health(base_url: &str) -> Result<()> {
     let base = base_url.trim_end_matches('/');
     let base = base.strip_suffix("/health").unwrap_or(base);
     let url = format!("{base}/health");
+    // A base URL carrying HTTP Basic userinfo (self-hosted shims) must
+    // never surface verbatim: every message below lands on stdout/stderr
+    // and container healthcheck logs. Request with the raw URL, print
+    // only the redacted form.
+    let display_url = av_core::url_redact::redact_userinfo(&url);
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(3))
@@ -1980,24 +2000,24 @@ pub async fn health(base_url: &str) -> Result<()> {
         // listening; name the likely fix instead of the transport.
         Err(error) if error.is_connect() => {
             anyhow::bail!(
-                "nothing is listening at {url} — the harness is not running \
+                "nothing is listening at {display_url} — the harness is not running \
                  (try `avctl start`, or check `listen` in the config if it \
                  should already be up)"
             );
         }
         Err(error) if error.is_timeout() => {
             anyhow::bail!(
-                "no response from {url} within 3s — the harness may be hung \
+                "no response from {display_url} within 3s — the harness may be hung \
                  or the address may be blackholed (check `listen` and any \
                  firewall between)"
             );
         }
-        Err(error) => return Err(anyhow::Error::new(error).context(format!("GET {url}"))),
+        Err(error) => return Err(anyhow::Error::new(error).context(format!("GET {display_url}"))),
     };
     if !response.status().is_success() {
         anyhow::bail!("harness unhealthy: HTTP {}", response.status().as_u16());
     }
-    println!("healthy {url}");
+    println!("healthy {display_url}");
     Ok(())
 }
 
@@ -2025,6 +2045,61 @@ mod tests {
         assert_eq!(redact_userinfo("host:9092"), "host:9092");
         // '@' after the authority (in a path) is not userinfo.
         assert_eq!(redact_userinfo("http://h/p@th"), "http://h/p@th");
+    }
+
+    /// `avctl health` prints its probe URL in the success line and in
+    /// every transport-failure message — container-healthcheck logs
+    /// capture all of them. A base URL carrying HTTP Basic userinfo
+    /// (self-hosted shims) must be redacted in that output; pre-fix
+    /// the raw URL (credentials included) surfaced verbatim.
+    #[tokio::test]
+    async fn health_output_never_carries_url_credentials() {
+        // Port 1 is never listening: deterministic connect failure.
+        let error = health("http://alice:hunter2@127.0.0.1:1")
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            !message.contains("hunter2") && !message.contains("alice:"),
+            "credentials leaked into health output: {message}"
+        );
+        assert!(
+            message.contains("http://***@127.0.0.1:1/health"),
+            "redacted URL must still name the host for triage: {message}"
+        );
+    }
+
+    /// A socket FILE with no listener behind it (stale socket left by
+    /// a dead daemon) must fail the doctor probe: metadata alone says
+    /// "socket", but the runtime's connect gets ECONNREFUSED. Pre-fix
+    /// `probe_endpoint_any` checked only the file type and reported
+    /// the dead endpoint reachable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_unix_socket_fails_the_doctor_probe() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("redis.sock");
+        let endpoint = format!("redis+unix://{}", path.display());
+
+        // Live listener: probe passes.
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        probe_endpoint_any(&endpoint)
+            .await
+            .unwrap();
+
+        // Dead listener, socket file left behind: probe must fail.
+        drop(listener);
+        assert!(
+            path.exists(),
+            "test premise: the socket file survives the listener"
+        );
+        let error = probe_endpoint_any(&endpoint)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("refuses connections"),
+            "{error:#}"
+        );
     }
 
     /// The piped-stdin (Plain) secret-reading path uses
