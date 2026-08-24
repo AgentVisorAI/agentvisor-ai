@@ -4046,6 +4046,21 @@ pub fn spawn_reconciler(
     metrics: Arc<Registry>,
 ) -> tokio::task::JoinHandle<()> {
     use futures::future::FutureExt as _;
+    // Tick-liveness gauge, registered SYNCHRONOUSLY at spawn so the
+    // series exists from the very first scrape (registering inside the
+    // spawned task would leave a scrape-visible gap until the runtime
+    // first polls it — the exact lazily-created-series hazard that
+    // defeats `time() - gauge > threshold` alerting during a boot-time
+    // stall). The duration histogram below only observes ticks that
+    // FINISH: a tick hung on a dead NFS mount or a lifecycle-lock
+    // deadlock records nothing, and closes, promotion retries,
+    // pending-close completion, idle finalization and outbox replay
+    // all silently stop with it. Operators alert on
+    // `time() - av_reconciler_last_tick_completed_seconds > N×tick_s`.
+    let last_tick_completed = metrics.gauge(
+        "av_reconciler_last_tick_completed_seconds",
+        "Unix time when the reconciler last completed a full tick (0 until the first completes)",
+    );
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(tick_s.max(1)));
         // Skip missed ticks instead of firing them back-to-back. Under
@@ -4142,6 +4157,7 @@ pub fn spawn_reconciler(
             metrics
                 .histogram("av_reconcile_duration_seconds", "Idle reconciliation duration")
                 .observe_us(elapsed_us(started));
+            last_tick_completed.set(av_core::time::now_ms() / av_core::units::MS_PER_SEC);
         }
     })
 }
@@ -4486,6 +4502,60 @@ mod tests {
             directory.to_path_buf(),
             Arc::new(Registry::new()),
         )
+    }
+
+    /// Tick-liveness contract (register #11/#12 follow-through): the
+    /// `av_reconciler_last_tick_completed_seconds` gauge must be
+    /// pre-registered BEFORE the first tick (present-and-zero in a
+    /// scrape while a boot-time stall is in progress — a lazily
+    /// created series can't be alerted on) and must advance to the
+    /// current unix time once a tick completes.
+    #[tokio::test]
+    async fn reconciler_tick_liveness_gauge_is_preregistered_and_advances() {
+        let directory = tempfile::tempdir().unwrap();
+        let metrics = Arc::new(Registry::new());
+        let finalizer = Finalizer::new(
+            Arc::new(Ed25519Signer::from_seed(&[7; 32])),
+            directory.path().to_path_buf(),
+            Arc::clone(&metrics),
+        );
+        let sessions = Arc::new(SessionRegistry::new());
+        let before = av_core::time::now_ms() / av_core::units::MS_PER_SEC;
+        let handle = spawn_reconciler(
+            Arc::clone(&sessions),
+            finalizer,
+            3600, // idle_s: nothing finalizes in this test
+            1,    // tick every second
+            Default::default(),
+            Arc::clone(&metrics),
+        );
+        // Pre-registration: the series must exist in a render even
+        // before any tick necessarily completed.
+        assert!(
+            metrics
+                .render()
+                .contains("av_reconciler_last_tick_completed_seconds"),
+            "the liveness gauge must be registered at spawn, not lazily"
+        );
+        // After a tick completes, the gauge carries a fresh unix time.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let value = metrics
+                .gauge(
+                    "av_reconciler_last_tick_completed_seconds",
+                    "Unix time when the reconciler last completed a full tick (0 until the first completes)",
+                )
+                .get();
+            if value >= before {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "gauge never advanced past {before}; last value {value}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        handle.abort();
     }
 
     /// A lifecycle emit that fails at `persist_outbox` must not have
