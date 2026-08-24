@@ -433,16 +433,22 @@ fn small_order_embedded_public_key_cannot_authenticate_a_receipt() {
         receipt.signature_b64 = base64::engine::general_purpose::STANDARD.encode(forged_sig);
         // Both paths route the embedded key through `Keyring::add_key_bytes`,
         // which now refuses small-order elements with `WeakKey`. The receipt
-        // error surface maps that to `ReceiptError::Key`.
+        // error surface maps that to `ReceiptError::Key`. Assert the TYPED
+        // variant, not bare is_err(): the refusal must come from the
+        // weak-key gate itself — a generic signature failure passing this
+        // test would hide a regressed gate behind dalek's verify outcome
+        // (exactly the "passes for unrelated reasons" class the external
+        // review flagged in the pre-fix version of this test).
+        use av_receipts::{KeyError, ReceiptError};
         let via_ring = receipt.verify(&ring);
         assert!(
-            via_ring.is_err(),
-            "small-order point {i} authenticated a receipt via ring"
+            matches!(via_ring, Err(ReceiptError::Key(KeyError::WeakKey))),
+            "small-order point {i} must be refused BY THE WEAK-KEY GATE via ring, got {via_ring:?}"
         );
         let via_embedded = receipt.verify_embedded();
         assert!(
-            via_embedded.is_err(),
-            "small-order point {i} authenticated via verify_embedded"
+            matches!(via_embedded, Err(ReceiptError::Key(KeyError::WeakKey))),
+            "small-order point {i} must be refused BY THE WEAK-KEY GATE via verify_embedded, got {via_embedded:?}"
         );
     }
 }
