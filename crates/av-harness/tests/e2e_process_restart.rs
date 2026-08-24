@@ -477,3 +477,117 @@ vector_backend = "memory"
     wait_healthy(second_port, &mut replacement);
     drop(replacement);
 }
+
+/// The register's "minute one" path, end-to-end against the REAL
+/// binary: a config carrying the exact posture `avctl init` now
+/// generates (signed default workflow, `ignore_client_authorization`,
+/// a binding `[budget]`) must accept a stock-OpenAI-SDK-shaped request
+/// — which unconditionally sends a placeholder `Authorization: Bearer`
+/// header and names no X-AV-Workflow — and mint a SIGNED receipt at
+/// session close. No prior test combined these: the restart suite
+/// forces unsigned and never sends Authorization, so the flagship
+/// onboarding promise ("past minute one", "every session ends with a
+/// signed receipt") had zero end-to-end coverage.
+#[test]
+fn init_shaped_config_serves_a_stock_sdk_request_and_signs_the_receipt() {
+    let upstream_port = spawn_mock_upstream();
+    let listen_port = free_port();
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path();
+    let spool = root.join("spool/atif");
+    std::fs::create_dir_all(&spool).unwrap();
+    std::fs::create_dir_all(root.join("tool-schemas")).unwrap();
+    let config_path = root.join("agentvisor.toml");
+    let seed_path = root.join("signing.seed");
+    // Mirrors `render_config` in av-cli (whose template is pinned by
+    // `every_preset_generates_a_valid_config`); this test pins the
+    // POSTURE end-to-end rather than the literal template bytes.
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"config_version = 1
+listen = "127.0.0.1:{listen_port}"
+upstream_url = "http://127.0.0.1:{upstream_port}"
+require_identity = false
+ignore_client_authorization = true
+default_workflow = "signed"
+compression_enabled = false
+dashboard_enabled = false
+atif_spool_dir = "{spool}"
+bridge_data_dir = "{bridge}"
+tool_schema_dir = "{schemas}"
+state_backend = "memory"
+embedder_backend = "hash"
+vector_backend = "memory"
+
+[budget]
+max_tokens = 200000
+max_payout_usd_micros = 50000000
+max_total_tool_calls = 100
+"#,
+            spool = spool.display(),
+            bridge = root.join("data/bridge").display(),
+            schemas = root.join("tool-schemas").display(),
+        ),
+    )
+    .unwrap();
+
+    let mut daemon = start_daemon(&config_path, &seed_path);
+    wait_healthy(listen_port, &mut daemon);
+
+    // Stock SDK shape: placeholder bearer, no X-AV-Workflow header.
+    let body = r#"{"model":"mock","messages":[{"role":"user","content":"ping"}]}"#;
+    let mut stream = std::net::TcpStream::connect_timeout(
+        &([127, 0, 0, 1], listen_port).into(),
+        Duration::from_millis(500),
+    )
+    .expect("connect");
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(
+        stream,
+        "POST /v1/chat/completions HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\nauthorization: Bearer sk-placeholder-from-stock-sdk\r\nx-av-session: minute-one\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    let status: u16 = response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert_eq!(
+        status, 200,
+        "a stock SDK request (placeholder bearer) must succeed on request one: {response}"
+    );
+    assert!(
+        response.contains("hello from mock"),
+        "relay must pass the upstream body: {response}"
+    );
+
+    // Close the session: the signed workflow must mint a receipt.
+    let mut stream = std::net::TcpStream::connect_timeout(
+        &([127, 0, 0, 1], listen_port).into(),
+        Duration::from_millis(500),
+    )
+    .expect("connect for close");
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(
+        stream,
+        "POST /v1/sessions/minute-one/close HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer sk-placeholder-from-stock-sdk\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut close_response = String::new();
+    stream.read_to_string(&mut close_response).unwrap();
+    let close_status: u16 = close_response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert_eq!(close_status, 200, "close must succeed: {close_response}");
+    assert!(
+        close_response.contains("signature_b64") && close_response.contains("receipt_id"),
+        "the shipped posture must mint a SIGNED receipt at close (the product's headline claim): {close_response}"
+    );
+    drop(daemon);
+}
