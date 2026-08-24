@@ -18,12 +18,14 @@ inventory:
 | --- | --- | --- | --- |
 | `{stem}.session.json` | Sealed metadata: session id, identity, workflow, journal version | worker (`append_active_event_journal`) at first event | `remove_step_journal` after successful close |
 | `{stem}.events.ndjson` | Append-only sealed journal — one JSON line per audit event | worker (`append_journal`) | `remove_step_journal` after successful close |
-| `{stem}.json` | ATIF trajectory (unsigned workflow) OR receipt subject (signed workflow) | finalizer at close | retention sweep OR archive on collision |
+| `{stem}.json` | ATIF trajectory (unsigned workflow) | finalizer at close | retention sweep OR archive on collision |
 | `{stem}.atif-auth` | Provenance sidecar: signature + key_id + integrity claim over `{stem}.json` | finalizer immediately after `write_atomic({stem}.json)` | retention sweep (paired with `.json`) |
-| `{stem}.close-complete` | Marker: close ran to completion (both bridge event and receipt/ATIF durably committed) | finalizer at end of close | retention sweep |
+| `{stem}.close-complete` | Marker: close ran to completion (both bridge event and receipt/ATIF durably committed) | finalizer at end of close | retention sweep (with its pair; orphaned markers past the window are healed) |
 | `{stem}.promote` | Promotion intent (unsigned → signed retrofit) | promote route handler | finalizer after receipt lands |
-| `{stem}.promote-archived` | Archived-on-collision promote intent | finalizer collision path | retention sweep |
-| `{stem}.session.close-complete` | Marker for signed-workflow closes | close_session_locked | retention sweep |
+| `{stem}.promote-archived` | Archived-on-collision promote intent | finalizer collision path | never (preserved collision evidence) |
+| `receipts/{stem}.json` | Signed receipt (signed workflow) | finalizer at close (`persist_receipt`) | never (audit evidence; manage retention externally) |
+| `receipts/{stem}.archived-<receipt-id>.json` | Prior incarnation's receipt after a recycled session id | `archive_conflicting_receipt` at the collision | never (preserved collision evidence) |
+| `{stem}.archived-<trajectory-id>` (+ `.atif-auth`, `.close-complete`) | Prior incarnation's ATIF evidence after a recycled session id | `archive_conflicting_atif` at the collision | never (preserved collision evidence) |
 | `{stem}.session.lifecycle-outbox.ndjson` | Bridge events queued when the bus was unavailable at close time | close_session_locked | outbox drain after successful bridge emit |
 | `{stem}.acks.ndjson` | Sealed broker acks, one line per published event: proves an event we tried to publish actually landed | worker after successful emit (appended; one `sync_data` per ack — round-51 §7.3) | `remove_step_journal` at close, with the other journals |
 | `broker-acks/{stem}/{event_uid}.json` | Legacy pre-round-51 per-event ack layout; still read as a fallback so mid-session upgrades see their earlier acks | (no longer written) | `remove_step_journal` at close |
@@ -107,8 +109,13 @@ never automatically deleted — they're on-disk forensics.
 
 If `atif_retention_days` is set, an independent hourly task
 (`prune_sealed_atif`) removes SEALED pairs (`.json` +
-`.atif-auth`) whose mtime is older than N days. Unpaired remnants
-are left for step 4 to quarantine. Counted in
+`.atif-auth`) whose mtime is older than N days, together with the
+pair's digest-bound `.close-complete` marker (an orphaned plain-stem
+marker past the window is also healed — the marker cannot verify
+without its artifact bytes). Unpaired remnants
+are left for step 4 to quarantine. Archived collision evidence
+(`.archived-…` names) and signed receipts under `receipts/` are
+never retention targets. Counted in
 `av_atif_retention_pruned_total`.
 
 ## Race analysis: the three tight windows
