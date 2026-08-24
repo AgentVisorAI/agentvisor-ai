@@ -418,6 +418,38 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
+    /// Mutation-run hardening (round 11): the static-asset handlers had
+    /// surviving Default-return mutants — an empty 200 for the CSS/JS
+    /// bundle renders a blank dashboard with no failing test. Pin that
+    /// each asset serves its non-empty bundle under the right type.
+    #[tokio::test]
+    async fn dashboard_assets_serve_their_bundles() {
+        for (handler, content_type, needle) in [
+            (super::style_css().await, "text/css; charset=utf-8", "{"),
+            (
+                super::app_js().await,
+                "text/javascript; charset=utf-8",
+                "function",
+            ),
+            (super::index().await, "text/html; charset=utf-8", "<html"),
+        ] {
+            assert_eq!(handler.status(), StatusCode::OK);
+            assert_eq!(
+                handler
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some(content_type)
+            );
+            let body = to_bytes(handler.into_body(), 1024 * 1024).await.unwrap();
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                text.contains(needle),
+                "{content_type} asset must carry its bundle (missing {needle:?})"
+            );
+        }
+    }
+
     struct NullBus;
 
     impl EventBus for NullBus {
@@ -527,16 +559,65 @@ mod tests {
         let config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
         let state = build_state(config);
         open_a_session(&state, "sess-open");
+        // Mixed registry (mutation-run hardening, round 11): the filter
+        // arms and the stats accumulators were unpinned because every
+        // fixture held only OPEN sessions — deleting a match arm fell
+        // through to `_ => true` with identical results.
+        open_a_session(&state, "sess-closed");
+        {
+            let session = state.sessions.get("sess-closed").unwrap();
+            assert!(session.try_close());
+            session.mark_artifact_committed();
+            session.mark_close_complete();
+        }
+        open_a_session(&state, "sess-failed");
+        state.sessions.get("sess-failed").unwrap().mark_capture_failed();
         let router = build_router(state);
 
         let (_, all) = get_json(&router, "/api/v1/dashboard/sessions?status=all").await;
-        assert_eq!(all["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(all["sessions"].as_array().unwrap().len(), 3);
 
         let (_, only_closed) = get_json(&router, "/api/v1/dashboard/sessions?status=closed").await;
-        assert_eq!(only_closed["sessions"].as_array().unwrap().len(), 0);
+        let closed: Vec<&str> = only_closed["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(closed, ["sess-closed"]);
 
         let (_, only_open) = get_json(&router, "/api/v1/dashboard/sessions?status=open").await;
-        assert_eq!(only_open["sessions"].as_array().unwrap().len(), 1);
+        let mut open: Vec<&str> = only_open["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect();
+        open.sort_unstable();
+        assert_eq!(open, ["sess-failed", "sess-open"]);
+
+        let (_, only_failed) = get_json(&router, "/api/v1/dashboard/sessions?status=failed").await;
+        let failed: Vec<&str> = only_failed["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(failed, ["sess-failed"]);
+
+        // The stats counters must partition the same mixed registry.
+        let (_, stats) = get_json(&router, "/api/v1/dashboard/stats").await;
+        assert_eq!(stats["session_count"], 3);
+        assert_eq!(stats["open_count"], 2);
+        assert_eq!(stats["closed_count"], 1);
+        assert_eq!(stats["capture_failed_count"], 1);
+        // Every session in this fixture is the default (unsigned)
+        // workflow — the per-workflow accumulators were unpinned too.
+        assert_eq!(
+            stats["workflow_signed"].as_u64().unwrap() + stats["workflow_unsigned"].as_u64().unwrap(),
+            3,
+            "the workflow partition must cover the whole registry"
+        );
     }
 
     #[tokio::test]

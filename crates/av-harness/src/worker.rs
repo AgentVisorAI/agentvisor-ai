@@ -2199,6 +2199,144 @@ mod tests {
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
+    /// Mutation-run hardening (round 11): the queue-drain notify in
+    /// `worker_job_finished` fires exactly on the LAST decrement — a
+    /// surviving `==`→`!=` mutant notified on every decrement EXCEPT
+    /// the final one, so a `wait_idle` caller that subscribed while the
+    /// last job was in flight waited forever (the lost-final-wakeup
+    /// class; shutdown and tests both sit in wait_idle).
+    #[tokio::test]
+    async fn wait_idle_wakes_on_the_final_job() {
+        let bus = Arc::new(GatedBus::new("drain-session"));
+        let worker = Arc::new(spawn_worker(
+            64,
+            Arc::clone(&bus) as Arc<dyn EventBus>,
+            Arc::new(HashEmbedder::default()),
+            Arc::new(Registry::new()),
+        ));
+        let session = session_with_id("drain-session");
+        worker.try_submit(job(Arc::clone(&session))).unwrap();
+        // Subscribe while the single job is still gated in publish.
+        let waiter = tokio::spawn({
+            let worker = Arc::clone(&worker);
+            async move { worker.wait_idle().await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!waiter.is_finished(), "wait_idle must block while the job is gated");
+        bus.release.store(true, std::sync::atomic::Ordering::Release);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("wait_idle must wake on the FINAL job's completion")
+            .unwrap();
+    }
+
+    /// Mutation-run hardening (round 11): a batch whose every job was
+    /// skipped by the capture-failed guard writes NO journal file —
+    /// the group-commit fsync must treat the missing file as success,
+    /// not an error (a guard mutant converting NotFound to failure
+    /// survived because no test synced a journal-less session).
+    #[tokio::test]
+    async fn sync_session_journal_tolerates_a_missing_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = session_with_id("never-journaled");
+        sync_session_journal(directory.path(), &session)
+            .await
+            .expect("a missing journal is the every-job-skipped shape, not a fault");
+    }
+
+    /// Mutation-run hardening (round 11): the attempt-id reservation
+    /// must mint unique non-empty ids (a constant would collide the
+    /// durable marker paths of concurrent attempts), the marker write
+    /// must create its spool subdirectory on FIRST use, and the
+    /// broker-ack lookup must refuse an ack whose session OR event uid
+    /// differs (an ||→&& mutant accepted half-matching acks — cross-
+    /// event ack reuse during recovery).
+    #[tokio::test]
+    async fn markers_and_acks_pin_identity_and_first_use() {
+        let a = reserve_response_attempt_id();
+        let b = reserve_response_attempt_id();
+        assert!(!a.is_empty());
+        assert_ne!(a, b, "attempt ids must be unique");
+
+        let directory = tempfile::tempdir().unwrap();
+        let key = [21u8; 32];
+        write_response_marker(directory.path(), &key, "marker-session", &a, "digest".to_owned())
+            .await
+            .expect("the first marker write must create the spool subdirectory");
+
+        let ack = PublishAck {
+            topic: "agent.session".to_owned(),
+            partition: 0,
+            offset: 7,
+        };
+        persist_broker_ack(directory.path(), "ack-session", "uid-1", &ack, &key)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_broker_ack(directory.path(), "ack-session", "uid-1", &key)
+                .await
+                .unwrap(),
+            Some(ack),
+            "the matching (session, uid) pair must resolve"
+        );
+        assert!(
+            read_broker_ack(directory.path(), "ack-session", "uid-2", &key)
+                .await
+                .unwrap()
+                .is_none()
+                || read_broker_ack(directory.path(), "ack-session", "uid-2", &key)
+                    .await
+                    .is_err(),
+            "a half-matching ack (same session, different uid) must never resolve"
+        );
+        assert!(
+            read_broker_ack(directory.path(), "other-session", "uid-1", &key)
+                .await
+                .unwrap()
+                .is_none()
+                || read_broker_ack(directory.path(), "other-session", "uid-1", &key)
+                    .await
+                    .is_err(),
+            "a half-matching ack (different session, same uid) must never resolve"
+        );
+    }
+
+    /// Mutation-run hardening (round 11): the fold invariant every
+    /// journal replay checks — classified tool outcomes can never
+    /// exceed observed calls — had a surviving Ok(()) mutant. A fold
+    /// that accepts inconsistent accounting attests corrupted tool
+    /// totals into the signed receipt.
+    #[test]
+    fn tool_accounting_invariant_is_enforced() {
+        let consistent = RecoveredTotals {
+            tool_calls: 5,
+            tool_allowed: 3,
+            tool_blocked: 2,
+            ..RecoveredTotals::default()
+        };
+        assert!(consistent.validate_tool_accounting().is_ok());
+        let inconsistent = RecoveredTotals {
+            tool_calls: 4,
+            tool_allowed: 3,
+            tool_blocked: 2,
+            ..RecoveredTotals::default()
+        };
+        assert!(
+            inconsistent.validate_tool_accounting().is_err(),
+            "classified > calls must be refused"
+        );
+        let overflowing = RecoveredTotals {
+            tool_calls: u64::MAX,
+            tool_allowed: u64::MAX,
+            tool_blocked: 1,
+            ..RecoveredTotals::default()
+        };
+        assert!(
+            overflowing.validate_tool_accounting().is_err(),
+            "the classified sum overflowing u64 must be refused"
+        );
+    }
+
     #[derive(Default)]
     struct RecordingBus {
         events: Mutex<Vec<(String, String, Value)>>,
