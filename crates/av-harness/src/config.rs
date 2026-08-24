@@ -2110,6 +2110,43 @@ mod tests {
         }
     }
 
+    /// The shipped example config must PARSE AND VALIDATE, and must
+    /// pin the register-#4 posture: loopback bind, dashboard off, and
+    /// every uncommented value acceptable to the strict loader. This
+    /// is the file the README tells checkout users to copy — nothing
+    /// exercised it before, which is exactly how the README's
+    /// checkout section drifted stale. All three shipped configs must
+    /// also opt into the signed workflow: the serde default is
+    /// "unsigned" (zero-config ergonomics), so any shipped config
+    /// that omits the key silently produces ZERO signed receipts on
+    /// clean traffic — the register's item-19 observation, found
+    /// live in the container/docker configs and the K8s ConfigMap.
+    #[test]
+    fn shipped_example_config_parses_and_pins_safe_posture() {
+        let raw = include_str!("../../../config/harness.example.toml");
+        let config = HarnessConfig::from_toml(raw)
+            .unwrap_or_else(|error| panic!("shipped example config must validate: {error}"));
+        assert_eq!(config.listen, "127.0.0.1:8484", "example must bind loopback");
+        assert!(!config.dashboard_enabled, "example must ship dashboard-off");
+        assert_eq!(
+            config.budget.max_tokens,
+            Some(200_000),
+            "example must bind a token budget"
+        );
+        assert_eq!(config.default_workflow, "signed");
+        for (name, raw) in [
+            ("container", include_str!("../../../config/harness.container.toml")),
+            ("docker", include_str!("../../../config/harness.docker.toml")),
+        ] {
+            let config = HarnessConfig::from_toml(raw)
+                .unwrap_or_else(|error| panic!("shipped {name} config must validate: {error}"));
+            assert_eq!(
+                config.default_workflow, "signed",
+                "{name} config must opt into the signed workflow"
+            );
+        }
+    }
+
     /// `tool_upstream_url = ""` used to pass validation while runtime
     /// routing gates tool forwarding on `is_some()` — the empty string
     /// silently enabled the tool-upstream branches and only failed at the

@@ -36,7 +36,9 @@ require_identity = false
 # config/harness.example.toml for the bare-metal / laptop posture.
 allow_wildcard_bind = true
 
-default_workflow = "unsigned"
+# "signed" is the product's core promise (every session close mints an
+# Ed25519 receipt); matches avctl init and the README headline claim.
+default_workflow = "signed"
 consequential_tools = ["db_write", "payout", "merge", "deploy"]
 
 # All paths below exist inside the published image.

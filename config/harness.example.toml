@@ -26,6 +26,13 @@ upstream_read_timeout_s = 300
 # Relay each client's own Authorization header instead of a static key
 # (mutually exclusive with the static key and require_identity):
 # upstream_authorization_passthrough = true
+# KEYLESS upstreams (Ollama, LM Studio, vLLM, llama.cpp): OpenAI SDKs
+# unconditionally send a placeholder Authorization header, and with no
+# static key configured the harness refuses it — request 1 fails with
+# 401. This flag accepts and DISCARDS the placeholder (it is never
+# forwarded). With a static key above, the same posture is implicit
+# and this flag is unnecessary.
+# ignore_client_authorization = true
 
 # tool_upstream_url = "http://host.docker.internal:3000/mcp"
 # Bearer token injected on forwarded MCP tool calls:
@@ -34,7 +41,12 @@ upstream_read_timeout_s = 300
 
 require_identity = false
 audience = "agentvisor-ai"
-default_workflow = "unsigned"
+# "signed" is the product's core promise (every session close mints an
+# Ed25519 receipt). The serde default is "unsigned" for zero-config
+# ergonomics, but every SHIPPED config opts into signed — matching
+# `avctl init` and the README's headline claim. Clients can still
+# override per request via X-AV-Workflow.
+default_workflow = "signed"
 consequential_tools = ["db_write", "payout", "merge", "deploy"]
 session_idle_close_s = 900
 atif_spool_dir = "spool/atif"

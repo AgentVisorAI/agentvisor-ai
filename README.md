@@ -164,10 +164,17 @@ Alternatively `upstream_authorization_passthrough = true` relays each client's o
 ## Run from a checkout
 
 ```bash
-cargo run -p av-harness --bin agentvisord     # finds config/harness.example.toml
+cp config/harness.example.toml config/harness.toml   # the example is a template, never auto-loaded
+OPENAI_API_KEY=sk-... cargo run -p av-harness --bin agentvisord
 curl http://127.0.0.1:8484/health
 curl http://127.0.0.1:8484/metrics
 ```
+
+The copy is deliberate: `config/harness.toml` is on the search path,
+the example file is not (so editing documentation can never
+reconfigure a running deployment). Uncomment `upstream_api_key_env`
+in the copy — or point `upstream_url` at a local keyless server and
+uncomment `ignore_client_authorization` — before sending traffic.
 
 ## Routes
 

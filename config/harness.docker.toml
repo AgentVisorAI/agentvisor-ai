@@ -20,7 +20,9 @@ enforce_identity_scopes = true
 chat_scope = "chat:write"
 session_close_scope = "session:close"
 session_promote_scope = "session:promote"
-default_workflow = "unsigned"
+# "signed" is the product's core promise (every session close mints an
+# Ed25519 receipt); matches avctl init and the README headline claim.
+default_workflow = "signed"
 consequential_tools = ["db_write", "payout", "merge", "deploy"]
 session_idle_close_s = 900
 atif_spool_dir = "/app/spool/atif"
