@@ -254,6 +254,18 @@ fn render_config(plan: &ConfigPlan) -> String {
             out.push_str("bridge_data_dir = \"data/bridge\"\n");
         }
     }
+    // LAST in the template: a TOML table header captures every key
+    // after it, so [budget] must follow all top-level keys.
+    out.push_str("\n# Module-B action budget: without a [budget] block NOTHING binds —\n");
+    out.push_str("# token, payout and per-tool caps are all unlimited, so a runaway\n");
+    out.push_str("# agent (or an SDK retry loop) spends against your provider key\n");
+    out.push_str("# unbounded. These mirror config/harness.example.toml; tune per\n");
+    out.push_str("# deployment. With require_identity, add [principal_budget] with\n");
+    out.push_str("# the same shape so limits survive session-id rotation.\n");
+    out.push_str("[budget]\n");
+    out.push_str("max_tokens = 200000\n");
+    out.push_str("max_payout_usd_micros = 50000000\n");
+    out.push_str("max_total_tool_calls = 100\n");
     out
 }
 
@@ -2202,6 +2214,23 @@ mod tests {
             let config = av_harness::HarnessConfig::from_toml(&rendered)
                 .unwrap_or_else(|error| panic!("{preset:?}: {error}"));
             assert!(!config.upstream_url.is_empty(), "{preset:?} upstream_url");
+            // Register #8 follow-through: a generated config must have
+            // at least one BINDING budget dimension out of the box —
+            // without it token/payout/tool caps are all unlimited and a
+            // runaway agent spends against the operator's provider key
+            // unbounded. Also proves the [budget] table landed after
+            // every top-level key (a misplaced header would swallow
+            // atif_spool_dir into budget.* and fail from_toml above).
+            assert_eq!(
+                config.budget.max_tokens,
+                Some(200_000),
+                "{preset:?}: generated config must bind a token budget"
+            );
+            assert_eq!(
+                config.budget.max_payout_usd_micros,
+                Some(50_000_000),
+                "{preset:?}: generated config must bind a payout cap"
+            );
         }
         // Custom with an explicit URL also validates.
         let rendered = render_config(&plan_for(Preset::Custom, "http://10.0.0.5:9000", Some("MY_KEY")));
