@@ -538,4 +538,66 @@ mod read_capped_tests {
         // Missing root is a clean no-op (fresh install).
         assert_eq!(sweep_orphaned_tmp(&dir.path().join("absent")).unwrap(), 0);
     }
+
+    /// Mutation-run hardening (round 8): the MAX_SWEEP_DEPTH guard had
+    /// surviving `>` boundary and `depth + 1` arithmetic mutants — no
+    /// test placed orphans at the depth edge. The contract: an orphan
+    /// 8 directories down is still swept; 9 down is left alone (the
+    /// bound exists so a symlink-cycle-shaped tree cannot walk
+    /// forever).
+    #[test]
+    fn sweep_depth_bound_is_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut at_bound = dir.path().to_path_buf();
+        for i in 0..8 {
+            at_bound.push(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&at_bound).unwrap();
+        std::fs::write(at_bound.join("edge.0200.tmp"), b"").unwrap();
+        let mut past_bound = at_bound.clone();
+        past_bound.push("d8");
+        std::fs::create_dir_all(&past_bound).unwrap();
+        std::fs::write(past_bound.join("deep.0201.tmp"), b"").unwrap();
+
+        let removed = sweep_orphaned_tmp(dir.path()).unwrap();
+        assert_eq!(removed, 1, "exactly the at-bound orphan");
+        assert!(
+            !at_bound.join("edge.0200.tmp").exists(),
+            "an orphan at depth 8 (the bound) must be swept"
+        );
+        assert!(
+            past_bound.join("deep.0201.tmp").exists(),
+            "an orphan at depth 9 (past the bound) must be left alone"
+        );
+    }
+
+    /// Mutation-run hardening (round 8): only NotFound may downgrade to
+    /// the Ok(0) no-op — a mutant widening the guard to every metadata
+    /// error silently swallowed permission faults, hiding a broken
+    /// spool from the boot sequence that relies on this sweep.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_surfaces_non_notfound_root_errors() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("locked");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = std::fs::metadata(root.join("probe")).is_err()
+            && std::fs::read_dir(&root).is_err();
+        if denied {
+            // metadata(root) itself succeeds (the parent is traversable);
+            // the sweep must not mask the unreadable directory as Ok —
+            // walk() skips unreadable dirs by design, so assert only the
+            // NotFound arm stays narrow: a root whose metadata errors
+            // with EACCES must surface. Build that shape: a child of the
+            // locked dir is unstattable.
+            let unreachable_root = root.join("inner");
+            assert!(
+                sweep_orphaned_tmp(&unreachable_root).is_err(),
+                "an EACCES root must surface as an error, not a silent Ok(0)"
+            );
+        }
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }
