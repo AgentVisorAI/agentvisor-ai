@@ -36,6 +36,7 @@ impl HarnessConfig {
             upstream_http2_prior_knowledge: false,
             upstream_read_timeout_s: None,
             shutdown_drain_timeout_s: None,
+            shutdown_ready_drain_s: 0,
             upstream_chat_path: default_chat_path(),
             provider: default_provider(),
             upstream_api_key_env: None,

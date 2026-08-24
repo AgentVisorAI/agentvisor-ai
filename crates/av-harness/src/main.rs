@@ -323,14 +323,27 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
         "HTTP graceful-drain phase exceeded budget; per-connection tasks may still be live",
     );
     let draining_flag = Arc::clone(&state.draining);
+    let ready_drain_window = std::time::Duration::from_secs(config.shutdown_ready_drain_s);
     let server = std::future::IntoFuture::into_future(
         axum::serve(listener, build_router(state.clone())).with_graceful_shutdown(async move {
             shutdown_signal().await;
-            // Flip the draining flag BEFORE the graceful drain begins so
-            // `/readyz` starts returning 503 immediately. This gives the
-            // load balancer / K8s Service the full drain window to stop
-            // routing new traffic before axum stops accepting. See §8.3.
+            // Flip the draining flag FIRST so `/readyz` reports 503 on
+            // every connection accepted from here on. NOTE: axum stops
+            // accepting the moment this future completes, so without
+            // the pre-drain window below a fresh readiness probe sees
+            // connection-refused (also a probe failure, but an LB that
+            // distinguishes "degraded" from "gone" gets no 503, and
+            // in-flight LB routing has zero grace). Kubernetes covers
+            // that window with the preStop sleep; everywhere else
+            // `shutdown_ready_drain_s` provides it.
             draining_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            if ready_drain_window > std::time::Duration::ZERO {
+                tracing::info!(
+                    window_s = ready_drain_window.as_secs(),
+                    "readiness-controlled pre-drain: /readyz now 503, still accepting"
+                );
+                tokio::time::sleep(ready_drain_window).await;
+            }
             let _ = shutdown_started_tx.send(());
         }),
     );

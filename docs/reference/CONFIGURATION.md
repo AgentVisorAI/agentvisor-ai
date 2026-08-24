@@ -61,6 +61,8 @@ source. All are optional.
 | `upstream_authorization_passthrough` | `false` | Forward the client's `Authorization` header verbatim to the upstream. **Only valid when `require_identity = true`** — otherwise the harness would forward an unvalidated attacker-controlled header. |
 | `upstream_http2_prior_knowledge` | `false` | Skip HTTP/1 → HTTP/2 upgrade negotiation on the outbound connection. |
 | `upstream_read_timeout_s` | none | Per-request read timeout. Unset means "no timeout beyond the client's". |
+| `shutdown_drain_timeout_s` | `max(30, upstream_read_timeout_s + 5)` | Graceful-shutdown drain budget. |
+| `shutdown_ready_drain_s` | `0` | Readiness-controlled pre-drain window: on SIGTERM, `/readyz` serves 503 while the listener keeps accepting for this long before the drain begins. Needed for non-Kubernetes LBs (K8s gets this from the preStop sleep). |
 | `upstream_api_key_env` / `upstream_api_key_file` | none | Where to pull the outbound API key from. `_file` wins over `_env` when both are set. |
 
 ## Budgets

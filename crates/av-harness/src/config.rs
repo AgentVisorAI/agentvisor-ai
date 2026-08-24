@@ -68,6 +68,21 @@ pub struct HarnessConfig {
     /// above this value or the kubelet SIGKILLs mid-drain.
     #[serde(default)]
     pub shutdown_drain_timeout_s: Option<u64>,
+    /// Readiness-controlled pre-drain window in seconds (default 0).
+    /// On SIGTERM/SIGINT the harness flips `/readyz` to 503 and then
+    /// KEEPS ACCEPTING connections for this long before the graceful
+    /// drain begins, so an external load balancer polling `/readyz`
+    /// can stop routing before the listener closes. Without it the
+    /// listener stops accepting the instant the signal lands and a
+    /// fresh readiness probe sees connection-refused, never the 503 —
+    /// fine on Kubernetes (the preStop sleep provides this window
+    /// before SIGTERM), but docker-compose / systemd / bare-LB
+    /// deployments have no preStop equivalent. Set it to your LB's
+    /// readiness poll interval plus one reconciliation. Counts against
+    /// the orchestrator's kill grace period ON TOP of the drain
+    /// budget.
+    #[serde(default)]
+    pub shutdown_ready_drain_s: u64,
     /// Chat-completions path appended to `upstream_url`. Override for
     /// providers with non-standard layouts (Azure deployments, Gemini's
     /// OpenAI-compatible surface).
@@ -1442,6 +1457,9 @@ impl HarnessConfig {
                 );
             }
             interval_fields.push(("shutdown_drain_timeout_s", drain));
+        }
+        if self.shutdown_ready_drain_s > 0 {
+            interval_fields.push(("shutdown_ready_drain_s", self.shutdown_ready_drain_s));
         }
         for (field, value) in interval_fields {
             if value > MAX_SECONDS_INTERVAL {
