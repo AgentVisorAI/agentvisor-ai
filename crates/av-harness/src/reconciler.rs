@@ -516,7 +516,8 @@ impl Finalizer {
     }
 
     /// Remove sealed ATIF trajectories (and their `.atif-auth` provenance
-    /// sidecars) whose mtime is older than `max_age`. Idempotent; a
+    /// sidecars and digest-bound `.close-complete` markers) whose mtime is
+    /// older than `max_age`. Idempotent; a
     /// missing file (already pruned) is silently skipped. Returns the
     /// number of `(atif, sidecar)` pairs removed so callers can log or
     /// bump a metric.
@@ -549,11 +550,49 @@ impl Finalizer {
                 let entry = entry.map_err(FinalizeError::atif_source)?;
                 let path = entry.path();
                 // We only prune paired sealed evidence: `<stem>.json` with
-                // its matching `<stem>.atif-auth`. Anything else — the
-                // step journals, corrupt-quarantine files, tool-execution
-                // markers — belongs to code paths that own their own
-                // deletion logic.
-                if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
+                // its matching `<stem>.atif-auth`, plus the pair's
+                // digest-bound `<stem>.close-complete` marker. Anything
+                // else — the step journals, corrupt-quarantine files,
+                // tool-execution markers — belongs to code paths that own
+                // their own deletion logic.
+                let extension = path.extension().and_then(std::ffi::OsStr::to_str);
+                if extension == Some("close-complete") {
+                    // A close-complete marker whose artifact is gone can
+                    // never verify again (it is digest-bound to the
+                    // artifact bytes) — it is dead weight left behind by
+                    // pre-fix sweeps that pruned the pair but not the
+                    // marker, one file per closed session, forever. Only
+                    // plain per-close markers (`<32-hex-stem>` names)
+                    // qualify: archived collision markers
+                    // (`{stem}.archived-….close-complete`) are preserved
+                    // evidence and keep their own pair.
+                    let is_plain_stem_marker = path
+                        .file_stem()
+                        .and_then(std::ffi::OsStr::to_str)
+                        .is_some_and(|stem| {
+                            stem.len() == 32 && stem.chars().all(|c| c.is_ascii_hexdigit())
+                        });
+                    if is_plain_stem_marker && !path.with_extension("json").exists() {
+                        let old_enough = entry
+                            .metadata()
+                            .and_then(|m| m.modified())
+                            .ok()
+                            .map(|modified| {
+                                now.duration_since(modified).unwrap_or(std::time::Duration::ZERO)
+                                    >= max_age
+                            })
+                            .unwrap_or(false);
+                        if old_enough {
+                            match std::fs::remove_file(&path) {
+                                Ok(()) => dir_changed = true,
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(error) => return Err(FinalizeError::atif_source(error)),
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if extension != Some("json") {
                     continue;
                 }
                 if path
@@ -592,6 +631,16 @@ impl Finalizer {
                 }
                 match std::fs::remove_file(&path) {
                     Ok(()) => removed_any = true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(FinalizeError::atif_source(error)),
+                }
+                // The pair's close-complete marker is digest-bound to the
+                // artifact just removed; without it the marker can never
+                // verify and would otherwise leak forever (one marker per
+                // closed unsigned session survived every sweep before
+                // this removal existed).
+                match std::fs::remove_file(path.with_extension("close-complete")) {
+                    Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => return Err(FinalizeError::atif_source(error)),
                 }
@@ -7426,6 +7475,21 @@ mod tests {
         let old_sc = spool.join("bbb.atif-auth");
         std::fs::write(&old_json, b"{}").unwrap();
         std::fs::write(&old_sc, b"provenance").unwrap();
+        // The pair's digest-bound close-complete marker must go WITH the
+        // pair — before this removal existed, one marker per closed
+        // unsigned session survived every sweep, forever.
+        let old_marker = spool.join("bbb.close-complete");
+        std::fs::write(&old_marker, b"sealed").unwrap();
+
+        // Orphaned per-close marker (pair already pruned by a pre-fix
+        // sweep): dead weight, must be healed.
+        let orphan_marker = spool.join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.close-complete");
+        std::fs::write(&orphan_marker, b"sealed").unwrap();
+
+        // Archived collision marker: preserved evidence, NEVER pruned
+        // (its name is not a plain 32-hex stem).
+        let archived_marker = spool.join("eee.archived-traj9.close-complete");
+        std::fs::write(&archived_marker, b"sealed").unwrap();
 
         // Unpaired old JSON (no sidecar): retention must NOT touch it —
         // that is the reconciler quarantine sweep's job.
@@ -7446,6 +7510,18 @@ mod tests {
         assert!(!old_json.exists(), "aged sealed evidence must be pruned");
         assert!(!old_sc.exists(), "aged sidecar must be pruned");
         assert!(
+            !old_marker.exists(),
+            "the pair's close-complete marker must be pruned with the pair"
+        );
+        assert!(
+            !orphan_marker.exists(),
+            "an orphaned per-close marker past retention must be healed"
+        );
+        assert!(
+            archived_marker.exists(),
+            "archived collision markers are preserved evidence, never retention targets"
+        );
+        assert!(
             orphan_json.exists(),
             "unpaired remnants belong to quarantine, not retention"
         );
@@ -7457,6 +7533,12 @@ mod tests {
         let fresh_sc = spool.join("aaa.atif-auth");
         std::fs::write(&fresh_json, b"{}").unwrap();
         std::fs::write(&fresh_sc, b"provenance").unwrap();
+        let fresh_marker = spool.join("aaa.close-complete");
+        std::fs::write(&fresh_marker, b"sealed").unwrap();
+        // A fresh orphaned marker (close in progress elsewhere, or pair
+        // just pruned moments ago) is inside the window — left alone.
+        let fresh_orphan_marker = spool.join("cccccccccccccccccccccccccccccccc.close-complete");
+        std::fs::write(&fresh_orphan_marker, b"sealed").unwrap();
 
         let removed = finalizer
             .prune_sealed_atif(std::time::Duration::from_secs(60 * 60))
@@ -7465,5 +7547,10 @@ mod tests {
         assert_eq!(removed, 0, "fresh evidence must be preserved");
         assert!(fresh_json.exists());
         assert!(fresh_sc.exists());
+        assert!(fresh_marker.exists(), "a live pair keeps its marker");
+        assert!(
+            fresh_orphan_marker.exists(),
+            "an orphaned marker inside the retention window is left alone"
+        );
     }
 }
