@@ -158,12 +158,15 @@ impl Sandbox {
                 // Protocol-level failures
                 // get the reserved JSON-RPC codes (-32700/-32600/
                 // -32602), not the -32001 policy code — the request
-                // never reached an authorization decision.
+                // never reached an authorization decision. The id is
+                // echoed whenever the envelope made it detectable
+                // (JSON-RPC 2.0 §5; see `detectable_error_id`).
+                let id = crate::rpc::detectable_error_id(raw, &e);
                 return ToolVerdict::Blocked {
                     tool: "<unparsed>".into(),
                     stage,
                     reason,
-                    response: crate::rpc::protocol_error(None, &e),
+                    response: crate::rpc::protocol_error(id.as_ref(), &e),
                     elapsed_us: elapsed(started),
                 };
             }
@@ -482,6 +485,29 @@ mod tests {
             ToolVerdict::Blocked { stage, reason, .. } => {
                 assert_eq!(stage, "policy");
                 assert!(reason.contains("deny-listed"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// JSON-RPC 2.0 §5: parse-gate refusals of a WELL-FORMED envelope
+    /// must echo the request id in the error response. Pre-fix the
+    /// blocked-response body always carried `id: null`, so SDK
+    /// correlation tables never matched and the pending call hung.
+    #[test]
+    fn blocked_parse_verdict_echoes_the_request_id() {
+        let store = InMemoryStore::new();
+        let raw = br#"{"jsonrpc":"2.0","id":42,"method":"initialize","params":{}}"#;
+        match sandbox().check(&store, "s", raw) {
+            ToolVerdict::Blocked { response, .. } => {
+                assert_eq!(response["id"], json!(42), "{response}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Unparseable JSON: the id is undetectable — null stands.
+        match sandbox().check(&store, "s", b"not json") {
+            ToolVerdict::Blocked { response, .. } => {
+                assert_eq!(response["id"], serde_json::Value::Null, "{response}");
             }
             other => panic!("{other:?}"),
         }

@@ -1043,6 +1043,30 @@ impl AppState {
             }
         }
 
+        // Validate and extract the relayed headers BEFORE any budget
+        // debit or admission journaling: `single_header` refuses
+        // multi-valued occurrences, and its `?` used to fire from the
+        // `PreparedRequest` construction AFTER both ledgers were
+        // debited with no refund arm — a client repeating a duplicate
+        // `openai-beta` header drained session + principal budgets
+        // without a single upstream call.
+        let client_authorization = if self.config.upstream_authorization_passthrough {
+            single_header(headers, "authorization")?.cloned()
+        } else {
+            None
+        };
+        // Strict allowlist of provider-semantic headers. Same
+        // single-value discipline as every other relayed header
+        // (a multi-valued occurrence is refused at ingress).
+        const UPSTREAM_HEADER_ALLOWLIST: [&str; 3] =
+            ["openai-organization", "openai-project", "openai-beta"];
+        let mut upstream_passthrough_headers = Vec::new();
+        for name in UPSTREAM_HEADER_ALLOWLIST {
+            if let Some(value) = single_header(headers, name)? {
+                upstream_passthrough_headers.push((axum::http::HeaderName::from_static(name), value.clone()));
+            }
+        }
+
         let stage = Instant::now();
         let identity = match self.resolve_identity(headers, Some(&self.config.chat_scope)) {
             Ok(identity) => identity,
@@ -1374,25 +1398,8 @@ impl AppState {
             lease,
             response_permit: Some(response_permit),
             capture_guard,
-            client_authorization: if self.config.upstream_authorization_passthrough {
-                single_header(headers, "authorization")?.cloned()
-            } else {
-                None
-            },
-            upstream_passthrough_headers: {
-                // Strict allowlist of provider-semantic headers. Same
-                // single-value discipline as every other relayed header
-                // (a multi-valued occurrence is refused at ingress).
-                const UPSTREAM_HEADER_ALLOWLIST: [&str; 3] =
-                    ["openai-organization", "openai-project", "openai-beta"];
-                let mut relayed = Vec::new();
-                for name in UPSTREAM_HEADER_ALLOWLIST {
-                    if let Some(value) = single_header(headers, name)? {
-                        relayed.push((axum::http::HeaderName::from_static(name), value.clone()));
-                    }
-                }
-                relayed
-            },
+            client_authorization,
+            upstream_passthrough_headers,
         })
     }
 
@@ -1505,10 +1512,18 @@ impl AppState {
         // (durable-capture failure, breaker-open, marker-write failure),
         // so the admission token debit provably bought no LLM work —
         // refund it exactly once (zeroed so a hypothetical double
-        // abandon cannot double-refund).
+        // abandon cannot double-refund). The admission debit landed on
+        // BOTH ledgers (see the post-compression charge in
+        // `prepare_chat`), so the refund must too: session-only
+        // refunding permanently drained principal tokens on every
+        // pre-dispatch abort.
         let debited = std::mem::take(&mut prepared.debited_tokens);
         ActionBudget::new(self.store.as_ref(), &prepared.session.id, &self.config.budget)
             .refund_tokens(debited);
+        if let Some(spec) = self.config.principal_budget.as_ref() {
+            let principal_id = principal_id_for_budget(&prepared.identity);
+            ActionBudget::for_principal(self.store.as_ref(), &principal_id, spec).refund_tokens(debited);
+        }
         let Some(permit) = prepared.response_permit.take() else {
             // Defensive: no permit means the guard's Drop is the only
             // resolver left. Leave it armed so the terminal record lands
@@ -3023,6 +3038,81 @@ mod tests {
             }
             Err(other) => panic!("unexpected refusal shape {other:?}"),
         }
+    }
+
+    /// `abandon_prepared` runs strictly pre-dispatch, so its refund must
+    /// mirror the DUAL-ledger admission debit. Pre-fix it refunded only
+    /// the session ledger: every pre-dispatch abort (durable-capture
+    /// failure, breaker-open, marker-write failure) permanently drained
+    /// principal tokens for zero LLM work — under header rotation the
+    /// principal ledger is the only one that binds, so aborts alone
+    /// could exhaust an identity's budget.
+    #[tokio::test]
+    async fn abandon_prepared_refunds_the_principal_ledger_too() {
+        let mut config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        config.budget.max_tokens = Some(1_000_000);
+        // Fits ONE ~30-token payload; a leaked (unrefunded) debit makes
+        // the next same-principal request refuse.
+        config.principal_budget = Some(av_state::BudgetSpec {
+            max_tokens: Some(40),
+            ..av_state::BudgetSpec::default()
+        });
+        let state = state(config);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(SESSION_HEADER, HeaderValue::from_static("abandon-a"));
+        let mut prepared = state.prepare_chat(&headers, payload()).unwrap();
+        state.abandon_prepared(&mut prepared, StopReason::Other, "test abandon");
+        drop(prepared);
+
+        // Same (anonymous) principal, different session: only the
+        // principal ledger can refuse here. It must not — the abandoned
+        // request's debit was refunded on both ledgers.
+        let mut headers_b = HeaderMap::new();
+        headers_b.insert(SESSION_HEADER, HeaderValue::from_static("abandon-b"));
+        let second = state.prepare_chat(&headers_b, payload());
+        assert!(
+            second.is_ok(),
+            "an abandoned request must not consume principal budget; got {:?}",
+            second.err()
+        );
+    }
+
+    /// The relayed-header single-value checks must run BEFORE the
+    /// budget debit: pre-fix, `single_header`'s `?` fired from the
+    /// `PreparedRequest` construction after BOTH ledgers were debited,
+    /// with no refund arm — a client repeating a duplicate
+    /// `openai-beta` header drained budgets without one upstream call.
+    #[tokio::test]
+    async fn duplicate_passthrough_header_is_refused_without_consuming_budget() {
+        let mut config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        // Fits ONE ~30-token payload: a pre-refusal debit leak makes the
+        // follow-up legitimate request refuse.
+        config.budget.max_tokens = Some(40);
+        let state = state(config);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(SESSION_HEADER, HeaderValue::from_static("dup-header"));
+        headers.append("openai-beta", HeaderValue::from_static("assistants=v1"));
+        headers.append("openai-beta", HeaderValue::from_static("assistants=v2"));
+        assert!(
+            matches!(
+                state.prepare_chat(&headers, payload()),
+                Err(PipelineError::BadRequest { .. })
+            ),
+            "duplicate allowlisted headers must be refused"
+        );
+
+        // The refusal must not have consumed the session budget.
+        let mut clean = HeaderMap::new();
+        clean.insert(SESSION_HEADER, HeaderValue::from_static("dup-header"));
+        clean.insert("openai-beta", HeaderValue::from_static("assistants=v2"));
+        let second = state.prepare_chat(&clean, payload());
+        assert!(
+            second.is_ok(),
+            "a header-refused request must not consume budget; got {:?}",
+            second.err()
+        );
     }
 
     #[tokio::test]
