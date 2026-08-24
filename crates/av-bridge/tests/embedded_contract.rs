@@ -118,6 +118,124 @@ fn event_uid_publication_is_idempotent_across_restart() {
     );
 }
 
+/// The idempotency UID must MATCH the event's embedded `metadata.uid`
+/// — a mismatch means the dedupe key and the recovery scan would
+/// disagree about the event's identity (crash recovery rebuilds the
+/// sidecar from `metadata.uid`, so an event published under a
+/// different dedupe UID would stop deduplicating after a restart).
+/// Mutation-run hardening (round 9): the mismatch guard had a
+/// surviving guard→false mutant — the refusal was never asserted.
+#[test]
+fn mismatched_metadata_uid_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = EmbeddedBroker::provision(dir.path(), &manifest()).unwrap();
+    let error = broker
+        .publish_idempotent(
+            "agent.session",
+            "inst-A",
+            &json!({"metadata": {"uid": "uid-embedded"}, "value": 1}),
+            "uid-argument",
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("does not match"),
+        "mismatched dedupe/metadata UIDs must be refused: {error}"
+    );
+}
+
+/// `maintenance` returns the number of hot records it expired — the
+/// count feeds operator metrics. Mutation-run hardening (round 9):
+/// constant-return mutants (Ok(0)/Ok(1)) survived because no test
+/// asserted the count, only side effects. Age two of three records
+/// past the retention window and pin the exact count.
+#[test]
+fn maintenance_reports_the_exact_expiry_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = EmbeddedBroker::provision(dir.path(), &manifest()).unwrap();
+    for i in 0..3 {
+        broker
+            .publish_idempotent(
+                "agent.session",
+                "inst-A",
+                &json!({"metadata": {"uid": format!("exp-uid-{i}")}, "value": i}),
+                &format!("exp-uid-{i}"),
+            )
+            .unwrap();
+    }
+    // Nothing is old yet: a maintenance pass expires zero.
+    let now = av_core::time::now_ms();
+    assert_eq!(broker.maintenance(now).unwrap(), 0, "fresh records must survive");
+    // Pretend the clock jumped past the hot window for ALL records,
+    // then verify the count is exactly 3 (not a constant).
+    let hot_ms = 720u64 * 3600 * 1000;
+    assert_eq!(
+        broker.maintenance(now + hot_ms + 60_000).unwrap(),
+        3,
+        "every expired record must be counted"
+    );
+}
+
+/// A retention crash-gap must not resurrect an already-published
+/// event: when a record vanishes from the segment (rewrite crash
+/// between segment and sidecar) but its offset lies INSIDE the
+/// surviving records' offset range, the sidecar's UID→offset entry is
+/// deliberately RETAINED so `publish_idempotent` still short-circuits
+/// to the original ack instead of appending a duplicate audit event.
+/// Mutation-run hardening (round 9): the `offset <= hi` half of the
+/// range check had a surviving mutant — nothing exercised the
+/// gap-offset shape.
+#[test]
+fn crash_gap_inside_offset_range_keeps_idempotency() {
+    let dir = tempfile::tempdir().unwrap();
+    let acks = {
+        let broker = EmbeddedBroker::provision(dir.path(), &manifest()).unwrap();
+        (0..3)
+            .map(|i| {
+                broker
+                    .publish_idempotent(
+                        "agent.session",
+                        "inst-A",
+                        &json!({"metadata": {"uid": format!("gap-uid-{i}")}, "value": i}),
+                        &format!("gap-uid-{i}"),
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(acks[1].offset, 1);
+
+    // Simulate the crash: the MIDDLE record is gone from the segment,
+    // the sidecar still remembers it.
+    let segment = dir
+        .path()
+        .join("topics")
+        .join("agent.session")
+        .join(format!("p{}.jsonl", acks[0].partition));
+    let surviving: Vec<String> = std::fs::read_to_string(&segment)
+        .unwrap()
+        .lines()
+        .enumerate()
+        .filter(|(i, _)| *i != 1)
+        .map(|(_, line)| line.to_owned())
+        .collect();
+    std::fs::write(&segment, format!("{}\n", surviving.join("\n"))).unwrap();
+
+    let reopened = EmbeddedBroker::open(dir.path()).unwrap();
+    let retry = reopened
+        .publish_idempotent(
+            "agent.session",
+            "inst-A",
+            &json!({"metadata": {"uid": "gap-uid-1"}, "value": 1}),
+            "gap-uid-1",
+        )
+        .unwrap();
+    assert_eq!(
+        retry, acks[1],
+        "a gap-offset UID inside the surviving range must keep deduplicating \
+         (a republish would mint a duplicate audit event)"
+    );
+}
+
 #[test]
 fn unknown_topic_is_an_error_not_autocreate() {
     let dir = tempfile::tempdir().unwrap();
