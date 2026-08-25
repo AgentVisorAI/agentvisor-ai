@@ -80,6 +80,9 @@ jobs:
           cp docs/style.css "$site/style.css"
           cp docs/logo.png "$site/logo.png"
           cp docs/social-preview.png "$site/social-preview.png"
+          # Product console (self-contained client-side app).
+          mkdir -p "$site/app"
+          cp docs/app/index.html docs/app/console.css docs/app/console.js "$site/app/"
           # Custom-domain marker for GitHub Pages. Without a CNAME file in
           # the published artifact, Pages resets the configured custom
           # domain on each deploy.

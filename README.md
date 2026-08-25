@@ -29,6 +29,10 @@ client = OpenAI(
 
 - **[Landing page](https://agentvisorai.github.io/agentvisor-ai/)** — the story, in
   three concrete examples.
+- **[Console](https://agentvisorai.github.io/agentvisor-ai/app/)** — the
+  product, clickable in your browser: setup, one-line integration, a live
+  capped session, the fleet overview, and offline receipt verification.
+  Client-side simulation with representative data; nothing leaves the page.
 - **[Releases](https://github.com/AgentVisorAI/agentvisor-ai/releases)** —
   pre-built binaries with SHA-256 checksums.
 - **[Security model](SECURITY.md)** — trust boundaries, controls, and how
