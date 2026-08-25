@@ -53,8 +53,9 @@ tracks four axes:
   refunded so a client rotating session ids can't drain the
   principal.
 * On upstream failure, both ledgers are refunded.
-* Refusal returns 429 with a `metadata.limit` field naming the axis
-  and cap.
+* Refusal returns 403 with a reason naming the axis and cap —
+  deliberately not 429, which mainstream SDKs treat as transient rate
+  limiting and auto-retry (see `PipelineError::status`).
 
 ## Loop detection
 
