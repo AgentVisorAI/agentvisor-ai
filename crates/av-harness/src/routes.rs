@@ -3512,9 +3512,21 @@ pub(crate) fn provider_u64(value: Option<&Value>, field: &str) -> Result<Option<
 fn map_finish_reason(native: &str) -> av_events::StopReason {
     match native {
         "stop" | "stop_sequence" | "end_turn" => av_events::StopReason::Stop,
-        "length" | "max_tokens" => av_events::StopReason::MaxTokens,
+        // Anthropic's `model_context_window_exceeded` is the same
+        // semantic as OpenAI's `length` / Gemini's `MAX_TOKENS` (the
+        // model hit a length limit). Pre-fix it fell through to Other
+        // — a capacity dashboard grouping sessions by "Length" missed
+        // Anthropic overflows.
+        "length" | "max_tokens" | "model_context_window_exceeded" => av_events::StopReason::MaxTokens,
         "tool_calls" | "function_call" | "tool_use" => av_events::StopReason::ToolUse,
-        "content_filter" => av_events::StopReason::ContentFilter,
+        // Anthropic's `refusal` (Claude Sonnet 4.5+) is a safety refusal
+        // — the same semantic as OpenAI's `content_filter` and the
+        // cluster Gemini folds via map_gemini_finish_reason. Pre-fix it
+        // fell through to Other, silently splitting safety-refusal
+        // analytics along provider lines (verified live: an Anthropic
+        // response with stop_reason=refusal journalled stop_reason_id=99
+        // where OpenAI/Gemini equivalents journalled id=90).
+        "content_filter" | "refusal" => av_events::StopReason::ContentFilter,
         _ => av_events::StopReason::Other,
     }
 }
@@ -4379,6 +4391,258 @@ mod tests {
         provider.abort();
     }
 
+    /// Anthropic mock that emits `stop_reason: "refusal"` — the safety
+    /// refusal stop reason Anthropic added with Claude Sonnet 4.5.
+    /// Semantically identical to OpenAI's `content_filter` and Gemini's
+    /// SAFETY/RECITATION/BLOCKLIST cluster.
+    async fn mock_anthropic_refusal() -> Response {
+        let frames = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":15,\"output_tokens\":1}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"I can't help with that.\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":6}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let mut response = Response::new(Body::from(frames));
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        response
+    }
+
+    async fn test_state_anthropic_refusal(
+        spool: &std::path::Path,
+    ) -> (AppState, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = Router::new().route("/v1/chat/completions", post(mock_anthropic_refusal));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, provider).await.unwrap();
+        });
+        let mut config = crate::config::HarnessConfig::for_tests(
+            &format!("http://{address}"),
+            &spool.to_string_lossy(),
+            &spool.to_string_lossy(),
+        );
+        config.provider = "anthropic".to_owned();
+        let state = AppState::new(
+            config,
+            Arc::new(InMemoryStore::new()),
+            Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
+            Arc::new(NullBus),
+            None,
+            Arc::new(Ed25519Signer::from_seed(&[15; 32])),
+        )
+        .unwrap();
+        (state, server)
+    }
+
+    /// Register item 28 — cross-provider stop-reason normalization for
+    /// safety refusals. OpenAI emits `finish_reason: "content_filter"`,
+    /// Gemini folds SAFETY/RECITATION/BLOCKLIST/PROHIBITED_CONTENT/SPII
+    /// to `content_filter`, and Anthropic (Claude Sonnet 4.5 and later)
+    /// emits `stop_reason: "refusal"`. All three name the same thing —
+    /// the model refused to generate on safety grounds — but pre-fix
+    /// only two of the three mapped to `StopReason::ContentFilter`;
+    /// Anthropic's `refusal` silently fell through to Other. A safety-
+    /// team dashboard filtering by `stop_reason == "Content Filter"`
+    /// would count OpenAI/Gemini refusals and miss Anthropic ones.
+    #[tokio::test]
+    async fn anthropic_refusal_stop_reason_attests_content_filter() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state_anthropic_refusal(directory.path()).await;
+        let app = build_router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(chat_request("anthropic-refusal"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), 64 * 1024).await;
+        let session = state.sessions.get("anthropic-refusal").unwrap();
+        session.wait_for_worker_jobs().await;
+        let close = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/anthropic-refusal/close")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(close.status(), StatusCode::OK);
+        let promoted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/anthropic-refusal/promote")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(promoted.status(), StatusCode::OK);
+        let receipt: av_receipts::Receipt = serde_json::from_slice(
+            &axum::body::to_bytes(promoted.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        receipt.verify_embedded().unwrap();
+        assert_eq!(
+            receipt.body.stop_reason_id,
+            av_events::StopReason::ContentFilter.id(),
+            "an Anthropic session that ended with stop_reason:refusal must attest \
+             StopReason::ContentFilter (id {}), not Other (id {}). OpenAI's \
+             content_filter and Gemini's SAFETY cluster both map to ContentFilter; \
+             leaving Anthropic's refusal as Other silently splits safety-refusal \
+             analytics along provider lines. Received: stop_reason_id={}, \
+             stop_reason={:?}.",
+            av_events::StopReason::ContentFilter.id(),
+            av_events::StopReason::Other.id(),
+            receipt.body.stop_reason_id,
+            receipt.body.stop_reason,
+        );
+        provider.abort();
+    }
+
+    /// Anthropic mock that emits `stop_reason:
+    /// "model_context_window_exceeded"` — Anthropic's dedicated stop
+    /// reason for when input + output overflows the context window.
+    /// Semantically identical to OpenAI's `length` / Gemini's
+    /// MAX_TOKENS.
+    async fn mock_anthropic_context_window_exceeded() -> Response {
+        let frames = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":200000,\"output_tokens\":1}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"model_context_window_exceeded\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":3}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let mut response = Response::new(Body::from(frames));
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        response
+    }
+
+    async fn test_state_anthropic_ctx_exceeded(
+        spool: &std::path::Path,
+    ) -> (AppState, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = Router::new().route(
+            "/v1/chat/completions",
+            post(mock_anthropic_context_window_exceeded),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, provider).await.unwrap();
+        });
+        let mut config = crate::config::HarnessConfig::for_tests(
+            &format!("http://{address}"),
+            &spool.to_string_lossy(),
+            &spool.to_string_lossy(),
+        );
+        config.provider = "anthropic".to_owned();
+        let state = AppState::new(
+            config,
+            Arc::new(InMemoryStore::new()),
+            Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
+            Arc::new(NullBus),
+            None,
+            Arc::new(Ed25519Signer::from_seed(&[17; 32])),
+        )
+        .unwrap();
+        (state, server)
+    }
+
+    /// Register item 28 — cross-provider stop-reason normalization for
+    /// context-window overflow. OpenAI emits `finish_reason: "length"`,
+    /// Gemini emits `MAX_TOKENS`, and Anthropic emits
+    /// `stop_reason: "model_context_window_exceeded"`. All three name
+    /// the same thing — the model hit a length limit — but pre-fix
+    /// Anthropic's variant silently fell through to Other. A capacity
+    /// dashboard filtering by `stop_reason == "Length"` would count
+    /// OpenAI/Gemini overflows and miss Anthropic ones, hiding a real
+    /// upgrade-tier signal.
+    #[tokio::test]
+    async fn anthropic_context_window_exceeded_attests_max_tokens() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state_anthropic_ctx_exceeded(directory.path()).await;
+        let app = build_router(state.clone());
+        let response = app.clone().oneshot(chat_request("anthropic-ctx")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), 64 * 1024).await;
+        let session = state.sessions.get("anthropic-ctx").unwrap();
+        session.wait_for_worker_jobs().await;
+        let close = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/anthropic-ctx/close")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(close.status(), StatusCode::OK);
+        let promoted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/anthropic-ctx/promote")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(promoted.status(), StatusCode::OK);
+        let receipt: av_receipts::Receipt = serde_json::from_slice(
+            &axum::body::to_bytes(promoted.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        receipt.verify_embedded().unwrap();
+        assert_eq!(
+            receipt.body.stop_reason_id,
+            av_events::StopReason::MaxTokens.id(),
+            "an Anthropic session that ended with \
+             stop_reason:model_context_window_exceeded must attest \
+             StopReason::MaxTokens (id {}), not Other (id {}). OpenAI's `length` \
+             and Gemini's MAX_TOKENS both map to MaxTokens; leaving Anthropic's \
+             overflow variant as Other hides capacity signals from operators. \
+             Received: stop_reason_id={}, stop_reason={:?}.",
+            av_events::StopReason::MaxTokens.id(),
+            av_events::StopReason::Other.id(),
+            receipt.body.stop_reason_id,
+            receipt.body.stop_reason,
+        );
+        provider.abort();
+    }
+
+    /// S3 step 2: a session against a mock Anthropic
     /// upstream produces the same audit-chain shape as an OpenAI one —
     /// provider-true usage in the totals, the native stop reason folded
     /// into the stop taxonomy, and the streamed bytes relayed verbatim.

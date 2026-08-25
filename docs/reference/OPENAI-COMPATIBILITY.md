@@ -49,6 +49,23 @@ instead, so downstream analytics grouping sessions by stop_reason
 are provider-agnostic. Pinned by
 `gemini_tool_call_with_finish_stop_attests_tool_use`.
 
+Two more Anthropic-specific stop reasons are folded into the
+canonical taxonomy:
+
+* `stop_reason: "refusal"` (Claude Sonnet 4.5+) → `ContentFilter`
+  (id 90). Semantically identical to OpenAI's `content_filter` and
+  the SAFETY/RECITATION/BLOCKLIST/PROHIBITED_CONTENT/SPII cluster
+  Gemini emits — the model refused to generate on safety grounds.
+  Pinned by `anthropic_refusal_stop_reason_attests_content_filter`.
+* `stop_reason: "model_context_window_exceeded"` → `MaxTokens`
+  (id 2). Same semantic as OpenAI's `length` / Gemini's
+  `MAX_TOKENS` — input + output overflowed the context window.
+  Pinned by `anthropic_context_window_exceeded_attests_max_tokens`.
+
+An operator dashboard filtering by `stop_reason == "Content Filter"`
+or `"Length"` sees the same population regardless of the upstream
+provider.
+
 The rest of this document describes the client-facing OpenAI surface,
 which does not change with the upstream dialect.
 
