@@ -2025,12 +2025,80 @@ mod tests {
         assert!(cfg.validate().unwrap_err().contains("delta_epsilon"));
     }
 
+    /// Register item 25 sub-clause: "`AV_SIGNING_SEED_FILE` is in zero
+    /// .md files" — the exact drift the reference table was supposed to
+    /// prevent. Pass 18 pinned config-file field completeness, but env
+    /// vars had no completeness guard, so `AV_SIGNING_SEED_FILE` could
+    /// silently vanish again on a future edit. Every operator-facing
+    /// `AV_*` env var must appear in at least one reference document.
+    /// The test-only `AV_HARBOR_INTEROP_OUT` (a Harbor-interop escape
+    /// hatch scoped to `full_chat_close_and_promotion_flow`) is not
+    /// operator-facing and is deliberately excluded.
+    #[test]
+    fn operator_env_vars_are_documented() {
+        let refs = [
+            include_str!("../../../docs/reference/CONFIGURATION.md"),
+            include_str!("../../../docs/reference/OPERATIONS.md"),
+            include_str!("../../../docs/reference/OPENAI-COMPATIBILITY.md"),
+            include_str!("../../../docs/reference/LIMITS.md"),
+        ]
+        .concat();
+        for var in [
+            // Config resolution (zero-config startup and file override).
+            "AV_CONFIG",
+            "AV_UPSTREAM_URL",
+            // Trust anchor path — the register item-25 explicit callout.
+            "AV_SIGNING_SEED_FILE",
+            // Bearer token loader used by `avctl session-promote`.
+            "AV_BEARER_TOKEN_FILE",
+        ] {
+            assert!(
+                refs.contains(var),
+                "operator-facing env var `{var}` is not documented in any \
+                 docs/reference/*.md — register item 25 explicitly names the \
+                 undocumented AV_ env var class as the drift signature."
+            );
+        }
+    }
+
     #[test]
     fn user_config_path_is_stable() {
         let path = user_config_path_from(std::path::Path::new("/home/pat"));
         assert_eq!(
             path,
             std::path::Path::new("/home/pat/.agentvisor/agentvisor.toml")
+        );
+    }
+
+    /// Pin the register-item-6 fix behaviorally. The original register
+    /// complained: "Wizard-then-`avctl start` inside a checkout silently
+    /// loads the example config: wrong bind, dead upstream, no API key,
+    /// no error." The fix was to REMOVE `config/harness.example.toml`
+    /// from the auto-discovery list entirely (better than the register's
+    /// requested rank swap): the example is a template, not a config.
+    /// If someone adds it back — well-meaning "make the example work
+    /// out of the box" — every developer with a wizard-written
+    /// `~/.agentvisor/agentvisor.toml` silently regresses to the
+    /// example's settings the moment they `cd` into a checkout.
+    #[test]
+    fn config_search_paths_never_include_the_example_config() {
+        for path in CONFIG_SEARCH_PATHS {
+            assert!(
+                !path.contains("example"),
+                "CONFIG_SEARCH_PATHS must not auto-discover a `*example*` file: {path:?}. \
+                 See the doc-comment on CONFIG_SEARCH_PATHS — the example is a template, \
+                 not a config, and auto-loading it defeats the wizard-written per-user file."
+            );
+        }
+        // Also pin: the per-user wizard file must sit at the documented
+        // location, so `avctl init --output ~/.agentvisor/agentvisor.toml`
+        // (the wizard's actual write path) is what `resolve_config_source`
+        // will find in the fall-through arm.
+        assert_eq!(
+            user_config_path_from(std::path::Path::new("/h")),
+            std::path::PathBuf::from("/h/.agentvisor/agentvisor.toml"),
+            "the wizard-written path is contract; changing it breaks every operator \
+             whose home already has this file"
         );
     }
 
