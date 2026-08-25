@@ -348,23 +348,21 @@ pub struct ResponsePermit {
 }
 
 impl ResponsePermit {
-    /// Commit a response-capture job. Consumes the response permit's
-    /// capacity slot and races for a shard's mpsc slot; if the shard is
-    /// momentarily full, returns a `SubmitError::Full` and bumps
-    /// `av_events_dropped_total{stage="response_slot"}` — NOT the
-    /// worker_queue counter. That distinction is the whole point of
-    /// the split: operators need to see which class of exhaustion is
-    /// producing drops.
+    /// Commit a response-capture job. The capacity slot reserved at
+    /// admission travels INTO the envelope: the submission never
+    /// contends on the main worker semaphore, so a backlog of new
+    /// admissions cannot starve the capture job of an
+    /// already-admitted stream — the guarantee `try_reserve_pair`'s
+    /// acquire-both-or-fail exists to provide. (A previous revision
+    /// dropped this permit and drew a fresh slot from the WORKER
+    /// semaphore, which both forfeited the reservation under load and
+    /// charged the resulting drop to `stage="response_slot"` when the
+    /// exhausted budget was actually worker capacity.) The only
+    /// remaining failure mode is the shard's bounded mpsc queue being
+    /// momentarily full, which returns `SubmitError::Full` and bumps
+    /// `av_events_dropped_total{stage="response_slot"}`.
     pub fn submit(self, worker: &WorkerHandle, job: WorkerJob) -> Result<(), SubmitError> {
-        // Release the response-capacity permit before contending for
-        // the mpsc slot so a failed submit does not artificially pin
-        // the response budget. An explicit drop — a named `_`-prefixed
-        // binding would live to end of scope (NLL shortens borrows,
-        // not Drop timing). The permit is not
-        // used by `try_submit_labeled`, which draws a fresh
-        // worker-capacity slot for the actual queue admission.
-        drop(self._capacity_permit);
-        worker.try_submit_labeled(job, DropStage::ResponseSlot)
+        worker.submit_with_permit(job, self._capacity_permit, DropStage::ResponseSlot)
     }
 }
 
@@ -479,6 +477,21 @@ impl WorkerHandle {
     /// See [`ResponsePermit::submit`].
     fn try_submit_labeled(&self, job: WorkerJob, stage: DropStage) -> Result<(), SubmitError> {
         let capacity_permit = self.try_capacity_labeled(stage)?;
+        self.submit_with_permit(job, capacity_permit, stage)
+    }
+
+    /// Queue-admission tail shared by [`Self::try_submit_labeled`]
+    /// (which draws a fresh worker-capacity slot) and
+    /// [`ResponsePermit::submit`] (which carries the response-capacity
+    /// slot reserved at admission). The permit — whichever semaphore
+    /// it came from — rides inside the envelope and releases to its
+    /// origin when the worker finishes the job.
+    fn submit_with_permit(
+        &self,
+        job: WorkerJob,
+        capacity_permit: tokio::sync::OwnedSemaphorePermit,
+        stage: DropStage,
+    ) -> Result<(), SubmitError> {
         let Some(sender) = self.sender_for(&job.session.id).cloned() else {
             return Err(SubmitError::Closed);
         };
@@ -3270,17 +3283,19 @@ mod tests {
         );
     }
 
-    /// The prior review caught that `ResponsePermit::submit` was going
-    /// through the generic `try_submit` path, which bumps
-    /// `stage="worker_queue"` on any capacity/mpsc-full failure — so a
-    /// mid-stream response-capture job that raced with re-admitted
-    /// worker jobs would be silently misattributed to the wrong
-    /// counter, defeating the observability goal of the fused-permit
-    /// split. Locking the correct routing: saturate worker capacity
-    /// AFTER a response permit is issued, then commit the response job
-    /// and assert it lands on `stage="response_slot"`.
+    /// The pair reservation exists so an ADMITTED stream's response-
+    /// capture job can never be starved by later admissions. A prior
+    /// revision of `ResponsePermit::submit` dropped the reserved
+    /// response slot and drew a fresh permit from the WORKER
+    /// semaphore — so a worker backlog at stream-completion time
+    /// failed the capture (latching the session capture-failed and
+    /// destroying an intact response) and charged the drop to
+    /// `stage="response_slot"` even though worker capacity was the
+    /// exhausted budget. Lock the guarantee: with worker capacity
+    /// fully exhausted, the response submit still succeeds on its
+    /// admission-time reservation, and no drop counter fires.
     #[tokio::test]
-    async fn response_permit_submit_bumps_response_slot_on_worker_capacity_exhaustion() {
+    async fn response_permit_submit_succeeds_on_worker_capacity_exhaustion() {
         let bridge = Arc::new(RecordingBus::default());
         let metrics = Arc::new(Registry::new());
         let worker = spawn_worker(
@@ -3298,29 +3313,30 @@ mod tests {
         // half stays held until we submit below.
         drop(permits.worker);
         // Now consume both remaining worker slots directly so any
-        // further worker-side acquire fails. The response semaphore
+        // fresh worker-side acquire would fail. The response semaphore
         // is untouched — permits.response still holds its slot.
         let hog_a = worker.try_reserve("hog-a").expect("hog-a");
         let hog_b = worker.try_reserve("hog-b").expect("hog-b");
-        // Submit the response-capture job. It draws from worker
-        // capacity + mpsc — worker capacity is exhausted → `Full`.
-        // The counter increment MUST be `stage="response_slot"`,
-        // NOT `stage="worker_queue"`.
+        // Submit the response-capture job. It must ride the response
+        // reservation taken at admission — worker-capacity exhaustion
+        // is irrelevant to an already-admitted stream's capture.
         let job = job(session(Workflow::Signed));
-        let err = permits.response.submit(&worker, job).unwrap_err();
-        assert_eq!(err, SubmitError::Full);
+        permits
+            .response
+            .submit(&worker, job)
+            .expect("an admitted stream's capture must not be starved by worker admissions");
         let rendered = metrics.render();
         assert!(
-            rendered.contains("av_events_dropped_total{stage=\"response_slot\"} 1"),
-            "response_slot MUST have been bumped by ResponsePermit::submit; got:\n{rendered}"
+            !rendered.contains("av_events_dropped_total{stage=\"response_slot\"} 1"),
+            "no response_slot drop: the reserved slot was used, not re-acquired; got:\n{rendered}"
         );
         assert!(
             !rendered.contains("av_events_dropped_total{stage=\"worker_queue\"} 1"),
-            "worker_queue must NOT be bumped by ResponsePermit::submit failure — that would \
-             mask which class of exhaustion produced the drop; got:\n{rendered}"
+            "no worker_queue drop either; got:\n{rendered}"
         );
         drop(hog_a);
         drop(hog_b);
+        worker.wait_idle().await;
     }
 
     #[tokio::test]
