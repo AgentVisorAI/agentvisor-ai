@@ -158,6 +158,9 @@ interaction.
 | `av_incomplete_sessions_total` | Sudden increase | Sessions where `capture_failed` was set on the audit chain. After round 51 §6.2 (D7) this is genuinely rare and represents unrecoverable pipeline state, not client disconnects. Escalate. |
 | `av_events_dropped_total{stage="response_slot"}` | Rate > 0 sustained | Response capture backpressure — the worker pool is saturated or the state store is slow. Scale up workers or investigate the state backend. |
 | `av_http_shutdown_drain_timeouts_total` | Any increase | A graceful drain hit its timeout with requests still in flight; usually upstream latency. |
+| `av_ephemeral_close_failures_total` | Any increase | The auto-close spawned for a stock-SDK one-shot session (no `X-AV-Session` header — the OpenAI-compatibility contract auto-closes it after the response) failed. The session is stranded open until the idle sweeper (`session_idle_close_s`) reaps it, delaying the receipt. If this fires steadily, the finalizer is unhealthy — investigate. |
+| `av_stream_abort_close_failures_total` | Any increase | A background close spawned from a stream-abort drop path failed. Same class as ephemeral-close: the session is left open until the idle sweeper. Steady-state 0 on healthy nodes. |
+| `av_stream_abort_no_runtime_total` | Any increase | A stream-abort drop path ran with no live Tokio runtime (harness shutdown, blocking-thread drop). Capture is marked failed so the reconciler retries on next tick. Any increase after boot suggests unclean shutdown ordering. |
 
 ## Backup
 
