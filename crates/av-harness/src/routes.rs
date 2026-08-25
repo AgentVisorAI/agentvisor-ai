@@ -653,6 +653,9 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
         billed_prompt_tokens,
         provider_adapter: Arc::clone(&state.provider_adapter),
         completed: false,
+        // Validated single-value by `prepare_chat`; absence means the
+        // id was generated server-side this request.
+        ephemeral: !headers.contains_key(crate::pipeline::SESSION_HEADER),
     };
     let mut response = if is_sse {
         // Peek the FIRST item before committing the response head: when
@@ -2328,6 +2331,15 @@ struct AbortFinalizingStream {
     /// S3: the provider wire dialect this stream parses with.
     provider_adapter: Arc<dyn crate::provider::ProviderAdapter>,
     completed: bool,
+    /// True when the client sent no `X-AV-Session` header and the id
+    /// was server-generated. The client cannot address this session
+    /// again (the id only travels back in the response header), so
+    /// OPENAI-COMPATIBILITY.md promises "the session then closes
+    /// immediately after the response — one turn, one audit event".
+    /// Before this flag existed, a completed one-shot lingered OPEN
+    /// until the idle sweeper (`session_idle_close_s`, default 900 s):
+    /// a stock SDK caller got no receipt for 15 minutes.
+    ephemeral: bool,
 }
 
 const MAX_PROVIDER_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
@@ -3469,6 +3481,44 @@ impl Drop for AbortFinalizingStream {
         // so the response_capture we submit here will land before finalize
         // reads the chain / atif.
         if self.completed {
+            // A completed EPHEMERAL one-shot (no client X-AV-Session —
+            // the generated id only travels back in the response
+            // header) must close NOW: OPENAI-COMPATIBILITY.md promises
+            // "the session then closes immediately after the response —
+            // one turn, one audit event", and before this arm the
+            // session sat OPEN until the idle sweeper
+            // (`session_idle_close_s`, default 900 s) — a stock SDK
+            // caller's signed receipt was 15 minutes late. Reproduced
+            // live pre-fix: open_count=1, zero receipts, 3 s after a
+            // 200. The client cannot address the generated id again, so
+            // there is no future turn to keep the session open for.
+            if self.ephemeral && !self.session.is_closed() && self.session.active_streams_count() <= 1 {
+                let session = Arc::clone(&self.session);
+                let finalizer = self.finalizer.clone();
+                let session_id = session.id.clone();
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        if let Err(error) = finalizer.close_session(session, StopReason::SessionClosed).await
+                        {
+                            finalizer
+                                .metrics()
+                                .counter(
+                                    "av_ephemeral_close_failures_total",
+                                    "Auto-close of a completed ephemeral one-shot failed; \
+                                     the session is left open until the idle sweeper reaps it",
+                                )
+                                .inc();
+                            tracing::warn!(
+                                %error,
+                                %session_id,
+                                "auto-close of completed ephemeral session failed"
+                            );
+                        }
+                    });
+                }
+                // No runtime (shutdown-time drop): the idle sweeper /
+                // recovery own the close, exactly as before this arm.
+            }
             return;
         }
         // Capture is_closed once so the fail-closed guards below agree on
@@ -3559,6 +3609,7 @@ impl Drop for AbortFinalizingStream {
             let session = Arc::clone(&self.session);
             let finalizer = self.finalizer.clone();
             let session_id = session.id.clone();
+            let stop_reason = StopReason::Other;
             match tokio::runtime::Handle::try_current() {
                 Ok(runtime) => {
                     // Detach: the drop is sync and cannot await. Mirror
@@ -3567,7 +3618,7 @@ impl Drop for AbortFinalizingStream {
                     // fallback path is otherwise invisible until the
                     // idle sweeper reaps the "still open" session.
                     runtime.spawn(async move {
-                        if let Err(error) = finalizer.close_session(session, StopReason::Other).await {
+                        if let Err(error) = finalizer.close_session(session, stop_reason).await {
                             finalizer
                                 .metrics()
                                 .counter(
@@ -4231,6 +4282,48 @@ mod tests {
 
     fn chat_request(session: &str) -> Request<Body> {
         chat_request_with_payload(session, chat_payload())
+    }
+
+    /// OPENAI-COMPATIBILITY.md session semantics: a request WITHOUT
+    /// `X-AV-Session` gets a server-generated id and "the session then
+    /// closes immediately after the response — one turn, one audit
+    /// event". Reproduced live pre-fix: 3 s after a 200, the session
+    /// was still OPEN with zero receipts — a stock SDK caller's signed
+    /// receipt waited on the idle sweeper (default 900 s).
+    #[tokio::test]
+    async fn header_less_one_shot_closes_immediately_after_the_response() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state(directory.path()).await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            // NO x-av-session: the id is server-generated (ephemeral).
+            .header("x-av-workflow", "unsigned")
+            .body(Body::from(serde_json::to_vec(&chat_payload()).unwrap()))
+            .unwrap();
+        let response = build_router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let session_id = response
+            .headers()
+            .get("x-av-session")
+            .and_then(|v| v.to_str().ok())
+            .expect("generated session id must be echoed in the response header")
+            .to_owned();
+        axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+
+        let session = state.sessions.get(&session_id).expect("session registered");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !session.is_closed() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "an ephemeral one-shot must close immediately after the response,                  not wait for the idle sweeper"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        provider.abort();
     }
 
     /// Register item 8 (bind budget to principal), completion side.
@@ -4939,6 +5032,7 @@ mod tests {
             }),
             captured_bytes: 100,
             completed: false,
+            ephemeral: false,
         };
 
         // Simulate the concurrent close's `try_close` having already fired.

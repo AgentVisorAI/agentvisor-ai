@@ -201,7 +201,9 @@ Chat requests carry two AgentVisor-specific headers:
 
 If your client speaks OpenAI's protocol out of the box, it will not
 set these. The harness defaults them from config
-(`default_workflow`) and generates a fresh session id per request.
+(`default_workflow`) and generates a fresh session id per request —
+echoed back in the `X-AV-Session` **response** header, so you can
+`avctl receipt-locate` the audit artifact later.
 The session then closes immediately after the response — one turn,
 one audit event.
 
