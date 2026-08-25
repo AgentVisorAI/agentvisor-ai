@@ -36,6 +36,19 @@ with the matching `upstream_url`, `upstream_chat_path`,
 values are refused at pre-flight by `avctl config-validate` and at
 boot by the daemon.
 
+Cross-provider stop-reason normalization deserves calling out
+because the upstream dialects disagree. OpenAI emits
+`finish_reason: "tool_calls"` and Anthropic emits `stop_reason:
+"tool_use"` when the model decides to invoke tools; both map to
+`StopReason::ToolUse` (id 3). Gemini does not — it emits
+`finishReason: STOP` and expects the client to notice the
+`functionCall` part in the candidate content. The harness normalizes
+this at capture time: any session whose response carried tool-call
+deltas and would otherwise attest `Stop` is attested `ToolUse`
+instead, so downstream analytics grouping sessions by stop_reason
+are provider-agnostic. Pinned by
+`gemini_tool_call_with_finish_stop_attests_tool_use`.
+
 The rest of this document describes the client-facing OpenAI surface,
 which does not change with the upstream dialect.
 
