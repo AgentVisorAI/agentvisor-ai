@@ -3,7 +3,7 @@
 mod setup;
 
 use anyhow::{Context, Result};
-use av_bridge::{BridgeManifest, EmbeddedBroker, EventBus};
+use av_bridge::{BridgeManifest, EmbeddedBroker};
 use av_receipts::{Ed25519Signer, Keyring, Receipt, Signer};
 use clap::{Parser, Subcommand, ValueEnum};
 use futures::{stream, StreamExt};
@@ -707,10 +707,13 @@ fn event_tail(data_dir: &Path, topic: &str, partition: u32, offset: u64, max: us
     if max > MAX_EVENT_TAIL {
         anyhow::bail!("--max {max} exceeds the safety cap of {MAX_EVENT_TAIL}; page with --offset instead");
     }
-    let bridge = EmbeddedBroker::open(data_dir).context("open Bridge")?;
-    for event in bridge
-        .fetch(topic, partition, offset, max)
-        .context("fetch events")?
+    // Read-only by construction: `EmbeddedBroker::open` recovers state
+    // (torn-tail `set_len`, sidecar rewrite, append-handle creation),
+    // which must never run beside a live daemon mid-append — a second
+    // process's "repair" could truncate bytes the daemon then acks as
+    // durable. `fetch_read_only` touches nothing on disk.
+    for event in
+        EmbeddedBroker::fetch_read_only(data_dir, topic, partition, offset, max).context("fetch events")?
     {
         println!("{}", serde_json::to_string(&event)?);
     }

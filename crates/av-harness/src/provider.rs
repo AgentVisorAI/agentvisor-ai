@@ -247,6 +247,7 @@ fn parse_anthropic_payload(
                 tool_call_deltas.push(ProviderToolCallDelta {
                     choice_index: 0,
                     index,
+                    complete: false,
                     id: block.get("id").and_then(Value::as_str).map(str::to_owned),
                     name: block.get("name").and_then(Value::as_str).map(str::to_owned),
                     arguments,
@@ -256,6 +257,7 @@ fn parse_anthropic_payload(
                 tool_call_deltas.push(ProviderToolCallDelta {
                     choice_index: 0,
                     index,
+                    complete: false,
                     id: None,
                     name: None,
                     arguments: block
@@ -484,8 +486,14 @@ impl ProviderAdapter for GoogleGeminiAdapter {
                         };
                         tool_call_deltas.push(ProviderToolCallDelta {
                             choice_index,
+                            // Frame-local part position, NOT stable
+                            // across streamed chunks (Gemini restarts
+                            // `parts` at 0 every frame). `complete`
+                            // tells `absorb_frame` to allocate a fresh
+                            // per-choice slot instead of merging on it.
                             index: u64::try_from(position)
                                 .map_err(|_| "provider part index overflow".to_owned())?,
+                            complete: true,
                             id: call.get("id").and_then(Value::as_str).map(str::to_owned),
                             name: call.get("name").and_then(Value::as_str).map(str::to_owned),
                             arguments,

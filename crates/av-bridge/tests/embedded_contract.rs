@@ -840,3 +840,66 @@ fn maintenance_retries_queued_cold_export_intents() {
     assert_eq!(stored.offset, ack.offset);
     assert_eq!(stored.value["metadata"]["uid"], "cold-retry-1");
 }
+
+/// `fetch_read_only` is the CLI's beside-a-live-daemon read path: it
+/// must return the same events as the broker's own `fetch` and must
+/// mutate NOTHING — in particular it must not "repair" a torn trailing
+/// line, because what looks torn to a second process may be the
+/// daemon's in-flight append, and truncating it destroys bytes the
+/// daemon then acks as durable.
+#[test]
+fn fetch_read_only_matches_fetch_and_never_mutates_a_torn_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = EmbeddedBroker::provision(dir.path(), &manifest()).unwrap();
+    let mut partition = 0u32;
+    for i in 0..5 {
+        partition = broker
+            .publish("agent.tool_call", "inst-A", &json!({"i": i}))
+            .unwrap()
+            .partition;
+    }
+    let via_broker = broker.fetch("agent.tool_call", partition, 0, 100).unwrap();
+    assert_eq!(via_broker.len(), 5);
+    drop(broker);
+
+    // Simulate the daemon mid-append: record bytes written, trailing
+    // newline not yet. A concurrent read-only tail must return the
+    // five complete events and leave the file byte-identical.
+    let segment = dir
+        .path()
+        .join("topics/agent.tool_call")
+        .join(format!("p{partition}.jsonl"));
+    let mut file = std::fs::OpenOptions::new().append(true).open(&segment).unwrap();
+    file.write_all(b"{\"partition\":0,\"offset\":5,\"key\":\"inst-A\",\"va")
+        .unwrap();
+    drop(file);
+    let before = std::fs::read(&segment).unwrap();
+
+    let events = EmbeddedBroker::fetch_read_only(dir.path(), "agent.tool_call", partition, 0, 100).unwrap();
+    assert_eq!(events.len(), 5);
+    for (fetched, expected) in events.iter().zip(via_broker.iter()) {
+        assert_eq!(fetched.offset, expected.offset);
+        assert_eq!(fetched.value, expected.value);
+    }
+    let after = std::fs::read(&segment).unwrap();
+    assert_eq!(
+        before, after,
+        "a read-only fetch must not repair/truncate the segment"
+    );
+
+    // Offset paging and the max cap behave like `fetch`.
+    let tail = EmbeddedBroker::fetch_read_only(dir.path(), "agent.tool_call", partition, 3, 100).unwrap();
+    assert_eq!(tail.first().map(|e| e.offset), Some(3));
+    let capped = EmbeddedBroker::fetch_read_only(dir.path(), "agent.tool_call", partition, 0, 2).unwrap();
+    assert_eq!(capped.len(), 2);
+
+    // Failure modes preserved for the CLI contract: unknown topic and
+    // out-of-range partition are refused, a non-provisioned dir errors.
+    assert!(matches!(
+        EmbeddedBroker::fetch_read_only(dir.path(), "agent.does_not_exist", 0, 0, 10),
+        Err(av_bridge::bus::BusError::UnknownTopic(_))
+    ));
+    assert!(EmbeddedBroker::fetch_read_only(dir.path(), "agent.tool_call", 99, 0, 10).is_err());
+    let empty = tempfile::tempdir().unwrap();
+    assert!(EmbeddedBroker::fetch_read_only(empty.path(), "agent.tool_call", 0, 0, 10).is_err());
+}

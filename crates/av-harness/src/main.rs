@@ -1213,10 +1213,10 @@ fn build_bridge(config: &HarnessConfig, manifest: &BridgeManifest) -> Result<Arc
             // Boot-time only, and only in the DAEMON (the single
             // writer): sweep temps orphaned by a crash between
             // `create_new` and `rename`. This must NOT live inside
-            // `EmbeddedBroker::open` — `avctl event-tail` also opens
-            // the broker read-only while a live daemon runs, and a
-            // sweep there could delete a temp the daemon is about to
-            // rename.
+            // `EmbeddedBroker::open` — `open()` itself is also
+            // daemon-only now (`avctl event-tail` reads via the
+            // mutation-free `fetch_read_only`), but keeping the sweep
+            // here preserves the boot-once discipline.
             match av_core::fsutil::sweep_orphaned_tmp(&path) {
                 Ok(0) => {}
                 Ok(removed) => {
