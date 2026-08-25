@@ -578,6 +578,50 @@ mod tests {
 
     use super::*;
 
+    /// Register pass 30 finding — LIMITS.md claimed the stub target
+    /// ratio was 50% ("half the pre-compression count") but the code
+    /// default has always been `target_reduction_millis: 300`, meaning
+    /// a 30% reduction (target = 70% of pre-compression tokens). An
+    /// operator sizing prompt budget by the doc would over-provision
+    /// by 40 percentage points. Pin the actual default to the number
+    /// LIMITS.md documents so changing either without matching the
+    /// other trips CI. Register item 25 named doc/code drift as the
+    /// most reliable failure mode.
+    #[test]
+    fn limits_md_names_the_actual_compression_defaults() {
+        let doc = include_str!("../../../docs/reference/LIMITS.md");
+        let cfg = CompressionConfig::default();
+
+        assert_eq!(
+            cfg.min_tokens_to_engage, 512,
+            "engagement floor default changed; update LIMITS.md"
+        );
+        assert!(
+            doc.contains("512 tokens"),
+            "LIMITS.md must name the 512-token engagement floor"
+        );
+
+        assert_eq!(
+            cfg.target_reduction_millis, 300,
+            "stub target reduction default changed from 300 (30%); update LIMITS.md"
+        );
+        // 300 per-mille = 30% reduction. LIMITS.md must state THIS
+        // number, not the historical "50% / half" figure that the
+        // code never actually implemented (found live pass 30).
+        assert!(
+            doc.contains("30% reduction") && doc.contains("70%"),
+            "LIMITS.md's stub-target row must name the actual behavior \
+             (30% reduction, 70% remaining), not the historical 50%/half claim"
+        );
+
+        // Also pin the 50k floor for summarize_middle so a rename
+        // there doesn't silently orphan the doc entry.
+        assert!(
+            doc.contains("50k prompt tokens"),
+            "LIMITS.md must name the 50k summarize_middle engagement threshold"
+        );
+    }
+
     /// The duplicate-key minification-skip guard is the semantic-
     /// destruction protection of `normalize_json_content`: minifying
     /// through `Value` collapses duplicate keys last-wins, so content
