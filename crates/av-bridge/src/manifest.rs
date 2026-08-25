@@ -714,6 +714,62 @@ topics:
         let errors: Vec<_> = validator.iter_errors(&value).collect();
         assert!(errors.is_empty(), "{errors:?}");
     }
+
+    /// Register pass 35 finding — the shipped manifests/bridge.example.
+    /// yaml is what the K8s ConfigMap points `bridge_manifest_path` at
+    /// (and what `avctl bridge-provision --manifest` consumes in the
+    /// README's copy-pasteable block). The default in-code manifest is
+    /// pinned by `default_manifest_matches_shipped_json_schema`, but
+    /// the on-disk YAML the daemon loads at boot was unpinned. If it
+    /// drifts (YAML anchor bomb, unknown topic key, missing field,
+    /// schema-ref rename), the daemon boots, calls
+    /// `BridgeManifest::from_yaml` on the file, and errors out with
+    /// `bridge_manifest: parse error at ...` — a CrashLoopBackOff on
+    /// Kubernetes, an immediate exit on bare-metal.
+    #[test]
+    fn shipped_bridge_example_yaml_parses_and_validates() {
+        let yaml = include_str!("../../../manifests/bridge.example.yaml");
+        let manifest = BridgeManifest::from_yaml(yaml).unwrap_or_else(|error| {
+            panic!(
+                "shipped manifests/bridge.example.yaml must parse — the daemon calls \
+                 BridgeManifest::from_yaml on the file at boot when \
+                 bridge_manifest_path is set (the K8s ConfigMap and the README's \
+                 avctl bridge-provision block both point at it). A parse failure \
+                 here CrashLoopBackOffs the pod. Error: {error}"
+            )
+        });
+        manifest.validate().unwrap_or_else(|error| {
+            panic!(
+                "shipped manifests/bridge.example.yaml must pass BridgeManifest::\
+                 validate() (the daemon calls this after from_yaml at boot). \
+                 Error: {error}"
+            )
+        });
+        // Same schema conformance the default in-code manifest gets.
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/bridge-manifest.schema.json")).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let value = serde_json::to_value(&manifest).unwrap();
+        let errors: Vec<_> = validator.iter_errors(&value).collect();
+        assert!(
+            errors.is_empty(),
+            "shipped manifests/bridge.example.yaml must validate against \
+             schemas/bridge-manifest.schema.json (the schema downstream \
+             consumers use): {errors:?}"
+        );
+        // Pin a specific piece of the shipped semantics: the manifest
+        // is single-broker (replication_factor 1) — matching the K8s
+        // ConfigMap's `bridge_backend = "embedded"` single-replica
+        // deployment. Bumping the default replication_factor here
+        // without matching the K8s manifest's Deployment `replicas`
+        // would ship an inconsistent example.
+        assert_eq!(
+            manifest.replication_factor, 1,
+            "shipped bridge.example.yaml is the single-replica starter; \
+             bumping this without also bumping deploy/kubernetes/agentvisor-ai.yaml's \
+             Deployment.replicas ships an inconsistent example"
+        );
+    }
 }
 
 #[cfg(test)]
