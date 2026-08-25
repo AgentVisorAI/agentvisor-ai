@@ -1568,6 +1568,42 @@ impl HarnessConfig {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+    /// Register item 25: docs/reference/CONFIGURATION.md claims to be
+    /// the configuration reference, yet 29 of 63 fields (including
+    /// `default_workflow` and `ignore_client_authorization` — the two
+    /// knobs at the center of the onboarding story) shipped
+    /// undocumented. Every `HarnessConfig` field must appear in the
+    /// reference; adding a config key without documenting it now
+    /// fails CI by design.
+    #[test]
+    fn configuration_reference_documents_every_config_field() {
+        let source = include_str!("config.rs");
+        let reference = include_str!("../../../docs/reference/CONFIGURATION.md");
+        let body = source
+            .split_once("pub struct HarnessConfig {")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split_once("\n}"))
+            .map(|(body, _)| body)
+            .unwrap();
+        let fields: Vec<&str> = body
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("pub "))
+            .filter_map(|rest| rest.split_once(':'))
+            .map(|(name, _)| name.trim())
+            .collect();
+        assert!(
+            fields.len() >= 60,
+            "field extraction broke — found only {} fields",
+            fields.len()
+        );
+        for field in fields {
+            assert!(
+                reference.contains(&format!("`{field}`")) || reference.contains(&format!("`[{field}]`")),
+                "config field `{field}` is not documented in docs/reference/CONFIGURATION.md"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
