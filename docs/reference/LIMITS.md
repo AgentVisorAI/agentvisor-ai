@@ -78,7 +78,7 @@ tests exercised.
 | Engagement floor | 512 tokens | Requests smaller than this bypass compression entirely. |
 | `summarize_middle` engagement | 50k prompt tokens | The stub-middle summarization only engages above this. |
 | Content-hash duplicate window | current session's assembled prompt | O(n) via HashSet; round-32 F2 fix. |
-| Stub target ratio | 50% | Middle is stubbed until `current_tokens` falls to half the pre-compression count. |
+| Stub target reduction | **30% reduction** (`target_reduction_millis: 300`) | Middle is stubbed until `current_tokens` falls to **70% of the pre-compression count**, not half. Sizing your prompt budget: allow ~1.4× headroom above the stub target, not 2×. |
 
 ## Reconciler ceilings
 
