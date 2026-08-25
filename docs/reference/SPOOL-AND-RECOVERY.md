@@ -16,6 +16,7 @@ inventory:
 
 | File | Contents | Written by | Removed by |
 | --- | --- | --- | --- |
+| `.agentvisord.lock` | Exclusive process lock at the spool root; boot refuses if another daemon holds it | `main::acquire_spool_lock` at process start | on clean process exit; stale locks are healed by fresh boots |
 | `{stem}.session.json` | Sealed metadata: session id, identity, workflow, journal version | worker (`append_active_event_journal`) at first event | `remove_step_journal` after successful close |
 | `{stem}.events.ndjson` | Append-only sealed journal — one JSON line per audit event | worker (`append_journal`) | `remove_step_journal` after successful close |
 | `{stem}.json` | ATIF trajectory (unsigned workflow) | finalizer at close | retention sweep OR archive on collision |
@@ -26,9 +27,14 @@ inventory:
 | `receipts/{stem}.json` | Signed receipt (signed workflow) | finalizer at close (`persist_receipt`) | never (audit evidence; manage retention externally) |
 | `receipts/{stem}.archived-<receipt-id>.json` | Prior incarnation's receipt after a recycled session id | `archive_conflicting_receipt` at the collision | never (preserved collision evidence) |
 | `{stem}.archived-<trajectory-id>` (+ `.atif-auth`, `.close-complete`) | Prior incarnation's ATIF evidence after a recycled session id | `archive_conflicting_atif` at the collision | never (preserved collision evidence) |
-| `{stem}.session.lifecycle-outbox.ndjson` | Bridge events queued when the bus was unavailable at close time | close_session_locked | outbox drain after successful bridge emit |
+| `outbox/{stem}.session.lifecycle-outbox.ndjson` | Bridge events queued when the bus was unavailable at close time | close_session_locked | outbox drain after successful bridge emit |
 | `{stem}.acks.ndjson` | Sealed broker acks, one line per published event: proves an event we tried to publish actually landed | worker after successful emit (appended; one `sync_data` per ack — round-51 §7.3) | `remove_step_journal` at close, with the other journals |
 | `broker-acks/{stem}/{event_uid}.json` | Legacy pre-round-51 per-event ack layout; still read as a fallback so mid-session upgrades see their earlier acks | (no longer written) | `remove_step_journal` at close |
+| `inflight-responses/{digest}.json` | Response-attempt markers (`digest = sha256(session_id:attempt_id)[..32]`) proving the client's response was durably captured before the last chunk left the socket | worker (`persist_response_marker`) at capture commit | worker at capture retirement; recovery reaps stranded markers |
+| `tool-executions/{key}.intent.json` | JCS-canonicalized, MAC-sealed tool invocation intent; underpins the at-most-once tool-execution state machine | mcp route handler at admission | `remove_tool_executions` at successful close |
+| `tool-executions/{key}.outcome.json` | Sealed tool execution outcome (upstream response + status) | worker after tool call returns | `remove_tool_executions` at successful close |
+| `tool-executions/{key}.audited` | Marker: the tool call's audit event has landed on the broker | worker after the ack lands | `remove_tool_executions` at successful close |
+| `tool-executions/{key}.{suffix}.capturefailed-<uid>` | Quarantined tool triple (intent/outcome/audited) after `quarantine_tool_executions` fired on a capture-failed session | reconciler (`quarantine_tool_executions`) | never (preserved incident evidence) |
 
 Every one of these files carries a `{stem}` derived as
 `sha256_hex(session_id.as_bytes())[..32]` — a 128-bit fixed-width
