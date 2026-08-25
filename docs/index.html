@@ -25,6 +25,7 @@
         <a href="#what-you-get">What you get</a>
         <a href="#dashboard">Dashboard</a>
         <a href="#try-it">Get started</a>
+        <a href="app/">Console</a>
         <a href="https://github.com/AgentVisorAI/agentvisor-ai">GitHub</a>
       </div>
     </div>
@@ -41,7 +42,8 @@
         anything except a public key.
       </p>
       <p class="cta-row">
-        <a class="cta primary" href="#try-it">Try it in 60 seconds</a>
+        <a class="cta primary" href="app/">Open the console</a>
+        <a class="cta" href="#try-it">Try it in 60 seconds</a>
         <a class="cta" href="https://github.com/AgentVisorAI/agentvisor-ai">Read the code</a>
       </p>
       <p class="hero-meta">
@@ -113,9 +115,16 @@
           <div class="feature-visual">
 <pre class="filename">receipt.json</pre>
 <pre class="code-json"><code>{
-  <span class="k">"receipt_id"</span>: <span class="s">"01924f8b-1f0c-7c31&hellip;"</span>,
-  <span class="k">"session_id"</span>: <span class="s">"sess-2024-08-14-42"</span>,
-  <span class="k">"issued_at_iso"</span>: <span class="s">"2024-08-14T21:07:14.000Z"</span>,
+  <span class="k">"receipt_version"</span>: <span class="n">2</span>,
+  <span class="k">"receipt_id"</span>: <span class="s">"01a00219-b3d0-7c31&hellip;"</span>,
+  <span class="k">"session_id"</span>: <span class="s">"sess-2026-08-14-42"</span>,
+  <span class="k">"issued_at"</span>: <span class="n">1786741634000</span>,
+  <span class="k">"issued_at_iso"</span>: <span class="s">"2026-08-14T21:07:14.000Z"</span>,
+  <span class="k">"ai_agent"</span>: {
+    <span class="k">"version"</span>: <span class="s">"0.1.0"</span>,
+    <span class="k">"charter"</span>: { <span class="k">"name"</span>: <span class="s">"triage&#8209;bot"</span>, <span class="k">"type_id"</span>: <span class="n">1</span> },
+    <span class="k">"instance_uid"</span>: <span class="s">"9c04e2d1&hellip;"</span>
+  },
   <span class="k">"subject"</span>: {
     <span class="k">"kind"</span>: <span class="s">"event_chain"</span>,
     <span class="k">"chain_head"</span>: <span class="s">"b2b7c9d8&hellip;"</span>,
@@ -133,6 +142,7 @@
   <span class="k">"stop_reason_id"</span>: <span class="n">92</span>,
   <span class="k">"stop_reason"</span>: <span class="s">"Budget Exceeded"</span>,
   <span class="k">"key_id"</span>: <span class="s">"c8f2&hellip;"</span>,
+  <span class="k">"public_key_b64"</span>: <span class="s">"fStglR1c&hellip;"</span>,
   <span class="k">"signature_b64"</span>: <span class="s">"wg7A0Kx3&hellip;"</span>
 }</code></pre>
           </div>
