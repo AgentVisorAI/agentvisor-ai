@@ -2692,10 +2692,31 @@ impl AbortFinalizingStream {
                 }),
             )
         } else if let Some(native) = &native_finish_reason {
+            // Cross-provider stop-reason normalization for the tool-use
+            // shape. OpenAI emits `finish_reason: "tool_calls"` and
+            // Anthropic emits `stop_reason: "tool_use"` when the model
+            // decides to invoke tools; both map cleanly to
+            // StopReason::ToolUse. Gemini does NOT: it emits
+            // `finishReason: STOP` and expects the client to notice
+            // `functionCall` parts in the candidate content. Left un-
+            // normalized, a receipt attests StopReason::Stop for the
+            // Gemini flow — an auditor grouping sessions by stop_reason
+            // would count Gemini tool sessions as clean stops and
+            // OpenAI/Anthropic tool sessions as tool_use, corrupting
+            // any cross-provider tool-invocation analytics. This is the
+            // adapter-leak `ProviderAdapter` exists to prevent. Verified
+            // live pre-fix: a Gemini stream with a functionCall part
+            // followed by finishReason:STOP journalled stop_reason_id=1.
+            let mapped = map_finish_reason(native);
+            let normalized = if mapped == av_events::StopReason::Stop && !tool_calls.is_empty() {
+                av_events::StopReason::ToolUse
+            } else {
+                mapped
+            };
             (
                 av_events::EventClass::StopReason,
                 av_events::StatusId::Success,
-                Some(map_finish_reason(native)),
+                Some(normalized),
                 json!({
                     "direction": "upstream_response",
                     "finish_reason": native,
@@ -4242,7 +4263,122 @@ mod tests {
         provider.abort();
     }
 
-    /// S3 step 2: a session against a mock Anthropic
+    /// Gemini mock: functionCall part in one frame, then finishReason:STOP
+    /// in the next. This is Gemini's actual wire shape when the model
+    /// decides to invoke a tool — Google's API does NOT emit a dedicated
+    /// tool-use finish reason; it uses STOP and expects the client to
+    /// notice the functionCall part in the candidate content.
+    async fn mock_gemini_tool_chat() -> Response {
+        let frames = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}}]},\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":15,\"candidatesTokenCount\":10},\"modelVersion\":\"gemini-2.0-flash\"}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":15,\"candidatesTokenCount\":10}}\n\n",
+        );
+        let mut response = Response::new(Body::from(frames));
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        response
+    }
+
+    async fn test_state_gemini_tool(spool: &std::path::Path) -> (AppState, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = Router::new().route("/v1/chat/completions", post(mock_gemini_tool_chat));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, provider).await.unwrap();
+        });
+        let mut config = crate::config::HarnessConfig::for_tests(
+            &format!("http://{address}"),
+            &spool.to_string_lossy(),
+            &spool.to_string_lossy(),
+        );
+        config.provider = "gemini".to_owned();
+        let state = AppState::new(
+            config,
+            Arc::new(InMemoryStore::new()),
+            Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
+            Arc::new(NullBus),
+            None,
+            Arc::new(Ed25519Signer::from_seed(&[13; 32])),
+        )
+        .unwrap();
+        (state, server)
+    }
+
+    /// Register item 28: the ProviderAdapter trait exists so downstream
+    /// code sees ONE canonical shape regardless of the upstream. That
+    /// includes stop-reason semantics — a session where the agent
+    /// invoked a tool must attest `StopReason::ToolUse` regardless of
+    /// which provider was upstream. OpenAI emits `finish_reason:
+    /// "tool_calls"` and Anthropic emits `stop_reason: "tool_use"` in
+    /// this case, both mapping cleanly to ToolUse. Gemini does NOT: it
+    /// emits `finishReason: STOP` and expects the client to notice the
+    /// `functionCall` part. Without normalization the receipt attests
+    /// `StopReason::Stop` for the Gemini flow — an auditor grouping
+    /// sessions by `stop_reason` would count Gemini tool sessions as
+    /// clean stops and OpenAI/Anthropic tool sessions as tool_use.
+    /// That is exactly the adapter-leak the trait exists to prevent.
+    #[tokio::test]
+    async fn gemini_tool_call_with_finish_stop_attests_tool_use() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state_gemini_tool(directory.path()).await;
+        let app = build_router(state.clone());
+        let response = app.clone().oneshot(chat_request("gemini-tool")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), 64 * 1024).await;
+        let session = state.sessions.get("gemini-tool").unwrap();
+        session.wait_for_worker_jobs().await;
+
+        // The receipt is the ground truth: a Gemini tool-call session
+        // must record ToolUse (id 3), not Stop (id 1).
+        let close = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/gemini-tool/close")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(close.status(), StatusCode::OK);
+        let promoted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/gemini-tool/promote")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(promoted.status(), StatusCode::OK);
+        let receipt: av_receipts::Receipt = serde_json::from_slice(
+            &axum::body::to_bytes(promoted.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        receipt.verify_embedded().unwrap();
+        assert_eq!(
+            receipt.body.stop_reason_id,
+            av_events::StopReason::ToolUse.id(),
+            "a Gemini session that ended with a functionCall part must attest \
+             StopReason::ToolUse (id {}), not Stop (id {}) — the adapter must \
+             normalize provider-specific quirks so downstream stop-reason \
+             analytics are provider-agnostic. Received: stop_reason_id={}, \
+             stop_reason={:?}.",
+            av_events::StopReason::ToolUse.id(),
+            av_events::StopReason::Stop.id(),
+            receipt.body.stop_reason_id,
+            receipt.body.stop_reason,
+        );
+        provider.abort();
+    }
+
     /// upstream produces the same audit-chain shape as an OpenAI one —
     /// provider-true usage in the totals, the native stop reason folded
     /// into the stop taxonomy, and the streamed bytes relayed verbatim.
