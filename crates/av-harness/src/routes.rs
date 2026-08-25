@@ -3787,6 +3787,148 @@ mod tests {
         }
     }
 
+    /// Register item 25 (docs drift) — sub-clause for the product
+    /// console at docs/app/. It ships as an offline HTML/JS
+    /// simulation of the whole operator flow (setup, sessions,
+    /// receipt verification, evidence layout) and is the customer-
+    /// facing evaluation surface. Every named factual claim in the
+    /// console must be pinned to real code: schema, topics, status
+    /// codes, and the stop-reason taxonomy. If the code drifts and
+    /// nobody updates the console, prospects clicking through it
+    /// see a product that no longer exists.
+    ///
+    /// Verified accurate live pass 32; this test locks the pins so
+    /// any future rename in receipt.rs, model.rs, or the topic set
+    /// trips CI unless the console is updated too.
+    #[test]
+    fn product_console_pins_match_real_schema_and_taxonomy() {
+        let console_js = include_str!("../../../docs/app/console.js");
+        let console_html = include_str!("../../../docs/app/index.html");
+        let combined = format!("{console_js}\n{console_html}");
+
+        // Receipt version — the console shows receipt_version: 2 as
+        // the SIGNED-body claim. If av-receipts bumps to v3 the
+        // console's tour renders a version that never existed.
+        assert_eq!(
+            av_receipts::RECEIPT_VERSION,
+            2,
+            "receipt version bumped from 2; update docs/app/console.js's \
+             receiptHtml() to render the new version",
+        );
+        assert!(
+            combined.contains(r#""receipt_version""#) && combined.contains(">2<"),
+            "the console must render receipt_version = 2 to match \
+             av_receipts::RECEIPT_VERSION",
+        );
+
+        // Every ReceiptBody top-level key the console renders must
+        // be a real field. A rename in receipt.rs without touching
+        // the console makes the sample receipt structurally invalid.
+        for key in [
+            "receipt_version",
+            "receipt_id",
+            "session_id",
+            "issued_at",
+            "issued_at_iso",
+            "ai_agent",
+            "subject",
+            "tool_calls",
+            "cost",
+            "stop_reason_id",
+            "stop_reason",
+            "key_id",
+            "public_key_b64",
+            "signature_b64",
+        ] {
+            assert!(
+                combined.contains(&format!(r#""{key}""#)),
+                "receipt field `{key}` is not rendered by the product \
+                 console — either the field was renamed (update the \
+                 console) or the console was truncated (update this test)",
+            );
+        }
+
+        // The receipt's cost sub-block: rename any of these and the
+        // console's tampering demo (change one digit of cost_usd_micros
+        // → signature refuses to verify) suddenly points at a field
+        // that does not exist.
+        for cost_key in [
+            "prompt_tokens",
+            "completion_tokens",
+            "cached_tokens",
+            "cost_usd_micros",
+        ] {
+            assert!(
+                combined.contains(&format!(r#""{cost_key}""#)),
+                "cost field `{cost_key}` is not rendered by the console",
+            );
+        }
+
+        // The tampering demo targets cost_usd_micros. Pin the
+        // console's tamper-target field name so if we ever move the
+        // integer field the demo doesn't silently point at a String.
+        assert!(
+            combined.contains("cost_usd_micros"),
+            "console tampering demo relies on cost_usd_micros being \
+             the integer field it changes; rename would break the demo",
+        );
+
+        // Stop reason id 92 = "Budget Exceeded" — the console renders
+        // exactly this pair for the receipt sample (the tour text
+        // says "the receipt attests a session that hit its budget").
+        assert_eq!(
+            av_events::StopReason::BudgetExceeded.id(),
+            92,
+            "BudgetExceeded id changed from 92; update the console's \
+             sample receipt receiptHtml()",
+        );
+        assert_eq!(
+            av_events::StopReason::BudgetExceeded.caption(),
+            "Budget Exceeded",
+            "BudgetExceeded caption changed; update the console",
+        );
+        assert!(
+            combined.contains(r#""stop_reason_id""#) && combined.contains(">92<"),
+            "console must render stop_reason_id = 92 to match \
+             StopReason::BudgetExceeded",
+        );
+        assert!(
+            combined.contains("Budget Exceeded"),
+            "console must render the 'Budget Exceeded' caption for the \
+             sample receipt",
+        );
+
+        // OCSF topics named by the console's evidence tree. The
+        // bridge topic list has drifted in the past; any rename
+        // that removes agent.tool_call or agent.session breaks the
+        // console's "OCSF events → your SIEM" claim silently.
+        for topic in ["agent.tool_call", "agent.session"] {
+            assert!(
+                combined.contains(topic),
+                "OCSF topic `{topic}` is not rendered by the console but is \
+                 shown as the file that lands in the operator's SIEM",
+            );
+        }
+
+        // The 403 policy-refusal HTTP status is the console's core
+        // "money kept in the building" demo (issue_refund $8,400
+        // refused → HTTP 403). Pinned against the pipeline's
+        // Blocked → 403 mapping (openai_error_body_test elsewhere).
+        assert!(
+            combined.contains("HTTP 403"),
+            "console must render the 403 policy-refusal status the \
+             pipeline emits (deliberately not 429, which SDKs auto-retry)",
+        );
+
+        // The default listen port shown throughout the setup + one-line
+        // integration sections.
+        assert!(
+            combined.contains("127.0.0.1:8484"),
+            "console must render the default listen address 127.0.0.1:8484; \
+             raise or lower the default and the setup/curl blocks lie",
+        );
+    }
+
     struct NullBus;
 
     struct SlowStore {
