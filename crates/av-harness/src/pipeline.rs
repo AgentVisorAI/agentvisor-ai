@@ -852,6 +852,16 @@ impl AppState {
         // render flat-zero from boot instead of "No data", and
         // `rate() > 0` alerts can fire the first time the bad thing
         // happens.
+        //
+        // A boot-time completeness test in the same crate
+        // (`documented_alert_series_are_preregistered_at_boot`) pins
+        // this set — new fallible arms added in later work must be
+        // added here or fail CI. That test caught three counters
+        // (`av_ephemeral_close_failures_total`,
+        // `av_stream_abort_close_failures_total`,
+        // `av_stream_abort_no_runtime_total`) that leaked past this
+        // block as lazy series — the exact defect this pre-registration
+        // pass exists to prevent.
         for kind in ["timeout", "connect", "send", "http_5xx"] {
             metrics.counter(
                 &format!("av_upstream_errors_total{{kind=\"{kind}\"}}"),
@@ -890,6 +900,27 @@ impl AppState {
             );
         }
         metrics.histogram("av_receipt_sign_duration_seconds", "Receipt signing latency");
+        // pre-register the stream-close failure counters. Each one is
+        // written only from an error arm on a background drop path,
+        // so left lazy they never appear on `/metrics` until the first
+        // failure — the exact "rate() > 0 never fires on a lazily-
+        // created series" defect this block exists to defeat. Adding
+        // one here is cheaper than an alert that never triggers.
+        metrics.counter(
+            "av_ephemeral_close_failures_total",
+            "Auto-close of a completed ephemeral one-shot failed; \
+             the session is left open until the idle sweeper reaps it",
+        );
+        metrics.counter(
+            "av_stream_abort_close_failures_total",
+            "Background close after a stream abort failed; \
+             the session is left open until the idle sweeper reaps it",
+        );
+        metrics.counter(
+            "av_stream_abort_no_runtime_total",
+            "Stream abort observed no tokio runtime; capture marked failed for \
+             reconciler retry",
+        );
         // Reconciler ticks scan the ATIF spool dir, which can be large;
         // finalisation waits for worker drain + broker publish. Wide
         // bounds keep long-tail p99 useful under load.
