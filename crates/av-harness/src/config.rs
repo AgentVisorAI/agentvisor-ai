@@ -2272,6 +2272,61 @@ mod tests {
         }
     }
 
+    /// Register pass 35 finding — the four shipped tool schemas under
+    /// config/tool-schemas/ are the daemon's boot-time contract: at
+    /// startup `load_sandbox` reads each `.json` file and parses it
+    /// with `serde_json::from_slice`, using the file stem as the tool
+    /// name. Any parse failure with default `tool_schema_dir =
+    /// "config/tool-schemas"` errors out the daemon with
+    /// "parse tool schema {path}: ..." — a CrashLoopBackOff on
+    /// Kubernetes, an immediate exit on bare-metal.
+    ///
+    /// Only db_write.json was parse-tested before this pass (via
+    /// `tests/sla.rs:33`, which include_str!s it). The other three —
+    /// payout.json, deploy.json, merge.json — shipped and were
+    /// referenced by config/harness.example.toml + the K8s ConfigMap,
+    /// but nothing exercised them at CI time.
+    #[test]
+    fn shipped_tool_schemas_parse_as_json() {
+        for (name, raw) in [
+            (
+                "payout.json",
+                include_str!("../../../config/tool-schemas/payout.json"),
+            ),
+            (
+                "db_write.json",
+                include_str!("../../../config/tool-schemas/db_write.json"),
+            ),
+            (
+                "deploy.json",
+                include_str!("../../../config/tool-schemas/deploy.json"),
+            ),
+            (
+                "merge.json",
+                include_str!("../../../config/tool-schemas/merge.json"),
+            ),
+        ] {
+            let value: serde_json::Value = serde_json::from_str(raw).unwrap_or_else(|error| {
+                panic!(
+                    "shipped tool schema {name} must parse as JSON — the daemon calls \
+                     serde_json::from_slice on each .json file under tool_schema_dir at \
+                     boot; a parse failure here CrashLoopBackOffs the pod. Error: {error}"
+                )
+            });
+            // The schema must be an object at the top level — that is
+            // what jsonschema treats as a "schema for a value"; a bare
+            // array or scalar would compile as "any input matches",
+            // silently gating nothing. Fail-closed at CI, not at
+            // request time.
+            assert!(
+                value.is_object(),
+                "shipped tool schema {name} must be a JSON object at the top level \
+                 (JSON Schema convention); a bare array/scalar would silently accept \
+                 every tool call"
+            );
+        }
+    }
+
     /// Register pass 34 finding — the K8s ConfigMap embeds a full
     /// TOML block for the daemon at deploy/kubernetes/agentvisor-ai.
     /// yaml. It ships with the shipped `.toml` files pinned above
