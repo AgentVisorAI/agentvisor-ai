@@ -517,144 +517,162 @@ impl Finalizer {
 
     /// Remove sealed ATIF trajectories (and their `.atif-auth` provenance
     /// sidecars and digest-bound `.close-complete` markers) whose mtime is
-    /// older than `max_age`. Idempotent; a
-    /// missing file (already pruned) is silently skipped. Returns the
-    /// number of `(atif, sidecar)` pairs removed so callers can log or
-    /// bump a metric.
-    ///
-    /// Live sessions are protected by two properties:
-    ///   * an in-flight session's per-session lifecycle lock is held
-    ///     across close, and prune touches only files whose mtime
-    ///     satisfies `age > max_age` — a session that just closed still
-    ///     has fresh mtimes and is far outside the retention window;
-    ///   * unpaired `.json` (no `.atif-auth`) files are LEFT ALONE — those
-    ///     are either the crash-torn transient state of an in-progress
-    ///     close or attacker-planted trajectories the reconciler's own
-    ///     quarantine sweep handles. Retention is only for *sealed*
-    ///     evidence pairs; unsealed remnants stay for the reconciler.
-    ///
-    /// Without retention the spool is append-only forever, and a
-    /// restart re-adopts every closed session it finds there.
+    /// older than `max_age`. Async wrapper over
+    /// [`prune_sealed_atif_blocking`] (which `avctl spool-prune` calls
+    /// directly) — see it for the full retention semantics.
     pub async fn prune_sealed_atif(&self, max_age: std::time::Duration) -> Result<usize, FinalizeError> {
         let spool_dir = self.spool_dir.clone();
-        tokio::task::spawn_blocking(move || -> Result<usize, FinalizeError> {
-            let entries = match std::fs::read_dir(&spool_dir) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-                Err(error) => return Err(FinalizeError::atif_source(error)),
-            };
-            let mut pruned = 0usize;
-            let now = std::time::SystemTime::now();
-            let mut dir_changed = false;
-            for entry in entries {
-                let entry = entry.map_err(FinalizeError::atif_source)?;
-                let path = entry.path();
-                // We only prune paired sealed evidence: `<stem>.json` with
-                // its matching `<stem>.atif-auth`, plus the pair's
-                // digest-bound `<stem>.close-complete` marker. Anything
-                // else — the step journals, corrupt-quarantine files,
-                // tool-execution markers — belongs to code paths that own
-                // their own deletion logic.
-                let extension = path.extension().and_then(std::ffi::OsStr::to_str);
-                if extension == Some("close-complete") {
-                    // A close-complete marker whose artifact is gone can
-                    // never verify again (it is digest-bound to the
-                    // artifact bytes) — it is dead weight left behind by
-                    // pre-fix sweeps that pruned the pair but not the
-                    // marker, one file per closed session, forever. Only
-                    // plain per-close markers (`<32-hex-stem>` names)
-                    // qualify: archived collision markers
-                    // (`{stem}.archived-….close-complete`) are preserved
-                    // evidence and keep their own pair.
-                    let is_plain_stem_marker = path
-                        .file_stem()
-                        .and_then(std::ffi::OsStr::to_str)
-                        .is_some_and(|stem| stem.len() == 32 && stem.chars().all(|c| c.is_ascii_hexdigit()));
-                    if is_plain_stem_marker && !path.with_extension("json").exists() {
-                        let old_enough = entry
-                            .metadata()
-                            .and_then(|m| m.modified())
-                            .ok()
-                            .map(|modified| {
-                                now.duration_since(modified).unwrap_or(std::time::Duration::ZERO) >= max_age
-                            })
-                            .unwrap_or(false);
-                        if old_enough {
-                            match std::fs::remove_file(&path) {
-                                Ok(()) => dir_changed = true,
-                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                                Err(error) => return Err(FinalizeError::atif_source(error)),
-                            }
-                        }
-                    }
-                    continue;
-                }
-                if extension != Some("json") {
-                    continue;
-                }
-                if path
-                    .file_name()
-                    .and_then(std::ffi::OsStr::to_str)
-                    .is_some_and(|name| name.ends_with(".session.json"))
-                {
-                    continue;
-                }
-                let sidecar = path.with_extension("atif-auth");
-                if !sidecar.exists() {
-                    continue;
-                }
-                let metadata = match entry.metadata() {
-                    Ok(m) => m,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(FinalizeError::atif_source(error)),
-                };
-                let modified = match metadata.modified() {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-                let age = now.duration_since(modified).unwrap_or(std::time::Duration::ZERO);
-                if age < max_age {
-                    continue;
-                }
-                // Remove the sidecar first so a concurrent recovery scan
-                // sees the sidecar-less window (which quarantines rather
-                // than replays), never the reverse (which would replay
-                // an already-pruned artifact).
-                let mut removed_any = false;
-                match std::fs::remove_file(&sidecar) {
-                    Ok(()) => removed_any = true,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(FinalizeError::atif_source(error)),
-                }
-                match std::fs::remove_file(&path) {
-                    Ok(()) => removed_any = true,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(FinalizeError::atif_source(error)),
-                }
-                // The pair's close-complete marker is digest-bound to the
-                // artifact just removed; without it the marker can never
-                // verify and would otherwise leak forever (one marker per
-                // closed unsigned session survived every sweep before
-                // this removal existed).
-                match std::fs::remove_file(path.with_extension("close-complete")) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(FinalizeError::atif_source(error)),
-                }
-                if removed_any {
-                    pruned += 1;
-                    dir_changed = true;
-                }
-            }
-            if dir_changed {
-                av_core::fsutil::sync_directory(&spool_dir).map_err(FinalizeError::atif_source)?;
-            }
-            Ok(pruned)
+        tokio::task::spawn_blocking(move || {
+            prune_sealed_atif_blocking(&spool_dir, max_age).map_err(FinalizeError::atif_source)
         })
         .await
         .map_err(FinalizeError::Task)?
     }
+}
 
+/// Blocking core of the sealed-ATIF retention sweep. Removes sealed
+/// ATIF trajectories (and their `.atif-auth` provenance sidecars and
+/// digest-bound `.close-complete` markers) whose mtime is older than
+/// `max_age`. Idempotent; a missing file (already pruned) is silently
+/// skipped. Returns the number of `(atif, sidecar)` pairs removed so
+/// callers can log or bump a metric.
+///
+/// Callable without a running harness: `avctl spool-prune` drives it
+/// directly against `atif_spool_dir`, and the hourly in-process
+/// retention task wraps it via [`Finalizer::prune_sealed_atif`].
+///
+/// Live sessions are protected by two properties:
+///   * an in-flight session's per-session lifecycle lock is held
+///     across close, and prune touches only files whose mtime
+///     satisfies `age > max_age` — a session that just closed still
+///     has fresh mtimes and is far outside the retention window;
+///   * unpaired `.json` (no `.atif-auth`) files are LEFT ALONE — those
+///     are either the crash-torn transient state of an in-progress
+///     close or attacker-planted trajectories the reconciler's own
+///     quarantine sweep handles. Retention is only for *sealed*
+///     evidence pairs; unsealed remnants stay for the reconciler.
+///
+/// Without retention the spool is append-only forever, and a
+/// restart re-adopts every closed session it finds there.
+pub fn prune_sealed_atif_blocking(
+    spool_dir: &std::path::Path,
+    max_age: std::time::Duration,
+) -> std::io::Result<usize> {
+    let entries = match std::fs::read_dir(spool_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut pruned = 0usize;
+    let now = std::time::SystemTime::now();
+    let mut dir_changed = false;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        // We only prune paired sealed evidence: `<stem>.json` with
+        // its matching `<stem>.atif-auth`, plus the pair's
+        // digest-bound `<stem>.close-complete` marker. Anything
+        // else — the step journals, corrupt-quarantine files,
+        // tool-execution markers — belongs to code paths that own
+        // their own deletion logic.
+        let extension = path.extension().and_then(std::ffi::OsStr::to_str);
+        if extension == Some("close-complete") {
+            // A close-complete marker whose artifact is gone can
+            // never verify again (it is digest-bound to the
+            // artifact bytes) — it is dead weight left behind by
+            // pre-fix sweeps that pruned the pair but not the
+            // marker, one file per closed session, forever. Only
+            // plain per-close markers (`<32-hex-stem>` names)
+            // qualify: archived collision markers
+            // (`{stem}.archived-….close-complete`) are preserved
+            // evidence and keep their own pair.
+            let is_plain_stem_marker = path
+                .file_stem()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|stem| stem.len() == 32 && stem.chars().all(|c| c.is_ascii_hexdigit()));
+            if is_plain_stem_marker && !path.with_extension("json").exists() {
+                let old_enough = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .map(|modified| {
+                        now.duration_since(modified).unwrap_or(std::time::Duration::ZERO) >= max_age
+                    })
+                    .unwrap_or(false);
+                if old_enough {
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => dir_changed = true,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            continue;
+        }
+        if extension != Some("json") {
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.ends_with(".session.json"))
+        {
+            continue;
+        }
+        let sidecar = path.with_extension("atif-auth");
+        if !sidecar.exists() {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let modified = match metadata.modified() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let age = now.duration_since(modified).unwrap_or(std::time::Duration::ZERO);
+        if age < max_age {
+            continue;
+        }
+        // Remove the sidecar first so a concurrent recovery scan
+        // sees the sidecar-less window (which quarantines rather
+        // than replays), never the reverse (which would replay
+        // an already-pruned artifact).
+        let mut removed_any = false;
+        match std::fs::remove_file(&sidecar) {
+            Ok(()) => removed_any = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed_any = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        // The pair's close-complete marker is digest-bound to the
+        // artifact just removed; without it the marker can never
+        // verify and would otherwise leak forever (one marker per
+        // closed unsigned session survived every sweep before
+        // this removal existed).
+        match std::fs::remove_file(path.with_extension("close-complete")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if removed_any {
+            pruned += 1;
+            dir_changed = true;
+        }
+    }
+    if dir_changed {
+        av_core::fsutil::sync_directory(spool_dir)?;
+    }
+    Ok(pruned)
+}
+
+impl Finalizer {
     #[cfg(test)]
     pub(crate) fn lifecycle_locks(&self) -> Arc<SessionLockTable> {
         Arc::clone(&self.lifecycle_locks)

@@ -85,6 +85,22 @@ enum Command {
         #[arg(long, default_value = "spool/atif")]
         spool: PathBuf,
     },
+    /// Remove sealed ATIF evidence pairs (`.json` + `.atif-auth`, plus
+    /// their digest-bound `.close-complete` markers) older than the
+    /// retention window. Same sweep the harness runs hourly when
+    /// `atif_retention_days` is set; run this for one-off reclaims or
+    /// from external cron when no retention is configured. Unpaired
+    /// remnants, archived collision evidence, and signed receipts
+    /// under `receipts/` are never touched.
+    SpoolPrune {
+        /// ATIF spool directory (`atif_spool_dir` in the harness config).
+        #[arg(long, default_value = "spool/atif")]
+        spool: PathBuf,
+        /// Retention window in days; sealed pairs whose mtime is older
+        /// are removed. `0` prunes every sealed pair immediately.
+        #[arg(long)]
+        retention_days: u32,
+    },
     /// Verify a receipt offline using an independently trusted public key.
     ReceiptVerify {
         /// Receipt JSON file.
@@ -222,6 +238,10 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Keygen { output } => keygen(&output),
         Command::Pubkey { seed } => pubkey(&seed),
         Command::ReceiptLocate { session_id, spool } => receipt_locate(&session_id, &spool),
+        Command::SpoolPrune {
+            spool,
+            retention_days,
+        } => spool_prune(&spool, retention_days),
         Command::ReceiptVerify { path, public_key_hex } => receipt_verify(&path, &public_key_hex),
         Command::AtifValidate { path, mode } => atif_validate(&path, mode),
         Command::ManifestValidate { path } => manifest_validate(&path),
@@ -516,6 +536,25 @@ fn receipt_locate(session_id: &str, spool: &Path) -> Result<()> {
             "stem": stem,
             "artifacts": artifacts,
             "archived_prior_incarnations": archived,
+        })
+    );
+    Ok(())
+}
+
+/// Manual, offline entry point to the sealed-ATIF retention sweep —
+/// the same `prune_sealed_atif_blocking` the harness's hourly
+/// `atif_retention_days` task runs, callable without a running
+/// harness (external cron, one-off reclaim, decommissioning).
+fn spool_prune(spool: &Path, retention_days: u32) -> Result<()> {
+    let max_age = std::time::Duration::from_secs(u64::from(retention_days) * 24 * 60 * 60);
+    let pruned = av_harness::reconciler::prune_sealed_atif_blocking(spool, max_age)
+        .with_context(|| format!("prune spool {}", spool.display()))?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "spool": spool,
+            "retention_days": retention_days,
+            "pruned_pairs": pruned,
         })
     );
     Ok(())

@@ -44,6 +44,7 @@ fn help_mentions_every_subcommand() {
         "session-promote",
         "config-validate",
         "loadgen",
+        "spool-prune",
     ];
     let out = run(&["--help"]);
     assert!(out.status.success(), "avctl --help must succeed");
@@ -73,6 +74,7 @@ fn each_subcommand_has_its_own_help() {
         "session-promote",
         "config-validate",
         "loadgen",
+        "spool-prune",
     ] {
         let out = run(&[cmd, "--help"]);
         assert!(

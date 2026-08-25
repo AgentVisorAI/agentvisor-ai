@@ -572,3 +572,81 @@ fn receipt_locate_reports_stem_artifacts_and_archived_incarnations() {
     );
     assert!(archived[0].as_str().unwrap().contains("archived-atif-x"));
 }
+
+// ------------------------------------------------------------------
+// `spool-prune` — manual retention sweep over sealed evidence pairs.
+// ------------------------------------------------------------------
+
+/// `--retention-days 0` must remove every sealed pair (`.json` +
+/// `.atif-auth`) and its `.close-complete` marker, while leaving
+/// unpaired remnants, archived collision evidence, and signed
+/// receipts under `receipts/` untouched — the same semantics as the
+/// harness's hourly `atif_retention_days` sweep.
+#[test]
+fn spool_prune_removes_sealed_pairs_and_spares_everything_else() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool = dir.path();
+    std::fs::create_dir_all(spool.join("receipts")).unwrap();
+    let stem = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // 32-hex spool stem
+                                                   // Sealed pair + digest-bound close marker: pruned.
+    std::fs::write(spool.join(format!("{stem}.json")), b"{}").unwrap();
+    std::fs::write(spool.join(format!("{stem}.atif-auth")), b"sig").unwrap();
+    std::fs::write(spool.join(format!("{stem}.close-complete")), b"mac").unwrap();
+    // Unpaired trajectory (no sidecar): left for the quarantine sweep.
+    let orphan = spool.join("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json");
+    std::fs::write(&orphan, b"{}").unwrap();
+    // Archived collision evidence: never a retention target.
+    let archived = spool.join(format!("{stem}.archived-atif-x.json"));
+    std::fs::write(&archived, b"{}").unwrap();
+    // Signed receipt: never a retention target.
+    let receipt = spool.join("receipts").join(format!("{stem}.json"));
+    std::fs::write(&receipt, b"{}").unwrap();
+
+    let out = run(&[
+        "spool-prune",
+        "--spool",
+        spool.to_str().unwrap(),
+        "--retention-days",
+        "0",
+    ]);
+    assert!(out.status.success(), "spool-prune failed: {}", stderr(&out));
+    let parsed: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(parsed["pruned_pairs"], 1, "one sealed pair: {parsed}");
+
+    assert!(!spool.join(format!("{stem}.json")).exists(), "pair pruned");
+    assert!(
+        !spool.join(format!("{stem}.atif-auth")).exists(),
+        "sidecar pruned"
+    );
+    assert!(
+        !spool.join(format!("{stem}.close-complete")).exists(),
+        "digest-bound marker pruned with its pair"
+    );
+    assert!(orphan.exists(), "unpaired remnant spared");
+    assert!(archived.exists(), "archived evidence spared");
+    assert!(receipt.exists(), "signed receipt spared");
+
+    // Idempotent: a second run prunes nothing and still succeeds.
+    let out = run(&[
+        "spool-prune",
+        "--spool",
+        spool.to_str().unwrap(),
+        "--retention-days",
+        "0",
+    ]);
+    assert!(out.status.success(), "second run failed: {}", stderr(&out));
+    let parsed: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(parsed["pruned_pairs"], 0, "idempotent: {parsed}");
+
+    // A missing spool directory is a clean no-op, not an error —
+    // matches the daemon sweep's NotFound handling.
+    let missing = dir.path().join("never-created");
+    let out = run(&[
+        "spool-prune",
+        "--spool",
+        missing.to_str().unwrap(),
+        "--retention-days",
+        "30",
+    ]);
+    assert!(out.status.success(), "missing dir must no-op: {}", stderr(&out));
+}
