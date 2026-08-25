@@ -3739,6 +3739,54 @@ mod tests {
     use std::time::Duration;
     use tower::ServiceExt;
 
+    /// Register item 25 sub-clause: OPENAI-COMPATIBILITY.md is the
+    /// integration-facing route contract. Pass 31 audit found the
+    /// bare `/mcp` route (registered alongside `/v1/mcp` for MCP SDK
+    /// convention) was documented in CONFIGURATION.md's
+    /// `max_request_bytes` but MISSING from OPENAI-COMPATIBILITY.md's
+    /// route split. An integration engineer following the doc would
+    /// assume MCP SDKs must POST to `/v1/mcp`; a client posting to
+    /// the standard `/mcp` path would succeed, but the doc's
+    /// silence about it is silently confusing.
+    ///
+    /// Every real client-facing agent-API route this crate registers
+    /// must appear verbatim in OPENAI-COMPATIBILITY.md. Adding a new
+    /// route to `build_router` without updating the doc now trips CI.
+    #[test]
+    fn openai_compatibility_documents_every_client_facing_route() {
+        let doc = include_str!("../../../docs/reference/OPENAI-COMPATIBILITY.md");
+        // The client-facing agent API surface — routes an SDK or MCP
+        // client will POST to. Operational probes (/health, /livez,
+        // /readyz, /metrics) and the operator/dashboard surface
+        // (/api/v1/...) are documented separately (OPERATIONS.md /
+        // the dashboard section) and are explicitly out of scope of
+        // this test to avoid pinning them to the wrong doc.
+        //
+        // Each route is checked with distinguishing context — a bare
+        // substring check would treat `/v1/mcp` as satisfying the
+        // `/mcp` requirement (found live pass 31 while red-testing
+        // this exact scenario). The context strings are what the doc
+        // uniquely uses for each variant.
+        for (route, must_contain) in [
+            ("/v1/chat/completions", "`/v1/chat/completions`"),
+            ("/v1/mcp", "`/v1/mcp`"),
+            // Distinguish the bare route by its "bare `/mcp`" phrase
+            // — the same character sequence used inside `/v1/mcp`
+            // would otherwise let the substring check pass.
+            ("/mcp (bare, MCP SDK convention)", "bare `/mcp`"),
+            ("/v1/sessions/{id}/close", "`/v1/sessions/{id}/close`"),
+            ("/v1/sessions/{id}/promote", "`/v1/sessions/{id}/promote`"),
+        ] {
+            assert!(
+                doc.contains(must_contain),
+                "route {route} is registered by build_router but the doc is missing \
+                 its distinguishing marker {must_contain:?} — an integration \
+                 engineer following the doc will not know it exists. Add a row to \
+                 the route table (or the /v1 vs /api/v1 split section) and re-run."
+            );
+        }
+    }
+
     struct NullBus;
 
     struct SlowStore {

@@ -86,7 +86,9 @@ The prefix split is deliberate, not accidental:
 
 * **`/v1/*`** is the client-facing **agent API** — the surface an
   agent or SDK touches during a conversation: `/v1/chat/completions`
-  (OpenAI-shaped), `/v1/mcp` (JSON-RPC tool gate), and the two
+  (OpenAI-shaped), `/v1/mcp` (JSON-RPC tool gate; **also served at
+  bare `/mcp`** for MCP SDK convention — both accept the same
+  requests and share the same `max_request_bytes` cap), and the two
   session lifecycle verbs `/v1/sessions/{id}/close` and
   `/v1/sessions/{id}/promote`. Errors on this surface use the
   OpenAI error body (`{"error":{"message","type","param","code"}}`)
