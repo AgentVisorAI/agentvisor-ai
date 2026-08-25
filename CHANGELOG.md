@@ -241,6 +241,19 @@ exercised against release binaries in CI on every push
 
 ### Documentation
 
+- Added an interactive product console (`docs/app/`, published at
+  `/app/` on the site): a self-contained client-side simulation of the
+  full operator flow — setup wizard, one-line integration, a live
+  session with budget refusals and a loop-breaker trip, the fleet
+  dashboard, offline receipt verification, and the on-disk evidence
+  layout. Content is display-only and mirrors the shipped surfaces
+  (config keys, `avctl` commands, HTTP status semantics, and the
+  receipt v2 schema). A captioned guided tour is available behind
+  `?tour=1`.
+- Corrected `docs/reference/LIMITS.md`: budget refusals return 403 —
+  deliberately not 429, which mainstream SDKs auto-retry — matching
+  `PipelineError::status`. The doc previously claimed 429 with a
+  `metadata.limit` field that does not exist.
 - Reference documentation expanded for operators: configuration
   reference, operations guide (probes, drain, key rotation), offline
   receipt verification walkthrough, spool-and-recovery semantics, and
