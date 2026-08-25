@@ -2272,6 +2272,92 @@ mod tests {
         }
     }
 
+    /// Register pass 34 finding — the K8s ConfigMap embeds a full
+    /// TOML block for the daemon at deploy/kubernetes/agentvisor-ai.
+    /// yaml. It ships with the shipped `.toml` files pinned above
+    /// but the ConfigMap's OWN copy of the config was never
+    /// parse-tested. If it drifts (typo in a field name, unknown
+    /// key from a rebase, a rename in HarnessConfig with no matching
+    /// yaml edit), `kubectl apply` succeeds — YAML syntax is fine —
+    /// but every pod CrashLoopBackOffs on boot with the classic
+    /// "unknown field `X`, expected one of ..." serde error. The
+    /// operator debugging this can't tell the daemon from the config
+    /// apart without shell access to the pod.
+    ///
+    /// This test extracts the embedded TOML at compile time,
+    /// un-indents it (each line has a 4-space YAML block indent),
+    /// runs it through the same strict loader `agentvisord` uses at
+    /// boot, and pins the same safe-posture invariants as the
+    /// shipped configs above.
+    #[test]
+    fn shipped_kubernetes_configmap_toml_parses_and_pins_safe_posture() {
+        let yaml = include_str!("../../../deploy/kubernetes/agentvisor-ai.yaml");
+        // Find the block scalar. The ConfigMap's `agentvisor.toml: |`
+        // header opens a literal block; the block continues while
+        // subsequent lines are indented at the block's level or
+        // deeper (or blank). The next YAML-level key or `---`
+        // separator ends it.
+        let block_header = "agentvisor.toml: |";
+        let block_start = yaml
+            .find(block_header)
+            .unwrap_or_else(|| panic!("K8s manifest must embed a `{block_header}` block"))
+            + block_header.len();
+        let after = &yaml[block_start..];
+        let after = after.trim_start_matches('\n');
+        // Every line of the block is indented at least 4 spaces
+        // (see the ConfigMap in the manifest). Take lines until we
+        // hit a non-blank line whose indent is smaller.
+        let mut toml = String::new();
+        for line in after.lines() {
+            if line.is_empty() || line.trim().is_empty() {
+                toml.push('\n');
+                continue;
+            }
+            if let Some(stripped) = line.strip_prefix("    ") {
+                toml.push_str(stripped);
+                toml.push('\n');
+            } else {
+                break;
+            }
+        }
+        assert!(
+            toml.contains("config_version"),
+            "extracted ConfigMap TOML looks empty; did the block indent change?"
+        );
+
+        let config = HarnessConfig::from_toml(&toml).unwrap_or_else(|error| {
+            panic!(
+                "K8s ConfigMap agentvisor.toml block must parse and validate under \
+                 the same strict loader agentvisord uses; a rename/typo here \
+                 CrashLoopBackOffs every pod at boot. Error: {error}\n\n\
+                 Extracted TOML:\n{toml}"
+            )
+        });
+
+        // Same safe-posture pins as the shipped configs. Adding the
+        // K8s ConfigMap to the roster the register's item 4 concern
+        // covers.
+        assert_eq!(
+            config.default_workflow, "signed",
+            "K8s ConfigMap must opt into the signed workflow (register item 19); \
+             the serde default `unsigned` silently mints zero receipts on clean \
+             traffic"
+        );
+        assert!(
+            !config.dashboard_enabled,
+            "K8s ConfigMap must ship dashboard-off — the pod binds 0.0.0.0 for \
+             cluster network reachability, so any workload with Service access \
+             could otherwise enumerate sessions/costs/receipts (register item 4)"
+        );
+        assert!(
+            config.allow_wildcard_bind,
+            "K8s ConfigMap MUST carry allow_wildcard_bind = true (paired with \
+             the 0.0.0.0 listen + require_identity = false posture); config \
+             validation refuses the combination otherwise and the daemon \
+             CrashLoopBackOffs at boot"
+        );
+    }
+
     /// `tool_upstream_url = ""` used to pass validation while runtime
     /// routing gates tool forwarding on `is_some()` — the empty string
     /// silently enabled the tool-upstream branches and only failed at the
