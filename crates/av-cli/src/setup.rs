@@ -2071,6 +2071,45 @@ mod tests {
 
     use super::*;
 
+    /// Register item 25 (docs drift) — sub-clause for README.md. Every
+    /// `avctl init --preset` variant listed in the README's Preset
+    /// table must be a real ValueEnum variant; every real variant
+    /// must appear in the README (adding a preset without documenting
+    /// it means a user running `avctl init --help` sees it but the
+    /// project's landing surface pretends it does not exist).
+    ///
+    /// Pass 33 verified all 16 current variants match README rows;
+    /// this test locks that so a future preset addition (or a
+    /// preset name rename via clap's default CamelCase → kebab-case
+    /// convention) trips CI if README is not updated too.
+    #[test]
+    fn readme_documents_every_avctl_init_preset() {
+        let readme = include_str!("../../../README.md");
+        for preset in Preset::value_variants() {
+            let Some(value) = preset.to_possible_value() else {
+                // ValueEnum::to_possible_value returns None for a
+                // variant with `#[clap(skip)]`; those aren't reachable
+                // from `avctl init --preset X` and don't need a
+                // README row.
+                continue;
+            };
+            let name = value.get_name().to_owned();
+            // The README lists presets as backtick-quoted lowercase
+            // identifiers inside a table row (`| `openai` | ... |`).
+            // Match the exact backtick form to distinguish real
+            // documentation from prose mentions (e.g. "OpenAI-compatible"
+            // contains "openai" but is not the same commitment).
+            let marker = format!("`{name}`");
+            assert!(
+                readme.contains(&marker),
+                "avctl init --preset {name} is a real ValueEnum variant but the \
+                 README's Preset table is missing a `{name}` row. Add the row \
+                 with the endpoint host and key env var so users landing on \
+                 the README see the same preset list `avctl init --help` shows."
+            );
+        }
+    }
+
     /// The doctor promise is "never prints secret values or
     /// URL userinfo" — the redactor must strip credentials from every
     /// display shape doctor prints (single URLs, cluster lists, bare
