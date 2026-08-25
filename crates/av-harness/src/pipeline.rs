@@ -1467,6 +1467,10 @@ impl AppState {
     /// `ActionBudget::try_tokens` → `StateStore::try_spend`, which on
     /// the redis backend is a synchronous network round-trip — that
     /// must never run inline on a tokio worker, whatever the body size.
+    /// The same applies to `[principal_budget]`: it drives its own
+    /// `for_principal(...).try_tokens` store round-trip in
+    /// `prepare_chat` even when the session `max_tokens` is unset, so
+    /// it must equally force the blocking pool.
     pub async fn prepare_chat_nonblocking(
         &self,
         headers: &HeaderMap,
@@ -1477,7 +1481,10 @@ impl AppState {
         /// 16 KiB ≈ 250 µs of gate work on the review's 2-vCPU
         /// reference box — comfortably under a poll-stall budget.
         const INLINE_BODY_LIMIT: usize = 16 * 1024;
-        if body_bytes <= INLINE_BODY_LIMIT && self.config.budget.max_tokens.is_none() {
+        if body_bytes <= INLINE_BODY_LIMIT
+            && self.config.budget.max_tokens.is_none()
+            && self.config.principal_budget.is_none()
+        {
             return self.prepare_chat(headers, payload);
         }
         let state = self.clone();

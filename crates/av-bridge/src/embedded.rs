@@ -191,11 +191,13 @@ impl EmbeddedBroker {
         )?;
         let manifest =
             BridgeManifest::from_yaml(&manifest_yaml).map_err(|e| BusError::Backend(e.to_string()))?;
-        // NOTE: no orphaned-temp sweep here — `open()` is also called by
-        // read-only CLI paths (`avctl event-tail`) while a live daemon
-        // may be writing; sweeping from a second process could delete a
-        // temp the daemon is about to rename. The daemon performs the
-        // sweep itself at boot (main.rs), where it is the single writer.
+        // NOTE: no orphaned-temp sweep here — the daemon performs the
+        // sweep itself at boot (main.rs), where it is the single
+        // writer. `open()` mutates on-disk state during recovery
+        // (torn-tail truncate, sidecar rewrite, append handles), so it
+        // must only ever run in the single-writer daemon; read-side
+        // tooling running beside a live daemon uses
+        // [`Self::fetch_read_only`] instead.
         let mut partitions = HashMap::new();
         let mut torn_total = 0u64;
         for t in &manifest.topics {
@@ -365,6 +367,100 @@ impl EmbeddedBroker {
     /// Data directory.
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// Read-only event fetch for tooling running BESIDE a live daemon
+    /// (`avctl event-tail`). [`Self::open`] is NOT safe for that use:
+    /// its recovery "repairs" a torn segment tail via `set_len` and
+    /// atomically rewrites the idempotency sidecar — racing a daemon
+    /// that is mid-append (between `write_all` of the record bytes and
+    /// the trailing newline), a second process's repair truncates
+    /// bytes the daemon goes on to ack as durable: a silently lost or
+    /// corrupted acked audit event. There is no cross-process lock, so
+    /// the only safe concurrent mode is one that mutates nothing.
+    ///
+    /// This path only reads: the manifest (capped, to validate the
+    /// topic/partition and locate the segment), then a bounded
+    /// streaming scan of the one segment file. An unparseable line is
+    /// skipped (same policy as [`EventBus::fetch`]); an unterminated
+    /// trailing line — an in-flight append or crash-torn tail — is
+    /// ignored, never truncated; an oversized line is drained in
+    /// bounded chunks and skipped.
+    pub fn fetch_read_only(
+        data_dir: &Path,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        max: usize,
+    ) -> Result<Vec<StoredEvent>, BusError> {
+        /// Same generous per-record bound as `recover_segment`.
+        const MAX_SEGMENT_LINE_BYTES: u64 = 16 * 1024 * 1024;
+        let manifest_yaml = av_core::fsutil::read_capped_string(
+            &data_dir.join("manifest.yaml"),
+            av_core::fsutil::MAX_CONTROL_BYTES,
+        )?;
+        let manifest =
+            BridgeManifest::from_yaml(&manifest_yaml).map_err(|e| BusError::Backend(e.to_string()))?;
+        let topic_spec = manifest
+            .topics
+            .iter()
+            .find(|t| t.name == topic)
+            .ok_or_else(|| BusError::UnknownTopic(topic.to_owned()))?;
+        if partition >= topic_spec.partitions {
+            return Err(BusError::Backend(format!("partition {partition} out of range")));
+        }
+        let path = data_dir
+            .join("topics")
+            .join(topic)
+            .join(format!("p{partition}.jsonl"));
+        let file = match fs::File::open(&path) {
+            Ok(file) => file,
+            // Provisioned topic whose segment has no events yet (the
+            // daemon materialises it lazily at open/publish).
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(BusError::Io(error)),
+        };
+        let mut reader = std::io::BufReader::new(file);
+        let mut out = Vec::with_capacity(max.min(1024));
+        let mut buf: Vec<u8> = Vec::new();
+        while out.len() < max {
+            buf.clear();
+            let read = {
+                use std::io::Read as _;
+                let mut limited = (&mut reader).take(MAX_SEGMENT_LINE_BYTES);
+                use std::io::BufRead as _;
+                limited.read_until(b'\n', &mut buf)?
+            };
+            if read == 0 {
+                break;
+            }
+            if buf.last() != Some(&b'\n') {
+                // In-flight append, crash-torn tail, or a record above
+                // the line cap. A writer-side open() decides what to do
+                // about those; a read-only tail just stops before them.
+                break;
+            }
+            let line = buf.get(..buf.len().saturating_sub(1)).unwrap_or_default();
+            if line.is_empty() {
+                continue;
+            }
+            let ev: StoredEvent = match serde_json::from_slice(line) {
+                Ok(ev) => ev,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        path = %av_core::fsutil::basename(&path),
+                        "skipping unparseable segment record during read-only fetch",
+                    );
+                    continue;
+                }
+            };
+            if ev.offset < offset {
+                continue;
+            }
+            out.push(ev);
+        }
+        Ok(out)
     }
 }
 
@@ -817,17 +913,63 @@ fn recover_event_uids(path: &Path) -> Result<HashMap<String, u64>, BusError> {
     let mut has_torn_tail = false;
     let mut logged_oversize_line = false;
     // A single oversized-line hard cap: 4 KiB is 20x the fattest
-    // sidecar record we produce and keeps `read_until`'s worst-case
-    // allocation bounded on adversarial inputs.
+    // sidecar record we produce. The reader is `take`-bounded to the
+    // cap (+1 to detect overshoot) so a planted multi-GiB single line
+    // cannot grow the buffer to file size; the overflow tail is
+    // drained in cap-sized chunks and the whole line is skipped,
+    // matching the parse-failure discipline below.
     const MAX_SIDECAR_LINE: usize = 4096;
     loop {
         line_buffer.clear();
-        let bytes_read = match reader.read_until(b'\n', &mut line_buffer) {
-            Ok(0) => break,
-            Ok(bytes) => bytes,
-            Err(error) => return Err(BusError::Io(error)),
+        let bytes_read = {
+            use std::io::Read as _;
+            let mut limited = (&mut reader).take(MAX_SIDECAR_LINE as u64 + 1);
+            match limited.read_until(b'\n', &mut line_buffer) {
+                Ok(0) => break,
+                Ok(bytes) => bytes,
+                Err(error) => return Err(BusError::Io(error)),
+            }
         };
         let terminated = line_buffer.last() == Some(&b'\n');
+        if !terminated && bytes_read > MAX_SIDECAR_LINE {
+            // Oversized line cut off by the `take` bound: drain the
+            // rest of it in bounded chunks so the skip stays O(cap)
+            // in memory whatever the line length on disk.
+            let mut drained: u64 = bytes_read as u64;
+            let mut found_newline = false;
+            loop {
+                line_buffer.clear();
+                use std::io::Read as _;
+                let mut limited = (&mut reader).take(MAX_SIDECAR_LINE as u64 + 1);
+                match limited.read_until(b'\n', &mut line_buffer) {
+                    Ok(0) => break,
+                    Ok(bytes) => {
+                        drained = drained.saturating_add(bytes as u64);
+                        if line_buffer.last() == Some(&b'\n') {
+                            found_newline = true;
+                            break;
+                        }
+                    }
+                    Err(error) => return Err(BusError::Io(error)),
+                }
+            }
+            if !found_newline {
+                // Oversized AND unterminated: the classic torn tail,
+                // just fat. Truncate to the last complete line.
+                has_torn_tail = true;
+                break;
+            }
+            if !logged_oversize_line {
+                tracing::warn!(
+                    path = %av_core::fsutil::basename(path),
+                    line_bytes = drained,
+                    "oversized event-uid sidecar record skipped during recovery"
+                );
+                logged_oversize_line = true;
+            }
+            valid_bytes = valid_bytes.saturating_add(drained);
+            continue;
+        }
         if !terminated {
             // Trailing partial line (crash between newline appends);
             // the atomic-append discipline in `publish_with_uid`
@@ -1376,6 +1518,49 @@ mod tests {
         let (next_offset, torn) = recover_segment(&path).unwrap();
         assert_eq!(torn, 0);
         assert_eq!(next_offset, 3);
+    }
+
+    /// The sidecar recovery's oversized-line skip must stay O(cap) in
+    /// memory: the reader is `take`-bounded, the overflow tail is
+    /// drained in chunks, and a well-formed record after the giant
+    /// line is still recovered. An oversized UNTERMINATED tail is the
+    /// classic torn tail and truncates back to the last complete line.
+    #[test]
+    fn recover_event_uids_skips_oversized_lines_with_bounded_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p0.event-uids.jsonl");
+        let good_before = "{\"event_uid\":\"uid-before\",\"offset\":1}\n";
+        // Well above the 4 KiB cap (and above cap+1 so the drain loop runs).
+        let oversized = format!("{{\"event_uid\":\"{}\",\"offset\":2}}\n", "x".repeat(20 * 1024));
+        let good_after = "{\"event_uid\":\"uid-after\",\"offset\":3}\n";
+        fs::write(&path, format!("{good_before}{oversized}{good_after}")).unwrap();
+        let seen = recover_event_uids(&path).unwrap();
+        assert_eq!(seen.get("uid-before"), Some(&1));
+        assert_eq!(
+            seen.get("uid-after"),
+            Some(&3),
+            "records after the giant line must survive"
+        );
+        assert_eq!(seen.len(), 2, "the oversized record itself is skipped");
+        // Complete lines are never rewritten by a skip-only pass.
+        assert!(
+            fs::read_to_string(&path).unwrap().ends_with(good_after),
+            "no truncation without a torn tail"
+        );
+
+        // Oversized AND unterminated: torn tail — truncate to the last
+        // complete line, exactly like a small torn tail.
+        let torn_path = dir.path().join("p1.event-uids.jsonl");
+        let torn_tail = format!("{{\"event_uid\":\"{}\",\"off", "y".repeat(20 * 1024));
+        fs::write(&torn_path, format!("{good_before}{torn_tail}")).unwrap();
+        let seen = recover_event_uids(&torn_path).unwrap();
+        assert_eq!(seen.get("uid-before"), Some(&1));
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            fs::read_to_string(&torn_path).unwrap(),
+            good_before,
+            "torn oversized tail must truncate to the valid prefix"
+        );
     }
 
     /// Crash-atomic write-once contract: identical re-export is

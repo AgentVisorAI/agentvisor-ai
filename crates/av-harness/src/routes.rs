@@ -2448,13 +2448,30 @@ impl AbortFinalizingStream {
         // overcharge).
         self.response_cost_usd_micros = self.response_cost_usd_micros.max(parsed.cost_usd_micros);
         for delta in parsed.tool_call_deltas {
-            if delta.index >= MAX_PROVIDER_TOOL_CALLS as u64 {
-                return Err(format!(
-                    "provider tool-call index {} is out of range",
-                    delta.index
-                ));
-            }
-            let key = (delta.choice_index, delta.index);
+            let key = if delta.complete {
+                // A complete delta's `index` is frame-local (Gemini part
+                // position, restarting at 0 every chunk): two whole
+                // calls arriving in separate chunks would collide at
+                // (choice, 0) and either concatenate into one corrupt
+                // attested call or hard-fail a legitimate stream on the
+                // name-conflict guard below. Allocate the next free
+                // per-choice slot instead; arrival order is preserved
+                // by the BTreeMap key.
+                let next = self
+                    .response_tool_calls
+                    .range((delta.choice_index, 0)..=(delta.choice_index, u64::MAX))
+                    .next_back()
+                    .map_or(0, |(&(_, index), _)| index.saturating_add(1));
+                (delta.choice_index, next)
+            } else {
+                if delta.index >= MAX_PROVIDER_TOOL_CALLS as u64 {
+                    return Err(format!(
+                        "provider tool-call index {} is out of range",
+                        delta.index
+                    ));
+                }
+                (delta.choice_index, delta.index)
+            };
             if !self.response_tool_calls.contains_key(&key)
                 && self.response_tool_calls.len() >= MAX_PROVIDER_TOOL_CALLS
             {
@@ -2604,9 +2621,23 @@ impl AbortFinalizingStream {
                     av_state::BudgetDecision::Allowed { .. } => {}
                 }
             }
-            let decision = av_state::ActionBudget::new(store.as_ref(), &session_id, &budget)
-                .try_tokens(delta)
-                .map_err(|error| format!("token budget backend failed closed: {error}"))?;
+            // Mirror admission's backend-ERROR arm too
+            // (`prepare_chat`): a session-ledger backend failure after
+            // the principal debit landed must also refund, or every
+            // transient store blip mid-stream leaks the delta on the
+            // principal ledger — which persists across sessions and
+            // never heals.
+            let decision =
+                match av_state::ActionBudget::new(store.as_ref(), &session_id, &budget).try_tokens(delta) {
+                    Ok(decision) => decision,
+                    Err(error) => {
+                        if let Some((principal_id, spec)) = principal.as_ref() {
+                            av_state::ActionBudget::for_principal(store.as_ref(), principal_id, spec)
+                                .refund_tokens(delta);
+                        }
+                        return Err(format!("token budget backend failed closed: {error}"));
+                    }
+                };
             if matches!(decision, av_state::BudgetDecision::Refused { .. }) {
                 if let Some((principal_id, spec)) = principal.as_ref() {
                     av_state::ActionBudget::for_principal(store.as_ref(), principal_id, spec)
@@ -2865,7 +2896,18 @@ pub(crate) struct ProviderToolCallDelta {
     /// merge into one corrupt audit record. (Anthropic has no choices;
     /// its adapter always uses 0.)
     pub(crate) choice_index: u64,
+    /// Stream-global tool-call slot within the choice for incremental
+    /// dialects (OpenAI `tool_calls[].index`, Anthropic content-block
+    /// index). For `complete` deltas this is only the part's position
+    /// within the CURRENT frame and is NOT stable across frames —
+    /// `absorb_frame` must ignore it and allocate a fresh slot.
     pub(crate) index: u64,
+    /// True when the delta carries an entire tool call (Gemini
+    /// `functionCall` parts arrive whole, never split across frames).
+    /// Complete deltas never need cross-frame accumulation keyed on
+    /// `index`; merging them by frame-local position collides distinct
+    /// calls emitted in separate chunks.
+    pub(crate) complete: bool,
     pub(crate) id: Option<String>,
     pub(crate) name: Option<String>,
     pub(crate) arguments: String,
@@ -3443,6 +3485,7 @@ pub(crate) fn parse_provider_chunk(raw: &str) -> Result<Option<ParsedProviderChu
                     tool_call_deltas.push(ProviderToolCallDelta {
                         choice_index,
                         index,
+                        complete: false,
                         id: call.get("id").and_then(Value::as_str).map(str::to_owned),
                         name: call
                             .pointer("/function/name")
@@ -4578,6 +4621,116 @@ mod tests {
             receipt.body.stop_reason_id,
             receipt.body.stop_reason,
         );
+        provider.abort();
+    }
+
+    /// Gemini parallel function calling: two COMPLETE `functionCall`
+    /// parts arriving in SEPARATE streamed chunks. Gemini part
+    /// positions restart at 0 in every chunk, so keying the
+    /// accumulator on the frame-local position collided both calls at
+    /// (choice 0, index 0): same-name calls concatenated their args
+    /// into one unparseable record (attested as `{"raw": ...}`), and
+    /// different-name calls hard-failed a legitimate stream on the
+    /// name-conflict guard. Complete deltas must each get a fresh slot.
+    async fn mock_gemini_parallel_tool_chat() -> Response {
+        let frames = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}}]},\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":15,\"candidatesTokenCount\":10},\"modelVersion\":\"gemini-2.0-flash\"}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_time\",\"args\":{\"city\":\"London\"}}}]},\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":15,\"candidatesTokenCount\":20}}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":15,\"candidatesTokenCount\":20}}\n\n",
+        );
+        let mut response = Response::new(Body::from(frames));
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        response
+    }
+
+    #[tokio::test]
+    async fn gemini_parallel_function_calls_across_chunks_attest_as_two_calls() {
+        let directory = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = Router::new().route("/v1/chat/completions", post(mock_gemini_parallel_tool_chat));
+        let provider = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let mut config = crate::config::HarnessConfig::for_tests(
+            &format!("http://{address}"),
+            &directory.path().to_string_lossy(),
+            &directory.path().to_string_lossy(),
+        );
+        config.provider = "gemini".to_owned();
+        let state = AppState::new(
+            config,
+            Arc::new(InMemoryStore::new()),
+            Arc::new(Sandbox::new(SandboxConfig::default(), Vec::new()).unwrap()),
+            Arc::new(NullBus),
+            None,
+            Arc::new(Ed25519Signer::from_seed(&[17; 32])),
+        )
+        .unwrap();
+        let app = build_router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(chat_request("gemini-parallel-tools"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "the stream must not hard-fail");
+        let _ = axum::body::to_bytes(response.into_body(), 64 * 1024).await;
+        let session = state.sessions.get("gemini-parallel-tools").unwrap();
+        session.wait_for_worker_jobs().await;
+        let close = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions/gemini-parallel-tools/close")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(close.status(), StatusCode::OK);
+
+        // The unsigned ATIF trajectory is the attested ground truth.
+        let digest = av_core::digest::sha256_hex(b"gemini-parallel-tools");
+        let stem = digest.get(..32).unwrap();
+        let trajectory: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.path().join(format!("{stem}.json"))).unwrap())
+                .unwrap();
+        let mut calls: Vec<(String, serde_json::Value)> = Vec::new();
+        for step in trajectory
+            .pointer("/steps")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+        {
+            for call in step
+                .pointer("/tool_calls")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+            {
+                calls.push((
+                    call.pointer("/function_name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    call.pointer("/arguments").cloned().unwrap_or_default(),
+                ));
+            }
+        }
+        assert_eq!(
+            calls.len(),
+            2,
+            "two functionCall parts in separate chunks must attest as two \
+             distinct tool calls, not merge at frame-local index 0: {trajectory}"
+        );
+        assert_eq!(calls[0].0, "get_weather");
+        assert_eq!(calls[0].1, serde_json::json!({"city": "Paris"}));
+        assert_eq!(calls[1].0, "get_time");
+        assert_eq!(calls[1].1, serde_json::json!({"city": "London"}));
         provider.abort();
     }
 

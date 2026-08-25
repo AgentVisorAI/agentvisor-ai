@@ -4201,6 +4201,7 @@ pub fn spawn_reconciler(
             })
             .catch_unwind()
             .await;
+            let tick_completed = outcome.is_ok();
             if let Err(panic) = outcome {
                 let msg = panic
                     .downcast_ref::<&'static str>()
@@ -4221,7 +4222,16 @@ pub fn spawn_reconciler(
             metrics
                 .histogram("av_reconcile_duration_seconds", "Idle reconciliation duration")
                 .observe_us(elapsed_us(started));
-            last_tick_completed.set(av_core::time::now_ms() / av_core::units::MS_PER_SEC);
+            // Only a tick that ran to completion may advance the
+            // liveness gauge: a persistently panicking tick body makes
+            // zero recovery/close/finalization progress, and advancing
+            // the gauge anyway would silence the documented
+            // `time() - av_reconciler_last_tick_completed_seconds`
+            // staleness alert in exactly the stuck-forever case
+            // (`av_reconciler_panics_total` still increments above).
+            if tick_completed {
+                last_tick_completed.set(av_core::time::now_ms() / av_core::units::MS_PER_SEC);
+            }
         }
     })
 }
