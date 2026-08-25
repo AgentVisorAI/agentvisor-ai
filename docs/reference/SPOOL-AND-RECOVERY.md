@@ -122,7 +122,10 @@ without its artifact bytes). Unpaired remnants
 are left for step 4 to quarantine. Archived collision evidence
 (`.archived-…` names) and signed receipts under `receipts/` are
 never retention targets. Counted in
-`av_atif_retention_pruned_total`.
+`av_atif_retention_pruned_total`. The identical sweep runs manually
+via `avctl spool-prune --spool <atif_spool_dir> --retention-days N`
+— useful when `atif_retention_days` is unset and retention is
+managed by external cron.
 
 ## Race analysis: the three tight windows
 

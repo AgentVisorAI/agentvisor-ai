@@ -110,7 +110,9 @@ The reconciler runs every `reconcile_tick_s` seconds and handles:
   quarantined out from under the finalize path.
 * **Sealed pair retention (round 51 §8.1):** when
   `atif_retention_days` is set, sealed pairs are pruned every hour.
-  Unpaired remnants are LEFT for the orphan sweep.
+  Unpaired remnants are LEFT for the orphan sweep. The same sweep is
+  available manually as `avctl spool-prune --spool <atif_spool_dir>
+  --retention-days N` (external cron, one-off reclaims).
 * **Signed-workflow recovery:** if a signed session's receipt is
   missing but its journal is intact, recovery re-signs and emits.
 

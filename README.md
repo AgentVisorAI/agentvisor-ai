@@ -217,6 +217,7 @@ avctl manifest-validate manifests/bridge.example.yaml
 avctl bridge-provision --manifest manifests/bridge.example.yaml --data-dir data/bridge
 avctl atif-validate trajectory.json
 avctl receipt-locate my-session-id --spool spool/atif   # session id -> artifact paths
+avctl spool-prune --spool spool/atif --retention-days 30  # one-off sealed-ATIF retention sweep
 avctl receipt-verify receipt.json --public-key-hex "$TRUSTED_ED25519_PUBLIC_KEY_HEX"  # repeatable; hex or base64
 avctl loadgen --connections 500
 ```
