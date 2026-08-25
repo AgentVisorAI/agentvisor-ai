@@ -756,6 +756,14 @@ vector_backend = "memory"
         "av_events_dropped_total{stage=\"worker_queue\"}",
         "av_http_shutdown_drain_timeouts_total",
         "av_reconciler_last_tick_completed_seconds",
+        // Stream-drop failure counters (pass 19 + pass 20). Each one
+        // is written only inside an error arm on the AbortFinalizingStream
+        // drop path; without pre-registration they never appear on
+        // `/metrics` until the first failure, so `rate() > 0` alerts
+        // silently miss the first incident. Documented in OPERATIONS.md.
+        "av_ephemeral_close_failures_total",
+        "av_stream_abort_close_failures_total",
+        "av_stream_abort_no_runtime_total",
     ] {
         assert!(
             body.contains(series),
