@@ -2618,7 +2618,10 @@ impl AbortFinalizingStream {
         self.pending_budget = Some(PendingBudget { task, continuation });
     }
 
-    fn submit_response_capture(&mut self, failure: Option<String>) -> Result<(), crate::worker::SubmitError> {
+    fn submit_response_capture(
+        &mut self,
+        failure: Option<(av_events::StopReason, String)>,
+    ) -> Result<(), crate::worker::SubmitError> {
         if self.capture_attempted {
             return Ok(());
         }
@@ -2665,11 +2668,17 @@ impl AbortFinalizingStream {
         // would otherwise poison the breaker's duplicate detection.
         let analyze_loop = !analysis_text.is_empty();
         let native_finish_reason = self.response_finish_reason.clone();
-        let (class, status, stop_reason, payload) = if let Some(reason) = failure {
+        // The failure arm records the CALLER's stop-reason verdict:
+        // BudgetExceeded only for the genuine mid-stream cap refusal,
+        // Other for everything else (network cuts, garbled frames,
+        // quota-backend outages, client disconnects). Hard-coding
+        // BudgetExceeded here previously attested every one of those
+        // as an enforcement stop.
+        let (class, status, stop_reason, payload) = if let Some((failure_reason, reason)) = failure {
             (
                 av_events::EventClass::StopReason,
                 av_events::StatusId::Failure,
-                Some(av_events::StopReason::BudgetExceeded),
+                Some(failure_reason),
                 json!({"reason": reason, "direction": "upstream_response"}),
             )
         } else if !self.upstream_status.is_success() {
@@ -2957,7 +2966,17 @@ impl AbortFinalizingStream {
     /// sealing the session: without the failure record the audit chain
     /// has a hole no later close could explain.
     fn record_response_failure(&mut self, reason: &str) {
-        if let Err(error) = self.submit_response_capture(Some(reason.to_owned())) {
+        // StopReason::Other, not BudgetExceeded: this path carries
+        // network cuts, garbled provider frames, and flush failures —
+        // none of them enforcement. Attesting them as "Budget
+        // Exceeded" (verified live: a provider-side TCP RST
+        // mid-stream journalled stop_reason_id 92) tells a compliance
+        // reviewer the harness cut the turn off when the provider
+        // crashed. Only the genuine mid-stream budget refusal passes
+        // BudgetExceeded (see the pending-budget Refused arm).
+        if let Err(error) =
+            self.submit_response_capture(Some((av_events::StopReason::Other, reason.to_owned())))
+        {
             tracing::warn!(
                 %error,
                 session = %self.session.id,
@@ -3003,9 +3022,14 @@ impl Stream for AbortFinalizingStream {
                     // deliberately avoids.
                     self.session
                         .latch_enforcement(av_events::StopReason::BudgetExceeded);
-                    Some(format!("{limit} exceeded (cap {cap})"))
+                    Some((
+                        av_events::StopReason::BudgetExceeded,
+                        format!("{limit} exceeded (cap {cap})"),
+                    ))
                 }
-                Ok(Err(reason)) => Some(reason),
+                // Backend outage: fail-closed refusal, not enforcement —
+                // attested Other, mirroring the no-latch decision above.
+                Ok(Err(reason)) => Some((av_events::StopReason::Other, reason)),
                 Err(error) => {
                     self.session.mark_capture_failed();
                     self.pending_output.clear();
@@ -3014,8 +3038,8 @@ impl Stream for AbortFinalizingStream {
                     )))));
                 }
             };
-            if let Some(reason) = failure {
-                if let Err(error) = self.submit_response_capture(Some(reason.clone())) {
+            if let Some((failure_reason, reason)) = failure {
+                if let Err(error) = self.submit_response_capture(Some((failure_reason, reason.clone()))) {
                     self.session.mark_capture_failed();
                     self.pending_output.clear();
                     return Poll::Ready(Some(Err(std::io::Error::other(format!(
@@ -3580,7 +3604,10 @@ impl Drop for AbortFinalizingStream {
         } else {
             None
         };
-        if let Err(error) = self.submit_response_capture(response_failure) {
+        if let Err(error) = self.submit_response_capture(
+            // Client-disconnect shapes — attested Other, not enforcement.
+            response_failure.map(|reason| (av_events::StopReason::Other, reason)),
+        ) {
             tracing::warn!(%error, "response-capture submit failed on drop");
             if !is_closed {
                 // The audit worker is unreachable — no future response
@@ -3785,6 +3812,36 @@ mod tests {
             let mut response = Response::new(Body::from(
                 "data: {\"choices\":[{\"delta\":{\"content\":\"partial ans\"}}]}\n\n",
             ));
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            return response;
+        }
+        if payload.get("model").and_then(Value::as_str) == Some("severed-stream") {
+            // One delta, a real pause (so the pipeline's peek-before-
+            // commit completes and the response is streaming through
+            // `AbortFinalizingStream`), then a mid-flight stream ERROR —
+            // the wire shape of a provider crash / LB kill (TCP RST),
+            // distinct from `truncated-stream`'s clean body end. Without
+            // the pause the error surfaces during the pipeline's initial
+            // send instead, which is a different (already-Other) path.
+            let chunks = futures::stream::unfold(0u8, |state| async move {
+                match state {
+                    0 => Some((
+                        Ok::<_, std::io::Error>(Bytes::from_static(
+                            b"data: {\"choices\":[{\"delta\":{\"content\":\"partial ans\"}}]}\n\n",
+                        )),
+                        1,
+                    )),
+                    1 => {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        Some((Err(std::io::Error::other("connection reset by peer")), 2))
+                    }
+                    _ => None,
+                }
+            });
+            let mut response = Response::new(Body::from_stream(chunks));
             response.headers_mut().insert(
                 axum::http::header::CONTENT_TYPE,
                 HeaderValue::from_static("text/event-stream"),
@@ -6483,6 +6540,61 @@ mod tests {
                 .iter()
                 .map(|r| r.event.get("payload").cloned())
                 .collect::<Vec<_>>()
+        );
+        provider.abort();
+    }
+
+    /// A provider-side mid-stream cut (TCP RST / stream error) is a
+    /// FAILED turn attested `StopReason::Other` — never `BudgetExceeded`.
+    /// Verified live before the fix: a socket-level RST after two SSE
+    /// deltas journalled `stop_reason_id: 92` ("Budget Exceeded") on a
+    /// daemon with no `[budget]` block at all, because the failure arm
+    /// of `submit_response_capture` hard-coded the enforcement variant
+    /// for every failure shape. A compliance reviewer reading that
+    /// record concludes the harness cut the turn off when the provider
+    /// crashed.
+    #[tokio::test]
+    async fn severed_stream_is_attested_other_not_budget_exceeded() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state(directory.path()).await;
+        let response = build_router(state.clone())
+            .oneshot(chat_request_with_payload(
+                "severed-stream",
+                json!({
+                    "model": "severed-stream",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "hello"}]
+                }),
+            ))
+            .await
+            .unwrap();
+        // The client's copy dies with the cut; the audit side is what
+        // this test pins.
+        let _ = axum::body::to_bytes(response.into_body(), 64 * 1024).await;
+        let session = state.sessions.get("severed-stream").unwrap();
+        session.wait_for_worker_jobs().await;
+        let records = active_records(directory.path(), &state, "severed-stream");
+        let stop_reasons: Vec<(u64, Option<String>)> = records
+            .iter()
+            .filter_map(|record| {
+                let id = record.event.get("stop_reason_id").and_then(Value::as_u64)?;
+                let reason = record
+                    .event
+                    .pointer("/payload/reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                Some((id, reason))
+            })
+            .collect();
+        assert!(
+            stop_reasons.iter().all(|(id, _)| *id != 92),
+            "a provider cut must never be attested as Budget Exceeded (92); got {stop_reasons:?}"
+        );
+        assert!(
+            stop_reasons
+                .iter()
+                .any(|(id, reason)| *id == 99 && reason.as_deref().is_some_and(|r| !r.is_empty())),
+            "the cut turn must be attested Other (99) with a free-text failure reason; got {stop_reasons:?}"
         );
         provider.abort();
     }
