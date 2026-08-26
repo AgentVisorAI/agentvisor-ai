@@ -8,7 +8,7 @@
   "properties": {
     "receipt_version": { "const": 2 },
     "receipt_id": { "type": "string", "minLength": 1 },
-    "session_id": { "type": "string", "minLength": 1 },
+    "session_id": { "type": "string", "minLength": 1, "maxLength": 128 },
     "issued_at": { "type": "integer", "minimum": 0, "maximum": 9007199254740992 },
     "issued_at_iso": { "type": "string", "format": "date-time" },
     "ai_agent": {
@@ -26,7 +26,7 @@
             "type_id": { "const": 1 }
           }
         },
-        "instance_uid": { "type": "string", "minLength": 1 },
+        "instance_uid": { "type": "string", "minLength": 1, "maxLength": 128 },
         "ttl_remaining_s": { "type": "integer", "minimum": 0 }
       }
     },
