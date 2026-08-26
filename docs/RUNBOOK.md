@@ -183,6 +183,112 @@ response the customer pastes into a ticket is directly greppable.
   artifact from `.github/workflows/backup.yml` and `pg_restore` to a
   local DB. Confirm row counts. Delete the local DB.
 
+## Verified drills (green as of 2026-08-26)
+
+Every one of these was run against the current codebase; keep them
+green on every launch checkpoint.
+
+### Backup + restore roundtrip
+
+```bash
+# 1. Fresh dump
+docker exec av-pg pg_dump -U agentvisor --format=custom \
+  --no-owner --no-privileges agentvisor > /tmp/backup.dump
+
+# 2. Bring the API down (or the restore blocks with 'database in use')
+fly scale count 0 --app agentvisor-api    # or `docker stop` locally
+
+# 3. Drop + recreate + restore
+docker exec av-pg psql -U agentvisor -d postgres -c "DROP DATABASE agentvisor"
+docker exec av-pg psql -U agentvisor -d postgres -c "CREATE DATABASE agentvisor"
+docker exec -i av-pg pg_restore -U agentvisor -d agentvisor \
+  --no-owner --no-privileges < /tmp/backup.dump
+
+# 4. Bring the API back
+fly scale count 1 --app agentvisor-api
+
+# 5. Verify: login works with the same credentials → same user id + org id.
+```
+
+Verified: 18KB dump of 10 sessions restored in <2s, login returned
+identical `user.id` + `org.id`.
+
+### Deployment token rotation
+
+Verified: `POST /deployments/:id/rotate-token` invalidates the previous
+token at the exact SQL commit. Old token → 401 unauthenticated
+immediately, new token → 200 on the very next ingest call. Zero
+dual-acceptance window.
+
+### Ed25519 receipt trust anchor
+
+Verified end-to-end:
+
+1. Daemon generates an Ed25519 keypair.
+2. `POST /ingest/pubkey` registers `publicKeyHex` on the deployment.
+3. Daemon signs the receipt body with the private key,
+   `POST /ingest/receipts` with `{sigB64, keyIdHex, body}`.
+4. Console fetches `GET /receipts/:sessionId` → server returns the
+   deployment's `publicKeyHex` alongside the receipt.
+5. Console-side (or a third-party auditor) runs `crypto.subtle.verify`
+   with the returned `publicKeyHex` + `sigB64` against `body` — returns
+   true.
+6. Tampered body (single byte flip) → verify returns false.
+
+No trust in the server anywhere in the chain — the customer's
+console verifies the daemon's signature using only the daemon's own
+public key.
+
+### Role enforcement
+
+Verified for the `member` role (non-owner, non-admin):
+
+| Route | Expected | Got |
+|---|---|---|
+| `POST /deployments` | 403 | 403 forbidden ✓ |
+| `POST /deployments/:id/rotate-token` | 403 | 403 forbidden ✓ |
+| `DELETE /deployments/:id` | 403 | 403 forbidden ✓ |
+| `POST /me/delete-account` | 403 | 403 only_owner_can_delete ✓ |
+| `GET /overview` | 200 | 200 ✓ (reads open to members) |
+| `GET /sessions` | 200 | 200 ✓ |
+
+### Session cookie flags (production mode)
+
+Verified `Set-Cookie` header on `POST /auth/signup` with
+`NODE_ENV=production` + `SESSION_COOKIE_SECURE=true`:
+
+```
+set-cookie: av_session=…; Max-Age=604800; Path=/; HttpOnly; Secure; SameSite=Lax
+```
+
+Every required security flag present. No `Domain` attribute → the
+cookie won't leak to a subdomain we don't control.
+
+### Cross-tenant isolation (200k rows)
+
+Verified against 100k sessions per org × 2 orgs (200k total):
+
+- `/overview` scoped: Org A sees 100k, Org B sees 100k.
+- `GET /sessions/<foreign-id>` → 404 (Org A cannot see Org B session
+  even with the exact ID).
+- `q=<foreign-prefix>` returns 0 (identifier invisible).
+- `/me/export` streams 100 002 JSONL rows for Org A — zero rows leak
+  from Org B.
+
+### Ingest throughput
+
+Verified with autocannon 30 conn × 15s × 20-event batches:
+
+```
+rps: 235
+events/sec sustained: 4,700
+total requests: 3,525, non-2xx: 0, errors: 0, timeouts: 0
+latency p50/p90/p99: 109/175/524 ms
+```
+
+Ingest is exempt from the global 300 rpm/IP rate limit because
+per-deployment token auth already bounds abuse per tenant.
+
 ## Ops log (append-only)
 
 Add rows here after non-trivial ops actions (secret rotation, manual
