@@ -380,15 +380,9 @@ code {
 
 .dash { padding: 0; overflow: hidden; }
 .dash-bar {
-  display: flex; align-items: center; gap: 0.45rem;
+  display: flex; align-items: center; justify-content: flex-end; gap: 0.45rem;
   background: var(--bg-alt); border-bottom: 1px solid var(--border);
   padding: 0.55rem 0.9rem; flex-wrap: wrap;
-}
-.dot { width: 0.65rem; height: 0.65rem; border-radius: 50%; display: inline-block; }
-.dot.red { background: #e0685e; } .dot.yellow { background: #e6c04a; } .dot.green { background: #6cc35a; }
-.dash-url {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.75rem; color: var(--fg-muted); margin: 0 auto 0 0.4rem;
 }
 .dash-tabs { display: flex; gap: 0.3rem; }
 .dash-tabs button { border-color: var(--border-strong); color: var(--fg-muted); }
