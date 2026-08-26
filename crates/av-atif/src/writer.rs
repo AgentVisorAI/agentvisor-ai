@@ -1,7 +1,6 @@
 //! Trajectory construction and crash-safe persistence.
 
 use crate::model::{Agent, FinalMetrics, Metrics, Step, Trajectory, ATIF_VERSION};
-use std::io::Write;
 use std::path::Path;
 
 /// Errors from trajectory building / writing.
@@ -133,7 +132,7 @@ impl TrajectoryBuilder {
                 });
             }
             // The validator caps step and total
-            // cost at MAX_COST_USD (1e12) and refuses to persist
+            // cost at MAX_COST_USD (9e9) and refuses to persist
             // anything beyond. The prior writer accepted any finite
             // non-negative step cost, so the reconciler's u64-micros ↔
             // f64 USD round-trip could construct a step whose cost
@@ -241,32 +240,21 @@ pub fn write_atomic(trajectory: &Trajectory, path: &Path) -> Result<(), WriterEr
         return Err(WriterError::Invalid(issues));
     }
     let json = serde_json::to_vec_pretty(trajectory)?;
-    // `parent()` of a relative leaf like "t.json" is `Some("")`, which is
-    // not a usable directory path; normalize to `.` (same fix as
-    // `av_core::fsutil::write_atomic`).
-    let dir = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    // Parity with `av_core::fsutil::write_atomic` —
-    // use `create_dir_all_synced` so a first ATIF write
-    // into a new subtree also fsyncs the newly-created ancestor
-    // dirents. `create_dir_all` alone left them volatile until the
-    // next ambient sync; a power loss between mkdir and sync could
-    // drop the trajectory even though its bytes were fsynced.
-    av_core::fsutil::create_dir_all_synced(dir).map_err(WriterError::Io)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    tmp.write_all(&json)?;
-    tmp.flush()?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(path).map_err(|e| WriterError::Io(e.error))?;
-    if let Err(error) = av_core::fsutil::sync_directory(dir) {
-        tracing::warn!(
-            path = %av_core::fsutil::basename(path),
-            error = %error,
-            "post-rename ATIF trajectory directory fsync failed; file is visible but its dirent may not survive an immediate power loss"
-        );
-    }
+    // Delegate to the shared `av_core::fsutil::write_atomic` recipe so
+    // ATIF trajectories inherit the SAME tmp-naming discipline as every
+    // other spool artifact: `{stem}.{uuid}.tmp` — the exact suffix the
+    // shared `sweep_orphaned_tmp` boot-time reaper filters on. The
+    // prior `tempfile::NamedTempFile::new_in(dir)` recipe produced
+    // `.tmpXXXXXX` (dot-tmp *prefix*, no `.tmp` *suffix*), so a SIGKILL
+    // between `new_in` and `persist` stranded `.tmpXXXXXX` files that
+    // the sweep filter never matched — under a crash-loop the ATIF
+    // spool would accumulate them until inode-table exhaustion on
+    // ext4/xfs. Delegating also picks up the shared recipe's explicit
+    // 0o600 mode on Unix, its `create_new(true)` symlink-refusal
+    // guard, its `TempPathGuard` RAII unlink, and its
+    // `create_dir_all_synced` ancestor-fsync — one code path, one set
+    // of durability invariants.
+    av_core::fsutil::write_atomic(path, &json).map_err(WriterError::Io)?;
     Ok(())
 }
 

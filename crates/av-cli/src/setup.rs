@@ -609,12 +609,22 @@ fn write_private_key_file(path: &Path, key: &str) -> Result<()> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent).with_context(|| format!("create key directory {}", parent.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-    }
+    // `create_dir_all_synced` atomically sets mode 0o700 at mkdir on
+    // Unix (via `DirBuilder::mode`), closing the world-listable
+    // window that a bare `create_dir_all` + `set_permissions(0o700)`
+    // opens: between the mkdir at `create_dir_all(0o777 & !umask)`
+    // and the follow-up chmod, a co-tenant with execute on the
+    // grandparent could `ls parent/` and see the deterministic
+    // `.agentvisor-key-<uuidv7>.tmp` name that's about to hold the
+    // private key. The synced helper also fsyncs every newly-created
+    // ancestor dirent — same first-boot power-loss durability guard
+    // as `install_seed_exclusive`. Skip the explicit
+    // `set_permissions` when the dir is fresh (the mkdir already
+    // narrowed); a pre-existing shared parent keeps its prior mode
+    // (rather than this call widening OTHER files' visibility by
+    // ratcheting the shared parent to 0o700).
+    av_core::fsutil::create_dir_all_synced(parent)
+        .with_context(|| format!("create key directory {}", parent.display()))?;
     let temporary = parent.join(format!(".agentvisor-key-{}.tmp", av_core::new_event_uid()));
     // Sibling of the harness's `install_seed_exclusive`.
     // Without the RAII guard, an early `?` return from write_all /
@@ -764,13 +774,13 @@ pub fn wizard(home: &Path, input: &mut dyn std::io::BufRead, secrets: &SecretInp
 
     // Key: pasted once, stored privately — no export step, ever.
     let root = home.join(".agentvisor");
-    std::fs::create_dir_all(&root)
+    // Same rationale as `write_private_key_file` above: atomic 0o700
+    // at mkdir + fsync of newly-created ancestor dirents. Closes the
+    // world-listable window that a bare `create_dir_all` +
+    // `set_permissions(0o700)` opens, and hardens against first-time
+    // install crash-loss of the `~/.agentvisor/` directory.
+    av_core::fsutil::create_dir_all_synced(&root)
         .with_context(|| format!("create settings directory {}", root.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
-    }
     let key_file = if needs_key {
         let name = friendly_name(preset);
         // `key` holds the accepted secret wrapped in
