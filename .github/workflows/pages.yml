@@ -96,6 +96,10 @@ jobs:
           # the published artifact, Pages resets the configured custom
           # domain on each deploy.
           cp docs/CNAME "$site/CNAME"
+          # RFC 9116 disclosure endpoint — must be preserved at the origin
+          # root so security scanners can find it.
+          mkdir -p "$site/.well-known"
+          cp docs/.well-known/security.txt "$site/.well-known/"
           # Publish the assembled directory.
           rm -rf target/doc
           mv "$site" target/doc

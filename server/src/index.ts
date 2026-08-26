@@ -4,6 +4,7 @@ import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
 import Fastify from "fastify";
 import { env } from "./env.js";
+import { bus } from "./lib/bus.js";
 import { authenticate } from "./lib/session-middleware.js";
 import { authRoutes } from "./routes/auth.js";
 import { deploymentRoutes } from "./routes/deployments.js";
@@ -103,9 +104,66 @@ async function main(): Promise<void> {
     },
   });
 
+  // Defense-in-depth CSRF check for state-changing methods. SameSite=Lax
+  // cookies + JSON-only endpoints already block cross-site form posts,
+  // but a strict Origin/Referer allow-list closes the remaining slivers
+  // (e.g. old browsers, subdomain takeovers). See OWASP Cross-Site
+  // Request Forgery Prevention Cheat Sheet §2.2 (2024 edition).
+  //
+  // Skipped when:
+  //   • Method is safe (GET/HEAD/OPTIONS).
+  //   • Path is /api/v1/ingest — daemons attach an X-AV-Deployment token
+  //     which is cryptographically verified before any state mutation.
+  //   • No Origin/Referer at all — same-origin fetches from most modern
+  //     browsers, curl/scripts (no cookie either), and health checks.
+  //
+  // Registered BEFORE authenticate so a forbidden origin never touches
+  // Prisma or the JWT verify.
+  app.addHook("preHandler", async (req, reply) => {
+    const method = req.method.toUpperCase();
+    if (method === "GET" || method === "HEAD" || method === "OPTIONS") return;
+    if (typeof req.url === "string" && req.url.startsWith("/api/v1/ingest")) return;
+
+    const origin = typeof req.headers.origin === "string" ? req.headers.origin : "";
+    const referer = typeof req.headers.referer === "string" ? req.headers.referer : "";
+    let refererOrigin = "";
+    if (referer) {
+      try {
+        refererOrigin = new URL(referer).origin;
+      } catch {
+        // Malformed Referer → treat as absent.
+      }
+    }
+    const rawSource = origin || refererOrigin;
+    if (!rawSource) return; // No cross-origin marker present.
+
+    const allowed = env.ALLOWED_ORIGINS;
+    // In dev with an empty allow-list we skip (matches the CORS choice).
+    if (allowed.length === 0 && env.NODE_ENV !== "production") return;
+    if (allowed.includes(rawSource)) return;
+
+    return reply.code(403).send({ error: "forbidden_origin" });
+  });
+
   app.addHook("preHandler", authenticate);
 
   app.get("/healthz", async () => ({ ok: true, version: "0.1.0" }));
+
+  // RFC 9116 — advertise a security contact + policy on the API too, not
+  // just the static docs. Researchers scanning the origin should always
+  // find a machine-readable disclosure path.
+  const securityTxt = [
+    "Contact: mailto:security@agentvisorai.me",
+    "Expires: 2027-08-25T00:00:00.000Z",
+    "Preferred-Languages: en",
+    "Canonical: https://api.agentvisorai.me/.well-known/security.txt",
+    "Policy: https://github.com/AgentVisorAI/agentvisor-ai/blob/main/SECURITY.md",
+    "",
+  ].join("\n");
+  app.get("/.well-known/security.txt", async (_req, reply) => {
+    reply.header("Content-Type", "text/plain; charset=utf-8");
+    return securityTxt;
+  });
 
   await app.register(async (r) => r.register(authRoutes), {
     prefix: "/api/v1/auth",
@@ -125,13 +183,22 @@ async function main(): Promise<void> {
 
   await app.listen({ port: env.PORT, host: env.HOST });
 
+  // Wire up the cross-instance SSE bridge. Non-fatal if it fails at boot —
+  // the in-process bus keeps working, and a reconnect loop retries the
+  // bridge on cadence. This is what lets us scale from 1 → N instances
+  // on Fly / Cloud Run / Render / k8s without adding Redis.
+  const bridgeUp = await bus.connectPgBridge();
+  app.log.info({ bridgeUp }, "pg listen/notify bridge status");
+
   // Graceful shutdown — Fly/Cloud Run/Kubernetes all send SIGTERM before
   // the hard kill window. Close the HTTP server (drains in-flight requests),
-  // disconnect Prisma, then exit. Target: sub-second in the common case.
+  // release the bus sockets, disconnect Prisma, then exit. Target:
+  // sub-second in the common case.
   const shutdown = async (signal: string) => {
     app.log.info({ signal }, "graceful shutdown starting");
     try {
       await app.close();
+      await bus.close();
     } catch (err) {
       app.log.error({ err }, "shutdown error");
     }

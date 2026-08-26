@@ -1,0 +1,61 @@
+# Render blueprint — one-click deploy for the AgentVisor API + Postgres.
+#
+# https://render.com/docs/blueprint-spec
+#
+# What you get on Render's free tier:
+#   • Web service:  0.1 CPU / 512 MB / 750 hrs / month  (sleeps on idle)
+#   • Postgres:     free 90 days, 1 GB, 256 MB RAM
+#   • TLS + custom domains + auto-deploy on push
+#   • Same Docker image as everywhere else — zero platform lock-in
+#
+# Usage:
+#   1. Fork this repo
+#   2. Render → New → Blueprint → point at your fork
+#   3. Set JWT_SECRET as a "sync: false" secret in the dashboard,
+#      or let Render generate a fresh one via `generateValue: true`.
+#   4. Deploy. First boot runs `prisma migrate deploy` before serving traffic.
+#
+# To move OFF Render later:
+#   docker build -t agentvisor-api server/
+#   docker push $REG/agentvisor-api
+#   pg_dump $OLD_DB | psql $NEW_DB
+#   # redeploy the image + point DATABASE_URL at the new DB. Done.
+
+services:
+  - type: web
+    name: agentvisor-api
+    runtime: docker
+    dockerfilePath: ./server/Dockerfile
+    dockerContext: ./server
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "8080"
+      - key: SESSION_COOKIE_SECURE
+        value: "true"
+      - key: ALLOWED_ORIGINS
+        # Adjust for your custom domain(s). Multiple values are comma-separated.
+        value: https://agentvisorai.me
+      - key: JWT_ISSUER
+        value: agentvisor-ai
+      - key: JWT_AUDIENCE
+        value: agentvisor-console
+      - key: JWT_SECRET
+        # Render generates a fresh 32-byte hex secret on first apply.
+        # Rotate later with a dashboard update — Render reboots the service,
+        # invalidating all outstanding JWTs on the next boot.
+        generateValue: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: agentvisor-db
+          property: connectionString
+
+databases:
+  - name: agentvisor-db
+    plan: free
+    databaseName: agentvisor
+    user: agentvisor

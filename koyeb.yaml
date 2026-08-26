@@ -1,0 +1,57 @@
+# Koyeb app spec — deploys the same Docker image on Koyeb's serverless
+# platform. Free tier gives you 2 nano services (256 MB / 0.1 vCPU) that
+# scale to zero and wake in ~250ms on cold requests.
+#
+# https://www.koyeb.com/docs/reference/app-spec
+#
+# Usage:
+#   koyeb app create -f koyeb.yaml
+#   koyeb secret create jwt-secret --value "$(openssl rand -hex 48)"
+#   koyeb secret create database-url --value "postgres://…your Neon URL…"
+#   # push to main → Koyeb rebuilds and rolls out.
+
+name: agentvisor
+services:
+  - name: api
+    type: web
+    git:
+      branch: main
+      dockerfile: server/Dockerfile
+      workdir: server
+    instance_type: nano       # 0.1 vCPU / 256 MB — free tier
+    scalings:
+      min: 0                  # scale to zero when idle → $0
+      max: 3
+    ports:
+      - port: 8080
+        protocol: http
+    routes:
+      - path: /
+    health_checks:
+      - http:
+          port: 8080
+          path: /healthz
+        grace_period: 30s
+        interval: 15s
+        restart_limit: 3
+        timeout: 5s
+    env:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "8080"
+      - key: SESSION_COOKIE_SECURE
+        value: "true"
+      - key: ALLOWED_ORIGINS
+        value: https://agentvisorai.me
+      - key: JWT_ISSUER
+        value: agentvisor-ai
+      - key: JWT_AUDIENCE
+        value: agentvisor-console
+      - key: JWT_SECRET
+        secret: jwt-secret
+      - key: DATABASE_URL
+        secret: database-url
+    regions:
+      - fra
+      - was

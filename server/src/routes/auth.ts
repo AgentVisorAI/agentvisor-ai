@@ -37,7 +37,25 @@ function orgSlug(name: string, salt: string): string {
 }
 
 export async function authRoutes(app: FastifyInstance): Promise<void> {
-  app.post("/signup", async (req, reply) => {
+  // Per-endpoint rate limits are tighter than the global 300rpm backstop.
+  // Anonymous auth endpoints get a per-IP cap because there's no user
+  // identity to rate-limit against yet. Numbers here are conservative
+  // for a real product (Auth0 defaults to 300/hr on signup; Cognito
+  // is 5/min on login). See OWASP ASVS 4.0 §11.1.4.
+  //
+  // Note: when @fastify/rate-limit's `config` accessor sees a route
+  // definition, it overrides the global keyGenerator + budget for that
+  // route only. Everything else on the API still uses the 300rpm global.
+  const perIp = (max: number, windowMs: number) => ({
+    max,
+    timeWindow: windowMs,
+    keyGenerator: (req: { ip: string }) => `ip:${req.ip}`,
+  });
+
+  app.post("/signup", {
+    // 5/min per IP — signup is an expensive path (argon2 + org create).
+    config: { rateLimit: perIp(5, 60_000) },
+  }, async (req, reply) => {
     const parsed = z
       .object({
         email: emailSchema,
@@ -100,7 +118,13 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     });
   });
 
-  app.post("/login", async (req, reply) => {
+  app.post("/login", {
+    // 10/min per IP is deliberate: a shared NAT still has plenty of
+    // budget for legitimate users, but credential-stuffing bursts get
+    // cut off quickly. Combine with argon2's built-in ~100ms cost per
+    // attempt for a hard ceiling on brute-force throughput.
+    config: { rateLimit: perIp(10, 60_000) },
+  }, async (req, reply) => {
     // Login accepts any well-formed input and lets the credential check
     // return a uniform 401. Rejecting on password length would leak the
     // signup constraint and give attackers a legit-vs-typo distinguisher.
@@ -181,7 +205,11 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   // membership. The plaintext token is delivered ONLY via the configured
   // email path; it is never logged in production (log-read access would
   // otherwise be sufficient to take over any account).
-  app.post("/reset-request", async (req, reply) => {
+  app.post("/reset-request", {
+    // 3/hour per IP. Reset-request is anonymous, so an attacker could
+    // spam it to burn our mail budget or DOS a specific mailbox.
+    config: { rateLimit: perIp(3, 60 * 60_000) },
+  }, async (req, reply) => {
     const body = z.object({ email: emailSchema }).safeParse(req.body);
     // Uniform response even on malformed input — no oracle for enumeration.
     if (!body.success) return reply.code(202).send({ ok: true });
@@ -214,7 +242,12 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   });
 
   const resetTtlMs = 24 * 60 * 60 * 1000;
-  app.post("/reset-confirm", async (req, reply) => {
+  app.post("/reset-confirm", {
+    // 10/min per IP. Consumes a random-looking 32-byte token, so brute
+    // force is already infeasible cryptographically; this just prevents
+    // an attacker from burning API budget while spraying candidate tokens.
+    config: { rateLimit: perIp(10, 60_000) },
+  }, async (req, reply) => {
     const body = z
       .object({
         email: emailSchema,
