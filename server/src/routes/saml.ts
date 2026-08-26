@@ -391,6 +391,20 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
     if (!body.success) {
       return reply.code(400).send({ error: "invalid_input" });
     }
+    // R76 review Q6 (landed R77): reject `jitEnabled=true` with
+    // an empty `allowedDomains` at CONFIG WRITE TIME. The R76
+    // ACS-time guard fails-closed at login time with 403
+    // `domain_allowlist_required_for_jit` — but the misconfig
+    // persists silently in the DB, and operators only see the
+    // problem when users can't log in. Fail early so the operator
+    // fixes the config at the point of change.
+    if (body.data.jitEnabled && body.data.allowedDomains.trim() === "") {
+      return reply.code(400).send({
+        error: "invalid_input",
+        detail:
+          "allowedDomains is required (non-empty comma-separated list) when jitEnabled=true — an empty allowlist would let a signed AuthnResponse with any asserted email JIT-create a user in this org",
+      });
+    }
     try {
       const cfg = await db.samlConfig.create({
         data: {
@@ -442,6 +456,23 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
         where: { id: req.params.configId, orgId: claims.orgId },
       });
       if (!existing) return reply.code(404).send({ error: "not_found" });
+      // R76 review Q6 (landed R77): same config-write-time guard
+      // as POST above, but check the RESULTING config after the
+      // partial patch — a caller could send just
+      // `{ allowedDomains: "" }` on a config that already has
+      // `jitEnabled=true`, or `{ jitEnabled: true }` on one with
+      // an empty allowlist.
+      const resultingJitEnabled =
+        body.data.jitEnabled ?? existing.jitEnabled;
+      const resultingDomains =
+        body.data.allowedDomains ?? existing.allowedDomains;
+      if (resultingJitEnabled && resultingDomains.trim() === "") {
+        return reply.code(400).send({
+          error: "invalid_input",
+          detail:
+            "allowedDomains is required (non-empty comma-separated list) when jitEnabled=true — an empty allowlist would let a signed AuthnResponse with any asserted email JIT-create a user in this org",
+        });
+      }
       const cfg = await db.samlConfig.update({
         where: { id: existing.id },
         data: {

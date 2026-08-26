@@ -75,15 +75,21 @@ if (!bundle.receipt?.rawSignatureB64) fail("no signature");
 if (!bundle.publicKey?.hex) fail("no publicKey.hex");
 console.log("✅ Bundle shape correct: format=" + bundle.format + " pubKey=" + bundle.publicKey.hex.slice(0, 12) + "…");
 
-// Verify — expect exit 0
+// Verify — expect exit 0. Since TRUSTED_RECEIPT_KEYS is empty
+// (no canonical anchor published yet, R78 HIGH #1), pass
+// `--allow-untrusted-key` to acknowledge that the drill is
+// exercising signature-vs-embedded-pubkey consistency, not
+// trust-anchor authorship. When the anchor list is populated
+// in a future release-hardening round, this flag can be
+// dropped.
 let out;
 try {
-  out = execSync(`node ${VERIFIER} ${bundlePath}`, { stdio: "pipe" }).toString();
+  out = execSync(`node ${VERIFIER} --allow-untrusted-key ${bundlePath}`, { stdio: "pipe" }).toString();
 } catch (e) {
   fail("verifier exited non-zero on legit bundle: " + (e.stdout?.toString() || "") + " " + (e.stderr?.toString() || ""));
 }
-if (!/SIGNATURE VERIFIES/i.test(out)) fail("verifier didn't say SIGNATURE VERIFIES: " + out.slice(0, 400));
-console.log("✅ verifier: SIGNATURE VERIFIES on legit bundle");
+if (!/SIGNATURE (VERIFIES|IS INTERNALLY CONSISTENT)/i.test(out)) fail("verifier didn't confirm legit bundle: " + out.slice(0, 400));
+console.log("✅ verifier: legit bundle passes internal consistency (trust anchor empty in R78)");
 
 // Tamper the rawBody
 const tampered = JSON.parse(JSON.stringify(bundle));
@@ -91,7 +97,7 @@ tampered.receipt.rawBody = tampered.receipt.rawBody.replace(/./, "X");
 const tamperedPath = bundlePath.replace(".json", "-tampered.json");
 writeFileSync(tamperedPath, JSON.stringify(tampered, null, 2));
 try {
-  execSync(`node ${VERIFIER} ${tamperedPath}`, { stdio: "pipe" });
+  execSync(`node ${VERIFIER} --allow-untrusted-key ${tamperedPath}`, { stdio: "pipe" });
   fail("tampered bundle verified — that's a security failure!");
 } catch (e) {
   const output = (e.stdout?.toString() || "") + (e.stderr?.toString() || "");
@@ -108,7 +114,7 @@ tamperedKey.publicKey.hex = tamperedKey.publicKey.hex.slice(0, 5)
 const tamperedKeyPath = bundlePath.replace(".json", "-keytamper.json");
 writeFileSync(tamperedKeyPath, JSON.stringify(tamperedKey, null, 2));
 try {
-  execSync(`node ${VERIFIER} ${tamperedKeyPath}`, { stdio: "pipe" });
+  execSync(`node ${VERIFIER} --allow-untrusted-key ${tamperedKeyPath}`, { stdio: "pipe" });
   fail("tampered public key verified!");
 } catch (e) {
   const output = (e.stdout?.toString() || "") + (e.stderr?.toString() || "");
@@ -116,10 +122,67 @@ try {
 }
 console.log("✅ tampered publicKey -> SIGNATURE DOES NOT VERIFY (exit 1)");
 
+// R78 F2: fresh-keypair forgery. The naive tamper cases above
+// only test that a `sed`-edited receipt fails Ed25519 verify.
+// The interesting attack — the one that undermines the "any
+// auditor can verify offline" pitch — is an attacker who
+// generates their own keypair, signs an arbitrary rawBody,
+// and embeds their pubkey. Prior to the R78 HIGH #1 fix, the
+// verifier printed "✅ SIGNATURE VERIFIES — authentic" on this
+// input. This drill must now assert (a) without
+// `--allow-untrusted-key`, exit is 2 with "internally
+// consistent"; (b) WITH `--allow-untrusted-key`, exit is 0
+// but the output NEVER says "authentic" without qualification.
+const { generateKeyPairSync, sign } = await import("node:crypto");
+const forgedKeys = generateKeyPairSync("ed25519");
+const forgedRaw = JSON.stringify({
+  version: 1,
+  sessionExternalId: "attacker-controlled",
+  eventCount: 0,
+  toolsBlocked: 0,
+  blockedPayoutUsdMicros: 0,
+});
+const forgedSig = sign(null, Buffer.from(forgedRaw, "utf8"), forgedKeys.privateKey);
+// Extract the raw 32 bytes of the public key from the SPKI DER.
+const forgedSpki = forgedKeys.publicKey.export({ format: "der", type: "spki" });
+const forgedPubHex = forgedSpki.slice(-32).toString("hex");
+const forged = JSON.parse(JSON.stringify(bundle));
+forged.receipt.rawBody = forgedRaw;
+forged.receipt.rawSignatureB64 = forgedSig.toString("base64");
+forged.publicKey.hex = forgedPubHex;
+const forgedPath = bundlePath.replace(".json", "-forged.json");
+writeFileSync(forgedPath, JSON.stringify(forged, null, 2));
+
+// (a) Without --allow-untrusted-key: MUST exit 2 with the
+// "internally consistent but untrusted" message.
+try {
+  execSync(`node ${VERIFIER} ${forgedPath}`, { stdio: "pipe" });
+  fail("forged bundle passed WITHOUT --allow-untrusted-key — trust anchor gate is broken!");
+} catch (e) {
+  const output = (e.stdout?.toString() || "") + (e.stderr?.toString() || "");
+  if (e.status !== 2) fail("forged-untrusted exit code: " + e.status + " expected 2");
+  if (!/INTERNALLY CONSISTENT/i.test(output)) fail("forged-untrusted didn't say INTERNALLY CONSISTENT: " + output.slice(0, 400));
+  if (/^✅ SIGNATURE VERIFIES against a TRUSTED key/im.test(output)) fail("forged-untrusted incorrectly claimed trusted: " + output.slice(0, 400));
+}
+console.log("✅ fresh-keypair forgery WITHOUT --allow-untrusted-key -> INTERNALLY CONSISTENT (exit 2)");
+
+// (b) With --allow-untrusted-key: exit 0 but output NEVER
+// contains "authentic" without the "internally consistent"
+// disclaimer. Grep the output text.
+let forgedAcked;
+try {
+  forgedAcked = execSync(`node ${VERIFIER} --allow-untrusted-key ${forgedPath}`, { stdio: "pipe" }).toString();
+} catch (e) {
+  fail("forged bundle failed WITH --allow-untrusted-key: " + (e.stdout?.toString() || "") + " " + (e.stderr?.toString() || ""));
+}
+if (/^✅ SIGNATURE VERIFIES against a TRUSTED key/im.test(forgedAcked)) fail("forged-ack claimed trusted: " + forgedAcked.slice(0, 400));
+if (!/INTERNALLY CONSISTENT/i.test(forgedAcked)) fail("forged-ack didn't say INTERNALLY CONSISTENT: " + forgedAcked.slice(0, 400));
+console.log("✅ fresh-keypair forgery WITH --allow-untrusted-key -> INTERNALLY CONSISTENT (exit 0, not TRUSTED)");
+
 // Cleanup
-for (const p of [bundlePath, tamperedPath, tamperedKeyPath]) {
+for (const p of [bundlePath, tamperedPath, tamperedKeyPath, forgedPath]) {
   try { unlinkSync(p); } catch {}
 }
 
 await browser.close();
-console.log("\nReceipt download + offline verification round-trip: 4/4 checks passed.");
+console.log("\nReceipt download + offline verification round-trip: 6/6 checks passed.");

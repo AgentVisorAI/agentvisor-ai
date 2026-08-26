@@ -20,6 +20,23 @@ on:
     - cron: "0 6 * * *"  # 06:00 UTC daily
   workflow_dispatch:
 
+# R78 F3 (landed R78): explicit workflow-scope permissions.
+# Every other workflow in .github/workflows/ declares
+# `contents: read` — this one didn't, defaulting to whatever
+# the repo's `default_workflow_permissions` setting is (which
+# on older repos is `write`). This workflow also grew a large
+# transitive dependency tree in the same commit that added it
+# (Lighthouse + chrome-launcher via `npm ci` on server/, plus
+# `npx playwright install --with-deps chromium`), so the least-
+# privilege posture matters: a supply-chain compromise in any
+# of those deps would otherwise reach `workflow_run`-triggered
+# and cron-triggered runs with a write-scoped GITHUB_TOKEN
+# and no PR-review gate. `contents: read` is enough for
+# `actions/checkout` + `npm ci`; nothing this workflow does
+# writes back to the repo.
+permissions:
+  contents: read
+
 concurrency:
   group: console-smoke-${{ github.ref }}
   cancel-in-progress: true
@@ -82,12 +99,15 @@ jobs:
           SITE: https://agentvisorai.me/
         run: node scripts/verify-page-drill.mjs
 
+<<<<<<< HEAD
       - name: CSP + security-headers drill
         working-directory: server
         env:
           SITE: https://agentvisorai.me/
         run: node scripts/csp-drill.mjs
 
+=======
+>>>>>>> origin/main
       - name: Lighthouse audit (perf + a11y + best-practices)
         working-directory: server
         env:

