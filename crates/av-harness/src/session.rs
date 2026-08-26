@@ -538,10 +538,22 @@ impl Session {
                 .cached_tokens
                 .store(cached_tokens, Ordering::Release);
             if let Some(extra) = metrics.extra.as_ref() {
-                let cost_usd_micros = recovered_counter(
-                    extra.get("cost_usd_micros").and_then(serde_json::Value::as_u64),
-                    "cost",
-                )?;
+                // Cost has two possible sources on the persisted extra:
+                //   1. `cost_usd_micros` — the current writer's exact
+                //      u64 field.
+                //   2. missing / null — an older writer's format,
+                //      pre-dating the cost_usd_micros key.
+                // Falling straight to `recovered_counter(...)?` on the
+                // missing key returned 0, silently zeroing the session's
+                // recovered cost even when `metrics.total_cost_usd` (the
+                // ATIF-level fallback consumed by the non-extra branch
+                // below) was present. Prefer the exact u64 when it's
+                // there, otherwise use the ATIF-level float — same logic
+                // as the pre-extra branch.
+                let cost_usd_micros = match extra.get("cost_usd_micros").and_then(serde_json::Value::as_u64) {
+                    Some(v) => recovered_counter(Some(v), "cost")?,
+                    None => cost_from_atif_total(metrics.total_cost_usd)?,
+                };
                 session
                     .totals
                     .cost_usd_micros
@@ -592,18 +604,10 @@ impl Session {
                     }
                 }
             } else if let Some(cost) = metrics.total_cost_usd {
-                if !cost.is_finite() || cost < 0.0 {
-                    return Err("recovered cost is not finite and nonnegative".to_owned());
-                }
-                let micros = (cost * av_core::units::USD_MICROS_PER_DOLLAR as f64).round();
-                if micros > av_core::error::JCS_SAFE_MAX as f64 {
-                    return Err("recovered cost exceeds JCS-safe bounds".to_owned());
-                }
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 session
                     .totals
                     .cost_usd_micros
-                    .store(micros as u64, Ordering::Release);
+                    .store(cost_from_atif_total(Some(cost))?, Ordering::Release);
             }
         }
         Ok(session)
@@ -814,6 +818,28 @@ fn recovered_counter(value: Option<u64>, field: &str) -> Result<u64, String> {
         return Err(format!("recovered {field} exceeds JCS-safe bounds"));
     }
     Ok(value)
+}
+
+/// Convert an ATIF-level `total_cost_usd` float (dollars) into u64
+/// micros with the same finite/nonnegative/JCS-safe guards the
+/// non-extra branch enforces inline. Returns 0 for a missing value,
+/// mirroring `recovered_counter`. Shared between the two recovery
+/// branches so a cross-version artifact — extra present but without
+/// `cost_usd_micros`, with `total_cost_usd` at the ATIF level — no
+/// longer silently zeroes the recovered cost.
+fn cost_from_atif_total(cost: Option<f64>) -> Result<u64, String> {
+    let Some(cost) = cost else {
+        return Ok(0);
+    };
+    if !cost.is_finite() || cost < 0.0 {
+        return Err("recovered cost is not finite and nonnegative".to_owned());
+    }
+    let micros = (cost * av_core::units::USD_MICROS_PER_DOLLAR as f64).round();
+    if micros > av_core::error::JCS_SAFE_MAX as f64 {
+        return Err("recovered cost exceeds JCS-safe bounds".to_owned());
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Ok(micros as u64)
 }
 
 /// RAII claim keeping a forwarded response active until completion or abort.
@@ -1258,6 +1284,37 @@ mod tests {
         );
         assert!(recovered_counter(Some(av_core::error::JCS_SAFE_MAX + 1), "tokens").is_err());
         assert_eq!(recovered_counter(None, "tokens").unwrap(), 0);
+    }
+
+    /// Cross-version recovery of cost totals: a session artifact
+    /// written by an older writer may carry `metrics.extra` (with
+    /// e.g. `tool_calls`) but NOT the newer `cost_usd_micros` key.
+    /// Pre-fix this path silently reset cost to 0 by taking the
+    /// missing-key → `recovered_counter(None,...) → Ok(0)` branch,
+    /// never reaching the ATIF-level `metrics.total_cost_usd`
+    /// fallback (which the non-extra branch already consumed). The
+    /// helper below now bridges the two: an extra without a cost
+    /// key falls through to the total_cost_usd value.
+    #[test]
+    fn cost_recovery_bridges_extra_and_total_cost_usd() {
+        // (a) extra with the u64 field wins over the ATIF float.
+        assert_eq!(
+            cost_from_atif_total(Some(1.0)).unwrap(),
+            av_core::units::USD_MICROS_PER_DOLLAR
+        );
+        // (b) None → 0 (no cost recorded anywhere).
+        assert_eq!(cost_from_atif_total(None).unwrap(), 0);
+        // (c) Fractional dollar rounds to nearest micro-USD.
+        assert_eq!(cost_from_atif_total(Some(0.000001)).unwrap(), 1);
+        // (d) NaN and negative refused.
+        assert!(cost_from_atif_total(Some(f64::NAN)).is_err());
+        assert!(cost_from_atif_total(Some(-1.0)).is_err());
+        // (e) Overflow past JCS-safe bound refused. Use 2× the bound
+        //     so the roundtrip through f64 (which loses precision at
+        //     values > 2^53) still lands well above the check.
+        let over_dollars =
+            (av_core::error::JCS_SAFE_MAX as f64 * 2.0) / av_core::units::USD_MICROS_PER_DOLLAR as f64;
+        assert!(cost_from_atif_total(Some(over_dollars)).is_err());
     }
 
     /// Receipt stop-reason precedence: a recorded KNOWN reason wins over
