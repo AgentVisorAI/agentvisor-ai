@@ -186,7 +186,7 @@ async fn session_id_exact_length_boundary() {
         let mut h = HeaderMap::new();
         h.insert("x-av-session", HeaderValue::from_str(&id).unwrap());
         assert!(
-            state.prepare_chat(&h, chat_payload()).is_ok(),
+            state.prepare_chat(&h, chat_payload(), None).is_ok(),
             "session id length {good_len} must be accepted"
         );
     }
@@ -195,7 +195,7 @@ async fn session_id_exact_length_boundary() {
         let mut h = HeaderMap::new();
         h.insert("x-av-session", HeaderValue::from_str(&id).unwrap());
         assert!(
-            state.prepare_chat(&h, chat_payload()).is_err(),
+            state.prepare_chat(&h, chat_payload(), None).is_err(),
             "session id length {bad_len} must be rejected"
         );
     }
@@ -215,7 +215,7 @@ async fn session_id_visible_ascii_boundary() {
         let mut h = HeaderMap::new();
         h.insert("x-av-session", HeaderValue::from_str(good).unwrap());
         assert!(
-            state.prepare_chat(&h, chat_payload()).is_ok(),
+            state.prepare_chat(&h, chat_payload(), None).is_ok(),
             "session id {good:?} must be accepted"
         );
     }
@@ -416,7 +416,7 @@ async fn concurrent_close_session_is_idempotent() {
     let state = state(cfg);
     let mut h = HeaderMap::new();
     h.insert("x-av-session", HeaderValue::from_static("idem-close"));
-    state.prepare_chat(&h, chat_payload()).unwrap();
+    state.prepare_chat(&h, chat_payload(), None).unwrap();
     let session = state.sessions.get("idem-close").unwrap();
     // Race N close_session invocations on the same session.
     let mut handles = Vec::new();

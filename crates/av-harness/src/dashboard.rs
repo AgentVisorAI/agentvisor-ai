@@ -551,7 +551,7 @@ mod tests {
             "model": "test",
             "messages": [{"role": "user", "content": "hello"}],
         });
-        state.prepare_chat(&headers, payload).unwrap();
+        state.prepare_chat(&headers, payload, None).unwrap();
     }
 
     #[tokio::test]
@@ -920,7 +920,7 @@ mod tests {
                     "model": "test",
                     "messages": [{"role":"user","content":"go"}],
                 });
-                state.prepare_chat(&headers, payload).unwrap();
+                state.prepare_chat(&headers, payload, None).unwrap();
             }));
         }
         for reader in readers {

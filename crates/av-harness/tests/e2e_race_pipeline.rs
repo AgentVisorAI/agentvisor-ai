@@ -54,7 +54,7 @@ async fn concurrent_prepare_chat_on_one_session_produces_matching_receipt() {
         let state = Arc::clone(&state);
         tasks.push(tokio::spawn(async move {
             let h = signed_headers("race-chat");
-            state.prepare_chat(&h, chat_payload()).unwrap();
+            state.prepare_chat(&h, chat_payload(), None).unwrap();
         }));
     }
     for t in tasks {
@@ -88,7 +88,7 @@ async fn concurrent_close_yields_one_receipt_and_rest_already_closed() {
     let state = app_state();
     let h = signed_headers("race-close");
     for _ in 0..5 {
-        state.prepare_chat(&h, chat_payload()).unwrap();
+        state.prepare_chat(&h, chat_payload(), None).unwrap();
     }
     let session = state.sessions.get("race-close").unwrap();
     const N: usize = 16;
@@ -135,7 +135,7 @@ async fn concurrent_multi_session_fanout_produces_correct_per_session_receipts()
             let id = format!("multi-{i}");
             let h = signed_headers(&id);
             for _ in 0..STEPS_PER_SESSION {
-                state.prepare_chat(&h, chat_payload()).unwrap();
+                state.prepare_chat(&h, chat_payload(), None).unwrap();
             }
             let s = state.sessions.get(&id).unwrap();
             state
@@ -178,7 +178,7 @@ async fn prepare_racing_close_produces_a_coherent_receipt() {
     let h = signed_headers("race-mixed");
     // Seed a few so the session exists before close.
     for _ in 0..3 {
-        state.prepare_chat(&h, chat_payload()).unwrap();
+        state.prepare_chat(&h, chat_payload(), None).unwrap();
     }
     let session = state.sessions.get("race-mixed").unwrap();
     let state_prep = Arc::clone(&state);
@@ -199,7 +199,7 @@ async fn prepare_racing_close_produces_a_coherent_receipt() {
     let prep = tokio::spawn(async move {
         let mut successes = 0u64;
         while stop_p.load(Ordering::Acquire) == 0 {
-            if let Ok(prepared) = state_prep.prepare_chat(&hp, chat_payload()) {
+            if let Ok(prepared) = state_prep.prepare_chat(&hp, chat_payload(), None) {
                 if Arc::ptr_eq(&prepared.session, &session_for_count) {
                     successes += 1;
                 }
@@ -235,7 +235,7 @@ async fn prepare_racing_close_produces_a_coherent_receipt() {
     // Post-close preps on the SAME incarnation are impossible: either
     // the id maps to a fresh recycled session (by design) or admission
     // refuses. Either way this receipt's chain is sealed.
-    if let Ok(prepared) = state.prepare_chat(&h, chat_payload()) {
+    if let Ok(prepared) = state.prepare_chat(&h, chat_payload(), None) {
         assert!(
             !Arc::ptr_eq(&prepared.session, &session),
             "post-close admission must not reuse the sealed incarnation"
