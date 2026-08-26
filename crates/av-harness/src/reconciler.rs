@@ -3066,6 +3066,7 @@ impl Finalizer {
         let spool_dir = self.spool_dir.clone();
         tokio::task::spawn_blocking(move || -> Result<(), FinalizeError> {
             let mut spool_changed = false;
+            let mut unlink_error: Option<FinalizeError> = None;
             // Deletion order matters: the `.session.json` sidecar is the
             // ONLY name the recovery scans iterate, so it must go LAST.
             // The old sidecar-first order had a crash window that left an
@@ -3081,11 +3082,42 @@ impl Finalizer {
                 match std::fs::remove_file(&path) {
                     Ok(()) => spool_changed = true,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(FinalizeError::atif_source(error)),
+                    Err(error) => {
+                        unlink_error = Some(FinalizeError::atif_source(error));
+                        // R64 F2: previously we returned here without
+                        // fsyncing, so any successful earlier unlinks
+                        // (e.g. `events.ndjson` durably removed before
+                        // `steps.ndjson` failed) were left dirent-non-
+                        // durable. A crash before the next tick's
+                        // retry+sync could then leave `.session.json`
+                        // durably-removed but `.events.ndjson` back on
+                        // disk — the exact "recycled id appends onto
+                        // stale bytes at position 0, permanently
+                        // breaking sequence == index" state the delete-
+                        // order invariant exists to prevent. Break here
+                        // and fsync outside the loop so partial
+                        // durability is captured even on error.
+                        break;
+                    }
                 }
             }
             if spool_changed {
-                av_core::fsutil::sync_directory(&spool_dir).map_err(FinalizeError::atif_source)?;
+                if let Err(error) = av_core::fsutil::sync_directory(&spool_dir) {
+                    // Prefer the original unlink error as the primary
+                    // report; a fsync failure after an unlink error is
+                    // strictly less informative.
+                    if unlink_error.is_none() {
+                        unlink_error = Some(FinalizeError::atif_source(error));
+                    } else {
+                        tracing::warn!(
+                            %error,
+                            "spool sync after partial step-journal removal failed; leaving as-is (retry on next tick)"
+                        );
+                    }
+                }
+            }
+            if let Some(error) = unlink_error {
+                return Err(error);
             }
             let ack_parent = spool_dir.join("broker-acks");
             let ack_path = ack_parent.join(&stem);
