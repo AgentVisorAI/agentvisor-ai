@@ -1949,7 +1949,30 @@
   }
   async function renderSettingsKeys(root) {
     root.innerHTML = '<div class="card">' + loadingBlock("table") + "</div>";
-    var keys = await state.ds.listApiKeys();
+    var keys = [];
+    try { keys = await state.ds.listApiKeys(); }
+    catch (e) { root.innerHTML = '<div class="card empty"><h3>Could not load keys</h3><p>' + esc(e.message || "Try again in a moment.") + '</p></div>'; return; }
+    function attachCreate(btn) {
+      if (!btn) return;
+      btn.addEventListener("click", function () {
+        openInputModal({
+          title: "Create an API key",
+          label: "Key name",
+          placeholder: "e.g. CI runner",
+          confirmLabel: "Create",
+          onConfirm: async function (name) {
+            if (!name || !name.trim()) return;
+            try {
+              var res = await state.ds.createApiKey(name.trim());
+              showTokenModal(res.plaintextToken, "API key created");
+              await renderSettingsKeys(root);
+            } catch (e) {
+              toast(e && e.message ? e.message : "Could not create key");
+            }
+          },
+        });
+      });
+    }
     if (!keys.length) {
       root.innerHTML =
         '<div class="card" style="padding:0">' +
@@ -1960,22 +1983,16 @@
           '<div style="padding: 24px 16px">' +
           emptyState("No API keys yet", "Create a server-side key to script deployments, rotate ingest tokens, or wire AgentVisor into CI/CD.", "+ Create key", null, "createKeyBtn") +
           "</div></div>";
-      var ck0 = $("#createKeyBtn", root);
-      if (ck0) ck0.addEventListener("click", function () {
-        openInputModal({ title: "Create an API key", label: "Key name", placeholder: "e.g. CI runner", confirmLabel: "Create", onConfirm: function (name) {
-          var token = "av_srv_" + Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
-          showTokenModal(token, "API key created");
-        }});
-      });
+      attachCreate($("#createKeyBtn", root));
       return;
     }
     var rows = keys.map(function (k) {
-      return "<tr>" +
+      return '<tr data-id="' + esc(k.id) + '">' +
         '<td><div style="font-weight:500">' + esc(k.name) + '</div><div class="id">' + esc(k.id) + "</div></td>" +
         '<td class="mono">' + esc(k.hint) + "</td>" +
         '<td style="color:var(--fg-2)">' + esc(timeAgo(k.lastUsedAt)) + "</td>" +
         '<td style="color:var(--fg-2)">' + esc(timeAgo(k.createdAt)) + "</td>" +
-        '<td><button class="btn danger">Revoke</button></td>' +
+        '<td><button class="btn danger" data-act="revoke">Revoke</button></td>' +
       "</tr>";
     }).join("");
     root.innerHTML =
@@ -1990,12 +2007,28 @@
           "<tbody>" + rows + "</tbody>" +
         "</table></div>" +
       "</div>";
-    var ck = $("#createKeyBtn", root);
-    if (ck) ck.addEventListener("click", function () {
-      openInputModal({ title: "Create an API key", label: "Key name", placeholder: "e.g. CI runner", confirmLabel: "Create", onConfirm: function (name) {
-        var token = "av_srv_" + Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
-        showTokenModal(token, "API key created");
-      }});
+    attachCreate($("#createKeyBtn", root));
+    $$("tr[data-id] button[data-act='revoke']", root).forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var tr = btn.closest("tr");
+        var id = tr && tr.getAttribute("data-id");
+        if (!id) return;
+        confirmModal({
+          title: "Revoke this API key?",
+          body: "Any script or dashboard using this key will immediately start returning 401. This cannot be undone.",
+          confirmLabel: "Revoke",
+          danger: true,
+          onConfirm: async function () {
+            try {
+              await state.ds.revokeApiKey(id);
+              toast("Key revoked.");
+              await renderSettingsKeys(root);
+            } catch (e) {
+              toast(e && e.message ? e.message : "Could not revoke");
+            }
+          },
+        });
+      });
     });
   }
   async function renderSettingsSSO(root) {

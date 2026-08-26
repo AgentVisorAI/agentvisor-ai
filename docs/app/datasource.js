@@ -983,6 +983,18 @@
       MOCK_MEMBERS = MOCK_MEMBERS.filter(function (m) { return m.userId !== userId && m.email !== userId; });
     },
     async listApiKeys() { await delay(100); return MOCK_API_KEYS.slice(); },
+    async createApiKey(name) {
+      await delay(120);
+      var hint = "av_srv_" + Math.random().toString(36).slice(2, 10) + "…";
+      var plaintext = "av_srv_" + Math.random().toString(36).slice(2, 10).padEnd(28, "0");
+      var row = { id: "key_" + Math.random().toString(36).slice(2, 8), name: name, createdAt: new Date().toISOString(), lastUsedAt: null, hint: hint };
+      MOCK_API_KEYS.unshift(row);
+      return { key: row, plaintextToken: plaintext };
+    },
+    async revokeApiKey(id) {
+      await delay(120);
+      MOCK_API_KEYS = MOCK_API_KEYS.filter(function (r) { return r.id !== id; });
+    },
     async listAudit() { await delay(100); return MOCK_AUDIT.slice(); },
     subscribe(callback) {
       // The demo needs to feel alive. Every 6-14 seconds we synthesize a new
@@ -1361,7 +1373,34 @@
     async removeMember(userId) {
       return apiFetch("/api/v1/members/" + encodeURIComponent(userId), { method: "DELETE" });
     },
-    async listApiKeys() { return MOCK_API_KEYS.slice(); },
+    async listApiKeys() {
+      // Real programmatic API keys. The console POSTs a name and gets
+      // back a plaintext token exactly once; we surface a hint like
+      // "av_srv_a091…" the operator can use to identify the row later.
+      try {
+        var res = await apiFetch("/api/v1/keys");
+        return (res.keys || []).map(function (k) {
+          return {
+            id: k.id,
+            name: k.name,
+            hint: k.hint,
+            role: k.role,
+            createdByEmail: k.createdByEmail,
+            createdAt: k.createdAt,
+            lastUsedAt: k.lastUsedAt,
+          };
+        });
+      } catch (e) {
+        return [];
+      }
+    },
+    async createApiKey(name) {
+      var res = await apiFetch("/api/v1/keys", { method: "POST", body: { name: name } });
+      return { key: res.key, plaintextToken: res.plaintextToken };
+    },
+    async revokeApiKey(id) {
+      return apiFetch("/api/v1/keys/" + encodeURIComponent(id), { method: "DELETE" });
+    },
     async listAudit(opts) {
       // Real audit log — the SPA maps our normalized shape into the
       // audit table. If the server returns 4xx/5xx we fall through to

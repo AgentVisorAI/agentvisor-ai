@@ -80,8 +80,37 @@ model Org {
   samlReplayRecords SamlReplayRecord[]
   auditEntries AuditEntry[]
   invites Invite[]
+  apiKeys ApiKey[]
 
   @@map("orgs")
+}
+
+// Server-side API key for programmatic console access. Wire scripts,
+// CI jobs, and dashboards can authenticate as an org (not a user) with
+// `Authorization: Bearer av_srv_<plaintext>`. Only the argon2 hash is
+// stored; plaintext is returned once at create time.
+//
+// A hint (first 8 chars) is stored so the UI can show 'av_srv_a091…'
+// without a lookup. lastUsedAt is bumped opportunistically on
+// authenticate. createdBy snapshots the operator email so a revoked
+// user's audit trail still shows who created what.
+model ApiKey {
+  id           String   @id @default(cuid())
+  orgId        String
+  name         String   // "CI runner", "Grafana dashboard"
+  tokenHash    String
+  tokenHint    String   // first 8 chars for UI display
+  createdById  String?
+  createdByEmail String?
+  role         String   @default("admin") // acts as this role for RBAC
+  lastUsedAt   DateTime?
+  createdAt    DateTime @default(now())
+  revokedAt    DateTime?
+
+  org Org @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@map("api_keys")
 }
 
 // Compliance-grade audit trail. Every sensitive action writes one row

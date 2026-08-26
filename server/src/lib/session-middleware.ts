@@ -1,13 +1,17 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { env } from "../env.js";
-import { SESSION_COOKIE_OPTS, verifySession } from "../lib/auth.js";
+import { SESSION_COOKIE_OPTS, verifyPassword, verifySession } from "../lib/auth.js";
 import { db } from "../db.js";
 
 /**
  * Populates `request.session` when a valid session cookie is present. Never
  * throws — routes that require auth call `requireSession()` below.
  *
- * Also confirms that:
+ * Two auth flavors:
+ *   1. av_session cookie (JWT) — the console SPA / OAuth / SAML users.
+ *   2. Authorization: Bearer av_srv_<plaintext> — programmatic API keys.
+ *
+ * Cookie path also confirms that:
  *   1. the (userId, orgId) pair in the token is still an active membership
  *      — closes the gap where a user removed from an org would keep
  *      read/write access via their existing JWT for the remainder of the
@@ -25,6 +29,48 @@ export async function authenticate(
   req: FastifyRequest,
   _reply: FastifyReply,
 ): Promise<void> {
+  // ---------- API key path ----------
+  const auth = req.headers.authorization;
+  if (typeof auth === "string" && auth.startsWith("Bearer av_srv_")) {
+    const plaintext = auth.slice("Bearer ".length);
+    // Load only non-revoked keys for this org — we need the tokenHint to
+    // narrow before argon2 verify.
+    const hint = plaintext.slice("av_srv_".length, "av_srv_".length + 8);
+    const candidates = await db.apiKey.findMany({
+      where: { tokenHint: hint, revokedAt: null },
+      select: {
+        id: true,
+        orgId: true,
+        role: true,
+        tokenHash: true,
+        createdById: true,
+      },
+    });
+    for (const c of candidates) {
+      const ok = await verifyPassword(c.tokenHash, plaintext);
+      if (!ok) continue;
+      // Synthesize a session equivalent to a JWT.
+      // Use the key's id as the subject so the audit trail
+      // distinguishes API-key actions from user actions.
+      req.session = {
+        sub: "apikey:" + c.id,
+        orgId: c.orgId,
+        membershipRole: c.role as "owner" | "admin" | "member",
+        iat: Math.floor(Date.now() / 1000),
+      };
+      // Bump lastUsedAt best-effort so a stuck DB doesn't slow down
+      // the caller. Don't await.
+      void db.apiKey
+        .update({ where: { id: c.id }, data: { lastUsedAt: new Date() } })
+        .catch(() => void 0);
+      return;
+    }
+    // Wrong / expired bearer: leave req.session unset. requireSession
+    // will return 401 on the next hop.
+    return;
+  }
+
+  // ---------- Cookie path ----------
   const token = req.cookies[env.SESSION_COOKIE_NAME];
   if (!token) return;
   const claims = await verifySession(token);

@@ -14,6 +14,7 @@ import {
   registry as metricsRegistry,
 } from "./lib/metrics.js";
 import { authenticate } from "./lib/session-middleware.js";
+import { apiKeyRoutes } from "./routes/api-keys.js";
 import { authRoutes } from "./routes/auth.js";
 import { deploymentRoutes } from "./routes/deployments.js";
 import { ingestRoutes } from "./routes/ingest.js";
@@ -457,6 +458,9 @@ async function main(): Promise<void> {
   });
   await app.register(async (r) => r.register(memberRoutes), {
     prefix: "/api/v1/members",
+  });
+  await app.register(async (r) => r.register(apiKeyRoutes), {
+    prefix: "/api/v1/keys",
   });
   await app.register(async (r) => r.register(deploymentRoutes), {
     prefix: "/api/v1/deployments",
