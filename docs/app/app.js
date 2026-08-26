@@ -942,8 +942,14 @@
       "</div>" +
       '<div class="detail-grid">' +
         '<div class="events-card card">' +
-          '<div class="events-head"><h2>Event stream</h2><span class="count">' + events.length + " events</span></div>" +
+          '<div class="events-head"><h2>Event stream</h2><span class="count">' + events.length + " event" + (events.length === 1 ? "" : "s") +
+            (data.nextEventCursor != null ? " (more available)" : "") + "</span></div>" +
           '<div id="eventList">' + eventsHtml + "</div>" +
+          (data.nextEventCursor != null
+            ? '<div style="padding: 12px 16px; text-align:center; border-top:1px solid var(--border);">' +
+                '<button class="btn" id="loadMoreEv">Load more events</button>' +
+              "</div>"
+            : "") +
         "</div>" +
         '<div>' +
           receiptCard(receipt) +
@@ -965,6 +971,29 @@
       var ev = events[parseInt(row.getAttribute("data-i"), 10)];
       renderEventDrawer(drawer, ev);
     });
+
+    // Load-more events for long sessions. The server caps at 500 per
+    // request and returns nextEventCursor if there are more. Same
+    // cursor pattern as the sessions list.
+    var loadMoreEv = $("#loadMoreEv");
+    if (loadMoreEv && data.nextEventCursor != null) {
+      loadMoreEv.addEventListener("click", async function () {
+        loadMoreEv.disabled = true;
+        loadMoreEv.textContent = "Loading…";
+        try {
+          var more = await state.ds.getSessionById(id, { eventCursor: data.nextEventCursor });
+          events = events.concat(more.events || []);
+          data.nextEventCursor = more.nextEventCursor;
+          // Rerender the events area only. Cheap enough for the ~500
+          // rows we're appending at once.
+          renderSessionDetail(main, id);
+        } catch (err) {
+          toast(err.message || "Failed to load events", true);
+          loadMoreEv.disabled = false;
+          loadMoreEv.textContent = "Load more events";
+        }
+      });
+    }
 
     // Copy receipt button
     $("#copyRcpt").addEventListener("click", function () {

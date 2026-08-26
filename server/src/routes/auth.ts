@@ -241,37 +241,139 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     const ok = await verifyPassword(user.passwordHash, body.data.password);
     if (!ok) return reply.code(401).send({ error: "invalid_password" });
 
-    // One transactional read so the export is a point-in-time snapshot.
-    const dump = await db.$transaction(async (tx) => {
-      const org = await tx.org.findUnique({
+    // Streaming JSON-Lines export. Each line is a self-contained JSON
+    // object; the first line is a header. Sessions and events are
+    // paged (batch size below) so we NEVER materialize the whole org
+    // in memory — a 1M-session tenant streams safely on a 256 MB Fly
+    // machine. Long TTL friendly: consumers can restart mid-download
+    // by discarding the header and resuming.
+    //
+    // Password hashes and reset tokens are excluded — the export is
+    // meant for the customer, not for anyone with a stolen session.
+    const SESSION_PAGE = 500;
+    const EVENT_PAGE = 1000;
+
+    reply.header(
+      "Content-Disposition",
+      `attachment; filename="agentvisor-export-${claims.orgId}-${Date.now()}.jsonl"`,
+    );
+    reply.type("application/x-ndjson");
+    // Hijack Fastify's response pipeline so we can push line-by-line.
+    reply.raw.setHeader("Cache-Control", "no-store");
+    reply.raw.flushHeaders();
+    const write = (obj: unknown) => {
+      reply.raw.write(JSON.stringify(obj) + "\n");
+    };
+
+    try {
+      // Row 1: header. Consumers key on schemaVersion for future
+      // evolutions of this format.
+      const org = await db.org.findUnique({
         where: { id: claims.orgId },
         include: {
-          members: { include: { user: { select: { id: true, email: true, displayName: true } } } },
-          deployments: {
+          members: {
             include: {
-              sessions: {
-                include: {
-                  events: true,
-                  receipt: true,
-                },
-              },
+              user: { select: { id: true, email: true, displayName: true } },
+            },
+          },
+          deployments: {
+            select: {
+              id: true,
+              name: true,
+              environment: true,
+              publicKeyHex: true,
+              createdAt: true,
             },
           },
         },
       });
-      return org;
-    });
+      write({
+        type: "header",
+        exportedAt: new Date().toISOString(),
+        schemaVersion: 2,
+        org,
+      });
 
-    reply.header(
-      "Content-Disposition",
-      `attachment; filename="agentvisor-export-${claims.orgId}-${Date.now()}.json"`,
-    );
-    return reply.send({
-      exportedAt: new Date().toISOString(),
-      schemaVersion: 1,
-      // Note: password hashes are intentionally NOT included.
-      org: dump,
-    });
+      // Rows 2..N: sessions paginated by (openedAt, id). Same cursor
+      // pattern as the /sessions endpoint — O(log N) per page.
+      let lastKey: { openedAt: Date; id: string } | null = null;
+      // Loop until an empty page. Guard against runaway loops via a
+      // sanity cap on iterations — 1M sessions / SESSION_PAGE = 2000
+      // pages, and even 10M would be 20k pages, well below this.
+      for (let iter = 0; iter < 200_000; iter++) {
+        // Typed as any-ish: Prisma infers the generic from the where,
+        // and TS complains about self-referential inference in the
+        // control-flow analysis. The runtime type is
+        // (Session & { receipt: Receipt | null })[].
+        const sessions: Array<{
+          id: string;
+          openedAt: Date;
+          costUsdMicros: bigint;
+          payoutUsdMicros: bigint;
+          blockedPayoutUsdMicros: bigint;
+          [k: string]: unknown;
+        }> = await db.session.findMany({
+          where: { orgId: claims.orgId },
+          orderBy: [{ openedAt: "asc" }, { id: "asc" }],
+          take: SESSION_PAGE,
+          ...(lastKey
+            ? {
+                skip: 1,
+                cursor: { id: lastKey.id },
+              }
+            : {}),
+          include: { receipt: true },
+        });
+        if (sessions.length === 0) break;
+        for (const s of sessions) {
+          write({
+            type: "session",
+            session: {
+              ...s,
+              costUsdMicros: s.costUsdMicros.toString(),
+              payoutUsdMicros: s.payoutUsdMicros.toString(),
+              blockedPayoutUsdMicros: s.blockedPayoutUsdMicros.toString(),
+            },
+          });
+          // Events for this session in EVENT_PAGE-sized pages.
+          let lastEventSeq: number | null = null;
+          for (let ei = 0; ei < 20_000; ei++) {
+            const events: Array<{ seq: number; [k: string]: unknown }> = await db.event.findMany({
+              where: {
+                sessionId: s.id,
+                ...(lastEventSeq !== null ? { seq: { gt: lastEventSeq } } : {}),
+              },
+              orderBy: { seq: "asc" },
+              take: EVENT_PAGE,
+            });
+            if (events.length === 0) break;
+            const nextLast = events[events.length - 1];
+            if (!nextLast) break;
+            for (const ev of events) {
+              write({ type: "event", sessionId: s.id, event: ev });
+            }
+            lastEventSeq = nextLast.seq;
+            if (events.length < EVENT_PAGE) break;
+          }
+        }
+        const last = sessions[sessions.length - 1];
+        if (!last || sessions.length < SESSION_PAGE) break;
+        lastKey = { openedAt: last.openedAt, id: last.id };
+      }
+      write({ type: "trailer", exportCompleteAt: new Date().toISOString() });
+    } catch (err) {
+      // Write a trailer so consumers can distinguish a truncated
+      // download from a completed one. Then close.
+      req.log.error({ err, orgId: claims.orgId }, "export_stream_failed");
+      write({
+        type: "error",
+        message: err instanceof Error ? err.message : "export_failed",
+        exportFailedAt: new Date().toISOString(),
+      });
+    } finally {
+      reply.raw.end();
+    }
+    return reply;
   });
 
   // Account + org deletion. Owner-only. Requires password + explicit

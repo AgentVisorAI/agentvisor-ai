@@ -109,9 +109,18 @@ async function main(): Promise<void> {
     // every 15s. A dozen instances × a couple of probers would eat the
     // 300/min budget and make the API look down. .well-known is also
     // always public (RFC 9116 disclosure lookup).
+    //
+    // Also exempt /api/v1/ingest/*. Daemons authenticate per-deployment
+    // via a cryptographically verified token (argon2), and legitimate
+    // production traffic can burst to thousands of events/sec on a
+    // single deployment. Rate-limiting them at 300rpm/IP would throttle
+    // every real customer as soon as they scale. Per-tenant abuse is
+    // bounded by the daemon token itself (only that deployment's org
+    // is affected).
     allowList: (req) => {
       const u = req.url ?? "";
-      return u === "/healthz" || u === "/readyz" || u === "/metrics" || u.startsWith("/.well-known/");
+      return u === "/healthz" || u === "/readyz" || u === "/metrics" ||
+        u.startsWith("/.well-known/") || u.startsWith("/api/v1/ingest");
     },
     keyGenerator: (req) => {
       // Prefer the authenticated user's ID for rate-limit accounting so a
@@ -345,9 +354,11 @@ async function main(): Promise<void> {
     if (!start) return;
     const diff = process.hrtime(start);
     const seconds = diff[0] + diff[1] / 1e9;
-    // routerPath is the parameterized template (e.g. /api/v1/sessions/:id)
-    // so we don't blow cardinality on session-id-shaped URLs.
-    const routeLabel = (req as unknown as { routerPath?: string }).routerPath ?? "unmatched";
+    // routeOptions.url is the parameterized template (e.g. /api/v1/sessions/:id)
+    // so we don't blow cardinality on session-id-shaped URLs. Fastify 5.x
+    // moved this from req.routerPath — an old req.routerPath fallback was
+    // silently returning "unmatched" for every request in prod.
+    const routeLabel = req.routeOptions?.url ?? "unmatched";
     const labels = {
       method: req.method,
       route: routeLabel,

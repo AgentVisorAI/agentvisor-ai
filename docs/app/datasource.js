@@ -1073,11 +1073,16 @@
         nextCursor: r.nextCursor || null,
       };
     },
-    async getSessionById(id) {
-      var r = await apiFetch("/api/v1/sessions/" + id);
+    async getSessionById(id, opts) {
+      var qs = "";
+      if (opts && opts.eventCursor != null) {
+        qs = "?eventCursor=" + encodeURIComponent(opts.eventCursor) +
+             "&eventLimit=" + (opts.eventLimit || 500);
+      }
+      var r = await apiFetch("/api/v1/sessions/" + id + qs);
       var s = normalizeSession(r.session);
       var events = (r.session.events || []).map(normalizeEvent);
-      return { session: s, events: events };
+      return { session: s, events: events, nextEventCursor: r.nextEventCursor || null };
     },
     async getReceipt(sessionId) {
       try {
