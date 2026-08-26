@@ -420,7 +420,9 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     let flush_telemetry = move || {
         if let Some(provider) = telemetry_provider {
             provider
-                .shutdown_with_timeout(std::time::Duration::from_secs(5))
+                .shutdown_with_timeout(std::time::Duration::from_secs(
+                    av_harness::config::OTEL_FLUSH_SECS,
+                ))
                 .map_err(|error| anyhow::anyhow!("flush OpenTelemetry: {error}"))?;
         }
         Ok(())
@@ -447,7 +449,7 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     };
     finish_shutdown(
         result,
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(av_harness::config::WORKER_FINALIZE_PHASE_SECS),
         state.worker.wait_idle(),
         finalize_sessions,
         flush_telemetry,
@@ -1860,7 +1862,12 @@ mod tests {
         let signer = Ed25519Signer::generate();
         std::fs::write(&path, hex::encode(signer.seed())).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(read_signer(&path).is_err());
+        // Pin the specific mode refusal (mirror the group-readable
+        // sibling above): a permission-bit refactor that returned e.g.
+        // "invalid seed length" for 0o644 still passed is_err() while
+        // the mode gate this test names was gone.
+        let err = read_signer(&path).unwrap_err().to_string();
+        assert!(err.contains("must be 0o600"), "got {err}");
     }
 
     /// Same guarantee for the identity HMAC secret file: refuse to load if

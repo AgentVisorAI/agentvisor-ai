@@ -107,6 +107,28 @@ pub enum IdentityError {
         /// Parent expiry.
         parent: u64,
     },
+    /// Child claims to be issued before its parent (the delegator).
+    /// A backdated child forges audit-trail causality: consumers that
+    /// treat `claims.iat` as "when this identity became authorized"
+    /// see the child asserting authority before the parent that
+    /// granted it existed.
+    #[error("child iat {child} predates parent iat {parent}")]
+    IatEscalation {
+        /// Child issued-at.
+        child: u64,
+        /// Parent issued-at.
+        parent: u64,
+    },
+    /// Child claims not-before earlier than its parent's not-before
+    /// (or than the parent's `iat` when the parent has no `nbf`) —
+    /// same forgery class as `IatEscalation`.
+    #[error("child nbf {child} predates parent nbf {parent}")]
+    NbfEscalation {
+        /// Child not-before.
+        child: u64,
+        /// Parent not-before (or iat if nbf absent).
+        parent: u64,
+    },
     /// Delegation chain deeper than permitted.
     #[error("delegation chain deeper than {0}")]
     ChainTooDeep(usize),
@@ -399,6 +421,43 @@ impl IdentityValidator {
                     parent: parent.exp,
                 });
             }
+            // Child must not be backdated before its parent. A
+            // hostile HMAC-shared-secret holder could otherwise mint
+            // a child with `iat` up to MAX_TTL_SECS BEFORE the parent
+            // that "delegated" it — asserting authorization causality
+            // that never happened. Consumers that treat `claims.iat`
+            // as "when this identity became authorized" (audit
+            // pipelines, revocation-cache pruning that keys eviction
+            // horizons on `iat + MAX_TTL_SECS`) are then lied to.
+            if child.iat < parent.iat {
+                return Err(IdentityError::IatEscalation {
+                    child: child.iat,
+                    parent: parent.iat,
+                });
+            }
+            // Same posture for `nbf`: a child cannot become usable
+            // before the parent that granted it did. Compare
+            // EFFECTIVE start times uniformly — fall back to `iat`
+            // on either side that omits `nbf`. Pre-R16 this block
+            // was guarded by `if let Some(child_nbf) = child.nbf`,
+            // so a child that OMITTED `nbf` sailed past the check
+            // even when its raw `iat` predated the parent's explicit
+            // `nbf`: e.g. `parent{iat=t0, nbf=t0+15}` +
+            // `child{iat=t0+10, nbf=None}` was accepted, though the
+            // child asserts authority 5 seconds before the parent
+            // grant became active. The `IatEscalation` check on
+            // line 432 fires only for `child.iat < parent.iat` and
+            // does not cover this gap. Consumers treating
+            // `claims.iat` (or `nbf`) as "when this identity became
+            // authorized" saw an inverted causal ordering.
+            let parent_start = parent.nbf.unwrap_or(parent.iat);
+            let child_start = child.nbf.unwrap_or(child.iat);
+            if child_start < parent_start {
+                return Err(IdentityError::NbfEscalation {
+                    child: child_start,
+                    parent: parent_start,
+                });
+            }
             parent_token = parent.parent_token.clone();
             child = parent;
         }
@@ -493,25 +552,65 @@ impl IdentityValidator {
         if claims.charter.is_empty() {
             return Err(IdentityError::EmptyField("charter"));
         }
-        // docs/reference/LIMITS.md documents a 256-code-point charter cap
-        // ("longer are refused with 400"); the charter flows verbatim into
-        // logs, receipts, and event chains, so an unbounded (up to the
-        // 8 KiB token cap) attacker-chosen string is also log-spam
-        // surface. Enforce the documented limit.
-        const MAX_CHARTER_CHARS: usize = 256;
-        if claims.charter.chars().count() > MAX_CHARTER_CHARS {
-            return Err(IdentityError::FieldTooLong {
-                field: "charter",
-                max: MAX_CHARTER_CHARS,
-            });
-        }
         if claims.version.is_empty() {
             return Err(IdentityError::EmptyField("version"));
+        }
+        // docs/reference/LIMITS.md documents a 256-code-point charter cap
+        // ("longer are refused with 400"); the same reasoning applies to
+        // EVERY identity string that flows into logs, receipts, and
+        // event chains — an unbounded (up to the ~7 KiB per-claim JWT
+        // budget) attacker-chosen field is log-spam surface and — since
+        // instance_uid/version bind into every SIGNED receipt — bloats
+        // the JCS-canonicalized signing input on every request. Cap all
+        // identity strings at the same limit for one consistent rule.
+        // Threat model: an HMAC-shared-secret deployment where multiple
+        // principals hold the identity signing key. Any of them can
+        // construct a valid JWT with hostile-length claims.
+        const MAX_IDENTITY_STRING_CHARS: usize = 256;
+        for (name, value) in [
+            ("instance_uid", claims.instance_uid.as_str()),
+            ("charter", claims.charter.as_str()),
+            ("version", claims.version.as_str()),
+            ("sub", claims.sub.as_str()),
+            ("iss", claims.iss.as_str()),
+            ("jti", claims.jti.as_str()),
+        ] {
+            if value.chars().count() > MAX_IDENTITY_STRING_CHARS {
+                return Err(IdentityError::FieldTooLong {
+                    field: name,
+                    max: MAX_IDENTITY_STRING_CHARS,
+                });
+            }
+        }
+        // Bound the scopes array too: an unbounded list (or an
+        // individually oversized scope) is the same log-spam / receipt-
+        // bloat vector as the strings above, and the delegation-chain
+        // subset check runs a per-element comparison so a 10000-entry
+        // scopes[] amplifies delegation-verification cost per request.
+        const MAX_SCOPES: usize = 64;
+        if claims.scopes.len() > MAX_SCOPES {
+            return Err(IdentityError::FieldTooLong {
+                field: "scopes",
+                max: MAX_SCOPES,
+            });
+        }
+        for scope in &claims.scopes {
+            if scope.chars().count() > MAX_IDENTITY_STRING_CHARS {
+                return Err(IdentityError::FieldTooLong {
+                    field: "scopes[]",
+                    max: MAX_IDENTITY_STRING_CHARS,
+                });
+            }
         }
         // Trojan-Source guard: any bidi override or zero-width character in
         // a rendered identity field would spoof how it looks in operator
         // logs, receipts, and event chains while remaining part of the raw
-        // bytes on the wire.
+        // bytes on the wire. Scopes must be guarded too — they are the
+        // most audit-prominent identity strings and were the only one
+        // omitted from the original list, an inconsistency that let a
+        // scope like `payout\u{202E}elbast` render as visually-corrupt
+        // junk in operator logs while still surviving the length cap and
+        // the scope-subset check on raw bytes.
         for (name, value) in [
             ("instance_uid", claims.instance_uid.as_str()),
             ("charter", claims.charter.as_str()),
@@ -522,6 +621,11 @@ impl IdentityValidator {
         ] {
             if av_core::text::contains_bidi_or_zero_width(value) {
                 return Err(IdentityError::SpoofingCharacter(name));
+            }
+        }
+        for scope in &claims.scopes {
+            if av_core::text::contains_bidi_or_zero_width(scope) {
+                return Err(IdentityError::SpoofingCharacter("scopes[]"));
             }
         }
         if let Some(allowed) = &self.allowed_issuers {

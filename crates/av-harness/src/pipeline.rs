@@ -1099,7 +1099,7 @@ impl AppState {
         // latency (Claude p99 ~15 s, GPT-4 p99 ~30 s) but firm enough
         // that a stalled provider surfaces as a definite 502 rather
         // than a resource-starving hang.
-        const DEFAULT_UPSTREAM_READ_TIMEOUT_S: u64 = 60;
+        const DEFAULT_UPSTREAM_READ_TIMEOUT_S: u64 = crate::config::DEFAULT_UPSTREAM_READ_TIMEOUT_S;
         let read_timeout_s = config
             .upstream_read_timeout_s
             .unwrap_or(DEFAULT_UPSTREAM_READ_TIMEOUT_S);

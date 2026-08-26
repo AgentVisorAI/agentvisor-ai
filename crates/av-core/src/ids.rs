@@ -24,8 +24,31 @@ impl SessionId {
     /// Wrap an externally supplied session id (validated non-empty, ≤ 128 chars,
     /// visible ASCII only — header-safe).
     pub fn parse(s: &str) -> Result<Self, crate::CoreError> {
-        if s.is_empty() || s.len() > 128 || !s.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
-            return Err(crate::CoreError::InvalidId(format!("session id {s:?}")));
+        if s.is_empty() {
+            return Err(crate::CoreError::InvalidId("session id is empty".to_owned()));
+        }
+        if s.len() > 128 {
+            // NEVER echo the full oversized value: an attacker who sends
+            // a 100 KB `X-AV-Session` header would otherwise get the
+            // entire hostile bytes back in the 400 response body (and
+            // in every log line that carries this error) — free ~2×
+            // amplification and log-storage pollution per malformed
+            // request. The length alone is diagnostic; a short
+            // fingerprint at the head/tail helps a developer notice
+            // trailing whitespace or accidental encoding.
+            return Err(crate::CoreError::InvalidId(format!(
+                "session id is {} bytes (max 128); starts {:?}",
+                s.len(),
+                &s[..s.floor_char_boundary(24.min(s.len()))],
+            )));
+        }
+        if !s.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+            // Length is bounded (≤ 128 by the check above), so echoing
+            // the value here is safe — and the byte class is what an
+            // operator needs to see to fix a broken client.
+            return Err(crate::CoreError::InvalidId(format!(
+                "session id {s:?} contains bytes outside visible ASCII (0x21-0x7e)"
+            )));
         }
         Ok(Self(s.to_owned()))
     }
@@ -63,8 +86,21 @@ impl InstanceUid {
     /// Wrap an externally supplied instance uid with the same constraints as
     /// [`SessionId::parse`].
     pub fn parse(s: &str) -> Result<Self, crate::CoreError> {
-        if s.is_empty() || s.len() > 128 || !s.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
-            return Err(crate::CoreError::InvalidId(format!("instance uid {s:?}")));
+        if s.is_empty() {
+            return Err(crate::CoreError::InvalidId("instance uid is empty".to_owned()));
+        }
+        if s.len() > 128 {
+            // Same amplification defense as SessionId::parse.
+            return Err(crate::CoreError::InvalidId(format!(
+                "instance uid is {} bytes (max 128); starts {:?}",
+                s.len(),
+                &s[..s.floor_char_boundary(24.min(s.len()))],
+            )));
+        }
+        if !s.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+            return Err(crate::CoreError::InvalidId(format!(
+                "instance uid {s:?} contains bytes outside visible ASCII (0x21-0x7e)"
+            )));
         }
         Ok(Self(s.to_owned()))
     }
@@ -119,6 +155,49 @@ mod tests {
         assert!(SessionId::parse("ctrl\x07char").is_err());
         assert!(SessionId::parse(&"x".repeat(129)).is_err());
         assert!(SessionId::parse("ok-id_123").is_ok());
+    }
+
+    /// Amplification defense: an over-length id must NOT be echoed in
+    /// full in the validation error. Before this fix, an attacker's
+    /// 10 KiB X-AV-Session header came back inside the 400 response
+    /// body (~2× amplification) and inside every log line that carried
+    /// the error — a free per-request DoS multiplier and a
+    /// log-storage-pollution vector.
+    #[test]
+    fn oversize_session_id_error_does_not_echo_the_full_input() {
+        let attacker_payload = "x".repeat(10_000);
+        let err = SessionId::parse(&attacker_payload).unwrap_err().to_string();
+        assert!(
+            err.len() < 128,
+            "over-length session id error must not embed the full input; got {} bytes",
+            err.len()
+        );
+        assert!(
+            err.contains("10000"),
+            "the length is the diagnostic operators need: {err}"
+        );
+        // Same defense for InstanceUid.
+        let uid_err = InstanceUid::parse(&attacker_payload).unwrap_err().to_string();
+        assert!(uid_err.len() < 128, "instance uid: got {} bytes", uid_err.len());
+    }
+
+    /// Multi-byte UTF-8 at the truncation boundary must not panic. The
+    /// preview uses `floor_char_boundary` explicitly for this — a naive
+    /// `&s[..24]` would split a 3-byte codepoint straddling the 24th
+    /// byte and panic.
+    #[test]
+    fn oversize_session_id_error_survives_utf8_at_the_truncation_boundary() {
+        // 26 leading bytes of ASCII, then a 3-byte codepoint straddling
+        // byte 24 (index 22 + 3 bytes = 22..25). The preview truncates
+        // at 24 → must NOT split the codepoint.
+        let mut input = "a".repeat(22);
+        input.push('€'); // 3 bytes: E2 82 AC
+        input.push_str(&"b".repeat(200));
+        // First byte outside visible-ASCII → hits the ascii branch, so
+        // force the length branch by making it > 128 chars first.
+        // (The bytes-check runs only after the length check.)
+        let err = SessionId::parse(&input).unwrap_err().to_string();
+        assert!(err.len() < 128, "{err}");
     }
 
     /// Every byte that could be used to escape a log line, terminal control

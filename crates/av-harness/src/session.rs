@@ -538,10 +538,22 @@ impl Session {
                 .cached_tokens
                 .store(cached_tokens, Ordering::Release);
             if let Some(extra) = metrics.extra.as_ref() {
-                let cost_usd_micros = recovered_counter(
-                    extra.get("cost_usd_micros").and_then(serde_json::Value::as_u64),
-                    "cost",
-                )?;
+                // Cost has two possible sources on the persisted extra:
+                //   1. `cost_usd_micros` — the current writer's exact
+                //      u64 field.
+                //   2. missing / null — an older writer's format,
+                //      pre-dating the cost_usd_micros key.
+                // Falling straight to `recovered_counter(...)?` on the
+                // missing key returned 0, silently zeroing the session's
+                // recovered cost even when `metrics.total_cost_usd` (the
+                // ATIF-level fallback consumed by the non-extra branch
+                // below) was present. Prefer the exact u64 when it's
+                // there, otherwise use the ATIF-level float — same logic
+                // as the pre-extra branch.
+                let cost_usd_micros = match extra.get("cost_usd_micros").and_then(serde_json::Value::as_u64) {
+                    Some(v) => recovered_counter(Some(v), "cost")?,
+                    None => cost_from_atif_total(metrics.total_cost_usd)?,
+                };
                 session
                     .totals
                     .cost_usd_micros
@@ -592,18 +604,10 @@ impl Session {
                     }
                 }
             } else if let Some(cost) = metrics.total_cost_usd {
-                if !cost.is_finite() || cost < 0.0 {
-                    return Err("recovered cost is not finite and nonnegative".to_owned());
-                }
-                let micros = (cost * av_core::units::USD_MICROS_PER_DOLLAR as f64).round();
-                if micros > av_core::error::JCS_SAFE_MAX as f64 {
-                    return Err("recovered cost exceeds JCS-safe bounds".to_owned());
-                }
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 session
                     .totals
                     .cost_usd_micros
-                    .store(micros as u64, Ordering::Release);
+                    .store(cost_from_atif_total(Some(cost))?, Ordering::Release);
             }
         }
         Ok(session)
@@ -814,6 +818,28 @@ fn recovered_counter(value: Option<u64>, field: &str) -> Result<u64, String> {
         return Err(format!("recovered {field} exceeds JCS-safe bounds"));
     }
     Ok(value)
+}
+
+/// Convert an ATIF-level `total_cost_usd` float (dollars) into u64
+/// micros with the same finite/nonnegative/JCS-safe guards the
+/// non-extra branch enforces inline. Returns 0 for a missing value,
+/// mirroring `recovered_counter`. Shared between the two recovery
+/// branches so a cross-version artifact — extra present but without
+/// `cost_usd_micros`, with `total_cost_usd` at the ATIF level — no
+/// longer silently zeroes the recovered cost.
+fn cost_from_atif_total(cost: Option<f64>) -> Result<u64, String> {
+    let Some(cost) = cost else {
+        return Ok(0);
+    };
+    if !cost.is_finite() || cost < 0.0 {
+        return Err("recovered cost is not finite and nonnegative".to_owned());
+    }
+    let micros = (cost * av_core::units::USD_MICROS_PER_DOLLAR as f64).round();
+    if micros > av_core::error::JCS_SAFE_MAX as f64 {
+        return Err("recovered cost exceeds JCS-safe bounds".to_owned());
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Ok(micros as u64)
 }
 
 /// RAII claim keeping a forwarded response active until completion or abort.
@@ -1260,6 +1286,86 @@ mod tests {
         assert_eq!(recovered_counter(None, "tokens").unwrap(), 0);
     }
 
+    /// Cross-version recovery of cost totals: a session artifact
+    /// written by an older writer may carry `metrics.extra` (with
+    /// e.g. `tool_calls`) but NOT the newer `cost_usd_micros` key.
+    /// Pre-fix this path silently reset cost to 0 by taking the
+    /// missing-key → `recovered_counter(None,...) → Ok(0)` branch,
+    /// never reaching the ATIF-level `metrics.total_cost_usd`
+    /// fallback (which the non-extra branch already consumed). The
+    /// helper below now bridges the two: an extra without a cost
+    /// key falls through to the total_cost_usd value.
+    #[test]
+    fn cost_recovery_bridges_extra_and_total_cost_usd() {
+        // Direct helper tests: complement the end-to-end
+        // integration test below so both the helper AND the branch
+        // selection at recover_unsigned are pinned.
+        // (a) Some(dollars) → micros; the exact fallback the extra-
+        //     missing branch now takes.
+        assert_eq!(
+            cost_from_atif_total(Some(1.0)).unwrap(),
+            av_core::units::USD_MICROS_PER_DOLLAR
+        );
+        // (b) None → 0 (no cost recorded anywhere).
+        assert_eq!(cost_from_atif_total(None).unwrap(), 0);
+        // (c) Fractional dollar rounds to nearest micro-USD.
+        assert_eq!(cost_from_atif_total(Some(0.000001)).unwrap(), 1);
+        // (d) NaN and negative refused.
+        assert!(cost_from_atif_total(Some(f64::NAN)).is_err());
+        assert!(cost_from_atif_total(Some(-1.0)).is_err());
+        // (e) Overflow past JCS-safe bound refused. Use 2× the bound
+        //     so the roundtrip through f64 (which loses precision at
+        //     values > 2^53) still lands well above the check.
+        let over_dollars =
+            (av_core::error::JCS_SAFE_MAX as f64 * 2.0) / av_core::units::USD_MICROS_PER_DOLLAR as f64;
+        assert!(cost_from_atif_total(Some(over_dollars)).is_err());
+    }
+
+    /// End-to-end integration test that pins the actual branch
+    /// selection in `Session::recover_unsigned`. The isolated helper
+    /// tests above pass regardless of whether the caller consults
+    /// them — the R11 review agent showed the standalone
+    /// helper-only test still passes when the fix is reverted to the
+    /// inline `recovered_counter(extra.get("cost_usd_micros")...)`
+    /// pattern. This test drives the actual call path with the exact
+    /// artifact shape the older writer produced: extra present, no
+    /// `cost_usd_micros` key, non-None `metrics.total_cost_usd` at
+    /// the ATIF level.
+    #[test]
+    fn recover_unsigned_bridges_missing_extra_cost_to_atif_fallback() {
+        let identity = identity();
+        let breaker = av_loopdetect::BreakerConfig::default();
+        // The shape an older writer produced: extra carries
+        // tool_calls but NOT cost_usd_micros; the ATIF-level
+        // total_cost_usd carries the actual cost.
+        let metrics = av_atif::FinalMetrics {
+            total_prompt_tokens: Some(0),
+            total_completion_tokens: Some(0),
+            total_cached_tokens: Some(0),
+            total_cost_usd: Some(1.23),
+            extra: Some(serde_json::json!({"tool_calls": 5})),
+            ..av_atif::FinalMetrics::default()
+        };
+        let session = Session::recover_unsigned(
+            "recover-cost".to_owned(),
+            identity,
+            breaker,
+            std::path::PathBuf::from("/tmp/atif.json"),
+            Some(&metrics),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            session.totals.cost_usd_micros.load(Ordering::Acquire),
+            1_230_000,
+            "extra present without cost_usd_micros must fall back to \
+             metrics.total_cost_usd; pre-fix this silently zeroed cost"
+        );
+        // Also confirm extra's tool_calls was still consumed (the
+        // extra-branch didn't fall through wholesale).
+        assert_eq!(session.totals.tool_calls.load(Ordering::Acquire), 5);
+    }
+
     /// Receipt stop-reason precedence: a recorded KNOWN reason wins over
     /// the caller's stop; an UNRECORDED session (raw id 0) takes the
     /// caller's stop; and a FOREIGN id (a newer node's stop-reason id
@@ -1380,8 +1486,21 @@ mod tests {
         }
         let mut all: Vec<u64> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
         all.sort_unstable();
-        all.dedup();
-        assert_eq!(all.len(), 8000, "sequence numbers must be unique");
+        // The invariant the journal MAC path depends on is dense
+        // unit-stride monotonicity — `metadata.sequence` must equal
+        // `journal_position` (see peek_seq's doc + restore_next_seq).
+        // The previous `dedup().len() == 8000` check only pinned
+        // uniqueness, so a regression from `fetch_add(1)` to
+        // `fetch_add(2)` (or any hash-seeded unique-nonce scheme) still
+        // passed while every restored session's first append misaligned.
+        assert_eq!(
+            all,
+            (0..8000).collect::<Vec<_>>(),
+            "next_seq must be dense unit-stride monotone: the journal MAC \
+             re-verifies metadata.sequence against journal_position at \
+             recovery, so any gap or stride > 1 breaks the invariant that \
+             makes crash recovery sound"
+        );
     }
 
     #[test]

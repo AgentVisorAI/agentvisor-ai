@@ -22,6 +22,8 @@ before you know the knob.
 | Session id length | 128 bytes of visible ASCII (`0x21..=0x7e`) | Longer ids — and any id with whitespace, control bytes, or non-ASCII — are refused with 400. |
 | Bearer TTL | provider-supplied | Tokens whose `exp` has passed are refused with 401 even if the JWKS still has the key. |
 | Identity charter length | 256 UTF-8 code points | Longer are refused with 401 (identity validation failure). |
+| Identity string fields (`instance_uid`, `version`, `sub`, `iss`, `jti`) | 256 UTF-8 code points each | Same cap and refusal path as `charter`. Each of these binds into every signed receipt's JCS-canonicalized signing input and into every log line for the session, so an unbounded (up to the ~7 KiB per-claim JWT budget) attacker-chosen field would bloat both. |
+| Identity scopes | 64 entries × 256 UTF-8 code points each | Bounded so delegation-chain subset checks stay per-request cheap and no single scope pollutes logs. |
 | Concurrent sessions per process | unbounded (RAM-limited) | Idle sweeper reaps at `session_idle_close_s`. |
 | Concurrent worker slots | `worker_channel_capacity` (default 32768), sharded over `max(16, available_parallelism)` shards | Additional concurrency queues in the request pipeline. |
 | Concurrent response slots | mirrors worker capacity | Backpressure surfaces as `av_events_dropped_total{stage="response_slot"}`. |

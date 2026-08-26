@@ -121,15 +121,22 @@ spec:
       labels:
         app: agentvisor-ai
     spec:
-      # Sum of the harness's four shutdown phases: HTTP drain (30 s) +
-      # worker wait_idle (30 s) + finalize_sessions (30 s) + telemetry
-      # flush (5 s when the `otel` feature is enabled, which it is in
-      # the default `--features full` build). Total budget 95 s worst
-      # case; 120 s here leaves headroom for a large spool at
-      # rolling-deploy time. If k8s sends SIGKILL before
-      # finalize_sessions returns, receipts and ATIF trajectories are
-      # lost — the very outcome the design is supposed to prevent.
-      terminationGracePeriodSeconds: 120
+      # Sum of the harness's four shutdown phases: HTTP drain
+      # (max(30, upstream_read_timeout_s + 5) — this ConfigMap does
+      # not set upstream_read_timeout_s so it defaults to 60 s and
+      # drain caps at 65 s) + worker wait_idle (30 s) +
+      # finalize_sessions (30 s) + telemetry flush (5 s when the
+      # `otel` feature is enabled, which it is in the default
+      # `--features full` build). Total budget 130 s worst case;
+      # 150 s here leaves headroom for a large spool at rolling-
+      # deploy time. If k8s sends SIGKILL before finalize_sessions
+      # returns, receipts and ATIF trajectories are lost — the very
+      # outcome the design is supposed to prevent. Prior 120 s value
+      # was too tight: the comment miscomputed drain as 30 s, so any
+      # rolling deploy under load hit SIGKILL mid-finalize; the
+      # shipped_kubernetes_configmap_total_shutdown_fits_termination_
+      # grace pin test now catches this class of drift at CI time.
+      terminationGracePeriodSeconds: 150
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

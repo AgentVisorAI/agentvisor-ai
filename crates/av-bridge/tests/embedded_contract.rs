@@ -631,8 +631,23 @@ fn fetch_on_out_of_range_partition_is_a_controlled_error() {
     let dir = tempfile::tempdir().unwrap();
     let broker = EmbeddedBroker::provision(dir.path(), &manifest()).unwrap();
     let parts = broker.partitions("agent.tool_call").unwrap();
-    assert!(broker.fetch("agent.tool_call", parts + 100, 0, 16).is_err());
-    assert!(broker.fetch("agent.nonexistent.topic", 0, 0, 16).is_err());
+    // Pin the class of error, not just "some error" — a refactor that
+    // misclassifies an out-of-range partition as UnknownTopic (or that
+    // makes every partition >= 1 refuse) still fails is_err() but for
+    // the wrong reason. The sibling assertion below already uses
+    // matches!() on UnknownTopic; the partition case should match it.
+    let partition_err = broker
+        .fetch("agent.tool_call", parts + 100, 0, 16)
+        .expect_err("out-of-range partition must be refused");
+    assert!(
+        matches!(partition_err, av_bridge::bus::BusError::Backend(ref msg) if msg.contains("partition")),
+        "out-of-range partition must surface as BusError::Backend(\"partition ... out of range\"), \
+         not any other variant; got {partition_err:?}"
+    );
+    assert!(matches!(
+        broker.fetch("agent.nonexistent.topic", 0, 0, 16),
+        Err(av_bridge::bus::BusError::UnknownTopic(_))
+    ));
 }
 
 /// Adversarial: after retention drains a partition, offsets must remain
@@ -899,7 +914,13 @@ fn fetch_read_only_matches_fetch_and_never_mutates_a_torn_tail() {
         EmbeddedBroker::fetch_read_only(dir.path(), "agent.does_not_exist", 0, 0, 10),
         Err(av_bridge::bus::BusError::UnknownTopic(_))
     ));
-    assert!(EmbeddedBroker::fetch_read_only(dir.path(), "agent.tool_call", 99, 0, 10).is_err());
+    let partition_err = EmbeddedBroker::fetch_read_only(dir.path(), "agent.tool_call", 99, 0, 10)
+        .expect_err("out-of-range partition must be refused by the read-only path too");
+    assert!(
+        matches!(partition_err, av_bridge::bus::BusError::Backend(ref msg) if msg.contains("partition")),
+        "read-only fetch must classify out-of-range partition as BusError::Backend, \
+         matching the writer-side fetch(); got {partition_err:?}"
+    );
     let empty = tempfile::tempdir().unwrap();
     assert!(EmbeddedBroker::fetch_read_only(empty.path(), "agent.tool_call", 0, 0, 10).is_err());
 }

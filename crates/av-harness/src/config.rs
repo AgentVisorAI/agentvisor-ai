@@ -28,6 +28,28 @@ pub const MAX_ONNX_DIMENSION: usize = 16_384;
 /// unit-conversion error (someone thought the field was in ms).
 pub const MAX_SECONDS_INTERVAL: u64 = 24 * 60 * 60;
 
+/// Per-phase timeout applied to both the worker `wait_idle` drain and
+/// the `finalize_sessions` sweep in `finish_shutdown`. Exposed on the
+/// public surface so the deployment-manifest pin tests below can
+/// compute the total shutdown budget from the SAME source of truth
+/// `main.rs` uses — a bump here that isn't matched by a bump in the
+/// K8s / compose grace periods trips CI at build time.
+pub const WORKER_FINALIZE_PHASE_SECS: u64 = 30;
+
+/// Deadline the OpenTelemetry provider gets to flush pending spans on
+/// shutdown when the `otel` feature is enabled. Same "single source of
+/// truth" purpose as [`WORKER_FINALIZE_PHASE_SECS`].
+pub const OTEL_FLUSH_SECS: u64 = 5;
+
+/// Default upstream read timeout (per-chunk) when `upstream_read_timeout_s`
+/// is unset. Public because [`HarnessConfig::effective_drain_timeout`]
+/// needs it to preserve the "one in-flight request cannot outlive the
+/// drain window" invariant its doc-comment promises — using two
+/// separate defaults (30 in the derivation, 60 in the pipeline) let a
+/// legitimate 60 s upstream read outlast a 30 s drain when both were
+/// left unset in the config.
+pub const DEFAULT_UPSTREAM_READ_TIMEOUT_S: u64 = 60;
+
 /// Top-level harness configuration.
 ///
 /// Unknown keys are rejected (`deny_unknown_fields`) so a typo like
@@ -753,13 +775,20 @@ impl HarnessConfig {
 
     /// Effective graceful-shutdown drain budget. Explicit
     /// `shutdown_drain_timeout_s` wins; otherwise derive
-    /// `max(30, upstream_read_timeout_s + 5)` so one legitimate
-    /// in-flight request cannot exceed the drain window (§8.8).
+    /// `max(30, upstream_read_timeout_s + 5)` — falling back to the
+    /// pipeline's own [`DEFAULT_UPSTREAM_READ_TIMEOUT_S`] when the
+    /// field is unset — so one legitimate in-flight request cannot
+    /// exceed the drain window (§8.8). Two different defaults here (30
+    /// in the derivation, 60 in the pipeline) previously let a 60 s
+    /// upstream read outlive a 30 s drain and get truncated by the
+    /// drain deadline while the config was still `None` on both sides.
     pub fn effective_drain_timeout(&self) -> std::time::Duration {
-        let seconds = self.shutdown_drain_timeout_s.unwrap_or_else(|| {
-            self.upstream_read_timeout_s
-                .map_or(30, |read| read.saturating_add(5).max(30))
-        });
+        let read_timeout_s = self
+            .upstream_read_timeout_s
+            .unwrap_or(DEFAULT_UPSTREAM_READ_TIMEOUT_S);
+        let seconds = self
+            .shutdown_drain_timeout_s
+            .unwrap_or_else(|| read_timeout_s.saturating_add(5).max(30));
         std::time::Duration::from_secs(seconds)
     }
 
@@ -1320,6 +1349,36 @@ impl HarnessConfig {
         }
         if self.bridge_data_dir.is_empty() {
             errors.push("bridge_data_dir must not be empty".into());
+        }
+        // Refuse any payout_field that isn't visible ASCII. This closes:
+        //   - empty and whitespace-only cases
+        //   - leading/trailing whitespace
+        //   - control characters
+        //   - non-ASCII (accents, smart quotes)
+        //   - AND the invisible-format class (BOM `\u{FEFF}`, zero-width
+        //     space `\u{200B}`, U+2060 word-joiner, ...) that Rust's
+        //     `trim()` misses because Unicode `White_Space` does not
+        //     include them.
+        // The invisible-format class is precisely what a browser or
+        // rich-editor paste can inject into a config value, and
+        // precisely the class where `serde_json::Value::get(field)`
+        // silently misses the real JSON key — the same silent-bypass
+        // class this field exists to prevent (see the field-level
+        // doc-comment). Real tool schemas' payout field names are
+        // always plain identifiers, so operator UX cost is zero.
+        // `is_ascii_graphic()` is the visible-ASCII predicate
+        // (0x21..=0x7E) shared with `SessionId::parse` and
+        // `InstanceUid::parse`.
+        if self.payout_field.is_empty() || !self.payout_field.chars().all(|c| c.is_ascii_graphic()) {
+            errors.push(
+                "payout_field must be non-empty visible ASCII (letters, digits, and \
+                 common punctuation only). An empty, whitespace, or invisible-format \
+                 (BOM / zero-width) value would match no argument key, silently disabling \
+                 max_payout_usd_micros — the very silent-bypass class this field exists \
+                 to prevent. Omit the key to use the default, or set it to your tool \
+                 schema's payout argument name."
+                    .into(),
+            );
         }
         // Backend selectors: the typed accessors (`bridge()`, `state()`,
         // `embedder()`, `vector()`) are the single site owning the
@@ -2145,20 +2204,35 @@ mod tests {
     fn bad_configs_rejected() {
         assert!(HarnessConfig::from_toml("").is_err()); // missing upstream
         assert!(HarnessConfig::from_toml(
-            r#"upstream_url = "x"
+            r#"upstream_url = "https://api"
                config_version = 99"#
         )
         .is_err());
-        assert!(HarnessConfig::from_toml(
-            r#"upstream_url = "x"
-               default_workflow = "sometimes""#
+        // Each case below must reach the check it names, not fall
+        // through to `upstream_url` scheme validation — otherwise
+        // deleting the specific validator here still leaves the outer
+        // is_err() true. Use a valid upstream_url and pin the actual
+        // rejection reason.
+        let bad_workflow = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               default_workflow = "sometimes""#,
         )
-        .is_err());
-        assert!(HarnessConfig::from_toml(
-            r#"upstream_url = "x"
-               worker_channel_capacity = 0"#
+        .unwrap_err();
+        assert!(
+            bad_workflow.contains("default_workflow"),
+            "the default_workflow allowlist must be what refuses this config, \
+             not the upstream_url scheme check via fallthrough; got {bad_workflow}"
+        );
+        let bad_capacity = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               worker_channel_capacity = 0"#,
         )
-        .is_err());
+        .unwrap_err();
+        assert!(
+            bad_capacity.contains("worker_channel_capacity"),
+            "the worker_channel_capacity bounds check must be what refuses this \
+             config, not the upstream_url scheme check via fallthrough; got {bad_capacity}"
+        );
     }
 
     /// A config from a newer format version must be refused by its declared
@@ -2413,6 +2487,370 @@ mod tests {
         );
     }
 
+    /// The K8s manifest ships a specific `terminationGracePeriodSeconds`
+    /// that must cover the daemon's worst-case shutdown budget for the
+    /// ConfigMap TOML it also ships. If the ConfigMap's
+    /// `shutdown_drain_timeout_s` (or its derivation from
+    /// `upstream_read_timeout_s`) pushes the total above the grace, a
+    /// rolling deploy under a long-tail request SIGKILLs mid-finalize
+    /// and drops receipts — the exact outcome the graceful-shutdown
+    /// machinery exists to prevent. Compute both from the SAME
+    /// manifest so a future edit that touches only one is caught here.
+    #[test]
+    fn shipped_kubernetes_configmap_total_shutdown_fits_termination_grace() {
+        let yaml = include_str!("../../../deploy/kubernetes/agentvisor-ai.yaml");
+        // Parse the ConfigMap TOML the same way the sibling test does.
+        let block_header = "agentvisor.toml: |";
+        let block_start = yaml.find(block_header).unwrap() + block_header.len();
+        let after = yaml[block_start..].trim_start_matches('\n');
+        let mut toml = String::new();
+        for line in after.lines() {
+            if line.trim().is_empty() {
+                toml.push('\n');
+                continue;
+            }
+            if let Some(stripped) = line.strip_prefix("    ") {
+                toml.push_str(stripped);
+                toml.push('\n');
+            } else {
+                break;
+            }
+        }
+        let config = HarnessConfig::from_toml(&toml).unwrap();
+        assert_total_shutdown_fits(
+            "K8s manifest ConfigMap",
+            &config,
+            extract_yaml_int(yaml, "terminationGracePeriodSeconds:").unwrap(),
+            // K8s runs preStop synchronously BEFORE SIGTERM and both
+            // count against the grace period. If the manifest has a
+            // preStop hook, its sleep MUST be parseable — a silent
+            // `unwrap_or(0)` here defeats the pin whenever the hook is
+            // reformatted (YAML block form, single-quoted strings, a
+            // mechanism other than `sleep`), which is exactly the drift
+            // class the test exists to catch.
+            require_prestop_sleep_seconds(yaml),
+        );
+    }
+
+    /// docker-compose.yml + config/harness.docker.toml pair (the
+    /// hardened stack). Same drift class as the K8s test above: a
+    /// tightening of `stop_grace_period` (or a bump in
+    /// `shutdown_drain_timeout_s`) that individually looks safe can
+    /// push the sum over the grace and silently start dropping
+    /// receipts on `docker compose down`.
+    #[test]
+    fn shipped_docker_compose_stop_grace_fits_harness_docker_shutdown() {
+        let compose = include_str!("../../../docker/docker-compose.yml");
+        let toml = include_str!("../../../config/harness.docker.toml");
+        let config = HarnessConfig::from_toml(toml).unwrap();
+        assert_total_shutdown_fits(
+            "docker-compose.yml / harness.docker.toml",
+            &config,
+            extract_yaml_grace_seconds(compose, "stop_grace_period:").unwrap(),
+            // Docker compose has no preStop equivalent.
+            0,
+        );
+    }
+
+    /// docker-compose.minimal.yml + config/harness.container.toml pair
+    /// (the evaluator on-ramp). Advertised in the README as the
+    /// zero-friction try-it flow, so an unclean `docker stop` here is
+    /// exactly the shape a prospect encounters when they Ctrl-C.
+    #[test]
+    fn shipped_docker_compose_minimal_stop_grace_fits_container_shutdown() {
+        let compose = include_str!("../../../docker/docker-compose.minimal.yml");
+        let toml = include_str!("../../../config/harness.container.toml");
+        let config = HarnessConfig::from_toml(toml).unwrap();
+        assert_total_shutdown_fits(
+            "docker-compose.minimal.yml / harness.container.toml",
+            &config,
+            extract_yaml_grace_seconds(compose, "stop_grace_period:").unwrap(),
+            0,
+        );
+    }
+
+    /// Shared budget check. The four shutdown phases in finish_shutdown
+    /// run sequentially, so the worst-case wall time is the sum of
+    /// each phase's cap plus any pre-drain wall time the deployment
+    /// requires BEFORE the phases start.
+    ///   1. HTTP drain: `effective_drain_timeout()` (config-derived).
+    ///   2. Worker wait_idle: [`WORKER_FINALIZE_PHASE_SECS`] — imported
+    ///      from the same source of truth `main.rs`'s `finish_shutdown`
+    ///      call site uses, so a bump there without matching bumps in
+    ///      the deployment manifests trips this test at CI time.
+    ///   3. finalize_sessions: same [`WORKER_FINALIZE_PHASE_SECS`].
+    ///   4. OTel telemetry flush: [`OTEL_FLUSH_SECS`] when the `otel`
+    ///      feature is on (which it is in the default `--features full`
+    ///      container image the shipped configs assume).
+    ///   5. Pre-drain wall time: `shutdown_ready_drain_s` counts
+    ///      against the grace period BEFORE the drain starts (see the
+    ///      field's own doc comment), and a K8s `preStop` hook counts
+    ///      against the grace period BEFORE SIGTERM is even delivered.
+    fn assert_total_shutdown_fits(
+        label: &str,
+        config: &HarnessConfig,
+        grace_seconds: u64,
+        pre_signal_seconds: u64,
+    ) {
+        let drain = config.effective_drain_timeout().as_secs();
+        let total = drain
+            .saturating_add(WORKER_FINALIZE_PHASE_SECS)
+            .saturating_add(WORKER_FINALIZE_PHASE_SECS)
+            .saturating_add(OTEL_FLUSH_SECS)
+            .saturating_add(config.shutdown_ready_drain_s)
+            .saturating_add(pre_signal_seconds);
+        assert!(
+            total <= grace_seconds,
+            "{label}: worst-case shutdown budget {total}s (drain {drain}s + \
+             worker {WORKER_FINALIZE_PHASE_SECS}s + finalize {WORKER_FINALIZE_PHASE_SECS}s + \
+             OTel {OTEL_FLUSH_SECS}s + shutdown_ready_drain_s {}s + pre-signal {}s) \
+             exceeds the grace period {grace_seconds}s — \
+             kubelet/dockerd will SIGKILL mid-finalize and drop receipts on \
+             rolling deploy. Either lower shutdown_drain_timeout_s / \
+             shutdown_ready_drain_s / the preStop sleep in the config or raise \
+             the grace period in the deployment manifest.",
+            config.shutdown_ready_drain_s,
+            pre_signal_seconds,
+        );
+    }
+
+    fn extract_yaml_int(yaml: &str, key: &str) -> Option<u64> {
+        for line in yaml.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix(key) {
+                return rest.trim().parse().ok();
+            }
+        }
+        None
+    }
+
+    /// Parses the shipped K8s manifest's `preStop.exec.command`
+    /// `sleep <n>` argument, accepting the three shapes YAML idiomatically
+    /// admits so a cosmetic reformat can't defeat the pin:
+    ///   1. inline flow list, double-quoted: `command: ["sh", "-c", "sleep 5"]`
+    ///   2. inline flow list, single-quoted: `command: ['sh', '-c', 'sleep 5']`
+    ///   3. block-scalar list — used elsewhere in the same manifest:
+    ///      ```yaml
+    ///      command:
+    ///        - sh
+    ///        - -c
+    ///        - sleep 5
+    ///      ```
+    /// Returns `None` when there is no preStop hook at all (no `preStop:`
+    /// key). Returns `None` when a preStop DOES exist but the shape is
+    /// unrecognized — the caller must panic on that so the drift is
+    /// caught at build time, not papered over with `unwrap_or(0)`.
+    fn extract_prestop_sleep_seconds(yaml: &str) -> Option<u64> {
+        // Locate the FIRST non-comment `preStop:` occurrence. A future
+        // manifest edit that adds `# don't use preStop:` above the real
+        // hook would otherwise anchor our scope to the comment and
+        // trawl the rest of the file for any `sleep`.
+        let (prestop_line_idx, prestop_indent) = yaml.lines().enumerate().find_map(|(i, line)| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') {
+                return None;
+            }
+            if trimmed.starts_with("preStop:") {
+                Some((i, line.len() - trimmed.len()))
+            } else {
+                None
+            }
+        })?;
+        // Scope: from the preStop line to the FIRST line whose indent
+        // is ≤ the preStop line's indent (that line starts a sibling
+        // key, ending the preStop block). Blank lines and comments
+        // don't end the block. The previous heuristic (`\nresources:`)
+        // never fired in real manifests where `resources:` is
+        // indented, so the parser trawled the whole rest of the file
+        // and returned `sleep` values from unrelated containers /
+        // probes / sidecars. Verified by the R8 review's mutation
+        // cases: block-form preStop `sleep 60` + downstream container
+        // `command: ["sh","-c","sleep 3"]` used to return 3, not 60.
+        let mut scope = String::new();
+        for (i, line) in yaml.lines().enumerate().skip(prestop_line_idx) {
+            if i == prestop_line_idx {
+                scope.push_str(line);
+                scope.push('\n');
+                continue;
+            }
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                scope.push_str(line);
+                scope.push('\n');
+                continue;
+            }
+            let indent = line.len() - trimmed.len();
+            if indent <= prestop_indent {
+                break;
+            }
+            scope.push_str(line);
+            scope.push('\n');
+        }
+        // Shape 1 & 2: same-line inline list. Look for either
+        // "sleep <n>" or 'sleep <n>' anywhere in the scoped block.
+        for quote in ['"', '\''] {
+            let marker = format!("{quote}sleep ");
+            if let Some(hit) = scope.find(&marker) {
+                let rest = &scope[hit + marker.len()..];
+                let n: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                if let Ok(seconds) = n.parse() {
+                    return Some(seconds);
+                }
+            }
+        }
+        // Shape 3: block-scalar list. A line whose non-indent content
+        // is `- sleep <n>`. YAML also allows `- sh` / `- -c` / `- sleep 5`
+        // on separate lines; we only need the sleep line.
+        for line in scope.lines() {
+            let stripped = line.trim_start().trim_start_matches('-').trim();
+            if let Some(rest) = stripped.strip_prefix("sleep ") {
+                let n: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                if let Ok(seconds) = n.parse() {
+                    return Some(seconds);
+                }
+            }
+        }
+        None
+    }
+
+    /// Caller-side companion for [`extract_prestop_sleep_seconds`]: a
+    /// shipped manifest with a `preStop:` hook MUST have a parseable
+    /// sleep, or the pin cannot compute the grace budget accurately
+    /// and silently green-lights a hook whose wall time it ignores.
+    /// The R7 review agent caught this exact class: a YAML block-form
+    /// reformat + `sleep 60` bump pushed total shutdown to 190 s
+    /// against the 150 s grace, and the previous `.unwrap_or(0)` let
+    /// the test pass.
+    fn require_prestop_sleep_seconds(yaml: &str) -> u64 {
+        // Only count a REAL preStop line (`preStop:` at the start of a
+        // non-comment line), not the substring inside a comment like
+        // `# don't use preStop:`. Same class of bug the scope-cut
+        // rewrite fixes below.
+        let has_prestop = yaml.lines().any(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with('#') && trimmed.starts_with("preStop:")
+        });
+        if !has_prestop {
+            return 0;
+        }
+        extract_prestop_sleep_seconds(yaml).expect(
+            "shipped K8s manifest has a preStop hook but extract_prestop_sleep_seconds \
+             could not parse its sleep duration — either update the parser to handle \
+             the new shape (inline vs block YAML, quoting style), or if preStop no \
+             longer uses `sleep`, delete this test and its helper. Silently returning \
+             0 would defeat the pin's own purpose: catching a preStop-time bump that \
+             pushes total shutdown past the grace period.",
+        )
+    }
+
+    /// Direct regression tests for the parser — pinning the exact
+    /// mutation cases the R8 review agent proved defeated the previous
+    /// scope-cut heuristic. If these ever regress, the shipped
+    /// K8s pin above no longer measures what its comment claims.
+    #[test]
+    fn extract_prestop_scope_ignores_downstream_sleep_after_the_block() {
+        // Block-form preStop `sleep 60` in one container followed by
+        // an unrelated inline container command with `"sleep 3"` in a
+        // real sibling later in the YAML. Previous version returned
+        // 3 (first inline match anywhere after preStop:), silently
+        // making the pin under-count preStop time by 57 s.
+        let yaml = "\
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+      - name: main
+        lifecycle:
+          preStop:
+            exec:
+              command:
+                - sh
+                - -c
+                - sleep 60
+        resources:
+          limits:
+            cpu: \"2\"
+      - name: sidecar
+        command: [\"sh\", \"-c\", \"sleep 3\"]
+";
+        assert_eq!(
+            extract_prestop_sleep_seconds(yaml),
+            Some(60),
+            "the parser must scope to the preStop block and ignore \
+             downstream containers' inline sleep commands"
+        );
+    }
+
+    #[test]
+    fn extract_prestop_scope_ignores_downstream_probe_sleep() {
+        // Inline preStop `sleep 3` next to a downstream livenessProbe
+        // exec `command: ["sh", "-c", "sleep 300"]`. The key
+        // differentiator is quote-style ordering: Shape-1 scanning
+        // walks `['"', '\'']` and returns on the first hit, so a
+        // single-quoted preStop + double-quoted probe forces the
+        // old (unscoped) parser to hit the probe's `"sleep 300"`
+        // FIRST — returning 300 → pin FALSELY reported "grace
+        // exceeded" for a config that was actually fine. With the
+        // indent-scoped scan, only the preStop's `'sleep 3'` is in
+        // range and the answer is 3. Reviewer note: an earlier
+        // version of this test used matching double quotes for both
+        // hooks, which the OLD parser also happened to return 3 for
+        // (double-quote scan hits the preStop's `"sleep 3"` first),
+        // making the test hollow — it asserted the same value both
+        // implementations produced.
+        let yaml = "\
+spec:
+  containers:
+  - name: main
+    lifecycle:
+      preStop:
+        exec:
+          command: ['sh', '-c', 'sleep 3']
+    livenessProbe:
+      exec:
+        command: [\"sh\", \"-c\", \"sleep 300\"]
+";
+        assert_eq!(extract_prestop_sleep_seconds(yaml), Some(3));
+    }
+
+    #[test]
+    fn require_prestop_skips_commented_out_prestop_line() {
+        // A YAML comment mentioning preStop must not fool the parser
+        // into thinking a hook exists — nor into returning an
+        // unrelated sleep from a downstream probe.
+        let yaml = "\
+spec:
+  containers:
+  - name: main
+    # NOTE: do not add preStop: to this container, see runbook.
+    livenessProbe:
+      exec:
+        command: [\"sh\", \"-c\", \"sleep 90\"]
+";
+        assert_eq!(
+            require_prestop_sleep_seconds(yaml),
+            0,
+            "a comment mentioning preStop: is NOT a real hook; require_prestop \
+             must return 0, not the downstream probe's sleep"
+        );
+    }
+
+    /// Parses `stop_grace_period: 180s` (compose accepts a `s`/`m`/`h`
+    /// suffix). We only ship an `s` suffix, so a bare int and `<n>s`
+    /// are the two shapes to accept.
+    fn extract_yaml_grace_seconds(yaml: &str, key: &str) -> Option<u64> {
+        for line in yaml.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix(key) {
+                let raw = rest.trim().trim_end_matches('s');
+                return raw.parse().ok();
+            }
+        }
+        None
+    }
+
     /// `tool_upstream_url = ""` used to pass validation while runtime
     /// routing gates tool forwarding on `is_some()` — the empty string
     /// silently enabled the tool-upstream branches and only failed at the
@@ -2425,6 +2863,72 @@ mod tests {
         assert!(err.contains("omit"), "should point at omitting the field: {err}");
         assert!(HarnessConfig::from_toml(
             "upstream_url = \"https://api\"\ntool_upstream_url = \"http://tools/mcp\"",
+        )
+        .is_ok());
+    }
+
+    /// `payout_field = ""` silently disabled the payout cap: the empty
+    /// string matches no argument key, `extract_payout_micros` returned
+    /// 0, and `ActionBudget::try_tool_call` skipped the payout dimension
+    /// entirely — including the fail-closed "unbounded payout must
+    /// never spend" refusal. Every peer field in the same class
+    /// (atif_spool_dir, bridge_data_dir, upstream_auth_header, …) is
+    /// checked non-empty; this was the outlier. Refuse at startup.
+    /// Whitespace, control, non-ASCII, and invisible-format (BOM,
+    /// zero-width space) variants are the same class — extremely
+    /// unlikely to match a real tool's JSON key and almost certainly
+    /// a paste typo from a rich-editor or Windows/UTF-8 signature.
+    /// `is_ascii_graphic()` covers all of these in one check.
+    #[test]
+    fn empty_or_whitespace_payout_field_is_rejected() {
+        for hostile in [
+            "",
+            " ",
+            "  ",
+            "\t",
+            " amount_usd",
+            "amount_usd ",
+            // Invisible-format class — the exact one browser paste
+            // injects and that `trim()` misses because Unicode's
+            // White_Space property does not cover these.
+            "\u{FEFF}amount_usd", // BOM at start (UTF-8 signature)
+            "amount_usd\u{FEFF}", // BOM at end
+            "\u{200B}amount_usd", // zero-width space
+            "amount\u{200B}_usd", // zero-width space in the middle
+            "\u{2060}amount_usd", // word-joiner
+            "amount_usd\u{00A0}", // NBSP (a Unicode whitespace)
+            // Non-ASCII: smart quotes / accents / emoji / RTL text.
+            "amount_usd\u{201D}", // right double-quote
+            "amóunt_usd",         // accented Latin
+        ] {
+            // Interpolate the RAW hostile bytes into the TOML — not
+            // `{:?}` Debug format, which emits Rust's `\u{feff}`
+            // escape that TOML doesn't accept (only `\uXXXX` /
+            // `\UXXXXXXXX`, no braces). The prior version parse-
+            // failed at the toml crate for every invisible-format
+            // case, so the payout_field check never actually ran on
+            // the class the fix targets: the R12 review agent proved
+            // that reverting the check to R11's `trim()`-based
+            // predicate still passed 6 of the 8 test cases.
+            //
+            // The `[` / `]` / `{` / `}` / `#` in `hostile` cannot
+            // appear here (all our fixtures are payout-key shapes),
+            // and TOML basic strings interpret embedded `\` and `"`
+            // — but our fixtures contain neither. Raw interpolation
+            // is therefore safe AND correct for THIS test.
+            let toml = format!("upstream_url = \"https://api.openai.com\"\npayout_field = \"{hostile}\"\n");
+            let err = match HarnessConfig::from_toml(&toml) {
+                Err(e) => e,
+                Ok(_) => panic!("must refuse payout_field = {hostile:?}"),
+            };
+            assert!(err.contains("payout_field"), "{hostile:?} => {err}");
+        }
+        // The default (omitted key) is fine.
+        assert!(HarnessConfig::from_toml(r#"upstream_url = "https://api.openai.com""#).is_ok());
+        // An explicit clean name is fine.
+        assert!(HarnessConfig::from_toml(
+            r#"upstream_url = "https://api.openai.com"
+               payout_field = "amount_usd""#,
         )
         .is_ok());
     }
@@ -2519,14 +3023,30 @@ mod tests {
     /// legitimate in-flight request instead of a hardcoded 30 s.
     #[test]
     fn drain_timeout_derives_from_upstream_read_timeout() {
-        // §8.8: unset drain + unset read timeout → 30 s floor.
+        // Unset drain + unset read timeout: falls back to the pipeline's
+        // DEFAULT_UPSTREAM_READ_TIMEOUT_S (60 s) so a legitimate
+        // in-flight request cannot outlive the derived drain. Using
+        // separate defaults (30 in the derivation, 60 in the pipeline)
+        // let a live 60 s read get truncated by a 30 s drain — the
+        // exact "one in-flight request cannot exceed the drain window"
+        // invariant this function's doc-comment promises.
         let base = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
-        assert_eq!(base.effective_drain_timeout().as_secs(), 30);
+        assert_eq!(
+            base.effective_drain_timeout().as_secs(),
+            DEFAULT_UPSTREAM_READ_TIMEOUT_S.saturating_add(5),
+            "unset drain must derive from the SAME default the pipeline uses"
+        );
         // Unset drain + 300 s read timeout → 305 s (one in-flight
         // request can never legitimately outlive the drain window).
         let mut derived = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
         derived.upstream_read_timeout_s = Some(300);
         assert_eq!(derived.effective_drain_timeout().as_secs(), 305);
+        // Unset drain + very small read timeout → 30 s floor (the
+        // documented lower bound; a 5 s read + 5 s doesn't leave enough
+        // slack for shutdown-side work).
+        let mut short = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        short.upstream_read_timeout_s = Some(10);
+        assert_eq!(short.effective_drain_timeout().as_secs(), 30);
         // Explicit value always wins.
         let mut explicit = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
         explicit.upstream_read_timeout_s = Some(300);

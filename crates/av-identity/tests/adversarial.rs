@@ -324,6 +324,68 @@ fn charter_length_cap_boundary_is_exact() {
     );
 }
 
+/// Same 256-code-point cap must apply to every identity string that
+/// flows into logs, signed receipts, and event chains — not only
+/// `charter`. Previously `instance_uid`, `version`, `sub`, `iss`, and
+/// `jti` were bounded only by the ~7 KiB per-claim JWT budget: a
+/// principal holding the identity signing key (typical in
+/// HMAC-shared-secret deployments) could construct claims with
+/// multi-KB fields that bloated every signed receipt's JCS-canonicalized
+/// signing input and every log line for the session.
+#[test]
+fn identity_string_caps_bound_every_field_that_flows_to_receipts() {
+    let keys = ed25519_keys("k1");
+    let v = validator(&keys);
+    for field in ["instance_uid", "version", "sub", "iss", "jti"] {
+        let mut c = claims(&[], 600, None);
+        match field {
+            "instance_uid" => c.instance_uid = "u".repeat(257),
+            "version" => c.version = "v".repeat(257),
+            "sub" => c.sub = "s".repeat(257),
+            "iss" => c.iss = "i".repeat(257),
+            "jti" => c.jti = "j".repeat(257),
+            _ => unreachable!(),
+        }
+        let outcome = v.validate(&mint(&keys, &c));
+        assert!(
+            matches!(&outcome, Err(IdentityError::FieldTooLong { field: got, .. }) if *got == field),
+            "field {field}: 257 chars must be refused as FieldTooLong; got {outcome:?}"
+        );
+    }
+}
+
+/// Scopes[] length and per-scope length must both be bounded. An
+/// unbounded scope list amplifies delegation-verification cost per
+/// request (the parent-covers-child check is per-element), and an
+/// oversized individual scope is the same log-spam / receipt-bloat
+/// vector as the identity strings above.
+#[test]
+fn scope_list_and_element_lengths_are_bounded() {
+    let keys = ed25519_keys("k1");
+    let v = validator(&keys);
+    let mut c = claims(&[], 600, None);
+    c.scopes = (0..65).map(|i| format!("scope-{i}")).collect();
+    assert!(
+        matches!(
+            v.validate(&mint(&keys, &c)),
+            Err(IdentityError::FieldTooLong { field: "scopes", .. })
+        ),
+        "65 scopes must be refused"
+    );
+    let mut c = claims(&[], 600, None);
+    c.scopes = vec!["s".repeat(257)];
+    assert!(
+        matches!(
+            v.validate(&mint(&keys, &c)),
+            Err(IdentityError::FieldTooLong {
+                field: "scopes[]",
+                ..
+            })
+        ),
+        "a 257-char scope must be refused"
+    );
+}
+
 // ---------- Delegation (scope inheritance) ----------
 
 #[test]
@@ -382,6 +444,162 @@ fn child_outliving_parent_rejected() {
         v.validate(&mint(&keys, &child)),
         Err(IdentityError::ExpEscalation { .. })
     ));
+}
+
+/// A child cannot claim `iat` before its parent's `iat`. A hostile
+/// HMAC-shared-secret holder could otherwise mint a backdated child
+/// asserting authorization causality that never happened (the child
+/// claims authority BEFORE the parent that granted it existed);
+/// consumers that treat `claims.iat` as "when this identity became
+/// authorized" (audit pipelines, revocation-cache pruning) are
+/// then lied to.
+#[test]
+fn child_backdated_before_parent_rejected() {
+    let keys = ed25519_keys("k1");
+    let v = validator(&keys);
+    let parent = claims(&["tool:read"], 600, None);
+    let parent_token = mint(&keys, &parent);
+    let mut child = claims(&["tool:read"], 300, Some(parent_token));
+    // Force child.iat < parent.iat.
+    child.iat = parent.iat.saturating_sub(120);
+    // Keep child.exp within parent to avoid tripping ExpEscalation instead.
+    child.exp = parent.exp - 60;
+    let outcome = v.validate(&mint(&keys, &child));
+    assert!(
+        matches!(
+            outcome,
+            Err(IdentityError::IatEscalation {
+                child: c,
+                parent: p,
+            }) if c == child.iat && p == parent.iat
+        ),
+        "expected IatEscalation, got {outcome:?}"
+    );
+}
+
+/// Same temporal-inversion refusal for `nbf`: a child that becomes
+/// usable before the parent's own start (parent's `nbf` when set,
+/// else parent's `iat`) is a forgery. `child.nbf < parent.nbf` and
+/// `child.nbf < parent.iat` (parent nbf absent) are both refused;
+/// `child.nbf == parent.nbf` is allowed.
+#[test]
+fn child_nbf_predating_parent_is_rejected() {
+    let keys = ed25519_keys("k1");
+    let v = validator(&keys);
+    // (a) parent has explicit nbf; child claims nbf earlier.
+    let mut parent = claims(&["tool:read"], 600, None);
+    parent.nbf = Some(parent.iat + 5);
+    let parent_token = mint(&keys, &parent);
+    let mut child = claims(&["tool:read"], 300, Some(parent_token));
+    child.exp = parent.exp - 60;
+    child.nbf = Some(parent.iat); // strictly before parent's nbf
+    assert!(
+        matches!(
+            v.validate(&mint(&keys, &child)),
+            Err(IdentityError::NbfEscalation { .. })
+        ),
+        "child.nbf < parent.nbf must be refused"
+    );
+
+    // (b) parent has no nbf; child.nbf < parent.iat still refused.
+    let parent = claims(&["tool:read"], 600, None);
+    let parent_token = mint(&keys, &parent);
+    let mut child = claims(&["tool:read"], 300, Some(parent_token));
+    child.exp = parent.exp - 60;
+    child.nbf = Some(parent.iat.saturating_sub(1));
+    assert!(matches!(
+        v.validate(&mint(&keys, &child)),
+        Err(IdentityError::NbfEscalation { .. })
+    ));
+
+    // (c) child.nbf == parent.nbf accepted (boundary is strict-less).
+    let mut parent = claims(&["tool:read"], 600, None);
+    parent.nbf = Some(parent.iat + 5);
+    let parent_token = mint(&keys, &parent);
+    let mut child = claims(&["tool:read"], 300, Some(parent_token));
+    child.exp = parent.exp - 60;
+    child.nbf = parent.nbf;
+    assert!(v.validate(&mint(&keys, &child)).is_ok());
+}
+
+/// R16 gap: the R12 `NbfEscalation` check was `if let Some(child_nbf)
+/// = child.nbf` — a child that OMITTED `nbf` sailed past the check
+/// even when its raw `iat` predated the parent's explicit `nbf`. The
+/// `IatEscalation` check (`child.iat < parent.iat`) only catches
+/// backdating past the parent's `iat`, not past the parent's later
+/// effective start (`nbf`). Fix compares EFFECTIVE start times
+/// (`nbf.unwrap_or(iat)`) uniformly on both sides, so this class
+/// closes even when the child omits `nbf`.
+///
+/// Reproducer (must be REFUSED post-R16):
+///  parent{iat=t, nbf=t+5, exp=t+600}
+///  child {iat=t, nbf=None, exp=t+300}
+/// Effective starts: parent=t+5, child=t. child_start < parent_start
+/// → temporal-inversion forgery.
+#[test]
+fn child_without_nbf_predating_parent_nbf_is_rejected() {
+    let keys = ed25519_keys("k1");
+    let v = validator(&keys);
+    let mut parent = claims(&["tool:read"], 600, None);
+    // Parent doesn't become active until 5s after its issue time.
+    parent.nbf = Some(parent.iat + 5);
+    let parent_token = mint(&keys, &parent);
+    // Child inherits parent.iat via `claims()` (both call `now_s()`),
+    // so child.iat == parent.iat < parent.nbf. Child omits `nbf`.
+    let mut child = claims(&["tool:read"], 300, Some(parent_token));
+    child.exp = parent.exp - 60;
+    child.nbf = None;
+    let outcome = v.validate(&mint(&keys, &child));
+    assert!(
+        matches!(outcome, Err(IdentityError::NbfEscalation { .. })),
+        "child.iat < parent.nbf with child.nbf=None must be refused as a \
+         temporal-inversion forgery — the R12 nbf guard missed this input case: {outcome:?}"
+    );
+}
+
+/// R16: the symmetric acceptance case — child omits `nbf`, but its
+/// `iat` is at-or-after the parent's effective start. Must be
+/// accepted (boundary is strict-less on effective starts).
+#[test]
+fn child_without_nbf_at_parent_effective_start_is_accepted() {
+    let keys = ed25519_keys("k1");
+    let v = validator(&keys);
+    let mut parent = claims(&["tool:read"], 600, None);
+    parent.nbf = Some(parent.iat); // effective start == iat
+    let parent_token = mint(&keys, &parent);
+    let mut child = claims(&["tool:read"], 300, Some(parent_token));
+    child.exp = parent.exp - 60;
+    child.nbf = None;
+    // child_start(iat) == parent_start(nbf == iat) → strict-less
+    // does NOT fire; accepted.
+    assert!(v.validate(&mint(&keys, &child)).is_ok());
+}
+
+/// The bidi/zero-width Trojan-Source guard must cover scopes[] too,
+/// not only the six primary identity strings. A scope like
+/// `payout\u{202E}elbast` (right-to-left override) renders as
+/// visually-corrupt junk in operator logs and receipts while still
+/// passing the length cap and the byte-exact scope-subset check —
+/// the same audit-view-spoofing surface the guard exists to close
+/// for `instance_uid`/`charter`/`version`/`sub`/`iss`/`jti`.
+#[test]
+fn scopes_are_bidi_and_zero_width_guarded() {
+    let keys = ed25519_keys("k1");
+    let v = validator(&keys);
+    for hostile in [
+        "payout\u{202E}elbast", // RLO override
+        "read\u{200B}",         // zero-width space
+        "\u{FEFF}scope",        // BOM
+        "\u{2066}wrap\u{2069}", // LRI / PDI
+    ] {
+        let mut c = claims(&[], 600, None);
+        c.scopes = vec![hostile.to_owned()];
+        let outcome = v.validate(&mint(&keys, &c));
+        assert!(
+            matches!(outcome, Err(IdentityError::SpoofingCharacter("scopes[]"))),
+            "scope with hostile invisible char {hostile:?} must be refused; got {outcome:?}"
+        );
+    }
 }
 
 #[test]
