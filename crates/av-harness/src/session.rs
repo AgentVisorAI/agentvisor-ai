@@ -1297,7 +1297,11 @@ mod tests {
     /// key falls through to the total_cost_usd value.
     #[test]
     fn cost_recovery_bridges_extra_and_total_cost_usd() {
-        // (a) extra with the u64 field wins over the ATIF float.
+        // Direct helper tests: complement the end-to-end
+        // integration test below so both the helper AND the branch
+        // selection at recover_unsigned are pinned.
+        // (a) Some(dollars) → micros; the exact fallback the extra-
+        //     missing branch now takes.
         assert_eq!(
             cost_from_atif_total(Some(1.0)).unwrap(),
             av_core::units::USD_MICROS_PER_DOLLAR
@@ -1315,6 +1319,51 @@ mod tests {
         let over_dollars =
             (av_core::error::JCS_SAFE_MAX as f64 * 2.0) / av_core::units::USD_MICROS_PER_DOLLAR as f64;
         assert!(cost_from_atif_total(Some(over_dollars)).is_err());
+    }
+
+    /// End-to-end integration test that pins the actual branch
+    /// selection in `Session::recover_unsigned`. The isolated helper
+    /// tests above pass regardless of whether the caller consults
+    /// them — the R11 review agent showed the standalone
+    /// helper-only test still passes when the fix is reverted to the
+    /// inline `recovered_counter(extra.get("cost_usd_micros")...)`
+    /// pattern. This test drives the actual call path with the exact
+    /// artifact shape the older writer produced: extra present, no
+    /// `cost_usd_micros` key, non-None `metrics.total_cost_usd` at
+    /// the ATIF level.
+    #[test]
+    fn recover_unsigned_bridges_missing_extra_cost_to_atif_fallback() {
+        let identity = identity();
+        let breaker = av_loopdetect::BreakerConfig::default();
+        // The shape an older writer produced: extra carries
+        // tool_calls but NOT cost_usd_micros; the ATIF-level
+        // total_cost_usd carries the actual cost.
+        let metrics = av_atif::FinalMetrics {
+            total_prompt_tokens: Some(0),
+            total_completion_tokens: Some(0),
+            total_cached_tokens: Some(0),
+            total_cost_usd: Some(1.23),
+            extra: Some(serde_json::json!({"tool_calls": 5})),
+            ..av_atif::FinalMetrics::default()
+        };
+        let session = Session::recover_unsigned(
+            "recover-cost".to_owned(),
+            identity,
+            breaker,
+            std::path::PathBuf::from("/tmp/atif.json"),
+            Some(&metrics),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            session.totals.cost_usd_micros.load(Ordering::Acquire),
+            1_230_000,
+            "extra present without cost_usd_micros must fall back to \
+             metrics.total_cost_usd; pre-fix this silently zeroed cost"
+        );
+        // Also confirm extra's tool_calls was still consumed (the
+        // extra-branch didn't fall through wholesale).
+        assert_eq!(session.totals.tool_calls.load(Ordering::Acquire), 5);
     }
 
     /// Receipt stop-reason precedence: a recorded KNOWN reason wins over
