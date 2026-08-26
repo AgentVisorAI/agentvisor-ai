@@ -19,11 +19,17 @@ services:
       - "127.0.0.1:8484:8484"
     # Docker's default stop_grace_period is 10 s — far shorter than the
     # harness's four shutdown phases (HTTP drain, worker wait_idle,
-    # finalize_sessions, telemetry flush; up to 30 s each for the first
-    # three plus 5 s for OTel). Without this override, docker stop /
-    # docker compose down sends SIGKILL mid-finalise, dropping receipts
-    # and truncating ATIF trajectories.
-    stop_grace_period: 120s
+    # finalize_sessions, telemetry flush). This service loads
+    # config/harness.docker.toml, which sets shutdown_drain_timeout_s
+    # = 110 (to fit the 300 s upstream_read_timeout_s streaming
+    # window). Total worst-case budget: 110 (HTTP drain) + 30 (worker
+    # wait_idle) + 30 (finalize_sessions) + 5 (OTel) = 175 s. Without
+    # this override, or with the previous 120 s value which the
+    # earlier comment miscomputed as "30 s each × 3 + 5 = 95 s",
+    # docker stop / docker compose down sent SIGKILL mid-finalize,
+    # dropping receipts and truncating ATIF trajectories. 180 s
+    # leaves a small safety margin.
+    stop_grace_period: 180s
     # Round-24 F2: pair the systemd-side Restart=on-failure hardening
     # (round-19 F7) with a compose-side policy. Without this, a single
     # OOMKill leaves agentvisor-ai Exited with no healthcheck consulted

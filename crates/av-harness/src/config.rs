@@ -2145,20 +2145,35 @@ mod tests {
     fn bad_configs_rejected() {
         assert!(HarnessConfig::from_toml("").is_err()); // missing upstream
         assert!(HarnessConfig::from_toml(
-            r#"upstream_url = "x"
+            r#"upstream_url = "https://api"
                config_version = 99"#
         )
         .is_err());
-        assert!(HarnessConfig::from_toml(
-            r#"upstream_url = "x"
-               default_workflow = "sometimes""#
+        // Each case below must reach the check it names, not fall
+        // through to `upstream_url` scheme validation — otherwise
+        // deleting the specific validator here still leaves the outer
+        // is_err() true. Use a valid upstream_url and pin the actual
+        // rejection reason.
+        let bad_workflow = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               default_workflow = "sometimes""#,
         )
-        .is_err());
-        assert!(HarnessConfig::from_toml(
-            r#"upstream_url = "x"
-               worker_channel_capacity = 0"#
+        .unwrap_err();
+        assert!(
+            bad_workflow.contains("default_workflow"),
+            "the default_workflow allowlist must be what refuses this config, \
+             not the upstream_url scheme check via fallthrough; got {bad_workflow}"
+        );
+        let bad_capacity = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api"
+               worker_channel_capacity = 0"#,
         )
-        .is_err());
+        .unwrap_err();
+        assert!(
+            bad_capacity.contains("worker_channel_capacity"),
+            "the worker_channel_capacity bounds check must be what refuses this \
+             config, not the upstream_url scheme check via fallthrough; got {bad_capacity}"
+        );
     }
 
     /// A config from a newer format version must be refused by its declared
@@ -2411,6 +2426,130 @@ mod tests {
              validation refuses the combination otherwise and the daemon \
              CrashLoopBackOffs at boot"
         );
+    }
+
+    /// The K8s manifest ships a specific `terminationGracePeriodSeconds`
+    /// that must cover the daemon's worst-case shutdown budget for the
+    /// ConfigMap TOML it also ships. If the ConfigMap's
+    /// `shutdown_drain_timeout_s` (or its derivation from
+    /// `upstream_read_timeout_s`) pushes the total above the grace, a
+    /// rolling deploy under a long-tail request SIGKILLs mid-finalize
+    /// and drops receipts — the exact outcome the graceful-shutdown
+    /// machinery exists to prevent. Compute both from the SAME
+    /// manifest so a future edit that touches only one is caught here.
+    #[test]
+    fn shipped_kubernetes_configmap_total_shutdown_fits_termination_grace() {
+        let yaml = include_str!("../../../deploy/kubernetes/agentvisor-ai.yaml");
+        // Parse the ConfigMap TOML the same way the sibling test does.
+        let block_header = "agentvisor.toml: |";
+        let block_start = yaml.find(block_header).unwrap() + block_header.len();
+        let after = yaml[block_start..].trim_start_matches('\n');
+        let mut toml = String::new();
+        for line in after.lines() {
+            if line.trim().is_empty() {
+                toml.push('\n');
+                continue;
+            }
+            if let Some(stripped) = line.strip_prefix("    ") {
+                toml.push_str(stripped);
+                toml.push('\n');
+            } else {
+                break;
+            }
+        }
+        let config = HarnessConfig::from_toml(&toml).unwrap();
+        assert_total_shutdown_fits(
+            "K8s manifest ConfigMap",
+            &config,
+            extract_yaml_int(yaml, "terminationGracePeriodSeconds:").unwrap(),
+        );
+    }
+
+    /// docker-compose.yml + config/harness.docker.toml pair (the
+    /// hardened stack). Same drift class as the K8s test above: a
+    /// tightening of `stop_grace_period` (or a bump in
+    /// `shutdown_drain_timeout_s`) that individually looks safe can
+    /// push the sum over the grace and silently start dropping
+    /// receipts on `docker compose down`.
+    #[test]
+    fn shipped_docker_compose_stop_grace_fits_harness_docker_shutdown() {
+        let compose = include_str!("../../../docker/docker-compose.yml");
+        let toml = include_str!("../../../config/harness.docker.toml");
+        let config = HarnessConfig::from_toml(toml).unwrap();
+        assert_total_shutdown_fits(
+            "docker-compose.yml / harness.docker.toml",
+            &config,
+            extract_yaml_grace_seconds(compose, "stop_grace_period:").unwrap(),
+        );
+    }
+
+    /// docker-compose.minimal.yml + config/harness.container.toml pair
+    /// (the evaluator on-ramp). Advertised in the README as the
+    /// zero-friction try-it flow, so an unclean `docker stop` here is
+    /// exactly the shape a prospect encounters when they Ctrl-C.
+    #[test]
+    fn shipped_docker_compose_minimal_stop_grace_fits_container_shutdown() {
+        let compose = include_str!("../../../docker/docker-compose.minimal.yml");
+        let toml = include_str!("../../../config/harness.container.toml");
+        let config = HarnessConfig::from_toml(toml).unwrap();
+        assert_total_shutdown_fits(
+            "docker-compose.minimal.yml / harness.container.toml",
+            &config,
+            extract_yaml_grace_seconds(compose, "stop_grace_period:").unwrap(),
+        );
+    }
+
+    /// Shared budget check. The four shutdown phases in finish_shutdown
+    /// run sequentially, so the worst-case wall time is the sum of
+    /// each phase's cap:
+    ///   1. HTTP drain: `effective_drain_timeout()` (config-derived)
+    ///   2. Worker wait_idle: hardcoded 30 s in main.rs
+    ///   3. finalize_sessions: hardcoded 30 s in main.rs
+    ///   4. OTel telemetry flush: 5 s when the `otel` feature is on
+    ///      (which it is in the default `--features full` container
+    ///      image the shipped configs assume).
+    fn assert_total_shutdown_fits(label: &str, config: &HarnessConfig, grace_seconds: u64) {
+        const WORKER_WAIT_IDLE_S: u64 = 30;
+        const FINALIZE_SESSIONS_S: u64 = 30;
+        const OTEL_FLUSH_S: u64 = 5;
+        let drain = config.effective_drain_timeout().as_secs();
+        let total = drain
+            .saturating_add(WORKER_WAIT_IDLE_S)
+            .saturating_add(FINALIZE_SESSIONS_S)
+            .saturating_add(OTEL_FLUSH_S);
+        assert!(
+            total <= grace_seconds,
+            "{label}: worst-case shutdown budget {total}s (drain {drain}s + \
+             worker {WORKER_WAIT_IDLE_S}s + finalize {FINALIZE_SESSIONS_S}s + \
+             OTel {OTEL_FLUSH_S}s) exceeds the grace period {grace_seconds}s — \
+             kubelet/dockerd will SIGKILL mid-finalize and drop receipts on \
+             rolling deploy. Either lower shutdown_drain_timeout_s in the \
+             config or raise the grace period in the deployment manifest."
+        );
+    }
+
+    fn extract_yaml_int(yaml: &str, key: &str) -> Option<u64> {
+        for line in yaml.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix(key) {
+                return rest.trim().parse().ok();
+            }
+        }
+        None
+    }
+
+    /// Parses `stop_grace_period: 180s` (compose accepts a `s`/`m`/`h`
+    /// suffix). We only ship an `s` suffix, so a bare int and `<n>s`
+    /// are the two shapes to accept.
+    fn extract_yaml_grace_seconds(yaml: &str, key: &str) -> Option<u64> {
+        for line in yaml.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix(key) {
+                let raw = rest.trim().trim_end_matches('s');
+                return raw.parse().ok();
+            }
+        }
+        None
     }
 
     /// `tool_upstream_url = ""` used to pass validation while runtime
