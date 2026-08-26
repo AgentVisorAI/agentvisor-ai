@@ -1350,6 +1350,27 @@ impl HarnessConfig {
         if self.bridge_data_dir.is_empty() {
             errors.push("bridge_data_dir must not be empty".into());
         }
+        if self.payout_field.is_empty() {
+            // Every peer field in the "wire-format is a bare identifier"
+            // class is checked non-empty; payout_field was the outlier.
+            // Its own doc-comment explicitly warns "a tool using
+            // `amount`, `value`, or `total_usd` silently bypassed the
+            // payout cap with no warning" — so it exists to close a
+            // silent-bypass class of bug. But an empty string here
+            // silently REOPENED the same class: `arguments.get("")`
+            // returns None for every JSON object, so
+            // `extract_payout_micros` returned 0, ActionBudget::try_tool_call
+            // skipped the payout dimension entirely (both the `> 0`
+            // charge branch AND the fail-closed "unbounded payout must
+            // never spend" branch), and a config with
+            // `max_payout_usd_micros = 50_000_000` accepted every
+            // `amount_usd: 999999999` call for zero cost. Refuse.
+            errors.push(
+                "payout_field must not be empty (empty string matches no argument key, \
+                 silently disabling max_payout_usd_micros); omit the key to use the \
+                 default, or set it to your tool schema's payout argument name".into(),
+            );
+        }
         // Backend selectors: the typed accessors (`bridge()`, `state()`,
         // `embedder()`, `vector()`) are the single site owning the
         // legal-value vocabulary and the required-companion rules —
@@ -2756,9 +2777,20 @@ spec:
     #[test]
     fn extract_prestop_scope_ignores_downstream_probe_sleep() {
         // Inline preStop `sleep 3` next to a downstream livenessProbe
-        // exec `command: [\"sh\", \"-c\", \"sleep 300\"]`. Previous
-        // version returned 300 → pin FALSELY reported "grace exceeded"
-        // for a config that was actually fine.
+        // exec `command: ["sh", "-c", "sleep 300"]`. The key
+        // differentiator is quote-style ordering: Shape-1 scanning
+        // walks `['"', '\'']` and returns on the first hit, so a
+        // single-quoted preStop + double-quoted probe forces the
+        // old (unscoped) parser to hit the probe's `"sleep 300"`
+        // FIRST — returning 300 → pin FALSELY reported "grace
+        // exceeded" for a config that was actually fine. With the
+        // indent-scoped scan, only the preStop's `'sleep 3'` is in
+        // range and the answer is 3. Reviewer note: an earlier
+        // version of this test used matching double quotes for both
+        // hooks, which the OLD parser also happened to return 3 for
+        // (double-quote scan hits the preStop's `"sleep 3"` first),
+        // making the test hollow — it asserted the same value both
+        // implementations produced.
         let yaml = "\
 spec:
   containers:
@@ -2766,7 +2798,7 @@ spec:
     lifecycle:
       preStop:
         exec:
-          command: [\"sh\", \"-c\", \"sleep 3\"]
+          command: ['sh', '-c', 'sleep 3']
     livenessProbe:
       exec:
         command: [\"sh\", \"-c\", \"sleep 300\"]
@@ -2822,6 +2854,35 @@ spec:
         assert!(err.contains("omit"), "should point at omitting the field: {err}");
         assert!(HarnessConfig::from_toml(
             "upstream_url = \"https://api\"\ntool_upstream_url = \"http://tools/mcp\"",
+        )
+        .is_ok());
+    }
+
+    /// `payout_field = ""` silently disabled the payout cap: the empty
+    /// string matches no argument key, `extract_payout_micros` returned
+    /// 0, and `ActionBudget::try_tool_call` skipped the payout dimension
+    /// entirely — including the fail-closed "unbounded payout must
+    /// never spend" refusal. Every peer field in the same class
+    /// (atif_spool_dir, bridge_data_dir, upstream_auth_header, …) is
+    /// checked non-empty; this was the outlier. Refuse at startup.
+    #[test]
+    fn empty_payout_field_is_rejected() {
+        let err = HarnessConfig::from_toml(
+            r#"upstream_url = "https://api.openai.com"
+               payout_field = """#,
+        )
+        .unwrap_err();
+        assert!(err.contains("payout_field"), "{err}");
+        assert!(
+            err.contains("silently disabling"),
+            "should point at the exact silent-bypass class: {err}"
+        );
+        // The default (omitted key) is fine.
+        assert!(HarnessConfig::from_toml(r#"upstream_url = "https://api.openai.com""#).is_ok());
+        // An explicit non-empty name is fine.
+        assert!(HarnessConfig::from_toml(
+            r#"upstream_url = "https://api.openai.com"
+               payout_field = "amount_usd""#,
         )
         .is_ok());
     }
