@@ -93,6 +93,15 @@ pub struct AppState {
     /// `enqueue_transient_failure`.
     pub(crate) identity_rejection_window: Arc<parking_lot::Mutex<(Instant, u32)>>,
     pub(crate) journal_key: [u8; 32],
+    /// Tracks in-flight `mcp_call_inner` detached spawns so
+    /// `finish_shutdown` can await their completion between HTTP drain
+    /// and `worker.wait_idle`. Without this barrier, a client-
+    /// disconnected `mcp_call` running past axum's graceful drain
+    /// could reach `worker.try_submit` AFTER `wait_idle` returned,
+    /// stranding a fresh job across `finalize_sessions` and tripping
+    /// `av_shutdown_session_close_timeouts_total` on an otherwise-
+    /// recoverable session.
+    pub mcp_inflight: Arc<crate::inflight::InflightTracker>,
 }
 
 /// Pre-resolved metric handles for the request hot path so the
@@ -1159,6 +1168,25 @@ impl AppState {
              their close; the coincident session id in the shutdown warn log is the \
              correlation key. Distinct from av_http_shutdown_drain_timeouts_total.",
         );
+        // Shutdown-time MCP-inflight drain-deadline counter. Fires when
+        // the shutdown barrier waiting for detached mcp_call_inner
+        // spawns to complete hits its 5 s deadline before `wait_idle`.
+        // Without this barrier the detached body could reach
+        // `worker.try_submit` AFTER `wait_idle` returned, race
+        // `finalize_sessions`, and trip
+        // `av_shutdown_session_close_timeouts_total` on an otherwise-
+        // recoverable session. Pre-registration matches the rest of
+        // the block — any occurrence must be visible to `rate() > 0`.
+        metrics.counter(
+            "av_shutdown_mcp_drain_timeouts_total",
+            "Shutdown MCP-inflight drain hit its 5 s deadline before every detached \
+             mcp_call_inner spawn completed. Downstream effects: some detached \
+             tool bodies were interrupted at close and their sessions may be \
+             quarantined at restart-time recovery. Any occurrence during a \
+             rollout indicates a class of tool calls that regularly outlive HTTP \
+             drain (long-running upstream tool, hung sandbox); check the \
+             coincident tracing warn line.",
+        );
         // Per-tick recovery-scan cap counter. Every recovery pass that
         // walks `read_dir` yields after `MAX_RECOVERY_ENTRIES_PER_TICK`
         // entries so a poisoned spool (millions of stale files) does
@@ -1336,6 +1364,7 @@ impl AppState {
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             identity_rejection_window: Arc::new(parking_lot::Mutex::new((Instant::now(), 0))),
             journal_key,
+            mcp_inflight: Arc::new(crate::inflight::InflightTracker::new()),
         })
     }
 

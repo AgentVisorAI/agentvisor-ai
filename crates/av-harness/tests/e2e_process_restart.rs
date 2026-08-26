@@ -822,6 +822,7 @@ vector_backend = "memory"
         "av_admission_refund_panics_total",
         "av_idle_close_timeouts_total",
         "av_shutdown_session_close_timeouts_total",
+        "av_shutdown_mcp_drain_timeouts_total",
         // Per-tick recovery-scan cap: one labelled series per pass.
         // Absent series → `rate() > 0` alerts miss the FIRST fire.
         "av_recovery_scan_capped_total{pass=\"adopt_strict_atif\"}",
