@@ -211,6 +211,7 @@ impl RecoveryPass for ReplayLifecycleOutboxesPass {
                 ctx.spool_dir,
                 ctx.journal_key,
                 std::sync::Arc::clone(bridge),
+                ctx.metrics,
             )
             .await?;
             Ok(outcome)
@@ -352,7 +353,17 @@ impl RecoveryPass for QuarantineOrphanJsonPass {
                 }
                 Err(error) => return Err(FinalizeError::atif_source(error)),
             };
+            let mut examined = 0usize;
             while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::atif_source)? {
+                examined = examined.saturating_add(1);
+                if examined > crate::reconciler::MAX_RECOVERY_ENTRIES_PER_TICK {
+                    crate::reconciler::bump_recovery_scan_cap(
+                        ctx.metrics,
+                        "quarantine_orphan_json",
+                        examined,
+                    );
+                    break;
+                }
                 let path = entry.path();
                 if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
                     continue;

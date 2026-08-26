@@ -1113,6 +1113,32 @@ impl AppState {
             "Admission-debit refund closure panicked in Drop; the session \
              and principal ledgers retain the debit until operator repair",
         );
+        // Per-tick recovery-scan cap counter. Every recovery pass that
+        // walks `read_dir` yields after `MAX_RECOVERY_ENTRIES_PER_TICK`
+        // entries so a poisoned spool (millions of stale files) does
+        // not starve legitimate recovery work. Pre-registering each
+        // labelled series eagerly closes the same "lazy series that
+        // rate()>0 never sees on the FIRST fire" defect the counters
+        // above defeat. Keep this labels list in-sync with every call
+        // to `bump_recovery_scan_cap`.
+        for pass in [
+            "adopt_strict_atif",
+            "recover_signed_journals",
+            "consolidate_step_journals",
+            "retry_marked_promotions",
+            "remove_acked_outboxes",
+            "replay_lifecycle_outboxes",
+            "quarantine_orphan_json",
+        ] {
+            metrics.counter(
+                &format!("av_recovery_scan_capped_total{{pass=\"{pass}\"}}"),
+                "Recovery pass hit the per-tick entry-scan cap and returned \
+                 early; the next tick will re-open the directory and resume. \
+                 A steady rate > 0 indicates a poisoned spool (millions of \
+                 stale files) that will starve legitimate recovery work \
+                 until an operator quarantines it.",
+            );
+        }
         // Reconciler ticks scan the ATIF spool dir, which can be large;
         // finalisation waits for worker drain + broker publish. Wide
         // bounds keep long-tail p99 useful under load.
