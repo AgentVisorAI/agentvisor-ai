@@ -11,6 +11,53 @@
 use std::io;
 use std::path::Path;
 
+/// POSIX `O_NOFOLLOW` open-flag value for the target platform. Used
+/// alongside `std::os::unix::fs::OpenOptionsExt::custom_flags` to
+/// refuse to follow a symlink at the file path being opened —
+/// closes the symlink-plant confused-deputy class where a co-tenant
+/// with write access to a spool directory pre-plants a symlink at
+/// a deterministic file path so the harness's authenticated append
+/// (running as the harness UID) is redirected to a file the
+/// attacker can then read or overwrite.
+///
+/// Rather than pull in a `libc` / `rustix` dependency for one
+/// constant this returns the POSIX-defined value directly; the
+/// values are stable ABI and are drawn from the libc crate's
+/// `constant.O_NOFOLLOW` documentation. On unknown Unix-like
+/// platforms we fall back to the Linux value (a conservative
+/// choice: a mismatch would surface as an `ELOOP`/`ENOTDIR`/`EACCES`
+/// at first symlink attempt, not silent success).
+#[cfg(unix)]
+pub const fn unix_o_nofollow() -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        0x20000
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        0x100
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )))]
+    {
+        0x20000
+    }
+}
+
 /// Return just the file name of `path` as a `&str`,
 /// suitable for `path = %basename(&path)` in tracing macros.
 ///
@@ -75,7 +122,24 @@ pub fn create_dir_all_synced(path: &Path) -> io::Result<()> {
     if missing.is_empty() {
         return Ok(());
     }
-    std::fs::create_dir_all(path)?;
+    // Same posture as `write_atomic`: pin the directory bit to 0700
+    // on Unix so the spool tree's confidentiality doesn't ride on
+    // the operator's umask. All spool contents (ATIF trajectories,
+    // receipts, journal envelopes) are already 0o600, but a 0755
+    // parent lets a co-tenant enumerate the deterministic
+    // `sha256(session-id)[..32]` file stems for probing / brute
+    // force even when they cannot read the contents.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(path)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)?;
+    }
     // Highest new ancestor first, so each synced parent already exists.
     for dir in missing.iter().rev() {
         if let Some(parent) = dir.parent() {
@@ -240,10 +304,25 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     create_dir_all_synced(parent)?;
     let temporary = path.with_extension(format!("{}.tmp", crate::new_event_uid()));
     let mut guard = TempPathGuard::new(temporary.clone());
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
+    // The temp file is `create_new` (exclusive create — refuses a
+    // pre-planted symlink, per the audit-integrity contract this
+    // module documents). Pair that with an EXPLICIT 0o600 mode on
+    // Unix so the file's confidentiality does not depend on the
+    // caller's umask. ATIF trajectories carry full prompt/response
+    // transcripts; receipts carry identity, cost, and instance_uid;
+    // `.session.json` sidecars carry auth session state. On a host
+    // where umask is the default 0022, a bare `create_new` produces
+    // 0644 — world-readable by any co-tenant with `execute` on the
+    // spool directory. The 0o600 mode closes that surface uniformly
+    // for every spool site that uses this helper.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     std::fs::rename(&temporary, path)?;
@@ -370,7 +449,103 @@ mod tests {
         assert!(read_capped_string(&path, 4).is_err(), "over-cap read must refuse");
     }
 
-    /// `basename` is a canonical name for the fix to
+    /// R18: spool files created via `write_atomic` MUST be 0o600 on
+    /// Unix. ATIF trajectories carry full user transcripts, receipts
+    /// carry identity + cost, journal metadata carries session
+    /// state. Any co-tenant with `execute` on the spool directory
+    /// used to be able to `cat` these files under the default 0022
+    /// umask; the explicit mode bit closes that surface uniformly.
+    #[test]
+    #[cfg(unix)]
+    fn write_atomic_produces_owner_only_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        // A subdirectory that doesn't yet exist forces
+        // `create_dir_all_synced` to run too.
+        let path = dir.path().join("nested").join("payload.bin");
+        write_atomic(&path, b"secret").unwrap();
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            file_mode, 0o600,
+            "spool files must be owner-only; got {file_mode:o}"
+        );
+        // And the newly-created ancestor dir must be 0o700 too, so a
+        // co-tenant with a permissive umask on the harness process
+        // still can't enumerate the deterministic
+        // sha256-of-session-id filename stems.
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "spool subdirectories must be owner-only; got {dir_mode:o}"
+        );
+    }
+
+    /// R18: `write_atomic` MUST refuse to follow a symlink placed
+    /// at the destination path (the symlink-plant confused-deputy
+    /// class). The exclusive-create on the temp closes the temp
+    /// side; the destination side is closed because `rename` on
+    /// Unix REPLACES the target atomically (never follows). Verify
+    /// end-to-end: a symlink at `path` gets replaced by the new
+    /// file, and the symlink target is UNCHANGED.
+    #[test]
+    #[cfg(unix)]
+    fn write_atomic_replaces_symlink_without_following_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim-should-be-untouched");
+        std::fs::write(&victim, b"original-target-contents").unwrap();
+        let spool_target = dir.path().join("payload.bin");
+        std::os::unix::fs::symlink(&victim, &spool_target).unwrap();
+        write_atomic(&spool_target, b"fresh").unwrap();
+        // The symlink was replaced (not followed).
+        assert_eq!(std::fs::read(&spool_target).unwrap(), b"fresh");
+        // The symlink's original target is untouched.
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"original-target-contents",
+            "write_atomic must not follow the symlink — it replaces at rename time"
+        );
+    }
+
+    /// R18: `unix_o_nofollow()` returns the platform's actual
+    /// `O_NOFOLLOW` value — verify by using it as a flag on
+    /// `OpenOptions::custom_flags` and confirming that a symlink
+    /// open FAILS while a regular file open succeeds. A wrong-value
+    /// constant would either silently follow symlinks (bug) or
+    /// error on regular files (also bug); this test catches both.
+    #[test]
+    #[cfg(unix)]
+    fn unix_o_nofollow_flag_refuses_symlinks_but_permits_regular_files() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        // Regular file with the flag: opens fine.
+        let regular = dir.path().join("regular");
+        std::fs::write(&regular, b"hi").unwrap();
+        let ok = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(unix_o_nofollow())
+            .open(&regular);
+        assert!(ok.is_ok(), "O_NOFOLLOW must permit regular files: {ok:?}");
+        // Symlink with the flag: MUST fail (ELOOP on most Unix).
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"target").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        let err = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(unix_o_nofollow())
+            .open(&link);
+        assert!(
+            err.is_err(),
+            "O_NOFOLLOW must refuse symlinks (guards the confused-deputy \
+             class); constant value {:#x} may be wrong for this platform",
+            unix_o_nofollow()
+        );
+    }
+
     /// the "path.display() in tracing → OTLP → SIEM leak" class.
     /// Assert the property callers rely on: never returns the
     /// parent directory, always the last segment.
