@@ -493,20 +493,55 @@ impl IdentityValidator {
         if claims.charter.is_empty() {
             return Err(IdentityError::EmptyField("charter"));
         }
-        // docs/reference/LIMITS.md documents a 256-code-point charter cap
-        // ("longer are refused with 400"); the charter flows verbatim into
-        // logs, receipts, and event chains, so an unbounded (up to the
-        // 8 KiB token cap) attacker-chosen string is also log-spam
-        // surface. Enforce the documented limit.
-        const MAX_CHARTER_CHARS: usize = 256;
-        if claims.charter.chars().count() > MAX_CHARTER_CHARS {
-            return Err(IdentityError::FieldTooLong {
-                field: "charter",
-                max: MAX_CHARTER_CHARS,
-            });
-        }
         if claims.version.is_empty() {
             return Err(IdentityError::EmptyField("version"));
+        }
+        // docs/reference/LIMITS.md documents a 256-code-point charter cap
+        // ("longer are refused with 400"); the same reasoning applies to
+        // EVERY identity string that flows into logs, receipts, and
+        // event chains — an unbounded (up to the ~7 KiB per-claim JWT
+        // budget) attacker-chosen field is log-spam surface and — since
+        // instance_uid/version bind into every SIGNED receipt — bloats
+        // the JCS-canonicalized signing input on every request. Cap all
+        // identity strings at the same limit for one consistent rule.
+        // Threat model: an HMAC-shared-secret deployment where multiple
+        // principals hold the identity signing key. Any of them can
+        // construct a valid JWT with hostile-length claims.
+        const MAX_IDENTITY_STRING_CHARS: usize = 256;
+        for (name, value) in [
+            ("instance_uid", claims.instance_uid.as_str()),
+            ("charter", claims.charter.as_str()),
+            ("version", claims.version.as_str()),
+            ("sub", claims.sub.as_str()),
+            ("iss", claims.iss.as_str()),
+            ("jti", claims.jti.as_str()),
+        ] {
+            if value.chars().count() > MAX_IDENTITY_STRING_CHARS {
+                return Err(IdentityError::FieldTooLong {
+                    field: name,
+                    max: MAX_IDENTITY_STRING_CHARS,
+                });
+            }
+        }
+        // Bound the scopes array too: an unbounded list (or an
+        // individually oversized scope) is the same log-spam / receipt-
+        // bloat vector as the strings above, and the delegation-chain
+        // subset check runs a per-element comparison so a 10000-entry
+        // scopes[] amplifies delegation-verification cost per request.
+        const MAX_SCOPES: usize = 64;
+        if claims.scopes.len() > MAX_SCOPES {
+            return Err(IdentityError::FieldTooLong {
+                field: "scopes",
+                max: MAX_SCOPES,
+            });
+        }
+        for scope in &claims.scopes {
+            if scope.chars().count() > MAX_IDENTITY_STRING_CHARS {
+                return Err(IdentityError::FieldTooLong {
+                    field: "scopes[]",
+                    max: MAX_IDENTITY_STRING_CHARS,
+                });
+            }
         }
         // Trojan-Source guard: any bidi override or zero-width character in
         // a rendered identity field would spoof how it looks in operator
