@@ -24,6 +24,11 @@ model User {
   // "issuedAt" timestamp are cleared on successful use or expiry (24h).
   resetTokenHash String?
   resetTokenAt   DateTime?
+  // JWT revocation fence — every session whose iat is before this timestamp
+  // is rejected in authenticate(). Bumped on logout and password change so
+  // a captured cookie stops working immediately even though the JWT itself
+  // is still cryptographically valid until its 7-day exp.
+  sessionRevokedAt DateTime?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 

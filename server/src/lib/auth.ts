@@ -57,11 +57,12 @@ export interface SessionClaims {
   sub: string; // user id
   orgId: string; // active org
   membershipRole: "owner" | "admin" | "member";
+  iat: number; // JWT issued-at, seconds since epoch — checked against user.sessionRevokedAt
 }
 
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
 
-export async function mintSession(claims: SessionClaims): Promise<string> {
+export async function mintSession(claims: Omit<SessionClaims, "iat">): Promise<string> {
   return new SignJWT({ ...claims })
     .setProtectedHeader({ alg: "HS256", typ: "JWT" })
     .setIssuer(env.JWT_ISSUER)
@@ -83,6 +84,7 @@ export async function verifySession(
     if (
       typeof payload.sub !== "string" ||
       typeof payload.orgId !== "string" ||
+      typeof payload.iat !== "number" ||
       (payload.membershipRole !== "owner" &&
         payload.membershipRole !== "admin" &&
         payload.membershipRole !== "member")
@@ -93,6 +95,7 @@ export async function verifySession(
       sub: payload.sub,
       orgId: payload.orgId,
       membershipRole: payload.membershipRole,
+      iat: payload.iat,
     };
   } catch {
     return null;

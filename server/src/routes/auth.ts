@@ -207,7 +207,23 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     });
   });
 
-  app.post("/logout", async (_req, reply) => {
+  app.post("/logout", async (req, reply) => {
+    // Bump the user's sessionRevokedAt fence so a captured cookie can't
+    // be replayed after logout, even though the JWT itself is still
+    // cryptographically valid until its 7-day exp. authenticate()
+    // checks jwt.iat < user.sessionRevokedAt and rejects.
+    if (req.session) {
+      await db.user
+        .update({
+          where: { id: req.session.sub },
+          data: { sessionRevokedAt: new Date() },
+        })
+        .catch((err) => {
+          // Log but don't fail logout — clearing the cookie is the
+          // essential piece; the fence bump is defense in depth.
+          req.log.warn({ err }, "logout_revoke_bump_failed");
+        });
+    }
     clearSessionCookie(reply);
     return reply.send({ ok: true });
   });
@@ -522,8 +538,16 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     const passwordHash = await hashPassword(body.data.newPassword);
     await db.user.update({
       where: { id: user.id },
-      // Clear the reset fields — one-shot use.
-      data: { passwordHash, resetTokenHash: null, resetTokenAt: null },
+      // Clear the reset fields — one-shot use. Also bump the
+      // sessionRevokedAt fence so any live cookie minted before this
+      // password change is invalidated on next request. A leaked
+      // cookie should stop working the moment the password is reset.
+      data: {
+        passwordHash,
+        resetTokenHash: null,
+        resetTokenAt: null,
+        sessionRevokedAt: new Date(),
+      },
     });
     return reply.send({ ok: true });
   });

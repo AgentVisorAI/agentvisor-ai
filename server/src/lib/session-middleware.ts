@@ -7,11 +7,19 @@ import { db } from "../db.js";
  * Populates `request.session` when a valid session cookie is present. Never
  * throws — routes that require auth call `requireSession()` below.
  *
- * Also confirms the (userId, orgId) pair in the token is still an active
- * membership. This closes a real security gap where a user removed from
- * an org would keep read/write access via their existing JWT for the
- * remainder of the 7-day TTL. The extra findUnique is on the compound
- * unique index so it stays sub-millisecond.
+ * Also confirms that:
+ *   1. the (userId, orgId) pair in the token is still an active membership
+ *      — closes the gap where a user removed from an org would keep
+ *      read/write access via their existing JWT for the remainder of the
+ *      7-day TTL;
+ *   2. the token's iat is not before the user's sessionRevokedAt fence
+ *      — closes the JWT logout replay gap where a captured cookie would
+ *      keep working after the user logged out. Bumping sessionRevokedAt
+ *      on logout and password change immediately invalidates every JWT
+ *      minted before that moment.
+ *
+ * One findUnique on users (with a joined membership include) covers both
+ * checks in a single sub-millisecond query against indexed columns.
  */
 export async function authenticate(
   req: FastifyRequest,
@@ -21,8 +29,24 @@ export async function authenticate(
   if (!token) return;
   const claims = await verifySession(token);
   if (!claims) return;
-  const stillMember = await assertOrgMembership(claims.sub, claims.orgId);
-  if (!stillMember) return;
+  const user = await db.user.findUnique({
+    where: { id: claims.sub },
+    select: {
+      sessionRevokedAt: true,
+      memberships: {
+        where: { orgId: claims.orgId },
+        select: { id: true },
+      },
+    },
+  });
+  if (!user) return;
+  if (user.memberships.length === 0) return;
+  if (
+    user.sessionRevokedAt &&
+    claims.iat * 1000 < user.sessionRevokedAt.getTime()
+  ) {
+    return;
+  }
   req.session = claims;
 }
 
