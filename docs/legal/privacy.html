@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Privacy Policy · AgentVisor AI</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="../style.css">
+<style>
+  main { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem; line-height: 1.6; }
+  main h1 { font-size: 1.75rem; }
+  main h2 { font-size: 1.2rem; margin-top: 2rem; }
+  main .draft { background: #fff8e1; border: 1px solid #f0d178; padding: 0.75rem 1rem; border-radius: 8px; color: #6d4b00; font-size: 0.9rem; }
+  main a { color: #0a58ff; }
+</style>
+</head>
+<body>
+<main>
+  <p class="draft">
+    <strong>Draft (not yet reviewed by counsel).</strong>
+    Ship-blocker before real customer signups: counsel-reviewed copy.
+  </p>
+
+  <h1>Privacy policy</h1>
+  <p>Last updated: 2026-08-26.</p>
+
+  <h2>1. What we collect</h2>
+  <ul>
+    <li><strong>Account:</strong> email, display name, argon2id password hash, org name.</li>
+    <li><strong>Session receipts:</strong> summaries your daemon posts — session id, agent name, model, token counts, cost estimate, tool-call metadata, blocked-vs-allowed markers, Ed25519 receipt signatures.</li>
+    <li><strong>Server logs:</strong> request method, path, status, latency, IP, request-id. Log lines never contain your password, session tokens, or reset tokens (verified with pino-redact + audit).</li>
+    <li><strong>Uptime metrics:</strong> aggregate counts + latency histograms, no per-user granularity.</li>
+  </ul>
+
+  <h2>2. What we do NOT collect</h2>
+  <ul>
+    <li>LLM prompt text</li>
+    <li>LLM completion text</li>
+    <li>Tool call arguments (default; opt-in stores hashes only)</li>
+    <li>Your customers' end-user PII</li>
+  </ul>
+
+  <p>These live inside your infrastructure. Our daemon runs in your
+  environment; only the summaries and receipts leave.</p>
+
+  <h2>3. How we store it</h2>
+  <p>Encrypted in transit (TLS 1.2+), encrypted at rest (managed
+  Postgres provider defaults; typically AES-256). Passwords hashed with
+  argon2id (19 MiB × 2 iterations × 1 lane, meets OWASP 2024 baseline).</p>
+
+  <h2>4. Who we share it with</h2>
+  <p>Nobody, unless legally compelled. Sub-processors:</p>
+  <ul>
+    <li><strong>Fly.io</strong> — API hosting (Europe/US regions).</li>
+    <li><strong>Neon</strong> — managed Postgres (or equivalent).</li>
+    <li><strong>Cloudflare</strong> — TLS termination + edge caching for the console SPA.</li>
+    <li><strong>GitHub</strong> — source control, container image registry.</li>
+  </ul>
+
+  <h2>5. Your rights (GDPR + CCPA baseline)</h2>
+  <ul>
+    <li><strong>Export:</strong> POST /api/v1/auth/me/export (password re-entry required) — full JSON dump of your org.</li>
+    <li><strong>Delete:</strong> POST /api/v1/auth/me/delete-account (owner + password + confirmation string required) — cascading delete.</li>
+    <li><strong>Access + rectify:</strong> everything is editable in the console.</li>
+    <li><strong>Object + restrict:</strong> email hello@agentvisorai.me for anything you can't do in-app.</li>
+  </ul>
+
+  <h2>6. Cookies</h2>
+  <p>One cookie: <code>av_session</code>, an HS256 JWT, httpOnly,
+  SameSite=Lax, Secure in production, 7-day TTL. No tracking cookies.
+  No third-party trackers. No analytics beacons.</p>
+
+  <h2>7. Data retention</h2>
+  <p>We keep your data as long as your account exists. Deleting your
+  account triggers immediate cascade delete. Nightly backups are
+  retained for 30 days per <a href="https://github.com/AgentVisorAI/agentvisor-ai/blob/main/.github/workflows/backup.yml">the backup workflow</a> — after that a
+  restore isn't possible.</p>
+
+  <h2>8. Children</h2>
+  <p>Not for anyone under 16.</p>
+
+  <h2>9. Contact</h2>
+  <p>Data protection questions or requests:
+  <a href="mailto:privacy@agentvisorai.me">privacy@agentvisorai.me</a>.
+  Security: <a href="../.well-known/security.txt">security.txt</a>.</p>
+</main>
+</body>
+</html>

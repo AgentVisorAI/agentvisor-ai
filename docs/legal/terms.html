@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Terms of Service · AgentVisor AI</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="../style.css">
+<style>
+  main { max-width: 720px; margin: 0 auto; padding: 3rem 1.5rem; line-height: 1.6; }
+  main h1 { font-size: 1.75rem; }
+  main h2 { font-size: 1.2rem; margin-top: 2rem; }
+  main .draft { background: #fff8e1; border: 1px solid #f0d178; padding: 0.75rem 1rem; border-radius: 8px; color: #6d4b00; font-size: 0.9rem; }
+  main a { color: #0a58ff; }
+</style>
+</head>
+<body>
+<main>
+  <p class="draft">
+    <strong>Draft (not yet reviewed by counsel).</strong>
+    This page ships to make the launch surface complete. Before real
+    customer signups it must be replaced by counsel-reviewed copy.
+  </p>
+
+  <h1>Terms of service</h1>
+  <p>Last updated: 2026-08-26.</p>
+
+  <p>By signing up for AgentVisor AI (the "Service"), you agree to
+  these terms. If you don't agree, don't sign up.</p>
+
+  <h2>1. The service</h2>
+  <p>AgentVisor AI is a policy enforcement + audit-receipt layer for AI
+  agents. You install a small daemon in your infrastructure; it enforces
+  the guardrails you configure and posts signed receipts to the hosted
+  control plane at <a href="https://api.agentvisorai.me">api.agentvisorai.me</a>.</p>
+
+  <h2>2. Your data</h2>
+  <p>We store the metadata your daemon posts (session summaries, tool
+  invocations, receipt signatures). We do NOT store the plaintext LLM
+  prompts, completions, or tool arguments unless you explicitly opt in
+  via a workspace setting. Password hashes use argon2id. Everything is
+  encrypted in transit (TLS) and at rest (managed provider defaults).</p>
+
+  <p>You can export all your data via the console (Settings → Export)
+  at any time. You can delete your account (Settings → Delete Account)
+  which triggers a cascade delete of every deployment, session, event,
+  and receipt in your organization.</p>
+
+  <h2>3. Acceptable use</h2>
+  <p>Don't use the service to enforce policies on illegal content,
+  spam, or copyright-infringing material. Don't try to break into other
+  tenants' data. Don't try to make the service unavailable to others
+  (i.e., no DoS).</p>
+
+  <h2>4. Uptime</h2>
+  <p>The pitch-stage service runs on free-tier infrastructure. See
+  <a href="../STATUS.md">STATUS</a> for current SLOs. We don't yet
+  offer contractual uptime guarantees.</p>
+
+  <h2>5. Fees</h2>
+  <p>The pitch demo is free. Paid tiers, if introduced, will require an
+  additional agreement.</p>
+
+  <h2>6. Termination</h2>
+  <p>You can delete your account at any time. We can suspend an
+  account that violates §3 with reasonable notice, except for
+  incidents that require immediate action (security).</p>
+
+  <h2>7. Limitation of liability</h2>
+  <p>The service is provided "as is." We're not liable for
+  indirect damages. This is the standard limitation you'd expect from
+  a startup SaaS.</p>
+
+  <h2>8. Governing law</h2>
+  <p>These terms are governed by the laws of France. Any disputes go to
+  the courts of Paris.</p>
+
+  <h2>9. Contact</h2>
+  <p>Questions? <a href="mailto:hello@agentvisorai.me">hello@agentvisorai.me</a>.
+  Security disclosures: <a href="mailto:security@agentvisorai.me">security@agentvisorai.me</a>
+  or see our <a href="../.well-known/security.txt">security.txt</a>.</p>
+</main>
+</body>
+</html>

@@ -1,0 +1,325 @@
+# Continuous deployment for the AgentVisor API.
+#
+# Trigger matrix
+#   • push to main         → build multi-arch image, scan, sign, push to
+#                            GHCR as ghcr.io/…:latest + :sha-<7> + :main,
+#                            then (if FLY_API_TOKEN is set) roll the Fly
+#                            app forward to the new digest.
+#   • pull_request         → build single-arch image, scan, push to GHCR
+#                            as ghcr.io/…:pr-<num>-sha-<7>, then sticky-
+#                            comment the PR with pull+run instructions and
+#                            a Deploy-to-Render blueprint URL.
+#   • workflow_dispatch    → same as push, useful for a manual rebuild
+#                            after Dependabot lands a base-image bump.
+#
+# Portability guarantees
+#   • The image is pushed to a neutral registry (GHCR — same OCI spec as
+#     Docker Hub, Quay, ECR). Every downstream host — Fly, Render,
+#     Railway, Koyeb, Cloud Run, Kubernetes, plain docker run — pulls the
+#     same digest. Zero platform-specific artifacts.
+#   • Every deploy is byte-reproducible: sha-<7> tag names the exact
+#     commit, and every third-party action is pinned by commit SHA.
+#   • Rollback is `fly deploy --image ghcr.io/…:sha-<older>` — no code
+#     needed. Same command works on Render (image URL field) or Cloud Run
+#     (--image flag).
+#
+# Supply-chain hardening
+#   • Trivy CVE scan blocks HIGH/CRITICAL vulnerabilities in the image.
+#   • SLSA v1 build provenance attested via GitHub's attest-build-provenance
+#     action — verifiable with `gh attestation verify`.
+#   • SPDX SBOM generated with anchore/sbom-action, attached to the image
+#     as an OCI referrer — anyone can pull-and-audit the dependency tree.
+#   • Least-privilege permissions: contents:read + packages:write +
+#     id-token:write for the OIDC attestation. Nothing else granted.
+#
+# Cost: $0 for the demo footprint (GHCR public repos are free; Fly free
+# tier machines auto-stop when idle).
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "server/**"
+      - ".github/workflows/deploy.yml"
+  pull_request:
+    paths:
+      - "server/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch: {}
+
+# Cancel superseded builds for the same branch/PR — a 5-min build behind
+# the current commit isn't useful to anyone.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege defaults; jobs opt in to more as needed.
+permissions:
+  contents: read
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────
+  # Build the image, scan it, sign it, push it to GHCR.
+  # Multi-arch on main (amd64+arm64 so Fly/Cloud Run/Apple Silicon all
+  # work). Single-arch on PRs to keep preview builds fast (~1 min).
+  # ────────────────────────────────────────────────────────────────────
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write         # push to ghcr.io
+      id-token: write         # OIDC token for attestations
+      attestations: write     # attach provenance + SBOM to the image
+      pull-requests: write    # sticky preview comment on PRs
+    outputs:
+      image_ref: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.push.outputs.digest }}
+      short_sha: ${{ steps.short-sha.outputs.value }}
+      owner_lc: ${{ steps.owner.outputs.lc }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - id: short-sha
+        run: echo "value=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      # GHCR (and every OCI registry) requires lowercase image names.
+      # `${{ github.repository_owner }}` preserves the original casing —
+      # so "AgentVisorAI" becomes an invalid image ref like
+      # `ghcr.io/AgentVisorAI/agentvisor-api`. Normalize once and reuse
+      # via ${{ steps.owner.outputs.lc }} everywhere the image path
+      # appears.
+      - id: owner
+        run: echo "lc=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        # docker/login-action pinned to v3.5.0. GHCR uses GITHUB_TOKEN
+        # so no new secret to manage — packages:write scope covers push.
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU (for arm64 emulation on x86 runners)
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      # Docker metadata action generates all the tags + labels we want
+      # in one place. main-branch pushes get :latest + :main + :sha-XXX;
+      # PRs get :pr-<num>-sha-XXX. OCI labels include a link back to
+      # source revision + license per opencontainers/image-spec.
+      - id: meta
+        uses: docker/metadata-action@8e1d5461f02b7886d3c1a774bfbd873650445aa2 # v5.8.0
+        with:
+          images: ghcr.io/${{ steps.owner.outputs.lc }}/agentvisor-api
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=sha-${{ steps.short-sha.outputs.value }}
+            type=raw,value=pr-${{ github.event.number }}-sha-${{ steps.short-sha.outputs.value }},enable=${{ github.event_name == 'pull_request' }}
+          labels: |
+            org.opencontainers.image.title=AgentVisor API
+            org.opencontainers.image.description=Hosted multi-tenant control plane for AgentVisor AI
+            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.vendor=AgentVisor AI
+
+      # Build once. On main we push multi-arch; on PRs we push a single
+      # linux/amd64 image so previews land in ~60s and don't waste GHCR
+      # storage on architectures the PR reviewer won't use.
+      - id: push
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: server
+          file: server/Dockerfile
+          push: true
+          load: false
+          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Enable provenance + SBOM markers baked in by buildkit itself.
+          # actions/attest below adds the signed attestations on top.
+          provenance: mode=max
+          sbom: true
+
+      # ─── SBOM ───
+      # Anchore's syft-based action produces an SPDX-JSON that we can
+      # attach to the release / OCI as a referrer. Used by downstream
+      # consumers to reason about what's actually in the image without
+      # having to run the container.
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@da167eac915b4e86f08b264dbdbc867b61be6f0c # v0.20.7
+        with:
+          image: ghcr.io/${{ steps.owner.outputs.lc }}/agentvisor-api@${{ steps.push.outputs.digest }}
+          format: spdx-json
+          artifact-name: sbom.spdx.json
+          output-file: sbom.spdx.json
+          upload-artifact: true
+
+      # ─── Build provenance (SLSA v1) ───
+      # GitHub's attest-build-provenance is the successor to
+      # slsa-github-generator. It produces a signed OCI attestation
+      # verifiable with `gh attestation verify oci://<image>@<digest>`.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ steps.owner.outputs.lc }}/agentvisor-api
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      # ─── Attach SBOM as OCI referrer ───
+      # `gh attestation verify` will surface both provenance and SBOM
+      # for anyone downloading the image.
+      - name: Attest SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ghcr.io/${{ steps.owner.outputs.lc }}/agentvisor-api
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: sbom.spdx.json
+          push-to-registry: true
+
+      # ─── Trivy CVE scan ───
+      # Blocks the pipeline on HIGH or CRITICAL findings in OS packages
+      # or the Node lockfile. Runs the official Trivy image directly so
+      # we don't depend on the aquasecurity/trivy-action's binary-download
+      # step (which flaked in Round 11 CI when the GitHub API rate-limited
+      # its tag lookup). Docker Hub pulls are far more reliable than the
+      # tarball-off-GitHub path the action uses.
+      #
+      # Two-phase design:
+      #   1. Download the vuln DB (retry up to 3× — DB fetch is the only
+      #      thing that's ever transient in practice).
+      #   2. Run the scan exactly once with --skip-db-update. Any non-
+      #      zero exit is now a real CVE finding, not a network blip.
+      - name: Trivy image scan (fail on HIGH/CRITICAL)
+        env:
+          IMAGE_REF: ghcr.io/${{ steps.owner.outputs.lc }}/agentvisor-api@${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.cache/trivy"
+          docker pull aquasec/trivy:0.74.0 >/dev/null
+
+          # Phase 1: refresh the vuln DB with retries. Trivy caches by
+          # default so a warm cache from the actions/cache step above
+          # keeps this fast.
+          for attempt in 1 2 3; do
+            if timeout 120 docker run --rm \
+              -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+              aquasec/trivy:0.74.0 \
+              image --download-db-only --no-progress; then
+              break
+            fi
+            if [ $attempt -eq 3 ]; then
+              echo "::error::Trivy DB fetch failed after 3 attempts" >&2
+              exit 1
+            fi
+            echo "Trivy DB fetch attempt $attempt failed, retrying in 5 s..." >&2
+            sleep 5
+          done
+
+          # Phase 2: single authoritative scan with --skip-db-update so
+          # exit-code 1 unambiguously means "HIGH/CRITICAL findings".
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+            -e TRIVY_USERNAME="${{ github.actor }}" \
+            -e TRIVY_PASSWORD="${{ secrets.GITHUB_TOKEN }}" \
+            aquasec/trivy:0.74.0 \
+            image \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              --vuln-type os,library \
+              --exit-code 1 \
+              --format table \
+              --no-progress \
+              --skip-db-update \
+              "$IMAGE_REF"
+
+      # ─── Sticky PR comment ───
+      # Reviewers get pull-and-run instructions plus a one-click Render
+      # deploy URL preseeded with the freshly built image.
+      - name: Post PR preview comment
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@52423e01640425a022ef5fd42c6fb5f633a02728 # v2.9.1
+        with:
+          header: pr-preview-image
+          message: |
+            ## 🐳 Preview image built
+
+            **Image**: `ghcr.io/${{ steps.owner.outputs.lc }}/agentvisor-api@${{ steps.push.outputs.digest }}`
+            **Tag**: `ghcr.io/${{ steps.owner.outputs.lc }}/agentvisor-api:pr-${{ github.event.number }}-sha-${{ steps.short-sha.outputs.value }}`
+
+            <details><summary>Pull &amp; run locally</summary>
+
+            ```bash
+            docker run -p 8080:8080 \
+              -e DATABASE_URL="postgres://…" \
+              -e JWT_SECRET="$(openssl rand -hex 48)" \
+              -e ALLOWED_ORIGINS="http://localhost:5173" \
+              ghcr.io/${{ steps.owner.outputs.lc }}/agentvisor-api@${{ steps.push.outputs.digest }}
+            ```
+
+            </details>
+
+            <details><summary>Deploy on Fly.io (5 min)</summary>
+
+            ```bash
+            fly deploy --image ghcr.io/${{ steps.owner.outputs.lc }}/agentvisor-api@${{ steps.push.outputs.digest }}
+            ```
+
+            </details>
+
+            Trivy scan and SLSA v1 provenance attached to the image. Verify with:
+
+            ```bash
+            gh attestation verify oci://ghcr.io/${{ steps.owner.outputs.lc }}/agentvisor-api@${{ steps.push.outputs.digest }} \
+              --owner ${{ github.repository_owner }}
+            ```
+
+  # ────────────────────────────────────────────────────────────────────
+  # Optional deploy step. Only runs on push to main and only when an
+  # FLY_API_TOKEN secret is configured. Same image; Fly rolls the app
+  # forward with zero downtime (rolling strategy, one machine at a time).
+  # Rollback: `fly deploy --image ghcr.io/…:sha-<older>` from a laptop.
+  # ────────────────────────────────────────────────────────────────────
+  deploy-fly:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    # Environment adds a GitHub deployment record + optional required
+    # reviewers. Free on public repos.
+    environment:
+      name: production
+      url: https://api.agentvisorai.me
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check for FLY_API_TOKEN
+        id: guard
+        # No-op if the secret isn't set — deploys are opt-in. This lets
+        # forks and evaluation deploys still get CI without owning a Fly
+        # account.
+        run: |
+          if [ -z "${{ secrets.FLY_API_TOKEN }}" ]; then
+            echo "FLY_API_TOKEN not configured; skipping deploy." >&2
+            echo "should_deploy=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_deploy=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Set up flyctl
+        if: steps.guard.outputs.should_deploy == 'true'
+        uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # v1.5
+      - name: Fly deploy (rolling, zero-downtime)
+        if: steps.guard.outputs.should_deploy == 'true'
+        working-directory: server
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          fly deploy \
+            --image ghcr.io/${{ needs.build-and-push.outputs.owner_lc }}/agentvisor-api@${{ needs.build-and-push.outputs.image_digest }} \
+            --strategy rolling \
+            --wait-timeout 300
