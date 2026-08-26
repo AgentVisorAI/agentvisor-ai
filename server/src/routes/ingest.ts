@@ -112,6 +112,21 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
     const body = sessionUpsert.safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: "invalid_input" });
     const s = body.data;
+    // Look up existing session first so we can protect a sealed status
+    // from being "un-sealed" by a buggy daemon retrying with status=live.
+    // Once a session is sealed the totals are finalized and the receipt
+    // is signed; reverting the status would corrupt the audit trail.
+    const existing = await db.session.findUnique({
+      where: {
+        deploymentId_externalId: {
+          deploymentId: daemon.deploymentId,
+          externalId: s.externalId,
+        },
+      },
+      select: { status: true },
+    });
+    const nextStatus =
+      existing?.status === "sealed" && s.status !== "sealed" ? existing.status : s.status;
     const session = await db.session.upsert({
       where: {
         deploymentId_externalId: {
@@ -133,7 +148,7 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       update: {
         agent: s.agent,
         workflow: s.workflow,
-        status: s.status,
+        status: nextStatus,
         policyVersion: s.policyVersion,
         closedAt: s.closedAt,
       },
@@ -169,6 +184,7 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
     }
 
     let inserted = 0;
+    const rejectedSealed: string[] = [];
     for (const [externalId, batch] of byExt) {
       const session = await db.session.findUnique({
         where: {
@@ -177,9 +193,18 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
             externalId,
           },
         },
-        select: { id: true },
+        select: { id: true, status: true },
       });
       if (!session) continue; // ignore events for a session the daemon didn't upsert first
+
+      // A sealed session's totals were finalized when the daemon issued
+      // the receipt. Allowing more events after that would silently
+      // corrupt the rollup. Reject the batch for this session; the
+      // daemon should never send more events for a session it sealed.
+      if (session.status === "sealed") {
+        rejectedSealed.push(externalId);
+        continue;
+      }
 
       // Idempotency: filter the batch down to *new* seqs before touching
       // the rollup counters. A retrying daemon that sends the same events
@@ -262,7 +287,10 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
         });
       }
     }
-    return reply.send({ inserted });
+    return reply.send({
+      inserted,
+      ...(rejectedSealed.length > 0 ? { rejectedSealed } : {}),
+    });
   });
 
   // Post a signed receipt at session seal.

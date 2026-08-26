@@ -1600,21 +1600,27 @@
     document.body.classList.add("locked");
     var previouslyFocused = document.activeElement;
     var uninstall;
+    var handled = false;
     function close() {
+      if (handled) return;
+      handled = true;
       backdrop.remove(); document.body.classList.remove("locked");
       if (uninstall) uninstall();
       if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {}
     }
     uninstall = installModalKeys(backdrop, close);
     backdrop.addEventListener("click", function (e) {
+      if (handled) return;
       if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
     });
     backdrop.querySelector("#inpForm").addEventListener("submit", function (e) {
       e.preventDefault();
+      if (handled) return;
       var v = backdrop.querySelector("#inpVal").value.trim();
       if (!v) return;
+      var cb = opts.onConfirm;
       close();
-      opts.onConfirm && opts.onConfirm(v);
+      if (cb) cb(v);
     });
     setTimeout(function () { backdrop.querySelector("#inpVal").focus(); }, 20);
   }
@@ -1842,15 +1848,23 @@
     document.body.classList.add("locked");
     var previouslyFocused = document.activeElement;
     var uninstall;
+    var handled = false;
     function close() {
+      if (handled) return;
+      handled = true;
       backdrop.remove(); document.body.classList.remove("locked");
       if (uninstall) uninstall();
       if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {}
     }
     uninstall = installModalKeys(backdrop, close);
     backdrop.addEventListener("click", function (e) {
-      if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
-      if (e.target.hasAttribute("data-confirm")) { close(); opts.onConfirm && opts.onConfirm(); }
+      if (handled) return;
+      if (e.target === backdrop || e.target.hasAttribute("data-close")) { close(); return; }
+      if (e.target.hasAttribute("data-confirm")) {
+        var cb = opts.onConfirm;
+        close();
+        if (cb) cb();
+      }
     });
     // Focus the confirm button so Enter confirms
     setTimeout(function () { backdrop.querySelector("[data-confirm]").focus(); }, 20);

@@ -80,7 +80,9 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
     // Reject if email is already registered. Do not disclose which case in
     // production — this handler is only reached anonymously, so returning 409
-    // is acceptable here.
+    // is acceptable here. The findUnique check is a fast-path; the create
+    // below is wrapped in try/catch to also catch the TOCTOU race where two
+    // concurrent signups slip past the check.
     const existing = await db.user.findUnique({ where: { email } });
     if (existing) {
       return reply.code(409).send({ error: "email_in_use" });
@@ -90,22 +92,38 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     const salt = Math.random().toString(36).slice(2, 8);
     const slug = orgSlug(orgName, salt);
 
-    const { user, org } = await db.$transaction(async (tx) => {
-      const org = await tx.org.create({
-        data: { name: orgName, slug },
-      });
-      const user = await tx.user.create({
-        data: {
-          email,
-          passwordHash,
-          displayName,
-          memberships: {
-            create: { orgId: org.id, role: "owner" },
+    let user, org;
+    try {
+      const result = await db.$transaction(async (tx) => {
+        const org = await tx.org.create({
+          data: { name: orgName, slug },
+        });
+        const user = await tx.user.create({
+          data: {
+            email,
+            passwordHash,
+            displayName,
+            memberships: {
+              create: { orgId: org.id, role: "owner" },
+            },
           },
-        },
+        });
+        return { user, org };
       });
-      return { user, org };
-    });
+      user = result.user;
+      org = result.org;
+    } catch (err) {
+      // Prisma P2002 = unique constraint violation. Two concurrent signups
+      // with the same email hit this — one wins, the rest get 409 Conflict
+      // (not a 500 with the Prisma error code leaked to the client).
+      if (
+        typeof err === "object" && err !== null &&
+        (err as { code?: string }).code === "P2002"
+      ) {
+        return reply.code(409).send({ error: "email_in_use" });
+      }
+      throw err;
+    }
 
     const token = await mintSession({
       sub: user.id,
