@@ -162,3 +162,17 @@ Legend: **✅ verified** · **🟢 configured** · **📋 documented**
 - **Malformed session upsert**: empty externalId, wrong-typed fields → 400 `invalid_input` (zod schema).
 - **healthz + readyz not rate-limited**: 20/20 rapid calls to each → 200.
 - **Hash XSS**: 6 hostile hashes (`<script>`, `<img onerror>`, encoded, path traversal, SVG onload) → 0 alerts fired, zero DOM script injection.
+- **JWT iss/aud + org membership**: wrong iss/aud → 401; forged token with fake orgId → 401 (round-33 membership fence).
+- **UTF-8 emoji + Cyrillic**: agent name `"🤖 assistant Ivan Иван"` round-trips through Postgres and Prisma `contains` filter.
+- **Wrong HTTP method**: `PUT /sessions` / `PATCH /login` → 404 (no 500).
+- **Prisma not-found**: `DELETE /deployments/nonexistent` → 404 problem+json (no P2025 leak).
+- **JWT logout replay**: post-logout replay of captured cookie → 401 (round-34 `sessionRevokedAt` fence).
+- **Membership check perf**: 200-concurrent GET /sessions → 429 req/s, zero 500s.
+- **/metrics format**: 31 HELP + 31 TYPE lines, well-formed Prometheus scrape target.
+- **Empty events detail**: 0-event session renders cleanly (`|| 1` guard on totalDur).
+- **PII in error body**: no email echo on 401 invalid_credentials.
+- **Ingest without cookie**: daemon auth (X-AV-Deployment + Bearer) works irrespective of session cookie state.
+- **Ingest rate-limit exempt**: 30 rapid ingest calls → 30/30 200.
+- **Log redaction**: pino redact + auth-handler discipline keeps passwords, ingest tokens, cookies out of every log line.
+- **Member role forbidden**: non-owner member gets 403 on POST /deployments and DELETE /deployments/:id; still 200 on GET /sessions.
+- **Big session perf**: 500-event mock session renders to DOM in 48ms.
