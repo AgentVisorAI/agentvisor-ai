@@ -2124,10 +2124,26 @@ pub(crate) async fn persist_broker_ack(
     let sealed = crate::journal::seal(journal_key, "broker-ack", 0, &record)?;
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         use std::io::Write as _;
-        let created = !path.exists();
-        let mut journal = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
+        // `symlink_metadata` (NOT `exists()`) so a dangling symlink
+        // planted at `path` is detected as "an entry lives here"
+        // rather than "no entry" — pairs with `O_NOFOLLOW` below to
+        // fail-close instead of following the symlink and corrupting
+        // an arbitrary path the harness UID can write. Same posture
+        // as the events-journal append; `BrokerAckRecord` carries
+        // plaintext session id + event uid + broker offset, which
+        // is the "low-entropy identifier" class that the deterministic
+        // `sha256(session-id)[..32]` stem was already supposed to hide.
+        let created = std::fs::symlink_metadata(&path).is_err();
+        let mut open_options = std::fs::OpenOptions::new();
+        open_options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            open_options
+                .custom_flags(av_core::fsutil::unix_o_nofollow())
+                .mode(0o600);
+        }
+        let mut journal = open_options
             .open(&path)
             .map_err(|error| format!("open ack journal {}: {error}", av_core::fsutil::basename(&path)))?;
         journal.write_all(&sealed).map_err(|error| error.to_string())?;
