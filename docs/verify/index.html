@@ -3,78 +3,22 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
+  <!--
+    Strict CSP: no inline scripts, no third-party origins. Web Crypto
+    Ed25519 runs against 'self'-served JS + a same-origin JSON fetch
+    for the sample receipt. Any pasted JSON is verified locally.
+  -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; base-uri 'none'; form-action 'none'; script-src 'self'; script-src-attr 'none'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; font-src 'self' data:; manifest-src 'self'; object-src 'none'; frame-src 'none'">
   <title>Verify a receipt — AgentVisor AI</title>
   <meta name="description" content="Drop an AgentVisor session receipt into your browser. The Ed25519 signature verifies right here, offline, against the receipt's embedded public key. No account, no upload.">
   <link rel="stylesheet" href="../style.css">
+  <link rel="stylesheet" href="verify.css">
   <link rel="icon" type="image/png" href="../logo.png">
   <meta property="og:title" content="Verify an AgentVisor receipt in your browser">
   <meta property="og:description" content="Drop a receipt JSON in your browser. Ed25519 signature verified offline in ~1 ms. No account, no upload.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://agentvisorai.me/verify/">
-  <style>
-    /* Verify-specific styles that layer on top of style.css */
-    .verify-shell { max-width: 56rem; margin: 0 auto; padding: 0 1.25rem; }
-    .verify-hero { text-align: center; padding: 3rem 0 1.5rem; }
-    .verify-hero h1 { font-size: clamp(1.75rem, 4vw, 2.5rem); margin: 0 0 0.5rem; }
-    .verify-hero p { color: var(--fg-muted); font-size: 1.05rem; margin: 0 auto; max-width: 40rem; }
-    .drop {
-      border: 2px dashed var(--border-strong);
-      border-radius: 12px;
-      padding: 3rem 1.5rem;
-      text-align: center;
-      background: var(--bg-alt);
-      transition: border-color 0.15s, background 0.15s;
-      cursor: pointer;
-      user-select: none;
-    }
-    .drop.hover { border-color: var(--accent); background: var(--bg); }
-    .drop-icon { font-size: 2.5rem; line-height: 1; margin-bottom: 0.5rem; }
-    .drop h2 { margin: 0 0 0.25rem; font-size: 1.2rem; font-weight: 600; }
-    .drop p { color: var(--fg-muted); margin: 0.5rem 0 0; font-size: 0.95rem; }
-    .drop .or { margin: 1rem 0 0.5rem; font-size: 0.85rem; color: var(--fg-muted); }
-    .drop .browse {
-      display: inline-block;
-      background: var(--accent);
-      color: var(--accent-fg);
-      padding: 0.5rem 1.25rem;
-      border-radius: 8px;
-      font-weight: 600;
-      cursor: pointer;
-      border: 0;
-      font: inherit;
-    }
-    .drop .browse:hover { background: var(--accent-hover); }
-    .example-row { margin-top: 1.25rem; text-align: center; font-size: 0.9rem; }
-    .example-row .link { color: var(--accent); cursor: pointer; text-decoration: underline; background: none; border: 0; font: inherit; padding: 0; }
-    .result { margin-top: 2rem; }
-    .result-card {
-      border-radius: 12px;
-      padding: 1.5rem;
-      border-left: 4px solid var(--fg-muted);
-      background: var(--bg-alt);
-    }
-    .result-card.ok { border-left-color: var(--success); }
-    .result-card.bad { border-left-color: var(--danger); }
-    .result-card.pending { border-left-color: var(--accent); }
-    .result-title { font-size: 1.3rem; font-weight: 600; margin: 0 0 0.25rem; }
-    .result-card.ok .result-title { color: var(--success); }
-    .result-card.bad .result-title { color: var(--danger); }
-    .result-sub { color: var(--fg-muted); margin: 0 0 1rem; font-size: 0.9rem; }
-    dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 0.35rem 0.75rem; font-size: 0.9rem; margin: 0; }
-    dl.kv dt { color: var(--fg-muted); font-weight: 500; }
-    dl.kv dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; overflow-wrap: anywhere; }
-    .details { margin-top: 1rem; }
-    .details summary { cursor: pointer; color: var(--fg-muted); font-size: 0.85rem; }
-    .details pre {
-      background: var(--bg-code); color: var(--fg-strong);
-      padding: 1rem; border-radius: 8px; overflow: auto;
-      font-size: 0.75rem; margin-top: 0.5rem;
-    }
-    .how { margin: 3rem 0; padding: 2rem 0; border-top: 1px solid var(--border); }
-    .how h3 { margin: 0 0 0.5rem; }
-    .how p { color: var(--fg-muted); margin: 0.5rem 0; font-size: 0.95rem; }
-    .how code { background: var(--bg-code); padding: 0.1rem 0.35rem; border-radius: 4px; font-size: 0.85rem; }
-  </style>
 </head>
 <body>
 
@@ -134,150 +78,7 @@
     </section>
   </main>
 
-  <script>
-    const drop = document.getElementById("drop");
-    const fileInput = document.getElementById("fileInput");
-    const browseBtn = document.getElementById("browseBtn");
-    const result = document.getElementById("result");
-    const loadExample = document.getElementById("loadExample");
-
-    function esc(s) {
-      return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-    }
-
-    function hex2bytes(hex) {
-      const b = new Uint8Array(hex.length / 2);
-      for (let i = 0; i < b.length; i++) b[i] = parseInt(hex.substr(i * 2, 2), 16);
-      return b;
-    }
-    function b64ToBytes(s) {
-      const bin = atob(s.replace(/-/g, "+").replace(/_/g, "/"));
-      const out = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-      return out;
-    }
-
-    async function verifyBundle(bundle) {
-      if (bundle.format !== "agentvisor.receipt.v1") {
-        throw new Error("Unrecognized bundle format: " + bundle.format);
-      }
-      const r = bundle.receipt || {};
-      const pub = bundle.publicKey || {};
-      if (!r.rawBody || !r.rawSignatureB64) throw new Error("Receipt is missing rawBody or rawSignatureB64.");
-      if (!pub.hex || !/^[0-9a-fA-F]{64}$/.test(pub.hex)) throw new Error("Bundle is missing a valid 32-byte Ed25519 public key.");
-      const keyBytes = hex2bytes(pub.hex);
-      let key;
-      try {
-        key = await crypto.subtle.importKey("raw", keyBytes, { name: "Ed25519" }, false, ["verify"]);
-      } catch (e) {
-        throw new Error("This browser doesn't support Web Crypto Ed25519. Try Chrome 113+, Firefox 130+, or Safari 17+. Or run the CLI: node scripts/verify-receipt.mjs receipt.json");
-      }
-      const msg = new TextEncoder().encode(r.rawBody);
-      const sig = b64ToBytes(r.rawSignatureB64);
-      const ok = await crypto.subtle.verify("Ed25519", key, sig, msg);
-      return { ok, bundle };
-    }
-
-    function render(state) {
-      result.hidden = false;
-      if (state.kind === "pending") {
-        result.innerHTML = `
-          <div class="result-card pending">
-            <p class="result-title">Verifying signature…</p>
-            <p class="result-sub">Running Ed25519 in your browser.</p>
-          </div>`;
-        return;
-      }
-      if (state.kind === "err") {
-        result.innerHTML = `
-          <div class="result-card bad">
-            <p class="result-title">Couldn't verify this bundle</p>
-            <p class="result-sub">${esc(state.message)}</p>
-          </div>`;
-        return;
-      }
-      const b = state.bundle;
-      const s = b.session || {};
-      const r = b.receipt || {};
-      const pub = b.publicKey || {};
-      const cls = state.ok ? "ok" : "bad";
-      const titleText = state.ok
-        ? "✅  Signature verifies"
-        : "❌  Signature does not verify";
-      const subText = state.ok
-        ? "This receipt is authentic. It was signed by the private key matching the embedded public key, and every byte of the payload is exactly what the daemon sent."
-        : "The signature does not match the payload. Either the receipt was modified after signing, or the public key doesn't correspond to the signing key.";
-      result.innerHTML = `
-        <div class="result-card ${cls}">
-          <p class="result-title">${titleText}</p>
-          <p class="result-sub">${subText}</p>
-          <dl class="kv">
-            <dt>Session</dt><dd>${esc(s.externalId || s.id || "—")}</dd>
-            <dt>Agent</dt><dd>${esc(s.agent || "—")}</dd>
-            <dt>Events sealed</dt><dd>${esc(r.eventCount ?? "—")}</dd>
-            <dt>Receipt ID</dt><dd>${esc(r.receiptId || "—")}</dd>
-            <dt>Public key</dt><dd>${esc(pub.hex || "—")}</dd>
-            <dt>Signature bytes</dt><dd>${esc((r.rawSignatureB64 || "").length)} base64 chars (64 bytes decoded)</dd>
-            <dt>Message bytes</dt><dd>${esc((r.rawBody || "").length)}</dd>
-          </dl>
-          <details class="details">
-            <summary>Show raw signed body</summary>
-            <pre>${esc(r.rawBody || "")}</pre>
-          </details>
-        </div>`;
-    }
-
-    async function handleText(text) {
-      render({ kind: "pending" });
-      let bundle;
-      try { bundle = JSON.parse(text); }
-      catch (e) { render({ kind: "err", message: "Not valid JSON: " + e.message }); return; }
-      try {
-        const { ok, bundle: b } = await verifyBundle(bundle);
-        render({ kind: "result", ok, bundle: b });
-      } catch (e) {
-        render({ kind: "err", message: e.message });
-      }
-    }
-    function handleFile(file) {
-      if (!file) return;
-      if (file.size > 5_000_000) { render({ kind: "err", message: "File larger than 5 MB — probably not a receipt." }); return; }
-      const reader = new FileReader();
-      reader.onload = () => handleText(reader.result);
-      reader.onerror = () => render({ kind: "err", message: "Could not read file." });
-      reader.readAsText(file);
-    }
-
-    ["dragenter", "dragover"].forEach((e) => drop.addEventListener(e, (ev) => { ev.preventDefault(); drop.classList.add("hover"); }));
-    ["dragleave", "drop"].forEach((e) => drop.addEventListener(e, (ev) => { ev.preventDefault(); drop.classList.remove("hover"); }));
-    drop.addEventListener("drop", (ev) => {
-      const f = ev.dataTransfer?.files?.[0];
-      if (f) handleFile(f);
-    });
-    drop.addEventListener("click", (ev) => { if (ev.target !== browseBtn) fileInput.click(); });
-    drop.addEventListener("keydown", (ev) => {
-      if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); fileInput.click(); }
-    });
-    browseBtn.addEventListener("click", (ev) => { ev.stopPropagation(); fileInput.click(); });
-    fileInput.addEventListener("change", () => handleFile(fileInput.files?.[0]));
-
-    // Paste anywhere on the page.
-    window.addEventListener("paste", (ev) => {
-      const text = ev.clipboardData?.getData("text");
-      if (text && text.trim().startsWith("{")) handleText(text);
-    });
-
-    loadExample.addEventListener("click", async () => {
-      try {
-        const res = await fetch("sample-receipt.json");
-        if (!res.ok) throw new Error("Sample not available");
-        const text = await res.text();
-        handleText(text);
-      } catch (e) {
-        render({ kind: "err", message: "Couldn't load sample: " + e.message });
-      }
-    });
-  </script>
+  <script src="verify.js"></script>
 
 </body>
 </html>

@@ -82,6 +82,12 @@ jobs:
           SITE: https://agentvisorai.me/
         run: node scripts/verify-page-drill.mjs
 
+      - name: CSP + security-headers drill
+        working-directory: server
+        env:
+          SITE: https://agentvisorai.me/
+        run: node scripts/csp-drill.mjs
+
       - name: Lighthouse audit (perf + a11y + best-practices)
         working-directory: server
         env:

@@ -91,6 +91,11 @@ jobs:
           mkdir -p "$site/app"
           cp docs/app/index.html "$site/app/"
           cp docs/app/styles.css "$site/app/"
+          # Boot-time config + crash guard extracted from index.html so
+          # that a strict CSP (`script-src 'self'`) can be enforced
+          # without allowing 'unsafe-inline'.
+          cp docs/app/config.js "$site/app/"
+          cp docs/app/crash-guard.js "$site/app/"
           # Minify JS. keep_classnames + keep_fnames stay on so the
           # in-app error boundary can still show a legible stack.
           npx --yes terser@5 docs/app/app.js \
@@ -122,9 +127,12 @@ jobs:
           cp docs/legal/privacy.html "$site/legal/"
           # Public /verify page — drop a receipt, watch it verify
           # offline via Web Crypto. Standalone HTML + one JSON
-          # sample; no build step needed.
+          # sample; no build step needed. Inline script + style
+          # extracted to verify.js + verify.css for strict CSP.
           mkdir -p "$site/verify"
           cp docs/verify/index.html "$site/verify/"
+          cp docs/verify/verify.js "$site/verify/"
+          cp docs/verify/verify.css "$site/verify/"
           cp docs/verify/sample-receipt.json "$site/verify/"
           # Publish the assembled directory.
           rm -rf target/doc
