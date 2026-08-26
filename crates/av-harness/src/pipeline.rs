@@ -1153,6 +1153,23 @@ impl AppState {
                  until an operator quarantines it.",
             );
         }
+        // Lifecycle-outbox backlog gauge. Rising baseline is the
+        // earliest signal of a broker outage — outboxes persist
+        // across restarts, so the disk-bounded queue grows until the
+        // bridge is reachable again. Pre-registering the gauge (with
+        // value 0) makes `absent(av_lifecycle_outbox_pending)`
+        // alerts distinguish "healthy, no backlog" from
+        // "reconciler tick hasn't fired yet" — on a fresh boot the
+        // gauge appears at 0 immediately, then updates on the first
+        // `remove_acked_lifecycle_outboxes` tick.
+        metrics.gauge(
+            "av_lifecycle_outbox_pending",
+            "Count of unacked lifecycle outbox files (RECEIPT + \
+             SESSION_CLOSE) sitting in the spool at the last \
+             reconciler tick. Steady-state 0 on a healthy node; a \
+             rising baseline indicates the bridge is unreachable \
+             or slow.",
+        );
         // Reconciler ticks scan the ATIF spool dir, which can be large;
         // finalisation waits for worker drain + broker publish. Wide
         // bounds keep long-tail p99 useful under load.
