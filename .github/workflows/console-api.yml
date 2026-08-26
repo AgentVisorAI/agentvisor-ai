@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v6.0.0
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version: "22"
       - name: Syntax-check every JS file
@@ -76,16 +76,19 @@ jobs:
       JWT_SECRET: ci_only_secret_at_least_32_bytes_of_entropy_here_ok
       ALLOWED_ORIGINS: http://127.0.0.1:8787
       PORT: "8985"
-      NODE_ENV: production
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v6.0.0
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: server/package-lock.json
-      - name: Install
+      - name: Install (with devDependencies)
         working-directory: server
+        env:
+          # Force dev deps even though we set NODE_ENV=production at runtime;
+          # without this npm ci drops @types/node + tsx and typecheck fails.
+          NODE_ENV: development
         run: npm ci --no-audit --no-fund
       - name: Prisma generate
         working-directory: server
@@ -98,6 +101,8 @@ jobs:
         run: npx prisma migrate deploy
       - name: Start API
         working-directory: server
+        env:
+          NODE_ENV: production
         run: |
           npx tsx src/index.ts &
           echo $! > /tmp/api.pid
@@ -125,7 +130,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
       - name: Build image
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c1c # v6.18.0
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           context: server
           push: false

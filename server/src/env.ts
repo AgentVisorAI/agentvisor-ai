@@ -37,6 +37,10 @@ if (!parsed.success) {
     console.error("  •", issue.path.join("."), "→", issue.message);
   }
   process.exit(1);
+  // Unreachable, but tells the type checker that env below is never
+  // undefined even in environments where @types/node hasn't loaded the
+  // `process.exit(): never` signature yet.
+  throw new Error("unreachable");
 }
 export const env = parsed.data;
 export type Env = z.infer<typeof Env>;
