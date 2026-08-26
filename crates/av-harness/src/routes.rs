@@ -3471,7 +3471,19 @@ pub(crate) fn parse_provider_chunk(raw: &str) -> Result<Option<ParsedProviderChu
         // skipped frame rather than aborting the whole stream and
         // sealing the session. Only refuse when non-empty `data:`
         // lines would otherwise be attributed to the model output.
-        if data.iter().all(|entry| entry.trim().is_empty()) {
+        //
+        // A `data: [DONE]` line under a named event (e.g.
+        // `event: summary\ndata: [DONE]\n\n` emitted by some OpenAI-
+        // compat gateways as they finalise their own event stream)
+        // is also attribution-free — the sentinel is not model
+        // output — so it must NOT fail-close the whole stream just
+        // because the terminator arrived under an unexpected event
+        // name. Matches the Anthropic parser's ordering, which
+        // short-circuits `[DONE]` before its named-event refusal.
+        if data.iter().all(|entry| {
+            let trimmed = entry.trim();
+            trimmed.is_empty() || trimmed == "[DONE]"
+        }) {
             return Ok(None);
         }
         return Err(format!(
@@ -7056,6 +7068,42 @@ mod tests {
                 Err(error) => panic!("[DONE] variant must not fail parse: {raw:?}: {error}"),
             }
         }
+    }
+
+    /// R44 Finding 3: OpenAI-compat gateways that batch a final
+    /// `[DONE]` under a summary event name (e.g.
+    /// `event: summary\ndata: [DONE]\n\n`) must not fail-close the
+    /// stream tail. `[DONE]` carries no attributable content, so the
+    /// named-event refusal at parse_provider_chunk's line ~3465 must
+    /// treat `data:` lines that are ALL `[DONE]` or empty as a
+    /// keepalive, matching the Anthropic parser's ordering which
+    /// short-circuits `[DONE]` before its event-type check.
+    #[test]
+    fn parse_provider_chunk_done_under_named_event_is_keepalive() {
+        for raw in [
+            "event: summary\ndata: [DONE]\n\n",
+            "event: error\ndata: [DONE]\n\n",
+            "event: custom\ndata:\ndata: [DONE]\n\n",
+            "event: batched\ndata: [DONE]\ndata: [DONE]\n\n",
+        ] {
+            match parse_provider_chunk(raw) {
+                Ok(None) => {}
+                Ok(Some(_)) => panic!(
+                    "[DONE] under named event {raw:?} must not yield a chunk (no attributable content)"
+                ),
+                Err(error) => {
+                    panic!("[DONE] under named event {raw:?} must not fail-close the stream: {error}")
+                }
+            }
+        }
+        // A named event with a mix of [DONE] AND real content must
+        // still refuse — the content bytes would otherwise be
+        // attributed to the wrong SSE listener per §9.2.8.
+        let mixed = "event: error\ndata: [DONE]\ndata: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n";
+        assert!(
+            parse_provider_chunk(mixed).is_err(),
+            "named event with mixed [DONE] + real content must still refuse: {mixed:?}"
+        );
     }
 
     /// SSE §9.2.6: the `data:` field strips exactly one leading
