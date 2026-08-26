@@ -217,9 +217,21 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     // touched; unpaired remnants stay for the reconciler quarantine
     // sweep. `None` (the ship default) preserves the historical
     // "manage-with-external-cron" behaviour.
+    //
+    // The tick body dispatches to `spawn_blocking` inside
+    // `prune_sealed_atif`, and `JoinHandle::abort()` cancels only the
+    // outer async task — a blocking `remove_file` sequence in flight
+    // would keep running against the spool concurrently with process
+    // exit and could leave orphan `.close-complete` markers on
+    // abandonment. Mirror the bridge-maintenance discipline with a
+    // dedicated Notify so shutdown returns the loop between ticks and
+    // the outer `.await` below actually waits for the blocking work
+    // to finish. Same rationale as `bridge_maintenance_shutdown`.
+    let retention_shutdown = Arc::new(tokio::sync::Notify::new());
     let retention = config.atif_retention_days.map(|days| {
         let finalizer = state.finalizer.clone();
         let metrics = Arc::clone(&state.metrics);
+        let shutdown = Arc::clone(&retention_shutdown);
         let pruned_total = metrics.counter(
             "av_atif_retention_pruned_total",
             "Sealed ATIF+sidecar pairs deleted by the retention sweep",
@@ -230,7 +242,15 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                ticker.tick().await;
+                // Race the shutdown notify against the ticker so the
+                // loop can exit between ticks and never launch a fresh
+                // `spawn_blocking` if shutdown fired during the tick's
+                // own await. Mirrors `spawn_bridge_maintenance`.
+                tokio::select! {
+                    biased;
+                    () = shutdown.notified() => return,
+                    _ = ticker.tick() => {}
+                }
                 // Supervise the tick body: a panic here (allocator OOM,
                 // a Display panic on a non-UTF8 error chain, a
                 // parking_lot poison-on-unwind) would otherwise silently
@@ -442,9 +462,16 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
         }
     };
     reconciler.abort();
-    if let Some(handle) = retention.as_ref() {
-        handle.abort();
-    }
+    // Signal retention to stop instead of aborting.
+    // JoinHandle::abort() cancels only the outer async task, but the
+    // retention tick body dispatches to spawn_blocking (each tick calls
+    // Finalizer::prune_sealed_atif which is a spawn_blocking wrapper).
+    // An abandoned blocking closure mid-remove_file sequence could leave
+    // an orphan .close-complete marker on the spool. Notify makes the
+    // loop return between ticks so the shutdown `.await` below actually
+    // waits for the blocking work to finish — same rationale as the
+    // bridge-maintenance loop below.
+    retention_shutdown.notify_one();
     // Signal maintenance to stop instead of aborting.
     // JoinHandle::abort() only cancels the outer async task; a
     // spawn_blocking closure that's already running keeps rewriting
