@@ -174,7 +174,13 @@ fn split_embedded_chat_path(url: String) -> (String, Option<String>) {
         Some(index) => index,
         None => return (url, None),
     };
-    let path = &url[path_start..];
+    // Tolerate the trailing slash a copy-paste commonly carries
+    // (`.../v1/chat/completions/`): without the trim, no split happens,
+    // the full URL becomes `upstream_url`, and the harness appends the
+    // default chat path — producing `.../chat/completions//v1/chat/…`
+    // and a provider 404 on every call from a config that
+    // self-validated cleanly.
+    let path = url[path_start..].trim_end_matches('/');
     let embeds_chat = path.ends_with("/chat/completions") || path.contains("/chat/completions?");
     if !embeds_chat {
         return (url, None);
@@ -840,7 +846,16 @@ pub fn wizard(home: &Path, input: &mut dyn std::io::BufRead, secrets: &SecretInp
     let config_path = av_harness::config::user_config_path_from(home);
     if config_path.exists() {
         let backup = config_path.with_extension("toml.bak");
-        std::fs::copy(&config_path, &backup).with_context(|| format!("back up {}", config_path.display()))?;
+        // `write_atomic`, NOT `std::fs::copy`: copy creates/truncates
+        // the destination FOLLOWING a symlink, so a pre-planted
+        // `agentvisor.toml.bak -> ~/.bashrc` would be clobbered with
+        // TOML. Every other write in this file already defends against
+        // exactly that (init's unlink + write_atomic, the key
+        // installer's rename); the backup was the one exception.
+        let previous = std::fs::read(&config_path)
+            .with_context(|| format!("read {} for backup", config_path.display()))?;
+        av_core::fsutil::write_atomic(&backup, &previous)
+            .with_context(|| format!("back up {}", config_path.display()))?;
         println!("\n(Your previous settings were saved to {})", backup.display());
     }
     // Two concurrent wizards on the same $HOME must not interleave into a
@@ -871,6 +886,29 @@ pub fn wizard(home: &Path, input: &mut dyn std::io::BufRead, secrets: &SecretInp
     println!("\nAll set!");
     println!();
     println!("  Settings: {}", config_path.display());
+    // The wizard writes the LOWEST-priority config location. A
+    // cwd-local `agentvisor.toml` / `config/harness.toml` (e.g. from an
+    // earlier `avctl init` in this directory) or an exported
+    // `AV_CONFIG` silently outranks it — the user pastes a fresh key,
+    // sees "All set!", and the daemon then loads the stale file. Detect
+    // the shadowing NOW and say so loudly, instead of leaving the only
+    // hint in `start`'s easily-missed "(settings: ...)" line.
+    if let Ok(av_harness::config::ConfigSource::File(effective)) = av_harness::config::resolve_config_source()
+    {
+        let same = match (
+            std::fs::canonicalize(&effective),
+            std::fs::canonicalize(&config_path),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => effective == config_path,
+        };
+        if !same {
+            println!();
+            println!("  WARNING: these settings will NOT be used yet.");
+            println!("  A higher-priority config shadows them: {}", effective.display());
+            println!("  Remove/rename that file (or unset AV_CONFIG) so the settings above take effect.");
+        }
+    }
     if let Some(path) = &key_file {
         println!("  API key:  {} (private to your user account)", path.display());
     }
@@ -1044,6 +1082,12 @@ pub async fn start() -> Result<()> {
 
     if health_ok(&base).await {
         println!("AgentVisor AI is already running at {base}");
+        // The running daemon loaded its settings at ITS boot — it does
+        // not reload on config rewrites. Right after the wizard (the
+        // common path into here) that means the fresh settings are NOT
+        // in effect until the old process is restarted; without this
+        // hint the success banner reads as "new settings active".
+        println!("Note: it keeps the settings it started with. To apply new settings, stop that process and run `avctl start` again.");
         print_usage_banner(&base);
         return Ok(());
     }
@@ -1644,15 +1688,40 @@ pub async fn doctor(offline: bool) -> Result<()> {
         }
 
         // 10. Backend endpoints (TCP probe only; skipped offline).
+        // Gate each probe on the BACKEND SELECTOR, not on the endpoint
+        // being set: the daemon ignores `state_endpoint` under
+        // `state_backend = "memory"` (and validates that as fine), so
+        // probing an unused endpoint made doctor FAIL configs the
+        // daemon runs happily — e.g. a compose template exporting
+        // AV_STATE_ENDPOINT while the config keeps the memory backend.
         if !offline {
-            for (label, endpoint) in [
-                ("state (redis)", config.state_endpoint.as_deref()),
-                ("bridge endpoint", config.bridge_endpoint.as_deref()),
-                ("qdrant", config.qdrant_url.as_deref()),
+            for (label, endpoint, used) in [
+                (
+                    "state (redis)",
+                    config.state_endpoint.as_deref(),
+                    config.state_backend != "memory",
+                ),
+                (
+                    "bridge endpoint",
+                    config.bridge_endpoint.as_deref(),
+                    config.bridge_backend != "embedded",
+                ),
+                (
+                    "qdrant",
+                    config.qdrant_url.as_deref(),
+                    config.vector_backend == "qdrant",
+                ),
             ] {
                 let Some(endpoint) = endpoint.filter(|e| !e.is_empty()) else {
                     continue;
                 };
+                if !used {
+                    checks.push(Check::Warn(format!(
+                        "{label}: endpoint configured but the selected backend does not use it \
+                         (the daemon ignores it); not probed"
+                    )));
+                    continue;
+                }
                 match probe_endpoint_any(endpoint).await {
                     Ok(()) => checks.push(Check::Pass(format!(
                         // The success line must
@@ -1825,6 +1894,17 @@ fn check_owner_only_secret(path: &Path) -> std::result::Result<(), String> {
         }
     }
     let contents = std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    // Mirror the daemon exactly: auth resolution uses `read_to_string`,
+    // which hard-errors on invalid UTF-8. Without this check a UTF-16
+    // key file (PowerShell `Out-File` default) passed doctor (0x00
+    // bytes are not ASCII whitespace) and then failed in the daemon.
+    if std::str::from_utf8(&contents).is_err() {
+        return Err(format!(
+            "{} is not valid UTF-8 (the daemon reads key files with read_to_string and will \
+             refuse it); re-save it as plain UTF-8/ASCII",
+            path.display()
+        ));
+    }
     if contents.iter().all(u8::is_ascii_whitespace) {
         return Err(format!("{} is empty", path.display()));
     }
