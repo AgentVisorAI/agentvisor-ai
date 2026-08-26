@@ -250,19 +250,32 @@ pub const MAX_VALIDATION_ISSUES: usize = 4096;
 const MAX_NESTED_DEPTH: usize = 128;
 
 /// Upper bound for USD-denominated cost fields
-/// (`total_cost_usd` in `final_metrics`, `cost_usd` per step). Strict
-/// mode's original floor at 0.0 was asymmetric — no ceiling — so a
-/// hostile trajectory carrying `total_cost_usd: 1.7e308` passed
-/// strict validation and flowed into promotion, dashboards, and
-/// receipt subject payloads. Not a signing hazard (receipt subject
-/// uses the ATIF file hash, not the cost fields) but a metrics-
-/// poisoning primitive: Prometheus histograms of av_session_cost_usd
-/// would blow up their bucketing; downstream billing exporters might
-/// saturate their accumulators. `1e12` (one trillion USD) is
-/// operationally absurd for any real agent run — 1000x the whole
-/// LLM industry's annual spend — while being 1e296 below f64::MAX,
-/// safe for any arithmetic combination downstream.
-pub(crate) const MAX_COST_USD: f64 = 1e12;
+/// (`total_cost_usd` in `final_metrics`, `cost_usd` per step). Aligned
+/// with the downstream recovery scaling in
+/// `av_harness::session::cost_from_atif_total`: recovery converts
+/// dollars → micros via `cost * USD_MICROS_PER_DOLLAR (1_000_000)`
+/// and refuses results exceeding `JCS_SAFE_MAX = 2^53`. Setting the
+/// strict-validator cap at `9e9` (nine billion USD) fits comfortably
+/// below `JCS_SAFE_MAX / USD_MICROS_PER_DOLLAR (~9.007e9)` and
+/// ensures every trajectory that passes strict validation can also
+/// pass recovery — before this alignment the validator accepted up
+/// to `1e12` (one trillion USD) while recovery capped at ~9e9, so
+/// hypothetical mid-range trajectories became unrecoverable with an
+/// explicit "recovered cost exceeds JCS-safe bounds" error.
+///
+/// `9e9` USD (~9× the whole LLM industry's 2026 annual spend) is
+/// still operationally absurd for any real agent run, so the cap
+/// remains a hostile-input guard, not a business-logic limit.
+///
+/// Historical context: strict mode's original floor at 0.0 was
+/// asymmetric — no ceiling — so a hostile trajectory carrying
+/// `total_cost_usd: 1.7e308` passed strict validation and flowed
+/// into promotion, dashboards, and receipt subject payloads. Not a
+/// signing hazard (receipt subject uses the ATIF file hash, not the
+/// cost fields) but a metrics-poisoning primitive: Prometheus
+/// histograms of av_session_cost_usd would blow up their bucketing;
+/// downstream billing exporters might saturate their accumulators.
+pub(crate) const MAX_COST_USD: f64 = 9e9;
 
 /// Upper bound for id-shaped string fields — matches
 /// [`av_core::ids::SessionId::parse`]'s 128-byte cap so a Trajectory
