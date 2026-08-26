@@ -1113,6 +1113,20 @@ impl AppState {
             "Admission-debit refund closure panicked in Drop; the session \
              and principal ledgers retain the debit until operator repair",
         );
+        // Idle-close per-session deadline counter. Same pre-
+        // registration discipline: this counter is emitted only
+        // from the timeout arm of `close_session` in the reconciler
+        // idle-close sweep, so a lazy `rate() > 0` alert wouldn't
+        // see the FIRST fire — exactly the incident the alert
+        // exists to catch. See OPERATIONS.md.
+        metrics.counter(
+            "av_idle_close_timeouts_total",
+            "Idle-close reached the per-session deadline (90 s) and returned \
+             to the next tick — indicates a session with an active lease \
+             that never drops (stuck stream, hung worker, unresponsive \
+             bridge). A steady rate > 0 requires operator investigation \
+             of the coincident session id.",
+        );
         // Per-tick recovery-scan cap counter. Every recovery pass that
         // walks `read_dir` yields after `MAX_RECOVERY_ENTRIES_PER_TICK`
         // entries so a poisoned spool (millions of stale files) does

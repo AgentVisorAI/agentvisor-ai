@@ -446,26 +446,49 @@ impl Registry {
                         out.push_str(&format!("# HELP {base} {help}\n# TYPE {base} histogram\n"));
                     }
                     // Snapshot the count ONCE before rendering either
-                    // the `+Inf` bucket or the `_count` line. `count()`
-                    // is a live atomic load; a concurrent `observe_us`
-                    // completing between the two loads would render
-                    // `_count = N+1` alongside `bucket{le="+Inf"} = N`,
-                    // violating the Prometheus text-format invariant
-                    // `_count == cum(bucket{le="+Inf"})`. Strict
-                    // OpenMetrics parsers reject the divergent scrape;
-                    // Prometheus 2.x is lenient but
-                    // `histogram_quantile` computes against the +Inf
-                    // bucket while summary panels display `_count`,
-                    // producing off-by-one quantile artifacts on hot
-                    // histograms (`av_upstream_latency_seconds`,
-                    // `av_request_duration_seconds{route="chat"}`).
+                    // the `+Inf` bucket or the `_count` line, AND
+                    // clamp the cumulative bucket sum against the
+                    // snapshot. Two invariants strict OpenMetrics
+                    // parsers enforce:
+                    //
+                    //   (a) `_count == cum(bucket{le="+Inf"})`
+                    //   (b) `bucket{le=X} <= bucket{le=Y}` for X < Y,
+                    //       and `bucket{le=X} <= _count` for all X
+                    //
+                    // `observe_us` writes `count.fetch_add` BEFORE
+                    // `bucket.fetch_add` (metrics.rs:176 → :181), so
+                    // a naive render that reads count first and
+                    // buckets after can see MORE bucket increments
+                    // than count increments — a concurrent observe
+                    // that completed both fetches between the
+                    // count snapshot and the bucket load. The
+                    // previous fix (R24 review) snapshotted count
+                    // once but didn't clamp; that closed invariant
+                    // (a) but re-opened invariant (b), because
+                    // `cum` could exceed `count_snapshot` on the
+                    // very next bucket iteration and get emitted
+                    // verbatim.
+                    //
+                    // Clamping cum against count_snapshot preserves
+                    // both invariants: bucket lines are monotone
+                    // non-decreasing (cum is monotone, `.min(K)` of
+                    // a monotone sequence is monotone), and every
+                    // bucket line is `<= count_snapshot` by
+                    // construction. Under a race, a bucket that
+                    // truly holds `N+1` observations may render as
+                    // `N` for one scrape; the missing observation
+                    // shows up on the next scrape. This is the same
+                    // "eventually consistent under concurrent
+                    // observation" contract every Prometheus client
+                    // library the ecosystem trusts uses.
                     let count_snapshot = h.count();
                     let mut cum = 0u64;
                     for (i, b) in h.bounds_us.iter().enumerate() {
                         cum += h.buckets.get(i).map_or(0, |x| x.load(Ordering::Relaxed));
+                        let clamped = cum.min(count_snapshot);
                         let le = (*b as f64) / 1_000_000.0;
                         out.push_str(&format!(
-                            "{base}_bucket{{{}le=\"{le}\"}} {cum}\n",
+                            "{base}_bucket{{{}le=\"{le}\"}} {clamped}\n",
                             join_labels(labels)
                         ));
                     }
@@ -804,54 +827,100 @@ mod tests {
     /// interprets as off-by-one quantile artifacts. Hammer both a
     /// writer and a reader in parallel and assert the invariant on
     /// EVERY scrape.
+    /// Prometheus text format enforces two invariants strict
+    /// OpenMetrics parsers reject on:
+    ///
+    ///   (a) `_count == cum(bucket{le="+Inf"})`
+    ///   (b) `bucket{le=X} <= bucket{le=Y}` for X < Y, and
+    ///       `bucket{le=X} <= _count` for all X
+    ///
+    /// R25 closed (a) by snapshotting count once, but LEFT (b) open
+    /// because `observe_us` writes count-then-bucket — a snapshot-
+    /// count-then-read-buckets order could see MORE bucket
+    /// increments than count increments (a concurrent observe that
+    /// completed both fetches between the count snapshot and the
+    /// bucket load). The current fix ALSO clamps cum against the
+    /// snapshot to preserve (b). Hammer a writer + reader in
+    /// parallel and assert BOTH invariants on EVERY scrape.
     #[test]
     #[allow(clippy::unwrap_used, clippy::expect_used)]
-    fn histogram_scrape_is_atomic_between_count_and_inf_bucket() {
+    fn histogram_scrape_preserves_all_invariants_under_concurrent_observe() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
         use std::thread;
 
         let r = Arc::new(Registry::new());
-        let h = r.histogram("av_race", "concurrent scrape probe");
+        // Diverse bucket bounds so a busy writer spreads observations
+        // across several buckets — increases the chance of catching a
+        // mid-loop race between the bucket loop and the count snapshot.
+        let h = r.histogram_with_bounds(
+            "av_race",
+            "concurrent scrape probe",
+            &[10, 100, 1_000, 10_000, 100_000],
+        );
         let stop = Arc::new(AtomicBool::new(false));
 
         let writer = {
             let h = h.clone();
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
+                // Rotate through values that hit different buckets.
+                let mut i: u64 = 0;
                 while !stop.load(Ordering::Relaxed) {
-                    h.observe_us(42);
+                    let us = (i % 5 + 1) * 50; // 50, 100, 150, 200, 250
+                    h.observe_us(us);
+                    i = i.wrapping_add(1);
                 }
             })
         };
 
-        // Read many scrapes and assert the invariant on each.
         let start = std::time::Instant::now();
         let mut scrapes = 0usize;
-        while start.elapsed() < std::time::Duration::from_millis(200) {
+        while start.elapsed() < std::time::Duration::from_millis(300) {
             let text = r.render();
-            // Extract the `+Inf` bucket value.
-            let inf_line = text
-                .lines()
-                .find(|line| line.starts_with("av_race_bucket") && line.contains("le=\"+Inf\""))
-                .expect("+Inf bucket line missing");
-            let inf_count: u64 = inf_line
-                .rsplit(' ')
-                .next()
-                .and_then(|s| s.parse().ok())
-                .expect("failed to parse +Inf bucket count");
-            let count_line = text
-                .lines()
-                .find(|line| line.starts_with("av_race_count"))
-                .expect("_count line missing");
-            let total: u64 = count_line
-                .rsplit(' ')
-                .next()
-                .and_then(|s| s.parse().ok())
-                .expect("failed to parse _count value");
+            let mut buckets: Vec<(f64, u64)> = Vec::new();
+            let mut count: Option<u64> = None;
+            for line in text.lines() {
+                if line.starts_with("av_race_bucket") {
+                    let le_start = line.find("le=\"").unwrap() + 4;
+                    let le_end = le_start + line[le_start..].find('"').unwrap();
+                    let le_str = &line[le_start..le_end];
+                    let val: u64 = line.rsplit(' ').next().and_then(|s| s.parse().ok()).unwrap();
+                    let le_f = if le_str == "+Inf" {
+                        f64::INFINITY
+                    } else {
+                        le_str.parse().unwrap()
+                    };
+                    buckets.push((le_f, val));
+                } else if line.starts_with("av_race_count") {
+                    count = Some(line.rsplit(' ').next().and_then(|s| s.parse().ok()).unwrap());
+                }
+            }
+            let count = count.expect("_count line missing");
+            buckets.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            let mut prev = 0u64;
+            for (le, val) in &buckets {
+                // Invariant (b1): buckets monotone non-decreasing.
+                assert!(
+                    *val >= prev,
+                    "monotonicity violated at le={le}: {val} < prev {prev} on scrape {scrapes}"
+                );
+                // Invariant (b2): every bucket <= _count.
+                assert!(
+                    *val <= count,
+                    "bucket at le={le} = {val} > _count = {count} on scrape {scrapes}"
+                );
+                prev = *val;
+            }
+            // Invariant (a): +Inf bucket == _count.
+            let inf = buckets
+                .iter()
+                .find(|(le, _)| le.is_infinite())
+                .expect("+Inf bucket missing")
+                .1;
             assert_eq!(
-                inf_count, total,
-                "invariant violated: bucket{{le=+Inf}}={inf_count} but _count={total} on scrape {scrapes}"
+                inf, count,
+                "invariant (a) violated: +Inf = {inf} != _count = {count} on scrape {scrapes}"
             );
             scrapes = scrapes.saturating_add(1);
         }
