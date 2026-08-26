@@ -157,3 +157,8 @@ Legend: **✅ verified** · **🟢 configured** · **📋 documented**
 - **CORS disallowed origin**: `Origin: https://evil.com` gets NO `Access-Control-Allow-Origin` header.
 - **CORS preflight**: OPTIONS returns `Allow-Origin`, `Allow-Credentials`, `Allow-Methods`, `Allow-Headers`.
 - **Graceful shutdown**: SIGTERM → `"graceful shutdown starting"` log → clean exit in ~300ms → port freed.
+- **Delete deployment cascade**: `DELETE /:id` → 204; deployments + sessions + events all drop to 0 rows.
+- **Empty ingest batch**: `POST /events` with `[]` → `{inserted:0}` clean.
+- **Malformed session upsert**: empty externalId, wrong-typed fields → 400 `invalid_input` (zod schema).
+- **healthz + readyz not rate-limited**: 20/20 rapid calls to each → 200.
+- **Hash XSS**: 6 hostile hashes (`<script>`, `<img onerror>`, encoded, path traversal, SVG onload) → 0 alerts fired, zero DOM script injection.
