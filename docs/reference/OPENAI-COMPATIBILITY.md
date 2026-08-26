@@ -270,4 +270,5 @@ curl -sS http://localhost:8484/v1/chat/completions \
 
 The response is an OpenAI-shaped `ChatCompletion` object. Your
 audit event lands on the broker in parallel; verify it with
-`avctl event-tail --topic agent.step`.
+`avctl event-tail --data-dir /path/to/bridge --topic agent.step`
+(the `--data-dir` points at the harness's `bridge_data_dir`).

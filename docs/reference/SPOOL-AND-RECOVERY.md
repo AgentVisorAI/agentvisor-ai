@@ -27,7 +27,7 @@ inventory:
 | `receipts/{stem}.json` | Signed receipt (signed workflow) | finalizer at close (`persist_receipt`) | never (audit evidence; manage retention externally) |
 | `receipts/{stem}.archived-<receipt-id>.json` | Prior incarnation's receipt after a recycled session id | `archive_conflicting_receipt` at the collision | never (preserved collision evidence) |
 | `{stem}.archived-<trajectory-id>` (+ `.atif-auth`, `.close-complete`) | Prior incarnation's ATIF evidence after a recycled session id | `archive_conflicting_atif` at the collision | never (preserved collision evidence) |
-| `outbox/{stem}.session.lifecycle-outbox.ndjson` | Bridge events queued when the bus was unavailable at close time | close_session_locked | outbox drain after successful bridge emit |
+| `outbox/{stem}.{kind}.json` where `kind` ∈ `{receipt, session-close}` | Bridge lifecycle events queued when the bus was unavailable at close time | close_session_locked | outbox drain after successful bridge emit |
 | `{stem}.acks.ndjson` | Sealed broker acks, one line per published event: proves an event we tried to publish actually landed | worker after successful emit (appended; one `sync_data` per ack — round-51 §7.3) | `remove_step_journal` at close, with the other journals |
 | `broker-acks/{stem}/{event_uid}.json` | Legacy pre-round-51 per-event ack layout; still read as a fallback so mid-session upgrades see their earlier acks | (no longer written) | `remove_step_journal` at close |
 | `inflight-responses/{digest}.json` | Response-attempt markers (`digest = sha256(session_id:attempt_id)[..32]`) proving the client's response was durably captured before the last chunk left the socket | worker (`persist_response_marker`) at capture commit | worker at capture retirement; recovery reaps stranded markers |
@@ -165,8 +165,12 @@ crashed before delivering the ack causes the recovered process to
 re-emit. The event is idempotent-keyed on `event_uid`, so
 downstream consumers dedup on the `event_uid` field. A broker
 without dedup capability WILL land the event twice — this is a
-known limit and the `av_events_dropped_total{stage="broker_ack"}`
-counter tracks the emit-succeeded-but-ack-lost case.
+known limit; operators alerting on emit-then-ack-loss should
+watch the broker-side per-topic ack-loss counter (or Kafka
+`records-lag-max`) rather than an in-process metric, because the
+harness's `av_events_dropped_total` only labels admission-side
+failures (`stage="worker_queue"` / `stage="response_slot"`), not
+post-emit ack loss.
 
 ### 3. Retention prune / live session (round-51 §8.1-§8.2)
 
