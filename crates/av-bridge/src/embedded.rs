@@ -998,6 +998,16 @@ fn recover_event_uids(path: &Path) -> Result<HashMap<String, u64>, BusError> {
     let mut valid_bytes: u64 = 0;
     let mut has_torn_tail = false;
     let mut logged_oversize_line = false;
+    // Sibling once-per-file guards for the parse-failure and
+    // duplicate-UID branches below. A crashed or hostile writer can
+    // leave sidecars with millions of mangled-JSON lines (up to
+    // hot-retention × events/partition, ≈ 1M per partition); without
+    // per-branch guards the recovery pass would emit one warn per
+    // corrupt line during the very restart it's diagnosing, bricking
+    // the log pipeline. Same discipline as `logged_oversize_line`
+    // above.
+    let mut logged_parse_failure = false;
+    let mut logged_duplicate_uid = false;
     // A single oversized-line hard cap: 4 KiB is 20x the fattest
     // sidecar record we produce. The reader is `take`-bounded to the
     // cap (+1 to detect overshoot) so a planted multi-GiB single line
@@ -1088,11 +1098,15 @@ fn recover_event_uids(path: &Path) -> Result<HashMap<String, u64>, BusError> {
             // an unreadable idempotency line at most costs a duplicate
             // ack for the same UID.
             Err(error) => {
-                tracing::warn!(
-                    %error,
-                    path = %av_core::fsutil::basename(path),
-                    "skipping unparseable event-uid sidecar record during recovery",
-                );
+                if !logged_parse_failure {
+                    tracing::warn!(
+                        %error,
+                        path = %av_core::fsutil::basename(path),
+                        "skipping unparseable event-uid sidecar record during recovery; \
+                         subsequent parse failures on this sidecar suppressed to avoid log storm"
+                    );
+                    logged_parse_failure = true;
+                }
                 continue;
             }
         };
@@ -1105,12 +1119,18 @@ fn recover_event_uids(path: &Path) -> Result<HashMap<String, u64>, BusError> {
                 // truth; log and let `recover_segment_event_uids` fix
                 // the mapping. Refusing to open the broker here would
                 // brick the whole tier over a benign inconsistency.
-                tracing::warn!(
-                    event_uid = %mapping.event_uid,
-                    prior_offset = existing,
-                    current_offset = mapping.offset,
-                    "sidecar has duplicate UID entry; segment offset will win after full recovery"
-                );
+                if !logged_duplicate_uid {
+                    tracing::warn!(
+                        event_uid = %mapping.event_uid,
+                        prior_offset = existing,
+                        current_offset = mapping.offset,
+                        path = %av_core::fsutil::basename(path),
+                        "sidecar has duplicate UID entry; segment offset will win after \
+                         full recovery. Subsequent duplicate-UID entries on this sidecar \
+                         suppressed to avoid log storm"
+                    );
+                    logged_duplicate_uid = true;
+                }
             }
         }
     }

@@ -3,6 +3,21 @@
 
 use crate::model::OcsfEvent;
 
+/// Upper bound (inclusive) for the `time` field on emitted events,
+/// in milliseconds since the Unix epoch.
+///
+/// `253_402_300_799_999` = `9999-12-31T23:59:59.999Z`. The shipped
+/// schema pins `time_iso` to a 4-digit year via its `pattern`, so
+/// any `time` above this bound would render a 6-digit year the
+/// schema rejects. Historically the schema advertised
+/// `2^53` (`JCS_SAFE_MAX`) as the upper bound while the Rust
+/// validator applied this tighter year-10000 cap first — a
+/// split-brain the R51/R52 schema-drift pass closed by aligning the
+/// schema to the same bound. Exposed as a `pub const` so tests can
+/// pin the schema-vs-code equality (see `schema_conformance.rs`)
+/// and so future changes to one side without the other fail CI.
+pub const SCHEMA_TIME_MAX_MS: u64 = 253_402_300_799_999;
+
 /// A structural validation failure.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
@@ -324,8 +339,8 @@ pub fn validate_event(ev: &OcsfEvent) -> Result<(), Vec<ValidationError>> {
     // Schema parity: the `time_iso` pattern pins a 4-digit year. A
     // `time` near 2^53 is JCS-safe and consistent with its own caption
     // (the cross-check below), but renders a 6-digit year the schema
-    // pattern rejects. 253402300799999 = 9999-12-31T23:59:59.999Z.
-    if ev.time > 253_402_300_799_999 {
+    // pattern rejects. `SCHEMA_TIME_MAX_MS` = 9999-12-31T23:59:59.999Z.
+    if ev.time > SCHEMA_TIME_MAX_MS {
         errors.push(ValidationError::TimeBeyondSchemaRange(ev.time));
     }
     // `time_iso` is the second representation of the event's timestamp;

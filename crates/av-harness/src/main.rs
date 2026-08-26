@@ -312,6 +312,13 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
             }
         })
     });
+    let tcp_nodelay_failures = state.metrics.counter(
+        "av_tcp_nodelay_failures_total",
+        "TCP_NODELAY setsockopt failed on an accepted connection; the \
+         suboptimal-latency connection still serves. Rate-limited to a \
+         single tracing warn per process to avoid a per-accept log storm \
+         under half-open flood / SYN flood.",
+    );
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("bind {}", config.listen))?
@@ -330,15 +337,33 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
         // `tap_io` is axum 0.8's idiomatic hook for per-connection
         // socket-option tuning without swapping listener types.
         // Failure to set the option (embedded system without full
-        // socket-option support) logs and falls through — a
-        // suboptimal-latency connection is still a working one.
-        .tap_io(|tcp_stream| {
+        // socket-option support, half-open flood socket teardown
+        // between accept and setsockopt, ECONNRESET race) logs and
+        // falls through — a suboptimal-latency connection is still
+        // a working one.
+        //
+        // Wrap the warn in a `std::sync::Once`: a SYN-flood or
+        // Slowloris-class probe against an unauthenticated endpoint
+        // could otherwise fire this warn at accept-rate (~20 k/s on
+        // a moderately-sized Linux node), saturating the log
+        // pipeline and amplifying the very DoS the SSE latency
+        // regression is a distant second to. Every occurrence is
+        // still counted via `av_tcp_nodelay_failures_total` so
+        // operators keep visibility of persistent failures without
+        // the log storm. Same dampener discipline as R33's
+        // identity_rejection_window sliding cap.
+        .tap_io(move |tcp_stream| {
             if let Err(error) = tcp_stream.set_nodelay(true) {
-                tracing::warn!(
-                    %error,
-                    "failed to set TCP_NODELAY on incoming connection; SSE inter-token \
-                     latency may regress by ~40 ms per frame"
-                );
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        %error,
+                        "failed to set TCP_NODELAY on incoming connection; SSE inter-token \
+                         latency may regress by ~40 ms per frame. Subsequent failures logged \
+                         only via av_tcp_nodelay_failures_total to avoid a per-accept log storm."
+                    );
+                });
+                tcp_nodelay_failures.inc();
             }
         });
     if let Some(segment) = config.duplicated_chat_path_segment() {

@@ -605,7 +605,7 @@ impl Drop for AdmissionDebit {
                     )
                     .inc();
                 tracing::error!(
-                    session_id = %sess_for_log,
+                    session = %sess_for_log,
                     tokens,
                     panic = %msg,
                     "admission-debit refund PANICKED (caught); \
@@ -1145,6 +1145,19 @@ impl AppState {
             "av_atif_retention_errors_total",
             "ATIF retention sweep tick returned an error; the loop continues \
              on the next hour",
+        );
+        // TCP_NODELAY setsockopt failure counter — written from the
+        // axum `tap_io` per-accept hook when `set_nodelay(true)` on
+        // the freshly-accepted socket fails (typically ENOTCONN /
+        // EBADF on a SYN-flood / Slowloris torn-down socket, or
+        // ENOPROTOOPT on an embedded target without full socket-
+        // option support). The tracing warn is dampened via
+        // `std::sync::Once` to avoid a per-accept log storm; this
+        // counter keeps operator visibility of the failure rate.
+        metrics.counter(
+            "av_tcp_nodelay_failures_total",
+            "TCP_NODELAY setsockopt failed on an accepted connection; the \
+             suboptimal-latency connection still serves",
         );
         // Drop-spawned close-session and admission-refund panics —
         // same rationale. Each is written only from a Drop-spawned

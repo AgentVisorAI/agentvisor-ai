@@ -55,14 +55,14 @@
     "category_uid": { "const": 6 },
     "activity_id": { "type": "integer", "minimum": 0, "maximum": 99 },
     "type_uid": { "type": "integer", "minimum": 990100, "maximum": 990699 },
-    "time": { "type": "integer", "minimum": 1, "maximum": 9007199254740992 },
+    "time": { "type": "integer", "minimum": 1, "maximum": 253402300799999 },
     "time_iso": {
       "type": "string",
       "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
     },
     "severity_id": { "type": "integer", "minimum": 1, "maximum": 6 },
     "status_id": { "type": "integer", "minimum": 0, "maximum": 2 },
-    "session_uid": { "type": "string", "minLength": 1 },
+    "session_uid": { "type": "string", "minLength": 1, "maxLength": 128 },
     "ai_agent": {
       "type": "object",
       "additionalProperties": false,
