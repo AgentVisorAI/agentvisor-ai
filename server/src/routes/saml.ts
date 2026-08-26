@@ -23,6 +23,7 @@ import { z } from "zod";
 import { generateKeyPairSync, createHash } from "node:crypto";
 import { db } from "../db.js";
 import { env } from "../env.js";
+import { writeAudit } from "../lib/audit.js";
 import {
   SESSION_COOKIE_OPTS,
   mintSession,
@@ -262,6 +263,23 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
         membershipRole: membership.role as "owner" | "admin" | "member",
       });
       reply.setCookie(env.SESSION_COOKIE_NAME, token, SESSION_COOKIE_OPTS);
+      writeAudit(
+        {
+          orgId: cfg.orgId,
+          event: "saml.signin",
+          actorId: user!.id,
+          actorEmail: user!.email,
+          target: cfg.displayName,
+          note: "SAML sign-in via " + cfg.displayName,
+          metadata: {
+            samlConfigId: cfg.id,
+            nameIDFormat: result.nameIDFormat,
+            assertionId: result.assertionId,
+          },
+          req,
+        },
+        req.log,
+      );
 
       // RelayState round-trip — restore the caller's deep link.
       const relay = result.relayState;
@@ -341,6 +359,21 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
           sloUrl: body.data.sloUrl ?? null,
         },
       });
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "saml.config_created",
+          actorId: claims.sub,
+          target: cfg.displayName,
+          metadata: {
+            samlConfigId: cfg.id,
+            entityIdIdp: cfg.entityIdIdp,
+            allowedDomains: cfg.allowedDomains,
+          },
+          req,
+        },
+        req.log,
+      );
       return reply.code(201).send({ config: serializeConfig(cfg) });
     } catch (err) {
       if (
@@ -379,6 +412,20 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
               : body.data.sloUrl ?? null,
         },
       });
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "saml.config_updated",
+          actorId: claims.sub,
+          target: cfg.displayName,
+          metadata: {
+            samlConfigId: cfg.id,
+            changed: Object.keys(body.data),
+          },
+          req,
+        },
+        req.log,
+      );
       return reply.send({ config: serializeConfig(cfg) });
     },
   );
@@ -396,6 +443,17 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
       });
       if (!existing) return reply.code(404).send({ error: "not_found" });
       await db.samlConfig.delete({ where: { id: existing.id } });
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "saml.config_deleted",
+          actorId: claims.sub,
+          target: existing.displayName,
+          metadata: { samlConfigId: existing.id },
+          req,
+        },
+        req.log,
+      );
       return reply.code(204).send();
     },
   );

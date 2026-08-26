@@ -1248,7 +1248,25 @@
     async togglePolicy(id) { return this.getPolicy(id); },
     async listMembers() { return MOCK_MEMBERS.slice(); },
     async listApiKeys() { return MOCK_API_KEYS.slice(); },
-    async listAudit() { return MOCK_AUDIT.slice(); },
+    async listAudit(opts) {
+      // Real audit log — the SPA maps our normalized shape into the
+      // audit table. If the server returns 4xx/5xx we fall through to
+      // an empty array so the settings page doesn't crash.
+      opts = opts || {};
+      var q = [];
+      if (opts.cursor) q.push("cursor=" + encodeURIComponent(opts.cursor));
+      if (opts.limit) q.push("limit=" + encodeURIComponent(opts.limit));
+      if (opts.event) q.push("event=" + encodeURIComponent(opts.event));
+      var qs = q.length ? ("?" + q.join("&")) : "";
+      try {
+        var res = await apiFetch("/api/v1/audit" + qs);
+        return (res.entries || []).map(function (e) {
+          return { at: e.at, actor: e.actor, event: e.event, target: e.target, note: e.note };
+        });
+      } catch (e) {
+        return [];
+      }
+    },
     subscribe(callback) {
       // EventSource has built-in reconnect on clean close, but silently
       // gives up on 401/403 or repeated connection errors. Wrap with

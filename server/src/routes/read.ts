@@ -319,4 +319,80 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
     };
     return reply.send({ receipt: safe });
   });
+
+  // GET /audit — compliance-grade audit log for the caller's org. Every
+  // sensitive action written via writeAudit lands here. Cursor pagination
+  // uses (at desc, id desc) to stay stable under concurrent writes.
+  app.get<{
+    Querystring: {
+      cursor?: string;
+      limit?: number;
+      event?: string;
+    };
+  }>("/audit", async (req, reply) => {
+    const claims = requireSession(req, reply);
+    if (!claims) return;
+    const query = z
+      .object({
+        cursor: z.string().optional(),
+        limit: z.coerce.number().int().min(1).max(200).default(50),
+        event: z.string().max(80).optional(),
+      })
+      .safeParse(req.query);
+    if (!query.success) return reply.code(400).send({ error: "invalid_input" });
+    let cursorPart: { id: string } | null = null;
+    if (query.data.cursor) {
+      try {
+        const decoded = JSON.parse(
+          Buffer.from(query.data.cursor, "base64url").toString("utf8"),
+        );
+        if (decoded && typeof decoded.id === "string") {
+          cursorPart = { id: decoded.id };
+        } else {
+          return reply.code(400).send({ error: "invalid_cursor" });
+        }
+      } catch {
+        return reply.code(400).send({ error: "invalid_cursor" });
+      }
+    }
+    const rows = await db.auditEntry.findMany({
+      where: {
+        orgId: claims.orgId,
+        ...(query.data.event ? { event: query.data.event } : {}),
+      },
+      orderBy: [{ at: "desc" }, { id: "desc" }],
+      take: query.data.limit + 1,
+      ...(cursorPart ? { skip: 1, cursor: cursorPart } : {}),
+      select: {
+        id: true,
+        event: true,
+        actorId: true,
+        actorEmail: true,
+        target: true,
+        note: true,
+        metadata: true,
+        ip: true,
+        at: true,
+      },
+    });
+    const hasMore = rows.length > query.data.limit;
+    const page = hasMore ? rows.slice(0, query.data.limit) : rows;
+    const last = page[page.length - 1];
+    const nextCursor = hasMore && last
+      ? Buffer.from(JSON.stringify({ id: last.id }), "utf8").toString("base64url")
+      : null;
+    return reply.send({
+      entries: page.map((r) => ({
+        id: r.id,
+        event: r.event,
+        actor: r.actorEmail || (r.actorId ? "user:" + r.actorId : "system"),
+        target: r.target,
+        note: r.note,
+        metadata: r.metadata,
+        ip: r.ip,
+        at: r.at,
+      })),
+      nextCursor,
+    });
+  });
 }

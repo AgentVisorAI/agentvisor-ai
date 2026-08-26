@@ -10,6 +10,7 @@ import {
   randomToken,
   verifyPassword,
 } from "../lib/auth.js";
+import { writeAudit } from "../lib/audit.js";
 import { getMailer, passwordResetMail, welcomeMail } from "../lib/mail.js";
 import {
   clearSessionCookie,
@@ -132,6 +133,18 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       membershipRole: "owner",
     });
     reply.setCookie(env.SESSION_COOKIE_NAME, token, SESSION_COOKIE_OPTS);
+    writeAudit(
+      {
+        orgId: org.id,
+        event: "auth.signup",
+        actorId: user.id,
+        actorEmail: user.email,
+        target: user.email,
+        note: `Org "${org.name}" created`,
+        req,
+      },
+      req.log,
+    );
     // Fire-and-forget welcome email. Failures don't block the signup
     // response — a stuck mailer would otherwise turn a hot-path signup
     // into a 30s timeout.
@@ -196,6 +209,17 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       membershipRole: membership.role as "owner" | "admin" | "member",
     });
     reply.setCookie(env.SESSION_COOKIE_NAME, token, SESSION_COOKIE_OPTS);
+    writeAudit(
+      {
+        orgId: membership.orgId,
+        event: "auth.login",
+        actorId: user.id,
+        actorEmail: user.email,
+        target: user.email,
+        req,
+      },
+      req.log,
+    );
     return reply.send({
       user: { id: user.id, email: user.email, displayName: user.displayName },
       org: {
@@ -223,6 +247,15 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
           // essential piece; the fence bump is defense in depth.
           req.log.warn({ err }, "logout_revoke_bump_failed");
         });
+      writeAudit(
+        {
+          orgId: req.session.orgId,
+          event: "auth.logout",
+          actorId: req.session.sub,
+          req,
+        },
+        req.log,
+      );
     }
     clearSessionCookie(reply);
     return reply.send({ ok: true });

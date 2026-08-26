@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { db } from "../db.js";
 import { hashPassword, randomToken } from "../lib/auth.js";
+import { writeAudit } from "../lib/audit.js";
 import { requireSession } from "../lib/session-middleware.js";
 
 const envSchema = z.enum(["production", "staging", "development"]);
@@ -82,6 +83,20 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
       }
       throw err;
     }
+    writeAudit(
+      {
+        orgId: claims.orgId,
+        event: "deployment.create",
+        actorId: claims.sub,
+        target: deployment.name,
+        metadata: {
+          deploymentId: deployment.id,
+          environment: deployment.environment,
+        },
+        req,
+      },
+      req.log,
+    );
     return reply.code(201).send({
       deployment,
       // Shown once. If lost, the user rotates.
@@ -101,7 +116,7 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
     if (!params.success) return reply.code(400).send({ error: "invalid_id" });
     const owned = await db.deployment.findFirst({
       where: { id: params.data.id, orgId: claims.orgId },
-      select: { id: true },
+      select: { id: true, name: true },
     });
     if (!owned) return reply.code(404).send({ error: "not_found" });
     const plaintextToken = randomToken(24);
@@ -110,6 +125,17 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
       where: { id: owned.id },
       data: { ingestTokenHash, ingestTokenHint: tokenHint(plaintextToken) },
     });
+    writeAudit(
+      {
+        orgId: claims.orgId,
+        event: "deployment.token_rotated",
+        actorId: claims.sub,
+        target: owned.name,
+        metadata: { deploymentId: owned.id },
+        req,
+      },
+      req.log,
+    );
     return reply.send({ ingestToken: plaintextToken });
   });
 
@@ -123,10 +149,21 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
     if (!params.success) return reply.code(400).send({ error: "invalid_id" });
     const owned = await db.deployment.findFirst({
       where: { id: params.data.id, orgId: claims.orgId },
-      select: { id: true },
+      select: { id: true, name: true },
     });
     if (!owned) return reply.code(404).send({ error: "not_found" });
     await db.deployment.delete({ where: { id: owned.id } });
+    writeAudit(
+      {
+        orgId: claims.orgId,
+        event: "deployment.delete",
+        actorId: claims.sub,
+        target: owned.name,
+        metadata: { deploymentId: owned.id },
+        req,
+      },
+      req.log,
+    );
     return reply.code(204).send();
   });
 }

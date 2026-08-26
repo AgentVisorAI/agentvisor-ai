@@ -50,8 +50,37 @@ model Org {
   deployments Deployment[]
   samlConfigs SamlConfig[]
   samlReplayRecords SamlReplayRecord[]
+  auditEntries AuditEntry[]
 
   @@map("orgs")
+}
+
+// Compliance-grade audit trail. Every sensitive action writes one row
+// here. Members can read their own org's log; owners can filter and
+// export. Retention is a business decision (default forever; a cron
+// can trim older-than-N rows if the operator wants).
+//
+// `event` is a machine-readable slug ("deployment.create", "saml.signin",
+// "member.role_changed", "session.export"). `actorEmail` is a snapshot
+// so the row survives the actor account being deleted — GDPR erasure
+// clears the email while preserving the row shape for compliance.
+model AuditEntry {
+  id         String   @id @default(cuid())
+  orgId      String
+  event      String
+  actorId    String?
+  actorEmail String?
+  target     String?  // Free-form: deployment name, member email, config displayName, …
+  note       String?
+  metadata   Json?    // Structured details: {oldRole, newRole}, {ip, ua}, {samlConfigId}
+  ip         String?
+  userAgent  String?
+  at         DateTime @default(now())
+
+  org Org @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([orgId, at])
+  @@map("audit_entries")
 }
 
 // Enterprise SAML 2.0 SSO configuration. One per IdP: an org can have
