@@ -2732,8 +2732,7 @@ impl AbortFinalizingStream {
         let tool_calls: Vec<av_atif::ToolCall> = std::mem::take(&mut self.response_tool_calls)
             .into_values()
             .map(|partial| {
-                let arguments = serde_json::from_str(&partial.arguments)
-                    .unwrap_or_else(|_| json!({"raw": partial.arguments}));
+                let arguments = normalize_tool_call_arguments(&partial.arguments);
                 av_atif::ToolCall {
                     tool_call_id: partial.id.unwrap_or_else(av_core::new_event_uid),
                     function_name: partial.name.unwrap_or_else(|| "unknown".to_owned()),
@@ -3648,6 +3647,33 @@ pub(crate) fn provider_u64(value: Option<&Value>, field: &str) -> Result<Option<
         return Err(format!("provider {field} exceeds JCS-safe bounds"));
     }
     Ok(Some(value))
+}
+
+/// Fold the accumulated provider tool-call arguments string into
+/// the JSON `Value` the signed ATIF step attests.
+///
+/// Zero-arg parity across the three provider adapters:
+/// - OpenAI's `"arguments":"{}"` accumulates as `"{}"` on the wire.
+/// - Gemini's `functionCall` without `args` is emitted as `"{}"` by
+///   the adapter (its deltas are `complete: true`, so no
+///   concatenation risk).
+/// - Anthropic streaming ships `content_block_start` with
+///   `"input":{}` as a PLACEHOLDER, then follows with
+///   `input_json_delta.partial_json` chunks that this accumulator
+///   CONCATENATES; emitting `"{}"` from the placeholder would
+///   corrupt every non-empty streaming tool_use to `{}{"city":…}`
+///   at the accumulator. The Anthropic adapter therefore emits `""`
+///   from the placeholder and this helper NORMALISES an empty
+///   accumulator to `"{}"` before parsing — so a truly-zero-arg
+///   streaming tool_use still attests as `{}` (matching OpenAI /
+///   Gemini) instead of the pre-R14 `{"raw":""}` fallback.
+///
+/// Any other unparseable raw (concatenation left corrupt bytes on
+/// the wire, or provider sent invalid JSON) still falls through to
+/// the `{"raw": …}` capture — the auditor sees the exact bytes.
+pub(crate) fn normalize_tool_call_arguments(raw: &str) -> serde_json::Value {
+    let candidate = if raw.is_empty() { "{}" } else { raw };
+    serde_json::from_str(candidate).unwrap_or_else(|_| json!({"raw": raw}))
 }
 
 pub(crate) fn map_finish_reason(native: &str) -> av_events::StopReason {
