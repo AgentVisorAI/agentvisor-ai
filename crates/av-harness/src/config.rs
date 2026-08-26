@@ -13,6 +13,17 @@ pub const CONFIG_VERSION: u32 = 1;
 /// defence-in-depth against a fat-finger, not a hard OOM prevention.
 pub const MAX_WORKER_CHANNEL_CAPACITY: usize = 1_000_000;
 
+/// Upper bound on `mcp_concurrency` (R71). Each admitted MCP call
+/// can buffer up to `MAX_TOOL_RESPONSE_BYTES = 16 MiB` in
+/// `read_limited_tool_response` (routes.rs), so the cap × 16 MiB
+/// bounds worst-case MCP resident memory. 4 096 × 16 MiB = 64 GiB
+/// worst case — a soft ceiling: operators typically want much less,
+/// and a fat-finger config like `mcp_concurrency = 100_000` would
+/// otherwise silently commit the runtime to a memory pressure model
+/// no real host survives. Defence-in-depth like
+/// `MAX_WORKER_CHANNEL_CAPACITY`.
+pub const MAX_MCP_CONCURRENCY: usize = 4_096;
+
 /// Upper bound on `max_request_bytes` (512 MiB). A single request body
 /// should never legitimately need more; lifting this defeats the
 /// sandbox payload guard and lets one request pin half a GB of RAM.
@@ -308,6 +319,19 @@ pub struct HarnessConfig {
     /// Worker channel capacity (bounded; overflow is counted, never blocking).
     #[serde(default = "default_channel_cap")]
     pub worker_channel_capacity: usize,
+    /// Max concurrent `mcp_call_inner` executions. Each call buffers
+    /// up to `MAX_TOOL_RESPONSE_BYTES = 16 MiB` (routes.rs), so the
+    /// admission cap × 16 MiB bounds worst-case MCP resident memory.
+    /// R70 F1 (landed R71): without this cap a slow-tool-upstream
+    /// attack + N concurrent MCP callers stacked N × 16 MiB in RAM
+    /// unbounded — the mcp_inflight tracker was a shutdown-drain
+    /// COUNTER, not a limiter.
+    ///
+    /// Default 128 (~2 GiB worst case). The `MAX_MCP_CONCURRENCY`
+    /// cap below refuses any config value above 4 096 for the same
+    /// class-safety reason as `MAX_WORKER_CHANNEL_CAPACITY`.
+    #[serde(default = "default_mcp_concurrency")]
+    pub mcp_concurrency: usize,
     /// Strict per-stage budget assertions (AV_STRICT_BUDGET also enables).
     #[serde(default)]
     pub strict_stage_budget: bool,
@@ -487,6 +511,9 @@ fn default_qdrant_collection() -> String {
 }
 fn default_channel_cap() -> usize {
     32_768
+}
+fn default_mcp_concurrency() -> usize {
+    128
 }
 fn default_compression() -> bool {
     true
@@ -1372,6 +1399,21 @@ impl HarnessConfig {
         }
         if self.worker_channel_capacity == 0 {
             errors.push("worker_channel_capacity must be > 0".into());
+        }
+        // R70 F1 (landed R71): reject `mcp_concurrency == 0` (would
+        // refuse every MCP call at admission) and values past
+        // `MAX_MCP_CONCURRENCY` (would silently commit worst-case
+        // 64 GiB+ of MCP buffering to the runtime).
+        if self.mcp_concurrency == 0 {
+            errors.push("mcp_concurrency must be > 0 (0 refuses every MCP call at admission)".into());
+        }
+        if self.mcp_concurrency > MAX_MCP_CONCURRENCY {
+            errors.push(format!(
+                "mcp_concurrency {} exceeds the safety cap of {} — each admitted MCP call \
+                 can buffer up to 16 MiB, so oversized values silently commit multi-GB of \
+                 resident memory to a slow-upstream attack surface",
+                self.mcp_concurrency, MAX_MCP_CONCURRENCY
+            ));
         }
         if crate::provider::adapter_for(&self.provider).is_none() {
             errors.push(format!(
