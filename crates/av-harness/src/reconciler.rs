@@ -4427,14 +4427,23 @@ async fn read_complete_journal(path: &std::path::Path) -> Result<Vec<String>, Fi
                 dropping = bytes.len() - complete_len,
                 "trimming partial trailing line from journal recovery"
             );
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .map_err(FinalizeError::atif_source)?;
+            let mut reopen = std::fs::OpenOptions::new();
+            reopen.write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                // O_NOFOLLOW: uniform with the events-journal set_len
+                // reopen (worker.rs) and the broker segment set_len
+                // reopen (av-bridge embedded.rs). The path here is
+                // inside the 0o700 daemon-owned spool subtree so a
+                // symlink plant requires already-privileged access,
+                // but the defense-in-depth cost is one flag bit.
+                reopen.custom_flags(av_core::fsutil::unix_o_nofollow());
+            }
+            let file = reopen.open(&path).map_err(FinalizeError::atif_source)?;
             file.set_len(complete_len as u64)
                 .map_err(FinalizeError::atif_source)?;
-            file.sync_all()
-                .map_err(FinalizeError::atif_source)?;
+            file.sync_all().map_err(FinalizeError::atif_source)?;
         }
         let complete = String::from_utf8(bytes.get(..complete_len).unwrap_or_default().to_vec())
             .map_err(FinalizeError::atif_source)?;
