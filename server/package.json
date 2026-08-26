@@ -45,6 +45,8 @@
     "@types/node": "^22.13.5",
     "@types/nodemailer": "^8.0.1",
     "@types/pg": "^8.23.1",
+    "chrome-launcher": "^1.2.1",
+    "lighthouse": "^13.4.1",
     "playwright": "^1.62.1",
     "tsx": "^4.19.3",
     "typescript": "^5.7.3"
