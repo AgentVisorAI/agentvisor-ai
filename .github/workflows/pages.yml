@@ -120,6 +120,12 @@ jobs:
           mkdir -p "$site/legal"
           cp docs/legal/terms.html "$site/legal/"
           cp docs/legal/privacy.html "$site/legal/"
+          # Public /verify page — drop a receipt, watch it verify
+          # offline via Web Crypto. Standalone HTML + one JSON
+          # sample; no build step needed.
+          mkdir -p "$site/verify"
+          cp docs/verify/index.html "$site/verify/"
+          cp docs/verify/sample-receipt.json "$site/verify/"
           # Publish the assembled directory.
           rm -rf target/doc
           mv "$site" target/doc
