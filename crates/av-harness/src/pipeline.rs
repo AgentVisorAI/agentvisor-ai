@@ -718,6 +718,22 @@ pub enum PipelineError {
         #[source]
         source: Option<ErrorSource>,
     },
+    /// The upstream provider accepted the connection but did not
+    /// finish responding within `upstream_read_timeout_s`. Distinct
+    /// from [`Self::Upstream`] so the response layer can map to
+    /// `504 Gateway Timeout` (RFC 7231 §6.6.5) rather than
+    /// `502 Bad Gateway`, letting operator dashboards distinguish
+    /// "provider slow" (504 — check provider health) from
+    /// "provider unreachable" (502 — check DNS / network / config).
+    /// SDK retry behaviour is unchanged (both retryable).
+    #[error("upstream request timed out: {context}")]
+    UpstreamTimeout {
+        /// Human-readable description.
+        context: String,
+        /// Underlying typed error, when one exists.
+        #[source]
+        source: Option<ErrorSource>,
+    },
     /// The breaker requested immediate connection closure.
     #[error("connection aborted: {0}")]
     Abort(String),
@@ -793,6 +809,16 @@ impl PipelineError {
         }
     }
 
+    /// Semantic upstream-timeout failure with no underlying typed
+    /// error. Response layer maps this to `504 Gateway Timeout`
+    /// (see [`Self::UpstreamTimeout`] docs).
+    pub fn upstream_timeout(context: impl Into<String>) -> Self {
+        Self::UpstreamTimeout {
+            context: context.into(),
+            source: None,
+        }
+    }
+
     /// Semantic unavailability with no underlying typed error.
     pub fn unavailable(context: impl Into<String>) -> Self {
         Self::Unavailable {
@@ -829,6 +855,7 @@ impl PipelineError {
             Self::Unauthorized(_) => axum::http::StatusCode::UNAUTHORIZED,
             Self::Blocked { .. } => axum::http::StatusCode::FORBIDDEN,
             Self::Upstream { .. } => axum::http::StatusCode::BAD_GATEWAY,
+            Self::UpstreamTimeout { .. } => axum::http::StatusCode::GATEWAY_TIMEOUT,
             Self::Abort(_) => axum::http::StatusCode::CONFLICT,
             Self::Unavailable { .. } => axum::http::StatusCode::SERVICE_UNAVAILABLE,
         }
@@ -2132,7 +2159,17 @@ impl AppState {
                     error.is_body = error.is_body(),
                     "upstream forwarding failed"
                 );
-                let client_error = PipelineError::upstream(client_reason.to_owned());
+                // Route timeouts (upstream accepted the connection but
+                // never finished responding) to 504 Gateway Timeout
+                // instead of the generic 502 Bad Gateway. Operator
+                // dashboards keying off HTTP status can now distinguish
+                // "provider slow" (504) from "provider unreachable"
+                // (502) without joining against the metric label.
+                let client_error = if error.is_timeout() {
+                    PipelineError::upstream_timeout(client_reason.to_owned())
+                } else {
+                    PipelineError::upstream(client_reason.to_owned())
+                };
                 let persisted_reason = format!("upstream_{client_reason}");
                 if let Some(permit) = response_permit {
                     let (response_marker, response_attempt_id) = capture_guard.disarm();
