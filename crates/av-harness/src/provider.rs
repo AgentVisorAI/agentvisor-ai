@@ -192,6 +192,10 @@ fn parse_anthropic_payload(
     use crate::routes::{provider_u64, ParsedProviderChunk, ProviderToolCallDelta};
     use serde_json::Value;
 
+    fn input_is_empty_object(v: &Value) -> bool {
+        v.as_object().is_some_and(serde_json::Map::is_empty)
+    }
+
     let mut message = String::new();
     let mut reasoning = String::new();
     let mut finish_reason = None;
@@ -228,7 +232,7 @@ fn parse_anthropic_payload(
         finish_reason = Some(reason.to_owned());
     }
 
-    let mut absorb_block = |index: u64, block: &Value| -> Result<(), String> {
+    let mut absorb_block = |index: u64, block: &Value, is_streaming_start: bool| -> Result<(), String> {
         match block.get("type").and_then(Value::as_str).unwrap_or_default() {
             "text" | "text_delta" => {
                 if let Some(text) = block.get("text").and_then(Value::as_str) {
@@ -245,21 +249,42 @@ fn parse_anthropic_payload(
                 }
             }
             "tool_use" => {
-                // Non-streaming (or content_block_start): id + name,
-                // with `input` as a JSON object. A zero-arg tool call
-                // arrives as `"input":{}` — emit `"{}"` (semantically
-                // the same as OpenAI's `"arguments":"{}"` on the wire
-                // and what `serde_json::to_string(&Value::Object({}))`
-                // produces) rather than an empty string. Pre-fix this
-                // path fell through to `arguments = ""` → the
-                // downstream fallback wrote `{"raw":""}` into the
-                // signed ATIF step, so the same logical zero-arg call
-                // attested with a DIFFERENT `arguments` shape depending
-                // on which provider handled it, silently breaking the
-                // "same signature ⇔ same bytes" auditor invariant.
+                // Two distinct scenarios share this arm:
+                //
+                //  1. NON-STREAMING (`message` / `message_start` with
+                //     the content array inline): `input` carries the
+                //     COMPLETE argument object. A zero-arg call arrives
+                //     as `"input":{}` and must attest as `"{}"` — the
+                //     same wire shape OpenAI produces (`"arguments":
+                //     "{}"`) — so the same logical call signs
+                //     identically regardless of provider. Pre-R14 this
+                //     branch fell through to `arguments = ""` and the
+                //     downstream fallback wrote `{"raw":""}` into the
+                //     signed ATIF step.
+                //
+                //  2. STREAMING (`content_block_start`): Anthropic's
+                //     protocol ALWAYS ships `"input":{}` here as a
+                //     PLACEHOLDER, then follows with
+                //     `input_json_delta.partial_json` chunks that
+                //     `absorb_frame` CONCATENATES into `arguments`.
+                //     Emitting `"{}"` here would corrupt every
+                //     non-empty streaming tool_use to
+                //     `{}{"city":"…"}` — invalid JSON, and the
+                //     `.unwrap_or_else(|_| json!({"raw": …}))`
+                //     fallback at routes.rs:2735 would attest the
+                //     mangled string. Emit `""` instead; the truly
+                //     zero-arg streaming case (no delta frames follow)
+                //     is normalised at that same finalize point,
+                //     where empty accumulated args become `"{}"`
+                //     before the parse attempt.
                 let arguments = match block.get("input") {
-                    Some(input) if !input.is_null() => serde_json::to_string(input)
-                        .map_err(|error| format!("provider tool input is not serializable: {error}"))?,
+                    Some(input)
+                        if !input.is_null() && !(is_streaming_start && input_is_empty_object(input)) =>
+                    {
+                        serde_json::to_string(input)
+                            .map_err(|error| format!("provider tool input is not serializable: {error}"))?
+                    }
+                    _ if is_streaming_start => String::new(),
                     _ => "{}".to_owned(),
                 };
                 tool_call_deltas.push(ProviderToolCallDelta {
@@ -300,7 +325,11 @@ fn parse_anthropic_payload(
                 .get("content_block")
                 .or_else(|| value.get("delta"))
                 .ok_or_else(|| "provider content frame has no block payload".to_owned())?;
-            absorb_block(index, block)?;
+            // Only the START frame carries the tool_use placeholder;
+            // `content_block_delta` frames of type `input_json_delta`
+            // are the concatenated chunks, never a placeholder.
+            let is_streaming_start = frame_type == "content_block_start";
+            absorb_block(index, block, is_streaming_start)?;
         }
         "message" | "message_start" => {
             let content = value.get("content").or_else(|| value.pointer("/message/content"));
@@ -308,7 +337,7 @@ fn parse_anthropic_payload(
                 for (position, block) in blocks.iter().enumerate() {
                     let index =
                         u64::try_from(position).map_err(|_| "provider content index overflow".to_owned())?;
-                    absorb_block(index, block)?;
+                    absorb_block(index, block, false)?;
                 }
             }
         }
@@ -841,9 +870,13 @@ mod tests {
         assert_eq!(delta.id.as_deref(), Some("toolu_1"));
         assert_eq!(delta.name.as_deref(), Some("get_weather"));
         assert_eq!(
-            delta.arguments, "{}",
-            "R14: empty input attests \"{{}}\" to match OpenAI's semantic-equivalent wire \
-             encoding — the pre-R14 empty-string leaked into the signed step as {{\"raw\":\"\"}}"
+            delta.arguments, "",
+            "R14 corrected: `content_block_start` with `input:{{}}` is a STREAMING placeholder \
+             that gets concatenated with subsequent `input_json_delta` chunks — emitting \"{{}}\" \
+             here would corrupt any non-empty streaming tool_use to `{{}}{{\"city\":…}}` at \
+             `absorb_frame`. The genuinely-zero-arg streaming case is normalised at finalize \
+             (empty accumulator → `\"{{}}\"` before parse), so audit parity holds without \
+             breaking the concatenation path."
         );
 
         let args = adapter
@@ -924,29 +957,35 @@ mod tests {
         let _ = adapter.parse_sse_chunk("\u{feff}data: {\"type\":\"unknown_event\",\"x\":1}");
     }
 
-    /// R14 fixes: adapter parity for cross-provider audit invariants.
+    /// R14 (as corrected by R15 review-of-R14): adapter parity for
+    /// cross-provider audit invariants.
     ///
-    /// (1) Zero-arg tool_use attests `arguments = "{}"` (matching what
-    ///     the OpenAI adapter's `arguments: "{}"` wire encoding
-    ///     preserves), not `""` — pre-fix the empty-object rejection
-    ///     produced `arguments = ""` and the downstream fallback wrote
-    ///     `{"raw": ""}` into the signed step, silently diverging the
-    ///     attested tool-call shape across providers.
+    /// (1) Zero-arg tool_use attests `arguments = "{}"` in the FINAL
+    ///     signed step regardless of provider. Anthropic's streaming
+    ///     `content_block_start` still emits `""` as the placeholder
+    ///     wire chunk (see the concatenation regression test below
+    ///     for why); the empty-accumulator → `"{}"` normalisation
+    ///     happens at finalize (`routes.rs::finalize_response`, where
+    ///     the tool_call becomes an `av_atif::ToolCall`).
     /// (2) `[DONE]` terminator swallowed as keepalive so OpenAI-compat
     ///     gateways (LiteLLM, OpenRouter passthroughs) don't fail-close
     ///     the last frame of an Anthropic stream.
     #[test]
     fn anthropic_zero_arg_tool_use_and_done_terminator_parity() {
         let adapter = adapter_for("anthropic").unwrap();
-        // Zero-arg tool_use (non-streaming or content_block_start with
-        // empty input): args round-trip as "{}" not "".
-        let frame = r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_time","input":{}}}"#;
+        // A NON-streaming `message` frame (whole-body inline) with
+        // `input: {}` attests "{}" at the wire level — this path has
+        // no concatenation risk because the whole content array is
+        // present in one frame.
+        let frame = concat!(
+            r#"data: {"type":"message","content":[{"type":"tool_use","id":"toolu_1","name":"get_time","input":{}}],"#,
+            r#""stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":3}}"#,
+        );
         let parsed = adapter.parse_sse_chunk(frame).unwrap().unwrap();
         assert_eq!(parsed.tool_call_deltas.len(), 1);
         assert_eq!(
             parsed.tool_call_deltas[0].arguments, "{}",
-            "zero-arg tool_use must attest arguments=\"{{}}\", matching OpenAI's semantic-equivalent \
-             encoding — not \"\" which downstream renders as {{\"raw\":\"\"}} in the signed step"
+            "non-streaming zero-arg tool_use attests \"{{}}\" — no concatenation risk here"
         );
         // `[DONE]` treated as keepalive, not a parse failure.
         assert!(
@@ -995,10 +1034,14 @@ mod tests {
     #[test]
     fn gemini_inline_error_frame_fails_with_provider_message() {
         let adapter = adapter_for("gemini").unwrap();
-        let frame = r#"data: {"error":{"code":429,"message":"resource exhausted","status":"RESOURCE_EXHAUSTED"}}"#;
+        let frame =
+            r#"data: {"error":{"code":429,"message":"resource exhausted","status":"RESOURCE_EXHAUSTED"}}"#;
         let err = adapter.parse_sse_chunk(frame).unwrap_err();
         assert!(err.contains("resource exhausted"), "{err}");
-        assert!(err.contains("RESOURCE_EXHAUSTED"), "status must reach the diagnostic: {err}");
+        assert!(
+            err.contains("RESOURCE_EXHAUSTED"),
+            "status must reach the diagnostic: {err}"
+        );
     }
 
     /// R14: Anthropic `pause_turn` (Claude 3.7+ extended-thinking +
@@ -1021,5 +1064,86 @@ mod tests {
             crate::routes::map_finish_reason("tool_calls"),
             av_events::StopReason::ToolUse
         );
+    }
+
+    /// R15 (review-of-R14): Anthropic streaming tool_use concatenation
+    /// regression. `content_block_start` ships `"input":{}` as a
+    /// placeholder — R14 initially emitted `"{}"` here, which
+    /// concatenated with subsequent `input_json_delta` chunks into
+    /// `{}{"city":…}` (invalid JSON). This test walks a real
+    /// three-frame streaming sequence, concatenates the deltas the
+    /// way `absorb_frame` does (`push_bounded`), and asserts:
+    ///   (a) the wire-level placeholder is empty
+    ///   (b) the accumulated arguments parse as valid JSON
+    ///   (c) `normalize_tool_call_arguments` renders the final
+    ///       attested `Value` — proving audit parity end-to-end.
+    #[test]
+    fn anthropic_streaming_tool_use_concatenates_to_valid_json_end_to_end() {
+        let adapter = adapter_for("anthropic").unwrap();
+        // Frame 1: content_block_start, placeholder input.
+        let start = adapter
+            .parse_sse_chunk(concat!(
+                r#"event: content_block_start"#,
+                "\n",
+                r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{}}}"#,
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            start.tool_call_deltas[0].arguments, "",
+            "placeholder MUST be empty — otherwise concatenation with subsequent \
+             input_json_delta chunks corrupts to `{{}}{{...}}`"
+        );
+
+        // Frame 2 + 3: input_json_delta chunks that concatenate.
+        let d1 = adapter
+            .parse_sse_chunk(
+                r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"city\":"}}"#,
+            )
+            .unwrap()
+            .unwrap();
+        let d2 = adapter
+            .parse_sse_chunk(
+                r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"NYC\"}"}}"#,
+            )
+            .unwrap()
+            .unwrap();
+
+        // Simulate absorb_frame's per-slot push_bounded concatenation.
+        let mut accum = String::new();
+        accum.push_str(&start.tool_call_deltas[0].arguments);
+        accum.push_str(&d1.tool_call_deltas[0].arguments);
+        accum.push_str(&d2.tool_call_deltas[0].arguments);
+        assert_eq!(accum, r#"{"city":"NYC"}"#);
+        // And finalize — the attested Value.
+        let attested = crate::routes::normalize_tool_call_arguments(&accum);
+        assert_eq!(attested, serde_json::json!({"city": "NYC"}));
+    }
+
+    /// R15: the OTHER half of the fix — a truly zero-arg streaming
+    /// tool_use (placeholder emits `""`, no delta frames follow) must
+    /// still attest as `{}` (matching OpenAI's `"arguments":"{}"`
+    /// wire encoding and Gemini's zero-arg `functionCall`) — the
+    /// R14 goal. `normalize_tool_call_arguments("")` covers it.
+    #[test]
+    fn empty_accumulator_normalises_to_empty_object_across_providers() {
+        // Empty accumulator (Anthropic streaming zero-arg): attests {}.
+        assert_eq!(
+            crate::routes::normalize_tool_call_arguments(""),
+            serde_json::json!({})
+        );
+        // Literal "{}" (OpenAI, Gemini, non-streaming Anthropic): {}.
+        assert_eq!(
+            crate::routes::normalize_tool_call_arguments("{}"),
+            serde_json::json!({})
+        );
+        // Real args round-trip.
+        assert_eq!(
+            crate::routes::normalize_tool_call_arguments(r#"{"city":"NYC"}"#),
+            serde_json::json!({"city": "NYC"})
+        );
+        // Corrupt bytes fall back to `{"raw": …}` (never a panic).
+        let attested = crate::routes::normalize_tool_call_arguments("{not json");
+        assert_eq!(attested["raw"], "{not json");
     }
 }
