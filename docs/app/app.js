@@ -1400,6 +1400,15 @@
     main.innerHTML = pageHeader("Policies", "Rules the daemon enforces before any tool call or LLM egress.", '<button class="btn accent" id="addPol">+ New policy</button>') + loadingBlock("table");
     var pols;
     try { pols = await state.ds.listPolicies(); } catch (e) { return renderError(main, e); }
+    if (!pols.length) {
+      main.innerHTML = pageHeader("Policies", "0 policies · none enabled", '<button class="btn accent" id="addPol">+ New policy</button>') +
+        emptyState("No policies yet", "Write your first policy to start blocking risky prompts, tool calls, or PII egress. The daemon evaluates policies before any request reaches your model.", "+ Write a policy", null, "addPolCta");
+      var addP = $("#addPol") || $("#addPolCta");
+      if (addP) addP.addEventListener("click", function () {
+        comingSoon("Write a new policy", "The policy editor supports a Rego-style DSL with autocomplete, dry-run against past sessions, and a shareable review link before rollout.");
+      });
+      return;
+    }
     var rows = pols.map(function (p) {
       var switchCls = p.enabled ? "on" : "";
       return '<tr data-clickable data-id="' + esc(p.id) + '" data-nav="#/policies/" tabindex="0">' +
@@ -1600,6 +1609,25 @@
   async function renderSettingsKeys(root) {
     root.innerHTML = '<div class="card">' + loadingBlock("table") + "</div>";
     var keys = await state.ds.listApiKeys();
+    if (!keys.length) {
+      root.innerHTML =
+        '<div class="card" style="padding:0">' +
+          '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:baseline">' +
+            '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">API keys</h2>' +
+            '<span style="margin-left:8px; color:var(--fg-3); font-size:var(--t-sec)">0 active</span>' +
+          "</div>" +
+          '<div style="padding: 24px 16px">' +
+          emptyState("No API keys yet", "Create a server-side key to script deployments, rotate ingest tokens, or wire AgentVisor into CI/CD.", "+ Create key", null, "createKeyBtn") +
+          "</div></div>";
+      var ck0 = $("#createKeyBtn", root);
+      if (ck0) ck0.addEventListener("click", function () {
+        openInputModal({ title: "Create an API key", label: "Key name", placeholder: "e.g. CI runner", confirmLabel: "Create", onConfirm: function (name) {
+          var token = "av_srv_" + Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
+          showTokenModal(token, "API key created");
+        }});
+      });
+      return;
+    }
     var rows = keys.map(function (k) {
       return "<tr>" +
         '<td><div style="font-weight:500">' + esc(k.name) + '</div><div class="id">' + esc(k.id) + "</div></td>" +
@@ -1686,6 +1714,17 @@
   async function renderSettingsAudit(root) {
     root.innerHTML = '<div class="card">' + loadingBlock("table") + "</div>";
     var audit = await state.ds.listAudit();
+    if (!audit.length) {
+      root.innerHTML =
+        '<div class="card" style="padding:0">' +
+          '<div style="padding:12px 16px; border-bottom:1px solid var(--border)">' +
+            '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">Audit log</h2>' +
+          "</div>" +
+          '<div style="padding: 24px 16px">' +
+          emptyState("No audit entries yet", "Sign-ins, deployment rotations, policy changes, and receipt verifications will appear here as your team uses the console.") +
+          "</div></div>";
+      return;
+    }
     var rows = audit.map(function (a) {
       return '<tr><td class="mono" style="color:var(--fg-3); font-size:11.5px; white-space:nowrap">' + esc(new Date(a.at).toLocaleString()) + '</td>' +
         '<td><span style="font-weight:500">' + esc(a.event) + "</span></td>" +

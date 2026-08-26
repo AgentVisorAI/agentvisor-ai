@@ -753,7 +753,7 @@ tbody tr { border-bottom: 1px solid var(--border); }
 tbody tr:last-child { border-bottom: 0; }
 tbody tr[data-clickable] { cursor: pointer; }
 tbody tr[data-clickable]:hover { background: var(--surface-hover); }
-td .id { font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 11.5px; color: var(--fg-3); margin-top: 2px; }
+td .id { font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 11.5px; color: var(--fg-3); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; }
 td .actor { display: flex; align-items: center; gap: 6px; }
 td .actor .av { width: 20px; height: 20px; border-radius: 50%; background: var(--surface-hover); border: 1px solid var(--border); display: grid; place-items: center; font-size: 10px; font-weight: 600; color: var(--fg-2); }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
