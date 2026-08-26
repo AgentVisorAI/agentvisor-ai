@@ -36,16 +36,23 @@ await page.waitForSelector("#drop", { timeout: 10000 });
 await page.waitForSelector("#loadExample", { timeout: 5000 });
 console.log("✅ /verify page renders with drop zone + sample button");
 
-// 2. Try sample -> should verify
+// 2. Try sample -> should render as internally consistent (empty trust anchor)
 await page.locator("#loadExample").click();
 await wait(1500);
 {
   const title = await page.locator(".result-title").innerText();
-  if (!/verifies/i.test(title) || /does not/i.test(title)) fail("sample didn't verify. title=" + title);
+  // R78 HIGH #1: with empty TRUSTED_RECEIPT_KEYS, ANY receipt
+  // (including the shipped sample) must render as INTERNALLY
+  // CONSISTENT, not TRUSTED. Any regression to the pre-R78
+  // string that says the sample is "authentic" without
+  // qualification re-opens the forgery surface.
+  if (/does not verify/i.test(title)) fail("sample rendered as does-not-verify. title=" + title);
+  if (/verifies against a trusted key/i.test(title)) fail("sample falsely claimed TRUSTED (empty anchor list should show INTERNALLY CONSISTENT until anchors are populated): " + title);
+  if (!/internally consistent/i.test(title)) fail("sample missing INTERNALLY CONSISTENT string: " + title);
   const kvText = await page.locator(".result-card dl.kv").innerText();
   if (!/Session/.test(kvText)) fail("no session field in kv");
   if (!/supply-planner|northwind|demo/i.test(kvText)) fail("session content missing");
-  console.log("✅ sample receipt verifies via Web Crypto in the browser");
+  console.log("✅ sample receipt renders as INTERNALLY CONSISTENT via Web Crypto in the browser");
 }
 
 // 3. Fetch the same sample and upload via file input
@@ -69,8 +76,16 @@ async function uploadJson(text) {
 await uploadJson(sampleText);
 {
   const title = await page.locator(".result-title").innerText();
-  if (!/verifies/i.test(title) || /does not/i.test(title)) fail("uploaded legit didn't verify");
-  console.log("✅ upload path also verifies legit receipt");
+  // R78 HIGH #1: post-anchor-check, the legit sample bundle
+  // (whose pubkey is NOT in TRUSTED_RECEIPT_KEYS yet) MUST
+  // render as "internally consistent" — NOT "verifies against
+  // a trusted key". Any regression to the pre-R78 "authentic"
+  // string on an untrusted-key bundle re-opens the forgery
+  // surface F1 identified.
+  if (/does not verify/i.test(title)) fail("uploaded legit rendered as does-not-verify");
+  if (/verifies against a trusted key/i.test(title)) fail("uploaded legit falsely claimed TRUSTED (empty anchor list should always give INTERNALLY CONSISTENT until anchors are populated)");
+  if (!/internally consistent/i.test(title)) fail("uploaded legit missing INTERNALLY CONSISTENT string: " + title);
+  console.log("✅ upload path renders legit receipt as INTERNALLY CONSISTENT (empty trust anchor)");
 }
 
 // 4. Upload tampered
@@ -81,6 +96,36 @@ await uploadJson(JSON.stringify(tampered));
   const title = await page.locator(".result-title").innerText();
   if (!/does not verify/i.test(title)) fail("tampered still says verifies: " + title);
   console.log("✅ tampered rawBody -> DOM shows 'Signature does not verify'");
+}
+
+// R78 F2: fresh-keypair forgery test on the DOM path.
+// Generate a fresh Ed25519 keypair in a Node subshell (the
+// browser can generate too but we already have the utilities
+// server-side), sign attacker-chosen contents, embed the
+// pubkey, upload, and assert the DOM does NOT render the
+// "authentic" / "verifies against a trusted key" wording.
+{
+  const { generateKeyPairSync, sign } = await import("node:crypto");
+  const forgedKeys = generateKeyPairSync("ed25519");
+  const forgedRaw = JSON.stringify({
+    version: 1,
+    sessionExternalId: "attacker-controlled",
+    eventCount: 0,
+    toolsBlocked: 0,
+    blockedPayoutUsdMicros: 0,
+  });
+  const forgedSig = sign(null, Buffer.from(forgedRaw, "utf8"), forgedKeys.privateKey);
+  const forgedSpki = forgedKeys.publicKey.export({ format: "der", type: "spki" });
+  const forgedPubHex = forgedSpki.slice(-32).toString("hex");
+  const forged = JSON.parse(sampleText);
+  forged.receipt.rawBody = forgedRaw;
+  forged.receipt.rawSignatureB64 = forgedSig.toString("base64");
+  forged.publicKey.hex = forgedPubHex;
+  await uploadJson(JSON.stringify(forged));
+  const title = await page.locator(".result-title").innerText();
+  if (/verifies against a trusted key/i.test(title)) fail("forged bundle rendered as TRUSTED — trust anchor gate bypassed: " + title);
+  if (!/internally consistent/i.test(title)) fail("forged bundle didn't render as INTERNALLY CONSISTENT: " + title);
+  console.log("✅ fresh-keypair forgery -> DOM shows INTERNALLY CONSISTENT (not TRUSTED)");
 }
 
 // 5. Upload malformed JSON
@@ -107,4 +152,4 @@ if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors))
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 7 /verify page drill checks passed.");
+console.log("\nAll 8 /verify page drill checks passed.");

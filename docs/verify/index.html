@@ -157,6 +157,27 @@
       return out;
     }
 
+    // R78 HIGH #1: trust anchor pinning. Without this, an
+    // attacker who generates their own Ed25519 keypair, signs an
+    // arbitrary `rawBody`, and embeds their pubkey in a fresh
+    // bundle gets the same "✅ authentic" verdict as a real
+    // AgentVisor-signed receipt — the verifier only ever proved
+    // self-consistency of `(body, sig, pubkey)`, not authorship.
+    // The trusted-anchors list below is the set of Ed25519
+    // pubkey hex strings the daemon publicly commits to. If the
+    // bundle's pubkey is NOT in this list, `verifyBundle` returns
+    // `trustedKey: false` and the UI must display
+    // "internally consistent — trust anchor not verified", NOT
+    // the word "authentic". The list is empty by default (no
+    // canonical anchor published yet); populate this via a
+    // release-hardening round or fetch from
+    // `https://agentvisorai.me/.well-known/receipt-keys.json`
+    // over TLS.
+    const TRUSTED_RECEIPT_KEYS = new Set([
+      // Populate with lowercased 64-hex Ed25519 pubkeys.
+      // Example: "0011223344...ff00" (32 bytes = 64 hex chars).
+    ]);
+
     async function verifyBundle(bundle) {
       if (bundle.format !== "agentvisor.receipt.v1") {
         throw new Error("Unrecognized bundle format: " + bundle.format);
@@ -175,7 +196,8 @@
       const msg = new TextEncoder().encode(r.rawBody);
       const sig = b64ToBytes(r.rawSignatureB64);
       const ok = await crypto.subtle.verify("Ed25519", key, sig, msg);
-      return { ok, bundle };
+      const trustedKey = TRUSTED_RECEIPT_KEYS.has(pub.hex.toLowerCase());
+      return { ok, trustedKey, bundle };
     }
 
     function render(state) {
@@ -200,12 +222,24 @@
       const s = b.session || {};
       const r = b.receipt || {};
       const pub = b.publicKey || {};
-      const cls = state.ok ? "ok" : "bad";
-      const titleText = state.ok
-        ? "✅  Signature verifies"
+      // R78 HIGH #1: differentiate "signature verifies against the
+      // pubkey embedded in the bundle" (internally consistent —
+      // an attacker can trivially achieve this by generating
+      // their own keypair) from "signature verifies AND pubkey is
+      // in the trust anchor list" (actually attesting AgentVisor
+      // authorship).
+      const trusted = state.ok && state.trustedKey;
+      const internallyConsistent = state.ok && !state.trustedKey;
+      const cls = trusted ? "ok" : (internallyConsistent ? "pending" : "bad");
+      const titleText = trusted
+        ? "✅  Signature verifies against a trusted key"
+        : internallyConsistent
+        ? "⚠️  Signature is internally consistent — trust anchor NOT verified"
         : "❌  Signature does not verify";
-      const subText = state.ok
-        ? "This receipt is authentic. It was signed by the private key matching the embedded public key, and every byte of the payload is exactly what the daemon sent."
+      const subText = trusted
+        ? "This receipt is authentic. It was signed by a key on the AgentVisor trust anchor list, and every byte of the payload matches the signature."
+        : internallyConsistent
+        ? "The bundle's signature matches its embedded public key, but that public key is NOT in the trust anchor list this verifier ships with. An attacker can generate a keypair, sign anything, and embed the pubkey, so this alone does NOT attest AgentVisor authorship. Compare the public key against a canonical AgentVisor deployment record before trusting the payload."
         : "The signature does not match the payload. Either the receipt was modified after signing, or the public key doesn't correspond to the signing key.";
       result.innerHTML = `
         <div class="result-card ${cls}">
