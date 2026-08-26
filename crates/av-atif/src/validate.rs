@@ -275,7 +275,7 @@ const MAX_NESTED_DEPTH: usize = 128;
 /// cost fields) but a metrics-poisoning primitive: Prometheus
 /// histograms of av_session_cost_usd would blow up their bucketing;
 /// downstream billing exporters might saturate their accumulators.
-pub(crate) const MAX_COST_USD: f64 = 9e9;
+pub const MAX_COST_USD: f64 = 9e9;
 
 /// Upper bound for id-shaped string fields — matches
 /// [`av_core::ids::SessionId::parse`]'s 128-byte cap so a Trajectory
