@@ -1977,7 +1977,15 @@ async fn append_journal(
             "identity": identity,
             "workflow": workflow,
         });
-        if !metadata_path.exists() {
+        // `symlink_metadata` (NOT `exists()`) so a dangling symlink
+        // at `metadata_path` is detected as "an entry lives here"
+        // rather than "no entry" — write_atomic's exclusive-create
+        // temp is elsewhere and its rename REPLACES the symlink at
+        // the destination (safe) rather than following it, but
+        // preserving symmetry with the events journal open below
+        // and future-proofing against a change that switches
+        // metadata to a non-atomic-rename recipe.
+        if std::fs::symlink_metadata(&metadata_path).is_err() {
             let metadata = crate::journal::seal(&journal_key, "metadata", 0, &metadata_payload)?;
             // Use the centralized atomic writer: it uses an RAII guard
             // so any intermediate failure (write_all / sync_all /
@@ -2024,17 +2032,40 @@ async fn append_journal(
         // on restart, `recover_signed_journals` treats the journal as
         // empty, deletes the metadata, and every already-acked event
         // becomes orphaned on the broker.
-        let journal_created = !journal_path.exists();
-        let mut journal = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&journal_path)
-            .map_err(|error| {
-                format!(
-                    "open event journal {}: {error}",
-                    av_core::fsutil::basename(&journal_path)
-                )
-            })?;
+        // `symlink_metadata` (NOT `exists()`) so a dangling symlink
+        // planted at `journal_path` is detected as "an entry lives
+        // here" rather than "no entry" — pairs with `O_NOFOLLOW`
+        // below to fail-close instead of following the symlink and
+        // corrupting an arbitrary path the harness UID can write.
+        let journal_created = std::fs::symlink_metadata(&journal_path).is_err();
+        let mut open_options = std::fs::OpenOptions::new();
+        open_options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            // O_NOFOLLOW: refuse to follow any symlink at
+            // `journal_path`. Signed events journals authenticate
+            // via HMAC-per-envelope on read, so a symlink redirect
+            // wouldn't produce a forged replay, but it would let a
+            // co-tenant with write access to the spool dir redirect
+            // the harness's authenticated append into an arbitrary
+            // path the harness UID can create (a canonical
+            // symlink-plant confused-deputy). 0o600 mode pairs with
+            // the same discipline that `write_atomic` uses; here
+            // the file is APPEND-created rather than atomic-renamed
+            // so the mode is set inline on the initial open. The
+            // O_NOFOLLOW constant lives in `av_core::fsutil` so the
+            // per-platform value is settled in one auditable place.
+            open_options
+                .custom_flags(av_core::fsutil::unix_o_nofollow())
+                .mode(0o600);
+        }
+        let mut journal = open_options.open(&journal_path).map_err(|error| {
+            format!(
+                "open event journal {}: {error}",
+                av_core::fsutil::basename(&journal_path)
+            )
+        })?;
         journal.write_all(&line).map_err(|error| error.to_string())?;
         journal.write_all(b"\n").map_err(|error| error.to_string())?;
         // Group commit: a same-session batch defers

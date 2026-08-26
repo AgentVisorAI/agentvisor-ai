@@ -129,10 +129,10 @@ pub enum IdentityError {
     #[error("child effective-start {child} predates parent effective-start {parent}")]
     NbfEscalation {
         /// Child effective start: `child.nbf` when set, else
-        /// `child.iat`. R16 broadened this variant to cover the
-        /// input case where the child omits `nbf` but its `iat`
-        /// predates the parent's explicit `nbf` — a temporal
-        /// inversion the pre-R16 guard silently accepted.
+        /// `child.iat`. The fallback closes an input case where the
+        /// child omits `nbf` but its `iat` predates the parent's
+        /// explicit `nbf` — a temporal-inversion forgery an earlier
+        /// version of this guard silently accepted.
         child: u64,
         /// Parent effective start: `parent.nbf` when set, else
         /// `parent.iat`.
@@ -447,18 +447,19 @@ impl IdentityValidator {
             // Same posture for `nbf`: a child cannot become usable
             // before the parent that granted it did. Compare
             // EFFECTIVE start times uniformly — fall back to `iat`
-            // on either side that omits `nbf`. Pre-R16 this block
-            // was guarded by `if let Some(child_nbf) = child.nbf`,
-            // so a child that OMITTED `nbf` sailed past the check
-            // even when its raw `iat` predated the parent's explicit
-            // `nbf`: e.g. `parent{iat=t0, nbf=t0+15}` +
+            // on either side that omits `nbf`. An earlier version
+            // of this block was guarded by
+            // `if let Some(child_nbf) = child.nbf`, so a child that
+            // OMITTED `nbf` sailed past the check even when its raw
+            // `iat` predated the parent's explicit `nbf`: e.g.
+            // `parent{iat=t0, nbf=t0+15}` +
             // `child{iat=t0+10, nbf=None}` was accepted, though the
             // child asserts authority 5 seconds before the parent
-            // grant became active. The `IatEscalation` check on
-            // line 432 fires only for `child.iat < parent.iat` and
-            // does not cover this gap. Consumers treating
-            // `claims.iat` (or `nbf`) as "when this identity became
-            // authorized" saw an inverted causal ordering.
+            // grant became active. The `IatEscalation` check above
+            // fires only for `child.iat < parent.iat` and does not
+            // cover this gap. Consumers treating `claims.iat` (or
+            // `nbf`) as "when this identity became authorized" saw
+            // an inverted causal ordering.
             let parent_start = parent.nbf.unwrap_or(parent.iat);
             let child_start = child.nbf.unwrap_or(child.iat);
             if child_start < parent_start {
