@@ -6,6 +6,7 @@ import Fastify from "fastify";
 import { db } from "./db.js";
 import { env } from "./env.js";
 import { bus } from "./lib/bus.js";
+import { getMailer } from "./lib/mail.js";
 import {
   httpRequestDurationSeconds,
   httpRequestsTotal,
@@ -15,6 +16,7 @@ import { authenticate } from "./lib/session-middleware.js";
 import { authRoutes } from "./routes/auth.js";
 import { deploymentRoutes } from "./routes/deployments.js";
 import { ingestRoutes } from "./routes/ingest.js";
+import { oauthRoutes } from "./routes/oauth.js";
 import { readRoutes } from "./routes/read.js";
 import { streamRoutes } from "./routes/stream.js";
 
@@ -409,6 +411,9 @@ async function main(): Promise<void> {
   await app.register(async (r) => r.register(authRoutes), {
     prefix: "/api/v1/auth",
   });
+  await app.register(async (r) => r.register(oauthRoutes), {
+    prefix: "/api/v1/auth/oauth",
+  });
   await app.register(async (r) => r.register(deploymentRoutes), {
     prefix: "/api/v1/deployments",
   });
@@ -423,6 +428,18 @@ async function main(): Promise<void> {
   });
 
   await app.listen({ port: env.PORT, host: env.HOST });
+
+  // Fail-fast on missing mailer in production. In dev we allow the
+  // stub driver (logs the reset link) — in prod, silently swallowing
+  // reset requests would be a security bug (users locked out and no
+  // signal to ops).
+  try {
+    const m = getMailer(app.log);
+    app.log.info({ mailer: m.driver }, "mailer configured");
+  } catch (err) {
+    app.log.error({ err }, "fatal: mailer required in production");
+    process.exit(1);
+  }
 
   // Wire up the cross-instance SSE bridge. Non-fatal if it fails at boot —
   // the in-process bus keeps working, and a reconnect loop retries the

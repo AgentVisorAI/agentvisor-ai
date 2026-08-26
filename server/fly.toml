@@ -31,10 +31,19 @@ kill_timeout = "10s"
   ALLOWED_ORIGINS = "https://agentvisorai.me,https://agentvisorai.github.io"
   JWT_ISSUER = "agentvisor-ai"
   JWT_AUDIENCE = "agentvisor-console"
+  APP_BASE_URL = "https://agentvisorai.me"
+  EMAIL_FROM = "AgentVisor AI <no-reply@agentvisorai.me>"
+  MICROSOFT_TENANT = "common"
 
-# DATABASE_URL and JWT_SECRET must be set as fly secrets, never in env:
+# Required secrets — set with `fly secrets set`, NEVER in this file:
 #   fly secrets set DATABASE_URL="postgres://…"
 #   fly secrets set JWT_SECRET="$(openssl rand -hex 48)"
+#   # Mailer — pick one. Prod refuses to boot without one:
+#   fly secrets set RESEND_API_KEY="re_…"          # OR
+#   fly secrets set SMTP_URL="smtps://user:pass@host:465"
+#   # OIDC — optional. Login buttons hide when the client-id is unset:
+#   fly secrets set GOOGLE_CLIENT_ID="…" GOOGLE_CLIENT_SECRET="…"
+#   fly secrets set MICROSOFT_CLIENT_ID="…" MICROSOFT_CLIENT_SECRET="…"
 
 [http_service]
   internal_port = 8080

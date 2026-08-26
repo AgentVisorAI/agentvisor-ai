@@ -675,6 +675,13 @@
       };
       return mockState.session;
     },
+    // Mock mode: pretend all providers are configured so investors see the buttons.
+    async getSSO() {
+      return { providers: [
+        { id: "google", displayName: "Google" },
+        { id: "microsoft", displayName: "Microsoft" },
+      ] };
+    },
     async logout() {
       try { localStorage.setItem("av_mock_signed_out", "1"); } catch (e) {}
       mockState.session = null;
@@ -937,8 +944,23 @@
       return { user: r.user, org: r.org };
     },
     async loginWithProvider(provider) {
-      // OAuth would redirect. For now, throw so the UI can fall back to the local flow.
-      throw new Error("OAuth is not configured in this deployment yet.");
+      // OAuth is a full-page redirect. Send the browser to the backend's
+      // start endpoint; it will 302 to Google / Microsoft, then back to
+      // /api/v1/auth/oauth/<provider>/callback which finally lands the
+      // user on /app/#/overview with a session cookie set.
+      window.location.assign(apiUrl("/api/v1/auth/oauth/" + encodeURIComponent(provider) + "/start"));
+      // Return a never-resolving promise so the caller doesn't try to
+      // navigate away before the redirect fires.
+      return new Promise(function () {});
+    },
+    // Query which SSO providers the backend has env for. Empty list =
+    // hide the buttons (no point clicking a button that will 404).
+    async getSSO() {
+      try {
+        return await apiFetch("/api/v1/auth/oauth/providers");
+      } catch (e) {
+        return { providers: [] };
+      }
     },
     async logout() { await apiFetch("/api/v1/auth/logout", { method: "POST" }); },
 

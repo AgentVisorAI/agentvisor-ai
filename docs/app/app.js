@@ -385,6 +385,28 @@
   function renderSignup() { renderAuth("signup"); }
   function renderAuth(kind) {
     var isSignup = kind === "signup";
+    // Discover which SSO providers the backend actually has env for.
+    // Rendering a button we can't honor would leave the user staring at
+    // a 404 after they clicked "Continue with Microsoft".
+    state.ds.getSSO().then(function (sso) {
+      var providers = (sso && sso.providers) || [];
+      renderAuthWithProviders(kind, providers);
+    }).catch(function () {
+      renderAuthWithProviders(kind, []);
+    });
+  }
+  function renderAuthWithProviders(kind, providers) {
+    var isSignup = kind === "signup";
+    var byId = {};
+    providers.forEach(function (p) { byId[p.id] = p; });
+    var ssoButtons = "";
+    if (byId.google)    ssoButtons += '<button type="button" data-sso="google">' + iconGoogle() + '<span>Continue with Google</span></button>';
+    if (byId.microsoft) ssoButtons += '<button type="button" data-sso="microsoft">' + iconMicrosoft() + '<span>Continue with Microsoft</span></button>';
+    // SAML/Okta = enterprise path. We're honest about not shipping it
+    // yet: click routes to a contact-sales mailto. Still visible so the
+    // login page communicates the roadmap without pretending.
+    ssoButtons += '<button type="button" data-sso="saml">' + iconKey() + '<span>SAML SSO (contact sales)</span></button>';
+    var showSsoBlock = ssoButtons !== "";
     app.innerHTML = "";
     app.appendChild(h(
       '<div class="auth-shell">' +
@@ -393,12 +415,7 @@
             '<div class="auth-brand"><span class="auth-brand-mark">A</span> AgentVisor</div>' +
             '<h1>' + (isSignup ? "Create your workspace" : "Sign in") + '</h1>' +
             '<p class="sub">' + (isSignup ? "Governance for every AI agent in your fleet." : "Access your agent control plane.") + '</p>' +
-            '<div class="sso">' +
-              '<button type="button" data-sso="google">' + iconGoogle() + '<span>Continue with Google</span></button>' +
-              '<button type="button" data-sso="microsoft">' + iconMicrosoft() + '<span>Continue with Microsoft</span></button>' +
-              '<button type="button" data-sso="saml">' + iconKey() + '<span>Continue with SAML SSO</span></button>' +
-            "</div>" +
-            '<div class="divider">or with email</div>' +
+            (showSsoBlock ? '<div class="sso">' + ssoButtons + "</div>" + '<div class="divider">or with email</div>' : '') +
             '<form id="authForm">' +
               (isSignup ? '<div class="field"><label for="orgName">Company name</label><input id="orgName" type="text" required placeholder="Acme Corp" autocomplete="organization" /></div>' : "") +
               '<div class="field"><label for="email">Work email</label><input id="email" type="email" required autocomplete="email" placeholder="you@company.com" /></div>' +
@@ -434,8 +451,14 @@
     $$('[data-sso]').forEach(function (b) {
       b.addEventListener("click", function () {
         var p = b.getAttribute("data-sso");
+        if (p === "saml") {
+          // Enterprise SSO — SAML/Okta isn't shipped yet. Honest CTA
+          // instead of a fake button.
+          window.location.assign("mailto:sales@agentvisorai.me?subject=Enterprise%20SSO%20(SAML%2FOkta)");
+          return;
+        }
         state.ds.loginWithProvider(p).then(function (s) {
-        state.session = s; startLiveStream(); navigate("#/overview");
+          state.session = s; startLiveStream(); navigate("#/overview");
         }).catch(function (e) {
           $("#authErr").innerHTML = '<div class="auth-err">' + esc(e.message) + "</div>";
         });

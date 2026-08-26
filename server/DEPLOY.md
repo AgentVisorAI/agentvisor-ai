@@ -150,6 +150,56 @@ window.API_BASE = "https://api.agentvisorai.me/api/v1";
 
 Commit + push → Pages redeploys in ~30 s.
 
+### 4. Mailer + SSO (required for a real launch)
+
+Beyond the `$0` demo, two things must be wired before customers can
+sign up in production:
+
+**Mailer** (password reset + welcome emails):
+
+- **Resend** (recommended) — 10k emails/mo free, easiest setup. Sign
+  up at [resend.com](https://resend.com), verify your domain, grab the
+  API key. Set `RESEND_API_KEY=re_…` as a secret. Prod refuses to boot
+  without either this or `SMTP_URL`.
+- **SMTP** (Postmark, SES, Mailgun, any provider that speaks SMTP)
+  — set `SMTP_URL=smtps://user:pass@host:465`. Uses nodemailer's
+  standard URL syntax — same URL works on every SMTP provider.
+- **Dev**: leave both unset. `NODE_ENV=development` logs the would-be
+  email to stdout so you can copy the reset link out of the terminal.
+
+`EMAIL_FROM` defaults to `AgentVisor AI <no-reply@agentvisorai.me>`;
+override per environment.
+
+**OIDC login** (Google + Microsoft):
+
+- **Google**: [Google Cloud → APIs & Services → OAuth 2.0 Client IDs](https://console.cloud.google.com/apis/credentials).
+  Create a Web application client. Add authorized redirect URI:
+  `https://api.agentvisorai.me/api/v1/auth/oauth/google/callback`
+  (swap the host for your API origin). Grab client id + secret.
+- **Microsoft**: [Azure Portal → App registrations](https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade).
+  Register a new app. Redirect URI (Web):
+  `https://api.agentvisorai.me/api/v1/auth/oauth/microsoft/callback`.
+  Under *Certificates & secrets* create a client secret. Set
+  `MICROSOFT_TENANT=common` for multi-tenant + personal, or a specific
+  tenant id for enterprise single-tenant.
+
+Set the four secrets:
+
+```bash
+fly secrets set \
+  GOOGLE_CLIENT_ID="…" GOOGLE_CLIENT_SECRET="…" \
+  MICROSOFT_CLIENT_ID="…" MICROSOFT_CLIENT_SECRET="…"
+```
+
+The login page automatically shows/hides each button based on which
+env vars are populated. No frontend flag to flip. Users signing in via
+OIDC land in a new org named after their email domain on first login;
+subsequent logins land in their existing org.
+
+**SAML / Okta**: not shipped. The login page's SAML button opens a
+`mailto:sales@` for enterprise inquiries — honest about the roadmap
+rather than presenting a fake button.
+
 ### Alternative backend: Render, Railway, Koyeb, Cloud Run
 
 Each provider has a first-class config file already committed:

@@ -49,6 +49,27 @@ services:
         # Rotate later with a dashboard update — Render reboots the service,
         # invalidating all outstanding JWTs on the next boot.
         generateValue: true
+      - key: APP_BASE_URL
+        value: https://agentvisorai.me
+      - key: EMAIL_FROM
+        value: AgentVisor AI <no-reply@agentvisorai.me>
+      - key: MICROSOFT_TENANT
+        value: common
+      # Mailer — pick ONE. Production refuses to boot without one.
+      # Set via the dashboard as a sync:false secret.
+      - key: RESEND_API_KEY
+        sync: false
+      - key: SMTP_URL
+        sync: false
+      # OIDC — optional. Login buttons only appear when both id + secret are set.
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: MICROSOFT_CLIENT_ID
+        sync: false
+      - key: MICROSOFT_CLIENT_SECRET
+        sync: false
       - key: DATABASE_URL
         fromDatabase:
           name: agentvisor-db

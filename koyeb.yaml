@@ -48,10 +48,31 @@ services:
         value: agentvisor-ai
       - key: JWT_AUDIENCE
         value: agentvisor-console
+      - key: APP_BASE_URL
+        value: https://agentvisorai.me
+      - key: EMAIL_FROM
+        value: AgentVisor AI <no-reply@agentvisorai.me>
+      - key: MICROSOFT_TENANT
+        value: common
       - key: JWT_SECRET
         secret: jwt-secret
       - key: DATABASE_URL
         secret: database-url
+      # Mailer — set one:
+      #   koyeb secret create resend-api-key --value "re_…"
+      #   koyeb secret create smtp-url --value "smtps://user:pass@host:465"
+      - key: RESEND_API_KEY
+        secret: resend-api-key
+      # OIDC providers — optional; buttons hide when unset:
+      #   koyeb secret create google-client-id --value "…"
+      - key: GOOGLE_CLIENT_ID
+        secret: google-client-id
+      - key: GOOGLE_CLIENT_SECRET
+        secret: google-client-secret
+      - key: MICROSOFT_CLIENT_ID
+        secret: microsoft-client-id
+      - key: MICROSOFT_CLIENT_SECRET
+        secret: microsoft-client-secret
     regions:
       - fra
       - was

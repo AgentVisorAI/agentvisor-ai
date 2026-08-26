@@ -70,6 +70,24 @@ const Env = z.object({
         .map((s) => s.trim())
         .filter(Boolean),
     ),
+  // Public base URL of the console. Used to build OAuth redirect_uri
+  // and password-reset links. e.g. https://agentvisorai.me
+  APP_BASE_URL: z.string().default("http://localhost:8787"),
+  // OIDC providers. All optional — the login page only shows a
+  // provider button when the corresponding client-id is set.
+  GOOGLE_CLIENT_ID: z.string().optional(),
+  GOOGLE_CLIENT_SECRET: z.string().optional(),
+  MICROSOFT_CLIENT_ID: z.string().optional(),
+  MICROSOFT_CLIENT_SECRET: z.string().optional(),
+  // Microsoft tenant id or 'common' (both work / school and personal).
+  MICROSOFT_TENANT: z.string().default("common"),
+  // Mailer. Priority: RESEND_API_KEY > SMTP_URL > dev-only stub. In
+  // production the app refuses to boot if neither is set (checked in
+  // main() so misconfigured deployments crash immediately, not on the
+  // first reset request weeks later).
+  RESEND_API_KEY: z.string().optional(),
+  SMTP_URL: z.string().optional(),
+  EMAIL_FROM: z.string().default("AgentVisor AI <no-reply@agentvisorai.me>"),
 });
 
 const parsed = Env.safeParse(process.env);

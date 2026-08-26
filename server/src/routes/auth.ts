@@ -9,6 +9,7 @@ import {
   randomToken,
   verifyPassword,
 } from "../lib/auth.js";
+import { getMailer, passwordResetMail, welcomeMail } from "../lib/mail.js";
 import {
   clearSessionCookie,
   requireSession,
@@ -112,6 +113,23 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       membershipRole: "owner",
     });
     reply.setCookie(env.SESSION_COOKIE_NAME, token, SESSION_COOKIE_OPTS);
+    // Fire-and-forget welcome email. Failures don't block the signup
+    // response — a stuck mailer would otherwise turn a hot-path signup
+    // into a 30s timeout.
+    void (async () => {
+      try {
+        const mail = getMailer(req.log);
+        const template = welcomeMail(user.displayName ?? user.email);
+        await mail.send({
+          to: user.email,
+          subject: template.subject,
+          text: template.text,
+          html: template.html,
+        });
+      } catch (err) {
+        req.log.warn({ err, userId: user.id }, "welcome_email_failed");
+      }
+    })();
     return reply.code(201).send({
       user: { id: user.id, email: user.email, displayName: user.displayName },
       org: { id: org.id, slug: org.slug, name: org.name, role: "owner" },
@@ -324,20 +342,30 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         where: { id: user.id },
         data: { resetTokenHash, resetTokenAt: new Date() },
       });
-      // TODO: send via mailer (Postmark/Resend/SES).
-      // Metadata-only in production; the plaintext token is emitted ONLY in
-      // non-production for local development. Logging it in production would
-      // hand any log-reader a one-shot account takeover, since /reset-confirm
-      // requires only {email, token, newPassword} — no session, no MFA.
-      if (env.NODE_ENV === "production") {
+      // Build the reset link the user will click.
+      const resetLink = `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/reset?token=${encodeURIComponent(plaintextToken)}&email=${encodeURIComponent(user.email)}`;
+      // Send it. Uses whichever mailer driver is configured (Resend,
+      // SMTP, or dev-stub). We never log the token itself — only the
+      // driver + message id — so a log leak can't lead to account takeover.
+      try {
+        const mail = getMailer(req.log);
+        const template = passwordResetMail(resetLink);
+        const result = await mail.send({
+          to: user.email,
+          subject: template.subject,
+          text: template.text,
+          html: template.html,
+        });
         req.log.info(
-          { userId: user.id },
-          "password_reset_token_issued",
+          { userId: user.id, mailer: result.driver, messageId: result.id },
+          "password_reset_email_sent",
         );
-      } else {
-        req.log.info(
-          { userId: user.id, devOnlyResetToken: plaintextToken },
-          "password_reset_token_issued (dev only — token in log)",
+      } catch (err) {
+        // Log — but still return 202 to the caller so we don't leak
+        // whether the email exists. Ops can investigate via the log.
+        req.log.error(
+          { err, userId: user.id },
+          "password_reset_email_failed",
         );
       }
     }
