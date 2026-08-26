@@ -593,10 +593,51 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
             Err(anyhow::anyhow!(failures.join("; ")))
         }
     };
+    // Compose the worker drain with a pre-step that first drains
+    // in-flight `mcp_call_inner` detached spawns (routes.rs). Axum's
+    // graceful drain only awaits outer handlers; a client-disconnected
+    // mcp_call whose spawned body is mid-execution outlives the drain.
+    // If we skipped straight to `wait_idle`, that body could reach
+    // `worker.try_submit` AFTER `wait_idle` returned, then race
+    // `finalize_sessions` and trip `av_shutdown_session_close_
+    // timeouts_total` on an otherwise-recoverable session.
+    //
+    // The 5 s inner budget is a small fraction of
+    // `WORKER_FINALIZE_PHASE_SECS = 30 s`, leaving 25 s for
+    // `wait_idle` to cover any worker jobs the drained bodies just
+    // submitted. On timeout the `av_shutdown_mcp_drain_timeouts_total`
+    // counter fires (pre-registered in `pipeline.rs`) so an operator
+    // sees the drain miss on the coincident rollout, but shutdown
+    // still proceeds (the affected session's post-drain worker
+    // submission will trip the per-session close deadline and be
+    // recovered on next boot).
+    let mcp_drain_budget = std::time::Duration::from_secs(5);
+    let mcp_inflight = Arc::clone(&state.mcp_inflight);
+    let mcp_metrics = Arc::clone(&state.metrics);
+    let worker_handle = state.worker.clone();
+    let worker_drain = async move {
+        if tokio::time::timeout(mcp_drain_budget, mcp_inflight.wait_drained())
+            .await
+            .is_err()
+        {
+            mcp_metrics
+                .counter(
+                    "av_shutdown_mcp_drain_timeouts_total",
+                    "Shutdown MCP-inflight drain hit its 5 s deadline before every detached \
+                     mcp_call_inner spawn completed",
+                )
+                .inc();
+            tracing::warn!(
+                inflight = mcp_inflight.count(),
+                "timed out draining in-flight MCP tool calls (5 s); shutdown proceeding"
+            );
+        }
+        worker_handle.wait_idle().await;
+    };
     finish_shutdown(
         result,
         std::time::Duration::from_secs(av_harness::config::WORKER_FINALIZE_PHASE_SECS),
-        state.worker.wait_idle(),
+        worker_drain,
         finalize_sessions,
         flush_telemetry,
     )

@@ -932,7 +932,22 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     // disconnect. Run the whole body on a spawned task so it always runs
     // to completion; the handler merely awaits (and may abandon) the
     // result.
-    match tokio::spawn(mcp_call_inner(state, headers, body)).await {
+    //
+    // The `mcp_inflight` guard is entered here on the outer handler and
+    // moved into the spawn so its `Drop` decrements the tracker on the
+    // spawn's completion path (including panic-caught unwind), NOT the
+    // outer handler's cancellation. `finish_shutdown` in main.rs waits
+    // for the tracker to drain before `worker.wait_idle`, so a detached
+    // body cannot submit a fresh worker job after shutdown thinks it has
+    // drained (which would trip `av_shutdown_session_close_timeouts_
+    // total` on an otherwise-recoverable session).
+    let inflight_guard = state.mcp_inflight.enter();
+    match tokio::spawn(async move {
+        let _inflight_guard = inflight_guard;
+        mcp_call_inner(state, headers, body).await
+    })
+    .await
+    {
         Ok(response) => response,
         Err(join_error) => lifecycle_error(format!("tool call task failed: {join_error}")),
     }
