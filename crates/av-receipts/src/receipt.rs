@@ -1393,13 +1393,25 @@ mod tests {
     #[test]
     fn verify_embedded_rejects_a_swapped_public_key() {
         // Substitute the embedded pubkey for someone else's — the id/key
-        // binding inside verify_embedded must catch this.
+        // binding inside verify_embedded must catch this AS a
+        // KeyMismatch, not defer to the signature check downstream.
+        // The previous bare `is_err()` still passed with the whole
+        // key_id ↔ pubkey binding block deleted (the signature-verify
+        // arm catches it too), reopening the substitution-attempt
+        // detection this test names.
         let honest = Ed25519Signer::generate();
         let attacker = Ed25519Signer::generate();
         let mut receipt = Receipt::issue(body(), &honest).unwrap();
         receipt.body.public_key_b64 =
             base64::engine::general_purpose::STANDARD.encode(attacker.public_key_bytes());
-        assert!(receipt.verify_embedded().is_err());
+        let err = receipt
+            .verify_embedded()
+            .expect_err("swapped embedded pubkey must be refused");
+        assert!(
+            matches!(err, ReceiptError::KeyMismatch(_)),
+            "the id/key binding in verify_embedded must recognise the substitution \
+             as KeyMismatch (not fall through to the signature-verify arm); got {err:?}"
+        );
     }
 
     /// Schema parity: the shipped schema pins `minLength: 1` on these

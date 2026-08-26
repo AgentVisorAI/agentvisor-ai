@@ -247,9 +247,16 @@ fn attacker_bytes_under_a_trusted_key_id_do_not_verify() {
     let err = receipt
         .verify(&ring)
         .expect_err("attacker's key should not verify against a ring that only knows the honest key");
-    let s = format!("{err:?}");
+    // Pin the specific refusal: an unknown key_id must be rejected as
+    // such, not caught by a downstream signature check. A weaker
+    // substring like `contains("Key")` matched almost every variant of
+    // ReceiptError/KeyError, so a regression turning UnknownKeyId into
+    // e.g. KeyMismatch (wrong error class, still refused) passed silently.
     assert!(
-        s.contains("UnknownKeyId") || s.contains("Key") || s.contains("BadSignature"),
-        "unexpected error variant: {s}"
+        matches!(
+            err,
+            av_receipts::ReceiptError::Key(av_receipts::KeyError::UnknownKeyId(_))
+        ),
+        "expected ReceiptError::Key(KeyError::UnknownKeyId), got {err:?}"
     );
 }

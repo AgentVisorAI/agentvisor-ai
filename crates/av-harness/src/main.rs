@@ -1860,7 +1860,12 @@ mod tests {
         let signer = Ed25519Signer::generate();
         std::fs::write(&path, hex::encode(signer.seed())).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(read_signer(&path).is_err());
+        // Pin the specific mode refusal (mirror the group-readable
+        // sibling above): a permission-bit refactor that returned e.g.
+        // "invalid seed length" for 0o644 still passed is_err() while
+        // the mode gate this test names was gone.
+        let err = read_signer(&path).unwrap_err().to_string();
+        assert!(err.contains("must be 0o600"), "got {err}");
     }
 
     /// Same guarantee for the identity HMAC secret file: refuse to load if

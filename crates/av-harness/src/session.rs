@@ -1380,8 +1380,21 @@ mod tests {
         }
         let mut all: Vec<u64> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
         all.sort_unstable();
-        all.dedup();
-        assert_eq!(all.len(), 8000, "sequence numbers must be unique");
+        // The invariant the journal MAC path depends on is dense
+        // unit-stride monotonicity — `metadata.sequence` must equal
+        // `journal_position` (see peek_seq's doc + restore_next_seq).
+        // The previous `dedup().len() == 8000` check only pinned
+        // uniqueness, so a regression from `fetch_add(1)` to
+        // `fetch_add(2)` (or any hash-seeded unique-nonce scheme) still
+        // passed while every restored session's first append misaligned.
+        assert_eq!(
+            all,
+            (0..8000).collect::<Vec<_>>(),
+            "next_seq must be dense unit-stride monotone: the journal MAC \
+             re-verifies metadata.sequence against journal_position at \
+             recovery, so any gap or stride > 1 breaks the invariant that \
+             makes crash recovery sound"
+        );
     }
 
     #[test]
