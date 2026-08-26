@@ -223,7 +223,20 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
     // id_token claims give us email + name without a second round-trip.
     const claims = tokens.claims();
     const email = typeof claims?.email === "string" ? claims.email.toLowerCase() : null;
-    const emailVerified = claims?.email_verified === true || claims?.email_verified === "true";
+    // R76 MEDIUM #5 (landed R77): only accept the JSON boolean
+    // `true` for `email_verified`. Prior shape accepted the string
+    // `"true"` too, which widened the acceptance surface to
+    // permissive IdPs that emit stringly-typed unverified addresses
+    // (some Azure AD B2C multi-tenant / personal MSA flows, some
+    // custom IdP appliances). An attacker who registers an
+    // outlook.com / gmail alias mimicking `victim@corp.com` via a
+    // misconfigured MSA tenant would then pass the `emailVerified`
+    // gate and be upserted onto the victim's existing account
+    // (line 241 `db.user.findUnique({ where: { email } })`) — an
+    // account-takeover primitive. If interop with a specific
+    // stringly-typed IdP is required, add a per-issuer allowlist
+    // that opts THAT `iss` in explicitly.
+    const emailVerified = claims?.email_verified === true;
     const displayName = typeof claims?.name === "string" ? claims.name : null;
 
     if (!email) {

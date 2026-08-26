@@ -201,7 +201,34 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     }
     const membership = user.memberships[0];
     if (!membership) {
-      return reply.code(403).send({ error: "no_org" });
+      // R77 F4 (MEDIUM): return the SAME 401 shape as
+      // `!user || !ok` above so a credential-stuffing attacker
+      // cannot distinguish "password correct + user has no org"
+      // from "email or password wrong". Prior shape returned 403
+      // `no_org` here, giving the attacker a bit ("password OK,
+      // no org") they could resell. A user reaching this branch
+      // is a genuine data-integrity issue (every user should
+      // have a membership by construction — SAML/OAuth JIT and
+      // signup both provision one atomically), so surfacing the
+      // underlying reason to the operator via audit + logging
+      // is preserved, but the wire response reveals nothing.
+      writeAudit(
+        {
+          orgId: "system",
+          event: "auth.password_ok_no_membership",
+          actorId: user.id,
+          actorEmail: user.email,
+          target: user.email,
+          note: "user has no membership; refusing session mint",
+          req,
+        },
+        req.log,
+      );
+      req.log.error(
+        { userId: user.id, email: user.email },
+        "user_authenticated_password_but_has_no_membership",
+      );
+      return reply.code(401).send({ error: "invalid_credentials" });
     }
 
     // MFA gate — if the user has any WebAuthn credentials, we do NOT

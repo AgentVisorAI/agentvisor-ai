@@ -7,6 +7,7 @@ import Fastify from "fastify";
 import { db } from "./db.js";
 import { env } from "./env.js";
 import { bus } from "./lib/bus.js";
+import { ipMatchesAny } from "./lib/cidr.js";
 import { getMailer } from "./lib/mail.js";
 import {
   httpRequestDurationSeconds,
@@ -360,11 +361,25 @@ async function main(): Promise<void> {
     const allowed = env.ALLOW_METRICS_IPS;
     if (allowed.length > 0) {
       const ip = req.ip;
-      // Simple prefix match — good enough for a CIDR-less allow-list of
-      // exact IPs or subnets. For real CIDR ranges, front the endpoint
-      // with the platform's network policy (Fly private networking,
-      // Cloud Run internal ingress, k8s NetworkPolicy).
-      const ok = allowed.some((a) => ip === a || ip.startsWith(a));
+      // R77 F2 (MEDIUM-HIGH): route allowlist checks through
+      // `ipMatchesAny` (lib/cidr.ts) so a naive `startsWith`
+      // prefix-match cannot silently widen the accepted set.
+      // Prior shape `ip === a || ip.startsWith(a)` treated
+      // `ALLOW_METRICS_IPS=10.0.0.1` as admitting `10.0.0.1`,
+      // `10.0.0.10..19`, `10.0.0.100..199` (30 addresses); a
+      // fat-finger `ALLOW_METRICS_IPS=1` admitted every IP
+      // starting with `1` (~30% of the v4 space). Prometheus
+      // counters leak tenant traffic patterns / model IDs /
+      // customer counts so widening the ACL by mistake is a
+      // real telemetry-exfiltration hazard.
+      //
+      // `ipMatchesAny` accepts either an exact IP (`10.0.0.1`)
+      // or a CIDR (`10.0.0.0/24`), and does a proper prefix-bit
+      // comparison — never a lexicographic startsWith on the
+      // string form. Operators can now express both single-IP
+      // and subnet allowlists correctly, and typos don't
+      // silently accept 30% of the internet.
+      const ok = ipMatchesAny(ip, allowed);
       if (!ok) return reply.code(403).send({ error: "forbidden" });
     }
     reply.header("Content-Type", metricsRegistry.contentType);

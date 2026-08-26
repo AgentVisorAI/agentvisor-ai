@@ -110,6 +110,44 @@ function bufferToB64u(b: Buffer | Uint8Array): string {
     .replace(/=+$/, "");
 }
 
+// R76 MEDIUM #4 (landed R77): deterministic decoy credentials
+// used by `/authenticate/challenge` to mask
+// account-existence + passkey-presence from an anonymous
+// caller. Seeded from HMAC-SHA256(JWT_SECRET, email) so the
+// count AND the credential-id bytes are stable per email
+// (a repeat probe for the same email gets the same decoys —
+// otherwise varying decoys per probe would themselves become
+// a "user does not exist" signal via correlation).
+//
+// Count varies 1-3 to match the natural distribution of real
+// accounts (most users have 1-2 passkeys). Length of each
+// decoy credential id is 32 bytes (typical for a real passkey).
+// Verifying against these will fail authentically — the
+// verify path treats userId=null as an authentication failure
+// with the same shape as a real credential mismatch, so the
+// caller cannot distinguish "wrong passkey" from "decoy
+// challenge because the user doesn't exist".
+async function deriveDecoyCredentials(
+  email: string,
+): Promise<{ id: string; transports?: undefined }[]> {
+  const crypto = await import("node:crypto");
+  const h = crypto.createHmac("sha256", env.JWT_SECRET);
+  h.update("webauthn:decoy:");
+  h.update(email);
+  const seed = h.digest();
+  // Count: 1-3 seeded by the first byte.
+  const count = 1 + ((seed[0] ?? 0) % 3);
+  const out: { id: string; transports?: undefined }[] = [];
+  for (let i = 0; i < count; i++) {
+    const idHmac = crypto.createHmac("sha256", env.JWT_SECRET);
+    idHmac.update("webauthn:decoy:");
+    idHmac.update(email);
+    idHmac.update(Buffer.from([i]));
+    out.push({ id: bufferToB64u(idHmac.digest()) });
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
@@ -250,18 +288,37 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
       where: { email: body.data.email },
       include: { webauthnCredentials: true },
     });
-    // Uniform response — never reveal whether the user exists / has credentials
-    // to a caller who guessed the email. If there are no credentials we
-    // return an empty allowCredentials, which the client interprets as
-    // "no passkey step required" and falls back to password-only flow.
+    // R76 MEDIUM #4 (landed R77): eliminate the credential-
+    // enumeration side channel. Prior shape returned an empty
+    // `allowCredentials` for unknown emails AND emitted a
+    // `hasCredential` boolean, letting an anonymous attacker
+    // build a directory of {email -> account_exists, has_passkey,
+    // credentialId} — cross-referenced with
+    // `/auth/password`'s `mfaRequired` this drove targeted
+    // phishing / credential-stuffing.
+    //
+    // Fix: for unknown emails or accounts with no real
+    // credentials, seed a deterministic decoy list from
+    // HMAC(JWT_SECRET, email) so the response shape is
+    // indistinguishable across existent / nonexistent /
+    // no-credential accounts. The count varies 1-3 seeded from
+    // the same HMAC so the LIST LENGTH is not a signal either.
+    // The verify endpoint will fail these attempts uniformly
+    // (userId=null triggers the same rejection as a real
+    // credential mismatch). Drop `hasCredential` from the
+    // response.
+    const realCreds = user?.webauthnCredentials ?? [];
+    const allowCredentials = realCreds.length > 0
+      ? realCreds.map((c) => ({
+          id: bufferToB64u(c.credentialId),
+          transports: c.transports
+            ? (c.transports.split(",") as ("usb" | "nfc" | "ble" | "internal" | "hybrid")[])
+            : undefined,
+        }))
+      : await deriveDecoyCredentials(body.data.email);
     const options = await generateAuthenticationOptions({
       rpID: rpID(),
-      allowCredentials: (user?.webauthnCredentials ?? []).map((c) => ({
-        id: bufferToB64u(c.credentialId),
-        transports: c.transports
-          ? (c.transports.split(",") as ("usb" | "nfc" | "ble" | "internal" | "hybrid")[])
-          : undefined,
-      })),
+      allowCredentials,
       userVerification: "preferred",
     });
     setChallengeCookie(
@@ -269,7 +326,12 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
       AUTH_CHALLENGE_COOKIE,
       JSON.stringify({ challenge: options.challenge, userId: user?.id ?? null }),
     );
-    return reply.send({ options, hasCredential: (user?.webauthnCredentials?.length ?? 0) > 0 });
+    // Drop `hasCredential` — it explicitly leaked account
+    // presence. Clients that gated their UI on it should switch
+    // to always calling `/authenticate/verify` and treating any
+    // failure as "wrong or missing passkey" (indistinguishable
+    // by design).
+    return reply.send({ options });
   });
 
   app.post("/authenticate/verify", async (req, reply) => {
