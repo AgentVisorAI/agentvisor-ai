@@ -450,7 +450,19 @@ impl ProviderAdapter for GoogleGeminiAdapter {
             }
         }
         if is_sse && !event_type.is_empty() && event_type != "message" {
-            if data.iter().all(|entry| entry.trim().is_empty()) {
+            // Same [DONE]-under-named-event carve-out as the OpenAI
+            // parser (routes.rs:3486) and the Anthropic parser's
+            // ordering (`[DONE]` short-circuits before the event-
+            // type check). `[DONE]` is a sentinel; a named event
+            // carrying only [DONE] lines has no attributable content
+            // and must not fail-close the whole stream. OpenAI-compat
+            // gateways fronting Gemini (per the comment below at
+            // line 472) commonly batch a final `[DONE]` under a
+            // summary event as they finalise their own event stream.
+            if data.iter().all(|entry| {
+                let trimmed = entry.trim();
+                trimmed.is_empty() || trimmed == "[DONE]"
+            }) {
                 return Ok(None);
             }
             return Err(format!(
@@ -1057,6 +1069,42 @@ mod tests {
         );
         // `[DONE]` treated as keepalive.
         assert!(adapter.parse_sse_chunk("data: [DONE]").unwrap().is_none());
+    }
+
+    /// R45 review-of-R44: OpenAI-compat gateways fronting Gemini
+    /// commonly batch a final `[DONE]` under a summary event as they
+    /// finalise their own event stream. `[DONE]` under a named event
+    /// carries no attributable content and must be treated as a
+    /// keepalive, matching the OpenAI and Anthropic parsers' ordering.
+    /// R44 fixed this on the OpenAI parser but missed the Gemini
+    /// adapter sibling — R45 review caught the miss.
+    #[test]
+    fn gemini_done_under_named_event_is_keepalive() {
+        let adapter = adapter_for("gemini").unwrap();
+        for raw in [
+            "event: summary\ndata: [DONE]\n\n",
+            "event: error\ndata: [DONE]\n\n",
+            "event: custom\ndata:\ndata: [DONE]\n\n",
+            "event: batched\ndata: [DONE]\ndata: [DONE]\n\n",
+        ] {
+            match adapter.parse_sse_chunk(raw) {
+                Ok(None) => {}
+                Ok(Some(_)) => panic!(
+                    "[DONE] under named event {raw:?} must not yield a chunk (no attributable content)"
+                ),
+                Err(error) => {
+                    panic!("[DONE] under named event {raw:?} must not fail-close the Gemini stream: {error}")
+                }
+            }
+        }
+        // A named event with a mix of [DONE] AND real content must
+        // still refuse — Gemini's "named frames not attributable"
+        // property is preserved for real content.
+        let mixed = "event: error\ndata: [DONE]\ndata: {\"candidates\":[{\"index\":0}]}\n\n";
+        assert!(
+            adapter.parse_sse_chunk(mixed).is_err(),
+            "named event with mixed [DONE] + real content must still refuse: {mixed:?}"
+        );
     }
 
     /// R14: inline `{"error":{...}}` on 200-OK streams must fail
