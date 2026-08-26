@@ -1752,6 +1752,22 @@ impl AppState {
         })?;
         tracing::info!(provider = provider_adapter.name(), "provider adapter selected");
         let mcp_admission = Arc::new(tokio::sync::Semaphore::new(config.mcp_concurrency));
+        // R72 review F1: pre-register the MCP admission-refusal
+        // counter so its series exists in a Prometheus scrape from
+        // the very first boot moment, not lazily on first refusal
+        // (which would defeat `alert on absent(av_mcp_admission_
+        // refusals_total)` dashboards and pay the register cost on
+        // the hot refusal path). Same discipline as HotMetrics and
+        // the reconciler's `av_reconciler_last_tick_completed_
+        // seconds` gauge.
+        metrics.counter(
+            "av_mcp_admission_refusals_total",
+            "MCP admission was refused because `mcp_concurrency` was already at capacity — \
+             each admitted call can buffer up to 16 MiB in `read_limited_tool_response`, \
+             so the cap bounds worst-case MCP resident memory. Sustained > 0 indicates \
+             tool-upstream slowdown, a burst-traffic event, or an undersized \
+             `mcp_concurrency`.",
+        );
         Ok(Self {
             config,
             store,
@@ -2835,7 +2851,7 @@ impl AppState {
             .ok_or_else(|| PipelineError::bad_request("session is already closed".to_owned()))
     }
 
-    fn enqueue_transient_failure(
+    pub(crate) fn enqueue_transient_failure(
         &self,
         session_id: &str,
         stop_reason: StopReason,
@@ -3276,7 +3292,7 @@ pub(crate) fn strip_bearer_scheme(value: &str) -> Option<&str> {
     Some(rest)
 }
 
-fn session_id(headers: &HeaderMap) -> Result<String, PipelineError> {
+pub(crate) fn session_id(headers: &HeaderMap) -> Result<String, PipelineError> {
     match single_header(headers, SESSION_HEADER)? {
         Some(value) => {
             let value = value

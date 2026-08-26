@@ -533,6 +533,34 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
     if let Some(err) = refuse_non_json_content_type(&headers, "chat completions") {
         return err;
     }
+    // R71 F3 (landed R72): pre-admission identity gate. Before
+    // this, an unauthenticated client could force
+    // `refuse_duplicate_json_keys` (full byte scan) +
+    // `serde_json::from_slice` (full parse) + `depth_of` (full
+    // recursion) on a `max_request_bytes = 16 MiB` body BEFORE
+    // any admission decision — a DoS amplification surface (three
+    // full-body passes × concurrent unauthenticated clients).
+    // Resolve identity here (header-only, no body touched) and
+    // fail fast on rejection; on success, discard the result and
+    // let `prepare_chat_nonblocking` re-resolve (cached JWKS
+    // makes the re-resolve cheap: HMAC compare / cached-key JWT
+    // verify).
+    //
+    // Audit-log the rejection through the same
+    // `enqueue_transient_failure` primitive `prepare_chat` uses,
+    // so `av_identity_rejections_total` and the per-minute
+    // sampled full audit records match pre-R72 behaviour on
+    // rejected requests.
+    if let Err(error) = state.resolve_identity(&headers, Some(&state.config.chat_scope)) {
+        if let Ok(sid) = crate::pipeline::session_id(&headers) {
+            let _ = state.enqueue_transient_failure(
+                &sid,
+                av_events::StopReason::IdentityRejected,
+                error.to_string(),
+            );
+        }
+        return pipeline_error(error);
+    }
     // Refuse duplicate top-level or
     // nested JSON keys before parsing. `Json<Value>` used
     // `serde_json` default "last-wins" semantics, so a hostile client
