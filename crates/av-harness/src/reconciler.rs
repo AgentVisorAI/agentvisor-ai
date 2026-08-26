@@ -3548,8 +3548,7 @@ impl Finalizer {
         // isn't more informative than an early return here anyway).
         let Some(mut outbox) = outbox else {
             return Err(FinalizeError::bridge(
-                "internal invariant: emit_bridge_event fresh-emit branch left outbox unset"
-                    .to_owned(),
+                "internal invariant: emit_bridge_event fresh-emit branch left outbox unset".to_owned(),
             ));
         };
         if outbox.ack.is_some() {
@@ -3806,11 +3805,34 @@ impl Finalizer {
         let directory = self.spool_dir.join(crate::spool::OUTBOX);
         let mut entries = match tokio::fs::read_dir(&directory).await {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Directory absent = 0 pending outboxes. Publish the
+                // observation gauge so `absent(av_lifecycle_outbox_
+                // pending)` alerts don't false-fire on a freshly
+                // booted node with no bridge activity yet.
+                self.metrics
+                    .gauge(
+                        "av_lifecycle_outbox_pending",
+                        "Count of unacked lifecycle outbox files (RECEIPT + \
+                         SESSION_CLOSE) sitting in the spool at the last \
+                         reconciler tick. Steady-state 0 on a healthy node \
+                         (each outbox is emitted, published, acked, and \
+                         removed within one close). A rising baseline \
+                         indicates the bridge is unreachable or slow — \
+                         outboxes persist across restarts, so growth is \
+                         disk-bounded rather than memory-bounded, but a \
+                         sustained rise is the earliest signal of a broker \
+                         outage before its downstream effects (disk fill, \
+                         `av_reconcile_errors_total`) fire.",
+                    )
+                    .set(0);
+                return Ok(());
+            }
             Err(error) => return Err(FinalizeError::bridge_source(error)),
         };
         let mut examined = 0usize;
         let mut dirents_seen = 0usize;
+        let mut pending_count: u64 = 0;
         while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::bridge_source)? {
             dirents_seen = dirents_seen.saturating_add(1);
             if dirents_seen > MAX_RECOVERY_DIRENTS_PER_TICK {
@@ -3897,8 +3919,29 @@ impl Finalizer {
                     }
                 }
                 remove_outbox(&path).await?;
+            } else {
+                // Unacked outbox: the bridge hasn't confirmed publication yet.
+                // Bump the pending-count observation so operators can see
+                // the backlog grow if the bridge is unreachable.
+                pending_count = pending_count.saturating_add(1);
             }
         }
+        self.metrics
+            .gauge(
+                "av_lifecycle_outbox_pending",
+                "Count of unacked lifecycle outbox files (RECEIPT + \
+                 SESSION_CLOSE) sitting in the spool at the last \
+                 reconciler tick. Steady-state 0 on a healthy node \
+                 (each outbox is emitted, published, acked, and \
+                 removed within one close). A rising baseline \
+                 indicates the bridge is unreachable or slow — \
+                 outboxes persist across restarts, so growth is \
+                 disk-bounded rather than memory-bounded, but a \
+                 sustained rise is the earliest signal of a broker \
+                 outage before its downstream effects (disk fill, \
+                 `av_reconcile_errors_total`) fire.",
+            )
+            .set(pending_count);
         Ok(())
     }
 
@@ -5746,8 +5789,7 @@ mod tests {
                 offset: 1,
             }),
         };
-        let outbox_path =
-            finalizer.lifecycle_outbox_path(session_id, crate::journal::RECEIPT_OUTBOX_KIND);
+        let outbox_path = finalizer.lifecycle_outbox_path(session_id, crate::journal::RECEIPT_OUTBOX_KIND);
         std::fs::create_dir_all(outbox_path.parent().unwrap()).unwrap();
         let sealed = crate::journal::seal(
             &finalizer.journal_key,
@@ -8094,6 +8136,66 @@ mod tests {
         assert!(
             scrape.contains("av_recovery_scan_capped_total{pass=\"adopt_strict_atif\"} 1"),
             "entries cap must fire exactly once on matching flood; got scrape:\n{scrape}"
+        );
+    }
+
+    /// R29 observability: the `av_lifecycle_outbox_pending` gauge
+    /// must reflect the count of unacked outbox files after
+    /// `remove_acked_lifecycle_outboxes` runs. Steady-state 0 on a
+    /// healthy node; if the bridge is unreachable and outboxes
+    /// accumulate, the gauge rises so operators can alert on the
+    /// backlog BEFORE its downstream effects (disk fill,
+    /// `av_reconcile_errors_total`) fire.
+    #[tokio::test]
+    async fn lifecycle_outbox_pending_gauge_reflects_unacked_count() {
+        let directory = tempfile::tempdir().unwrap();
+        let metrics = Arc::new(Registry::new());
+        let finalizer = Finalizer::new(
+            Arc::new(Ed25519Signer::from_seed(&[7; 32])),
+            directory.path().to_path_buf(),
+            Arc::clone(&metrics),
+        );
+        let outbox_dir = directory.path().join(crate::spool::OUTBOX);
+        std::fs::create_dir_all(&outbox_dir).unwrap();
+
+        let topic = av_events::EventClass::Receipt.topic();
+        // Plant 3 UNACKED outboxes.
+        for i in 0..3 {
+            let session_id = format!("session-unacked-{i}");
+            let outbox = LifecycleOutbox {
+                schema_version: LIFECYCLE_OUTBOX_SCHEMA_V1,
+                session_id: session_id.clone(),
+                kind: crate::journal::RECEIPT_OUTBOX_KIND.to_owned(),
+                topic: topic.to_owned(),
+                key: format!("instance-{i}"),
+                value: serde_json::json!({
+                    "metadata": { "sequence": 0, "uid": av_core::new_event_uid() },
+                    "topic": topic,
+                }),
+                ack: None,
+            };
+            let path = finalizer
+                .lifecycle_outbox_path(&session_id, crate::journal::RECEIPT_OUTBOX_KIND);
+            let sealed = crate::journal::seal(
+                &finalizer.journal_key,
+                crate::journal::LIFECYCLE_OUTBOX_DOMAIN,
+                0,
+                &outbox,
+            )
+            .unwrap();
+            std::fs::write(path, sealed).unwrap();
+        }
+
+        let sessions = SessionRegistry::new();
+        finalizer
+            .remove_acked_lifecycle_outboxes(&sessions)
+            .await
+            .unwrap();
+
+        let scrape = metrics.render();
+        assert!(
+            scrape.contains("av_lifecycle_outbox_pending 3"),
+            "gauge must reflect the 3 unacked outboxes; scrape:\n{scrape}"
         );
     }
 }
