@@ -118,11 +118,12 @@ code {
 }
 .top-link:hover { color: var(--fg); }
 .env-pill {
+  display: inline-flex; align-items: center; gap: 0.3rem;
   font-size: 0.72rem; font-weight: 600; letter-spacing: 0.02em; color: var(--success);
   border: 1px solid var(--success); border-radius: 999px;
-  padding: 0.12rem 0.6rem; white-space: nowrap;
+  padding: 0.12rem 0.6rem; white-space: nowrap; line-height: 1.4;
 }
-.env-pill::before { content: "● "; font-size: 0.6rem; vertical-align: 0.08em; }
+.env-pill::before { content: "●"; font-size: 0.55rem; }
 .avatar {
   width: 1.7rem; height: 1.7rem; border-radius: 50%;
   background: var(--accent); color: var(--accent-fg);
@@ -146,7 +147,7 @@ code {
   color: var(--accent-fg); background: var(--accent); border-color: var(--accent);
 }
 .stepper li.done button { color: var(--success); }
-.topbar-actions { display: flex; gap: 0.5rem; }
+.topbar-actions { display: flex; align-items: center; gap: 0.5rem; }
 
 /* --- Buttons -------------------------------------------------------- */
 
