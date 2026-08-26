@@ -372,6 +372,16 @@ fn scope_list_and_element_lengths_are_bounded() {
         ),
         "65 scopes must be refused"
     );
+    // Boundary-accept pin: exactly MAX_SCOPES (64) must be accepted.
+    // A `>` → `>=` mutation on the length check at validator.rs:600
+    // would silently narrow the cap to 63 without failing any
+    // reject-side test; this positive-at-cap assertion catches it.
+    let mut c = claims(&[], 600, None);
+    c.scopes = (0..64).map(|i| format!("scope-{i}")).collect();
+    assert!(
+        v.validate(&mint(&keys, &c)).is_ok(),
+        "exactly MAX_SCOPES=64 scopes must be accepted (pins > vs >= at the cap)"
+    );
     let mut c = claims(&[], 600, None);
     c.scopes = vec!["s".repeat(257)];
     assert!(
@@ -383,6 +393,18 @@ fn scope_list_and_element_lengths_are_bounded() {
             })
         ),
         "a 257-char scope must be refused"
+    );
+    // Boundary-accept pin: exactly MAX_IDENTITY_STRING_CHARS (256)
+    // must be accepted at scope-element granularity too. The
+    // charter-side path pins the 256 case, but the scope-element
+    // check at validator.rs:608 is a separate site; a mutation
+    // flipping only THAT `>` to `>=` would survive if this test
+    // didn't also pin it.
+    let mut c = claims(&[], 600, None);
+    c.scopes = vec!["s".repeat(256)];
+    assert!(
+        v.validate(&mint(&keys, &c)).is_ok(),
+        "a 256-char scope must be accepted (pins > vs >= at the per-element cap)"
     );
 }
 
