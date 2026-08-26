@@ -3,20 +3,15 @@ name: CI
 on:
   push:
     branches: [main]
-    # Prose and deploy manifests have no CI-executed checks (the Docs
-    # workflow owns the docs/ site build). Skipping them here saves the
-    # full 30-60 min pipeline on docs-only commits.
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
-      - "deploy/**"
-      - "LICENSE"
+    # No paths-ignore: prose and deploy manifests ARE CI-executed
+    # inputs. The workspace `include_str!`s (and asserts against)
+    # deploy/kubernetes/agentvisor-ai.yaml, docs/reference/*.md,
+    # docs/app/console.js + index.html, README.md and the shipped
+    # configs/schemas/manifests — a docs-only or deploy-only commit
+    # that renames or breaks one of them fails compilation or the
+    # contract tests, and a skipped pipeline would land that breakage
+    # on main to surface in the next unrelated PR's red run.
   pull_request:
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
-      - "deploy/**"
-      - "LICENSE"
 
 # A superseded run of this pipeline costs 30-60 runner-minutes; always
 # yield to the newer commit.
@@ -168,7 +163,9 @@ jobs:
           AV_HARBOR_INTEROP_OUT=/tmp/agentvisor-atif.json cargo test -p av-harness full_chat_close_and_promotion_flow
           python -m harbor.utils.trajectory_validator /tmp/agentvisor-atif.json --no-validate-images
       - name: Compose
-        run: docker compose -f docker/docker-compose.yml config >/dev/null
+        run: |
+          docker compose -f docker/docker-compose.yml config >/dev/null
+          docker compose -f docker/docker-compose.minimal.yml config >/dev/null
       - name: Container build
         # Release-profile in-container build (~10-20 min): main-only, same
         # rationale as the SLA gate. `Compose` above still validates the

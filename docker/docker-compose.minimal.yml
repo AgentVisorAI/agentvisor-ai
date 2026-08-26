@@ -62,9 +62,16 @@ services:
       # The seed lives in the tmpfs /run path below; auto-generated
       # by the harness on first boot via load_or_create_signer.
       AV_SIGNING_SEED_FILE: /run/signing.seed
-      # Uncomment (or pass via the shell) to target a cloud provider:
-      # AV_UPSTREAM_URL: https://api.openai.com
-      # AV_UPSTREAM_API_KEY: ${AV_UPSTREAM_API_KEY}
+      # Shell overrides for a cloud provider (see the header of this
+      # file). Compose does NOT forward host env vars unless they are
+      # declared here — without these mappings the documented
+      # `AV_UPSTREAM_URL=... AV_UPSTREAM_API_KEY=... docker compose up`
+      # on-ramp silently kept the Ollama default and ignored the key.
+      # Empty renders as unset: the daemon treats empty values as
+      # absent (`apply_env_overrides_from`), so leaving them undefined
+      # in the shell changes nothing.
+      AV_UPSTREAM_URL: ${AV_UPSTREAM_URL:-}
+      AV_UPSTREAM_API_KEY: ${AV_UPSTREAM_API_KEY:-}
     volumes:
       - bridge-data:/app/data
       - atif-spool:/app/spool

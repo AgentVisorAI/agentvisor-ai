@@ -8,8 +8,12 @@ Targets:
 
 * `canonicalize_receipt_subject` — JCS canonicalization over
   arbitrary JSON values (any panic here breaks the signing chain).
+* `compress_invariants` — prompt-compression passes over arbitrary
+  chat payloads (must preserve tail/system invariants without panic).
 * `parse_provider_chunk` — provider SSE frame parser (bytes-in,
   ParsedProviderChunk-out; must be total over arbitrary input).
+* `redact_userinfo` — URL userinfo redactor guarding secrets in
+  logs (must never leak credentials or panic on malformed URLs).
 * `sse_frame_end` — SSE frame terminator scanner (bytes-in, index-out;
   must never overflow or misreport).
 * `parse_tool_call` — MCP JSON-RPC tool-call parser (bytes-in,

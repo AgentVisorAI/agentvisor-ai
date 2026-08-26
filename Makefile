@@ -40,7 +40,7 @@ bench:
 # Fuzz smoke: 60 s per libFuzzer target (see fuzz/README.md). Needs a
 # nightly toolchain and cargo-fuzz; deliberately not part of `make ci`.
 fuzz-smoke:
-	cd fuzz && for target in canonicalize_receipt_subject parse_provider_chunk sse_frame_end parse_tool_call; do \
+	cd fuzz && for target in canonicalize_receipt_subject compress_invariants parse_provider_chunk redact_userinfo sse_frame_end parse_tool_call; do \
 		cargo +nightly fuzz run $$target -- -max_total_time=60 || exit 1; \
 	done
 

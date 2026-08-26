@@ -2407,13 +2407,37 @@ impl AbortFinalizingStream {
             return Ok(0);
         }
         let mut budget_delta = 0u64;
-        while let Some(end) = sse_frame_end(&self.protocol_buffer) {
+        let absorb_result = loop {
+            let Some(end) = sse_frame_end(&self.protocol_buffer) else {
+                break Ok(());
+            };
             let frame: Vec<u8> = self.protocol_buffer.drain(..end).collect();
-            let frame = std::str::from_utf8(&frame)
-                .map_err(|error| format!("provider SSE frame is not UTF-8: {error}"))?;
-            budget_delta = budget_delta
-                .checked_add(self.absorb_frame(frame)?)
-                .ok_or_else(|| "provider completion-token delta overflow".to_owned())?;
+            let frame = match std::str::from_utf8(&frame) {
+                Ok(frame) => frame,
+                Err(error) => break Err(format!("provider SSE frame is not UTF-8: {error}")),
+            };
+            match self.absorb_frame(frame) {
+                Ok(delta) => match budget_delta.checked_add(delta) {
+                    Some(total) => budget_delta = total,
+                    None => break Err("provider completion-token delta overflow".to_owned()),
+                },
+                Err(error) => break Err(error),
+            }
+        };
+        if let Err(error) = absorb_result {
+            // A chunk's deltas are only debited AFTER this loop (one
+            // budget check per network chunk), but `absorb_frame` bumps
+            // `charged_completion_tokens` per frame. An error on a later
+            // frame abandons the never-debited `budget_delta` while the
+            // earlier frames' bumps stay in `charged` — and the terminal
+            // over-charge refund computes `charged − reported`, so it
+            // would credit tokens that were never debited (a hostile
+            // upstream could replenish the session ledger at will). Roll
+            // `charged` back to exactly what was debited. `absorb_frame`
+            // errors strictly before charging its own frame, so the
+            // accumulated `budget_delta` is precisely the undebited part.
+            self.charged_completion_tokens = self.charged_completion_tokens.saturating_sub(budget_delta);
+            return Err(error);
         }
         if self.protocol_buffer.len() > MAX_PROVIDER_FIELD_BYTES {
             return Err("unterminated provider SSE frame exceeds limit".to_owned());
@@ -3235,10 +3259,18 @@ impl Stream for AbortFinalizingStream {
                         // capture). `saw_chunk` exists precisely to gate
                         // this.
                         if self.upstream_status.is_success() && !self.saw_chunk {
+                            // Attest the refused turn as a TERMINAL
+                            // FAILURE before sealing: returning without a
+                            // capture left Drop to submit one with
+                            // failure=None (no flush error, no unbilled
+                            // delta), journalling a Success-shaped Session
+                            // event for exactly the body this guard
+                            // refuses to attest.
+                            let reason = "successful provider response has an empty body".to_owned();
+                            self.record_response_failure(&reason);
                             self.session.mark_capture_failed();
                             self.pending_output.clear();
-                            let error =
-                                self.abort_error("successful provider response has an empty body".to_owned());
+                            let error = self.abort_error(reason);
                             return Poll::Ready(Some(Err(error)));
                         }
                         if let Err(error) = self.submit_response_capture(None) {
@@ -3294,8 +3326,14 @@ impl Stream for AbortFinalizingStream {
                 // above: a 200 SSE response that delivered zero bytes
                 // must not be attested as a clean assistant turn.
                 if self.upstream_status.is_success() && !self.saw_chunk {
+                    // Same terminal-failure attestation as the non-SSE
+                    // twin: seal AFTER capturing the refusal so Drop's
+                    // failure=None capture cannot journal a
+                    // Success-shaped event for the refused body.
+                    let reason = "successful provider response has an empty body".to_owned();
+                    self.record_response_failure(&reason);
                     self.session.mark_capture_failed();
-                    let error = self.abort_error("successful provider response has an empty body".to_owned());
+                    let error = self.abort_error(reason);
                     return Poll::Ready(Some(Err(error)));
                 }
                 if let Err(error) = self.submit_response_capture(None) {
@@ -5897,6 +5935,86 @@ mod tests {
             "close_session must succeed after AbortFinalizingStream::drop submits the response capture — a session sealed without its artifact is worse than a marginally-over-budget response record, because the receipt is lost entirely",
         );
 
+        provider.abort();
+    }
+
+    /// A network chunk's frame deltas are debited ONCE after the drain
+    /// loop, but `absorb_frame` bumps `charged_completion_tokens` per
+    /// frame. An error on a later frame in the same chunk abandons the
+    /// never-debited delta — without a rollback, the terminal refund
+    /// (`charged − reported`) credited tokens that were never debited,
+    /// letting a hostile upstream replenish the session ledger at will.
+    #[tokio::test]
+    async fn absorb_error_rolls_back_undebited_completion_charges() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state(directory.path()).await;
+        let identity = av_events::AgentIdentity {
+            version: "1".into(),
+            charter: "c".into(),
+            instance_uid: "i".into(),
+            ttl_remaining_s: None,
+        };
+        let session = state.sessions.get_or_open(
+            "absorb-rollback",
+            crate::session::Workflow::Signed,
+            &identity,
+            &state.config.breaker,
+        );
+        let lease = crate::session::SessionLease::new(Arc::clone(&session));
+        let mut stream = AbortFinalizingStream {
+            inner: futures::stream::empty::<Result<Bytes, std::io::Error>>().boxed(),
+            session: Arc::clone(&session),
+            identity,
+            response_permit: None,
+            worker: state.worker.clone(),
+            store: Arc::clone(&state.store),
+            budget: state.config.budget.clone(),
+            billed_prompt_tokens: 0,
+            principal_budget: None,
+            provider_adapter: Arc::clone(&state.provider_adapter),
+            finalizer: state.finalizer.clone(),
+            _lease: lease,
+            response_marker: None,
+            response_attempt_id: "absorb-rollback-attempt".into(),
+            response_message: String::new(),
+            response_reasoning: String::new(),
+            response_model: None,
+            response_finish_reason: None,
+            upstream_status: StatusCode::OK,
+            response_cost_usd_micros: 0,
+            response_tool_calls: std::collections::BTreeMap::new(),
+            response_metrics: av_events::EventMetrics::default(),
+            charged_completion_tokens: 0,
+            last_reported_completion_tokens: None,
+            last_reported_prompt_tokens: None,
+            last_reported_cached_tokens: None,
+            last_reported_cost_usd_micros: None,
+            saw_chunk: false,
+            capture_attempted: true,
+            is_sse: true,
+            protocol_buffer: Vec::new(),
+            pending_output: std::collections::VecDeque::new(),
+            pending_budget: None,
+            captured_bytes: 0,
+            completed: false,
+            ephemeral: false,
+        };
+        // Frame A: content without usage → the estimate branch bumps
+        // `charged_completion_tokens`. Frame B: malformed JSON → error.
+        // Both frames arrive in ONE network chunk, so frame A's delta
+        // was never debited.
+        let chunk = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"some streamed words here\"}}]}\n\n",
+            "data: {not-json\n\n",
+        );
+        let result = stream.absorb_network_chunk(chunk.as_bytes());
+        assert!(result.is_err(), "the malformed frame must fail the chunk");
+        assert_eq!(
+            stream.charged_completion_tokens, 0,
+            "an errored chunk's never-debited frame deltas must be rolled back \
+             from charged_completion_tokens, or the terminal refund credits \
+             tokens that were never debited"
+        );
         provider.abort();
     }
 
