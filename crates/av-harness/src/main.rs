@@ -1904,41 +1904,55 @@ async fn shutdown_signal() {
                  (Term). Investigate seccomp / signal syscall restrictions if this appears."
             );
         }
+        // R72 review F3 (landed R73): eliminate the second-signal
+        // race window by keeping the signal receivers alive
+        // across the first-signal select and moving them into
+        // the force-exit spawn. Prior shape called
+        // `tokio::signal::ctrl_c()` inside the spawn, creating a
+        // FRESH SIGINT receiver AFTER the outer select returned —
+        // a signal arriving in that window landed on no armed
+        // receiver and was silently dropped. Operator's `Ctrl-C,
+        // Ctrl-C` or `docker stop; docker stop` muscle memory
+        // silently didn't force-exit; graceful shutdown ran to
+        // completion (or Kubernetes SIGKILL after
+        // terminationGracePeriodSeconds).
+        //
+        // Fix: `interrupt` is created upfront, kept alive across
+        // the outer select via `&mut`, and MOVED into the force-
+        // exit spawn along with `terminate`. Both receivers stay
+        // armed continuously across the first-signal window —
+        // a second signal arriving at ANY point is queued in the
+        // receiver's tokio internals and delivered on the next
+        // `.recv().await` inside the spawn.
+        let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
         tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                if let Err(error) = result {
-                    tracing::error!(%error, "failed to listen for Ctrl-C");
+            _ = async {
+                if let Some(ref mut sig) = interrupt {
+                    sig.recv().await;
+                } else {
+                    // No SIGINT receiver — mirror the prior shape's
+                    // `tokio::signal::ctrl_c()` semantics via a fresh
+                    // one-shot fallback. If ctrl_c() itself errors,
+                    // log and pend so the terminate arm can still
+                    // fire.
+                    if let Err(error) = tokio::signal::ctrl_c().await {
+                        tracing::error!(%error, "failed to listen for Ctrl-C");
+                        std::future::pending::<()>().await;
+                    }
                 }
-            }
+            } => {}
             _ = terminate.recv() => {}
         }
-        // force-exit on a second signal. Once the first
-        // signal fires and this fn returns, the tokio handlers stay
-        // registered process-wide — the OS default action never runs
-        // and subsequent SIGTERM / SIGINT are silently consumed by
-        // the still-armed receivers. An operator sending a second
-        // Ctrl-C to force-abort a hung graceful shutdown (stuck
-        // upstream connection preventing `wait_for_worker_jobs`
-        // from returning, for instance) sees no effect until
-        // Kubernetes' terminationGracePeriodSeconds elapses and
-        // SIGKILL fires — the "docker stop; docker stop" pattern
-        // is broken. Spawn a background task that races a second
-        // signal to `std::process::exit(130)` (the conventional
-        // Ctrl-C exit code). If a second signal arrives during
-        // graceful shutdown, the process exits immediately with
-        // a clear tracing line.
-        tokio::spawn(async {
-            let mut terminate =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+        tokio::spawn(async move {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
                 _ = async {
-                    if let Some(ref mut sig) = terminate {
+                    if let Some(ref mut sig) = interrupt {
                         sig.recv().await;
                     } else {
                         std::future::pending::<()>().await;
                     }
                 } => {}
+                _ = terminate.recv() => {}
             }
             tracing::warn!(
                 "second shutdown signal received during graceful shutdown; forcing exit(130) \
