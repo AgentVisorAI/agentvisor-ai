@@ -200,7 +200,7 @@ function stopReasonCaption(s) {
   return s.stop_reason;
 }
 
-function renderSessions(rows) {
+function renderSessions(rows, matched) {
   const body = document.getElementById('session-body');
   // Rebuild only when the rendered data actually changed. A rebuild on
   // every poll tick destroys DOM nodes out from under an in-progress
@@ -208,7 +208,7 @@ function renderSessions(rows) {
   // selection. `last_activity_ms` is part of the key, so any real change
   // still re-renders; between changes only the relative age captions
   // need refreshing, done in place below.
-  const key = JSON.stringify(rows);
+  const key = JSON.stringify([rows, matched]);
   if (key === state.lastSessionsKey) {
     for (const span of body.querySelectorAll('.age[data-ms]')) {
       span.textContent = fmtAge(Number(span.dataset.ms));
@@ -293,6 +293,23 @@ function renderSessions(rows) {
       ),
     );
     body.appendChild(tr);
+  }
+  // The API caps the list (default 50, max 500 via ?limit=) and returns
+  // `matched` — the pre-truncation count — expressly as a pagination
+  // hint. Without this notice the table silently showed the most recent
+  // rows while the stats strip reported a larger session_count, and
+  // older live sessions were unreachable from the UI with no
+  // indication anything was missing.
+  if (Number.isFinite(matched) && matched > rows.length) {
+    body.appendChild(el(
+      'tr',
+      { class: 'truncation-note' },
+      el(
+        'td',
+        { colspan: '8', class: 'muted' },
+        `Showing the ${rows.length} most recently active of ${matched} matching sessions — narrow the filter to see the rest.`,
+      ),
+    ));
   }
 }
 
@@ -485,7 +502,7 @@ async function refresh() {
     // fresher one, so drop it silently.
     if (gen !== state.refreshGen) return;
     renderStats(stats);
-    renderSessions(list.sessions || []);
+    renderSessions(list.sessions || [], list.matched);
     setLive({ ok: true });
     if (state.activeSession) {
       const sid = state.activeSession;

@@ -95,7 +95,9 @@
       '<span class="k">max_payout_usd_micros</span> = <span class="n">' + (c.payout * 1e6) + "</span> <span class=\"c\"># $" + c.payout + "</span>",
       '<span class="k">max_tokens</span> = <span class="n">' + (c.llm * 4000000) + "</span> <span class=\"c\"># ≈ $" + c.llm + " at gpt-4o-mini rates</span>",
       '<span class="k">max_total_tool_calls</span> = <span class="n">' + c.tools + "</span>",
-      '<span class="k">max_tool_calls</span> = <span class="n">' + c.refunds + "</span> <span class=\"c\"># ceiling per single tool (issue_refund…)</span>"
+      "",
+      '[<span class="k">budget.max_tool_calls</span>] <span class="c"># per-tool ceilings (protects issue_refund…)</span>',
+      '<span class="k">issue_refund</span> = <span class="n">' + c.refunds + "</span>"
     ];
     if (c.loop) {
       lines = lines.concat([
@@ -396,19 +398,19 @@
       detail: { receipt: "84a3f01c…", payout: "$229 of $500", note: "This morning's injection attempt: two refund attempts blocked ($8,894), loop breaker tripped, receipt signed." } },
     { id: "refund-agent · sess-8413", status: "live", cost: "$0.0042", tin: "1,209", tout: "633", ok: 3, bad: 0, stop: "—",
       detail: { receipt: "pending (session open)", payout: "$85 of $500", note: "Routine refund in progress. Every event already journaled." } },
-    { id: "refund-agent · sess-8407", status: "sealed", cost: "$0.0002", tin: "13", tout: "8", ok: 0, bad: 0, stop: "Completed",
+    { id: "refund-agent · sess-8407", status: "sealed", cost: "$0.0002", tin: "13", tout: "8", ok: 0, bad: 0, stop: "Session Closed",
       detail: { receipt: "e2d10c44…", payout: "$0", note: "The connection test from setup — one chat completion, 21 tokens." } },
     { id: "booking-copilot · sess-8391", status: "live", cost: "$0.0088", tin: "2,455", tout: "1,102", ok: 7, bad: 0, stop: "—",
       detail: { receipt: "pending (session open)", payout: "$0 (read-only tools)", note: "Search + rebooking suggestions. No payment tools in its policy." } },
-    { id: "support-triage · sess-8388", status: "sealed", cost: "$0.0310", tin: "9,180", tout: "7,010", ok: 41, bad: 0, stop: "Completed",
+    { id: "support-triage · sess-8388", status: "sealed", cost: "$0.0310", tin: "9,180", tout: "7,010", ok: 41, bad: 0, stop: "Session Closed",
       detail: { receipt: "6c11d9a2…", payout: "n/a", note: "41 tool calls, all allowed. Clean run; receipt verifiable offline." } },
-    { id: "invoice-bot · sess-8371", status: "blocked", cost: "$0.0009", tin: "455", tout: "203", ok: 1, bad: 1, stop: "Payout Cap",
+    { id: "invoice-bot · sess-8371", status: "blocked", cost: "$0.0009", tin: "455", tout: "203", ok: 1, bad: 1, stop: "Budget Exceeded",
       detail: { receipt: "f04b7731…", payout: "$500 of $500", note: "Hit its payout cap on a duplicate invoice. Refused at the door; $0 lost." } },
-    { id: "support-triage · sess-8367", status: "sealed", cost: "$0.0125", tin: "4,002", tout: "2,447", ok: 18, bad: 0, stop: "Completed",
+    { id: "support-triage · sess-8367", status: "sealed", cost: "$0.0125", tin: "4,002", tout: "2,447", ok: 18, bad: 0, stop: "Session Closed",
       detail: { receipt: "b81c2e90…", payout: "n/a", note: "Clean run." } },
-    { id: "booking-copilot · sess-8342", status: "sealed", cost: "$0.0071", tin: "2,010", tout: "990", ok: 5, bad: 0, stop: "Completed",
+    { id: "booking-copilot · sess-8342", status: "sealed", cost: "$0.0071", tin: "2,010", tout: "990", ok: 5, bad: 0, stop: "Session Closed",
       detail: { receipt: "27aa10ce…", payout: "$0", note: "Clean run." } },
-    { id: "refund-agent · sess-8340", status: "blocked", cost: "$0.0051", tin: "1,530", tout: "801", ok: 2, bad: 3, stop: "Loop Breaker",
+    { id: "refund-agent · sess-8340", status: "blocked", cost: "$0.0051", tin: "1,530", tout: "801", ok: 2, bad: 3, stop: "Loop Detected",
       detail: { receipt: "9d3e55b7…", payout: "$120 of $500", note: "Agent got stuck retrying a failing airline API. Circuit opened after 3 similar attempts." } }
   ];
 
