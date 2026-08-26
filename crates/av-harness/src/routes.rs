@@ -415,7 +415,24 @@ async fn metrics(State(state): State<AppState>) -> Response {
             "Accepted-but-not-yet-completed worker jobs",
         )
         .set(state.worker.queue_depth());
-    let (spool_bytes, spool_files) = spool_footprint(std::path::Path::new(&state.config.atif_spool_dir));
+    // Move the synchronous `read_dir` + per-entry `metadata` calls to
+    // the blocking pool. Pre-fix this ran directly on the tokio worker
+    // polling the /metrics request, so any co-scheduled task on that
+    // worker (SSE frame writes, per-connection reads, close-session
+    // waits, the reconciler tick if it landed on the same worker)
+    // stalled for the walk's duration. Prometheus/OTel scrape every
+    // 15-30 s from every replica, so this was a periodic tail-
+    // latency step visible on the streaming path. Worse: a stuck
+    // NFS/EFS mount for the spool volume could hang the request
+    // handler entirely, letting `/readyz` and `/metrics` lie about
+    // liveness while workers hung. `spawn_blocking` isolates the
+    // syscall on the blocking pool and lets the tokio scheduler
+    // continue polling other futures.
+    let spool_dir = state.config.atif_spool_dir.clone();
+    let (spool_bytes, spool_files) =
+        tokio::task::spawn_blocking(move || spool_footprint(std::path::Path::new(&spool_dir)))
+            .await
+            .unwrap_or((0, 0));
     state
         .metrics
         .gauge(
