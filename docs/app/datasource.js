@@ -934,6 +934,18 @@
       err.data = data;
       err.errorCode = data.errorCode;
       err.requestId = data.requestId || window.__lastRequestId;
+      // Global auth-expiry handler. If the JWT expired mid-session,
+      // every subsequent datasource call would return 401. Rather
+      // than let each page render "Something went wrong", bounce the
+      // user cleanly to /login with a friendly notice. The 'me' probe
+      // during boot handles its own 401 (returns null) so we skip that
+      // path here to avoid a redirect loop.
+      if (res.status === 401 && !path.endsWith("/auth/me")) {
+        // Signal the app; app.js listens for this and navigates.
+        try {
+          window.dispatchEvent(new CustomEvent("av-session-expired", { detail: { errorCode: err.errorCode } }));
+        } catch (e) {}
+      }
       throw err;
     }
     return data;

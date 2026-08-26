@@ -65,6 +65,17 @@
     else render();
     installKeyboardShortcuts();
     if (state.session) startLiveStream();
+    // Listen for the datasource-emitted expiry signal. Any 401 that
+    // isn't from the boot-time /me probe kicks the user to /login with
+    // a toast so they know why. Redirect is a full navigate() so the
+    // hash-router picks up "no session" cleanly.
+    window.addEventListener("av-session-expired", function () {
+      if (!state.session) return; // already logged out; ignore
+      state.session = null;
+      stopLiveStream();
+      toast("Your session expired — please sign in again");
+      navigate("#/login");
+    });
   }
 
   var liveUnsub = null;
@@ -199,7 +210,16 @@
     }
     return '<div class="empty"><span class="spinner"></span>Loading…</div>';
   }
-  function notFound() { return '<div class="empty"><h3>Not found</h3><p>The page you\'re looking for doesn\'t exist.</p><a class="btn" href="#/overview">Go to overview</a></div>'; }
+  function notFound() {
+    return '<div class="page-header"><div><h1>Page not found</h1>' +
+      '<div class="sub">The URL you followed doesn\'t point at anything in this workspace.</div></div></div>' +
+      '<div class="empty">' +
+        '<h3>404 — nothing here</h3>' +
+        '<p>The page you\'re looking for might have been renamed, or the link that brought you here is stale.</p>' +
+        '<a class="btn accent" href="#/overview">Go to overview</a> ' +
+        '<a class="btn" href="#/sessions">Or view sessions</a>' +
+      '</div>';
+  }
   function usdMicros(str) {
     var n = typeof str === "string" ? parseInt(str, 10) : (str || 0);
     return "$" + (n / 1e6).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -1930,8 +1950,21 @@
   }
 
   function renderError(main, err) {
+    // Log the original once so ops can grep the browser console (or
+    // Sentry when we wire it) — but don't render the raw message; a
+    // customer-facing "Something went wrong" is a better UX than
+    // "not_found" for a stale bookmark.
     console.error(err);
-    main.innerHTML = pageHeader("Error") + '<div class="card"><div class="empty"><h3>Something went wrong</h3><p>' + esc(err.message || "Unknown error") + '</p><button class="btn" onclick="location.reload()">Reload</button></div></div>';
+    var isNotFound = err && (err.message === "not_found" || err.status === 404);
+    var title = isNotFound ? "Not found" : "Something went wrong";
+    var detail = isNotFound
+      ? "That item doesn't exist, or you don't have access to it."
+      : "This shouldn't happen. Try again in a moment or reload the page."
+        + (err && err.requestId ? " (request id: " + esc(err.requestId) + ")" : "");
+    var actions = isNotFound
+      ? '<a class="btn accent" href="#/sessions">Back to sessions</a> <a class="btn" href="#/overview">Overview</a>'
+      : '<button class="btn accent" onclick="location.reload()">Reload</button> <a class="btn" href="#/overview">Overview</a>';
+    main.innerHTML = pageHeader(title) + '<div class="card"><div class="empty"><h3>' + esc(title) + "</h3><p>" + detail + "</p>" + actions + "</div></div>";
   }
 
   /* ---------- go ---------- */
