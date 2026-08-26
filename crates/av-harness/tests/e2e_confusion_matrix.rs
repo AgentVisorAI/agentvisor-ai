@@ -75,6 +75,13 @@ fn observed_from_verdict(v: &ToolVerdict) -> Observed {
     match v {
         ToolVerdict::Allowed { .. } => Observed::Allowed,
         ToolVerdict::Blocked { .. } => Observed::Blocked,
+        // `ToolVerdict` is `#[non_exhaustive]` (R56 SemVer-hardening).
+        // A future variant reaching this test surface must fail loudly
+        // — silently treating it as Blocked would let a new "shadow-
+        // mode" or "deferred" verdict pass this confusion-matrix
+        // scenario check unaudited. panic! forces the test author to
+        // extend the mapping the moment a new variant lands.
+        _ => panic!("unhandled ToolVerdict variant in test: {v:?}"),
     }
 }
 

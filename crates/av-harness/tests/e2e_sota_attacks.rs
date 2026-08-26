@@ -88,6 +88,7 @@ fn tpa_sidenote_exfiltration_is_refused_by_schema_additional_properties_false() 
                  additionalProperties=false — otherwise the exfiltration channel opens"
             );
         }
+        _ => panic!("unhandled ToolVerdict variant in test"),
     }
 }
 
@@ -133,6 +134,7 @@ fn shadowing_hijacked_recipient_is_refused_by_argument_content_policy() {
         ToolVerdict::Allowed { .. } => {
             panic!("shadowed hostile recipient must be refused by argument-content policy")
         }
+        _ => panic!("unhandled ToolVerdict variant in test"),
     }
     // A legitimate recipient still succeeds.
     let raw = tools_call(
@@ -184,6 +186,7 @@ fn rug_pull_argument_drift_is_refused_when_schema_is_pinned() {
         ToolVerdict::Allowed { .. } => {
             panic!("rug-pulled argument drift must be refused when schemas are pinned")
         }
+        _ => panic!("unhandled ToolVerdict variant in test"),
     }
 }
 
@@ -294,6 +297,7 @@ fn steganographic_exfiltration_via_oversized_argument_field_is_refused() {
     match sandbox.check(&store, "size-bomb", &raw) {
         ToolVerdict::Blocked { stage, .. } => assert_eq!(stage, "policy"),
         ToolVerdict::Allowed { .. } => panic!("oversized argument must be refused"),
+        _ => panic!("unhandled ToolVerdict variant in test"),
     }
 }
 
@@ -328,6 +332,7 @@ fn agentdojo_indirect_injection_does_not_weaken_the_policy_chain() {
         ToolVerdict::Allowed { .. } => {
             panic!("agent-following-injection must not weaken the deny-list")
         }
+        _ => panic!("unhandled ToolVerdict variant in test"),
     }
 }
 
@@ -387,6 +392,7 @@ fn path_traversal_and_shell_metachars_in_tool_args_are_refused() {
         match sandbox.check(&store, "trav", &raw) {
             ToolVerdict::Blocked { stage, .. } => assert_eq!(stage, "policy"),
             ToolVerdict::Allowed { .. } => panic!("hostile payload {hostile:?} was allowed"),
+            _ => panic!("unhandled ToolVerdict variant in test"),
         }
     }
     // Legitimate path succeeds.

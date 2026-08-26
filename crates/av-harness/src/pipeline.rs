@@ -2356,6 +2356,30 @@ impl AppState {
                     "decision_us": elapsed_us,
                 }),
             ),
+            // `ToolVerdict` is `#[non_exhaustive]` (R56 SemVer
+            // hardening) — a future variant (e.g. `Warn` for shadow-
+            // mode, `Deferred` for async policy evaluation) must NOT
+            // be silently forwarded to the tool server. Fail-closed:
+            // emit a Blocked-shaped audit payload and log at ERROR
+            // level so operators discover the unhandled variant
+            // during rollout. Same defensive posture the sandbox's
+            // own `is_allowed` uses (whitelist Allowed, treat
+            // everything else as blocked).
+            _ => {
+                tracing::error!(
+                    "unhandled ToolVerdict variant reached the harness matcher; \
+                     failing closed. This is a bug — extend the match to handle the new variant."
+                );
+                (
+                    StatusId::Failure,
+                    serde_json::json!({
+                        "tool": "<unknown>",
+                        "allowed": false,
+                        "stage": "unhandled_verdict",
+                        "reason": "unhandled ToolVerdict variant; fail-closed",
+                    }),
+                )
+            }
         };
         let tool_call_id = parsed_call
             .as_ref()
@@ -2382,6 +2406,12 @@ impl AppState {
             ToolVerdict::Allowed { .. } => None,
             ToolVerdict::Blocked { stage: "budget", .. } => Some(StopReason::BudgetExceeded),
             ToolVerdict::Blocked { .. } => Some(StopReason::PolicyBlocked),
+            // See the sibling `match &verdict` above for the rationale
+            // — an unhandled `#[non_exhaustive]` variant fails closed
+            // (treat as policy-blocked so the audit chain seals with
+            // a defensible refusal reason rather than silently
+            // proceeding).
+            _ => Some(StopReason::PolicyBlocked),
         };
         worker_permit.submit(WorkerJob {
             session: Arc::clone(&session),
