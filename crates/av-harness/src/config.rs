@@ -2611,21 +2611,53 @@ mod tests {
     /// unrecognized — the caller must panic on that so the drift is
     /// caught at build time, not papered over with `unwrap_or(0)`.
     fn extract_prestop_sleep_seconds(yaml: &str) -> Option<u64> {
-        // Locate the preStop block first; a shipped manifest that
-        // removes preStop entirely legitimately has no sleep and the
-        // caller wants `None` to distinguish "no hook" from "hook that
-        // this parser can't read".
-        let prestop_idx = yaml.find("preStop:")?;
-        let after_prestop = &yaml[prestop_idx..];
-        // Scope to just this preStop block: the next key at the same or
-        // shallower indent ends it. Cheap heuristic — anything after
-        // `resources:` (the next sibling in the shipped manifest) is
-        // out of scope.
-        let scope = after_prestop
-            .find("\nresources:")
-            .map_or(after_prestop, |end| &after_prestop[..end]);
+        // Locate the FIRST non-comment `preStop:` occurrence. A future
+        // manifest edit that adds `# don't use preStop:` above the real
+        // hook would otherwise anchor our scope to the comment and
+        // trawl the rest of the file for any `sleep`.
+        let (prestop_line_idx, prestop_indent) = yaml.lines().enumerate().find_map(|(i, line)| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') {
+                return None;
+            }
+            if trimmed.starts_with("preStop:") {
+                Some((i, line.len() - trimmed.len()))
+            } else {
+                None
+            }
+        })?;
+        // Scope: from the preStop line to the FIRST line whose indent
+        // is ≤ the preStop line's indent (that line starts a sibling
+        // key, ending the preStop block). Blank lines and comments
+        // don't end the block. The previous heuristic (`\nresources:`)
+        // never fired in real manifests where `resources:` is
+        // indented, so the parser trawled the whole rest of the file
+        // and returned `sleep` values from unrelated containers /
+        // probes / sidecars. Verified by the R8 review's mutation
+        // cases: block-form preStop `sleep 60` + downstream container
+        // `command: ["sh","-c","sleep 3"]` used to return 3, not 60.
+        let mut scope = String::new();
+        for (i, line) in yaml.lines().enumerate().skip(prestop_line_idx) {
+            if i == prestop_line_idx {
+                scope.push_str(line);
+                scope.push('\n');
+                continue;
+            }
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                scope.push_str(line);
+                scope.push('\n');
+                continue;
+            }
+            let indent = line.len() - trimmed.len();
+            if indent <= prestop_indent {
+                break;
+            }
+            scope.push_str(line);
+            scope.push('\n');
+        }
         // Shape 1 & 2: same-line inline list. Look for either
-        // "sleep <n>" or 'sleep <n>' anywhere in the block.
+        // "sleep <n>" or 'sleep <n>' anywhere in the scoped block.
         for quote in ['"', '\''] {
             let marker = format!("{quote}sleep ");
             if let Some(hit) = scope.find(&marker) {
@@ -2660,7 +2692,15 @@ mod tests {
     /// against the 150 s grace, and the previous `.unwrap_or(0)` let
     /// the test pass.
     fn require_prestop_sleep_seconds(yaml: &str) -> u64 {
-        if !yaml.contains("preStop:") {
+        // Only count a REAL preStop line (`preStop:` at the start of a
+        // non-comment line), not the substring inside a comment like
+        // `# don't use preStop:`. Same class of bug the scope-cut
+        // rewrite fixes below.
+        let has_prestop = yaml.lines().any(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with('#') && trimmed.starts_with("preStop:")
+        });
+        if !has_prestop {
             return 0;
         }
         extract_prestop_sleep_seconds(yaml).expect(
@@ -2671,6 +2711,89 @@ mod tests {
              0 would defeat the pin's own purpose: catching a preStop-time bump that \
              pushes total shutdown past the grace period.",
         )
+    }
+
+    /// Direct regression tests for the parser — pinning the exact
+    /// mutation cases the R8 review agent proved defeated the previous
+    /// scope-cut heuristic. If these ever regress, the shipped
+    /// K8s pin above no longer measures what its comment claims.
+    #[test]
+    fn extract_prestop_scope_ignores_downstream_sleep_after_the_block() {
+        // Block-form preStop `sleep 60` in one container followed by
+        // an unrelated inline container command with `"sleep 3"` in a
+        // real sibling later in the YAML. Previous version returned
+        // 3 (first inline match anywhere after preStop:), silently
+        // making the pin under-count preStop time by 57 s.
+        let yaml = "\
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+      - name: main
+        lifecycle:
+          preStop:
+            exec:
+              command:
+                - sh
+                - -c
+                - sleep 60
+        resources:
+          limits:
+            cpu: \"2\"
+      - name: sidecar
+        command: [\"sh\", \"-c\", \"sleep 3\"]
+";
+        assert_eq!(
+            extract_prestop_sleep_seconds(yaml),
+            Some(60),
+            "the parser must scope to the preStop block and ignore \
+             downstream containers' inline sleep commands"
+        );
+    }
+
+    #[test]
+    fn extract_prestop_scope_ignores_downstream_probe_sleep() {
+        // Inline preStop `sleep 3` next to a downstream livenessProbe
+        // exec `command: [\"sh\", \"-c\", \"sleep 300\"]`. Previous
+        // version returned 300 → pin FALSELY reported "grace exceeded"
+        // for a config that was actually fine.
+        let yaml = "\
+spec:
+  containers:
+  - name: main
+    lifecycle:
+      preStop:
+        exec:
+          command: [\"sh\", \"-c\", \"sleep 3\"]
+    livenessProbe:
+      exec:
+        command: [\"sh\", \"-c\", \"sleep 300\"]
+";
+        assert_eq!(extract_prestop_sleep_seconds(yaml), Some(3));
+    }
+
+    #[test]
+    fn require_prestop_skips_commented_out_prestop_line() {
+        // A YAML comment mentioning preStop must not fool the parser
+        // into thinking a hook exists — nor into returning an
+        // unrelated sleep from a downstream probe.
+        let yaml = "\
+spec:
+  containers:
+  - name: main
+    # NOTE: do not add preStop: to this container, see runbook.
+    livenessProbe:
+      exec:
+        command: [\"sh\", \"-c\", \"sleep 90\"]
+";
+        assert_eq!(
+            require_prestop_sleep_seconds(yaml),
+            0,
+            "a comment mentioning preStop: is NOT a real hook; require_prestop \
+             must return 0, not the downstream probe's sleep"
+        );
     }
 
     /// Parses `stop_grace_period: 180s` (compose accepts a `s`/`m`/`h`
