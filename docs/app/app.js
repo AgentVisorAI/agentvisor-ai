@@ -1684,7 +1684,7 @@
     if (tab === "billing") return renderSettingsBilling(panel);
   }
 
-  function renderSettingsGeneral(root) {
+  async function renderSettingsGeneral(root) {
     root.innerHTML =
       '<div class="card"><h2>Organization</h2>' +
         '<dl class="kv" style="display:grid;grid-template-columns:140px 1fr;gap:5px 12px;font-size:13px">' +
@@ -1692,6 +1692,11 @@
           "<dt style=\"color:var(--fg-3)\">Org ID</dt><dd class=\"mono\">" + esc(state.session.org.id) + "</dd>" +
           "<dt style=\"color:var(--fg-3)\">Created</dt><dd>" + esc(new Date(state.session.org.createdAt).toLocaleDateString()) + "</dd>" +
         "</dl>" +
+      "</div>" +
+      '<div class="card" id="retentionCard">' +
+        '<h2>Data retention</h2>' +
+        '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 12px">Sessions, events, receipts, and audit log entries older than the retention window are automatically purged. Set to 0 to keep everything forever.</p>' +
+        loadingBlock("table") +
       "</div>" +
       '<div class="card"><h2>Account</h2>' +
         '<dl class="kv" style="display:grid;grid-template-columns:140px 1fr;gap:5px 12px;font-size:13px">' +
@@ -1704,6 +1709,63 @@
         '<div class="card"><h2>Demo mode</h2><p style="color: var(--fg-2); margin: 0 0 8px; font-size: var(--t-sec)">This console is running against built-in fixtures. To connect to a real backend, set <code>window.MOCK_MODE = false</code> in <code>docs/app/index.html</code>.</p></div>' : "");
     var so = $("#signOut", root);
     if (so) so.addEventListener("click", signOut);
+
+    // Retention: load current + render editor
+    var card = $("#retentionCard", root);
+    if (card && state.ds.getRetention) {
+      try {
+        var res = await state.ds.getRetention();
+        var r = res.retention || { sessionRetentionDays: 90, auditRetentionDays: 365 };
+        var editable = state.session.org.role === "owner" || state.session.org.role === "admin";
+        card.innerHTML =
+          '<h2>Data retention</h2>' +
+          '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 12px">Sessions, events, receipts, and audit log entries older than the window are automatically purged. Set to 0 to keep everything forever.</p>' +
+          '<div style="display:grid;grid-template-columns:200px 1fr;gap:12px 16px;font-size:13px;align-items:center">' +
+            '<label for="retSess">Sessions + events</label>' +
+            '<div style="display:flex;gap:8px;align-items:center">' +
+              '<input id="retSess" type="number" min="0" max="3650" value="' + r.sessionRetentionDays + '" style="width:100px"' + (editable ? '' : ' disabled') + '>' +
+              '<span style="color:var(--fg-3)">days</span>' +
+            '</div>' +
+            '<label for="retAudit">Audit log</label>' +
+            '<div style="display:flex;gap:8px;align-items:center">' +
+              '<input id="retAudit" type="number" min="0" max="3650" value="' + r.auditRetentionDays + '" style="width:100px"' + (editable ? '' : ' disabled') + '>' +
+              '<span style="color:var(--fg-3)">days</span>' +
+            '</div>' +
+          '</div>' +
+          (editable
+            ? '<div style="margin-top:16px;display:flex;gap:8px">' +
+                '<button class="btn accent" id="retSave">Save</button>' +
+                '<button class="btn" id="retSweepNow">Run sweep now</button>' +
+              '</div>'
+            : '<p style="margin-top:12px;color:var(--fg-3);font-size:12px">Only owners and admins can change retention.</p>');
+        if (editable) {
+          $("#retSave", card).addEventListener("click", async function () {
+            var s = parseInt($("#retSess", card).value, 10);
+            var a = parseInt($("#retAudit", card).value, 10);
+            if (isNaN(s) || isNaN(a) || s < 0 || a < 0) { toast("Invalid values"); return; }
+            try {
+              await state.ds.updateRetention({ sessionRetentionDays: s, auditRetentionDays: a });
+              toast("Retention updated.");
+            } catch (e) { toast(e.message || "Save failed"); }
+          });
+          $("#retSweepNow", card).addEventListener("click", function () {
+            confirmModal({
+              title: "Run retention sweep now?",
+              body: "Rows older than the retention window will be permanently deleted. This runs automatically every 6 hours anyway; use this button only if you need immediate cleanup.",
+              confirmLabel: "Sweep now", danger: true,
+              onConfirm: async function () {
+                try {
+                  var res = await state.ds.retentionSweepNow();
+                  toast("Purged " + (res.result.sessionsPurged + res.result.auditPurged + res.result.webhookDeliveriesPurged) + " rows.");
+                } catch (e) { toast(e.message || "Sweep failed"); }
+              },
+            });
+          });
+        }
+      } catch (e) {
+        card.innerHTML = '<h2>Data retention</h2><p style="color:var(--fg-2);font-size:var(--t-sec)">Could not load (' + esc(e.message || "network") + ').</p>';
+      }
+    }
   }
   // Wire Escape + Tab focus trap for a modal backdrop. Returns nothing;
   // the caller is expected to append the backdrop first and pass its

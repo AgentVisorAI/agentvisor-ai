@@ -20,12 +20,14 @@ import { deploymentRoutes } from "./routes/deployments.js";
 import { ingestRoutes } from "./routes/ingest.js";
 import { memberRoutes } from "./routes/members.js";
 import { oauthRoutes } from "./routes/oauth.js";
+import { orgRoutes } from "./routes/org.js";
 import { readRoutes } from "./routes/read.js";
 import { samlRoutes } from "./routes/saml.js";
 import { streamRoutes } from "./routes/stream.js";
 import { webauthnRoutes } from "./routes/webauthn.js";
 import { webhookRoutes } from "./routes/webhooks.js";
 import { startWebhookSweeper, stopWebhookSweeper } from "./lib/webhooks.js";
+import { startRetentionSweeper, stopRetentionSweeper } from "./lib/retention.js";
 
 // `types.d.ts` declares the `request.session` typing. It's picked up by the
 // TypeScript compiler via `include`, no runtime import required.
@@ -467,6 +469,9 @@ async function main(): Promise<void> {
   await app.register(async (r) => r.register(webhookRoutes), {
     prefix: "/api/v1/webhooks",
   });
+  await app.register(async (r) => r.register(orgRoutes), {
+    prefix: "/api/v1/org",
+  });
   await app.register(async (r) => r.register(deploymentRoutes), {
     prefix: "/api/v1/deployments",
   });
@@ -505,11 +510,13 @@ async function main(): Promise<void> {
   // status='retrying' deliveries whose nextRetryAt has passed and
   // re-fires them. Idempotent — safe against double-registration.
   startWebhookSweeper(app.log);
+  startRetentionSweeper(app.log);
 
   const shutdown = async (signal: string) => {
     app.log.info({ signal }, "graceful shutdown starting");
     try {
       stopWebhookSweeper();
+      stopRetentionSweeper();
       await app.close();
       await bus.close();
     } catch (err) {

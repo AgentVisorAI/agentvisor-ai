@@ -1001,6 +1001,9 @@
     async deleteWebhook() { await delay(80); },
     async testWebhook() { await delay(80); },
     async listWebhookDeliveries() { await delay(80); return []; },
+    async getRetention() { await delay(80); return { retention: { sessionRetentionDays: 90, auditRetentionDays: 365 } }; },
+    async updateRetention() { await delay(80); },
+    async retentionSweepNow() { await delay(120); return { result: { sessionsPurged: 0, auditPurged: 0, webhookDeliveriesPurged: 0 } }; },
     downloadAuditCsv: function () { /* no-op in mock */ },
     async listAudit() { await delay(100); return MOCK_AUDIT.slice(); },
     subscribe(callback) {
@@ -1432,6 +1435,15 @@
         var res = await apiFetch("/api/v1/webhooks/" + encodeURIComponent(id) + "/deliveries");
         return res.deliveries || [];
       } catch (e) { return []; }
+    },
+    async getRetention() {
+      return apiFetch("/api/v1/org/retention");
+    },
+    async updateRetention(patch) {
+      return apiFetch("/api/v1/org/retention", { method: "PATCH", body: patch });
+    },
+    async retentionSweepNow() {
+      return apiFetch("/api/v1/org/retention/sweep-now", { method: "POST" });
     },
     downloadAuditCsv: function () {
       // Redirect to the CSV endpoint — cookies auto-attach, browser

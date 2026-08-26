@@ -1,0 +1,2 @@
+ALTER TABLE "orgs" ADD COLUMN "sessionRetentionDays" INT NOT NULL DEFAULT 90;
+ALTER TABLE "orgs" ADD COLUMN "auditRetentionDays" INT NOT NULL DEFAULT 365;

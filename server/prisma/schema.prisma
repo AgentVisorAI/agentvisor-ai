@@ -74,6 +74,17 @@ model Org {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  // Data retention windows (days). Sessions + their events + receipts
+  // older than sessionRetentionDays are purged by the retention sweeper.
+  // Audit entries have a separate longer window because compliance
+  // frameworks (SOC-2, ISO 27001) generally expect 365 days of
+  // authoritative access history.
+  //
+  // 0 = keep forever (no purge). Sensible defaults: 90 days for
+  // operational data, 365 for audit.
+  sessionRetentionDays Int @default(90)
+  auditRetentionDays   Int @default(365)
+
   members     Membership[]
   deployments Deployment[]
   samlConfigs SamlConfig[]
