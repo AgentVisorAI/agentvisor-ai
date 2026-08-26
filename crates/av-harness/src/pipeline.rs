@@ -1805,10 +1805,23 @@ impl AppState {
 
     /// Run identity, breaker, quota, sanitize, compression, and asynchronous
     /// dispatch in the mandated order without awaiting worker or upstream I/O.
+    ///
+    /// `identity_hint`, when `Some`, is trusted as the resolved identity for
+    /// this request — the internal `resolve_identity` + audit-enqueue step
+    /// is skipped. Used by `chat_completions` (R72 F3 pre-admission gate)
+    /// which already resolved the identity to fail-fast on unauthenticated
+    /// probes before the body parses. Without this hint, the R72 pre-check
+    /// path would `enqueue_transient_failure` on a JWKS-rotation race
+    /// (pre-check success + re-check failure between the two calls),
+    /// double-counting `av_identity_rejections_total` and burning two
+    /// of the sampled full-audit slots per rejected request (R73 review
+    /// F3). `None` preserves the historical behaviour for callers that
+    /// do NOT pre-resolve.
     pub fn prepare_chat(
         &self,
         headers: &HeaderMap,
         mut payload: Value,
+        identity_hint: Option<AgentIdentity>,
     ) -> Result<PreparedRequest, PipelineError> {
         let total_started = Instant::now();
         let session_id = session_id(headers)?;
@@ -1858,11 +1871,25 @@ impl AppState {
         }
 
         let stage = Instant::now();
-        let identity = match self.resolve_identity(headers, Some(&self.config.chat_scope)) {
-            Ok(identity) => identity,
-            Err(error) => {
-                self.enqueue_transient_failure(&session_id, StopReason::IdentityRejected, error.to_string())?;
-                return Err(error);
+        let identity = if let Some(pre_resolved) = identity_hint {
+            // R73 review F3: pre-resolved from an earlier caller
+            // (chat_completions pre-admission gate). Skip the
+            // internal resolve + audit-enqueue so a rotation race
+            // between the two calls cannot double-count
+            // `av_identity_rejections_total` or burn a second
+            // full-audit sample slot per request.
+            pre_resolved
+        } else {
+            match self.resolve_identity(headers, Some(&self.config.chat_scope)) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    self.enqueue_transient_failure(
+                        &session_id,
+                        StopReason::IdentityRejected,
+                        error.to_string(),
+                    )?;
+                    return Err(error);
+                }
             }
         };
         self.observe_stage("identity", stage);
@@ -2228,11 +2255,15 @@ impl AppState {
     /// `for_principal(...).try_tokens` store round-trip in
     /// `prepare_chat` even when the session `max_tokens` is unset, so
     /// it must equally force the blocking pool.
+    /// Async wrapper over [`Self::prepare_chat`] that spawn-blocks on
+    /// bodies large enough to stall the reactor. See `prepare_chat`
+    /// for the `identity_hint` contract.
     pub async fn prepare_chat_nonblocking(
         &self,
         headers: &HeaderMap,
         payload: Value,
         body_bytes: usize,
+        identity_hint: Option<AgentIdentity>,
     ) -> Result<PreparedRequest, PipelineError> {
         /// Above this the CPU-bound gates run on the blocking pool.
         /// 16 KiB ≈ 250 µs of gate work on the review's 2-vCPU
@@ -2242,11 +2273,11 @@ impl AppState {
             && self.config.budget.max_tokens.is_none()
             && self.config.principal_budget.is_none()
         {
-            return self.prepare_chat(headers, payload);
+            return self.prepare_chat(headers, payload, identity_hint);
         }
         let state = self.clone();
         let headers = headers.clone();
-        tokio::task::spawn_blocking(move || state.prepare_chat(&headers, payload))
+        tokio::task::spawn_blocking(move || state.prepare_chat(&headers, payload, identity_hint))
             .await
             .map_err(PipelineError::unavailable_source)?
     }
@@ -2270,7 +2301,7 @@ impl AppState {
         }
         let state = self.clone();
         let headers = headers.clone();
-        let mut prepared = tokio::task::spawn_blocking(move || state.prepare_chat(&headers, payload))
+        let mut prepared = tokio::task::spawn_blocking(move || state.prepare_chat(&headers, payload, None))
             .await
             .map_err(PipelineError::unavailable_source)??;
         prepared.session.wait_for_worker_jobs().await;
@@ -3757,7 +3788,7 @@ mod tests {
 
     async fn trip_loop(state: &AppState, headers: &HeaderMap, repeated: &Value) {
         for expected in 1..=4u64 {
-            let mut prepared = state.prepare_chat(headers, repeated.clone()).unwrap();
+            let mut prepared = state.prepare_chat(headers, repeated.clone(), None).unwrap();
             // This helper abandons the prepared request without forwarding.
             // Defuse the capture guard so its terminal failure job does not
             // pad the chain — the chain-count waits below must count only
@@ -3784,7 +3815,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(SESSION_HEADER, HeaderValue::from_static("session-1"));
 
-        let prepared = state.prepare_chat(&headers, payload()).unwrap();
+        let prepared = state.prepare_chat(&headers, payload(), None).unwrap();
         assert_eq!(prepared.session.id, "session-1");
         // Debug-build ceiling: 100ms is 3 orders of magnitude above the release
         // SLA (~33us p95); a regression an order of magnitude worse still trips
@@ -3801,7 +3832,7 @@ mod tests {
     async fn missing_identity_fails_closed_when_required() {
         let mut config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
         config.require_identity = true;
-        let error = match state(config).prepare_chat(&HeaderMap::new(), payload()) {
+        let error = match state(config).prepare_chat(&HeaderMap::new(), payload(), None) {
             Ok(_) => panic!("missing identity was accepted"),
             Err(error) => error,
         };
@@ -3815,7 +3846,7 @@ mod tests {
         let state = state(config);
         let mut headers = HeaderMap::new();
         headers.insert(SESSION_HEADER, HeaderValue::from_static("quota-failure"));
-        let error = match state.prepare_chat(&headers, payload()) {
+        let error = match state.prepare_chat(&headers, payload(), None) {
             Ok(_) => panic!("over-budget request was accepted"),
             Err(error) => error,
         };
@@ -3855,7 +3886,7 @@ mod tests {
         // First request under session A: fits the principal budget.
         let mut headers_a = HeaderMap::new();
         headers_a.insert(SESSION_HEADER, HeaderValue::from_static("rotated-a"));
-        let first = state.prepare_chat(&headers_a, payload());
+        let first = state.prepare_chat(&headers_a, payload(), None);
         assert!(first.is_ok(), "first principal request must be admitted");
         // Mark the admission dispatched before dropping: a dropped
         // UNdispatched request now (correctly) refunds via
@@ -3872,7 +3903,7 @@ mod tests {
         // is closed.
         let mut headers_b = HeaderMap::new();
         headers_b.insert(SESSION_HEADER, HeaderValue::from_static("rotated-b"));
-        match state.prepare_chat(&headers_b, payload()) {
+        match state.prepare_chat(&headers_b, payload(), None) {
             Ok(_) => panic!("header rotation defeated principal budget — the fix from §3.2 has regressed"),
             Err(PipelineError::Blocked { context: msg, .. }) => {
                 assert!(
@@ -3905,7 +3936,7 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert(SESSION_HEADER, HeaderValue::from_static("abandon-a"));
-        let mut prepared = state.prepare_chat(&headers, payload()).unwrap();
+        let mut prepared = state.prepare_chat(&headers, payload(), None).unwrap();
         state.abandon_prepared(&mut prepared, StopReason::Other, "test abandon");
         drop(prepared);
 
@@ -3914,7 +3945,7 @@ mod tests {
         // request's debit was refunded on both ledgers.
         let mut headers_b = HeaderMap::new();
         headers_b.insert(SESSION_HEADER, HeaderValue::from_static("abandon-b"));
-        let second = state.prepare_chat(&headers_b, payload());
+        let second = state.prepare_chat(&headers_b, payload(), None);
         assert!(
             second.is_ok(),
             "an abandoned request must not consume principal budget; got {:?}",
@@ -3941,20 +3972,20 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert(SESSION_HEADER, HeaderValue::from_static("cancelled-a"));
-        let prepared = state.prepare_chat(&headers, payload()).unwrap();
+        let prepared = state.prepare_chat(&headers, payload(), None).unwrap();
         // Simulate the cancelled future: drop with no explicit abort.
         drop(prepared);
 
         // The Drop refund runs on the blocking pool; poll until it lands.
         let mut headers_b = HeaderMap::new();
         headers_b.insert(SESSION_HEADER, HeaderValue::from_static("cancelled-b"));
-        let mut second = state.prepare_chat(&headers_b, payload());
+        let mut second = state.prepare_chat(&headers_b, payload(), None);
         for _ in 0..200 {
             if second.is_ok() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            second = state.prepare_chat(&headers_b, payload());
+            second = state.prepare_chat(&headers_b, payload(), None);
         }
         assert!(
             second.is_ok(),
@@ -3980,7 +4011,7 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert(SESSION_HEADER, HeaderValue::from_static("dispatched-a"));
-        let mut prepared = state.prepare_chat(&headers, payload()).unwrap();
+        let mut prepared = state.prepare_chat(&headers, payload(), None).unwrap();
         let debited = prepared.admission_debit.take_for_dispatch();
         assert!(debited > 0, "admission must have debited tokens");
         drop(prepared);
@@ -3992,7 +4023,7 @@ mod tests {
         headers_b.insert(SESSION_HEADER, HeaderValue::from_static("dispatched-b"));
         assert!(
             matches!(
-                state.prepare_chat(&headers_b, payload()),
+                state.prepare_chat(&headers_b, payload(), None),
                 Err(PipelineError::Blocked { .. })
             ),
             "a dispatched request's debit must stand after drop"
@@ -4018,7 +4049,7 @@ mod tests {
         headers.append("openai-beta", HeaderValue::from_static("assistants=v2"));
         assert!(
             matches!(
-                state.prepare_chat(&headers, payload()),
+                state.prepare_chat(&headers, payload(), None),
                 Err(PipelineError::BadRequest { .. })
             ),
             "duplicate allowlisted headers must be refused"
@@ -4028,7 +4059,7 @@ mod tests {
         let mut clean = HeaderMap::new();
         clean.insert(SESSION_HEADER, HeaderValue::from_static("dup-header"));
         clean.insert("openai-beta", HeaderValue::from_static("assistants=v2"));
-        let second = state.prepare_chat(&clean, payload());
+        let second = state.prepare_chat(&clean, payload(), None);
         assert!(
             second.is_ok(),
             "a header-refused request must not consume budget; got {:?}",
@@ -4043,7 +4074,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(WORKFLOW_HEADER, HeaderValue::from_static("sometimes"));
         assert!(matches!(
-            state.prepare_chat(&headers, payload()),
+            state.prepare_chat(&headers, payload(), None),
             Err(PipelineError::BadRequest { .. })
         ));
     }
@@ -4055,10 +4086,10 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(SESSION_HEADER, HeaderValue::from_static("bound-session"));
         headers.insert(WORKFLOW_HEADER, HeaderValue::from_static("signed"));
-        state.prepare_chat(&headers, payload()).unwrap();
+        state.prepare_chat(&headers, payload(), None).unwrap();
         headers.insert(WORKFLOW_HEADER, HeaderValue::from_static("unsigned"));
         assert!(matches!(
-            state.prepare_chat(&headers, payload()),
+            state.prepare_chat(&headers, payload(), None),
             Err(PipelineError::BadRequest { .. })
         ));
     }
@@ -4080,7 +4111,7 @@ mod tests {
         });
         trip_loop(&state, &headers, &repeated).await;
         assert!(matches!(
-            state.prepare_chat(&headers, repeated),
+            state.prepare_chat(&headers, repeated, None),
             Err(PipelineError::Blocked { .. })
         ));
     }
@@ -4098,7 +4129,7 @@ mod tests {
             "messages": [{"role": "assistant", "content": "repeat the database query"}]
         });
         trip_loop(&state, &headers, &repeated).await;
-        let prepared = state.prepare_chat(&headers, repeated).unwrap();
+        let prepared = state.prepare_chat(&headers, repeated, None).unwrap();
         let correction = prepared
             .payload
             .get("messages")
@@ -4125,7 +4156,7 @@ mod tests {
         });
         trip_loop(&state, &headers, &repeated).await;
         assert!(matches!(
-            state.prepare_chat(&headers, repeated),
+            state.prepare_chat(&headers, repeated, None),
             Err(PipelineError::Abort(_))
         ));
     }
@@ -4156,7 +4187,7 @@ mod tests {
         // per-admission token amount after the first job lands.
         let mut per_request = 0u64;
         for expected in 1..=4u64 {
-            state.prepare_chat(&headers, repeated.clone()).unwrap();
+            state.prepare_chat(&headers, repeated.clone(), None).unwrap();
             let session = state.sessions.get("loop-session").unwrap();
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 while session.chain.lock().count() < expected {
@@ -4217,7 +4248,7 @@ mod tests {
         .unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(SESSION_HEADER, HeaderValue::from_static("budget-cleanup"));
-        state.prepare_chat(&headers, payload()).unwrap();
+        state.prepare_chat(&headers, payload(), None).unwrap();
         let tokens_key = format!(
             "{}tokens",
             av_state::ActionBudget::session_prefix("budget-cleanup")
@@ -4386,7 +4417,7 @@ mod tests {
         let state = state(config);
         let mut headers = HeaderMap::new();
         headers.insert(SESSION_HEADER, HeaderValue::from_static("marker-outage"));
-        let prepared = state.prepare_chat(&headers, payload()).unwrap();
+        let prepared = state.prepare_chat(&headers, payload(), None).unwrap();
         let attempt_id = prepared.capture_guard.attempt_id().to_owned();
         // Sabotage the marker directory: a regular file at
         // <spool>/inflight-responses makes `create_dir_all` inside
@@ -4570,7 +4601,7 @@ mod tests {
         headers.insert(WORKFLOW_HEADER, HeaderValue::from_static("signed"));
         let mut agent_payload = payload();
         agent_payload["messages"][0]["role"] = Value::String("assistant".to_owned());
-        let mut first = state.prepare_chat(&headers, agent_payload.clone()).unwrap();
+        let mut first = state.prepare_chat(&headers, agent_payload.clone(), None).unwrap();
         // Abandoning without forwarding: defuse the guard, or its terminal
         // job (refused by the size-1 queue) marks the session
         // capture-failed and the worker skips the sink this test blocks on.
@@ -4584,7 +4615,7 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(
-            state.prepare_chat(&headers, agent_payload),
+            state.prepare_chat(&headers, agent_payload, None),
             Err(PipelineError::Unavailable { .. })
         ));
         sink.release.notify_waiters();
@@ -4941,7 +4972,7 @@ mod tests {
             axum::http::header::AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {}", scoped_token(&["chat:write"]))).unwrap(),
         );
-        let prepared = state.prepare_chat(&headers, payload()).unwrap();
+        let prepared = state.prepare_chat(&headers, payload(), None).unwrap();
         // RFC 6750 §3.1: missing scope on a valid token is 403
         // insufficient_scope (Blocked), NOT 401 — a refreshed token would
         // carry the same grant, so telling the SDK to re-authenticate
@@ -4970,7 +5001,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(SESSION_HEADER, HeaderValue::from_static("upstream-failure"));
         headers.insert(WORKFLOW_HEADER, HeaderValue::from_static("signed"));
-        let prepared = state.prepare_chat(&headers, payload()).unwrap();
+        let prepared = state.prepare_chat(&headers, payload(), None).unwrap();
         let session = Arc::clone(&prepared.session);
         assert!(matches!(
             state.forward_chat(prepared).await,
@@ -5002,7 +5033,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(SESSION_HEADER, HeaderValue::from_static("cwe-209-check"));
         headers.insert(WORKFLOW_HEADER, HeaderValue::from_static("signed"));
-        let prepared = state.prepare_chat(&headers, payload()).unwrap();
+        let prepared = state.prepare_chat(&headers, payload(), None).unwrap();
         let error = match state.forward_chat(prepared).await {
             Ok(_) => panic!("connect to unroutable host must fail"),
             Err(error) => error,

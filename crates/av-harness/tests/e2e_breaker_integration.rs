@@ -65,7 +65,7 @@ async fn pipeline_blocks_dispatch_when_breaker_is_open() {
     // AFTER the first response, but the NEXT prepare_chat after the session
     // is Open should be blocked. We simulate by directly manipulating the
     // session loop state.
-    state.prepare_chat(&h, chat(content)).unwrap();
+    state.prepare_chat(&h, chat(content), None).unwrap();
     let sess = state.sessions.get("breaker-block").unwrap();
     // Manually trip the breaker so the next prepare_chat sees Open state.
     let e = HashEmbedder::default();
@@ -75,7 +75,7 @@ async fn pipeline_blocks_dispatch_when_breaker_is_open() {
     sess.loop_state.observe_embedding(embedding.clone(), 0); // streak 2 → Tripped
     assert_eq!(sess.loop_state.state(), av_loopdetect::BreakerState::Open);
     // Next prepare_chat must be blocked.
-    let result = state.prepare_chat(&h, chat("anything"));
+    let result = state.prepare_chat(&h, chat("anything"), None);
     assert!(
         result.is_err(),
         "prepare_chat should be blocked when breaker is Open"
@@ -262,7 +262,7 @@ async fn pipeline_auto_resets_breaker_on_inject_action() {
     });
     let h = signed_headers("inject-sess");
     let content = "same loop step again";
-    state.prepare_chat(&h, chat(content)).unwrap();
+    state.prepare_chat(&h, chat(content), None).unwrap();
     let sess = state.sessions.get("inject-sess").unwrap();
     let e = HashEmbedder::default();
     let embedding = e.embed(content);
@@ -272,7 +272,7 @@ async fn pipeline_auto_resets_breaker_on_inject_action() {
     assert_eq!(sess.loop_state.state(), av_loopdetect::BreakerState::Open);
     // The harness pipeline should inject a corrective message and reset,
     // so prepare_chat succeeds (returns Ok) rather than blocking.
-    let result = state.prepare_chat(&h, chat("fresh request after correction"));
+    let result = state.prepare_chat(&h, chat("fresh request after correction"), None);
     assert!(
         result.is_ok(),
         "Inject action should reset and allow the next request"
