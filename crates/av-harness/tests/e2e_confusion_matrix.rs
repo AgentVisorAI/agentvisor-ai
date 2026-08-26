@@ -115,6 +115,7 @@ fn scenarios() -> Vec<Scenario> {
                         "model": "gpt-x",
                         "messages": [{"role": "user", "content": "hello"}]
                     }),
+                    None,
                 )
                 .is_ok();
             if ok {
@@ -151,6 +152,7 @@ fn scenarios() -> Vec<Scenario> {
                                         eleven twelve thirteen fourteen fifteen sixteen"
                         }]
                     }),
+                    None,
                 )
                 .is_ok();
             if ok {
@@ -171,7 +173,9 @@ fn scenarios() -> Vec<Scenario> {
                 BudgetSpec::default(),
             );
             let headers = signed_headers("scn-chat-tp-nomsg");
-            let ok = state.prepare_chat(&headers, json!({"model": "gpt-x"})).is_ok();
+            let ok = state
+                .prepare_chat(&headers, json!({"model": "gpt-x"}), None)
+                .is_ok();
             if ok {
                 Observed::Allowed
             } else {
@@ -199,6 +203,7 @@ fn scenarios() -> Vec<Scenario> {
                         "model": "gpt-x",
                         "messages": [{"role": "user", "content": "hi"}]
                     }),
+                    None,
                 )
                 .is_ok();
             if ok {
@@ -231,6 +236,7 @@ fn scenarios() -> Vec<Scenario> {
                         "model": "gpt-x",
                         "messages": [{"role": "user", "content": "hi"}]
                     }),
+                    None,
                 )
                 .is_ok();
             if ok {

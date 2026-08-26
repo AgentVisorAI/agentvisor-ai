@@ -52,11 +52,11 @@ async fn session_binding_refuses_workflow_change_after_open() {
     );
     // Open with signed workflow.
     let signed = signed_headers("sess-A");
-    state.prepare_chat(&signed, chat_payload()).unwrap();
+    state.prepare_chat(&signed, chat_payload(), None).unwrap();
     // Try to reuse the same session with the unsigned workflow.
     let mut unsigned = signed.clone();
     unsigned.insert("x-av-workflow", HeaderValue::from_static("unsigned"));
-    let Err(err) = state.prepare_chat(&unsigned, chat_payload()) else {
+    let Err(err) = state.prepare_chat(&unsigned, chat_payload(), None) else {
         panic!("workflow change must be refused");
     };
     assert!(
@@ -360,7 +360,7 @@ async fn tool_intercept_after_session_close_refuses() {
         BudgetSpec::default(),
     );
     let headers = signed_headers("close-then-tool");
-    state.prepare_chat(&headers, chat_payload()).unwrap();
+    state.prepare_chat(&headers, chat_payload(), None).unwrap();
     let session = state.sessions.get("close-then-tool").unwrap();
     state
         .finalizer

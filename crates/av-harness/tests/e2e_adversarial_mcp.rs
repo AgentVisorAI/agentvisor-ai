@@ -69,7 +69,7 @@ async fn many_shot_prompt_is_refused_at_token_budget_before_upstream_dispatch() 
     }
     let payload = json!({"model": "gpt-x", "messages": messages});
     let headers = signed_headers("many-shot");
-    let Err(err) = state.prepare_chat(&headers, payload) else {
+    let Err(err) = state.prepare_chat(&headers, payload, None) else {
         panic!("many-shot request must be blocked at the token budget");
     };
     assert!(
@@ -115,6 +115,7 @@ async fn prompt_injection_in_tool_result_does_not_bypass_the_next_gate() {
                     {"role": "user", "content": format!("summarize: {injection}")}
                 ]
             }),
+            None,
         )
         .unwrap();
     // Successfully calling prepare_chat above proves the hostile content
@@ -193,6 +194,7 @@ async fn bearer_token_never_appears_in_receipt_or_event_payloads() {
     let result = state.prepare_chat(
         &headers,
         json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}),
+        None,
     );
     let error = match result {
         Ok(_) => panic!("presenting a bearer with no validator must be refused"),
@@ -237,7 +239,7 @@ async fn gcg_style_adversarial_suffix_survives_capture_and_close() {
         ]
     });
     let headers = signed_headers("gcg-suffix");
-    state.prepare_chat(&headers, payload).unwrap();
+    state.prepare_chat(&headers, payload, None).unwrap();
     let session = state.sessions.get("gcg-suffix").unwrap();
     let outcome = state
         .finalizer
@@ -271,6 +273,7 @@ async fn tampered_atif_trajectory_is_rejected_on_promotion() {
         .prepare_chat(
             &headers,
             json!({"model": "m", "messages": [{"role": "user", "content": "safe request"}]}),
+            None,
         )
         .unwrap();
     let session = state.sessions.get("poison").unwrap();
@@ -317,6 +320,7 @@ async fn session_hijack_via_headers_cannot_swap_identity() {
         .prepare_chat(
             &headers,
             json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}),
+            None,
         )
         .unwrap();
     // Same session id + workflow but a hostile agent identity via headers.
@@ -332,6 +336,7 @@ async fn session_hijack_via_headers_cannot_swap_identity() {
         .prepare_chat(
             &hostile,
             json!({"model": "m", "messages": [{"role": "user", "content": "still me"}]}),
+            None,
         )
         .unwrap();
     let session = state.sessions.get("hijack").unwrap();

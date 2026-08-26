@@ -46,6 +46,7 @@ async fn sixty_four_agents_preserve_all_signed_steps_under_contention() {
                                 "content": format!("agent {agent} distinct step {step}")
                             }]
                         }),
+                        None,
                     )
                     .unwrap();
                 // Dropping without forwarding models a client disconnect:

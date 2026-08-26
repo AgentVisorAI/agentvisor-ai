@@ -231,6 +231,7 @@ async fn unicode_tags_smuggled_instructions_survive_capture_and_receipt_signing(
                     "content": format!("{visible}{hidden}")
                 }]
             }),
+            None,
         )
         .unwrap();
     let session = state.sessions.get("smuggle").unwrap();

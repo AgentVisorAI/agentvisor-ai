@@ -45,7 +45,7 @@ async fn signed_workflow_close_produces_receipt_with_matching_event_count() {
     let h = headers("wf-signed", "signed");
     const STEPS: u64 = 3;
     for _ in 0..STEPS {
-        state.prepare_chat(&h, chat_payload()).unwrap();
+        state.prepare_chat(&h, chat_payload(), None).unwrap();
     }
     let session = state.sessions.get("wf-signed").unwrap();
     let outcome = state
@@ -87,7 +87,7 @@ async fn unsigned_workflow_close_writes_valid_atif_file() {
     let state = state_with_bus(Arc::clone(&bus));
     let h = headers("wf-unsigned", "unsigned");
     for _ in 0..2 {
-        state.prepare_chat(&h, chat_payload()).unwrap();
+        state.prepare_chat(&h, chat_payload(), None).unwrap();
     }
     let session = state.sessions.get("wf-unsigned").unwrap();
     let outcome = state
@@ -126,7 +126,7 @@ async fn unsigned_workflow_promote_produces_atif_trajectory_receipt() {
     let state = state_with_bus(Arc::clone(&bus));
     let h = headers("wf-promote", "unsigned");
     for _ in 0..2 {
-        state.prepare_chat(&h, chat_payload()).unwrap();
+        state.prepare_chat(&h, chat_payload(), None).unwrap();
     }
     let session = state.sessions.get("wf-promote").unwrap();
     state
@@ -161,7 +161,7 @@ async fn promote_of_an_open_unsigned_session_finalizes_and_promotes() {
     let bus = Arc::new(RecordingBus::default());
     let state = state_with_bus(Arc::clone(&bus));
     let h = headers("wf-promote-open", "unsigned");
-    state.prepare_chat(&h, chat_payload()).unwrap();
+    state.prepare_chat(&h, chat_payload(), None).unwrap();
     let session = state.sessions.get("wf-promote-open").unwrap();
     let receipt = state
         .finalizer
@@ -185,7 +185,7 @@ async fn signed_close_then_promote_returns_the_same_receipt() {
     let bus = Arc::new(RecordingBus::default());
     let state = state_with_bus(Arc::clone(&bus));
     let h = headers("wf-signed-then-promote", "signed");
-    state.prepare_chat(&h, chat_payload()).unwrap();
+    state.prepare_chat(&h, chat_payload(), None).unwrap();
     let session = state.sessions.get("wf-signed-then-promote").unwrap();
     let receipt = match state
         .finalizer
@@ -211,7 +211,7 @@ async fn signed_close_emits_a_receipt_event_to_the_receipt_topic() {
     let bus = Arc::new(RecordingBus::default());
     let state = state_with_bus(Arc::clone(&bus));
     let h = headers("wf-receipt-emit", "signed");
-    state.prepare_chat(&h, chat_payload()).unwrap();
+    state.prepare_chat(&h, chat_payload(), None).unwrap();
     let session = state.sessions.get("wf-receipt-emit").unwrap();
     state
         .finalizer
@@ -238,7 +238,7 @@ async fn concurrent_promote_on_the_same_session_is_idempotent() {
     let bus = Arc::new(RecordingBus::default());
     let state = state_with_bus(Arc::clone(&bus));
     let h = headers("wf-promote-race", "unsigned");
-    state.prepare_chat(&h, chat_payload()).unwrap();
+    state.prepare_chat(&h, chat_payload(), None).unwrap();
     let session = state.sessions.get("wf-promote-race").unwrap();
     state
         .finalizer
