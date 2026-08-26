@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 /// Workflow kind (brief Modules G/H).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Workflow {
     /// Consequential actions: event chain + receipt at close.
     Signed,
@@ -143,6 +144,7 @@ pub struct Session {
 /// combinations that all remain reachable.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SessionState {
     /// Admitting requests.
     Open = 0,
