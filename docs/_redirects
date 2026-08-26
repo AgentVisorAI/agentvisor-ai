@@ -1,0 +1,25 @@
+# Cloudflare Pages routing — hides internal paths from public and forwards
+# the API + SSE stream to the hosted backend.
+#
+# On Cloudflare Pages you upload `docs/` as the site root and set the
+# custom domain to agentvisorai.me. Pages inherits Cloudflare's global
+# edge network — unlimited bandwidth, HTTP/3, Brotli, automatic Argo.
+#
+# Free tier: 500 builds/month, unlimited bandwidth, unlimited requests.
+# Zero rebuild cost when compared to Vercel/Netlify. No lock-in — the
+# static site is the same directory you would rsync anywhere.
+#
+# _redirects syntax: <source> <dest> [status] [!Header=…]
+# https://developers.cloudflare.com/pages/configuration/redirects/
+
+# API proxy — keeps the console and API on the same origin so cookies
+# work with SameSite=Lax and no CORS preflight is needed. Change the
+# right-hand side to point at your API host (Fly.io, Cloud Run, Koyeb).
+/api/*  https://api.agentvisorai.me/api/:splat  200
+/healthz  https://api.agentvisorai.me/healthz  200
+
+# Legacy pitch walkthrough — keep the deep link so investor video
+# references stay valid.
+/pitch  /app/pitch/index.html  301
+
+# App entrypoint stays as a hard-coded SPA — no history-mode router yet.

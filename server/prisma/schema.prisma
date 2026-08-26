@@ -1,0 +1,433 @@
+// AgentVisor AI hosted-console data model.
+//
+// PostgreSQL is the canonical datasource — portable across Neon, Supabase,
+// Fly Postgres, Google Cloud SQL, AWS RDS, or a self-hosted docker container.
+// The schema uses only standard SQL types (no Postgres-only extensions),
+// so `pg_dump` gives you a clean export you can restore anywhere.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// A person with a login. Owns one or more organizations.
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  displayName  String?
+  // Short-lived password-reset token (argon2-hashed). Both the token and the
+  // "issuedAt" timestamp are cleared on successful use or expiry (24h).
+  resetTokenHash String?
+  resetTokenAt   DateTime?
+  // JWT revocation fence — every session whose iat is before this timestamp
+  // is rejected in authenticate(). Bumped on logout and password change so
+  // a captured cookie stops working immediately even though the JWT itself
+  // is still cryptographically valid until its 7-day exp.
+  sessionRevokedAt DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  memberships Membership[]
+  webauthnCredentials WebauthnCredential[]
+
+  @@map("users")
+}
+
+// A user's registered WebAuthn credential (passkey / security key / platform
+// authenticator). One user can have several (Yubikey + iPhone + laptop, etc)
+// which is standard practice — no single point of loss.
+//
+// The counter is the WebAuthn signCount — increases monotonically on every
+// use and lets us detect cloned authenticators. label is the human name
+// ("Zach's YubiKey", "iPhone 15 Pro"). transports hints the browser which
+// USB/NFC/BLE/internal channels the credential supports so re-auth prompts
+// the right UI.
+model WebauthnCredential {
+  id             String   @id @default(cuid())
+  userId         String
+  credentialId   Bytes    @unique
+  publicKey      Bytes
+  counter        BigInt   @default(0)
+  transports     String   @default("") // comma-separated: "usb,nfc,internal"
+  label          String   @default("Passkey")
+  aaguid         String?  // Authenticator model attestation UUID
+  createdAt      DateTime @default(now())
+  lastUsedAt     DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("webauthn_credentials")
+}
+
+// A tenant boundary — a team/company account. Every deployment, session,
+// receipt, and event belongs to exactly one org.
+model Org {
+  id        String   @id @default(cuid())
+  slug      String   @unique
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Data retention windows (days). Sessions + their events + receipts
+  // older than sessionRetentionDays are purged by the retention sweeper.
+  // Audit entries have a separate longer window because compliance
+  // frameworks (SOC-2, ISO 27001) generally expect 365 days of
+  // authoritative access history.
+  //
+  // 0 = keep forever (no purge). Sensible defaults: 90 days for
+  // operational data, 365 for audit.
+  sessionRetentionDays Int @default(90)
+  auditRetentionDays   Int @default(365)
+
+  // Optional per-org IP allowlist for console + API-key access. Each
+  // entry is a CIDR block (v4 or v6). Empty array = allow from
+  // anywhere (default). Non-empty = every /api/v1/* request whose
+  // remote IP does NOT fall within one of the CIDRs is refused with
+  // 403 forbidden_ip. Health / OAuth callbacks are exempt so the
+  // config can't lock ops or an IdP redirect out.
+  //
+  // The self-lockout guard on PATCH refuses to save an allowlist
+  // that would exclude the caller's own current IP.
+  ipAllowlist String[] @default([])
+
+  members     Membership[]
+  deployments Deployment[]
+  samlConfigs SamlConfig[]
+  samlReplayRecords SamlReplayRecord[]
+  auditEntries AuditEntry[]
+  invites Invite[]
+  apiKeys ApiKey[]
+  webhookEndpoints WebhookEndpoint[]
+
+  @@map("orgs")
+}
+
+// Server-side API key for programmatic console access. Wire scripts,
+// CI jobs, and dashboards can authenticate as an org (not a user) with
+// `Authorization: Bearer av_srv_<plaintext>`. Only the argon2 hash is
+// stored; plaintext is returned once at create time.
+//
+// A hint (first 8 chars) is stored so the UI can show 'av_srv_a091…'
+// without a lookup. lastUsedAt is bumped opportunistically on
+// authenticate. createdBy snapshots the operator email so a revoked
+// user's audit trail still shows who created what.
+model ApiKey {
+  id           String   @id @default(cuid())
+  orgId        String
+  name         String   // "CI runner", "Grafana dashboard"
+  tokenHash    String
+  tokenHint    String   // first 8 chars for UI display
+  createdById  String?
+  createdByEmail String?
+  role         String   @default("admin") // acts as this role for RBAC
+  lastUsedAt   DateTime?
+  createdAt    DateTime @default(now())
+  revokedAt    DateTime?
+
+  org Org @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@map("api_keys")
+}
+
+// Compliance-grade audit trail. Every sensitive action writes one row
+// here. Members can read their own org's log; owners can filter and
+// export. Retention is a business decision (default forever; a cron
+// can trim older-than-N rows if the operator wants).
+//
+// `event` is a machine-readable slug ("deployment.create", "saml.signin",
+// "member.role_changed", "session.export"). `actorEmail` is a snapshot
+// so the row survives the actor account being deleted — GDPR erasure
+// clears the email while preserving the row shape for compliance.
+model AuditEntry {
+  id         String   @id @default(cuid())
+  orgId      String
+  event      String
+  actorId    String?
+  actorEmail String?
+  target     String?  // Free-form: deployment name, member email, config displayName, …
+  note       String?
+  metadata   Json?    // Structured details: {oldRole, newRole}, {ip, ua}, {samlConfigId}
+  ip         String?
+  userAgent  String?
+  at         DateTime @default(now())
+
+  org Org @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([orgId, at])
+  @@map("audit_entries")
+}
+
+// Pending team invite. Owner/admin sends one; invitee clicks the link
+// in the email, sets a password if new, and lands as a member.
+//
+// Token is argon2-hashed at rest; only the plaintext is emailed. Every
+// invite has a 7-day TTL. Accepted invites keep the row (acceptedAt set)
+// so the audit log can show "accepted N days after sent".
+model Invite {
+  id            String    @id @default(cuid())
+  orgId         String
+  email         String
+  role          String    @default("member") // owner|admin|member
+  tokenHash     String
+  invitedById   String?   // FK-less snapshot — inviter may leave the org
+  invitedByEmail String?
+  expiresAt     DateTime
+  acceptedAt    DateTime?
+  revokedAt     DateTime?
+  createdAt     DateTime  @default(now())
+
+  org Org @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, email])
+  @@index([expiresAt])
+  @@map("invites")
+}
+
+// Enterprise SAML 2.0 SSO configuration. One per IdP: an org can have
+// multiple (e.g. Okta prod + Okta staging, or Okta + Auth0 for M&A).
+// Every field here is what an IdP admin pastes into their config.
+//
+// The workflow:
+//  1. Owner creates a config, gives its ACS URL + Entity ID + SP cert to
+//     the IdP administrator.
+//  2. IdP admin configures the app there and pastes the IdP metadata (or
+//     ssoUrl + x509Cert) back into our settings page.
+//  3. Enable jitEnabled and set allowedDomains so real users land safely.
+model SamlConfig {
+  id                       String    @id @default(cuid())
+  orgId                    String
+  displayName              String    // "Okta production", "Auth0 corporate", …
+  // IdP-side config the admin pastes:
+  ssoUrl                   String    // Where we redirect the browser to start authn.
+  sloUrl                   String?   // Optional Single Logout endpoint.
+  entityIdIdp              String    // IdP entity ID / issuer.
+  x509Cert                 String    // IdP signing cert (PEM-encoded, may hold multiple certs during rotation)
+  wantAssertionsSigned     Boolean   @default(true)  // Reject unsigned assertions.
+  wantResponseSigned       Boolean   @default(false) // Some IdPs sign response envelope too.
+  allowEncryptedAssertions Boolean   @default(true)  // Decrypt if IdP encrypted them.
+  signatureAlgorithm       String    @default("sha256")
+  digestAlgorithm          String    @default("sha256")
+  nameIdFormat             String    @default("urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress")
+  // JIT provisioning: on first successful SAML sign-in, create the user
+  // + membership if the assertion email is on an allowed domain. Without
+  // this, only pre-invited members can sign in via SSO.
+  jitEnabled               Boolean   @default(true)
+  jitDefaultRole           String    @default("member") // "member" | "admin"
+  // Comma-separated allowed email domains for JIT. Empty means "all domains
+  // this IdP asserts". Recommended to always set (e.g. "acme.com").
+  allowedDomains           String    @default("")
+  // If both are non-null we sign our AuthnRequests. Ops rotate these by
+  // regenerating a new keypair and posting the new cert to the IdP.
+  spPrivateKeyPem          String?
+  spCertPem                String?
+  isActive                 Boolean   @default(true)
+  createdAt                DateTime  @default(now())
+  updatedAt                DateTime  @updatedAt
+
+  org Org @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, displayName])
+  @@index([orgId])
+  @@map("saml_configs")
+}
+
+// One row per successfully consumed SAML Response ID. Prevents replay by
+// remembering assertion IDs until they naturally expire past
+// NotOnOrAfter. Rows are cleaned up by a periodic sweep or opportunistic
+// delete-if-expired at read time.
+model SamlReplayRecord {
+  id           String   @id @default(cuid())
+  orgId        String
+  assertionId  String   // The IdP-issued Response ID (or Assertion ID)
+  notOnOrAfter DateTime // When the assertion legitimately expires.
+  createdAt    DateTime @default(now())
+
+  org Org @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, assertionId])
+  @@index([notOnOrAfter])
+  @@map("saml_replay_records")
+}
+
+// User ↔ Org join with a role.
+model Membership {
+  id     String  @id @default(cuid())
+  userId String
+  orgId  String
+  role   String  @default("owner") // "owner" | "admin" | "member" (checked in code)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  org  Org  @relation(fields: [orgId],  references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, orgId])
+  @@index([orgId])
+  @@map("memberships")
+}
+
+// A `agentvisord` instance registered with the console. The daemon uses
+// `ingestToken` to POST events; the org holds `publicKeyHex` so the console
+// can verify receipts offline. Provider secrets never enter this database.
+model Deployment {
+  id             String   @id @default(cuid())
+  orgId          String
+  name           String
+  environment    String   @default("production") // "production" | "staging" | "development"
+  // Hex-encoded 32-byte Ed25519 verifying key, published by the daemon at
+  // startup. Optional until the daemon first checks in.
+  publicKeyHex   String?
+  // Hash of the plaintext ingest token (argon2). Plaintext is shown once at
+  // creation and never stored.
+  ingestTokenHash String
+  ingestTokenHint String  // first 8 chars for UI display
+  lastIngestAt   DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  org      Org       @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  sessions Session[]
+
+  @@unique([orgId, name])
+  @@index([orgId])
+  @@map("deployments")
+}
+
+// One conversation as observed by the checkpoint.
+model Session {
+  id             String   @id @default(cuid())
+  deploymentId   String
+  // Denormalized from Deployment.orgId. Populated on insert/upsert so
+  // org-scoped queries (list, count, aggregate) can use a single index
+  // instead of joining via deployments. At 1M+ sessions the join +
+  // sort was O(N log N); the compound (orgId, openedAt DESC, id DESC)
+  // index below turns cursor pagination into O(log N).
+  orgId          String
+  externalId     String   // the daemon's own session id
+  agent          String   // charter.name
+  workflow       String   @default("signed") // "signed" | "unsigned"
+  status         String   @default("live")   // "live" | "sealed" | "blocked"
+  policyVersion  Int      @default(1)
+  openedAt       DateTime
+  closedAt       DateTime?
+  // Rollups — the daemon pushes deltas; totals live here.
+  promptTokens   Int      @default(0)
+  completionTokens Int    @default(0)
+  costUsdMicros  BigInt   @default(0)
+  payoutUsdMicros BigInt  @default(0)
+  blockedPayoutUsdMicros BigInt @default(0)
+  toolsAllowed   Int      @default(0)
+  toolsBlocked   Int      @default(0)
+  stopReasonId   Int?
+  stopReason     String?
+
+  deployment Deployment @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+  events     Event[]
+  receipt    Receipt?
+
+  @@unique([deploymentId, externalId])
+  @@index([deploymentId, openedAt])
+  // Primary index for org-wide session listing + counters. openedAt +
+  // id are both DESC so cursor pagination is a straight index scan.
+  @@index([orgId, openedAt, id])
+  // Fast filter: "blocked only" across the whole org.
+  @@index([orgId, toolsBlocked])
+  @@map("sessions")
+}
+
+// One journaled event within a session.
+model Event {
+  id        String   @id @default(cuid())
+  sessionId String
+  seq       Int      // monotonically increasing per session — dedupe key
+  kind      String   // "sys" | "user" | "llm" | "tool" | "block" | "guard" | "audit"
+  tag       String   // short label ("BLOCKED", "TOOL ✓", "LOOP", …)
+  body      String   // HTML-safe rendered body — sanitized on ingest
+  sub       String?  // secondary line
+  occurredAt DateTime
+  journalCount Int   @default(1) // number of journal entries this row represents
+
+  session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@unique([sessionId, seq])
+  @@index([sessionId, occurredAt])
+  @@map("events")
+}
+
+// The signed receipt itself. `body` is the canonical receipt JSON as posted
+// by the daemon; `sigB64` is the Ed25519 signature. Verification is
+// performed client-side using `Deployment.publicKeyHex`.
+model Receipt {
+  id            String   @id @default(cuid())
+  sessionId     String   @unique
+  receiptId     String   @unique  // UUIDv7 from the receipt itself
+  body          String              // full canonical JSON
+  sigB64        String              // Ed25519 signature (base64)
+  keyIdHint     String              // first 8 hex chars of key_id, for display
+  eventCount    Int
+  issuedAt      DateTime
+  createdAt     DateTime @default(now())
+
+  session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@map("receipts")
+}
+
+// An outbound webhook subscription. Operators wire AgentVisor into their
+// Slack channel, PagerDuty routing key, Datadog event stream, or their
+// own internal notification bus. Each endpoint subscribes to one or more
+// event names (policy.block, session.blocked, apikey.created, etc.).
+//
+// Payloads are signed with HMAC-SHA256 over the raw body using `secret`.
+// Consumers verify by computing the same HMAC and constant-time comparing
+// with the X-AgentVisor-Signature header. A ts-nonce anti-replay
+// mechanism sits on the same headers.
+model WebhookEndpoint {
+  id           String   @id @default(cuid())
+  orgId        String
+  name         String
+  url          String
+  secret       String   // random 32-byte hex, shown once on create
+  events       String[] // subscribed event names; ["*"] means everything
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  org        Org               @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  deliveries WebhookDelivery[]
+
+  @@index([orgId])
+  @@map("webhook_endpoints")
+}
+
+// One delivery attempt. Kept for observability so operators can debug
+// "why didn't Slack get the alert?" from the console UI without
+// grepping application logs. Bounded retention TTL is enforced by a
+// background sweeper (7 days by default).
+model WebhookDelivery {
+  id           String   @id @default(cuid())
+  endpointId   String
+  event        String
+  payload      String   @db.Text
+  responseCode Int?
+  responseBody String?  @db.Text
+  attempt      Int      @default(1)
+  status       String   @default("pending") // pending | delivered | failed | retrying
+  errorMessage String?
+  createdAt    DateTime @default(now())
+  deliveredAt  DateTime?
+  nextRetryAt  DateTime?
+
+  endpoint WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+
+  @@index([endpointId, createdAt])
+  @@index([status, nextRetryAt])
+  @@map("webhook_deliveries")
+}

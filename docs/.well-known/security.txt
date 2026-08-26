@@ -1,0 +1,23 @@
+Contact: mailto:security@agentvisorai.me
+Expires: 2027-08-25T00:00:00.000Z
+Preferred-Languages: en
+Canonical: https://agentvisorai.me/.well-known/security.txt
+Policy: https://github.com/AgentVisorAI/agentvisor-ai/blob/main/SECURITY.md
+Acknowledgments: https://github.com/AgentVisorAI/agentvisor-ai/blob/main/SECURITY-AUDIT.md
+
+# AgentVisor AI security disclosure — RFC 9116 (securitytxt.org).
+#
+# We welcome coordinated disclosure. Please email security@agentvisorai.me
+# with a description of the issue, reproduction steps, and any suggested
+# remediation. We aim to acknowledge within 48h and ship a fix within 14
+# days for high/critical severity.
+#
+# In-scope surfaces:
+#   • agentvisorai.me and *.agentvisorai.me
+#   • the AgentVisor console SPA at /app
+#   • the hosted API
+#   • the on-device daemon (crates/atif in this repo)
+#
+# Out of scope: dependency CVEs already tracked upstream, findings that
+# require an already-compromised administrator account, DoS via unbounded
+# request payloads (rate-limited at the edge).

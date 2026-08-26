@@ -1,24 +1,69 @@
-# Product console (client-side simulation)
+# AgentVisor AI Console
 
-A self-contained, clickable version of the AgentVisor AI console, presented
-exactly as the shipped product: setup wizard, one-line integration, a live
-session (including an $8,400 prompt-injection payout refused at the door), the
-fleet overview, signed-receipt verification, and the evidence layout on disk.
+The console served at `agentvisorai.me/app/` is a real multi-tenant SPA:
+sign in, view your fleet of policed agent sessions, add & rotate deployment
+ingest tokens, and inspect any session's event stream and signed receipt.
 
-It is a client-side simulation with representative data — there is no backend
-and no network call; it works offline from a `file://` URL. Numbers, sessions,
-and signatures shown are illustrative, but the behavior mirrors the real Rust
-implementation 1:1 (receipt fields, 403 policy refusals, loop breaker, spool
-layout).
+## Two operating modes
 
-- **Published at:** <https://agentvisorai.me/app/> (deployed by
-  `.github/workflows/pages.yml` together with the landing page).
-- **Run locally / offline:** open `index.html` in any browser.
-- **Presenter tour:** append `?tour=1` to the URL to reveal the
-  **▶ Guided tour** button — a captioned, self-advancing walkthrough
-  (~80 seconds). Without the parameter the page shows pure product chrome.
-- **Reset:** the ↻ button in the top bar returns everything to a first-run
-  state (useful between viewers).
-- **Scripted recordings:** the page exposes `window.avConsole`
-  (`play(speed)`, `setSpeed(s)`, `goTo(step)`, `reset()`, `isPlaying()`),
-  which is how the walkthrough video is captured with Playwright.
+The console is built as a client-side app with a swappable data source. The
+switch lives at the top of [`index.html`](./index.html):
+
+```html
+<script>
+  window.MOCK_MODE = true;
+  window.API_BASE = "";
+</script>
+```
+
+### Mock mode (default — investor / preview use)
+
+When `MOCK_MODE=true` the console runs against built-in **Northwind Traders**
+fixtures baked into [`datasource.js`](./datasource.js). Anyone landing on the
+URL sees a fully populated workspace: 2 deployments, 7 sessions with events
+and receipts, headline KPIs. Any email + password combination signs you in.
+
+This is what powers the investor pitch until the backend is deployed to
+production.
+
+### Live mode
+
+Set:
+
+```js
+window.MOCK_MODE = false;
+window.API_BASE = "https://api.agentvisorai.me/api/v1";
+```
+
+…and the same UI now talks to the real hosted backend defined in [`../../server/`](../../server/).
+Signup / login create real users and orgs. Deployments mint real ingest
+tokens. Session data is streamed by real `agentvisord` daemons.
+
+See [`server/README.md`](../../server/README.md) for the full deploy runbook.
+
+## Structure
+
+| File | Purpose |
+|---|---|
+| `index.html` | Entry, sets `MOCK_MODE`, mounts `#app` |
+| `styles.css` | Design tokens + shell / auth / cards / tables |
+| `datasource.js` | Swappable data layer — `MockDataSource` vs `ApiDataSource` |
+| `app.js` | Hash router, auth, view renderers |
+| `pitch/` | The original scripted narrative walkthrough (kept for reference) |
+
+## Views
+
+- `#/login`, `#/signup` — unauth
+- `#/overview` — 24h fleet KPIs + recent sessions
+- `#/sessions` — full list
+- `#/sessions/:id` — event stream + signed receipt for one session
+- `#/deployments` — create, rotate token, delete
+- `#/settings` — org/user metadata + mock-mode escape hatch
+
+## The scripted pitch demo
+
+The linear investor walkthrough previously served at this URL now lives at
+[`pitch/`](./pitch/). It's a scripted narrative — Northwind Traders onboards,
+first agent session flows through, a rogue purchase order is blocked, a
+signed receipt is minted, and audit evidence is exported. Useful when the
+audience needs the story, not a playground.

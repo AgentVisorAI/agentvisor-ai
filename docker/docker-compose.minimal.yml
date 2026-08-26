@@ -88,12 +88,12 @@ services:
       # runs as uid 65532 (Dockerfile USER) — without uid/gid options
       # the harness cannot create /run/signing.seed and the first boot
       # crash-loops on Permission denied.
-      - type: tmpfs
-        target: /run
-        tmpfs:
-          mode: 0700
-          uid: 65532
-          gid: 65532
+      # Round-33 F1: the `tmpfs.uid` / `tmpfs.gid` long-form fields are
+      # no longer in the compose spec (`docker compose config` refuses
+      # them). Use a named volume with the `local` driver + tmpfs opts
+      # instead — same tmpfs semantics, same uid ownership, but the
+      # schema validates cleanly. See volumes: block below.
+      - signing-seed:/run
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
@@ -109,3 +109,15 @@ services:
 volumes:
   bridge-data:
   atif-spool:
+  # Round-33 F1: replacement for the long-form `type: tmpfs` mount that
+  # used to live under the service's volumes:. The `local` driver with
+  # `type=tmpfs` gives us a tmpfs mount whose ownership is set via mount
+  # options — same runtime semantics as the old long-form (ephemeral,
+  # not shared with any other volume), but expressed in a way the
+  # current compose schema accepts.
+  signing-seed:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "uid=65532,gid=65532,mode=0700,size=16m"

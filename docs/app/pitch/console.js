@@ -1,6 +1,16 @@
 /*
  * AgentVisor AI console.
+ *
+ * MOCK_MODE controls whether this page runs the built-in Northwind demo
+ * (true — used for the marketing site and investor pitch) or talks to a real
+ * backend (false — used once the SaaS is deployed).
+ *
+ * The mock story is baked into this file; the API surface it consumes is
+ * defined in datasource.js. Flip the flag, deploy the backend, done.
  */
+window.MOCK_MODE = true;
+window.API_BASE = "";  // e.g. "https://api.agentvisorai.me/api/v1" once deployed
+
 (function () {
   "use strict";
 
