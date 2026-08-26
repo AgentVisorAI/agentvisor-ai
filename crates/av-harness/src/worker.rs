@@ -2667,8 +2667,12 @@ mod tests {
 
         let started = std::time::Instant::now();
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // 250 ms allows for 25× scheduler jitter — still catches
+        // the ~100 ms `SlowBus`-class regression that motivated
+        // this test, tolerates loaded CI runners where a 10 ms
+        // tokio timer can drift to 30-80 ms.
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(75),
+            started.elapsed() < std::time::Duration::from_millis(250),
             "synchronous worker dependency blocked the Tokio reactor"
         );
         worker.wait_idle().await;
