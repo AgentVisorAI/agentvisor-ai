@@ -746,6 +746,7 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
         capture_attempted: false,
         is_sse,
         protocol_buffer: Vec::new(),
+        frame_scratch: Vec::new(),
         pending_output: std::collections::VecDeque::new(),
         pending_budget: None,
         principal_budget,
@@ -2558,6 +2559,16 @@ struct AbortFinalizingStream {
     capture_attempted: bool,
     is_sse: bool,
     protocol_buffer: Vec<u8>,
+    /// Reusable per-frame parse buffer. R62 perf optimisation: the
+    /// SSE absorb loop previously did `let frame: Vec<u8> = self
+    /// .protocol_buffer.drain(..end).collect();` per frame — one
+    /// heap alloc per frame × 50-500 frames per streamed completion.
+    /// Reusing a single Vec (drained-then-refilled from
+    /// `protocol_buffer[..end]`) drops that to ONE amortised alloc
+    /// per stream. The scratch is `mem::take`'d into a local across
+    /// the absorb loop to satisfy the borrow checker against
+    /// `self.absorb_frame(&mut self, &str)`.
+    frame_scratch: Vec<u8>,
     pending_output: std::collections::VecDeque<Bytes>,
     pending_budget: Option<PendingBudget>,
     /// Principal-scoped ledger (id + spec) when `[principal_budget]` is
@@ -2620,12 +2631,28 @@ impl AbortFinalizingStream {
             return Ok(0);
         }
         let mut budget_delta = 0u64;
+        // R62 perf: reuse `frame_scratch` across iterations instead
+        // of the prior `let frame: Vec<u8> = self.protocol_buffer
+        // .drain(..end).collect();` which allocated a fresh Vec per
+        // frame (50-500 frames per streamed completion). `mem::take`
+        // moves the buffer into a local so the loop body can `&scratch`
+        // in a &str while simultaneously calling `&mut self` methods
+        // (borrow checker won't allow the direct `&self.frame_scratch`
+        // + `&mut self` pattern). Restored to `self` after the loop
+        // so subsequent `absorb_network_chunk` calls reuse the same
+        // capacity.
+        let mut scratch: Vec<u8> = std::mem::take(&mut self.frame_scratch);
         let absorb_result = loop {
             let Some(end) = sse_frame_end(&self.protocol_buffer) else {
                 break Ok(());
             };
-            let frame: Vec<u8> = self.protocol_buffer.drain(..end).collect();
-            let frame = match std::str::from_utf8(&frame) {
+            scratch.clear();
+            // Safe: `sse_frame_end` returns `end <= self.protocol_buffer.len()`
+            // by construction (it locates a frame boundary within the buffer).
+            #[allow(clippy::indexing_slicing)]
+            scratch.extend_from_slice(&self.protocol_buffer[..end]);
+            self.protocol_buffer.drain(..end);
+            let frame = match std::str::from_utf8(&scratch) {
                 Ok(frame) => frame,
                 Err(error) => break Err(format!("provider SSE frame is not UTF-8: {error}")),
             };
@@ -2637,6 +2664,7 @@ impl AbortFinalizingStream {
                 Err(error) => break Err(error),
             }
         };
+        self.frame_scratch = scratch;
         if let Err(error) = absorb_result {
             // A chunk's deltas are only debited AFTER this loop (one
             // budget check per network chunk), but `absorb_frame` bumps
@@ -6276,6 +6304,7 @@ mod tests {
             capture_attempted: false,
             is_sse: true,
             protocol_buffer: Vec::new(),
+            frame_scratch: Vec::new(),
             pending_output: std::collections::VecDeque::new(),
             pending_budget: Some(PendingBudget {
                 task: budget_task,
@@ -6374,6 +6403,7 @@ mod tests {
             capture_attempted: true,
             is_sse: true,
             protocol_buffer: Vec::new(),
+            frame_scratch: Vec::new(),
             pending_output: std::collections::VecDeque::new(),
             pending_budget: None,
             captured_bytes: 0,
