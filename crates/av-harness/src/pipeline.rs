@@ -118,6 +118,17 @@ pub struct AppState {
     /// server-side capacity signal (matches breaker-open 503-not-
     /// 429 discipline documented in finalize_error_response.rs).
     pub mcp_admission: Arc<tokio::sync::Semaphore>,
+    /// Pre-resolved `Arc<Counter>` handle for
+    /// `av_mcp_admission_refusals_total`. R72 review F2 (landed
+    /// R74): the R72 eager registration removed only
+    /// `HashMap::insert` + `String::to_owned` from the refusal-
+    /// arm cost; the `.counter(NAME, HELP)` lookup itself still
+    /// took `metrics.lock()` (a global parking_lot::Mutex across
+    /// the entire registry) on every refusal. Storing the handle
+    /// here — matching the HotMetrics discipline — lets the
+    /// refusal arm call `.inc()` directly with zero registry
+    /// contention.
+    pub(crate) mcp_admission_refusals_counter: Arc<av_core::metrics::Counter>,
 }
 
 /// Pre-resolved metric handles for the request hot path so the
@@ -1752,15 +1763,13 @@ impl AppState {
         })?;
         tracing::info!(provider = provider_adapter.name(), "provider adapter selected");
         let mcp_admission = Arc::new(tokio::sync::Semaphore::new(config.mcp_concurrency));
-        // R72 review F1: pre-register the MCP admission-refusal
-        // counter so its series exists in a Prometheus scrape from
-        // the very first boot moment, not lazily on first refusal
-        // (which would defeat `alert on absent(av_mcp_admission_
-        // refusals_total)` dashboards and pay the register cost on
-        // the hot refusal path). Same discipline as HotMetrics and
-        // the reconciler's `av_reconciler_last_tick_completed_
-        // seconds` gauge.
-        metrics.counter(
+        // R72 review F1 + F2 (landed R74): eager registration
+        // stores the returned `Arc<Counter>` handle so the
+        // refusal arm calls `.inc()` directly, bypassing the
+        // registry mutex on the hot path. Prior R72 shape
+        // eagerly registered but discarded the handle,
+        // requiring a re-lookup per refusal.
+        let mcp_admission_refusals_counter = metrics.counter(
             "av_mcp_admission_refusals_total",
             "MCP admission was refused because `mcp_concurrency` was already at capacity — \
              each admitted call can buffer up to 16 MiB in `read_limited_tool_response`, \
@@ -1790,6 +1799,7 @@ impl AppState {
             journal_key,
             mcp_inflight: Arc::new(crate::inflight::InflightTracker::new()),
             mcp_admission,
+            mcp_admission_refusals_counter,
         })
     }
 
