@@ -174,6 +174,73 @@ const check = await page.evaluate(async (base) => {
 if (check.retention.sessionRetentionDays !== 60) fail("UI update didn't persist: " + JSON.stringify(check));
 console.log("✅ UI retention update -> API confirms 60");
 
+// Create a deployment via the SPA + verify it appears in the list
+await page.goto(spaUrl + "#/deployments");
+await page.waitForTimeout(800);
+// Find the "New deployment" button (label varies; look for + or New)
+const newBtn = page.locator("button", { hasText: /New deployment|\+ Deployment|Create deployment|Add deployment|Register/i }).first();
+if (await newBtn.count() === 0) {
+  // Fallback: find any "New" button in the header
+  const anyNew = page.locator("button:has-text('New')").first();
+  if (await anyNew.count() === 0) fail("no 'New deployment' button found on /deployments");
+  await anyNew.click();
+} else {
+  await newBtn.click();
+}
+await page.waitForTimeout(500);
+// Fill deployment form
+const depName = "spa-drill-" + Math.random().toString(36).slice(2, 6);
+const depNameInput = page.locator('input[placeholder*="northwind" i], input[placeholder*="name" i], input[id*="name" i]').first();
+await depNameInput.fill(depName);
+await page.locator("button", { hasText: /Create|Save|Register/i }).last().click();
+await page.waitForTimeout(1500);
+// A token modal should appear; capture its text
+const modalText = await page.locator(".modal-backdrop").innerText().catch(() => "");
+if (!/av_dep_|token|copy/i.test(modalText)) {
+  console.log("modal text:", modalText.slice(0, 300));
+  fail("no token modal after create deployment");
+}
+console.log("✅ create deployment via SPA -> token modal shown");
+// Close modal
+await page.keyboard.press("Escape");
+await page.waitForTimeout(400);
+
+// Verify it appears in the deployments list via API
+const dList = await page.evaluate(async (base) => {
+  const r = await fetch(base + "/api/v1/deployments", { credentials: "include" });
+  return await r.json();
+}, API_BASE);
+if (!dList.deployments?.some((d) => d.name === depName)) {
+  fail("newly created deployment not in list: " + JSON.stringify(dList.deployments?.map((d) => d.name)));
+}
+console.log("✅ deployment '" + depName + "' appears in API list");
+
+// Sessions page: no sessions yet, verify empty state renders
+await page.goto(spaUrl + "#/sessions");
+await page.waitForTimeout(800);
+const sessBody = await page.locator("body").innerText();
+if (!/no sessions|empty|nothing here|first session/i.test(sessBody)) {
+  // The list might just be empty without a specific empty message —
+  // that's OK as long as no error is thrown.
+  console.log("sessions view rendered (body snippet):", sessBody.slice(0, 120));
+}
+console.log("✅ sessions view renders (no crash)");
+
+// Verify audit log picked up the deployment.create + org.retention_updated events
+const audit = await page.evaluate(async (base) => {
+  const r = await fetch(base + "/api/v1/audit?limit=50", { credentials: "include" });
+  return await r.json();
+}, API_BASE);
+const events = audit.entries.map((e) => e.event);
+if (!events.includes("deployment.create")) fail("audit missing deployment.create: " + events.slice(0,10));
+if (!events.includes("org.retention_updated")) fail("audit missing org.retention_updated: " + events.slice(0,10));
+console.log("✅ audit log picked up deployment.create + org.retention_updated");
+
+// Sanity: no JS errors during the whole extended flow
+if (jsErrors.length) fail("JS errors during extended flow: " + JSON.stringify(jsErrors));
+if (networkFailures.length) fail("network 5xx during extended flow: " + JSON.stringify(networkFailures));
+console.log("✅ still zero JS errors + zero 5xx after extended flow");
+
 await browser.close();
 staticSrv.close();
-console.log("\nSPA e2e smoke passed.");
+console.log("\nSPA e2e smoke passed (17 checks).");

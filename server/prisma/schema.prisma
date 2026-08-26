@@ -85,6 +85,17 @@ model Org {
   sessionRetentionDays Int @default(90)
   auditRetentionDays   Int @default(365)
 
+  // Optional per-org IP allowlist for console + API-key access. Each
+  // entry is a CIDR block (v4 or v6). Empty array = allow from
+  // anywhere (default). Non-empty = every /api/v1/* request whose
+  // remote IP does NOT fall within one of the CIDRs is refused with
+  // 403 forbidden_ip. Health / OAuth callbacks are exempt so the
+  // config can't lock ops or an IdP redirect out.
+  //
+  // The self-lockout guard on PATCH refuses to save an allowlist
+  // that would exclude the caller's own current IP.
+  ipAllowlist String[] @default([])
+
   members     Membership[]
   deployments Deployment[]
   samlConfigs SamlConfig[]
