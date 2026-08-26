@@ -1486,9 +1486,9 @@ async fn complete_tool_audit(
     session: Arc<crate::session::Session>,
 ) -> Response {
     let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
-    let bytes = match hex::decode(&outcome.body_hex) {
-        Ok(bytes) => Bytes::from(bytes),
-        Err(error) => return lifecycle_error(format!("decode tool response: {error}")),
+    let bytes = match decode_cached_tool_body(&outcome.body_hex) {
+        Ok(bytes) => bytes,
+        Err(response) => return *response,
     };
     let success = status.is_success();
     // If a prior attempt in this process already journaled the completion
@@ -1567,25 +1567,46 @@ struct ToolOutcome {
 impl ToolOutcome {
     fn into_response(self) -> Response {
         let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::BAD_GATEWAY);
-        match hex::decode(self.body_hex) {
-            Ok(body) => tool_response(status, Bytes::from(body), self.content_type.as_deref()),
-            Err(error) => {
-                // The body_hex is server-authored + MAC-sealed (see
-                // `ToolExecution::load`), so `hex::decode` failing implies
-                // either a control-key compromise or an on-disk MAC bypass —
-                // not attacker-influencable from the wire. Even so, echoing
-                // the `hex::FromHexError` Display (which includes the
-                // offending byte offset and hex character) leaks internal
-                // spool detail into the client-facing 500 body. Return a
-                // stable string; log the decode error separately at ERROR
-                // level so operators still get the diagnostic without the
-                // client seeing it.
-                tracing::error!(
-                    %error,
-                    "cached tool outcome body_hex failed to decode; possible control-key compromise or on-disk MAC bypass"
-                );
-                lifecycle_error("cached tool outcome is corrupt".to_owned())
-            }
+        match decode_cached_tool_body(&self.body_hex) {
+            Ok(body) => tool_response(status, body, self.content_type.as_deref()),
+            Err(response) => *response,
+        }
+    }
+}
+
+/// Decode a MAC-sealed cached tool outcome's `body_hex` payload into
+/// wire bytes. Shared by both consumers — `ToolOutcome::into_response`
+/// (the Completed fast-path replay) and `complete_tool_audit` (the
+/// Unaudited path that runs the completion-audit job) — so a future
+/// refactor cannot asymmetrically regress the leak-free error
+/// contract on one branch while preserving it on the other.
+///
+/// The body_hex is server-authored + MAC-sealed by
+/// `ToolExecution::load` (which opens the outcome file through
+/// `crate::journal::open` under the MAC `TOOL_OUTCOME_DOMAIN`), so a
+/// decode failure implies either a control-key compromise or an
+/// on-disk MAC bypass — not attacker-influencable from the wire.
+/// Even so, echoing the `hex::FromHexError` Display (which includes
+/// the offending byte offset and hex character) leaks internal
+/// spool detail into the client-facing 500 body. Return a stable
+/// string on the wire; log the decode error separately at
+/// `tracing::error!` so operators still get the diagnostic without
+/// the client seeing it.
+///
+/// Returns `Err(Box<Response>)` on failure rather than `Err(Response)`
+/// so the discriminant stays small (`clippy::result_large_err`).
+fn decode_cached_tool_body(body_hex: &str) -> Result<Bytes, Box<Response>> {
+    match hex::decode(body_hex) {
+        Ok(bytes) => Ok(Bytes::from(bytes)),
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "cached tool outcome body_hex failed to decode; \
+                 possible control-key compromise or on-disk MAC bypass"
+            );
+            Err(Box::new(lifecycle_error(
+                "cached tool outcome is corrupt".to_owned(),
+            )))
         }
     }
 }
@@ -8522,5 +8543,56 @@ mod tests {
         )
         .into_owned();
         assert!(body.contains("av_open_sessions 1"), "{body}");
+    }
+
+    /// R49 review-of-R48: the stable client-facing error message
+    /// for a corrupt cached tool outcome must not regress. R48 fixed
+    /// `ToolOutcome::into_response` but missed the sibling
+    /// `complete_tool_audit` decode site. Both are now routed through
+    /// `decode_cached_tool_body`; a future refactor that reintroduces
+    /// `format!("...{error}...")` on either branch would leak
+    /// `hex::FromHexError` Display detail (offending byte offset +
+    /// character) into the 500 body. Pin the stable message so the
+    /// leak-free contract survives.
+    #[tokio::test]
+    async fn decode_cached_tool_body_returns_stable_error_message() {
+        let helper_err = decode_cached_tool_body("zz").expect_err("`zz` must not hex-decode");
+        let body = String::from_utf8(
+            axum::body::to_bytes((*helper_err).into_body(), 16 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .expect("lifecycle_error body is UTF-8");
+        assert!(
+            body.contains("cached tool outcome is corrupt"),
+            "leak-free stable error message expected in body: {body}"
+        );
+        // Must NOT contain the raw `hex::FromHexError` Display
+        // fingerprints — byte offset ("at 0") or the offending
+        // character (`z`).
+        assert!(
+            !body.contains("at 0"),
+            "hex::FromHexError position must not leak: {body}"
+        );
+        // The `into_response` path must produce the same stable
+        // body: prove both consumers share the helper.
+        let outcome_response = ToolOutcome {
+            status: 200,
+            body_hex: "zz".to_owned(),
+            content_type: None,
+        }
+        .into_response();
+        let outcome_body = String::from_utf8(
+            axum::body::to_bytes(outcome_response.into_body(), 16 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .expect("into_response body is UTF-8");
+        assert!(
+            outcome_body.contains("cached tool outcome is corrupt"),
+            "ToolOutcome::into_response must route through the shared helper: {outcome_body}"
+        );
     }
 }

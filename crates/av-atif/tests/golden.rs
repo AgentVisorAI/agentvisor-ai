@@ -446,8 +446,11 @@ fn subagent_trajectory_ref_requires_v17() {
     );
 }
 
-/// Total_cost_usd is capped at 1e12 (one trillion USD)
-/// in strict mode. Without a ceiling, a hostile trajectory carrying
+/// Total_cost_usd is capped at 9e9 (nine billion USD)
+/// in strict mode. Aligned with the recovery scaling
+/// (`cost * USD_MICROS_PER_DOLLAR ≤ JCS_SAFE_MAX = 2^53`) so every
+/// trajectory that passes strict validation also passes recovery.
+/// Without a ceiling, a hostile trajectory carrying
 /// `total_cost_usd: 1.7e308` used to pass strict validation and
 /// flow into promotion / dashboards / receipt subject payloads —
 /// downstream Prometheus histograms and OTLP billing exporters
@@ -480,7 +483,7 @@ fn total_cost_usd_capped_in_strict_mode() {
     assert!(
         issues
             .iter()
-            .any(|i| { i.path.contains("total_cost_usd") && i.message.contains("1e12") }),
+            .any(|i| { i.path.contains("total_cost_usd") && i.message.contains("9e9") }),
         "expected cost-cap issue, got: {issues:#?}"
     );
     // A sane cost (below the cap) still passes.
@@ -493,7 +496,7 @@ fn total_cost_usd_capped_in_strict_mode() {
     );
 }
 
-/// Per-step `cost_usd` is capped at the same 1e12 in
+/// Per-step `cost_usd` is capped at the same 9e9 in
 /// strict mode.
 #[test]
 fn per_step_cost_usd_capped_in_strict_mode() {
@@ -517,7 +520,7 @@ fn per_step_cost_usd_capped_in_strict_mode() {
     assert!(
         issues
             .iter()
-            .any(|i| { i.path.contains("cost_usd") && i.message.contains("1e12") }),
+            .any(|i| { i.path.contains("cost_usd") && i.message.contains("9e9") }),
         "expected per-step cost-cap issue, got: {issues:#?}"
     );
 }
