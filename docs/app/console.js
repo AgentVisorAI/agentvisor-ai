@@ -422,7 +422,7 @@
       '<div class="dash-stat"><div class="s">Sessions today</div><div class="v">' + SESSIONS.length + '</div><div class="s">' + live + " live · " + sealed + " sealed · " + blocked + ' blocked</div></div>' +
       '<div class="dash-stat"><div class="s">LLM cost today</div><div class="v">$0.086</div><div class="s">busiest session $0.031 of the $10 cap</div></div>' +
       '<div class="dash-stat"><div class="s">Tool calls</div><div class="v">' + (ok + bad) + '</div><div class="s"><span class="ok">' + ok + ' allowed</span> · <span class="bad">' + bad + " blocked</span></div></div>" +
-      '<div class="dash-stat"><div class="s">Money kept in the building</div><div class="v">$9,394</div><div class="s">sum of blocked payouts this week</div></div>';
+      '<div class="dash-stat"><div class="s">Blocked payouts (7 days)</div><div class="v">$9,394</div><div class="s">refused before any money moved</div></div>';
   }
 
   var dashFilter = "all";
