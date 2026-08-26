@@ -272,8 +272,26 @@ code {
 .wstep { border: none; margin: 0 0 var(--s-6); padding: 0; }
 .wstep:last-child { margin-bottom: 0; }
 .wstep legend {
-  font-weight: 600; font-size: var(--t-body); margin-bottom: var(--s-3); padding: 0;
+  font-weight: 600; font-size: var(--t-body); margin-bottom: var(--s-1); padding: 0;
   color: var(--fg); display: flex; align-items: center; gap: var(--s-2);
+}
+.wstep-help {
+  margin: 0 0 var(--s-4) 28px;
+  font-size: var(--t-sec); line-height: 18px; color: var(--fg-2);
+}
+.policy-group { margin-top: var(--s-4); }
+.policy-group:first-of-type { margin-top: 0; }
+.policy-group-label {
+  display: flex; align-items: center; gap: var(--s-2);
+  font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--fg-3);
+  padding: var(--s-2) 0;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 2px;
+}
+.policy-group-tag {
+  font-weight: 400; text-transform: none; letter-spacing: 0;
+  font-size: var(--t-min); color: var(--fg-3);
 }
 .wnum {
   display: inline-flex; align-items: center; justify-content: center;
@@ -304,7 +322,7 @@ code {
 .key-row input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .key-note { font-size: var(--t-min); line-height: 16px; color: var(--fg-2); }
 
-.guardrails { display: flex; flex-direction: column; }
+.guardrails, .policy-group { display: flex; flex-direction: column; }
 .g-row {
   display: flex; align-items: center; justify-content: space-between; gap: var(--s-4);
   padding: var(--s-3) 0; border-bottom: 1px solid var(--border);
@@ -315,7 +333,7 @@ code {
 .g-help { display: block; font-weight: 400; font-size: var(--t-min); line-height: 16px; color: var(--fg-2); margin-top: 1px; }
 .g-ctl { display: inline-flex; align-items: center; gap: 6px; font-weight: 500; font-size: var(--t-sec); color: var(--fg-2); flex-shrink: 0; }
 .g-ctl input[type="number"] {
-  width: 76px; font-family: inherit; font-size: var(--t-body); font-weight: 500;
+  width: 96px; font-family: inherit; font-size: var(--t-body); font-weight: 500;
   height: 32px; padding: 0 var(--s-2);
   border-radius: var(--r); border: 1px solid var(--border-strong);
   background: var(--surface); color: var(--fg); text-align: right;
