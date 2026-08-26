@@ -75,6 +75,43 @@ export function spUrls(cfg: SamlConfig): {
   };
 }
 
+/**
+ * Extract the `<saml:Assertion ID="…">` attribute from a POSTed
+ * SAMLResponse. R76 MEDIUM #3 (landed R77): the prior shape used
+ * `profile["ID"]` from `@node-saml/node-saml`, which returns the
+ * ID of the OUTER `<Response>` element, not the enclosed
+ * `<Assertion>`. A captured signed assertion can be re-wrapped
+ * inside a fresh Response envelope with a new Response ID —
+ * the (orgId, response.id) uniqueness check misses. When
+ * `wantAuthnResponseSigned=false` (schema default), the envelope
+ * rewrap is signature-agnostic; the assertion-level replay
+ * guard is what stops the attack.
+ *
+ * Base64-decode the raw body, then match the FIRST `Assertion`
+ * element (may be namespaced as `saml:`, `saml2:`, or bare).
+ * If nothing matches, return null so the caller fails closed
+ * — never fall back to a body-tail hash (unstable across
+ * whitespace re-encoding, and gives false uniqueness for
+ * rewrapped payloads).
+ */
+export function extractAssertionId(rawB64: string): string | null {
+  let xml: string;
+  try {
+    xml = Buffer.from(rawB64, "base64").toString("utf8");
+  } catch {
+    return null;
+  }
+  // Match `<Assertion ID="…">` or `<saml:Assertion ID="…">` or
+  // `<saml2:Assertion ID="…">`. The `ID` attribute is REQUIRED
+  // on Assertion elements per SAML 2.0 §2.3.3, so a well-
+  // formed assertion always has one. `[^>]*?` allows other
+  // attributes (Version, IssueInstant) to appear in any order
+  // before the ID.
+  const re = /<(?:[\w-]+:)?Assertion\b[^>]*?\bID\s*=\s*"([^"]+)"/;
+  const m = xml.match(re);
+  return m?.[1] ?? null;
+}
+
 /** Construct the @node-saml/node-saml adapter from our stored config. */
 function buildAdapter(cfg: SamlConfig): SAML {
   const urls = spUrls(cfg);
@@ -187,11 +224,23 @@ export async function consumeSamlResponse(
   // NotOnOrAfter conditions, but we additionally persist the assertion
   // ID until it expires so a captured SAMLResponse can't be re-posted
   // inside the 5-min skew window.
-  const assertionId = (profile["ID"] as string | undefined) ??
-    (profile["sessionIndex"] as string | undefined) ??
-    // As a fallback, hash the SAMLResponse — better than nothing so a
-    // buggy IdP without a stable ID still gets replay-guarded.
-    body.SAMLResponse.slice(-64);
+  //
+  // R76 MEDIUM #3 (landed R77): parse the actual `<Assertion ID>`
+  // from the raw XML rather than trusting `profile["ID"]` (which is
+  // the outer `<Response ID>`). A captured signed assertion can be
+  // re-wrapped inside a FRESH Response envelope with a new Response
+  // `ID` — the (orgId, response.id) uniqueness check misses. The
+  // schema's `wantAuthnResponseSigned` default is FALSE (see
+  // routes/saml.ts:127), so re-wrapping is a signature-agnostic
+  // replay primitive against the 5-min skew window. Fail closed
+  // when neither the assertion ID nor a stable derivative is
+  // extractable — never fall back to a body-tail hash (unstable
+  // across whitespace / re-encoding, and doesn't survive Response-
+  // envelope rewrap).
+  const assertionId = extractAssertionId(body.SAMLResponse);
+  if (!assertionId) {
+    return { ok: false, error: "no_stable_assertion_id" };
+  }
 
   const notOnOrAfterRaw = profile["notOnOrAfter"];
   const notOnOrAfter =
