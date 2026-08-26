@@ -309,10 +309,15 @@
     var current = state.route.path[0] || "overview";
     var org = state.session.org;
     var user = state.session.user;
-    var modeChip = state.ds.mode === "mock"
+    // One status chip in the topbar, not two. In mock mode we surface
+    // the "Demo" label so investors instantly see the data is fixtures.
+    // In live/api mode a single pulsing "Live" pill doubles as SSE
+    // stream health — it flips to "Reconnecting" when the EventSource
+    // drops. Rendering both a mode chip AND a stream chip in live mode
+    // duplicated the word "Live" next to itself.
+    var statusChip = state.ds.mode === "mock"
       ? '<span class="env-pill" title="Console is showing built-in demo data. Set MOCK_MODE=false to talk to a live backend.">Demo</span>'
-      : '<span class="env-pill">Live</span>';
-    var liveChip = '<span class="env-pill live-pulse" title="Streaming events from the daemon"><span class="live-label">Live</span></span>';
+      : '<span class="env-pill live-pulse" title="Streaming events from the daemon"><span class="live-label">Live</span></span>';
 
     app.innerHTML = "";
     app.appendChild(h(
@@ -322,8 +327,7 @@
             '<span class="brand-mark">A</span>' +
             '<span>AgentVisor</span>' +
           "</a>" +
-          modeChip +
-          liveChip +
+          statusChip +
           '<div class="spacer"></div>' +
           '<button class="cmdk-trigger" id="cmdkOpen" aria-label="Open command palette (⌘K)">' +
             '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>' +
