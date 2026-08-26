@@ -310,6 +310,68 @@ if (!detailText.includes("refund")) {
 }
 console.log("✅ session detail page renders events");
 
+// ============================================================
+// LIVE SSE STREAMING — the "wow" moment in the pitch. Open the
+// sessions page, keep it open, then ingest a NEW session from
+// another daemon and verify it lands in the DOM without any
+// reload.
+// ============================================================
+await page.goto(spaUrl + "#/sessions");
+await page.waitForTimeout(1500); // allow SSE handshake
+
+const liveSessionId = "sess_live_" + Math.random().toString(36).slice(2, 8);
+// Ingest a fresh session while the browser tab sits on /sessions
+{
+  const r = await fetch(API_BASE + "/api/v1/ingest/sessions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: "Bearer " + ingestToken,
+      "x-av-deployment": deploymentId,
+    },
+    body: JSON.stringify({
+      externalId: liveSessionId,
+      agent: "live-streaming-bot",
+      openedAt: new Date().toISOString(),
+      status: "live",
+    }),
+  });
+  if (r.status !== 200) fail("live ingest -> " + r.status);
+  const r2 = await fetch(API_BASE + "/api/v1/ingest/events", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: "Bearer " + ingestToken,
+      "x-av-deployment": deploymentId,
+    },
+    body: JSON.stringify([
+      {
+        sessionExternalId: liveSessionId,
+        seq: 0,
+        kind: "sys",
+        tag: "start",
+        body: "hello live",
+        occurredAt: new Date().toISOString(),
+      },
+    ]),
+  });
+  if (r2.status !== 200) fail("live event -> " + r2.status);
+}
+// Wait up to ~6s for the DOM to reflect the new session via SSE
+let liveAppeared = false;
+for (let i = 0; i < 30; i++) {
+  await page.waitForTimeout(200);
+  const html = await page.locator("body").innerText();
+  if (html.includes("live-streaming-bot")) {
+    liveAppeared = true;
+    break;
+  }
+}
+if (!liveAppeared) {
+  fail("live session never appeared in DOM after ingest — SSE broken?");
+}
+console.log("✅ SSE live streaming: new session appeared in DOM without reload");
+
 // Verify audit log picked up ALL our activity
 const audit = await page.evaluate(async (base) => {
   const r = await fetch(base + "/api/v1/audit?limit=50", { credentials: "include" });
@@ -327,4 +389,4 @@ console.log("✅ still zero JS errors + zero 5xx after extended flow");
 
 await browser.close();
 staticSrv.close();
-console.log("\nSPA e2e smoke passed (23 checks).");
+console.log("\nSPA e2e smoke passed (24 checks).");

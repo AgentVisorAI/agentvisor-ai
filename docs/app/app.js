@@ -158,6 +158,12 @@
     if (path[0] === "overview") scheduleOverviewRefresh();
     else if (path[0] === "sessions" && path[1] && msg.type === "events.appended" && msg.data.sessionId === path[1]) {
       scheduleSessionDetailRefresh(path[1]);
+    } else if (path[0] === "sessions" && !path[1] && (msg.type === "session.upsert" || msg.type === "events.appended")) {
+      // A new session or a batch of events came in — refresh the list
+      // so the operator sees new rows appear without hitting reload.
+      // Debounced so a burst of events doesn't cause a re-render on
+      // every message.
+      scheduleSessionsListRefresh();
     }
   }
   var _ovT;
@@ -175,6 +181,16 @@
       var main = document.getElementById("view");
       if (main && state.route && state.route.path[0] === "sessions" && state.route.path[1] === id) {
         renderSessionDetail(main, id);
+      }
+    }, 400);
+  }
+  var _slT;
+  function scheduleSessionsListRefresh() {
+    clearTimeout(_slT);
+    _slT = setTimeout(function () {
+      var main = document.getElementById("view");
+      if (main && state.route && state.route.path[0] === "sessions" && !state.route.path[1]) {
+        renderSessionsList(main);
       }
     }, 400);
   }

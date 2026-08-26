@@ -34,6 +34,7 @@ import { promises as dns } from "node:dns";
 import type { FastifyBaseLogger } from "fastify";
 import { db } from "../db.js";
 import { env } from "../env.js";
+import { formatForAdapter, pickAdapter } from "./webhook-adapters.js";
 
 const MAX_ATTEMPT = 6;
 const BACKOFF_SECONDS = [30, 120, 600, 1800, 7200];
@@ -201,12 +202,18 @@ export function dispatchEvent(opts: DispatchOpts): void {
         select: { id: true, url: true, secret: true },
       });
       if (endpoints.length === 0) return;
-      const body = JSON.stringify({
+      const envelope = {
         event: opts.event,
         createdAt: new Date().toISOString(),
         data: opts.data,
-      });
+      };
       for (const ep of endpoints) {
+        // Each endpoint might resolve to a different adapter (one org
+        // could have Slack + Datadog + custom webhooks all subscribed).
+        // Format per-endpoint so the signature is over what we actually
+        // send.
+        const adapter = pickAdapter(ep.url);
+        const body = formatForAdapter(adapter, envelope);
         void deliverOne(ep.id, ep.url, ep.secret, opts.event, body, 1, opts.logger);
       }
     } catch (e) {
