@@ -16,7 +16,7 @@ pub mod store;
 pub mod velocity;
 
 pub use budget::{ActionBudget, BudgetDecision, BudgetSpec};
-pub use store::{InMemoryStore, Refund, Spend, StateError, StateStore};
+pub use store::{InMemoryStore, Refund, Spend, StateError, StateStore, TrySpendOutcome};
 pub use velocity::TokenVelocity;
 
 #[cfg(feature = "redis")]
@@ -76,7 +76,7 @@ pub fn state_store_contract(store: &dyn StateStore, hash_tag: &str) {
                 },
             ])
             .unwrap(),
-        Some(1),
+        TrySpendOutcome::Refused { index: 1 },
         "second dimension over-cap must be reported by index"
     );
     assert_eq!(
@@ -84,6 +84,7 @@ pub fn state_store_contract(store: &dyn StateStore, hash_tag: &str) {
         0,
         "failed multi-spend must commit NOTHING"
     );
+    // dim_a: 3/10 -> remaining 7; dim_b: 4/10 -> remaining 6. Min = 6.
     assert_eq!(
         store
             .try_spend_many(&[
@@ -99,7 +100,12 @@ pub fn state_store_contract(store: &dyn StateStore, hash_tag: &str) {
                 },
             ])
             .unwrap(),
-        None
+        TrySpendOutcome::Committed {
+            post_commit_min_remaining: 6,
+        },
+        "R66 F3: try_spend_many must return post-commit min-headroom \
+         computed inside the atomic section; a subsequent get-based \
+         computation would race with concurrent remove_prefix/spend/refund"
     );
     assert_eq!(store.get(&dim_a).unwrap(), 3);
     assert_eq!(store.get(&dim_b).unwrap(), 4);

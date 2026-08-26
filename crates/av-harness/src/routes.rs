@@ -4482,7 +4482,17 @@ mod tests {
             self.inner.try_spend(key, amount, limit)
         }
 
-        fn try_spend_many(&self, spends: &[Spend]) -> Result<Option<usize>, StateError> {
+        fn try_spend_many(&self, spends: &[Spend]) -> Result<av_state::TrySpendOutcome, StateError> {
+            // R68: `ActionBudget::try_tokens` now routes through
+            // `try_spend_many` (single-key) so the reported
+            // `remaining` comes from the atomic section that
+            // committed the spend (R66 F3). Instrument this path
+            // identically to `try_spend` so `SlowStore` still
+            // observes the reactor-blocking regression test
+            // (`completion_budget_store_does_not_block_stream_runtime`
+            // asserts the two per-request spend calls).
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            std::thread::sleep(Duration::from_millis(100));
             self.inner.try_spend_many(spends)
         }
 
