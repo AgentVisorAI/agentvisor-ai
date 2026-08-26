@@ -4,6 +4,15 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="theme-color" content="#0a5c8b" />
+  <!--
+    Strict CSP: no inline scripts (they're extracted to config.js +
+    crash-guard.js), no third-party origins, connect-src limited to
+    self + the deployed AgentVisor API. Any XSS payload landed in
+    daemon-supplied event body is inert. base-uri prevents <base> tag
+    hijacking. object-src / frame-src none blocks embed/plugin abuse.
+  -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; base-uri 'none'; form-action 'none'; script-src 'self'; script-src-attr 'none'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://api.agentvisorai.me; img-src 'self' data:; font-src 'self' data:; manifest-src 'self'; object-src 'none'; frame-src 'none'; media-src 'none'" />
   <title>AgentVisor AI · Console</title>
   <meta name="description" content="AgentVisor AI console — sign in, view your fleet of policed agent sessions, and manage daemon deployments." />
 
@@ -12,16 +21,7 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <!--
-    MOCK_MODE: when true the console shows built-in Northwind Traders fixtures
-    so investors and prospects see a fully populated workspace immediately.
-    Set to false and point API_BASE at a deployed backend to run against the
-    real hosted API. See server/README.md for the deploy runbook.
-  -->
-  <script>
-    window.MOCK_MODE = true;
-    window.API_BASE = "";
-  </script>
+  <script src="config.js"></script>
 
   <div id="app"></div>
 
@@ -32,43 +32,7 @@
     </div>
   </noscript>
 
-  <!--
-    Boot-time safety net. If anything below this comment throws before
-    or during the app's own error handler installs, the user sees a
-    small centered crash card with a Reload button + a request-id
-    (when known). This runs BEFORE the app scripts load so a syntax
-    error in either app.js or datasource.js doesn't leave a blank page.
-  -->
-  <script>
-    (function () {
-      function crashCard(msg, requestId) {
-        try {
-          var host = document.getElementById("app") || document.body;
-          host.innerHTML =
-            '<div style="max-width:520px;margin:96px auto;padding:24px 28px;font:14px/1.5 -apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;background:#fff;border:1px solid #e0e0e0;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.06)">' +
-              '<div style="font-size:15px;font-weight:600;margin-bottom:6px">The console hit an error</div>' +
-              '<div style="color:#4a4a4a;margin-bottom:16px">' + String(msg || "Unknown error").replace(/[<&"]/g, function (c) { return c === "<" ? "&lt;" : c === "&" ? "&amp;" : "&quot;"; }) + '</div>' +
-              (requestId ? '<div style="font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:#888;margin-bottom:16px">request-id: ' + String(requestId).replace(/[<&"]/g, "") + '</div>' : "") +
-              '<button style="border:0;background:#0a5c8b;color:#fff;padding:8px 16px;border-radius:8px;font-weight:500;cursor:pointer" onclick="location.reload()">Reload</button>' +
-              '<a style="margin-left:12px;color:#0a5c8b;text-decoration:none" href="mailto:hello@agentvisorai.me?subject=Console%20crash">Contact support</a>' +
-            '</div>';
-        } catch (e) {
-          // Truly wedged — fall back to a native alert.
-          alert("Console crashed: " + msg + (requestId ? " (request-id " + requestId + ")" : ""));
-        }
-      }
-      window.addEventListener("error", function (ev) {
-        var msg = (ev.error && ev.error.message) || ev.message || "Uncaught error";
-        crashCard(msg, window.__lastRequestId);
-      });
-      window.addEventListener("unhandledrejection", function (ev) {
-        var reason = ev.reason;
-        var msg = (reason && (reason.message || reason.detail || reason.toString && reason.toString())) || "Unhandled promise rejection";
-        crashCard(msg, window.__lastRequestId);
-      });
-    }());
-  </script>
-
+  <script src="crash-guard.js"></script>
   <script src="datasource.js"></script>
   <script src="app.js"></script>
 </body>

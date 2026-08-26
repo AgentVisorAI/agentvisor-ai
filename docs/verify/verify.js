@@ -1,0 +1,142 @@
+    const drop = document.getElementById("drop");
+    const fileInput = document.getElementById("fileInput");
+    const browseBtn = document.getElementById("browseBtn");
+    const result = document.getElementById("result");
+    const loadExample = document.getElementById("loadExample");
+
+    function esc(s) {
+      return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    }
+
+    function hex2bytes(hex) {
+      const b = new Uint8Array(hex.length / 2);
+      for (let i = 0; i < b.length; i++) b[i] = parseInt(hex.substr(i * 2, 2), 16);
+      return b;
+    }
+    function b64ToBytes(s) {
+      const bin = atob(s.replace(/-/g, "+").replace(/_/g, "/"));
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    }
+
+    async function verifyBundle(bundle) {
+      if (bundle.format !== "agentvisor.receipt.v1") {
+        throw new Error("Unrecognized bundle format: " + bundle.format);
+      }
+      const r = bundle.receipt || {};
+      const pub = bundle.publicKey || {};
+      if (!r.rawBody || !r.rawSignatureB64) throw new Error("Receipt is missing rawBody or rawSignatureB64.");
+      if (!pub.hex || !/^[0-9a-fA-F]{64}$/.test(pub.hex)) throw new Error("Bundle is missing a valid 32-byte Ed25519 public key.");
+      const keyBytes = hex2bytes(pub.hex);
+      let key;
+      try {
+        key = await crypto.subtle.importKey("raw", keyBytes, { name: "Ed25519" }, false, ["verify"]);
+      } catch (e) {
+        throw new Error("This browser doesn't support Web Crypto Ed25519. Try Chrome 113+, Firefox 130+, or Safari 17+. Or run the CLI: node scripts/verify-receipt.mjs receipt.json");
+      }
+      const msg = new TextEncoder().encode(r.rawBody);
+      const sig = b64ToBytes(r.rawSignatureB64);
+      const ok = await crypto.subtle.verify("Ed25519", key, sig, msg);
+      return { ok, bundle };
+    }
+
+    function render(state) {
+      result.hidden = false;
+      if (state.kind === "pending") {
+        result.innerHTML = `
+          <div class="result-card pending">
+            <p class="result-title">Verifying signature…</p>
+            <p class="result-sub">Running Ed25519 in your browser.</p>
+          </div>`;
+        return;
+      }
+      if (state.kind === "err") {
+        result.innerHTML = `
+          <div class="result-card bad">
+            <p class="result-title">Couldn't verify this bundle</p>
+            <p class="result-sub">${esc(state.message)}</p>
+          </div>`;
+        return;
+      }
+      const b = state.bundle;
+      const s = b.session || {};
+      const r = b.receipt || {};
+      const pub = b.publicKey || {};
+      const cls = state.ok ? "ok" : "bad";
+      const titleText = state.ok
+        ? "✅  Signature verifies"
+        : "❌  Signature does not verify";
+      const subText = state.ok
+        ? "This receipt is authentic. It was signed by the private key matching the embedded public key, and every byte of the payload is exactly what the daemon sent."
+        : "The signature does not match the payload. Either the receipt was modified after signing, or the public key doesn't correspond to the signing key.";
+      result.innerHTML = `
+        <div class="result-card ${cls}">
+          <p class="result-title">${titleText}</p>
+          <p class="result-sub">${subText}</p>
+          <dl class="kv">
+            <dt>Session</dt><dd>${esc(s.externalId || s.id || "—")}</dd>
+            <dt>Agent</dt><dd>${esc(s.agent || "—")}</dd>
+            <dt>Events sealed</dt><dd>${esc(r.eventCount ?? "—")}</dd>
+            <dt>Receipt ID</dt><dd>${esc(r.receiptId || "—")}</dd>
+            <dt>Public key</dt><dd>${esc(pub.hex || "—")}</dd>
+            <dt>Signature bytes</dt><dd>${esc((r.rawSignatureB64 || "").length)} base64 chars (64 bytes decoded)</dd>
+            <dt>Message bytes</dt><dd>${esc((r.rawBody || "").length)}</dd>
+          </dl>
+          <details class="details">
+            <summary>Show raw signed body</summary>
+            <pre>${esc(r.rawBody || "")}</pre>
+          </details>
+        </div>`;
+    }
+
+    async function handleText(text) {
+      render({ kind: "pending" });
+      let bundle;
+      try { bundle = JSON.parse(text); }
+      catch (e) { render({ kind: "err", message: "Not valid JSON: " + e.message }); return; }
+      try {
+        const { ok, bundle: b } = await verifyBundle(bundle);
+        render({ kind: "result", ok, bundle: b });
+      } catch (e) {
+        render({ kind: "err", message: e.message });
+      }
+    }
+    function handleFile(file) {
+      if (!file) return;
+      if (file.size > 5_000_000) { render({ kind: "err", message: "File larger than 5 MB — probably not a receipt." }); return; }
+      const reader = new FileReader();
+      reader.onload = () => handleText(reader.result);
+      reader.onerror = () => render({ kind: "err", message: "Could not read file." });
+      reader.readAsText(file);
+    }
+
+    ["dragenter", "dragover"].forEach((e) => drop.addEventListener(e, (ev) => { ev.preventDefault(); drop.classList.add("hover"); }));
+    ["dragleave", "drop"].forEach((e) => drop.addEventListener(e, (ev) => { ev.preventDefault(); drop.classList.remove("hover"); }));
+    drop.addEventListener("drop", (ev) => {
+      const f = ev.dataTransfer?.files?.[0];
+      if (f) handleFile(f);
+    });
+    drop.addEventListener("click", (ev) => { if (ev.target !== browseBtn) fileInput.click(); });
+    drop.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); fileInput.click(); }
+    });
+    browseBtn.addEventListener("click", (ev) => { ev.stopPropagation(); fileInput.click(); });
+    fileInput.addEventListener("change", () => handleFile(fileInput.files?.[0]));
+
+    // Paste anywhere on the page.
+    window.addEventListener("paste", (ev) => {
+      const text = ev.clipboardData?.getData("text");
+      if (text && text.trim().startsWith("{")) handleText(text);
+    });
+
+    loadExample.addEventListener("click", async () => {
+      try {
+        const res = await fetch("sample-receipt.json");
+        if (!res.ok) throw new Error("Sample not available");
+        const text = await res.text();
+        handleText(text);
+      } catch (e) {
+        render({ kind: "err", message: "Couldn't load sample: " + e.message });
+      }
+    });
