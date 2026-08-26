@@ -121,6 +121,21 @@ pub(crate) struct HotMetrics {
     /// called per stage per request because `||` cannot short-circuit
     /// a false config default.
     pub(crate) strict_stage_budget: bool,
+    /// Pre-resolved `av_requests_total{route,status_class}` counters,
+    /// indexed by `(Route::index(), StatusClass::index())`. Populated
+    /// at boot; every hit is O(1) with zero string alloc and zero
+    /// registry-mutex acquisition — R58 audit found the previous
+    /// per-request `metrics.counter(&format!("..."))` path did 4
+    /// mutex ops on the shared `Registry` per HTTP request plus
+    /// ~120 B of allocator churn (at 10k req/s: ~40k mutex ops/s +
+    /// 1.2 MB/s allocs on the request middleware alone).
+    pub(crate) request_counters: [[Arc<av_core::metrics::Counter>; 5]; 10],
+    /// Pre-resolved `av_request_duration_seconds{route}` histograms,
+    /// indexed by `Route::index()`. Same rationale as
+    /// `request_counters` above; the histogram fetch used to hit
+    /// TWO Registry mutex ops per request (base_kinds + metrics
+    /// map).
+    pub(crate) request_duration_histograms: [Arc<av_core::metrics::Histogram>; 10],
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -166,6 +181,123 @@ impl Stage {
     }
 }
 
+/// HTTP route label enum. Mirrors the closed vocabulary in
+/// `route_label(path)` — pre-resolved into a fixed-index array of
+/// `Arc<Counter>` / `Arc<Histogram>` so the request-metrics
+/// middleware never touches the shared `Registry` mutex on the hot
+/// path (see `HotMetrics::request_counters`).
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum Route {
+    Chat,
+    Mcp,
+    Health,
+    Livez,
+    Readyz,
+    Metrics,
+    SessionClose,
+    SessionPromote,
+    Dashboard,
+    Other,
+}
+
+impl Route {
+    pub(crate) const ORDER: [Route; 10] = [
+        Route::Chat,
+        Route::Mcp,
+        Route::Health,
+        Route::Livez,
+        Route::Readyz,
+        Route::Metrics,
+        Route::SessionClose,
+        Route::SessionPromote,
+        Route::Dashboard,
+        Route::Other,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Route::Chat => "chat",
+            Route::Mcp => "mcp",
+            Route::Health => "health",
+            Route::Livez => "livez",
+            Route::Readyz => "readyz",
+            Route::Metrics => "metrics",
+            Route::SessionClose => "session_close",
+            Route::SessionPromote => "session_promote",
+            Route::Dashboard => "dashboard",
+            Route::Other => "other",
+        }
+    }
+
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Route::Chat => 0,
+            Route::Mcp => 1,
+            Route::Health => 2,
+            Route::Livez => 3,
+            Route::Readyz => 4,
+            Route::Metrics => 5,
+            Route::SessionClose => 6,
+            Route::SessionPromote => 7,
+            Route::Dashboard => 8,
+            Route::Other => 9,
+        }
+    }
+}
+
+/// HTTP status-class label. Mirrors the closed vocabulary in the
+/// request-metrics middleware. Kept as a separate enum so future
+/// additions (e.g., a hypothetical `2xx-slow`) surface via
+/// exhaustive-match compile checks.
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum StatusClass {
+    Informational, // 1xx
+    Success,       // 2xx
+    Redirection,   // 3xx
+    ClientError,   // 4xx
+    ServerError,   // 5xx
+}
+
+impl StatusClass {
+    pub(crate) const ORDER: [StatusClass; 5] = [
+        StatusClass::Informational,
+        StatusClass::Success,
+        StatusClass::Redirection,
+        StatusClass::ClientError,
+        StatusClass::ServerError,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            StatusClass::Informational => "1xx",
+            StatusClass::Success => "2xx",
+            StatusClass::Redirection => "3xx",
+            StatusClass::ClientError => "4xx",
+            StatusClass::ServerError => "5xx",
+        }
+    }
+
+    pub(crate) fn index(self) -> usize {
+        match self {
+            StatusClass::Informational => 0,
+            StatusClass::Success => 1,
+            StatusClass::Redirection => 2,
+            StatusClass::ClientError => 3,
+            StatusClass::ServerError => 4,
+        }
+    }
+
+    pub(crate) fn from_u16(status: u16) -> Self {
+        match status {
+            100..=199 => StatusClass::Informational,
+            200..=299 => StatusClass::Success,
+            300..=399 => StatusClass::Redirection,
+            400..=499 => StatusClass::ClientError,
+            _ => StatusClass::ServerError,
+        }
+    }
+}
+
 impl HotMetrics {
     fn new(metrics: &Registry, config_strict_stage_budget: bool) -> Self {
         // Registrations here mirror the boot loop below. Using the
@@ -186,10 +318,37 @@ impl HotMetrics {
                 "Middleware stages that exceeded the strict per-stage budget",
             )
         });
+        // Pre-resolve the request-metrics middleware's counters +
+        // histograms as a [route][status_class] array so the hot
+        // path is O(1) with zero string alloc and zero Registry
+        // mutex ops. Registration order matches the enum ORDER
+        // constants, matched at read time via `Route::index()` and
+        // `StatusClass::index()`.
+        let request_counters: [[Arc<av_core::metrics::Counter>; 5]; 10] = Route::ORDER.map(|route| {
+            StatusClass::ORDER.map(|status| {
+                metrics.counter(
+                    &format!(
+                        "av_requests_total{{route=\"{}\",status_class=\"{}\"}}",
+                        route.label(),
+                        status.label()
+                    ),
+                    "HTTP requests by route and status class",
+                )
+            })
+        });
+        let request_duration_histograms: [Arc<av_core::metrics::Histogram>; 10] = Route::ORDER.map(|route| {
+            metrics.histogram_with_bounds(
+                &format!("av_request_duration_seconds{{route=\"{}\"}}", route.label()),
+                "End-to-end HTTP request latency by route",
+                av_core::metrics::WIDE_LATENCY_BOUNDS_US,
+            )
+        });
         Self {
             stage_histograms,
             stage_strict_budget_counters,
             strict_stage_budget: config_strict_stage_budget || truthy_env("AV_STRICT_BUDGET"),
+            request_counters,
+            request_duration_histograms,
         }
     }
 }
@@ -2406,12 +2565,19 @@ impl AppState {
             ToolVerdict::Allowed { .. } => None,
             ToolVerdict::Blocked { stage: "budget", .. } => Some(StopReason::BudgetExceeded),
             ToolVerdict::Blocked { .. } => Some(StopReason::PolicyBlocked),
-            // See the sibling `match &verdict` above for the rationale
-            // — an unhandled `#[non_exhaustive]` variant fails closed
-            // (treat as policy-blocked so the audit chain seals with
-            // a defensible refusal reason rather than silently
-            // proceeding).
-            _ => Some(StopReason::PolicyBlocked),
+            // See the sibling `match &verdict` above for the rationale.
+            // R58 correction: use `StopReason::Other` (the ships-with-
+            // `#[serde(other)]` forward-compat sink documented for
+            // exactly this "unrecognised upstream variant during
+            // heterogeneous rolling upgrade" case) rather than
+            // `PolicyBlocked`. Returning `PolicyBlocked` here would
+            // contaminate policy-block counters / alerts / dashboards
+            // with a HARNESS CODE BUG signal, and disagree with the
+            // sibling `stage: "unhandled_verdict"` payload label that
+            // is honestly synthetic. `Other` preserves fail-closed
+            // semantics (non-None, terminates the turn, seals the
+            // receipt) while telling the truth on the wire.
+            _ => Some(StopReason::Other),
         };
         worker_permit.submit(WorkerJob {
             session: Arc::clone(&session),

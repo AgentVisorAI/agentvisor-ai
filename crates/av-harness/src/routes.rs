@@ -189,50 +189,52 @@ async fn enforce_allowed_hosts(
 /// `av_request_duration_seconds{route}`. The route label is drawn
 /// from a FIXED set (no client-controlled values) so metric
 /// cardinality is bounded; unknown paths collapse to `other`.
+///
+/// R58 hot-path: metric handles are pre-resolved into
+/// `HotMetrics.request_counters` / `request_duration_histograms`
+/// arrays indexed by `Route::index()` and `StatusClass::index()`.
+/// This eliminates the per-request `format!` (~120 B alloc) and the
+/// 4 shared-`Registry` mutex acquisitions (2 for each `.counter()`
+/// and `.histogram_with_bounds()` call) that the prior lazy path
+/// incurred — at 10k req/s that's ~40k mutex ops/s + 1.2 MB/s of
+/// allocator churn on the middleware alone. K8s liveness /
+/// readiness probes at 5-10 s intervals per replica are the
+/// dominant callers by count.
 async fn request_metrics(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
-    let route = route_label(request.uri().path());
+    let route = route(request.uri().path());
     let started = std::time::Instant::now();
     let response = next.run(request).await;
-    let status_class = match response.status().as_u16() {
-        100..=199 => "1xx",
-        200..=299 => "2xx",
-        300..=399 => "3xx",
-        400..=499 => "4xx",
-        _ => "5xx",
-    };
-    state
-        .metrics
-        .counter(
-            &format!("av_requests_total{{route=\"{route}\",status_class=\"{status_class}\"}}"),
-            "HTTP requests by route and status class",
-        )
-        .inc();
-    state
-        .metrics
-        .histogram_with_bounds(
-            &format!("av_request_duration_seconds{{route=\"{route}\"}}"),
-            "End-to-end HTTP request latency by route",
-            av_core::metrics::WIDE_LATENCY_BOUNDS_US,
-        )
-        .observe_us(elapsed_us(started));
+    let status_class = crate::pipeline::StatusClass::from_u16(response.status().as_u16());
+    // Safe: `Route::index()` returns `0..10` (see `Route::ORDER`
+    // length) and `StatusClass::index()` returns `0..5` (see
+    // `StatusClass::ORDER` length); `HotMetrics` allocates arrays
+    // of exactly those sizes. Silence `clippy::indexing_slicing`
+    // — a debug-assertion sanity check would be more expensive than
+    // the guarded lookup on the hot path.
+    #[allow(clippy::indexing_slicing)]
+    {
+        state.hot_metrics.request_counters[route.index()][status_class.index()].inc();
+        state.hot_metrics.request_duration_histograms[route.index()].observe_us(elapsed_us(started));
+    }
     response
 }
 
 /// Fixed route-label set for `av_requests_total`. NEVER interpolate a
 /// client-controlled value here — Prometheus cardinality is bounded
 /// only because this set is closed.
-fn route_label(path: &str) -> &'static str {
+fn route(path: &str) -> crate::pipeline::Route {
+    use crate::pipeline::Route;
     match path {
-        "/v1/chat/completions" => "chat",
-        "/v1/mcp" | "/mcp" => "mcp",
-        "/health" => "health",
-        "/livez" => "livez",
-        "/readyz" => "readyz",
-        "/metrics" => "metrics",
-        _ if path.starts_with("/v1/sessions/") && path.ends_with("/close") => "session_close",
-        _ if path.starts_with("/v1/sessions/") && path.ends_with("/promote") => "session_promote",
-        _ if path.starts_with("/dashboard") || path.starts_with("/api/v1/dashboard") => "dashboard",
-        _ => "other",
+        "/v1/chat/completions" => Route::Chat,
+        "/v1/mcp" | "/mcp" => Route::Mcp,
+        "/health" => Route::Health,
+        "/livez" => Route::Livez,
+        "/readyz" => Route::Readyz,
+        "/metrics" => Route::Metrics,
+        _ if path.starts_with("/v1/sessions/") && path.ends_with("/close") => Route::SessionClose,
+        _ if path.starts_with("/v1/sessions/") && path.ends_with("/promote") => Route::SessionPromote,
+        _ if path.starts_with("/dashboard") || path.starts_with("/api/v1/dashboard") => Route::Dashboard,
+        _ => Route::Other,
     }
 }
 
@@ -339,15 +341,28 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     // ends in `.tmp`, matching the boot sweep's orphan pattern, so a
     // crash between create and remove self-heals on restart; UUIDv7
     // uniqueness keeps concurrent probes from colliding.
+    //
+    // Run under `spawn_blocking` so a partial I/O outage (the exact
+    // condition this probe exists to catch) cannot stall a Tokio
+    // worker thread. Under a K8s probe interval smaller than a
+    // stall's ms-to-second latency, blocking the runtime here would
+    // escalate a filesystem hiccup into runtime-wide starvation
+    // exactly when other request paths need the workers most.
     let spool_writable = {
-        let probe = std::path::Path::new(&state.config.atif_spool_dir)
-            .join(format!(".readyz-{}.tmp", av_core::new_event_uid()));
-        let outcome = std::fs::write(&probe, b"readyz").and_then(|()| {
-            // fsync would double the probe's IOPS cost for no signal:
-            // ENOSPC surfaces at write() on every mainstream filesystem.
-            std::fs::remove_file(&probe)
-        });
-        outcome.is_ok()
+        let dir = state.config.atif_spool_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let probe = std::path::Path::new(&dir).join(format!(".readyz-{}.tmp", av_core::new_event_uid()));
+            std::fs::write(&probe, b"readyz")
+                .and_then(|()| {
+                    // fsync would double the probe's IOPS cost for no
+                    // signal: ENOSPC surfaces at write() on every
+                    // mainstream filesystem.
+                    std::fs::remove_file(&probe)
+                })
+                .is_ok()
+        })
+        .await
+        .unwrap_or(false)
     };
     let ready = !draining && spool_writable;
     let body = Json(json!({
