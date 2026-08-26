@@ -110,6 +110,7 @@ fn sandbox_gate_cascade_attributes_the_exact_first_failure() {
     match verdict {
         ToolVerdict::Blocked { stage, .. } => assert_eq!(stage, "parse", "expected parse first"),
         ToolVerdict::Allowed { .. } => panic!("malformed must not be allowed"),
+        _ => panic!("unhandled ToolVerdict variant in test"),
     }
 
     // Case B: parse OK, schema fails (arguments.q is a number, must be string).
@@ -118,6 +119,7 @@ fn sandbox_gate_cascade_attributes_the_exact_first_failure() {
     match sb.check(&store, "s", &raw) {
         ToolVerdict::Blocked { stage, .. } => assert_eq!(stage, "schema"),
         ToolVerdict::Allowed { .. } => panic!("schema violation must not be allowed"),
+        _ => panic!("unhandled ToolVerdict variant in test"),
     }
 
     // Case C: parse OK, schema OK (unknown schema tolerated), policy denies.
@@ -126,6 +128,7 @@ fn sandbox_gate_cascade_attributes_the_exact_first_failure() {
     match sb.check(&store, "s", &raw) {
         ToolVerdict::Blocked { stage, .. } => assert_eq!(stage, "policy"),
         ToolVerdict::Allowed { .. } => panic!("policy-denied must not be allowed"),
+        _ => panic!("unhandled ToolVerdict variant in test"),
     }
 
     // Case D: parse OK, schema OK (no schema for db_write), policy OK, budget=0.
@@ -134,6 +137,7 @@ fn sandbox_gate_cascade_attributes_the_exact_first_failure() {
     match sb.check(&store, "s", &raw) {
         ToolVerdict::Blocked { stage, .. } => assert_eq!(stage, "budget"),
         ToolVerdict::Allowed { .. } => panic!("cap=0 must block first call"),
+        _ => panic!("unhandled ToolVerdict variant in test"),
     }
 
     // Case E: everything passes — allowed.
@@ -213,6 +217,7 @@ fn policy_chain_first_deny_wins_regardless_of_order() {
     match sb.check(&store, "s", &raw) {
         ToolVerdict::Blocked { stage, .. } => assert_eq!(stage, "policy"),
         ToolVerdict::Allowed { .. } => panic!("policy chain must block hostile"),
+        _ => panic!("unhandled ToolVerdict variant in test"),
     }
 
     // Chain: [Allow, Deny] — Allow is not final; Deny still fires.
@@ -227,6 +232,7 @@ fn policy_chain_first_deny_wins_regardless_of_order() {
     match sb.check(&store, "s", &raw) {
         ToolVerdict::Blocked { stage, .. } => assert_eq!(stage, "policy"),
         ToolVerdict::Allowed { .. } => panic!("later Deny must still fire"),
+        _ => panic!("unhandled ToolVerdict variant in test"),
     }
 }
 
@@ -407,6 +413,7 @@ fn sandbox_stage_attribution_is_stable_under_concurrent_mixed_input() {
                         assert_eq!(stage, expected_stage, "stage attribution drifted");
                     }
                     ToolVerdict::Allowed { .. } => panic!("bad payload was allowed"),
+                    _ => panic!("unhandled ToolVerdict variant in test"),
                 }
             }));
         }

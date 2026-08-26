@@ -1403,6 +1403,22 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
             (status, Json(response)).into_response()
         }
         Err(error) => pipeline_error(error),
+        // `ToolVerdict` is `#[non_exhaustive]` (R56 SemVer-hardening).
+        // A future variant reaching this matcher must fail closed:
+        // emit a 503 with a stable message rather than silently
+        // returning success. Mirrors the pipeline-level unhandled-
+        // verdict handling at pipeline.rs's `check_with_principal`
+        // matcher, so both entry points to the tool sandbox agree on
+        // the defensive posture.
+        Ok(_) => {
+            tracing::error!(
+                "unhandled ToolVerdict variant reached routes::tool_forward; failing closed. \
+                 This is a bug — extend the match to handle the new variant."
+            );
+            pipeline_error(crate::pipeline::PipelineError::unavailable(
+                "tool sandbox produced an unhandled verdict; refusing to proceed".to_owned(),
+            ))
+        }
     }
 }
 

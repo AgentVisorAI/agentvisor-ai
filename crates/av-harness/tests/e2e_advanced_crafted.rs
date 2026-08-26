@@ -199,6 +199,7 @@ fn receipt_shaped_tool_argument_is_treated_as_opaque_data() {
     match sandbox.check(&store, "sess", &raw) {
         ToolVerdict::Blocked { stage, .. } => assert_eq!(stage, "schema"),
         ToolVerdict::Allowed { .. } => panic!("receipt-shaped payload passed the schema gate"),
+        _ => panic!("unhandled ToolVerdict variant in test"),
     }
 }
 
@@ -291,6 +292,7 @@ fn duplicate_key_parser_differential_cannot_split_schema_from_policy() {
         ToolVerdict::Allowed { .. } => {
             panic!("duplicate-key payload must be refused, not allowed");
         }
+        _ => panic!("unhandled ToolVerdict variant in test"),
     }
 }
 

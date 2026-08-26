@@ -4237,9 +4237,11 @@ fn archive_conflicting_atif(
     //
     // The archived name MUST NOT have `Path::extension()`
     // equal to `"promote"` — that extension re-enters the
-    // `retry_marked_promotions` scan filter (`reconciler.rs:2227`), which
-    // then MAC-verifies the archived bytes (unchanged by rename), looks
-    // up `sessions.get(&marker.session_id)` and gets the *recycled*
+    // `retry_marked_promotions` scan filter at
+    // `reconciler.rs::retry_marked_promotions` (the
+    // `path.extension() != Some("promote")` check that gates the
+    // MAC-verify+promote loop), which then MAC-verifies the
+    // archived bytes (unchanged by rename), looks up `sessions.get(&marker.session_id)` and gets the *recycled*
     // Session (S2) — and calls `promote(S2)` on it. Effect: an
     // unrequested promotion of S2 minted a receipt and emitted a
     // receipt event no operator asked for; the archived marker stayed
