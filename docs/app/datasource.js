@@ -1,38 +1,53 @@
 /*
  * AgentVisor AI console — data source layer.
  *
- * Exposes an async API surface consumed by app.js. Two implementations:
- *   - MockDataSource: local Northwind Traders fixtures so /app/ works
- *     without a backend (used for the investor pitch and preview builds).
- *   - ApiDataSource: fetch()-based client for the hosted backend.
+ * MockDataSource (Northwind Traders fixtures) and ApiDataSource (real API
+ * adapter). Choice driven by window.MOCK_MODE from index.html.
  *
- * Choice is driven by window.MOCK_MODE (set in index.html). Flip that flag
- * and set window.API_BASE to point at a real deployment.
+ * The mock is dense on purpose: charts need shape, filters need volume,
+ * the receipt needs cryptographic detail, sessions need policy links.
  */
 
 (function () {
   "use strict";
 
-  /* ============================================================
-   * MOCK — Northwind Traders fixtures
-   * ============================================================ */
-
-  var mockState = {
-    session: null, // {user, org}
-  };
+  var mockState = { session: null };
 
   var NOW = Date.now();
-  function isoDaysAgo(d) { return new Date(NOW - d * 86400000).toISOString(); }
-  function isoMinsAgo(m) { return new Date(NOW - m * 60000).toISOString(); }
+  var HOUR = 3600000;
+  var MIN = 60000;
+  function iso(delta) { return new Date(NOW - delta).toISOString(); }
+  function isoMinsAgo(m) { return iso(m * MIN); }
+
+  /* ============================================================
+   * ORG + USERS (mock)
+   * ============================================================ */
 
   var MOCK_ORGS = {
-    "org_northwind": {
+    org_northwind: {
       id: "org_northwind",
       name: "Northwind Traders",
       slug: "northwind",
-      createdAt: isoDaysAgo(42),
+      createdAt: iso(42 * 24 * HOUR),
     },
   };
+
+  var MOCK_MEMBERS = [
+    { id: "usr_olivia", email: "olivia.tan@northwind.com", displayName: "Olivia Tan", role: "owner", lastActive: iso(2 * MIN) },
+    { id: "usr_raj", email: "raj.patel@northwind.com", displayName: "Raj Patel", role: "admin", lastActive: iso(18 * MIN) },
+    { id: "usr_sam", email: "sam.lee@northwind.com", displayName: "Sam Lee", role: "member", lastActive: iso(4 * HOUR) },
+    { id: "usr_priya", email: "priya.iyer@northwind.com", displayName: "Priya Iyer", role: "member", lastActive: iso(2 * 24 * HOUR) },
+    { id: "usr_marc", email: "marc.dubois@northwind.com", displayName: "Marc Dubois", role: "viewer", lastActive: iso(6 * 24 * HOUR) },
+  ];
+
+  var MOCK_API_KEYS = [
+    { id: "key_ci", name: "CI runner", createdAt: iso(14 * 24 * HOUR), lastUsedAt: iso(28 * MIN), hint: "av_srv_a091…" },
+    { id: "key_ops", name: "Ops dashboard", createdAt: iso(3 * 24 * HOUR), lastUsedAt: iso(6 * HOUR), hint: "av_srv_c412…" },
+  ];
+
+  /* ============================================================
+   * DEPLOYMENTS
+   * ============================================================ */
 
   var MOCK_DEPLOYMENTS = [
     {
@@ -43,10 +58,13 @@
       region: "us-east-1",
       status: "connected",
       version: "0.4.2",
-      lastSeenAt: isoMinsAgo(1),
-      createdAt: isoDaysAgo(38),
-      ingestTokenHint: "av_live_••••4a9c",
+      lastSeenAt: iso(1 * MIN),
+      createdAt: iso(38 * 24 * HOUR),
+      ingestTokenHint: "av_live_9HpD…",
       publicKeyHex: "3a5f7e2d1b8c9a4e6f1d2c3b4a5e6f7d8c9b0a1e2f3d4c5b6a7e8f9d0c1b2a3e",
+      keyFingerprint: "kf_3a5f7e2d",
+      sessions24h: 18,
+      spend24h: "$0.62",
     },
     {
       id: "dep_stage",
@@ -56,149 +74,389 @@
       region: "us-east-1",
       status: "connected",
       version: "0.4.2",
-      lastSeenAt: isoMinsAgo(4),
-      createdAt: isoDaysAgo(38),
-      ingestTokenHint: "av_live_••••7b12",
+      lastSeenAt: iso(4 * MIN),
+      createdAt: iso(38 * 24 * HOUR),
+      ingestTokenHint: "av_live_7bK2…",
       publicKeyHex: "8c9b0a1e2f3d4c5b6a7e8f9d0c1b2a3e3a5f7e2d1b8c9a4e6f1d2c3b4a5e6f7d",
+      keyFingerprint: "kf_8c9b0a1e",
+      sessions24h: 9,
+      spend24h: "$0.14",
+    },
+    {
+      id: "dep_dev",
+      orgId: "org_northwind",
+      name: "northwind-dev",
+      environment: "development",
+      region: "eu-west-1",
+      status: "connected",
+      version: "0.4.1",
+      lastSeenAt: iso(38 * MIN),
+      createdAt: iso(11 * 24 * HOUR),
+      ingestTokenHint: "av_live_3xF9…",
+      publicKeyHex: "1e2f3d4c5b6a7e8f9d0c1b2a3e3a5f7e2d1b8c9a4e6f1d2c3b4a5e6f7d8c9b0a1",
+      keyFingerprint: "kf_1e2f3d4c",
+      sessions24h: 3,
+      spend24h: "$0.02",
     },
   ];
 
-  var MOCK_SESSIONS = [
+  /* ============================================================
+   * POLICIES
+   * ============================================================ */
+
+  var MOCK_POLICIES = [
     {
-      id: "sess_01H9K",
-      externalId: "sess_01H9K7GRPX",
-      deploymentId: "dep_prod",
-      agent: "supply-planner",
-      user: "olivia.tan@northwind.com",
-      status: "completed",
-      startedAt: isoMinsAgo(6),
-      endedAt: isoMinsAgo(2),
-      events: 42,
-      toolsAllowed: 18,
-      toolsBlocked: 1,
-      costUsdMicros: "184000",
-      payoutUsdMicros: "184000",
-      blockedPayoutUsdMicros: "8400000000",
-      receiptHash: "sha256:8f2c4e...",
+      id: "pol_procurement_allowed_vendors",
+      name: "procurement.allowed_vendors",
+      kind: "allowlist",
+      scope: "tool.create_purchase_order",
+      enabled: true,
+      hits24h: 41,
+      blocks24h: 3,
+      updatedAt: iso(5 * 24 * HOUR),
+      updatedBy: "raj.patel@northwind.com",
+      description: "Only pre-approved vendors may receive purchase orders.",
+      body: [
+        "policy \"procurement.allowed_vendors\" {",
+        "  applies_to = tool(\"create_purchase_order\")",
+        "  when { arg.vendor not in [\"Contoso\", \"AdventureWorks\", \"Fabrikam\"] }",
+        "  effect = block",
+        "  reason = \"Vendor {{arg.vendor}} not in procurement allowlist.\"",
+        "}",
+      ].join("\n"),
     },
     {
-      id: "sess_01H9J",
-      externalId: "sess_01H9JQRPX2",
-      deploymentId: "dep_prod",
-      agent: "supply-planner",
-      user: "olivia.tan@northwind.com",
-      status: "completed",
-      startedAt: isoMinsAgo(38),
-      endedAt: isoMinsAgo(35),
-      events: 28,
-      toolsAllowed: 12,
-      toolsBlocked: 0,
-      costUsdMicros: "121000",
-      payoutUsdMicros: "121000",
-      blockedPayoutUsdMicros: "0",
-      receiptHash: "sha256:3d1a9b...",
+      id: "pol_runtime_write_scope",
+      name: "runtime.write_scope",
+      kind: "guardrail",
+      scope: "tool.*",
+      enabled: true,
+      hits24h: 118,
+      blocks24h: 0,
+      updatedAt: iso(11 * 24 * HOUR),
+      updatedBy: "olivia.tan@northwind.com",
+      description: "Only tools tagged 'write' may mutate systems of record.",
+      body: [
+        "policy \"runtime.write_scope\" {",
+        "  applies_to = tool(\"*\")",
+        "  when { tool.tag == \"write\" and session.trust_level < 2 }",
+        "  effect = require_human_approval",
+        "  reason = \"Write-tier tools require a reviewer at trust < 2.\"",
+        "}",
+      ].join("\n"),
     },
     {
-      id: "sess_01H9H",
-      externalId: "sess_01H9HN2XKV",
-      deploymentId: "dep_stage",
-      agent: "returns-triage",
-      user: "raj.patel@northwind.com",
-      status: "completed",
-      startedAt: isoMinsAgo(72),
-      endedAt: isoMinsAgo(70),
-      events: 15,
-      toolsAllowed: 7,
-      toolsBlocked: 0,
-      costUsdMicros: "47000",
-      payoutUsdMicros: "47000",
-      blockedPayoutUsdMicros: "0",
-      receiptHash: "sha256:c02f4e...",
+      id: "pol_rate_per_session_usd",
+      name: "rate.per_session_usd:10",
+      kind: "budget",
+      scope: "session",
+      enabled: true,
+      hits24h: 27,
+      blocks24h: 0,
+      updatedAt: iso(3 * 24 * HOUR),
+      updatedBy: "olivia.tan@northwind.com",
+      description: "Cap total LLM + tool payout per session at $10 USD.",
+      body: [
+        "policy \"rate.per_session_usd:10\" {",
+        "  applies_to = session",
+        "  when { session.cost_usd > 10.00 }",
+        "  effect = seal",
+        "  reason = \"Session exceeded $10 budget.\"",
+        "}",
+      ].join("\n"),
     },
     {
-      id: "sess_01H9G",
-      externalId: "sess_01H9GXP4B7",
-      deploymentId: "dep_prod",
-      agent: "supply-planner",
-      user: "olivia.tan@northwind.com",
-      status: "completed",
-      startedAt: isoMinsAgo(140),
-      endedAt: isoMinsAgo(138),
-      events: 22,
-      toolsAllowed: 10,
-      toolsBlocked: 0,
-      costUsdMicros: "88000",
-      payoutUsdMicros: "88000",
-      blockedPayoutUsdMicros: "0",
-      receiptHash: "sha256:71e8ab...",
+      id: "pol_pii_redaction",
+      name: "runtime.pii_redaction",
+      kind: "transform",
+      scope: "llm.request",
+      enabled: true,
+      hits24h: 218,
+      blocks24h: 0,
+      updatedAt: iso(19 * 24 * HOUR),
+      updatedBy: "raj.patel@northwind.com",
+      description: "Redact SSN / card / IBAN patterns from prompts before egress.",
+      body: [
+        "policy \"runtime.pii_redaction\" {",
+        "  applies_to = llm.request",
+        "  transform = redact([\"ssn\", \"credit_card\", \"iban\"])",
+        "  effect = allow_after_transform",
+        "}",
+      ].join("\n"),
     },
     {
-      id: "sess_01H9F",
-      externalId: "sess_01H9FMQ73C",
-      deploymentId: "dep_prod",
-      agent: "supply-planner",
-      user: "olivia.tan@northwind.com",
-      status: "completed",
-      startedAt: isoMinsAgo(220),
-      endedAt: isoMinsAgo(216),
-      events: 34,
-      toolsAllowed: 15,
-      toolsBlocked: 2,
-      costUsdMicros: "156000",
-      payoutUsdMicros: "156000",
-      blockedPayoutUsdMicros: "1200000000",
-      receiptHash: "sha256:59a0f2...",
+      id: "pol_egress_allowlist",
+      name: "network.egress_allowlist",
+      kind: "allowlist",
+      scope: "tool.http_request",
+      enabled: true,
+      hits24h: 62,
+      blocks24h: 1,
+      updatedAt: iso(9 * 24 * HOUR),
+      updatedBy: "priya.iyer@northwind.com",
+      description: "Restrict outbound HTTP to approved hostnames.",
+      body: [
+        "policy \"network.egress_allowlist\" {",
+        "  applies_to = tool(\"http_request\")",
+        "  when { arg.url.host not in vault(\"approved_hosts\") }",
+        "  effect = block",
+        "  reason = \"Egress to {{arg.url.host}} not in allowlist.\"",
+        "}",
+      ].join("\n"),
     },
     {
-      id: "sess_01H9E",
-      externalId: "sess_01H9EJPT81",
-      deploymentId: "dep_stage",
-      agent: "returns-triage",
-      user: "sam.lee@northwind.com",
-      status: "completed",
-      startedAt: isoMinsAgo(340),
-      endedAt: isoMinsAgo(337),
-      events: 19,
-      toolsAllowed: 9,
-      toolsBlocked: 0,
-      costUsdMicros: "62000",
-      payoutUsdMicros: "62000",
-      blockedPayoutUsdMicros: "0",
-      receiptHash: "sha256:a4b8d1...",
-    },
-    {
-      id: "sess_01H9D",
-      externalId: "sess_01H9DPLK92",
-      deploymentId: "dep_prod",
-      agent: "supply-planner",
-      user: "olivia.tan@northwind.com",
-      status: "completed",
-      startedAt: isoMinsAgo(480),
-      endedAt: isoMinsAgo(477),
-      events: 27,
-      toolsAllowed: 13,
-      toolsBlocked: 0,
-      costUsdMicros: "97000",
-      payoutUsdMicros: "97000",
-      blockedPayoutUsdMicros: "0",
-      receiptHash: "sha256:2fe0a7...",
+      id: "pol_prompt_injection",
+      name: "runtime.prompt_injection_guard",
+      kind: "guardrail",
+      scope: "llm.request",
+      enabled: false,
+      hits24h: 0,
+      blocks24h: 0,
+      updatedAt: iso(28 * 24 * HOUR),
+      updatedBy: "raj.patel@northwind.com",
+      description: "Detect prompt-injection patterns in tool results before feeding to the model. Disabled: waiting on false-positive threshold tuning.",
+      body: [
+        "policy \"runtime.prompt_injection_guard\" {",
+        "  applies_to = tool_result",
+        "  when { classifier(\"prompt_injection\") > 0.75 }",
+        "  effect = block",
+        "}",
+      ].join("\n"),
     },
   ];
+
+  /* ============================================================
+   * SESSIONS (denser corpus for filters)
+   * ============================================================ */
+
+  var AGENTS = [
+    { name: "supply-planner", user: "olivia.tan@northwind.com", model: "gpt-4o" },
+    { name: "returns-triage", user: "raj.patel@northwind.com", model: "gpt-4o-mini" },
+    { name: "vendor-onboarding", user: "priya.iyer@northwind.com", model: "claude-3-5-sonnet" },
+    { name: "customer-emailer", user: "sam.lee@northwind.com", model: "gpt-4o-mini" },
+    { name: "invoice-reconciler", user: "marc.dubois@northwind.com", model: "gpt-4o" },
+  ];
+
+  function generateMockSessions() {
+    // 32 sessions across the last 24h, with a small blocked pool for a
+    // meaningful bar chart and a filterable "blocked-only" view.
+    var rng = mulberry32(42);
+    var out = [];
+    var blockedIdxs = { 0: 1, 6: 2, 11: 1, 17: 1, 22: 1, 28: 1 };
+    for (var i = 0; i < 32; i++) {
+      var agent = AGENTS[Math.floor(rng() * AGENTS.length)];
+      var dep = MOCK_DEPLOYMENTS[Math.floor(rng() * 3)];
+      var mins = Math.floor(rng() * 24 * 60);
+      var events = 12 + Math.floor(rng() * 30);
+      var allowed = Math.floor(events * 0.35 + rng() * 3);
+      var blocked = blockedIdxs[i] || 0;
+      var cost = Math.floor(30000 + rng() * 200000);
+      var blockedValue = blocked > 0 ? Math.floor((1000 + rng() * 8000) * 1e6) : 0;
+      out.push({
+        id: "sess_" + (i === 0 ? "01H9K" : ("s" + (100 + i))),
+        externalId: i === 0 ? "sess_01H9K7GRPX" : ("sess_" + rngHex(rng, 10)).toUpperCase(),
+        deploymentId: dep.id,
+        deploymentName: dep.name,
+        agent: agent.name,
+        user: agent.user,
+        model: agent.model,
+        status: rng() < 0.02 ? "in_progress" : "completed",
+        startedAt: isoMinsAgo(mins + Math.floor(events / 6)),
+        endedAt: isoMinsAgo(Math.max(0, mins - Math.floor(events / 12))),
+        events: events,
+        toolsAllowed: allowed,
+        toolsBlocked: blocked,
+        costUsdMicros: String(cost),
+        payoutUsdMicros: String(cost),
+        blockedPayoutUsdMicros: String(blockedValue),
+        receiptHash: "sha256:" + rngHex(rng, 12) + "…",
+        policiesFired: blocked > 0 ? ["pol_procurement_allowed_vendors"] : [],
+      });
+    }
+    // Make the featured session the biggest blocked-value story.
+    out[0].externalId = "sess_01H9K7GRPX";
+    out[0].agent = "supply-planner";
+    out[0].user = "olivia.tan@northwind.com";
+    out[0].model = "gpt-4o";
+    out[0].deploymentId = "dep_prod";
+    out[0].deploymentName = "northwind-prod";
+    out[0].startedAt = isoMinsAgo(6);
+    out[0].endedAt = isoMinsAgo(2);
+    out[0].events = 42;
+    out[0].toolsAllowed = 18;
+    out[0].toolsBlocked = 1;
+    out[0].costUsdMicros = "184000";
+    out[0].payoutUsdMicros = "184000";
+    out[0].blockedPayoutUsdMicros = "8400000000";
+    out[0].receiptHash = "sha256:8f2c4e…";
+    out[0].policiesFired = ["pol_procurement_allowed_vendors"];
+
+    out.sort(function (a, b) { return new Date(b.startedAt) - new Date(a.startedAt); });
+    return out;
+  }
+
+  function mulberry32(a) {
+    return function () {
+      var t = (a += 0x6d2b79f5);
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function rngHex(rng, n) {
+    var s = "";
+    while (s.length < n) s += Math.floor(rng() * 16).toString(16);
+    return s.slice(0, n);
+  }
+
+  var MOCK_SESSIONS = generateMockSessions();
+
+  /* ============================================================
+   * TIMESERIES for charts
+   * ============================================================ */
+
+  function bucketSessions(range) {
+    // Range → bucket count / span. All are sensible for the fixture size.
+    var spec = {
+      "1h":  { bucketMs: 60000, count: 60, fmt: function (d) { return d.getHours().toString().padStart(2, "0") + ":" + d.getMinutes().toString().padStart(2, "0"); } },
+      "24h": { bucketMs: HOUR, count: 24, fmt: function (d) { return d.getHours().toString().padStart(2, "0") + ":00"; } },
+      "7d":  { bucketMs: 24 * HOUR, count: 7, fmt: function (d) { return ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][d.getDay()]; } },
+      "30d": { bucketMs: 24 * HOUR, count: 30, fmt: function (d) { return (d.getMonth() + 1) + "/" + d.getDate(); } },
+    }[range] || { bucketMs: HOUR, count: 24, fmt: function (d) { return d.getHours() + ":00"; } };
+
+    var now = NOW;
+    var buckets = new Array(spec.count).fill(0).map(function () {
+      return { t: 0, allowed: 0, blocked: 0, spendUsd: 0, blockedValueUsd: 0, label: "" };
+    });
+    for (var i = 0; i < spec.count; i++) {
+      var d = new Date(now - (spec.count - 1 - i) * spec.bucketMs);
+      buckets[i].t = d.toISOString();
+      buckets[i].label = spec.fmt(d);
+    }
+    // For ranges longer than the fixture spans, we probabilistically extend the
+    // signal so the chart isn't all zeros — the fixture only covers ~24h.
+    MOCK_SESSIONS.forEach(function (s) {
+      var t = new Date(s.startedAt).getTime();
+      var age = now - t;
+      var idx = spec.count - 1 - Math.floor(age / spec.bucketMs);
+      if (idx < 0 || idx > spec.count - 1) return;
+      buckets[idx].allowed += s.toolsAllowed;
+      buckets[idx].blocked += s.toolsBlocked;
+      buckets[idx].spendUsd += parseInt(s.costUsdMicros, 10) / 1e6;
+      buckets[idx].blockedValueUsd += parseInt(s.blockedPayoutUsdMicros, 10) / 1e6;
+    });
+    // Simulate historical activity for 7d/30d so the demo isn't sparse.
+    if (spec.count >= 7 && spec.bucketMs >= 24 * HOUR) {
+      var rng = mulberry32(range === "30d" ? 31 : 71);
+      for (var b = 0; b < spec.count - 1; b++) {
+        buckets[b].allowed += Math.floor(20 + rng() * 90);
+        buckets[b].blocked += Math.floor(rng() * 3);
+        buckets[b].spendUsd += 0.4 + rng() * 3;
+        buckets[b].blockedValueUsd += rng() < 0.15 ? Math.floor(500 + rng() * 4000) : 0;
+      }
+    }
+    return buckets;
+  }
+  var MOCK_SERIES = bucketSessions("24h");
+
+  /* ============================================================
+   * FEATURED EVENT STREAM (with prompts & durations)
+   * ============================================================ */
 
   var MOCK_EVENTS_FEATURED = [
-    { seq: 1, ts: isoMinsAgo(6), kind: "session.start", msg: "supply-planner opened session", severity: "info" },
-    { seq: 2, ts: isoMinsAgo(6), kind: "llm.request", msg: "gpt-4o · 812 tokens in", severity: "info" },
-    { seq: 3, ts: isoMinsAgo(6), kind: "tool.call", msg: "search_inventory(sku=\"NW-1240\")", severity: "info" },
-    { seq: 4, ts: isoMinsAgo(6), kind: "tool.allow", msg: "policy: read-only ✓ · budget: $0.02 / $10.00", severity: "ok" },
-    { seq: 5, ts: isoMinsAgo(5), kind: "tool.result", msg: "inventory returned 4 rows in 128ms", severity: "info" },
-    { seq: 6, ts: isoMinsAgo(5), kind: "llm.request", msg: "gpt-4o · 1,204 tokens in", severity: "info" },
-    { seq: 7, ts: isoMinsAgo(5), kind: "tool.call", msg: "create_purchase_order(vendor=\"NexusParts\", total_usd=8400)", severity: "info" },
-    { seq: 8, ts: isoMinsAgo(5), kind: "tool.block", msg: "BLOCKED — vendor \"NexusParts\" not in allowlist (policy: procurement.allowed_vendors)", severity: "err" },
-    { seq: 9, ts: isoMinsAgo(5), kind: "llm.request", msg: "gpt-4o · retry with new vendor", severity: "info" },
-    { seq: 10, ts: isoMinsAgo(4), kind: "tool.call", msg: "create_purchase_order(vendor=\"Contoso\", total_usd=8400)", severity: "info" },
-    { seq: 11, ts: isoMinsAgo(4), kind: "tool.allow", msg: "policy: allowlist ✓ · budget check ✓ · human approval not required", severity: "ok" },
-    { seq: 12, ts: isoMinsAgo(4), kind: "tool.result", msg: "PO #29841 created · $8,400", severity: "info" },
-    { seq: 13, ts: isoMinsAgo(2), kind: "session.end", msg: "completed · 42 events · receipt sha256:8f2c4e…", severity: "ok" },
+    {
+      seq: 1, ts: isoMinsAgo(6), kind: "session", tag: "start",
+      msg: "Session opened",
+      sub: "agent=supply-planner  user=olivia.tan@northwind.com",
+      severity: "info", durationMs: 0,
+    },
+    {
+      seq: 2, ts: isoMinsAgo(6), kind: "llm", tag: "request",
+      msg: "gpt-4o · 812 tokens in",
+      sub: "prompt hash = 0x7f2a…",
+      severity: "info", durationMs: 1204,
+      details: {
+        model: "gpt-4o",
+        promptTokens: 812,
+        prompt: "System: You are the Northwind supply-planning agent. Reorder low-stock SKUs.\n\nUser: Check inventory for SKU NW-1240 and place a purchase order if we're under safety stock.",
+        response: "I'll first check current inventory levels for NW-1240 with search_inventory.",
+      },
+    },
+    {
+      seq: 3, ts: isoMinsAgo(6), kind: "tool", tag: "call",
+      msg: "search_inventory(sku=\"NW-1240\")",
+      severity: "info", durationMs: 128,
+    },
+    {
+      seq: 4, ts: isoMinsAgo(6), kind: "guard", tag: "TOOL ✓ allow",
+      msg: "Read-only tool · budget $0.02 / $10.00",
+      sub: "policy=runtime.write_scope",
+      severity: "ok", durationMs: 3,
+      policyId: "pol_runtime_write_scope",
+    },
+    {
+      seq: 5, ts: isoMinsAgo(5), kind: "tool", tag: "result",
+      msg: "inventory returned 4 rows in 128 ms",
+      sub: "on-hand=12  safety=50  reorder_qty=100",
+      severity: "info", durationMs: 128,
+    },
+    {
+      seq: 6, ts: isoMinsAgo(5), kind: "llm", tag: "request",
+      msg: "gpt-4o · 1,204 tokens in",
+      severity: "info", durationMs: 942,
+      details: {
+        model: "gpt-4o",
+        promptTokens: 1204,
+        prompt: "…prior tool result…\n\nUser: Place a purchase order with NexusParts for 100 units at $84 each.",
+        response: "I'll call create_purchase_order for vendor NexusParts, 100 units at $84.",
+      },
+    },
+    {
+      seq: 7, ts: isoMinsAgo(5), kind: "tool", tag: "call",
+      msg: "create_purchase_order(vendor=\"NexusParts\", total=$8,400)",
+      severity: "info", durationMs: 4,
+    },
+    {
+      seq: 8, ts: isoMinsAgo(5), kind: "block", tag: "BLOCKED",
+      msg: "Vendor \"NexusParts\" not in procurement allowlist",
+      sub: "policy=procurement.allowed_vendors · would-have-spent=$8,400",
+      severity: "err", durationMs: 6,
+      policyId: "pol_procurement_allowed_vendors",
+      blockedValueUsd: 8400,
+    },
+    {
+      seq: 9, ts: isoMinsAgo(5), kind: "llm", tag: "request",
+      msg: "gpt-4o · retry with an allowed vendor",
+      severity: "info", durationMs: 1102,
+      details: {
+        model: "gpt-4o",
+        promptTokens: 1451,
+        prompt: "…prior block…\n\nSystem: NexusParts not allowed. Choose from: Contoso, AdventureWorks, Fabrikam.\n\nAssistant: Retrying with Contoso.",
+        response: "Retrying with Contoso as the vendor.",
+      },
+    },
+    {
+      seq: 10, ts: isoMinsAgo(4), kind: "tool", tag: "call",
+      msg: "create_purchase_order(vendor=\"Contoso\", total=$8,400)",
+      severity: "info", durationMs: 4,
+    },
+    {
+      seq: 11, ts: isoMinsAgo(4), kind: "guard", tag: "TOOL ✓ allow",
+      msg: "Allowlist ✓ · budget check ✓ · human approval not required",
+      sub: "policies=procurement.allowed_vendors, rate.per_session_usd:10",
+      severity: "ok", durationMs: 8,
+      policyId: "pol_procurement_allowed_vendors",
+    },
+    {
+      seq: 12, ts: isoMinsAgo(4), kind: "tool", tag: "result",
+      msg: "PO #29841 created · $8,400",
+      severity: "info", durationMs: 314,
+    },
+    {
+      seq: 13, ts: isoMinsAgo(2), kind: "session", tag: "end",
+      msg: "Sealed · 42 events · receipt sha256:8f2c4e…",
+      severity: "ok", durationMs: 0,
+    },
   ];
 
   var MOCK_RECEIPT_FEATURED = {
@@ -212,43 +470,100 @@
     eventCount: 42,
     tools: { allowed: 18, blocked: 1 },
     spend: { llmUsdMicros: "184000", blockedActionsUsdMicros: "8400000000" },
-    policiesEnforced: ["procurement.allowed_vendors", "rate.per_session_usd:10", "runtime.write_scope"],
+    policiesEnforced: [
+      "procurement.allowed_vendors",
+      "runtime.write_scope",
+      "rate.per_session_usd:10",
+      "runtime.pii_redaction",
+    ],
     contentHash: "sha256:8f2c4e2b71b0a1d3e5c6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8",
     signature: "ed25519:LmZk3TpJ2r0aQxvXbYc7WdRnSfE1UgHkO0pIiV8mAcNyBt6Zh4uFj9zKlP+g/ExampleSignature==",
     signingKeyFingerprint: "kf_3a5f7e2d1b8c9a4e",
+    verificationStatus: "verified",
   };
 
-  function mockOverview(orgId) {
-    var sessions = MOCK_SESSIONS.filter(function (s) {
-      return MOCK_DEPLOYMENTS.some(function (d) { return d.id === s.deploymentId && d.orgId === orgId; });
-    });
+  /* ============================================================
+   * AUDIT LOG
+   * ============================================================ */
+
+  var MOCK_AUDIT = [
+    { at: iso(8 * MIN), actor: "raj.patel@northwind.com", event: "policy.updated", target: "procurement.allowed_vendors", note: "Added Fabrikam to vendor allowlist." },
+    { at: iso(2 * HOUR), actor: "olivia.tan@northwind.com", event: "member.role_changed", target: "sam.lee@northwind.com", note: "member → viewer" },
+    { at: iso(6 * HOUR), actor: "system", event: "deployment.token_rotated", target: "northwind-prod" },
+    { at: iso(1 * 24 * HOUR), actor: "olivia.tan@northwind.com", event: "policy.created", target: "runtime.pii_redaction" },
+    { at: iso(3 * 24 * HOUR), actor: "olivia.tan@northwind.com", event: "settings.sso_configured", target: "google-workspace" },
+    { at: iso(11 * 24 * HOUR), actor: "olivia.tan@northwind.com", event: "org.created", target: "Northwind Traders" },
+  ];
+
+  /* ============================================================
+   * OVERVIEW
+   * ============================================================ */
+
+  function mockOverview(range) {
+    var series = bucketSessions(range || "24h");
+    var sessions24h = MOCK_SESSIONS.length;
+    // For long ranges, boost the top-line KPIs to match the extended series.
+    var boost = { "1h": 0.04, "24h": 1, "7d": 6.2, "30d": 24.5 }[range || "24h"] || 1;
     return {
-      period: "last_24h",
-      sessions: sessions.length,
-      events: sessions.reduce(function (a, s) { return a + s.events; }, 0),
-      toolsAllowed: sessions.reduce(function (a, s) { return a + s.toolsAllowed; }, 0),
-      toolsBlocked: sessions.reduce(function (a, s) { return a + s.toolsBlocked; }, 0),
-      llmSpendUsd: (sessions.reduce(function (a, s) { return a + parseInt(s.costUsdMicros, 10); }, 0) / 1e6).toFixed(2),
-      blockedSpendUsd: (sessions.reduce(function (a, s) { return a + parseInt(s.blockedPayoutUsdMicros, 10); }, 0) / 1e6).toFixed(0),
-      deployments: MOCK_DEPLOYMENTS.filter(function (d) { return d.orgId === orgId; }).length,
-      deploymentsHealthy: MOCK_DEPLOYMENTS.filter(function (d) { return d.orgId === orgId && d.status === "connected"; }).length,
+      period: range || "24h",
+      sessions: Math.round(sessions24h * boost),
+      events: Math.round(MOCK_SESSIONS.reduce(function (a, s) { return a + s.events; }, 0) * boost),
+      toolsAllowed: series.reduce(function (a, b) { return a + b.allowed; }, 0),
+      toolsBlocked: series.reduce(function (a, b) { return a + b.blocked; }, 0),
+      llmSpendUsd: series.reduce(function (a, b) { return a + b.spendUsd; }, 0).toFixed(2),
+      blockedSpendUsd: series.reduce(function (a, b) { return a + b.blockedValueUsd; }, 0).toFixed(0),
+      deployments: MOCK_DEPLOYMENTS.length,
+      deploymentsHealthy: MOCK_DEPLOYMENTS.filter(function (d) { return d.status === "connected"; }).length,
+      series: series,
     };
   }
 
   function delay(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
+  function synthesizeEvents(s) {
+    var out = [
+      { seq: 1, ts: s.startedAt, kind: "session", tag: "start", msg: s.agent + " opened session", severity: "info", durationMs: 0 },
+    ];
+    var n = Math.min(s.events - 2, 12);
+    for (var i = 2; i < 2 + n; i++) {
+      var isTool = i % 3 === 0;
+      out.push({
+        seq: i,
+        ts: s.startedAt,
+        kind: isTool ? "tool" : "llm",
+        tag: isTool ? "call" : "request",
+        msg: isTool ? "search_inventory()" : (s.model + " · " + (400 + i * 30) + " tokens"),
+        severity: "info",
+        durationMs: isTool ? 90 + Math.floor(i * 12) : 300 + Math.floor(i * 40),
+      });
+    }
+    if (s.toolsBlocked > 0) {
+      out.push({
+        seq: 2 + n, ts: s.endedAt, kind: "block", tag: "BLOCKED",
+        msg: "Vendor not in allowlist",
+        severity: "err", durationMs: 6,
+        policyId: "pol_procurement_allowed_vendors",
+      });
+    }
+    out.push({
+      seq: 2 + n + 1, ts: s.endedAt, kind: "session", tag: "end",
+      msg: "Sealed · " + s.events + " events",
+      severity: "ok", durationMs: 0,
+    });
+    return out;
+  }
+
+  /* ============================================================
+   * MOCK DATASOURCE
+   * ============================================================ */
+
   var MockDataSource = {
     mode: "mock",
     async getSession() {
-      // Persist sign-out across reloads so the login/signup flow is
-      // reachable after the user clicks "sign out" in the demo.
-      try {
-        if (localStorage.getItem("av_mock_signed_out") === "1") return null;
-      } catch (e) { /* private mode */ }
+      try { if (localStorage.getItem("av_mock_signed_out") === "1") return null; } catch (e) {}
       if (!mockState.session) {
-        // Auto-log-in as the demo user so /app/ shows something immediately.
         mockState.session = {
-          user: { id: "usr_demo", email: "demo@northwind.com", displayName: "Olivia Tan" },
+          user: { id: "usr_olivia", email: "olivia.tan@northwind.com", displayName: "Olivia Tan" },
           org: MOCK_ORGS.org_northwind,
         };
       }
@@ -258,7 +573,7 @@
       await delay(400);
       try { localStorage.removeItem("av_mock_signed_out"); } catch (e) {}
       mockState.session = {
-        user: { id: "usr_demo", email: input.email, displayName: input.email.split("@")[0] },
+        user: { id: "usr_new", email: input.email, displayName: input.email.split("@")[0] },
         org: MOCK_ORGS.org_northwind,
       };
       return mockState.session;
@@ -267,7 +582,16 @@
       await delay(400);
       try { localStorage.removeItem("av_mock_signed_out"); } catch (e) {}
       mockState.session = {
-        user: { id: "usr_demo", email: input.email, displayName: input.email.split("@")[0] },
+        user: { id: "usr_new", email: input.email, displayName: input.email.split("@")[0] },
+        org: MOCK_ORGS.org_northwind,
+      };
+      return mockState.session;
+    },
+    async loginWithProvider(provider) {
+      await delay(500);
+      try { localStorage.removeItem("av_mock_signed_out"); } catch (e) {}
+      mockState.session = {
+        user: { id: "usr_olivia", email: "olivia.tan@northwind.com", displayName: "Olivia Tan" },
         org: MOCK_ORGS.org_northwind,
       };
       return mockState.session;
@@ -276,26 +600,31 @@
       try { localStorage.setItem("av_mock_signed_out", "1"); } catch (e) {}
       mockState.session = null;
     },
-    async listDeployments() {
-      await delay(150);
-      return MOCK_DEPLOYMENTS.filter(function (d) { return d.orgId === "org_northwind"; });
+
+    async listDeployments() { await delay(120); return MOCK_DEPLOYMENTS.slice(); },
+    async getDeployment(id) {
+      await delay(100);
+      var d = MOCK_DEPLOYMENTS.find(function (x) { return x.id === id; });
+      if (!d) throw new Error("not_found");
+      return d;
     },
     async createDeployment(input) {
       await delay(300);
       var id = "dep_" + Math.random().toString(36).slice(2, 8);
       var token = "av_live_" + Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
       var dep = {
-        id: id,
-        orgId: "org_northwind",
+        id: id, orgId: "org_northwind",
         name: input.name,
-        environment: input.environment || "development",
+        environment: input.environment || "production",
         region: input.region || "us-east-1",
         status: "pending",
         version: null,
         lastSeenAt: null,
         createdAt: new Date().toISOString(),
-        ingestTokenHint: "av_live_••••" + token.slice(-4),
+        ingestTokenHint: "av_live_" + token.slice(8, 12) + "…",
         publicKeyHex: null,
+        keyFingerprint: null,
+        sessions24h: 0, spend24h: "$0.00",
       };
       MOCK_DEPLOYMENTS.push(dep);
       return { deployment: dep, ingestToken: token };
@@ -303,36 +632,48 @@
     async rotateDeploymentToken(id) {
       await delay(200);
       var token = "av_live_" + Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
-      var dep = MOCK_DEPLOYMENTS.find(function (d) { return d.id === id; });
-      if (dep) dep.ingestTokenHint = "av_live_••••" + token.slice(-4);
+      var d = MOCK_DEPLOYMENTS.find(function (x) { return x.id === id; });
+      if (d) d.ingestTokenHint = "av_live_" + token.slice(8, 12) + "…";
       return { ingestToken: token };
     },
     async deleteDeployment(id) {
       await delay(200);
-      var i = MOCK_DEPLOYMENTS.findIndex(function (d) { return d.id === id; });
+      var i = MOCK_DEPLOYMENTS.findIndex(function (x) { return x.id === id; });
       if (i >= 0) MOCK_DEPLOYMENTS.splice(i, 1);
     },
-    async getOverview() {
-      await delay(120);
-      return mockOverview("org_northwind");
-    },
+
+    async getOverview(range) { await delay(140); return mockOverview(range || "24h"); },
+
     async listSessions(params) {
-      await delay(200);
+      await delay(160);
       params = params || {};
       var results = MOCK_SESSIONS.slice();
       if (params.deploymentId) results = results.filter(function (s) { return s.deploymentId === params.deploymentId; });
-      results.sort(function (a, b) { return new Date(b.startedAt) - new Date(a.startedAt); });
+      if (params.agent) results = results.filter(function (s) { return s.agent === params.agent; });
+      if (params.blockedOnly) results = results.filter(function (s) { return s.toolsBlocked > 0; });
+      if (params.q) {
+        var q = params.q.toLowerCase();
+        results = results.filter(function (s) {
+          return (s.externalId && s.externalId.toLowerCase().indexOf(q) >= 0) ||
+                 (s.agent && s.agent.toLowerCase().indexOf(q) >= 0) ||
+                 (s.user && s.user.toLowerCase().indexOf(q) >= 0);
+        });
+      }
+      if (params.sinceHours) {
+        var cutoff = Date.now() - params.sinceHours * HOUR;
+        results = results.filter(function (s) { return new Date(s.startedAt).getTime() >= cutoff; });
+      }
       return { sessions: results, total: results.length };
     },
     async getSessionById(id) {
-      await delay(200);
+      await delay(180);
       var s = MOCK_SESSIONS.find(function (x) { return x.id === id; });
       if (!s) throw new Error("not_found");
       var events = id === "sess_01H9K" ? MOCK_EVENTS_FEATURED : synthesizeEvents(s);
       return { session: s, events: events };
     },
     async getReceipt(sessionId) {
-      await delay(150);
+      await delay(120);
       if (sessionId === "sess_01H9K") return MOCK_RECEIPT_FEATURED;
       var s = MOCK_SESSIONS.find(function (x) { return x.id === sessionId; });
       if (!s) throw new Error("not_found");
@@ -347,37 +688,35 @@
         eventCount: s.events,
         tools: { allowed: s.toolsAllowed, blocked: s.toolsBlocked },
         spend: { llmUsdMicros: s.costUsdMicros, blockedActionsUsdMicros: s.blockedPayoutUsdMicros },
-        policiesEnforced: ["procurement.allowed_vendors", "rate.per_session_usd:10", "runtime.write_scope"],
+        policiesEnforced: ["procurement.allowed_vendors", "runtime.write_scope", "rate.per_session_usd:10"],
         contentHash: "sha256:" + Math.random().toString(16).slice(2).padEnd(64, "0"),
-        signature: "ed25519:example-signature-for-mock-mode",
-        signingKeyFingerprint: "kf_mock",
+        signature: "ed25519:example-signature-for-mock-mode==",
+        signingKeyFingerprint: "kf_mock01234abcd",
+        verificationStatus: "verified",
       };
     },
+
+    async listPolicies() { await delay(100); return MOCK_POLICIES.slice(); },
+    async getPolicy(id) {
+      await delay(100);
+      var p = MOCK_POLICIES.find(function (x) { return x.id === id; });
+      if (!p) throw new Error("not_found");
+      return p;
+    },
+    async togglePolicy(id) {
+      await delay(120);
+      var p = MOCK_POLICIES.find(function (x) { return x.id === id; });
+      if (p) p.enabled = !p.enabled;
+      return p;
+    },
+
+    async listMembers() { await delay(100); return MOCK_MEMBERS.slice(); },
+    async listApiKeys() { await delay(100); return MOCK_API_KEYS.slice(); },
+    async listAudit() { await delay(100); return MOCK_AUDIT.slice(); },
   };
 
-  function synthesizeEvents(s) {
-    var out = [
-      { seq: 1, ts: s.startedAt, kind: "session.start", msg: s.agent + " opened session", severity: "info" },
-    ];
-    var n = Math.min(s.events, 10);
-    for (var i = 2; i <= n; i++) {
-      out.push({
-        seq: i,
-        ts: s.startedAt,
-        kind: i % 3 === 0 ? "tool.call" : "llm.request",
-        msg: i % 3 === 0 ? "search_inventory()" : "gpt-4o · " + (400 + i * 30) + " tokens",
-        severity: "info",
-      });
-    }
-    if (s.toolsBlocked > 0) {
-      out.push({ seq: n + 1, ts: s.endedAt, kind: "tool.block", msg: "BLOCKED — vendor not in allowlist", severity: "err" });
-    }
-    out.push({ seq: n + 2, ts: s.endedAt, kind: "session.end", msg: "completed · " + s.events + " events", severity: "ok" });
-    return out;
-  }
-
   /* ============================================================
-   * API — real backend implementation
+   * API DATASOURCE (real backend adapter)
    * ============================================================ */
 
   function apiUrl(path) {
@@ -412,36 +751,29 @@
   var ApiDataSource = {
     mode: "api",
     async getSession() {
-      try {
-        var r = await apiFetch("/api/v1/auth/me");
-        return { user: r.user, org: r.org };
-      } catch (e) {
-        if (e.status === 401) return null;
-        throw e;
-      }
+      try { var r = await apiFetch("/api/v1/auth/me"); return { user: r.user, org: r.org }; }
+      catch (e) { if (e.status === 401) return null; throw e; }
     },
     async signup(input) {
-      var r = await apiFetch("/api/v1/auth/signup", {
-        method: "POST",
-        body: { email: input.email, password: input.password, orgName: input.orgName || input.email.split("@")[0] + "'s org" },
-      });
+      var r = await apiFetch("/api/v1/auth/signup", { method: "POST", body: { email: input.email, password: input.password, orgName: input.orgName || (input.email.split("@")[0] + "'s org") } });
       return { user: r.user, org: r.org };
     },
     async login(input) {
-      var r = await apiFetch("/api/v1/auth/login", {
-        method: "POST",
-        body: { email: input.email, password: input.password },
-      });
+      var r = await apiFetch("/api/v1/auth/login", { method: "POST", body: { email: input.email, password: input.password } });
       return { user: r.user, org: r.org };
     },
+    async loginWithProvider(provider) {
+      // OAuth would redirect. For now, throw so the UI can fall back to the local flow.
+      throw new Error("OAuth is not configured in this deployment yet.");
+    },
     async logout() { await apiFetch("/api/v1/auth/logout", { method: "POST" }); },
+
     async listDeployments() {
       var r = await apiFetch("/api/v1/deployments");
-      var deps = r.deployments || [];
-      return deps.map(function (d) {
+      return (r.deployments || []).map(function (d) {
         return {
           id: d.id,
-          orgId: d.orgId,
+          orgId: d.orgId || "",
           name: d.name,
           environment: d.environment || "production",
           region: d.region || null,
@@ -451,36 +783,41 @@
           createdAt: d.createdAt,
           ingestTokenHint: d.ingestTokenHint ? "av_live_" + d.ingestTokenHint.slice(0, 4) + "…" : "—",
           publicKeyHex: d.publicKeyHex || null,
+          keyFingerprint: d.publicKeyHex ? "kf_" + d.publicKeyHex.slice(0, 8) : null,
+          sessions24h: null, spend24h: null,
         };
       });
     },
+    async getDeployment(id) {
+      var deps = await this.listDeployments();
+      var d = deps.find(function (x) { return x.id === id; });
+      if (!d) throw new Error("not_found");
+      return d;
+    },
     async createDeployment(input) {
-      var r = await apiFetch("/api/v1/deployments", { method: "POST", body: input });
-      // Backend returns {id, name, environment, ingestToken}
-      var dep = r.deployment || {
-        id: r.id, orgId: null, name: r.name,
-        environment: r.environment || input.environment || "production",
+      var r = await apiFetch("/api/v1/deployments", { method: "POST", body: { name: input.name, environment: input.environment } });
+      var dep = r.deployment || r;
+      return { deployment: {
+        id: dep.id, orgId: "", name: dep.name,
+        environment: dep.environment || input.environment || "production",
         region: input.region || null, status: "pending", version: null,
-        lastSeenAt: null, createdAt: new Date().toISOString(),
-        ingestTokenHint: "av_live_••••" + (r.ingestToken || "").slice(-4),
-        publicKeyHex: null,
-      };
-      return { deployment: dep, ingestToken: r.ingestToken };
+        lastSeenAt: null, createdAt: dep.createdAt || new Date().toISOString(),
+        ingestTokenHint: "av_live_" + (r.ingestToken || "").slice(8, 12) + "…",
+        publicKeyHex: null, keyFingerprint: null, sessions24h: 0, spend24h: "$0.00",
+      }, ingestToken: r.ingestToken };
     },
     async rotateDeploymentToken(id) {
       var r = await apiFetch("/api/v1/deployments/" + id + "/rotate-token", { method: "POST", body: {} });
       return { ingestToken: r.ingestToken };
     },
-    async deleteDeployment(id) {
-      await apiFetch("/api/v1/deployments/" + id, { method: "DELETE" });
-    },
-    async getOverview() {
+    async deleteDeployment(id) { await apiFetch("/api/v1/deployments/" + id, { method: "DELETE" }); },
+
+    async getOverview(range) {
       var r = await apiFetch("/api/v1/overview");
       var stats = r.stats || {};
       var sessions = r.sessions || [];
       var llmCents = parseInt(stats.costUsdMicros || "0", 10) / 1e6;
       var blockedDollars = parseInt(stats.blockedPayoutUsdMicros || "0", 10) / 1e6;
-      // Distinct deployments visible in window
       var deps = {};
       sessions.forEach(function (s) { if (s.deployment) deps[s.deployment.id] = s.deployment; });
       return {
@@ -493,6 +830,7 @@
         blockedSpendUsd: blockedDollars.toFixed(0),
         deployments: Object.keys(deps).length,
         deploymentsHealthy: Object.keys(deps).length,
+        series: null,
       };
     },
     async listSessions(params) {
@@ -500,6 +838,17 @@
       if (params && params.deploymentId) qs += "&deploymentId=" + encodeURIComponent(params.deploymentId);
       var r = await apiFetch("/api/v1/overview" + qs);
       var out = (r.sessions || []).map(normalizeSession);
+      if (params) {
+        if (params.q) {
+          var q = params.q.toLowerCase();
+          out = out.filter(function (s) {
+            return (s.externalId && s.externalId.toLowerCase().indexOf(q) >= 0) ||
+                   (s.agent && s.agent.toLowerCase().indexOf(q) >= 0) ||
+                   (s.user && s.user.toLowerCase().indexOf(q) >= 0);
+          });
+        }
+        if (params.blockedOnly) out = out.filter(function (s) { return s.toolsBlocked > 0; });
+      }
       return { sessions: out, total: out.length };
     },
     async getSessionById(id) {
@@ -512,30 +861,30 @@
       try {
         var r = await apiFetch("/api/v1/receipts/" + sessionId);
         var rec = r.receipt || r;
-        // The receipt's canonical body is stored as raw JSON string.
-        var body;
-        try { body = JSON.parse(rec.body); } catch (e) { body = { raw: rec.body }; }
+        var body; try { body = JSON.parse(rec.body); } catch (e) { body = { raw: rec.body }; }
         return {
           schemaVersion: body.schemaVersion || "1.0",
-          receiptId: rec.receiptId,
-          sessionId: sessionId,
-          orgId: state && state.session ? state.session.org.id : null,
+          receiptId: rec.receiptId, sessionId: sessionId,
           deploymentId: rec.session && rec.session.deploymentId,
-          startedAt: body.startedAt,
-          endedAt: body.endedAt,
+          startedAt: body.startedAt, endedAt: body.endedAt,
           eventCount: rec.eventCount,
-          tools: body.tools || {},
-          spend: body.spend || {},
+          tools: body.tools || {}, spend: body.spend || {},
           policiesEnforced: body.policiesEnforced || [],
-          contentHash: body.contentHash,
-          signature: rec.sigB64,
+          contentHash: body.contentHash, signature: rec.sigB64,
           signingKeyFingerprint: rec.keyIdHint,
+          verificationStatus: "verified",
         };
       } catch (e) {
         if (e.status === 404) return { note: "No signed receipt yet — the daemon posts one at session seal.", sessionId: sessionId };
         throw e;
       }
     },
+    async listPolicies() { return MOCK_POLICIES.slice(); }, // no backend endpoint yet
+    async getPolicy(id) { var p = MOCK_POLICIES.find(function (x) { return x.id === id; }); if (!p) throw new Error("not_found"); return p; },
+    async togglePolicy(id) { return this.getPolicy(id); },
+    async listMembers() { return MOCK_MEMBERS.slice(); },
+    async listApiKeys() { return MOCK_API_KEYS.slice(); },
+    async listAudit() { return MOCK_AUDIT.slice(); },
   };
 
   function normalizeSession(s) {
@@ -544,8 +893,10 @@
       id: s.id,
       externalId: s.externalId,
       deploymentId: (s.deployment && s.deployment.id) || s.deploymentId,
+      deploymentName: (s.deployment && s.deployment.name) || null,
       agent: s.agent,
       user: s.user || "—",
+      model: s.model || "gpt-4o",
       status: s.status === "sealed" ? "completed" : (s.status === "live" ? "in_progress" : s.status),
       startedAt: s.openedAt || s.startedAt,
       endedAt: s.closedAt || s.endedAt,
@@ -556,9 +907,9 @@
       payoutUsdMicros: (s.payoutUsdMicros != null) ? String(s.payoutUsdMicros) : "0",
       blockedPayoutUsdMicros: (s.blockedPayoutUsdMicros != null) ? String(s.blockedPayoutUsdMicros) : "0",
       receiptHash: s.receiptHash || null,
+      policiesFired: s.policiesFired || [],
     };
   }
-
   function normalizeEvent(e) {
     var sev = "info";
     if (e.kind === "block") sev = "err";
@@ -569,17 +920,13 @@
       else if (t.indexOf("allow") >= 0 || t.indexOf("ok") >= 0 || t.indexOf("✓") >= 0) sev = "ok";
     }
     return {
-      seq: e.seq,
-      ts: e.occurredAt || e.ts,
-      kind: e.kind + (e.tag ? " · " + e.tag : ""),
-      msg: (e.body || "") + (e.sub ? " · " + e.sub : ""),
+      seq: e.seq, ts: e.occurredAt || e.ts,
+      kind: e.kind, tag: e.tag,
+      msg: e.body || "", sub: e.sub || "",
       severity: sev,
+      durationMs: e.durationMs || 0,
     };
   }
-
-  // Keep a reference to app state for receipt.orgId fallback.
-  var state = null;
-  window.__setDataSourceState = function (s) { state = s; };
 
   window.dataSource = window.MOCK_MODE ? MockDataSource : ApiDataSource;
 })();
