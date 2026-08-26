@@ -3122,30 +3122,35 @@ impl Finalizer {
             let ack_parent = spool_dir.join("broker-acks");
             let ack_path = ack_parent.join(&stem);
             let mut ack_error: Option<FinalizeError> = None;
-            let mut ack_changed = false;
+            let mut ack_attempted = false;
             match std::fs::remove_dir_all(&ack_path) {
-                Ok(()) => ack_changed = true,
+                Ok(()) => ack_attempted = true,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    // R65 L2: same fsync-always discipline as the
-                    // step-journal loop above. `remove_dir_all` may
-                    // successfully unlink some inner ack tokens
-                    // before failing on a later element — those
-                    // removals need the `ack_path` (or its parent)
-                    // fsync'd to be crash-durable. Ack tokens are
-                    // per-`event_uid` idempotency markers, not part
-                    // of the `sequence == index` invariant, so a
-                    // stale token on next tick is a soft-degrade
-                    // (retry drops it), unlike the step-journal case
-                    // where non-durability could recycle stale
-                    // journal bytes at position 0. Still worth
-                    // matching the discipline so a future refactor
-                    // doesn't have to re-derive the two paths'
-                    // durability differences separately.
+                    // R66 review L1: `remove_dir_all` is opaque about
+                    // partial progress — it may have successfully
+                    // unlinked some inner ack tokens (mutating the
+                    // `ack_path` dirent state) before failing on a
+                    // later element. To match the same fsync-always
+                    // discipline as the step-journal loop above, we
+                    // must fsync the parent even on Err, because we
+                    // cannot know whether the failure preceded or
+                    // followed any inner-file removals.
+                    //
+                    // Ack tokens are per-`event_uid` idempotency
+                    // markers, not part of the `sequence == index`
+                    // invariant, so a stale token on next tick is a
+                    // soft-degrade (retry drops it), unlike the
+                    // step-journal case where non-durability could
+                    // recycle stale journal bytes at position 0.
+                    // Still worth matching the discipline so a future
+                    // refactor doesn't have to re-derive the two
+                    // paths' durability differences separately.
+                    ack_attempted = true;
                     ack_error = Some(FinalizeError::atif_source(error));
                 }
             }
-            if ack_changed {
+            if ack_attempted {
                 if let Err(error) = av_core::fsutil::sync_directory(&ack_parent) {
                     if ack_error.is_none() {
                         ack_error = Some(FinalizeError::atif_source(error));
