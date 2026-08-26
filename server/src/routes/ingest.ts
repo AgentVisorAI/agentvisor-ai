@@ -3,6 +3,7 @@ import { z } from "zod";
 import { db } from "../db.js";
 import { verifyPassword } from "../lib/auth.js";
 import { bus } from "../lib/bus.js";
+import { dispatchEvent } from "../lib/webhooks.js";
 
 // ── Auth for the ingest endpoint ────────────────────────────────────────────
 //
@@ -302,6 +303,22 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
           allowed: dToolsOk,
           blocked: dToolsBad,
         });
+        // Any block in this batch triggers policy.block webhooks so
+        // Slack / PagerDuty / Datadog can wake an on-call responder.
+        if (dToolsBad > 0) {
+          dispatchEvent({
+            orgId: daemon.orgId,
+            event: "policy.block",
+            data: {
+              deploymentId: daemon.deploymentId,
+              sessionId: session.id,
+              sessionExternalId: externalId,
+              blockedCount: dToolsBad,
+              blockedPayoutUsdMicros: dBlockedPayout,
+            },
+            logger: req.log,
+          });
+        }
       }
     }
     return reply.send({

@@ -995,6 +995,13 @@
       await delay(120);
       MOCK_API_KEYS = MOCK_API_KEYS.filter(function (r) { return r.id !== id; });
     },
+    async listWebhooks() { await delay(80); return []; },
+    async createWebhook() { await delay(150); return { endpoint: { id: "wh_demo", name: "Slack #ops", url: "https://hooks.slack.com/…", events: ["policy.block"], isActive: true }, secret: "demo_secret_" + Math.random().toString(36).slice(2, 18) }; },
+    async updateWebhook() { await delay(80); },
+    async deleteWebhook() { await delay(80); },
+    async testWebhook() { await delay(80); },
+    async listWebhookDeliveries() { await delay(80); return []; },
+    downloadAuditCsv: function () { /* no-op in mock */ },
     async listAudit() { await delay(100); return MOCK_AUDIT.slice(); },
     subscribe(callback) {
       // The demo needs to feel alive. Every 6-14 seconds we synthesize a new
@@ -1400,6 +1407,41 @@
     },
     async revokeApiKey(id) {
       return apiFetch("/api/v1/keys/" + encodeURIComponent(id), { method: "DELETE" });
+    },
+    async listWebhooks() {
+      try {
+        var res = await apiFetch("/api/v1/webhooks");
+        return res.endpoints || [];
+      } catch (e) { return []; }
+    },
+    async createWebhook(body) {
+      var res = await apiFetch("/api/v1/webhooks", { method: "POST", body: body });
+      return { endpoint: res.endpoint, secret: res.secret };
+    },
+    async updateWebhook(id, patch) {
+      return apiFetch("/api/v1/webhooks/" + encodeURIComponent(id), { method: "PATCH", body: patch });
+    },
+    async deleteWebhook(id) {
+      return apiFetch("/api/v1/webhooks/" + encodeURIComponent(id), { method: "DELETE" });
+    },
+    async testWebhook(id) {
+      return apiFetch("/api/v1/webhooks/" + encodeURIComponent(id) + "/test", { method: "POST" });
+    },
+    async listWebhookDeliveries(id) {
+      try {
+        var res = await apiFetch("/api/v1/webhooks/" + encodeURIComponent(id) + "/deliveries");
+        return res.deliveries || [];
+      } catch (e) { return []; }
+    },
+    downloadAuditCsv: function () {
+      // Redirect to the CSV endpoint — cookies auto-attach, browser
+      // saves the response using the Content-Disposition filename.
+      var link = document.createElement("a");
+      link.href = "/api/v1/audit.csv";
+      link.rel = "noopener";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
     },
     async listAudit(opts) {
       // Real audit log — the SPA maps our normalized shape into the

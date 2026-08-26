@@ -81,6 +81,7 @@ model Org {
   auditEntries AuditEntry[]
   invites Invite[]
   apiKeys ApiKey[]
+  webhookEndpoints WebhookEndpoint[]
 
   @@map("orgs")
 }
@@ -355,4 +356,56 @@ model Receipt {
   session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
 
   @@map("receipts")
+}
+
+// An outbound webhook subscription. Operators wire AgentVisor into their
+// Slack channel, PagerDuty routing key, Datadog event stream, or their
+// own internal notification bus. Each endpoint subscribes to one or more
+// event names (policy.block, session.blocked, apikey.created, etc.).
+//
+// Payloads are signed with HMAC-SHA256 over the raw body using `secret`.
+// Consumers verify by computing the same HMAC and constant-time comparing
+// with the X-AgentVisor-Signature header. A ts-nonce anti-replay
+// mechanism sits on the same headers.
+model WebhookEndpoint {
+  id           String   @id @default(cuid())
+  orgId        String
+  name         String
+  url          String
+  secret       String   // random 32-byte hex, shown once on create
+  events       String[] // subscribed event names; ["*"] means everything
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  org        Org               @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  deliveries WebhookDelivery[]
+
+  @@index([orgId])
+  @@map("webhook_endpoints")
+}
+
+// One delivery attempt. Kept for observability so operators can debug
+// "why didn't Slack get the alert?" from the console UI without
+// grepping application logs. Bounded retention TTL is enforced by a
+// background sweeper (7 days by default).
+model WebhookDelivery {
+  id           String   @id @default(cuid())
+  endpointId   String
+  event        String
+  payload      String   @db.Text
+  responseCode Int?
+  responseBody String?  @db.Text
+  attempt      Int      @default(1)
+  status       String   @default("pending") // pending | delivered | failed | retrying
+  errorMessage String?
+  createdAt    DateTime @default(now())
+  deliveredAt  DateTime?
+  nextRetryAt  DateTime?
+
+  endpoint WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+
+  @@index([endpointId, createdAt])
+  @@index([status, nextRetryAt])
+  @@map("webhook_deliveries")
 }

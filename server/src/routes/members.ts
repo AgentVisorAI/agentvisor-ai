@@ -33,6 +33,7 @@ import {
   verifyPassword,
 } from "../lib/auth.js";
 import { writeAudit } from "../lib/audit.js";
+import { dispatchEvent } from "../lib/webhooks.js";
 import { getMailer, inviteMail } from "../lib/mail.js";
 import { requireSession } from "../lib/session-middleware.js";
 
@@ -240,6 +241,18 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       },
       req.log,
     );
+    dispatchEvent({
+      orgId: claims.orgId,
+      event: "member.invited",
+      data: {
+        inviteId: inv.id,
+        email: inv.email,
+        role: inv.role,
+        invitedByEmail: inviter.email,
+        expiresAt: inv.expiresAt.toISOString(),
+      },
+      logger: req.log,
+    });
 
     return reply.code(201).send({
       invite: {

@@ -2409,21 +2409,132 @@
     });
     setTimeout(function () { backdrop.querySelector("#s_name").focus(); }, 20);
   }
-  function renderSettingsWebhooks(root) {
+  async function renderSettingsWebhooks(root) {
+    root.innerHTML = '<div class="card">' + loadingBlock("table") + "</div>";
+    var endpoints;
+    try { endpoints = await state.ds.listWebhooks(); }
+    catch (e) { root.innerHTML = '<div class="card empty"><h3>Could not load webhooks</h3><p>' + esc(e.message || "Try again in a moment.") + '</p></div>'; return; }
+
+    function openAddModal() {
+      var events = ["policy.block", "member.invited", "apikey.created", "apikey.revoked", "webhook.test_fired", "*"];
+      var backdrop = h(
+        '<div class="modal-backdrop" role="dialog" aria-modal="true">' +
+          '<div class="modal">' +
+            '<h2>Add webhook</h2>' +
+            '<p class="sub">Forward events to Slack, PagerDuty, Datadog, or your own endpoint. Payloads are signed with HMAC-SHA256.</p>' +
+            '<label style="display:block;margin-top:12px"><span style="display:block;font-size:12px;color:var(--fg-2);margin-bottom:4px">Name</span>' +
+              '<input type="text" id="whName" placeholder="e.g. Slack #ops" style="width:100%">' +
+            '</label>' +
+            '<label style="display:block;margin-top:12px"><span style="display:block;font-size:12px;color:var(--fg-2);margin-bottom:4px">URL</span>' +
+              '<input type="url" id="whUrl" placeholder="https://hooks.slack.com/services/…" style="width:100%">' +
+            '</label>' +
+            '<div style="margin-top:12px"><div style="font-size:12px;color:var(--fg-2);margin-bottom:4px">Events</div>' +
+              '<div style="display:flex;flex-wrap:wrap;gap:6px" id="whEventsPicker">' +
+                events.map(function (ev) {
+                  return '<label class="pill neutral" style="cursor:pointer;user-select:none"><input type="checkbox" value="' + esc(ev) + '" style="margin-right:6px">' + esc(ev) + '</label>';
+                }).join("") +
+              '</div>' +
+            '</div>' +
+            '<div class="actions">' +
+              '<button type="button" class="btn" data-close>Cancel</button>' +
+              '<button type="button" class="btn primary" id="whSave">Create endpoint</button>' +
+            '</div>' +
+          '</div>' +
+        '</div>',
+      );
+      document.body.appendChild(backdrop);
+      installModalKeys(backdrop);
+      backdrop.querySelectorAll("[data-close]").forEach(function (b) { b.addEventListener("click", function () { backdrop.remove(); }); });
+      backdrop.addEventListener("click", function (e) { if (e.target === backdrop) backdrop.remove(); });
+      $("#whSave", backdrop).addEventListener("click", async function () {
+        var name = $("#whName", backdrop).value.trim();
+        var url = $("#whUrl", backdrop).value.trim();
+        var events = Array.from(backdrop.querySelectorAll("#whEventsPicker input:checked")).map(function (i) { return i.value; });
+        if (!name || !url) { toast("Name and URL are required"); return; }
+        if (!events.length) { toast("Pick at least one event"); return; }
+        try {
+          var res = await state.ds.createWebhook({ name: name, url: url, events: events });
+          backdrop.remove();
+          showTokenModal(res.secret, "Webhook secret");
+          await renderSettingsWebhooks(root);
+        } catch (e) {
+          toast(e && e.message ? e.message : "Could not create webhook");
+        }
+      });
+    }
+
+    if (!endpoints.length) {
+      root.innerHTML =
+        '<div class="card" style="padding:0">' +
+          '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:baseline">' +
+            '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">Webhooks</h2>' +
+            '<span style="margin-left:8px; color:var(--fg-3); font-size:var(--t-sec)">0 endpoints</span>' +
+          "</div>" +
+          '<div style="padding: 24px 16px">' +
+          emptyState("No webhooks yet", "Wire AgentVisor to Slack / PagerDuty / Datadog / your own service. Payloads are HMAC-SHA256 signed.", "+ Add webhook", null, "whAdd") +
+          "</div></div>";
+      $("#whAdd", root).addEventListener("click", openAddModal);
+      return;
+    }
+
+    var rows = endpoints.map(function (e) {
+      return '<tr data-id="' + esc(e.id) + '">' +
+        '<td><div style="font-weight:500">' + esc(e.name) + '</div><div class="id">' + esc(e.id) + '</div></td>' +
+        '<td class="mono" style="font-size:11.5px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(e.url) + '</td>' +
+        '<td style="font-size:12px">' + (e.events || []).map(function (ev) { return '<span class="pill neutral" style="margin-right:4px">' + esc(ev) + '</span>'; }).join("") + '</td>' +
+        '<td>' + (e.isActive ? '<span class="pill ok status-dot">active</span>' : '<span class="pill neutral">paused</span>') + '</td>' +
+        '<td>' +
+          '<button class="btn" data-act="test">Send test</button> ' +
+          '<button class="btn" data-act="toggle">' + (e.isActive ? "Pause" : "Resume") + '</button> ' +
+          '<button class="btn danger" data-act="delete">Delete</button>' +
+        '</td>' +
+      '</tr>';
+    }).join("");
+
     root.innerHTML =
-      '<div class="card">' +
-        "<h2>Webhooks</h2>" +
-        '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 var(--s-4)">Forward events to Slack, PagerDuty, or your own endpoint. Payloads are HMAC-signed.</p>' +
-        '<div class="empty">' +
-          '<div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 8h16M4 16h16M8 4v16M16 4v16"/></svg></div>' +
-          '<h3>No webhooks yet</h3>' +
-          '<p>Wire AgentVisor to your incident-response tools.</p>' +
-          '<button class="btn accent" id="whAdd">+ Add webhook</button>' +
+      '<div class="card" style="padding:0">' +
+        '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:baseline">' +
+          '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">Webhooks</h2>' +
+          '<span style="margin-left:8px; color:var(--fg-3); font-size:var(--t-sec)">' + endpoints.length + " endpoint" + (endpoints.length === 1 ? "" : "s") + "</span>" +
+          '<button class="btn accent" id="whAdd" style="margin-left:auto">+ Add webhook</button>' +
         "</div>" +
+        '<div class="table-wrap"><table>' +
+          "<thead><tr><th>Name</th><th>URL</th><th>Events</th><th>Status</th><th><span class=\"sr-only\">Actions</span></th></tr></thead>" +
+          "<tbody>" + rows + "</tbody>" +
+        "</table></div>" +
       "</div>";
-    var b = $("#whAdd", root);
-    if (b) b.addEventListener("click", function () {
-      openInputModal({ title: "Add webhook", label: "Endpoint URL", placeholder: "https://hooks.example.com/agentvisor", confirmLabel: "Save", onConfirm: function (v) { toast("Webhook saved: " + v.slice(0, 40) + "…"); } });
+
+    $("#whAdd", root).addEventListener("click", openAddModal);
+
+    root.addEventListener("click", async function (e) {
+      var btn = e.target.closest("button[data-act]");
+      if (!btn) return;
+      var tr = btn.closest("tr[data-id]");
+      if (!tr) return;
+      var id = tr.getAttribute("data-id");
+      var act = btn.getAttribute("data-act");
+      var current = endpoints.find(function (x) { return x.id === id; });
+      if (!current) return;
+      if (act === "test") {
+        try { await state.ds.testWebhook(id); toast("Test event fired."); }
+        catch (err) { toast(err.message || "Test failed"); }
+      } else if (act === "toggle") {
+        try {
+          await state.ds.updateWebhook(id, { isActive: !current.isActive });
+          toast(current.isActive ? "Paused." : "Resumed.");
+          await renderSettingsWebhooks(root);
+        } catch (err) { toast(err.message || "Update failed"); }
+      } else if (act === "delete") {
+        confirmModal({
+          title: "Delete this webhook?",
+          body: "The endpoint and its delivery history will be permanently removed.",
+          confirmLabel: "Delete", danger: true,
+          onConfirm: async function () {
+            try { await state.ds.deleteWebhook(id); toast("Deleted."); await renderSettingsWebhooks(root); }
+            catch (err) { toast(err.message || "Delete failed"); }
+          },
+        });
+      }
     });
   }
   function renderSettingsBilling(root) {
@@ -2440,34 +2551,43 @@
   async function renderSettingsAudit(root) {
     root.innerHTML = '<div class="card">' + loadingBlock("table") + "</div>";
     var audit = await state.ds.listAudit();
+    var header =
+      '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:baseline">' +
+        '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">Audit log</h2>' +
+        '<span style="margin-left:8px; color:var(--fg-3); font-size:var(--t-sec)">' + (audit.length || 0) + " event" + (audit.length === 1 ? "" : "s") + "</span>" +
+        '<button class="btn" id="auditExportBtn" style="margin-left:auto">↓ Export CSV</button>' +
+      "</div>";
     if (!audit.length) {
       root.innerHTML =
-        '<div class="card" style="padding:0">' +
-          '<div style="padding:12px 16px; border-bottom:1px solid var(--border)">' +
-            '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">Audit log</h2>' +
-          "</div>" +
+        '<div class="card" style="padding:0">' + header +
           '<div style="padding: 24px 16px">' +
           emptyState("No audit entries yet", "Sign-ins, deployment rotations, policy changes, and receipt verifications will appear here as your team uses the console.") +
           "</div></div>";
-      return;
+    } else {
+      var rows = audit.map(function (a) {
+        return '<tr><td class="mono" style="color:var(--fg-3); font-size:11.5px; white-space:nowrap">' + esc(new Date(a.at).toLocaleString()) + '</td>' +
+          '<td><span style="font-weight:500">' + esc(a.event) + "</span></td>" +
+          "<td>" + esc(a.actor) + "</td>" +
+          "<td>" + esc(a.target || "—") + "</td>" +
+          '<td style="color: var(--fg-2)">' + esc(a.note || "") + "</td></tr>";
+      }).join("");
+      root.innerHTML =
+        '<div class="card" style="padding:0">' + header +
+          '<div class="table-wrap"><table>' +
+            "<thead><tr><th>When</th><th>Event</th><th>Actor</th><th>Target</th><th>Note</th></tr></thead>" +
+            "<tbody>" + rows + "</tbody>" +
+          "</table></div>" +
+        "</div>";
     }
-    var rows = audit.map(function (a) {
-      return '<tr><td class="mono" style="color:var(--fg-3); font-size:11.5px; white-space:nowrap">' + esc(new Date(a.at).toLocaleString()) + '</td>' +
-        '<td><span style="font-weight:500">' + esc(a.event) + "</span></td>" +
-        "<td>" + esc(a.actor) + "</td>" +
-        "<td>" + esc(a.target || "—") + "</td>" +
-        '<td style="color: var(--fg-2)">' + esc(a.note || "") + "</td></tr>";
-    }).join("");
-    root.innerHTML =
-      '<div class="card" style="padding:0">' +
-        '<div style="padding:12px 16px; border-bottom:1px solid var(--border)">' +
-          '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">Audit log</h2>' +
-        "</div>" +
-        '<div class="table-wrap"><table>' +
-          "<thead><tr><th>When</th><th>Event</th><th>Actor</th><th>Target</th><th>Note</th></tr></thead>" +
-          "<tbody>" + rows + "</tbody>" +
-        "</table></div>" +
-      "</div>";
+    var exp = $("#auditExportBtn", root);
+    if (exp) exp.addEventListener("click", function () {
+      // Real download in api mode; toast in mock.
+      if (state.ds.downloadAuditCsv) {
+        state.ds.downloadAuditCsv();
+      } else {
+        toast("CSV export not available in demo mode.");
+      }
+    });
   }
   function renderSettingsBilling_OLD_UNUSED(root) {
     root.innerHTML =

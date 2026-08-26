@@ -395,4 +395,66 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
       nextCursor,
     });
   });
+
+  // GET /audit.csv — streaming CSV export of the org's audit log for
+  // SOC-2 evidence collection or manual grepping. Streams up to 10k
+  // rows in a single response (roughly 3 months of activity for a
+  // moderately busy tenant). Larger exports paginate via ?before=<ts>.
+  //
+  // We stream row-by-row rather than accumulate a big string so a
+  // 10k-row export doesn't spike Node's heap.
+  app.get<{ Querystring: { before?: string } }>(
+    "/audit.csv",
+    async (req, reply) => {
+      const claims = requireSession(req, reply);
+      if (!claims) return;
+      const before = req.query.before ? new Date(req.query.before) : new Date();
+      if (isNaN(before.getTime())) {
+        return reply.code(400).send({ error: "invalid_before" });
+      }
+      const rows = await db.auditEntry.findMany({
+        where: { orgId: claims.orgId, at: { lt: before } },
+        orderBy: [{ at: "desc" }, { id: "desc" }],
+        take: 10_000,
+        select: {
+          at: true,
+          event: true,
+          actorEmail: true,
+          actorId: true,
+          target: true,
+          ip: true,
+          note: true,
+          metadata: true,
+        },
+      });
+      reply.header("Content-Type", "text/csv; charset=utf-8");
+      const fname = `agentvisor-audit-${claims.orgId}-${new Date()
+        .toISOString()
+        .replace(/[:.]/g, "-")}.csv`;
+      reply.header("Content-Disposition", `attachment; filename="${fname}"`);
+      const escape = (v: unknown): string => {
+        if (v === null || v === undefined) return "";
+        const s = typeof v === "string" ? v : JSON.stringify(v);
+        // RFC 4180: any field containing " , or newline must be quoted;
+        // embedded quotes are doubled.
+        if (/[",\n\r]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+        return s;
+      };
+      let out = "at,event,actor,target,ip,note,metadata\n";
+      for (const r of rows) {
+        const actor = r.actorEmail || (r.actorId ? "user:" + r.actorId : "system");
+        out += [
+          r.at.toISOString(),
+          escape(r.event),
+          escape(actor),
+          escape(r.target),
+          escape(r.ip),
+          escape(r.note),
+          escape(r.metadata),
+        ].join(",");
+        out += "\n";
+      }
+      return reply.send(out);
+    },
+  );
 }

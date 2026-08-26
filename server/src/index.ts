@@ -24,6 +24,8 @@ import { readRoutes } from "./routes/read.js";
 import { samlRoutes } from "./routes/saml.js";
 import { streamRoutes } from "./routes/stream.js";
 import { webauthnRoutes } from "./routes/webauthn.js";
+import { webhookRoutes } from "./routes/webhooks.js";
+import { startWebhookSweeper, stopWebhookSweeper } from "./lib/webhooks.js";
 
 // `types.d.ts` declares the `request.session` typing. It's picked up by the
 // TypeScript compiler via `include`, no runtime import required.
@@ -462,6 +464,9 @@ async function main(): Promise<void> {
   await app.register(async (r) => r.register(apiKeyRoutes), {
     prefix: "/api/v1/keys",
   });
+  await app.register(async (r) => r.register(webhookRoutes), {
+    prefix: "/api/v1/webhooks",
+  });
   await app.register(async (r) => r.register(deploymentRoutes), {
     prefix: "/api/v1/deployments",
   });
@@ -496,13 +501,15 @@ async function main(): Promise<void> {
   const bridgeUp = await bus.connectPgBridge();
   app.log.info({ bridgeUp }, "pg listen/notify bridge status");
 
-  // Graceful shutdown — Fly/Cloud Run/Kubernetes all send SIGTERM before
-  // the hard kill window. Close the HTTP server (drains in-flight requests),
-  // release the bus sockets, disconnect Prisma, then exit. Target:
-  // sub-second in the common case.
+  // Start the webhook retry sweeper. 15s cadence; scans for
+  // status='retrying' deliveries whose nextRetryAt has passed and
+  // re-fires them. Idempotent — safe against double-registration.
+  startWebhookSweeper(app.log);
+
   const shutdown = async (signal: string) => {
     app.log.info({ signal }, "graceful shutdown starting");
     try {
+      stopWebhookSweeper();
       await app.close();
       await bus.close();
     } catch (err) {
