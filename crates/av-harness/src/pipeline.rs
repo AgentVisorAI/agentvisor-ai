@@ -1127,6 +1127,23 @@ impl AppState {
              bridge). A steady rate > 0 requires operator investigation \
              of the coincident session id.",
         );
+        // Shutdown-time per-session close deadline counter. Fires
+        // when the shutdown-path close_session (main.rs
+        // finalize_sessions loop) hits its 3 s per-session deadline
+        // — distinct from `av_idle_close_timeouts_total` (steady-
+        // state idle sweep) and `av_http_shutdown_drain_timeouts_
+        // total` (outer HTTP-drain phase). Pre-registration matches
+        // the discipline for the rest of this block: a lazy
+        // `rate() > 0` alert would miss the FIRST fire on the very
+        // shutdown that surfaces the class.
+        metrics.counter(
+            "av_shutdown_session_close_timeouts_total",
+            "Per-session close hit the shutdown-time per-session deadline (3 s) \
+             and was deferred to restart-time spool recovery. A sustained rate > 0 \
+             on every rollout indicates a class of sessions that regularly hang \
+             their close; the coincident session id in the shutdown warn log is the \
+             correlation key. Distinct from av_http_shutdown_drain_timeouts_total.",
+        );
         // Per-tick recovery-scan cap counter. Every recovery pass that
         // walks `read_dir` yields after `MAX_RECOVERY_ENTRIES_PER_TICK`
         // entries so a poisoned spool (millions of stale files) does
