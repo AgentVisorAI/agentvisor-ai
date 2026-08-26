@@ -45,7 +45,41 @@ const MAX_ATIF_RECOVERY_BYTES: u64 = 256 * 1024 * 1024;
 /// filesystem-defined, so a stable order across ticks is not
 /// promised — the invariant is only that every entry present on
 /// disk is EVENTUALLY visited across enough ticks).
+/// Real-work cap: after this many entries have PASSED the pass's
+/// extension filter (i.e., are candidates for the pass's actual
+/// work), stop and resume on the next tick. Prevents ONE pass from
+/// burning all reconciler-tick budget on a single legitimate burst.
 pub(crate) const MAX_RECOVERY_ENTRIES_PER_TICK: usize = 10_000;
+
+/// Wall-time cap: after this many TOTAL directory entries have been
+/// visited (regardless of extension), stop even if the real-work
+/// cap hasn't fired. Bounds the wall-clock cost of a single tick
+/// when the spool is packed with wrong-extension entries (attacker-
+/// planted `.junk`, orphaned `.close-complete` markers under the
+/// default `atif_retention_days = None` posture, etc.) that no
+/// pass will remove. Without this second cap, an attacker who
+/// plants a million wrong-extension entries starves the pass's
+/// wall-clock budget on every tick even though the "real work" cap
+/// never fires — the tick still burns 1-3 seconds walking dirents,
+/// which knocks the sibling passes off their tick schedule.
+///
+/// The 10× ratio to `MAX_RECOVERY_ENTRIES_PER_TICK` matches
+/// observed dirent-read throughput on modern kernels (~100k-1M
+/// entries/second on ext4/xfs/tmpfs); 100 000 dirents = 100 ms
+/// upper bound on unloaded hardware.
+///
+/// Note: this cap does NOT close the persistent-cursor gap. On a
+/// filesystem with deterministic `readdir` ordering (ext4, xfs,
+/// tmpfs), a spool where the first `MAX_RECOVERY_DIRENTS_PER_TICK`
+/// entries are all wrong-extension junk that no pass will remove
+/// leaves legitimate files at position > cap PERMANENTLY
+/// unreachable. The operator-facing mitigation is documented in
+/// OPERATIONS.md: a sustained rate on
+/// `av_recovery_scan_capped_total` requires an operator to
+/// quarantine the offending files. A future audit round can add
+/// a persistent scan cursor if this class becomes exploitable in
+/// practice.
+pub(crate) const MAX_RECOVERY_DIRENTS_PER_TICK: usize = 100_000;
 
 /// Emit the per-tick scan-cap counter for `pass_label` and log a
 /// single warn line so operators can observe the class from
@@ -56,7 +90,12 @@ pub(crate) const MAX_RECOVERY_ENTRIES_PER_TICK: usize = 10_000;
 /// counters — a lazy `rate(av_recovery_scan_capped_total) > 0` alert
 /// cannot distinguish "never fired" from "never registered", so the
 /// FIRST fire that the guardrail exists to catch would slip past).
-pub(crate) fn bump_recovery_scan_cap(metrics: &Registry, pass_label: &'static str, examined: usize) {
+pub(crate) fn bump_recovery_scan_cap(
+    metrics: &Registry,
+    pass_label: &'static str,
+    examined: usize,
+    dirents_seen: usize,
+) {
     metrics
         .counter(
             &format!("av_recovery_scan_capped_total{{pass=\"{pass_label}\"}}"),
@@ -69,7 +108,9 @@ pub(crate) fn bump_recovery_scan_cap(metrics: &Registry, pass_label: &'static st
     tracing::warn!(
         pass = %pass_label,
         examined,
-        cap = MAX_RECOVERY_ENTRIES_PER_TICK,
+        dirents_seen,
+        work_cap = MAX_RECOVERY_ENTRIES_PER_TICK,
+        dirent_cap = MAX_RECOVERY_DIRENTS_PER_TICK,
         "recovery pass hit per-tick scan cap; resuming next tick"
     );
 }
@@ -1430,10 +1471,11 @@ impl Finalizer {
             .collect();
         let mut recovered = 0usize;
         let mut examined = 0usize;
+        let mut dirents_seen = 0usize;
         while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::atif_source)? {
-            examined = examined.saturating_add(1);
-            if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
-                bump_recovery_scan_cap(&self.metrics, "adopt_strict_atif", examined);
+            dirents_seen = dirents_seen.saturating_add(1);
+            if dirents_seen > MAX_RECOVERY_DIRENTS_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "adopt_strict_atif", examined, dirents_seen);
                 break;
             }
             let path = entry.path();
@@ -1450,6 +1492,15 @@ impl Finalizer {
                 .is_some_and(|name| name.ends_with(".session.json"))
             {
                 continue;
+            }
+            // Real-work cap: count only entries that made it past the
+            // extension + `.session.json` filter, so wrong-extension
+            // junk cannot consume the pass's real-work budget for
+            // this tick.
+            examined = examined.saturating_add(1);
+            if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "adopt_strict_atif", examined, dirents_seen);
+                break;
             }
             // The session is already in the
             // registry — adoption would skip it after an expensive
@@ -1960,10 +2011,11 @@ impl Finalizer {
         };
         let mut recovered = 0usize;
         let mut examined = 0usize;
+        let mut dirents_seen = 0usize;
         while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::atif_source)? {
-            examined = examined.saturating_add(1);
-            if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
-                bump_recovery_scan_cap(&self.metrics, "recover_signed_journals", examined);
+            dirents_seen = dirents_seen.saturating_add(1);
+            if dirents_seen > MAX_RECOVERY_DIRENTS_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "recover_signed_journals", examined, dirents_seen);
                 break;
             }
             let metadata_path = entry.path();
@@ -1973,6 +2025,11 @@ impl Finalizer {
             let Some(stem) = name.strip_suffix(".session.json") else {
                 continue;
             };
+            examined = examined.saturating_add(1);
+            if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "recover_signed_journals", examined, dirents_seen);
+                break;
+            }
             // per-candidate body wrapped in an inner
             // async block so every `?` and `return Err(...)` inside
             // gets caught by the outer match instead of propagating
@@ -2396,10 +2453,11 @@ impl Finalizer {
             Err(error) => return Err(FinalizeError::atif_source(error)),
         };
         let mut examined = 0usize;
+        let mut dirents_seen = 0usize;
         while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::atif_source)? {
-            examined = examined.saturating_add(1);
-            if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
-                bump_recovery_scan_cap(&self.metrics, "consolidate_step_journals", examined);
+            dirents_seen = dirents_seen.saturating_add(1);
+            if dirents_seen > MAX_RECOVERY_DIRENTS_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "consolidate_step_journals", examined, dirents_seen);
                 break;
             }
             let metadata_path = entry.path();
@@ -2409,6 +2467,11 @@ impl Finalizer {
             let Some(stem) = name.strip_suffix(".session.json") else {
                 continue;
             };
+            examined = examined.saturating_add(1);
+            if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "consolidate_step_journals", examined, dirents_seen);
+                break;
+            }
             // Twin of the recover_signed_journals fix:
             // wrap the per-candidate body so per-session errors
             // warn+continue instead of aborting the whole
@@ -3113,15 +3176,21 @@ impl Finalizer {
         };
         let mut promoted = 0usize;
         let mut examined = 0usize;
+        let mut dirents_seen = 0usize;
         while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::atif_source)? {
-            examined = examined.saturating_add(1);
-            if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
-                bump_recovery_scan_cap(&self.metrics, "retry_marked_promotions", examined);
+            dirents_seen = dirents_seen.saturating_add(1);
+            if dirents_seen > MAX_RECOVERY_DIRENTS_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "retry_marked_promotions", examined, dirents_seen);
                 break;
             }
             let path = entry.path();
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("promote") {
                 continue;
+            }
+            examined = examined.saturating_add(1);
+            if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "retry_marked_promotions", examined, dirents_seen);
+                break;
             }
             // Previously any read failure or MAC-verify
             // failure aborted the entire retry pass via `?`. One
@@ -3676,15 +3745,21 @@ impl Finalizer {
             Err(error) => return Err(FinalizeError::bridge_source(error)),
         };
         let mut examined = 0usize;
+        let mut dirents_seen = 0usize;
         while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::bridge_source)? {
-            examined = examined.saturating_add(1);
-            if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
-                bump_recovery_scan_cap(&self.metrics, "remove_acked_outboxes", examined);
+            dirents_seen = dirents_seen.saturating_add(1);
+            if dirents_seen > MAX_RECOVERY_DIRENTS_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "remove_acked_outboxes", examined, dirents_seen);
                 break;
             }
             let path = entry.path();
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
                 continue;
+            }
+            examined = examined.saturating_add(1);
+            if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "remove_acked_outboxes", examined, dirents_seen);
+                break;
             }
             let sealed = match read_capped_async(path.clone(), av_core::fsutil::MAX_CONTROL_BYTES).await {
                 Ok(bytes) => bytes,
@@ -4031,15 +4106,21 @@ pub(crate) async fn replay_lifecycle_outboxes_in(
     };
     let mut replayed = 0usize;
     let mut examined = 0usize;
+    let mut dirents_seen = 0usize;
     while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::bridge_source)? {
-        examined = examined.saturating_add(1);
-        if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
-            bump_recovery_scan_cap(metrics, "replay_lifecycle_outboxes", examined);
+        dirents_seen = dirents_seen.saturating_add(1);
+        if dirents_seen > MAX_RECOVERY_DIRENTS_PER_TICK {
+            bump_recovery_scan_cap(metrics, "replay_lifecycle_outboxes", examined, dirents_seen);
             break;
         }
         let path = entry.path();
         if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
             continue;
+        }
+        examined = examined.saturating_add(1);
+        if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
+            bump_recovery_scan_cap(metrics, "replay_lifecycle_outboxes", examined, dirents_seen);
+            break;
         }
         let sealed = match read_capped_async(path.clone(), av_core::fsutil::MAX_CONTROL_BYTES).await {
             Ok(bytes) => bytes,
@@ -4388,6 +4469,23 @@ async fn resolve_lifecycle_ack(
 /// the "empty" is actually "torn and moved out for post-mortem" and
 /// the metadata must be preserved (or quarantined itself) rather
 /// than removed.
+/// Search the spool directory for a `{stem}.events.ndjson.corrupt-<uid>`
+/// sibling that a prior quarantine pass wrote. Used by the empty-
+/// journal branches of `consolidate_step_journals` /
+/// `recover_signed_journals` to decide whether the empty
+/// `.events.ndjson` reflects a completed quarantine (safe to delete
+/// the metadata) or a legitimate not-yet-written state (must
+/// preserve).
+///
+/// The scan is bounded by `MAX_RECOVERY_DIRENTS_PER_TICK`. If the
+/// cap fires before a match is found, return `Err(...)` instead of
+/// `Ok(false)`: the caller uses `!quarantine_sibling_exists(...)`
+/// to gate a metadata delete, so a false negative under the cap
+/// would DATA-LOSS the metadata even though the corrupt sibling
+/// exists past the cap. The caller propagates the Err via `?` and
+/// the outer pass retries on the next tick. If the poisoned spool
+/// persists across ticks, the affected session lingers rather than
+/// losing evidence — the strictly safer failure direction.
 async fn quarantine_sibling_exists(spool_dir: &std::path::Path, stem: &str) -> Result<bool, FinalizeError> {
     let prefix = format!("{stem}.events.ndjson.corrupt-");
     let spool_dir = spool_dir.to_path_buf();
@@ -4397,7 +4495,16 @@ async fn quarantine_sibling_exists(spool_dir: &std::path::Path, stem: &str) -> R
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(FinalizeError::atif_source(error)),
         };
+        let mut examined = 0usize;
         for entry in entries {
+            examined = examined.saturating_add(1);
+            if examined > MAX_RECOVERY_DIRENTS_PER_TICK {
+                return Err(FinalizeError::atif_source(std::io::Error::other(format!(
+                    "quarantine_sibling scan exceeded {MAX_RECOVERY_DIRENTS_PER_TICK} \
+                     entries without finding {prefix}* — spool is over-populated; \
+                     preserving metadata rather than risking data loss"
+                ))));
+            }
             let entry = entry.map_err(FinalizeError::atif_source)?;
             let name = entry.file_name();
             if let Some(name) = name.to_str() {
@@ -7678,13 +7785,15 @@ mod tests {
         );
     }
 
-    /// A recovery pass with more entries than the per-tick cap must
-    /// return early and bump `av_recovery_scan_capped_total{pass=…}`
-    /// exactly once. Prevents the class where a poisoned spool
-    /// (millions of stale files) starves every OTHER recovery pass
-    /// on every tick — the reconciler's tick budget is finite.
+    /// R25 (review of R24): two-tier cap. The DIRENTS cap fires on
+    /// total-directory-entries (regardless of extension) so a spool
+    /// packed with wrong-extension junk can't run wall-time
+    /// unbounded; the ENTRIES cap fires on entries that passed the
+    /// extension filter so wrong-extension junk can't consume real
+    /// work budget. Both caps target the same counter, so a single
+    /// increment fires when EITHER cap breaches.
     #[tokio::test]
-    async fn recovery_scan_cap_returns_early_and_bumps_counter() {
+    async fn recovery_scan_dirent_cap_returns_early_on_wrong_extension_flood() {
         let temp = tempfile::tempdir().unwrap();
         let spool = temp.path().to_path_buf();
         let metrics = Arc::new(Registry::new());
@@ -7694,16 +7803,12 @@ mod tests {
             Arc::clone(&metrics),
         );
 
-        // `adopt_strict_atif_artifacts` is the cheapest to poison: it
-        // walks `spool_dir` looking at anything ending in `.json`, so
-        // MAX_RECOVERY_ENTRIES_PER_TICK + 1 zero-byte files with any
-        // hex-hash-ish stem trigger the cap without needing sealed
-        // metadata. Each file is one entry the scan visits before the
-        // extension check even runs.
-        let overshoot = MAX_RECOVERY_ENTRIES_PER_TICK + 100;
-        // The stem shape doesn't matter — the loop counts EVERY
-        // read_dir entry, not just parseable ones. Use short numeric
-        // filenames to keep filesystem-op cost low.
+        // Plant MAX_RECOVERY_DIRENTS_PER_TICK + 100 wrong-extension
+        // entries. These do NOT reach the pass's real work
+        // (extension != "json"), so they don't consume `examined`,
+        // but they DO consume `dirents_seen` and must fire the
+        // dirent cap.
+        let overshoot = MAX_RECOVERY_DIRENTS_PER_TICK + 100;
         for i in 0..overshoot {
             std::fs::write(spool.join(format!("junk-{i}.junk")), b"").unwrap();
         }
@@ -7714,17 +7819,60 @@ mod tests {
             .adopt_strict_atif_artifacts(&sessions, &breaker)
             .await
             .expect("scan returns cleanly on cap-hit, not error");
-        assert_eq!(
-            recovered, 0,
-            "no artifacts to adopt (all files have the wrong extension)"
-        );
+        assert_eq!(recovered, 0, "wrong-extension entries are never adopted");
 
-        // Scrape /metrics-format text and assert the labelled counter
-        // saw exactly one increment.
         let scrape = metrics.render();
         assert!(
             scrape.contains("av_recovery_scan_capped_total{pass=\"adopt_strict_atif\"} 1"),
-            "cap counter must fire exactly once on the overshoot tick; got scrape:\n{scrape}"
+            "dirent cap must fire exactly once on wrong-extension flood; got scrape:\n{scrape}"
+        );
+    }
+
+    /// R25: the ENTRIES cap fires on entries that PASSED the
+    /// extension filter — legitimate matching artifacts beyond the
+    /// per-tick real-work cap are deferred to the next tick. This
+    /// separates "wrong-extension junk" (wall-time bounded by the
+    /// dirent cap) from "matching artifacts under legitimate load"
+    /// (real-work bounded by the entries cap).
+    #[tokio::test]
+    async fn recovery_scan_entries_cap_fires_on_matching_entries_flood() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().to_path_buf();
+        let metrics = Arc::new(Registry::new());
+        let finalizer = Finalizer::new(
+            Arc::new(Ed25519Signer::from_seed(&[7; 32])),
+            spool.clone(),
+            Arc::clone(&metrics),
+        );
+
+        // Plant MAX_RECOVERY_ENTRIES_PER_TICK + 100 files that pass
+        // the `.json` extension filter but fail the `.session.json`
+        // secondary filter (so they DO consume the entries cap, but
+        // don't need to be sealed metadata to reach that point).
+        // `adopt_strict_atif_artifacts` counts them, hits the
+        // per-tick entries cap, breaks, bumps counter.
+        let overshoot = MAX_RECOVERY_ENTRIES_PER_TICK + 100;
+        for i in 0..overshoot {
+            // Legitimately-shaped .json files (not .session.json)
+            // that fail deeper validation → each one consumes
+            // exactly one `examined` slot before falling through
+            // to the read+parse+validate path where an empty file
+            // errors out (warn+continue in adopt_strict_atif).
+            let stem = format!("{:032x}", i);
+            std::fs::write(spool.join(format!("{stem}.json")), b"").unwrap();
+        }
+
+        let sessions = SessionRegistry::new();
+        let breaker = av_loopdetect::BreakerConfig::default();
+        let _ = finalizer
+            .adopt_strict_atif_artifacts(&sessions, &breaker)
+            .await
+            .expect("scan returns cleanly on cap-hit, not error");
+
+        let scrape = metrics.render();
+        assert!(
+            scrape.contains("av_recovery_scan_capped_total{pass=\"adopt_strict_atif\"} 1"),
+            "entries cap must fire exactly once on matching flood; got scrape:\n{scrape}"
         );
     }
 }

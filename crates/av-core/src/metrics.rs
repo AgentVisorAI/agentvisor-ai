@@ -445,6 +445,21 @@ impl Registry {
                     if declared.insert(base.to_owned()) {
                         out.push_str(&format!("# HELP {base} {help}\n# TYPE {base} histogram\n"));
                     }
+                    // Snapshot the count ONCE before rendering either
+                    // the `+Inf` bucket or the `_count` line. `count()`
+                    // is a live atomic load; a concurrent `observe_us`
+                    // completing between the two loads would render
+                    // `_count = N+1` alongside `bucket{le="+Inf"} = N`,
+                    // violating the Prometheus text-format invariant
+                    // `_count == cum(bucket{le="+Inf"})`. Strict
+                    // OpenMetrics parsers reject the divergent scrape;
+                    // Prometheus 2.x is lenient but
+                    // `histogram_quantile` computes against the +Inf
+                    // bucket while summary panels display `_count`,
+                    // producing off-by-one quantile artifacts on hot
+                    // histograms (`av_upstream_latency_seconds`,
+                    // `av_request_duration_seconds{route="chat"}`).
+                    let count_snapshot = h.count();
                     let mut cum = 0u64;
                     for (i, b) in h.bounds_us.iter().enumerate() {
                         cum += h.buckets.get(i).map_or(0, |x| x.load(Ordering::Relaxed));
@@ -455,9 +470,8 @@ impl Registry {
                         ));
                     }
                     out.push_str(&format!(
-                        "{base}_bucket{{{}le=\"+Inf\"}} {}\n",
+                        "{base}_bucket{{{}le=\"+Inf\"}} {count_snapshot}\n",
                         join_labels(labels),
-                        h.count()
                     ));
                     let sum_s = (h.sum_us.load(Ordering::Relaxed) as f64) / 1_000_000.0;
                     out.push_str(&format!(
@@ -465,8 +479,7 @@ impl Registry {
                         labels_block = labels_suffix(labels)
                     ));
                     out.push_str(&format!(
-                        "{base}_count{labels_block} {}\n",
-                        h.count(),
+                        "{base}_count{labels_block} {count_snapshot}\n",
                         labels_block = labels_suffix(labels)
                     ));
                 }
@@ -780,6 +793,71 @@ mod tests {
         assert!(text.contains("av_lat_bucket{le=\"0.001\"} 3"), "{text}");
         assert!(text.contains("av_lat_bucket{le=\"+Inf\"} 3"), "{text}");
         assert!(text.contains("av_lat_count 3"), "{text}");
+    }
+
+    /// Prometheus text format requires `_count == cum(bucket{le="+Inf"})`.
+    /// Pre-fix, the render read `h.count()` TWICE — once for the `+Inf`
+    /// bucket, once for the `_count` line — with `sum_us.load(...)` in
+    /// between. A concurrent `observe_us` completing between the two
+    /// loads left the scrape with `_count = N+1` and `+Inf = N`, which
+    /// strict OpenMetrics parsers reject and `histogram_quantile`
+    /// interprets as off-by-one quantile artifacts. Hammer both a
+    /// writer and a reader in parallel and assert the invariant on
+    /// EVERY scrape.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn histogram_scrape_is_atomic_between_count_and_inf_bucket() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let r = Arc::new(Registry::new());
+        let h = r.histogram("av_race", "concurrent scrape probe");
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let writer = {
+            let h = h.clone();
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    h.observe_us(42);
+                }
+            })
+        };
+
+        // Read many scrapes and assert the invariant on each.
+        let start = std::time::Instant::now();
+        let mut scrapes = 0usize;
+        while start.elapsed() < std::time::Duration::from_millis(200) {
+            let text = r.render();
+            // Extract the `+Inf` bucket value.
+            let inf_line = text
+                .lines()
+                .find(|line| line.starts_with("av_race_bucket") && line.contains("le=\"+Inf\""))
+                .expect("+Inf bucket line missing");
+            let inf_count: u64 = inf_line
+                .rsplit(' ')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .expect("failed to parse +Inf bucket count");
+            let count_line = text
+                .lines()
+                .find(|line| line.starts_with("av_race_count"))
+                .expect("_count line missing");
+            let total: u64 = count_line
+                .rsplit(' ')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .expect("failed to parse _count value");
+            assert_eq!(
+                inf_count, total,
+                "invariant violated: bucket{{le=+Inf}}={inf_count} but _count={total} on scrape {scrapes}"
+            );
+            scrapes = scrapes.saturating_add(1);
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(scrapes > 100, "should have taken > 100 scrapes; got {scrapes}");
     }
 
     #[test]
