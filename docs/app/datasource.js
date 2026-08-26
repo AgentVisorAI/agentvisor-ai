@@ -128,6 +128,36 @@
     { id: "key_ops", name: "Ops dashboard", createdAt: iso(3 * 24 * HOUR), lastUsedAt: iso(6 * HOUR), hint: "av_srv_c412…" },
   ];
 
+  var MOCK_WEBHOOKS = [
+    {
+      id: "wh_slack_ops",
+      name: "Slack #ops",
+      url: "https://hooks.slack.com/services/T5H2G3F/B7Q9R2X/vgFKm2XQ3s",
+      events: ["policy.block", "webhook.test_fired"],
+      isActive: true,
+      createdAt: iso(21 * 24 * HOUR),
+      updatedAt: iso(2 * 24 * HOUR),
+    },
+    {
+      id: "wh_pd_oncall",
+      name: "PagerDuty on-call",
+      url: "https://events.pagerduty.com/v2/enqueue",
+      events: ["policy.block"],
+      isActive: true,
+      createdAt: iso(10 * 24 * HOUR),
+      updatedAt: iso(4 * 24 * HOUR),
+    },
+    {
+      id: "wh_dd_events",
+      name: "Datadog events",
+      url: "https://api.datadoghq.com/api/v1/events",
+      events: ["*"],
+      isActive: false,
+      createdAt: iso(45 * 24 * HOUR),
+      updatedAt: iso(12 * 24 * HOUR),
+    },
+  ];
+
   /* ============================================================
    * DEPLOYMENTS
    * ============================================================ */
@@ -995,12 +1025,35 @@
       await delay(120);
       MOCK_API_KEYS = MOCK_API_KEYS.filter(function (r) { return r.id !== id; });
     },
-    async listWebhooks() { await delay(80); return []; },
-    async createWebhook() { await delay(150); return { endpoint: { id: "wh_demo", name: "Slack #ops", url: "https://hooks.slack.com/…", events: ["policy.block"], isActive: true }, secret: "demo_secret_" + Math.random().toString(36).slice(2, 18) }; },
-    async updateWebhook() { await delay(80); },
-    async deleteWebhook() { await delay(80); },
-    async testWebhook() { await delay(80); },
-    async listWebhookDeliveries() { await delay(80); return []; },
+    async listWebhooks() { await delay(80); return MOCK_WEBHOOKS.slice(); },
+    async createWebhook(body) {
+      await delay(180);
+      var row = {
+        id: "wh_" + Math.random().toString(36).slice(2, 8),
+        name: body.name, url: body.url, events: body.events || [], isActive: true,
+        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      };
+      MOCK_WEBHOOKS.unshift(row);
+      return { endpoint: row, secret: "whsec_" + Math.random().toString(36).slice(2, 34) };
+    },
+    async updateWebhook(id, patch) {
+      await delay(120);
+      MOCK_WEBHOOKS = MOCK_WEBHOOKS.map(function (w) { return w.id === id ? Object.assign({}, w, patch, { updatedAt: new Date().toISOString() }) : w; });
+    },
+    async deleteWebhook(id) {
+      await delay(100);
+      MOCK_WEBHOOKS = MOCK_WEBHOOKS.filter(function (w) { return w.id !== id; });
+    },
+    async testWebhook() { await delay(90); },
+    async listWebhookDeliveries(id) {
+      await delay(80);
+      var now = Date.now();
+      return [
+        { id: "d1", event: "policy.block", status: "delivered", attempt: 1, responseCode: 200, createdAt: new Date(now - 3 * MIN).toISOString(), deliveredAt: new Date(now - 3 * MIN + 340).toISOString() },
+        { id: "d2", event: "policy.block", status: "delivered", attempt: 1, responseCode: 200, createdAt: new Date(now - 47 * MIN).toISOString(), deliveredAt: new Date(now - 47 * MIN + 210).toISOString() },
+        { id: "d3", event: "policy.block", status: "delivered", attempt: 2, responseCode: 200, createdAt: new Date(now - 6 * HOUR).toISOString(), deliveredAt: new Date(now - 6 * HOUR + 32_500).toISOString(), errorMessage: "server_error_502 (attempt 1)" },
+      ];
+    },
     async getRetention() { await delay(80); return { retention: { sessionRetentionDays: 90, auditRetentionDays: 365 } }; },
     async updateRetention() { await delay(80); },
     async retentionSweepNow() { await delay(120); return { result: { sessionsPurged: 0, auditPurged: 0, webhookDeliveriesPurged: 0 } }; },
