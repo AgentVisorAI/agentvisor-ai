@@ -31,6 +31,7 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { isIP } from "node:net";
 import { promises as dns } from "node:dns";
+import { Agent, fetch as undiciFetch } from "undici";
 import type { FastifyBaseLogger } from "fastify";
 import { db } from "../db.js";
 import { env } from "../env.js";
@@ -262,43 +263,140 @@ async function deliverOne(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), DELIVERY_TIMEOUT_MS);
 
-  // R76 HIGH #2: re-validate the URL immediately before the fetch
-  // to close the DNS-rebinding TOCTOU. Prior shape resolved DNS
-  // only at config-create/patch time (`validateWebhookUrl` in the
-  // create/update handlers). An attacker with a fast-TTL DNS name
-  // pointed at a public IP at create time could flip authoritative
-  // DNS to `169.254.169.254` (or any RFC1918 range) between
-  // config-time and delivery-time. `fetch()` then re-resolves
-  // independently, connects to the cloud metadata endpoint, and
-  // reads the response into `respText` — persisted as
-  // `responseBody` and readable by any org member via
-  // `GET /webhooks/:id/deliveries`. This is a cloud-instance
-  // takeover primitive (IAM STS credentials exfil for the pod).
-  //
-  // Re-validating here forces a fresh DNS lookup at delivery time.
-  // A rebinding attacker would have to hit the tiny window between
-  // this DNS lookup and undici's — practically infeasible on most
-  // resolvers (kernel caches, undici's own cache). A hardened
-  // future round should pin the resolved IP via a custom
-  // `undici.Agent` with a fixed `connect` handler, closing the
-  // TOCTOU window entirely.
-  const ssrf = await validateWebhookUrl(url);
-  if (!ssrf.ok) {
+  // R77-defer-1 (landed R78): pin the resolved IP for THIS
+  // delivery so the DNS-rebinding TOCTOU is closed entirely.
+  // Prior R76 shape ran `validateWebhookUrl` immediately
+  // before `fetch`, then let undici do ITS OWN independent
+  // `getaddrinfo` — a fast-authoritative-rebind attacker could
+  // flip the record between our lookup and undici's (ms-scale
+  // window on a resolver that respects TTL=0). Now:
+  //   1. Resolve every A/AAAA for the URL's hostname here.
+  //   2. Refuse if any address is in the blocklist (metadata /
+  //      RFC 1918 / loopback etc.) or if resolution failed.
+  //   3. Build a one-shot `undici.Agent` whose `connect.lookup`
+  //      returns the pre-vetted IP for THIS hostname; any
+  //      other lookup call throws.
+  //   4. Pass the Agent as the fetch `dispatcher`; TLS SNI
+  //      still uses the URL's hostname (correct for cert
+  //      validation), but the TCP connection goes to the
+  //      pinned IP — the DNS record cannot be flipped between
+  //      our check and undici's because undici's lookup IS
+  //      our lookup.
+  //   5. Close the Agent in the `finally` block so per-
+  //      delivery Agents don't leak connection pool state.
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(url);
+  } catch {
     clearTimeout(timer);
     await db.webhookDelivery.update({
       where: { id: deliveryId },
       data: {
         status: "failed",
         responseCode: 0,
-        responseBody: `SSRF re-check failed at delivery time: ${ssrf.reason}`,
+        responseBody: "invalid webhook URL",
         deliveredAt: new Date(),
       },
     });
     return;
   }
+  const hostname = parsedUrl.hostname.toLowerCase();
+  let pinnedAddr: { address: string; family: 4 | 6 } | null = null;
+  if (isIP(hostname)) {
+    // Literal IP — validateWebhookUrl already blocked private
+    // and metadata IPs in `production`. Re-check here for
+    // defence-in-depth and skip the DNS lookup.
+    if (env.NODE_ENV === "production" && isBlockedIp(hostname)) {
+      clearTimeout(timer);
+      await db.webhookDelivery.update({
+        where: { id: deliveryId },
+        data: {
+          status: "failed",
+          responseCode: 0,
+          responseBody: "SSRF re-check failed at delivery time: private_ip_blocked",
+          deliveredAt: new Date(),
+        },
+      });
+      return;
+    }
+    if (hostname === "169.254.169.254" || hostname === "fd00:ec2::254") {
+      clearTimeout(timer);
+      await db.webhookDelivery.update({
+        where: { id: deliveryId },
+        data: {
+          status: "failed",
+          responseCode: 0,
+          responseBody: "SSRF re-check failed at delivery time: blocked_metadata_ip",
+          deliveredAt: new Date(),
+        },
+      });
+      return;
+    }
+    pinnedAddr = { address: hostname, family: isIP(hostname) as 4 | 6 };
+  } else {
+    try {
+      const addrs = await dns.lookup(hostname, { all: true, verbatim: true });
+      if (addrs.length === 0) {
+        throw new Error("unresolvable");
+      }
+      // In production, every returned address must be public.
+      if (env.NODE_ENV === "production") {
+        for (const a of addrs) {
+          if (isBlockedIp(a.address)) {
+            throw new Error(`resolves_to_private_ip:${a.address}`);
+          }
+        }
+      }
+      // Pin the FIRST returned address. Any subsequent lookup for
+      // this hostname (by undici) will return the same value —
+      // no chance for a rebinding attacker to flip the record.
+      pinnedAddr = { address: addrs[0]!.address, family: addrs[0]!.family as 4 | 6 };
+    } catch (err) {
+      clearTimeout(timer);
+      const reason = err instanceof Error ? err.message : String(err);
+      await db.webhookDelivery.update({
+        where: { id: deliveryId },
+        data: {
+          status: "failed",
+          responseCode: 0,
+          responseBody: `SSRF re-check failed at delivery time: ${reason}`,
+          deliveredAt: new Date(),
+        },
+      });
+      return;
+    }
+  }
+
+  const dispatcher = new Agent({
+    connect: {
+      // Pin DNS: any lookup for the target hostname returns the
+      // pre-vetted IP. Any OTHER hostname (shouldn't happen —
+      // fetch is scoped to `url` only, and undici doesn't
+      // follow redirects by default under fetch()) throws so a
+      // regression can't silently re-open the TOCTOU.
+      lookup: (
+        h: string,
+        _opts: unknown,
+        cb: (err: NodeJS.ErrnoException | null, address: string, family: number) => void,
+      ): void => {
+        if (h.toLowerCase() === hostname && pinnedAddr) {
+          cb(null, pinnedAddr.address, pinnedAddr.family);
+        } else {
+          cb(
+            Object.assign(
+              new Error(`unexpected DNS lookup for ${h}; expected ${hostname}`),
+              { code: "ENOTFOUND" },
+            ) as NodeJS.ErrnoException,
+            "",
+            0,
+          );
+        }
+      },
+    },
+  });
 
   try {
-    const res = await fetch(url, {
+    const res = await undiciFetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -310,6 +408,7 @@ async function deliverOne(
       },
       body,
       signal: controller.signal,
+      dispatcher,
     });
     clearTimeout(timer);
     const responseCode = res.status;
@@ -345,6 +444,13 @@ async function deliverOne(
     clearTimeout(timer);
     const msg = e instanceof Error ? e.message : String(e);
     await scheduleRetry(deliveryId, attempt, msg, null, null, logger);
+  } finally {
+    // R77-defer-1: close the per-delivery Agent so its
+    // connection pool releases the sockets. Long-lived Agents
+    // would keep the pinned-DNS lookup fn alive across
+    // deliveries — we intentionally scope to one delivery so
+    // each delivery's DNS is re-vetted.
+    await dispatcher.close().catch(() => undefined);
   }
 }
 
