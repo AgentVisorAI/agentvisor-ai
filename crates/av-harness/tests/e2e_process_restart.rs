@@ -777,6 +777,15 @@ vector_backend = "memory"
         "av_stream_abort_panics_total",
         "av_ephemeral_close_panics_total",
         "av_admission_refund_panics_total",
+        // Per-tick recovery-scan cap: one labelled series per pass.
+        // Absent series → `rate() > 0` alerts miss the FIRST fire.
+        "av_recovery_scan_capped_total{pass=\"adopt_strict_atif\"}",
+        "av_recovery_scan_capped_total{pass=\"recover_signed_journals\"}",
+        "av_recovery_scan_capped_total{pass=\"consolidate_step_journals\"}",
+        "av_recovery_scan_capped_total{pass=\"retry_marked_promotions\"}",
+        "av_recovery_scan_capped_total{pass=\"remove_acked_outboxes\"}",
+        "av_recovery_scan_capped_total{pass=\"replay_lifecycle_outboxes\"}",
+        "av_recovery_scan_capped_total{pass=\"quarantine_orphan_json\"}",
     ] {
         assert!(
             body.contains(series),

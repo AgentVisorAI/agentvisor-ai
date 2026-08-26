@@ -21,6 +21,59 @@ use std::time::Instant;
 /// recovery to OOM.
 const MAX_ATIF_RECOVERY_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Maximum number of directory entries any single recovery-pass call
+/// is allowed to examine before yielding.
+///
+/// Every recovery pass walks a spool directory with
+/// `read_dir(...).next_entry().await` and does at least one stat
+/// (`.exists()`, `.metadata()`, or `symlink_metadata()`) per entry.
+/// A poisoned spool populated with millions of entries (an operator
+/// mount error, a hostile co-tenant with write access to the spool
+/// pre-R18 was the concern; even post-R18 an operator debug session
+/// leaving a stress-test spool is realistic) would let ONE pass burn
+/// tens of seconds every tick — starving `retry_marked_promotions`,
+/// `complete_pending_closes`, `idle_sessions` sweep, and outbox
+/// replay for LEGITIMATE sessions. The 10_000-per-tick cap is a
+/// conservative floor (`ls -1U | wc -l` on a healthy spool is
+/// steady-state under 500, and the reconciler ticks every ~250 ms,
+/// so 10_000 covers a 40× burst without needing multi-tick catchup).
+///
+/// When the cap fires the pass increments
+/// `av_recovery_scan_capped_total{pass=…}` and returns cleanly;
+/// `entries` is not durable across ticks so the next tick re-opens
+/// `read_dir` and resumes (directory iteration order is
+/// filesystem-defined, so a stable order across ticks is not
+/// promised — the invariant is only that every entry present on
+/// disk is EVENTUALLY visited across enough ticks).
+pub(crate) const MAX_RECOVERY_ENTRIES_PER_TICK: usize = 10_000;
+
+/// Emit the per-tick scan-cap counter for `pass_label` and log a
+/// single warn line so operators can observe the class from
+/// `/metrics` and correlate with a coincident tracing incident.
+///
+/// The counter is pre-registered eagerly in the pipeline's
+/// pre-registration block (same discipline as the panic-supervision
+/// counters — a lazy `rate(av_recovery_scan_capped_total) > 0` alert
+/// cannot distinguish "never fired" from "never registered", so the
+/// FIRST fire that the guardrail exists to catch would slip past).
+pub(crate) fn bump_recovery_scan_cap(metrics: &Registry, pass_label: &'static str, examined: usize) {
+    metrics
+        .counter(
+            &format!("av_recovery_scan_capped_total{{pass=\"{pass_label}\"}}"),
+            "Recovery pass hit the per-tick entry-scan cap and returned early; \
+             the next tick will re-open the directory and resume. A steady rate \
+             > 0 indicates a poisoned spool (millions of stale files) that will \
+             starve legitimate recovery work until an operator quarantines it.",
+        )
+        .inc();
+    tracing::warn!(
+        pass = %pass_label,
+        examined,
+        cap = MAX_RECOVERY_ENTRIES_PER_TICK,
+        "recovery pass hit per-tick scan cap; resuming next tick"
+    );
+}
+
 /// Result of closing a session.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -1376,7 +1429,13 @@ impl Finalizer {
             })
             .collect();
         let mut recovered = 0usize;
+        let mut examined = 0usize;
         while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::atif_source)? {
+            examined = examined.saturating_add(1);
+            if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "adopt_strict_atif", examined);
+                break;
+            }
             let path = entry.path();
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
                 continue;
@@ -1900,7 +1959,13 @@ impl Finalizer {
             Err(error) => return Err(FinalizeError::atif_source(error)),
         };
         let mut recovered = 0usize;
+        let mut examined = 0usize;
         while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::atif_source)? {
+            examined = examined.saturating_add(1);
+            if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "recover_signed_journals", examined);
+                break;
+            }
             let metadata_path = entry.path();
             let Some(name) = metadata_path.file_name().and_then(std::ffi::OsStr::to_str) else {
                 continue;
@@ -2330,7 +2395,13 @@ impl Finalizer {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(FinalizeError::atif_source(error)),
         };
+        let mut examined = 0usize;
         while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::atif_source)? {
+            examined = examined.saturating_add(1);
+            if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "consolidate_step_journals", examined);
+                break;
+            }
             let metadata_path = entry.path();
             let Some(name) = metadata_path.file_name().and_then(std::ffi::OsStr::to_str) else {
                 continue;
@@ -3041,7 +3112,13 @@ impl Finalizer {
             Err(error) => return Err(FinalizeError::atif_source(error)),
         };
         let mut promoted = 0usize;
+        let mut examined = 0usize;
         while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::atif_source)? {
+            examined = examined.saturating_add(1);
+            if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "retry_marked_promotions", examined);
+                break;
+            }
             let path = entry.path();
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("promote") {
                 continue;
@@ -3421,7 +3498,7 @@ impl Finalizer {
         let Some(bridge) = self.bridge.as_ref().map(Arc::clone) else {
             return Ok(0);
         };
-        replay_lifecycle_outboxes_in(&self.spool_dir, &self.journal_key, bridge).await
+        replay_lifecycle_outboxes_in(&self.spool_dir, &self.journal_key, bridge, &self.metrics).await
     }
 
     /// Complete the finalization tail for sessions
@@ -3598,7 +3675,13 @@ impl Finalizer {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(FinalizeError::bridge_source(error)),
         };
+        let mut examined = 0usize;
         while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::bridge_source)? {
+            examined = examined.saturating_add(1);
+            if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "remove_acked_outboxes", examined);
+                break;
+            }
             let path = entry.path();
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
                 continue;
@@ -3938,6 +4021,7 @@ pub(crate) async fn replay_lifecycle_outboxes_in(
     spool_dir: &std::path::Path,
     journal_key: &[u8; 32],
     bridge: Arc<dyn EventBus>,
+    metrics: &Registry,
 ) -> Result<usize, FinalizeError> {
     let directory = spool_dir.join(crate::spool::OUTBOX);
     let mut entries = match tokio::fs::read_dir(&directory).await {
@@ -3946,7 +4030,13 @@ pub(crate) async fn replay_lifecycle_outboxes_in(
         Err(error) => return Err(FinalizeError::bridge_source(error)),
     };
     let mut replayed = 0usize;
+    let mut examined = 0usize;
     while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::bridge_source)? {
+        examined = examined.saturating_add(1);
+        if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
+            bump_recovery_scan_cap(metrics, "replay_lifecycle_outboxes", examined);
+            break;
+        }
         let path = entry.path();
         if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
             continue;
@@ -7585,6 +7675,56 @@ mod tests {
         assert!(
             fresh_orphan_marker.exists(),
             "an orphaned marker inside the retention window is left alone"
+        );
+    }
+
+    /// A recovery pass with more entries than the per-tick cap must
+    /// return early and bump `av_recovery_scan_capped_total{pass=…}`
+    /// exactly once. Prevents the class where a poisoned spool
+    /// (millions of stale files) starves every OTHER recovery pass
+    /// on every tick — the reconciler's tick budget is finite.
+    #[tokio::test]
+    async fn recovery_scan_cap_returns_early_and_bumps_counter() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().to_path_buf();
+        let metrics = Arc::new(Registry::new());
+        let finalizer = Finalizer::new(
+            Arc::new(Ed25519Signer::from_seed(&[7; 32])),
+            spool.clone(),
+            Arc::clone(&metrics),
+        );
+
+        // `adopt_strict_atif_artifacts` is the cheapest to poison: it
+        // walks `spool_dir` looking at anything ending in `.json`, so
+        // MAX_RECOVERY_ENTRIES_PER_TICK + 1 zero-byte files with any
+        // hex-hash-ish stem trigger the cap without needing sealed
+        // metadata. Each file is one entry the scan visits before the
+        // extension check even runs.
+        let overshoot = MAX_RECOVERY_ENTRIES_PER_TICK + 100;
+        // The stem shape doesn't matter — the loop counts EVERY
+        // read_dir entry, not just parseable ones. Use short numeric
+        // filenames to keep filesystem-op cost low.
+        for i in 0..overshoot {
+            std::fs::write(spool.join(format!("junk-{i}.junk")), b"").unwrap();
+        }
+
+        let sessions = SessionRegistry::new();
+        let breaker = av_loopdetect::BreakerConfig::default();
+        let recovered = finalizer
+            .adopt_strict_atif_artifacts(&sessions, &breaker)
+            .await
+            .expect("scan returns cleanly on cap-hit, not error");
+        assert_eq!(
+            recovered, 0,
+            "no artifacts to adopt (all files have the wrong extension)"
+        );
+
+        // Scrape /metrics-format text and assert the labelled counter
+        // saw exactly one increment.
+        let scrape = metrics.render();
+        assert!(
+            scrape.contains("av_recovery_scan_capped_total{pass=\"adopt_strict_atif\"} 1"),
+            "cap counter must fire exactly once on the overshoot tick; got scrape:\n{scrape}"
         );
     }
 }
