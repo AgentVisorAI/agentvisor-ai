@@ -2017,7 +2017,12 @@ impl ToolExecution {
         // directory — `create_dir_all` on an existing path still issues
         // an EEXIST mkdir syscall on the tool-claim hot path.
         if !directory.is_dir() {
-            std::fs::create_dir_all(directory).map_err(|error| ClaimError::Backend(error.to_string()))?;
+            // `create_dir_all_synced` (not `create_dir_all`) so the
+            // first-write path applies the 0o700 dir mode discipline
+            // — pairs with the 0o600 file mode below so the tool
+            // intents subtree cannot be enumerated by a co-tenant.
+            av_core::fsutil::create_dir_all_synced(directory)
+                .map_err(|error| ClaimError::Backend(error.to_string()))?;
         }
         // `create_new(true)` is atomic on the underlying filesystem —
         // its only reason to return `AlreadyExists` is that another
@@ -2030,9 +2035,24 @@ impl ToolExecution {
         // would loop on the same underlying disk fault while the
         // client learns nothing useful. Split the two shapes at the
         // source so the caller can respond appropriately.
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        //
+        // This path deliberately bypasses `write_atomic` (the sibling
+        // `persist`/`mark_audited` calls go through it) because the
+        // AlreadyExists→Race distinction is destroyed by the temp+
+        // rename pattern (a colliding claim would land on a fresh
+        // temp path with a UUIDv7 suffix). That bypass means we need
+        // to set the 0o600 mode explicitly here — otherwise this
+        // intent file (sealed but plaintext session_id, tool name,
+        // and request digest) inherits the ambient umask, typically
+        // 0022 → 0o644, and becomes co-tenant readable.
+        let mut open_options = std::fs::OpenOptions::new();
+        open_options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            open_options.mode(0o600);
+        }
+        let mut file = open_options
             .open(&self.intent_path)
             .map_err(|error| match error.kind() {
                 std::io::ErrorKind::AlreadyExists => ClaimError::Race,
