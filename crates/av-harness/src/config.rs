@@ -96,13 +96,19 @@ pub struct HarnessConfig {
     /// drain begins, so an external load balancer polling `/readyz`
     /// can stop routing before the listener closes. Without it the
     /// listener stops accepting the instant the signal lands and a
-    /// fresh readiness probe sees connection-refused, never the 503 —
-    /// fine on Kubernetes (the preStop sleep provides this window
-    /// before SIGTERM), but docker-compose / systemd / bare-LB
-    /// deployments have no preStop equivalent. Set it to your LB's
-    /// readiness poll interval plus one reconciliation. Counts against
-    /// the orchestrator's kill grace period ON TOP of the drain
-    /// budget.
+    /// fresh readiness probe sees connection-refused, never the 503.
+    /// Set it to your LB's readiness poll interval plus one
+    /// reconciliation. Counts against the orchestrator's kill grace
+    /// period ON TOP of the drain budget.
+    ///
+    /// Kubernetes note: a preStop `sleep` hook can theoretically
+    /// provide the same window BEFORE SIGTERM lands, but only if
+    /// the runtime image contains a shell + `sleep`. The shipped
+    /// manifest at `deploy/kubernetes/agentvisor-ai.yaml` uses a
+    /// distroless base (chainguard/glibc-dynamic) that has neither,
+    /// so it sets this key instead and omits the preStop hook.
+    /// Bare-VM, systemd, and docker-compose deployments also need
+    /// this key because they have no preStop equivalent at all.
     #[serde(default)]
     pub shutdown_ready_drain_s: u64,
     /// Chat-completions path appended to `upstream_url`. Override for
