@@ -3454,6 +3454,29 @@ pub(crate) fn parse_provider_chunk(raw: &str) -> Result<Option<ParsedProviderChu
     }
     let value = serde_json::from_str::<Value>(&candidate)
         .map_err(|error| format!("invalid provider JSON frame: {error}"))?;
+    // OpenAI-shape inline error: mid-stream on a 200 OK the provider
+    // can ship `data: {"error":{"code":"…","message":"…","type":"…"}}`
+    // (Azure OpenAI and every OpenAI-compat shim do the same). Pre-fix
+    // this fell through to `has_choices = false` and aborted the
+    // stream with the generic "successful provider response has no
+    // choices array" — the actual `error.message` was discarded and
+    // the receipt attested `stop_reason = Other` with no error text
+    // for exactly the diagnostics an auditor needs (context overflow,
+    // billing 402, safety terminal). Refuse the frame carrying the
+    // provider's own reason instead. Anthropic's `event: error`
+    // handler in provider.rs does the same for that dialect.
+    if let Some(err_obj) = value.get("error").filter(|v| !v.is_null()) {
+        let message = err_obj
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("provider ended stream with an unspecified error");
+        let code = err_obj.get("code").and_then(Value::as_str).unwrap_or("");
+        return Err(if code.is_empty() {
+            format!("provider stream error: {message}")
+        } else {
+            format!("provider stream error [{code}]: {message}")
+        });
+    }
     let model_name = value.get("model").and_then(Value::as_str).map(str::to_owned);
     // OpenAI streams with `stream_options: {"include_usage": true}` carry
     // `"usage": null` on every content chunk, with the real usage object
@@ -3627,7 +3650,7 @@ pub(crate) fn provider_u64(value: Option<&Value>, field: &str) -> Result<Option<
     Ok(Some(value))
 }
 
-fn map_finish_reason(native: &str) -> av_events::StopReason {
+pub(crate) fn map_finish_reason(native: &str) -> av_events::StopReason {
     match native {
         "stop" | "stop_sequence" | "end_turn" => av_events::StopReason::Stop,
         // Anthropic's `model_context_window_exceeded` is the same
@@ -3637,6 +3660,13 @@ fn map_finish_reason(native: &str) -> av_events::StopReason {
         // Anthropic overflows.
         "length" | "max_tokens" | "model_context_window_exceeded" => av_events::StopReason::MaxTokens,
         "tool_calls" | "function_call" | "tool_use" => av_events::StopReason::ToolUse,
+        // Anthropic's `pause_turn` (Claude 3.7+ extended-thinking +
+        // tool sessions) is a natural mid-response continuation
+        // awaiting a resume — semantically a tool-shaped stop, not a
+        // "we're done" stop. Fold with tool_use so dashboards
+        // grouping tool sessions catch these too, matching the
+        // existing pattern of provider-native aliasing above.
+        "pause_turn" => av_events::StopReason::ToolUse,
         // Anthropic's `refusal` (Claude Sonnet 4.5+) is a safety refusal
         // — the same semantic as OpenAI's `content_filter` and the
         // cluster Gemini folds via map_gemini_finish_reason. Pre-fix it

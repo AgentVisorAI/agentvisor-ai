@@ -2916,9 +2916,7 @@ spec:
             // and TOML basic strings interpret embedded `\` and `"`
             // — but our fixtures contain neither. Raw interpolation
             // is therefore safe AND correct for THIS test.
-            let toml = format!(
-                "upstream_url = \"https://api.openai.com\"\npayout_field = \"{hostile}\"\n"
-            );
+            let toml = format!("upstream_url = \"https://api.openai.com\"\npayout_field = \"{hostile}\"\n");
             let err = match HarnessConfig::from_toml(&toml) {
                 Err(e) => e,
                 Ok(_) => panic!("must refuse payout_field = {hostile:?}"),
