@@ -110,6 +110,36 @@ pub fn state_store_contract(store: &dyn StateStore, hash_tag: &str) {
     assert_eq!(store.get(&dim_a).unwrap(), 3);
     assert_eq!(store.get(&dim_b).unwrap(), 4);
 
+    // -- R69 F4 boundary coverage: empty spends slice and exact-fit
+    // to a fresh key. Both must match across backends; the
+    // RedisStore Lua has a `min_remaining == -1` empty-KEYS branch
+    // (redis_store.rs:73-76) that a client-side short-circuit
+    // covers today, so an incidental change to the short-circuit
+    // condition that let the empty branch reach Rust decode would
+    // silently break callers passing `try_spend_many(&[])`.
+    assert_eq!(
+        store.try_spend_many(&[]).unwrap(),
+        TrySpendOutcome::Committed {
+            post_commit_min_remaining: u64::MAX,
+        },
+        "empty spends slice must commit with u64::MAX headroom sentinel"
+    );
+    let boundary = key("boundary-exact-fit");
+    assert_eq!(
+        store
+            .try_spend_many(&[Spend {
+                key: boundary.clone(),
+                amount: 10,
+                limit: 10,
+            }])
+            .unwrap(),
+        TrySpendOutcome::Committed {
+            post_commit_min_remaining: 0,
+        },
+        "exact-fit spend must commit with 0 headroom, not refuse"
+    );
+    assert_eq!(store.get(&boundary).unwrap(), 10);
+
     // -- try_spend_many refuses duplicate keys (API-misuse class).
     assert!(
         store

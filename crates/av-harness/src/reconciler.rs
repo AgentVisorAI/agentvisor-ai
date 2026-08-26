@@ -4573,6 +4573,7 @@ pub fn spawn_reconciler(
     tick_s: u64,
     breaker: av_loopdetect::BreakerConfig,
     metrics: Arc<Registry>,
+    shutdown: Arc<tokio::sync::Notify>,
 ) -> tokio::task::JoinHandle<()> {
     use futures::future::FutureExt as _;
     // Tick-liveness gauge, registered SYNCHRONOUSLY at spawn so the
@@ -4599,7 +4600,36 @@ pub fn spawn_reconciler(
         // pressure into a stall spiral.
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            interval.tick().await;
+            // R69 F1: cooperative shutdown via `Notify` instead of
+            // `JoinHandle::abort` from `main.rs`. Abort cancels only
+            // the outer async task, but the reconciler tick body
+            // dispatches to `spawn_blocking` (write_atomic markers,
+            // remove_file journal cleanup, publish_idempotent for
+            // SESSION_CLOSE, and up to 64 close_session calls per
+            // tick — each an internally spawned blocking closure).
+            // Under abort those keep running orphaned; the awaiting
+            // handle in main.rs returns immediately and does NOT wait
+            // for them, so half-written `.close-complete` markers or
+            // torn journal tails could race the process exit — the
+            // exact "orphan marker" hazard the retention-loop and
+            // bridge-maintenance-loop comments in main.rs cite as
+            // rationale for their existing `Notify` discipline. The
+            // reconciler ticks 14 400× more often than the retention
+            // loop (250 ms vs 1 h) and does far more spool-mutating
+            // work per tick; it is the odd one out.
+            //
+            // Biased select: prefer shutdown over another tick so a
+            // signal arriving mid-tick-window latches immediately;
+            // and we NEVER start a new tick body after shutdown even
+            // if the interval and shutdown are ready simultaneously.
+            tokio::select! {
+                biased;
+                () = shutdown.notified() => {
+                    tracing::debug!("reconciler shutdown notified; exiting loop between ticks");
+                    return;
+                }
+                _ = interval.tick() => {}
+            }
             let started = Instant::now();
             // Wrap the whole tick body in catch_unwind: any panic in
             // the reconciler (fs unwrap, JCS overflow, allocator
@@ -5143,6 +5173,7 @@ mod tests {
             1,    // tick every second
             Default::default(),
             Arc::clone(&metrics),
+            Arc::new(tokio::sync::Notify::new()),
         );
         // Pre-registration: the series must exist in a render even
         // before any tick necessarily completed.
