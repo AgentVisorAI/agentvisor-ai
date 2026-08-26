@@ -1,0 +1,156 @@
+// AgentVisor AI hosted-console data model.
+//
+// PostgreSQL is the canonical datasource — portable across Neon, Supabase,
+// Fly Postgres, Google Cloud SQL, AWS RDS, or a self-hosted docker container.
+// The schema uses only standard SQL types (no Postgres-only extensions),
+// so `pg_dump` gives you a clean export you can restore anywhere.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// A person with a login. Owns one or more organizations.
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  displayName  String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  memberships Membership[]
+
+  @@map("users")
+}
+
+// A tenant boundary — a team/company account. Every deployment, session,
+// receipt, and event belongs to exactly one org.
+model Org {
+  id        String   @id @default(cuid())
+  slug      String   @unique
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  members     Membership[]
+  deployments Deployment[]
+
+  @@map("orgs")
+}
+
+// User ↔ Org join with a role.
+model Membership {
+  id     String  @id @default(cuid())
+  userId String
+  orgId  String
+  role   String  @default("owner") // "owner" | "admin" | "member" (checked in code)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  org  Org  @relation(fields: [orgId],  references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, orgId])
+  @@index([orgId])
+  @@map("memberships")
+}
+
+// A `agentvisord` instance registered with the console. The daemon uses
+// `ingestToken` to POST events; the org holds `publicKeyHex` so the console
+// can verify receipts offline. Provider secrets never enter this database.
+model Deployment {
+  id             String   @id @default(cuid())
+  orgId          String
+  name           String
+  environment    String   @default("production") // "production" | "staging" | "development"
+  // Hex-encoded 32-byte Ed25519 verifying key, published by the daemon at
+  // startup. Optional until the daemon first checks in.
+  publicKeyHex   String?
+  // Hash of the plaintext ingest token (argon2). Plaintext is shown once at
+  // creation and never stored.
+  ingestTokenHash String
+  ingestTokenHint String  // first 8 chars for UI display
+  lastIngestAt   DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  org      Org       @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  sessions Session[]
+
+  @@index([orgId])
+  @@map("deployments")
+}
+
+// One conversation as observed by the checkpoint.
+model Session {
+  id             String   @id @default(cuid())
+  deploymentId   String
+  externalId     String   // the daemon's own session id
+  agent          String   // charter.name
+  workflow       String   @default("signed") // "signed" | "unsigned"
+  status         String   @default("live")   // "live" | "sealed" | "blocked"
+  policyVersion  Int      @default(1)
+  openedAt       DateTime
+  closedAt       DateTime?
+  // Rollups — the daemon pushes deltas; totals live here.
+  promptTokens   Int      @default(0)
+  completionTokens Int    @default(0)
+  costUsdMicros  BigInt   @default(0)
+  payoutUsdMicros BigInt  @default(0)
+  blockedPayoutUsdMicros BigInt @default(0)
+  toolsAllowed   Int      @default(0)
+  toolsBlocked   Int      @default(0)
+  stopReasonId   Int?
+  stopReason     String?
+
+  deployment Deployment @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+  events     Event[]
+  receipt    Receipt?
+
+  @@unique([deploymentId, externalId])
+  @@index([deploymentId, openedAt])
+  @@map("sessions")
+}
+
+// One journaled event within a session.
+model Event {
+  id        String   @id @default(cuid())
+  sessionId String
+  seq       Int      // monotonically increasing per session — dedupe key
+  kind      String   // "sys" | "user" | "llm" | "tool" | "block" | "guard" | "audit"
+  tag       String   // short label ("BLOCKED", "TOOL ✓", "LOOP", …)
+  body      String   // HTML-safe rendered body — sanitized on ingest
+  sub       String?  // secondary line
+  occurredAt DateTime
+  journalCount Int   @default(1) // number of journal entries this row represents
+
+  session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@unique([sessionId, seq])
+  @@index([sessionId, occurredAt])
+  @@map("events")
+}
+
+// The signed receipt itself. `body` is the canonical receipt JSON as posted
+// by the daemon; `sigB64` is the Ed25519 signature. Verification is
+// performed client-side using `Deployment.publicKeyHex`.
+model Receipt {
+  id            String   @id @default(cuid())
+  sessionId     String   @unique
+  receiptId     String   @unique  // UUIDv7 from the receipt itself
+  body          String              // full canonical JSON
+  sigB64        String              // Ed25519 signature (base64)
+  keyIdHint     String              // first 8 hex chars of key_id, for display
+  eventCount    Int
+  issuedAt      DateTime
+  createdAt     DateTime @default(now())
+
+  session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@map("receipts")
+}
