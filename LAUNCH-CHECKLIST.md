@@ -109,3 +109,25 @@ Legend: **✅ verified** · **🟢 configured** · **📋 documented**
 - **Empty-state gaps**: `renderPolicies`, `renderSettingsKeys`, `renderSettingsAudit` all previously rendered a bare table when the list was empty. Fixed with `emptyState()` calls; verified via playwright by monkey-patching the mock datasource to return `[]`. Deployments list already had `deploymentEmptyHero`.
 - **Sec-Fetch-Site**: legitimate SPA fetches (`same-origin`, `same-site`, `none`, or missing header) all pass; only literal `cross-site` gets a 403 `forbidden_cross_site`. Verified with 5 curl variants against a live server.
 - **SQL injection**: `'; DROP TABLE users; --`, `' OR 1=1 --`, and `'; SELECT pg_sleep(3); --` payloads via `/api/v1/sessions?q=` all returned `{sessions:[], nextCursor:null}` in ~50ms with the users table intact. Prisma's parameterized `contains` filter is safe.
+
+## Verified in Rounds 22-26
+
+- **Body-size cap**: 5 MiB POST → 413 problem+json (Fastify `bodyLimit: 4 MiB`).
+- **Unknown endpoint 404**: GET/POST to `/api/v1/nonsense/*` returns proper problem+json (not HTML).
+- **Modal focus trap**: 5 modal openers share `installModalKeys` — Escape closes, Tab wraps, previously-focused element gets focus back, `role="dialog" aria-modal="true"`.
+- **Copy-token button**: swaps to "Copied ✓" with green flash for 1.6s; clipboard genuinely holds the token.
+- **SSE stale-connection watchdog**: named `keepalive` events every 15s + client watchdog force-closes if lastSeen goes stale >30s. Covers the Chromium bug where a killed peer keeps `readyState=OPEN`.
+- **Ingest rollup dedup**: pre-filter batch by existing seqs so `promptTokens/costUsdMicros` only increment on genuinely new events.
+- **Sealed session guard**: `POST /events` on `status=sealed` session → `{inserted:0, rejectedSealed:["externalId"]}`, DB unchanged. Un-sealing via upsert also blocked.
+- **Concurrent signup**: Prisma P2002 caught and mapped to clean 409 email_in_use (was leaking `errorCode:"P2002"` + 500).
+- **Confirm-modal replay**: 3 rapid clicks on danger confirm → 1 API call (`handled` flag).
+- **Clock-skewed ingest**: `occurredAt > now+5min` or `< 2000-01-01` are silently dropped with per-batch counters in the response.
+- **Hostile cursor**: 6 hostile inputs (SQL, path traversal, huge, junk) → clean `400 invalid_cursor`.
+- **Reset-token single-use**: successful reset clears the hash, replay → `401 invalid_token`.
+- **Concurrent-ingest rollup**: 3 parallel 100-event batches → exact 300/300/300 rollup (Prisma atomic `increment`).
+- **Login brute-force**: rate limit fires at attempt 11; no email-vs-password oracle in the 401 body.
+- **Cross-tenant IDOR**: user B fetching user A's session/deployment ID → 404, no data leak.
+- **Ingest-token revocation**: post-rotate, old token → 401; new token → 200.
+- **Receipt tamper**: Ed25519 verify (in-browser) rejects both body-modified and signature-modified receipts.
+- **NDJSON export escape**: hostile agent name with commas, escaped quotes, and newlines round-trips as a valid JSON line.
+- **Cursor pagination stability**: mid-scan inserts of 5 fresh sessions with later `openedAt` do not appear on page 2; zero overlap between pages.
