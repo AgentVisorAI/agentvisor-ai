@@ -551,15 +551,35 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
     // so `av_identity_rejections_total` and the per-minute
     // sampled full audit records match pre-R72 behaviour on
     // rejected requests.
-    if let Err(error) = state.resolve_identity(&headers, Some(&state.config.chat_scope)) {
-        if let Ok(sid) = crate::pipeline::session_id(&headers) {
-            let _ = state.enqueue_transient_failure(
-                &sid,
-                av_events::StopReason::IdentityRejected,
-                error.to_string(),
-            );
+    if let Err(identity_error) = state.resolve_identity(&headers, Some(&state.config.chat_scope)) {
+        // R72 review F3 (landed R73): always run
+        // `enqueue_transient_failure`, even when
+        // `session_id(&headers)` failed (malformed / oversized /
+        // non-ASCII `X-AV-Session`), so a fuzzer / unauthenticated
+        // probe cannot silently bypass the
+        // `av_identity_rejections_total` counter by sending an
+        // unparseable session header. The `unwrap_or_default()`
+        // gives an empty-string session id — the enqueue path
+        // treats that as anonymous, which matches how the
+        // pre-check would classify a header-less request.
+        let sid = crate::pipeline::session_id(&headers).unwrap_or_default();
+        // R72 review F1 (landed R73): honour the Err path of
+        // `enqueue_transient_failure`, which maps a worker-channel
+        // backpressure failure to `PipelineError::unavailable_source`
+        // (503 + Retry-After). Pre-R72 the request reached
+        // `prepare_chat`'s `?` and returned 503 in that case; R72's
+        // `let _ = ...` silently downgraded it to 401, defeating
+        // SDK retry policies that key on 503. The audited path
+        // now returns 503 on queue-full and 401 on genuine
+        // identity failure, matching pre-R72 semantics exactly.
+        if let Err(enqueue_error) = state.enqueue_transient_failure(
+            &sid,
+            av_events::StopReason::IdentityRejected,
+            identity_error.to_string(),
+        ) {
+            return pipeline_error(enqueue_error);
         }
-        return pipeline_error(error);
+        return pipeline_error(identity_error);
     }
     // Refuse duplicate top-level or
     // nested JSON keys before parsing. `Json<Value>` used
