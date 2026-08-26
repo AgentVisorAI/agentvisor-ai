@@ -143,9 +143,33 @@ mod tests {
 
     #[test]
     fn v7_ids_are_time_ordered() {
-        let a = new_event_uid();
-        let b = new_event_uid();
-        assert!(a <= b, "UUIDv7 must sort by creation time: {a} vs {b}");
+        // R55 mutation-run hardening: the `uuid` crate uses a shared
+        // monotonic counter within a single millisecond, so `a < b`
+        // (strict) is the actual invariant. `a <= b` (non-strict)
+        // would tolerate a mutation replacing `Uuid::now_v7()` with
+        // `Uuid::new_v4()` about 50 % of the time (v4 has no time
+        // ordering, so half the paired comparisons would still
+        // satisfy `<=`). Batch-generate so a mutation would be
+        // caught deterministically.
+        const N: usize = 64;
+        let mut ids: Vec<_> = (0..N).map(|_| new_event_uid()).collect();
+        for pair in ids.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "UUIDv7 must strictly sort by creation time: {} vs {}",
+                pair[0],
+                pair[1]
+            );
+        }
+        // Also verify the batch itself is already sorted (no external
+        // sort needed) — the shared-monotonic property under the
+        // `uuid` crate is that successive calls are strictly monotone.
+        let sorted = ids.clone();
+        ids.sort_unstable();
+        assert_eq!(
+            ids, sorted,
+            "successive UUIDv7 calls must be strictly monotone without an external sort"
+        );
     }
 
     #[test]
