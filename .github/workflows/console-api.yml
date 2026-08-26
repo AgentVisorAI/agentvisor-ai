@@ -1,0 +1,140 @@
+# CI for the hosted console (docs/app/) + its backend server (server/).
+# Runs on every push/PR that touches those directories. Keeps the main
+# Rust workspace CI (ci.yml) uncluttered — different toolchain, different
+# concurrency needs.
+name: Console + API
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/app/**"
+      - "server/**"
+      - ".github/workflows/console-api.yml"
+  pull_request:
+    paths:
+      - "docs/app/**"
+      - "server/**"
+      - ".github/workflows/console-api.yml"
+
+concurrency:
+  group: console-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────
+  # Frontend — static SPA at docs/app/. No build step; just syntax-check
+  # every JS file and verify the entry HTML references what it should.
+  # ────────────────────────────────────────────────────────────────────
+  console-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v6.0.0
+        with:
+          node-version: "22"
+      - name: Syntax-check every JS file
+        run: |
+          for f in docs/app/*.js; do
+            echo "→ $f"
+            node --check "$f"
+          done
+      - name: Verify MOCK_MODE flag present in entry HTML
+        run: grep -q 'window.MOCK_MODE' docs/app/index.html
+      - name: Verify datasource + app scripts loaded
+        run: |
+          grep -q 'src="datasource.js"' docs/app/index.html
+          grep -q 'src="app.js"' docs/app/index.html
+      - name: Verify pitch demo is preserved at /app/pitch/
+        run: |
+          test -f docs/app/pitch/index.html
+          test -f docs/app/pitch/console.js
+          test -f docs/app/pitch/console.css
+
+  # ────────────────────────────────────────────────────────────────────
+  # Backend — Fastify + Prisma + Postgres. Type-check, install, migrate,
+  # then run the Python smoke suite that exercises the full HTTP surface
+  # and the Node E2E that drives the ApiDataSource adapter.
+  # ────────────────────────────────────────────────────────────────────
+  server-tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: agentvisor
+          POSTGRES_PASSWORD: devpw
+          POSTGRES_DB: agentvisor
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U agentvisor"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://agentvisor:devpw@127.0.0.1:5432/agentvisor
+      JWT_SECRET: ci_only_secret_at_least_32_bytes_of_entropy_here_ok
+      ALLOWED_ORIGINS: http://127.0.0.1:8787
+      PORT: "8985"
+      NODE_ENV: production
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v6.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - name: Install
+        working-directory: server
+        run: npm ci --no-audit --no-fund
+      - name: Prisma generate
+        working-directory: server
+        run: npx prisma generate
+      - name: Typecheck
+        working-directory: server
+        run: npx tsc --noEmit
+      - name: Migrate DB
+        working-directory: server
+        run: npx prisma migrate deploy
+      - name: Start API
+        working-directory: server
+        run: |
+          npx tsx src/index.ts &
+          echo $! > /tmp/api.pid
+          for i in $(seq 1 20); do
+            if curl -sf http://127.0.0.1:8985/healthz > /dev/null; then break; fi
+            sleep 0.5
+          done
+          curl -sf http://127.0.0.1:8985/healthz
+      - name: Backend API smoke (Python)
+        run: python3 server/ci/smoke.py
+      - name: Backend E2E (Node fetch through ApiDataSource)
+        run: node server/ci/e2e.mjs
+      - name: Stop API
+        if: always()
+        run: |
+          kill $(cat /tmp/api.pid) 2>/dev/null || true
+
+  # ────────────────────────────────────────────────────────────────────
+  # Docker image — verify the multi-stage Dockerfile builds and runs.
+  # Uses buildx cache so this stays fast on repeat runs.
+  # ────────────────────────────────────────────────────────────────────
+  docker-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - name: Build image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c1c # v6.18.0
+        with:
+          context: server
+          push: false
+          load: true
+          tags: agentvisor-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Verify image runs as non-root
+        run: |
+          docker run --rm --entrypoint /usr/bin/id agentvisor-api:ci | grep 'uid=1000(node)'
+      - name: Verify healthcheck defined
+        run: docker inspect --format '{{.Config.Healthcheck.Test}}' agentvisor-api:ci | grep healthz
