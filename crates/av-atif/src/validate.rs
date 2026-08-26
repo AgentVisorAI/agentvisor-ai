@@ -264,6 +264,79 @@ const MAX_NESTED_DEPTH: usize = 128;
 /// safe for any arithmetic combination downstream.
 pub(crate) const MAX_COST_USD: f64 = 1e12;
 
+/// Upper bound for id-shaped string fields — matches
+/// [`av_core::ids::SessionId::parse`]'s 128-byte cap so a Trajectory
+/// whose `session_id` / `trajectory_id` / `tool_call_id` /
+/// `function_name` / `continued_trajectory_ref` passes strict
+/// validation is guaranteed constructible into a `SessionId`-like
+/// value downstream without further length-guarding.
+///
+/// The runtime is protected via `ensure_atif_provenance_from_bytes`
+/// (a hostile writer can't forge the sidecar MAC), but external
+/// consumers of [`validate_value`]/[`validate_bytes`] — `avctl
+/// atif-validate`, third-party promotion pipelines, dashboards
+/// ingesting foreign trajectories — get log-injection and
+/// preview-corruption primitives if raw `String` id fields aren't
+/// class-checked here. Same amplification-defense reasoning as
+/// `SessionId::parse` applies (echoing 128-byte values is safe).
+pub(crate) const MAX_ID_LEN: usize = 128;
+
+/// Upper bound for freeform text fields (`notes`). Freeform allows
+/// any UTF-8 (including control chars like `\n`), but a 10 MiB
+/// `notes` field would bloat receipts and dashboards — cap at 8 KiB
+/// which comfortably fits any legitimate annotation.
+pub(crate) const MAX_NOTES_LEN: usize = 8 * 1024;
+
+/// True iff every byte of `s` is in the visible-ASCII range 0x21..=0x7E.
+/// Same predicate as [`av_core::ids::SessionId::parse`]. Header-safe
+/// / log-injection-safe / filesystem-safe / JCS-safe class.
+fn is_visible_ascii(s: &str) -> bool {
+    s.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
+/// Validate that `obj[field]`, if present and non-null, is an
+/// id-shaped string: non-empty, ≤ [`MAX_ID_LEN`] bytes, visible-ASCII
+/// only. The type check ("must be a string") is expected to already
+/// have been emitted upstream for the same field; this helper only
+/// runs when the value IS a string, so an `is_string()` guard prevents
+/// double-flagging a wrong-typed field.
+fn check_id_field(
+    obj: &serde_json::Map<String, Value>,
+    field: &str,
+    path: &str,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let Some(s) = obj.get(field).and_then(Value::as_str) else {
+        return;
+    };
+    if s.is_empty() {
+        issue!(issues, format!("{path}.{field}"), "must be non-empty");
+        return;
+    }
+    if s.len() > MAX_ID_LEN {
+        // NEVER echo the full oversized value — same amplification
+        // defense as SessionId::parse's "starts …" fingerprint.
+        issue!(
+            issues,
+            format!("{path}.{field}"),
+            "id length {} exceeds {MAX_ID_LEN} bytes (SessionId parity); starts {:?}",
+            s.len(),
+            &s[..s.floor_char_boundary(24.min(s.len()))],
+        );
+        return;
+    }
+    if !is_visible_ascii(s) {
+        // Length is bounded (≤ MAX_ID_LEN by the check above), so
+        // echoing the value here is safe.
+        issue!(
+            issues,
+            format!("{path}.{field}"),
+            "id {s:?} contains bytes outside visible ASCII (0x21-0x7e); \
+             log-injection-safe class required for downstream tools that display it"
+        );
+    }
+}
+
 /// Validate a raw JSON value as an ATIF trajectory.
 ///
 /// Returns at most [`MAX_VALIDATION_ISSUES`] issues plus a
@@ -517,6 +590,28 @@ fn validate_trajectory_obj(
     for f in ["session_id", "trajectory_id", "notes", "continued_trajectory_ref"] {
         if obj.get(f).is_some_and(|v| !v.is_string() && !v.is_null()) {
             issue!(issues, format!("{path}.{f}"), "must be a string");
+        }
+    }
+    // Id-shape byte-class + length checks for the trajectory-root id
+    // fields. Parity with `SessionId::parse` so downstream consumers
+    // (avctl atif-validate, promotion pipelines, dashboards) receive
+    // ids that are safe to log / display / use as filesystem stems.
+    // See `MAX_ID_LEN` for the full rationale.
+    for f in ["session_id", "trajectory_id", "continued_trajectory_ref"] {
+        check_id_field(obj, f, path, issues);
+    }
+    // `notes` is freeform text (any UTF-8, including \n) but must be
+    // bounded so a hostile trajectory can't bloat receipts or
+    // dashboards. Type check for `notes` is emitted above; length
+    // check only runs on the string branch.
+    if let Some(s) = obj.get("notes").and_then(Value::as_str) {
+        if s.len() > MAX_NOTES_LEN {
+            issue!(
+                issues,
+                format!("{path}.notes"),
+                "notes length {} exceeds {MAX_NOTES_LEN} bytes",
+                s.len()
+            );
         }
     }
     // session_id optionality was relaxed in v1.7; older files must carry it.
@@ -971,6 +1066,14 @@ fn validate_step(
                             "required field is missing"
                         ),
                     }
+                    // Byte-class + length parity with SessionId — id
+                    // fields inside tool calls must be safe for
+                    // downstream logging / display too. Only runs if
+                    // the field is a non-empty string (present +
+                    // non-empty was checked above); a wrong-type or
+                    // missing value already has its own issue.
+                    check_id_field(c, "tool_call_id", &cpath, issues);
+                    check_id_field(c, "function_name", &cpath, issues);
                     if c.get("function_name")
                         .and_then(Value::as_str)
                         .is_none_or(str::is_empty)
@@ -1088,6 +1191,14 @@ fn validate_step(
                                             issue!(issues, format!("{ref_path}.{field}"), "must be a string");
                                         }
                                     }
+                                    // Byte-class + length parity with
+                                    // SessionId for the id-shaped
+                                    // fields inside subagent refs. A
+                                    // wrong-type value already flagged
+                                    // above; check_id_field skips
+                                    // non-string values.
+                                    check_id_field(reference, "trajectory_id", &ref_path, issues);
+                                    check_id_field(reference, "session_id", &ref_path, issues);
                                     let has_id = reference
                                         .get("trajectory_id")
                                         .and_then(Value::as_str)
@@ -1499,6 +1610,189 @@ mod tests {
         );
         // Validator and serde must agree: typed deserialization also rejects.
         assert!(serde_json::from_value::<crate::model::Trajectory>(value).is_err());
+    }
+
+    /// R45 Finding 2: id-shaped string fields must be visible-ASCII
+    /// only and ≤ MAX_ID_LEN bytes, matching SessionId::parse. A
+    /// hostile trajectory carrying `session_id: "sess\r\nfake-log"`
+    /// or a 10 KiB trajectory_id would pass Strict before this fix
+    /// and give external CLI/library consumers (avctl atif-validate,
+    /// third-party promotion pipelines, dashboards) log-injection /
+    /// preview-corruption primitives that SessionId was designed to
+    /// eliminate. Runtime is protected via MAC verification but
+    /// external consumers were not.
+    #[test]
+    fn id_shaped_fields_reject_control_bytes_and_oversize() {
+        // Control byte (CR/LF) — log-injection primitive.
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": "sess\r\nfake-log-line",
+            "trajectory_id": "traj-ok",
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{"step_id": 1, "source": "user", "message": "hi"}],
+        });
+        let issues = validate_value(&value, Mode::Strict);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == "trajectory.session_id" && i.message.contains("visible ASCII")),
+            "control bytes in session_id must be flagged: {issues:?}"
+        );
+
+        // Oversize id (129 bytes = MAX_ID_LEN + 1).
+        let oversize = "x".repeat(MAX_ID_LEN + 1);
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": "s",
+            "trajectory_id": oversize,
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{"step_id": 1, "source": "user", "message": "hi"}],
+        });
+        let issues = validate_value(&value, Mode::Strict);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == "trajectory.trajectory_id" && i.message.contains("exceeds")),
+            "oversize trajectory_id must be flagged: {issues:?}"
+        );
+
+        // Non-ASCII (RTL override) is refused.
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": "sess-\u{202E}rtl-legit",
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{"step_id": 1, "source": "user", "message": "hi"}],
+        });
+        let issues = validate_value(&value, Mode::Strict);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == "trajectory.session_id" && i.message.contains("visible ASCII")),
+            "RTL override in session_id must be flagged: {issues:?}"
+        );
+
+        // Empty session_id (present but empty string): flagged distinctly
+        // from "missing" — the type check passes, but the class check
+        // rejects for being non-empty-required.
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": "",
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{"step_id": 1, "source": "user", "message": "hi"}],
+        });
+        let issues = validate_value(&value, Mode::Strict);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == "trajectory.session_id" && i.message == "must be non-empty"),
+            "empty-string session_id must be flagged non-empty: {issues:?}"
+        );
+
+        // Valid id passes — MAX_ID_LEN (128) exact-length,
+        // visible-ASCII stays legal.
+        let at_cap = "x".repeat(MAX_ID_LEN);
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": at_cap,
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{"step_id": 1, "source": "user", "message": "hi"}],
+        });
+        assert!(
+            validate_value(&value, Mode::Strict).is_empty(),
+            "id at MAX_ID_LEN (128) must remain legal (SessionId parity)"
+        );
+    }
+
+    /// R45 Finding 2: `notes` is freeform text (any UTF-8) but must
+    /// be length-bounded so a hostile writer can't bloat receipts
+    /// and dashboards with a 10 MiB annotation field.
+    #[test]
+    fn notes_field_rejects_oversize() {
+        let oversize = "n".repeat(MAX_NOTES_LEN + 1);
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": "s",
+            "notes": oversize,
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{"step_id": 1, "source": "user", "message": "hi"}],
+        });
+        let issues = validate_value(&value, Mode::Strict);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == "trajectory.notes" && i.message.contains("exceeds")),
+            "oversize notes must be flagged: {issues:?}"
+        );
+
+        // At-cap notes stay legal.
+        let at_cap = "n".repeat(MAX_NOTES_LEN);
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": "s",
+            "notes": at_cap,
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{"step_id": 1, "source": "user", "message": "hi"}],
+        });
+        assert!(
+            validate_value(&value, Mode::Strict).is_empty(),
+            "notes at MAX_NOTES_LEN must remain legal"
+        );
+    }
+
+    /// R45 Finding 2: tool call id-shaped fields (`tool_call_id`,
+    /// `function_name`) must apply the same visible-ASCII + length
+    /// guards as top-level ids — they flow into audit records, logs,
+    /// and dashboards the same way.
+    #[test]
+    fn tool_call_id_fields_reject_control_bytes_and_oversize() {
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": "s",
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{
+                "step_id": 1,
+                "source": "agent",
+                "message": "hi",
+                "metrics": {"prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0},
+                "tool_calls": [{
+                    "tool_call_id": "call\r\nfake-log",
+                    "function_name": "get_time",
+                    "arguments": {},
+                }],
+            }],
+        });
+        let issues = validate_value(&value, Mode::Strict);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path.ends_with(".tool_call_id") && i.message.contains("visible ASCII")),
+            "control bytes in tool_call_id must be flagged: {issues:?}"
+        );
+
+        let oversize = "x".repeat(MAX_ID_LEN + 1);
+        let value = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": "s",
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{
+                "step_id": 1,
+                "source": "agent",
+                "message": "hi",
+                "metrics": {"prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0},
+                "tool_calls": [{
+                    "tool_call_id": "call-1",
+                    "function_name": oversize,
+                    "arguments": {},
+                }],
+            }],
+        });
+        let issues = validate_value(&value, Mode::Strict);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path.ends_with(".function_name") && i.message.contains("exceeds")),
+            "oversize function_name must be flagged: {issues:?}"
+        );
     }
 
     /// Wrong-typed step-level optional fields must be flagged, not silently
