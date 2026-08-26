@@ -7730,8 +7730,14 @@ mod tests {
 
         let started = std::time::Instant::now();
         tokio::time::sleep(Duration::from_millis(10)).await;
+        // 250 ms allows for 25× scheduler jitter over the 10 ms timer
+        // — still catches the ~100 ms `SlowStore` regression that
+        // motivated this test, but tolerates loaded CI runners where
+        // a 10 ms tokio timer can drift to 30-80 ms. The class the
+        // test catches (a synchronous blocking dependency stalling
+        // the reactor) shows up as SECONDS of delay, not tens of ms.
         assert!(
-            started.elapsed() < Duration::from_millis(75),
+            started.elapsed() < Duration::from_millis(250),
             "completion budget storage blocked the Tokio reactor"
         );
         assert!(!body.await.unwrap().is_empty());

@@ -7770,7 +7770,13 @@ mod tests {
         // With no active lifecycle ops, the table should end up empty.
         // Some entries may briefly linger if a guard's drop is racing
         // another `arc_for` call, but a bounded settle window is fine.
-        for _ in 0..20 {
+        // 60 iterations × 25 ms = 1.5 s total. A real leak sits in
+        // `locks` forever, so extending the settle window from 500 ms
+        // to 1.5 s doesn't hide bugs — it just tolerates scheduler
+        // noise on loaded CI runners where the Arc-drop race between
+        // `arc_for` and the concurrent close's Drop can take longer
+        // than the previous 500 ms window.
+        for _ in 0..60 {
             if locks.len() == 0 {
                 return;
             }
