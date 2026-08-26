@@ -131,3 +131,19 @@ Legend: **✅ verified** · **🟢 configured** · **📋 documented**
 - **Receipt tamper**: Ed25519 verify (in-browser) rejects both body-modified and signature-modified receipts.
 - **NDJSON export escape**: hostile agent name with commas, escaped quotes, and newlines round-trips as a valid JSON line.
 - **Cursor pagination stability**: mid-scan inserts of 5 fresh sessions with later `openedAt` do not appear on page 2; zero overlap between pages.
+- **Auth-before-404**: routes with real handlers return 401 without cookie; only truly unknown routes return 404.
+- **HttpOnly cookie**: JS can't read `document.cookie`; ctx shows `httpOnly: true, sameSite: 'Lax'`.
+- **Receipt XSS**: 8 hostile fields via monkey-patched getReceipt — zero alerts, DOM contains `&lt;script`.
+- **Malformed JSON body**: 4 hostile bodies return proper problem+json 400.
+- **Deep-link resume**: `sessionStorage.av_return_to` restores URL after login.
+- **Cookie Secure default**: reads NODE_ENV — Secure=true in prod, false in dev; explicit override wins.
+- **Login timing side-channel**: precomputed real argon2id dummy hash keeps missing-user latency within 5% of wrong-password latency.
+- **Cross-tab sign-out sync**: `localStorage.av_signed_out_at` + storage event listener drops peer tab session immediately.
+- **OAuth state**: missing / malformed / provider-mismatch cookies all 400 with proper `errorCode`.
+- **Reset token expired**: 25h-old token → `401 expired_token`; DB untouched.
+- **Sign-out cleanup**: SSE unsub + logout + state null + navigate to /login.
+- **Ingest field length**: externalId >128, agent >80, tag >32, body >8000, batch >500 all return 400.
+- **Prod security headers**: HSTS + CSP + X-Frame-Options + X-Content-Type + Referrer-Policy present on 200 / 400 / 401 / 404.
+- **Concurrency load**: 200 concurrent GET /sessions on 100-row org → 200/200 clean at 314 req/s; no pool exhaustion.
+- **CmdK keyboard nav**: `⌘K` opens with input focused; ArrowDown highlights results; Enter navigates; Escape closes.
+- **Loading skeleton**: slow list request renders 6 skeleton rows in-place; cleanly swaps to real rows on resolve.
