@@ -2,7 +2,7 @@
   "name": "@agentvisor/api",
   "version": "0.1.0",
   "private": true,
-  "description": "AgentVisor AI hosted API — multi-tenant control plane.",
+  "description": "AgentVisor AI hosted API \u2014 multi-tenant control plane.",
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -21,18 +21,18 @@
     "@fastify/helmet": "^13.0.1",
     "@fastify/rate-limit": "^10.3.0",
     "@node-rs/argon2": "^2.0.2",
-    "@prisma/client": "^6.5.0",
+    "@prisma/client": "6.12.0",
     "dotenv": "^17.2.3",
     "fastify": "^5.2.1",
     "jose": "^5.10.0",
     "pg": "^8.23.0",
     "pino": "^9.7.0",
-    "zod": "^3.24.2"
+    "zod": "^3.24.2",
+    "prisma": "6.12.0"
   },
   "devDependencies": {
     "@types/node": "^22.13.5",
     "@types/pg": "^8.23.1",
-    "prisma": "^6.5.0",
     "tsx": "^4.19.3",
     "typescript": "^5.7.3"
   },

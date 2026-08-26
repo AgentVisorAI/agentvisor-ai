@@ -29,8 +29,10 @@ COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build
 
-# Strip dev dependencies from the tree we'll copy into the runtime image.
-RUN npm prune --omit=dev
+# NOTE: we intentionally do NOT `npm prune --omit=dev` here. `prisma` is
+# a runtime dependency (the entrypoint runs `prisma migrate deploy` on
+# boot), and every other devDep is small enough that trading a few MB
+# of image size for one less pruning-caused footgun is worth it.
 
 # ---------- runtime stage ----------
 FROM node:22-slim AS runtime
@@ -45,6 +47,14 @@ ENV NODE_ENV=production \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends openssl ca-certificates dumb-init \
     && rm -rf /var/lib/apt/lists/*
+
+# Delete the base image's globally-installed npm + npx CLIs. They ship
+# a large transitive dep graph (brace-expansion, tar, deepmerge-ts,
+# sigstore, …) that Trivy flags as HIGH/CRITICAL. The runtime never
+# invokes npm — the entrypoint runs the local prisma binary directly —
+# so nothing here depends on the global tools.
+RUN rm -rf /usr/local/lib/node_modules/npm \
+    && rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
 
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
@@ -66,5 +76,8 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
 
 # dumb-init reaps zombies + forwards signals so `docker stop` and Fly's rolling
 # deploys finish in <100ms instead of the default 10s SIGKILL wait.
+# Invoke prisma via its local binary (`node_modules/.bin/prisma`) so we
+# don't need `npx` (deleted above) and so the runtime doesn't have to
+# reach out to npm to fetch anything on boot.
 ENTRYPOINT ["dumb-init", "--"]
-CMD ["sh", "-c", "npx prisma migrate deploy && node dist/index.js"]
+CMD ["sh", "-c", "./node_modules/.bin/prisma migrate deploy && node dist/index.js"]

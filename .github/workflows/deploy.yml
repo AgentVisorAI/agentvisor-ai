@@ -189,61 +189,56 @@ jobs:
       # we don't depend on the aquasecurity/trivy-action's binary-download
       # step (which flaked in Round 11 CI when the GitHub API rate-limited
       # its tag lookup). Docker Hub pulls are far more reliable than the
-      # tarball-off-GitHub path the action uses, and the image is pinned
-      # by digest so a Docker Hub takeover can't swap the binary.
+      # tarball-off-GitHub path the action uses.
       #
-      # Retries: up to 3 attempts with 5 s backoff. Each attempt is
-      # bounded to 4 minutes so a stuck DB fetch fails visibly instead of
-      # hanging the job.
+      # Two-phase design:
+      #   1. Download the vuln DB (retry up to 3× — DB fetch is the only
+      #      thing that's ever transient in practice).
+      #   2. Run the scan exactly once with --skip-db-update. Any non-
+      #      zero exit is now a real CVE finding, not a network blip.
       - name: Trivy image scan (fail on HIGH/CRITICAL)
         env:
           IMAGE_REF: ghcr.io/${{ steps.owner.outputs.lc }}/agentvisor-api@${{ steps.push.outputs.digest }}
         run: |
           set -euo pipefail
-          # Pull the pinned Trivy image once so retries don't re-download.
+          mkdir -p "$HOME/.cache/trivy"
           docker pull aquasec/trivy:0.74.0 >/dev/null
 
+          # Phase 1: refresh the vuln DB with retries. Trivy caches by
+          # default so a warm cache from the actions/cache step above
+          # keeps this fast.
           for attempt in 1 2 3; do
-            echo "::group::Trivy attempt $attempt"
-            if timeout 240 docker run --rm \
-              -v /var/run/docker.sock:/var/run/docker.sock \
+            if timeout 120 docker run --rm \
               -v "$HOME/.cache/trivy:/root/.cache/trivy" \
-              -e TRIVY_USERNAME="${{ github.actor }}" \
-              -e TRIVY_PASSWORD="${{ secrets.GITHUB_TOKEN }}" \
               aquasec/trivy:0.74.0 \
-              image \
-                --severity HIGH,CRITICAL \
-                --ignore-unfixed \
-                --vuln-type os,library \
-                --exit-code 1 \
-                --format table \
-                --no-progress \
-                "$IMAGE_REF"; then
-              echo "::endgroup::"
-              exit 0
+              image --download-db-only --no-progress; then
+              break
             fi
-            rc=$?
-            echo "::endgroup::"
-            if [ $rc -eq 1 ]; then
-              # Real CVE finding — Trivy uses exit 1 for both "found HIGH/CRITICAL"
-              # AND transient DB failures. Disambiguate by re-running with
-              # --exit-code 0: if that still errors we know it wasn't a finding.
-              if timeout 60 docker run --rm \
-                -v "$HOME/.cache/trivy:/root/.cache/trivy" \
-                aquasec/trivy:0.74.0 \
-                image --severity HIGH,CRITICAL --ignore-unfixed \
-                --vuln-type os,library --exit-code 0 --format table --no-progress \
-                "$IMAGE_REF" >/dev/null; then
-                # DB fetch succeeded → the exit-1 was a genuine CVE finding.
-                echo "Trivy reported HIGH/CRITICAL findings above." >&2
-                exit 1
-              fi
+            if [ $attempt -eq 3 ]; then
+              echo "::error::Trivy DB fetch failed after 3 attempts" >&2
+              exit 1
             fi
-            echo "Trivy attempt $attempt failed transiently, retrying in 5 s..." >&2
+            echo "Trivy DB fetch attempt $attempt failed, retrying in 5 s..." >&2
             sleep 5
           done
-          echo "Trivy scan failed after 3 attempts." >&2
-          exit 1
+
+          # Phase 2: single authoritative scan with --skip-db-update so
+          # exit-code 1 unambiguously means "HIGH/CRITICAL findings".
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+            -e TRIVY_USERNAME="${{ github.actor }}" \
+            -e TRIVY_PASSWORD="${{ secrets.GITHUB_TOKEN }}" \
+            aquasec/trivy:0.74.0 \
+            image \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              --vuln-type os,library \
+              --exit-code 1 \
+              --format table \
+              --no-progress \
+              --skip-db-update \
+              "$IMAGE_REF"
 
       # ─── Sticky PR comment ───
       # Reviewers get pull-and-run instructions plus a one-click Render
