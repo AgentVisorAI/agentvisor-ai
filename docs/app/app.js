@@ -1008,14 +1008,21 @@
   }
 
   function renderEventDrawer(root, ev) {
+    // Values are plain-text by default; opt into HTML via a third
+    // tuple element only when we control the markup (like the Policy
+    // link below). Otherwise ev.tag / ev.policyId would carry any
+    // <script>/<img onerror> the daemon put there straight into the
+    // DOM — high-signal XSS surface since the daemon is customer code
+    // and event tags flow through the console for every viewer of
+    // that session.
     var meta = [
       ["Seq", "#" + ev.seq],
       ["Kind", ev.kind + (ev.tag ? " · " + ev.tag : "")],
       ["Time", new Date(ev.ts).toLocaleTimeString()],
       ["Duration", ev.durationMs ? ev.durationMs + " ms" : "—"],
     ];
-    if (ev.policyId) meta.push(["Policy", '<a href="#/policies/' + ev.policyId + '">' + ev.policyId + "</a>"]);
-    if (ev.blockedValueUsd) meta.push(["Would-have-spent", "$" + ev.blockedValueUsd.toLocaleString()]);
+    if (ev.policyId) meta.push(["Policy", '<a href="#/policies/' + encodeURIComponent(ev.policyId) + '">' + esc(ev.policyId) + "</a>", true]);
+    if (ev.blockedValueUsd) meta.push(["Would-have-spent", "$" + Number(ev.blockedValueUsd).toLocaleString()]);
 
     var payload = "";
     if (ev.details) {
@@ -1033,7 +1040,13 @@
 
     root.innerHTML =
       '<h3>Event detail</h3>' +
-      '<dl class="meta">' + meta.map(function (m) { return "<dt>" + esc(m[0]) + "</dt><dd>" + m[1] + "</dd>"; }).join("") + "</dl>" +
+      '<dl class="meta">' + meta.map(function (m) {
+        // m[2] === true means m[1] is pre-built trusted HTML (e.g.
+        // the Policy link we construct above). Everything else is
+        // treated as plain text and escaped.
+        var valueHtml = m[2] === true ? m[1] : esc(m[1]);
+        return "<dt>" + esc(m[0]) + "</dt><dd>" + valueHtml + "</dd>";
+      }).join("") + "</dl>" +
       payload;
   }
 

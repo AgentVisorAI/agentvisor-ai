@@ -9,10 +9,14 @@
 /*
   # Content Security Policy — strict allow-list.
   #   • script-src 'self' — no inline scripts, no external CDN.
+  #   • script-src-attr 'none' — blocks inline `onerror=…`, `onclick=…`
+  #     etc. Even if an XSS payload landed inside daemon-supplied event
+  #     text and slipped past our esc() filter, an `<img onerror>` would
+  #     be inert. Belt-and-suspenders with the frontend esc() audit.
   #   • connect-src is the same-origin API and its EventSource. Adjust
   #     if you deploy the API on a different host.
   #   • frame-ancestors 'none' — clickjacking protection.
-  Content-Security-Policy: default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://api.agentvisorai.me; img-src 'self' data:; font-src 'self' data:; manifest-src 'self'; object-src 'none'
+  Content-Security-Policy: default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; script-src 'self'; script-src-attr 'none'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://api.agentvisorai.me; img-src 'self' data:; font-src 'self' data:; manifest-src 'self'; object-src 'none'
   # 2-year HSTS with subdomain + preload. Cloudflare handles TLS.
   Strict-Transport-Security: max-age=63072000; includeSubDomains; preload
   X-Content-Type-Options: nosniff
