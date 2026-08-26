@@ -745,6 +745,10 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   font-weight: 500;
   border: 1px solid transparent;
   line-height: 1.5;
+  /* Keep the dot + label on one line inside narrow table cells —
+     without this, e.g. the Status column wraps "connected" under the
+     dot in the Deployments table. */
+  white-space: nowrap;
 }
 .pill.ok { background: var(--success-bg); border-color: var(--success-border); color: var(--success); }
 .pill.warn { background: var(--warning-bg); border-color: var(--warning-border); color: var(--warning); }
@@ -1096,8 +1100,12 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   background: var(--code-bg); color: var(--code-fg); border: 1px solid var(--code-border);
   padding: var(--s-3) var(--s-4); border-radius: var(--r);
   font-family: "SF Mono", ui-monospace, monospace; font-size: 12px;
-  white-space: pre;
-  overflow: auto;
+  /* pre-wrap: preserve the '\n' between the two shell commands as a
+     hard line break, but let long lines soft-wrap on spaces so the
+     snippet stays fully visible instead of clipping under a horizontal
+     scrollbar in narrow grid columns. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .empty-hero .snippet .prompt { color: #8b93a1; }
 .empty-hero .snippet .cmd { color: #f0f2f6; }
