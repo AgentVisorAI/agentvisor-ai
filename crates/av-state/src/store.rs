@@ -39,6 +39,24 @@ pub struct Spend {
     pub limit: u64,
 }
 
+/// One key/amount entry in an atomic multi-dimensional refund. Twin to
+/// [`Spend`]. Introduced in R67 to close R66 F2: the previous shape
+/// issued 3 independent `store.refund` calls (`total_calls`, per-tool,
+/// payout), each its own Redis round-trip. Crash/reconnect between
+/// steps left partial refund state; concurrent `try_tool_call`
+/// under `InMemoryStore` could observe partially-refunded state
+/// (fresh `total_calls` headroom but still-charged per-tool) — an
+/// ordering result impossible under a single-Lua refund and a
+/// cross-backend divergence with `RedisStore` (which has zero
+/// serialization between the 3 refunds).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refund {
+    /// Counter key.
+    pub key: String,
+    /// Amount to return.
+    pub amount: u64,
+}
+
 /// Atomic counter operations. Every mutation is atomic with respect to
 /// concurrent callers; `try_spend` is a single check-and-spend (never a
 /// read-then-write).
@@ -106,6 +124,35 @@ pub trait StateStore: Send + Sync {
     /// admitted work.
     fn refund(&self, key: &str, amount: u64) {
         let _ = (key, amount);
+    }
+
+    /// Atomic multi-key refund. Twin to [`Self::try_spend_many`].
+    ///
+    /// Best-effort by contract (mirroring `refund`): backends
+    /// swallow errors internally so a compensation failure never
+    /// turns into a 5xx on the caller path. The atomicity guarantee
+    /// is: every backend implementation MUST either apply every
+    /// listed refund or none of them, so a concurrent
+    /// `try_tool_call` / `try_spend_many` cannot observe partially-
+    /// refunded state (fresh `total_calls` headroom but still-
+    /// charged per-tool, etc.). The trait's default falls back to
+    /// per-key `refund` calls — safe for the single-key case and
+    /// for backends that inherit the default, but atomicity of
+    /// downstream callers relies on backends overriding this with a
+    /// single-transaction implementation. `InMemoryStore` takes
+    /// its `transaction_lock` once around the whole batch;
+    /// `RedisStore` sends a single Lua script keyed on every
+    /// counter (all sharing the session's Redis Cluster hash tag,
+    /// so cross-slot fan-out is impossible).
+    ///
+    /// Duplicate keys in a single call are folded (each key's total
+    /// refund equals the sum of amounts across matching entries)
+    /// so callers building refund vectors by iteration cannot
+    /// accidentally lose or double-count.
+    fn refund_many(&self, refunds: &[Refund]) {
+        for r in refunds {
+            self.refund(&r.key, r.amount);
+        }
     }
 
     /// Remove every key beginning with `prefix` (whole-session cleanup at
@@ -294,6 +341,31 @@ impl StateStore for InMemoryStore {
         let amount = i64::try_from(amount).unwrap_or(i64::MAX);
         let next = prev.saturating_sub(amount).max(0);
         cell.store(next, Ordering::Release);
+    }
+
+    /// R66 F2: fold ALL listed refunds under a single acquisition
+    /// of `transaction_lock` so a concurrent `try_spend_many` (which
+    /// also holds this lock) cannot observe partial state. Under
+    /// the old shape (per-key `refund`), a concurrent `try_tool_call`
+    /// running between refund step 1 and step 2 could pass
+    /// `total_calls` (freshly refunded) but be refused by the per-
+    /// tool cap (not yet refunded) — an ordering result impossible
+    /// under the single-Lua RedisStore path. Now the two backends
+    /// serialise the batch identically.
+    fn refund_many(&self, refunds: &[Refund]) {
+        if refunds.is_empty() {
+            return;
+        }
+        let _transaction = self.transaction_lock.lock();
+        for r in refunds {
+            let Some(cell) = self.counters.get(&r.key).map(|entry| Arc::clone(entry.value())) else {
+                continue;
+            };
+            let prev = cell.load(Ordering::Acquire);
+            let amount = i64::try_from(r.amount).unwrap_or(i64::MAX);
+            let next = prev.saturating_sub(amount).max(0);
+            cell.store(next, Ordering::Release);
+        }
     }
 
     fn remove_prefix(&self, prefix: &str) {
