@@ -201,6 +201,13 @@ if (!/av_dep_|token|copy/i.test(modalText)) {
   fail("no token modal after create deployment");
 }
 console.log("✅ create deployment via SPA -> token modal shown");
+// Capture the ingest token from the modal so we can simulate a daemon
+// against it later.
+const ingestToken = await page.locator(".modal-backdrop .token-display").innerText();
+if (!ingestToken || ingestToken.length < 20) {
+  fail("ingest token doesn't look right: " + ingestToken.slice(0, 40));
+}
+console.log("✅ captured ingest token from modal: " + ingestToken.slice(0, 12) + "…");
 // Close modal
 await page.keyboard.press("Escape");
 await page.waitForTimeout(400);
@@ -215,18 +222,95 @@ if (!dList.deployments?.some((d) => d.name === depName)) {
 }
 console.log("✅ deployment '" + depName + "' appears in API list");
 
-// Sessions page: no sessions yet, verify empty state renders
-await page.goto(spaUrl + "#/sessions");
-await page.waitForTimeout(800);
-const sessBody = await page.locator("body").innerText();
-if (!/no sessions|empty|nothing here|first session/i.test(sessBody)) {
-  // The list might just be empty without a specific empty message —
-  // that's OK as long as no error is thrown.
-  console.log("sessions view rendered (body snippet):", sessBody.slice(0, 120));
+// ============================================================
+// DAEMON SIMULATION — prove the "customer's daemon ships events"
+// leg of the full investor flow works end-to-end from the actual
+// hosted ingest surface.
+// ============================================================
+const sessionExternalId = "sess_" + Math.random().toString(36).slice(2, 8);
+const now = new Date();
+// Ingest requires x-av-deployment + Bearer. Get deployment id via API.
+const deploymentId = dList.deployments.find((d) => d.name === depName).id;
+{
+  const r = await fetch(API_BASE + "/api/v1/ingest/sessions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: "Bearer " + ingestToken,
+      "x-av-deployment": deploymentId,
+    },
+    body: JSON.stringify({
+      externalId: sessionExternalId,
+      agent: "demo-support-bot",
+      openedAt: now.toISOString(),
+      status: "live",
+    }),
+  });
+  if (r.status !== 200) fail("ingest session -> " + r.status + " " + await r.text());
 }
-console.log("✅ sessions view renders (no crash)");
+console.log("✅ daemon simulation: session upserted");
+{
+  const evs = [
+    { seq: 0, kind: "sys",  tag: "start",     body: "Session started" },
+    { seq: 1, kind: "user", tag: "prompt",    body: "Refund the customer's order" },
+    { seq: 2, kind: "llm",  tag: "response",  body: "I will refund the order.", addPromptTokens: 40, addCompletionTokens: 12 },
+    { seq: 3, kind: "tool", tag: "search",    body: "results ok", addToolsAllowed: 1 },
+    { seq: 4, kind: "block",tag: "refund",    body: "policy_denied high_value_refund", addToolsBlocked: 1 },
+  ].map((e) => ({
+    ...e,
+    sessionExternalId,
+    occurredAt: new Date(now.getTime() + e.seq * 1000).toISOString(),
+    journalCount: 1,
+  }));
+  const r = await fetch(API_BASE + "/api/v1/ingest/events", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: "Bearer " + ingestToken,
+      "x-av-deployment": deploymentId,
+    },
+    body: JSON.stringify(evs),
+  });
+  if (r.status !== 200) fail("ingest events -> " + r.status + " " + await r.text());
+  const j = await r.json();
+  if (j.inserted !== 5) fail("expected 5 inserted, got " + j.inserted);
+}
+console.log("✅ daemon simulation: 5 events ingested (1 tool_block)");
 
-// Verify audit log picked up the deployment.create + org.retention_updated events
+// Navigate to sessions list — the newly-ingested session should be there
+await page.goto(spaUrl + "#/sessions");
+await page.waitForTimeout(1500);
+const sessListText = await page.locator("body").innerText();
+if (!sessListText.includes("demo-support-bot") && !sessListText.includes(sessionExternalId.slice(0, 8))) {
+  console.log("sessions body snippet:", sessListText.slice(0, 400));
+  fail("session not visible in sessions list");
+}
+console.log("✅ session appears in /sessions list");
+
+// Verify the session's rollup counters via API
+const sessDetail = await page.evaluate(async (base) => {
+  const r = await fetch(base + "/api/v1/sessions", { credentials: "include" });
+  return await r.json();
+}, API_BASE);
+const sess = sessDetail.sessions.find((s) => s.externalId === sessionExternalId);
+if (!sess) fail("session not in API list: " + JSON.stringify(sessDetail.sessions.map((s) => s.externalId)));
+if (sess.toolsAllowed !== 1) fail("toolsAllowed rollup: " + sess.toolsAllowed);
+if (sess.toolsBlocked !== 1) fail("toolsBlocked rollup: " + sess.toolsBlocked);
+if (sess.promptTokens !== 40) fail("promptTokens rollup: " + sess.promptTokens);
+if (sess.completionTokens !== 12) fail("completionTokens rollup: " + sess.completionTokens);
+console.log("✅ session rollups correct: prompt=" + sess.promptTokens + " completion=" + sess.completionTokens + " allowed=" + sess.toolsAllowed + " blocked=" + sess.toolsBlocked);
+
+// Session detail page — verify events render
+await page.goto(spaUrl + "#/sessions/" + sess.id);
+await page.waitForTimeout(1500);
+const detailText = await page.locator("body").innerText();
+if (!detailText.includes("refund")) {
+  console.log("session detail body:", detailText.slice(0, 500));
+  fail("session detail missing event text");
+}
+console.log("✅ session detail page renders events");
+
+// Verify audit log picked up ALL our activity
 const audit = await page.evaluate(async (base) => {
   const r = await fetch(base + "/api/v1/audit?limit=50", { credentials: "include" });
   return await r.json();
@@ -243,4 +327,4 @@ console.log("✅ still zero JS errors + zero 5xx after extended flow");
 
 await browser.close();
 staticSrv.close();
-console.log("\nSPA e2e smoke passed (17 checks).");
+console.log("\nSPA e2e smoke passed (23 checks).");
