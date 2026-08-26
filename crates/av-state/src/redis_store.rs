@@ -475,7 +475,19 @@ impl StateStore for RedisStore {
             }
             RedisBackend::Cluster(pool) => {
                 if let Ok(mut connection) = pool.get() {
-                    scan_and_delete_cluster(&mut connection, &pattern);
+                    // Route by the ORIGINAL (unescaped) prefix so the
+                    // hash-tag slot matches the one Redis derives from
+                    // the on-cluster keys. If the future adds a prefix
+                    // shape that contains any glob metachar, computing
+                    // the slot from the ESCAPED pattern would embed
+                    // `\` characters that never appear in the on-cluster
+                    // keys — SCAN would route to a slot no key lives on
+                    // and `remove_prefix` would silently no-op, letting
+                    // budget counters survive up to the 24 h TTL. Today's
+                    // prefix is metachar-free so escaping is a no-op and
+                    // this bug is latent; the fix protects against the
+                    // future shape change.
+                    scan_and_delete_cluster(&mut connection, &pattern, prefix);
                 }
             }
         }
@@ -551,14 +563,19 @@ fn scan_and_delete_single(conn: &mut redis::Connection, pattern: &str) {
 /// construction (`ActionBudget::session_prefix` wraps the digest in
 /// `{hash-tag}`), so compute the slot from the prefix and route both
 /// SCAN and DEL through `route_command` to that specific master.
-fn scan_and_delete_cluster(conn: &mut redis::cluster::ClusterConnection, pattern: &str) {
+///
+/// `pattern` carries the ESCAPED glob (metachars prefixed with `\`)
+/// for the SCAN MATCH argument. `route_prefix` carries the ORIGINAL
+/// unescaped prefix used SOLELY for slot computation — the hash-tag
+/// content Redis extracts from an on-cluster key is the RAW bytes,
+/// so a slot computed from an escaped pattern would miss on any
+/// prefix shape containing a glob metachar. Today's prefix is
+/// metachar-free so escape is a no-op; the separation protects
+/// against a future prefix shape change.
+fn scan_and_delete_cluster(conn: &mut redis::cluster::ClusterConnection, pattern: &str, route_prefix: &str) {
     use redis::cluster_routing::{Route, RoutingInfo, SingleNodeRoutingInfo, SlotAddr};
     const SCAN_COUNT: usize = 500;
-    // `redis::cluster_routing::get_slot` extracts the hash-tag content
-    // (`{HASH}`) itself, so passing the pattern's non-wildcard prefix
-    // (which contains the hash tag verbatim) yields the same slot every
-    // key under the prefix maps to.
-    let route_key = pattern.trim_end_matches('*');
+    let route_key = route_prefix.trim_end_matches('*');
     let slot = redis::cluster_routing::get_slot(route_key.as_bytes());
     let routing = RoutingInfo::SingleNode(SingleNodeRoutingInfo::SpecificNode(Route::new(
         slot,

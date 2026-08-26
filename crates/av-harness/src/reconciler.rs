@@ -4358,11 +4358,52 @@ pub fn spawn_reconciler(
                 }
                 for session in idle.into_iter().take(MAX_IDLE_CLOSES_PER_TICK) {
                     let session_id = session.id.clone();
-                    if let Err(error) = finalizer.close_session(session, StopReason::SessionClosed).await {
-                        tracing::warn!(session = %session_id, error = &error as &dyn std::error::Error, "idle session finalization failed");
-                        metrics
-                            .counter("av_reconcile_errors_total", "Reconciliation errors")
-                            .inc();
+                    // Bound the per-session close so ONE stuck session
+                    // (a slow-but-alive upstream keeping a stream lease,
+                    // a worker awaiting a Redis reply, a bridge publish
+                    // that never returns) cannot freeze the whole tick.
+                    // `close_session_locked` internally calls
+                    // `wait_for_streams` / `wait_for_worker_jobs` which
+                    // are unbounded loops — the reconciler idle-close
+                    // batch runs serially, so at 64 sessions × the
+                    // upstream_read_timeout (default 60 s), one poisoned
+                    // batch used to be able to stall the reconciler for
+                    // ~64 min. The deadline is generous (90 s) so a
+                    // legitimate long-tail close doesn't false-timeout;
+                    // sessions that time out here return to `idle` on
+                    // the next tick and get another chance.
+                    const IDLE_CLOSE_DEADLINE: std::time::Duration =
+                        std::time::Duration::from_secs(90);
+                    let outcome = tokio::time::timeout(
+                        IDLE_CLOSE_DEADLINE,
+                        finalizer.close_session(session, StopReason::SessionClosed),
+                    )
+                    .await;
+                    match outcome {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(session = %session_id, error = &error as &dyn std::error::Error, "idle session finalization failed");
+                            metrics
+                                .counter("av_reconcile_errors_total", "Reconciliation errors")
+                                .inc();
+                        }
+                        Err(_elapsed) => {
+                            tracing::warn!(
+                                session = %session_id,
+                                deadline_s = IDLE_CLOSE_DEADLINE.as_secs(),
+                                "idle-close deadline exceeded; deferring to next tick"
+                            );
+                            metrics
+                                .counter(
+                                    "av_idle_close_timeouts_total",
+                                    "Idle-close reached the per-session deadline and \
+                                     returned to the next tick — indicates a session with \
+                                     an active lease that never drops (stuck stream, hung \
+                                     worker) or a bridge publish stalled behind an \
+                                     unresponsive broker.",
+                                )
+                                .inc();
+                        }
                     }
                 }
                 let evicted = sessions.evict_finalized(idle_s);
