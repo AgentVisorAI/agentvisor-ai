@@ -147,3 +147,13 @@ Legend: **✅ verified** · **🟢 configured** · **📋 documented**
 - **Concurrency load**: 200 concurrent GET /sessions on 100-row org → 200/200 clean at 314 req/s; no pool exhaustion.
 - **CmdK keyboard nav**: `⌘K` opens with input focused; ArrowDown highlights results; Enter navigates; Escape closes.
 - **Loading skeleton**: slow list request renders 6 skeleton rows in-place; cleanly swaps to real rows on resolve.
+- **JWT weak secret**: production boot with `JWT_SECRET < 32 chars` fatal-exits with clear message.
+- **Cross-deployment token**: `token A + header B` → 401; `token B + header A` → 401.
+- **Chart 0 / 1 data points**: empty series renders 0 bars, no NaN; single point renders 1 bar cleanly.
+- **JWT future NBF**: token with `nbf=now+3600s` → 401 (`jwtVerify` honors NBF).
+- **Load-more events**: session detail Load-more accumulates across pages (5 → 8 after click); cursor null hides button.
+- **Email normalization**: `"  AlIcE@T.CoM  "` stored as `alice@t.com`; login with mixed-case/spaces → 200.
+- **Logout cookie clear**: `POST /logout` returns `Set-Cookie: av_session=; Max-Age=0`.
+- **CORS disallowed origin**: `Origin: https://evil.com` gets NO `Access-Control-Allow-Origin` header.
+- **CORS preflight**: OPTIONS returns `Allow-Origin`, `Allow-Credentials`, `Allow-Methods`, `Allow-Headers`.
+- **Graceful shutdown**: SIGTERM → `"graceful shutdown starting"` log → clean exit in ~300ms → port freed.
