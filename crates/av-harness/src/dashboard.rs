@@ -39,17 +39,27 @@ pub const MAX_LIST_LIMIT: usize = 500;
 /// a new endpoint that calls `record()` is instrumented automatically,
 /// and one that doesn't shows up as a missing series in the
 /// dashboard-metrics tests (render() itself never panics on absent keys).
-fn record(state: &AppState, endpoint: &'static str, status: &'static str, started: Instant) {
-    let latency_key = format!("av_dashboard_request_duration_seconds{{endpoint=\"{endpoint}\"}}");
-    let counter_key = format!("av_dashboard_requests_total{{endpoint=\"{endpoint}\",status=\"{status}\"}}");
-    state
-        .metrics
-        .histogram(&latency_key, "Dashboard endpoint latency")
-        .observe_us(elapsed_us(started));
-    state
-        .metrics
-        .counter(&counter_key, "Dashboard endpoint requests, labeled by status")
-        .inc();
+///
+/// R59 hot-path: metric handles are pre-resolved into
+/// `HotMetrics.dashboard_request_counters` /
+/// `dashboard_request_duration_histograms` — same rationale as R58's
+/// request-metrics middleware pre-resolution. Prior code did 2
+/// per-endpoint-hit `format!` allocs + 4 shared-Registry mutex ops.
+fn record(
+    state: &AppState,
+    endpoint: crate::pipeline::DashboardEndpoint,
+    status: crate::pipeline::DashboardStatus,
+    started: Instant,
+) {
+    // Safe: `DashboardEndpoint::index()` returns `0..3` and
+    // `DashboardStatus::index()` returns `0..2`; `HotMetrics`
+    // allocates arrays of exactly those sizes at boot.
+    #[allow(clippy::indexing_slicing)]
+    {
+        state.hot_metrics.dashboard_request_duration_histograms[endpoint.index()]
+            .observe_us(elapsed_us(started));
+        state.hot_metrics.dashboard_request_counters[endpoint.index()][status.index()].inc();
+    }
 }
 
 #[derive(Serialize)]
@@ -274,7 +284,12 @@ pub async fn list_sessions(
         // `limit` cap). Useful for pagination hints and diagnostics.
         "matched": matched,
     }));
-    record(&state, "list", "ok", started);
+    record(
+        &state,
+        crate::pipeline::DashboardEndpoint::List,
+        crate::pipeline::DashboardStatus::Ok,
+        started,
+    );
     response
 }
 
@@ -282,7 +297,12 @@ pub async fn list_sessions(
 pub async fn session_detail(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let started = Instant::now();
     let Some(session) = state.sessions.get(&id) else {
-        record(&state, "detail", "not_found", started);
+        record(
+            &state,
+            crate::pipeline::DashboardEndpoint::Detail,
+            crate::pipeline::DashboardStatus::NotFound,
+            started,
+        );
         let mut response = no_store_json_response(json!({"error": "session not found in registry"}));
         *response.status_mut() = StatusCode::NOT_FOUND;
         return response;
@@ -323,7 +343,12 @@ pub async fn session_detail(State(state): State<AppState>, Path(id): Path<String
         "receipt": receipt,
         "atif_filename": atif_filename,
     }));
-    record(&state, "detail", "ok", started);
+    record(
+        &state,
+        crate::pipeline::DashboardEndpoint::Detail,
+        crate::pipeline::DashboardStatus::Ok,
+        started,
+    );
     response
 }
 
@@ -383,7 +408,12 @@ pub async fn stats(State(state): State<AppState>) -> Response {
             .saturating_add(session.totals.tool_blocked.load(Ordering::Acquire));
     }
     let response = no_store_json_response(totals);
-    record(&state, "stats", "ok", started);
+    record(
+        &state,
+        crate::pipeline::DashboardEndpoint::Stats,
+        crate::pipeline::DashboardStatus::Ok,
+        started,
+    );
     response
 }
 
