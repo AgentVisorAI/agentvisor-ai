@@ -2492,10 +2492,13 @@ mod tests {
             &config,
             extract_yaml_int(yaml, "terminationGracePeriodSeconds:").unwrap(),
             // K8s runs preStop synchronously BEFORE SIGTERM and both
-            // count against the grace period. Extract the sleep so a
-            // bump to `sleep 25` (the surrounding comment explicitly
-            // invites this) is reflected in the pin.
-            extract_prestop_sleep_seconds(yaml).unwrap_or(0),
+            // count against the grace period. If the manifest has a
+            // preStop hook, its sleep MUST be parseable — a silent
+            // `unwrap_or(0)` here defeats the pin whenever the hook is
+            // reformatted (YAML block form, single-quoted strings, a
+            // mechanism other than `sleep`), which is exactly the drift
+            // class the test exists to catch.
+            require_prestop_sleep_seconds(yaml),
         );
     }
 
@@ -2591,34 +2594,83 @@ mod tests {
         None
     }
 
-    /// Parses the shipped K8s manifest's `preStop.exec.command: ["sh",
-    /// "-c", "sleep <n>"]` entry. Returns `None` if no preStop hook is
-    /// present. A `sleep <n>` argument is what the shipped manifest
-    /// uses today; the surrounding comment invites operators to tune
-    /// it, so a bump to `sleep 25` in a future edit must reflect in
-    /// the pin's total budget or the test silently green-lights a
-    /// grace-exceeded configuration.
+    /// Parses the shipped K8s manifest's `preStop.exec.command`
+    /// `sleep <n>` argument, accepting the three shapes YAML idiomatically
+    /// admits so a cosmetic reformat can't defeat the pin:
+    ///   1. inline flow list, double-quoted: `command: ["sh", "-c", "sleep 5"]`
+    ///   2. inline flow list, single-quoted: `command: ['sh', '-c', 'sleep 5']`
+    ///   3. block-scalar list — used elsewhere in the same manifest:
+    ///      ```yaml
+    ///      command:
+    ///        - sh
+    ///        - -c
+    ///        - sleep 5
+    ///      ```
+    /// Returns `None` when there is no preStop hook at all (no `preStop:`
+    /// key). Returns `None` when a preStop DOES exist but the shape is
+    /// unrecognized — the caller must panic on that so the drift is
+    /// caught at build time, not papered over with `unwrap_or(0)`.
     fn extract_prestop_sleep_seconds(yaml: &str) -> Option<u64> {
-        // Look for `command: ["sh", "-c", "sleep <n>"]` anywhere in the
-        // file (there's only one preStop in the shipped manifest).
-        for line in yaml.lines() {
-            let trimmed = line.trim_start();
-            let Some(rest) = trimmed.strip_prefix("command:") else {
-                continue;
-            };
-            // Only accept the shell-sleep shape; anything else means
-            // the shipped manifest changed to a mechanism whose wall
-            // time this helper can't estimate — the caller should
-            // update this test rather than pretending 0 seconds.
-            let sleep_marker = "\"sleep ";
-            if let Some(after) = rest.find(sleep_marker).map(|i| &rest[i + sleep_marker.len()..]) {
-                let n: String = after.chars().take_while(char::is_ascii_digit).collect();
+        // Locate the preStop block first; a shipped manifest that
+        // removes preStop entirely legitimately has no sleep and the
+        // caller wants `None` to distinguish "no hook" from "hook that
+        // this parser can't read".
+        let prestop_idx = yaml.find("preStop:")?;
+        let after_prestop = &yaml[prestop_idx..];
+        // Scope to just this preStop block: the next key at the same or
+        // shallower indent ends it. Cheap heuristic — anything after
+        // `resources:` (the next sibling in the shipped manifest) is
+        // out of scope.
+        let scope = after_prestop
+            .find("\nresources:")
+            .map_or(after_prestop, |end| &after_prestop[..end]);
+        // Shape 1 & 2: same-line inline list. Look for either
+        // "sleep <n>" or 'sleep <n>' anywhere in the block.
+        for quote in ['"', '\''] {
+            let marker = format!("{quote}sleep ");
+            if let Some(hit) = scope.find(&marker) {
+                let rest = &scope[hit + marker.len()..];
+                let n: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                if let Ok(seconds) = n.parse() {
+                    return Some(seconds);
+                }
+            }
+        }
+        // Shape 3: block-scalar list. A line whose non-indent content
+        // is `- sleep <n>`. YAML also allows `- sh` / `- -c` / `- sleep 5`
+        // on separate lines; we only need the sleep line.
+        for line in scope.lines() {
+            let stripped = line.trim_start().trim_start_matches('-').trim();
+            if let Some(rest) = stripped.strip_prefix("sleep ") {
+                let n: String = rest.chars().take_while(char::is_ascii_digit).collect();
                 if let Ok(seconds) = n.parse() {
                     return Some(seconds);
                 }
             }
         }
         None
+    }
+
+    /// Caller-side companion for [`extract_prestop_sleep_seconds`]: a
+    /// shipped manifest with a `preStop:` hook MUST have a parseable
+    /// sleep, or the pin cannot compute the grace budget accurately
+    /// and silently green-lights a hook whose wall time it ignores.
+    /// The R7 review agent caught this exact class: a YAML block-form
+    /// reformat + `sleep 60` bump pushed total shutdown to 190 s
+    /// against the 150 s grace, and the previous `.unwrap_or(0)` let
+    /// the test pass.
+    fn require_prestop_sleep_seconds(yaml: &str) -> u64 {
+        if !yaml.contains("preStop:") {
+            return 0;
+        }
+        extract_prestop_sleep_seconds(yaml).expect(
+            "shipped K8s manifest has a preStop hook but extract_prestop_sleep_seconds \
+             could not parse its sleep duration — either update the parser to handle \
+             the new shape (inline vs block YAML, quoting style), or if preStop no \
+             longer uses `sleep`, delete this test and its helper. Silently returning \
+             0 would defeat the pin's own purpose: catching a preStop-time bump that \
+             pushes total shutdown past the grace period.",
+        )
     }
 
     /// Parses `stop_grace_period: 180s` (compose accepts a `s`/`m`/`h`
