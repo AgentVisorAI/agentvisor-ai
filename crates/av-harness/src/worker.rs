@@ -708,11 +708,19 @@ pub fn spawn_worker_with_spool_authenticated(
         .unwrap_or(MIN_SHARDS)
         .max(MIN_SHARDS);
     // Per-shard channel size: enough that a single shard can absorb
-    // the full admission burst if every request happens to hash to it,
-    // capped at `capacity` so we never over-allocate the caller's
-    // memory budget across shards.
-    let per_shard_capacity = capacity.min(capacity.div_ceil(shard_count).max(1) * shard_count);
-    let per_shard_capacity = per_shard_capacity.max(1);
+    // the full admission burst even if every envelope happens to hash
+    // to it. TWO same-sized semaphores feed the same shard channels —
+    // worker capacity (admission jobs) and response capacity
+    // (capture jobs riding their admission-time reservation) — so the
+    // worst-case in-flight envelope count against one shard is
+    // 2 × `capacity`. Sizing at `capacity` alone let response
+    // envelopes fill a shard and (a) fail-close response captures
+    // whose slot was reserved at admission, and (b) break
+    // `submit_and_wait`'s cancellation-safety invariant that
+    // `send().await` never blocks while a permit is held (a
+    // cancellation while blocked leaks `pending` and deadlocks
+    // `wait_idle`).
+    let per_shard_capacity = capacity.saturating_mul(2);
     let global_capacity = Arc::new(tokio::sync::Semaphore::new(capacity));
     // Response-slot capacity mirrors worker capacity by default. Keeping
     // them equal preserves the historical behaviour (both counters were
