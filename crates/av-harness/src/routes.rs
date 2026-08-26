@@ -793,6 +793,21 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
         axum::http::HeaderName::from_static("x-content-type-options"),
         HeaderValue::from_static("nosniff"),
     );
+    // SSE relays fronted by nginx (or an ingress that honours the
+    // hint) must set `X-Accel-Buffering: no` on the response, or
+    // nginx's default `proxy_buffering on` accumulates the entire
+    // SSE body before flushing — the SDK sees no incremental
+    // deltas until upstream EOF and the chat appears hung to
+    // end-users. Same class of ops footgun even under GCP HTTPS LB
+    // and other buffering front-ends that recognise this vendor
+    // header. Non-SSE responses do not need or want the hint (it's
+    // a no-op there).
+    if is_sse {
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static("x-accel-buffering"),
+            HeaderValue::from_static("no"),
+        );
+    }
     response
 }
 
@@ -2229,6 +2244,27 @@ async fn promote_session(
 /// deliberate 403-not-429 choice, and the tool path's CONFLICT mapping).
 fn finalize_error_response(error: &crate::reconciler::FinalizeError) -> Response {
     use crate::reconciler::FinalizeError;
+    // Transient I/O (spool disk full, read-only filesystem,
+    // temporarily unavailable storage) wrapping an Atif or Receipt
+    // failure gets 503 + Retry-After, mirroring the `/readyz` probe
+    // policy that already treats ENOSPC/EROFS as transient. Without
+    // this split the same incident produced `readyz=503` (correct)
+    // but `close=500` (misclassified as a permanent server bug),
+    // making SDKs configured with default retry-on-503 stop
+    // retrying and paging operators for a disk-full infra event.
+    // Same permanence-split discipline as `Bridge` vs `BridgeConfig`
+    // — the underlying `io::ErrorKind` is the discriminant.
+    if error.is_transient_io() {
+        let mut response = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": error.to_string()})),
+        )
+            .into_response();
+        response
+            .headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("5"));
+        return response;
+    }
     let status = match error {
         // Deterministic state conflicts: the request conflicts with the
         // session's current state and retrying cannot change the outcome

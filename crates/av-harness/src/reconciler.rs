@@ -271,6 +271,45 @@ impl FinalizeError {
             source: Some(Box::new(error)),
         }
     }
+
+    /// True iff this error is caused by a transient I/O condition
+    /// (spool disk full, read-only filesystem, spool storage
+    /// temporarily unreachable). The response layer maps these to
+    /// `503 Service Unavailable` + `Retry-After` rather than the
+    /// default `500 Internal Server Error`, matching the
+    /// `/readyz` probe policy that already treats ENOSPC/EROFS as
+    /// transient. Same permanence-split discipline as
+    /// `Bridge` vs `BridgeConfig`.
+    ///
+    /// Walks the `source` chain via `std::error::Error::source` so
+    /// an `av_atif::WriteError { source: io::Error }` or an
+    /// `av_receipts::SignError { source: io::Error }` are both
+    /// detected regardless of how deep the wrap is.
+    pub fn is_transient_io(&self) -> bool {
+        let root = match self {
+            Self::Atif { source: Some(s), .. } | Self::Receipt { source: Some(s), .. } => &**s,
+            _ => return false,
+        };
+        let mut current: &dyn std::error::Error = root;
+        loop {
+            if let Some(io) = current.downcast_ref::<std::io::Error>() {
+                return matches!(
+                    io.kind(),
+                    std::io::ErrorKind::StorageFull
+                        | std::io::ErrorKind::ReadOnlyFilesystem
+                        | std::io::ErrorKind::QuotaExceeded
+                        | std::io::ErrorKind::ResourceBusy
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::TimedOut
+                );
+            }
+            match current.source() {
+                Some(next) => current = next,
+                None => return false,
+            }
+        }
+    }
 }
 
 impl From<av_bridge::BusError> for FinalizeError {
