@@ -185,9 +185,21 @@ mod tests {
         let key = [7; 32];
         let sealed = seal(&key, "session:signed", 0, &serde_json::json!({"v": 1})).unwrap();
         let mut envelope: serde_json::Value = serde_json::from_slice(&sealed).unwrap();
-        envelope["mac"] = serde_json::json!("a".repeat(129));
+        // Use an EVEN oversized length so hex::decode wouldn't refuse
+        // it for the wrong reason (odd length). The previous 129-char
+        // fixture masked a regression that deleted the > 128 cap
+        // entirely: hex::decode caught it on the parity check, so
+        // is_err() still passed even though the DoS-prevention cap
+        // that gives this test its name was gone.
+        envelope["mac"] = serde_json::json!("a".repeat(4096));
         let oversized = serde_json::to_vec(&envelope).unwrap();
-        assert!(open::<serde_json::Value>(&key, "session:signed", 0, &oversized).is_err());
+        let err = open::<serde_json::Value>(&key, "session:signed", 0, &oversized)
+            .expect_err("multi-KiB mac field must be refused before hex::decode allocates");
+        assert!(
+            err.contains("64 hex chars"),
+            "the cap this test names (mac field length before hex decode) must be what \
+             refuses the value — got {err:?}"
+        );
         envelope["mac"] = serde_json::json!("a".repeat(128));
         let at_cap = serde_json::to_vec(&envelope).unwrap();
         assert!(open::<serde_json::Value>(&key, "session:signed", 0, &at_cap).is_err());

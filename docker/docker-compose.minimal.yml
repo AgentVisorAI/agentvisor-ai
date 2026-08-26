@@ -24,7 +24,13 @@ services:
     # materially less-hardened surface than the full stack (default
     # capabilities include NET_RAW / CHOWN / DAC_OVERRIDE, no
     # process-cap, no grace budget for the four-phase shutdown).
-    stop_grace_period: 120s
+    # 180 s matches the docker-compose.yml sibling: this service
+    # mounts config/harness.container.toml which sets
+    # shutdown_drain_timeout_s = 110 (to fit the 300 s streaming
+    # window). Total worst case: 110 (drain) + 30 (worker) + 30
+    # (finalize) + 5 (OTel) = 175 s. Prior 120 s value dropped
+    # receipts on any docker stop that ran the drain to completion.
+    stop_grace_period: 180s
     restart: unless-stopped
     security_opt:
       - "no-new-privileges:true"
