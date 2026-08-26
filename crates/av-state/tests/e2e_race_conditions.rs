@@ -237,13 +237,22 @@ fn cross_key_multi_spend_pairs_do_not_deadlock_or_double_spend() {
     const N: usize = 200;
     const LIMIT: u64 = 50;
     let barrier = Arc::new(Barrier::new(2 * N));
+    // R54 mutation-run hardening: without counting successful commits,
+    // a mutation that makes `try_spend_many` unconditionally return
+    // Err(Overflow) would keep both keys at 0 (trivially `<= LIMIT`)
+    // and the "never double-spend" test would pass with zero real
+    // spending. Count commits on the Ok(None) branch and cross-check
+    // the total against the summed keys.
+    let commits_ab = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let commits_ba = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut handles = Vec::new();
-    for i in 0..N {
+    for _ in 0..N {
         let store_a = Arc::clone(&store);
         let barrier_a = Arc::clone(&barrier);
+        let commits_a = Arc::clone(&commits_ab);
         handles.push(thread::spawn(move || {
             barrier_a.wait();
-            let _ = store_a.try_spend_many(&[
+            if let Ok(None) = store_a.try_spend_many(&[
                 Spend {
                     key: "A".to_owned(),
                     amount: 1,
@@ -254,14 +263,16 @@ fn cross_key_multi_spend_pairs_do_not_deadlock_or_double_spend() {
                     amount: 1,
                     limit: LIMIT,
                 },
-            ]);
-            let _ = i;
+            ]) {
+                commits_a.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }));
         let store_b = Arc::clone(&store);
         let barrier_b = Arc::clone(&barrier);
+        let commits_b = Arc::clone(&commits_ba);
         handles.push(thread::spawn(move || {
             barrier_b.wait();
-            let _ = store_b.try_spend_many(&[
+            if let Ok(None) = store_b.try_spend_many(&[
                 Spend {
                     key: "B".to_owned(),
                     amount: 1,
@@ -272,14 +283,38 @@ fn cross_key_multi_spend_pairs_do_not_deadlock_or_double_spend() {
                     amount: 1,
                     limit: LIMIT,
                 },
-            ]);
+            ]) {
+                commits_b.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }));
     }
     for h in handles {
         h.join().unwrap();
     }
-    assert!(store.get("A").unwrap() <= LIMIT, "double-spend on A");
-    assert!(store.get("B").unwrap() <= LIMIT, "double-spend on B");
+    let a = store.get("A").unwrap();
+    let b = store.get("B").unwrap();
+    assert!(a <= LIMIT, "double-spend on A: {a} > {LIMIT}");
+    assert!(b <= LIMIT, "double-spend on B: {b} > {LIMIT}");
+    // Every successful commit increments BOTH A and B by 1, so
+    // (a + b) == 2 × total_commits. If a mutation broke commit
+    // accounting or double-committed, this equality would fail.
+    let total_commits = commits_ab.load(std::sync::atomic::Ordering::Relaxed)
+        + commits_ba.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        a + b,
+        2 * total_commits,
+        "counted commits ({total_commits}) do not match summed keys \
+         (A={a}, B={b}) — a partial-commit or lost-update bug"
+    );
+    // At least ONE commit must have succeeded — a mutation that
+    // makes try_spend_many always return Err(Overflow) or always
+    // return Ok(Some) (reject all) would keep total_commits == 0
+    // and previously slipped past this test.
+    assert!(
+        total_commits > 0,
+        "no cross-key spend committed under 2×{N} contending threads at LIMIT={LIMIT}; \
+         `try_spend_many` may be rejecting every call (mutation-suspect)"
+    );
 }
 
 /// Mutation-run hardening: the JCS_SAFE_MAX overflow guards in
