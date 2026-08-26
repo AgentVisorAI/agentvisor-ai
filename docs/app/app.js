@@ -1,0 +1,2974 @@
+/*
+ * AgentVisor AI console — application.
+ *
+ * Hash-routed vanilla SPA. All data flows through window.dataSource
+ * (mock or api). Views: /login /signup /overview /sessions /sessions/:id
+ * /deployments /deployments/:id /policies /policies/:id /settings
+ *
+ * The console assumes a keyboard-first user: ⌘K palette, g-o / g-s / g-d /
+ * g-p / g-, navigation shortcuts, ? for the shortcut sheet.
+ */
+
+(function () {
+  "use strict";
+
+  var $ = function (sel, root) { return (root || document).querySelector(sel); };
+  var $$ = function (sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); };
+  var app = $("#app");
+
+  var state = {
+    session: null,
+    route: null,
+    ds: window.dataSource,
+    range: "24h",
+    theme: null,
+    gPrefixAt: 0,
+    settingsTab: "general",
+  };
+
+  /* ---------- theme ---------- */
+
+  function applyTheme(t) {
+    document.documentElement.setAttribute("data-theme", t);
+    state.theme = t;
+    try { localStorage.setItem("av_theme", t); } catch (e) {}
+  }
+  function initTheme() {
+    var saved;
+    try { saved = localStorage.getItem("av_theme"); } catch (e) {}
+    if (saved === "light" || saved === "dark") applyTheme(saved);
+    else state.theme = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  }
+  function toggleTheme() { applyTheme((state.theme === "dark") ? "light" : "dark"); render(); }
+
+  /* ---------- routing ---------- */
+
+  function parseHash() {
+    var h = (location.hash || "#/overview").replace(/^#/, "");
+    // Strip a query fragment (`#/reset?token=…&email=…`) before splitting.
+    var pathPart = h.split("?")[0];
+    var parts = pathPart.split("/").filter(Boolean);
+    return { path: parts, hash: h };
+  }
+  function navigate(hash) {
+    if (location.hash === hash) render();
+    else location.hash = hash;
+  }
+  window.addEventListener("hashchange", render);
+
+  /* ---------- session bootstrap ---------- */
+
+  // Called after a successful login/signup to restore whatever route
+  // the user was trying to visit before we bounced them to /login. We
+  // only accept hash routes that start with # so an attacker can't
+  // stash `javascript:` in sessionStorage from another tab.
+  function consumeReturnTo() {
+    try {
+      var t = sessionStorage.getItem("av_return_to");
+      sessionStorage.removeItem("av_return_to");
+      if (typeof t === "string" && t.charAt(0) === "#" && t !== "#/login" && t !== "#/signup") {
+        return t;
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  async function boot() {
+    initTheme();
+    try { state.session = await state.ds.getSession(); } catch (e) { console.error("session", e); }
+    if (!location.hash) location.hash = state.session ? "#/overview" : "#/login";
+    else render();
+    installKeyboardShortcuts();
+    if (state.session) startLiveStream();
+    // Listen for the datasource-emitted expiry signal. Any 401 that
+    // isn't from the boot-time /me probe kicks the user to /login with
+    // a toast so they know why. Redirect is a full navigate() so the
+    // hash-router picks up "no session" cleanly.
+    window.addEventListener("av-session-expired", function () {
+      if (!state.session) return; // already logged out; ignore
+      state.session = null;
+      stopLiveStream();
+      toast("Your session expired — please sign in again");
+      navigate("#/login");
+    });
+    // Cross-tab sign-out: when another tab in this browser signs out,
+    // it writes localStorage.av_signed_out_at. The storage event fires
+    // in *other* tabs (not the writer). We drop our in-memory session
+    // and bounce to login without waiting for the next API 401.
+    window.addEventListener("storage", function (e) {
+      if (e.key !== "av_signed_out_at" || !e.newValue) return;
+      if (!state.session) return;
+      state.session = null;
+      stopLiveStream();
+      toast("Signed out in another tab");
+      navigate("#/login");
+    });
+  }
+
+  var liveUnsub = null;
+  var liveEventBuffer = [];
+  function startLiveStream() {
+    if (liveUnsub || !state.ds.subscribe) return;
+    try {
+      liveUnsub = state.ds.subscribe(function (msg) {
+        // Meta messages control the pill's connection state.
+        if (msg.type === "stream.open" || msg.type === "hello") {
+          setLiveState("live");
+          return;
+        }
+        if (msg.type === "stream.closed") {
+          setLiveState("reconnecting");
+          return;
+        }
+        liveEventBuffer.push({ at: Date.now(), msg: msg });
+        if (liveEventBuffer.length > 40) liveEventBuffer.shift();
+        pulseLiveIndicator();
+        onLiveEvent(msg);
+      });
+    } catch (e) {
+      console.warn("live stream unavailable", e);
+    }
+  }
+  function stopLiveStream() {
+    if (liveUnsub) { liveUnsub(); liveUnsub = null; }
+  }
+  function setLiveState(s) {
+    var el = document.querySelector('.env-pill.live-pulse');
+    if (!el) return;
+    el.classList.toggle('reconnecting', s === "reconnecting");
+    el.title = s === "reconnecting"
+      ? "Reconnecting to the daemon stream…"
+      : "Streaming events from the daemon";
+    var label = el.querySelector('.live-label');
+    if (label) label.textContent = s === "reconnecting" ? "Reconnecting" : "Live";
+  }
+  function pulseLiveIndicator() {
+    var el = document.querySelector('.env-pill.live-pulse');
+    if (!el) return;
+    el.classList.remove('pulsing');
+    // Force reflow so re-adding the class restarts the animation.
+    void el.offsetWidth;
+    el.classList.add('pulsing');
+  }
+  function onLiveEvent(msg) {
+    // Overview: refresh KPIs + chart on any relevant event. Debounced so a
+    // burst of events (common right after a session opens) only redraws once.
+    var path = state.route && state.route.path;
+    if (!path || !path[0]) return;
+    if (path[0] === "overview") scheduleOverviewRefresh();
+    else if (path[0] === "sessions" && path[1] && msg.type === "events.appended" && msg.data.sessionId === path[1]) {
+      scheduleSessionDetailRefresh(path[1]);
+    } else if (path[0] === "sessions" && !path[1] && (msg.type === "session.upsert" || msg.type === "events.appended")) {
+      // A new session or a batch of events came in — refresh the list
+      // so the operator sees new rows appear without hitting reload.
+      // Debounced so a burst of events doesn't cause a re-render on
+      // every message.
+      scheduleSessionsListRefresh();
+    }
+  }
+  var _ovT;
+  function scheduleOverviewRefresh() {
+    clearTimeout(_ovT);
+    _ovT = setTimeout(function () {
+      var main = document.getElementById("view");
+      if (main && (!state.route || state.route.path[0] === "overview")) renderOverview(main);
+    }, 700);
+  }
+  var _sdT;
+  function scheduleSessionDetailRefresh(id) {
+    clearTimeout(_sdT);
+    _sdT = setTimeout(function () {
+      var main = document.getElementById("view");
+      if (main && state.route && state.route.path[0] === "sessions" && state.route.path[1] === id) {
+        renderSessionDetail(main, id);
+      }
+    }, 400);
+  }
+  var _slT;
+  function scheduleSessionsListRefresh() {
+    clearTimeout(_slT);
+    _slT = setTimeout(function () {
+      var main = document.getElementById("view");
+      if (main && state.route && state.route.path[0] === "sessions" && !state.route.path[1]) {
+        renderSessionsList(main);
+      }
+    }, 400);
+  }
+
+  /* ---------- main render ---------- */
+
+  async function render() {
+    state.route = parseHash();
+    var path = state.route.path;
+    var publicRoutes = ["login", "signup", "reset", "accept-invite"];
+    if (!state.session && !publicRoutes.includes(path[0])) {
+      // Remember where the user was trying to go so we can restore
+      // after login. A deep-link from a Slack notification / email
+      // shouldn't dump the user on Overview after they authenticate.
+      try {
+        var full = location.hash || "";
+        if (full && full !== "#/login") sessionStorage.setItem("av_return_to", full);
+      } catch (e) {}
+      return navigate("#/login");
+    }
+    if (state.session && publicRoutes.includes(path[0])) return navigate("#/overview");
+    if (!state.session) {
+      if (path[0] === "signup") return renderSignup();
+      if (path[0] === "reset") return renderReset();
+      if (path[0] === "accept-invite") return renderAcceptInvite();
+      return renderLogin();
+    }
+
+    renderShell();
+    var main = $("#view");
+    if (path[0] === "overview" || !path[0]) return renderOverview(main);
+    if (path[0] === "sessions" && path[1]) return renderSessionDetail(main, path[1]);
+    if (path[0] === "sessions") return renderSessionsList(main);
+    if (path[0] === "deployments" && path[1]) return renderDeploymentDetail(main, path[1]);
+    if (path[0] === "deployments") return renderDeployments(main);
+    if (path[0] === "policies" && path[1]) return renderPolicyDetail(main, path[1]);
+    if (path[0] === "policies") return renderPolicies(main);
+    if (path[0] === "settings") return renderSettings(main, path[1] || "general");
+    main.innerHTML = notFound();
+  }
+
+  /* ---------- utilities ---------- */
+
+  function h(html) { var t = document.createElement("template"); t.innerHTML = html.trim(); return t.content.firstChild; }
+  function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
+  function initials(name) { return String(name || "?").trim().slice(0, 1).toUpperCase(); }
+  function timeAgo(iso) {
+    if (!iso) return "—";
+    var s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+    if (s < 60) return Math.floor(s) + "s ago";
+    if (s < 3600) return Math.floor(s / 60) + "m ago";
+    if (s < 86400) return Math.floor(s / 3600) + "h ago";
+    return Math.floor(s / 86400) + "d ago";
+  }
+  function toast(msg, err) {
+    var t = h('<div class="toast ' + (err ? "err" : "") + '">' + esc(msg) + "</div>");
+    document.body.appendChild(t);
+    setTimeout(function () { t.remove(); }, 2200);
+  }
+  function loadingBlock(kind) {
+    if (kind === "stats") {
+      var boxes = "";
+      for (var i = 0; i < 5; i++) boxes += '<div class="stat"><span class="skl h-12 w-4"></span><br/><span class="skl h-24 w-6" style="margin-top:6px"></span></div>';
+      return '<div class="stats">' + boxes + '</div><div class="skl h-180 w-full"></div>';
+    }
+    if (kind === "table") {
+      var rows = "";
+      for (var j = 0; j < 6; j++) rows += '<div style="padding:12px 16px; border-bottom:1px solid var(--border);"><span class="skl h-16 w-4"></span></div>';
+      return '<div class="table-wrap">' + rows + '</div>';
+    }
+    return '<div class="empty"><span class="spinner"></span>Loading…</div>';
+  }
+  function notFound() {
+    return '<div class="page-header"><div><h1>Page not found</h1>' +
+      '<div class="sub">The URL you followed doesn\'t point at anything in this workspace.</div></div></div>' +
+      '<div class="empty">' +
+        '<h3>404 — nothing here</h3>' +
+        '<p>The page you\'re looking for might have been renamed, or the link that brought you here is stale.</p>' +
+        '<a class="btn accent" href="#/overview">Go to overview</a> ' +
+        '<a class="btn" href="#/sessions">Or view sessions</a>' +
+      '</div>';
+  }
+  function usdMicros(str) {
+    var n = typeof str === "string" ? parseInt(str, 10) : (str || 0);
+    return "$" + (n / 1e6).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+  function usdMicrosBig(str) {
+    var n = typeof str === "string" ? parseInt(str, 10) : (str || 0);
+    var v = n / 1e6;
+    if (v >= 1000) return "$" + Math.round(v).toLocaleString();
+    return "$" + v.toFixed(2);
+  }
+
+  /* ============================================================
+   * SVG CHART GENERATORS
+   * ============================================================ */
+
+  function sparkline(values, opts) {
+    opts = opts || {};
+    var w = opts.w || 88, hh = opts.h || 28;
+    var max = Math.max.apply(null, values.length ? values : [1]);
+    var min = 0;
+    var range = Math.max(1, max - min);
+    var stepX = values.length > 1 ? w / (values.length - 1) : 0;
+    var pts = values.map(function (v, i) {
+      var x = i * stepX;
+      var y = hh - ((v - min) / range) * (hh - 3) - 1;
+      return x.toFixed(1) + "," + y.toFixed(1);
+    }).join(" ");
+    var color = opts.color || "var(--accent)";
+    var fill = opts.fill || "var(--accent-bg)";
+    var area = "0," + hh + " " + pts + " " + w + "," + hh;
+    return '<svg class="spark" viewBox="0 0 ' + w + ' ' + hh + '" xmlns="http://www.w3.org/2000/svg">' +
+      '<polygon fill="' + fill + '" points="' + area + '"/>' +
+      '<polyline fill="none" stroke="' + color + '" stroke-width="1.5" stroke-linejoin="round" points="' + pts + '"/>' +
+      '</svg>';
+  }
+
+  function stackedBarChart(series, opts) {
+    opts = opts || {};
+    var w = opts.w || 720, hh = opts.h || 180;
+    var padL = 32, padR = 8, padT = 12, padB = 22;
+    var chartW = w - padL - padR;
+    var chartH = hh - padT - padB;
+    var n = series.length;
+    var gap = n <= 24 ? 3 : (n <= 30 ? 2 : 1);
+    var barW = Math.max(2, chartW / n - gap);
+    var max = Math.max.apply(null, series.map(function (s) { return s.allowed + s.blocked; }).concat([1]));
+    max = Math.ceil(max / 5) * 5 || 5;
+    var bars = "";
+    var hoverRects = "";
+    for (var i = 0; i < n; i++) {
+      var s = series[i];
+      var x = padL + i * (barW + gap);
+      var totalH = ((s.allowed + s.blocked) / max) * chartH;
+      var blockedH = (s.blocked / max) * chartH;
+      var yAllowedTop = padT + chartH - totalH;
+      var yBlockedTop = padT + chartH - blockedH;
+      if (s.allowed) bars += '<rect class="bar" x="' + x.toFixed(1) + '" y="' + yAllowedTop.toFixed(1) + '" width="' + barW.toFixed(1) + '" height="' + (totalH - blockedH).toFixed(1) + '" rx="1.5"/>';
+      if (s.blocked) bars += '<rect class="bar blocked" x="' + x.toFixed(1) + '" y="' + yBlockedTop.toFixed(1) + '" width="' + barW.toFixed(1) + '" height="' + blockedH.toFixed(1) + '" rx="1.5"/>';
+      // Wide hover strip covering each bucket for tooltip pickup
+      hoverRects += '<rect class="hover-strip" x="' + x.toFixed(1) + '" y="' + padT + '" width="' + (barW + gap).toFixed(1) + '" height="' + chartH + '" fill="transparent" data-idx="' + i + '" />';
+    }
+    var grid = "";
+    for (var g = 0; g <= 4; g++) {
+      var gy = (padT + (chartH / 4) * g).toFixed(1);
+      grid += '<line x1="' + padL + '" y1="' + gy + '" x2="' + (w - padR) + '" y2="' + gy + '"/>';
+    }
+    var yLabels = "";
+    for (var yi = 0; yi <= 4; yi++) {
+      var yv = Math.round(max - (max / 4) * yi);
+      var yy = (padT + (chartH / 4) * yi + 3).toFixed(1);
+      yLabels += '<text x="' + (padL - 6) + '" y="' + yy + '" text-anchor="end">' + yv + '</text>';
+    }
+    var xStep = Math.max(1, Math.floor(n / 6));
+    var xLabels = "";
+    for (var xi = 0; xi < n; xi += xStep) {
+      var xx = padL + xi * (barW + gap) + barW / 2;
+      xLabels += '<text x="' + xx.toFixed(1) + '" y="' + (hh - 6) + '" text-anchor="middle">' + esc(series[xi].label || "") + '</text>';
+    }
+    var cursor = '<line class="cursor" id="chartCursor" x1="0" y1="' + padT + '" x2="0" y2="' + (padT + chartH) + '" style="opacity:0"/>';
+    return '<svg class="chart-svg" viewBox="0 0 ' + w + ' ' + hh + '" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="none">' +
+      '<g class="grid">' + grid + '</g>' +
+      '<g class="axis">' + yLabels + xLabels + '</g>' +
+      bars +
+      cursor +
+      '<g>' + hoverRects + '</g>' +
+      '</svg>';
+  }
+
+  /* ============================================================
+   * SHELL
+   * ============================================================ */
+
+  function signOut() {
+    confirmModal({
+      title: "Sign out?",
+      body: "You'll need to sign in again to access this workspace.",
+      confirmLabel: "Sign out",
+      danger: false,
+      onConfirm: function () {
+        stopLiveStream();
+        state.ds.logout().then(function () {
+          state.session = null;
+          // Cross-tab sync: any other console tab open in this browser
+          // notices via a storage event and drops its own session state
+          // without waiting for the next API 401. The value is a
+          // timestamp so re-signing-out later fires the event again.
+          try { localStorage.setItem("av_signed_out_at", String(Date.now())); } catch (e) {}
+          navigate("#/login");
+        });
+      },
+    });
+  }
+
+  function renderShell() {
+    var current = state.route.path[0] || "overview";
+    var org = state.session.org;
+    var user = state.session.user;
+    // One status chip in the topbar, not two. In mock mode we surface
+    // the "Demo" label so investors instantly see the data is fixtures.
+    // In live/api mode a single pulsing "Live" pill doubles as SSE
+    // stream health — it flips to "Reconnecting" when the EventSource
+    // drops. Rendering both a mode chip AND a stream chip in live mode
+    // duplicated the word "Live" next to itself.
+    var statusChip = state.ds.mode === "mock"
+      ? '<span class="env-pill" title="Console is showing built-in demo data. Set MOCK_MODE=false to talk to a live backend.">Demo</span>'
+      : '<span class="env-pill live-pulse" title="Streaming events from the daemon"><span class="live-label">Live</span></span>';
+
+    app.innerHTML = "";
+    app.appendChild(h(
+      '<div class="app-shell">' +
+        '<header class="topbar" role="banner">' +
+          '<a class="brand" href="#/overview">' +
+            '<span class="brand-mark">A</span>' +
+            '<span>AgentVisor</span>' +
+          "</a>" +
+          statusChip +
+          '<div class="spacer"></div>' +
+          '<button class="cmdk-trigger" id="cmdkOpen" aria-label="Open command palette (⌘K)">' +
+            '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>' +
+            '<span>Search or run a command…</span>' +
+            '<span class="kbd">⌘K</span>' +
+          "</button>" +
+          '<button class="theme-btn" id="themeBtn" title="Toggle theme" aria-label="Toggle light/dark theme">' + iconTheme() + "</button>" +
+          '<button class="user-btn" id="userBtn" aria-label="Account menu">' +
+            '<span class="avatar" aria-hidden="true">' + esc(initials(user.displayName || user.email)) + "</span>" +
+            "<span>" + esc(user.email) + "</span>" +
+          "</button>" +
+        "</header>" +
+        '<nav class="sidebar" aria-label="Primary navigation">' +
+          '<div class="org-switcher">' +
+            '<span class="avatar">' + esc(org.name.slice(0, 1).toUpperCase()) + "</span>" +
+            "<span>" + esc(org.name) + "</span>" +
+            '<span class="env">Production</span>' +
+          "</div>" +
+          navLink("overview", current, "Overview", iconChart(), "G O") +
+          navLink("sessions", current, "Sessions", iconActivity(), "G S") +
+          navLink("policies", current, "Policies", iconShield(), "G P") +
+          navLink("deployments", current, "Deployments", iconServer(), "G D") +
+          '<div class="group-label">Account</div>' +
+          navLink("settings", current, "Settings", iconGear(), "G ,") +
+        "</nav>" +
+        '<main class="main" id="view" aria-label="Main content"></main>' +
+      "</div>"
+    ));
+    $("#cmdkOpen").addEventListener("click", openCmdK);
+    $("#themeBtn").addEventListener("click", toggleTheme);
+    $("#userBtn").addEventListener("click", signOut);
+  }
+  function navLink(key, current, label, icon, kbd) {
+    var active = current === key ? ' class="active"' : "";
+    return '<a href="#/' + key + '"' + active + ">" + icon + "<span>" + label + "</span>" +
+      (kbd ? '<span class="kbd-hint">' + kbd + "</span>" : "") + "</a>";
+  }
+
+  /* ---------- icons ---------- */
+  function iconChart() { return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" stroke-linecap="round" stroke-linejoin="round"><path d="M2 14V3M2 14h12M5 11V8M8 11V6M11 11v-4"/></svg>'; }
+  function iconActivity() { return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 8h3l2-5 3 10 2-5h3"/></svg>'; }
+  function iconServer() { return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="2" y="3" width="12" height="4" rx="1"/><rect x="2" y="9" width="12" height="4" rx="1"/><circle cx="5" cy="5" r=".7" fill="currentColor"/><circle cx="5" cy="11" r=".7" fill="currentColor"/></svg>'; }
+  function iconGear() { return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" stroke-linecap="round"><circle cx="8" cy="8" r="2"/><path d="M8 1v2M8 13v2M15 8h-2M3 8H1M13 3l-1.4 1.4M4.4 11.6L3 13M13 13l-1.4-1.4M4.4 4.4L3 3"/></svg>'; }
+  function iconShield() { return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" stroke-linejoin="round"><path d="M8 1.5l5.5 2v4c0 3-2.4 5.7-5.5 6.5C4.9 13.2 2.5 10.5 2.5 7.5v-4L8 1.5z"/><path d="M5.8 7.8l1.6 1.6L10.4 6.4" stroke-linecap="round"/></svg>'; }
+  function iconTheme() { return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M3 3l1 1M12 12l1 1M3 13l1-1M12 4l1-1"/></svg>'; }
+  function iconGoogle() { return '<svg viewBox="0 0 18 18"><path fill="#4285F4" d="M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84c-.21 1.13-.85 2.08-1.8 2.72v2.26h2.92c1.7-1.57 2.68-3.88 2.68-6.62z"/><path fill="#34A853" d="M9 18c2.43 0 4.47-.8 5.96-2.18l-2.92-2.26c-.8.54-1.83.86-3.04.86-2.34 0-4.32-1.58-5.03-3.7H.96v2.32C2.44 15.98 5.48 18 9 18z"/><path fill="#FBBC05" d="M3.97 10.72c-.18-.54-.28-1.12-.28-1.72s.1-1.18.28-1.72V4.96H.96C.35 6.18 0 7.55 0 9s.35 2.82.96 4.04l3.01-2.32z"/><path fill="#EA4335" d="M9 3.58c1.32 0 2.51.45 3.44 1.35l2.58-2.58C13.46.89 11.43 0 9 0 5.48 0 2.44 2.02.96 4.96l3.01 2.32C4.68 5.16 6.66 3.58 9 3.58z"/></svg>'; }
+  function iconMicrosoft() { return '<svg viewBox="0 0 16 16"><rect x="1" y="1" width="6.5" height="6.5" fill="#F25022"/><rect x="8.5" y="1" width="6.5" height="6.5" fill="#7FBA00"/><rect x="1" y="8.5" width="6.5" height="6.5" fill="#00A4EF"/><rect x="8.5" y="8.5" width="6.5" height="6.5" fill="#FFB900"/></svg>'; }
+  function iconKey() { return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="5.5" cy="8.5" r="3"/><path d="M8.5 8.5H14M13 8.5V11M11 8.5V10"/></svg>'; }
+
+  /* ============================================================
+   * LOGIN / SIGNUP — split-screen with SSO
+   * ============================================================ */
+
+  function renderLogin() { renderAuth("login"); }
+  function renderSignup() { renderAuth("signup"); }
+  function renderAuth(kind) {
+    var isSignup = kind === "signup";
+    // Discover which SSO providers the backend actually has env for.
+    // Rendering a button we can't honor would leave the user staring at
+    // a 404 after they clicked "Continue with Microsoft".
+    state.ds.getSSO().then(function (sso) {
+      var providers = (sso && sso.providers) || [];
+      renderAuthWithProviders(kind, providers);
+    }).catch(function () {
+      renderAuthWithProviders(kind, []);
+    });
+  }
+  function renderAuthWithProviders(kind, providers) {
+    var isSignup = kind === "signup";
+    var byId = {};
+    providers.forEach(function (p) { byId[p.id] = p; });
+    var ssoButtons = "";
+    if (byId.google)    ssoButtons += '<button type="button" data-sso="google">' + iconGoogle() + '<span>Continue with Google</span></button>';
+    if (byId.microsoft) ssoButtons += '<button type="button" data-sso="microsoft">' + iconMicrosoft() + '<span>Continue with Microsoft</span></button>';
+    // SAML/Okta = enterprise path. We're honest about not shipping it
+    // yet: click routes to a contact-sales mailto. Still visible so the
+    // login page communicates the roadmap without pretending.
+    ssoButtons += '<button type="button" data-sso="saml">' + iconKey() + '<span>SAML SSO (contact sales)</span></button>';
+    var showSsoBlock = ssoButtons !== "";
+    app.innerHTML = "";
+    app.appendChild(h(
+      '<div class="auth-shell">' +
+        '<section class="auth-form">' +
+          '<div class="auth-form-inner">' +
+            '<div class="auth-brand"><span class="auth-brand-mark">A</span> AgentVisor</div>' +
+            '<h1>' + (isSignup ? "Create your workspace" : "Sign in") + '</h1>' +
+            '<p class="sub">' + (isSignup ? "Governance for every AI agent in your fleet." : "Access your agent control plane.") + '</p>' +
+            (showSsoBlock ? '<div class="sso">' + ssoButtons + "</div>" + '<div class="divider">or with email</div>' : '') +
+            '<form id="authForm">' +
+              (isSignup ? '<div class="field"><label for="orgName">Company name</label><input id="orgName" type="text" required placeholder="Acme Corp" autocomplete="organization" /></div>' : "") +
+              '<div class="field"><label for="email">Work email</label><input id="email" type="email" required autocomplete="email" placeholder="you@company.com" /></div>' +
+              '<div class="field"><label for="password">Password' + (isSignup ? " (min 12 characters)" : "") + '</label><input id="password" type="password" required ' + (isSignup ? 'minlength="12" autocomplete="new-password"' : 'autocomplete="current-password"') + ' /></div>' +
+              (isSignup ? "" : '<div style="margin-top: -4px; text-align: right;"><a href="#/reset" style="font-size: 12px; color: var(--fg-3);">Forgot password?</a></div>') +
+              '<div id="authErr"></div>' +
+              '<button class="primary" type="submit">' + (isSignup ? "Create account" : "Sign in") + '</button>' +
+            "</form>" +
+            '<div class="auth-alt">' +
+              (isSignup ? "Already have an account? " + '<a href="#/login">Sign in</a>' : "New here? " + '<a href="#/signup">Create an account</a>') +
+            "</div>" +
+            (state.ds.mode === "mock"
+              ? '<div class="mock-badge">Demo — any credentials work</div>'
+              : "") +
+          "</div>" +
+        "</section>" +
+        '<aside class="auth-panel"><div class="panel-inner">' +
+          '<h2>Ship autonomous agents your compliance team trusts.</h2>' +
+          '<p>Every LLM call, every tool call, every policy hit — captured, evaluated, and signed. In production, in real time.</p>' +
+          '<div class="demo-stream">' +
+            demoStreamRow(1, 6, '<b>tool.call</b> search_inventory(sku=\"NW-1240\")') +
+            demoStreamRow(2, 5, '<b class="ok">TOOL ✓ allow</b> policy: read-only ✓') +
+            demoStreamRow(3, 5, '<b>tool.call</b> create_purchase_order(vendor="NexusParts", $8,400)') +
+            demoStreamRow(4, 5, '<b class="blk">BLOCKED</b> vendor not in procurement.allowed_vendors') +
+            demoStreamRow(5, 4, '<b>tool.call</b> create_purchase_order(vendor="Contoso", $8,400)') +
+            demoStreamRow(6, 4, '<b class="ok">TOOL ✓ allow</b> PO #29841 · $8,400') +
+            demoStreamRow(7, 2, '<b class="ok">receipt</b> ed25519:kf_3a5f7e2d ✓ verified') +
+          "</div>" +
+        "</div></aside>" +
+      "</div>"
+    ));
+
+    $$('[data-sso]').forEach(function (b) {
+      b.addEventListener("click", function () {
+        var p = b.getAttribute("data-sso");
+        if (p === "saml") {
+          // Prompt for the email so we can look up the org's SAML
+          // config, then redirect to its login endpoint. This is the
+          // "Sign in with SSO" flow — no OAuth involved.
+          openInputModal({
+            title: "Sign in with SAML SSO",
+            label: "Work email",
+            placeholder: "you@company.com",
+            confirmLabel: "Continue",
+            sub: "We'll look up your workspace's identity provider by email domain.",
+            onConfirm: function (email) {
+              state.ds.discoverSaml(email).then(function (r) {
+                if (!r.ssoConfig) {
+                  toast("No SSO configured for that domain. Ask your admin to add your IdP in Settings → Single sign-on.", true);
+                  return;
+                }
+                var relay = (sessionStorage.getItem("av_return_to") || "");
+                var url = r.ssoConfig.loginUrl + (relay ? "?RelayState=" + encodeURIComponent(relay) : "");
+                window.location.assign(url);
+              }).catch(function (err) {
+                toast(err.message || "SSO discovery failed", true);
+              });
+            },
+          });
+          return;
+        }
+        state.ds.loginWithProvider(p).then(function (s) {
+          state.session = s; startLiveStream();
+          navigate(consumeReturnTo() || "#/overview");
+        }).catch(function (e) {
+          $("#authErr").innerHTML = '<div class="auth-err">' + esc(e.message) + "</div>";
+        });
+      });
+    });
+
+    $("#authForm").addEventListener("submit", function (e) {
+      e.preventDefault();
+      var email = $("#email").value.trim();
+      var pw = $("#password").value;
+      var errEl = $("#authErr");
+      var btn = e.target.querySelector("button[type=submit]");
+      btn.disabled = true;
+      var promise = isSignup
+        ? state.ds.signup({ email: email, password: pw, orgName: ($("#orgName") || {}).value })
+        : state.ds.login({ email: email, password: pw });
+      promise.then(async function (s) {
+        // MFA gate — server returned {mfaRequired: true, email}. Run the
+        // WebAuthn ceremony to complete auth.
+        if (s && s.mfaRequired) {
+          errEl.innerHTML = '<div class="auth-hint" style="color: var(--fg-2); padding: 8px 12px;">Touch your passkey…</div>';
+          try {
+            var full = await runPasskeyLogin(s.email);
+            state.session = full;
+            startLiveStream();
+            navigate(consumeReturnTo() || "#/overview");
+            return;
+          } catch (err) {
+            btn.disabled = false;
+            errEl.innerHTML = '<div class="auth-err">' + esc(err.message || "Passkey step failed") + "</div>";
+            return;
+          }
+        }
+        state.session = s;
+        startLiveStream();
+        navigate(consumeReturnTo() || "#/overview");
+      })
+        .catch(function (err) {
+          btn.disabled = false;
+          // 429 rate-limit → surface friendly message + countdown so
+          // the user has actionable info (e.g. shared corporate NAT
+          // where multiple people are hitting login at once).
+          var friendly = err.friendlyMessage || err.message || "Failed";
+          errEl.innerHTML = '<div class="auth-err">' + esc(friendly) + "</div>";
+          // If the server told us how long to wait, kick a countdown
+          // that re-enables the button when time's up.
+          if (err.retryAfterSec && err.retryAfterSec > 0) {
+            var left = err.retryAfterSec;
+            btn.disabled = true;
+            var iv = setInterval(function () {
+              left -= 1;
+              if (left <= 0) {
+                clearInterval(iv);
+                btn.disabled = false;
+                errEl.innerHTML = "";
+                return;
+              }
+              errEl.innerHTML = '<div class="auth-err">Too many attempts. Try again in ' + left + " second" + (left === 1 ? "" : "s") + ".</div>";
+            }, 1000);
+          }
+        });
+    });
+  }
+  function demoStreamRow(i, t, msg) {
+    return '<div class="row" style="animation-delay:' + (i * 90) + 'ms">' +
+      '<span class="seq">#' + i + '</span>' +
+      '<span class="msg">' + msg + '</span>' +
+      '<span class="t">' + t + 'm</span>' +
+      '</div>';
+  }
+
+  /* ============================================================
+   * PASSWORD RESET (two-step)
+   * ============================================================ */
+
+  function renderAcceptInvite() {
+    var qs = (location.hash.split("?")[1] || "");
+    var params = new URLSearchParams(qs);
+    var email = params.get("email") || "";
+    var token = params.get("token") || "";
+    if (!token) {
+      app.innerHTML = "";
+      app.appendChild(h('<div class="auth-shell"><section class="auth-form"><div class="auth-form-inner"><h1>Invite link invalid</h1><p class="sub">This link is missing its token. Ask your teammate to resend the invite.</p><a class="btn accent" href="#/login">Back to sign in</a></div></section></div>'));
+      return;
+    }
+    app.innerHTML = "";
+    app.appendChild(h(
+      '<div class="auth-shell">' +
+        '<section class="auth-form">' +
+          '<div class="auth-form-inner">' +
+            '<div class="auth-brand"><span class="auth-brand-mark">A</span> AgentVisor</div>' +
+            '<h1>Join the workspace</h1>' +
+            '<p class="sub">Accept your invite for <b>' + esc(email) + '</b> and set a password.</p>' +
+            '<form id="acceptForm">' +
+              '<div class="field"><label for="displayName">Your name</label><input id="displayName" type="text" placeholder="First Last" autocomplete="name" /></div>' +
+              '<div class="field"><label for="password">Password (min 12)</label><input id="password" type="password" required minlength="12" autocomplete="new-password" /></div>' +
+              '<div id="acceptErr"></div>' +
+              '<button class="primary" type="submit">Accept invite</button>' +
+            '</form>' +
+            '<div class="auth-alt">Already have an account? <a href="#/login">Sign in</a> first, then click the invite link again.</div>' +
+          '</div>' +
+        '</section>' +
+        '<aside class="auth-panel"><div class="panel-inner">' +
+          '<h2>Team invites are single-use.</h2>' +
+          '<p>The token is argon2-hashed at rest and expires in 7 days. Only the email address on the invite can accept it.</p>' +
+        '</div></aside>' +
+      '</div>'
+    ));
+    $("#acceptForm").addEventListener("submit", function (e) {
+      e.preventDefault();
+      var btn = e.target.querySelector('button[type="submit"]');
+      btn.disabled = true;
+      state.ds.acceptInvite({
+        email: email,
+        token: token,
+        password: $("#password").value,
+        displayName: ($("#displayName") || {}).value || undefined,
+      }).then(function (s) {
+        state.session = { user: s.user, org: s.org };
+        startLiveStream();
+        toast("Welcome to " + (s.org && s.org.name ? s.org.name : "the workspace"));
+        navigate("#/overview");
+      }).catch(function (err) {
+        btn.disabled = false;
+        $("#acceptErr").innerHTML = '<div class="auth-err">' + esc(err.message || "Accept failed") + '</div>';
+      });
+    });
+  }
+
+  function renderReset() {
+    // Optional inline second step: if the URL is #/reset?email=...&token=...
+    // (delivered by the reset email) skip straight to the "set new password"
+    // form; otherwise start with the "enter your email" form.
+    var qs = (location.hash.split("?")[1] || "");
+    var params = new URLSearchParams(qs);
+    var prefillEmail = params.get("email") || "";
+    var prefillToken = params.get("token") || "";
+    var stage = prefillToken ? "confirm" : "request";
+
+    app.innerHTML = "";
+    app.appendChild(h(
+      '<div class="auth-shell">' +
+        '<section class="auth-form">' +
+          '<div class="auth-form-inner">' +
+            '<div class="auth-brand"><span class="auth-brand-mark">A</span> AgentVisor</div>' +
+            (stage === "request"
+              ? '<h1>Reset your password</h1>' +
+                '<p class="sub">We\'ll email you a link to pick a new one.</p>' +
+                '<form id="resetReqForm">' +
+                  '<div class="field"><label for="email">Work email</label><input id="email" type="email" required autocomplete="email" placeholder="you@company.com" value="' + esc(prefillEmail) + '"/></div>' +
+                  '<div id="resetErr"></div>' +
+                  '<button class="primary" type="submit">Send reset link</button>' +
+                "</form>"
+              : '<h1>Choose a new password</h1>' +
+                '<p class="sub">Reset link verified. Pick something at least 12 characters.</p>' +
+                '<form id="resetConfirmForm">' +
+                  '<div class="field"><label for="email">Work email</label><input id="email" type="email" required autocomplete="email" value="' + esc(prefillEmail) + '"/></div>' +
+                  '<input type="hidden" id="token" value="' + esc(prefillToken) + '"/>' +
+                  '<div class="field"><label for="newPassword">New password</label><input id="newPassword" type="password" minlength="12" required autocomplete="new-password" /></div>' +
+                  '<div id="resetErr"></div>' +
+                  '<button class="primary" type="submit">Save new password</button>' +
+                "</form>"
+            ) +
+            '<div class="auth-alt"><a href="#/login">← Back to sign in</a></div>' +
+            (state.ds.mode === "mock"
+              ? '<div class="mock-badge">Demo — the token is displayed inline after "Send reset link".</div>'
+              : "") +
+          "</div>" +
+        "</section>" +
+        '<aside class="auth-panel"><div class="panel-inner">' +
+          '<h2>One reset link per address, valid for 24 hours.</h2>' +
+          '<p>The token is argon2-hashed at rest and single-use. Rotate a compromised password and every prior session cookie stops working at next check-in.</p>' +
+        "</div></aside>" +
+      "</div>"
+    ));
+
+    var reqForm = $("#resetReqForm");
+    if (reqForm) reqForm.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var email = $("#email").value.trim();
+      var btn = e.target.querySelector("button");
+      btn.disabled = true;
+      state.ds.requestPasswordReset({ email: email }).then(function (r) {
+        // In mock mode surface the token inline so a reviewer can complete
+        // the flow without an email server.
+        if (state.ds.mode === "mock" && r.mockToken) {
+          $("#resetErr").innerHTML =
+            '<div class="mock-badge" style="margin-top: 0; text-align:left; padding: 10px 12px;">' +
+              '<div style="margin-bottom: 6px;">Reset email sent. Demo token below:</div>' +
+              '<div class="mono" style="word-break:break-all; padding: 6px 8px; background: var(--surface-hover); border-radius: 4px;">' + esc(r.mockToken) + '</div>' +
+              '<div style="margin-top: 8px;"><a href="#/reset?email=' + encodeURIComponent(email) + '&token=' + encodeURIComponent(r.mockToken) + '">Continue →</a></div>' +
+            '</div>';
+        } else {
+          $("#resetErr").innerHTML = '<div class="mock-badge" style="margin-top: 0;">If that email exists, a reset link is on the way.</div>';
+        }
+      }).catch(function (err) {
+        btn.disabled = false;
+        $("#resetErr").innerHTML = '<div class="auth-err">' + esc(err.message) + "</div>";
+      });
+    });
+
+    var confirmForm = $("#resetConfirmForm");
+    if (confirmForm) confirmForm.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var email = $("#email").value.trim();
+      var token = $("#token").value;
+      var newPassword = $("#newPassword").value;
+      var btn = e.target.querySelector("button");
+      btn.disabled = true;
+      state.ds.confirmPasswordReset({ email: email, token: token, newPassword: newPassword }).then(function () {
+        toast("Password updated — please sign in");
+        navigate("#/login");
+      }).catch(function (err) {
+        btn.disabled = false;
+        var msg = err.status === 401 ? "This link is invalid or has expired." : (err.message || "Reset failed");
+        $("#resetErr").innerHTML = '<div class="auth-err">' + esc(msg) + "</div>";
+      });
+    });
+  }
+
+  /* ============================================================
+   * OVERVIEW — stats with sparklines + a real chart
+   * ============================================================ */
+
+  async function renderOverview(main) {
+    var rangeLabel = { "1h": "the last hour", "24h": "the last 24 hours", "7d": "the last 7 days", "30d": "the last 30 days" }[state.range] || "the last 24 hours";
+    main.innerHTML = pageHeader("Overview", "Fleet activity for " + rangeLabel + ".", rangeGroup()) + loadingBlock("stats");
+    var stats, sessions;
+    try {
+      stats = await state.ds.getOverview(state.range);
+      var res = await state.ds.listSessions();
+      sessions = res.sessions.slice(0, 8);
+    } catch (e) { return renderError(main, e); }
+
+    var series = stats.series || [];
+    var allowedByHour = series.map(function (b) { return b.allowed; });
+    var blockedByHour = series.map(function (b) { return b.blocked; });
+    var spendByHour = series.map(function (b) { return b.spendUsd; });
+    // Cumulative running total of blocked action value across the last 24 h —
+    // shape matches the "savings so far" story of the stat card.
+    var blockedValueCumulative = [];
+    var running = 0;
+    series.forEach(function (b) { running += b.blockedValueUsd; blockedValueCumulative.push(running); });
+    var pctBlocked = stats.toolsAllowed + stats.toolsBlocked > 0
+      ? Math.round((stats.toolsBlocked / (stats.toolsAllowed + stats.toolsBlocked)) * 100) : 0;
+
+    main.innerHTML =
+      pageHeader("Overview", "Fleet activity for " + rangeLabel + ".", rangeGroup()) +
+      '<div class="stats">' +
+        stat("Sessions", stats.sessions, stats.deployments + " deployment" + (stats.deployments === 1 ? "" : "s"), sparkline(series.map(function (b) { return b.allowed + b.blocked; }))) +
+        stat("Tool calls allowed", stats.toolsAllowed.toLocaleString(), "policy pass", sparkline(allowedByHour)) +
+        stat("Tool calls blocked", stats.toolsBlocked.toLocaleString(), pctBlocked + "% block rate", sparkline(blockedByHour, { color: "var(--danger-solid)", fill: "var(--danger-bg)" }), "blocks") +
+        stat("LLM spend", "$" + stats.llmSpendUsd, "usage this window", sparkline(spendByHour)) +
+        stat("Prevented losses", "$" + Number(stats.blockedSpendUsd).toLocaleString(), "blocked action value", sparkline(blockedValueCumulative, { color: "var(--success-solid)", fill: "var(--success-bg)" }), "savings") +
+      "</div>" +
+      '<div class="chart-card">' +
+        '<div class="head">' +
+          '<h2>Tool call activity</h2>' +
+          '<span class="sub">' + esc(rangeLabel) + ' · ' + { "1h": "1-minute", "24h": "hourly", "7d": "daily", "30d": "daily" }[state.range] + ' buckets</span>' +
+          '<div class="legend">' +
+            '<span><span class="dot" style="background: var(--accent)"></span> Allowed</span>' +
+            '<span><span class="dot" style="background: var(--danger-solid)"></span> Blocked</span>' +
+          "</div>" +
+        "</div>" +
+        stackedBarChart(series) +
+      "</div>" +
+      '<div class="card" style="padding:0">' +
+        '<div style="padding:12px 16px; border-bottom: 1px solid var(--border); display:flex; align-items:baseline; gap:8px;">' +
+          '<h2 style="margin:0; font-size: var(--t-section); font-weight:600">Recent sessions</h2>' +
+          '<span style="color: var(--fg-3); font-size: var(--t-sec)">' + sessions.length + ' shown</span>' +
+          '<div style="margin-left:auto"><a href="#/sessions" style="font-size: var(--t-sec)">View all →</a></div>' +
+        "</div>" +
+        sessionsTable(sessions) +
+      "</div>";
+
+    installRangeGroup(main);
+    installChartHover(main, series);
+  }
+
+  function installChartHover(root, series) {
+    var chart = root.querySelector(".chart-svg");
+    if (!chart) return;
+    var cursor = chart.querySelector("#chartCursor");
+    var tip = h('<div class="chart-tip" style="display:none"></div>');
+    root.querySelector(".chart-card").appendChild(tip);
+    chart.addEventListener("mousemove", function (e) {
+      var strip = e.target.closest(".hover-strip");
+      if (!strip) { tip.style.display = "none"; cursor.style.opacity = "0"; return; }
+      var idx = parseInt(strip.getAttribute("data-idx"), 10);
+      var s = series[idx];
+      var x = parseFloat(strip.getAttribute("x")) + parseFloat(strip.getAttribute("width")) / 2;
+      cursor.setAttribute("x1", x);
+      cursor.setAttribute("x2", x);
+      cursor.style.opacity = "1";
+      var box = chart.getBoundingClientRect();
+      var relX = (x / 720) * box.width;
+      tip.style.display = "block";
+      tip.style.left = Math.min(Math.max(0, relX - 60), box.width - 140) + "px";
+      tip.style.top = "-4px";
+      tip.innerHTML =
+        '<div class="tip-label">' + esc(s.label || "") + "</div>" +
+        '<div class="tip-row"><span class="d" style="background: var(--accent)"></span>Allowed <b>' + s.allowed + "</b></div>" +
+        '<div class="tip-row"><span class="d" style="background: var(--danger-solid)"></span>Blocked <b>' + s.blocked + "</b></div>" +
+        (s.spendUsd > 0 ? '<div class="tip-row muted">Spend $' + s.spendUsd.toFixed(2) + "</div>" : "");
+    });
+    chart.addEventListener("mouseleave", function () {
+      tip.style.display = "none";
+      cursor.style.opacity = "0";
+    });
+  }
+  function rangeGroup() {
+    var opts = ["1h", "24h", "7d", "30d"];
+    return '<div class="range-group">' + opts.map(function (o) {
+      return '<button data-range="' + o + '"' + (state.range === o ? ' class="active"' : "") + '>' + o + '</button>';
+    }).join("") + '</div>';
+  }
+  function installRangeGroup(root) {
+    $$('.range-group button', root).forEach(function (b) {
+      b.addEventListener("click", function () {
+        state.range = b.getAttribute("data-range");
+        render();
+      });
+    });
+  }
+  function stat(label, value, delta, spark, cls) {
+    return '<div class="stat ' + (cls || "") + '">' +
+      '<div class="head"><div class="label">' + esc(label) + "</div></div>" +
+      '<div class="value">' + esc(value) + "</div>" +
+      (delta ? '<div class="delta">' + esc(delta) + "</div>" : "") +
+      (spark || "") +
+      "</div>";
+  }
+  function pageHeader(title, sub, actions) {
+    return '<div class="page-header"><div><h1>' + esc(title) + "</h1>" +
+      (sub ? '<div class="sub">' + esc(sub) + "</div>" : "") + "</div>" +
+      (actions ? '<div class="actions">' + actions + "</div>" : "") + "</div>";
+  }
+
+  /* ============================================================
+   * SESSIONS LIST — with filter bar
+   * ============================================================ */
+
+  var sessionsFilter = { q: "", deploymentId: "", agent: "", blockedOnly: false, sinceHours: 24 };
+  var sessionsPageSize = 50;
+  // Hard cap on DOM rows. At 1M sessions the API pages 50 at a time,
+  // and "Load more" keeps appending — but we stop at 1000 rendered so
+  // the browser never has to reflow 100k+ rows. Past this point the
+  // filter bar is the correct escape hatch (search, date range, etc).
+  var SESSIONS_DOM_CAP = 1000;
+  var sessionsLoaded = []; // { sessions: [...], nextCursor }
+  var sessionsCursor = null;
+
+  async function renderSessionsList(main) {
+    main.innerHTML = pageHeader("Sessions", "Every agent session policed by AgentVisor.") + filterBar() + loadingBlock("table");
+    var deps;
+    try {
+      deps = await state.ds.listDeployments();
+      // Reset accumulator on every top-level render (filter change etc).
+      sessionsLoaded = [];
+      sessionsCursor = null;
+      var firstPage = await state.ds.listSessions(Object.assign({ limit: sessionsPageSize }, sessionsFilter));
+      sessionsLoaded = firstPage.sessions;
+      sessionsCursor = firstPage.nextCursor;
+    } catch (e) { return renderError(main, e); }
+    installFilters(main, deps);
+    renderSessionsBody(main, deps);
+  }
+  function renderSessionsBody(main, deps) {
+    var body;
+    if (sessionsLoaded.length === 0) {
+      body = emptyState("No sessions match your filters", "Try widening the date range or clearing the search.", null);
+    } else {
+      body = '<div class="card" style="padding:0">' + sessionsTable(sessionsLoaded) + '</div>';
+      if (sessionsCursor && sessionsLoaded.length < SESSIONS_DOM_CAP) {
+        body += '<div style="margin-top:12px; text-align:center;">' +
+          '<button class="btn" id="loadMore">Load more</button>' +
+          "</div>";
+      } else if (sessionsCursor) {
+        // Hit the DOM cap. Nudge users toward narrower filters.
+        body += '<div style="margin-top:12px; text-align:center; color: var(--fg-2); font-size: var(--t-sec);">' +
+          "Showing the newest " + sessionsLoaded.length.toLocaleString() + " sessions. " +
+          "Narrow the date range or search to see older matches." +
+          "</div>";
+      }
+    }
+    var showingLabel = sessionsLoaded.length > 0
+      ? sessionsLoaded.length.toLocaleString() + " session" + (sessionsLoaded.length === 1 ? "" : "s") + " shown"
+      : "no sessions";
+    main.innerHTML = pageHeader("Sessions", showingLabel) + filterBar() + body;
+    installFilters(main, deps);
+    var lm = $("#loadMore");
+    if (lm) {
+      lm.addEventListener("click", async function () {
+        lm.disabled = true;
+        lm.textContent = "Loading…";
+        try {
+          var page = await state.ds.listSessions(Object.assign({ limit: sessionsPageSize, cursor: sessionsCursor }, sessionsFilter));
+          sessionsLoaded = sessionsLoaded.concat(page.sessions);
+          sessionsCursor = page.nextCursor;
+          renderSessionsBody(main, deps);
+        } catch (err) {
+          toast(err.message || "Failed to load", true);
+          lm.disabled = false;
+          lm.textContent = "Load more";
+        }
+      });
+    }
+  }
+
+  function filterBar() {
+    return '<div class="filter-bar">' +
+      '<div class="search">' +
+        '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>' +
+        '<input id="fSearch" type="search" placeholder="Search by session id, agent, or actor…" aria-label="Search sessions" value="' + esc(sessionsFilter.q) + '" />' +
+      "</div>" +
+      '<select id="fRange" aria-label="Filter by time range">' +
+        '<option value="1"' + (sessionsFilter.sinceHours === 1 ? " selected" : "") + '>Last 1h</option>' +
+        '<option value="24"' + (sessionsFilter.sinceHours === 24 ? " selected" : "") + '>Last 24h</option>' +
+        '<option value="168"' + (sessionsFilter.sinceHours === 168 ? " selected" : "") + '>Last 7d</option>' +
+        '<option value="720"' + (sessionsFilter.sinceHours === 720 ? " selected" : "") + '>Last 30d</option>' +
+      "</select>" +
+      '<select id="fDep" aria-label="Filter by deployment"><option value="">All deployments</option></select>' +
+      '<select id="fAgent" aria-label="Filter by agent"><option value="">All agents</option></select>' +
+      '<label class="toggle"><input id="fBlocked" type="checkbox"' + (sessionsFilter.blockedOnly ? " checked" : "") + '/> Blocked only</label>' +
+      "</div>";
+  }
+  function installFilters(root, deps) {
+    var fS = $("#fSearch", root);
+    if (fS) {
+      var timer;
+      fS.addEventListener("input", function () {
+        clearTimeout(timer);
+        timer = setTimeout(function () { sessionsFilter.q = fS.value.trim(); renderSessionsList(root); }, 220);
+      });
+    }
+    var fR = $("#fRange", root);
+    if (fR) fR.addEventListener("change", function () { sessionsFilter.sinceHours = parseInt(fR.value, 10); renderSessionsList(root); });
+    var fD = $("#fDep", root);
+    if (fD && deps) {
+      deps.forEach(function (d) {
+        var o = document.createElement("option");
+        o.value = d.id; o.textContent = d.name;
+        if (sessionsFilter.deploymentId === d.id) o.selected = true;
+        fD.appendChild(o);
+      });
+      fD.addEventListener("change", function () { sessionsFilter.deploymentId = fD.value; renderSessionsList(root); });
+    }
+    var fA = $("#fAgent", root);
+    if (fA) {
+      var agents = ["supply-planner", "returns-triage", "vendor-onboarding", "customer-emailer", "invoice-reconciler"];
+      agents.forEach(function (a) {
+        var o = document.createElement("option");
+        o.value = a; o.textContent = a;
+        if (sessionsFilter.agent === a) o.selected = true;
+        fA.appendChild(o);
+      });
+      fA.addEventListener("change", function () { sessionsFilter.agent = fA.value; renderSessionsList(root); });
+    }
+    var fB = $("#fBlocked", root);
+    if (fB) fB.addEventListener("change", function () { sessionsFilter.blockedOnly = fB.checked; renderSessionsList(root); });
+  }
+
+  function sessionsTable(sessions) {
+    if (sessions.length === 0) return emptyState("No sessions yet", "Sessions from your daemons will appear here.");
+    var rows = sessions.map(function (s) {
+      var blocks = s.toolsBlocked > 0
+        ? '<span class="pill err">' + s.toolsBlocked + " blocked</span>"
+        : '<span class="pill ok">clean</span>';
+      return '<tr data-clickable data-id="' + esc(s.id) + '" data-nav="#/sessions/" tabindex="0">' +
+        '<td><div style="font-weight:500">' + esc(s.agent) + '</div><div class="id">' + esc(s.externalId) + "</div></td>" +
+        '<td><div class="actor"><span class="av">' + esc(initials(s.user)) + '</span>' + esc(s.user || "—") + '</div></td>' +
+        '<td class="num tabular">' + s.events + "</td>" +
+        '<td class="num tabular">' + s.toolsAllowed + "</td>" +
+        "<td>" + blocks + "</td>" +
+        '<td class="num tabular">' + usdMicros(s.costUsdMicros) + "</td>" +
+        '<td style="color: var(--fg-2)">' + esc(timeAgo(s.startedAt)) + "</td>" +
+      "</tr>";
+    }).join("");
+    return '<div class="table-wrap"><table>' +
+      "<thead><tr><th>Session</th><th>Actor</th><th class=\"num\">Events</th><th class=\"num\">Allowed</th><th>Blocked</th><th class=\"num\">LLM cost</th><th>Started</th></tr></thead>" +
+      "<tbody>" + rows + "</tbody></table></div>";
+  }
+
+  // Global click delegation: any <tr data-clickable data-id data-nav>
+  // navigates to `${data-nav}${data-id}` when the click isn't on a nested
+  // button/link that stopped propagation.
+  document.addEventListener("click", function (e) {
+    var tr = e.target.closest("tr[data-clickable]");
+    if (!tr) return;
+    if (e.target.closest("button, a")) return;
+    var id = tr.getAttribute("data-id");
+    var prefix = tr.getAttribute("data-nav");
+    if (id && prefix) navigate(prefix + id);
+  });
+
+  // Global keyboard nav for tables: arrow keys move focus, Enter opens.
+  document.addEventListener("keydown", function (e) {
+    if (!/^(ArrowDown|ArrowUp|Enter)$/.test(e.key)) return;
+    var active = document.activeElement;
+    if (!active || active.tagName !== "TR" || !active.hasAttribute("data-clickable")) return;
+    if (e.key === "Enter") {
+      e.preventDefault();
+      active.click();
+      return;
+    }
+    e.preventDefault();
+    var next = e.key === "ArrowDown" ? active.nextElementSibling : active.previousElementSibling;
+    while (next && (!next.hasAttribute("data-clickable"))) {
+      next = e.key === "ArrowDown" ? next.nextElementSibling : next.previousElementSibling;
+    }
+    if (next) next.focus();
+  });
+
+  /* ============================================================
+   * SESSION DETAIL — compact rows + right drawer + verified receipt
+   * ============================================================ */
+
+  async function renderSessionDetail(main, id, initial) {
+    main.innerHTML = pageHeader("Session", "", '<a href="#/sessions" class="btn">← All sessions</a>') + loadingBlock("stats");
+    var data, receipt;
+    try {
+      data = initial && initial.data ? initial.data : await state.ds.getSessionById(id);
+      receipt = initial && initial.receipt ? initial.receipt : await state.ds.getReceipt(id);
+    } catch (e) { return renderError(main, e); }
+    var s = data.session;
+    var events = data.events || [];
+
+    // Compute cumulative offsets from session start so the waterfall shows
+    // when each event actually happened relative to the session's timeline,
+    // and derive a parent-child depth so LLM → tool-call chains indent.
+    var totalDur = events.reduce(function (a, e) { return a + (e.durationMs || 0); }, 0) || 1;
+    var offset = 0;
+    var parentLlm = -1;
+    var eventsWithLayout = events.map(function (e, i) {
+      var startPct = (offset / totalDur) * 100;
+      var widthPct = Math.max(1, ((e.durationMs || 0) / totalDur) * 100);
+      var depth = 0;
+      if (e.kind === "llm") { parentLlm = i; depth = 0; }
+      else if (e.kind === "tool" || e.kind === "guard" || e.kind === "block") {
+        depth = parentLlm >= 0 ? 1 : 0;
+      } else { depth = 0; }
+      var layout = { startPct: startPct, widthPct: widthPct, depth: depth };
+      offset += e.durationMs || 0;
+      return Object.assign({}, e, { layout: layout });
+    });
+
+    var eventsHtml = eventsWithLayout.map(function (ev, i) {
+      var sev = ev.severity === "err" ? "err" : (ev.severity === "ok" ? "ok" : "");
+      var iconClass = ev.kind === "block" ? "err" : (ev.severity === "ok" ? "ok" : (ev.kind === "llm" ? "accent" : ""));
+      var iconChar = ev.kind === "llm" ? "L" : ev.kind === "tool" ? "T" : ev.kind === "block" ? "!" : ev.kind === "guard" ? "✓" : ev.kind === "session" ? "S" : "•";
+      var durTxt = ev.durationMs ? ev.durationMs + " ms" : "";
+      var barColor = ev.severity === "err" ? "var(--danger-solid)" : (ev.severity === "ok" ? "var(--success-solid)" : "var(--accent)");
+      return '<div class="evt ' + sev + '" data-i="' + i + '" style="--depth: ' + ev.layout.depth + ';">' +
+        '<span class="seq">#' + esc(ev.seq) + "</span>" +
+        '<span class="icon ' + iconClass + '">' + iconChar + "</span>" +
+        '<span class="body"><b>' + esc(ev.tag || ev.kind) + '</b> ' + esc(ev.msg || "") +
+          (ev.sub ? '<span class="sub">· ' + esc(ev.sub) + "</span>" : "") +
+        "</span>" +
+        '<span class="waterfall">' +
+          '<span class="wf-track"></span>' +
+          '<span class="wf-bar" style="left:' + ev.layout.startPct.toFixed(2) + '%; width:' + ev.layout.widthPct.toFixed(2) + '%; background:' + barColor + ';"></span>' +
+        "</span>" +
+        '<span class="dur">' + esc(durTxt) + "</span>" +
+      "</div>";
+    }).join("");
+
+    main.innerHTML =
+      pageHeader("Session " + s.externalId, s.agent + " · " + (s.user || "—") + " · " + (s.model || ""), '<a href="#/sessions" class="btn">← All sessions</a> <button class="btn" id="copyRcpt">Copy receipt</button>') +
+      '<div class="session-summary">' +
+        cell("Events", s.events, "streamed") +
+        cell("Allowed", s.toolsAllowed, "tool calls") +
+        cell("Blocked", s.toolsBlocked, "policy hits", s.toolsBlocked > 0 ? "blocks" : "") +
+        cell("LLM cost", usdMicros(s.costUsdMicros), "actual usage") +
+        cell("Blocked value", usdMicrosBig(s.blockedPayoutUsdMicros), "would-have-spent", parseInt(s.blockedPayoutUsdMicros, 10) > 0 ? "savings" : "") +
+      "</div>" +
+      '<div class="detail-grid">' +
+        '<div class="events-card card">' +
+          '<div class="events-head"><h2>Event stream</h2><span class="count">' + events.length + " event" + (events.length === 1 ? "" : "s") +
+            (data.nextEventCursor != null ? " (more available)" : "") + "</span></div>" +
+          '<div id="eventList">' + eventsHtml + "</div>" +
+          (data.nextEventCursor != null
+            ? '<div style="padding: 12px 16px; text-align:center; border-top:1px solid var(--border);">' +
+                '<button class="btn" id="loadMoreEv">Load more events</button>' +
+              "</div>"
+            : "") +
+        "</div>" +
+        '<div>' +
+          receiptCard(receipt) +
+          '<div class="event-drawer" id="eventDrawer" style="margin-top: 12px;">' +
+            '<h3>Event detail</h3>' +
+            '<div class="empty-mini">Click an event to inspect.</div>' +
+          "</div>" +
+        "</div>" +
+      "</div>";
+
+    // event click → drawer
+    var evList = $("#eventList");
+    var drawer = $("#eventDrawer");
+    evList.addEventListener("click", function (e) {
+      var row = e.target.closest(".evt");
+      if (!row) return;
+      $$('.evt', evList).forEach(function (r) { r.classList.remove("selected"); });
+      row.classList.add("selected");
+      var ev = events[parseInt(row.getAttribute("data-i"), 10)];
+      renderEventDrawer(drawer, ev);
+    });
+
+    // Load-more events for long sessions. The server caps at 500 per
+    // request and returns nextEventCursor if there are more. Same
+    // cursor pattern as the sessions list.
+    var loadMoreEv = $("#loadMoreEv");
+    if (loadMoreEv && data.nextEventCursor != null) {
+      loadMoreEv.addEventListener("click", async function () {
+        loadMoreEv.disabled = true;
+        loadMoreEv.textContent = "Loading…";
+        try {
+          var more = await state.ds.getSessionById(id, { eventCursor: data.nextEventCursor });
+          // Merge the fresh page into the current data snapshot and
+          // re-render *without re-fetching*. Threading data through
+          // renderSessionDetail as `initial` preserves the appended
+          // events across renders — the previous version called
+          // renderSessionDetail without an argument, which re-fetched
+          // from scratch and threw away every appended page.
+          var merged = Object.assign({}, data, {
+            events: (data.events || []).concat(more.events || []),
+            nextEventCursor: more.nextEventCursor,
+          });
+          renderSessionDetail(main, id, { data: merged, receipt: receipt });
+        } catch (err) {
+          toast(err.message || "Failed to load events", true);
+          loadMoreEv.disabled = false;
+          loadMoreEv.textContent = "Load more events";
+        }
+      });
+    }
+
+    // Copy receipt button
+    $("#copyRcpt").addEventListener("click", function () {
+      navigator.clipboard.writeText(JSON.stringify(receipt, null, 2)).then(function () {
+        toast("Receipt copied");
+      });
+    });
+
+    // Fire the real Ed25519 verification. When it lands, the "Verifying…"
+    // header flips to ✓ verified, ✗ INVALID, or ? not-supported.
+    applyReceiptVerification(receipt);
+  }
+
+  function renderEventDrawer(root, ev) {
+    // Values are plain-text by default; opt into HTML via a third
+    // tuple element only when we control the markup (like the Policy
+    // link below). Otherwise ev.tag / ev.policyId would carry any
+    // <script>/<img onerror> the daemon put there straight into the
+    // DOM — high-signal XSS surface since the daemon is customer code
+    // and event tags flow through the console for every viewer of
+    // that session.
+    var meta = [
+      ["Seq", "#" + ev.seq],
+      ["Kind", ev.kind + (ev.tag ? " · " + ev.tag : "")],
+      ["Time", new Date(ev.ts).toLocaleTimeString()],
+      ["Duration", ev.durationMs ? ev.durationMs + " ms" : "—"],
+    ];
+    if (ev.policyId) meta.push(["Policy", '<a href="#/policies/' + encodeURIComponent(ev.policyId) + '">' + esc(ev.policyId) + "</a>", true]);
+    if (ev.blockedValueUsd) meta.push(["Would-have-spent", "$" + Number(ev.blockedValueUsd).toLocaleString()]);
+
+    var payload = "";
+    if (ev.details) {
+      payload = '<pre class="payload">' +
+        '<b>Model</b>  ' + esc(ev.details.model) + '\n' +
+        '<b>Tokens</b> ' + esc(ev.details.promptTokens) + '\n\n' +
+        '<b>Prompt</b>\n' + esc(ev.details.prompt) + '\n\n' +
+        '<b>Response</b>\n' + esc(ev.details.response) +
+        "</pre>";
+    } else if (ev.severity === "err") {
+      payload = '<pre class="payload">' + esc(JSON.stringify({ severity: ev.severity, msg: ev.msg, sub: ev.sub, policy: ev.policyId }, null, 2)) + "</pre>";
+    } else {
+      payload = '<div class="empty-mini">No payload attached.</div>';
+    }
+
+    root.innerHTML =
+      '<h3>Event detail</h3>' +
+      '<dl class="meta">' + meta.map(function (m) {
+        // m[2] === true means m[1] is pre-built trusted HTML (e.g.
+        // the Policy link we construct above). Everything else is
+        // treated as plain text and escaped.
+        var valueHtml = m[2] === true ? m[1] : esc(m[1]);
+        return "<dt>" + esc(m[0]) + "</dt><dd>" + valueHtml + "</dd>";
+      }).join("") + "</dl>" +
+      payload;
+  }
+
+  function cell(label, value, sub, cls) {
+    return '<div class="cell ' + (cls || "") + '">' +
+      '<div class="label">' + esc(label) + "</div>" +
+      '<div class="value">' + esc(value) + "</div>" +
+      (sub ? '<div style="color: var(--fg-3); font-size: 11.5px; margin-top: 2px;">' + esc(sub) + "</div>" : "") +
+      "</div>";
+  }
+
+  function receiptCard(r) {
+    if (!r || r.note) {
+      return '<div class="card"><h2>Signed receipt</h2><p style="color: var(--fg-2); font-size: var(--t-sec); margin:0">' + esc(r && r.note || "No receipt yet.") + "</p></div>";
+    }
+    var policies = (r.policiesEnforced || []).map(function (p) {
+      return '<span class="pill accent status-dot">' + esc(p) + "</span>";
+    }).join(" ");
+    // Placeholder verifier state — the real answer arrives after the async
+    // Web Crypto verify call. Marked "verifying" so the UI doesn't lie
+    // about the outcome while we're still waiting.
+    return '<div class="receipt-card card">' +
+      '<div class="receipt-head" data-verify-state="pending">' +
+        '<span class="check">…</span>' +
+        '<div><div class="title">Verifying signature…</div>' +
+             '<div style="font-size: 11px;">ed25519 · ' + esc(r.signingKeyFingerprint || "") + '</div></div>' +
+        '<span class="kf">' + esc((r.receiptId || "").slice(0, 24)) + '…</span>' +
+      "</div>" +
+      '<div class="receipt-body">' +
+        '<dl class="kv">' +
+          "<dt>Receipt ID</dt><dd class=\"mono\">" + esc(r.receiptId || "") + "</dd>" +
+          "<dt>Content hash</dt><dd class=\"mono\">" + esc(r.contentHash || "") + "</dd>" +
+          "<dt>Events sealed</dt><dd>" + esc(r.eventCount || 0) + "</dd>" +
+          "<dt>Tools</dt><dd>" + (r.tools ? esc(r.tools.allowed || 0) + " allowed · " + esc(r.tools.blocked || 0) + " blocked" : "—") + "</dd>" +
+        "</dl>" +
+        '<div style="font-size: 11.5px; color: var(--fg-3); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; margin-bottom: 6px;">Policies enforced</div>' +
+        '<div class="policies">' + policies + "</div>" +
+        '<details class="raw-toggle"><summary>View raw signed body</summary>' +
+          '<pre class="raw">' + esc(JSON.stringify(r, null, 2)) + "</pre>" +
+        "</details>" +
+      "</div>" +
+      "</div>";
+  }
+
+  // Run the real Ed25519 verify and update the receipt-head with the result.
+  // Kept out of receiptCard() because that runs synchronously as innerHTML.
+  async function applyReceiptVerification(r) {
+    var head = document.querySelector('.receipt-head[data-verify-state="pending"]');
+    if (!head) return;
+    if (!window.avVerifyReceipt) return;
+    var res = await window.avVerifyReceipt(r.publicKeyHex, r.rawSignatureB64, r.rawBody);
+    var check = head.querySelector('.check');
+    var title = head.querySelector('.title');
+    var sub = head.querySelector('div > div:last-child');
+    if (!res.supported) {
+      head.setAttribute("data-verify-state", "unsupported");
+      head.classList.add("unsupported");
+      check.textContent = "?";
+      title.textContent = "Signature not verified";
+      if (sub) sub.textContent = "This browser cannot verify Ed25519 signatures.";
+      return;
+    }
+    if (res.ok) {
+      head.setAttribute("data-verify-state", "verified");
+      check.textContent = "✓";
+      title.textContent = "Signature verified";
+      if (sub) sub.textContent = "ed25519 · " + (r.signingKeyFingerprint || "");
+    } else {
+      head.setAttribute("data-verify-state", "invalid");
+      head.classList.add("invalid");
+      check.textContent = "✗";
+      title.textContent = "Signature INVALID";
+      if (sub) sub.textContent = "The receipt does not match the deployment's public key.";
+    }
+  }
+
+  /* ============================================================
+   * DEPLOYMENTS — list + detail + install snippet
+   * ============================================================ */
+
+  async function renderDeployments(main) {
+    var actions = '<button class="btn accent" id="addDep">+ New deployment</button>';
+    main.innerHTML = pageHeader("Deployments", "Each daemon streams events and signed receipts to this console.", actions) + loadingBlock("table");
+    var deps;
+    try { deps = await state.ds.listDeployments(); }
+    catch (e) { return renderError(main, e); }
+
+    var body;
+    if (deps.length === 0) {
+      body = deploymentEmptyHero();
+    } else {
+      var rows = deps.map(function (d) {
+        var statusPill = d.status === "connected"
+          ? '<span class="pill ok status-dot">connected</span>'
+          : '<span class="pill neutral status-dot">' + esc(d.status) + "</span>";
+        return '<tr data-clickable data-id="' + esc(d.id) + '" data-nav="#/deployments/" tabindex="0">' +
+          '<td><div style="font-weight:500">' + esc(d.name) + '</div><div class="id">' + esc(d.id) + "</div></td>" +
+          '<td><span class="pill neutral">' + esc(d.environment) + "</span></td>" +
+          '<td>' + esc(d.region || "—") + "</td>" +
+          "<td>" + statusPill + "</td>" +
+          '<td class="mono">' + esc(d.version || "—") + "</td>" +
+          '<td style="color: var(--fg-2)">' + esc(timeAgo(d.lastSeenAt)) + "</td>" +
+          '<td>' +
+            '<button class="btn" data-action="rotate">Rotate</button> ' +
+            '<button class="btn danger" data-action="delete">Delete</button>' +
+          "</td>" +
+        "</tr>";
+      }).join("");
+      body =
+        '<div class="empty-hero" style="margin-bottom: 16px; padding: 16px 20px; grid-template-columns: 1fr 1fr;">' +
+          '<div><h2 style="font-size: 15px; margin: 0 0 4px">Connect a new daemon</h2>' +
+          '<p style="margin: 0; font-size: 13px">Install <code>agentvisord</code> on your infra with the ingest token, and events start streaming here.</p></div>' +
+          '<div class="snippet"><span class="prompt">$</span> <span class="cmd">curl -fsSL https://get.agentvisorai.me/install.sh | sh</span>\n<span class="prompt">$</span> <span class="cmd">agentvisord start --token=$AV_INGEST_TOKEN</span></div>' +
+        "</div>" +
+        '<div class="card" style="padding:0"><div class="table-wrap"><table>' +
+          "<thead><tr><th>Deployment</th><th>Environment</th><th>Region</th><th>Status</th><th>Version</th><th>Last seen</th><th><span class=\"sr-only\">Actions</span></th></tr></thead>" +
+          "<tbody>" + rows + "</tbody></table></div></div>";
+    }
+    main.innerHTML = pageHeader("Deployments", "Each daemon streams events and signed receipts to this console.", actions) + body;
+
+    var addBtn = $("#addDep");
+    if (addBtn) addBtn.addEventListener("click", openCreateDeploymentModal);
+    var addBtn2 = $("#addDep2");
+    if (addBtn2) addBtn2.addEventListener("click", openCreateDeploymentModal);
+
+    var tbody = main.querySelector("tbody");
+    if (tbody) {
+      tbody.addEventListener("click", function (e) {
+        var tr = e.target.closest("tr[data-id]");
+        if (!tr) return;
+        var id = tr.getAttribute("data-id");
+        var btn = e.target.closest("button[data-action]");
+        if (btn) {
+          e.stopPropagation();
+          if (btn.getAttribute("data-action") === "rotate") {
+            confirmModal({
+              title: "Rotate ingest token?",
+              body: "The old token stops working immediately. Any daemon using it will fail to connect until you paste the new one.",
+              confirmLabel: "Rotate token",
+              danger: true,
+              onConfirm: function () {
+                state.ds.rotateDeploymentToken(id).then(function (r) { showTokenModal(r.ingestToken, "Token rotated"); })
+                  .catch(function (err) { toast(err.message || "Rotation failed", true); });
+              },
+            });
+          } else if (btn.getAttribute("data-action") === "delete") {
+            confirmModal({
+              title: "Delete deployment?",
+              body: "Existing sessions remain in the workspace, but the daemon can no longer connect.",
+              confirmLabel: "Delete",
+              danger: true,
+              onConfirm: function () {
+                state.ds.deleteDeployment(id).then(function () {
+                  toast("Deployment removed");
+                  renderDeployments(main);
+                }).catch(function (err) { toast(err.message || "Delete failed", true); });
+              },
+            });
+          }
+          return;
+        }
+        navigate("#/deployments/" + id);
+      });
+    }
+  }
+
+  function deploymentEmptyHero() {
+    return '<div class="empty-hero">' +
+      '<div><h2>Connect your first agent</h2>' +
+      '<p>Install the AgentVisor daemon on the box that runs your agent. Once it starts, sessions and signed receipts stream directly into this console.</p>' +
+      '<button class="btn accent" id="addDep2">+ New deployment</button></div>' +
+      '<div class="snippet"><span class="prompt">$</span> <span class="cmd">curl -fsSL https://get.agentvisorai.me/install.sh | sh</span>\n\n<span class="prompt">$</span> <span class="cmd">agentvisord start --token=$AV_INGEST_TOKEN</span></div>' +
+      "</div>";
+  }
+
+  async function renderDeploymentDetail(main, id) {
+    main.innerHTML = pageHeader("Deployment", "", '<a href="#/deployments" class="btn">← All deployments</a>') + loadingBlock("stats");
+    var d, sessions;
+    try {
+      d = await state.ds.getDeployment(id);
+      var res = await state.ds.listSessions({ deploymentId: id });
+      sessions = res.sessions.slice(0, 8);
+    } catch (e) { return renderError(main, e); }
+
+    var statusPill = d.status === "connected"
+      ? '<span class="pill ok status-dot">connected</span>'
+      : '<span class="pill neutral status-dot">' + esc(d.status) + "</span>";
+
+    main.innerHTML =
+      pageHeader(d.name, d.environment + " · " + (d.region || ""), '<a href="#/deployments" class="btn">← All deployments</a>') +
+      '<div class="dep-summary">' +
+        depCell("Status", statusPill) +
+        depCell("Version", d.version || "—", true) +
+        depCell("Last seen", timeAgo(d.lastSeenAt)) +
+        depCell("Sessions (24h)", d.sessions24h != null ? d.sessions24h : "—") +
+        depCell("Spend (24h)", d.spend24h || "—") +
+      "</div>" +
+      '<div class="card" style="margin-bottom:12px">' +
+        "<h2>Signing key</h2>" +
+        '<dl class="kv" style="display:grid;grid-template-columns:140px 1fr;gap:5px 12px;font-size:13px">' +
+          '<dt style="color:var(--fg-3)">Fingerprint</dt><dd class="mono">' + esc(d.keyFingerprint || "—") + "</dd>" +
+          '<dt style="color:var(--fg-3)">Public key</dt><dd class="mono" style="word-break:break-all">' + esc(d.publicKeyHex || "—") + "</dd>" +
+          '<dt style="color:var(--fg-3)">Ingest token</dt><dd class="mono">' + esc(d.ingestTokenHint || "—") + "</dd>" +
+        "</dl>" +
+        '<div style="margin-top: 12px; display:flex; gap:8px">' +
+          '<button class="btn" id="depRotate">Rotate token</button>' +
+          '<button class="btn danger" id="depDelete">Delete</button>' +
+        "</div>" +
+      "</div>" +
+      '<div class="card" style="padding:0">' +
+        '<div style="padding:12px 16px; border-bottom: 1px solid var(--border); display:flex; align-items:baseline; gap:8px;">' +
+          '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">Recent sessions</h2>' +
+          '<span style="color:var(--fg-3); font-size:var(--t-sec)">' + sessions.length + " shown</span>" +
+          '<div style="margin-left:auto"><a href="#/sessions" style="font-size:var(--t-sec)">View all →</a></div>' +
+        "</div>" +
+        (sessions.length ? sessionsTable(sessions) : emptyState("No sessions yet", "This deployment has not streamed any sessions.")) +
+      "</div>";
+
+    var rotBtn = $("#depRotate");
+    if (rotBtn) rotBtn.addEventListener("click", function () {
+      confirmModal({
+        title: "Rotate ingest token?",
+        body: "The old token stops working immediately.",
+        confirmLabel: "Rotate", danger: true,
+        onConfirm: function () {
+          state.ds.rotateDeploymentToken(d.id).then(function (r) { showTokenModal(r.ingestToken, "Token rotated"); })
+            .catch(function (err) { toast(err.message, true); });
+        },
+      });
+    });
+    var delBtn = $("#depDelete");
+    if (delBtn) delBtn.addEventListener("click", function () {
+      confirmModal({
+        title: "Delete deployment?",
+        body: "Sessions remain, the daemon can no longer connect.",
+        confirmLabel: "Delete", danger: true,
+        onConfirm: function () {
+          state.ds.deleteDeployment(d.id).then(function () {
+            toast("Deployment removed");
+            navigate("#/deployments");
+          });
+        },
+      });
+    });
+  }
+  function depCell(label, value, mono) {
+    return '<div class="cell"><div class="label">' + esc(label) + '</div><div class="value' + (mono ? " mono" : "") + '">' + value + "</div></div>";
+  }
+
+  function openCreateDeploymentModal() {
+    // Guard against a rage-click / double-tap opening N stacked modals.
+    if (document.body.classList.contains("locked")) return;
+    var backdrop = h(
+      '<div class="modal-backdrop" role="dialog" aria-modal="true">' +
+        '<div class="modal">' +
+          "<h2>New deployment</h2>" +
+          '<p class="sub">Register a daemon. You\'ll get an ingest token — copy it now; it won\'t be shown again.</p>' +
+          '<form id="depForm">' +
+            '<div class="field"><label>Name</label><input id="depName" required placeholder="acme-prod" pattern="[a-zA-Z0-9\\-_]+" /></div>' +
+            '<div class="field"><label>Environment</label><select id="depEnv"><option>production</option><option>staging</option><option>development</option></select></div>' +
+            '<div class="field"><label>Region (optional)</label><input id="depRegion" placeholder="us-east-1" /></div>' +
+            '<div class="actions"><button type="button" class="btn" data-close>Cancel</button><button class="btn accent" type="submit">Create</button></div>' +
+          "</form>" +
+        "</div>" +
+      "</div>"
+    );
+    document.body.appendChild(backdrop);
+    document.body.classList.add("locked");
+    var previouslyFocused = document.activeElement;
+    var uninstall;
+    function close() {
+      backdrop.remove(); document.body.classList.remove("locked");
+      if (uninstall) uninstall();
+      if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {}
+    }
+    uninstall = installModalKeys(backdrop, close);
+    backdrop.addEventListener("click", function (e) {
+      if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
+    });
+    backdrop.querySelector("#depForm").addEventListener("submit", function (e) {
+      e.preventDefault();
+      var btn = e.target.querySelector('button[type="submit"]');
+      btn.disabled = true;
+      state.ds.createDeployment({ name: $("#depName").value.trim(), environment: $("#depEnv").value, region: $("#depRegion").value.trim() || undefined })
+        .then(function (r) { close(); showTokenModal(r.ingestToken, "Deployment created"); })
+        .catch(function (err) { btn.disabled = false; toast(err.message || "Create failed", true); });
+    });
+    setTimeout(function () { backdrop.querySelector('#depName').focus(); }, 20);
+  }
+
+  function showTokenModal(token, title) {
+    if (document.body.classList.contains("locked")) return;
+    var backdrop = h(
+      '<div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="tokTitle">' +
+        '<div class="modal">' +
+          '<h2 id="tokTitle">' + esc(title || "Ingest token") + "</h2>" +
+          '<p class="sub">Point your daemon at this console using the token below. Store it in your secret manager — it won\'t be shown again.</p>' +
+          '<div class="token-display">' + esc(token) + "</div>" +
+          '<div class="notice"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M8 1L15 14H1L8 1z"/><path d="M8 6v3M8 11v.5"/></svg>' +
+            '<span>This is the only time you\'ll see the full token. If you lose it, rotate to get a new one.</span></div>' +
+          '<div class="actions"><button type="button" class="btn" id="copyTok">Copy</button><button type="button" class="btn accent" data-close>Done</button></div>' +
+        "</div>" +
+      "</div>"
+    );
+    document.body.appendChild(backdrop);
+    document.body.classList.add("locked");
+    var previouslyFocused = document.activeElement;
+    var uninstall;
+    function close() {
+      backdrop.remove(); document.body.classList.remove("locked");
+      if (uninstall) uninstall();
+      if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {}
+      var main = $("#view"); if (main) renderDeployments(main);
+    }
+    uninstall = installModalKeys(backdrop, close);
+    backdrop.addEventListener("click", function (e) {
+      if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
+    });
+    var copyBtn = backdrop.querySelector("#copyTok");
+    copyBtn.addEventListener("click", function () {
+      var doneText = "Copied ✓";
+      var origText = copyBtn.textContent;
+      function markCopied() {
+        copyBtn.textContent = doneText;
+        copyBtn.classList.add("ok-flash");
+        setTimeout(function () { copyBtn.textContent = origText; copyBtn.classList.remove("ok-flash"); }, 1600);
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(token).then(markCopied).catch(function () {
+          toast("Copy blocked — select the token manually");
+        });
+      } else {
+        toast("Clipboard unavailable in this browser");
+      }
+    });
+    setTimeout(function () { backdrop.querySelector('[data-close]').focus(); }, 20);
+  }
+
+  /* ============================================================
+   * POLICIES
+   * ============================================================ */
+
+  async function renderPolicies(main) {
+    main.innerHTML = pageHeader("Policies", "Rules the daemon enforces before any tool call or LLM egress.", '<button class="btn accent" id="addPol">+ New policy</button>') + loadingBlock("table");
+    var pols;
+    try { pols = await state.ds.listPolicies(); } catch (e) { return renderError(main, e); }
+    if (!pols.length) {
+      main.innerHTML = pageHeader("Policies", "0 policies · none enabled", '<button class="btn accent" id="addPol">+ New policy</button>') +
+        emptyState("No policies yet", "Write your first policy to start blocking risky prompts, tool calls, or PII egress. The daemon evaluates policies before any request reaches your model.", "+ Write a policy", null, "addPolCta");
+      var addP = $("#addPol") || $("#addPolCta");
+      if (addP) addP.addEventListener("click", function () {
+        comingSoon("Write a new policy", "The policy editor supports a Rego-style DSL with autocomplete, dry-run against past sessions, and a shareable review link before rollout.");
+      });
+      return;
+    }
+    var rows = pols.map(function (p) {
+      var switchCls = p.enabled ? "on" : "";
+      return '<tr data-clickable data-id="' + esc(p.id) + '" data-nav="#/policies/" tabindex="0">' +
+        '<td class="policy-row"><div class="name">' + esc(p.name) + '</div><div class="kind">' + esc(p.kind) + " · " + esc(p.scope) + "</div></td>" +
+        "<td>" + esc(p.description) + "</td>" +
+        '<td class="num tabular">' + esc(p.hits24h) + "</td>" +
+        '<td class="num tabular">' + (p.blocks24h > 0 ? '<span style="color: var(--danger-solid); font-weight:500">' + esc(p.blocks24h) + "</span>" : esc(p.blocks24h)) + "</td>" +
+        '<td style="color:var(--fg-2)">' + esc(timeAgo(p.updatedAt)) + "</td>" +
+        '<td><button class="switch ' + switchCls + '" data-id="' + esc(p.id) + '" aria-label="Toggle policy ' + esc(p.name) + '" role="switch" aria-checked="' + (p.enabled ? "true" : "false") + '"></button></td>' +
+        "</tr>";
+    }).join("");
+    main.innerHTML = pageHeader("Policies", pols.length + " policies · " + pols.filter(function (p) { return p.enabled; }).length + " enabled", '<button class="btn accent" id="addPol">+ New policy</button>') +
+      '<div class="card" style="padding:0"><div class="table-wrap"><table>' +
+        "<thead><tr><th>Policy</th><th>Description</th><th class=\"num\">Hits 24h</th><th class=\"num\">Blocks</th><th>Updated</th><th><span class=\"sr-only\">Actions</span></th></tr></thead>" +
+        "<tbody>" + rows + "</tbody></table></div></div>";
+    var tbody = main.querySelector("tbody");
+    tbody.addEventListener("click", function (e) {
+      var sw = e.target.closest(".switch");
+      if (sw) {
+        e.stopPropagation();
+        state.ds.togglePolicy(sw.getAttribute("data-id")).then(function () { renderPolicies(main); });
+        return;
+      }
+      var tr = e.target.closest("tr[data-id]");
+      if (tr) navigate("#/policies/" + tr.getAttribute("data-id"));
+    });
+    var addBtn = $("#addPol");
+    if (addBtn) addBtn.addEventListener("click", function () {
+      comingSoon("Write a new policy", "The policy editor supports a Rego-style DSL with autocomplete, dry-run against past sessions, and a shareable review link before rollout.");
+    });
+  }
+
+  async function renderPolicyDetail(main, id) {
+    main.innerHTML = pageHeader("Policy", "", '<a href="#/policies" class="btn">← All policies</a>') + loadingBlock("stats");
+    var p;
+    try { p = await state.ds.getPolicy(id); } catch (e) { return renderError(main, e); }
+    var switchCls = p.enabled ? "on" : "";
+    main.innerHTML =
+      pageHeader(p.name, p.kind + " · " + p.scope, '<a href="#/policies" class="btn">← All policies</a> <button class="switch ' + switchCls + '" id="polSwitch" title="Toggle enabled" aria-label="Toggle policy enabled" role="switch" aria-checked="' + (p.enabled ? "true" : "false") + '"></button>') +
+      '<div class="dep-summary">' +
+        depCell("Status", p.enabled ? '<span class="pill ok status-dot">enabled</span>' : '<span class="pill neutral">disabled</span>') +
+        depCell("Hits (24h)", p.hits24h.toLocaleString()) +
+        depCell("Blocks (24h)", p.blocks24h > 0 ? '<span style="color: var(--danger-solid)">' + p.blocks24h + "</span>" : p.blocks24h) +
+        depCell("Updated", timeAgo(p.updatedAt)) +
+      "</div>" +
+      '<div class="card"><h2>Description</h2><p style="margin:0;color:var(--fg-2);font-size:var(--t-body)">' + esc(p.description) + '</p></div>' +
+      '<div class="card" style="margin-top:12px"><h2>Definition</h2><pre class="policy-body">' + syntaxPolicy(p.body) + "</pre></div>";
+    $("#polSwitch").addEventListener("click", function () {
+      state.ds.togglePolicy(id).then(function () { renderPolicyDetail(main, id); });
+    });
+  }
+  function syntaxPolicy(src) {
+    return esc(src)
+      .replace(/\b(policy|applies_to|when|effect|reason|transform)\b/g, "<span class='k'>$1</span>")
+      .replace(/&quot;[^&]*?&quot;/g, function (m) { return "<span class='s'>" + m + "</span>"; })
+      .replace(/\b(\d+(?:\.\d+)?)\b/g, "<span class='n'>$1</span>");
+  }
+
+  /* ============================================================
+   * SETTINGS — tabs
+   * ============================================================ */
+
+  var SETTINGS_TABS = [
+    { id: "general", label: "General" },
+    { id: "members", label: "Members" },
+    { id: "keys", label: "API keys" },
+    { id: "sso", label: "SSO" },
+    { id: "webhooks", label: "Webhooks" },
+    { id: "audit", label: "Audit log" },
+    { id: "billing", label: "Billing" },
+  ];
+
+  async function renderSettings(main, tab) {
+    state.settingsTab = tab;
+    var nav = SETTINGS_TABS.map(function (t) {
+      return '<button data-tab="' + t.id + '"' + (tab === t.id ? ' class="active"' : "") + ">" + esc(t.label) + "</button>";
+    }).join("");
+    main.innerHTML =
+      pageHeader("Settings", "Organization and workspace preferences.") +
+      '<div class="settings-shell">' +
+        '<div class="settings-nav">' + nav + "</div>" +
+        '<div class="settings-panel" id="setPanel"></div>' +
+      "</div>";
+    $$('.settings-nav button', main).forEach(function (b) {
+      b.addEventListener("click", function () { navigate("#/settings/" + b.getAttribute("data-tab")); });
+    });
+    var panel = $("#setPanel");
+    if (tab === "general") return renderSettingsGeneral(panel);
+    if (tab === "members") return renderSettingsMembers(panel);
+    if (tab === "keys") return renderSettingsKeys(panel);
+    if (tab === "sso") return renderSettingsSSO(panel);
+    if (tab === "webhooks") return renderSettingsWebhooks(panel);
+    if (tab === "audit") return renderSettingsAudit(panel);
+    if (tab === "billing") return renderSettingsBilling(panel);
+  }
+
+  async function renderSettingsGeneral(root) {
+    root.innerHTML =
+      '<div class="card"><h2>Organization</h2>' +
+        '<dl class="kv" style="display:grid;grid-template-columns:140px 1fr;gap:5px 12px;font-size:13px">' +
+          "<dt style=\"color:var(--fg-3)\">Name</dt><dd>" + esc(state.session.org.name) + "</dd>" +
+          "<dt style=\"color:var(--fg-3)\">Org ID</dt><dd class=\"mono\">" + esc(state.session.org.id) + "</dd>" +
+          "<dt style=\"color:var(--fg-3)\">Created</dt><dd>" + esc(new Date(state.session.org.createdAt).toLocaleDateString()) + "</dd>" +
+        "</dl>" +
+      "</div>" +
+      '<div class="card" id="retentionCard">' +
+        '<h2>Data retention</h2>' +
+        '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 12px">Sessions, events, receipts, and audit log entries older than the retention window are automatically purged. Set to 0 to keep everything forever.</p>' +
+        loadingBlock("table") +
+      "</div>" +
+      '<div class="card"><h2>Account</h2>' +
+        '<dl class="kv" style="display:grid;grid-template-columns:140px 1fr;gap:5px 12px;font-size:13px">' +
+          "<dt style=\"color:var(--fg-3)\">Email</dt><dd>" + esc(state.session.user.email) + "</dd>" +
+          "<dt style=\"color:var(--fg-3)\">User ID</dt><dd class=\"mono\">" + esc(state.session.user.id) + "</dd>" +
+        "</dl>" +
+        '<div style="margin-top:12px"><button class="btn danger" id="signOut">Sign out</button></div>' +
+      "</div>" +
+      (state.ds.mode === "mock" ?
+        '<div class="card"><h2>Demo mode</h2><p style="color: var(--fg-2); margin: 0 0 8px; font-size: var(--t-sec)">This console is running against built-in fixtures. To connect to a real backend, set <code>window.MOCK_MODE = false</code> in <code>docs/app/index.html</code>.</p></div>' : "");
+    var so = $("#signOut", root);
+    if (so) so.addEventListener("click", signOut);
+
+    // Retention: load current + render editor
+    var card = $("#retentionCard", root);
+    if (card && state.ds.getRetention) {
+      try {
+        var res = await state.ds.getRetention();
+        var r = res.retention || { sessionRetentionDays: 90, auditRetentionDays: 365 };
+        var editable = state.session.org.role === "owner" || state.session.org.role === "admin";
+        card.innerHTML =
+          '<h2>Data retention</h2>' +
+          '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 12px">Sessions, events, receipts, and audit log entries older than the window are automatically purged. Set to 0 to keep everything forever.</p>' +
+          '<div style="display:grid;grid-template-columns:200px 1fr;gap:12px 16px;font-size:13px;align-items:center">' +
+            '<label for="retSess">Sessions + events</label>' +
+            '<div style="display:flex;gap:8px;align-items:center">' +
+              '<input id="retSess" type="number" min="0" max="3650" value="' + r.sessionRetentionDays + '" style="width:100px"' + (editable ? '' : ' disabled') + '>' +
+              '<span style="color:var(--fg-3)">days</span>' +
+            '</div>' +
+            '<label for="retAudit">Audit log</label>' +
+            '<div style="display:flex;gap:8px;align-items:center">' +
+              '<input id="retAudit" type="number" min="0" max="3650" value="' + r.auditRetentionDays + '" style="width:100px"' + (editable ? '' : ' disabled') + '>' +
+              '<span style="color:var(--fg-3)">days</span>' +
+            '</div>' +
+          '</div>' +
+          (editable
+            ? '<div style="margin-top:16px;display:flex;gap:8px">' +
+                '<button class="btn accent" id="retSave">Save</button>' +
+                '<button class="btn" id="retSweepNow">Run sweep now</button>' +
+              '</div>'
+            : '<p style="margin-top:12px;color:var(--fg-3);font-size:12px">Only owners and admins can change retention.</p>');
+        if (editable) {
+          $("#retSave", card).addEventListener("click", async function () {
+            var s = parseInt($("#retSess", card).value, 10);
+            var a = parseInt($("#retAudit", card).value, 10);
+            if (isNaN(s) || isNaN(a) || s < 0 || a < 0) { toast("Invalid values"); return; }
+            try {
+              await state.ds.updateRetention({ sessionRetentionDays: s, auditRetentionDays: a });
+              toast("Retention updated.");
+            } catch (e) { toast(e.message || "Save failed"); }
+          });
+          $("#retSweepNow", card).addEventListener("click", function () {
+            confirmModal({
+              title: "Run retention sweep now?",
+              body: "Rows older than the retention window will be permanently deleted. This runs automatically every 6 hours anyway; use this button only if you need immediate cleanup.",
+              confirmLabel: "Sweep now", danger: true,
+              onConfirm: async function () {
+                try {
+                  var res = await state.ds.retentionSweepNow();
+                  toast("Purged " + (res.result.sessionsPurged + res.result.auditPurged + res.result.webhookDeliveriesPurged) + " rows.");
+                } catch (e) { toast(e.message || "Sweep failed"); }
+              },
+            });
+          });
+        }
+      } catch (e) {
+        card.innerHTML = '<h2>Data retention</h2><p style="color:var(--fg-2);font-size:var(--t-sec)">Could not load (' + esc(e.message || "network") + ').</p>';
+      }
+    }
+  }
+  // Wire Escape + Tab focus trap for a modal backdrop. Returns nothing;
+  // the caller is expected to append the backdrop first and pass its
+  // own close() so the same teardown path runs on Escape and on click.
+  function installModalKeys(backdrop, close) {
+    function focusables() {
+      return Array.from(backdrop.querySelectorAll('button, [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+        .filter(function (el) { return el.offsetParent !== null || el.tagName === "INPUT"; });
+    }
+    function onKey(e) {
+      if (e.key === "Escape") { e.preventDefault(); close(); return; }
+      if (e.key === "Tab") {
+        var els = focusables(); if (!els.length) return;
+        var first = els[0], last = els[els.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+      }
+    }
+    document.addEventListener("keydown", onKey);
+    return function uninstall() { document.removeEventListener("keydown", onKey); };
+  }
+
+  function openInputModal(opts) {
+    if (document.body.classList.contains("locked")) return;
+    var backdrop = h(
+      '<div class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal">' +
+        "<h2>" + esc(opts.title) + "</h2>" +
+        (opts.sub ? '<p class="sub">' + esc(opts.sub) + "</p>" : "") +
+        '<form id="inpForm">' +
+          '<div class="field"><label>' + esc(opts.label || "Value") + "</label>" +
+          '<input id="inpVal" type="text" required placeholder="' + esc(opts.placeholder || "") + '" /></div>' +
+          '<div class="actions">' +
+            '<button type="button" class="btn" data-close>Cancel</button>' +
+            '<button class="btn accent" type="submit">' + esc(opts.confirmLabel || "Save") + "</button>" +
+          "</div>" +
+        "</form>" +
+      "</div></div>"
+    );
+    document.body.appendChild(backdrop);
+    document.body.classList.add("locked");
+    var previouslyFocused = document.activeElement;
+    var uninstall;
+    var handled = false;
+    function close() {
+      if (handled) return;
+      handled = true;
+      backdrop.remove(); document.body.classList.remove("locked");
+      if (uninstall) uninstall();
+      if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {}
+    }
+    uninstall = installModalKeys(backdrop, close);
+    backdrop.addEventListener("click", function (e) {
+      if (handled) return;
+      if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
+    });
+    backdrop.querySelector("#inpForm").addEventListener("submit", function (e) {
+      e.preventDefault();
+      if (handled) return;
+      var v = backdrop.querySelector("#inpVal").value.trim();
+      if (!v) return;
+      var cb = opts.onConfirm;
+      close();
+      if (cb) cb(v);
+    });
+    setTimeout(function () { backdrop.querySelector("#inpVal").focus(); }, 20);
+  }
+
+  function comingSoon(title, body) {
+    if (document.body.classList.contains("locked")) return;
+    var backdrop = h(
+      '<div class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal">' +
+        "<h2>" + esc(title) + "</h2>" +
+        '<p class="sub">' + esc(body) + "</p>" +
+        '<div class="notice"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="6"/><path d="M8 5v3M8 11v.5"/></svg><span>This is a demo. Full flow will ship with the beta.</span></div>' +
+        '<div class="actions"><button type="button" class="btn primary" data-close>Got it</button></div>' +
+      "</div></div>"
+    );
+    document.body.appendChild(backdrop);
+    document.body.classList.add("locked");
+    var previouslyFocused = document.activeElement;
+    var uninstall;
+    function close() {
+      backdrop.remove(); document.body.classList.remove("locked");
+      if (uninstall) uninstall();
+      if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {}
+    }
+    uninstall = installModalKeys(backdrop, close);
+    backdrop.addEventListener("click", function (e) {
+      if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
+    });
+    setTimeout(function () { backdrop.querySelector('[data-close]').focus(); }, 20);
+  }
+
+  async function renderSettingsMembers(root) {
+    root.innerHTML = '<div class="card">' + loadingBlock("table") + "</div>";
+    var members, invitesRes;
+    try {
+      members = await state.ds.listMembers();
+      invitesRes = await state.ds.listInvites();
+    } catch (e) {
+      root.innerHTML = '<div class="card empty"><h3>Could not load members</h3><p>' + esc(e.message || "") + '</p></div>';
+      return;
+    }
+    var invites = (invitesRes && invitesRes.invites) || [];
+
+    var memberRows = members.map(function (m) {
+      var roles = ["owner", "admin", "member"];
+      var selector = '<select data-role-user="' + esc(m.userId || m.id) + '">' +
+        roles.map(function (r) { return '<option' + (m.role === r ? ' selected' : '') + '>' + r + '</option>'; }).join('') +
+        '</select>';
+      return '<tr data-user="' + esc(m.userId || m.id) + '">' +
+        '<td><div class="actor"><span class="av">' + esc(initials(m.displayName || m.email)) + '</span><div><div style="font-weight:500">' + esc(m.displayName || m.email) + '</div><div class="id">' + esc(m.email) + '</div></div></div></td>' +
+        '<td>' + selector + '</td>' +
+        '<td style="color:var(--fg-2)">' + esc(timeAgo(m.lastActive)) + '</td>' +
+        '<td><button class="btn danger" data-act="remove">Remove</button></td>' +
+      '</tr>';
+    }).join("");
+
+    var membersCard =
+      '<div class="card" style="padding:0">' +
+        '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:baseline">' +
+          '<h2 style="margin:0; font-size: var(--t-section); font-weight:600">Members</h2>' +
+          '<span style="margin-left:8px; color:var(--fg-3); font-size:var(--t-sec)">' + members.length + " people</span>" +
+          '<button class="btn accent" id="inviteBtn" style="margin-left:auto">+ Invite</button>' +
+        "</div>" +
+        '<div class="table-wrap"><table>' +
+          '<thead><tr><th>Person</th><th>Role</th><th>Last active</th><th><span class="sr-only">Actions</span></th></tr></thead>' +
+          '<tbody>' + memberRows + '</tbody>' +
+        '</table></div>' +
+      '</div>';
+
+    var inviteRows = invites.map(function (i) {
+      return '<tr data-invite="' + esc(i.id) + '">' +
+        '<td><div style="font-weight:500">' + esc(i.email) + '</div><div class="id">by ' + esc(i.invitedByEmail || "?") + '</div></td>' +
+        '<td><span class="pill neutral">' + esc(i.role) + "</span></td>" +
+        '<td style="color:var(--fg-2)">expires ' + esc(timeAgo(i.expiresAt)) + '</td>' +
+        '<td><button class="btn danger" data-act="revoke">Revoke</button></td>' +
+      '</tr>';
+    }).join('');
+    var invitesCard = invites.length
+      ? ('<div class="card" style="padding:0">' +
+          '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:baseline">' +
+            '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">Pending invites</h2>' +
+            '<span style="margin-left:8px; color:var(--fg-3); font-size:var(--t-sec)">' + invites.length + '</span>' +
+          '</div>' +
+          '<div class="table-wrap"><table>' +
+            '<thead><tr><th>Email</th><th>Role</th><th>Expires</th><th><span class="sr-only">Actions</span></th></tr></thead>' +
+            '<tbody>' + inviteRows + '</tbody>' +
+          '</table></div>' +
+        '</div>')
+      : '';
+
+    root.innerHTML = membersCard + invitesCard;
+
+    var ib = $("#inviteBtn", root);
+    if (ib) ib.addEventListener("click", function () { openInviteModal(root); });
+
+    // Member row actions — role change + remove
+    var tables = root.querySelectorAll("table");
+    tables[0].addEventListener("change", function (e) {
+      var sel = e.target.closest("[data-role-user]");
+      if (!sel) return;
+      var uid = sel.getAttribute("data-role-user");
+      state.ds.changeMemberRole(uid, sel.value).then(function () {
+        toast("Role updated");
+      }).catch(function (err) {
+        toast(err.message || "Role change failed", true);
+        renderSettingsMembers(root);
+      });
+    });
+    tables[0].addEventListener("click", function (e) {
+      var btn = e.target.closest("[data-act='remove']");
+      if (!btn) return;
+      var tr = e.target.closest("tr[data-user]");
+      var uid = tr.getAttribute("data-user");
+      confirmModal({
+        title: "Remove member?",
+        body: "They will lose access immediately. You can invite them again later.",
+        confirmLabel: "Remove", danger: true,
+        onConfirm: function () {
+          state.ds.removeMember(uid).then(function () {
+            toast("Member removed");
+            renderSettingsMembers(root);
+          }).catch(function (err) { toast(err.message || "Remove failed", true); });
+        },
+      });
+    });
+    if (tables[1]) tables[1].addEventListener("click", function (e) {
+      var btn = e.target.closest("[data-act='revoke']");
+      if (!btn) return;
+      var tr = e.target.closest("tr[data-invite]");
+      var invId = tr.getAttribute("data-invite");
+      state.ds.revokeInvite(invId).then(function () {
+        toast("Invite revoked");
+        renderSettingsMembers(root);
+      }).catch(function (err) { toast(err.message || "Revoke failed", true); });
+    });
+  }
+
+  function openInviteModal(rootAfterSave) {
+    if (document.body.classList.contains("locked")) return;
+    var backdrop = h(
+      '<div class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal">' +
+        '<h2>Invite a teammate</h2>' +
+        '<p class="sub">They\'ll get an email with a link to join. Links expire in 7 days.</p>' +
+        '<form id="inviteForm">' +
+          '<div class="field"><label>Work email</label><input id="inv_email" type="email" required placeholder="teammate@company.com"></div>' +
+          '<div class="field"><label>Role</label><select id="inv_role"><option value="member">member</option><option value="admin">admin</option><option value="owner">owner</option></select></div>' +
+          '<div class="actions"><button type="button" class="btn" data-close>Cancel</button><button type="submit" class="btn accent">Send invite</button></div>' +
+        '</form>' +
+      '</div></div>'
+    );
+    document.body.appendChild(backdrop);
+    document.body.classList.add("locked");
+    var previouslyFocused = document.activeElement;
+    var uninstall;
+    var handled = false;
+    function close() { if (handled) return; handled = true; backdrop.remove(); document.body.classList.remove("locked"); if (uninstall) uninstall(); if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {} }
+    uninstall = installModalKeys(backdrop, close);
+    backdrop.addEventListener("click", function (e) {
+      if (handled) return;
+      if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
+    });
+    backdrop.querySelector("#inviteForm").addEventListener("submit", function (e) {
+      e.preventDefault();
+      if (handled) return;
+      var email = backdrop.querySelector("#inv_email").value.trim();
+      var role = backdrop.querySelector("#inv_role").value;
+      var btn = e.target.querySelector('button[type="submit"]');
+      btn.disabled = true;
+      state.ds.inviteMember({ email: email, role: role }).then(function () {
+        close();
+        toast("Invite sent to " + email);
+        if (rootAfterSave) renderSettingsMembers(rootAfterSave);
+      }).catch(function (err) {
+        btn.disabled = false;
+        var msg = err.message || "Invite failed";
+        if (err.errorCode === "already_a_member") msg = "This person is already a member.";
+        toast(msg, true);
+      });
+    });
+    setTimeout(function () { backdrop.querySelector("#inv_email").focus(); }, 20);
+  }
+  async function renderSettingsKeys(root) {
+    root.innerHTML = '<div class="card">' + loadingBlock("table") + "</div>";
+    var keys = [];
+    try { keys = await state.ds.listApiKeys(); }
+    catch (e) { root.innerHTML = '<div class="card empty"><h3>Could not load keys</h3><p>' + esc(e.message || "Try again in a moment.") + '</p></div>'; return; }
+    function attachCreate(btn) {
+      if (!btn) return;
+      btn.addEventListener("click", function () {
+        openInputModal({
+          title: "Create an API key",
+          label: "Key name",
+          placeholder: "e.g. CI runner",
+          confirmLabel: "Create",
+          onConfirm: async function (name) {
+            if (!name || !name.trim()) return;
+            try {
+              var res = await state.ds.createApiKey(name.trim());
+              showTokenModal(res.plaintextToken, "API key created");
+              await renderSettingsKeys(root);
+            } catch (e) {
+              toast(e && e.message ? e.message : "Could not create key");
+            }
+          },
+        });
+      });
+    }
+    if (!keys.length) {
+      root.innerHTML =
+        '<div class="card" style="padding:0">' +
+          '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:baseline">' +
+            '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">API keys</h2>' +
+            '<span style="margin-left:8px; color:var(--fg-3); font-size:var(--t-sec)">0 active</span>' +
+          "</div>" +
+          '<div style="padding: 24px 16px">' +
+          emptyState("No API keys yet", "Create a server-side key to script deployments, rotate ingest tokens, or wire AgentVisor into CI/CD.", "+ Create key", null, "createKeyBtn") +
+          "</div></div>";
+      attachCreate($("#createKeyBtn", root));
+      return;
+    }
+    var rows = keys.map(function (k) {
+      return '<tr data-id="' + esc(k.id) + '">' +
+        '<td><div style="font-weight:500">' + esc(k.name) + '</div><div class="id">' + esc(k.id) + "</div></td>" +
+        '<td class="mono">' + esc(k.hint) + "</td>" +
+        '<td style="color:var(--fg-2)">' + esc(timeAgo(k.lastUsedAt)) + "</td>" +
+        '<td style="color:var(--fg-2)">' + esc(timeAgo(k.createdAt)) + "</td>" +
+        '<td><button class="btn danger" data-act="revoke">Revoke</button></td>' +
+      "</tr>";
+    }).join("");
+    root.innerHTML =
+      '<div class="card" style="padding:0">' +
+        '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:baseline">' +
+          '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">API keys</h2>' +
+          '<span style="margin-left:8px; color:var(--fg-3); font-size:var(--t-sec)">' + keys.length + " active</span>" +
+          '<button class="btn accent" id="createKeyBtn" style="margin-left:auto">+ Create key</button>' +
+        "</div>" +
+        '<div class="table-wrap"><table>' +
+          "<thead><tr><th>Name</th><th>Prefix</th><th>Last used</th><th>Created</th><th><span class=\"sr-only\">Actions</span></th></tr></thead>" +
+          "<tbody>" + rows + "</tbody>" +
+        "</table></div>" +
+      "</div>";
+    attachCreate($("#createKeyBtn", root));
+    $$("tr[data-id] button[data-act='revoke']", root).forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var tr = btn.closest("tr");
+        var id = tr && tr.getAttribute("data-id");
+        if (!id) return;
+        confirmModal({
+          title: "Revoke this API key?",
+          body: "Any script or dashboard using this key will immediately start returning 401. This cannot be undone.",
+          confirmLabel: "Revoke",
+          danger: true,
+          onConfirm: async function () {
+            try {
+              await state.ds.revokeApiKey(id);
+              toast("Key revoked.");
+              await renderSettingsKeys(root);
+            } catch (e) {
+              toast(e && e.message ? e.message : "Could not revoke");
+            }
+          },
+        });
+      });
+    });
+  }
+  async function renderSettingsSSO(root) {
+    root.innerHTML = '<div class="card">' + loadingBlock("table") + "</div>";
+    var res;
+    try { res = await state.ds.listSamlConfigs(); }
+    catch (e) { root.innerHTML = '<div class="card empty"><h3>Could not load SSO</h3><p>' + esc(e.message || "Try again in a moment.") + '</p></div>'; return; }
+    var configs = res.configs || [];
+
+    var oauthCard =
+      '<div class="card">' +
+        '<h2>Social sign-in (OAuth)</h2>' +
+        '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 var(--s-4)">Anyone with a Google Workspace or Microsoft Entra account at your domain can sign in. Configured server-side via provider env vars.</p>' +
+        '<div style="display:flex; gap:8px; flex-wrap:wrap">' +
+          '<span class="pill neutral">' + iconGoogle() + '<span style="margin-left:6px">Google Workspace</span></span>' +
+          '<span class="pill neutral">' + iconMicrosoft() + '<span style="margin-left:6px">Microsoft Entra</span></span>' +
+        "</div>" +
+      "</div>";
+
+    var samlList = configs.length
+      ? '<div class="table-wrap"><table>' +
+          '<thead><tr><th>Display name</th><th>IdP entity ID</th><th>Domains</th><th>JIT</th><th>Status</th><th><span class="sr-only">Actions</span></th></tr></thead>' +
+          '<tbody>' + configs.map(function (c) {
+            return '<tr data-id="' + esc(c.id) + '">' +
+              '<td><div style="font-weight:500">' + esc(c.displayName) + '</div><div class="id">' + esc((c.spEntityId || '').slice(-40)) + '</div></td>' +
+              '<td class="mono" style="font-size:11.5px">' + esc((c.entityIdIdp || '').slice(0, 50)) + (c.entityIdIdp && c.entityIdIdp.length > 50 ? '…' : '') + '</td>' +
+              '<td class="mono" style="font-size:11.5px">' + esc(c.allowedDomains || "(any)") + '</td>' +
+              '<td>' + (c.jitEnabled ? '<span class="pill ok">on · ' + esc(c.jitDefaultRole) + '</span>' : '<span class="pill neutral">off</span>') + '</td>' +
+              '<td>' + (c.isActive ? '<span class="pill ok status-dot">active</span>' : '<span class="pill neutral">disabled</span>') + '</td>' +
+              '<td>' +
+                '<button class="btn" data-act="details">Details</button> ' +
+                '<button class="btn" data-act="edit">Edit</button> ' +
+                '<button class="btn danger" data-act="delete">Delete</button>' +
+              '</td>' +
+            '</tr>';
+          }).join('') + '</tbody>' +
+        '</table></div>'
+      : emptyState("No SAML IdPs yet", "Wire an Okta / Auth0 / Microsoft Entra / Ping / any SAML 2.0 provider into the workspace.", "+ Add IdP", null, "addSamlBtn");
+
+    var samlCard =
+      '<div class="card" style="padding:0">' +
+        '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:baseline">' +
+          '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">SAML 2.0 identity providers</h2>' +
+          '<span style="margin-left:8px; color:var(--fg-3); font-size:var(--t-sec)">' + configs.length + ' configured</span>' +
+          (configs.length ? '<button class="btn accent" id="addSamlBtn" style="margin-left:auto">+ Add IdP</button>' : '') +
+        '</div>' +
+        '<div style="padding: 20px 16px">' + samlList + '</div>' +
+      '</div>';
+
+    // Fetch passkeys inline so the MFA card is populated before render.
+    var passkeys = [];
+    try { passkeys = (await state.ds.webauthnListCredentials()).credentials || []; }
+    catch (e) { passkeys = []; }
+
+    var mfaRows = passkeys.length
+      ? '<div class="table-wrap"><table>' +
+          '<thead><tr><th>Passkey</th><th>Transport</th><th>Last used</th><th>Registered</th><th><span class="sr-only">Actions</span></th></tr></thead>' +
+          '<tbody>' + passkeys.map(function (p) {
+            return '<tr data-pk="' + esc(p.id) + '">' +
+              '<td><div style="font-weight:500">' + esc(p.label) + '</div><div class="id">' + esc((p.aaguid || 'aaguid unknown').slice(0, 24)) + '</div></td>' +
+              '<td>' + (p.transports || []).map(function (t) { return '<span class="pill neutral">' + esc(t) + '</span>'; }).join(' ') + '</td>' +
+              '<td style="color: var(--fg-2)">' + esc(p.lastUsedAt ? timeAgo(p.lastUsedAt) : "never") + '</td>' +
+              '<td style="color: var(--fg-2)">' + esc(timeAgo(p.createdAt)) + '</td>' +
+              '<td><button class="btn danger" data-pk-act="revoke">Revoke</button></td>' +
+            '</tr>';
+          }).join('') + '</tbody>' +
+        '</table></div>'
+      : emptyState("No passkeys yet", "Add a hardware key or platform authenticator (Touch ID, Windows Hello, iCloud) to require a passkey on every sign-in. WebAuthn is phishing-resistant and requires no shared secrets.", "+ Add passkey", null, "addPasskeyBtn");
+
+    var mfaCard =
+      '<div class="card" style="padding:0">' +
+        '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:baseline">' +
+          '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">Multi-factor auth (passkeys)</h2>' +
+          '<span style="margin-left:8px; color:var(--fg-3); font-size:var(--t-sec)">' + passkeys.length + ' registered</span>' +
+          (passkeys.length ? '<button class="btn accent" id="addPasskeyBtn" style="margin-left:auto">+ Add passkey</button>' : '') +
+        '</div>' +
+        '<div style="padding: 20px 16px">' + mfaRows + '</div>' +
+      '</div>';
+
+    root.innerHTML = oauthCard + samlCard + mfaCard;
+
+    var addBtn = $("#addSamlBtn", root);
+    if (addBtn) addBtn.addEventListener("click", function () { openSamlEditor(root, null); });
+    var addPk = $("#addPasskeyBtn", root);
+    if (addPk) addPk.addEventListener("click", function () { addPasskey(root); });
+
+    // Passkey row actions
+    var pkTbody = $$("main .table-wrap tbody", root)[1] || null; // sometimes there are two tables — SSO + MFA
+    var pkTables = root.querySelectorAll("table");
+    for (var pi = 0; pi < pkTables.length; pi++) {
+      pkTables[pi].addEventListener("click", function (e) {
+        var btn = e.target.closest("[data-pk-act]");
+        if (!btn) return;
+        var tr = e.target.closest("tr[data-pk]");
+        if (!tr) return;
+        var pkId = tr.getAttribute("data-pk");
+        confirmModal({
+          title: "Revoke passkey?",
+          body: "The passkey will stop working immediately. You'll need to sign in with password only, then register another passkey.",
+          confirmLabel: "Revoke",
+          danger: true,
+          onConfirm: function () {
+            state.ds.webauthnRevoke(pkId).then(function () {
+              toast("Passkey revoked");
+              renderSettingsSSO(root);
+            }).catch(function (err) { toast(err.message || "Revoke failed", true); });
+          },
+        });
+      });
+    }
+
+    var tbody = root.querySelector("tbody");
+    if (tbody) tbody.addEventListener("click", function (e) {
+      var tr = e.target.closest("tr[data-id]");
+      if (!tr) return;
+      var id = tr.getAttribute("data-id");
+      var cfg = configs.find(function (c) { return c.id === id; });
+      var act = (e.target.closest("[data-act]") || {}).getAttribute && (e.target.closest("[data-act]")).getAttribute("data-act");
+      if (!act || !cfg) return;
+      e.stopPropagation();
+      if (act === "details") openSamlDetails(cfg);
+      else if (act === "edit") openSamlEditor(root, cfg);
+      else if (act === "delete") {
+        confirmModal({
+          title: "Delete SSO config?",
+          body: "The '" + cfg.displayName + "' IdP will be removed. Members signed in via it will need to re-authenticate.",
+          confirmLabel: "Delete", danger: true,
+          onConfirm: function () {
+            state.ds.deleteSamlConfig(cfg.id).then(function () {
+              toast("SSO config deleted");
+              renderSettingsSSO(root);
+            }).catch(function (err) { toast(err.message || "Delete failed", true); });
+          },
+        });
+      }
+    });
+  }
+
+  // ---------- SAML details drawer ----------
+
+  function openSamlDetails(cfg) {
+    if (document.body.classList.contains("locked")) return;
+    var backdrop = h(
+      '<div class="modal-backdrop" role="dialog" aria-modal="true">' +
+        '<div class="modal" style="max-width: 640px">' +
+          '<h2>' + esc(cfg.displayName) + '</h2>' +
+          '<p class="sub">Give these values to your IdP administrator.</p>' +
+          '<dl class="kv" style="grid-template-columns: 200px 1fr; gap: 8px 14px;">' +
+            '<dt>SP Entity ID</dt><dd class="mono" style="font-size:11.5px; word-break:break-all;">' + esc(cfg.spEntityId) + '</dd>' +
+            '<dt>ACS (Reply) URL</dt><dd class="mono" style="font-size:11.5px; word-break:break-all;">' + esc(cfg.spAcsUrl) + '</dd>' +
+            '<dt>SLO URL</dt><dd class="mono" style="font-size:11.5px; word-break:break-all;">' + esc(cfg.spSloUrl) + '</dd>' +
+            '<dt>Metadata URL</dt><dd class="mono" style="font-size:11.5px; word-break:break-all;"><a href="' + esc(cfg.spMetadataUrl) + '" target="_blank">' + esc(cfg.spMetadataUrl) + '</a></dd>' +
+            '<dt>IdP cert fingerprint</dt><dd class="mono" style="font-size:11.5px; word-break:break-all;">' + esc(cfg.x509CertFingerprint || "(not parsed)") + '</dd>' +
+            '<dt>SP signing keypair</dt><dd>' + (cfg.hasSpKeypair ? '<span class="pill ok">present</span>' : '<span class="pill neutral">none — using unsigned AuthnRequests</span>') + '</dd>' +
+            '<dt>NameID format</dt><dd class="mono" style="font-size:11.5px">' + esc(cfg.nameIdFormat) + '</dd>' +
+            '<dt>JIT provisioning</dt><dd>' + (cfg.jitEnabled ? 'enabled · default role = ' + esc(cfg.jitDefaultRole) : 'disabled') + '</dd>' +
+            '<dt>Allowed domains</dt><dd class="mono" style="font-size:11.5px">' + esc(cfg.allowedDomains || "(any)") + '</dd>' +
+          '</dl>' +
+          '<div class="actions">' +
+            '<button class="btn" data-act="regen">Regenerate SP keypair</button>' +
+            '<button class="btn accent" data-close>Done</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>'
+    );
+    document.body.appendChild(backdrop);
+    document.body.classList.add("locked");
+    var previouslyFocused = document.activeElement;
+    var uninstall;
+    function close() { backdrop.remove(); document.body.classList.remove("locked"); if (uninstall) uninstall(); if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {} }
+    uninstall = installModalKeys(backdrop, close);
+    backdrop.addEventListener("click", function (e) {
+      if (e.target === backdrop || e.target.hasAttribute("data-close")) return close();
+      var act = e.target.closest("[data-act]");
+      if (act && act.getAttribute("data-act") === "regen") {
+        act.disabled = true;
+        state.ds.regenerateSamlSpKeypair(cfg.id).then(function (r) {
+          toast("SP keypair regenerated");
+          showTokenModal(r.spCertPem, "New SP certificate");
+        }).catch(function (err) { toast(err.message || "Regenerate failed", true); act.disabled = false; });
+      }
+    });
+    setTimeout(function () { backdrop.querySelector('[data-close]').focus(); }, 20);
+  }
+
+  // ---------- WebAuthn / passkey ----------
+
+  // base64url <-> ArrayBuffer helpers. WebAuthn API returns ArrayBuffers
+  // for the challenge, credentialId, and signature; we send them to the
+  // server as base64url strings.
+  function b64uToBuffer(s) {
+    var pad = 4 - (s.length % 4);
+    var b64 = s.replace(/-/g, "+").replace(/_/g, "/") + (pad === 4 ? "" : new Array(pad + 1).join("="));
+    var bin = atob(b64);
+    var out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out.buffer;
+  }
+  function bufferToB64u(buf) {
+    var bytes = new Uint8Array(buf);
+    var bin = "";
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  async function addPasskey(rootAfterAdd) {
+    if (!window.PublicKeyCredential) {
+      toast("This browser doesn't support WebAuthn.", true);
+      return;
+    }
+    // Ask for a label first
+    openInputModal({
+      title: "Add a passkey",
+      label: "Name this passkey",
+      placeholder: "iPhone 15 Pro, YubiKey 5C, laptop, …",
+      confirmLabel: "Continue",
+      onConfirm: async function (label) {
+        try {
+          var opts = (await state.ds.webauthnRegisterStart()).options;
+          // Convert challenge + user.id + excludeCredentials[].id to ArrayBuffer.
+          opts.challenge = b64uToBuffer(opts.challenge);
+          opts.user.id = b64uToBuffer(opts.user.id);
+          if (opts.excludeCredentials) {
+            opts.excludeCredentials = opts.excludeCredentials.map(function (c) {
+              return Object.assign({}, c, { id: b64uToBuffer(c.id) });
+            });
+          }
+          var cred = await navigator.credentials.create({ publicKey: opts });
+          if (!cred) throw new Error("no_credential_returned");
+          var response = {
+            id: cred.id,
+            rawId: bufferToB64u(cred.rawId),
+            type: cred.type,
+            response: {
+              attestationObject: bufferToB64u(cred.response.attestationObject),
+              clientDataJSON: bufferToB64u(cred.response.clientDataJSON),
+              transports: cred.response.getTransports ? cred.response.getTransports() : [],
+            },
+            clientExtensionResults: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {},
+            authenticatorAttachment: cred.authenticatorAttachment || null,
+          };
+          await state.ds.webauthnRegisterFinish(response, label);
+          toast("Passkey added");
+          if (rootAfterAdd) renderSettingsSSO(rootAfterAdd);
+        } catch (err) {
+          toast(err.message || "Passkey registration failed", true);
+        }
+      },
+    });
+  }
+
+  async function runPasskeyLogin(email) {
+    if (!window.PublicKeyCredential) {
+      throw new Error("browser_no_webauthn");
+    }
+    var start = await state.ds.webauthnAuthStart(email);
+    if (!start.hasCredential) throw new Error("no_credential_for_email");
+    var opts = start.options;
+    opts.challenge = b64uToBuffer(opts.challenge);
+    if (opts.allowCredentials) {
+      opts.allowCredentials = opts.allowCredentials.map(function (c) {
+        return Object.assign({}, c, { id: b64uToBuffer(c.id) });
+      });
+    }
+    var cred = await navigator.credentials.get({ publicKey: opts });
+    if (!cred) throw new Error("no_credential_returned");
+    var response = {
+      id: cred.id,
+      rawId: bufferToB64u(cred.rawId),
+      type: cred.type,
+      response: {
+        clientDataJSON: bufferToB64u(cred.response.clientDataJSON),
+        authenticatorData: bufferToB64u(cred.response.authenticatorData),
+        signature: bufferToB64u(cred.response.signature),
+        userHandle: cred.response.userHandle ? bufferToB64u(cred.response.userHandle) : null,
+      },
+      clientExtensionResults: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {},
+      authenticatorAttachment: cred.authenticatorAttachment || null,
+    };
+    return state.ds.webauthnAuthFinish(response);
+  }
+
+
+  // ---------- SAML editor ----------
+
+  function openSamlEditor(rootAfterSave, existing) {
+    if (document.body.classList.contains("locked")) return;
+    var c = existing || {
+      displayName: "", ssoUrl: "", sloUrl: "", entityIdIdp: "", x509Cert: "",
+      wantAssertionsSigned: true, wantResponseSigned: false, allowEncryptedAssertions: true,
+      signatureAlgorithm: "sha256", digestAlgorithm: "sha256",
+      nameIdFormat: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+      jitEnabled: true, jitDefaultRole: "member", allowedDomains: "",
+    };
+    var backdrop = h(
+      '<div class="modal-backdrop" role="dialog" aria-modal="true">' +
+        '<div class="modal" style="max-width:680px">' +
+          '<h2>' + (existing ? 'Edit SAML IdP' : 'New SAML IdP') + '</h2>' +
+          '<p class="sub">Paste values from your Okta / Auth0 / Entra / SAML IdP admin console.</p>' +
+          '<form id="samlForm">' +
+            '<div class="field"><label>Display name</label><input id="s_name" required maxlength="80" placeholder="Okta production" value="' + esc(c.displayName) + '"></div>' +
+            '<div class="field"><label>IdP SSO URL</label><input id="s_ssoUrl" required type="url" placeholder="https://acme.okta.com/app/agentvisor/sso/saml" value="' + esc(c.ssoUrl) + '"></div>' +
+            '<div class="field"><label>IdP SLO URL (optional)</label><input id="s_sloUrl" type="url" placeholder="https://acme.okta.com/app/agentvisor/slo/saml" value="' + esc(c.sloUrl || "") + '"></div>' +
+            '<div class="field"><label>IdP Entity ID</label><input id="s_entityIdIdp" required placeholder="http://www.okta.com/exkABCDE" value="' + esc(c.entityIdIdp) + '"></div>' +
+            '<div class="field"><label>IdP X.509 Certificate (PEM)</label><textarea id="s_x509" required rows="6" style="font-family: SF Mono, ui-monospace, monospace; font-size:11.5px" placeholder="-----BEGIN CERTIFICATE-----&#10;MIIDpDCC...&#10;-----END CERTIFICATE-----">' + esc(c.x509Cert) + '</textarea></div>' +
+            '<div style="display:grid; grid-template-columns:1fr 1fr; gap:12px">' +
+              '<div class="field"><label>NameID format</label><select id="s_nameIdFormat">' +
+                ["emailAddress","persistent","transient","unspecified"].map(function (n) {
+                  var v = "urn:oasis:names:tc:SAML:" + (n === "unspecified" ? "1.1:nameid-format:" : (n === "persistent" || n === "transient" ? "2.0:nameid-format:" : "1.1:nameid-format:")) + n;
+                  return '<option value="' + esc(v) + '"' + (c.nameIdFormat === v ? ' selected' : '') + '>' + esc(n) + '</option>';
+                }).join('') +
+              '</select></div>' +
+              '<div class="field"><label>Signature algorithm</label><select id="s_sig">' +
+                ["sha256","sha512","sha1"].map(function (a) { return '<option' + (c.signatureAlgorithm === a ? ' selected' : '') + '>' + a + '</option>'; }).join('') +
+              '</select></div>' +
+            '</div>' +
+            '<div class="field"><label class="toggle"><input type="checkbox" id="s_wantAssertionsSigned"' + (c.wantAssertionsSigned ? ' checked' : '') + '> Require signed assertions</label></div>' +
+            '<div class="field"><label class="toggle"><input type="checkbox" id="s_wantResponseSigned"' + (c.wantResponseSigned ? ' checked' : '') + '> Require signed response envelope</label></div>' +
+            '<div class="field"><label class="toggle"><input type="checkbox" id="s_allowEncrypted"' + (c.allowEncryptedAssertions ? ' checked' : '') + '> Accept encrypted assertions</label></div>' +
+            '<hr style="border:0; border-top:1px solid var(--border); margin:12px 0">' +
+            '<div class="field"><label class="toggle"><input type="checkbox" id="s_jit"' + (c.jitEnabled ? ' checked' : '') + '> Just-in-time provisioning</label></div>' +
+            '<div style="display:grid; grid-template-columns:1fr 1fr; gap:12px">' +
+              '<div class="field"><label>Default role for new users</label><select id="s_jitRole">' +
+                ["member","admin"].map(function (r) { return '<option' + (c.jitDefaultRole === r ? ' selected' : '') + '>' + r + '</option>'; }).join('') +
+              '</select></div>' +
+              '<div class="field"><label>Allowed email domains (comma-separated)</label><input id="s_domains" placeholder="acme.com,acme.co.uk" value="' + esc(c.allowedDomains) + '"></div>' +
+            '</div>' +
+            '<div class="actions"><button type="button" class="btn" data-close>Cancel</button><button type="submit" class="btn accent">' + (existing ? 'Save' : 'Create') + '</button></div>' +
+          '</form>' +
+        '</div>' +
+      '</div>'
+    );
+    document.body.appendChild(backdrop);
+    document.body.classList.add("locked");
+    var previouslyFocused = document.activeElement;
+    var uninstall;
+    var handled = false;
+    function close() { if (handled) return; handled = true; backdrop.remove(); document.body.classList.remove("locked"); if (uninstall) uninstall(); if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {} }
+    uninstall = installModalKeys(backdrop, close);
+    backdrop.addEventListener("click", function (e) {
+      if (handled) return;
+      if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
+    });
+    backdrop.querySelector("#samlForm").addEventListener("submit", function (e) {
+      e.preventDefault();
+      if (handled) return;
+      var input = {
+        displayName: backdrop.querySelector("#s_name").value.trim(),
+        ssoUrl: backdrop.querySelector("#s_ssoUrl").value.trim(),
+        sloUrl: backdrop.querySelector("#s_sloUrl").value.trim() || null,
+        entityIdIdp: backdrop.querySelector("#s_entityIdIdp").value.trim(),
+        x509Cert: backdrop.querySelector("#s_x509").value.trim(),
+        wantAssertionsSigned: backdrop.querySelector("#s_wantAssertionsSigned").checked,
+        wantResponseSigned: backdrop.querySelector("#s_wantResponseSigned").checked,
+        allowEncryptedAssertions: backdrop.querySelector("#s_allowEncrypted").checked,
+        signatureAlgorithm: backdrop.querySelector("#s_sig").value,
+        digestAlgorithm: backdrop.querySelector("#s_sig").value,
+        nameIdFormat: backdrop.querySelector("#s_nameIdFormat").value,
+        jitEnabled: backdrop.querySelector("#s_jit").checked,
+        jitDefaultRole: backdrop.querySelector("#s_jitRole").value,
+        allowedDomains: backdrop.querySelector("#s_domains").value.trim(),
+      };
+      var btn = e.target.querySelector('button[type="submit"]');
+      btn.disabled = true;
+      var promise = existing
+        ? state.ds.updateSamlConfig(existing.id, input)
+        : state.ds.createSamlConfig(input);
+      promise.then(function () {
+        close();
+        toast(existing ? "SSO config saved" : "SSO config created");
+        renderSettingsSSO(rootAfterSave);
+      }).catch(function (err) {
+        btn.disabled = false;
+        var msg = err.message || "Save failed";
+        if ((err.errorCode || err.detail) === "displayname_in_use") msg = "Another IdP already uses that display name.";
+        toast(msg, true);
+      });
+    });
+    setTimeout(function () { backdrop.querySelector("#s_name").focus(); }, 20);
+  }
+  async function renderSettingsWebhooks(root) {
+    root.innerHTML = '<div class="card">' + loadingBlock("table") + "</div>";
+    var endpoints;
+    try { endpoints = await state.ds.listWebhooks(); }
+    catch (e) { root.innerHTML = '<div class="card empty"><h3>Could not load webhooks</h3><p>' + esc(e.message || "Try again in a moment.") + '</p></div>'; return; }
+
+    function openAddModal() {
+      var events = ["policy.block", "member.invited", "apikey.created", "apikey.revoked", "webhook.test_fired", "*"];
+      var backdrop = h(
+        '<div class="modal-backdrop" role="dialog" aria-modal="true">' +
+          '<div class="modal">' +
+            '<h2>Add webhook</h2>' +
+            '<p class="sub">Forward events to Slack, PagerDuty, Datadog, or your own endpoint. Payloads are signed with HMAC-SHA256.</p>' +
+            '<label style="display:block;margin-top:12px"><span style="display:block;font-size:12px;color:var(--fg-2);margin-bottom:4px">Name</span>' +
+              '<input type="text" id="whName" placeholder="e.g. Slack #ops" style="width:100%">' +
+            '</label>' +
+            '<label style="display:block;margin-top:12px"><span style="display:block;font-size:12px;color:var(--fg-2);margin-bottom:4px">URL</span>' +
+              '<input type="url" id="whUrl" placeholder="https://hooks.slack.com/services/…" style="width:100%">' +
+            '</label>' +
+            '<div style="margin-top:12px"><div style="font-size:12px;color:var(--fg-2);margin-bottom:4px">Events</div>' +
+              '<div style="display:flex;flex-wrap:wrap;gap:6px" id="whEventsPicker">' +
+                events.map(function (ev) {
+                  return '<label class="pill neutral" style="cursor:pointer;user-select:none"><input type="checkbox" value="' + esc(ev) + '" style="margin-right:6px">' + esc(ev) + '</label>';
+                }).join("") +
+              '</div>' +
+            '</div>' +
+            '<div class="actions">' +
+              '<button type="button" class="btn" data-close>Cancel</button>' +
+              '<button type="button" class="btn primary" id="whSave">Create endpoint</button>' +
+            '</div>' +
+          '</div>' +
+        '</div>',
+      );
+      document.body.appendChild(backdrop);
+      installModalKeys(backdrop);
+      backdrop.querySelectorAll("[data-close]").forEach(function (b) { b.addEventListener("click", function () { backdrop.remove(); }); });
+      backdrop.addEventListener("click", function (e) { if (e.target === backdrop) backdrop.remove(); });
+      $("#whSave", backdrop).addEventListener("click", async function () {
+        var name = $("#whName", backdrop).value.trim();
+        var url = $("#whUrl", backdrop).value.trim();
+        var events = Array.from(backdrop.querySelectorAll("#whEventsPicker input:checked")).map(function (i) { return i.value; });
+        if (!name || !url) { toast("Name and URL are required"); return; }
+        if (!events.length) { toast("Pick at least one event"); return; }
+        try {
+          var res = await state.ds.createWebhook({ name: name, url: url, events: events });
+          backdrop.remove();
+          showTokenModal(res.secret, "Webhook secret");
+          await renderSettingsWebhooks(root);
+        } catch (e) {
+          toast(e && e.message ? e.message : "Could not create webhook");
+        }
+      });
+    }
+
+    if (!endpoints.length) {
+      root.innerHTML =
+        '<div class="card" style="padding:0">' +
+          '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:baseline">' +
+            '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">Webhooks</h2>' +
+            '<span style="margin-left:8px; color:var(--fg-3); font-size:var(--t-sec)">0 endpoints</span>' +
+          "</div>" +
+          '<div style="padding: 24px 16px">' +
+          emptyState("No webhooks yet", "Wire AgentVisor to Slack / PagerDuty / Datadog / your own service. Payloads are HMAC-SHA256 signed.", "+ Add webhook", null, "whAdd") +
+          "</div></div>";
+      $("#whAdd", root).addEventListener("click", openAddModal);
+      return;
+    }
+
+    var rows = endpoints.map(function (e) {
+      return '<tr data-id="' + esc(e.id) + '">' +
+        '<td><div style="font-weight:500">' + esc(e.name) + '</div><div class="id">' + esc(e.id) + '</div></td>' +
+        '<td class="mono" style="font-size:11.5px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(e.url) + '</td>' +
+        '<td style="font-size:12px">' + (e.events || []).map(function (ev) { return '<span class="pill neutral" style="margin-right:4px">' + esc(ev) + '</span>'; }).join("") + '</td>' +
+        '<td>' + (e.isActive ? '<span class="pill ok status-dot">active</span>' : '<span class="pill neutral">paused</span>') + '</td>' +
+        '<td>' +
+          '<button class="btn" data-act="test">Send test</button> ' +
+          '<button class="btn" data-act="toggle">' + (e.isActive ? "Pause" : "Resume") + '</button> ' +
+          '<button class="btn danger" data-act="delete">Delete</button>' +
+        '</td>' +
+      '</tr>';
+    }).join("");
+
+    root.innerHTML =
+      '<div class="card" style="padding:0">' +
+        '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:baseline">' +
+          '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">Webhooks</h2>' +
+          '<span style="margin-left:8px; color:var(--fg-3); font-size:var(--t-sec)">' + endpoints.length + " endpoint" + (endpoints.length === 1 ? "" : "s") + "</span>" +
+          '<button class="btn accent" id="whAdd" style="margin-left:auto">+ Add webhook</button>' +
+        "</div>" +
+        '<div class="table-wrap"><table>' +
+          "<thead><tr><th>Name</th><th>URL</th><th>Events</th><th>Status</th><th><span class=\"sr-only\">Actions</span></th></tr></thead>" +
+          "<tbody>" + rows + "</tbody>" +
+        "</table></div>" +
+      "</div>";
+
+    $("#whAdd", root).addEventListener("click", openAddModal);
+
+    root.addEventListener("click", async function (e) {
+      var btn = e.target.closest("button[data-act]");
+      if (!btn) return;
+      var tr = btn.closest("tr[data-id]");
+      if (!tr) return;
+      var id = tr.getAttribute("data-id");
+      var act = btn.getAttribute("data-act");
+      var current = endpoints.find(function (x) { return x.id === id; });
+      if (!current) return;
+      if (act === "test") {
+        try { await state.ds.testWebhook(id); toast("Test event fired."); }
+        catch (err) { toast(err.message || "Test failed"); }
+      } else if (act === "toggle") {
+        try {
+          await state.ds.updateWebhook(id, { isActive: !current.isActive });
+          toast(current.isActive ? "Paused." : "Resumed.");
+          await renderSettingsWebhooks(root);
+        } catch (err) { toast(err.message || "Update failed"); }
+      } else if (act === "delete") {
+        confirmModal({
+          title: "Delete this webhook?",
+          body: "The endpoint and its delivery history will be permanently removed.",
+          confirmLabel: "Delete", danger: true,
+          onConfirm: async function () {
+            try { await state.ds.deleteWebhook(id); toast("Deleted."); await renderSettingsWebhooks(root); }
+            catch (err) { toast(err.message || "Delete failed"); }
+          },
+        });
+      }
+    });
+  }
+  function renderSettingsBilling(root) {
+    root.innerHTML =
+      '<div class="card">' +
+        "<h2>Plan</h2>" +
+        '<div style="display:flex; align-items:baseline; gap:8px; margin-bottom: 12px"><span style="font-size:22px; font-weight:600">Free</span> <span class="pill accent">up to 10 deployments</span></div>' +
+        '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 var(--s-3)">All governance features included. Upgrade to Team for SSO enforcement, longer retention, and priority support.</p>' +
+        '<button class="btn accent" id="upgradeBtn">Upgrade to Team</button>' +
+      "</div>";
+    var b = $("#upgradeBtn", root);
+    if (b) b.addEventListener("click", function () { comingSoon("Upgrade to Team", "Billing lands in the beta. In the meantime, ping the AgentVisor team to enable Team features on your workspace."); });
+  }
+  async function renderSettingsAudit(root) {
+    root.innerHTML = '<div class="card">' + loadingBlock("table") + "</div>";
+    var audit = await state.ds.listAudit();
+    var header =
+      '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:baseline">' +
+        '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">Audit log</h2>' +
+        '<span style="margin-left:8px; color:var(--fg-3); font-size:var(--t-sec)">' + (audit.length || 0) + " event" + (audit.length === 1 ? "" : "s") + "</span>" +
+        '<button class="btn" id="auditExportBtn" style="margin-left:auto">↓ Export CSV</button>' +
+      "</div>";
+    if (!audit.length) {
+      root.innerHTML =
+        '<div class="card" style="padding:0">' + header +
+          '<div style="padding: 24px 16px">' +
+          emptyState("No audit entries yet", "Sign-ins, deployment rotations, policy changes, and receipt verifications will appear here as your team uses the console.") +
+          "</div></div>";
+    } else {
+      var rows = audit.map(function (a) {
+        return '<tr><td class="mono" style="color:var(--fg-3); font-size:11.5px; white-space:nowrap">' + esc(new Date(a.at).toLocaleString()) + '</td>' +
+          '<td><span style="font-weight:500">' + esc(a.event) + "</span></td>" +
+          "<td>" + esc(a.actor) + "</td>" +
+          "<td>" + esc(a.target || "—") + "</td>" +
+          '<td style="color: var(--fg-2)">' + esc(a.note || "") + "</td></tr>";
+      }).join("");
+      root.innerHTML =
+        '<div class="card" style="padding:0">' + header +
+          '<div class="table-wrap"><table>' +
+            "<thead><tr><th>When</th><th>Event</th><th>Actor</th><th>Target</th><th>Note</th></tr></thead>" +
+            "<tbody>" + rows + "</tbody>" +
+          "</table></div>" +
+        "</div>";
+    }
+    var exp = $("#auditExportBtn", root);
+    if (exp) exp.addEventListener("click", function () {
+      // Real download in api mode; toast in mock.
+      if (state.ds.downloadAuditCsv) {
+        state.ds.downloadAuditCsv();
+      } else {
+        toast("CSV export not available in demo mode.");
+      }
+    });
+  }
+  function renderSettingsBilling_OLD_UNUSED(root) {
+    root.innerHTML =
+      '<div class="card">' +
+        "<h2>Plan</h2>" +
+        '<div style="display:flex; align-items:baseline; gap:8px; margin-bottom: 12px"><span style="font-size:22px; font-weight:600">Free</span> <span class="pill accent">up to 10 deployments</span></div>' +
+        '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 var(--s-3)">All governance features included. Upgrade to Team for SSO enforcement, longer retention, and priority support.</p>' +
+        '<button class="btn accent">Upgrade to Team</button>' +
+      "</div>";
+  }
+
+  /* ============================================================
+   * CONFIRM MODAL
+   * ============================================================ */
+
+  function confirmModal(opts) {
+    if (document.body.classList.contains("locked")) return;
+    var backdrop = h(
+      '<div class="modal-backdrop" role="dialog" aria-modal="true">' +
+        '<div class="modal ' + (opts.danger ? "confirm-danger" : "") + '">' +
+          "<h2>" + esc(opts.title) + "</h2>" +
+          '<p class="sub">' + esc(opts.body) + "</p>" +
+          '<div class="actions">' +
+            '<button type="button" class="btn" data-close>Cancel</button>' +
+            '<button type="button" class="btn ' + (opts.danger ? "danger" : "primary") + '" data-confirm>' + esc(opts.confirmLabel || "Confirm") + "</button>" +
+          "</div>" +
+        "</div>" +
+      "</div>"
+    );
+    document.body.appendChild(backdrop);
+    document.body.classList.add("locked");
+    var previouslyFocused = document.activeElement;
+    var uninstall;
+    var handled = false;
+    function close() {
+      if (handled) return;
+      handled = true;
+      backdrop.remove(); document.body.classList.remove("locked");
+      if (uninstall) uninstall();
+      if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {}
+    }
+    uninstall = installModalKeys(backdrop, close);
+    backdrop.addEventListener("click", function (e) {
+      if (handled) return;
+      if (e.target === backdrop || e.target.hasAttribute("data-close")) { close(); return; }
+      if (e.target.hasAttribute("data-confirm")) {
+        var cb = opts.onConfirm;
+        close();
+        if (cb) cb();
+      }
+    });
+    // Focus the confirm button so Enter confirms
+    setTimeout(function () { backdrop.querySelector("[data-confirm]").focus(); }, 20);
+  }
+
+  /* ============================================================
+   * COMMAND PALETTE (⌘K)
+   * ============================================================ */
+
+  var cmdkOpen_ = false;
+  async function openCmdK() {
+    if (cmdkOpen_) return;
+    cmdkOpen_ = true;
+    document.body.classList.add("locked");
+
+    // Gather static targets synchronously — these render immediately so
+    // the palette shell is on screen the same tick as the ⌘K keystroke.
+    var routes = [
+      { g: "Navigate", label: "Overview", desc: "Fleet 24h dashboard", kbd: "G O", href: "#/overview", icon: iconChart() },
+      { g: "Navigate", label: "Sessions", desc: "Every agent session", kbd: "G S", href: "#/sessions", icon: iconActivity() },
+      { g: "Navigate", label: "Policies", desc: "Rules the daemon enforces", kbd: "G P", href: "#/policies", icon: iconShield() },
+      { g: "Navigate", label: "Deployments", desc: "Daemons & tokens", kbd: "G D", href: "#/deployments", icon: iconServer() },
+      { g: "Navigate", label: "Settings", desc: "Org, members, keys, audit", kbd: "G ,", href: "#/settings", icon: iconGear() },
+    ];
+    var actions = [
+      { g: "Actions", label: "Toggle theme", desc: "Switch light / dark", run: function () { toggleTheme(); } },
+      { g: "Actions", label: "New deployment", desc: "Register an agentvisord daemon", run: function () { navigate("#/deployments"); setTimeout(openCreateDeploymentModal, 100); } },
+      { g: "Actions", label: "Sign out", desc: "Leave this workspace", run: signOut },
+    ];
+    // Dynamic targets get filled in when the async datasource calls
+    // resolve. Palette shell is already interactive — user can navigate
+    // + search static entries with zero latency.
+    var sessions = [], policies = [], deployments = [];
+    var all = routes.concat(actions);
+
+    var backdrop = h(
+      '<div class="cmdk-backdrop">' +
+        '<div class="cmdk">' +
+          '<input type="text" placeholder="Search or run a command…" autocomplete="off" spellcheck="false" />' +
+          '<div class="list" id="cmdkList"></div>' +
+          '<div class="cmdk-footer">' +
+            '<span class="hint"><span class="kbd">↑↓</span> navigate</span>' +
+            '<span class="hint"><span class="kbd">↵</span> select</span>' +
+            '<span class="hint"><span class="kbd">Esc</span> close</span>' +
+          "</div>" +
+        "</div>" +
+      "</div>"
+    );
+    document.body.appendChild(backdrop);
+    var input = backdrop.querySelector("input");
+    var list = backdrop.querySelector("#cmdkList");
+    var selected = 0;
+
+    function fuzzyMatch(q, s) { s = s.toLowerCase(); q = q.toLowerCase(); var i = 0; for (var c of s) if (c === q[i]) i++; return i === q.length; }
+    function paint() {
+      var q = input.value.trim();
+      var filtered = q ? all.filter(function (it) { return fuzzyMatch(q, it.label + " " + (it.desc || "")); }) : all;
+      selected = Math.min(selected, filtered.length - 1);
+      if (selected < 0) selected = 0;
+      if (filtered.length === 0) {
+        list.innerHTML = '<div class="empty-hint">No matches</div>';
+        return;
+      }
+      var byGroup = {};
+      filtered.forEach(function (it) { (byGroup[it.g] = byGroup[it.g] || []).push(it); });
+      var html = "";
+      var idx = 0;
+      Object.keys(byGroup).forEach(function (g) {
+        html += '<div class="group-label">' + esc(g) + "</div>";
+        byGroup[g].forEach(function (it) {
+          var isSel = idx === selected;
+          html += '<div class="item' + (isSel ? " selected" : "") + '" data-idx="' + idx + '">' +
+            (it.icon || "") +
+            "<span>" + esc(it.label) + "</span>" +
+            (it.desc ? '<span class="desc">' + esc(it.desc) + "</span>" : "") +
+            (it.kbd ? '<span class="kbd">' + esc(it.kbd) + "</span>" : "") +
+            "</div>";
+          idx++;
+        });
+      });
+      list.innerHTML = html;
+      list._flat = filtered;
+    }
+    paint();
+    setTimeout(function () { input.focus(); }, 10);
+
+    // Populate dynamic entries in the background — palette is already
+    // interactive with the 8 static routes/actions above. When the data
+    // arrives we extend `all` and repaint (throttled to the current
+    // query). Any error is silently absorbed; the palette stays useful
+    // even offline.
+    (async function loadDynamic() {
+      try {
+        var sres = await state.ds.listSessions();
+        sessions = sres.sessions.slice(0, 20).map(function (s) {
+          return { g: "Sessions", label: s.externalId, desc: s.agent + " · " + s.user, href: "#/sessions/" + s.id, icon: iconActivity() };
+        });
+        all = all.concat(sessions);
+        if (backdrop.isConnected) paint();
+      } catch (e) {}
+      try {
+        policies = (await state.ds.listPolicies()).map(function (p) {
+          return { g: "Policies", label: p.name, desc: p.description, href: "#/policies/" + p.id, icon: iconShield() };
+        });
+        all = all.concat(policies);
+        if (backdrop.isConnected) paint();
+      } catch (e) {}
+      try {
+        deployments = (await state.ds.listDeployments()).map(function (d) {
+          return { g: "Deployments", label: d.name, desc: d.environment + " · " + (d.region || ""), href: "#/deployments/" + d.id, icon: iconServer() };
+        });
+        all = all.concat(deployments);
+        if (backdrop.isConnected) paint();
+      } catch (e) {}
+    }());
+
+    input.addEventListener("input", function () { selected = 0; paint(); });
+    input.addEventListener("keydown", function (e) {
+      var flat = list._flat || [];
+      if (e.key === "ArrowDown") { e.preventDefault(); selected = Math.min(selected + 1, flat.length - 1); paint(); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); selected = Math.max(selected - 1, 0); paint(); }
+      else if (e.key === "Enter") { e.preventDefault(); run(flat[selected]); }
+      else if (e.key === "Escape") close();
+    });
+    list.addEventListener("click", function (e) {
+      var it = e.target.closest(".item");
+      if (!it) return;
+      var idx = parseInt(it.getAttribute("data-idx"), 10);
+      run((list._flat || [])[idx]);
+    });
+
+    function close() {
+      cmdkOpen_ = false;
+      backdrop.remove();
+      document.body.classList.remove("locked");
+    }
+    function run(it) {
+      if (!it) return;
+      if (it.href) { close(); navigate(it.href); }
+      else if (it.run) { close(); it.run(); }
+    }
+    backdrop.addEventListener("click", function (e) { if (e.target === backdrop) close(); });
+  }
+
+  /* ============================================================
+   * KEYBOARD SHORTCUTS
+   * ============================================================ */
+
+  function installKeyboardShortcuts() {
+    document.addEventListener("keydown", function (e) {
+      // ⌘K / Ctrl+K
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        // If any modal / overlay is open, don't stack the palette on top.
+        // The palette itself sets `.locked` so pressing ⌘K twice can't
+        // reopen it either.
+        if (document.body.classList.contains("locked")) return;
+        openCmdK();
+        return;
+      }
+      // Ignore keystrokes inside inputs
+      if (/^(INPUT|TEXTAREA|SELECT)$/.test((e.target || {}).tagName || "")) return;
+      // g-then-x shortcuts
+      if (e.key.toLowerCase() === "g") {
+        state.gPrefixAt = Date.now();
+        return;
+      }
+      if (state.gPrefixAt && Date.now() - state.gPrefixAt < 900) {
+        var k = e.key.toLowerCase();
+        if (k === "o") { state.gPrefixAt = 0; navigate("#/overview"); }
+        else if (k === "s") { state.gPrefixAt = 0; navigate("#/sessions"); }
+        else if (k === "p") { state.gPrefixAt = 0; navigate("#/policies"); }
+        else if (k === "d") { state.gPrefixAt = 0; navigate("#/deployments"); }
+        else if (k === ",") { state.gPrefixAt = 0; navigate("#/settings"); }
+      }
+      if (e.key === "?") {
+        openShortcutSheet();
+      }
+    });
+  }
+
+  function openShortcutSheet() {
+    var groups = [
+      { title: "Navigate", items: [
+        ["G O", "Overview"], ["G S", "Sessions"], ["G P", "Policies"],
+        ["G D", "Deployments"], ["G ,", "Settings"],
+      ]},
+      { title: "Actions", items: [
+        ["⌘ K", "Open command palette"], ["Esc", "Close dialogs"], ["?", "Show this sheet"],
+      ]},
+    ];
+    var html = groups.map(function (g) {
+      return '<div style="margin-bottom: 16px;">' +
+        '<div style="font-size: 11px; color: var(--fg-3); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; margin-bottom: 8px;">' + g.title + "</div>" +
+        g.items.map(function (i) {
+          return '<div style="display: flex; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border);">' +
+            '<span style="flex: 1; font-size: 13px;">' + i[1] + "</span>" +
+            '<span class="kbd">' + i[0] + "</span>" +
+            "</div>";
+        }).join("") +
+      "</div>";
+    }).join("");
+    var backdrop = h(
+      '<div class="modal-backdrop"><div class="modal">' +
+        "<h2>Keyboard shortcuts</h2>" +
+        '<p class="sub">Move around without a mouse.</p>' +
+        html +
+        '<div class="actions"><button type="button" class="btn primary" data-close>Done</button></div>' +
+      "</div></div>"
+    );
+    document.body.appendChild(backdrop);
+    document.body.classList.add("locked");
+    function close() { backdrop.remove(); document.body.classList.remove("locked"); document.removeEventListener("keydown", onKey); }
+    function onKey(ev) { if (ev.key === "Escape") close(); }
+    document.addEventListener("keydown", onKey);
+    backdrop.addEventListener("click", function (e) {
+      if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
+    });
+  }
+
+  /* ============================================================
+   * MISC
+   * ============================================================ */
+
+  function emptyState(title, body, ctaLabel, ctaHref, ctaId) {
+    var cta = "";
+    if (ctaLabel && ctaHref) cta = '<a class="btn accent" href="' + esc(ctaHref) + '">' + esc(ctaLabel) + "</a>";
+    else if (ctaLabel) cta = '<button class="btn accent" id="' + esc(ctaId || "cta") + '">' + esc(ctaLabel) + "</button>";
+    return '<div class="empty">' +
+      '<div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="9"/><path d="M8 12h8"/></svg></div>' +
+      "<h3>" + esc(title) + "</h3><p>" + esc(body) + "</p>" + cta +
+    "</div>";
+  }
+
+  function renderError(main, err) {
+    // Log the original once so ops can grep the browser console (or
+    // Sentry when we wire it) — but don't render the raw message; a
+    // customer-facing "Something went wrong" is a better UX than
+    // "not_found" for a stale bookmark.
+    console.error(err);
+    var isNotFound = err && (err.message === "not_found" || err.status === 404);
+    var title = isNotFound ? "Not found" : "Something went wrong";
+    var detail = isNotFound
+      ? "That item doesn't exist, or you don't have access to it."
+      : "This shouldn't happen. Try again in a moment or reload the page."
+        + (err && err.requestId ? " (request id: " + esc(err.requestId) + ")" : "");
+    var actions = isNotFound
+      ? '<a class="btn accent" href="#/sessions">Back to sessions</a> <a class="btn" href="#/overview">Overview</a>'
+      : '<button class="btn accent" onclick="location.reload()">Reload</button> <a class="btn" href="#/overview">Overview</a>';
+    main.innerHTML = pageHeader(title) + '<div class="card"><div class="empty"><h3>' + esc(title) + "</h3><p>" + detail + "</p>" + actions + "</div></div>";
+  }
+
+  /* ---------- go ---------- */
+
+  boot();
+})();

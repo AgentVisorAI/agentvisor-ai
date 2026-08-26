@@ -5,6 +5,8 @@
 # AgentVisor AI
 
 [![CI](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/ci.yml)
+[![Console + API](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/console-api.yml/badge.svg)](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/console-api.yml)
+[![Deploy](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/deploy.yml/badge.svg)](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/deploy.yml)
 [![Supply chain](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/deny.yml/badge.svg)](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/deny.yml)
 [![Docs](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/pages.yml/badge.svg)](https://agentvisorai.github.io/agentvisor-ai/)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)

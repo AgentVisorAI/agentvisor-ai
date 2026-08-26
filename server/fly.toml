@@ -1,0 +1,75 @@
+# Fly.io deployment config — sized for the free tier.
+#
+# Free tier as of 2025:
+#   - Up to 3 shared-cpu-1x machines with 256 MB RAM
+#   - 3 GB persistent volume total
+#   - 160 GB outbound bandwidth / month
+#   - Auto stop/start = you only pay when serving traffic
+#
+# Scaling path (no re-architecture required):
+#   fly scale count 3 --region iad,fra,syd   # multi-region
+#   fly scale vm shared-cpu-2x --memory 1024 # bigger machines
+#   Autoscaler: `fly autoscale set min=1 max=20` — handles 100→1M req/day.
+#
+# Portability: this file is Fly-specific but the container image is not.
+# Same Dockerfile runs on Cloud Run, Render, Railway, Kubernetes, or a VPS.
+# To leave Fly, `fly logs`+`pg_dump` for backup and redeploy elsewhere.
+
+app = "agentvisor-api"
+primary_region = "iad"
+kill_signal = "SIGTERM"
+kill_timeout = "10s"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  HOST = "0.0.0.0"
+  NODE_ENV = "production"
+  SESSION_COOKIE_SECURE = "true"
+  ALLOWED_ORIGINS = "https://agentvisorai.me,https://agentvisorai.github.io"
+  JWT_ISSUER = "agentvisor-ai"
+  JWT_AUDIENCE = "agentvisor-console"
+  APP_BASE_URL = "https://agentvisorai.me"
+  EMAIL_FROM = "AgentVisor AI <no-reply@agentvisorai.me>"
+  MICROSOFT_TENANT = "common"
+
+# Required secrets — set with `fly secrets set`, NEVER in this file:
+#   fly secrets set DATABASE_URL="postgres://…"
+#   fly secrets set JWT_SECRET="$(openssl rand -hex 48)"
+#   # Mailer — pick one. Prod refuses to boot without one:
+#   fly secrets set RESEND_API_KEY="re_…"          # OR
+#   fly secrets set SMTP_URL="smtps://user:pass@host:465"
+#   # OIDC — optional. Login buttons hide when the client-id is unset:
+#   fly secrets set GOOGLE_CLIENT_ID="…" GOOGLE_CLIENT_SECRET="…"
+#   fly secrets set MICROSOFT_CLIENT_ID="…" MICROSOFT_CLIENT_SECRET="…"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Auto-stop when idle for cost efficiency; first request wakes the machine
+  # in ~250 ms on Fly. For always-on, set `min_machines_running = 1`.
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 250
+    soft_limit = 200
+
+[[http_service.checks]]
+  interval = "15s"
+  timeout = "2s"
+  method = "GET"
+  # /readyz probes both process + DB. Fly stops routing traffic on 503,
+  # so a DB blip drains the pool instead of surfacing 500s on the LB.
+  path = "/readyz"
+
+# Cheapest tier that still handles a healthy demo load. Autoscale up in prod:
+#   fly scale vm shared-cpu-2x --memory 1024
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "256mb"

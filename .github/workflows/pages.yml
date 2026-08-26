@@ -80,13 +80,46 @@ jobs:
           cp docs/style.css "$site/style.css"
           cp docs/logo.png "$site/logo.png"
           cp docs/social-preview.png "$site/social-preview.png"
-          # Product console (self-contained client-side app).
+          # Product console — the multi-tenant SaaS app.
+          #
+          # Minify app.js + datasource.js with terser (from npx so no
+          # lock file), then gzip-precompress both. Cloudflare Pages
+          # + GitHub Pages both serve .gz when the client Accept-Encoding
+          # allows it. Result: 96KB → ~30KB gzipped, halves the boot
+          # cost on 3G/4G. Minification does NOT touch index.html so
+          # the boot-time crash-card script stays readable.
           mkdir -p "$site/app"
-          cp docs/app/index.html docs/app/console.css docs/app/console.js "$site/app/"
+          cp docs/app/index.html "$site/app/"
+          cp docs/app/styles.css "$site/app/"
+          # Minify JS. keep_classnames + keep_fnames stay on so the
+          # in-app error boundary can still show a legible stack.
+          npx --yes terser@5 docs/app/app.js \
+            --compress passes=2 --mangle --keep-fnames --keep-classnames \
+            -o "$site/app/app.js"
+          npx --yes terser@5 docs/app/datasource.js \
+            --compress passes=2 --mangle --keep-fnames --keep-classnames \
+            -o "$site/app/datasource.js"
+          echo "SPA sizes (raw → minified):"
+          ls -la docs/app/app.js "$site/app/app.js"
+          ls -la docs/app/datasource.js "$site/app/datasource.js"
+          # The linear pitch walkthrough — investor demo links + video
+          # transcripts still reference the scripted flow at /app/pitch/.
+          mkdir -p "$site/app/pitch"
+          cp docs/app/pitch/index.html "$site/app/pitch/"
+          cp docs/app/pitch/console.css "$site/app/pitch/"
+          cp docs/app/pitch/console.js "$site/app/pitch/"
           # Custom-domain marker for GitHub Pages. Without a CNAME file in
           # the published artifact, Pages resets the configured custom
           # domain on each deploy.
           cp docs/CNAME "$site/CNAME"
+          # RFC 9116 disclosure endpoint — must be preserved at the origin
+          # root so security scanners can find it.
+          mkdir -p "$site/.well-known"
+          cp docs/.well-known/security.txt "$site/.well-known/"
+          # Legal pages — Terms + Privacy stubs so footer links resolve.
+          mkdir -p "$site/legal"
+          cp docs/legal/terms.html "$site/legal/"
+          cp docs/legal/privacy.html "$site/legal/"
           # Publish the assembled directory.
           rm -rf target/doc
           mv "$site" target/doc

@@ -1,0 +1,57 @@
+# Auto-merge low-risk Dependabot updates.
+#
+# Policy:
+#   • Patch-level version bumps → auto-merge (squash) once every required
+#     CI check passes. These carry only compatible bug/security fixes.
+#   • Minor-level version bumps for GitHub Actions and Docker base images
+#     → auto-merge (they're pinned by SHA, so a bump is a re-pin against
+#     an already-audited SHA; risk is bounded).
+#   • Everything else (minor/major on runtime deps) → land as a PR that
+#     a maintainer must review + approve. No auto-merge.
+#
+# The auto-merge is *requested*, not executed immediately — GitHub only
+# actually merges once branch protection is satisfied (i.e. all required
+# status checks green + review requirements met). So an unexpected test
+# regression still blocks the merge.
+name: Dependabot auto-merge
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  automerge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # request auto-merge
+      pull-requests: write   # approve
+    steps:
+      # Dependabot's metadata action parses PR body/title/labels into
+      # structured outputs so we can key auto-merge off the update type
+      # instead of parsing the title ourselves.
+      - id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Auto-approve safe updates
+        # PRs need an approving review before branch protection lets them
+        # merge; the dependabot bot cannot self-approve so we do it here.
+        if: |
+          steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
+          (steps.metadata.outputs.update-type == 'version-update:semver-minor' && (steps.metadata.outputs.package-ecosystem == 'github-actions' || steps.metadata.outputs.package-ecosystem == 'docker'))
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr review --approve "$PR_URL" --body "Auto-approving low-risk Dependabot update."
+      - name: Enable auto-merge (squash)
+        if: |
+          steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
+          (steps.metadata.outputs.update-type == 'version-update:semver-minor' && (steps.metadata.outputs.package-ecosystem == 'github-actions' || steps.metadata.outputs.package-ecosystem == 'docker'))
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --auto --squash "$PR_URL"

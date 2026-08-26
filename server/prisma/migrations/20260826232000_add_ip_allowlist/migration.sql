@@ -1,0 +1,1 @@
+ALTER TABLE "orgs" ADD COLUMN "ipAllowlist" TEXT[] NOT NULL DEFAULT '{}';

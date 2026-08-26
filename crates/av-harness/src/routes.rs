@@ -4393,8 +4393,12 @@ mod tests {
     /// trips CI unless the console is updated too.
     #[test]
     fn product_console_pins_match_real_schema_and_taxonomy() {
-        let console_js = include_str!("../../../docs/app/console.js");
-        let console_html = include_str!("../../../docs/app/index.html");
+        // The pitch/investor walkthrough moved to /app/pitch/ when the
+        // main console became a multi-tenant SaaS app. That's the surface
+        // that still renders sample receipts word-for-word, so this test
+        // continues to pin against it.
+        let console_js = include_str!("../../../docs/app/pitch/console.js");
+        let console_html = include_str!("../../../docs/app/pitch/index.html");
         let combined = format!("{console_js}\n{console_html}");
 
         // Receipt version — the console shows receipt_version: 2 as
@@ -4403,7 +4407,7 @@ mod tests {
         assert_eq!(
             av_receipts::RECEIPT_VERSION,
             2,
-            "receipt version bumped from 2; update docs/app/console.js's \
+            "receipt version bumped from 2; update docs/app/pitch/console.js's \
              receiptHtml() to render the new version",
         );
         assert!(

@@ -1,0 +1,62 @@
+# AgentVisor AI console backend — local dev stack.
+#
+# Runs:
+#   - Postgres 16 (identical major version to Neon free tier + Fly Postgres)
+#   - The Node server hot-reloaded via tsx watch
+#
+# Bring it up:
+#   docker compose up
+#
+# Reset the volume:
+#   docker compose down -v
+#
+# Nothing here is Fly / Neon / Supabase specific — this stack is exactly
+# what runs in production, just with a locally-mounted Postgres instead of
+# a managed one. Migrating providers means changing DATABASE_URL.
+#
+# NOTE: pin base image digests before running in production. The tags here
+# stay floating for local dev convenience.
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: agentvisor
+      POSTGRES_PASSWORD: dev_password_replace_me
+      POSTGRES_DB: agentvisor
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentvisor"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://agentvisor:dev_password_replace_me@db:5432/agentvisor
+      JWT_SECRET: dev_only_change_me_for_prod_use_openssl_rand_hex_48
+      PORT: "8080"
+      HOST: "0.0.0.0"
+      ALLOWED_ORIGINS: "http://localhost:8787,http://127.0.0.1:8787"
+      NODE_ENV: production
+    ports:
+      - "127.0.0.1:8985:8080"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  pgdata:
