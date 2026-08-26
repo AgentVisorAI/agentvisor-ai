@@ -1943,6 +1943,47 @@ async fn shutdown_signal() {
             } => {}
             _ = terminate.recv() => {}
         }
+        // R73 review F1 (landed R74): drain any queued permits
+        // from both receivers before moving them into the force-
+        // exit spawn. `Signal::recv()` is cancel-safe (tokio
+        // 1.52+ documents the wake permit persists on the
+        // watch::Receiver after the awaiting future is dropped),
+        // so concurrent SIGINT+SIGTERM delivery where the outer
+        // `select!` consumes ONE side would leave the OTHER
+        // receiver holding a queued permit. Moving those
+        // receivers into the spawn would cause `.recv().await`
+        // to return immediately with the stale permit and
+        // exit(130) BEFORE graceful shutdown even runs — trading
+        // R72's "silently drop second signal" bug for a "silently
+        // bypass graceful shutdown" bug that is arguably worse
+        // (the "in-flight receipt or ATIF write will be picked
+        // up by recovery on restart" narrative assumes graceful
+        // drain got to start; here it doesn't).
+        //
+        // Drain non-blockingly via `tokio::time::timeout(ZERO,
+        // recv())`: if a permit is queued, it resolves in the
+        // first poll and `Ok(Some(()))` is returned; otherwise
+        // the 0-duration timer fires with `Err(Elapsed)`. Loop
+        // to handle the (pathological) case of multiple queued
+        // permits per receiver.
+        loop {
+            let mut drained_any = false;
+            if let Some(ref mut sig) = interrupt {
+                if let Ok(Some(())) =
+                    tokio::time::timeout(std::time::Duration::from_millis(0), sig.recv()).await
+                {
+                    drained_any = true;
+                }
+            }
+            if let Ok(Some(())) =
+                tokio::time::timeout(std::time::Duration::from_millis(0), terminate.recv()).await
+            {
+                drained_any = true;
+            }
+            if !drained_any {
+                break;
+            }
+        }
         tokio::spawn(async move {
             tokio::select! {
                 _ = async {
