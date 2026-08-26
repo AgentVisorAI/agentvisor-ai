@@ -3783,7 +3783,12 @@ impl Drop for AbortFinalizingStream {
                                     "auto-close of completed ephemeral session failed"
                                 );
                             }
-                            Err(_) => {
+                            Err(panic) => {
+                                let msg = panic
+                                    .downcast_ref::<&'static str>()
+                                    .copied()
+                                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                                    .unwrap_or("panic payload was not a string");
                                 finalizer
                                     .metrics()
                                     .counter(
@@ -3795,6 +3800,7 @@ impl Drop for AbortFinalizingStream {
                                     .inc();
                                 tracing::warn!(
                                     %session_id,
+                                    panic = %msg,
                                     "auto-close of completed ephemeral session PANICKED (caught)"
                                 );
                             }
@@ -3934,7 +3940,12 @@ impl Drop for AbortFinalizingStream {
                                     "background close on stream abort failed"
                                 );
                             }
-                            Err(_) => {
+                            Err(panic) => {
+                                let msg = panic
+                                    .downcast_ref::<&'static str>()
+                                    .copied()
+                                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                                    .unwrap_or("panic payload was not a string");
                                 finalizer
                                     .metrics()
                                     .counter(
@@ -3946,6 +3957,7 @@ impl Drop for AbortFinalizingStream {
                                     .inc();
                                 tracing::warn!(
                                     %session_id,
+                                    panic = %msg,
                                     "background close on stream abort PANICKED (caught)"
                                 );
                             }

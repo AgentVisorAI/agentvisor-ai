@@ -582,7 +582,12 @@ impl Drop for AdmissionDebit {
                     ActionBudget::for_principal(store.as_ref(), principal_id, spec).refund_tokens(tokens);
                 }
             }));
-            if outcome.is_err() {
+            if let Err(panic) = outcome {
+                let msg = panic
+                    .downcast_ref::<&'static str>()
+                    .copied()
+                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("panic payload was not a string");
                 metrics
                     .counter(
                         "av_admission_refund_panics_total",
@@ -593,6 +598,7 @@ impl Drop for AdmissionDebit {
                 tracing::error!(
                     session_id = %sess_for_log,
                     tokens,
+                    panic = %msg,
                     "admission-debit refund PANICKED (caught); \
                      principal ledger drain persists until operator repair"
                 );
