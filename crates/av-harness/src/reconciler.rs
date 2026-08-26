@@ -3121,10 +3121,44 @@ impl Finalizer {
             }
             let ack_parent = spool_dir.join("broker-acks");
             let ack_path = ack_parent.join(&stem);
+            let mut ack_error: Option<FinalizeError> = None;
+            let mut ack_changed = false;
             match std::fs::remove_dir_all(&ack_path) {
-                Ok(()) => av_core::fsutil::sync_directory(&ack_parent).map_err(FinalizeError::atif_source)?,
+                Ok(()) => ack_changed = true,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(FinalizeError::atif_source(error)),
+                Err(error) => {
+                    // R65 L2: same fsync-always discipline as the
+                    // step-journal loop above. `remove_dir_all` may
+                    // successfully unlink some inner ack tokens
+                    // before failing on a later element — those
+                    // removals need the `ack_path` (or its parent)
+                    // fsync'd to be crash-durable. Ack tokens are
+                    // per-`event_uid` idempotency markers, not part
+                    // of the `sequence == index` invariant, so a
+                    // stale token on next tick is a soft-degrade
+                    // (retry drops it), unlike the step-journal case
+                    // where non-durability could recycle stale
+                    // journal bytes at position 0. Still worth
+                    // matching the discipline so a future refactor
+                    // doesn't have to re-derive the two paths'
+                    // durability differences separately.
+                    ack_error = Some(FinalizeError::atif_source(error));
+                }
+            }
+            if ack_changed {
+                if let Err(error) = av_core::fsutil::sync_directory(&ack_parent) {
+                    if ack_error.is_none() {
+                        ack_error = Some(FinalizeError::atif_source(error));
+                    } else {
+                        tracing::warn!(
+                            %error,
+                            "broker-acks sync after partial removal failed; leaving as-is (retry on next tick)"
+                        );
+                    }
+                }
+            }
+            if let Some(error) = ack_error {
+                return Err(error);
             }
             Ok(())
         })

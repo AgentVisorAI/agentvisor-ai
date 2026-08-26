@@ -225,7 +225,7 @@ impl ActiveJournalRecord {
     /// bubbles up with no store; only on success do we publish.
     ///
     /// Safe under sequential-per-session semantics: the only
-    /// production caller is `journal_step_completion` (worker.rs
+    /// production caller is `finish_job` (worker.rs
     /// below), which runs one step at a time per session inside the
     /// worker loop. Metrics scrape may still observe a mid-publish
     /// window across the seven per-field stores in `store_on`, but
@@ -1871,7 +1871,7 @@ pub(crate) async fn inflight_response_sessions(
                 continue;
             }
             // CRASH-WINDOW FALSE-POSITIVE GUARD (R63 Finding 1).
-            // `journal_step_completion` fsyncs the terminal response
+            // `finish_job` fsyncs the terminal response
             // record BEFORE `clear_response_marker` runs, and the
             // interval between the two is broker publish
             // (spawn_blocking) + persist_broker_ack (spool write) +
