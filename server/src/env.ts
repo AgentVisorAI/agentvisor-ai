@@ -37,7 +37,13 @@ if (!process.env.JWT_SECRET && process.env.NODE_ENV !== "production") {
 
 const Env = z.object({
   PORT: z.coerce.number().int().min(1).max(65535).default(8080),
-  HOST: z.string().default("0.0.0.0"),
+  // Listen on all interfaces via IPv6 wildcard `::`. Modern OS kernels map
+  // this to accept both IPv4 and IPv6 connections (v4-mapped IPv6), so a
+  // single bind covers dual-stack cloud providers (Fly.io, GCP, K8s IPv6
+  // service meshes) without needing two sockets. Explicit HOST env still
+  // wins if the operator wants a stricter bind (e.g. 127.0.0.1 for a
+  // sidecar-only deployment).
+  HOST: z.string().default("::"),
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
   LOG_LEVEL: z.string().default("info"),
   JWT_SECRET: z.string().min(32, "JWT_SECRET must be at least 32 chars"),
