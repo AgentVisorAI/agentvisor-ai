@@ -10,6 +10,7 @@ use av_loopdetect::{Embedder, HashEmbedder, NoopVectorSink, VectorSink};
 use av_receipts::{Ed25519Signer, Signer};
 use av_sandbox::{PolicyEngine, Sandbox, SandboxConfig, WasmPolicy};
 use av_state::{InMemoryStore, StateStore};
+use axum::serve::ListenerExt as _;
 use futures::future::FutureExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -253,7 +254,33 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     });
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
-        .with_context(|| format!("bind {}", config.listen))?;
+        .with_context(|| format!("bind {}", config.listen))?
+        // Set TCP_NODELAY on every accepted socket. Nagle + delayed-
+        // ACK together produce ~40 ms of avoidable per-frame stall
+        // in the SSE relay: each streamed frame is 50-200 bytes
+        // (one token or a small delta), so the second small frame
+        // sits in the sender's kernel queue until the first is
+        // ACK'd. Compounded across a 500-token stream that's tens
+        // of seconds of inter-token latency the operator would
+        // otherwise trace to "OpenAI feels slower behind the
+        // proxy". The outbound-side reqwest client already sets
+        // `.tcp_keepalive(30 s)` on the upstream direction
+        // (`pipeline.rs`); this closes the reverse-facing hole.
+        //
+        // `tap_io` is axum 0.8's idiomatic hook for per-connection
+        // socket-option tuning without swapping listener types.
+        // Failure to set the option (embedded system without full
+        // socket-option support) logs and falls through — a
+        // suboptimal-latency connection is still a working one.
+        .tap_io(|tcp_stream| {
+            if let Err(error) = tcp_stream.set_nodelay(true) {
+                tracing::warn!(
+                    %error,
+                    "failed to set TCP_NODELAY on incoming connection; SSE inter-token \
+                     latency may regress by ~40 ms per frame"
+                );
+            }
+        });
     if let Some(segment) = config.duplicated_chat_path_segment() {
         tracing::warn!(
             upstream_url = %av_core::url_redact::redact_userinfo(&config.upstream_url),
@@ -436,12 +463,40 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     let shutdown_finalizer = state.finalizer.clone();
     let finalize_sessions = async move {
         let mut failures = Vec::new();
+        // Bound each per-session close so ONE stuck session (a leaked
+        // SessionLease from an axum-cancelled handler, a worker permit
+        // dropped without decrementing, an upstream half-closed after
+        // TCP_KEEPALIVE-less client disconnect) does not starve the
+        // remaining sessions' close budget. `close_session_locked`
+        // internally calls `wait_for_streams` / `wait_for_worker_jobs`
+        // which are unbounded loops on internal counters. The
+        // reconciler already mirrors this pattern with
+        // `IDLE_CLOSE_DEADLINE = 90 s` per session — the shutdown
+        // path had the same serial-close semantics but no per-session
+        // deadline, so one stuck session could burn the entire
+        // `WORKER_FINALIZE_PHASE_SECS` (30 s) budget and force every
+        // OTHER session into restart-time spool recovery.
+        //
+        // The bound is 30 s per session (matching WORKER_FINALIZE_
+        // PHASE_SECS): each successfully-closed session finishes in
+        // under 100 ms in the healthy case, so a per-session 30 s
+        // deadline still permits 300+ sessions to close serially
+        // within the overall shutdown budget.
+        const PER_SESSION_CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
         for session in open_sessions {
-            if let Err(error) = shutdown_finalizer
-                .close_session(session, av_events::StopReason::SessionClosed)
-                .await
-            {
-                failures.push(error.to_string());
+            let session_id = session.id.clone();
+            let outcome = tokio::time::timeout(
+                PER_SESSION_CLOSE_DEADLINE,
+                shutdown_finalizer.close_session(session, av_events::StopReason::SessionClosed),
+            )
+            .await;
+            match outcome {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => failures.push(format!("session {session_id}: {error}")),
+                Err(_elapsed) => failures.push(format!(
+                    "session {session_id}: per-session close deadline ({}s) exceeded — deferred to restart-time recovery",
+                    PER_SESSION_CLOSE_DEADLINE.as_secs()
+                )),
             }
         }
         if failures.is_empty() {
@@ -1620,6 +1675,34 @@ async fn shutdown_signal() {
                 std::process::exit(2);
             }
         };
+        // Install SIGHUP as an explicitly-ignored signal. The default
+        // action for SIGHUP on Unix is `Term` — the process gets
+        // killed immediately, no finalize_sessions, no worker drain,
+        // no receipt persistence. Real-world triggers that would
+        // otherwise crash-terminate the daemon: `systemctl reload
+        // agentvisord` (systemd's default `ExecReload` sends SIGHUP),
+        // a lost controlling terminal in an interactive `docker exec`
+        // session, or an operator's `pkill -HUP` muscle memory from
+        // other daemons that reload on SIGHUP. The daemon does NOT
+        // support config-reload on SIGHUP (see OPERATIONS.md); this
+        // handler drains the signal into a no-op so that stance is
+        // enforced by construction. Installation failure is
+        // non-fatal (unlike SIGTERM) — the worst case is a returned
+        // to pre-fix behavior on this ONE signal, and we log a warn.
+        if let Ok(mut hup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+            tokio::spawn(async move {
+                while hup.recv().await.is_some() {
+                    tracing::info!(
+                        "SIGHUP received; ignored (this daemon does not reload config on SIGHUP — see OPERATIONS.md 'Shutdown' section)"
+                    );
+                }
+            });
+        } else {
+            tracing::warn!(
+                "failed to install SIGHUP handler; SIGHUP will kill the daemon per Unix default action \
+                 (Term). Investigate seccomp / signal syscall restrictions if this appears."
+            );
+        }
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
                 if let Err(error) = result {
