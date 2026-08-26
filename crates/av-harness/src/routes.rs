@@ -1569,7 +1569,23 @@ impl ToolOutcome {
         let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::BAD_GATEWAY);
         match hex::decode(self.body_hex) {
             Ok(body) => tool_response(status, Bytes::from(body), self.content_type.as_deref()),
-            Err(error) => lifecycle_error(format!("decode cached tool response: {error}")),
+            Err(error) => {
+                // The body_hex is server-authored + MAC-sealed (see
+                // `ToolExecution::load`), so `hex::decode` failing implies
+                // either a control-key compromise or an on-disk MAC bypass —
+                // not attacker-influencable from the wire. Even so, echoing
+                // the `hex::FromHexError` Display (which includes the
+                // offending byte offset and hex character) leaks internal
+                // spool detail into the client-facing 500 body. Return a
+                // stable string; log the decode error separately at ERROR
+                // level so operators still get the diagnostic without the
+                // client seeing it.
+                tracing::error!(
+                    %error,
+                    "cached tool outcome body_hex failed to decode; possible control-key compromise or on-disk MAC bypass"
+                );
+                lifecycle_error("cached tool outcome is corrupt".to_owned())
+            }
         }
     }
 }
