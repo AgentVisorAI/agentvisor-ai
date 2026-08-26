@@ -887,3 +887,45 @@ fn unicode_tag_characters_survive_the_typed_round_trip_byte_exactly() {
         "shipped schema must accept tagged content: {errors:#?}"
     );
 }
+
+/// R51: the shipped JSON Schema must advertise the same
+/// `cost_usd` / `total_cost_usd` upper bound as the Rust strict
+/// validator. R49 aligned the Rust constant from `1e12` to `9e9`
+/// (JCS-safe recovery scaling); the shipped schema kept the old
+/// `1e12` bound and drifted, so a downstream SIEM using the schema
+/// accepted trajectories the harness's own recovery path would
+/// reject with `recovered cost exceeds JCS-safe bounds`. Pin the
+/// two so they cannot drift again.
+///
+/// Same class-fix pattern: the exposed `av_atif::validate::MAX_COST_USD`
+/// constant is the source of truth; the shipped schema references
+/// its numeric value literally, so if either side changes without
+/// the other, this test fails.
+#[test]
+fn shipped_schema_cost_cap_matches_rust_validator() {
+    let schema: Value = serde_json::from_str(include_str!("../../../schemas/atif-v1.7.schema.json")).unwrap();
+    // step-level `metrics.cost_usd.maximum`
+    let step_cost_max = schema
+        .pointer("/properties/steps/items/properties/metrics/properties/cost_usd/maximum")
+        .and_then(Value::as_f64)
+        .expect("shipped schema must declare a maximum on steps[].metrics.cost_usd");
+    assert_eq!(
+        step_cost_max,
+        av_atif::validate::MAX_COST_USD,
+        "step cost_usd maximum in shipped schema ({step_cost_max}) diverged from \
+         av_atif::validate::MAX_COST_USD ({}); R49-style drift class",
+        av_atif::validate::MAX_COST_USD
+    );
+    // final_metrics.total_cost_usd.maximum
+    let total_cost_max = schema
+        .pointer("/properties/final_metrics/properties/total_cost_usd/maximum")
+        .and_then(Value::as_f64)
+        .expect("shipped schema must declare a maximum on final_metrics.total_cost_usd");
+    assert_eq!(
+        total_cost_max,
+        av_atif::validate::MAX_COST_USD,
+        "total_cost_usd maximum in shipped schema ({total_cost_max}) diverged from \
+         av_atif::validate::MAX_COST_USD ({}); R49-style drift class",
+        av_atif::validate::MAX_COST_USD
+    );
+}
