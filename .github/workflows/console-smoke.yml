@@ -76,6 +76,12 @@ jobs:
           SITE: https://agentvisorai.me/app/
         run: node scripts/receipt-verify-drill.mjs
 
+      - name: /verify page drill
+        working-directory: server
+        env:
+          SITE: https://agentvisorai.me/
+        run: node scripts/verify-page-drill.mjs
+
       - name: Lighthouse audit (perf + a11y + best-practices)
         working-directory: server
         env:

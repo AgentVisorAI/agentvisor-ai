@@ -1,0 +1,47 @@
+{
+  "format": "agentvisor.receipt.v1",
+  "exportedAt": "2026-08-26T23:33:10.446Z",
+  "session": {
+    "id": "sess_northwind_demo_a1",
+    "externalId": "sess_northwind_demo_a1",
+    "agent": "supply-planner",
+    "user": "olivia.tan@northwind.com",
+    "model": "gpt-4o",
+    "openedAt": "2026-08-26T19:33:10.446Z",
+    "closedAt": "2026-08-26T23:33:10.446Z",
+    "events": 42,
+    "toolsAllowed": 18,
+    "toolsBlocked": 1
+  },
+  "receipt": {
+    "receiptId": "rcpt_63b964n6gt_sample",
+    "contentHash": "sha256:8ad4d756c95db051a2a7333b4aeeeaa094c8fc580a8b750a653e1ba4839dfb1d",
+    "eventCount": 42,
+    "signingKeyFingerprint": "kf_9992e71f",
+    "signature": "ed25519:6G0Atb5YhnQPVNqsl9ApK8xJ8BeSu1chNCU/2zZHClAdP6ZhvRf04+zdmDsLRMt+nN4YNGMBbb5WtvRpVwrWAw==",
+    "signedAt": "2026-08-26T23:33:10.446Z",
+    "rawBody": "{\"receiptId\":\"rcpt_63b964n6gt_sample\",\"sessionExternalId\":\"sess_northwind_demo_a1\",\"agent\":\"supply-planner\",\"workflow\":\"signed\",\"eventCount\":42,\"toolsAllowed\":18,\"toolsBlocked\":1,\"costUsdMicros\":179000,\"blockedPayoutUsdMicros\":8400000000,\"openedAt\":\"2026-08-26T19:33:10.446Z\",\"closedAt\":\"2026-08-26T23:33:10.446Z\",\"policiesEnforced\":[\"procurement.allowed_vendors\",\"runtime.write_scope\",\"rate.per_session_usd/10\",\"runtime.pii_redaction\"],\"contentHash\":\"sha256:8ad4d756c95db051a2a7333b4aeeeaa094c8fc580a8b750a653e1ba4839dfb1d\"}",
+    "rawSignatureB64": "6G0Atb5YhnQPVNqsl9ApK8xJ8BeSu1chNCU/2zZHClAdP6ZhvRf04+zdmDsLRMt+nN4YNGMBbb5WtvRpVwrWAw==",
+    "tools": {
+      "allowed": 18,
+      "blocked": 1
+    },
+    "policiesEnforced": [
+      "procurement.allowed_vendors",
+      "runtime.write_scope",
+      "rate.per_session_usd/10",
+      "runtime.pii_redaction"
+    ]
+  },
+  "publicKey": {
+    "algorithm": "ed25519",
+    "hex": "9992e71fe6a6e5edc18129becef2ec640f9611a4e12a4b9a311bab943ab19467"
+  },
+  "verifyingInstructions": {
+    "algorithm": "Ed25519",
+    "message": "receipt.rawBody (UTF-8 bytes)",
+    "signature": "base64-decode(receipt.rawSignatureB64)",
+    "publicKey": "hex-decode(publicKey.hex)",
+    "docs": "https://agentvisorai.me/reference/receipts"
+  }
+}
