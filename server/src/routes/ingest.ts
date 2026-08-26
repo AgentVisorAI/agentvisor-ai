@@ -185,6 +185,17 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
 
     let inserted = 0;
     const rejectedSealed: string[] = [];
+    // Reject events whose occurredAt is more than 5 minutes in the future
+    // (allows NTP drift + reasonable batch send delay). Similarly reject
+    // events dated before Jan 1 2000 — no legitimate agent runs predate
+    // that. Both are silent per-event drops rather than a whole-batch 400
+    // so a mostly-good batch still lands.
+    const now = Date.now();
+    const maxFutureMs = 5 * 60_000;
+    const minPastMs = new Date("2000-01-01T00:00:00Z").getTime();
+    let droppedSkewed = 0;
+    let droppedAncient = 0;
+
     for (const [externalId, batch] of byExt) {
       const session = await db.session.findUnique({
         where: {
@@ -216,7 +227,13 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
         select: { seq: true },
       });
       const existingSeqs = new Set(existing.map((e) => e.seq));
-      const fresh = batch.filter((e) => !existingSeqs.has(e.seq));
+      const fresh = batch.filter((e) => {
+        if (existingSeqs.has(e.seq)) return false;
+        const t = e.occurredAt.getTime();
+        if (t > now + maxFutureMs) { droppedSkewed++; return false; }
+        if (t < minPastMs) { droppedAncient++; return false; }
+        return true;
+      });
       if (fresh.length === 0) continue;
 
       // Rollups computed from the *fresh* subset only.
@@ -290,6 +307,8 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
     return reply.send({
       inserted,
       ...(rejectedSealed.length > 0 ? { rejectedSealed } : {}),
+      ...(droppedSkewed > 0 ? { droppedFuture: droppedSkewed } : {}),
+      ...(droppedAncient > 0 ? { droppedAncient } : {}),
     });
   });
 
