@@ -43,8 +43,9 @@
       <div class="wrap">
         <p class="kicker">Setup</p>
         <h1>Set up your checkpoint</h1>
-        <p class="lede">AgentVisor AI runs between your agent and its LLM provider. Every request
-          is recorded, every limit is enforced before the call goes out.</p>
+        <p class="lede">AgentVisor AI is a policy checkpoint for LLM and tool traffic. Every request
+          runs through identity, quota, size, and safety gates <em>before</em> it leaves your
+          network — so an agent can never call a model or a tool you did not authorize.</p>
 
         <div class="wizard-grid">
           <div class="wizard card">
@@ -71,27 +72,49 @@
               </fieldset>
 
               <fieldset class="wstep" id="wstep-guardrails">
-                <legend><span class="wnum">3</span> Set the guardrails. Enforced <em>before</em> any call goes out.</legend>
-                <div class="guardrails">
+                <legend><span class="wnum">3</span> Set the policy. Enforced <em>before</em> every call.</legend>
+                <p class="wstep-help">The checkpoint runs identity, quota, size, policy, compression and loop
+                  detection on every LLM and tool call. Below are the defaults — tune per session or
+                  per principal.</p>
+                <div class="policy-group">
+                  <div class="policy-group-label">Rate limits <span class="policy-group-tag">tokens &amp; requests</span></div>
                   <label class="g-row">
-                    <span class="g-name">Payout cap <span class="g-help">max money the agent can move via tools, per session</span></span>
+                    <span class="g-name">Tokens per minute <span class="g-help">sliding-window prompt+completion budget</span></span>
+                    <span class="g-ctl"><input type="number" id="cap-tpm" value="120000" min="0" step="10000"></span>
+                  </label>
+                  <label class="g-row">
+                    <span class="g-name">Requests per minute <span class="g-help">refused with 403 + reason on overrun</span></span>
+                    <span class="g-ctl"><input type="number" id="cap-rpm" value="600" min="0" step="10"></span>
+                  </label>
+                </div>
+                <div class="policy-group">
+                  <div class="policy-group-label">Session budgets <span class="policy-group-tag">per-session ceilings</span></div>
+                  <label class="g-row">
+                    <span class="g-name">Tool calls per session</span>
+                    <span class="g-ctl"><input type="number" id="cap-tools" value="100" min="1"></span>
+                  </label>
+                  <label class="g-row">
+                    <span class="g-name">Per-tool call cap <span class="g-help">ceiling for any single tool — bounds high-impact tools like <code>issue_refund</code>, <code>send_email</code>, <code>execute_query</code></span></span>
+                    <span class="g-ctl"><input type="number" id="cap-refunds" value="5" min="0"></span>
+                  </label>
+                  <label class="g-row">
+                    <span class="g-name">Payout cap <span class="g-help">max USD any tool can move per session (0 = disabled for read-only agents)</span></span>
                     <span class="g-ctl">$ <input type="number" id="cap-payout" value="500" min="0" step="50"></span>
                   </label>
                   <label class="g-row">
                     <span class="g-name">LLM spend cap <span class="g-help">max provider spend per session</span></span>
                     <span class="g-ctl">$ <input type="number" id="cap-llm" value="10" min="0" step="1"></span>
                   </label>
-                  <label class="g-row">
-                    <span class="g-name">Tool calls per session</span>
-                    <span class="g-ctl"><input type="number" id="cap-tools" value="100" min="1"></span>
-                  </label>
-                  <label class="g-row">
-                    <span class="g-name">Per-tool call cap <span class="g-help">ceiling for any single tool per session — protects <code>issue_refund</code></span></span>
-                    <span class="g-ctl"><input type="number" id="cap-refunds" value="5" min="0"></span>
+                </div>
+                <div class="policy-group">
+                  <div class="policy-group-label">Runtime controls</div>
+                  <label class="g-row toggle-row">
+                    <span class="g-name">Semantic loop breaker <span class="g-help">trips after 3 near-duplicate steps · prevents runaway retry loops</span></span>
+                    <span class="g-ctl"><input type="checkbox" id="opt-loop" checked><span class="toggle"></span></span>
                   </label>
                   <label class="g-row toggle-row">
-                    <span class="g-name">Semantic loop breaker <span class="g-help">stops the agent when it keeps retrying the same failing thing</span></span>
-                    <span class="g-ctl"><input type="checkbox" id="opt-loop" checked><span class="toggle"></span></span>
+                    <span class="g-name">Context compression <span class="g-help">summarize long histories above 50k prompt tokens</span></span>
+                    <span class="g-ctl"><input type="checkbox" id="opt-compress" checked><span class="toggle"></span></span>
                   </label>
                   <label class="g-row toggle-row">
                     <span class="g-name">Signed receipts <span class="g-help">every session seals with tamper-proof evidence, verifiable offline with this deployment's public key</span></span>
