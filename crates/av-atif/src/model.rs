@@ -20,6 +20,7 @@ pub const SUPPORTED_VERSIONS: &[&str] = &[
 /// Step source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Source {
     /// System / environment step.
     System,
@@ -123,6 +124,7 @@ pub struct Step {
 /// String or numeric ATIF reasoning effort.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum ReasoningEffort {
     /// Qualitative effort label.
     Text(String),

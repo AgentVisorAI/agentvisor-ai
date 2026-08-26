@@ -61,6 +61,7 @@ impl Default for BreakerConfig {
 
 /// Verdict for one observed step.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum BreakerVerdict {
     /// Session is making progress.
     Progressing {
@@ -89,6 +90,7 @@ pub enum BreakerVerdict {
 
 /// Current breaker state (exposed to metrics / events).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum BreakerState {
     /// Not tripped.
     Closed,

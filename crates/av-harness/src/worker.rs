@@ -259,6 +259,7 @@ struct Envelope {
 
 /// Non-blocking submission error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum SubmitError {
     /// The bounded worker queue has no remaining capacity.
     #[error("worker queue is full")]
