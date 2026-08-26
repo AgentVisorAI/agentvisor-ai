@@ -971,12 +971,12 @@
    * SESSION DETAIL — compact rows + right drawer + verified receipt
    * ============================================================ */
 
-  async function renderSessionDetail(main, id) {
+  async function renderSessionDetail(main, id, initial) {
     main.innerHTML = pageHeader("Session", "", '<a href="#/sessions" class="btn">← All sessions</a>') + loadingBlock("stats");
     var data, receipt;
     try {
-      data = await state.ds.getSessionById(id);
-      receipt = await state.ds.getReceipt(id);
+      data = initial && initial.data ? initial.data : await state.ds.getSessionById(id);
+      receipt = initial && initial.receipt ? initial.receipt : await state.ds.getReceipt(id);
     } catch (e) { return renderError(main, e); }
     var s = data.session;
     var events = data.events || [];
@@ -1071,11 +1071,17 @@
         loadMoreEv.textContent = "Loading…";
         try {
           var more = await state.ds.getSessionById(id, { eventCursor: data.nextEventCursor });
-          events = events.concat(more.events || []);
-          data.nextEventCursor = more.nextEventCursor;
-          // Rerender the events area only. Cheap enough for the ~500
-          // rows we're appending at once.
-          renderSessionDetail(main, id);
+          // Merge the fresh page into the current data snapshot and
+          // re-render *without re-fetching*. Threading data through
+          // renderSessionDetail as `initial` preserves the appended
+          // events across renders — the previous version called
+          // renderSessionDetail without an argument, which re-fetched
+          // from scratch and threw away every appended page.
+          var merged = Object.assign({}, data, {
+            events: (data.events || []).concat(more.events || []),
+            nextEventCursor: more.nextEventCursor,
+          });
+          renderSessionDetail(main, id, { data: merged, receipt: receipt });
         } catch (err) {
           toast(err.message || "Failed to load events", true);
           loadMoreEv.disabled = false;
