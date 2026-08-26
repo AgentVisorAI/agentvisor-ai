@@ -418,6 +418,86 @@ impl StateStore for RedisStore {
         }
     }
 
+    /// R66 F2: atomic multi-key refund via a single Lua script.
+    /// All keys share the caller's Redis Cluster hash tag (guaranteed
+    /// by `ActionBudget::session_prefix` which wraps its digest in
+    /// `{...}`), so cross-slot dispatch is impossible and the script
+    /// runs on ONE server-side EVAL. Per-key semantics match
+    /// `refund` exactly: EXISTS gate (never resurrect a
+    /// remove_prefix-cleared cell), DECRBY, clamp-at-zero via SET
+    /// with fresh TTL on underflow, EXPIRE refresh on non-underflow.
+    /// Best-effort like `refund` — Redis errors log-warn but never
+    /// propagate.
+    fn refund_many(&self, refunds: &[crate::Refund]) {
+        if refunds.is_empty() {
+            return;
+        }
+        let batch_script = format!(
+            r"
+            for i, key in ipairs(KEYS) do
+                if redis.call('EXISTS', key) == 1 then
+                    local amount = tonumber(ARGV[i])
+                    local new = redis.call('DECRBY', key, amount)
+                    if new < 0 then
+                        redis.call('SET', key, 0, 'EX', {BUDGET_COUNTER_TTL_SECS})
+                    else
+                        redis.call('EXPIRE', key, {BUDGET_COUNTER_TTL_SECS})
+                    end
+                end
+            end
+            return 0
+        "
+        );
+        let outcome: Result<i64, redis::RedisError> = match &self.backend {
+            RedisBackend::Single(pool) => match pool.get() {
+                Ok(mut connection) => {
+                    let mut script = redis::Script::new(&batch_script);
+                    let mut invocation = script.prepare_invoke();
+                    for r in refunds {
+                        invocation.key(&r.key);
+                        // Cap at i64::MAX so a caller passing u64::MAX
+                        // cannot silently wrap into a negative value.
+                        invocation.arg(i64::try_from(r.amount).unwrap_or(i64::MAX));
+                    }
+                    invocation.invoke(&mut *connection)
+                }
+                Err(error) => Err(redis::RedisError::from((
+                    redis::ErrorKind::IoError,
+                    "connection pool exhausted",
+                    error.to_string(),
+                ))),
+            },
+            RedisBackend::Cluster(pool) => match pool.get() {
+                Ok(mut connection) => {
+                    let mut script = redis::Script::new(&batch_script);
+                    let mut invocation = script.prepare_invoke();
+                    for r in refunds {
+                        invocation.key(&r.key);
+                        invocation.arg(i64::try_from(r.amount).unwrap_or(i64::MAX));
+                    }
+                    invocation.invoke(&mut *connection)
+                }
+                Err(error) => Err(redis::RedisError::from((
+                    redis::ErrorKind::IoError,
+                    "connection pool exhausted",
+                    error.to_string(),
+                ))),
+            },
+        };
+        if let Err(error) = outcome {
+            let error_kind = error.kind();
+            tracing::warn!(
+                target: "av_state::redis",
+                kind = ?error_kind,
+                detail = %error,
+                refunds = refunds.len(),
+                "Redis refund_many failed silently; per-key compensation was not applied — \
+                 budget counters may remain over-charged until the 24 h TTL expires or a \
+                 successful spend/refund lands"
+            );
+        }
+    }
+
     /// Whole-session counter cleanup. Previously left as the
     /// trait's default no-op on the assumption that the 24 h TTL made it
     /// pure hygiene — but `SessionRegistry::get_or_open` recycles a
