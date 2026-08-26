@@ -107,6 +107,52 @@ return result
     )
 });
 
+/// Saturating single-key refund. `EXISTS`-gated to never resurrect
+/// a `remove_prefix`-cleared cell; `SET key 0 EX {BUDGET_COUNTER_TTL_SECS}`
+/// on underflow keeps the counter TTL-aligned; `EXPIRE` on the
+/// non-underflow path matches the same discipline. Extracted to a
+/// static (R69) so `every_counter_script_applies_the_shared_ttl`
+/// enrolls it in the TTL-drift regression test (R67 review L3).
+static REFUND_LUA: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        r"
+if redis.call('EXISTS', KEYS[1]) == 0 then
+    return 0
+end
+local new = redis.call('DECRBY', KEYS[1], ARGV[1])
+if new < 0 then
+    redis.call('SET', KEYS[1], 0, 'EX', {BUDGET_COUNTER_TTL_SECS})
+    return 0
+end
+redis.call('EXPIRE', KEYS[1], {BUDGET_COUNTER_TTL_SECS})
+return new
+"
+    )
+});
+
+/// Atomic multi-key refund. Per-key semantics match `REFUND_LUA`
+/// exactly (EXISTS gate + DECRBY + clamp-at-zero via SET with
+/// fresh TTL / EXPIRE refresh on non-underflow). Extracted to a
+/// static (R69) so the same TTL-drift test enrolls it.
+static REFUND_MANY_LUA: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        r"
+for i, key in ipairs(KEYS) do
+    if redis.call('EXISTS', key) == 1 then
+        local amount = tonumber(ARGV[i])
+        local new = redis.call('DECRBY', key, amount)
+        if new < 0 then
+            redis.call('SET', key, 0, 'EX', {BUDGET_COUNTER_TTL_SECS})
+        else
+            redis.call('EXPIRE', key, {BUDGET_COUNTER_TTL_SECS})
+        end
+    end
+end
+return 0
+"
+    )
+});
+
 /// Redis-backed store. Connections are pooled internally (r2d2 for both
 /// single-node and cluster; the redis crate implements
 /// `r2d2::ManageConnection` for `ClusterClient` directly).
@@ -407,20 +453,6 @@ impl StateStore for RedisStore {
         // Redis DECRBY takes i64. Cap at i64::MAX so a caller passing
         // u64::MAX cannot silently wrap into a negative value.
         let amount = i64::try_from(amount).unwrap_or(i64::MAX);
-        let clamp_script = format!(
-            r"
-            if redis.call('EXISTS', KEYS[1]) == 0 then
-                return 0
-            end
-            local new = redis.call('DECRBY', KEYS[1], ARGV[1])
-            if new < 0 then
-                redis.call('SET', KEYS[1], 0, 'EX', {BUDGET_COUNTER_TTL_SECS})
-                return 0
-            end
-            redis.call('EXPIRE', KEYS[1], {BUDGET_COUNTER_TTL_SECS})
-            return new
-        "
-        );
         // Refund is best-effort by the trait contract, but
         // its silent-swallow used to be COMPLETELY invisible — no log,
         // no metric — so an operator seeing budget depletion during a
@@ -431,7 +463,7 @@ impl StateStore for RedisStore {
         // never learns a compensation failure as a 5xx.
         let outcome: Result<i64, redis::RedisError> = match &self.backend {
             RedisBackend::Single(pool) => match pool.get() {
-                Ok(mut connection) => redis::Script::new(&clamp_script)
+                Ok(mut connection) => redis::Script::new(&REFUND_LUA)
                     .key(key)
                     .arg(amount)
                     .invoke(&mut *connection),
@@ -442,7 +474,7 @@ impl StateStore for RedisStore {
                 ))),
             },
             RedisBackend::Cluster(pool) => match pool.get() {
-                Ok(mut connection) => redis::Script::new(&clamp_script)
+                Ok(mut connection) => redis::Script::new(&REFUND_LUA)
                     .key(key)
                     .arg(amount)
                     .invoke(&mut *connection),
@@ -480,26 +512,10 @@ impl StateStore for RedisStore {
         if refunds.is_empty() {
             return;
         }
-        let batch_script = format!(
-            r"
-            for i, key in ipairs(KEYS) do
-                if redis.call('EXISTS', key) == 1 then
-                    local amount = tonumber(ARGV[i])
-                    local new = redis.call('DECRBY', key, amount)
-                    if new < 0 then
-                        redis.call('SET', key, 0, 'EX', {BUDGET_COUNTER_TTL_SECS})
-                    else
-                        redis.call('EXPIRE', key, {BUDGET_COUNTER_TTL_SECS})
-                    end
-                end
-            end
-            return 0
-        "
-        );
         let outcome: Result<i64, redis::RedisError> = match &self.backend {
             RedisBackend::Single(pool) => match pool.get() {
                 Ok(mut connection) => {
-                    let script = redis::Script::new(&batch_script);
+                    let script = redis::Script::new(&REFUND_MANY_LUA);
                     let mut invocation = script.prepare_invoke();
                     for r in refunds {
                         invocation.key(&r.key);
@@ -517,7 +533,7 @@ impl StateStore for RedisStore {
             },
             RedisBackend::Cluster(pool) => match pool.get() {
                 Ok(mut connection) => {
-                    let script = redis::Script::new(&batch_script);
+                    let script = redis::Script::new(&REFUND_MANY_LUA);
                     let mut invocation = script.prepare_invoke();
                     for r in refunds {
                         invocation.key(&r.key);
@@ -795,12 +811,20 @@ mod tests {
     /// shared TTL constant — a hardcoded-literal drift between the
     /// spend/add/refund paths would make some counters outlive others
     /// and silently split the session-expiry policy.
+    ///
+    /// R69: extended to enrol REFUND_LUA and REFUND_MANY_LUA. Both
+    /// were inline `format!` strings pre-R69 (a per-call allocation);
+    /// extraction to statics closed R67 review L3's coverage gap so
+    /// a future edit that drops `EXPIRE` from either would be caught
+    /// here.
     #[test]
     fn every_counter_script_applies_the_shared_ttl() {
         let ttl = BUDGET_COUNTER_TTL_SECS.to_string();
         for (name, script) in [
             ("TRY_SPEND_LUA", TRY_SPEND_LUA.as_str()),
             ("ADD_LUA", ADD_LUA.as_str()),
+            ("REFUND_LUA", REFUND_LUA.as_str()),
+            ("REFUND_MANY_LUA", REFUND_MANY_LUA.as_str()),
         ] {
             assert!(
                 script.contains(&format!("EXPIRE', KEYS[1], {ttl}"))

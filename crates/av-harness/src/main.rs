@@ -204,6 +204,7 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
         Arc::clone(&state.metrics),
         Arc::clone(&bridge_maintenance_shutdown),
     );
+    let reconciler_shutdown = Arc::new(tokio::sync::Notify::new());
     let reconciler = spawn_reconciler(
         Arc::clone(&state.sessions),
         state.finalizer.clone(),
@@ -211,6 +212,7 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
         config.reconcile_tick_s,
         config.breaker.clone(),
         Arc::clone(&state.metrics),
+        Arc::clone(&reconciler_shutdown),
     );
     // Retention: prune sealed ATIF trajectories + sidecars older than
     // `atif_retention_days` on an hourly cadence. Only sealed pairs are
@@ -486,7 +488,18 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
             }
         }
     };
-    reconciler.abort();
+    // R69 F1: Signal reconciler to stop instead of aborting.
+    // JoinHandle::abort() cancels only the outer async task; any
+    // spawn_blocking closure inside the tick body — write_atomic
+    // markers, remove_file cleanup, publish_idempotent for
+    // SESSION_CLOSE, and up to 64 close_session calls per tick —
+    // keeps running orphaned. The reconciler ticks 14 400× more
+    // often than the retention loop below and does far more spool-
+    // mutating work per tick; without Notify, orphan reconciler
+    // closures race `finalize_sessions` at :596-614 for the same
+    // session journal / bridge segment on process exit. Same
+    // rationale as retention and bridge_maintenance below.
+    reconciler_shutdown.notify_one();
     // Signal retention to stop instead of aborting.
     // JoinHandle::abort() cancels only the outer async task, but the
     // retention tick body dispatches to spawn_blocking (each tick calls
@@ -514,9 +527,13 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
         handle.abort();
     }
     // Silence the expected cancellation; log everything else (panic).
+    // The reconciler now uses cooperative shutdown (R69 F1) so a
+    // clean stop returns `Ok(())`, not `Err(is_cancelled)`. Retain
+    // the is_cancelled branch in case of any pathological path (e.g.
+    // a future refactor that aborts on hard timeout).
     if let Err(error) = reconciler.await {
         if !error.is_cancelled() {
-            tracing::warn!(%error, "reconciler task exited with an error before shutdown abort");
+            tracing::warn!(%error, "reconciler task exited with an error before shutdown");
         }
     }
     if let Err(error) = bridge_maintenance.await {
