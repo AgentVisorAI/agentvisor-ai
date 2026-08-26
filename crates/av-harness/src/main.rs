@@ -463,26 +463,44 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     let shutdown_finalizer = state.finalizer.clone();
     let finalize_sessions = async move {
         let mut failures = Vec::new();
-        // Bound each per-session close so ONE stuck session (a leaked
+        // Bound each per-session close so a stuck session (a leaked
         // SessionLease from an axum-cancelled handler, a worker permit
         // dropped without decrementing, an upstream half-closed after
         // TCP_KEEPALIVE-less client disconnect) does not starve the
         // remaining sessions' close budget. `close_session_locked`
         // internally calls `wait_for_streams` / `wait_for_worker_jobs`
-        // which are unbounded loops on internal counters. The
-        // reconciler already mirrors this pattern with
-        // `IDLE_CLOSE_DEADLINE = 90 s` per session — the shutdown
-        // path had the same serial-close semantics but no per-session
-        // deadline, so one stuck session could burn the entire
-        // `WORKER_FINALIZE_PHASE_SECS` (30 s) budget and force every
-        // OTHER session into restart-time spool recovery.
+        // which are unbounded loops on internal counters.
         //
-        // The bound is 30 s per session (matching WORKER_FINALIZE_
-        // PHASE_SECS): each successfully-closed session finishes in
-        // under 100 ms in the healthy case, so a per-session 30 s
-        // deadline still permits 300+ sessions to close serially
-        // within the overall shutdown budget.
-        const PER_SESSION_CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+        // The per-session deadline MUST be small relative to the outer
+        // `WORKER_FINALIZE_PHASE_SECS` (30 s) budget — otherwise ONE
+        // stuck session eats the whole outer window and every REMAINING
+        // session is still skipped, which is the pathology this fix
+        // exists to close. Set it to 3 s: healthy close_session
+        // completes in < 100 ms so 3 s is 30× headroom for the healthy
+        // path, and up to 10 stuck sessions can fire their per-session
+        // deadline before the outer timer expires — giving the 11th
+        // (and later) healthy sessions a chance to close cleanly.
+        //
+        // Contrast with the reconciler's `IDLE_CLOSE_DEADLINE = 90 s`
+        // (R26): that path is NOT wrapped by an outer timeout so a
+        // large per-session bound is fine there.
+        //
+        // On per-session timeout, bump a pre-registered metric so
+        // operators tuning the deadline (or diagnosing why shutdown
+        // leaves sessions for restart-time recovery) can see the class
+        // separately from `av_http_shutdown_drain_timeouts_total`
+        // (which fires on OUTER drain timeout, a distinct condition).
+        const PER_SESSION_CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+        let session_close_timeouts = shutdown_finalizer.metrics().counter(
+            "av_shutdown_session_close_timeouts_total",
+            "Per-session close hit the shutdown-time per-session deadline (3 s) and \
+             was deferred to restart-time spool recovery. A sustained rate > 0 on \
+             every rollout indicates a class of sessions that regularly hang their \
+             close (leaked leases, dropped worker permits, unresponsive bridge \
+             publish) — the coincident session id in the shutdown warn log is the \
+             correlation key. Distinct from `av_http_shutdown_drain_timeouts_total` \
+             which fires on the OUTER phase timeout.",
+        );
         for session in open_sessions {
             let session_id = session.id.clone();
             let outcome = tokio::time::timeout(
@@ -493,10 +511,13 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
             match outcome {
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => failures.push(format!("session {session_id}: {error}")),
-                Err(_elapsed) => failures.push(format!(
-                    "session {session_id}: per-session close deadline ({}s) exceeded — deferred to restart-time recovery",
-                    PER_SESSION_CLOSE_DEADLINE.as_secs()
-                )),
+                Err(_elapsed) => {
+                    session_close_timeouts.inc();
+                    failures.push(format!(
+                        "session {session_id}: per-session close deadline ({}s) exceeded — deferred to restart-time recovery",
+                        PER_SESSION_CLOSE_DEADLINE.as_secs()
+                    ));
+                }
             }
         }
         if failures.is_empty() {
