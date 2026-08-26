@@ -38,8 +38,15 @@ pub struct TopicSpec {
     pub name: String,
     /// Partition count (partitioned by `ai_agent.instance_uid`).
     pub partitions: u32,
-    /// Retention policy.
-    #[serde(default)]
+    /// Retention policy. Required (declared as such in the shipped
+    /// JSON Schema at `schemas/bridge-manifest.schema.json`). If we
+    /// silently defaulted here the `avctl manifest-validate` verdict
+    /// would split from every external JSON-Schema linter's — an
+    /// operator seeing the CLI's OK plus their platform gate's FAIL
+    /// on the same file has to guess which is correct. Retention is
+    /// also semantically load-bearing: an operator who reads the
+    /// schema's `hot_hours: default: 720` and omits the block gets
+    /// 30 days of hot storage they never asked for.
     pub retention: RetentionSpec,
     /// JSON Schema reference events on this topic must satisfy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -769,6 +776,54 @@ topics:
              bumping this without also bumping deploy/kubernetes/agentvisor-ai.yaml's \
              Deployment.replicas ships an inconsistent example"
         );
+    }
+
+    /// Split-verdict guard: for every field the shipped JSON Schema
+    /// declares required at `topics[].`, the Rust `from_yaml` parser
+    /// must ALSO refuse a manifest that omits it. Any mismatch here
+    /// means `avctl manifest-validate` and an external JSON-Schema
+    /// linter return different verdicts on the same file — the exact
+    /// class of drift that used to hide behind `#[serde(default)]` on
+    /// `TopicSpec.retention` (schema said required, Rust silently
+    /// defaulted to `hot_hours: 720`).
+    #[test]
+    fn topic_required_fields_agree_with_shipped_json_schema() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/bridge-manifest.schema.json")).unwrap();
+        let required: Vec<String> = schema
+            .pointer("/properties/topics/items/required")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect();
+        assert!(
+            required.contains(&"retention".to_owned()),
+            "test premise: schema must still require retention"
+        );
+
+        for field in &required {
+            // Build a minimal one-topic manifest with `field` removed.
+            let mut topic = serde_json::json!({
+                "name": "agent.tool_call",
+                "partitions": 1,
+                "retention": {"hot_hours": 720}
+            });
+            topic.as_object_mut().unwrap().remove(field);
+            let manifest = serde_json::json!({
+                "manifest_version": MANIFEST_VERSION,
+                "name": "drift-probe",
+                "topics": [topic],
+            });
+            let yaml = serde_yaml::to_string(&manifest).unwrap();
+            assert!(
+                BridgeManifest::from_yaml(&yaml).is_err(),
+                "topics[].{field} is required by the shipped JSON Schema; \
+                 the Rust parser must refuse a manifest that omits it, or \
+                 avctl manifest-validate splits verdict with every external \
+                 schema linter"
+            );
+        }
     }
 }
 
