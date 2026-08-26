@@ -479,7 +479,16 @@ enum CliAction {
 /// handle must stay alive for the process lifetime; dropping it — or
 /// any process exit, including SIGKILL — releases the lock.
 fn acquire_spool_lock(spool_dir: &Path) -> Result<std::fs::File> {
-    std::fs::create_dir_all(spool_dir)
+    // Use `create_dir_all_synced` (not bare `create_dir_all`) so the
+    // spool ROOT is materialised at 0o700 on Unix. Every subsequent
+    // path (`append_journal`, `write_atomic`, `claim_sync`) short-
+    // circuits its own mkdir with an `is_dir()` fast path, so this
+    // is the ONLY site that ever creates the root — leaving it at
+    // the ambient umask (0o755 under the default 0022) would leak
+    // enumeration of the deterministic `sha256(session-id)[..32]`
+    // filename stems to any co-tenant with `execute` on the parent,
+    // even though the individual spool files are now 0o600.
+    av_core::fsutil::create_dir_all_synced(spool_dir)
         .with_context(|| format!("create spool directory {}", spool_dir.display()))?;
     let path = spool_dir.join(".agentvisord.lock");
     let file = std::fs::OpenOptions::new()

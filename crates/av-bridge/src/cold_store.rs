@@ -588,7 +588,7 @@ fn cold_url(value: &str) -> Result<url::Url, BusError> {
         return url::Url::parse(value)
             .map_err(|error| BusError::Backend(format!("invalid cold_uri {value:?}: {error}")));
     }
-    std::fs::create_dir_all(value)?;
+    av_core::fsutil::create_dir_all_synced(std::path::Path::new(value))?;
     // `Url::from_directory_path` rejects relative paths outright, so a
     // portable manifest entry like `cold_uri: "data/cold"` used to create
     // the directory and then fail provisioning. Canonicalize against the
