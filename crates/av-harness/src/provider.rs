@@ -132,6 +132,16 @@ impl ProviderAdapter for AnthropicAdapter {
         if candidate.is_empty() {
             return Ok(None);
         }
+        // `[DONE]` is technically OpenAI's terminator, not Anthropic's,
+        // but OpenAI-compat gateways (LiteLLM in `--rewrite openai`
+        // mode, OpenRouter's Anthropic passthrough with
+        // `stream_options`) commonly append it. Treat it as a keepalive
+        // rather than trying to `serde_json::from_str("[DONE]")` and
+        // aborting the whole stream on its last frame. Same handling
+        // is applied by the OpenAI parser directly.
+        if candidate.trim() == "[DONE]" {
+            return Ok(None);
+        }
         let value: serde_json::Value = serde_json::from_str(&candidate)
             .map_err(|error| format!("invalid provider JSON frame: {error}"))?;
         let frame_type = value
@@ -236,13 +246,21 @@ fn parse_anthropic_payload(
             }
             "tool_use" => {
                 // Non-streaming (or content_block_start): id + name,
-                // with `input` as a JSON object.
+                // with `input` as a JSON object. A zero-arg tool call
+                // arrives as `"input":{}` — emit `"{}"` (semantically
+                // the same as OpenAI's `"arguments":"{}"` on the wire
+                // and what `serde_json::to_string(&Value::Object({}))`
+                // produces) rather than an empty string. Pre-fix this
+                // path fell through to `arguments = ""` → the
+                // downstream fallback wrote `{"raw":""}` into the
+                // signed ATIF step, so the same logical zero-arg call
+                // attested with a DIFFERENT `arguments` shape depending
+                // on which provider handled it, silently breaking the
+                // "same signature ⇔ same bytes" auditor invariant.
                 let arguments = match block.get("input") {
-                    Some(input) if !input.is_null() && input != &Value::Object(serde_json::Map::new()) => {
-                        serde_json::to_string(input)
-                            .map_err(|error| format!("provider tool input is not serializable: {error}"))?
-                    }
-                    _ => String::new(),
+                    Some(input) if !input.is_null() => serde_json::to_string(input)
+                        .map_err(|error| format!("provider tool input is not serializable: {error}"))?,
+                    _ => "{}".to_owned(),
                 };
                 tool_call_deltas.push(ProviderToolCallDelta {
                     choice_index: 0,
@@ -411,8 +429,37 @@ impl ProviderAdapter for GoogleGeminiAdapter {
         if candidate.is_empty() {
             return Ok(None);
         }
+        // `[DONE]` is OpenAI-shaped, not Gemini's native terminator,
+        // but OpenAI-compat gateways in front of Gemini commonly
+        // append it. Treat as keepalive instead of aborting the
+        // stream on its last frame. Same handling as OpenAI and
+        // Anthropic parsers.
+        if candidate.trim() == "[DONE]" {
+            return Ok(None);
+        }
         let value: Value = serde_json::from_str(&candidate)
             .map_err(|error| format!("invalid provider JSON frame: {error}"))?;
+
+        // Same top-level error handling as the OpenAI parser: a
+        // Gemini-shaped stream can carry `{"error":{"code":...,
+        // "message":"...","status":"..."}}` mid-stream. Pre-fix this
+        // fell through to `has_choices = false` (no candidates, no
+        // usage, no finishReason) and aborted with the generic "no
+        // choices array" — the provider's real reason (INVALID_ARGUMENT,
+        // RESOURCE_EXHAUSTED, PERMISSION_DENIED) never reached the
+        // receipt.
+        if let Some(err_obj) = value.get("error").filter(|v| !v.is_null()) {
+            let message = err_obj
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("provider ended stream with an unspecified error");
+            let status = err_obj.get("status").and_then(Value::as_str).unwrap_or("");
+            return Err(if status.is_empty() {
+                format!("provider stream error: {message}")
+            } else {
+                format!("provider stream error [{status}]: {message}")
+            });
+        }
 
         let mut message = String::new();
         let mut reasoning = String::new();
@@ -476,13 +523,21 @@ impl ProviderAdapter for GoogleGeminiAdapter {
                         }
                     }
                     if let Some(call) = part.get("functionCall").filter(|call| !call.is_null()) {
+                        // Emit `"{}"` when args are absent/null, mirroring the
+                        // Anthropic tool_use fix above and OpenAI's
+                        // `"arguments":"{}"` for a zero-arg tool call.
+                        // Falling through to `String::new()` here made the
+                        // ATIF step attest `{"raw":""}` on Gemini while the
+                        // OpenAI equivalent for the same logical call
+                        // attested `{}`, breaking the "same signature ⇔
+                        // same bytes" auditor invariant across providers.
                         let arguments = match call.get("args") {
                             Some(args) if !args.is_null() => {
                                 serde_json::to_string(args).map_err(|error| {
                                     format!("provider function args are not serializable: {error}")
                                 })?
                             }
-                            _ => String::new(),
+                            _ => "{}".to_owned(),
                         };
                         tool_call_deltas.push(ProviderToolCallDelta {
                             choice_index,
@@ -554,6 +609,14 @@ fn map_gemini_finish_reason(reason: &str) -> String {
         "STOP" => "stop".to_owned(),
         "MAX_TOKENS" => "max_tokens".to_owned(),
         "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" => "content_filter".to_owned(),
+        // Gemini emits these when the model tried to invoke a tool
+        // but produced invalid JSON args, or invoked a tool that
+        // wasn't declared. Both are semantically tool-shaped stops
+        // (a signal to the auditor: "the model tried to use a
+        // tool"), not generic "Other" — dashboards grouping
+        // tool-call correctness failures need them in the ToolUse
+        // bucket rather than in Other's grab-bag.
+        "MALFORMED_FUNCTION_CALL" | "UNEXPECTED_TOOL_CALL" => "tool_calls".to_owned(),
         other => other.to_ascii_lowercase(),
     }
 }
@@ -638,7 +701,11 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(null_args.tool_call_deltas[0].arguments, "");
+        assert_eq!(
+            null_args.tool_call_deltas[0].arguments, "{}",
+            "R14: args=null zero-arg call attests \"{{}}\" to match OpenAI's semantic-equivalent \
+             wire encoding — the pre-R14 empty-string leaked into the signed step as {{\"raw\":\"\"}}"
+        );
         // A candidates-only frame (no usage, no finish reason) must pass
         // the empty-200 guard on candidates alone — pins the first arm
         // of the has_choices disjunction independently of the other two.
@@ -773,9 +840,10 @@ mod tests {
         assert_eq!((delta.choice_index, delta.index), (0, 1));
         assert_eq!(delta.id.as_deref(), Some("toolu_1"));
         assert_eq!(delta.name.as_deref(), Some("get_weather"));
-        assert!(
-            delta.arguments.is_empty(),
-            "empty input carries no argument bytes"
+        assert_eq!(
+            delta.arguments, "{}",
+            "R14: empty input attests \"{{}}\" to match OpenAI's semantic-equivalent wire \
+             encoding — the pre-R14 empty-string leaked into the signed step as {{\"raw\":\"\"}}"
         );
 
         let args = adapter
@@ -854,5 +922,104 @@ mod tests {
             .is_err());
         let _ = adapter.parse_sse_chunk("data: {not json");
         let _ = adapter.parse_sse_chunk("\u{feff}data: {\"type\":\"unknown_event\",\"x\":1}");
+    }
+
+    /// R14 fixes: adapter parity for cross-provider audit invariants.
+    ///
+    /// (1) Zero-arg tool_use attests `arguments = "{}"` (matching what
+    ///     the OpenAI adapter's `arguments: "{}"` wire encoding
+    ///     preserves), not `""` — pre-fix the empty-object rejection
+    ///     produced `arguments = ""` and the downstream fallback wrote
+    ///     `{"raw": ""}` into the signed step, silently diverging the
+    ///     attested tool-call shape across providers.
+    /// (2) `[DONE]` terminator swallowed as keepalive so OpenAI-compat
+    ///     gateways (LiteLLM, OpenRouter passthroughs) don't fail-close
+    ///     the last frame of an Anthropic stream.
+    #[test]
+    fn anthropic_zero_arg_tool_use_and_done_terminator_parity() {
+        let adapter = adapter_for("anthropic").unwrap();
+        // Zero-arg tool_use (non-streaming or content_block_start with
+        // empty input): args round-trip as "{}" not "".
+        let frame = r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_time","input":{}}}"#;
+        let parsed = adapter.parse_sse_chunk(frame).unwrap().unwrap();
+        assert_eq!(parsed.tool_call_deltas.len(), 1);
+        assert_eq!(
+            parsed.tool_call_deltas[0].arguments, "{}",
+            "zero-arg tool_use must attest arguments=\"{{}}\", matching OpenAI's semantic-equivalent \
+             encoding — not \"\" which downstream renders as {{\"raw\":\"\"}} in the signed step"
+        );
+        // `[DONE]` treated as keepalive, not a parse failure.
+        assert!(
+            adapter.parse_sse_chunk("data: [DONE]").unwrap().is_none(),
+            "OpenAI-compat gateways append [DONE]; must not fail-close the stream tail"
+        );
+        assert!(adapter.parse_sse_chunk("data: [DONE]  ").unwrap().is_none());
+    }
+
+    /// R14: same adapter-parity properties for Gemini.
+    #[test]
+    fn gemini_zero_arg_function_call_and_done_terminator_parity() {
+        let adapter = adapter_for("gemini").unwrap();
+        // functionCall without `args` field (Gemini's zero-arg shape).
+        let frame = concat!(
+            r#"data: {"candidates":[{"index":0,"content":{"parts":[{"functionCall":{"name":"get_time"}}]}}],"#,
+            r#""modelVersion":"gemini-2.0-flash"}"#,
+        );
+        let parsed = adapter.parse_sse_chunk(frame).unwrap().unwrap();
+        assert_eq!(parsed.tool_call_deltas.len(), 1);
+        assert_eq!(
+            parsed.tool_call_deltas[0].arguments, "{}",
+            "zero-arg functionCall must attest arguments=\"{{}}\", not \"\""
+        );
+        // `[DONE]` treated as keepalive.
+        assert!(adapter.parse_sse_chunk("data: [DONE]").unwrap().is_none());
+    }
+
+    /// R14: inline `{"error":{...}}` on 200-OK streams must fail
+    /// capture with the provider's own message, not fall through to
+    /// the generic "no choices array" abort — the provider's
+    /// diagnostic (context_length_exceeded, INVALID_ARGUMENT, etc.)
+    /// belongs in the receipt, not a synthetic reason.
+    #[test]
+    fn openai_inline_error_frame_fails_with_provider_message() {
+        let adapter = adapter_for("openai").unwrap();
+        let frame = r#"data: {"error":{"message":"context length exceeded","type":"invalid_request_error","code":"context_length_exceeded"}}"#;
+        let err = adapter.parse_sse_chunk(frame).unwrap_err();
+        assert!(err.contains("context length exceeded"), "{err}");
+        assert!(
+            err.contains("context_length_exceeded") || err.contains("[context_length_exceeded]"),
+            "provider error code must reach the diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn gemini_inline_error_frame_fails_with_provider_message() {
+        let adapter = adapter_for("gemini").unwrap();
+        let frame = r#"data: {"error":{"code":429,"message":"resource exhausted","status":"RESOURCE_EXHAUSTED"}}"#;
+        let err = adapter.parse_sse_chunk(frame).unwrap_err();
+        assert!(err.contains("resource exhausted"), "{err}");
+        assert!(err.contains("RESOURCE_EXHAUSTED"), "status must reach the diagnostic: {err}");
+    }
+
+    /// R14: Anthropic `pause_turn` (Claude 3.7+ extended-thinking +
+    /// tool sessions) and Gemini's `MALFORMED_FUNCTION_CALL` /
+    /// `UNEXPECTED_TOOL_CALL` both indicate tool-shaped stops.
+    /// Grouping them with Other hid a class of tool-call correctness
+    /// analytics that provider-agnostic dashboards need to see.
+    #[test]
+    fn provider_native_tool_shaped_stops_all_map_to_tool_use() {
+        // Anthropic `pause_turn` → ToolUse via map_finish_reason.
+        assert_eq!(
+            crate::routes::map_finish_reason("pause_turn"),
+            av_events::StopReason::ToolUse
+        );
+        // Gemini's tool-error finish reasons fold to lowercase
+        // "tool_calls" then to ToolUse via map_finish_reason.
+        assert_eq!(map_gemini_finish_reason("MALFORMED_FUNCTION_CALL"), "tool_calls");
+        assert_eq!(map_gemini_finish_reason("UNEXPECTED_TOOL_CALL"), "tool_calls");
+        assert_eq!(
+            crate::routes::map_finish_reason("tool_calls"),
+            av_events::StopReason::ToolUse
+        );
     }
 }
