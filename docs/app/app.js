@@ -325,14 +325,14 @@
           modeChip +
           liveChip +
           '<div class="spacer"></div>' +
-          '<button class="cmdk-trigger" id="cmdkOpen">' +
-            '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>' +
+          '<button class="cmdk-trigger" id="cmdkOpen" aria-label="Open command palette (⌘K)">' +
+            '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>' +
             '<span>Search or run a command…</span>' +
             '<span class="kbd">⌘K</span>' +
           "</button>" +
-          '<button class="theme-btn" id="themeBtn" title="Toggle theme">' + iconTheme() + "</button>" +
-          '<button class="user-btn" id="userBtn">' +
-            '<span class="avatar">' + esc(initials(user.displayName || user.email)) + "</span>" +
+          '<button class="theme-btn" id="themeBtn" title="Toggle theme" aria-label="Toggle light/dark theme">' + iconTheme() + "</button>" +
+          '<button class="user-btn" id="userBtn" aria-label="Account menu">' +
+            '<span class="avatar" aria-hidden="true">' + esc(initials(user.displayName || user.email)) + "</span>" +
             "<span>" + esc(user.email) + "</span>" +
           "</button>" +
         "</header>" +
@@ -363,15 +363,15 @@
   }
 
   /* ---------- icons ---------- */
-  function iconChart() { return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 14V3M2 14h12M5 11V8M8 11V6M11 11v-4"/></svg>'; }
-  function iconActivity() { return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 8h3l2-5 3 10 2-5h3"/></svg>'; }
-  function iconServer() { return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="12" height="4" rx="1"/><rect x="2" y="9" width="12" height="4" rx="1"/><circle cx="5" cy="5" r=".7" fill="currentColor"/><circle cx="5" cy="11" r=".7" fill="currentColor"/></svg>'; }
-  function iconGear() { return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="2"/><path d="M8 1v2M8 13v2M15 8h-2M3 8H1M13 3l-1.4 1.4M4.4 11.6L3 13M13 13l-1.4-1.4M4.4 4.4L3 3"/></svg>'; }
-  function iconShield() { return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M8 1.5l5.5 2v4c0 3-2.4 5.7-5.5 6.5C4.9 13.2 2.5 10.5 2.5 7.5v-4L8 1.5z"/><path d="M5.8 7.8l1.6 1.6L10.4 6.4" stroke-linecap="round"/></svg>'; }
-  function iconTheme() { return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="3"/><path d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M3 3l1 1M12 12l1 1M3 13l1-1M12 4l1-1"/></svg>'; }
+  function iconChart() { return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" stroke-linecap="round" stroke-linejoin="round"><path d="M2 14V3M2 14h12M5 11V8M8 11V6M11 11v-4"/></svg>'; }
+  function iconActivity() { return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 8h3l2-5 3 10 2-5h3"/></svg>'; }
+  function iconServer() { return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="2" y="3" width="12" height="4" rx="1"/><rect x="2" y="9" width="12" height="4" rx="1"/><circle cx="5" cy="5" r=".7" fill="currentColor"/><circle cx="5" cy="11" r=".7" fill="currentColor"/></svg>'; }
+  function iconGear() { return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" stroke-linecap="round"><circle cx="8" cy="8" r="2"/><path d="M8 1v2M8 13v2M15 8h-2M3 8H1M13 3l-1.4 1.4M4.4 11.6L3 13M13 13l-1.4-1.4M4.4 4.4L3 3"/></svg>'; }
+  function iconShield() { return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" stroke-linejoin="round"><path d="M8 1.5l5.5 2v4c0 3-2.4 5.7-5.5 6.5C4.9 13.2 2.5 10.5 2.5 7.5v-4L8 1.5z"/><path d="M5.8 7.8l1.6 1.6L10.4 6.4" stroke-linecap="round"/></svg>'; }
+  function iconTheme() { return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M3 3l1 1M12 12l1 1M3 13l1-1M12 4l1-1"/></svg>'; }
   function iconGoogle() { return '<svg viewBox="0 0 18 18"><path fill="#4285F4" d="M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84c-.21 1.13-.85 2.08-1.8 2.72v2.26h2.92c1.7-1.57 2.68-3.88 2.68-6.62z"/><path fill="#34A853" d="M9 18c2.43 0 4.47-.8 5.96-2.18l-2.92-2.26c-.8.54-1.83.86-3.04.86-2.34 0-4.32-1.58-5.03-3.7H.96v2.32C2.44 15.98 5.48 18 9 18z"/><path fill="#FBBC05" d="M3.97 10.72c-.18-.54-.28-1.12-.28-1.72s.1-1.18.28-1.72V4.96H.96C.35 6.18 0 7.55 0 9s.35 2.82.96 4.04l3.01-2.32z"/><path fill="#EA4335" d="M9 3.58c1.32 0 2.51.45 3.44 1.35l2.58-2.58C13.46.89 11.43 0 9 0 5.48 0 2.44 2.02.96 4.96l3.01 2.32C4.68 5.16 6.66 3.58 9 3.58z"/></svg>'; }
   function iconMicrosoft() { return '<svg viewBox="0 0 16 16"><rect x="1" y="1" width="6.5" height="6.5" fill="#F25022"/><rect x="8.5" y="1" width="6.5" height="6.5" fill="#7FBA00"/><rect x="1" y="8.5" width="6.5" height="6.5" fill="#00A4EF"/><rect x="8.5" y="8.5" width="6.5" height="6.5" fill="#FFB900"/></svg>'; }
-  function iconKey() { return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="5.5" cy="8.5" r="3"/><path d="M8.5 8.5H14M13 8.5V11M11 8.5V10"/></svg>'; }
+  function iconKey() { return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="5.5" cy="8.5" r="3"/><path d="M8.5 8.5H14M13 8.5V11M11 8.5V10"/></svg>'; }
 
   /* ============================================================
    * LOGIN / SIGNUP — split-screen with SSO
@@ -717,7 +717,7 @@
   function filterBar() {
     return '<div class="filter-bar">' +
       '<div class="search">' +
-        '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>' +
+        '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>' +
         '<input id="fSearch" type="search" placeholder="Search by session id, agent, or actor…" value="' + esc(sessionsFilter.q) + '" />' +
       "</div>" +
       '<select id="fRange">' +
@@ -1231,7 +1231,7 @@
           "<h2>" + esc(title || "Ingest token") + "</h2>" +
           '<p class="sub">Point your daemon at this console using the token below. Store it in your secret manager — it won\'t be shown again.</p>' +
           '<div class="token-display">' + esc(token) + "</div>" +
-          '<div class="notice"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 1L15 14H1L8 1z"/><path d="M8 6v3M8 11v.5"/></svg>' +
+          '<div class="notice"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M8 1L15 14H1L8 1z"/><path d="M8 6v3M8 11v.5"/></svg>' +
             '<span>This is the only time you\'ll see the full token. If you lose it, rotate to get a new one.</span></div>' +
           '<div class="actions"><button type="button" class="btn" id="copyTok">Copy</button><button type="button" class="btn accent" data-close>Done</button></div>' +
         "</div>" +
@@ -1266,7 +1266,7 @@
         '<td class="num tabular">' + esc(p.hits24h) + "</td>" +
         '<td class="num tabular">' + (p.blocks24h > 0 ? '<span style="color: var(--danger-solid); font-weight:500">' + esc(p.blocks24h) + "</span>" : esc(p.blocks24h)) + "</td>" +
         '<td style="color:var(--fg-2)">' + esc(timeAgo(p.updatedAt)) + "</td>" +
-        '<td onclick="event.stopPropagation()"><span class="switch ' + switchCls + '" data-id="' + esc(p.id) + '"></span></td>' +
+        '<td><button class="switch ' + switchCls + '" data-id="' + esc(p.id) + '" aria-label="Toggle policy ' + esc(p.name) + '" role="switch" aria-checked="' + (p.enabled ? "true" : "false") + '"></button></td>' +
         "</tr>";
     }).join("");
     main.innerHTML = pageHeader("Policies", pols.length + " policies · " + pols.filter(function (p) { return p.enabled; }).length + " enabled", '<button class="btn accent" id="addPol">+ New policy</button>') +
@@ -1296,7 +1296,7 @@
     try { p = await state.ds.getPolicy(id); } catch (e) { return renderError(main, e); }
     var switchCls = p.enabled ? "on" : "";
     main.innerHTML =
-      pageHeader(p.name, p.kind + " · " + p.scope, '<a href="#/policies" class="btn">← All policies</a> <span class="switch ' + switchCls + '" id="polSwitch" title="Toggle enabled"></span>') +
+      pageHeader(p.name, p.kind + " · " + p.scope, '<a href="#/policies" class="btn">← All policies</a> <button class="switch ' + switchCls + '" id="polSwitch" title="Toggle enabled" aria-label="Toggle policy enabled" role="switch" aria-checked="' + (p.enabled ? "true" : "false") + '"></button>') +
       '<div class="dep-summary">' +
         depCell("Status", p.enabled ? '<span class="pill ok status-dot">enabled</span>' : '<span class="pill neutral">disabled</span>') +
         depCell("Hits (24h)", p.hits24h.toLocaleString()) +
@@ -1413,7 +1413,7 @@
       '<div class="modal-backdrop"><div class="modal">' +
         "<h2>" + esc(title) + "</h2>" +
         '<p class="sub">' + esc(body) + "</p>" +
-        '<div class="notice"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><path d="M8 5v3M8 11v.5"/></svg><span>This is a demo. Full flow will ship with the beta.</span></div>' +
+        '<div class="notice"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="6"/><path d="M8 5v3M8 11v.5"/></svg><span>This is a demo. Full flow will ship with the beta.</span></div>' +
         '<div class="actions"><button type="button" class="btn primary" data-close>Got it</button></div>' +
       "</div></div>"
     );

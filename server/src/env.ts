@@ -28,5 +28,15 @@ const Env = z.object({
     ),
 });
 
-export const env = Env.parse(process.env);
+const parsed = Env.safeParse(process.env);
+if (!parsed.success) {
+  // eslint-disable-next-line no-console
+  console.error("Environment validation failed. Missing or invalid:");
+  for (const issue of parsed.error.issues) {
+    // eslint-disable-next-line no-console
+    console.error("  •", issue.path.join("."), "→", issue.message);
+  }
+  process.exit(1);
+}
+export const env = parsed.data;
 export type Env = z.infer<typeof Env>;
