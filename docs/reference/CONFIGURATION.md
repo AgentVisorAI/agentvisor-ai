@@ -65,7 +65,7 @@ source. All are optional.
 | `upstream_http2_prior_knowledge` | `false` | Skip HTTP/1 → HTTP/2 upgrade negotiation on the outbound connection. |
 | `upstream_read_timeout_s` | none | Per-request read timeout. Unset means "no timeout beyond the client's". |
 | `shutdown_drain_timeout_s` | `max(30, upstream_read_timeout_s + 5)` | Graceful-shutdown drain budget. |
-| `shutdown_ready_drain_s` | `0` | Readiness-controlled pre-drain window: on SIGTERM, `/readyz` serves 503 while the listener keeps accepting for this long before the drain begins. Needed for non-Kubernetes LBs (K8s gets this from the preStop sleep). |
+| `shutdown_ready_drain_s` | `0` | Readiness-controlled pre-drain window: on SIGTERM, `/readyz` serves 503 while the listener keeps accepting for this long before the drain begins. Needed for every deployment target where the LB polls `/readyz` — this includes Kubernetes distroless images (no `/bin/sh` for a `preStop` sleep hook), docker-compose, systemd, and bare-VM LBs. The shipped k8s manifest sets this to `5`. |
 | `upstream_api_key_env` / `upstream_api_key_file` | none | Where to pull the outbound API key from. `_file` wins over `_env` when both are set. |
 | `upstream_auth_header` | `authorization` | Header carrying the upstream API key — `authorization` (OpenAI), `api-key` (Azure), `x-api-key` (Anthropic). |
 | `upstream_auth_scheme` | `Bearer` | Prefix inserted before the key in the auth header; an empty string sends the raw key (Azure style). |
@@ -113,7 +113,7 @@ max_payout_usd_micros }`).
 | Key | Default | Notes |
 | --- | --- | --- |
 | `atif_spool_dir` | `spool/atif` (relative to the working directory) | Where ATIF trajectories and their `.atif-auth` sidecars land. Backup with the same discipline you use for receipts. |
-| `atif_retention_days` | unset | When set, an hourly sweep removes **sealed** ATIF pairs (`.json` + `.atif-auth`) whose mtime is older than N days. Unpaired remnants are left for the reconciler's quarantine sweep. See round 51 §8.1. |
+| `atif_retention_days` | unset | When set to a positive N, an hourly sweep removes **sealed** ATIF pairs (`.json` + `.atif-auth`) whose mtime is older than N days. Unpaired remnants are left for the reconciler's quarantine sweep. Leave the key unset (or set to `None` in TOML by omitting it) to disable in-process retention entirely; `0` is rejected by config validation because a zero-day window would prune every sealed pair on the first tick. See round 51 §8.1. |
 | `bridge_data_dir` / `bridge_backend` / `bridge_endpoint` | see docs | Broker configuration; either the embedded Bridge or an external one. |
 | `bridge_manifest_path` | `manifests/bridge.example.yaml` | Declarative topic-schema manifest used by every Bridge backend; resolves to an embedded built-in when the default path has no file on disk. |
 | `state_backend` / `state_endpoint` | see docs | State store: embedded or Redis. |

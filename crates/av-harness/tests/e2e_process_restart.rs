@@ -162,6 +162,46 @@ fn spool_file_count(dir: &std::path::Path) -> usize {
         .unwrap_or(0)
 }
 
+/// Poll `spool_file_count` until it stabilises (same value across
+/// `stable_polls` consecutive reads spaced by `poll_interval`), then
+/// return that value. Times out after `budget`.
+///
+/// Replaces a hardcoded `thread::sleep(Duration::from_secs(2))` used
+/// as a "let reconciler tick to quiescence" wait — on a slow CI the
+/// first tick can still be in-flight at 2 s, giving a
+/// mid-tick file count and a spurious idempotence-regression failure.
+/// Polling for a stable value tolerates loaded runners while still
+/// detecting a real unbounded-growth regression (the count would
+/// never stabilise).
+fn wait_for_spool_quiescence(
+    dir: &std::path::Path,
+    poll_interval: Duration,
+    stable_polls: usize,
+    budget: Duration,
+) -> usize {
+    let deadline = Instant::now() + budget;
+    let mut last = spool_file_count(dir);
+    let mut stable = 0usize;
+    while Instant::now() < deadline {
+        std::thread::sleep(poll_interval);
+        let now = spool_file_count(dir);
+        if now == last {
+            stable = stable.saturating_add(1);
+            if stable >= stable_polls {
+                return now;
+            }
+        } else {
+            stable = 0;
+            last = now;
+        }
+    }
+    // Budget exhausted; return the most recent count. A real failure
+    // shape here (recovery still churning after the whole budget) is
+    // caught by the caller's idempotence assertion on the resulting
+    // value against the previous boot's stable value.
+    last
+}
+
 /// The kill-and-restart experiment: serve → SIGKILL → restart → serve →
 /// SIGKILL → restart. Asserts the daemon survives its own crash artifacts,
 /// the spool recovery is idempotent across repeated restarts (no
@@ -223,10 +263,11 @@ vector_backend = "memory"
     wait_healthy(listen_port, &mut daemon);
     let (status, body) = http_post_chat(listen_port, "post-restart-session").expect("chat after restart");
     assert_eq!(status, 200, "post-restart chat failed: {body}");
-    // Give the reconciler's first tick a moment to run recovery to
-    // quiescence before measuring the idempotence baseline.
-    std::thread::sleep(Duration::from_secs(2));
-    let after_second_boot = spool_file_count(&spool);
+    // Wait for the reconciler's recovery to reach a stable file
+    // count before measuring the idempotence baseline. Replaces a
+    // fixed 2 s sleep that races the first tick on loaded CI.
+    let after_second_boot =
+        wait_for_spool_quiescence(&spool, Duration::from_millis(200), 3, Duration::from_secs(10));
     daemon.0.kill().unwrap();
     daemon.0.wait().unwrap();
     drop(daemon);
@@ -234,8 +275,8 @@ vector_backend = "memory"
     // ---- Boot 3: recovery must be idempotent. ----
     let mut daemon = start_daemon(&config_path, &seed_path);
     wait_healthy(listen_port, &mut daemon);
-    std::thread::sleep(Duration::from_secs(2));
-    let after_third_boot = spool_file_count(&spool);
+    let after_third_boot =
+        wait_for_spool_quiescence(&spool, Duration::from_millis(200), 3, Duration::from_secs(10));
     // The failure shape to guard against is unbounded growth: a buggy
     // recovery re-adopted and re-finalized every closed session on each
     // restart, emitting duplicate events.
@@ -764,6 +805,39 @@ vector_backend = "memory"
         "av_ephemeral_close_failures_total",
         "av_stream_abort_close_failures_total",
         "av_stream_abort_no_runtime_total",
+        // Panic-supervision counters. Each is written only from the
+        // panic arm of a background task or Drop-spawned task; without
+        // pre-registration `rate() > 0` alerts silently miss the FIRST
+        // panic — exactly the incident the alert exists to catch.
+        // Documented in OPERATIONS.md.
+        "av_reconciler_panics_total",
+        "av_worker_shard_panics_total",
+        "av_bridge_maintenance_panics_total",
+        "av_bridge_maintenance_errors_total",
+        "av_bridge_maintenance_join_errors_total",
+        "av_atif_retention_panics_total",
+        "av_atif_retention_errors_total",
+        "av_tcp_nodelay_failures_total",
+        "av_stream_abort_panics_total",
+        "av_ephemeral_close_panics_total",
+        "av_admission_refund_panics_total",
+        "av_idle_close_timeouts_total",
+        "av_shutdown_session_close_timeouts_total",
+        "av_shutdown_mcp_drain_timeouts_total",
+        // Per-tick recovery-scan cap: one labelled series per pass.
+        // Absent series → `rate() > 0` alerts miss the FIRST fire.
+        "av_recovery_scan_capped_total{pass=\"adopt_strict_atif\"}",
+        "av_recovery_scan_capped_total{pass=\"recover_signed_journals\"}",
+        "av_recovery_scan_capped_total{pass=\"consolidate_step_journals\"}",
+        "av_recovery_scan_capped_total{pass=\"retry_marked_promotions\"}",
+        "av_recovery_scan_capped_total{pass=\"remove_acked_outboxes\"}",
+        "av_recovery_scan_capped_total{pass=\"replay_lifecycle_outboxes\"}",
+        "av_recovery_scan_capped_total{pass=\"quarantine_orphan_json\"}",
+        // Lifecycle-outbox backlog gauge. On a fresh boot no bridge
+        // activity has happened, so the gauge is 0 — but it must
+        // be pre-registered so `absent()` alerts distinguish
+        // "healthy, no backlog" from "reconciler tick hasn't run yet".
+        "av_lifecycle_outbox_pending",
     ] {
         assert!(
             body.contains(series),
@@ -779,10 +853,12 @@ vector_backend = "memory"
 /// `/livez` stays 200, and the process must exit cleanly after the
 /// window. Without the window, axum stops accepting the instant the
 /// signal lands and a fresh probe sees connection-refused, never the
-/// 503 — Kubernetes hides this behind the preStop sleep, but
-/// docker-compose / systemd / bare-LB deployments have no preStop.
-/// Reproduced live before the fix: 0.5 s after SIGTERM both probes
-/// got connection-refused.
+/// 503. This applies to every deployment: the shipped k8s manifest
+/// runs on a distroless base with no shell so a `preStop` sleep
+/// hook cannot execute, and docker-compose / systemd / bare-LB
+/// deployments have no preStop equivalent at all. Reproduced live
+/// before the fix: 0.5 s after SIGTERM both probes got
+/// connection-refused.
 #[cfg(unix)]
 #[test]
 fn sigterm_serves_readyz_503_during_the_pre_drain_window() {

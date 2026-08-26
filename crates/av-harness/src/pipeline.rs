@@ -93,6 +93,15 @@ pub struct AppState {
     /// `enqueue_transient_failure`.
     pub(crate) identity_rejection_window: Arc<parking_lot::Mutex<(Instant, u32)>>,
     pub(crate) journal_key: [u8; 32],
+    /// Tracks in-flight `mcp_call_inner` detached spawns so
+    /// `finish_shutdown` can await their completion between HTTP drain
+    /// and `worker.wait_idle`. Without this barrier, a client-
+    /// disconnected `mcp_call` running past axum's graceful drain
+    /// could reach `worker.try_submit` AFTER `wait_idle` returned,
+    /// stranding a fresh job across `finalize_sessions` and tripping
+    /// `av_shutdown_session_close_timeouts_total` on an otherwise-
+    /// recoverable session.
+    pub mcp_inflight: Arc<crate::inflight::InflightTracker>,
 }
 
 /// Pre-resolved metric handles for the request hot path so the
@@ -503,6 +512,18 @@ pub(crate) struct AdmissionDebit {
     budget: av_state::BudgetSpec,
     principal: Option<(String, av_state::BudgetSpec)>,
     tokens: u64,
+    /// Metrics registry for the Drop-path panic supervisor.
+    ///
+    /// If the refund closure panics inside the spawn_blocking pool (a
+    /// backend allocator failure, a parking_lot mutex panic during
+    /// unwind, a HashMap grow OOM), tokio's default
+    /// `UnhandledPanic::Ignore` swallows it silently. The debit then
+    /// stays permanent on BOTH the session ledger and — the material
+    /// consequence — the principal ledger, which persists across
+    /// sessions and never heals. Surface the panic via a bumped
+    /// counter and a tracing::error so `rate(av_admission_refund_panics_total)`
+    /// catches it.
+    metrics: Arc<Registry>,
 }
 
 impl AdmissionDebit {
@@ -545,10 +566,51 @@ impl Drop for AdmissionDebit {
         let session_id = std::mem::take(&mut self.session_id);
         let budget = std::mem::take(&mut self.budget);
         let principal = self.principal.take();
+        let metrics = Arc::clone(&self.metrics);
+        // `catch_unwind` around the refund body so a panic inside
+        // spawn_blocking (backend allocator OOM, parking_lot mutex
+        // panic during unwind, a HashMap grow at capacity) doesn't
+        // get swallowed by tokio's default `UnhandledPanic::Ignore`.
+        // The `store: Arc<dyn StateStore>` and `metrics: Arc<Registry>`
+        // captures are already `UnwindSafe` (Arc is UnwindSafe when
+        // its inner T is `RefUnwindSafe`, and the store trait's
+        // implementors are RefUnwindSafe by convention here).
+        // `session_id: String`, `budget: BudgetSpec`, and
+        // `principal: Option<(String, BudgetSpec)>` are all
+        // Send + UnwindSafe. Wrap the whole thing in
+        // `AssertUnwindSafe` to bypass the `RefUnwindSafe` check on
+        // the trait object rather than plumb the bound through the
+        // whole StateStore hierarchy — the invariant we care about
+        // (no shared mutable state leaked from the refund) is
+        // upheld by construction.
+        let sess_for_log = session_id.clone();
         let refund = move || {
-            ActionBudget::new(store.as_ref(), &session_id, &budget).refund_tokens(tokens);
-            if let Some((principal_id, spec)) = principal.as_ref() {
-                ActionBudget::for_principal(store.as_ref(), principal_id, spec).refund_tokens(tokens);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ActionBudget::new(store.as_ref(), &session_id, &budget).refund_tokens(tokens);
+                if let Some((principal_id, spec)) = principal.as_ref() {
+                    ActionBudget::for_principal(store.as_ref(), principal_id, spec).refund_tokens(tokens);
+                }
+            }));
+            if let Err(panic) = outcome {
+                let msg = panic
+                    .downcast_ref::<&'static str>()
+                    .copied()
+                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("panic payload was not a string");
+                metrics
+                    .counter(
+                        "av_admission_refund_panics_total",
+                        "Admission-debit refund closure panicked in Drop; the session \
+                         and principal ledgers retain the debit until operator repair",
+                    )
+                    .inc();
+                tracing::error!(
+                    session = %sess_for_log,
+                    tokens,
+                    panic = %msg,
+                    "admission-debit refund PANICKED (caught); \
+                     principal ledger drain persists until operator repair"
+                );
             }
         };
         match tokio::runtime::Handle::try_current() {
@@ -656,6 +718,22 @@ pub enum PipelineError {
         #[source]
         source: Option<ErrorSource>,
     },
+    /// The upstream provider accepted the connection but did not
+    /// finish responding within `upstream_read_timeout_s`. Distinct
+    /// from [`Self::Upstream`] so the response layer can map to
+    /// `504 Gateway Timeout` (RFC 7231 §6.6.5) rather than
+    /// `502 Bad Gateway`, letting operator dashboards distinguish
+    /// "provider slow" (504 — check provider health) from
+    /// "provider unreachable" (502 — check DNS / network / config).
+    /// SDK retry behaviour is unchanged (both retryable).
+    #[error("upstream request timed out: {context}")]
+    UpstreamTimeout {
+        /// Human-readable description.
+        context: String,
+        /// Underlying typed error, when one exists.
+        #[source]
+        source: Option<ErrorSource>,
+    },
     /// The breaker requested immediate connection closure.
     #[error("connection aborted: {0}")]
     Abort(String),
@@ -731,6 +809,16 @@ impl PipelineError {
         }
     }
 
+    /// Semantic upstream-timeout failure with no underlying typed
+    /// error. Response layer maps this to `504 Gateway Timeout`
+    /// (see [`Self::UpstreamTimeout`] docs).
+    pub fn upstream_timeout(context: impl Into<String>) -> Self {
+        Self::UpstreamTimeout {
+            context: context.into(),
+            source: None,
+        }
+    }
+
     /// Semantic unavailability with no underlying typed error.
     pub fn unavailable(context: impl Into<String>) -> Self {
         Self::Unavailable {
@@ -767,6 +855,7 @@ impl PipelineError {
             Self::Unauthorized(_) => axum::http::StatusCode::UNAUTHORIZED,
             Self::Blocked { .. } => axum::http::StatusCode::FORBIDDEN,
             Self::Upstream { .. } => axum::http::StatusCode::BAD_GATEWAY,
+            Self::UpstreamTimeout { .. } => axum::http::StatusCode::GATEWAY_TIMEOUT,
             Self::Abort(_) => axum::http::StatusCode::CONFLICT,
             Self::Unavailable { .. } => axum::http::StatusCode::SERVICE_UNAVAILABLE,
         }
@@ -1004,6 +1093,200 @@ impl AppState {
             "Stream abort observed no tokio runtime; capture marked failed for \
              reconciler retry",
         );
+        // Panic-supervision counters — same lazy-series defect the
+        // stream-close counters above defeat, applied to every
+        // background loop's `catch_unwind` arm. Absent-series alerts
+        // (`absent(av_reconciler_panics_total)`) fire a false-positive
+        // on healthy nodes when the counter is registered only inside
+        // the panic arm, and `rate() > 0` alerts cannot distinguish
+        // "never panicked" from "never registered" — so the FIRST
+        // panic that the guardrail exists to catch slips past the
+        // alert. Pre-register the five outliers alongside the
+        // stream-close set. `av_jwks_refresh_panics_total` is
+        // already eagerly registered at its call site (main.rs
+        // beside its interval creation); the five below are the
+        // panic-arm-only stragglers.
+        metrics.counter(
+            "av_reconciler_panics_total",
+            "Reconciler tick body panicked and was caught; the reconciler \
+             continues on the next tick",
+        );
+        // `av_worker_shard_panics_total` fires from the OUTER
+        // envelope-routing supervisor in worker.rs — NOT from the
+        // inner job body (that path uses `av_worker_panics_total`).
+        // The distinction is load-bearing during incident triage:
+        // a routing/dispatcher panic points at the shard task
+        // structure (backlog, channel, batch-boundary logic), while
+        // a job-body panic points at the specific request that
+        // panicked. HELP text and comment kept aligned with the
+        // write site at worker.rs:864.
+        metrics.counter(
+            "av_worker_shard_panics_total",
+            "Worker shard driver panicked outside a job; supervised via catch_unwind",
+        );
+        metrics.counter(
+            "av_bridge_maintenance_panics_total",
+            "Bridge maintenance tick panicked and was caught; the loop \
+             continues on the next interval",
+        );
+        metrics.counter(
+            "av_bridge_maintenance_errors_total",
+            "Bridge maintenance tick returned an error; the loop continues \
+             on the next interval",
+        );
+        metrics.counter(
+            "av_bridge_maintenance_join_errors_total",
+            "Bridge maintenance tick's spawned task failed to join (panic \
+             or cancellation); the loop continues on the next interval",
+        );
+        // ATIF retention loop: same supervision discipline. A silent
+        // panic in the hourly sweep would let the spool grow unbounded
+        // until it fills the disk (retention is the only in-process
+        // reclaim path). Pre-register both counters so `rate() > 0`
+        // alerts see the FIRST fire.
+        metrics.counter(
+            "av_atif_retention_panics_total",
+            "ATIF retention sweep tick panicked and was caught; the loop \
+             continues on the next hour",
+        );
+        metrics.counter(
+            "av_atif_retention_errors_total",
+            "ATIF retention sweep tick returned an error; the loop continues \
+             on the next hour",
+        );
+        // TCP_NODELAY setsockopt failure counter — written from the
+        // axum `tap_io` per-accept hook when `set_nodelay(true)` on
+        // the freshly-accepted socket fails (typically ENOTCONN /
+        // EBADF on a SYN-flood / Slowloris torn-down socket, or
+        // ENOPROTOOPT on an embedded target without full socket-
+        // option support). The tracing warn is dampened via
+        // `std::sync::Once` to avoid a per-accept log storm; this
+        // counter keeps operator visibility of the failure rate.
+        //
+        // Help string MUST match the main.rs registration site
+        // byte-exact: `Registry::counter` returns the pre-registered
+        // Arc<Counter> and discards subsequent `help` strings, so
+        // divergent HELP would silently drop the more informative
+        // one from `/metrics`. Same discipline as every sibling
+        // `*_panics_total` pre-registration.
+        metrics.counter(
+            "av_tcp_nodelay_failures_total",
+            "TCP_NODELAY setsockopt failed on an accepted connection; the \
+             suboptimal-latency connection still serves. Rate-limited to a \
+             single tracing warn per process to avoid a per-accept log storm \
+             under half-open flood / SYN flood.",
+        );
+        // Drop-spawned close-session and admission-refund panics —
+        // same rationale. Each is written only from a Drop-spawned
+        // background task on the panic arm.
+        metrics.counter(
+            "av_stream_abort_panics_total",
+            "Background close after a stream abort panicked and was caught; \
+             the session is left open until the idle sweeper reaps it",
+        );
+        metrics.counter(
+            "av_ephemeral_close_panics_total",
+            "Auto-close of a completed ephemeral one-shot panicked and was \
+             caught; the session is left open until the idle sweeper reaps it",
+        );
+        metrics.counter(
+            "av_admission_refund_panics_total",
+            "Admission-debit refund closure panicked in Drop; the session \
+             and principal ledgers retain the debit until operator repair",
+        );
+        // Idle-close per-session deadline counter. Same pre-
+        // registration discipline: this counter is emitted only
+        // from the timeout arm of `close_session` in the reconciler
+        // idle-close sweep, so a lazy `rate() > 0` alert wouldn't
+        // see the FIRST fire — exactly the incident the alert
+        // exists to catch. See OPERATIONS.md.
+        metrics.counter(
+            "av_idle_close_timeouts_total",
+            "Idle-close reached the per-session deadline (90 s) and returned \
+             to the next tick — indicates a session with an active lease \
+             that never drops (stuck stream, hung worker, unresponsive \
+             bridge). A steady rate > 0 requires operator investigation \
+             of the coincident session id.",
+        );
+        // Shutdown-time per-session close deadline counter. Fires
+        // when the shutdown-path close_session (main.rs
+        // finalize_sessions loop) hits its 3 s per-session deadline
+        // — distinct from `av_idle_close_timeouts_total` (steady-
+        // state idle sweep) and `av_http_shutdown_drain_timeouts_
+        // total` (outer HTTP-drain phase). Pre-registration matches
+        // the discipline for the rest of this block: a lazy
+        // `rate() > 0` alert would miss the FIRST fire on the very
+        // shutdown that surfaces the class.
+        metrics.counter(
+            "av_shutdown_session_close_timeouts_total",
+            "Per-session close hit the shutdown-time per-session deadline (3 s) \
+             and was deferred to restart-time spool recovery. A sustained rate > 0 \
+             on every rollout indicates a class of sessions that regularly hang \
+             their close; the coincident session id in the shutdown warn log is the \
+             correlation key. Distinct from av_http_shutdown_drain_timeouts_total.",
+        );
+        // Shutdown-time MCP-inflight drain-deadline counter. Fires when
+        // the shutdown barrier waiting for detached mcp_call_inner
+        // spawns to complete hits its 5 s deadline before `wait_idle`.
+        // Without this barrier the detached body could reach
+        // `worker.try_submit` AFTER `wait_idle` returned, race
+        // `finalize_sessions`, and trip
+        // `av_shutdown_session_close_timeouts_total` on an otherwise-
+        // recoverable session. Pre-registration matches the rest of
+        // the block — any occurrence must be visible to `rate() > 0`.
+        metrics.counter(
+            "av_shutdown_mcp_drain_timeouts_total",
+            "Shutdown MCP-inflight drain hit its 5 s deadline before every detached \
+             mcp_call_inner spawn completed. Downstream effects: some detached \
+             tool bodies were interrupted at close and their sessions may be \
+             quarantined at restart-time recovery. Any occurrence during a \
+             rollout indicates a class of tool calls that regularly outlive HTTP \
+             drain (long-running upstream tool, hung sandbox); check the \
+             coincident tracing warn line.",
+        );
+        // Per-tick recovery-scan cap counter. Every recovery pass that
+        // walks `read_dir` yields after `MAX_RECOVERY_ENTRIES_PER_TICK`
+        // entries so a poisoned spool (millions of stale files) does
+        // not starve legitimate recovery work. Pre-registering each
+        // labelled series eagerly closes the same "lazy series that
+        // rate()>0 never sees on the FIRST fire" defect the counters
+        // above defeat. Keep this labels list in-sync with every call
+        // to `bump_recovery_scan_cap`.
+        for pass in [
+            "adopt_strict_atif",
+            "recover_signed_journals",
+            "consolidate_step_journals",
+            "retry_marked_promotions",
+            "remove_acked_outboxes",
+            "replay_lifecycle_outboxes",
+            "quarantine_orphan_json",
+        ] {
+            metrics.counter(
+                &format!("av_recovery_scan_capped_total{{pass=\"{pass}\"}}"),
+                "Recovery pass hit the per-tick entry-scan cap and returned \
+                 early; the next tick will re-open the directory and resume. \
+                 A steady rate > 0 indicates a poisoned spool (millions of \
+                 stale files) that will starve legitimate recovery work \
+                 until an operator quarantines it.",
+            );
+        }
+        // Lifecycle-outbox backlog gauge. Rising baseline is the
+        // earliest signal of a broker outage — outboxes persist
+        // across restarts, so the disk-bounded queue grows until the
+        // bridge is reachable again. Pre-registering the gauge (with
+        // value 0) makes `absent(av_lifecycle_outbox_pending)`
+        // alerts distinguish "healthy, no backlog" from
+        // "reconciler tick hasn't fired yet" — on a fresh boot the
+        // gauge appears at 0 immediately, then updates on the first
+        // `remove_acked_lifecycle_outboxes` tick.
+        metrics.gauge(
+            "av_lifecycle_outbox_pending",
+            "Count of unacked lifecycle outbox files (RECEIPT + \
+             SESSION_CLOSE) sitting in the spool at the last \
+             reconciler tick. Steady-state 0 on a healthy node; a \
+             rising baseline indicates the bridge is unreachable \
+             or slow.",
+        );
         // Reconciler ticks scan the ATIF spool dir, which can be large;
         // finalisation waits for worker drain + broker publish. Wide
         // bounds keep long-tail p99 useful under load.
@@ -1138,6 +1421,7 @@ impl AppState {
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             identity_rejection_window: Arc::new(parking_lot::Mutex::new((Instant::now(), 0))),
             journal_key,
+            mcp_inflight: Arc::new(crate::inflight::InflightTracker::new()),
         })
     }
 
@@ -1527,6 +1811,7 @@ impl AppState {
                 .as_ref()
                 .map(|spec| (principal_id_for_budget(&identity), spec.clone())),
             tokens: billed_tokens,
+            metrics: Arc::clone(&self.metrics),
         };
         Ok(PreparedRequest {
             session,
@@ -1904,7 +2189,17 @@ impl AppState {
                     error.is_body = error.is_body(),
                     "upstream forwarding failed"
                 );
-                let client_error = PipelineError::upstream(client_reason.to_owned());
+                // Route timeouts (upstream accepted the connection but
+                // never finished responding) to 504 Gateway Timeout
+                // instead of the generic 502 Bad Gateway. Operator
+                // dashboards keying off HTTP status can now distinguish
+                // "provider slow" (504) from "provider unreachable"
+                // (502) without joining against the metric label.
+                let client_error = if error.is_timeout() {
+                    PipelineError::upstream_timeout(client_reason.to_owned())
+                } else {
+                    PipelineError::upstream(client_reason.to_owned())
+                };
                 let persisted_reason = format!("upstream_{client_reason}");
                 if let Some(permit) = response_permit {
                     let (response_marker, response_attempt_id) = capture_guard.disarm();

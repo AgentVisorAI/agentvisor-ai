@@ -454,7 +454,23 @@ fn persist_pending(
     // ENOSPC/EIO on a bad-disk day would otherwise unboundedly
     // consume inodes (UUIDv7-suffixed .tmp names never collide).
     let mut guard = av_core::fsutil::TempPathGuard::new(temporary.clone());
-    let mut file = std::fs::File::create(&temporary)?;
+    // Explicit 0o600 mode + create_new — cold-outbox pending intent
+    // files hold the full sealed event value (session-derived data,
+    // same class as `write_cold_event_once` and the hot segment
+    // JSONL that were hardened elsewhere in this crate). The
+    // previous `File::create` recipe landed at 0o644 under the
+    // default umask, and `rename` propagated that mode into the
+    // durable pending file at `{pending_dir}/{sha256(topic:uid)}.json`.
+    // `create_new(true)` closes the (formally-possible) symlink-plant
+    // window at the UUIDv7-suffixed tmp path.
+    let mut tmp_options = std::fs::OpenOptions::new();
+    tmp_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        tmp_options.mode(0o600);
+    }
+    let mut file = tmp_options.open(&temporary)?;
     let mac = pending_mac(control_key, pending)?;
     file.write_all(&serde_json::to_vec(&PendingEnvelope {
         payload: pending.clone(),
@@ -588,7 +604,7 @@ fn cold_url(value: &str) -> Result<url::Url, BusError> {
         return url::Url::parse(value)
             .map_err(|error| BusError::Backend(format!("invalid cold_uri {value:?}: {error}")));
     }
-    std::fs::create_dir_all(value)?;
+    av_core::fsutil::create_dir_all_synced(std::path::Path::new(value))?;
     // `Url::from_directory_path` rejects relative paths outright, so a
     // portable manifest entry like `cold_uri: "data/cold"` used to create
     // the directory and then fail provisioning. Canonicalize against the

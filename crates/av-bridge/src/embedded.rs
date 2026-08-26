@@ -84,7 +84,7 @@ impl EmbeddedBroker {
         // already been taken (see the rollback note further down).
         let resolved_schemas = resolve_referenced_schemas(manifest)?;
         let manifest_path = data_dir.join("manifest.yaml");
-        fs::create_dir_all(data_dir)?;
+        av_core::fsutil::create_dir_all_synced(data_dir)?;
         let yaml = manifest.to_yaml().map_err(|e| BusError::Backend(e.to_string()))?;
         // Atomic single-winner claim on a fresh provision: the
         // `hard_link(2)` below fails with EEXIST if the target already
@@ -120,7 +120,22 @@ impl EmbeddedBroker {
             path: Some(tmp.clone()),
         };
         {
-            let mut file = fs::File::create(&tmp)?;
+            // Explicit 0o600 mode so the manifest doesn't inherit the
+            // ambient umask. `hard_link` creates a second entry with
+            // the SAME inode (and same mode), so the final manifest
+            // path is 0o600 too. Bridge topology, schema refs, and
+            // `cold_uri` are not per-session data, but the same
+            // uniformity discipline the harness spool applies —
+            // durability-critical control files should not ride on
+            // the operator's umask.
+            let mut tmp_options = fs::OpenOptions::new();
+            tmp_options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                tmp_options.mode(0o600);
+            }
+            let mut file = tmp_options.open(&tmp)?;
             file.write_all(yaml.as_bytes())?;
             file.sync_all()?;
         }
@@ -167,7 +182,7 @@ impl EmbeddedBroker {
         // directory (the retry-clean invariant).
         let post_claim = write_referenced_schemas(data_dir, &resolved_schemas).and_then(|()| {
             for t in &manifest.topics {
-                fs::create_dir_all(data_dir.join("topics").join(&t.name))?;
+                av_core::fsutil::create_dir_all_synced(&data_dir.join("topics").join(&t.name))?;
             }
             Ok(())
         });
@@ -202,7 +217,7 @@ impl EmbeddedBroker {
         let mut torn_total = 0u64;
         for t in &manifest.topics {
             let dir = data_dir.join("topics").join(&t.name);
-            fs::create_dir_all(&dir)?;
+            av_core::fsutil::create_dir_all_synced(&dir)?;
             let mut parts = Vec::with_capacity(t.partitions as usize);
             for p in 0..t.partitions {
                 let path = dir.join(format!("p{p}.jsonl"));
@@ -315,8 +330,22 @@ impl EmbeddedBroker {
                 // another directory-fsyncing path runs (the retention
                 // rewrite, or the sidecar-creation fsync in
                 // `publish_with_uid`).
-                let segment_created = !path.exists();
-                let writer = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+                let segment_created = std::fs::symlink_metadata(&path).is_err();
+                // Same 0o600 + O_NOFOLLOW discipline the harness spool
+                // applies. Segment JSONL carries full `StoredEvent`
+                // records (instance_uid + event payload + tool/prompt
+                // bytes + cost), which is the same "session-derived
+                // data" class the harness-side R18/R19 fix protected.
+                let mut open_options = fs::OpenOptions::new();
+                open_options.create(true).append(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    open_options
+                        .custom_flags(av_core::fsutil::unix_o_nofollow())
+                        .mode(0o600);
+                }
+                let writer = open_options.open(&path)?;
                 if segment_created {
                     av_core::fsutil::sync_directory(&dir).map_err(BusError::Io)?;
                 }
@@ -587,7 +616,22 @@ impl EmbeddedBroker {
                     // table with UUID-suffixed orphan .tmp files.
                     let mut guard = av_core::fsutil::TempPathGuard::new(tmp.clone());
                     {
-                        let mut f = fs::File::create(&tmp)?;
+                        // Explicit 0o600 mode so the retention rewrite
+                        // doesn't silently ratchet segment permissions
+                        // back to 0o644 under the ambient umask — the
+                        // previous `File::create` recipe would land at
+                        // 0o644 on default-umask hosts and, because
+                        // `rename` preserves the tmp's mode, every
+                        // retention pass re-opened the confidentiality
+                        // gap the initial 0o600 append open closes.
+                        let mut tmp_options = fs::OpenOptions::new();
+                        tmp_options.write(true).create_new(true);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::OpenOptionsExt as _;
+                            tmp_options.mode(0o600);
+                        }
+                        let mut f = tmp_options.open(&tmp)?;
                         for line in &kept {
                             f.write_all(line.as_bytes())?;
                             f.write_all(b"\n")?;
@@ -657,7 +701,23 @@ impl EmbeddedBroker {
                             }
                             rewrite_atomic(&part.idempotency_path, &sidecar)?;
                         }
-                        part.writer = fs::OpenOptions::new().append(true).open(&part.path)?;
+                        // Segment reopen after retention rewrite. Use
+                        // O_NOFOLLOW so a co-tenant that raced the
+                        // rename window with a symlink plant cannot
+                        // hijack the next authenticated append (a
+                        // spool-plant confused-deputy). No create ⇒
+                        // 0o600 mode is decorative but preserved for
+                        // uniformity with the initial-open site.
+                        let mut reopen = fs::OpenOptions::new();
+                        reopen.append(true);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::OpenOptionsExt as _;
+                            reopen
+                                .custom_flags(av_core::fsutil::unix_o_nofollow())
+                                .mode(0o600);
+                        }
+                        part.writer = reopen.open(&part.path)?;
                         Ok(())
                     })();
                     if let Err(error) = post_rename {
@@ -728,7 +788,20 @@ fn write_cold_event_once(directory: &Path, event: &StoredEvent) -> Result<(), Bu
     let tmp = path.with_extension(format!("json.{}.tmp", av_core::new_event_uid()));
     let mut guard = av_core::fsutil::TempPathGuard::new(tmp.clone());
     {
-        let mut file = fs::File::create(&tmp)?;
+        // Explicit 0o600 mode — cold objects carry full `StoredEvent`
+        // records (same session-data class as the hot segment). The
+        // previous `File::create` recipe landed at 0o644 under the
+        // ambient umask; `rename` preserves the tmp's mode, so cold
+        // storage inherited world-readable posture without
+        // announcement.
+        let mut tmp_options = fs::OpenOptions::new();
+        tmp_options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            tmp_options.mode(0o600);
+        }
+        let mut file = tmp_options.open(&tmp)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
     }
@@ -766,7 +839,7 @@ fn write_referenced_schemas(
     for (reference, value) in resolved {
         let destination = data_dir.join(reference);
         if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
+            av_core::fsutil::create_dir_all_synced(parent)?;
         }
         // Fsync-safe atomic replace: a crash mid-`fs::write` (the old
         // shape) left torn JSON that made the `load_validators` disk
@@ -882,7 +955,20 @@ fn recover_segment(path: &Path) -> Result<(u64, u64), BusError> {
         // leaves either the torn or the truncated length, never an
         // empty/renamed-away segment, so the total-segment-loss hazard
         // the old comment guarded against cannot occur.
-        let file = fs::OpenOptions::new().write(true).open(path)?;
+        //
+        // O_NOFOLLOW: this reopens a path derived from a broker
+        // partition name; a pre-planted symlink at that path would
+        // otherwise let a co-tenant redirect the `set_len` +
+        // `sync_all` to an arbitrary file the daemon UID can touch
+        // (canonical confused-deputy).
+        let mut reopen = fs::OpenOptions::new();
+        reopen.write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            reopen.custom_flags(av_core::fsutil::unix_o_nofollow());
+        }
+        let file = reopen.open(path)?;
         file.set_len(complete_len)?;
         file.sync_all()?;
     }
@@ -912,6 +998,16 @@ fn recover_event_uids(path: &Path) -> Result<HashMap<String, u64>, BusError> {
     let mut valid_bytes: u64 = 0;
     let mut has_torn_tail = false;
     let mut logged_oversize_line = false;
+    // Sibling once-per-file guards for the parse-failure and
+    // duplicate-UID branches below. A crashed or hostile writer can
+    // leave sidecars with millions of mangled-JSON lines (up to
+    // hot-retention × events/partition, ≈ 1M per partition); without
+    // per-branch guards the recovery pass would emit one warn per
+    // corrupt line during the very restart it's diagnosing, bricking
+    // the log pipeline. Same discipline as `logged_oversize_line`
+    // above.
+    let mut logged_parse_failure = false;
+    let mut logged_duplicate_uid = false;
     // A single oversized-line hard cap: 4 KiB is 20x the fattest
     // sidecar record we produce. The reader is `take`-bounded to the
     // cap (+1 to detect overshoot) so a planted multi-GiB single line
@@ -1002,11 +1098,15 @@ fn recover_event_uids(path: &Path) -> Result<HashMap<String, u64>, BusError> {
             // an unreadable idempotency line at most costs a duplicate
             // ack for the same UID.
             Err(error) => {
-                tracing::warn!(
-                    %error,
-                    path = %av_core::fsutil::basename(path),
-                    "skipping unparseable event-uid sidecar record during recovery",
-                );
+                if !logged_parse_failure {
+                    tracing::warn!(
+                        %error,
+                        path = %av_core::fsutil::basename(path),
+                        "skipping unparseable event-uid sidecar record during recovery; \
+                         subsequent parse failures on this sidecar suppressed to avoid log storm"
+                    );
+                    logged_parse_failure = true;
+                }
                 continue;
             }
         };
@@ -1019,19 +1119,37 @@ fn recover_event_uids(path: &Path) -> Result<HashMap<String, u64>, BusError> {
                 // truth; log and let `recover_segment_event_uids` fix
                 // the mapping. Refusing to open the broker here would
                 // brick the whole tier over a benign inconsistency.
-                tracing::warn!(
-                    event_uid = %mapping.event_uid,
-                    prior_offset = existing,
-                    current_offset = mapping.offset,
-                    "sidecar has duplicate UID entry; segment offset will win after full recovery"
-                );
+                if !logged_duplicate_uid {
+                    tracing::warn!(
+                        event_uid = %mapping.event_uid,
+                        prior_offset = existing,
+                        current_offset = mapping.offset,
+                        path = %av_core::fsutil::basename(path),
+                        "sidecar has duplicate UID entry; segment offset will win after \
+                         full recovery. Subsequent duplicate-UID entries on this sidecar \
+                         suppressed to avoid log storm"
+                    );
+                    logged_duplicate_uid = true;
+                }
             }
         }
     }
     if has_torn_tail {
         // Truncate to the last complete line so future appends land
-        // cleanly (the on-disk record set is unchanged).
-        rewrite_atomic(path, &read_valid_prefix(path, valid_bytes).unwrap_or_default())?;
+        // cleanly (the on-disk record set is unchanged). A transient
+        // I/O error on `read_valid_prefix` (bit-rot, ENOENT race
+        // with a concurrent unlink between the earlier BufReader
+        // open and this reopen) must NOT collapse to an
+        // `unwrap_or_default()` empty Vec — that atomically renames
+        // a zero-byte file on top of the sidecar, permanently
+        // destroying every persisted `EventUidOffset` mapping under
+        // the guise of "torn-tail repair". Fail closed instead —
+        // the caller retries recovery on the next daemon boot with
+        // the sidecar bytes still intact. Same posture as
+        // `read_high_water` (line 1132), which explicitly refused
+        // its old "fail-open Ok(0)" for the identical rationale.
+        let valid_prefix = read_valid_prefix(path, valid_bytes).map_err(BusError::Io)?;
+        rewrite_atomic(path, &valid_prefix)?;
     }
     Ok(seen)
 }
@@ -1149,7 +1267,19 @@ fn persist_high_water(path: &Path, next_offset: u64) -> Result<(), BusError> {
     // on every publish; orphan tmp accumulation would be fastest here.
     let mut guard = av_core::fsutil::TempPathGuard::new(temporary.clone());
     {
-        let mut file = fs::File::create(&temporary)?;
+        // Explicit 0o600 mode — the watermark leaks throughput
+        // pattern (a next-offset u64), which is minor per-file but
+        // adds up over a busy broker. Cheap uniformity with the
+        // segment/sidecar posture; removes umask-dependence from
+        // the durability-critical control files.
+        let mut tmp_options = fs::OpenOptions::new();
+        tmp_options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            tmp_options.mode(0o600);
+        }
+        let mut file = tmp_options.open(&temporary)?;
         file.write_all(next_offset.to_string().as_bytes())?;
         file.sync_all()?;
     }
@@ -1304,11 +1434,20 @@ impl EmbeddedBroker {
             // loss cannot lose the whole sidecar (which would silently
             // convert future publish_idempotent calls into duplicate
             // appends).
-            let sidecar_created = !part.idempotency_path.exists();
-            let mut idempotency = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&part.idempotency_path)?;
+            let sidecar_created = std::fs::symlink_metadata(&part.idempotency_path).is_err();
+            // Same 0o600 + O_NOFOLLOW discipline the segment append
+            // gets — sidecar entries are (event_uid, offset) pairs,
+            // and event_uids are session-derived identifiers.
+            let mut sidecar_options = fs::OpenOptions::new();
+            sidecar_options.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                sidecar_options
+                    .custom_flags(av_core::fsutil::unix_o_nofollow())
+                    .mode(0o600);
+            }
+            let mut idempotency = sidecar_options.open(&part.idempotency_path)?;
             idempotency.write_all(mapping.as_bytes())?;
             idempotency.write_all(b"\n")?;
             idempotency.sync_data()?;
@@ -1347,6 +1486,44 @@ impl EventBus for EmbeddedBroker {
         event_uid: &str,
     ) -> Result<PublishAck, BusError> {
         self.publish_with_uid(topic, key, value, Some(event_uid))
+    }
+
+    /// O(1) event-UID lookup via the partition's in-memory
+    /// `seen_event_uids` map. The default trait impl at
+    /// `bus.rs::find_event_by_uid` linearly scans the segment from
+    /// offset 0 with `fetch`, which for `EmbeddedBroker` re-opens
+    /// the segment file each call and streams from the head with
+    /// a `BufReader` — so each fetch page for offset > 0 also walks
+    /// the whole prefix. `resolve_lifecycle_ack` in the harness
+    /// calls this on EVERY `emit_bridge_event` (twice per session
+    /// close — RECEIPT + SESSION_CLOSE), which meant close latency
+    /// grew O(total events per partition²) amortised. The Kafka
+    /// and NATS bus implementations both override with O(1) lookups;
+    /// only the embedded broker was still on the trait default.
+    fn find_event_by_uid(
+        &self,
+        topic: &str,
+        key: &str,
+        event_uid: &str,
+    ) -> Result<Option<PublishAck>, BusError> {
+        let parts = self
+            .partitions
+            .get(topic)
+            .ok_or_else(|| BusError::UnknownTopic(topic.to_owned()))?;
+        let partition = partition_for(key, u32::try_from(parts.len()).unwrap_or(u32::MAX));
+        let slot = parts
+            .get(partition as usize)
+            .ok_or_else(|| BusError::Backend(format!("partition {partition} out of range")))?;
+        let part = slot.lock();
+        Ok(part
+            .seen_event_uids
+            .get(event_uid)
+            .copied()
+            .map(|offset| PublishAck {
+                topic: topic.to_owned(),
+                partition,
+                offset,
+            }))
     }
 
     fn fetch(

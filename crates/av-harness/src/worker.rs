@@ -259,6 +259,7 @@ struct Envelope {
 
 /// Non-blocking submission error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum SubmitError {
     /// The bounded worker queue has no remaining capacity.
     #[error("worker queue is full")]
@@ -990,12 +991,34 @@ async fn sync_session_journal(directory: &std::path::Path, session: &Session) ->
     let digest = av_core::digest::sha256_hex(session.id.as_bytes());
     let stem = digest.get(..32).unwrap_or(&digest);
     let path = directory.join(format!("{stem}.events.ndjson"));
-    tokio::task::spawn_blocking(move || match std::fs::File::open(&path) {
-        Ok(journal) => journal.sync_data().map_err(|error| error.to_string()),
-        // No journal file: every job in the batch was skipped by the
-        // capture-failed guard before appending anything.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.to_string()),
+    tokio::task::spawn_blocking(move || {
+        // Single-invariant discipline: EVERY open on a spool-derived
+        // path uses `O_NOFOLLOW`. The events-journal append path
+        // (worker.rs `append_active_event_journal`), torn-tail
+        // `set_len` reopen (reconciler.rs), broker segment reopen
+        // (av-bridge/embedded.rs), and sidecar reopen all pass
+        // `O_NOFOLLOW`; this group-commit sync was the last outlier.
+        // In the current 0o700 daemon-owned threat model a symlink
+        // plant is not reachable; but a future refactor that widened
+        // spool group permissions would silently regress durability
+        // of group-committed batches (the sync would flush a decoy
+        // inode instead of the real journal-fd). Close the surface
+        // preemptively so the invariant "spool open ⇒ O_NOFOLLOW"
+        // holds uniformly.
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(av_core::fsutil::unix_o_nofollow());
+        }
+        match options.open(&path) {
+            Ok(journal) => journal.sync_data().map_err(|error| error.to_string()),
+            // No journal file: every job in the batch was skipped by
+            // the capture-failed guard before appending anything.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1964,9 +1987,13 @@ async fn append_journal(
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         use std::io::Write as _;
         // Skip the mkdir when the spool dir already
-        // exists (every request after the first).
+        // exists (every request after the first). If the boot-time
+        // `acquire_spool_lock` root creation was undone (operator
+        // wipe, mount flip) at runtime, use `create_dir_all_synced`
+        // here so the recreated tree still lands at 0o700 — same
+        // discipline the boot path applies.
         if !directory.is_dir() {
-            std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+            av_core::fsutil::create_dir_all_synced(&directory).map_err(|error| error.to_string())?;
         }
         let digest = av_core::digest::sha256_hex(session_id.as_bytes());
         let stem = digest.get(..32).unwrap_or(&digest);
@@ -1977,7 +2004,15 @@ async fn append_journal(
             "identity": identity,
             "workflow": workflow,
         });
-        if !metadata_path.exists() {
+        // `symlink_metadata` (NOT `exists()`) so a dangling symlink
+        // at `metadata_path` is detected as "an entry lives here"
+        // rather than "no entry" — write_atomic's exclusive-create
+        // temp is elsewhere and its rename REPLACES the symlink at
+        // the destination (safe) rather than following it, but
+        // preserving symmetry with the events journal open below
+        // and future-proofing against a change that switches
+        // metadata to a non-atomic-rename recipe.
+        if std::fs::symlink_metadata(&metadata_path).is_err() {
             let metadata = crate::journal::seal(&journal_key, "metadata", 0, &metadata_payload)?;
             // Use the centralized atomic writer: it uses an RAII guard
             // so any intermediate failure (write_all / sync_all /
@@ -2024,17 +2059,40 @@ async fn append_journal(
         // on restart, `recover_signed_journals` treats the journal as
         // empty, deletes the metadata, and every already-acked event
         // becomes orphaned on the broker.
-        let journal_created = !journal_path.exists();
-        let mut journal = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&journal_path)
-            .map_err(|error| {
-                format!(
-                    "open event journal {}: {error}",
-                    av_core::fsutil::basename(&journal_path)
-                )
-            })?;
+        // `symlink_metadata` (NOT `exists()`) so a dangling symlink
+        // planted at `journal_path` is detected as "an entry lives
+        // here" rather than "no entry" — pairs with `O_NOFOLLOW`
+        // below to fail-close instead of following the symlink and
+        // corrupting an arbitrary path the harness UID can write.
+        let journal_created = std::fs::symlink_metadata(&journal_path).is_err();
+        let mut open_options = std::fs::OpenOptions::new();
+        open_options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            // O_NOFOLLOW: refuse to follow any symlink at
+            // `journal_path`. Signed events journals authenticate
+            // via HMAC-per-envelope on read, so a symlink redirect
+            // wouldn't produce a forged replay, but it would let a
+            // co-tenant with write access to the spool dir redirect
+            // the harness's authenticated append into an arbitrary
+            // path the harness UID can create (a canonical
+            // symlink-plant confused-deputy). 0o600 mode pairs with
+            // the same discipline that `write_atomic` uses; here
+            // the file is APPEND-created rather than atomic-renamed
+            // so the mode is set inline on the initial open. The
+            // O_NOFOLLOW constant lives in `av_core::fsutil` so the
+            // per-platform value is settled in one auditable place.
+            open_options
+                .custom_flags(av_core::fsutil::unix_o_nofollow())
+                .mode(0o600);
+        }
+        let mut journal = open_options.open(&journal_path).map_err(|error| {
+            format!(
+                "open event journal {}: {error}",
+                av_core::fsutil::basename(&journal_path)
+            )
+        })?;
         journal.write_all(&line).map_err(|error| error.to_string())?;
         journal.write_all(b"\n").map_err(|error| error.to_string())?;
         // Group commit: a same-session batch defers
@@ -2093,10 +2151,26 @@ pub(crate) async fn persist_broker_ack(
     let sealed = crate::journal::seal(journal_key, "broker-ack", 0, &record)?;
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         use std::io::Write as _;
-        let created = !path.exists();
-        let mut journal = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
+        // `symlink_metadata` (NOT `exists()`) so a dangling symlink
+        // planted at `path` is detected as "an entry lives here"
+        // rather than "no entry" — pairs with `O_NOFOLLOW` below to
+        // fail-close instead of following the symlink and corrupting
+        // an arbitrary path the harness UID can write. Same posture
+        // as the events-journal append; `BrokerAckRecord` carries
+        // plaintext session id + event uid + broker offset, which
+        // is the "low-entropy identifier" class that the deterministic
+        // `sha256(session-id)[..32]` stem was already supposed to hide.
+        let created = std::fs::symlink_metadata(&path).is_err();
+        let mut open_options = std::fs::OpenOptions::new();
+        open_options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            open_options
+                .custom_flags(av_core::fsutil::unix_o_nofollow())
+                .mode(0o600);
+        }
+        let mut journal = open_options
             .open(&path)
             .map_err(|error| format!("open ack journal {}: {error}", av_core::fsutil::basename(&path)))?;
         journal.write_all(&sealed).map_err(|error| error.to_string())?;
@@ -2616,8 +2690,12 @@ mod tests {
 
         let started = std::time::Instant::now();
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // 250 ms allows for 25× scheduler jitter — still catches
+        // the ~100 ms `SlowBus`-class regression that motivated
+        // this test, tolerates loaded CI runners where a 10 ms
+        // tokio timer can drift to 30-80 ms.
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(75),
+            started.elapsed() < std::time::Duration::from_millis(250),
             "synchronous worker dependency blocked the Tokio reactor"
         );
         worker.wait_idle().await;

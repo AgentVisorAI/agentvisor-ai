@@ -96,13 +96,19 @@ pub struct HarnessConfig {
     /// drain begins, so an external load balancer polling `/readyz`
     /// can stop routing before the listener closes. Without it the
     /// listener stops accepting the instant the signal lands and a
-    /// fresh readiness probe sees connection-refused, never the 503 —
-    /// fine on Kubernetes (the preStop sleep provides this window
-    /// before SIGTERM), but docker-compose / systemd / bare-LB
-    /// deployments have no preStop equivalent. Set it to your LB's
-    /// readiness poll interval plus one reconciliation. Counts against
-    /// the orchestrator's kill grace period ON TOP of the drain
-    /// budget.
+    /// fresh readiness probe sees connection-refused, never the 503.
+    /// Set it to your LB's readiness poll interval plus one
+    /// reconciliation. Counts against the orchestrator's kill grace
+    /// period ON TOP of the drain budget.
+    ///
+    /// Kubernetes note: a preStop `sleep` hook can theoretically
+    /// provide the same window BEFORE SIGTERM lands, but only if
+    /// the runtime image contains a shell + `sleep`. The shipped
+    /// manifest at `deploy/kubernetes/agentvisor-ai.yaml` uses a
+    /// distroless base (chainguard/glibc-dynamic) that has neither,
+    /// so it sets this key instead and omits the preStop hook.
+    /// Bare-VM, systemd, and docker-compose deployments also need
+    /// this key because they have no preStop equivalent at all.
     #[serde(default)]
     pub shutdown_ready_drain_s: u64,
     /// Chat-completions path appended to `upstream_url`. Override for
@@ -1125,6 +1131,22 @@ impl HarnessConfig {
                     .into(),
             );
         }
+        // `atif_retention_days = Some(0)` would deploy a daemon whose
+        // hourly sweep computes `max_age = Duration::ZERO`; the sweep
+        // predicate is `age < max_age`, which is false for every sealed
+        // pair, so every sealed `<stem>.json` + `.atif-auth` +
+        // `.close-complete` triple is deleted on the first tick — total
+        // loss of the pre-signing evidence chain. `None` (the ship
+        // default) disables retention; the CLI `avctl spool-prune
+        // --retention-days 0` path is a separate, one-off decommission
+        // command and is intentionally not gated here.
+        if self.atif_retention_days == Some(0) {
+            errors.push(
+                "atif_retention_days = 0 would delete every sealed ATIF pair on the first hourly sweep; \
+                 omit the field to disable retention, or set >= 1 to enable an N-day window"
+                    .into(),
+            );
+        }
         if self.upstream_url.is_empty() {
             errors.push("upstream_url is required".into());
         }
@@ -2072,6 +2094,21 @@ mod tests {
         cfg = base();
         cfg.session_idle_close_s = 0;
         assert!(cfg.validate().unwrap_err().contains("session_idle_close_s"));
+
+        // `atif_retention_days = Some(0)` would nuke every sealed pair
+        // on the first hourly sweep (max_age = 0 → `age < 0` false for
+        // all mtimes → all pruned). Validate must reject it; `None`
+        // (disable) and `Some(1)`+ (real windows) stay legal.
+        cfg = base();
+        cfg.atif_retention_days = Some(0);
+        assert!(
+            cfg.validate().unwrap_err().contains("atif_retention_days = 0"),
+            "atif_retention_days = 0 should be rejected"
+        );
+        cfg.atif_retention_days = None;
+        cfg.validate().unwrap();
+        cfg.atif_retention_days = Some(1);
+        cfg.validate().unwrap();
 
         cfg = base();
         cfg.breaker.window = 0;

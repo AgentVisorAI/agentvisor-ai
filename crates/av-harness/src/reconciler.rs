@@ -21,6 +21,100 @@ use std::time::Instant;
 /// recovery to OOM.
 const MAX_ATIF_RECOVERY_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Maximum number of directory entries any single recovery-pass call
+/// is allowed to examine before yielding.
+///
+/// Every recovery pass walks a spool directory with
+/// `read_dir(...).next_entry().await` and does at least one stat
+/// (`.exists()`, `.metadata()`, or `symlink_metadata()`) per entry.
+/// A poisoned spool populated with millions of entries (an operator
+/// mount error, a hostile co-tenant with write access to the spool
+/// pre-R18 was the concern; even post-R18 an operator debug session
+/// leaving a stress-test spool is realistic) would let ONE pass burn
+/// tens of seconds every tick — starving `retry_marked_promotions`,
+/// `complete_pending_closes`, `idle_sessions` sweep, and outbox
+/// replay for LEGITIMATE sessions. The 10_000-per-tick cap is a
+/// conservative floor (`ls -1U | wc -l` on a healthy spool is
+/// steady-state under 500, and the reconciler ticks every ~250 ms,
+/// so 10_000 covers a 40× burst without needing multi-tick catchup).
+///
+/// When the cap fires the pass increments
+/// `av_recovery_scan_capped_total{pass=…}` and returns cleanly;
+/// `entries` is not durable across ticks so the next tick re-opens
+/// `read_dir` and resumes (directory iteration order is
+/// filesystem-defined, so a stable order across ticks is not
+/// promised — the invariant is only that every entry present on
+/// disk is EVENTUALLY visited across enough ticks).
+/// Real-work cap: after this many entries have PASSED the pass's
+/// extension filter (i.e., are candidates for the pass's actual
+/// work), stop and resume on the next tick. Prevents ONE pass from
+/// burning all reconciler-tick budget on a single legitimate burst.
+pub(crate) const MAX_RECOVERY_ENTRIES_PER_TICK: usize = 10_000;
+
+/// Wall-time cap: after this many TOTAL directory entries have been
+/// visited (regardless of extension), stop even if the real-work
+/// cap hasn't fired. Bounds the wall-clock cost of a single tick
+/// when the spool is packed with wrong-extension entries (attacker-
+/// planted `.junk`, orphaned `.close-complete` markers under the
+/// default `atif_retention_days = None` posture, etc.) that no
+/// pass will remove. Without this second cap, an attacker who
+/// plants a million wrong-extension entries starves the pass's
+/// wall-clock budget on every tick even though the "real work" cap
+/// never fires — the tick still burns 1-3 seconds walking dirents,
+/// which knocks the sibling passes off their tick schedule.
+///
+/// The 10× ratio to `MAX_RECOVERY_ENTRIES_PER_TICK` matches
+/// observed dirent-read throughput on modern kernels (~100k-1M
+/// entries/second on ext4/xfs/tmpfs); 100 000 dirents = 100 ms
+/// upper bound on unloaded hardware.
+///
+/// Note: this cap does NOT close the persistent-cursor gap. On a
+/// filesystem with deterministic `readdir` ordering (ext4, xfs,
+/// tmpfs), a spool where the first `MAX_RECOVERY_DIRENTS_PER_TICK`
+/// entries are all wrong-extension junk that no pass will remove
+/// leaves legitimate files at position > cap PERMANENTLY
+/// unreachable. The operator-facing mitigation is documented in
+/// OPERATIONS.md: a sustained rate on
+/// `av_recovery_scan_capped_total` requires an operator to
+/// quarantine the offending files. A future audit round can add
+/// a persistent scan cursor if this class becomes exploitable in
+/// practice.
+pub(crate) const MAX_RECOVERY_DIRENTS_PER_TICK: usize = 100_000;
+
+/// Emit the per-tick scan-cap counter for `pass_label` and log a
+/// single warn line so operators can observe the class from
+/// `/metrics` and correlate with a coincident tracing incident.
+///
+/// The counter is pre-registered eagerly in the pipeline's
+/// pre-registration block (same discipline as the panic-supervision
+/// counters — a lazy `rate(av_recovery_scan_capped_total) > 0` alert
+/// cannot distinguish "never fired" from "never registered", so the
+/// FIRST fire that the guardrail exists to catch would slip past).
+pub(crate) fn bump_recovery_scan_cap(
+    metrics: &Registry,
+    pass_label: &'static str,
+    examined: usize,
+    dirents_seen: usize,
+) {
+    metrics
+        .counter(
+            &format!("av_recovery_scan_capped_total{{pass=\"{pass_label}\"}}"),
+            "Recovery pass hit the per-tick entry-scan cap and returned early; \
+             the next tick will re-open the directory and resume. A steady rate \
+             > 0 indicates a poisoned spool (millions of stale files) that will \
+             starve legitimate recovery work until an operator quarantines it.",
+        )
+        .inc();
+    tracing::warn!(
+        pass = %pass_label,
+        examined,
+        dirents_seen,
+        work_cap = MAX_RECOVERY_ENTRIES_PER_TICK,
+        dirent_cap = MAX_RECOVERY_DIRENTS_PER_TICK,
+        "recovery pass hit per-tick scan cap; resuming next tick"
+    );
+}
+
 /// Result of closing a session.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -177,6 +271,45 @@ impl FinalizeError {
             source: Some(Box::new(error)),
         }
     }
+
+    /// True iff this error is caused by a transient I/O condition
+    /// (spool disk full, read-only filesystem, spool storage
+    /// temporarily unreachable). The response layer maps these to
+    /// `503 Service Unavailable` + `Retry-After` rather than the
+    /// default `500 Internal Server Error`, matching the
+    /// `/readyz` probe policy that already treats ENOSPC/EROFS as
+    /// transient. Same permanence-split discipline as
+    /// `Bridge` vs `BridgeConfig`.
+    ///
+    /// Walks the `source` chain via `std::error::Error::source` so
+    /// an `av_atif::WriteError { source: io::Error }` or an
+    /// `av_receipts::SignError { source: io::Error }` are both
+    /// detected regardless of how deep the wrap is.
+    pub fn is_transient_io(&self) -> bool {
+        let root = match self {
+            Self::Atif { source: Some(s), .. } | Self::Receipt { source: Some(s), .. } => &**s,
+            _ => return false,
+        };
+        let mut current: &dyn std::error::Error = root;
+        loop {
+            if let Some(io) = current.downcast_ref::<std::io::Error>() {
+                return matches!(
+                    io.kind(),
+                    std::io::ErrorKind::StorageFull
+                        | std::io::ErrorKind::ReadOnlyFilesystem
+                        | std::io::ErrorKind::QuotaExceeded
+                        | std::io::ErrorKind::ResourceBusy
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::TimedOut
+                );
+            }
+            match current.source() {
+                Some(next) => current = next,
+                None => return false,
+            }
+        }
+    }
 }
 
 impl From<av_bridge::BusError> for FinalizeError {
@@ -222,7 +355,7 @@ pub struct Finalizer {
     /// client close behind a long recovery scan or an idle sweep of
     /// thousands of sessions.
     lifecycle_locks: Arc<SessionLockTable>,
-    quarantined_sessions: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    quarantined_sessions: Arc<parking_lot::Mutex<QuarantinedSessions>>,
     /// Artifacts already warned about during recovery scans, so a corrupt
     /// file left on disk as evidence does not repeat its warning every tick.
     /// Bounded by `warn_once` via FIFO
@@ -298,6 +431,76 @@ impl WarnedArtifacts {
 /// together every tick.
 const WARNED_ARTIFACTS_CAP: usize = 4096;
 
+/// Cap on `quarantined_sessions` — same rationale and FIFO
+/// discipline as `warned_artifacts`. `quarantined_sessions` was
+/// previously an unbounded `HashSet<String>` justified by comment as
+/// "bounded by real crash events", but the code enforced no cap and
+/// its sibling collection `warned_artifacts` in the same struct DID
+/// have an explicit cap. Persistent quarantine markers on disk plus
+/// the recovery scan (`recover_signed_sessions`,
+/// `recover_spooled_sessions`) that re-inserts on every restart
+/// meant the set could grow indefinitely across a long-lived
+/// process's lifetime — one `String` id per quarantine, paired with
+/// an `Arc<Session>` retained by `SessionRegistry` (see the coupled
+/// cap in `SessionRegistry::evict_finalized`). On insert-past-cap,
+/// ONE oldest id evicts (FIFO); the eviction is safe because the
+/// on-disk quarantine artifact is what fundamentally gates
+/// resurrection — the in-memory set is only a lookup accelerator.
+/// A subsequent recovery pass restores an evicted id if the
+/// artifact still lives on disk.
+pub(crate) const MAX_QUARANTINED_SESSIONS: usize = 4096;
+
+/// FIFO-evicting id-set used by the finalizer to track sessions
+/// whose recovery-time inconsistent-effects verdict quarantined
+/// them (unresolved tool marker, inflight-response marker, receipt
+/// verification failure). Same shape as [`WarnedArtifacts`] — FIFO
+/// rather than clear-on-overflow so a rotating-id attacker cannot
+/// force every legitimate quarantine to "un-quarantine" together on
+/// the same tick.
+pub(crate) struct QuarantinedSessions {
+    order: std::collections::VecDeque<String>,
+    set: std::collections::HashSet<String>,
+    cap: usize,
+}
+
+impl QuarantinedSessions {
+    pub(crate) fn new(cap: usize) -> Self {
+        // Clamp `cap` to a minimum of 1 for the same reason as
+        // `WarnedArtifacts::new` — `cap: 0` would oscillate the set
+        // at size 1 and silently break the quarantine-persistence
+        // contract for any working set above 1.
+        let cap = cap.max(1);
+        Self {
+            order: std::collections::VecDeque::new(),
+            set: std::collections::HashSet::new(),
+            cap,
+        }
+    }
+
+    pub(crate) fn insert(&mut self, id: String) -> bool {
+        if self.set.contains(&id) {
+            return false;
+        }
+        if self.order.len() >= self.cap {
+            if let Some(evicted) = self.order.pop_front() {
+                self.set.remove(&evicted);
+            }
+        }
+        self.order.push_back(id.clone());
+        self.set.insert(id);
+        true
+    }
+
+    pub(crate) fn contains(&self, id: &str) -> bool {
+        self.set.contains(id)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+}
+
 /// Per-session lifecycle mutex table.
 ///
 /// Invariants:
@@ -363,8 +566,23 @@ struct CloseClaim<'a> {
     committed: bool,
 }
 
+/// Schema-version discriminator for lifecycle outbox payloads. New
+/// on-disk records write this version; older files that lack the
+/// field decode via `#[serde(default)]` as `LIFECYCLE_OUTBOX_SCHEMA_V1`,
+/// keeping cross-upgrade reads correct. A future release adding a
+/// required payload field can gate the read arm on this version and
+/// migrate v1 records explicitly rather than failing MAC-verified
+/// decodes with an ambiguous serde error.
+const LIFECYCLE_OUTBOX_SCHEMA_V1: u16 = 1;
+
+fn lifecycle_outbox_schema_v1() -> u16 {
+    LIFECYCLE_OUTBOX_SCHEMA_V1
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct LifecycleOutbox {
+    #[serde(default = "lifecycle_outbox_schema_v1")]
+    schema_version: u16,
     session_id: String,
     kind: String,
     topic: String,
@@ -467,7 +685,9 @@ impl Finalizer {
             state_store: None,
             recovery_lock: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle_locks: Arc::new(SessionLockTable::default()),
-            quarantined_sessions: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            quarantined_sessions: Arc::new(parking_lot::Mutex::new(QuarantinedSessions::new(
+                MAX_QUARANTINED_SESSIONS,
+            ))),
             warned_artifacts: Arc::new(parking_lot::Mutex::new(WarnedArtifacts::new(
                 WARNED_ARTIFACTS_CAP,
             ))),
@@ -492,7 +712,9 @@ impl Finalizer {
             state_store: None,
             recovery_lock: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle_locks: Arc::new(SessionLockTable::default()),
-            quarantined_sessions: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            quarantined_sessions: Arc::new(parking_lot::Mutex::new(QuarantinedSessions::new(
+                MAX_QUARANTINED_SESSIONS,
+            ))),
             warned_artifacts: Arc::new(parking_lot::Mutex::new(WarnedArtifacts::new(
                 WARNED_ARTIFACTS_CAP,
             ))),
@@ -1376,7 +1598,14 @@ impl Finalizer {
             })
             .collect();
         let mut recovered = 0usize;
+        let mut examined = 0usize;
+        let mut dirents_seen = 0usize;
         while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::atif_source)? {
+            dirents_seen = dirents_seen.saturating_add(1);
+            if dirents_seen > MAX_RECOVERY_DIRENTS_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "adopt_strict_atif", examined, dirents_seen);
+                break;
+            }
             let path = entry.path();
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
                 continue;
@@ -1391,6 +1620,15 @@ impl Finalizer {
                 .is_some_and(|name| name.ends_with(".session.json"))
             {
                 continue;
+            }
+            // Real-work cap: count only entries that made it past the
+            // extension + `.session.json` filter, so wrong-extension
+            // junk cannot consume the pass's real-work budget for
+            // this tick.
+            examined = examined.saturating_add(1);
+            if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "adopt_strict_atif", examined, dirents_seen);
+                break;
             }
             // The session is already in the
             // registry — adoption would skip it after an expensive
@@ -1900,7 +2138,14 @@ impl Finalizer {
             Err(error) => return Err(FinalizeError::atif_source(error)),
         };
         let mut recovered = 0usize;
+        let mut examined = 0usize;
+        let mut dirents_seen = 0usize;
         while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::atif_source)? {
+            dirents_seen = dirents_seen.saturating_add(1);
+            if dirents_seen > MAX_RECOVERY_DIRENTS_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "recover_signed_journals", examined, dirents_seen);
+                break;
+            }
             let metadata_path = entry.path();
             let Some(name) = metadata_path.file_name().and_then(std::ffi::OsStr::to_str) else {
                 continue;
@@ -1908,6 +2153,11 @@ impl Finalizer {
             let Some(stem) = name.strip_suffix(".session.json") else {
                 continue;
             };
+            examined = examined.saturating_add(1);
+            if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "recover_signed_journals", examined, dirents_seen);
+                break;
+            }
             // per-candidate body wrapped in an inner
             // async block so every `?` and `return Err(...)` inside
             // gets caught by the outer match instead of propagating
@@ -2330,7 +2580,14 @@ impl Finalizer {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(FinalizeError::atif_source(error)),
         };
+        let mut examined = 0usize;
+        let mut dirents_seen = 0usize;
         while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::atif_source)? {
+            dirents_seen = dirents_seen.saturating_add(1);
+            if dirents_seen > MAX_RECOVERY_DIRENTS_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "consolidate_step_journals", examined, dirents_seen);
+                break;
+            }
             let metadata_path = entry.path();
             let Some(name) = metadata_path.file_name().and_then(std::ffi::OsStr::to_str) else {
                 continue;
@@ -2338,6 +2595,11 @@ impl Finalizer {
             let Some(stem) = name.strip_suffix(".session.json") else {
                 continue;
             };
+            examined = examined.saturating_add(1);
+            if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "consolidate_step_journals", examined, dirents_seen);
+                break;
+            }
             // Twin of the recover_signed_journals fix:
             // wrap the per-candidate body so per-session errors
             // warn+continue instead of aborting the whole
@@ -3041,10 +3303,22 @@ impl Finalizer {
             Err(error) => return Err(FinalizeError::atif_source(error)),
         };
         let mut promoted = 0usize;
+        let mut examined = 0usize;
+        let mut dirents_seen = 0usize;
         while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::atif_source)? {
+            dirents_seen = dirents_seen.saturating_add(1);
+            if dirents_seen > MAX_RECOVERY_DIRENTS_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "retry_marked_promotions", examined, dirents_seen);
+                break;
+            }
             let path = entry.path();
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("promote") {
                 continue;
+            }
+            examined = examined.saturating_add(1);
+            if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "retry_marked_promotions", examined, dirents_seen);
+                break;
             }
             // Previously any read failure or MAC-verify
             // failure aborted the entire retry pass via `?`. One
@@ -3282,6 +3556,7 @@ impl Finalizer {
             return Ok(());
         };
         let path = self.lifecycle_outbox_path(&session.id, kind);
+        let current_instance_uid = session.current_identity().instance_uid;
         let mut outbox = if path.exists() {
             let sealed = read_capped_async(path.clone(), av_core::fsutil::MAX_CONTROL_BYTES)
                 .await
@@ -3298,23 +3573,60 @@ impl Finalizer {
                     "lifecycle outbox does not match its session and kind".to_owned(),
                 ));
             }
-            // A crash between a prior successful emit and a subsequent one loses the
-            // in-memory seq advance for this outbox — recovery only restores seq from
-            // the journal length. Fast-forward past the persisted seq so a following
-            // lifecycle event (e.g., SESSION_CLOSE after a persisted RECEIPT_OUTBOX)
-            // cannot land on the same metadata.sequence value.
-            if let Some(persisted_seq) = outbox
-                .value
-                .get("metadata")
-                .and_then(|metadata| metadata.get("sequence"))
-                .and_then(serde_json::Value::as_u64)
-            {
-                if session.peek_seq() <= persisted_seq {
-                    session.advance_seq_past(persisted_seq);
+            // Recycled-id / stale-orphan guard: `outbox.key` is set at
+            // emit time to the session's `instance_uid` (see the fresh-
+            // emit branch below). If we encounter an outbox for
+            // `(session_id, kind)` whose recorded instance_uid does not
+            // match the CURRENT session's instance_uid, this file is a
+            // leftover from a PREVIOUS incarnation of a recycled
+            // session id (e.g., a race between `remove_lifecycle_outbox`
+            // during close and `replay_lifecycle_outboxes_in`
+            // re-persisting an acked copy after the unlink; the new
+            // incarnation opens under the same id but a fresh
+            // `instance_uid`). Under `outbox.ack.is_some()` the current
+            // code would silently return `Ok(())` without publishing,
+            // dropping the new incarnation's authoritative lifecycle
+            // event from the audit stream. Detect the mismatch, delete
+            // the stale file, and fall through to the fresh-emit path.
+            //
+            // The retention retention-rule at
+            // `remove_acked_lifecycle_outboxes` also RETAINS acked
+            // outboxes while their session is still registered and
+            // not close-complete — during a recycled-id window that
+            // means the leftover survives GC until the fresh close
+            // hits this branch.
+            if outbox.key != current_instance_uid {
+                remove_outbox(&path).await?;
+                // Fresh emit: fall through by returning to the outer
+                // async block via a boolean sentinel. Rust's `if let`
+                // doesn't allow re-entering the else arm from the
+                // if body, so structure the state via `None` and let
+                // the branch below take over.
+                None
+            } else {
+                // A crash between a prior successful emit and a subsequent one loses the
+                // in-memory seq advance for this outbox — recovery only restores seq from
+                // the journal length. Fast-forward past the persisted seq so a following
+                // lifecycle event (e.g., SESSION_CLOSE after a persisted RECEIPT_OUTBOX)
+                // cannot land on the same metadata.sequence value.
+                if let Some(persisted_seq) = outbox
+                    .value
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get("sequence"))
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    if session.peek_seq() <= persisted_seq {
+                        session.advance_seq_past(persisted_seq);
+                    }
                 }
+                Some(outbox)
             }
-            outbox
         } else {
+            None
+        };
+        // Fresh-emit branch (either no existing outbox, or the
+        // existing one was a recycled-id orphan we just deleted).
+        if outbox.is_none() {
             // Peek the seq without consuming it; a failed persist_outbox
             // below would otherwise burn a seq that recovery expects to see
             // at a later journal position, breaking the position-vs-seq
@@ -3329,17 +3641,28 @@ impl Finalizer {
             .payload(payload)
             .build()
             .map_err(FinalizeError::bridge_source)?;
-            let outbox = LifecycleOutbox {
+            let fresh = LifecycleOutbox {
+                schema_version: LIFECYCLE_OUTBOX_SCHEMA_V1,
                 session_id: session.id.clone(),
                 kind: kind.to_owned(),
                 topic: class.topic().to_owned(),
-                key: session.current_identity().instance_uid,
+                key: current_instance_uid.clone(),
                 value: serde_json::to_value(event).map_err(FinalizeError::bridge_source)?,
                 ack: None,
             };
-            persist_outbox(&path, &outbox, &self.journal_key).await?;
+            persist_outbox(&path, &fresh, &self.journal_key).await?;
             session.advance_seq_past(event_seq);
-            outbox
+            outbox = Some(fresh);
+        }
+        // `outbox` is Some at this point: the `if outbox.is_none()`
+        // arm above unconditionally set it. Use pattern rather than
+        // `.expect` to keep clippy's expect-used lint happy in
+        // production (Debug printing an internal invariant break
+        // isn't more informative than an early return here anyway).
+        let Some(mut outbox) = outbox else {
+            return Err(FinalizeError::bridge(
+                "internal invariant: emit_bridge_event fresh-emit branch left outbox unset".to_owned(),
+            ));
         };
         if outbox.ack.is_some() {
             return Ok(());
@@ -3421,7 +3744,7 @@ impl Finalizer {
         let Some(bridge) = self.bridge.as_ref().map(Arc::clone) else {
             return Ok(0);
         };
-        replay_lifecycle_outboxes_in(&self.spool_dir, &self.journal_key, bridge).await
+        replay_lifecycle_outboxes_in(&self.spool_dir, &self.journal_key, bridge, &self.metrics).await
     }
 
     /// Complete the finalization tail for sessions
@@ -3595,13 +3918,48 @@ impl Finalizer {
         let directory = self.spool_dir.join(crate::spool::OUTBOX);
         let mut entries = match tokio::fs::read_dir(&directory).await {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Directory absent = 0 pending outboxes. Publish the
+                // observation gauge so `absent(av_lifecycle_outbox_
+                // pending)` alerts don't false-fire on a freshly
+                // booted node with no bridge activity yet.
+                self.metrics
+                    .gauge(
+                        "av_lifecycle_outbox_pending",
+                        "Count of unacked lifecycle outbox files (RECEIPT + \
+                         SESSION_CLOSE) sitting in the spool at the last \
+                         reconciler tick. Steady-state 0 on a healthy node \
+                         (each outbox is emitted, published, acked, and \
+                         removed within one close). A rising baseline \
+                         indicates the bridge is unreachable or slow — \
+                         outboxes persist across restarts, so growth is \
+                         disk-bounded rather than memory-bounded, but a \
+                         sustained rise is the earliest signal of a broker \
+                         outage before its downstream effects (disk fill, \
+                         `av_reconcile_errors_total`) fire.",
+                    )
+                    .set(0);
+                return Ok(());
+            }
             Err(error) => return Err(FinalizeError::bridge_source(error)),
         };
+        let mut examined = 0usize;
+        let mut dirents_seen = 0usize;
+        let mut pending_count: u64 = 0;
         while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::bridge_source)? {
+            dirents_seen = dirents_seen.saturating_add(1);
+            if dirents_seen > MAX_RECOVERY_DIRENTS_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "remove_acked_outboxes", examined, dirents_seen);
+                break;
+            }
             let path = entry.path();
             if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
                 continue;
+            }
+            examined = examined.saturating_add(1);
+            if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
+                bump_recovery_scan_cap(&self.metrics, "remove_acked_outboxes", examined, dirents_seen);
+                break;
             }
             let sealed = match read_capped_async(path.clone(), av_core::fsutil::MAX_CONTROL_BYTES).await {
                 Ok(bytes) => bytes,
@@ -3674,8 +4032,29 @@ impl Finalizer {
                     }
                 }
                 remove_outbox(&path).await?;
+            } else {
+                // Unacked outbox: the bridge hasn't confirmed publication yet.
+                // Bump the pending-count observation so operators can see
+                // the backlog grow if the bridge is unreachable.
+                pending_count = pending_count.saturating_add(1);
             }
         }
+        self.metrics
+            .gauge(
+                "av_lifecycle_outbox_pending",
+                "Count of unacked lifecycle outbox files (RECEIPT + \
+                 SESSION_CLOSE) sitting in the spool at the last \
+                 reconciler tick. Steady-state 0 on a healthy node \
+                 (each outbox is emitted, published, acked, and \
+                 removed within one close). A rising baseline \
+                 indicates the bridge is unreachable or slow — \
+                 outboxes persist across restarts, so growth is \
+                 disk-bounded rather than memory-bounded, but a \
+                 sustained rise is the earliest signal of a broker \
+                 outage before its downstream effects (disk fill, \
+                 `av_reconcile_errors_total`) fire.",
+            )
+            .set(pending_count);
         Ok(())
     }
 
@@ -3938,6 +4317,7 @@ pub(crate) async fn replay_lifecycle_outboxes_in(
     spool_dir: &std::path::Path,
     journal_key: &[u8; 32],
     bridge: Arc<dyn EventBus>,
+    metrics: &Registry,
 ) -> Result<usize, FinalizeError> {
     let directory = spool_dir.join(crate::spool::OUTBOX);
     let mut entries = match tokio::fs::read_dir(&directory).await {
@@ -3946,10 +4326,22 @@ pub(crate) async fn replay_lifecycle_outboxes_in(
         Err(error) => return Err(FinalizeError::bridge_source(error)),
     };
     let mut replayed = 0usize;
+    let mut examined = 0usize;
+    let mut dirents_seen = 0usize;
     while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::bridge_source)? {
+        dirents_seen = dirents_seen.saturating_add(1);
+        if dirents_seen > MAX_RECOVERY_DIRENTS_PER_TICK {
+            bump_recovery_scan_cap(metrics, "replay_lifecycle_outboxes", examined, dirents_seen);
+            break;
+        }
         let path = entry.path();
         if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
             continue;
+        }
+        examined = examined.saturating_add(1);
+        if examined > MAX_RECOVERY_ENTRIES_PER_TICK {
+            bump_recovery_scan_cap(metrics, "replay_lifecycle_outboxes", examined, dirents_seen);
+            break;
         }
         let sealed = match read_capped_async(path.clone(), av_core::fsutil::MAX_CONTROL_BYTES).await {
             Ok(bytes) => bytes,
@@ -4187,11 +4579,52 @@ pub fn spawn_reconciler(
                 }
                 for session in idle.into_iter().take(MAX_IDLE_CLOSES_PER_TICK) {
                     let session_id = session.id.clone();
-                    if let Err(error) = finalizer.close_session(session, StopReason::SessionClosed).await {
-                        tracing::warn!(session = %session_id, error = &error as &dyn std::error::Error, "idle session finalization failed");
-                        metrics
-                            .counter("av_reconcile_errors_total", "Reconciliation errors")
-                            .inc();
+                    // Bound the per-session close so ONE stuck session
+                    // (a slow-but-alive upstream keeping a stream lease,
+                    // a worker awaiting a Redis reply, a bridge publish
+                    // that never returns) cannot freeze the whole tick.
+                    // `close_session_locked` internally calls
+                    // `wait_for_streams` / `wait_for_worker_jobs` which
+                    // are unbounded loops — the reconciler idle-close
+                    // batch runs serially, so at 64 sessions × the
+                    // upstream_read_timeout (default 60 s), one poisoned
+                    // batch used to be able to stall the reconciler for
+                    // ~64 min. The deadline is generous (90 s) so a
+                    // legitimate long-tail close doesn't false-timeout;
+                    // sessions that time out here return to `idle` on
+                    // the next tick and get another chance.
+                    const IDLE_CLOSE_DEADLINE: std::time::Duration =
+                        std::time::Duration::from_secs(90);
+                    let outcome = tokio::time::timeout(
+                        IDLE_CLOSE_DEADLINE,
+                        finalizer.close_session(session, StopReason::SessionClosed),
+                    )
+                    .await;
+                    match outcome {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(session = %session_id, error = &error as &dyn std::error::Error, "idle session finalization failed");
+                            metrics
+                                .counter("av_reconcile_errors_total", "Reconciliation errors")
+                                .inc();
+                        }
+                        Err(_elapsed) => {
+                            tracing::warn!(
+                                session = %session_id,
+                                deadline_s = IDLE_CLOSE_DEADLINE.as_secs(),
+                                "idle-close deadline exceeded; deferring to next tick"
+                            );
+                            metrics
+                                .counter(
+                                    "av_idle_close_timeouts_total",
+                                    "Idle-close reached the per-session deadline and \
+                                     returned to the next tick — indicates a session with \
+                                     an active lease that never drops (stuck stream, hung \
+                                     worker) or a bridge publish stalled behind an \
+                                     unresponsive broker.",
+                                )
+                                .inc();
+                        }
                     }
                 }
                 let evicted = sessions.evict_finalized(idle_s);
@@ -4298,6 +4731,23 @@ async fn resolve_lifecycle_ack(
 /// the "empty" is actually "torn and moved out for post-mortem" and
 /// the metadata must be preserved (or quarantined itself) rather
 /// than removed.
+/// Search the spool directory for a `{stem}.events.ndjson.corrupt-<uid>`
+/// sibling that a prior quarantine pass wrote. Used by the empty-
+/// journal branches of `consolidate_step_journals` /
+/// `recover_signed_journals` to decide whether the empty
+/// `.events.ndjson` reflects a completed quarantine (safe to delete
+/// the metadata) or a legitimate not-yet-written state (must
+/// preserve).
+///
+/// The scan is bounded by `MAX_RECOVERY_DIRENTS_PER_TICK`. If the
+/// cap fires before a match is found, return `Err(...)` instead of
+/// `Ok(false)`: the caller uses `!quarantine_sibling_exists(...)`
+/// to gate a metadata delete, so a false negative under the cap
+/// would DATA-LOSS the metadata even though the corrupt sibling
+/// exists past the cap. The caller propagates the Err via `?` and
+/// the outer pass retries on the next tick. If the poisoned spool
+/// persists across ticks, the affected session lingers rather than
+/// losing evidence — the strictly safer failure direction.
 async fn quarantine_sibling_exists(spool_dir: &std::path::Path, stem: &str) -> Result<bool, FinalizeError> {
     let prefix = format!("{stem}.events.ndjson.corrupt-");
     let spool_dir = spool_dir.to_path_buf();
@@ -4307,7 +4757,16 @@ async fn quarantine_sibling_exists(spool_dir: &std::path::Path, stem: &str) -> R
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(FinalizeError::atif_source(error)),
         };
+        let mut examined = 0usize;
         for entry in entries {
+            examined = examined.saturating_add(1);
+            if examined > MAX_RECOVERY_DIRENTS_PER_TICK {
+                return Err(FinalizeError::atif_source(std::io::Error::other(format!(
+                    "quarantine_sibling scan exceeded {MAX_RECOVERY_DIRENTS_PER_TICK} \
+                     entries without finding {prefix}* — spool is over-populated; \
+                     preserving metadata rather than risking data loss"
+                ))));
+            }
             let entry = entry.map_err(FinalizeError::atif_source)?;
             let name = entry.file_name();
             if let Some(name) = name.to_str() {
@@ -4427,14 +4886,23 @@ async fn read_complete_journal(path: &std::path::Path) -> Result<Vec<String>, Fi
                 dropping = bytes.len() - complete_len,
                 "trimming partial trailing line from journal recovery"
             );
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .map_err(FinalizeError::atif_source)?;
+            let mut reopen = std::fs::OpenOptions::new();
+            reopen.write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                // O_NOFOLLOW: uniform with the events-journal set_len
+                // reopen (worker.rs) and the broker segment set_len
+                // reopen (av-bridge embedded.rs). The path here is
+                // inside the 0o700 daemon-owned spool subtree so a
+                // symlink plant requires already-privileged access,
+                // but the defense-in-depth cost is one flag bit.
+                reopen.custom_flags(av_core::fsutil::unix_o_nofollow());
+            }
+            let file = reopen.open(&path).map_err(FinalizeError::atif_source)?;
             file.set_len(complete_len as u64)
                 .map_err(FinalizeError::atif_source)?;
-            file.sync_all()
-                .map_err(FinalizeError::atif_source)?;
+            file.sync_all().map_err(FinalizeError::atif_source)?;
         }
         let complete = String::from_utf8(bytes.get(..complete_len).unwrap_or_default().to_vec())
             .map_err(FinalizeError::atif_source)?;
@@ -4704,6 +5172,7 @@ mod tests {
             "topic": av_events::EventClass::Receipt.topic(),
         });
         let outbox = LifecycleOutbox {
+            schema_version: LIFECYCLE_OUTBOX_SCHEMA_V1,
             session_id: session.id.clone(),
             kind: crate::journal::RECEIPT_OUTBOX_KIND.to_owned(),
             topic: av_events::EventClass::Receipt.topic().to_owned(),
@@ -5333,6 +5802,7 @@ mod tests {
         let session_id = "promo-retain";
         let topic = av_events::EventClass::Receipt.topic();
         let outbox = LifecycleOutbox {
+            schema_version: LIFECYCLE_OUTBOX_SCHEMA_V1,
             session_id: session_id.to_owned(),
             kind: crate::journal::RECEIPT_OUTBOX_KIND.to_owned(),
             topic: topic.to_owned(),
@@ -5382,6 +5852,118 @@ mod tests {
         assert!(
             !outbox_path.exists(),
             "with no promotion pending, the orphan acked outbox must be collected"
+        );
+    }
+
+    /// Recycled-session-id + stale-outbox: when `emit_bridge_event`
+    /// finds an existing outbox at `(session_id, kind)` but the
+    /// outbox's stored `key` (which was set to the previous
+    /// incarnation's `instance_uid` at emit time) does not match
+    /// the CURRENT session's `instance_uid`, the outbox is a
+    /// leftover from a recycled id. Pre-R28 code silently returned
+    /// Ok(()) without publishing when `outbox.ack.is_some()`,
+    /// dropping the new incarnation's authoritative lifecycle event
+    /// from the audit stream. Post-fix: the stale file is removed
+    /// and a fresh outbox is emitted + published.
+    #[tokio::test]
+    async fn recycled_session_id_re_emits_lifecycle_event_over_stale_acked_outbox() {
+        let directory = tempfile::tempdir().unwrap();
+        let concrete_bus = Arc::new(FailFirstReceiptBus {
+            fail: std::sync::atomic::AtomicBool::new(false),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+        });
+        let bus_probe = Arc::clone(&concrete_bus);
+        let bus: Arc<dyn EventBus> = concrete_bus;
+        let finalizer = Finalizer::with_bridge(
+            Arc::new(Ed25519Signer::from_seed(&[7; 32])),
+            directory.path().to_path_buf(),
+            Arc::new(Registry::new()),
+            bus,
+        );
+
+        // Plant a stale acked outbox for the OLD incarnation
+        // (instance_uid = "instance-old"). Same session id + kind
+        // as the new incarnation will emit under.
+        let session_id = "recycled-id";
+        let topic = av_events::EventClass::Receipt.topic();
+        let stale = LifecycleOutbox {
+            schema_version: LIFECYCLE_OUTBOX_SCHEMA_V1,
+            session_id: session_id.to_owned(),
+            kind: crate::journal::RECEIPT_OUTBOX_KIND.to_owned(),
+            topic: topic.to_owned(),
+            key: "instance-old".to_owned(),
+            value: serde_json::json!({
+                "metadata": { "sequence": 0, "uid": av_core::new_event_uid() },
+                "topic": topic,
+            }),
+            ack: Some(av_bridge::PublishAck {
+                topic: topic.to_owned(),
+                partition: 0,
+                offset: 1,
+            }),
+        };
+        let outbox_path = finalizer.lifecycle_outbox_path(session_id, crate::journal::RECEIPT_OUTBOX_KIND);
+        std::fs::create_dir_all(outbox_path.parent().unwrap()).unwrap();
+        let sealed = crate::journal::seal(
+            &finalizer.journal_key,
+            crate::journal::LIFECYCLE_OUTBOX_DOMAIN,
+            0,
+            &stale,
+        )
+        .unwrap();
+        std::fs::write(&outbox_path, sealed).unwrap();
+
+        // Fresh incarnation with a DIFFERENT instance_uid.
+        let session = Arc::new(Session::new(
+            session_id.to_owned(),
+            Workflow::Signed,
+            AgentIdentity {
+                version: "1".to_owned(),
+                charter: "test".into(),
+                instance_uid: "instance-fresh".to_owned(),
+                ttl_remaining_s: Some(600),
+            },
+            Default::default(),
+        ));
+        let payload = serde_json::json!({
+            "receipt_id": "01936000-0000-7000-8000-000000000001",
+            "chain_head": "0000",
+        });
+
+        finalizer
+            .emit_bridge_event(
+                &session,
+                av_events::EventClass::Receipt,
+                payload,
+                crate::journal::RECEIPT_OUTBOX_KIND,
+            )
+            .await
+            .expect("recycled-id emit succeeds");
+
+        // Downcast bus_probe (kept as concrete Arc) to inspect attempts.
+        let attempts = bus_probe.attempts.lock();
+        assert!(
+            attempts.iter().any(|(t, _)| t == topic),
+            "the fresh incarnation MUST publish a receipt lifecycle event even when a stale \
+             acked outbox for the recycled id exists (pre-R28 this silently returned Ok(()) \
+             without publishing, dropping the audit event); got attempts: {attempts:?}"
+        );
+
+        // The persisted outbox file must now reference the fresh
+        // instance_uid, not the stale one.
+        let bytes = std::fs::read(&outbox_path).unwrap();
+        let outbox: LifecycleOutbox = crate::journal::open(
+            &finalizer.journal_key,
+            crate::journal::LIFECYCLE_OUTBOX_DOMAIN,
+            0,
+            &bytes,
+        )
+        .unwrap();
+        assert_eq!(
+            outbox.key, "instance-fresh",
+            "persisted outbox key must reflect the fresh incarnation's instance_uid; \
+             stale key would let the next tick's `remove_acked_lifecycle_outboxes` see \
+             it as a valid ack and never re-publish"
         );
     }
 
@@ -7095,6 +7677,41 @@ mod tests {
         assert!(!warned.insert(PathBuf::from("a")));
     }
 
+    /// R47 F1: `QuarantinedSessions` must share the FIFO+cap
+    /// discipline of `WarnedArtifacts` — previously an unbounded
+    /// `HashSet<String>` could grow indefinitely across a long-lived
+    /// process's lifetime as recovery passes re-inserted disk-persisted
+    /// quarantine markers on every restart.
+    #[test]
+    fn quarantined_sessions_clamps_zero_cap_and_evicts_fifo() {
+        let mut q = QuarantinedSessions::new(0);
+        assert!(q.insert("a".to_owned()));
+        assert!(q.contains("a"));
+        assert_eq!(q.len(), 1);
+        assert!(!q.insert("a".to_owned()), "duplicate must not re-insert");
+        // A distinct entry evicts the first — cap=1 (clamped from 0).
+        assert!(q.insert("b".to_owned()));
+        assert_eq!(q.len(), 1);
+        assert!(!q.contains("a"));
+        assert!(q.contains("b"));
+
+        // FIFO discipline: ONE eviction per insert past cap, not a
+        // full flush. A rotating-id attacker cannot cause all
+        // legitimate quarantines to disappear on a single insert.
+        let mut q = QuarantinedSessions::new(3);
+        assert!(q.insert("a".to_owned()));
+        assert!(q.insert("b".to_owned()));
+        assert!(q.insert("c".to_owned()));
+        assert_eq!(q.len(), 3);
+        assert!(q.insert("d".to_owned()));
+        assert_eq!(q.len(), 3);
+        assert!(!q.contains("a"), "a evicted");
+        assert!(q.contains("b") && q.contains("c") && q.contains("d"));
+        assert!(q.insert("e".to_owned()));
+        assert!(!q.contains("b"), "b evicted next");
+        assert!(q.contains("c") && q.contains("d") && q.contains("e"));
+    }
+
     #[tokio::test]
     async fn torn_journal_tail_is_truncated_without_losing_complete_records() {
         let directory = tempfile::tempdir().unwrap();
@@ -7301,7 +7918,13 @@ mod tests {
         // With no active lifecycle ops, the table should end up empty.
         // Some entries may briefly linger if a guard's drop is racing
         // another `arc_for` call, but a bounded settle window is fine.
-        for _ in 0..20 {
+        // 60 iterations × 25 ms = 1.5 s total. A real leak sits in
+        // `locks` forever, so extending the settle window from 500 ms
+        // to 1.5 s doesn't hide bugs — it just tolerates scheduler
+        // noise on loaded CI runners where the Arc-drop race between
+        // `arc_for` and the concurrent close's Drop can take longer
+        // than the previous 500 ms window.
+        for _ in 0..60 {
             if locks.len() == 0 {
                 return;
             }
@@ -7576,6 +8199,156 @@ mod tests {
         assert!(
             fresh_orphan_marker.exists(),
             "an orphaned marker inside the retention window is left alone"
+        );
+    }
+
+    /// R25 (review of R24): two-tier cap. The DIRENTS cap fires on
+    /// total-directory-entries (regardless of extension) so a spool
+    /// packed with wrong-extension junk can't run wall-time
+    /// unbounded; the ENTRIES cap fires on entries that passed the
+    /// extension filter so wrong-extension junk can't consume real
+    /// work budget. Both caps target the same counter, so a single
+    /// increment fires when EITHER cap breaches.
+    #[tokio::test]
+    async fn recovery_scan_dirent_cap_returns_early_on_wrong_extension_flood() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().to_path_buf();
+        let metrics = Arc::new(Registry::new());
+        let finalizer = Finalizer::new(
+            Arc::new(Ed25519Signer::from_seed(&[7; 32])),
+            spool.clone(),
+            Arc::clone(&metrics),
+        );
+
+        // Plant MAX_RECOVERY_DIRENTS_PER_TICK + 100 wrong-extension
+        // entries. These do NOT reach the pass's real work
+        // (extension != "json"), so they don't consume `examined`,
+        // but they DO consume `dirents_seen` and must fire the
+        // dirent cap.
+        let overshoot = MAX_RECOVERY_DIRENTS_PER_TICK + 100;
+        for i in 0..overshoot {
+            std::fs::write(spool.join(format!("junk-{i}.junk")), b"").unwrap();
+        }
+
+        let sessions = SessionRegistry::new();
+        let breaker = av_loopdetect::BreakerConfig::default();
+        let recovered = finalizer
+            .adopt_strict_atif_artifacts(&sessions, &breaker)
+            .await
+            .expect("scan returns cleanly on cap-hit, not error");
+        assert_eq!(recovered, 0, "wrong-extension entries are never adopted");
+
+        let scrape = metrics.render();
+        assert!(
+            scrape.contains("av_recovery_scan_capped_total{pass=\"adopt_strict_atif\"} 1"),
+            "dirent cap must fire exactly once on wrong-extension flood; got scrape:\n{scrape}"
+        );
+    }
+
+    /// R25: the ENTRIES cap fires on entries that PASSED the
+    /// extension filter — legitimate matching artifacts beyond the
+    /// per-tick real-work cap are deferred to the next tick. This
+    /// separates "wrong-extension junk" (wall-time bounded by the
+    /// dirent cap) from "matching artifacts under legitimate load"
+    /// (real-work bounded by the entries cap).
+    #[tokio::test]
+    async fn recovery_scan_entries_cap_fires_on_matching_entries_flood() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().to_path_buf();
+        let metrics = Arc::new(Registry::new());
+        let finalizer = Finalizer::new(
+            Arc::new(Ed25519Signer::from_seed(&[7; 32])),
+            spool.clone(),
+            Arc::clone(&metrics),
+        );
+
+        // Plant MAX_RECOVERY_ENTRIES_PER_TICK + 100 files that pass
+        // the `.json` extension filter but fail the `.session.json`
+        // secondary filter (so they DO consume the entries cap, but
+        // don't need to be sealed metadata to reach that point).
+        // `adopt_strict_atif_artifacts` counts them, hits the
+        // per-tick entries cap, breaks, bumps counter.
+        let overshoot = MAX_RECOVERY_ENTRIES_PER_TICK + 100;
+        for i in 0..overshoot {
+            // Legitimately-shaped .json files (not .session.json)
+            // that fail deeper validation → each one consumes
+            // exactly one `examined` slot before falling through
+            // to the read+parse+validate path where an empty file
+            // errors out (warn+continue in adopt_strict_atif).
+            let stem = format!("{:032x}", i);
+            std::fs::write(spool.join(format!("{stem}.json")), b"").unwrap();
+        }
+
+        let sessions = SessionRegistry::new();
+        let breaker = av_loopdetect::BreakerConfig::default();
+        let _ = finalizer
+            .adopt_strict_atif_artifacts(&sessions, &breaker)
+            .await
+            .expect("scan returns cleanly on cap-hit, not error");
+
+        let scrape = metrics.render();
+        assert!(
+            scrape.contains("av_recovery_scan_capped_total{pass=\"adopt_strict_atif\"} 1"),
+            "entries cap must fire exactly once on matching flood; got scrape:\n{scrape}"
+        );
+    }
+
+    /// R29 observability: the `av_lifecycle_outbox_pending` gauge
+    /// must reflect the count of unacked outbox files after
+    /// `remove_acked_lifecycle_outboxes` runs. Steady-state 0 on a
+    /// healthy node; if the bridge is unreachable and outboxes
+    /// accumulate, the gauge rises so operators can alert on the
+    /// backlog BEFORE its downstream effects (disk fill,
+    /// `av_reconcile_errors_total`) fire.
+    #[tokio::test]
+    async fn lifecycle_outbox_pending_gauge_reflects_unacked_count() {
+        let directory = tempfile::tempdir().unwrap();
+        let metrics = Arc::new(Registry::new());
+        let finalizer = Finalizer::new(
+            Arc::new(Ed25519Signer::from_seed(&[7; 32])),
+            directory.path().to_path_buf(),
+            Arc::clone(&metrics),
+        );
+        let outbox_dir = directory.path().join(crate::spool::OUTBOX);
+        std::fs::create_dir_all(&outbox_dir).unwrap();
+
+        let topic = av_events::EventClass::Receipt.topic();
+        // Plant 3 UNACKED outboxes.
+        for i in 0..3 {
+            let session_id = format!("session-unacked-{i}");
+            let outbox = LifecycleOutbox {
+                schema_version: LIFECYCLE_OUTBOX_SCHEMA_V1,
+                session_id: session_id.clone(),
+                kind: crate::journal::RECEIPT_OUTBOX_KIND.to_owned(),
+                topic: topic.to_owned(),
+                key: format!("instance-{i}"),
+                value: serde_json::json!({
+                    "metadata": { "sequence": 0, "uid": av_core::new_event_uid() },
+                    "topic": topic,
+                }),
+                ack: None,
+            };
+            let path = finalizer.lifecycle_outbox_path(&session_id, crate::journal::RECEIPT_OUTBOX_KIND);
+            let sealed = crate::journal::seal(
+                &finalizer.journal_key,
+                crate::journal::LIFECYCLE_OUTBOX_DOMAIN,
+                0,
+                &outbox,
+            )
+            .unwrap();
+            std::fs::write(path, sealed).unwrap();
+        }
+
+        let sessions = SessionRegistry::new();
+        finalizer
+            .remove_acked_lifecycle_outboxes(&sessions)
+            .await
+            .unwrap();
+
+        let scrape = metrics.render();
+        assert!(
+            scrape.contains("av_lifecycle_outbox_pending 3"),
+            "gauge must reflect the 3 unacked outboxes; scrape:\n{scrape}"
         );
     }
 }

@@ -155,8 +155,8 @@ to "nothing else in your app moves":
 | --- | --- | --- |
 | duplicate-system collapse | 512 approx tokens | Repeated identical system messages collapse to one |
 | duplicate-message collapse | 512 approx tokens | Byte-identical repeated messages become `[pruned: N tokens (duplicate message), sha256:…]` stubs |
-| middle stubbing | 512 approx tokens | Middle-of-history messages are stubbed toward a target size; the first system message and the tail are preserved byte-identical |
-| middle summarization | 50,000 approx tokens | Aggressive middle-of-history summarization |
+| stale-tool-output stub | 512 approx tokens | Verbose `tool` role messages whose tool_call has since been overtaken become size-bounded stubs; the linkage-preserving `tool_call_id` is kept |
+| middle stubbing | 50,000 approx tokens | Middle-of-history messages are stubbed toward a target size; the first system message and the tail are preserved byte-identical |
 
 Invariants the passes guarantee: message count order and roles are
 preserved, the first system message and the `keep_tail` suffix are

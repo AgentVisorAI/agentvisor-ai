@@ -38,7 +38,7 @@ pub(crate) struct ReconcilerContext<'a> {
     /// Session ids already warned about as incomplete-effect
     /// quarantines: markers stay on disk as evidence, so every tick
     /// rediscovers the same set and must not repeat the warning.
-    pub quarantined_sessions: &'a parking_lot::Mutex<HashSet<String>>,
+    pub quarantined_sessions: &'a parking_lot::Mutex<crate::reconciler::QuarantinedSessions>,
     /// The lifecycle event bus, when configured. `None` (tests,
     /// bridge-less deployments) makes bus-dependent passes no-ops.
     pub bridge: Option<&'a std::sync::Arc<dyn av_bridge::EventBus>>,
@@ -170,12 +170,17 @@ impl RecoveryPass for QuarantineIncompleteEffectsPass {
                 // about ids not already known — otherwise a single
                 // crash would repeat this warning every tick forever.
                 let mut known = ctx.quarantined_sessions.lock();
-                let new = quarantined.iter().filter(|id| !known.contains(*id)).count();
+                let new = quarantined
+                    .iter()
+                    .filter(|id| !known.contains(id.as_str()))
+                    .count();
                 if new > 0 {
                     outcome.quarantined = new;
                     tracing::warn!(sessions = new, "quarantining sessions with incomplete effects");
                 }
-                known.extend(quarantined.iter().cloned());
+                for id in quarantined.iter().cloned() {
+                    known.insert(id);
+                }
             }
             Ok(outcome)
         })
@@ -211,6 +216,7 @@ impl RecoveryPass for ReplayLifecycleOutboxesPass {
                 ctx.spool_dir,
                 ctx.journal_key,
                 std::sync::Arc::clone(bridge),
+                ctx.metrics,
             )
             .await?;
             Ok(outcome)
@@ -352,7 +358,19 @@ impl RecoveryPass for QuarantineOrphanJsonPass {
                 }
                 Err(error) => return Err(FinalizeError::atif_source(error)),
             };
+            let mut examined = 0usize;
+            let mut dirents_seen = 0usize;
             while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::atif_source)? {
+                dirents_seen = dirents_seen.saturating_add(1);
+                if dirents_seen > crate::reconciler::MAX_RECOVERY_DIRENTS_PER_TICK {
+                    crate::reconciler::bump_recovery_scan_cap(
+                        ctx.metrics,
+                        "quarantine_orphan_json",
+                        examined,
+                        dirents_seen,
+                    );
+                    break;
+                }
                 let path = entry.path();
                 if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
                     continue;
@@ -374,6 +392,16 @@ impl RecoveryPass for QuarantineOrphanJsonPass {
                     .is_some_and(|stem| known_stems.contains(stem))
                 {
                     continue;
+                }
+                examined = examined.saturating_add(1);
+                if examined > crate::reconciler::MAX_RECOVERY_ENTRIES_PER_TICK {
+                    crate::reconciler::bump_recovery_scan_cap(
+                        ctx.metrics,
+                        "quarantine_orphan_json",
+                        examined,
+                        dirents_seen,
+                    );
+                    break;
                 }
                 if path.with_extension("atif-auth").exists() {
                     continue;
@@ -444,7 +472,7 @@ mod tests {
         metrics: Registry,
         sessions: crate::session::SessionRegistry,
         journal_key: [u8; 32],
-        quarantined_sessions: parking_lot::Mutex<HashSet<String>>,
+        quarantined_sessions: parking_lot::Mutex<crate::reconciler::QuarantinedSessions>,
     }
 
     impl CtxParts {
@@ -453,7 +481,9 @@ mod tests {
                 metrics: Registry::new(),
                 sessions: crate::session::SessionRegistry::new(),
                 journal_key: [7u8; 32],
-                quarantined_sessions: parking_lot::Mutex::new(HashSet::new()),
+                quarantined_sessions: parking_lot::Mutex::new(crate::reconciler::QuarantinedSessions::new(
+                    crate::reconciler::MAX_QUARANTINED_SESSIONS,
+                )),
             }
         }
 

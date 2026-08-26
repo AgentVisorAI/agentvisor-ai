@@ -599,6 +599,11 @@ fn verdict_delta_is_always_in_range_0_to_2() {
             BreakerVerdict::Progressing { delta }
             | BreakerVerdict::Suspicious { delta, .. }
             | BreakerVerdict::Tripped { delta, .. } => delta,
+            // `BreakerVerdict` is `#[non_exhaustive]` — a future
+            // variant would compile-error here without this arm;
+            // fail the test loudly so an unhandled verdict surfaces
+            // in the delta-conservation invariant.
+            _ => panic!("unexpected BreakerVerdict variant: {v:?}"),
         };
         assert!(
             (0.0..=2.0).contains(&delta),

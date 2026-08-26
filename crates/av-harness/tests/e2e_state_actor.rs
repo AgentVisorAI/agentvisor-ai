@@ -81,6 +81,16 @@ fn byte_flip_fuzz_on_signed_receipt_never_verifies() {
     // Deterministic xorshift keeps the coverage reproducible.
     let mut state: u64 = 0x0b10_00de_adbe_ef12;
     let mut acceptances = 0u32;
+    // R54 mutation-run hardening: without counting mutants that
+    // actually REACHED `verify()`, a mutation making every serde
+    // parse fail (or a `Receipt::to_json_str` refactor that
+    // shortens the body and shifts the mutation distribution
+    // toward structural bytes only) would drop verified_mutants
+    // toward zero and this test would silently degrade to the
+    // vacuous "verifier never accepts anything that fails serde
+    // parse" invariant. Assert a floor so the fuzz coverage
+    // regression surfaces.
+    let mut verified_mutants = 0u32;
     for iter in 0..200 {
         state ^= state << 13;
         state ^= state >> 7;
@@ -93,6 +103,7 @@ fn byte_flip_fuzz_on_signed_receipt_never_verifies() {
         let Ok(candidate) = serde_json::from_slice::<Receipt>(&mutated) else {
             continue;
         };
+        verified_mutants += 1;
         if candidate.verify(&ring).is_ok() {
             acceptances += 1;
             eprintln!("iter {iter}: mutation at byte {offset} bit {bit_index} was silently accepted");
@@ -101,6 +112,18 @@ fn byte_flip_fuzz_on_signed_receipt_never_verifies() {
     assert_eq!(
         acceptances, 0,
         "verifier silently accepted {acceptances} single-bit mutations"
+    );
+    // Coverage floor: at least 50 of the 200 mutants must have
+    // parsed and reached `verify()`. Empirically ~140-160 do on
+    // the shipped Receipt layout (~1 KB body, structural byte
+    // ratio ~30%); 50 leaves comfortable margin for legitimate
+    // Receipt shape evolution while still failing loudly if a
+    // regression pushes the mutation surface below meaningful
+    // fuzz coverage.
+    assert!(
+        verified_mutants >= 50,
+        "only {verified_mutants} of 200 mutants reached verify() — Receipt structural \
+         byte ratio may have changed such that the fuzz coverage has silently degraded"
     );
 }
 

@@ -10,6 +10,7 @@ use av_loopdetect::{Embedder, HashEmbedder, NoopVectorSink, VectorSink};
 use av_receipts::{Ed25519Signer, Signer};
 use av_sandbox::{PolicyEngine, Sandbox, SandboxConfig, WasmPolicy};
 use av_state::{InMemoryStore, StateStore};
+use axum::serve::ListenerExt as _;
 use futures::future::FutureExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -216,9 +217,21 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     // touched; unpaired remnants stay for the reconciler quarantine
     // sweep. `None` (the ship default) preserves the historical
     // "manage-with-external-cron" behaviour.
+    //
+    // The tick body dispatches to `spawn_blocking` inside
+    // `prune_sealed_atif`, and `JoinHandle::abort()` cancels only the
+    // outer async task — a blocking `remove_file` sequence in flight
+    // would keep running against the spool concurrently with process
+    // exit and could leave orphan `.close-complete` markers on
+    // abandonment. Mirror the bridge-maintenance discipline with a
+    // dedicated Notify so shutdown returns the loop between ticks and
+    // the outer `.await` below actually waits for the blocking work
+    // to finish. Same rationale as `bridge_maintenance_shutdown`.
+    let retention_shutdown = Arc::new(tokio::sync::Notify::new());
     let retention = config.atif_retention_days.map(|days| {
         let finalizer = state.finalizer.clone();
         let metrics = Arc::clone(&state.metrics);
+        let shutdown = Arc::clone(&retention_shutdown);
         let pruned_total = metrics.counter(
             "av_atif_retention_pruned_total",
             "Sealed ATIF+sidecar pairs deleted by the retention sweep",
@@ -229,31 +242,130 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                ticker.tick().await;
-                match finalizer.prune_sealed_atif(max_age).await {
-                    Ok(0) => {}
-                    Ok(n) => {
-                        pruned_total.add(n as u64);
-                        tracing::info!(
-                            pruned = n,
-                            retention_days = days,
-                            "ATIF retention sweep removed sealed evidence pairs"
-                        );
+                // Race the shutdown notify against the ticker so the
+                // loop can exit between ticks and never launch a fresh
+                // `spawn_blocking` if shutdown fired during the tick's
+                // own await. Mirrors `spawn_bridge_maintenance`.
+                tokio::select! {
+                    biased;
+                    () = shutdown.notified() => return,
+                    _ = ticker.tick() => {}
+                }
+                // Supervise the tick body: a panic here (allocator OOM,
+                // a Display panic on a non-UTF8 error chain, a
+                // parking_lot poison-on-unwind) would otherwise silently
+                // terminate the retention sweep under Tokio's default
+                // UnhandledPanic::Ignore. The 1 h cadence means one
+                // panic invisibly loses one hour of retention — a
+                // persistent panic condition drops retention entirely
+                // until the daemon restarts, and the spool grows
+                // unbounded until it fills the disk. Mirrors the
+                // bridge-maintenance and JWKS-refresh discipline.
+                let pruned_total = pruned_total.clone();
+                let metrics_tick = Arc::clone(&metrics);
+                let finalizer_tick = finalizer.clone();
+                let outcome = std::panic::AssertUnwindSafe(async move {
+                    match finalizer_tick.prune_sealed_atif(max_age).await {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            pruned_total.add(n as u64);
+                            tracing::info!(
+                                pruned = n,
+                                retention_days = days,
+                                "ATIF retention sweep removed sealed evidence pairs"
+                            );
+                        }
+                        Err(error) => {
+                            metrics_tick
+                                .counter(
+                                    "av_atif_retention_errors_total",
+                                    "ATIF retention sweep tick returned an error",
+                                )
+                                .inc();
+                            tracing::warn!(
+                                %error,
+                                retention_days = days,
+                                "ATIF retention sweep failed; will retry next hour"
+                            );
+                        }
                     }
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            retention_days = days,
-                            "ATIF retention sweep failed; will retry next hour"
-                        );
-                    }
+                })
+                .catch_unwind()
+                .await;
+                if let Err(panic) = outcome {
+                    let msg = panic
+                        .downcast_ref::<&'static str>()
+                        .copied()
+                        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("panic payload was not a string");
+                    metrics
+                        .counter(
+                            "av_atif_retention_panics_total",
+                            "ATIF retention sweep tick panicked; loop supervised via catch_unwind",
+                        )
+                        .inc();
+                    tracing::error!(
+                        panic = %msg,
+                        "ATIF retention sweep tick panicked; continuing"
+                    );
                 }
             }
         })
     });
+    let tcp_nodelay_failures = state.metrics.counter(
+        "av_tcp_nodelay_failures_total",
+        "TCP_NODELAY setsockopt failed on an accepted connection; the \
+         suboptimal-latency connection still serves. Rate-limited to a \
+         single tracing warn per process to avoid a per-accept log storm \
+         under half-open flood / SYN flood.",
+    );
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
-        .with_context(|| format!("bind {}", config.listen))?;
+        .with_context(|| format!("bind {}", config.listen))?
+        // Set TCP_NODELAY on every accepted socket. Nagle + delayed-
+        // ACK together produce ~40 ms of avoidable per-frame stall
+        // in the SSE relay: each streamed frame is 50-200 bytes
+        // (one token or a small delta), so the second small frame
+        // sits in the sender's kernel queue until the first is
+        // ACK'd. Compounded across a 500-token stream that's tens
+        // of seconds of inter-token latency the operator would
+        // otherwise trace to "OpenAI feels slower behind the
+        // proxy". The outbound-side reqwest client already sets
+        // `.tcp_keepalive(30 s)` on the upstream direction
+        // (`pipeline.rs`); this closes the reverse-facing hole.
+        //
+        // `tap_io` is axum 0.8's idiomatic hook for per-connection
+        // socket-option tuning without swapping listener types.
+        // Failure to set the option (embedded system without full
+        // socket-option support, half-open flood socket teardown
+        // between accept and setsockopt, ECONNRESET race) logs and
+        // falls through — a suboptimal-latency connection is still
+        // a working one.
+        //
+        // Wrap the warn in a `std::sync::Once`: a SYN-flood or
+        // Slowloris-class probe against an unauthenticated endpoint
+        // could otherwise fire this warn at accept-rate (~20 k/s on
+        // a moderately-sized Linux node), saturating the log
+        // pipeline and amplifying the very DoS the SSE latency
+        // regression is a distant second to. Every occurrence is
+        // still counted via `av_tcp_nodelay_failures_total` so
+        // operators keep visibility of persistent failures without
+        // the log storm. Same dampener discipline as R33's
+        // identity_rejection_window sliding cap.
+        .tap_io(move |tcp_stream| {
+            if let Err(error) = tcp_stream.set_nodelay(true) {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        %error,
+                        "failed to set TCP_NODELAY on incoming connection; SSE inter-token \
+                         latency may regress by ~40 ms per frame. Subsequent failures logged \
+                         only via av_tcp_nodelay_failures_total to avoid a per-accept log storm."
+                    );
+                });
+                tcp_nodelay_failures.inc();
+            }
+        });
     if let Some(segment) = config.duplicated_chat_path_segment() {
         tracing::warn!(
             upstream_url = %av_core::url_redact::redact_userinfo(&config.upstream_url),
@@ -333,9 +445,12 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
             // the pre-drain window below a fresh readiness probe sees
             // connection-refused (also a probe failure, but an LB that
             // distinguishes "degraded" from "gone" gets no 503, and
-            // in-flight LB routing has zero grace). Kubernetes covers
-            // that window with the preStop sleep; everywhere else
-            // `shutdown_ready_drain_s` provides it.
+            // in-flight LB routing has zero grace). Every deployment
+            // target uses `shutdown_ready_drain_s` for this window:
+            // the shipped k8s manifest sets it to 5 because the
+            // distroless runtime base has no shell for a preStop
+            // `sleep` hook to run in; docker-compose, systemd, and
+            // bare-VM LBs have no preStop equivalent at all.
             draining_flag.store(true, std::sync::atomic::Ordering::SeqCst);
             if ready_drain_window > std::time::Duration::ZERO {
                 tracing::info!(
@@ -372,9 +487,16 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
         }
     };
     reconciler.abort();
-    if let Some(handle) = retention.as_ref() {
-        handle.abort();
-    }
+    // Signal retention to stop instead of aborting.
+    // JoinHandle::abort() cancels only the outer async task, but the
+    // retention tick body dispatches to spawn_blocking (each tick calls
+    // Finalizer::prune_sealed_atif which is a spawn_blocking wrapper).
+    // An abandoned blocking closure mid-remove_file sequence could leave
+    // an orphan .close-complete marker on the spool. Notify makes the
+    // loop return between ticks so the shutdown `.await` below actually
+    // waits for the blocking work to finish — same rationale as the
+    // bridge-maintenance loop below.
+    retention_shutdown.notify_one();
     // Signal maintenance to stop instead of aborting.
     // JoinHandle::abort() only cancels the outer async task; a
     // spawn_blocking closure that's already running keeps rewriting
@@ -433,12 +555,61 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     let shutdown_finalizer = state.finalizer.clone();
     let finalize_sessions = async move {
         let mut failures = Vec::new();
+        // Bound each per-session close so a stuck session (a leaked
+        // SessionLease from an axum-cancelled handler, a worker permit
+        // dropped without decrementing, an upstream half-closed after
+        // TCP_KEEPALIVE-less client disconnect) does not starve the
+        // remaining sessions' close budget. `close_session_locked`
+        // internally calls `wait_for_streams` / `wait_for_worker_jobs`
+        // which are unbounded loops on internal counters.
+        //
+        // The per-session deadline MUST be small relative to the outer
+        // `WORKER_FINALIZE_PHASE_SECS` (30 s) budget — otherwise ONE
+        // stuck session eats the whole outer window and every REMAINING
+        // session is still skipped, which is the pathology this fix
+        // exists to close. Set it to 3 s: healthy close_session
+        // completes in < 100 ms so 3 s is 30× headroom for the healthy
+        // path, and up to 10 stuck sessions can fire their per-session
+        // deadline before the outer timer expires — giving the 11th
+        // (and later) healthy sessions a chance to close cleanly.
+        //
+        // Contrast with the reconciler's `IDLE_CLOSE_DEADLINE = 90 s`
+        // (R26): that path is NOT wrapped by an outer timeout so a
+        // large per-session bound is fine there.
+        //
+        // On per-session timeout, bump a pre-registered metric so
+        // operators tuning the deadline (or diagnosing why shutdown
+        // leaves sessions for restart-time recovery) can see the class
+        // separately from `av_http_shutdown_drain_timeouts_total`
+        // (which fires on OUTER drain timeout, a distinct condition).
+        const PER_SESSION_CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+        let session_close_timeouts = shutdown_finalizer.metrics().counter(
+            "av_shutdown_session_close_timeouts_total",
+            "Per-session close hit the shutdown-time per-session deadline (3 s) and \
+             was deferred to restart-time spool recovery. A sustained rate > 0 on \
+             every rollout indicates a class of sessions that regularly hang their \
+             close (leaked leases, dropped worker permits, unresponsive bridge \
+             publish) — the coincident session id in the shutdown warn log is the \
+             correlation key. Distinct from `av_http_shutdown_drain_timeouts_total` \
+             which fires on the OUTER phase timeout.",
+        );
         for session in open_sessions {
-            if let Err(error) = shutdown_finalizer
-                .close_session(session, av_events::StopReason::SessionClosed)
-                .await
-            {
-                failures.push(error.to_string());
+            let session_id = session.id.clone();
+            let outcome = tokio::time::timeout(
+                PER_SESSION_CLOSE_DEADLINE,
+                shutdown_finalizer.close_session(session, av_events::StopReason::SessionClosed),
+            )
+            .await;
+            match outcome {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => failures.push(format!("session {session_id}: {error}")),
+                Err(_elapsed) => {
+                    session_close_timeouts.inc();
+                    failures.push(format!(
+                        "session {session_id}: per-session close deadline ({}s) exceeded — deferred to restart-time recovery",
+                        PER_SESSION_CLOSE_DEADLINE.as_secs()
+                    ));
+                }
             }
         }
         if failures.is_empty() {
@@ -447,10 +618,51 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
             Err(anyhow::anyhow!(failures.join("; ")))
         }
     };
+    // Compose the worker drain with a pre-step that first drains
+    // in-flight `mcp_call_inner` detached spawns (routes.rs). Axum's
+    // graceful drain only awaits outer handlers; a client-disconnected
+    // mcp_call whose spawned body is mid-execution outlives the drain.
+    // If we skipped straight to `wait_idle`, that body could reach
+    // `worker.try_submit` AFTER `wait_idle` returned, then race
+    // `finalize_sessions` and trip `av_shutdown_session_close_
+    // timeouts_total` on an otherwise-recoverable session.
+    //
+    // The 5 s inner budget is a small fraction of
+    // `WORKER_FINALIZE_PHASE_SECS = 30 s`, leaving 25 s for
+    // `wait_idle` to cover any worker jobs the drained bodies just
+    // submitted. On timeout the `av_shutdown_mcp_drain_timeouts_total`
+    // counter fires (pre-registered in `pipeline.rs`) so an operator
+    // sees the drain miss on the coincident rollout, but shutdown
+    // still proceeds (the affected session's post-drain worker
+    // submission will trip the per-session close deadline and be
+    // recovered on next boot).
+    let mcp_drain_budget = std::time::Duration::from_secs(5);
+    let mcp_inflight = Arc::clone(&state.mcp_inflight);
+    let mcp_metrics = Arc::clone(&state.metrics);
+    let worker_handle = state.worker.clone();
+    let worker_drain = async move {
+        if tokio::time::timeout(mcp_drain_budget, mcp_inflight.wait_drained())
+            .await
+            .is_err()
+        {
+            mcp_metrics
+                .counter(
+                    "av_shutdown_mcp_drain_timeouts_total",
+                    "Shutdown MCP-inflight drain hit its 5 s deadline before every detached \
+                     mcp_call_inner spawn completed",
+                )
+                .inc();
+            tracing::warn!(
+                inflight = mcp_inflight.count(),
+                "timed out draining in-flight MCP tool calls (5 s); shutdown proceeding"
+            );
+        }
+        worker_handle.wait_idle().await;
+    };
     finish_shutdown(
         result,
         std::time::Duration::from_secs(av_harness::config::WORKER_FINALIZE_PHASE_SECS),
-        state.worker.wait_idle(),
+        worker_drain,
         finalize_sessions,
         flush_telemetry,
     )
@@ -479,7 +691,16 @@ enum CliAction {
 /// handle must stay alive for the process lifetime; dropping it — or
 /// any process exit, including SIGKILL — releases the lock.
 fn acquire_spool_lock(spool_dir: &Path) -> Result<std::fs::File> {
-    std::fs::create_dir_all(spool_dir)
+    // Use `create_dir_all_synced` (not bare `create_dir_all`) so the
+    // spool ROOT is materialised at 0o700 on Unix. Every subsequent
+    // path (`append_journal`, `write_atomic`, `claim_sync`) short-
+    // circuits its own mkdir with an `is_dir()` fast path, so this
+    // is the ONLY site that ever creates the root — leaving it at
+    // the ambient umask (0o755 under the default 0022) would leak
+    // enumeration of the deterministic `sha256(session-id)[..32]`
+    // filename stems to any co-tenant with `execute` on the parent,
+    // even though the individual spool files are now 0o600.
+    av_core::fsutil::create_dir_all_synced(spool_dir)
         .with_context(|| format!("create spool directory {}", spool_dir.display()))?;
     let path = spool_dir.join(".agentvisord.lock");
     let file = std::fs::OpenOptions::new()
@@ -1510,7 +1731,21 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)
+    // A bare `create_dir_all` fsyncs no dirent. If `parent` was newly
+    // created (first-boot install), the ancestor dirents stay
+    // volatile: the later `sync_directory(parent)` fsyncs the
+    // CONTENTS of `parent`, not the `parent` dirent inside the
+    // grandparent. A power loss immediately after install could drop
+    // the whole `keys/` directory even though the seed file itself
+    // was fsynced — the next boot would generate a fresh key with a
+    // different public identity and every already-issued receipt
+    // would fail signature verification. Route the mkdir through
+    // `create_dir_all_synced` (which fsyncs every newly-created
+    // ancestor and sets mode 0o700 atomically at mkdir on Unix,
+    // closing the shared-tenant enumeration window until the
+    // seed-file mode gets applied) — same posture as
+    // `av_core::fsutil::write_atomic`.
+    av_core::fsutil::create_dir_all_synced(parent)
         .with_context(|| format!("create signing seed directory {}", parent.display()))?;
     let temporary = parent.join(format!(".signing-seed-{}.tmp", av_core::new_event_uid()));
     // Previously an early `?` return from write_all or
@@ -1608,6 +1843,34 @@ async fn shutdown_signal() {
                 std::process::exit(2);
             }
         };
+        // Install SIGHUP as an explicitly-ignored signal. The default
+        // action for SIGHUP on Unix is `Term` — the process gets
+        // killed immediately, no finalize_sessions, no worker drain,
+        // no receipt persistence. Real-world triggers that would
+        // otherwise crash-terminate the daemon: `systemctl reload
+        // agentvisord` (systemd's default `ExecReload` sends SIGHUP),
+        // a lost controlling terminal in an interactive `docker exec`
+        // session, or an operator's `pkill -HUP` muscle memory from
+        // other daemons that reload on SIGHUP. The daemon does NOT
+        // support config-reload on SIGHUP (see OPERATIONS.md); this
+        // handler drains the signal into a no-op so that stance is
+        // enforced by construction. Installation failure is
+        // non-fatal (unlike SIGTERM) — the worst case is a returned
+        // to pre-fix behavior on this ONE signal, and we log a warn.
+        if let Ok(mut hup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+            tokio::spawn(async move {
+                while hup.recv().await.is_some() {
+                    tracing::info!(
+                        "SIGHUP received; ignored (this daemon does not reload config on SIGHUP — see OPERATIONS.md 'Shutdown' section)"
+                    );
+                }
+            });
+        } else {
+            tracing::warn!(
+                "failed to install SIGHUP handler; SIGHUP will kill the daemon per Unix default action \
+                 (Term). Investigate seccomp / signal syscall restrictions if this appears."
+            );
+        }
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
                 if let Err(error) = result {

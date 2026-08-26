@@ -139,3 +139,28 @@ fn schema_rejects_tampered_events() {
         );
     }
 }
+
+/// R52: pin the shipped schema's `time.maximum` to the Rust
+/// validator's `SCHEMA_TIME_MAX_MS` constant so a future edit that
+/// changes one side without the other fails CI. R51 initially set
+/// the schema max to `2^53 = JCS_SAFE_MAX`, but the Rust validator
+/// applies a tighter year-10000 cap first (`SCHEMA_TIME_MAX_MS =
+/// 253402300799999`), so any `time` in the gap band passed the
+/// shipped schema but was rejected by `validate_event` — exactly
+/// the split-brain the alignment closes.
+#[test]
+fn shipped_schema_time_max_matches_rust_validator() {
+    let raw = include_str!("../../../schemas/ocsf-agent-event.schema.json");
+    let doc: serde_json::Value = serde_json::from_str(raw).expect("schema file parses");
+    let schema_max = doc
+        .pointer("/properties/time/maximum")
+        .and_then(serde_json::Value::as_u64)
+        .expect("shipped schema must declare a maximum on properties.time");
+    assert_eq!(
+        schema_max,
+        av_events::SCHEMA_TIME_MAX_MS,
+        "shipped schema time.maximum ({schema_max}) diverged from \
+         av_events::SCHEMA_TIME_MAX_MS ({}); R51/R52 split-brain drift class",
+        av_events::SCHEMA_TIME_MAX_MS
+    );
+}

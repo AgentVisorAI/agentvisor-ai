@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::stream::BoxStream;
-use futures::{Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use serde_json::{json, Value};
 use std::future::Future as _;
 use std::pin::Pin;
@@ -415,7 +415,24 @@ async fn metrics(State(state): State<AppState>) -> Response {
             "Accepted-but-not-yet-completed worker jobs",
         )
         .set(state.worker.queue_depth());
-    let (spool_bytes, spool_files) = spool_footprint(std::path::Path::new(&state.config.atif_spool_dir));
+    // Move the synchronous `read_dir` + per-entry `metadata` calls to
+    // the blocking pool. Pre-fix this ran directly on the tokio worker
+    // polling the /metrics request, so any co-scheduled task on that
+    // worker (SSE frame writes, per-connection reads, close-session
+    // waits, the reconciler tick if it landed on the same worker)
+    // stalled for the walk's duration. Prometheus/OTel scrape every
+    // 15-30 s from every replica, so this was a periodic tail-
+    // latency step visible on the streaming path. Worse: a stuck
+    // NFS/EFS mount for the spool volume could hang the request
+    // handler entirely, letting `/readyz` and `/metrics` lie about
+    // liveness while workers hung. `spawn_blocking` isolates the
+    // syscall on the blocking pool and lets the tokio scheduler
+    // continue polling other futures.
+    let spool_dir = state.config.atif_spool_dir.clone();
+    let (spool_bytes, spool_files) =
+        tokio::task::spawn_blocking(move || spool_footprint(std::path::Path::new(&spool_dir)))
+            .await
+            .unwrap_or((0, 0));
     state
         .metrics
         .gauge(
@@ -776,6 +793,21 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
         axum::http::HeaderName::from_static("x-content-type-options"),
         HeaderValue::from_static("nosniff"),
     );
+    // SSE relays fronted by nginx (or an ingress that honours the
+    // hint) must set `X-Accel-Buffering: no` on the response, or
+    // nginx's default `proxy_buffering on` accumulates the entire
+    // SSE body before flushing — the SDK sees no incremental
+    // deltas until upstream EOF and the chat appears hung to
+    // end-users. Same class of ops footgun even under GCP HTTPS LB
+    // and other buffering front-ends that recognise this vendor
+    // header. Non-SSE responses do not need or want the hint (it's
+    // a no-op there).
+    if is_sse {
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static("x-accel-buffering"),
+            HeaderValue::from_static("no"),
+        );
+    }
     response
 }
 
@@ -915,7 +947,22 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     // disconnect. Run the whole body on a spawned task so it always runs
     // to completion; the handler merely awaits (and may abandon) the
     // result.
-    match tokio::spawn(mcp_call_inner(state, headers, body)).await {
+    //
+    // The `mcp_inflight` guard is entered here on the outer handler and
+    // moved into the spawn so its `Drop` decrements the tracker on the
+    // spawn's completion path (including panic-caught unwind), NOT the
+    // outer handler's cancellation. `finish_shutdown` in main.rs waits
+    // for the tracker to drain before `worker.wait_idle`, so a detached
+    // body cannot submit a fresh worker job after shutdown thinks it has
+    // drained (which would trip `av_shutdown_session_close_timeouts_
+    // total` on an otherwise-recoverable session).
+    let inflight_guard = state.mcp_inflight.enter();
+    match tokio::spawn(async move {
+        let _inflight_guard = inflight_guard;
+        mcp_call_inner(state, headers, body).await
+    })
+    .await
+    {
         Ok(response) => response,
         Err(join_error) => lifecycle_error(format!("tool call task failed: {join_error}")),
     }
@@ -1439,9 +1486,9 @@ async fn complete_tool_audit(
     session: Arc<crate::session::Session>,
 ) -> Response {
     let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
-    let bytes = match hex::decode(&outcome.body_hex) {
-        Ok(bytes) => Bytes::from(bytes),
-        Err(error) => return lifecycle_error(format!("decode tool response: {error}")),
+    let bytes = match decode_cached_tool_body(&outcome.body_hex) {
+        Ok(bytes) => bytes,
+        Err(response) => return *response,
     };
     let success = status.is_success();
     // If a prior attempt in this process already journaled the completion
@@ -1520,9 +1567,46 @@ struct ToolOutcome {
 impl ToolOutcome {
     fn into_response(self) -> Response {
         let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::BAD_GATEWAY);
-        match hex::decode(self.body_hex) {
-            Ok(body) => tool_response(status, Bytes::from(body), self.content_type.as_deref()),
-            Err(error) => lifecycle_error(format!("decode cached tool response: {error}")),
+        match decode_cached_tool_body(&self.body_hex) {
+            Ok(body) => tool_response(status, body, self.content_type.as_deref()),
+            Err(response) => *response,
+        }
+    }
+}
+
+/// Decode a MAC-sealed cached tool outcome's `body_hex` payload into
+/// wire bytes. Shared by both consumers — `ToolOutcome::into_response`
+/// (the Completed fast-path replay) and `complete_tool_audit` (the
+/// Unaudited path that runs the completion-audit job) — so a future
+/// refactor cannot asymmetrically regress the leak-free error
+/// contract on one branch while preserving it on the other.
+///
+/// The body_hex is server-authored + MAC-sealed by
+/// `ToolExecution::load` (which opens the outcome file through
+/// `crate::journal::open` under the MAC `TOOL_OUTCOME_DOMAIN`), so a
+/// decode failure implies either a control-key compromise or an
+/// on-disk MAC bypass — not attacker-influencable from the wire.
+/// Even so, echoing the `hex::FromHexError` Display (which includes
+/// the offending byte offset and hex character) leaks internal
+/// spool detail into the client-facing 500 body. Return a stable
+/// string on the wire; log the decode error separately at
+/// `tracing::error!` so operators still get the diagnostic without
+/// the client seeing it.
+///
+/// Returns `Err(Box<Response>)` on failure rather than `Err(Response)`
+/// so the discriminant stays small (`clippy::result_large_err`).
+fn decode_cached_tool_body(body_hex: &str) -> Result<Bytes, Box<Response>> {
+    match hex::decode(body_hex) {
+        Ok(bytes) => Ok(Bytes::from(bytes)),
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "cached tool outcome body_hex failed to decode; \
+                 possible control-key compromise or on-disk MAC bypass"
+            );
+            Err(Box::new(lifecycle_error(
+                "cached tool outcome is corrupt".to_owned(),
+            )))
         }
     }
 }
@@ -2017,7 +2101,12 @@ impl ToolExecution {
         // directory — `create_dir_all` on an existing path still issues
         // an EEXIST mkdir syscall on the tool-claim hot path.
         if !directory.is_dir() {
-            std::fs::create_dir_all(directory).map_err(|error| ClaimError::Backend(error.to_string()))?;
+            // `create_dir_all_synced` (not `create_dir_all`) so the
+            // first-write path applies the 0o700 dir mode discipline
+            // — pairs with the 0o600 file mode below so the tool
+            // intents subtree cannot be enumerated by a co-tenant.
+            av_core::fsutil::create_dir_all_synced(directory)
+                .map_err(|error| ClaimError::Backend(error.to_string()))?;
         }
         // `create_new(true)` is atomic on the underlying filesystem —
         // its only reason to return `AlreadyExists` is that another
@@ -2030,9 +2119,24 @@ impl ToolExecution {
         // would loop on the same underlying disk fault while the
         // client learns nothing useful. Split the two shapes at the
         // source so the caller can respond appropriately.
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        //
+        // This path deliberately bypasses `write_atomic` (the sibling
+        // `persist`/`mark_audited` calls go through it) because the
+        // AlreadyExists→Race distinction is destroyed by the temp+
+        // rename pattern (a colliding claim would land on a fresh
+        // temp path with a UUIDv7 suffix). That bypass means we need
+        // to set the 0o600 mode explicitly here — otherwise this
+        // intent file (sealed but plaintext session_id, tool name,
+        // and request digest) inherits the ambient umask, typically
+        // 0022 → 0o644, and becomes co-tenant readable.
+        let mut open_options = std::fs::OpenOptions::new();
+        open_options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            open_options.mode(0o600);
+        }
+        let mut file = open_options
             .open(&self.intent_path)
             .map_err(|error| match error.kind() {
                 std::io::ErrorKind::AlreadyExists => ClaimError::Race,
@@ -2177,6 +2281,27 @@ async fn promote_session(
 /// deliberate 403-not-429 choice, and the tool path's CONFLICT mapping).
 fn finalize_error_response(error: &crate::reconciler::FinalizeError) -> Response {
     use crate::reconciler::FinalizeError;
+    // Transient I/O (spool disk full, read-only filesystem,
+    // temporarily unavailable storage) wrapping an Atif or Receipt
+    // failure gets 503 + Retry-After, mirroring the `/readyz` probe
+    // policy that already treats ENOSPC/EROFS as transient. Without
+    // this split the same incident produced `readyz=503` (correct)
+    // but `close=500` (misclassified as a permanent server bug),
+    // making SDKs configured with default retry-on-503 stop
+    // retrying and paging operators for a disk-full infra event.
+    // Same permanence-split discipline as `Bridge` vs `BridgeConfig`
+    // — the underlying `io::ErrorKind` is the discriminant.
+    if error.is_transient_io() {
+        let mut response = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": error.to_string()})),
+        )
+            .into_response();
+        response
+            .headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("5"));
+        return response;
+    }
     let status = match error {
         // Deterministic state conflicts: the request conflicts with the
         // session's current state and retrying cannot change the outcome
@@ -3419,7 +3544,19 @@ pub(crate) fn parse_provider_chunk(raw: &str) -> Result<Option<ParsedProviderChu
         // skipped frame rather than aborting the whole stream and
         // sealing the session. Only refuse when non-empty `data:`
         // lines would otherwise be attributed to the model output.
-        if data.iter().all(|entry| entry.trim().is_empty()) {
+        //
+        // A `data: [DONE]` line under a named event (e.g.
+        // `event: summary\ndata: [DONE]\n\n` emitted by some OpenAI-
+        // compat gateways as they finalise their own event stream)
+        // is also attribution-free — the sentinel is not model
+        // output — so it must NOT fail-close the whole stream just
+        // because the terminator arrived under an unexpected event
+        // name. Matches the Anthropic parser's ordering, which
+        // short-circuits `[DONE]` before its named-event refusal.
+        if data.iter().all(|entry| {
+            let trimmed = entry.trim();
+            trimmed.is_empty() || trimmed == "[DONE]"
+        }) {
             return Ok(None);
         }
         return Err(format!(
@@ -3729,21 +3866,61 @@ impl Drop for AbortFinalizingStream {
                 let session_id = session.id.clone();
                 if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                     runtime.spawn(async move {
-                        if let Err(error) = finalizer.close_session(session, StopReason::SessionClosed).await
-                        {
-                            finalizer
-                                .metrics()
-                                .counter(
-                                    "av_ephemeral_close_failures_total",
-                                    "Auto-close of a completed ephemeral one-shot failed; \
-                                     the session is left open until the idle sweeper reaps it",
-                                )
-                                .inc();
-                            tracing::warn!(
-                                %error,
-                                %session_id,
-                                "auto-close of completed ephemeral session failed"
-                            );
+                        // Catch panics inside `close_session` (bridge
+                        // publish, receipt-signing JCS overflow, a
+                        // metric-registry collision on any lazy
+                        // `.counter(...)`, tracing Display allocator
+                        // failure): a panicking async body in a
+                        // detached `spawn` is silently swallowed by
+                        // tokio's default `UnhandledPanic::Ignore`,
+                        // so the operator would never see the class.
+                        // Emit the panic counter so
+                        // `rate(av_ephemeral_close_panics_total)`
+                        // catches it. Same discipline as the workspace's
+                        // long-lived loops (reconciler, worker, bridge).
+                        let outcome = std::panic::AssertUnwindSafe(
+                            finalizer.close_session(session, StopReason::SessionClosed),
+                        )
+                        .catch_unwind()
+                        .await;
+                        match outcome {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                finalizer
+                                    .metrics()
+                                    .counter(
+                                        "av_ephemeral_close_failures_total",
+                                        "Auto-close of a completed ephemeral one-shot failed; \
+                                         the session is left open until the idle sweeper reaps it",
+                                    )
+                                    .inc();
+                                tracing::warn!(
+                                    %error,
+                                    session = %session_id,
+                                    "auto-close of completed ephemeral session failed"
+                                );
+                            }
+                            Err(panic) => {
+                                let msg = panic
+                                    .downcast_ref::<&'static str>()
+                                    .copied()
+                                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                                    .unwrap_or("panic payload was not a string");
+                                finalizer
+                                    .metrics()
+                                    .counter(
+                                        "av_ephemeral_close_panics_total",
+                                        "Auto-close of a completed ephemeral one-shot panicked \
+                                         and was caught; the session is left open until the idle \
+                                         sweeper reaps it",
+                                    )
+                                    .inc();
+                                tracing::warn!(
+                                    session = %session_id,
+                                    panic = %msg,
+                                    "auto-close of completed ephemeral session PANICKED (caught)"
+                                );
+                            }
                         }
                     });
                 }
@@ -3851,21 +4028,56 @@ impl Drop for AbortFinalizingStream {
                     // so a PromQL alert can catch the class — the
                     // fallback path is otherwise invisible until the
                     // idle sweeper reaps the "still open" session.
+                    // `catch_unwind`: an async body panicking inside
+                    // detached `tokio::spawn` is silently swallowed by
+                    // tokio's default `UnhandledPanic::Ignore`. Route
+                    // the panic to `av_stream_abort_panics_total` so
+                    // the class shows up on `/metrics` — matches the
+                    // discipline every other background-loop
+                    // supervisor in this workspace applies.
                     runtime.spawn(async move {
-                        if let Err(error) = finalizer.close_session(session, stop_reason).await {
-                            finalizer
-                                .metrics()
-                                .counter(
-                                    "av_stream_abort_close_failures_total",
-                                    "Background close after a stream abort failed; \
-                                     the session is left open until the idle sweeper reaps it",
-                                )
-                                .inc();
-                            tracing::warn!(
-                                %error,
-                                %session_id,
-                                "background close on stream abort failed"
-                            );
+                        let outcome =
+                            std::panic::AssertUnwindSafe(finalizer.close_session(session, stop_reason))
+                                .catch_unwind()
+                                .await;
+                        match outcome {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                finalizer
+                                    .metrics()
+                                    .counter(
+                                        "av_stream_abort_close_failures_total",
+                                        "Background close after a stream abort failed; \
+                                         the session is left open until the idle sweeper reaps it",
+                                    )
+                                    .inc();
+                                tracing::warn!(
+                                    %error,
+                                    session = %session_id,
+                                    "background close on stream abort failed"
+                                );
+                            }
+                            Err(panic) => {
+                                let msg = panic
+                                    .downcast_ref::<&'static str>()
+                                    .copied()
+                                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                                    .unwrap_or("panic payload was not a string");
+                                finalizer
+                                    .metrics()
+                                    .counter(
+                                        "av_stream_abort_panics_total",
+                                        "Background close after a stream abort panicked and was \
+                                         caught; the session is left open until the idle sweeper \
+                                         reaps it",
+                                    )
+                                    .inc();
+                                tracing::warn!(
+                                    session = %session_id,
+                                    panic = %msg,
+                                    "background close on stream abort PANICKED (caught)"
+                                );
+                            }
                         }
                     });
                 }
@@ -3885,7 +4097,7 @@ impl Drop for AbortFinalizingStream {
                         .inc();
                     tracing::warn!(
                         %error,
-                        %session_id,
+                        session = %session_id,
                         "no tokio runtime available for stream-abort close; marking capture failed for reconciler retry"
                     );
                     self.session.mark_capture_failed();
@@ -6935,6 +7147,42 @@ mod tests {
         }
     }
 
+    /// R44 Finding 3: OpenAI-compat gateways that batch a final
+    /// `[DONE]` under a summary event name (e.g.
+    /// `event: summary\ndata: [DONE]\n\n`) must not fail-close the
+    /// stream tail. `[DONE]` carries no attributable content, so the
+    /// named-event refusal at parse_provider_chunk's line ~3465 must
+    /// treat `data:` lines that are ALL `[DONE]` or empty as a
+    /// keepalive, matching the Anthropic parser's ordering which
+    /// short-circuits `[DONE]` before its event-type check.
+    #[test]
+    fn parse_provider_chunk_done_under_named_event_is_keepalive() {
+        for raw in [
+            "event: summary\ndata: [DONE]\n\n",
+            "event: error\ndata: [DONE]\n\n",
+            "event: custom\ndata:\ndata: [DONE]\n\n",
+            "event: batched\ndata: [DONE]\ndata: [DONE]\n\n",
+        ] {
+            match parse_provider_chunk(raw) {
+                Ok(None) => {}
+                Ok(Some(_)) => panic!(
+                    "[DONE] under named event {raw:?} must not yield a chunk (no attributable content)"
+                ),
+                Err(error) => {
+                    panic!("[DONE] under named event {raw:?} must not fail-close the stream: {error}")
+                }
+            }
+        }
+        // A named event with a mix of [DONE] AND real content must
+        // still refuse — the content bytes would otherwise be
+        // attributed to the wrong SSE listener per §9.2.8.
+        let mixed = "event: error\ndata: [DONE]\ndata: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n";
+        assert!(
+            parse_provider_chunk(mixed).is_err(),
+            "named event with mixed [DONE] + real content must still refuse: {mixed:?}"
+        );
+    }
+
     /// SSE §9.2.6: the `data:` field strips exactly one leading
     /// U+0020 SPACE — no more, and no other whitespace class. A
     /// regression to `.trim_start()` would eat runs of Unicode
@@ -7622,8 +7870,14 @@ mod tests {
 
         let started = std::time::Instant::now();
         tokio::time::sleep(Duration::from_millis(10)).await;
+        // 250 ms allows for 25× scheduler jitter over the 10 ms timer
+        // — still catches the ~100 ms `SlowStore` regression that
+        // motivated this test, but tolerates loaded CI runners where
+        // a 10 ms tokio timer can drift to 30-80 ms. The class the
+        // test catches (a synchronous blocking dependency stalling
+        // the reactor) shows up as SECONDS of delay, not tens of ms.
         assert!(
-            started.elapsed() < Duration::from_millis(75),
+            started.elapsed() < Duration::from_millis(250),
             "completion budget storage blocked the Tokio reactor"
         );
         assert!(!body.await.unwrap().is_empty());
@@ -8293,5 +8547,56 @@ mod tests {
         )
         .into_owned();
         assert!(body.contains("av_open_sessions 1"), "{body}");
+    }
+
+    /// R49 review-of-R48: the stable client-facing error message
+    /// for a corrupt cached tool outcome must not regress. R48 fixed
+    /// `ToolOutcome::into_response` but missed the sibling
+    /// `complete_tool_audit` decode site. Both are now routed through
+    /// `decode_cached_tool_body`; a future refactor that reintroduces
+    /// `format!("...{error}...")` on either branch would leak
+    /// `hex::FromHexError` Display detail (offending byte offset +
+    /// character) into the 500 body. Pin the stable message so the
+    /// leak-free contract survives.
+    #[tokio::test]
+    async fn decode_cached_tool_body_returns_stable_error_message() {
+        let helper_err = decode_cached_tool_body("zz").expect_err("`zz` must not hex-decode");
+        let body = String::from_utf8(
+            axum::body::to_bytes((*helper_err).into_body(), 16 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .expect("lifecycle_error body is UTF-8");
+        assert!(
+            body.contains("cached tool outcome is corrupt"),
+            "leak-free stable error message expected in body: {body}"
+        );
+        // Must NOT contain the raw `hex::FromHexError` Display
+        // fingerprints — byte offset ("at 0") or the offending
+        // character (`z`).
+        assert!(
+            !body.contains("at 0"),
+            "hex::FromHexError position must not leak: {body}"
+        );
+        // The `into_response` path must produce the same stable
+        // body: prove both consumers share the helper.
+        let outcome_response = ToolOutcome {
+            status: 200,
+            body_hex: "zz".to_owned(),
+            content_type: None,
+        }
+        .into_response();
+        let outcome_body = String::from_utf8(
+            axum::body::to_bytes(outcome_response.into_body(), 16 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .expect("into_response body is UTF-8");
+        assert!(
+            outcome_body.contains("cached tool outcome is corrupt"),
+            "ToolOutcome::into_response must route through the shared helper: {outcome_body}"
+        );
     }
 }

@@ -50,9 +50,17 @@ last 5 seconds of traffic drop off before the process actually
 terminates.
 
 The included Kubernetes manifest at
-`deploy/kubernetes/agentvisor-ai.yaml` wires all three, plus a
-`preStop` hook that sleeps 5 seconds so the endpoint churn overlaps
-the drain window.
+`deploy/kubernetes/agentvisor-ai.yaml` wires **liveness and readiness**
+(via `startupProbe`, `readinessProbe`, and `livenessProbe` against
+`/livez` and `/readyz`) and uses the daemon's own readiness-controlled
+pre-drain window (ConfigMap key `shutdown_ready_drain_s = 5`) instead
+of a `preStop` shell hook — the shipped runtime base image
+(`chainguard/glibc-dynamic`) is distroless and has no `/bin/sh` /
+`/bin/sleep`, so a `preStop: exec: ["sh", "-c", "sleep 5"]` hook would
+have failed `FailedPreStopHook` and kubelet would have proceeded
+straight to SIGTERM. `/health` exists only for pre-`/livez`/`/readyz`
+deployments and mirrors `/livez` — new deployments should probe
+`/livez` and `/readyz` directly.
 
 ## Shutdown
 
@@ -63,11 +71,13 @@ the drain window.
    connections for that long so an external load balancer polling
    `/readyz` actually observes the 503 before the listener closes.
    Without it, step 3 begins immediately and a fresh readiness probe
-   sees connection-refused instead — fine on Kubernetes (the preStop
-   sleep provides this window before SIGTERM is even sent), but
-   docker-compose / systemd / bare-LB deployments have no preStop
-   equivalent, so set this to your LB's poll interval plus one
-   reconciliation.
+   sees connection-refused instead. This applies to every deployment
+   target — Kubernetes distroless images (like the shipped
+   `chainguard/glibc-dynamic` runtime) cannot use a preStop shell
+   hook, and docker-compose / systemd / bare-LB deployments have no
+   preStop equivalent at all. Set this to your LB's poll interval
+   plus one reconciliation (5 s covers a typical kube-proxy /
+   ingress reconciliation and matches the shipped ConfigMap).
 3. Await axum's graceful shutdown (in-flight requests complete;
    new TCP accepts are refused).
 4. Abort background tasks (reconciler tick, retention sweep, etc.).
@@ -160,13 +170,33 @@ interaction.
 | `av_atif_retention_pruned_total` | Sudden increase | Retention sweep ran (usually just noise, but confirm the `atif_retention_days` you set). |
 | `av_reconciler_last_tick_completed_seconds` | `time() - value > 5 × tick interval` | The reconciler tick is stalled (hung filesystem, lifecycle-lock deadlock) or has never completed since boot. Closes, promotion retries, idle finalization and outbox replay are all stopped with it. The series exists from boot and reads 0 until the first tick completes. |
 | `av_atif_recovery_skipped_total{reason="unauthenticated"}` | Rate > 0 sustained | Someone/something is planting sidecar-less .json files. Escalate. |
-| `av_atif_recovery_skipped_total{reason="too_large"}` | Rate > 0 | Adversarial ATIF payload attempts. Investigate the spool contents. |
+| `av_atif_recovery_skipped_total{reason="too_large"}` | Rate > 0 | Adversarial ATIF payload attempts (> `MAX_ATIF_RECOVERY_BYTES`). Investigate the spool contents. |
+| `av_atif_recovery_skipped_total{reason="read_error"}` | Rate > 0 sustained | Recovery failed to open a spool file after `MAX_ATIF_RECOVERY_BYTES` metadata pre-check — disk / permission fault, or a symlink-plant beat the pre-check. Investigate the disk. |
+| `av_atif_recovery_skipped_total{reason="invalid_json"}` | Any occurrence | ATIF file bytes could not parse as JSON. Adversarial payload or bit-rot. Escalate. |
+| `av_atif_recovery_skipped_total{reason="nonconformant"}` | Any occurrence | ATIF parsed as JSON but failed strict-mode structural validation. Same class as `invalid_json` — either a hostile plant or a schema-version mismatch that the operator needs to reconcile. Escalate. |
+| `av_atif_recovery_skipped_total{reason="provenance"}` | Any occurrence | `.atif-auth` sidecar HMAC failed to verify against the current signer key. This is a cryptographic integrity failure — either a key rotation that missed the retirement window, or a tampered/planted trajectory. **Escalate immediately.** |
 | `av_incomplete_sessions_total` | Sudden increase | Sessions where `capture_failed` was set on the audit chain. After round 51 §6.2 (D7) this is genuinely rare and represents unrecoverable pipeline state, not client disconnects. Escalate. |
 | `av_events_dropped_total{stage="response_slot"}` | Rate > 0 sustained | Response capture backpressure — the worker pool is saturated or the state store is slow. Scale up workers or investigate the state backend. |
 | `av_http_shutdown_drain_timeouts_total` | Any increase | A graceful drain hit its timeout with requests still in flight; usually upstream latency. |
 | `av_ephemeral_close_failures_total` | Any increase | The auto-close spawned for a stock-SDK one-shot session (no `X-AV-Session` header — the OpenAI-compatibility contract auto-closes it after the response) failed. The session is stranded open until the idle sweeper (`session_idle_close_s`) reaps it, delaying the receipt. If this fires steadily, the finalizer is unhealthy — investigate. |
 | `av_stream_abort_close_failures_total` | Any increase | A background close spawned from a stream-abort drop path failed. Same class as ephemeral-close: the session is left open until the idle sweeper. Steady-state 0 on healthy nodes. |
 | `av_stream_abort_no_runtime_total` | Any increase | A stream-abort drop path ran with no live Tokio runtime (harness shutdown, blocking-thread drop). Capture is marked failed so the reconciler retries on next tick. Any increase after boot suggests unclean shutdown ordering. |
+| `av_reconciler_panics_total` | Any increase | The reconciler tick body panicked and was caught. The reconciler continues on the next tick, but a panic here indicates a bug or an environmental fault (allocator OOM, disk corruption); investigate the coincident logs. |
+| `av_worker_shard_panics_total` | Any increase | A worker shard job body panicked and was caught. The shard continues serving subsequent jobs, but any occurrence is a bug or a hostile input that reached beyond the parser guards; capture the coincident session for triage. |
+| `av_bridge_maintenance_panics_total` | Any increase | The bridge maintenance loop tick body panicked. The loop continues on the next interval. Same triage class as reconciler panics. |
+| `av_bridge_maintenance_errors_total` | Rate > 0 sustained | The bridge maintenance loop tick returned an error (retention rewrite failed, cold-outbox stage failed). Steady errors indicate a persistent broker/disk fault. |
+| `av_bridge_maintenance_join_errors_total` | Any increase | The bridge maintenance loop's spawned task failed to join (panic or cancellation). Any increase after boot is a signal of shutdown-ordering issues or a hostile panic in the maintenance body. |
+| `av_atif_retention_panics_total` | Any increase | The hourly ATIF retention sweep tick body panicked and was caught. The loop continues on the next hour, but retention is the ONLY in-process reclaim path — a repeated firing lets the spool grow unbounded until the disk fills. Same triage class as `av_bridge_maintenance_panics_total`. |
+| `av_atif_retention_errors_total` | Rate > 0 sustained | The hourly ATIF retention sweep returned an error (permission drift on the spool subtree, a corrupt sidecar the pass keeps re-tripping on). Steady errors here mean the spool is not being reclaimed; investigate before the disk fills. |
+| `av_tcp_nodelay_failures_total` | Sustained rate > 0 | TCP_NODELAY setsockopt failed on an accepted connection. Single events are noise (ECONNRESET race between accept and setsockopt); a sustained rate is either (a) a client half-open flood / SYN flood exhausting sockets before setsockopt runs, or (b) an embedded target without full socket-option support. Under (a) the log is rate-limited to one `warn!` per process to avoid a log storm — this counter is the primary observability signal instead. |
+| `av_stream_abort_panics_total` | Any increase | A background close spawned from the stream-abort drop path PANICKED (caught). The session is left open until the idle sweeper. Same class as `av_stream_abort_close_failures_total` but for panics rather than returned errors. |
+| `av_ephemeral_close_panics_total` | Any increase | Same as `av_ephemeral_close_failures_total` but for panics rather than returned errors — the auto-close of a completed one-shot ephemeral session panicked in a Drop-spawned task. |
+| `av_admission_refund_panics_total` | Any increase | The admission-debit refund closure panicked inside its Drop-spawned `spawn_blocking` refund. The session and principal ledgers RETAIN the debit; a repeated firing drains the principal budget under real load. Investigate the state backend (Redis) and the store trait implementors' allocator health. |
+| `av_idle_close_timeouts_total` | Any sustained rate > 0 | The reconciler's idle-close sweep hit its 90 s per-session deadline. The session is deferred to the next tick. A steady rate > 0 indicates a session with a lease that never drops (stuck stream, hung worker, unresponsive bridge) — inspect the coincident tracing warn line for the session id. |
+| `av_shutdown_session_close_timeouts_total` | Any occurrence during a rollout | The shutdown-time per-session close hit its 3 s deadline. The session's finalize is deferred to the daemon's next-boot spool recovery (idempotent, no receipts lost). Distinct from `av_http_shutdown_drain_timeouts_total` which fires on the OUTER phase timeout. Any occurrence on a rollout indicates a class of sessions that hang close — leaked SessionLease, dropped worker permit, unresponsive bridge publish. Inspect the coincident tracing warn line for the session id. |
+| `av_shutdown_mcp_drain_timeouts_total` | Any occurrence during a rollout | The shutdown MCP-inflight drain hit its 5 s deadline before every detached `mcp_call_inner` spawn completed. `mcp_call` decouples the tool-execution body from axum's per-connection cancellation to keep durable state consistent under client disconnect; the drain waits for those bodies between HTTP graceful drain and `worker.wait_idle` so a late worker submission can't race the per-session close deadline. On drain timeout, shutdown still proceeds; sessions whose detached body was interrupted may be quarantined at restart-time recovery. Any occurrence on a rollout indicates a class of tool calls that regularly outlive the drain window (long-running upstream tool, hung sandbox). Distinct from `av_shutdown_session_close_timeouts_total` (per-session close deadline) and `av_http_shutdown_drain_timeouts_total` (outer HTTP-drain phase). |
+| `av_lifecycle_outbox_pending` (gauge) | Sustained > 0, or growth rate | Count of unacked lifecycle outbox files (RECEIPT + SESSION_CLOSE) sitting in the spool at the last reconciler tick. Steady-state 0 on a healthy node. A rising baseline is the earliest signal of a broker outage — outboxes persist across restarts, so the disk-bounded queue grows until the bridge is reachable again. Investigate the bridge/broker health when this alerts. |
+| `av_recovery_scan_capped_total{pass="…"}` | Any sustained rate > 0 | A recovery pass hit its per-tick entry-scan cap (10 000 entries) and returned early. The next tick re-opens the directory and resumes. A steady rate > 0 indicates a POISONED SPOOL (millions of stale files) that will starve legitimate recovery work until an operator quarantines the offending files. The `pass` label identifies which pass hit the cap: `adopt_strict_atif`, `recover_signed_journals`, `consolidate_step_journals`, `retry_marked_promotions`, `remove_acked_outboxes`, `replay_lifecycle_outboxes`, or `quarantine_orphan_json`. |
 
 ## Backup
 

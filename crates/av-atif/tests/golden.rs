@@ -446,8 +446,11 @@ fn subagent_trajectory_ref_requires_v17() {
     );
 }
 
-/// Total_cost_usd is capped at 1e12 (one trillion USD)
-/// in strict mode. Without a ceiling, a hostile trajectory carrying
+/// Total_cost_usd is capped at 9e9 (nine billion USD)
+/// in strict mode. Aligned with the recovery scaling
+/// (`cost * USD_MICROS_PER_DOLLAR ≤ JCS_SAFE_MAX = 2^53`) so every
+/// trajectory that passes strict validation also passes recovery.
+/// Without a ceiling, a hostile trajectory carrying
 /// `total_cost_usd: 1.7e308` used to pass strict validation and
 /// flow into promotion / dashboards / receipt subject payloads —
 /// downstream Prometheus histograms and OTLP billing exporters
@@ -480,7 +483,7 @@ fn total_cost_usd_capped_in_strict_mode() {
     assert!(
         issues
             .iter()
-            .any(|i| { i.path.contains("total_cost_usd") && i.message.contains("1e12") }),
+            .any(|i| { i.path.contains("total_cost_usd") && i.message.contains("9e9") }),
         "expected cost-cap issue, got: {issues:#?}"
     );
     // A sane cost (below the cap) still passes.
@@ -493,7 +496,7 @@ fn total_cost_usd_capped_in_strict_mode() {
     );
 }
 
-/// Per-step `cost_usd` is capped at the same 1e12 in
+/// Per-step `cost_usd` is capped at the same 9e9 in
 /// strict mode.
 #[test]
 fn per_step_cost_usd_capped_in_strict_mode() {
@@ -517,7 +520,7 @@ fn per_step_cost_usd_capped_in_strict_mode() {
     assert!(
         issues
             .iter()
-            .any(|i| { i.path.contains("cost_usd") && i.message.contains("1e12") }),
+            .any(|i| { i.path.contains("cost_usd") && i.message.contains("9e9") }),
         "expected per-step cost-cap issue, got: {issues:#?}"
     );
 }
@@ -882,5 +885,47 @@ fn unicode_tag_characters_survive_the_typed_round_trip_byte_exactly() {
     assert!(
         errors.is_empty(),
         "shipped schema must accept tagged content: {errors:#?}"
+    );
+}
+
+/// R51: the shipped JSON Schema must advertise the same
+/// `cost_usd` / `total_cost_usd` upper bound as the Rust strict
+/// validator. R49 aligned the Rust constant from `1e12` to `9e9`
+/// (JCS-safe recovery scaling); the shipped schema kept the old
+/// `1e12` bound and drifted, so a downstream SIEM using the schema
+/// accepted trajectories the harness's own recovery path would
+/// reject with `recovered cost exceeds JCS-safe bounds`. Pin the
+/// two so they cannot drift again.
+///
+/// Same class-fix pattern: the exposed `av_atif::validate::MAX_COST_USD`
+/// constant is the source of truth; the shipped schema references
+/// its numeric value literally, so if either side changes without
+/// the other, this test fails.
+#[test]
+fn shipped_schema_cost_cap_matches_rust_validator() {
+    let schema: Value = serde_json::from_str(include_str!("../../../schemas/atif-v1.7.schema.json")).unwrap();
+    // step-level `metrics.cost_usd.maximum`
+    let step_cost_max = schema
+        .pointer("/properties/steps/items/properties/metrics/properties/cost_usd/maximum")
+        .and_then(Value::as_f64)
+        .expect("shipped schema must declare a maximum on steps[].metrics.cost_usd");
+    assert_eq!(
+        step_cost_max,
+        av_atif::validate::MAX_COST_USD,
+        "step cost_usd maximum in shipped schema ({step_cost_max}) diverged from \
+         av_atif::validate::MAX_COST_USD ({}); R49-style drift class",
+        av_atif::validate::MAX_COST_USD
+    );
+    // final_metrics.total_cost_usd.maximum
+    let total_cost_max = schema
+        .pointer("/properties/final_metrics/properties/total_cost_usd/maximum")
+        .and_then(Value::as_f64)
+        .expect("shipped schema must declare a maximum on final_metrics.total_cost_usd");
+    assert_eq!(
+        total_cost_max,
+        av_atif::validate::MAX_COST_USD,
+        "total_cost_usd maximum in shipped schema ({total_cost_max}) diverged from \
+         av_atif::validate::MAX_COST_USD ({}); R49-style drift class",
+        av_atif::validate::MAX_COST_USD
     );
 }

@@ -14,6 +14,7 @@
 
 pub mod config;
 pub mod dashboard;
+pub(crate) mod inflight;
 pub(crate) mod journal;
 pub mod pipeline;
 pub(crate) mod provider;

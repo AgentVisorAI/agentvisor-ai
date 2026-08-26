@@ -298,27 +298,64 @@ fn closed_sessions_never_reappear_in_open_snapshots() {
             &av_loopdetect::BreakerConfig::default(),
         );
     }
+    // R54 mutation-run hardening: the test's stated invariant
+    // ("a session that closed BEFORE the snapshot must be gone")
+    // was never actually asserted — reader threads only did
+    // `let _ = s.id.as_str()`. Track closed ids in a shared set;
+    // every reader now asserts that no snapshot entry names an id
+    // the closers have already committed. A snapshot-consistency
+    // bug that briefly re-exposes a previously-closed session
+    // would surface here.
+    let closed = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::<String>::new()));
     let barrier = Arc::new(Barrier::new(SESSIONS + 4));
     let mut handles = Vec::new();
     for i in 0..SESSIONS {
         let registry = Arc::clone(&registry);
         let barrier = Arc::clone(&barrier);
+        let closed = Arc::clone(&closed);
         handles.push(thread::spawn(move || {
             barrier.wait();
-            let s = registry.get(&format!("s{i}")).unwrap();
+            let id = format!("s{i}");
+            let s = registry.get(&id).unwrap();
             assert!(s.try_close());
+            // Register the id as closed AFTER `try_close` committed.
+            // Every subsequent reader-snapshot MUST NOT observe this
+            // id as open.
+            closed.lock().insert(id);
         }));
     }
     for _ in 0..4 {
         let registry = Arc::clone(&registry);
         let barrier = Arc::clone(&barrier);
+        let closed = Arc::clone(&closed);
         handles.push(thread::spawn(move || {
             barrier.wait();
             for _ in 0..100 {
-                for s in registry.open_sessions() {
-                    // Sessions may close between snapshot and here, but a
-                    // session that closed BEFORE the snapshot must be gone.
-                    let _ = s.id.as_str();
+                // Snapshot the closed-set FIRST, then open_sessions.
+                // A session id that was already in `closed` at the
+                // moment we sampled MUST NOT then appear in an
+                // `open_sessions()` snapshot taken later — that
+                // would be a snapshot-consistency regression (the
+                // registry re-exposes a session after its close was
+                // committed by a peer). Sampling closed AFTER
+                // open_sessions would be a false-positive-prone
+                // ordering: a legitimate close committed between
+                // the two reads would make the reader see the
+                // still-open snapshot plus the just-committed
+                // closed id.
+                let closed_snapshot = closed.lock().clone();
+                let snapshot: Vec<String> = registry
+                    .open_sessions()
+                    .into_iter()
+                    .map(|s| s.id.clone())
+                    .collect();
+                for id in &snapshot {
+                    assert!(
+                        !closed_snapshot.contains(id),
+                        "session {id} is in an open_sessions() snapshot \
+                         after it was already recorded as closed — \
+                         snapshot-consistency regression"
+                    );
                 }
             }
         }));
@@ -329,5 +366,10 @@ fn closed_sessions_never_reappear_in_open_snapshots() {
     assert!(
         registry.open_sessions().is_empty(),
         "closed sessions still visible in open snapshot"
+    );
+    assert_eq!(
+        closed.lock().len(),
+        SESSIONS,
+        "every session should have been recorded as closed by the joiners"
     );
 }

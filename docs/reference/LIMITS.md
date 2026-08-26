@@ -31,18 +31,22 @@ before you know the knob.
 ## Budgets
 
 Budgets are two-ledger (session + optional principal). Each ledger
-tracks four axes:
+tracks absolute per-session quotas — there is NO sliding-window refill
+and NO time-based recovery. A session's quota is consumed as tokens
+land against `compression.tokens_after` and as tools are called; the
+only way a quota drops back down is on explicit refund (upstream
+failure, request cancellation, lost-race compensation).
 
-| Axis | Refill | Config key |
+| Axis | Config key | Type |
 | --- | --- | --- |
-| Tokens per minute | 60s sliding window | `per_min_tokens` |
-| Tokens per hour | 3600s sliding window | `hourly_tokens` |
-| Requests per minute | 60s sliding window | `per_min_requests` |
-| Requests per hour | 3600s sliding window | `hourly_requests` |
+| Prompt/completion tokens across the session | `max_tokens` | `Option<u64>` |
+| Aggregate USD-payout from `payout` tools | `max_payout_usd_micros` | `Option<u64>` (micros) |
+| Per-tool call count | `max_tool_calls.<tool>` | `BTreeMap<String, u64>` |
+| Total tool calls across the session | `max_total_tool_calls` | `Option<u64>` |
 
 * Both ledgers are checked **after** compression against
   `compression.tokens_after`. Compression runs at 50k prompt tokens
-  with a floor of 512 tokens (see round 51 §6.3).
+  with a floor of 512 tokens.
 * **Backend counter TTL**: the Redis backend expires every budget
   counter after 24 hours of key inactivity (`counter_ttl_secs()` on
   the `StateStore` trait; logged at startup as
@@ -54,7 +58,12 @@ tracks four axes:
   checked second. If the session refuses, the principal debit is
   refunded so a client rotating session ids can't drain the
   principal.
-* On upstream failure, both ledgers are refunded.
+* On upstream failure, both ledgers are refunded. On mid-stream
+  cancellation (client disconnect after some tokens completed), the
+  session ledger receives the over-charge refund but the principal
+  ledger conservatively keeps the debit (documented anti-abuse
+  posture; see `routes.rs` "principal-side conservative retention"
+  comment).
 * Refusal returns 403 with a reason naming the axis and cap —
   deliberately not 429, which mainstream SDKs treat as transient rate
   limiting and auto-retry (see `PipelineError::status`).
