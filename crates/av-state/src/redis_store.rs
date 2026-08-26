@@ -43,14 +43,40 @@ for i, key in ipairs(KEYS) do
                 redis.call('EXPIRE', k, {BUDGET_COUNTER_TTL_SECS})
             end
         end
-        return i
+        -- Refusal shape: {{-1, refusal_index_1_based}}.
+        -- The leading -1 discriminates from the commit shape
+        -- ({{post_commit_min_remaining, 0}}). See TrySpendOutcome
+        -- in store.rs for rationale.
+        return {{-1, i}}
     end
 end
+-- R66 F3: compute post-commit min-headroom inside the SAME atomic
+-- EVAL that commits the spends, so `BudgetDecision::Allowed
+-- {{ remaining }}` cannot race with a concurrent
+-- remove_prefix/spend/refund on the same keys. Every key shares
+-- the caller's session hash tag, so the whole script runs on ONE
+-- server-side slot.
+local min_remaining = -1
 for i, key in ipairs(KEYS) do
-    redis.call('INCRBY', key, ARGV[(i - 1) * 2 + 1])
+    local amount = tonumber(ARGV[(i - 1) * 2 + 1])
+    local limit = tonumber(ARGV[(i - 1) * 2 + 2])
+    local new = redis.call('INCRBY', key, amount)
     redis.call('EXPIRE', key, {BUDGET_COUNTER_TTL_SECS})
+    local remaining = limit - new
+    if remaining < 0 then
+        remaining = 0
+    end
+    if min_remaining == -1 or remaining < min_remaining then
+        min_remaining = remaining
+    end
 end
-return 0
+if min_remaining == -1 then
+    -- Empty KEYS: sentinel meaning `u64::MAX` on the client side.
+    min_remaining = -1
+end
+-- Commit shape: {{min_remaining, 0}}. See TRY_SPEND_LUA_REFUSED_SENTINEL
+-- in redis_store.rs.
+return {{min_remaining, 0}}
 "
     )
 });
@@ -211,7 +237,7 @@ fn get_on<C: redis::ConnectionLike>(conn: &mut C, key: &str) -> Result<u64, Stat
 fn spend_many_on<C: redis::ConnectionLike>(
     conn: &mut C,
     spends: &[Spend],
-) -> Result<Option<usize>, StateError> {
+) -> Result<crate::TrySpendOutcome, StateError> {
     // Shared duplicate-key guard: the Lua script reads
     // GET(key) once per iteration in the check phase, so two spends on
     // the same key each see the pre-commit value — same hazard as the
@@ -222,20 +248,48 @@ fn spend_many_on<C: redis::ConnectionLike>(
             return Err(StateError::Overflow(spend.key.clone()));
         }
     }
+    if spends.is_empty() {
+        // Match the sentinel InMemoryStore returns for the empty-
+        // slice case. No EVAL round-trip; nothing to spend.
+        return Ok(crate::TrySpendOutcome::Committed {
+            post_commit_min_remaining: u64::MAX,
+        });
+    }
     let script = redis::Script::new(&TRY_SPEND_LUA);
     let mut invocation = script.prepare_invoke();
     for spend in spends {
         invocation.key(&spend.key).arg(spend.amount).arg(spend.limit);
     }
-    let failed: i64 = invocation
+    // Return shape: [i64, i64]. Two disjoint carriers:
+    //   Commit:  [post_commit_min_remaining, 0]  (min_remaining
+    //            may be -1 to sentinel u64::MAX for empty KEYS;
+    //            spends.is_empty() short-circuits above so we
+    //            should not see -1 here).
+    //   Refusal: [-1, refusal_index_1_based]
+    let outcome: (i64, i64) = invocation
         .invoke(conn)
         .map_err(|e| StateError::Backend(e.to_string()))?;
-    if failed == 0 {
-        Ok(None)
-    } else {
-        usize::try_from(failed - 1)
-            .map(Some)
-            .map_err(|_| StateError::Backend(format!("invalid Lua failure index {failed}")))
+    match outcome {
+        (-1, refused) => {
+            let refused = usize::try_from(refused - 1)
+                .map_err(|_| StateError::Backend(format!("invalid Lua failure index {refused}")))?;
+            Ok(crate::TrySpendOutcome::Refused { index: refused })
+        }
+        (min_remaining, 0) => {
+            // -1 is the empty-KEYS sentinel (see the Lua); in practice
+            // unreachable here (guarded above) but honour it.
+            let remaining = if min_remaining < 0 {
+                u64::MAX
+            } else {
+                u64::try_from(min_remaining).unwrap_or(0)
+            };
+            Ok(crate::TrySpendOutcome::Committed {
+                post_commit_min_remaining: remaining,
+            })
+        }
+        (a, b) => Err(StateError::Backend(format!(
+            "TRY_SPEND_LUA returned unrecognised shape [{a}, {b}]"
+        ))),
     }
 }
 
@@ -272,17 +326,11 @@ impl StateStore for RedisStore {
         }
     }
 
-    fn try_spend(&self, key: &str, amount: u64, limit: u64) -> Result<bool, StateError> {
-        Ok(self
-            .try_spend_many(&[Spend {
-                key: key.to_owned(),
-                amount,
-                limit,
-            }])?
-            .is_none())
-    }
+    // `try_spend` uses the default trait impl (routes through
+    // `try_spend_many` with a 1-element slice). Removed the standalone
+    // wrapper in R68 — the default is exactly the same shape.
 
-    fn try_spend_many(&self, spends: &[Spend]) -> Result<Option<usize>, StateError> {
+    fn try_spend_many(&self, spends: &[Spend]) -> Result<crate::TrySpendOutcome, StateError> {
         match &self.backend {
             RedisBackend::Single(pool) => spend_many_on(
                 &mut pool.get().map_err(|e| StateError::Backend(e.to_string()))?,
@@ -451,7 +499,7 @@ impl StateStore for RedisStore {
         let outcome: Result<i64, redis::RedisError> = match &self.backend {
             RedisBackend::Single(pool) => match pool.get() {
                 Ok(mut connection) => {
-                    let mut script = redis::Script::new(&batch_script);
+                    let script = redis::Script::new(&batch_script);
                     let mut invocation = script.prepare_invoke();
                     for r in refunds {
                         invocation.key(&r.key);
@@ -469,7 +517,7 @@ impl StateStore for RedisStore {
             },
             RedisBackend::Cluster(pool) => match pool.get() {
                 Ok(mut connection) => {
-                    let mut script = redis::Script::new(&batch_script);
+                    let script = redis::Script::new(&batch_script);
                     let mut invocation = script.prepare_invoke();
                     for r in refunds {
                         invocation.key(&r.key);
