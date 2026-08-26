@@ -787,6 +787,11 @@ vector_backend = "memory"
         "av_recovery_scan_capped_total{pass=\"remove_acked_outboxes\"}",
         "av_recovery_scan_capped_total{pass=\"replay_lifecycle_outboxes\"}",
         "av_recovery_scan_capped_total{pass=\"quarantine_orphan_json\"}",
+        // Lifecycle-outbox backlog gauge. On a fresh boot no bridge
+        // activity has happened, so the gauge is 0 — but it must
+        // be pre-registered so `absent()` alerts distinguish
+        // "healthy, no backlog" from "reconciler tick hasn't run yet".
+        "av_lifecycle_outbox_pending",
     ] {
         assert!(
             body.contains(series),
