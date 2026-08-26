@@ -333,9 +333,12 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
             // the pre-drain window below a fresh readiness probe sees
             // connection-refused (also a probe failure, but an LB that
             // distinguishes "degraded" from "gone" gets no 503, and
-            // in-flight LB routing has zero grace). Kubernetes covers
-            // that window with the preStop sleep; everywhere else
-            // `shutdown_ready_drain_s` provides it.
+            // in-flight LB routing has zero grace). Every deployment
+            // target uses `shutdown_ready_drain_s` for this window:
+            // the shipped k8s manifest sets it to 5 because the
+            // distroless runtime base has no shell for a preStop
+            // `sleep` hook to run in; docker-compose, systemd, and
+            // bare-VM LBs have no preStop equivalent at all.
             draining_flag.store(true, std::sync::atomic::Ordering::SeqCst);
             if ready_drain_window > std::time::Duration::ZERO {
                 tracing::info!(

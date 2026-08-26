@@ -65,7 +65,7 @@ source. All are optional.
 | `upstream_http2_prior_knowledge` | `false` | Skip HTTP/1 → HTTP/2 upgrade negotiation on the outbound connection. |
 | `upstream_read_timeout_s` | none | Per-request read timeout. Unset means "no timeout beyond the client's". |
 | `shutdown_drain_timeout_s` | `max(30, upstream_read_timeout_s + 5)` | Graceful-shutdown drain budget. |
-| `shutdown_ready_drain_s` | `0` | Readiness-controlled pre-drain window: on SIGTERM, `/readyz` serves 503 while the listener keeps accepting for this long before the drain begins. Needed for non-Kubernetes LBs (K8s gets this from the preStop sleep). |
+| `shutdown_ready_drain_s` | `0` | Readiness-controlled pre-drain window: on SIGTERM, `/readyz` serves 503 while the listener keeps accepting for this long before the drain begins. Needed for every deployment target where the LB polls `/readyz` — this includes Kubernetes distroless images (no `/bin/sh` for a `preStop` sleep hook), docker-compose, systemd, and bare-VM LBs. The shipped k8s manifest sets this to `5`. |
 | `upstream_api_key_env` / `upstream_api_key_file` | none | Where to pull the outbound API key from. `_file` wins over `_env` when both are set. |
 | `upstream_auth_header` | `authorization` | Header carrying the upstream API key — `authorization` (OpenAI), `api-key` (Azure), `x-api-key` (Anthropic). |
 | `upstream_auth_scheme` | `Bearer` | Prefix inserted before the key in the auth header; an empty string sends the raw key (Azure style). |
