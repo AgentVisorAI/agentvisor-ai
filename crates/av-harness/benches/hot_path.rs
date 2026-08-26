@@ -95,7 +95,7 @@ fn benchmark(c: &mut Criterion) {
                 for _ in 0..batch {
                     black_box(
                         state
-                            .prepare_chat(&headers, payload.clone())
+                            .prepare_chat(&headers, payload.clone(), None)
                             .unwrap()
                             .middleware_us,
                     );

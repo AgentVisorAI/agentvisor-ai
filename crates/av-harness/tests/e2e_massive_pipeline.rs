@@ -55,7 +55,7 @@ async fn prepare_chat_accepts_a_large_prompt_without_a_token_cap() {
     let state = app_state(None);
     let h = signed_headers("mass-prep");
     state
-        .prepare_chat(&h, payload_with_prompt_size(256 * 1024))
+        .prepare_chat(&h, payload_with_prompt_size(256 * 1024), None)
         .unwrap();
     // The session was opened and one event was accepted.
     assert!(state.sessions.get("mass-prep").is_some());
@@ -70,7 +70,7 @@ async fn prepare_chat_accepts_a_large_prompt_without_a_token_cap() {
 async fn prepare_chat_refuses_a_massive_prompt_that_blows_the_token_budget() {
     let state = app_state(Some(1_000));
     let h = signed_headers("mass-refuse");
-    let outcome = state.prepare_chat(&h, payload_with_prompt_size(256 * 1024));
+    let outcome = state.prepare_chat(&h, payload_with_prompt_size(256 * 1024), None);
     assert!(outcome.is_err(), "budget gate let a large prompt through");
 }
 
@@ -87,7 +87,7 @@ async fn many_medium_requests_accumulate_correctly_on_one_session() {
     const N: u64 = 16;
     for _ in 0..N {
         state
-            .prepare_chat(&h, payload_with_prompt_size(16 * 1024))
+            .prepare_chat(&h, payload_with_prompt_size(16 * 1024), None)
             .unwrap();
     }
     let s = state.sessions.get("mass-accum").unwrap();
@@ -125,7 +125,7 @@ async fn prepare_chat_handles_wide_turn_conversation() {
         .map(|i| json!({"role": if i % 2 == 0 {"user"} else {"assistant"}, "content": format!("turn {i}")}))
         .collect();
     let payload = json!({"model": "m", "messages": messages});
-    state.prepare_chat(&h, payload).unwrap();
+    state.prepare_chat(&h, payload, None).unwrap();
     // The wide payload made it through without panicking; close produces
     // a receipt with event_count = 2 (one prepare call: admission event +
     // the capture guard's terminal resolution of the dropped request).
@@ -164,7 +164,7 @@ async fn concurrent_massive_prompts_across_sessions_do_not_leak() {
             let id = format!("mass-{i}");
             let h = signed_headers(&id);
             state
-                .prepare_chat(&h, payload_with_prompt_size(64 * 1024))
+                .prepare_chat(&h, payload_with_prompt_size(64 * 1024), None)
                 .unwrap();
             let s = state.sessions.get(&id).unwrap();
             state

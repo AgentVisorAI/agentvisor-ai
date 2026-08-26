@@ -1904,87 +1904,87 @@ async fn shutdown_signal() {
                  (Term). Investigate seccomp / signal syscall restrictions if this appears."
             );
         }
-        // R72 review F3 (landed R73): eliminate the second-signal
-        // race window by keeping the signal receivers alive
-        // across the first-signal select and moving them into
-        // the force-exit spawn. Prior shape called
-        // `tokio::signal::ctrl_c()` inside the spawn, creating a
-        // FRESH SIGINT receiver AFTER the outer select returned —
-        // a signal arriving in that window landed on no armed
-        // receiver and was silently dropped. Operator's `Ctrl-C,
-        // Ctrl-C` or `docker stop; docker stop` muscle memory
-        // silently didn't force-exit; graceful shutdown ran to
-        // completion (or Kubernetes SIGKILL after
-        // terminationGracePeriodSeconds).
+        // R75-F1 (landed R76): Notify-based sequential-consume
+        // shutdown-signal design with a 100ms coalescing window.
         //
-        // Fix: `interrupt` is created upfront, kept alive across
-        // the outer select via `&mut`, and MOVED into the force-
-        // exit spawn along with `terminate`. Both receivers stay
-        // armed continuously across the first-signal window —
-        // a second signal arriving at ANY point is queued in the
-        // receiver's tokio internals and delivered on the next
-        // `.recv().await` inside the spawn.
+        // Prior R74 shape had the outer `select!` consume the
+        // first signal, then a drain loop popped any queued
+        // permits BEFORE moving the receivers into a force-exit
+        // spawn. Two failure modes remained: (a) a genuinely-new
+        // signal arriving during the drain window was silently
+        // swallowed; (b) the drain vs "concurrent SIGINT+SIGTERM"
+        // trade-off had no distinction between "operator intent:
+        // one signal, OS delivered a second concurrently" and
+        // "operator intent: two signals, force-exit".
+        //
+        // Fix: ONE spawn owns both signal receivers and consumes
+        // them sequentially. On the first signal, it notifies
+        // the outer via `first_signal_ready` (which returns from
+        // `wait_for_shutdown` so `finish_shutdown` can begin
+        // graceful drain). It then sleeps 100 ms and drains any
+        // additional permits queued during the coalescing window
+        // — these are treated as PART of the first-signal event
+        // (concurrent SIGINT+SIGTERM burst, muscle-memory
+        // Ctrl-C-Ctrl-C within OS scheduler jitter). Only a
+        // signal arriving AFTER the 100 ms window trips
+        // exit(130) — matching operator intent for
+        // "double Ctrl-C to force-exit" (typically 200-500 ms
+        // between presses).
+        //
+        // Concurrent SIGINT+SIGTERM within 100 ms → drained →
+        // no spurious exit; the graceful drain runs uninterrupted.
+        // Genuine second signal at t>100ms → captured →
+        // exit(130) as documented.
+        let first_signal_ready = Arc::new(tokio::sync::Notify::new());
+        let notify_outer = Arc::clone(&first_signal_ready);
         let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
-        tokio::select! {
-            _ = async {
+        tokio::spawn(async move {
+            // Consume the FIRST signal.
+            tokio::select! {
+                _ = async {
+                    if let Some(ref mut sig) = interrupt {
+                        sig.recv().await;
+                    } else {
+                        // No SIGINT receiver — mirror the prior shape's
+                        // `tokio::signal::ctrl_c()` fallback. If ctrl_c()
+                        // itself errors, log and pend so terminate can
+                        // still fire.
+                        if let Err(error) = tokio::signal::ctrl_c().await {
+                            tracing::error!(%error, "failed to listen for Ctrl-C");
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                } => {}
+                _ = terminate.recv() => {}
+            }
+            // Wake the outer (main-thread) shutdown flow.
+            notify_outer.notify_one();
+            // 100 ms coalescing window: signals arriving in this
+            // window are treated as part of the same operator
+            // intent as the first signal (concurrent SIGINT+SIGTERM
+            // burst, or OS scheduler jitter reordering a single
+            // logical signal).
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            loop {
+                let mut drained_any = false;
                 if let Some(ref mut sig) = interrupt {
-                    sig.recv().await;
-                } else {
-                    // No SIGINT receiver — mirror the prior shape's
-                    // `tokio::signal::ctrl_c()` semantics via a fresh
-                    // one-shot fallback. If ctrl_c() itself errors,
-                    // log and pend so the terminate arm can still
-                    // fire.
-                    if let Err(error) = tokio::signal::ctrl_c().await {
-                        tracing::error!(%error, "failed to listen for Ctrl-C");
-                        std::future::pending::<()>().await;
+                    if let Ok(Some(())) =
+                        tokio::time::timeout(std::time::Duration::from_millis(0), sig.recv()).await
+                    {
+                        drained_any = true;
                     }
                 }
-            } => {}
-            _ = terminate.recv() => {}
-        }
-        // R73 review F1 (landed R74): drain any queued permits
-        // from both receivers before moving them into the force-
-        // exit spawn. `Signal::recv()` is cancel-safe (tokio
-        // 1.52+ documents the wake permit persists on the
-        // watch::Receiver after the awaiting future is dropped),
-        // so concurrent SIGINT+SIGTERM delivery where the outer
-        // `select!` consumes ONE side would leave the OTHER
-        // receiver holding a queued permit. Moving those
-        // receivers into the spawn would cause `.recv().await`
-        // to return immediately with the stale permit and
-        // exit(130) BEFORE graceful shutdown even runs — trading
-        // R72's "silently drop second signal" bug for a "silently
-        // bypass graceful shutdown" bug that is arguably worse
-        // (the "in-flight receipt or ATIF write will be picked
-        // up by recovery on restart" narrative assumes graceful
-        // drain got to start; here it doesn't).
-        //
-        // Drain non-blockingly via `tokio::time::timeout(ZERO,
-        // recv())`: if a permit is queued, it resolves in the
-        // first poll and `Ok(Some(()))` is returned; otherwise
-        // the 0-duration timer fires with `Err(Elapsed)`. Loop
-        // to handle the (pathological) case of multiple queued
-        // permits per receiver.
-        loop {
-            let mut drained_any = false;
-            if let Some(ref mut sig) = interrupt {
                 if let Ok(Some(())) =
-                    tokio::time::timeout(std::time::Duration::from_millis(0), sig.recv()).await
+                    tokio::time::timeout(std::time::Duration::from_millis(0), terminate.recv()).await
                 {
                     drained_any = true;
                 }
+                if !drained_any {
+                    break;
+                }
             }
-            if let Ok(Some(())) =
-                tokio::time::timeout(std::time::Duration::from_millis(0), terminate.recv()).await
-            {
-                drained_any = true;
-            }
-            if !drained_any {
-                break;
-            }
-        }
-        tokio::spawn(async move {
+            // Any signal from HERE on is a genuine second-signal
+            // event, indicating operator intent to force-exit.
             tokio::select! {
                 _ = async {
                     if let Some(ref mut sig) = interrupt {
@@ -2001,6 +2001,7 @@ async fn shutdown_signal() {
             );
             std::process::exit(130);
         });
+        first_signal_ready.notified().await;
     }
     #[cfg(not(unix))]
     if let Err(error) = tokio::signal::ctrl_c().await {
