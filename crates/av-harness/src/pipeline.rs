@@ -136,6 +136,27 @@ pub(crate) struct HotMetrics {
     /// TWO Registry mutex ops per request (base_kinds + metrics
     /// map).
     pub(crate) request_duration_histograms: [Arc<av_core::metrics::Histogram>; 10],
+    /// Pre-resolved `av_upstream_latency_seconds` histogram — hit
+    /// on every successful chat forward. R59 continuation of R58's
+    /// hot-path pre-resolution: prior code called
+    /// `metrics.histogram_with_bounds("av_upstream_latency_seconds",
+    /// ...)` per request, doing 2 Registry mutex ops per chat.
+    pub(crate) upstream_latency_histogram: Arc<av_core::metrics::Histogram>,
+    /// Pre-resolved `av_upstream_errors_total{kind}` counters,
+    /// indexed by `UpstreamErrorKind::index()`. Prior code called
+    /// `metrics.counter(&format!("av_upstream_errors_total{...}"))`
+    /// per error, doing 2 Registry mutex ops + a String alloc per
+    /// upstream failure. Kinds order matches boot pre-registration.
+    pub(crate) upstream_errors_counters: [Arc<av_core::metrics::Counter>; 4],
+    /// Pre-resolved `av_dashboard_requests_total{endpoint,status}`
+    /// counters, indexed by `(DashboardEndpoint::index(),
+    /// DashboardStatus::index())`. Same rationale as
+    /// `request_counters`; the dashboard is lower volume but
+    /// hits the same shared Registry mutex.
+    pub(crate) dashboard_request_counters: [[Arc<av_core::metrics::Counter>; 2]; 3],
+    /// Pre-resolved `av_dashboard_request_duration_seconds{endpoint}`
+    /// histograms, indexed by `DashboardEndpoint::index()`.
+    pub(crate) dashboard_request_duration_histograms: [Arc<av_core::metrics::Histogram>; 3],
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -298,6 +319,116 @@ impl StatusClass {
     }
 }
 
+/// Upstream error classifier used for `av_upstream_errors_total{kind}`.
+/// Mirrors `classify_upstream_error(err)` — same set as the boot
+/// pre-registration at pipeline.rs:1196.
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum UpstreamErrorKind {
+    Timeout,
+    Connect,
+    Send,
+    Http5xx,
+}
+
+impl UpstreamErrorKind {
+    pub(crate) const ORDER: [UpstreamErrorKind; 4] = [
+        UpstreamErrorKind::Timeout,
+        UpstreamErrorKind::Connect,
+        UpstreamErrorKind::Send,
+        UpstreamErrorKind::Http5xx,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            UpstreamErrorKind::Timeout => "timeout",
+            UpstreamErrorKind::Connect => "connect",
+            UpstreamErrorKind::Send => "send",
+            UpstreamErrorKind::Http5xx => "http_5xx",
+        }
+    }
+
+    pub(crate) fn index(self) -> usize {
+        match self {
+            UpstreamErrorKind::Timeout => 0,
+            UpstreamErrorKind::Connect => 1,
+            UpstreamErrorKind::Send => 2,
+            UpstreamErrorKind::Http5xx => 3,
+        }
+    }
+
+    /// Convert `classify_upstream_error`'s `&'static str` output into
+    /// a typed variant. The classifier at pipeline.rs:2736 already
+    /// exhaustively covers this set; this fn is the typed mirror.
+    pub(crate) fn from_reqwest(error: &reqwest::Error) -> Self {
+        if error.is_timeout() {
+            UpstreamErrorKind::Timeout
+        } else if error.is_connect() {
+            UpstreamErrorKind::Connect
+        } else {
+            UpstreamErrorKind::Send
+        }
+    }
+}
+
+/// Dashboard endpoint label. Mirrors the `record()` call sites in
+/// dashboard.rs (list, detail, stats).
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum DashboardEndpoint {
+    Stats,
+    List,
+    Detail,
+}
+
+impl DashboardEndpoint {
+    pub(crate) const ORDER: [DashboardEndpoint; 3] = [
+        DashboardEndpoint::Stats,
+        DashboardEndpoint::List,
+        DashboardEndpoint::Detail,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            DashboardEndpoint::Stats => "stats",
+            DashboardEndpoint::List => "list",
+            DashboardEndpoint::Detail => "detail",
+        }
+    }
+
+    pub(crate) fn index(self) -> usize {
+        match self {
+            DashboardEndpoint::Stats => 0,
+            DashboardEndpoint::List => 1,
+            DashboardEndpoint::Detail => 2,
+        }
+    }
+}
+
+/// Dashboard endpoint response status label. Mirrors the `record()`
+/// call sites (`ok`, `not_found`) in dashboard.rs.
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum DashboardStatus {
+    Ok,
+    NotFound,
+}
+
+impl DashboardStatus {
+    pub(crate) const ORDER: [DashboardStatus; 2] = [DashboardStatus::Ok, DashboardStatus::NotFound];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            DashboardStatus::Ok => "ok",
+            DashboardStatus::NotFound => "not_found",
+        }
+    }
+
+    pub(crate) fn index(self) -> usize {
+        match self {
+            DashboardStatus::Ok => 0,
+            DashboardStatus::NotFound => 1,
+        }
+    }
+}
+
 impl HotMetrics {
     fn new(metrics: &Registry, config_strict_stage_budget: bool) -> Self {
         // Registrations here mirror the boot loop below. Using the
@@ -343,12 +474,56 @@ impl HotMetrics {
                 av_core::metrics::WIDE_LATENCY_BOUNDS_US,
             )
         });
+        // Pre-resolve upstream latency + error counters — hit on
+        // every chat forward. Same rationale as request_counters.
+        let upstream_latency_histogram = metrics.histogram_with_bounds(
+            "av_upstream_latency_seconds",
+            "Time to upstream response headers",
+            av_core::metrics::WIDE_LATENCY_BOUNDS_US,
+        );
+        let upstream_errors_counters: [Arc<av_core::metrics::Counter>; 4] =
+            UpstreamErrorKind::ORDER.map(|kind| {
+                metrics.counter(
+                    &format!("av_upstream_errors_total{{kind=\"{}\"}}", kind.label()),
+                    "Upstream failures by kind",
+                )
+            });
+        // Pre-resolve dashboard endpoint counters + histograms. Same
+        // rationale as request_counters; lower volume but hits the
+        // same shared Registry mutex.
+        let dashboard_request_counters: [[Arc<av_core::metrics::Counter>; 2]; 3] = DashboardEndpoint::ORDER
+            .map(|endpoint| {
+                DashboardStatus::ORDER.map(|status| {
+                    metrics.counter(
+                        &format!(
+                            "av_dashboard_requests_total{{endpoint=\"{}\",status=\"{}\"}}",
+                            endpoint.label(),
+                            status.label()
+                        ),
+                        "Dashboard endpoint requests, labeled by status",
+                    )
+                })
+            });
+        let dashboard_request_duration_histograms: [Arc<av_core::metrics::Histogram>; 3] =
+            DashboardEndpoint::ORDER.map(|endpoint| {
+                metrics.histogram(
+                    &format!(
+                        "av_dashboard_request_duration_seconds{{endpoint=\"{}\"}}",
+                        endpoint.label()
+                    ),
+                    "Dashboard endpoint latency",
+                )
+            });
         Self {
             stage_histograms,
             stage_strict_budget_counters,
             strict_stage_budget: config_strict_stage_budget || truthy_env("AV_STRICT_BUDGET"),
             request_counters,
             request_duration_histograms,
+            upstream_latency_histogram,
+            upstream_errors_counters,
+            dashboard_request_counters,
+            dashboard_request_duration_histograms,
         }
     }
 }
@@ -2264,20 +2439,14 @@ impl AppState {
         let debited_tokens = admission_debit.take_for_dispatch();
         match upstream_request.send().await {
             Ok(response) => {
-                self.metrics
-                    .histogram_with_bounds(
-                        "av_upstream_latency_seconds",
-                        "Time to upstream response headers",
-                        av_core::metrics::WIDE_LATENCY_BOUNDS_US,
-                    )
+                self.hot_metrics
+                    .upstream_latency_histogram
                     .observe_us(elapsed_us(upstream_started));
                 if response.status().is_server_error() {
-                    self.metrics
-                        .counter(
-                            "av_upstream_errors_total{kind=\"http_5xx\"}",
-                            "Upstream failures by kind",
-                        )
-                        .inc();
+                    #[allow(clippy::indexing_slicing)]
+                    {
+                        self.hot_metrics.upstream_errors_counters[UpstreamErrorKind::Http5xx.index()].inc();
+                    }
                 }
                 Ok(ForwardedResponse {
                     response,
@@ -2288,19 +2457,11 @@ impl AppState {
                 })
             }
             Err(error) => {
-                let kind = if error.is_timeout() {
-                    "timeout"
-                } else if error.is_connect() {
-                    "connect"
-                } else {
-                    "send"
-                };
-                self.metrics
-                    .counter(
-                        &format!("av_upstream_errors_total{{kind=\"{kind}\"}}"),
-                        "Upstream failures by kind",
-                    )
-                    .inc();
+                let kind = UpstreamErrorKind::from_reqwest(&error);
+                #[allow(clippy::indexing_slicing)]
+                {
+                    self.hot_metrics.upstream_errors_counters[kind.index()].inc();
+                }
                 // `reqwest::Error::Display` embeds the
                 // request URL (see the redaction rule at
                 // routes.rs::read_limited_tool_response — the same
