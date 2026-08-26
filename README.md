@@ -237,10 +237,11 @@ Full reference stack (Redpanda, AOF-backed Redis, Qdrant, Vector/OTLP):
 
 ```bash
 docker secret create identity_hmac /path/to/identity-hmac-secret
+docker secret create signing_seed /path/to/signing.seed
 docker compose -f docker/docker-compose.yml up --build
 ```
 
-The external `identity_hmac` secret is required by the production profile. Bridge data, cold exports, Redis state, and Qdrant data use persistent volumes. The embedded Bridge remains available for single-binary and air-gapped deployments. Container healthchecks use `avctl health` (real liveness, not config parsing).
+Both external secrets are required by the production profile — the compose file declares `identity_hmac` and `signing_seed` as external, and `docker compose up` refuses to start if either is missing. Bridge data, cold exports, Redis state, and Qdrant data use persistent volumes. The embedded Bridge remains available for single-binary and air-gapped deployments. Container healthchecks use `avctl health` (real liveness, not config parsing).
 
 The production image checksum-pins `sentence-transformers/all-MiniLM-L6-v2` at revision `1110a243fdf4706b3f48f1d95db1a4f5529b4d41`, validates the model/tokenizer hashes during build, and selects the ONNX backend. Air-gapped builds can mirror those immutable URLs or mount equivalent verified artifacts and update the configured paths.
 

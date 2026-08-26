@@ -40,7 +40,7 @@ Three routes with distinct semantics:
 
 | Route | Purpose | Failure mode |
 | --- | --- | --- |
-| `/health` | Legacy composite: 200 while all subsystems are healthy. | Do **not** wire new probes at this; it flaps as subsystems briefly hiccup. |
+| `/health` | Legacy constant 200 (kept for backwards compatibility with pre-`/livez/readyz` deployments; identical to `/livez` today). | Only fails when the axum runtime is dead; prefer `/livez`/`/readyz` for new probes so the semantic split is explicit. |
 | `/livez` | Kubernetes-style liveness. Returns 200 constant. | Only fails when the axum runtime is dead; use as `livenessProbe`. |
 | `/readyz` | Kubernetes-style readiness. 200 while accepting new traffic; 503 during drain. | Fails immediately when SIGTERM is received AND while the spool is not **writable** (probe file create+remove — a full disk or read-only remount flips readiness even though the directory stays readable). Use as `readinessProbe`. |
 
@@ -139,9 +139,13 @@ manual release procedure:
    never happened or is acceptable to lose from the trail.
 2. Stop routing traffic for that session id (or drain the pod).
 3. Delete the session's marker file under
-   `<atif_spool_dir>/inflight-responses/` — the filename embeds the
-   session-id hash (`sha256(session_id)[..32]`). Keep a copy if your
-   compliance posture requires evidence of the intervention.
+   `<atif_spool_dir>/inflight-responses/` — filenames are
+   `sha256(session_id:attempt_id)[..32].json`, so a stuck session may
+   have MULTIPLE markers (one per response attempt). Grep the
+   directory for a `session_id` field match inside each file (they
+   are small JSON blobs) rather than computing the digest by hand.
+   Keep a copy if your compliance posture requires evidence of the
+   intervention.
 4. Restart the harness (or wait one reconcile tick). The quarantine
    set is rebuilt from the markers, so the id admits traffic again.
 

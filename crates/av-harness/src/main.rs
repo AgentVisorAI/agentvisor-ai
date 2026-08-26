@@ -420,7 +420,9 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     let flush_telemetry = move || {
         if let Some(provider) = telemetry_provider {
             provider
-                .shutdown_with_timeout(std::time::Duration::from_secs(5))
+                .shutdown_with_timeout(std::time::Duration::from_secs(
+                    av_harness::config::OTEL_FLUSH_SECS,
+                ))
                 .map_err(|error| anyhow::anyhow!("flush OpenTelemetry: {error}"))?;
         }
         Ok(())
@@ -447,7 +449,7 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     };
     finish_shutdown(
         result,
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(av_harness::config::WORKER_FINALIZE_PHASE_SECS),
         state.worker.wait_idle(),
         finalize_sessions,
         flush_telemetry,

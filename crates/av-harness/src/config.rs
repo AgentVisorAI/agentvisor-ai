@@ -28,6 +28,28 @@ pub const MAX_ONNX_DIMENSION: usize = 16_384;
 /// unit-conversion error (someone thought the field was in ms).
 pub const MAX_SECONDS_INTERVAL: u64 = 24 * 60 * 60;
 
+/// Per-phase timeout applied to both the worker `wait_idle` drain and
+/// the `finalize_sessions` sweep in `finish_shutdown`. Exposed on the
+/// public surface so the deployment-manifest pin tests below can
+/// compute the total shutdown budget from the SAME source of truth
+/// `main.rs` uses — a bump here that isn't matched by a bump in the
+/// K8s / compose grace periods trips CI at build time.
+pub const WORKER_FINALIZE_PHASE_SECS: u64 = 30;
+
+/// Deadline the OpenTelemetry provider gets to flush pending spans on
+/// shutdown when the `otel` feature is enabled. Same "single source of
+/// truth" purpose as [`WORKER_FINALIZE_PHASE_SECS`].
+pub const OTEL_FLUSH_SECS: u64 = 5;
+
+/// Default upstream read timeout (per-chunk) when `upstream_read_timeout_s`
+/// is unset. Public because [`HarnessConfig::effective_drain_timeout`]
+/// needs it to preserve the "one in-flight request cannot outlive the
+/// drain window" invariant its doc-comment promises — using two
+/// separate defaults (30 in the derivation, 60 in the pipeline) let a
+/// legitimate 60 s upstream read outlast a 30 s drain when both were
+/// left unset in the config.
+pub const DEFAULT_UPSTREAM_READ_TIMEOUT_S: u64 = 60;
+
 /// Top-level harness configuration.
 ///
 /// Unknown keys are rejected (`deny_unknown_fields`) so a typo like
@@ -753,13 +775,20 @@ impl HarnessConfig {
 
     /// Effective graceful-shutdown drain budget. Explicit
     /// `shutdown_drain_timeout_s` wins; otherwise derive
-    /// `max(30, upstream_read_timeout_s + 5)` so one legitimate
-    /// in-flight request cannot exceed the drain window (§8.8).
+    /// `max(30, upstream_read_timeout_s + 5)` — falling back to the
+    /// pipeline's own [`DEFAULT_UPSTREAM_READ_TIMEOUT_S`] when the
+    /// field is unset — so one legitimate in-flight request cannot
+    /// exceed the drain window (§8.8). Two different defaults here (30
+    /// in the derivation, 60 in the pipeline) previously let a 60 s
+    /// upstream read outlive a 30 s drain and get truncated by the
+    /// drain deadline while the config was still `None` on both sides.
     pub fn effective_drain_timeout(&self) -> std::time::Duration {
-        let seconds = self.shutdown_drain_timeout_s.unwrap_or_else(|| {
-            self.upstream_read_timeout_s
-                .map_or(30, |read| read.saturating_add(5).max(30))
-        });
+        let read_timeout_s = self
+            .upstream_read_timeout_s
+            .unwrap_or(DEFAULT_UPSTREAM_READ_TIMEOUT_S);
+        let seconds = self
+            .shutdown_drain_timeout_s
+            .unwrap_or_else(|| read_timeout_s.saturating_add(5).max(30));
         std::time::Duration::from_secs(seconds)
     }
 
@@ -2462,6 +2491,11 @@ mod tests {
             "K8s manifest ConfigMap",
             &config,
             extract_yaml_int(yaml, "terminationGracePeriodSeconds:").unwrap(),
+            // K8s runs preStop synchronously BEFORE SIGTERM and both
+            // count against the grace period. Extract the sleep so a
+            // bump to `sleep 25` (the surrounding comment explicitly
+            // invites this) is reflected in the pin.
+            extract_prestop_sleep_seconds(yaml).unwrap_or(0),
         );
     }
 
@@ -2480,6 +2514,8 @@ mod tests {
             "docker-compose.yml / harness.docker.toml",
             &config,
             extract_yaml_grace_seconds(compose, "stop_grace_period:").unwrap(),
+            // Docker compose has no preStop equivalent.
+            0,
         );
     }
 
@@ -2496,35 +2532,52 @@ mod tests {
             "docker-compose.minimal.yml / harness.container.toml",
             &config,
             extract_yaml_grace_seconds(compose, "stop_grace_period:").unwrap(),
+            0,
         );
     }
 
     /// Shared budget check. The four shutdown phases in finish_shutdown
     /// run sequentially, so the worst-case wall time is the sum of
-    /// each phase's cap:
-    ///   1. HTTP drain: `effective_drain_timeout()` (config-derived)
-    ///   2. Worker wait_idle: hardcoded 30 s in main.rs
-    ///   3. finalize_sessions: hardcoded 30 s in main.rs
-    ///   4. OTel telemetry flush: 5 s when the `otel` feature is on
-    ///      (which it is in the default `--features full` container
-    ///      image the shipped configs assume).
-    fn assert_total_shutdown_fits(label: &str, config: &HarnessConfig, grace_seconds: u64) {
-        const WORKER_WAIT_IDLE_S: u64 = 30;
-        const FINALIZE_SESSIONS_S: u64 = 30;
-        const OTEL_FLUSH_S: u64 = 5;
+    /// each phase's cap plus any pre-drain wall time the deployment
+    /// requires BEFORE the phases start.
+    ///   1. HTTP drain: `effective_drain_timeout()` (config-derived).
+    ///   2. Worker wait_idle: [`WORKER_FINALIZE_PHASE_SECS`] — imported
+    ///      from the same source of truth `main.rs`'s `finish_shutdown`
+    ///      call site uses, so a bump there without matching bumps in
+    ///      the deployment manifests trips this test at CI time.
+    ///   3. finalize_sessions: same [`WORKER_FINALIZE_PHASE_SECS`].
+    ///   4. OTel telemetry flush: [`OTEL_FLUSH_SECS`] when the `otel`
+    ///      feature is on (which it is in the default `--features full`
+    ///      container image the shipped configs assume).
+    ///   5. Pre-drain wall time: `shutdown_ready_drain_s` counts
+    ///      against the grace period BEFORE the drain starts (see the
+    ///      field's own doc comment), and a K8s `preStop` hook counts
+    ///      against the grace period BEFORE SIGTERM is even delivered.
+    fn assert_total_shutdown_fits(
+        label: &str,
+        config: &HarnessConfig,
+        grace_seconds: u64,
+        pre_signal_seconds: u64,
+    ) {
         let drain = config.effective_drain_timeout().as_secs();
         let total = drain
-            .saturating_add(WORKER_WAIT_IDLE_S)
-            .saturating_add(FINALIZE_SESSIONS_S)
-            .saturating_add(OTEL_FLUSH_S);
+            .saturating_add(WORKER_FINALIZE_PHASE_SECS)
+            .saturating_add(WORKER_FINALIZE_PHASE_SECS)
+            .saturating_add(OTEL_FLUSH_SECS)
+            .saturating_add(config.shutdown_ready_drain_s)
+            .saturating_add(pre_signal_seconds);
         assert!(
             total <= grace_seconds,
             "{label}: worst-case shutdown budget {total}s (drain {drain}s + \
-             worker {WORKER_WAIT_IDLE_S}s + finalize {FINALIZE_SESSIONS_S}s + \
-             OTel {OTEL_FLUSH_S}s) exceeds the grace period {grace_seconds}s — \
+             worker {WORKER_FINALIZE_PHASE_SECS}s + finalize {WORKER_FINALIZE_PHASE_SECS}s + \
+             OTel {OTEL_FLUSH_SECS}s + shutdown_ready_drain_s {}s + pre-signal {}s) \
+             exceeds the grace period {grace_seconds}s — \
              kubelet/dockerd will SIGKILL mid-finalize and drop receipts on \
-             rolling deploy. Either lower shutdown_drain_timeout_s in the \
-             config or raise the grace period in the deployment manifest."
+             rolling deploy. Either lower shutdown_drain_timeout_s / \
+             shutdown_ready_drain_s / the preStop sleep in the config or raise \
+             the grace period in the deployment manifest.",
+            config.shutdown_ready_drain_s,
+            pre_signal_seconds,
         );
     }
 
@@ -2533,6 +2586,36 @@ mod tests {
             let trimmed = line.trim_start();
             if let Some(rest) = trimmed.strip_prefix(key) {
                 return rest.trim().parse().ok();
+            }
+        }
+        None
+    }
+
+    /// Parses the shipped K8s manifest's `preStop.exec.command: ["sh",
+    /// "-c", "sleep <n>"]` entry. Returns `None` if no preStop hook is
+    /// present. A `sleep <n>` argument is what the shipped manifest
+    /// uses today; the surrounding comment invites operators to tune
+    /// it, so a bump to `sleep 25` in a future edit must reflect in
+    /// the pin's total budget or the test silently green-lights a
+    /// grace-exceeded configuration.
+    fn extract_prestop_sleep_seconds(yaml: &str) -> Option<u64> {
+        // Look for `command: ["sh", "-c", "sleep <n>"]` anywhere in the
+        // file (there's only one preStop in the shipped manifest).
+        for line in yaml.lines() {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix("command:") else {
+                continue;
+            };
+            // Only accept the shell-sleep shape; anything else means
+            // the shipped manifest changed to a mechanism whose wall
+            // time this helper can't estimate — the caller should
+            // update this test rather than pretending 0 seconds.
+            let sleep_marker = "\"sleep ";
+            if let Some(after) = rest.find(sleep_marker).map(|i| &rest[i + sleep_marker.len()..]) {
+                let n: String = after.chars().take_while(char::is_ascii_digit).collect();
+                if let Ok(seconds) = n.parse() {
+                    return Some(seconds);
+                }
             }
         }
         None
@@ -2658,14 +2741,30 @@ mod tests {
     /// legitimate in-flight request instead of a hardcoded 30 s.
     #[test]
     fn drain_timeout_derives_from_upstream_read_timeout() {
-        // §8.8: unset drain + unset read timeout → 30 s floor.
+        // Unset drain + unset read timeout: falls back to the pipeline's
+        // DEFAULT_UPSTREAM_READ_TIMEOUT_S (60 s) so a legitimate
+        // in-flight request cannot outlive the derived drain. Using
+        // separate defaults (30 in the derivation, 60 in the pipeline)
+        // let a live 60 s read get truncated by a 30 s drain — the
+        // exact "one in-flight request cannot exceed the drain window"
+        // invariant this function's doc-comment promises.
         let base = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
-        assert_eq!(base.effective_drain_timeout().as_secs(), 30);
+        assert_eq!(
+            base.effective_drain_timeout().as_secs(),
+            DEFAULT_UPSTREAM_READ_TIMEOUT_S.saturating_add(5),
+            "unset drain must derive from the SAME default the pipeline uses"
+        );
         // Unset drain + 300 s read timeout → 305 s (one in-flight
         // request can never legitimately outlive the drain window).
         let mut derived = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
         derived.upstream_read_timeout_s = Some(300);
         assert_eq!(derived.effective_drain_timeout().as_secs(), 305);
+        // Unset drain + very small read timeout → 30 s floor (the
+        // documented lower bound; a 5 s read + 5 s doesn't leave enough
+        // slack for shutdown-side work).
+        let mut short = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        short.upstream_read_timeout_s = Some(10);
+        assert_eq!(short.effective_drain_timeout().as_secs(), 30);
         // Explicit value always wins.
         let mut explicit = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
         explicit.upstream_read_timeout_s = Some(300);

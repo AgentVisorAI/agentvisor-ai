@@ -201,7 +201,10 @@ message makes a signature from one protocol unusable in any other.
 The recommended pattern for auditors and downstream consumers:
 
 * subscribe to the `agent.receipt` broker topic (or replay it from
-  the embedded Bridge with `avctl event-tail --topic agent.receipt`)
+  the embedded Bridge with
+  `avctl event-tail --data-dir /path/to/bridge --topic agent.receipt`
+  — `--data-dir` is required and points at the harness's
+  `bridge_data_dir`)
 * verify each receipt as it arrives
 * if a batch's `event_count` sum diverges from your own count of
   the corresponding `agent.step` events on the same session ids,
