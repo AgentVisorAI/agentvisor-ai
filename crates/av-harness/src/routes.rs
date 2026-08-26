@@ -2440,6 +2440,11 @@ impl AbortFinalizingStream {
             return Err(error);
         }
         if self.protocol_buffer.len() > MAX_PROVIDER_FIELD_BYTES {
+            // Same rollback as above: this Err also means
+            // `begin_budget_check` never debits the frames this call DID
+            // drain successfully, so their charges must not survive into
+            // the terminal refund either.
+            self.charged_completion_tokens = self.charged_completion_tokens.saturating_sub(budget_delta);
             return Err("unterminated provider SSE frame exceeds limit".to_owned());
         }
         Ok(budget_delta)
@@ -4039,6 +4044,26 @@ mod tests {
             combined.contains("127.0.0.1:8484"),
             "console must render the default listen address 127.0.0.1:8484; \
              raise or lower the default and the setup/curl blocks lie",
+        );
+
+        // The wizard-preview TOML must render `max_tool_calls` in its
+        // real SHAPE, not just its name: `BudgetSpec.max_tool_calls` is
+        // a per-tool map (`[budget.max_tool_calls]` table), and the
+        // console once rendered it as a bare scalar under `[budget]` —
+        // a config that `deny_unknown_fields` + serde reject with
+        // "invalid type: integer, expected a map" the moment a prospect
+        // copies the "written for you, live" file. Substring name
+        // checks alone codified that drift; pin the shape.
+        assert!(
+            combined.contains("budget.max_tool_calls"),
+            "console's TOML preview must render the per-tool cap as the \
+             `[budget.max_tool_calls]` table the real BudgetSpec requires",
+        );
+        assert!(
+            !console_js.contains(r#"max_tool_calls</span> = "#),
+            "console's TOML preview renders `max_tool_calls = <scalar>`, \
+             which the real config parser rejects (BudgetSpec.max_tool_calls \
+             is a BTreeMap; the valid shape is a [budget.max_tool_calls] table)",
         );
     }
 

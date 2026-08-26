@@ -856,6 +856,20 @@ pub fn wizard(home: &Path, input: &mut dyn std::io::BufRead, secrets: &SecretInp
             .with_context(|| format!("read {} for backup", config_path.display()))?;
         av_core::fsutil::write_atomic(&backup, &previous)
             .with_context(|| format!("back up {}", config_path.display()))?;
+        // The old `fs::copy` inherited the config's 0600; `write_atomic`
+        // creates default-mode (world-readable under umask 022) files.
+        // The backup carries the same upstream_url / key-env metadata the
+        // 0600 policy on the live config exists to protect.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if let Err(error) = std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600)) {
+                eprintln!(
+                    "warning: failed to chmod 0600 on {}: {error}; contents may be world-readable",
+                    backup.display(),
+                );
+            }
+        }
         println!("\n(Your previous settings were saved to {})", backup.display());
     }
     // Two concurrent wizards on the same $HOME must not interleave into a
