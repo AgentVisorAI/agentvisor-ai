@@ -207,6 +207,32 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
         if (!cfg.jitEnabled) {
           return reply.code(403).send({ error: "jit_disabled" });
         }
+        // R76 HIGH #1: refuse JIT attach-across-orgs. Prior
+        // shape allowed the SAML ACS to silently create a
+        // membership in `cfg.orgId` for a user record that
+        // ALREADY belonged to some other tenant, driven only
+        // by the caller-asserted email. An owner/admin of ANY
+        // tenant could then post a signed AuthnResponse
+        // asserting `email = victim@othercorp.com` and pull
+        // the victim's identity into their org — cross-tenant
+        // identity contamination. JIT must ONLY create fresh
+        // users; cross-org linking of an existing account has
+        // to go through an out-of-band claim/challenge, not a
+        // silent server-side attach. Refuse loudly so the
+        // operator sees the misconfig or attack in the audit
+        // log.
+        if (user) {
+          req.log.warn(
+            {
+              orgId: cfg.orgId,
+              configId: cfg.id,
+              existingUserId: user.id,
+              assertedEmail: result.email,
+            },
+            "saml_jit_refused_existing_user_in_other_org",
+          );
+          return reply.code(403).send({ error: "user_exists_in_other_org" });
+        }
         // Domain check: only allow provisioning within the configured
         // domains (defense against a misconfigured IdP asserting a
         // random email).
@@ -216,15 +242,29 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
           .split(",")
           .map((d) => d.trim().toLowerCase())
           .filter(Boolean);
-        if (domains.length > 0 && !domains.includes(domain)) {
+        // R76 HIGH #1 (companion): refuse an empty allowlist.
+        // Prior shape returned `ok` when `domains.length === 0`,
+        // effectively opting out of the domain guard when the
+        // operator left the field blank (schema default `""`).
+        // An empty allowlist is almost always a misconfig; make
+        // it fail-closed so JIT provisioning cannot be enabled
+        // without an explicit domain scope.
+        if (domains.length === 0) {
+          req.log.warn(
+            { orgId: cfg.orgId, configId: cfg.id },
+            "saml_jit_refused_empty_domain_allowlist",
+          );
+          return reply
+            .code(403)
+            .send({ error: "domain_allowlist_required_for_jit" });
+        }
+        if (!domains.includes(domain)) {
           return reply.code(403).send({ error: "domain_not_allowed" });
         }
 
         // Create the user + membership atomically.
         const provisioned = await db.$transaction(async (tx) => {
-          const u = user
-            ? user
-            : await tx.user.create({
+          const u = await tx.user.create({
                 data: {
                   email: result.email,
                   // A JIT user has no password. Login endpoint uses the
