@@ -33,8 +33,36 @@ model User {
   updatedAt    DateTime @updatedAt
 
   memberships Membership[]
+  webauthnCredentials WebauthnCredential[]
 
   @@map("users")
+}
+
+// A user's registered WebAuthn credential (passkey / security key / platform
+// authenticator). One user can have several (Yubikey + iPhone + laptop, etc)
+// which is standard practice — no single point of loss.
+//
+// The counter is the WebAuthn signCount — increases monotonically on every
+// use and lets us detect cloned authenticators. label is the human name
+// ("Zach's YubiKey", "iPhone 15 Pro"). transports hints the browser which
+// USB/NFC/BLE/internal channels the credential supports so re-auth prompts
+// the right UI.
+model WebauthnCredential {
+  id             String   @id @default(cuid())
+  userId         String
+  credentialId   Bytes    @unique
+  publicKey      Bytes
+  counter        BigInt   @default(0)
+  transports     String   @default("") // comma-separated: "usb,nfc,internal"
+  label          String   @default("Passkey")
+  aaguid         String?  // Authenticator model attestation UUID
+  createdAt      DateTime @default(now())
+  lastUsedAt     DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("webauthn_credentials")
 }
 
 // A tenant boundary — a team/company account. Every deployment, session,

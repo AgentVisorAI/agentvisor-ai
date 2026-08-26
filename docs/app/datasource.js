@@ -607,6 +607,25 @@
     },
   ];
 
+  var MOCK_PASSKEYS = [
+    {
+      id: "pk_yubikey",
+      label: "Zach's YubiKey 5C",
+      transports: ["usb", "nfc"],
+      aaguid: "6d44ba9b-f6ec-2e49-b930-0c8fe920cb73",
+      createdAt: iso(90 * 24 * HOUR),
+      lastUsedAt: iso(3 * HOUR),
+    },
+    {
+      id: "pk_iphone",
+      label: "iPhone 15 Pro",
+      transports: ["internal", "hybrid"],
+      aaguid: null,
+      createdAt: iso(21 * 24 * HOUR),
+      lastUsedAt: iso(2 * 24 * HOUR),
+    },
+  ];
+
   /* ============================================================
    * OVERVIEW
    * ============================================================ */
@@ -765,6 +784,18 @@
       });
       return { config: MOCK_SAML_CONFIGS[i], spCertPem: MOCK_SAML_CONFIGS[i].spCertPem };
     },
+    // Mock passkeys — a fake yubikey + a fake iCloud passkey so the
+    // settings page in the demo looks real.
+    async webauthnListCredentials() {
+      return { credentials: MOCK_PASSKEYS.slice() };
+    },
+    async webauthnRegisterStart() { throw new Error("mock_no_real_authenticator"); },
+    async webauthnRegisterFinish() { throw new Error("mock_no_real_authenticator"); },
+    async webauthnRevoke(id) {
+      MOCK_PASSKEYS = MOCK_PASSKEYS.filter(function (p) { return p.id !== id; });
+    },
+    async webauthnAuthStart() { return { options: { challenge: "mock" }, hasCredential: false }; },
+    async webauthnAuthFinish() { throw new Error("mock_no_real_authenticator"); },
     async logout() {
       try { localStorage.setItem("av_mock_signed_out", "1"); } catch (e) {}
       mockState.session = null;
@@ -1104,6 +1135,31 @@
     },
     async regenerateSamlSpKeypair(id) {
       return apiFetch("/api/v1/auth/saml/" + encodeURIComponent(id) + "/keypair", { method: "POST", body: {} });
+    },
+
+    // WebAuthn ceremonies. The SPA calls navigator.credentials.create /
+    // .get with the options the server returns; results go back through
+    // /verify. All raw bytes cross the wire as base64url.
+    async webauthnListCredentials() {
+      return apiFetch("/api/v1/auth/webauthn/credentials");
+    },
+    async webauthnRegisterStart() {
+      return apiFetch("/api/v1/auth/webauthn/register/challenge", { method: "POST", body: {} });
+    },
+    async webauthnRegisterFinish(response, label) {
+      return apiFetch("/api/v1/auth/webauthn/register/verify", {
+        method: "POST",
+        body: { response: response, label: label || "Passkey" },
+      });
+    },
+    async webauthnRevoke(id) {
+      return apiFetch("/api/v1/auth/webauthn/credentials/" + encodeURIComponent(id), { method: "DELETE" });
+    },
+    async webauthnAuthStart(email) {
+      return apiFetch("/api/v1/auth/webauthn/authenticate/challenge", { method: "POST", body: { email: email } });
+    },
+    async webauthnAuthFinish(response) {
+      return apiFetch("/api/v1/auth/webauthn/authenticate/verify", { method: "POST", body: { response: response } });
     },
     async logout() { await apiFetch("/api/v1/auth/logout", { method: "POST" }); },
 

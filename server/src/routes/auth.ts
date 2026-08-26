@@ -203,6 +203,32 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     if (!membership) {
       return reply.code(403).send({ error: "no_org" });
     }
+
+    // MFA gate — if the user has any WebAuthn credentials, we do NOT
+    // mint the session cookie here. Instead we return { mfaRequired:
+    // true } and the SPA runs the WebAuthn ceremony to complete auth.
+    // Password alone is not sufficient once a passkey exists.
+    const credentialCount = await db.webauthnCredential.count({
+      where: { userId: user.id },
+    });
+    if (credentialCount > 0) {
+      writeAudit(
+        {
+          orgId: membership.orgId,
+          event: "auth.password_ok_mfa_required",
+          actorId: user.id,
+          actorEmail: user.email,
+          target: user.email,
+          req,
+        },
+        req.log,
+      );
+      return reply.send({
+        mfaRequired: true,
+        email: user.email,
+      });
+    }
+
     const token = await mintSession({
       sub: user.id,
       orgId: membership.orgId,

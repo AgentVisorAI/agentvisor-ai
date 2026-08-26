@@ -21,6 +21,7 @@ import { oauthRoutes } from "./routes/oauth.js";
 import { readRoutes } from "./routes/read.js";
 import { samlRoutes } from "./routes/saml.js";
 import { streamRoutes } from "./routes/stream.js";
+import { webauthnRoutes } from "./routes/webauthn.js";
 
 // `types.d.ts` declares the `request.session` typing. It's picked up by the
 // TypeScript compiler via `include`, no runtime import required.
@@ -449,6 +450,9 @@ async function main(): Promise<void> {
   });
   await app.register(async (r) => r.register(samlRoutes), {
     prefix: "/api/v1/auth/saml",
+  });
+  await app.register(async (r) => r.register(webauthnRoutes), {
+    prefix: "/api/v1/auth/webauthn",
   });
   await app.register(async (r) => r.register(deploymentRoutes), {
     prefix: "/api/v1/deployments",

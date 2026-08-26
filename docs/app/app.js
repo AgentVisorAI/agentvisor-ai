@@ -560,7 +560,23 @@
       var promise = isSignup
         ? state.ds.signup({ email: email, password: pw, orgName: ($("#orgName") || {}).value })
         : state.ds.login({ email: email, password: pw });
-      promise.then(function (s) {
+      promise.then(async function (s) {
+        // MFA gate — server returned {mfaRequired: true, email}. Run the
+        // WebAuthn ceremony to complete auth.
+        if (s && s.mfaRequired) {
+          errEl.innerHTML = '<div class="auth-hint" style="color: var(--fg-2); padding: 8px 12px;">Touch your passkey…</div>';
+          try {
+            var full = await runPasskeyLogin(s.email);
+            state.session = full;
+            startLiveStream();
+            navigate(consumeReturnTo() || "#/overview");
+            return;
+          } catch (err) {
+            btn.disabled = false;
+            errEl.innerHTML = '<div class="auth-err">' + esc(err.message || "Passkey step failed") + "</div>";
+            return;
+          }
+        }
         state.session = s;
         startLiveStream();
         navigate(consumeReturnTo() || "#/overview");
@@ -1852,21 +1868,67 @@
         '<div style="padding: 20px 16px">' + samlList + '</div>' +
       '</div>';
 
+    // Fetch passkeys inline so the MFA card is populated before render.
+    var passkeys = [];
+    try { passkeys = (await state.ds.webauthnListCredentials()).credentials || []; }
+    catch (e) { passkeys = []; }
+
+    var mfaRows = passkeys.length
+      ? '<div class="table-wrap"><table>' +
+          '<thead><tr><th>Passkey</th><th>Transport</th><th>Last used</th><th>Registered</th><th><span class="sr-only">Actions</span></th></tr></thead>' +
+          '<tbody>' + passkeys.map(function (p) {
+            return '<tr data-pk="' + esc(p.id) + '">' +
+              '<td><div style="font-weight:500">' + esc(p.label) + '</div><div class="id">' + esc((p.aaguid || 'aaguid unknown').slice(0, 24)) + '</div></td>' +
+              '<td>' + (p.transports || []).map(function (t) { return '<span class="pill neutral">' + esc(t) + '</span>'; }).join(' ') + '</td>' +
+              '<td style="color: var(--fg-2)">' + esc(p.lastUsedAt ? timeAgo(p.lastUsedAt) : "never") + '</td>' +
+              '<td style="color: var(--fg-2)">' + esc(timeAgo(p.createdAt)) + '</td>' +
+              '<td><button class="btn danger" data-pk-act="revoke">Revoke</button></td>' +
+            '</tr>';
+          }).join('') + '</tbody>' +
+        '</table></div>'
+      : emptyState("No passkeys yet", "Add a hardware key or platform authenticator (Touch ID, Windows Hello, iCloud) to require a passkey on every sign-in. WebAuthn is phishing-resistant and requires no shared secrets.", "+ Add passkey", null, "addPasskeyBtn");
+
     var mfaCard =
-      '<div class="card">' +
-        '<h2>Multi-factor auth</h2>' +
-        '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 var(--s-4)">Require WebAuthn (passkeys) or TOTP for all sign-ins. Enforced at the mint-session boundary — SAML users inherit their IdP\'s MFA posture.</p>' +
-        '<button class="btn accent" id="mfaBtn">Require MFA for all members</button>' +
+      '<div class="card" style="padding:0">' +
+        '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:baseline">' +
+          '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">Multi-factor auth (passkeys)</h2>' +
+          '<span style="margin-left:8px; color:var(--fg-3); font-size:var(--t-sec)">' + passkeys.length + ' registered</span>' +
+          (passkeys.length ? '<button class="btn accent" id="addPasskeyBtn" style="margin-left:auto">+ Add passkey</button>' : '') +
+        '</div>' +
+        '<div style="padding: 20px 16px">' + mfaRows + '</div>' +
       '</div>';
 
     root.innerHTML = oauthCard + samlCard + mfaCard;
 
     var addBtn = $("#addSamlBtn", root);
     if (addBtn) addBtn.addEventListener("click", function () { openSamlEditor(root, null); });
-    var mfa = $("#mfaBtn", root);
-    if (mfa) mfa.addEventListener("click", function () {
-      comingSoon("Require MFA", "Every member will be required to enroll a passkey or TOTP at their next sign-in.");
-    });
+    var addPk = $("#addPasskeyBtn", root);
+    if (addPk) addPk.addEventListener("click", function () { addPasskey(root); });
+
+    // Passkey row actions
+    var pkTbody = $$("main .table-wrap tbody", root)[1] || null; // sometimes there are two tables — SSO + MFA
+    var pkTables = root.querySelectorAll("table");
+    for (var pi = 0; pi < pkTables.length; pi++) {
+      pkTables[pi].addEventListener("click", function (e) {
+        var btn = e.target.closest("[data-pk-act]");
+        if (!btn) return;
+        var tr = e.target.closest("tr[data-pk]");
+        if (!tr) return;
+        var pkId = tr.getAttribute("data-pk");
+        confirmModal({
+          title: "Revoke passkey?",
+          body: "The passkey will stop working immediately. You'll need to sign in with password only, then register another passkey.",
+          confirmLabel: "Revoke",
+          danger: true,
+          onConfirm: function () {
+            state.ds.webauthnRevoke(pkId).then(function () {
+              toast("Passkey revoked");
+              renderSettingsSSO(root);
+            }).catch(function (err) { toast(err.message || "Revoke failed", true); });
+          },
+        });
+      });
+    }
 
     var tbody = root.querySelector("tbody");
     if (tbody) tbody.addEventListener("click", function (e) {
@@ -1941,6 +2003,104 @@
     });
     setTimeout(function () { backdrop.querySelector('[data-close]').focus(); }, 20);
   }
+
+  // ---------- WebAuthn / passkey ----------
+
+  // base64url <-> ArrayBuffer helpers. WebAuthn API returns ArrayBuffers
+  // for the challenge, credentialId, and signature; we send them to the
+  // server as base64url strings.
+  function b64uToBuffer(s) {
+    var pad = 4 - (s.length % 4);
+    var b64 = s.replace(/-/g, "+").replace(/_/g, "/") + (pad === 4 ? "" : new Array(pad + 1).join("="));
+    var bin = atob(b64);
+    var out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out.buffer;
+  }
+  function bufferToB64u(buf) {
+    var bytes = new Uint8Array(buf);
+    var bin = "";
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  async function addPasskey(rootAfterAdd) {
+    if (!window.PublicKeyCredential) {
+      toast("This browser doesn't support WebAuthn.", true);
+      return;
+    }
+    // Ask for a label first
+    openInputModal({
+      title: "Add a passkey",
+      label: "Name this passkey",
+      placeholder: "iPhone 15 Pro, YubiKey 5C, laptop, …",
+      confirmLabel: "Continue",
+      onConfirm: async function (label) {
+        try {
+          var opts = (await state.ds.webauthnRegisterStart()).options;
+          // Convert challenge + user.id + excludeCredentials[].id to ArrayBuffer.
+          opts.challenge = b64uToBuffer(opts.challenge);
+          opts.user.id = b64uToBuffer(opts.user.id);
+          if (opts.excludeCredentials) {
+            opts.excludeCredentials = opts.excludeCredentials.map(function (c) {
+              return Object.assign({}, c, { id: b64uToBuffer(c.id) });
+            });
+          }
+          var cred = await navigator.credentials.create({ publicKey: opts });
+          if (!cred) throw new Error("no_credential_returned");
+          var response = {
+            id: cred.id,
+            rawId: bufferToB64u(cred.rawId),
+            type: cred.type,
+            response: {
+              attestationObject: bufferToB64u(cred.response.attestationObject),
+              clientDataJSON: bufferToB64u(cred.response.clientDataJSON),
+              transports: cred.response.getTransports ? cred.response.getTransports() : [],
+            },
+            clientExtensionResults: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {},
+            authenticatorAttachment: cred.authenticatorAttachment || null,
+          };
+          await state.ds.webauthnRegisterFinish(response, label);
+          toast("Passkey added");
+          if (rootAfterAdd) renderSettingsSSO(rootAfterAdd);
+        } catch (err) {
+          toast(err.message || "Passkey registration failed", true);
+        }
+      },
+    });
+  }
+
+  async function runPasskeyLogin(email) {
+    if (!window.PublicKeyCredential) {
+      throw new Error("browser_no_webauthn");
+    }
+    var start = await state.ds.webauthnAuthStart(email);
+    if (!start.hasCredential) throw new Error("no_credential_for_email");
+    var opts = start.options;
+    opts.challenge = b64uToBuffer(opts.challenge);
+    if (opts.allowCredentials) {
+      opts.allowCredentials = opts.allowCredentials.map(function (c) {
+        return Object.assign({}, c, { id: b64uToBuffer(c.id) });
+      });
+    }
+    var cred = await navigator.credentials.get({ publicKey: opts });
+    if (!cred) throw new Error("no_credential_returned");
+    var response = {
+      id: cred.id,
+      rawId: bufferToB64u(cred.rawId),
+      type: cred.type,
+      response: {
+        clientDataJSON: bufferToB64u(cred.response.clientDataJSON),
+        authenticatorData: bufferToB64u(cred.response.authenticatorData),
+        signature: bufferToB64u(cred.response.signature),
+        userHandle: cred.response.userHandle ? bufferToB64u(cred.response.userHandle) : null,
+      },
+      clientExtensionResults: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {},
+      authenticatorAttachment: cred.authenticatorAttachment || null,
+    };
+    return state.ds.webauthnAuthFinish(response);
+  }
+
 
   // ---------- SAML editor ----------
 
