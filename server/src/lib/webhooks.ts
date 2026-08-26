@@ -29,12 +29,118 @@
  * production deployments would swap in Sidekiq / BullMQ.
  */
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { isIP } from "node:net";
+import { promises as dns } from "node:dns";
 import type { FastifyBaseLogger } from "fastify";
 import { db } from "../db.js";
+import { env } from "../env.js";
 
 const MAX_ATTEMPT = 6;
 const BACKOFF_SECONDS = [30, 120, 600, 1800, 7200];
 const DELIVERY_TIMEOUT_MS = 5000;
+
+/**
+ * SSRF guard — refuse to send outbound requests to internal / metadata
+ * / link-local / loopback / RFC-1918 destinations.
+ *
+ * In production we're strict: any private-range IP fails validation.
+ * The cloud metadata endpoints (AWS 169.254.169.254, GCP
+ * metadata.google.internal, Azure 169.254.169.254) are the most
+ * dangerous — a compromised operator could otherwise register a
+ * webhook that exfiltrates instance-role credentials.
+ *
+ * In development we allow 127.0.0.1 + link-local so operators can
+ * point at their local receiver for testing. The env-driven allowlist
+ * is what makes the drill work without disabling the guard entirely.
+ */
+const BLOCKED_HOSTS_ALWAYS = new Set([
+  "metadata.google.internal",
+  "metadata.goog",
+  "169.254.169.254",
+  "fd00:ec2::254",
+  "instance-data",
+]);
+
+function isBlockedIp(ip: string): boolean {
+  // IPv6
+  if (isIP(ip) === 6) {
+    // ::1 loopback
+    if (ip === "::1" || ip.startsWith("::ffff:127.")) return true;
+    // link-local fe80::/10 and unique-local fc00::/7
+    const lc = ip.toLowerCase();
+    if (lc.startsWith("fe80:") || lc.startsWith("fc") || lc.startsWith("fd")) {
+      return true;
+    }
+    return false;
+  }
+  // IPv4
+  const parts = ip.split(".").map((n) => parseInt(n, 10));
+  if (parts.length !== 4 || parts.some((n) => isNaN(n))) return true;
+  const [a = 0, b = 0] = parts;
+  if (a === 10) return true;                 // 10.0.0.0/8
+  if (a === 127) return true;                // 127.0.0.0/8
+  if (a === 169 && b === 254) return true;   // 169.254.0.0/16 (link-local + metadata)
+  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+  if (a === 192 && b === 168) return true;   // 192.168.0.0/16
+  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT 100.64.0.0/10
+  if (a === 0) return true;                  // 0.0.0.0/8
+  return false;
+}
+
+export interface SsrfCheckResult {
+  ok: boolean;
+  reason?: string;
+}
+
+export async function validateWebhookUrl(rawUrl: string): Promise<SsrfCheckResult> {
+  let u: URL;
+  try {
+    u = new URL(rawUrl);
+  } catch {
+    return { ok: false, reason: "invalid_url" };
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") {
+    return { ok: false, reason: "unsupported_scheme" };
+  }
+  const host = u.hostname.toLowerCase();
+  if (BLOCKED_HOSTS_ALWAYS.has(host)) {
+    return { ok: false, reason: "blocked_metadata_host" };
+  }
+  // Explicit IP literal — check directly. This is the most common attack
+  // vector because it dodges DNS resolution.
+  if (isIP(host)) {
+    // Metadata (169.254.169.254) is *always* refused, even in dev —
+    // there's no legitimate reason a webhook target would live there.
+    if (host === "169.254.169.254" || host === "fd00:ec2::254") {
+      return { ok: false, reason: "blocked_metadata_ip" };
+    }
+    if (env.NODE_ENV === "production" && isBlockedIp(host)) {
+      return { ok: false, reason: "private_ip_blocked" };
+    }
+    return { ok: true };
+  }
+  // Hostname — resolve to A/AAAA and check every result. Attackers can
+  // register a DNS name that points at 127.0.0.1 or a metadata IP; the
+  // literal string 'evil.com' looks innocent but resolves to 169.254.169.254.
+  try {
+    const addrs = await dns.lookup(host, { all: true, verbatim: true });
+    if (addrs.length === 0) return { ok: false, reason: "unresolvable" };
+    if (env.NODE_ENV === "production") {
+      for (const a of addrs) {
+        if (isBlockedIp(a.address)) {
+          return { ok: false, reason: "resolves_to_private_ip" };
+        }
+      }
+    }
+  } catch {
+    // In production, unresolvable == suspicious. In dev, tolerate it so
+    // ephemeral test hosts don't break the flow.
+    if (env.NODE_ENV === "production") {
+      return { ok: false, reason: "dns_failed" };
+    }
+  }
+  return { ok: true };
+}
 
 export function generateWebhookSecret(): string {
   return randomBytes(32).toString("hex");
@@ -117,17 +223,32 @@ async function deliverOne(
   body: string,
   attempt: number,
   logger?: FastifyBaseLogger,
+  existingDeliveryId?: string,
 ): Promise<void> {
-  const row = await db.webhookDelivery.create({
-    data: {
-      endpointId,
-      event,
-      payload: body,
-      attempt,
-      status: "pending",
-    },
-    select: { id: true },
-  });
+  // On the first attempt, create a new WebhookDelivery row. On retries
+  // driven by the sweeper, we reuse the existing row so the operator sees
+  // one row per (event, endpoint) with an `attempt` counter that grows,
+  // not one row per retry attempt.
+  let deliveryId: string;
+  if (existingDeliveryId) {
+    deliveryId = existingDeliveryId;
+    await db.webhookDelivery.update({
+      where: { id: existingDeliveryId },
+      data: { attempt, status: "pending", nextRetryAt: null },
+    });
+  } else {
+    const row = await db.webhookDelivery.create({
+      data: {
+        endpointId,
+        event,
+        payload: body,
+        attempt,
+        status: "pending",
+      },
+      select: { id: true },
+    });
+    deliveryId = row.id;
+  }
 
   const timestamp = String(Math.floor(Date.now() / 1000));
   const sig = signPayload(secret, timestamp, body);
@@ -141,7 +262,7 @@ async function deliverOne(
         "Content-Type": "application/json",
         "User-Agent": "AgentVisor-Webhook/1.0",
         "X-AgentVisor-Event": event,
-        "X-AgentVisor-Delivery": row.id,
+        "X-AgentVisor-Delivery": deliveryId,
         "X-AgentVisor-Timestamp": timestamp,
         "X-AgentVisor-Signature": sig,
       },
@@ -154,7 +275,7 @@ async function deliverOne(
     const truncated = respText.length > 2000 ? respText.slice(0, 2000) + "…" : respText;
     if (responseCode >= 200 && responseCode < 300) {
       await db.webhookDelivery.update({
-        where: { id: row.id },
+        where: { id: deliveryId },
         data: {
           status: "delivered",
           responseCode,
@@ -167,7 +288,7 @@ async function deliverOne(
     // 4xx = give up (endpoint misconfigured); 5xx = retry with backoff.
     if (responseCode >= 400 && responseCode < 500) {
       await db.webhookDelivery.update({
-        where: { id: row.id },
+        where: { id: deliveryId },
         data: {
           status: "failed",
           responseCode,
@@ -177,11 +298,11 @@ async function deliverOne(
       });
       return;
     }
-    await scheduleRetry(row.id, attempt, "server_error_" + responseCode, truncated, responseCode, logger);
+    await scheduleRetry(deliveryId, attempt, "server_error_" + responseCode, truncated, responseCode, logger);
   } catch (e) {
     clearTimeout(timer);
     const msg = e instanceof Error ? e.message : String(e);
-    await scheduleRetry(row.id, attempt, msg, null, null, logger);
+    await scheduleRetry(deliveryId, attempt, msg, null, null, logger);
   }
 }
 
@@ -223,6 +344,8 @@ async function scheduleRetry(
 
 let sweeperTimer: NodeJS.Timeout | null = null;
 
+const SWEEPER_INTERVAL_MS = Number(process.env.WEBHOOK_SWEEPER_INTERVAL_MS ?? 15_000);
+
 /**
  * Start the retry sweeper. Idempotent — safe to call multiple times
  * (Fastify plugin encapsulation might otherwise cause double-registration
@@ -256,11 +379,8 @@ export function startWebhookSweeper(logger?: FastifyBaseLogger): void {
           });
           continue;
         }
-        // Mark pending so a concurrent sweeper doesn't double-fire.
-        await db.webhookDelivery.update({
-          where: { id: d.id },
-          data: { status: "pending", nextRetryAt: null },
-        });
+        // deliverOne with existingDeliveryId reuses this row rather than
+        // creating a new one — attempt counter bumps in place.
         void deliverOne(
           d.endpointId,
           d.endpoint.url,
@@ -269,13 +389,14 @@ export function startWebhookSweeper(logger?: FastifyBaseLogger): void {
           d.payload,
           d.attempt + 1,
           logger,
+          d.id,
         );
       }
     } catch (e) {
       logger?.warn({ err: e }, "webhook_sweeper_iteration_failed");
     }
   };
-  sweeperTimer = setInterval(tick, 15_000);
+  sweeperTimer = setInterval(tick, SWEEPER_INTERVAL_MS);
   // First tick immediately so tests don't have to wait 15s.
   void tick();
 }

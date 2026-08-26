@@ -23,6 +23,7 @@ import { createServer } from "node:http";
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 const BASE = process.env.BASE ?? "http://127.0.0.1:8747";
+const PG_CONTAINER = process.env.PG_CONTAINER ?? "av-pg-r47";
 const RECV_PORT = 44117;
 const nonce = Math.random().toString(36).slice(2, 6);
 
@@ -199,7 +200,7 @@ capture = [];
   receiverBehavior = { status: 200 };
   const { execSync } = await import("node:child_process");
   execSync(
-    `docker exec av-pg-r47 psql -U av -d avdb -c "UPDATE webhook_deliveries SET \\"nextRetryAt\\" = NOW() - INTERVAL '1 minute' WHERE status='retrying'"`,
+    `docker exec ${PG_CONTAINER} psql -U av -d avdb -c "UPDATE webhook_deliveries SET \\"nextRetryAt\\" = NOW() - INTERVAL '1 minute' WHERE status='retrying'"`,
     { stdio: "ignore" },
   );
   capture = [];

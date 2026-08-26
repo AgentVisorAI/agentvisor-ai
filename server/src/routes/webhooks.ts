@@ -21,7 +21,7 @@ import { z } from "zod";
 import { db } from "../db.js";
 import { requireSession } from "../lib/session-middleware.js";
 import { writeAudit } from "../lib/audit.js";
-import { dispatchEvent, generateWebhookSecret } from "../lib/webhooks.js";
+import { dispatchEvent, generateWebhookSecret, validateWebhookUrl } from "../lib/webhooks.js";
 
 const urlSchema = z
   .string()
@@ -75,6 +75,10 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
       })
       .safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: "invalid_input" });
+    const ssrf = await validateWebhookUrl(body.data.url);
+    if (!ssrf.ok) {
+      return reply.code(400).send({ error: "ssrf_" + (ssrf.reason ?? "blocked") });
+    }
     const secret = generateWebhookSecret();
     const ep = await db.webhookEndpoint.create({
       data: {
@@ -123,6 +127,12 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
       })
       .safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: "invalid_input" });
+    if (body.data.url) {
+      const ssrf = await validateWebhookUrl(body.data.url);
+      if (!ssrf.ok) {
+        return reply.code(400).send({ error: "ssrf_" + (ssrf.reason ?? "blocked") });
+      }
+    }
     const existing = await db.webhookEndpoint.findFirst({
       where: { id: req.params.id, orgId: claims.orgId },
     });
