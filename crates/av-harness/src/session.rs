@@ -1110,6 +1110,45 @@ impl SessionRegistry {
                 evicted.push(session);
             }
         }
+        // Overflow pass: cap capture-failed (quarantined) session
+        // retention. Same shape as the latched pass above but for a
+        // distinct class: capture-failed sessions are supposed to be
+        // bounded by real crash events, but the paired
+        // `Finalizer::quarantined_sessions` set is now FIFO-capped at
+        // MAX_QUARANTINED_SESSIONS. Their in-registry retention needed
+        // a matching cap to prevent the Session Arcs from growing
+        // indefinitely across a long-lived process's lifetime. Beyond
+        // the cap, evict oldest-first — the quarantine artifact on
+        // disk is what fundamentally gates resurrection, so evicting
+        // the in-memory Arc is safe (a subsequent recovery pass
+        // re-inserts if the artifact still lives on disk).
+        const MAX_CAPTURE_FAILED_RETAINED: usize = 4096;
+        let mut capture_failed: Vec<Arc<Session>> = self
+            .sessions
+            .iter()
+            .filter(|entry| {
+                entry.close_complete_flag()
+                    && entry.capture_failed()
+                    && entry.active_streams.load(Ordering::Acquire) == 0
+                    && entry.pending_jobs.load(Ordering::Acquire) == 0
+            })
+            .map(|entry| Arc::clone(&entry))
+            .collect();
+        if capture_failed.len() > MAX_CAPTURE_FAILED_RETAINED {
+            capture_failed.sort_by_key(|session| std::cmp::Reverse(session.idle_duration()));
+            let excess = capture_failed.len() - MAX_CAPTURE_FAILED_RETAINED;
+            tracing::warn!(
+                excess,
+                cap = MAX_CAPTURE_FAILED_RETAINED,
+                "capture-failed sessions exceed the retention cap; evicting oldest \
+                 (their same-id fail-closed refusal expires until on-disk quarantine \
+                 artifact re-inserts on the next recovery tick)"
+            );
+            for session in capture_failed.into_iter().take(excess) {
+                self.sessions.remove(&session.id);
+                evicted.push(session);
+            }
+        }
         evicted
     }
 
