@@ -102,6 +102,22 @@ pub struct AppState {
     /// `av_shutdown_session_close_timeouts_total` on an otherwise-
     /// recoverable session.
     pub mcp_inflight: Arc<crate::inflight::InflightTracker>,
+    /// Admission semaphore bounding concurrent `mcp_call_inner`
+    /// executions to `config.mcp_concurrency`. R70 F1 (landed R71):
+    /// without this limit a slow-tool-upstream attack + N
+    /// concurrent MCP callers each buffering up to
+    /// `MAX_TOOL_RESPONSE_BYTES = 16 MiB` in
+    /// `read_limited_tool_response` stacked N × 16 MiB unbounded.
+    /// `mcp_inflight` above is a shutdown-drain COUNTER — not a
+    /// limiter. Chat path already has admission via
+    /// `worker.try_reserve_pair`; MCP was the odd one out.
+    ///
+    /// Refused admissions increment `av_mcp_admission_refusals_
+    /// total` (see mcp_call in routes.rs) and respond 503 with a
+    /// Retry-After header — 503 not 429 because the refusal is a
+    /// server-side capacity signal (matches breaker-open 503-not-
+    /// 429 discipline documented in finalize_error_response.rs).
+    pub mcp_admission: Arc<tokio::sync::Semaphore>,
 }
 
 /// Pre-resolved metric handles for the request hot path so the
@@ -121,6 +137,42 @@ pub(crate) struct HotMetrics {
     /// called per stage per request because `||` cannot short-circuit
     /// a false config default.
     pub(crate) strict_stage_budget: bool,
+    /// Pre-resolved `av_requests_total{route,status_class}` counters,
+    /// indexed by `(Route::index(), StatusClass::index())`. Populated
+    /// at boot; every hit is O(1) with zero string alloc and zero
+    /// registry-mutex acquisition — R58 audit found the previous
+    /// per-request `metrics.counter(&format!("..."))` path did 4
+    /// mutex ops on the shared `Registry` per HTTP request plus
+    /// ~120 B of allocator churn (at 10k req/s: ~40k mutex ops/s +
+    /// 1.2 MB/s allocs on the request middleware alone).
+    pub(crate) request_counters: [[Arc<av_core::metrics::Counter>; 5]; 10],
+    /// Pre-resolved `av_request_duration_seconds{route}` histograms,
+    /// indexed by `Route::index()`. Same rationale as
+    /// `request_counters` above; the histogram fetch used to hit
+    /// TWO Registry mutex ops per request (base_kinds + metrics
+    /// map).
+    pub(crate) request_duration_histograms: [Arc<av_core::metrics::Histogram>; 10],
+    /// Pre-resolved `av_upstream_latency_seconds` histogram — hit
+    /// on every successful chat forward. R59 continuation of R58's
+    /// hot-path pre-resolution: prior code called
+    /// `metrics.histogram_with_bounds("av_upstream_latency_seconds",
+    /// ...)` per request, doing 2 Registry mutex ops per chat.
+    pub(crate) upstream_latency_histogram: Arc<av_core::metrics::Histogram>,
+    /// Pre-resolved `av_upstream_errors_total{kind}` counters,
+    /// indexed by `UpstreamErrorKind::index()`. Prior code called
+    /// `metrics.counter(&format!("av_upstream_errors_total{...}"))`
+    /// per error, doing 2 Registry mutex ops + a String alloc per
+    /// upstream failure. Kinds order matches boot pre-registration.
+    pub(crate) upstream_errors_counters: [Arc<av_core::metrics::Counter>; 4],
+    /// Pre-resolved `av_dashboard_requests_total{endpoint,status}`
+    /// counters, indexed by `(DashboardEndpoint::index(),
+    /// DashboardStatus::index())`. Same rationale as
+    /// `request_counters`; the dashboard is lower volume but
+    /// hits the same shared Registry mutex.
+    pub(crate) dashboard_request_counters: [[Arc<av_core::metrics::Counter>; 2]; 3],
+    /// Pre-resolved `av_dashboard_request_duration_seconds{endpoint}`
+    /// histograms, indexed by `DashboardEndpoint::index()`.
+    pub(crate) dashboard_request_duration_histograms: [Arc<av_core::metrics::Histogram>; 3],
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -166,6 +218,233 @@ impl Stage {
     }
 }
 
+/// HTTP route label enum. Mirrors the closed vocabulary in
+/// `route_label(path)` — pre-resolved into a fixed-index array of
+/// `Arc<Counter>` / `Arc<Histogram>` so the request-metrics
+/// middleware never touches the shared `Registry` mutex on the hot
+/// path (see `HotMetrics::request_counters`).
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum Route {
+    Chat,
+    Mcp,
+    Health,
+    Livez,
+    Readyz,
+    Metrics,
+    SessionClose,
+    SessionPromote,
+    Dashboard,
+    Other,
+}
+
+impl Route {
+    pub(crate) const ORDER: [Route; 10] = [
+        Route::Chat,
+        Route::Mcp,
+        Route::Health,
+        Route::Livez,
+        Route::Readyz,
+        Route::Metrics,
+        Route::SessionClose,
+        Route::SessionPromote,
+        Route::Dashboard,
+        Route::Other,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Route::Chat => "chat",
+            Route::Mcp => "mcp",
+            Route::Health => "health",
+            Route::Livez => "livez",
+            Route::Readyz => "readyz",
+            Route::Metrics => "metrics",
+            Route::SessionClose => "session_close",
+            Route::SessionPromote => "session_promote",
+            Route::Dashboard => "dashboard",
+            Route::Other => "other",
+        }
+    }
+
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Route::Chat => 0,
+            Route::Mcp => 1,
+            Route::Health => 2,
+            Route::Livez => 3,
+            Route::Readyz => 4,
+            Route::Metrics => 5,
+            Route::SessionClose => 6,
+            Route::SessionPromote => 7,
+            Route::Dashboard => 8,
+            Route::Other => 9,
+        }
+    }
+}
+
+/// HTTP status-class label. Mirrors the closed vocabulary in the
+/// request-metrics middleware. Kept as a separate enum so future
+/// additions (e.g., a hypothetical `2xx-slow`) surface via
+/// exhaustive-match compile checks.
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum StatusClass {
+    Informational, // 1xx
+    Success,       // 2xx
+    Redirection,   // 3xx
+    ClientError,   // 4xx
+    ServerError,   // 5xx
+}
+
+impl StatusClass {
+    pub(crate) const ORDER: [StatusClass; 5] = [
+        StatusClass::Informational,
+        StatusClass::Success,
+        StatusClass::Redirection,
+        StatusClass::ClientError,
+        StatusClass::ServerError,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            StatusClass::Informational => "1xx",
+            StatusClass::Success => "2xx",
+            StatusClass::Redirection => "3xx",
+            StatusClass::ClientError => "4xx",
+            StatusClass::ServerError => "5xx",
+        }
+    }
+
+    pub(crate) fn index(self) -> usize {
+        match self {
+            StatusClass::Informational => 0,
+            StatusClass::Success => 1,
+            StatusClass::Redirection => 2,
+            StatusClass::ClientError => 3,
+            StatusClass::ServerError => 4,
+        }
+    }
+
+    pub(crate) fn from_u16(status: u16) -> Self {
+        match status {
+            100..=199 => StatusClass::Informational,
+            200..=299 => StatusClass::Success,
+            300..=399 => StatusClass::Redirection,
+            400..=499 => StatusClass::ClientError,
+            _ => StatusClass::ServerError,
+        }
+    }
+}
+
+/// Upstream error classifier used for `av_upstream_errors_total{kind}`.
+/// Mirrors `classify_upstream_error(err)` — same set as the boot
+/// pre-registration at pipeline.rs:1196.
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum UpstreamErrorKind {
+    Timeout,
+    Connect,
+    Send,
+    Http5xx,
+}
+
+impl UpstreamErrorKind {
+    pub(crate) const ORDER: [UpstreamErrorKind; 4] = [
+        UpstreamErrorKind::Timeout,
+        UpstreamErrorKind::Connect,
+        UpstreamErrorKind::Send,
+        UpstreamErrorKind::Http5xx,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            UpstreamErrorKind::Timeout => "timeout",
+            UpstreamErrorKind::Connect => "connect",
+            UpstreamErrorKind::Send => "send",
+            UpstreamErrorKind::Http5xx => "http_5xx",
+        }
+    }
+
+    pub(crate) fn index(self) -> usize {
+        match self {
+            UpstreamErrorKind::Timeout => 0,
+            UpstreamErrorKind::Connect => 1,
+            UpstreamErrorKind::Send => 2,
+            UpstreamErrorKind::Http5xx => 3,
+        }
+    }
+
+    /// Convert `classify_upstream_error`'s `&'static str` output into
+    /// a typed variant. The classifier at pipeline.rs:2736 already
+    /// exhaustively covers this set; this fn is the typed mirror.
+    pub(crate) fn from_reqwest(error: &reqwest::Error) -> Self {
+        if error.is_timeout() {
+            UpstreamErrorKind::Timeout
+        } else if error.is_connect() {
+            UpstreamErrorKind::Connect
+        } else {
+            UpstreamErrorKind::Send
+        }
+    }
+}
+
+/// Dashboard endpoint label. Mirrors the `record()` call sites in
+/// dashboard.rs (list, detail, stats).
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum DashboardEndpoint {
+    Stats,
+    List,
+    Detail,
+}
+
+impl DashboardEndpoint {
+    pub(crate) const ORDER: [DashboardEndpoint; 3] = [
+        DashboardEndpoint::Stats,
+        DashboardEndpoint::List,
+        DashboardEndpoint::Detail,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            DashboardEndpoint::Stats => "stats",
+            DashboardEndpoint::List => "list",
+            DashboardEndpoint::Detail => "detail",
+        }
+    }
+
+    pub(crate) fn index(self) -> usize {
+        match self {
+            DashboardEndpoint::Stats => 0,
+            DashboardEndpoint::List => 1,
+            DashboardEndpoint::Detail => 2,
+        }
+    }
+}
+
+/// Dashboard endpoint response status label. Mirrors the `record()`
+/// call sites (`ok`, `not_found`) in dashboard.rs.
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum DashboardStatus {
+    Ok,
+    NotFound,
+}
+
+impl DashboardStatus {
+    pub(crate) const ORDER: [DashboardStatus; 2] = [DashboardStatus::Ok, DashboardStatus::NotFound];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            DashboardStatus::Ok => "ok",
+            DashboardStatus::NotFound => "not_found",
+        }
+    }
+
+    pub(crate) fn index(self) -> usize {
+        match self {
+            DashboardStatus::Ok => 0,
+            DashboardStatus::NotFound => 1,
+        }
+    }
+}
+
 impl HotMetrics {
     fn new(metrics: &Registry, config_strict_stage_budget: bool) -> Self {
         // Registrations here mirror the boot loop below. Using the
@@ -186,10 +465,81 @@ impl HotMetrics {
                 "Middleware stages that exceeded the strict per-stage budget",
             )
         });
+        // Pre-resolve the request-metrics middleware's counters +
+        // histograms as a [route][status_class] array so the hot
+        // path is O(1) with zero string alloc and zero Registry
+        // mutex ops. Registration order matches the enum ORDER
+        // constants, matched at read time via `Route::index()` and
+        // `StatusClass::index()`.
+        let request_counters: [[Arc<av_core::metrics::Counter>; 5]; 10] = Route::ORDER.map(|route| {
+            StatusClass::ORDER.map(|status| {
+                metrics.counter(
+                    &format!(
+                        "av_requests_total{{route=\"{}\",status_class=\"{}\"}}",
+                        route.label(),
+                        status.label()
+                    ),
+                    "HTTP requests by route and status class",
+                )
+            })
+        });
+        let request_duration_histograms: [Arc<av_core::metrics::Histogram>; 10] = Route::ORDER.map(|route| {
+            metrics.histogram_with_bounds(
+                &format!("av_request_duration_seconds{{route=\"{}\"}}", route.label()),
+                "End-to-end HTTP request latency by route",
+                av_core::metrics::WIDE_LATENCY_BOUNDS_US,
+            )
+        });
+        // Pre-resolve upstream latency + error counters — hit on
+        // every chat forward. Same rationale as request_counters.
+        let upstream_latency_histogram = metrics.histogram_with_bounds(
+            "av_upstream_latency_seconds",
+            "Time to upstream response headers",
+            av_core::metrics::WIDE_LATENCY_BOUNDS_US,
+        );
+        let upstream_errors_counters: [Arc<av_core::metrics::Counter>; 4] =
+            UpstreamErrorKind::ORDER.map(|kind| {
+                metrics.counter(
+                    &format!("av_upstream_errors_total{{kind=\"{}\"}}", kind.label()),
+                    "Upstream failures by kind",
+                )
+            });
+        // Pre-resolve dashboard endpoint counters + histograms. Same
+        // rationale as request_counters; lower volume but hits the
+        // same shared Registry mutex.
+        let dashboard_request_counters: [[Arc<av_core::metrics::Counter>; 2]; 3] = DashboardEndpoint::ORDER
+            .map(|endpoint| {
+                DashboardStatus::ORDER.map(|status| {
+                    metrics.counter(
+                        &format!(
+                            "av_dashboard_requests_total{{endpoint=\"{}\",status=\"{}\"}}",
+                            endpoint.label(),
+                            status.label()
+                        ),
+                        "Dashboard endpoint requests, labeled by status",
+                    )
+                })
+            });
+        let dashboard_request_duration_histograms: [Arc<av_core::metrics::Histogram>; 3] =
+            DashboardEndpoint::ORDER.map(|endpoint| {
+                metrics.histogram(
+                    &format!(
+                        "av_dashboard_request_duration_seconds{{endpoint=\"{}\"}}",
+                        endpoint.label()
+                    ),
+                    "Dashboard endpoint latency",
+                )
+            });
         Self {
             stage_histograms,
             stage_strict_budget_counters,
             strict_stage_budget: config_strict_stage_budget || truthy_env("AV_STRICT_BUDGET"),
+            request_counters,
+            request_duration_histograms,
+            upstream_latency_histogram,
+            upstream_errors_counters,
+            dashboard_request_counters,
+            dashboard_request_duration_histograms,
         }
     }
 }
@@ -1401,6 +1751,23 @@ impl AppState {
             PipelineError::bad_request(format!("unsupported provider {:?}", config.provider))
         })?;
         tracing::info!(provider = provider_adapter.name(), "provider adapter selected");
+        let mcp_admission = Arc::new(tokio::sync::Semaphore::new(config.mcp_concurrency));
+        // R72 review F1: pre-register the MCP admission-refusal
+        // counter so its series exists in a Prometheus scrape from
+        // the very first boot moment, not lazily on first refusal
+        // (which would defeat `alert on absent(av_mcp_admission_
+        // refusals_total)` dashboards and pay the register cost on
+        // the hot refusal path). Same discipline as HotMetrics and
+        // the reconciler's `av_reconciler_last_tick_completed_
+        // seconds` gauge.
+        metrics.counter(
+            "av_mcp_admission_refusals_total",
+            "MCP admission was refused because `mcp_concurrency` was already at capacity — \
+             each admitted call can buffer up to 16 MiB in `read_limited_tool_response`, \
+             so the cap bounds worst-case MCP resident memory. Sustained > 0 indicates \
+             tool-upstream slowdown, a burst-traffic event, or an undersized \
+             `mcp_concurrency`.",
+        );
         Ok(Self {
             config,
             store,
@@ -1422,6 +1789,7 @@ impl AppState {
             identity_rejection_window: Arc::new(parking_lot::Mutex::new((Instant::now(), 0))),
             journal_key,
             mcp_inflight: Arc::new(crate::inflight::InflightTracker::new()),
+            mcp_admission,
         })
     }
 
@@ -2105,20 +2473,14 @@ impl AppState {
         let debited_tokens = admission_debit.take_for_dispatch();
         match upstream_request.send().await {
             Ok(response) => {
-                self.metrics
-                    .histogram_with_bounds(
-                        "av_upstream_latency_seconds",
-                        "Time to upstream response headers",
-                        av_core::metrics::WIDE_LATENCY_BOUNDS_US,
-                    )
+                self.hot_metrics
+                    .upstream_latency_histogram
                     .observe_us(elapsed_us(upstream_started));
                 if response.status().is_server_error() {
-                    self.metrics
-                        .counter(
-                            "av_upstream_errors_total{kind=\"http_5xx\"}",
-                            "Upstream failures by kind",
-                        )
-                        .inc();
+                    #[allow(clippy::indexing_slicing)]
+                    {
+                        self.hot_metrics.upstream_errors_counters[UpstreamErrorKind::Http5xx.index()].inc();
+                    }
                 }
                 Ok(ForwardedResponse {
                     response,
@@ -2129,19 +2491,11 @@ impl AppState {
                 })
             }
             Err(error) => {
-                let kind = if error.is_timeout() {
-                    "timeout"
-                } else if error.is_connect() {
-                    "connect"
-                } else {
-                    "send"
-                };
-                self.metrics
-                    .counter(
-                        &format!("av_upstream_errors_total{{kind=\"{kind}\"}}"),
-                        "Upstream failures by kind",
-                    )
-                    .inc();
+                let kind = UpstreamErrorKind::from_reqwest(&error);
+                #[allow(clippy::indexing_slicing)]
+                {
+                    self.hot_metrics.upstream_errors_counters[kind.index()].inc();
+                }
                 // `reqwest::Error::Display` embeds the
                 // request URL (see the redaction rule at
                 // routes.rs::read_limited_tool_response — the same
@@ -2356,6 +2710,30 @@ impl AppState {
                     "decision_us": elapsed_us,
                 }),
             ),
+            // `ToolVerdict` is `#[non_exhaustive]` (R56 SemVer
+            // hardening) — a future variant (e.g. `Warn` for shadow-
+            // mode, `Deferred` for async policy evaluation) must NOT
+            // be silently forwarded to the tool server. Fail-closed:
+            // emit a Blocked-shaped audit payload and log at ERROR
+            // level so operators discover the unhandled variant
+            // during rollout. Same defensive posture the sandbox's
+            // own `is_allowed` uses (whitelist Allowed, treat
+            // everything else as blocked).
+            _ => {
+                tracing::error!(
+                    "unhandled ToolVerdict variant reached the harness matcher; \
+                     failing closed. This is a bug — extend the match to handle the new variant."
+                );
+                (
+                    StatusId::Failure,
+                    serde_json::json!({
+                        "tool": "<unknown>",
+                        "allowed": false,
+                        "stage": "unhandled_verdict",
+                        "reason": "unhandled ToolVerdict variant; fail-closed",
+                    }),
+                )
+            }
         };
         let tool_call_id = parsed_call
             .as_ref()
@@ -2382,6 +2760,19 @@ impl AppState {
             ToolVerdict::Allowed { .. } => None,
             ToolVerdict::Blocked { stage: "budget", .. } => Some(StopReason::BudgetExceeded),
             ToolVerdict::Blocked { .. } => Some(StopReason::PolicyBlocked),
+            // See the sibling `match &verdict` above for the rationale.
+            // R58 correction: use `StopReason::Other` (the ships-with-
+            // `#[serde(other)]` forward-compat sink documented for
+            // exactly this "unrecognised upstream variant during
+            // heterogeneous rolling upgrade" case) rather than
+            // `PolicyBlocked`. Returning `PolicyBlocked` here would
+            // contaminate policy-block counters / alerts / dashboards
+            // with a HARNESS CODE BUG signal, and disagree with the
+            // sibling `stage: "unhandled_verdict"` payload label that
+            // is honestly synthetic. `Other` preserves fail-closed
+            // semantics (non-None, terminates the turn, seals the
+            // receipt) while telling the truth on the wire.
+            _ => Some(StopReason::Other),
         };
         worker_permit.submit(WorkerJob {
             session: Arc::clone(&session),
@@ -2460,7 +2851,7 @@ impl AppState {
             .ok_or_else(|| PipelineError::bad_request("session is already closed".to_owned()))
     }
 
-    fn enqueue_transient_failure(
+    pub(crate) fn enqueue_transient_failure(
         &self,
         session_id: &str,
         stop_reason: StopReason,
@@ -2901,7 +3292,7 @@ pub(crate) fn strip_bearer_scheme(value: &str) -> Option<&str> {
     Some(rest)
 }
 
-fn session_id(headers: &HeaderMap) -> Result<String, PipelineError> {
+pub(crate) fn session_id(headers: &HeaderMap) -> Result<String, PipelineError> {
     match single_header(headers, SESSION_HEADER)? {
         Some(value) => {
             let value = value

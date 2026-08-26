@@ -5,7 +5,7 @@
 //! Money is tracked in integer micro-USD; a payout of $12.34 spends
 //! 12_340_000. Fractional-cent dust can therefore never accumulate invisibly.
 
-use crate::store::{Spend, StateError, StateStore};
+use crate::store::{Refund, Spend, StateError, StateStore, TrySpendOutcome};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -199,21 +199,34 @@ impl<'a> ActionBudget<'a> {
             }
         }
 
-        if let Some(index) = self.store.try_spend_many(&spends)? {
-            let spend = spends
-                .get(index)
-                .ok_or_else(|| StateError::Backend(format!("invalid failed spend index {index}")))?;
-            let limit = limit_names
-                .get(index)
-                .ok_or_else(|| StateError::Backend(format!("invalid failed spend index {index}")))?;
-            return Ok(BudgetDecision::Refused {
-                limit: limit.clone(),
-                cap: spend.limit,
-            });
+        // R66 F3: previously called `try_spend_many` for the atomic
+        // commit and then `remaining_min` for the reported headroom
+        // — three additional GET round-trips that could race with a
+        // concurrent `remove_prefix` DEL and inflate the reported
+        // `remaining` to the full cap (a debit that WAS committed).
+        // Now the outcome carries the post-commit min-headroom
+        // computed inside the SAME atomic section that committed the
+        // spend, so `BudgetDecision::Allowed { remaining }` can be
+        // taken directly without a follow-up read.
+        match self.store.try_spend_many(&spends)? {
+            TrySpendOutcome::Refused { index } => {
+                let spend = spends
+                    .get(index)
+                    .ok_or_else(|| StateError::Backend(format!("invalid failed spend index {index}")))?;
+                let limit = limit_names
+                    .get(index)
+                    .ok_or_else(|| StateError::Backend(format!("invalid failed spend index {index}")))?;
+                Ok(BudgetDecision::Refused {
+                    limit: limit.clone(),
+                    cap: spend.limit,
+                })
+            }
+            TrySpendOutcome::Committed {
+                post_commit_min_remaining,
+            } => Ok(BudgetDecision::Allowed {
+                remaining: post_commit_min_remaining,
+            }),
         }
-
-        let remaining = self.remaining_min(tool)?;
-        Ok(BudgetDecision::Allowed { remaining })
     }
 
     /// Compensating refund for a previously-successful
@@ -227,14 +240,37 @@ impl<'a> ActionBudget<'a> {
     /// the compensation path must never turn a lost-race response
     /// into a 5xx.
     pub fn refund_tool_call(&self, tool: &str, payout_usd_micros: u64) {
+        // R66 F2: single atomic refund_many call so all three
+        // dimensions (total_calls / tool:{X} / payout) are refunded
+        // as one transaction under InMemoryStore's `transaction_lock`
+        // and one Lua EVAL under RedisStore. Prior shape was 3
+        // independent `store.refund` calls — a crash / connection
+        // drop between steps left partial refund state, and a
+        // concurrent `try_tool_call` on InMemoryStore could observe
+        // the mid-batch state (fresh `total_calls` headroom but
+        // still-charged per-tool cap), an ordering impossible on
+        // RedisStore's single-Lua path.
+        let mut refunds: Vec<Refund> = Vec::with_capacity(3);
         if self.spec.max_total_tool_calls.is_some() {
-            self.store.refund(&self.key("total_calls"), 1);
+            refunds.push(Refund {
+                key: self.key("total_calls"),
+                amount: 1,
+            });
         }
         if self.spec.max_tool_calls.contains_key(tool) {
-            self.store.refund(&self.key(&format!("tool:{tool}")), 1);
+            refunds.push(Refund {
+                key: self.key(&format!("tool:{tool}")),
+                amount: 1,
+            });
         }
         if payout_usd_micros > 0 && self.spec.max_payout_usd_micros.is_some() {
-            self.store.refund(&self.key("payout"), payout_usd_micros);
+            refunds.push(Refund {
+                key: self.key("payout"),
+                amount: payout_usd_micros,
+            });
+        }
+        if !refunds.is_empty() {
+            self.store.refund_many(&refunds);
         }
     }
 
@@ -255,38 +291,31 @@ impl<'a> ActionBudget<'a> {
     pub fn try_tokens(&self, tokens: u64) -> Result<BudgetDecision, StateError> {
         match self.spec.max_tokens {
             Some(cap) => {
-                let key = self.key("tokens");
-                if self.store.try_spend(&key, tokens, cap)? {
-                    let used = self.store.get(&key)?;
-                    Ok(BudgetDecision::Allowed {
-                        remaining: cap.saturating_sub(used),
-                    })
-                } else {
-                    Ok(BudgetDecision::Refused {
+                // R66 F3: route through `try_spend_many` so the
+                // reported `remaining` comes from the same atomic
+                // section that committed the spend. The previous
+                // shape did `try_spend` + `get` — a 2-RTT window
+                // in which a concurrent `remove_prefix` could DEL
+                // the counter and make `get` return 0, inflating
+                // `remaining` to `cap`. See `TrySpendOutcome`.
+                match self.store.try_spend_many(&[Spend {
+                    key: self.key("tokens"),
+                    amount: tokens,
+                    limit: cap,
+                }])? {
+                    TrySpendOutcome::Committed {
+                        post_commit_min_remaining,
+                    } => Ok(BudgetDecision::Allowed {
+                        remaining: post_commit_min_remaining,
+                    }),
+                    TrySpendOutcome::Refused { .. } => Ok(BudgetDecision::Refused {
                         limit: "max_tokens".into(),
                         cap,
-                    })
+                    }),
                 }
             }
             None => Ok(BudgetDecision::Allowed { remaining: u64::MAX }),
         }
-    }
-
-    fn remaining_min(&self, tool: &str) -> Result<u64, StateError> {
-        let mut min = u64::MAX;
-        if let Some(cap) = self.spec.max_total_tool_calls {
-            let used = self.store.get(&self.key("total_calls"))?;
-            min = min.min(cap.saturating_sub(used));
-        }
-        if let Some(cap) = self.spec.max_tool_calls.get(tool) {
-            let used = self.store.get(&self.key(&format!("tool:{tool}")))?;
-            min = min.min(cap.saturating_sub(used));
-        }
-        if let Some(cap) = self.spec.max_payout_usd_micros {
-            let used = self.store.get(&self.key("payout"))?;
-            min = min.min(cap.saturating_sub(used));
-        }
-        Ok(min)
     }
 }
 

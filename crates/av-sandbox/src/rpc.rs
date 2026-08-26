@@ -174,7 +174,11 @@ pub fn parse_tool_call(raw: &[u8]) -> Result<ToolCallRequest, RpcError> {
     })
 }
 
-fn depth_of(v: &Value, current: usize) -> usize {
+/// Compute the maximum nesting depth of a JSON value. Exposed so
+/// callers outside this crate (chat-completions ingress and any
+/// admin body parser) can apply the same trust-boundary
+/// depth cap without duplicating logic.
+pub fn depth_of(v: &Value, current: usize) -> usize {
     if current > MAX_JSON_DEPTH {
         return current; // early-out: no need to recurse further
     }

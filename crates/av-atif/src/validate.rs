@@ -85,9 +85,22 @@ pub fn validate_bytes(bytes: &[u8], mode: Mode) -> Result<Vec<ValidationIssue>, 
 /// and `av-sandbox::refuse_duplicate_json_keys`; exposed here to give
 /// ATIF ingest a single strict-parse primitive without cross-crate
 /// coupling.
+///
+/// R65 F1: uses `DUP_KEY_SENTINEL` for stable classification, matching
+/// the discipline in `av_receipts::check_no_duplicate_keys`
+/// (`__av_dup:`) and `av_sandbox::rpc::reject_duplicate_keys`
+/// (`__av_sandbox_dup:`). Without a sentinel, operators inspecting
+/// FinalizeError chains have no stable substring to distinguish an
+/// ATIF duplicate-key rejection from an ordinary
+/// serde_json parse error ("expected value at line N column M"),
+/// making triage and metric-labelling noisier. The sentinel is
+/// stripped before returning so the caller's error text stays
+/// human-readable.
 fn refuse_duplicate_json_keys(raw: &[u8]) -> Result<(), String> {
     use serde::de::{Deserializer as _, MapAccess, SeqAccess, Visitor};
     use std::fmt;
+
+    const DUP_KEY_SENTINEL: &str = "__av_atif_dup:";
 
     struct NoDupKeys;
     impl<'de> Visitor<'de> for NoDupKeys {
@@ -131,7 +144,7 @@ fn refuse_duplicate_json_keys(raw: &[u8]) -> Result<(), String> {
             while let Some(key) = map.next_key::<String>()? {
                 if !seen.insert(key.clone()) {
                     return Err(serde::de::Error::custom(format!(
-                        "duplicate object key `{}` in ATIF",
+                        "{DUP_KEY_SENTINEL}duplicate object key `{}` in ATIF",
                         key.escape_debug()
                     )));
                 }
@@ -148,7 +161,21 @@ fn refuse_duplicate_json_keys(raw: &[u8]) -> Result<(), String> {
         }
     }
     let mut de = serde_json::Deserializer::from_slice(raw);
-    de.deserialize_any(NoDupKeys).map_err(|error| error.to_string())
+    de.deserialize_any(NoDupKeys).map_err(|error| {
+        let text = error.to_string();
+        // Sentinel exists so classification is stable even after
+        // serde_json wraps the message with " at line N column M"
+        // trailer. Reformat with the shared "duplicate JSON key
+        // rejected: " prefix that `av_sandbox::rpc::reject_duplicate_keys`
+        // uses (rpc.rs:323) so operators grepping error logs see
+        // one canonical marker across both trust-boundary
+        // reject sites.
+        if let Some(rest) = text.strip_prefix(DUP_KEY_SENTINEL) {
+            format!("duplicate JSON key rejected: {rest}")
+        } else {
+            text
+        }
+    })
 }
 
 macro_rules! issue {

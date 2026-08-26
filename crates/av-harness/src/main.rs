@@ -204,6 +204,7 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
         Arc::clone(&state.metrics),
         Arc::clone(&bridge_maintenance_shutdown),
     );
+    let reconciler_shutdown = Arc::new(tokio::sync::Notify::new());
     let reconciler = spawn_reconciler(
         Arc::clone(&state.sessions),
         state.finalizer.clone(),
@@ -211,6 +212,7 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
         config.reconcile_tick_s,
         config.breaker.clone(),
         Arc::clone(&state.metrics),
+        Arc::clone(&reconciler_shutdown),
     );
     // Retention: prune sealed ATIF trajectories + sidecars older than
     // `atif_retention_days` on an hourly cadence. Only sealed pairs are
@@ -486,7 +488,18 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
             }
         }
     };
-    reconciler.abort();
+    // R69 F1: Signal reconciler to stop instead of aborting.
+    // JoinHandle::abort() cancels only the outer async task; any
+    // spawn_blocking closure inside the tick body — write_atomic
+    // markers, remove_file cleanup, publish_idempotent for
+    // SESSION_CLOSE, and up to 64 close_session calls per tick —
+    // keeps running orphaned. The reconciler ticks 14 400× more
+    // often than the retention loop below and does far more spool-
+    // mutating work per tick; without Notify, orphan reconciler
+    // closures race `finalize_sessions` (declared below) for the
+    // same session journal / bridge segment on process exit. Same
+    // rationale as retention and bridge_maintenance below.
+    reconciler_shutdown.notify_one();
     // Signal retention to stop instead of aborting.
     // JoinHandle::abort() cancels only the outer async task, but the
     // retention tick body dispatches to spawn_blocking (each tick calls
@@ -514,9 +527,13 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
         handle.abort();
     }
     // Silence the expected cancellation; log everything else (panic).
+    // The reconciler now uses cooperative shutdown (R69 F1) so a
+    // clean stop returns `Ok(())`, not `Err(is_cancelled)`. Retain
+    // the is_cancelled branch in case of any pathological path (e.g.
+    // a future refactor that aborts on hard timeout).
     if let Err(error) = reconciler.await {
         if !error.is_cancelled() {
-            tracing::warn!(%error, "reconciler task exited with an error before shutdown abort");
+            tracing::warn!(%error, "reconciler task exited with an error before shutdown");
         }
     }
     if let Err(error) = bridge_maintenance.await {
@@ -612,6 +629,22 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
                 }
             }
         }
+        // R70 Track B misdiagnosis correction (R71 review): the
+        // previous shape appended `post_finalize_worker.wait_idle()`
+        // here on the claim that `close_session` internally submits
+        // new WORKER jobs (SESSION_CLOSE bridge publish). It does
+        // NOT — `close_session_locked` (`reconciler.rs:961`) awaits
+        // `emit_bridge_event → resolve_lifecycle_ack →
+        // spawn_blocking(bridge.publish_idempotent)` INLINE with no
+        // WorkerHandle::submit. `pending` (the counter `wait_idle`
+        // polls) is only incremented by `routes.rs`/`pipeline.rs`
+        // submissions — none from the finalizer path. The added
+        // `wait_idle` observed `pending == 0` on the first read and
+        // returned immediately: defensive dead-code. Removed to avoid
+        // future maintainers reasoning from a false comment. If a
+        // real "close job races exit" hazard emerges, it lives in the
+        // `spawn_blocking` layer (finalizer bridge publishes) and the
+        // fix is a JoinSet-style tracker, not `WorkerHandle::wait_idle`.
         if failures.is_empty() {
             Ok(())
         } else {
@@ -1871,41 +1904,55 @@ async fn shutdown_signal() {
                  (Term). Investigate seccomp / signal syscall restrictions if this appears."
             );
         }
+        // R72 review F3 (landed R73): eliminate the second-signal
+        // race window by keeping the signal receivers alive
+        // across the first-signal select and moving them into
+        // the force-exit spawn. Prior shape called
+        // `tokio::signal::ctrl_c()` inside the spawn, creating a
+        // FRESH SIGINT receiver AFTER the outer select returned —
+        // a signal arriving in that window landed on no armed
+        // receiver and was silently dropped. Operator's `Ctrl-C,
+        // Ctrl-C` or `docker stop; docker stop` muscle memory
+        // silently didn't force-exit; graceful shutdown ran to
+        // completion (or Kubernetes SIGKILL after
+        // terminationGracePeriodSeconds).
+        //
+        // Fix: `interrupt` is created upfront, kept alive across
+        // the outer select via `&mut`, and MOVED into the force-
+        // exit spawn along with `terminate`. Both receivers stay
+        // armed continuously across the first-signal window —
+        // a second signal arriving at ANY point is queued in the
+        // receiver's tokio internals and delivered on the next
+        // `.recv().await` inside the spawn.
+        let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
         tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                if let Err(error) = result {
-                    tracing::error!(%error, "failed to listen for Ctrl-C");
+            _ = async {
+                if let Some(ref mut sig) = interrupt {
+                    sig.recv().await;
+                } else {
+                    // No SIGINT receiver — mirror the prior shape's
+                    // `tokio::signal::ctrl_c()` semantics via a fresh
+                    // one-shot fallback. If ctrl_c() itself errors,
+                    // log and pend so the terminate arm can still
+                    // fire.
+                    if let Err(error) = tokio::signal::ctrl_c().await {
+                        tracing::error!(%error, "failed to listen for Ctrl-C");
+                        std::future::pending::<()>().await;
+                    }
                 }
-            }
+            } => {}
             _ = terminate.recv() => {}
         }
-        // force-exit on a second signal. Once the first
-        // signal fires and this fn returns, the tokio handlers stay
-        // registered process-wide — the OS default action never runs
-        // and subsequent SIGTERM / SIGINT are silently consumed by
-        // the still-armed receivers. An operator sending a second
-        // Ctrl-C to force-abort a hung graceful shutdown (stuck
-        // upstream connection preventing `wait_for_worker_jobs`
-        // from returning, for instance) sees no effect until
-        // Kubernetes' terminationGracePeriodSeconds elapses and
-        // SIGKILL fires — the "docker stop; docker stop" pattern
-        // is broken. Spawn a background task that races a second
-        // signal to `std::process::exit(130)` (the conventional
-        // Ctrl-C exit code). If a second signal arrives during
-        // graceful shutdown, the process exits immediately with
-        // a clear tracing line.
-        tokio::spawn(async {
-            let mut terminate =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+        tokio::spawn(async move {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
                 _ = async {
-                    if let Some(ref mut sig) = terminate {
+                    if let Some(ref mut sig) = interrupt {
                         sig.recv().await;
                     } else {
                         std::future::pending::<()>().await;
                     }
                 } => {}
+                _ = terminate.recv() => {}
             }
             tracing::warn!(
                 "second shutdown signal received during graceful shutdown; forcing exit(130) \

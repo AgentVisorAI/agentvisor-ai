@@ -32,6 +32,7 @@ impl Default for SandboxConfig {
 
 /// Verdict for one intercepted tool call.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ToolVerdict {
     /// Forward to the downstream tool server.
     Allowed {

@@ -189,50 +189,52 @@ async fn enforce_allowed_hosts(
 /// `av_request_duration_seconds{route}`. The route label is drawn
 /// from a FIXED set (no client-controlled values) so metric
 /// cardinality is bounded; unknown paths collapse to `other`.
+///
+/// R58 hot-path: metric handles are pre-resolved into
+/// `HotMetrics.request_counters` / `request_duration_histograms`
+/// arrays indexed by `Route::index()` and `StatusClass::index()`.
+/// This eliminates the per-request `format!` (~120 B alloc) and the
+/// 4 shared-`Registry` mutex acquisitions (2 for each `.counter()`
+/// and `.histogram_with_bounds()` call) that the prior lazy path
+/// incurred — at 10k req/s that's ~40k mutex ops/s + 1.2 MB/s of
+/// allocator churn on the middleware alone. K8s liveness /
+/// readiness probes at 5-10 s intervals per replica are the
+/// dominant callers by count.
 async fn request_metrics(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
-    let route = route_label(request.uri().path());
+    let route = route(request.uri().path());
     let started = std::time::Instant::now();
     let response = next.run(request).await;
-    let status_class = match response.status().as_u16() {
-        100..=199 => "1xx",
-        200..=299 => "2xx",
-        300..=399 => "3xx",
-        400..=499 => "4xx",
-        _ => "5xx",
-    };
-    state
-        .metrics
-        .counter(
-            &format!("av_requests_total{{route=\"{route}\",status_class=\"{status_class}\"}}"),
-            "HTTP requests by route and status class",
-        )
-        .inc();
-    state
-        .metrics
-        .histogram_with_bounds(
-            &format!("av_request_duration_seconds{{route=\"{route}\"}}"),
-            "End-to-end HTTP request latency by route",
-            av_core::metrics::WIDE_LATENCY_BOUNDS_US,
-        )
-        .observe_us(elapsed_us(started));
+    let status_class = crate::pipeline::StatusClass::from_u16(response.status().as_u16());
+    // Safe: `Route::index()` returns `0..10` (see `Route::ORDER`
+    // length) and `StatusClass::index()` returns `0..5` (see
+    // `StatusClass::ORDER` length); `HotMetrics` allocates arrays
+    // of exactly those sizes. Silence `clippy::indexing_slicing`
+    // — a debug-assertion sanity check would be more expensive than
+    // the guarded lookup on the hot path.
+    #[allow(clippy::indexing_slicing)]
+    {
+        state.hot_metrics.request_counters[route.index()][status_class.index()].inc();
+        state.hot_metrics.request_duration_histograms[route.index()].observe_us(elapsed_us(started));
+    }
     response
 }
 
 /// Fixed route-label set for `av_requests_total`. NEVER interpolate a
 /// client-controlled value here — Prometheus cardinality is bounded
 /// only because this set is closed.
-fn route_label(path: &str) -> &'static str {
+fn route(path: &str) -> crate::pipeline::Route {
+    use crate::pipeline::Route;
     match path {
-        "/v1/chat/completions" => "chat",
-        "/v1/mcp" | "/mcp" => "mcp",
-        "/health" => "health",
-        "/livez" => "livez",
-        "/readyz" => "readyz",
-        "/metrics" => "metrics",
-        _ if path.starts_with("/v1/sessions/") && path.ends_with("/close") => "session_close",
-        _ if path.starts_with("/v1/sessions/") && path.ends_with("/promote") => "session_promote",
-        _ if path.starts_with("/dashboard") || path.starts_with("/api/v1/dashboard") => "dashboard",
-        _ => "other",
+        "/v1/chat/completions" => Route::Chat,
+        "/v1/mcp" | "/mcp" => Route::Mcp,
+        "/health" => Route::Health,
+        "/livez" => Route::Livez,
+        "/readyz" => Route::Readyz,
+        "/metrics" => Route::Metrics,
+        _ if path.starts_with("/v1/sessions/") && path.ends_with("/close") => Route::SessionClose,
+        _ if path.starts_with("/v1/sessions/") && path.ends_with("/promote") => Route::SessionPromote,
+        _ if path.starts_with("/dashboard") || path.starts_with("/api/v1/dashboard") => Route::Dashboard,
+        _ => Route::Other,
     }
 }
 
@@ -339,15 +341,28 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     // ends in `.tmp`, matching the boot sweep's orphan pattern, so a
     // crash between create and remove self-heals on restart; UUIDv7
     // uniqueness keeps concurrent probes from colliding.
+    //
+    // Run under `spawn_blocking` so a partial I/O outage (the exact
+    // condition this probe exists to catch) cannot stall a Tokio
+    // worker thread. Under a K8s probe interval smaller than a
+    // stall's ms-to-second latency, blocking the runtime here would
+    // escalate a filesystem hiccup into runtime-wide starvation
+    // exactly when other request paths need the workers most.
     let spool_writable = {
-        let probe = std::path::Path::new(&state.config.atif_spool_dir)
-            .join(format!(".readyz-{}.tmp", av_core::new_event_uid()));
-        let outcome = std::fs::write(&probe, b"readyz").and_then(|()| {
-            // fsync would double the probe's IOPS cost for no signal:
-            // ENOSPC surfaces at write() on every mainstream filesystem.
-            std::fs::remove_file(&probe)
-        });
-        outcome.is_ok()
+        let dir = state.config.atif_spool_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let probe = std::path::Path::new(&dir).join(format!(".readyz-{}.tmp", av_core::new_event_uid()));
+            std::fs::write(&probe, b"readyz")
+                .and_then(|()| {
+                    // fsync would double the probe's IOPS cost for no
+                    // signal: ENOSPC surfaces at write() on every
+                    // mainstream filesystem.
+                    std::fs::remove_file(&probe)
+                })
+                .is_ok()
+        })
+        .await
+        .unwrap_or(false)
     };
     let ready = !draining && spool_writable;
     let body = Json(json!({
@@ -476,7 +491,96 @@ fn spool_footprint(dir: &std::path::Path) -> (u64, u64) {
     (bytes, files)
 }
 
+/// Refuse an inbound request whose declared `Content-Type` is not
+/// `application/json`. Shared by `chat_completions` and `mcp_call`
+/// so both trust-boundary ingress points agree on the same rules —
+/// a client sending e.g. `Content-Type: multipart/form-data` with a
+/// JSON body would otherwise process successfully on a route that
+/// forgot the check. Missing Content-Type is tolerated (minimal
+/// clients skip it and JSON parsers accept the body's shape).
+///
+/// `context_label` is inlined into the client-facing 400 body so
+/// operators reading the message know which endpoint refused.
+fn refuse_non_json_content_type(headers: &HeaderMap, context_label: &str) -> Option<Response> {
+    let value = headers.get(axum::http::header::CONTENT_TYPE)?;
+    let is_json = value
+        .to_str()
+        .ok()
+        .and_then(|s| s.split(';').next())
+        .map(|main| main.trim().eq_ignore_ascii_case("application/json"))
+        .unwrap_or(false);
+    if is_json {
+        return None;
+    }
+    let display = value.to_str().unwrap_or("<non-ascii>");
+    Some(pipeline_error(crate::pipeline::PipelineError::bad_request(
+        format!("{context_label} requires Content-Type: application/json, got {display:?}"),
+    )))
+}
+
 async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    // Parity with the MCP path (routes.rs::mcp_call): refuse an
+    // inbound request whose declared `Content-Type` is not
+    // `application/json`. The chat endpoint historically accepted
+    // any Content-Type and relied on `serde_json::from_slice` to
+    // fail — that pattern falls back to a stringly-typed 400 on
+    // deserialise error instead of a specific "spec expects
+    // application/json" 400 the operator can triage. Missing
+    // Content-Type stays tolerated (minimal clients skip it and
+    // JSON parsers accept the body's shape anyway); an EXPLICIT
+    // non-JSON declaration is refused. Same helper as MCP for
+    // strictly one place to change the parsing rules.
+    if let Some(err) = refuse_non_json_content_type(&headers, "chat completions") {
+        return err;
+    }
+    // R71 F3 (landed R72): pre-admission identity gate. Before
+    // this, an unauthenticated client could force
+    // `refuse_duplicate_json_keys` (full byte scan) +
+    // `serde_json::from_slice` (full parse) + `depth_of` (full
+    // recursion) on a `max_request_bytes = 16 MiB` body BEFORE
+    // any admission decision — a DoS amplification surface (three
+    // full-body passes × concurrent unauthenticated clients).
+    // Resolve identity here (header-only, no body touched) and
+    // fail fast on rejection; on success, discard the result and
+    // let `prepare_chat_nonblocking` re-resolve (cached JWKS
+    // makes the re-resolve cheap: HMAC compare / cached-key JWT
+    // verify).
+    //
+    // Audit-log the rejection through the same
+    // `enqueue_transient_failure` primitive `prepare_chat` uses,
+    // so `av_identity_rejections_total` and the per-minute
+    // sampled full audit records match pre-R72 behaviour on
+    // rejected requests.
+    if let Err(identity_error) = state.resolve_identity(&headers, Some(&state.config.chat_scope)) {
+        // R72 review F3 (landed R73): always run
+        // `enqueue_transient_failure`, even when
+        // `session_id(&headers)` failed (malformed / oversized /
+        // non-ASCII `X-AV-Session`), so a fuzzer / unauthenticated
+        // probe cannot silently bypass the
+        // `av_identity_rejections_total` counter by sending an
+        // unparseable session header. The `unwrap_or_default()`
+        // gives an empty-string session id — the enqueue path
+        // treats that as anonymous, which matches how the
+        // pre-check would classify a header-less request.
+        let sid = crate::pipeline::session_id(&headers).unwrap_or_default();
+        // R72 review F1 (landed R73): honour the Err path of
+        // `enqueue_transient_failure`, which maps a worker-channel
+        // backpressure failure to `PipelineError::unavailable_source`
+        // (503 + Retry-After). Pre-R72 the request reached
+        // `prepare_chat`'s `?` and returned 503 in that case; R72's
+        // `let _ = ...` silently downgraded it to 401, defeating
+        // SDK retry policies that key on 503. The audited path
+        // now returns 503 on queue-full and 401 on genuine
+        // identity failure, matching pre-R72 semantics exactly.
+        if let Err(enqueue_error) = state.enqueue_transient_failure(
+            &sid,
+            av_events::StopReason::IdentityRejected,
+            identity_error.to_string(),
+        ) {
+            return pipeline_error(enqueue_error);
+        }
+        return pipeline_error(identity_error);
+    }
     // Refuse duplicate top-level or
     // nested JSON keys before parsing. `Json<Value>` used
     // `serde_json` default "last-wins" semantics, so a hostile client
@@ -497,6 +601,19 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
         Ok(value) => value,
         Err(error) => return pipeline_error(crate::pipeline::PipelineError::bad_request_source(error)),
     };
+    // Parity with the MCP path (`av_sandbox::parse_tool_call`) which
+    // caps `MAX_JSON_DEPTH = 64`. serde_json's built-in
+    // `RECURSION_LIMIT = 128` prevents stack blowout, but the chat
+    // trust-boundary discipline is uneven relative to the tool-call
+    // gate: a 4 MiB nested payload that MCP would refuse silently
+    // parsed on chat. Apply the same cap so both trust-boundary
+    // ingress points agree on JSON-shape limits.
+    if av_sandbox::rpc::depth_of(&payload, 0) > av_sandbox::rpc::MAX_JSON_DEPTH {
+        return pipeline_error(crate::pipeline::PipelineError::bad_request(format!(
+            "chat request nesting depth exceeds {}",
+            av_sandbox::rpc::MAX_JSON_DEPTH
+        )));
+    }
     let admission_started = std::time::Instant::now();
     let mut prepared = match state
         .prepare_chat_nonblocking(&headers, payload, body.len())
@@ -677,6 +794,7 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
         capture_attempted: false,
         is_sse,
         protocol_buffer: Vec::new(),
+        frame_scratch: Vec::new(),
         pending_output: std::collections::VecDeque::new(),
         pending_budget: None,
         principal_budget,
@@ -921,20 +1039,46 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     // no defensible use case. Missing Content-Type is tolerated
     // (some minimal clients skip it and JSON-RPC parsers accept the
     // body's shape).
-    if let Some(value) = headers.get(axum::http::header::CONTENT_TYPE) {
-        let is_json = value
-            .to_str()
-            .ok()
-            .and_then(|s| s.split(';').next())
-            .map(|main| main.trim().eq_ignore_ascii_case("application/json"))
-            .unwrap_or(false);
-        if !is_json {
-            let display = value.to_str().unwrap_or("<non-ascii>");
-            return pipeline_error(crate::pipeline::PipelineError::bad_request(format!(
-                "MCP requires Content-Type: application/json (spec: JSON-RPC 2.0), got {display:?}"
-            )));
-        }
+    if let Some(err) = refuse_non_json_content_type(&headers, "MCP") {
+        return err;
     }
+    // R70 F1 (landed R71): admission cap before spawn. `mcp_call_inner`
+    // buffers up to `MAX_TOOL_RESPONSE_BYTES = 16 MiB` per call in
+    // `read_limited_tool_response`; without a limiter, N concurrent
+    // slow-tool-upstream callers stacked N × 16 MiB unbounded. Chat
+    // path is capped via `worker.try_reserve_pair`; the MCP path was
+    // the odd one out. `try_acquire_owned` is non-blocking: on
+    // capacity refusal we return 503 (server-side capacity signal,
+    // matches breaker-open discipline) with Retry-After: 1 so
+    // well-behaved SDKs pace themselves.
+    let admission_permit = match Arc::clone(&state.mcp_admission).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            state
+                .metrics
+                .counter(
+                    "av_mcp_admission_refusals_total",
+                    "MCP admission was refused because `mcp_concurrency` was already at capacity — \
+                     each admitted call can buffer up to 16 MiB in `read_limited_tool_response`, \
+                     so the cap bounds worst-case MCP resident memory. Sustained > 0 indicates \
+                     tool-upstream slowdown, a burst-traffic event, or an undersized \
+                     `mcp_concurrency`.",
+                )
+                .inc();
+            let mut response = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(openai_error_body(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "MCP admission at capacity; retry shortly",
+                )),
+            )
+                .into_response();
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+            return response;
+        }
+    };
     // The tool path mutates durable state at several awaits: the sandbox
     // gate debits the budget, `execution.claim()` claims the execution
     // key, the upstream call executes the tool, and persist/audit resolve
@@ -958,6 +1102,7 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     // total` on an otherwise-recoverable session).
     let inflight_guard = state.mcp_inflight.enter();
     match tokio::spawn(async move {
+        let _admission_permit = admission_permit;
         let _inflight_guard = inflight_guard;
         mcp_call_inner(state, headers, body).await
     })
@@ -1403,6 +1548,22 @@ async fn mcp_call_inner(state: AppState, headers: HeaderMap, body: Bytes) -> Res
             (status, Json(response)).into_response()
         }
         Err(error) => pipeline_error(error),
+        // `ToolVerdict` is `#[non_exhaustive]` (R56 SemVer-hardening).
+        // A future variant reaching this matcher must fail closed:
+        // emit a 503 with a stable message rather than silently
+        // returning success. Mirrors the pipeline-level unhandled-
+        // verdict handling at pipeline.rs's `check_with_principal`
+        // matcher, so both entry points to the tool sandbox agree on
+        // the defensive posture.
+        Ok(_) => {
+            tracing::error!(
+                "unhandled ToolVerdict variant reached routes::tool_forward; failing closed. \
+                 This is a bug — extend the match to handle the new variant."
+            );
+            pipeline_error(crate::pipeline::PipelineError::unavailable(
+                "tool sandbox produced an unhandled verdict; refusing to proceed".to_owned(),
+            ))
+        }
     }
 }
 
@@ -1943,9 +2104,23 @@ impl ToolExecution {
         // sometimes merge duplicates on the wire and log aggregators
         // can then observe a comma-joined value that leaks a
         // client-desync into audit).
-        let session_id = crate::pipeline::single_header(headers, crate::pipeline::SESSION_HEADER)?
-            .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| crate::pipeline::PipelineError::bad_request("missing x-av-session".to_owned()))?;
+        // Distinguish "header not present" from "header value is not
+        // valid UTF-8 text" — the chat path at pipeline.rs::session_id
+        // emits the specific "X-AV-Session is not valid text" 400 for
+        // the non-UTF-8 case, and the tool path historically reported
+        // the same non-UTF-8 case as "missing" — misleading operator
+        // triage. Same discipline as the chat path now.
+        let raw_header = crate::pipeline::single_header(headers, crate::pipeline::SESSION_HEADER)?;
+        let session_id = match raw_header {
+            None => {
+                return Err(crate::pipeline::PipelineError::bad_request(
+                    "missing x-av-session".to_owned(),
+                ));
+            }
+            Some(value) => value.to_str().map_err(|_| {
+                crate::pipeline::PipelineError::bad_request("X-AV-Session is not valid text".to_owned())
+            })?,
+        };
         // Same validation as the pipeline's `session_id`: an id the intercept
         // path would reject must not key a tool-execution intent either.
         let session_id = av_core::SessionId::parse(session_id)
@@ -2221,7 +2396,11 @@ async fn close_session(
         {
             return pipeline_error(error);
         }
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "unknown session"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(openai_error_body(StatusCode::NOT_FOUND, "unknown session")),
+        )
+            .into_response();
     };
     if let Err(error) = state.authorize_session(&headers, &session, &state.config.session_close_scope) {
         return pipeline_error(error);
@@ -2249,7 +2428,11 @@ async fn promote_session(
         {
             return pipeline_error(error);
         }
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "unknown session"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(openai_error_body(StatusCode::NOT_FOUND, "unknown session")),
+        )
+            .into_response();
     };
     if let Err(error) = state.authorize_session(&headers, &session, &state.config.session_promote_scope) {
         return pipeline_error(error);
@@ -2294,7 +2477,10 @@ fn finalize_error_response(error: &crate::reconciler::FinalizeError) -> Response
     if error.is_transient_io() {
         let mut response = (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": error.to_string()})),
+            Json(openai_error_body(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &error.to_string(),
+            )),
         )
             .into_response();
         response
@@ -2320,7 +2506,7 @@ fn finalize_error_response(error: &crate::reconciler::FinalizeError) -> Response
         // Everything else is a genuine internal fault.
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    let mut response = (status, Json(json!({"error": error.to_string()}))).into_response();
+    let mut response = (status, Json(openai_error_body(status, &error.to_string()))).into_response();
     if status == StatusCode::SERVICE_UNAVAILABLE {
         // Same advisory as pipeline_error's retryable class.
         response
@@ -2328,6 +2514,34 @@ fn finalize_error_response(error: &crate::reconciler::FinalizeError) -> Response
             .insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("5"));
     }
     response
+}
+
+/// OpenAI-shape error body used by `pipeline_error`,
+/// `lifecycle_error`, and `finalize_error_response` (R66 F1).
+/// SDKs dispatch on `error.type` / `error.code`
+/// (`openai.APIError.code`); the flat `{"error": <string>}` shape the
+/// close/promote handlers previously emitted left retry classifiers
+/// dead, silently retrying `409 CaptureIncomplete` and `409
+/// Promotion(...)` until the SDK's request budget expired against a
+/// permanently-quarantined session. Centralising the body construction
+/// here also fixes the earlier five-different-shapes drift across
+/// sibling routes.
+fn openai_error_body(status: StatusCode, message: &str) -> serde_json::Value {
+    let error_type = match status.as_u16() {
+        400 | 404 | 409 | 413 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        429 => "rate_limit_error",
+        _ => "api_error",
+    };
+    json!({
+        "error": {
+            "message": message,
+            "type": error_type,
+            "param": null,
+            "code": status.as_u16(),
+        }
+    })
 }
 
 /// `pipeline_error` plus the `X-AV-Session` echo. Once a request is
@@ -2352,31 +2566,7 @@ fn pipeline_error(error: crate::pipeline::PipelineError) -> Response {
     use crate::pipeline::PipelineError;
     let close = matches!(error, PipelineError::Abort(_));
     let status = error.status();
-    // OpenAI-shaped error body. SDKs dispatch on
-    // `error.type` / `error.code` (`openai.APIError.code`), and the
-    // previous bare `{"error": "<string>"}` left that handling dead —
-    // five inconsistent shapes across sibling routes. `message` keeps
-    // the exact text the old shape carried; `type` follows OpenAI's
-    // taxonomy so stock retry/backoff classifiers behave correctly.
-    let error_type = match status.as_u16() {
-        400 | 404 | 409 | 413 => "invalid_request_error",
-        401 => "authentication_error",
-        403 => "permission_error",
-        429 => "rate_limit_error",
-        _ => "api_error",
-    };
-    let mut response = (
-        status,
-        Json(json!({
-            "error": {
-                "message": error.to_string(),
-                "type": error_type,
-                "param": null,
-                "code": status.as_u16(),
-            }
-        })),
-    )
-        .into_response();
+    let mut response = (status, Json(openai_error_body(status, &error.to_string()))).into_response();
     if close {
         response
             .headers_mut()
@@ -2414,18 +2604,12 @@ fn pipeline_error(error: crate::pipeline::PipelineError) -> Response {
 }
 
 fn lifecycle_error(error: String) -> Response {
-    // Same OpenAI-shaped body as `pipeline_error` so
-    // the two sibling routes agree on one error contract.
+    // Same OpenAI-shaped body as `pipeline_error` and
+    // `finalize_error_response` so all four sibling routes agree on
+    // one error contract. Central via `openai_error_body` (R66 F1).
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({
-            "error": {
-                "message": error,
-                "type": "api_error",
-                "param": null,
-                "code": 500,
-            }
-        })),
+        Json(openai_error_body(StatusCode::INTERNAL_SERVER_ERROR, &error)),
     )
         .into_response()
 }
@@ -2470,6 +2654,16 @@ struct AbortFinalizingStream {
     capture_attempted: bool,
     is_sse: bool,
     protocol_buffer: Vec<u8>,
+    /// Reusable per-frame parse buffer. R62 perf optimisation: the
+    /// SSE absorb loop previously did `let frame: Vec<u8> = self
+    /// .protocol_buffer.drain(..end).collect();` per frame — one
+    /// heap alloc per frame × 50-500 frames per streamed completion.
+    /// Reusing a single Vec (drained-then-refilled from
+    /// `protocol_buffer[..end]`) drops that to ONE amortised alloc
+    /// per stream. The scratch is `mem::take`'d into a local across
+    /// the absorb loop to satisfy the borrow checker against
+    /// `self.absorb_frame(&mut self, &str)`.
+    frame_scratch: Vec<u8>,
     pending_output: std::collections::VecDeque<Bytes>,
     pending_budget: Option<PendingBudget>,
     /// Principal-scoped ledger (id + spec) when `[principal_budget]` is
@@ -2532,12 +2726,28 @@ impl AbortFinalizingStream {
             return Ok(0);
         }
         let mut budget_delta = 0u64;
+        // R62 perf: reuse `frame_scratch` across iterations instead
+        // of the prior `let frame: Vec<u8> = self.protocol_buffer
+        // .drain(..end).collect();` which allocated a fresh Vec per
+        // frame (50-500 frames per streamed completion). `mem::take`
+        // moves the buffer into a local so the loop body can `&scratch`
+        // in a &str while simultaneously calling `&mut self` methods
+        // (borrow checker won't allow the direct `&self.frame_scratch`
+        // + `&mut self` pattern). Restored to `self` after the loop
+        // so subsequent `absorb_network_chunk` calls reuse the same
+        // capacity.
+        let mut scratch: Vec<u8> = std::mem::take(&mut self.frame_scratch);
         let absorb_result = loop {
             let Some(end) = sse_frame_end(&self.protocol_buffer) else {
                 break Ok(());
             };
-            let frame: Vec<u8> = self.protocol_buffer.drain(..end).collect();
-            let frame = match std::str::from_utf8(&frame) {
+            scratch.clear();
+            // Safe: `sse_frame_end` returns `end <= self.protocol_buffer.len()`
+            // by construction (it locates a frame boundary within the buffer).
+            #[allow(clippy::indexing_slicing)]
+            scratch.extend_from_slice(&self.protocol_buffer[..end]);
+            self.protocol_buffer.drain(..end);
+            let frame = match std::str::from_utf8(&scratch) {
                 Ok(frame) => frame,
                 Err(error) => break Err(format!("provider SSE frame is not UTF-8: {error}")),
             };
@@ -2549,6 +2759,7 @@ impl AbortFinalizingStream {
                 Err(error) => break Err(error),
             }
         };
+        self.frame_scratch = scratch;
         if let Err(error) = absorb_result {
             // A chunk's deltas are only debited AFTER this loop (one
             // budget check per network chunk), but `absorb_frame` bumps
@@ -4361,7 +4572,17 @@ mod tests {
             self.inner.try_spend(key, amount, limit)
         }
 
-        fn try_spend_many(&self, spends: &[Spend]) -> Result<Option<usize>, StateError> {
+        fn try_spend_many(&self, spends: &[Spend]) -> Result<av_state::TrySpendOutcome, StateError> {
+            // R68: `ActionBudget::try_tokens` now routes through
+            // `try_spend_many` (single-key) so the reported
+            // `remaining` comes from the atomic section that
+            // committed the spend (R66 F3). Instrument this path
+            // identically to `try_spend` so `SlowStore` still
+            // observes the reactor-blocking regression test
+            // (`completion_budget_store_does_not_block_stream_runtime`
+            // asserts the two per-request spend calls).
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            std::thread::sleep(Duration::from_millis(100));
             self.inner.try_spend_many(spends)
         }
 
@@ -6192,6 +6413,7 @@ mod tests {
             capture_attempted: false,
             is_sse: true,
             protocol_buffer: Vec::new(),
+            frame_scratch: Vec::new(),
             pending_output: std::collections::VecDeque::new(),
             pending_budget: Some(PendingBudget {
                 task: budget_task,
@@ -6290,6 +6512,7 @@ mod tests {
             capture_attempted: true,
             is_sse: true,
             protocol_buffer: Vec::new(),
+            frame_scratch: Vec::new(),
             pending_output: std::collections::VecDeque::new(),
             pending_budget: None,
             captured_bytes: 0,

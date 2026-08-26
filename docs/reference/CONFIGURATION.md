@@ -143,6 +143,7 @@ max_payout_usd_micros }`).
 | --- | --- | --- |
 | `compression_enabled` | `true` | Context-compression pipeline on the chat path. |
 | `worker_channel_capacity` | `32768` | Bounded audit-worker channel; overflow is counted (`av_events_dropped_total`), never blocking. |
+| `mcp_concurrency` | `128` | Max concurrent `mcp_call_inner` executions. Each admitted call can buffer up to `MAX_TOOL_RESPONSE_BYTES = 16 MiB` in `read_limited_tool_response`, so this cap bounds worst-case MCP resident memory (default: ~2 GiB). Refused admissions increment `av_mcp_admission_refusals_total` and respond `503` with `Retry-After: 1` — a server-side capacity signal (mirrors the breaker-open discipline). |
 | `strict_stage_budget` | `false` | Strict per-stage latency assertions (`AV_STRICT_BUDGET=1` also enables). Development diagnostics, not a production knob. |
 
 ## Development-only knobs

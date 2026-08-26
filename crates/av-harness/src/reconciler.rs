@@ -3066,6 +3066,7 @@ impl Finalizer {
         let spool_dir = self.spool_dir.clone();
         tokio::task::spawn_blocking(move || -> Result<(), FinalizeError> {
             let mut spool_changed = false;
+            let mut unlink_error: Option<FinalizeError> = None;
             // Deletion order matters: the `.session.json` sidecar is the
             // ONLY name the recovery scans iterate, so it must go LAST.
             // The old sidecar-first order had a crash window that left an
@@ -3081,18 +3082,88 @@ impl Finalizer {
                 match std::fs::remove_file(&path) {
                     Ok(()) => spool_changed = true,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(FinalizeError::atif_source(error)),
+                    Err(error) => {
+                        unlink_error = Some(FinalizeError::atif_source(error));
+                        // R64 F2: previously we returned here without
+                        // fsyncing, so any successful earlier unlinks
+                        // (e.g. `events.ndjson` durably removed before
+                        // `steps.ndjson` failed) were left dirent-non-
+                        // durable. A crash before the next tick's
+                        // retry+sync could then leave `.session.json`
+                        // durably-removed but `.events.ndjson` back on
+                        // disk — the exact "recycled id appends onto
+                        // stale bytes at position 0, permanently
+                        // breaking sequence == index" state the delete-
+                        // order invariant exists to prevent. Break here
+                        // and fsync outside the loop so partial
+                        // durability is captured even on error.
+                        break;
+                    }
                 }
             }
             if spool_changed {
-                av_core::fsutil::sync_directory(&spool_dir).map_err(FinalizeError::atif_source)?;
+                if let Err(error) = av_core::fsutil::sync_directory(&spool_dir) {
+                    // Prefer the original unlink error as the primary
+                    // report; a fsync failure after an unlink error is
+                    // strictly less informative.
+                    if unlink_error.is_none() {
+                        unlink_error = Some(FinalizeError::atif_source(error));
+                    } else {
+                        tracing::warn!(
+                            %error,
+                            "spool sync after partial step-journal removal failed; leaving as-is (retry on next tick)"
+                        );
+                    }
+                }
+            }
+            if let Some(error) = unlink_error {
+                return Err(error);
             }
             let ack_parent = spool_dir.join("broker-acks");
             let ack_path = ack_parent.join(&stem);
+            let mut ack_error: Option<FinalizeError> = None;
+            let mut ack_attempted = false;
             match std::fs::remove_dir_all(&ack_path) {
-                Ok(()) => av_core::fsutil::sync_directory(&ack_parent).map_err(FinalizeError::atif_source)?,
+                Ok(()) => ack_attempted = true,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(FinalizeError::atif_source(error)),
+                Err(error) => {
+                    // R66 review L1: `remove_dir_all` is opaque about
+                    // partial progress — it may have successfully
+                    // unlinked some inner ack tokens (mutating the
+                    // `ack_path` dirent state) before failing on a
+                    // later element. To match the same fsync-always
+                    // discipline as the step-journal loop above, we
+                    // must fsync the parent even on Err, because we
+                    // cannot know whether the failure preceded or
+                    // followed any inner-file removals.
+                    //
+                    // Ack tokens are per-`event_uid` idempotency
+                    // markers, not part of the `sequence == index`
+                    // invariant, so a stale token on next tick is a
+                    // soft-degrade (retry drops it), unlike the
+                    // step-journal case where non-durability could
+                    // recycle stale journal bytes at position 0.
+                    // Still worth matching the discipline so a future
+                    // refactor doesn't have to re-derive the two
+                    // paths' durability differences separately.
+                    ack_attempted = true;
+                    ack_error = Some(FinalizeError::atif_source(error));
+                }
+            }
+            if ack_attempted {
+                if let Err(error) = av_core::fsutil::sync_directory(&ack_parent) {
+                    if ack_error.is_none() {
+                        ack_error = Some(FinalizeError::atif_source(error));
+                    } else {
+                        tracing::warn!(
+                            %error,
+                            "broker-acks sync after partial removal failed; leaving as-is (retry on next tick)"
+                        );
+                    }
+                }
+            }
+            if let Some(error) = ack_error {
+                return Err(error);
             }
             Ok(())
         })
@@ -4237,9 +4308,11 @@ fn archive_conflicting_atif(
     //
     // The archived name MUST NOT have `Path::extension()`
     // equal to `"promote"` — that extension re-enters the
-    // `retry_marked_promotions` scan filter (`reconciler.rs:2227`), which
-    // then MAC-verifies the archived bytes (unchanged by rename), looks
-    // up `sessions.get(&marker.session_id)` and gets the *recycled*
+    // `retry_marked_promotions` scan filter at
+    // `reconciler.rs::retry_marked_promotions` (the
+    // `path.extension() != Some("promote")` check that gates the
+    // MAC-verify+promote loop), which then MAC-verifies the
+    // archived bytes (unchanged by rename), looks up `sessions.get(&marker.session_id)` and gets the *recycled*
     // Session (S2) — and calls `promote(S2)` on it. Effect: an
     // unrequested promotion of S2 minted a receipt and emitted a
     // receipt event no operator asked for; the archived marker stayed
@@ -4500,6 +4573,7 @@ pub fn spawn_reconciler(
     tick_s: u64,
     breaker: av_loopdetect::BreakerConfig,
     metrics: Arc<Registry>,
+    shutdown: Arc<tokio::sync::Notify>,
 ) -> tokio::task::JoinHandle<()> {
     use futures::future::FutureExt as _;
     // Tick-liveness gauge, registered SYNCHRONOUSLY at spawn so the
@@ -4526,7 +4600,36 @@ pub fn spawn_reconciler(
         // pressure into a stall spiral.
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            interval.tick().await;
+            // R69 F1: cooperative shutdown via `Notify` instead of
+            // `JoinHandle::abort` from `main.rs`. Abort cancels only
+            // the outer async task, but the reconciler tick body
+            // dispatches to `spawn_blocking` (write_atomic markers,
+            // remove_file journal cleanup, publish_idempotent for
+            // SESSION_CLOSE, and up to 64 close_session calls per
+            // tick — each an internally spawned blocking closure).
+            // Under abort those keep running orphaned; the awaiting
+            // handle in main.rs returns immediately and does NOT wait
+            // for them, so half-written `.close-complete` markers or
+            // torn journal tails could race the process exit — the
+            // exact "orphan marker" hazard the retention-loop and
+            // bridge-maintenance-loop comments in main.rs cite as
+            // rationale for their existing `Notify` discipline. The
+            // reconciler ticks 14 400× more often than the retention
+            // loop (250 ms vs 1 h) and does far more spool-mutating
+            // work per tick; it is the odd one out.
+            //
+            // Biased select: prefer shutdown over another tick so a
+            // signal arriving mid-tick-window latches immediately;
+            // and we NEVER start a new tick body after shutdown even
+            // if the interval and shutdown are ready simultaneously.
+            tokio::select! {
+                biased;
+                () = shutdown.notified() => {
+                    tracing::debug!("reconciler shutdown notified; exiting loop between ticks");
+                    return;
+                }
+                _ = interval.tick() => {}
+            }
             let started = Instant::now();
             // Wrap the whole tick body in catch_unwind: any panic in
             // the reconciler (fs unwrap, JCS overflow, allocator
@@ -5070,6 +5173,7 @@ mod tests {
             1,    // tick every second
             Default::default(),
             Arc::clone(&metrics),
+            Arc::new(tokio::sync::Notify::new()),
         );
         // Pre-registration: the series must exist in a render even
         // before any tick necessarily completed.

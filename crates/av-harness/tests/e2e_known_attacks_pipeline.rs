@@ -60,7 +60,7 @@ fn multi_key_check_and_spend_is_all_or_nothing_at_the_boundary() {
             },
         ])
         .unwrap();
-    assert_eq!(outcome, Some(1));
+    assert_eq!(outcome, av_state::TrySpendOutcome::Refused { index: 1 });
     assert_eq!(store.get("room").unwrap(), 0, "partial commit leaked");
     assert_eq!(store.get("starved").unwrap(), 100);
 }

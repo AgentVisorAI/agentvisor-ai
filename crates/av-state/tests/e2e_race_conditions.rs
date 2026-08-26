@@ -88,7 +88,11 @@ fn try_spend_many_is_all_or_nothing_under_contention() {
                         },
                     ])
                     .unwrap();
-                assert_eq!(outcome, Some(1), "starved dim didn't refuse");
+                assert_eq!(
+                    outcome,
+                    av_state::TrySpendOutcome::Refused { index: 1 },
+                    "starved dim didn't refuse"
+                );
             })
         })
         .collect();
@@ -252,7 +256,7 @@ fn cross_key_multi_spend_pairs_do_not_deadlock_or_double_spend() {
         let commits_a = Arc::clone(&commits_ab);
         handles.push(thread::spawn(move || {
             barrier_a.wait();
-            if let Ok(None) = store_a.try_spend_many(&[
+            if let Ok(av_state::TrySpendOutcome::Committed { .. }) = store_a.try_spend_many(&[
                 Spend {
                     key: "A".to_owned(),
                     amount: 1,
@@ -272,7 +276,7 @@ fn cross_key_multi_spend_pairs_do_not_deadlock_or_double_spend() {
         let commits_b = Arc::clone(&commits_ba);
         handles.push(thread::spawn(move || {
             barrier_b.wait();
-            if let Ok(None) = store_b.try_spend_many(&[
+            if let Ok(av_state::TrySpendOutcome::Committed { .. }) = store_b.try_spend_many(&[
                 Spend {
                     key: "B".to_owned(),
                     amount: 1,
@@ -335,7 +339,9 @@ fn in_memory_spend_boundary_is_exact_at_jcs_safe_max() {
                 limit: max,
             }])
             .unwrap(),
-        None,
+        av_state::TrySpendOutcome::Committed {
+            post_commit_min_remaining: 0,
+        },
         "amount == limit == JCS_SAFE_MAX must commit"
     );
     for (amount, limit) in [(max + 1, max), (1, max + 1)] {

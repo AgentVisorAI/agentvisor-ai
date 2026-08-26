@@ -127,6 +127,7 @@ async fn prompt_injection_in_tool_result_does_not_bypass_the_next_gate() {
         ToolVerdict::Allowed { .. } => {
             panic!("hostile follow-up must not be allowed by the same policy chain")
         }
+        _ => panic!("unhandled ToolVerdict variant in test"),
     }
 }
 
@@ -161,6 +162,7 @@ fn typosquat_tool_names_are_refused_by_allowlist() {
             ToolVerdict::Allowed { .. } => {
                 panic!("typosquat {lookalike:?} bypassed the allow-list")
             }
+            _ => panic!("unhandled ToolVerdict variant in test"),
         }
     }
 }

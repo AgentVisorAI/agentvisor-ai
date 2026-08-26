@@ -39,6 +39,63 @@ pub struct Spend {
     pub limit: u64,
 }
 
+/// One key/amount entry in an atomic multi-dimensional refund. Twin to
+/// [`Spend`]. Introduced in R67 to close R66 F2: the previous shape
+/// issued 3 independent `store.refund` calls (`total_calls`, per-tool,
+/// payout), each its own Redis round-trip. Crash/reconnect between
+/// steps left partial refund state; concurrent `try_tool_call`
+/// under `InMemoryStore` could observe partially-refunded state
+/// (fresh `total_calls` headroom but still-charged per-tool) — an
+/// ordering result impossible under a single-Lua refund and a
+/// cross-backend divergence with `RedisStore` (which has zero
+/// serialization between the 3 refunds).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refund {
+    /// Counter key.
+    pub key: String,
+    /// Amount to return.
+    pub amount: u64,
+}
+
+/// Outcome of an atomic multi-dimensional spend. Carries the post-
+/// commit min-headroom across the spent keys on success — a value
+/// that CANNOT race with a concurrent spend/refund because it is
+/// computed inside the same atomic Lua (RedisStore) / mutex-critical
+/// section (InMemoryStore) that commits the spend.
+///
+/// Introduced in R68 to close R66 F3: the previous shape returned
+/// `Result<Option<usize>, StateError>` (`None` = committed), forcing
+/// downstream `remaining_min` code to issue a SECOND set of GET
+/// round-trips to compute the reported headroom. Between the atomic
+/// spend and those GETs, a concurrent `remove_prefix` could DEL the
+/// counter — the GET returns 0, `remaining = cap.saturating_sub(0)`
+/// reports the full budget as available immediately after a debit
+/// that WAS committed. `BudgetDecision::Allowed { remaining }` is
+/// used as a flow-control signal (routes.rs, pipeline.rs), so wrong
+/// values reshape tail behaviour: bursts allowed through when they
+/// should be paced, or requests refused when they should be
+/// admitted. Not a security bug (the spend itself was atomic and
+/// cap-checked); a correctness bug on the "remaining headroom" API
+/// contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrySpendOutcome {
+    /// All spends committed atomically. `post_commit_min_remaining`
+    /// = min over spends of `spend.limit - post_commit_counter(spend.key)`,
+    /// where the post-commit counter is the value the same atomic
+    /// section wrote. `u64::MAX` for an empty spends slice.
+    Committed {
+        /// Min-headroom across the batch after commit. See enum
+        /// doc for full contract.
+        post_commit_min_remaining: u64,
+    },
+    /// The `index`-th spend would have exceeded its limit; nothing
+    /// was committed.
+    Refused {
+        /// Position in the original spends slice.
+        index: usize,
+    },
+}
+
 /// Atomic counter operations. Every mutation is atomic with respect to
 /// concurrent callers; `try_spend` is a single check-and-spend (never a
 /// read-then-write).
@@ -73,17 +130,42 @@ pub trait StateStore: Send + Sync {
     /// Atomically spend `amount` from the remaining budget `limit - spent(key)`.
     /// Returns `Ok(true)` and records the spend if the full `amount` fits,
     /// `Ok(false)` (recording nothing) otherwise.
-    fn try_spend(&self, key: &str, amount: u64, limit: u64) -> Result<bool, StateError>;
+    ///
+    /// Default impl routes through [`Self::try_spend_many`]; backends
+    /// override only if they can express single-key check-and-spend
+    /// more cheaply than the multi-key path.
+    fn try_spend(&self, key: &str, amount: u64, limit: u64) -> Result<bool, StateError> {
+        Ok(matches!(
+            self.try_spend_many(&[Spend {
+                key: key.to_owned(),
+                amount,
+                limit,
+            }])?,
+            TrySpendOutcome::Committed { .. }
+        ))
+    }
 
-    /// Atomically validate and commit every spend, or commit none. Returns the
-    /// index of the first dimension that would exceed its limit.
+    /// Atomically validate and commit every spend, or commit none.
     ///
     /// Every `Spend` in `spends` must carry a distinct `key`; two entries for
     /// the same key would each observe the pre-commit value in the check
     /// phase and pass their independent limit checks, then the commit phase
     /// would sum them and blow through the cap. Duplicate keys return
     /// `StateError::Backend` (not `Overflow`), matching the API-misuse class.
-    fn try_spend_many(&self, spends: &[Spend]) -> Result<Option<usize>, StateError>;
+    ///
+    /// On success returns [`TrySpendOutcome::Committed`] carrying the
+    /// post-commit min-headroom across the spent keys — computed
+    /// server-side in the SAME atomic section that committed the
+    /// spend, so it cannot race with a concurrent spend/refund/
+    /// remove_prefix on the same keys. Callers that previously
+    /// followed a successful spend with a `get`-per-dimension
+    /// `remaining_min` computation to build
+    /// `BudgetDecision::Allowed { remaining }` should use the
+    /// returned value directly (R66 F3).
+    ///
+    /// On refusal returns [`TrySpendOutcome::Refused`] with the
+    /// index of the offending spend.
+    fn try_spend_many(&self, spends: &[Spend]) -> Result<TrySpendOutcome, StateError>;
 
     /// Remove a key (session cleanup).
     fn remove(&self, key: &str);
@@ -106,6 +188,38 @@ pub trait StateStore: Send + Sync {
     /// admitted work.
     fn refund(&self, key: &str, amount: u64) {
         let _ = (key, amount);
+    }
+
+    /// Atomic multi-key refund. Twin to [`Self::try_spend_many`].
+    ///
+    /// Best-effort by contract (mirroring `refund`): backends
+    /// swallow errors internally so a compensation failure never
+    /// turns into a 5xx on the caller path. The atomicity guarantee
+    /// is: every backend implementation MUST either apply every
+    /// listed refund or none of them, so a concurrent
+    /// `try_tool_call` / `try_spend_many` cannot observe partially-
+    /// refunded state (fresh `total_calls` headroom but still-
+    /// charged per-tool, etc.). The trait's default falls back to
+    /// per-key `refund` calls — safe for the single-key case and
+    /// for backends that inherit the default, but atomicity of
+    /// downstream callers relies on backends overriding this with a
+    /// single-transaction implementation. `InMemoryStore` takes
+    /// its `transaction_lock` once around the whole batch;
+    /// `RedisStore` sends a single Lua script keyed on every
+    /// counter (all sharing the session's Redis Cluster hash tag,
+    /// so cross-slot fan-out is impossible).
+    ///
+    /// Duplicate keys in a single call are applied step-wise per
+    /// entry with the same saturate-at-zero clamp as the single-key
+    /// `refund`; the two backends match. In practice production
+    /// callers (currently only `refund_tool_call`) never produce
+    /// duplicate keys, so the step-wise-vs-summed distinction is
+    /// only relevant to a bespoke caller that intentionally batches
+    /// multiple entries against one counter.
+    fn refund_many(&self, refunds: &[Refund]) {
+        for r in refunds {
+            self.refund(&r.key, r.amount);
+        }
     }
 
     /// Remove every key beginning with `prefix` (whole-session cleanup at
@@ -215,17 +329,7 @@ impl StateStore for InMemoryStore {
         }
     }
 
-    fn try_spend(&self, key: &str, amount: u64, limit: u64) -> Result<bool, StateError> {
-        Ok(self
-            .try_spend_many(&[Spend {
-                key: key.to_owned(),
-                amount,
-                limit,
-            }])?
-            .is_none())
-    }
-
-    fn try_spend_many(&self, spends: &[Spend]) -> Result<Option<usize>, StateError> {
+    fn try_spend_many(&self, spends: &[Spend]) -> Result<TrySpendOutcome, StateError> {
         let _transaction = self.transaction_lock.lock();
         refuse_duplicate_spend_keys(spends)?;
         let mut prepared = Vec::with_capacity(spends.len());
@@ -252,14 +356,24 @@ impl StateStore for InMemoryStore {
                 .checked_add(amount)
                 .ok_or_else(|| StateError::Overflow(spend.key.clone()))?;
             if next > limit {
-                return Ok(Some(index));
+                return Ok(TrySpendOutcome::Refused { index });
             }
-            prepared.push((cell, amount));
+            prepared.push((cell, amount, limit, next));
         }
-        for (cell, amount) in prepared {
+        // R66 F3: compute post-commit min-headroom under the SAME
+        // transaction_lock that commits the spends. A subsequent
+        // `get`-per-key read would race with a concurrent
+        // remove_prefix/spend/refund; this value is the exact
+        // headroom at the instant of commit.
+        let mut min_remaining: u64 = u64::MAX;
+        for (cell, amount, limit, next) in prepared {
             cell.fetch_add(amount, Ordering::AcqRel);
+            let remaining = u64::try_from(limit - next).unwrap_or(0);
+            min_remaining = min_remaining.min(remaining);
         }
-        Ok(None)
+        Ok(TrySpendOutcome::Committed {
+            post_commit_min_remaining: min_remaining,
+        })
     }
 
     fn remove(&self, key: &str) {
@@ -294,6 +408,31 @@ impl StateStore for InMemoryStore {
         let amount = i64::try_from(amount).unwrap_or(i64::MAX);
         let next = prev.saturating_sub(amount).max(0);
         cell.store(next, Ordering::Release);
+    }
+
+    /// R66 F2: fold ALL listed refunds under a single acquisition
+    /// of `transaction_lock` so a concurrent `try_spend_many` (which
+    /// also holds this lock) cannot observe partial state. Under
+    /// the old shape (per-key `refund`), a concurrent `try_tool_call`
+    /// running between refund step 1 and step 2 could pass
+    /// `total_calls` (freshly refunded) but be refused by the per-
+    /// tool cap (not yet refunded) — an ordering result impossible
+    /// under the single-Lua RedisStore path. Now the two backends
+    /// serialise the batch identically.
+    fn refund_many(&self, refunds: &[Refund]) {
+        if refunds.is_empty() {
+            return;
+        }
+        let _transaction = self.transaction_lock.lock();
+        for r in refunds {
+            let Some(cell) = self.counters.get(&r.key).map(|entry| Arc::clone(entry.value())) else {
+                continue;
+            };
+            let prev = cell.load(Ordering::Acquire);
+            let amount = i64::try_from(r.amount).unwrap_or(i64::MAX);
+            let next = prev.saturating_sub(amount).max(0);
+            cell.store(next, Ordering::Release);
+        }
     }
 
     fn remove_prefix(&self, prefix: &str) {
@@ -541,7 +680,9 @@ mod tests {
                 },
             ])
             .unwrap(),
-            None,
+            TrySpendOutcome::Committed {
+                post_commit_min_remaining: 6,
+            },
         );
         assert_eq!(s.get("a").unwrap(), 3);
         assert_eq!(s.get("b").unwrap(), 4);
