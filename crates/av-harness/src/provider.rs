@@ -675,7 +675,7 @@ fn map_gemini_finish_reason(reason: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::expect_used, clippy::panic)]
 
     use super::*;
 
