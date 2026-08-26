@@ -498,7 +498,27 @@
       promise.then(function (s) { state.session = s; startLiveStream(); navigate("#/overview"); })
         .catch(function (err) {
           btn.disabled = false;
-          errEl.innerHTML = '<div class="auth-err">' + esc(err.message || "Failed") + "</div>";
+          // 429 rate-limit → surface friendly message + countdown so
+          // the user has actionable info (e.g. shared corporate NAT
+          // where multiple people are hitting login at once).
+          var friendly = err.friendlyMessage || err.message || "Failed";
+          errEl.innerHTML = '<div class="auth-err">' + esc(friendly) + "</div>";
+          // If the server told us how long to wait, kick a countdown
+          // that re-enables the button when time's up.
+          if (err.retryAfterSec && err.retryAfterSec > 0) {
+            var left = err.retryAfterSec;
+            btn.disabled = true;
+            var iv = setInterval(function () {
+              left -= 1;
+              if (left <= 0) {
+                clearInterval(iv);
+                btn.disabled = false;
+                errEl.innerHTML = "";
+                return;
+              }
+              errEl.innerHTML = '<div class="auth-err">Too many attempts. Try again in ' + left + " second" + (left === 1 ? "" : "s") + ".</div>";
+            }, 1000);
+          }
         });
     });
   }

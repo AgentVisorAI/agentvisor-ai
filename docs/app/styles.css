@@ -729,8 +729,17 @@ code, pre, .mono {
  * TABLES
  * ============================================================ */
 .table-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden; }
-table { width: 100%; border-collapse: collapse; font-size: var(--t-body); }
+/* table-layout: fixed prevents any single evil-long cell from stretching
+   the whole table. Combined with the per-cell truncation below, hostile
+   or accidentally-long user data stays contained. */
+table { width: 100%; border-collapse: collapse; font-size: var(--t-body); table-layout: fixed; }
 th, td { padding: 10px var(--s-4); text-align: left; }
+/* Every cell truncates its overflowing content. The full string is
+   available via a native tooltip (title attr, set by the renderer when
+   worth doing) or by clicking into the row's detail view. */
+td, th { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Cells that hold two lines (deployment name + subhead) opt back in. */
+td > div:first-child { overflow: hidden; text-overflow: ellipsis; }
 th {
   font-size: 11.5px;
   color: var(--fg-2);

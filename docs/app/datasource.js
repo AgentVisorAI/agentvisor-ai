@@ -934,6 +934,17 @@
       err.data = data;
       err.errorCode = data.errorCode;
       err.requestId = data.requestId || window.__lastRequestId;
+      // Rate limit — surface Retry-After so callers can render an
+      // actionable "try again in Xs" instead of a generic error. The
+      // Fastify rate-limit plugin sets Retry-After (seconds) + a
+      // human-readable message; we keep both.
+      if (res.status === 429) {
+        var retry = res.headers.get && res.headers.get("retry-after");
+        err.retryAfterSec = retry ? parseInt(retry, 10) : null;
+        err.friendlyMessage = "Too many attempts. Try again"
+          + (err.retryAfterSec ? " in " + err.retryAfterSec + " second" + (err.retryAfterSec === 1 ? "" : "s") : " shortly")
+          + ".";
+      }
       // Global auth-expiry handler. If the JWT expired mid-session,
       // every subsequent datasource call would return 401. Rather
       // than let each page render "Something went wrong", bounce the
