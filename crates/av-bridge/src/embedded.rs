@@ -384,8 +384,8 @@ impl EmbeddedBroker {
     /// streaming scan of the one segment file. An unparseable line is
     /// skipped (same policy as [`EventBus::fetch`]); an unterminated
     /// trailing line — an in-flight append or crash-torn tail — is
-    /// ignored, never truncated; an oversized line is drained in
-    /// bounded chunks and skipped.
+    /// ignored, never truncated; a record above the per-line bound
+    /// stops the scan at that point (fail-stop, mutation-free).
     pub fn fetch_read_only(
         data_dir: &Path,
         topic: &str,
