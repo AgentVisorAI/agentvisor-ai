@@ -1,0 +1,71 @@
+name: Console smoke
+
+# Runs Playwright drills against the deployed console after the Pages
+# workflow has published. Catches regressions like:
+#   * A settings tab going empty because mock data got moved.
+#   * A JS error introduced by a routing change.
+#   * A route returning 4xx from the Pages CDN.
+#   * Mobile viewport breaking with horizontal scroll.
+#   * A11y regressions on any route.
+#
+# Runs on push to main (post-deploy) + a nightly cron so a broken
+# CDN cache doesn't sit unnoticed for a week.
+
+on:
+  workflow_run:
+    workflows: ["Docs"]
+    types: [completed]
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * *"  # 06:00 UTC daily
+  workflow_dispatch:
+
+concurrency:
+  group: console-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  live-smoke:
+    # Only run if the Docs workflow (which builds+deploys Pages)
+    # actually succeeded — a failed deploy doesn't need us re-testing
+    # the old bits.
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name != 'workflow_run' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install server deps (includes Playwright)
+        working-directory: server
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: server
+        run: npx playwright install --with-deps chromium
+
+      - name: Wait 10s for CDN cache to warm
+        run: sleep 10
+
+      - name: Live SPA smoke
+        working-directory: server
+        env:
+          SITE: https://agentvisorai.me/app/
+        run: node scripts/live-site-smoke.mjs
+
+      - name: Mobile viewport smoke
+        working-directory: server
+        env:
+          SITE: https://agentvisorai.me/app/
+        run: node scripts/mobile-smoke.mjs
+
+      - name: A11y audit (axe-core)
+        working-directory: server
+        env:
+          SITE: https://agentvisorai.me/app/
+        run: node scripts/a11y-audit.mjs
