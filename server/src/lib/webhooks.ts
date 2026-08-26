@@ -262,6 +262,41 @@ async function deliverOne(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), DELIVERY_TIMEOUT_MS);
 
+  // R76 HIGH #2: re-validate the URL immediately before the fetch
+  // to close the DNS-rebinding TOCTOU. Prior shape resolved DNS
+  // only at config-create/patch time (`validateWebhookUrl` in the
+  // create/update handlers). An attacker with a fast-TTL DNS name
+  // pointed at a public IP at create time could flip authoritative
+  // DNS to `169.254.169.254` (or any RFC1918 range) between
+  // config-time and delivery-time. `fetch()` then re-resolves
+  // independently, connects to the cloud metadata endpoint, and
+  // reads the response into `respText` — persisted as
+  // `responseBody` and readable by any org member via
+  // `GET /webhooks/:id/deliveries`. This is a cloud-instance
+  // takeover primitive (IAM STS credentials exfil for the pod).
+  //
+  // Re-validating here forces a fresh DNS lookup at delivery time.
+  // A rebinding attacker would have to hit the tiny window between
+  // this DNS lookup and undici's — practically infeasible on most
+  // resolvers (kernel caches, undici's own cache). A hardened
+  // future round should pin the resolved IP via a custom
+  // `undici.Agent` with a fixed `connect` handler, closing the
+  // TOCTOU window entirely.
+  const ssrf = await validateWebhookUrl(url);
+  if (!ssrf.ok) {
+    clearTimeout(timer);
+    await db.webhookDelivery.update({
+      where: { id: deliveryId },
+      data: {
+        status: "failed",
+        responseCode: 0,
+        responseBody: `SSRF re-check failed at delivery time: ${ssrf.reason}`,
+        deliveredAt: new Date(),
+      },
+    });
+    return;
+  }
+
   try {
     const res = await fetch(url, {
       method: "POST",
