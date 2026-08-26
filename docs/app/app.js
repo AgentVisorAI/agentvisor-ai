@@ -62,6 +62,65 @@
     if (!location.hash) location.hash = state.session ? "#/overview" : "#/login";
     else render();
     installKeyboardShortcuts();
+    if (state.session) startLiveStream();
+  }
+
+  var liveUnsub = null;
+  var liveEventBuffer = [];
+  function startLiveStream() {
+    if (liveUnsub || !state.ds.subscribe) return;
+    try {
+      liveUnsub = state.ds.subscribe(function (msg) {
+        // Track a small ring for the pulse indicator and any listener on
+        // the current view. The Overview refreshes stats when new events
+        // land; the Session detail rerenders when its session is hit.
+        liveEventBuffer.push({ at: Date.now(), msg: msg });
+        if (liveEventBuffer.length > 40) liveEventBuffer.shift();
+        pulseLiveIndicator();
+        onLiveEvent(msg);
+      });
+    } catch (e) {
+      console.warn("live stream unavailable", e);
+    }
+  }
+  function stopLiveStream() {
+    if (liveUnsub) { liveUnsub(); liveUnsub = null; }
+  }
+  function pulseLiveIndicator() {
+    var el = document.querySelector('.env-pill.live-pulse');
+    if (!el) return;
+    el.classList.remove('pulsing');
+    // Force reflow so re-adding the class restarts the animation.
+    void el.offsetWidth;
+    el.classList.add('pulsing');
+  }
+  function onLiveEvent(msg) {
+    // Overview: refresh KPIs + chart on any relevant event. Debounced so a
+    // burst of events (common right after a session opens) only redraws once.
+    var path = state.route && state.route.path;
+    if (!path || !path[0]) return;
+    if (path[0] === "overview") scheduleOverviewRefresh();
+    else if (path[0] === "sessions" && path[1] && msg.type === "events.appended" && msg.data.sessionId === path[1]) {
+      scheduleSessionDetailRefresh(path[1]);
+    }
+  }
+  var _ovT;
+  function scheduleOverviewRefresh() {
+    clearTimeout(_ovT);
+    _ovT = setTimeout(function () {
+      var main = document.getElementById("view");
+      if (main && (!state.route || state.route.path[0] === "overview")) renderOverview(main);
+    }, 700);
+  }
+  var _sdT;
+  function scheduleSessionDetailRefresh(id) {
+    clearTimeout(_sdT);
+    _sdT = setTimeout(function () {
+      var main = document.getElementById("view");
+      if (main && state.route && state.route.path[0] === "sessions" && state.route.path[1] === id) {
+        renderSessionDetail(main, id);
+      }
+    }, 400);
   }
 
   /* ---------- main render ---------- */
@@ -218,6 +277,7 @@
       confirmLabel: "Sign out",
       danger: false,
       onConfirm: function () {
+        stopLiveStream();
         state.ds.logout().then(function () { state.session = null; navigate("#/login"); });
       },
     });
@@ -230,6 +290,7 @@
     var modeChip = state.ds.mode === "mock"
       ? '<span class="env-pill" title="Console is showing built-in demo data. Set MOCK_MODE=false to talk to a live backend.">Demo</span>'
       : '<span class="env-pill">Live</span>';
+    var liveChip = '<span class="env-pill live-pulse" title="Streaming events from the daemon"><span class="dot"></span>Live</span>';
 
     app.innerHTML = "";
     app.appendChild(h(
@@ -240,6 +301,7 @@
             '<span>AgentVisor</span>' +
           "</a>" +
           modeChip +
+          liveChip +
           '<div class="spacer"></div>' +
           '<button class="cmdk-trigger" id="cmdkOpen">' +
             '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>' +
@@ -346,7 +408,7 @@
       b.addEventListener("click", function () {
         var p = b.getAttribute("data-sso");
         state.ds.loginWithProvider(p).then(function (s) {
-          state.session = s; navigate("#/overview");
+        state.session = s; startLiveStream(); navigate("#/overview");
         }).catch(function (e) {
           $("#authErr").innerHTML = '<div class="auth-err">' + esc(e.message) + "</div>";
         });
@@ -363,7 +425,7 @@
       var promise = isSignup
         ? state.ds.signup({ email: email, password: pw, orgName: ($("#orgName") || {}).value })
         : state.ds.login({ email: email, password: pw });
-      promise.then(function (s) { state.session = s; navigate("#/overview"); })
+      promise.then(function (s) { state.session = s; startLiveStream(); navigate("#/overview"); })
         .catch(function (err) {
           btn.disabled = false;
           errEl.innerHTML = '<div class="auth-err">' + esc(err.message || "Failed") + "</div>";

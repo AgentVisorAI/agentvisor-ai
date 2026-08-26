@@ -9,6 +9,7 @@ import { authRoutes } from "./routes/auth.js";
 import { deploymentRoutes } from "./routes/deployments.js";
 import { ingestRoutes } from "./routes/ingest.js";
 import { readRoutes } from "./routes/read.js";
+import { streamRoutes } from "./routes/stream.js";
 
 // `types.d.ts` declares the `request.session` typing. It's picked up by the
 // TypeScript compiler via `include`, no runtime import required.
@@ -93,6 +94,9 @@ async function main(): Promise<void> {
     prefix: "/api/v1/ingest",
   });
   await app.register(async (r) => r.register(readRoutes), {
+    prefix: "/api/v1",
+  });
+  await app.register(async (r) => r.register(streamRoutes), {
     prefix: "/api/v1",
   });
 

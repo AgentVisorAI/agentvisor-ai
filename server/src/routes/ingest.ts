@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { db } from "../db.js";
 import { verifyPassword } from "../lib/auth.js";
+import { bus } from "../lib/bus.js";
 
 // ── Auth for the ingest endpoint ────────────────────────────────────────────
 //
@@ -137,6 +138,14 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       },
       select: { id: true, externalId: true },
     });
+    bus.publish({
+      type: "session.upsert",
+      orgId: daemon.orgId,
+      deploymentId: daemon.deploymentId,
+      sessionId: session.id,
+      externalId: session.externalId,
+      agent: s.agent,
+    });
     return reply.send({ session });
   });
 
@@ -224,6 +233,18 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
           },
         });
       }
+
+      if (result.count > 0 || dToolsOk || dToolsBad) {
+        bus.publish({
+          type: "events.appended",
+          orgId: daemon.orgId,
+          deploymentId: daemon.deploymentId,
+          sessionId: session.id,
+          count: result.count,
+          allowed: dToolsOk,
+          blocked: dToolsBad,
+        });
+      }
     }
     return reply.send({ inserted });
   });
@@ -272,6 +293,13 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
         stopReasonId: r.stopReasonId,
         stopReason: r.stopReason,
       },
+    });
+    bus.publish({
+      type: "receipt.finalized",
+      orgId: daemon.orgId,
+      deploymentId: daemon.deploymentId,
+      sessionId: session.id,
+      receiptId: r.receiptId,
     });
     return reply.send({ ok: true });
   });

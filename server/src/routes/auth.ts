@@ -98,8 +98,11 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post("/login", async (req, reply) => {
+    // Login accepts any well-formed input and lets the credential check
+    // return a uniform 401. Rejecting on password length would leak the
+    // signup constraint and give attackers a legit-vs-typo distinguisher.
     const body = z
-      .object({ email: emailSchema, password: passwordSchema })
+      .object({ email: emailSchema, password: z.string().min(1).max(1024) })
       .safeParse(req.body);
     if (!body.success) {
       return reply.code(400).send({ error: "invalid_input" });

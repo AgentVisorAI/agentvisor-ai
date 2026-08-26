@@ -376,6 +376,21 @@ code, pre, .mono {
   content: ""; width: 5px; height: 5px; border-radius: 50%;
   background: var(--accent);
 }
+.topbar .env-pill.live-pulse {
+  background: var(--success-bg);
+  border-color: var(--success-border);
+  color: var(--success);
+}
+.topbar .env-pill.live-pulse::before { background: var(--success-solid); }
+.topbar .env-pill.live-pulse .dot { display: none; }
+.topbar .env-pill.live-pulse.pulsing::before {
+  animation: livePulse 700ms cubic-bezier(.22,1,.36,1);
+}
+@keyframes livePulse {
+  0% { transform: scale(1); box-shadow: 0 0 0 0 currentColor; }
+  60% { transform: scale(1.8); box-shadow: 0 0 0 6px transparent; }
+  100% { transform: scale(1); box-shadow: 0 0 0 0 transparent; }
+}
 .topbar .spacer { flex: 1; }
 .topbar .cmdk-trigger {
   display: flex; align-items: center; gap: var(--s-2);

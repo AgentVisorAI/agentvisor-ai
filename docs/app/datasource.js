@@ -713,6 +713,54 @@
     async listMembers() { await delay(100); return MOCK_MEMBERS.slice(); },
     async listApiKeys() { await delay(100); return MOCK_API_KEYS.slice(); },
     async listAudit() { await delay(100); return MOCK_AUDIT.slice(); },
+    subscribe(callback) {
+      // The demo needs to feel alive. Every 6-14 seconds we synthesize a new
+      // event or session and hand it to the callback exactly like the SSE
+      // consumer would receive one from the backend.
+      var stopped = false;
+      var timer;
+      function tick() {
+        if (stopped) return;
+        var kind = Math.random();
+        if (kind < 0.25) {
+          // A new session appears
+          var newId = "sess_live" + Math.floor(Math.random() * 1e6).toString(36);
+          var agent = AGENTS[Math.floor(Math.random() * AGENTS.length)];
+          callback({ type: "session.upsert", data: {
+            orgId: "org_northwind",
+            deploymentId: MOCK_DEPLOYMENTS[0].id,
+            sessionId: newId,
+            externalId: newId,
+            agent: agent.name,
+          }});
+        } else if (kind < 0.85) {
+          // Events appended to an existing session
+          var s = MOCK_SESSIONS[Math.floor(Math.random() * MOCK_SESSIONS.length)];
+          var blocked = Math.random() < 0.06 ? 1 : 0;
+          var allowed = blocked ? 0 : 1 + Math.floor(Math.random() * 3);
+          callback({ type: "events.appended", data: {
+            orgId: "org_northwind",
+            deploymentId: s.deploymentId,
+            sessionId: s.id,
+            count: allowed + blocked,
+            allowed: allowed,
+            blocked: blocked,
+          }});
+        } else {
+          // A receipt got sealed
+          var sr = MOCK_SESSIONS[Math.floor(Math.random() * MOCK_SESSIONS.length)];
+          callback({ type: "receipt.finalized", data: {
+            orgId: "org_northwind",
+            deploymentId: sr.deploymentId,
+            sessionId: sr.id,
+            receiptId: "rcpt_" + sr.externalId,
+          }});
+        }
+        timer = setTimeout(tick, 6000 + Math.floor(Math.random() * 8000));
+      }
+      timer = setTimeout(tick, 3500);
+      return function () { stopped = true; if (timer) clearTimeout(timer); };
+    },
   };
 
   /* ============================================================
@@ -885,6 +933,19 @@
     async listMembers() { return MOCK_MEMBERS.slice(); },
     async listApiKeys() { return MOCK_API_KEYS.slice(); },
     async listAudit() { return MOCK_AUDIT.slice(); },
+    subscribe(callback) {
+      // EventSource always uses same-origin credentials — the console tab
+      // already carries the av_session cookie, so no extra plumbing.
+      var url = apiUrl("/api/v1/stream");
+      var es = new EventSource(url, { withCredentials: true });
+      ["hello", "session.upsert", "events.appended", "receipt.finalized"].forEach(function (name) {
+        es.addEventListener(name, function (msg) {
+          try { callback({ type: name, data: JSON.parse(msg.data) }); }
+          catch (e) { /* swallow — malformed frame from a proxy */ }
+        });
+      });
+      return function () { es.close(); };
+    },
   };
 
   function normalizeSession(s) {
