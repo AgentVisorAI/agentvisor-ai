@@ -807,10 +807,12 @@ vector_backend = "memory"
 /// `/livez` stays 200, and the process must exit cleanly after the
 /// window. Without the window, axum stops accepting the instant the
 /// signal lands and a fresh probe sees connection-refused, never the
-/// 503 — Kubernetes hides this behind the preStop sleep, but
-/// docker-compose / systemd / bare-LB deployments have no preStop.
-/// Reproduced live before the fix: 0.5 s after SIGTERM both probes
-/// got connection-refused.
+/// 503. This applies to every deployment: the shipped k8s manifest
+/// runs on a distroless base with no shell so a `preStop` sleep
+/// hook cannot execute, and docker-compose / systemd / bare-LB
+/// deployments have no preStop equivalent at all. Reproduced live
+/// before the fix: 0.5 s after SIGTERM both probes got
+/// connection-refused.
 #[cfg(unix)]
 #[test]
 fn sigterm_serves_readyz_503_during_the_pre_drain_window() {

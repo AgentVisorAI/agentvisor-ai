@@ -52,10 +52,15 @@ terminates.
 The included Kubernetes manifest at
 `deploy/kubernetes/agentvisor-ai.yaml` wires **liveness and readiness**
 (via `startupProbe`, `readinessProbe`, and `livenessProbe` against
-`/livez` and `/readyz`), plus a `preStop` hook that sleeps 5 seconds
-so the endpoint churn overlaps the drain window. `/health` exists
-only for pre-`/livez`/`/readyz` deployments and mirrors `/livez` — new
-deployments should probe `/livez` and `/readyz` directly.
+`/livez` and `/readyz`) and uses the daemon's own readiness-controlled
+pre-drain window (ConfigMap key `shutdown_ready_drain_s = 5`) instead
+of a `preStop` shell hook — the shipped runtime base image
+(`chainguard/glibc-dynamic`) is distroless and has no `/bin/sh` /
+`/bin/sleep`, so a `preStop: exec: ["sh", "-c", "sleep 5"]` hook would
+have failed `FailedPreStopHook` and kubelet would have proceeded
+straight to SIGTERM. `/health` exists only for pre-`/livez`/`/readyz`
+deployments and mirrors `/livez` — new deployments should probe
+`/livez` and `/readyz` directly.
 
 ## Shutdown
 
@@ -66,11 +71,13 @@ deployments should probe `/livez` and `/readyz` directly.
    connections for that long so an external load balancer polling
    `/readyz` actually observes the 503 before the listener closes.
    Without it, step 3 begins immediately and a fresh readiness probe
-   sees connection-refused instead — fine on Kubernetes (the preStop
-   sleep provides this window before SIGTERM is even sent), but
-   docker-compose / systemd / bare-LB deployments have no preStop
-   equivalent, so set this to your LB's poll interval plus one
-   reconciliation.
+   sees connection-refused instead. This applies to every deployment
+   target — Kubernetes distroless images (like the shipped
+   `chainguard/glibc-dynamic` runtime) cannot use a preStop shell
+   hook, and docker-compose / systemd / bare-LB deployments have no
+   preStop equivalent at all. Set this to your LB's poll interval
+   plus one reconciliation (5 s covers a typical kube-proxy /
+   ingress reconciliation and matches the shipped ConfigMap).
 3. Await axum's graceful shutdown (in-flight requests complete;
    new TCP accepts are refused).
 4. Abort background tasks (reconciler tick, retention sweep, etc.).
