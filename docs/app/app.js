@@ -322,7 +322,7 @@
     app.innerHTML = "";
     app.appendChild(h(
       '<div class="app-shell">' +
-        '<header class="topbar">' +
+        '<header class="topbar" role="banner">' +
           '<a class="brand" href="#/overview">' +
             '<span class="brand-mark">A</span>' +
             '<span>AgentVisor</span>' +
@@ -330,7 +330,7 @@
           statusChip +
           '<div class="spacer"></div>' +
           '<button class="cmdk-trigger" id="cmdkOpen" aria-label="Open command palette (⌘K)">' +
-            '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>' +
+            '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>' +
             '<span>Search or run a command…</span>' +
             '<span class="kbd">⌘K</span>' +
           "</button>" +
@@ -340,7 +340,7 @@
             "<span>" + esc(user.email) + "</span>" +
           "</button>" +
         "</header>" +
-        '<nav class="sidebar">' +
+        '<nav class="sidebar" aria-label="Primary navigation">' +
           '<div class="org-switcher">' +
             '<span class="avatar">' + esc(org.name.slice(0, 1).toUpperCase()) + "</span>" +
             "<span>" + esc(org.name) + "</span>" +
@@ -353,7 +353,7 @@
           '<div class="group-label">Account</div>' +
           navLink("settings", current, "Settings", iconGear(), "G ,") +
         "</nav>" +
-        '<main class="main" id="view"></main>' +
+        '<main class="main" id="view" aria-label="Main content"></main>' +
       "</div>"
     ));
     $("#cmdkOpen").addEventListener("click", openCmdK);
@@ -778,16 +778,16 @@
     return '<div class="filter-bar">' +
       '<div class="search">' +
         '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>' +
-        '<input id="fSearch" type="search" placeholder="Search by session id, agent, or actor…" value="' + esc(sessionsFilter.q) + '" />' +
+        '<input id="fSearch" type="search" placeholder="Search by session id, agent, or actor…" aria-label="Search sessions" value="' + esc(sessionsFilter.q) + '" />' +
       "</div>" +
-      '<select id="fRange">' +
+      '<select id="fRange" aria-label="Filter by time range">' +
         '<option value="1"' + (sessionsFilter.sinceHours === 1 ? " selected" : "") + '>Last 1h</option>' +
         '<option value="24"' + (sessionsFilter.sinceHours === 24 ? " selected" : "") + '>Last 24h</option>' +
         '<option value="168"' + (sessionsFilter.sinceHours === 168 ? " selected" : "") + '>Last 7d</option>' +
         '<option value="720"' + (sessionsFilter.sinceHours === 720 ? " selected" : "") + '>Last 30d</option>' +
       "</select>" +
-      '<select id="fDep"><option value="">All deployments</option></select>' +
-      '<select id="fAgent"><option value="">All agents</option></select>' +
+      '<select id="fDep" aria-label="Filter by deployment"><option value="">All deployments</option></select>' +
+      '<select id="fAgent" aria-label="Filter by agent"><option value="">All agents</option></select>' +
       '<label class="toggle"><input id="fBlocked" type="checkbox"' + (sessionsFilter.blockedOnly ? " checked" : "") + '/> Blocked only</label>' +
       "</div>";
   }
@@ -1162,7 +1162,7 @@
           '<div class="snippet"><span class="prompt">$</span> <span class="cmd">curl -fsSL https://get.agentvisorai.me/install.sh | sh</span>\n<span class="prompt">$</span> <span class="cmd">agentvisord start --token=$AV_INGEST_TOKEN</span></div>' +
         "</div>" +
         '<div class="card" style="padding:0"><div class="table-wrap"><table>' +
-          "<thead><tr><th>Deployment</th><th>Environment</th><th>Region</th><th>Status</th><th>Version</th><th>Last seen</th><th></th></tr></thead>" +
+          "<thead><tr><th>Deployment</th><th>Environment</th><th>Region</th><th>Status</th><th>Version</th><th>Last seen</th><th><span class=\"sr-only\">Actions</span></th></tr></thead>" +
           "<tbody>" + rows + "</tbody></table></div></div>";
     }
     main.innerHTML = pageHeader("Deployments", "Each daemon streams events and signed receipts to this console.", actions) + body;
@@ -1373,7 +1373,7 @@
     }).join("");
     main.innerHTML = pageHeader("Policies", pols.length + " policies · " + pols.filter(function (p) { return p.enabled; }).length + " enabled", '<button class="btn accent" id="addPol">+ New policy</button>') +
       '<div class="card" style="padding:0"><div class="table-wrap"><table>' +
-        "<thead><tr><th>Policy</th><th>Description</th><th class=\"num\">Hits 24h</th><th class=\"num\">Blocks</th><th>Updated</th><th></th></tr></thead>" +
+        "<thead><tr><th>Policy</th><th>Description</th><th class=\"num\">Hits 24h</th><th class=\"num\">Blocks</th><th>Updated</th><th><span class=\"sr-only\">Actions</span></th></tr></thead>" +
         "<tbody>" + rows + "</tbody></table></div></div>";
     var tbody = main.querySelector("tbody");
     tbody.addEventListener("click", function (e) {
@@ -1548,7 +1548,7 @@
           '<button class="btn accent" id="inviteBtn" style="margin-left:auto">+ Invite</button>' +
         "</div>" +
         '<div class="table-wrap"><table>' +
-          "<thead><tr><th>Person</th><th>Role</th><th>Last active</th><th></th></tr></thead>" +
+          "<thead><tr><th>Person</th><th>Role</th><th>Last active</th><th><span class=\"sr-only\">Actions</span></th></tr></thead>" +
           "<tbody>" + rows + "</tbody>" +
         "</table></div>" +
       "</div>";
@@ -1577,7 +1577,7 @@
           '<button class="btn accent" id="createKeyBtn" style="margin-left:auto">+ Create key</button>' +
         "</div>" +
         '<div class="table-wrap"><table>' +
-          "<thead><tr><th>Name</th><th>Prefix</th><th>Last used</th><th>Created</th><th></th></tr></thead>" +
+          "<thead><tr><th>Name</th><th>Prefix</th><th>Last used</th><th>Created</th><th><span class=\"sr-only\">Actions</span></th></tr></thead>" +
           "<tbody>" + rows + "</tbody>" +
         "</table></div>" +
       "</div>";
@@ -1714,7 +1714,8 @@
     cmdkOpen_ = true;
     document.body.classList.add("locked");
 
-    // Gather targets
+    // Gather static targets synchronously — these render immediately so
+    // the palette shell is on screen the same tick as the ⌘K keystroke.
     var routes = [
       { g: "Navigate", label: "Overview", desc: "Fleet 24h dashboard", kbd: "G O", href: "#/overview", icon: iconChart() },
       { g: "Navigate", label: "Sessions", desc: "Every agent session", kbd: "G S", href: "#/sessions", icon: iconActivity() },
@@ -1727,19 +1728,11 @@
       { g: "Actions", label: "New deployment", desc: "Register an agentvisord daemon", run: function () { navigate("#/deployments"); setTimeout(openCreateDeploymentModal, 100); } },
       { g: "Actions", label: "Sign out", desc: "Leave this workspace", run: signOut },
     ];
+    // Dynamic targets get filled in when the async datasource calls
+    // resolve. Palette shell is already interactive — user can navigate
+    // + search static entries with zero latency.
     var sessions = [], policies = [], deployments = [];
-    try {
-      var sres = await state.ds.listSessions(); sessions = sres.sessions.slice(0, 20).map(function (s) {
-        return { g: "Sessions", label: s.externalId, desc: s.agent + " · " + s.user, href: "#/sessions/" + s.id, icon: iconActivity() };
-      });
-      policies = (await state.ds.listPolicies()).map(function (p) {
-        return { g: "Policies", label: p.name, desc: p.description, href: "#/policies/" + p.id, icon: iconShield() };
-      });
-      deployments = (await state.ds.listDeployments()).map(function (d) {
-        return { g: "Deployments", label: d.name, desc: d.environment + " · " + (d.region || ""), href: "#/deployments/" + d.id, icon: iconServer() };
-      });
-    } catch (e) {}
-    var all = routes.concat(actions).concat(sessions).concat(policies).concat(deployments);
+    var all = routes.concat(actions);
 
     var backdrop = h(
       '<div class="cmdk-backdrop">' +
@@ -1791,6 +1784,36 @@
     }
     paint();
     setTimeout(function () { input.focus(); }, 10);
+
+    // Populate dynamic entries in the background — palette is already
+    // interactive with the 8 static routes/actions above. When the data
+    // arrives we extend `all` and repaint (throttled to the current
+    // query). Any error is silently absorbed; the palette stays useful
+    // even offline.
+    (async function loadDynamic() {
+      try {
+        var sres = await state.ds.listSessions();
+        sessions = sres.sessions.slice(0, 20).map(function (s) {
+          return { g: "Sessions", label: s.externalId, desc: s.agent + " · " + s.user, href: "#/sessions/" + s.id, icon: iconActivity() };
+        });
+        all = all.concat(sessions);
+        if (backdrop.isConnected) paint();
+      } catch (e) {}
+      try {
+        policies = (await state.ds.listPolicies()).map(function (p) {
+          return { g: "Policies", label: p.name, desc: p.description, href: "#/policies/" + p.id, icon: iconShield() };
+        });
+        all = all.concat(policies);
+        if (backdrop.isConnected) paint();
+      } catch (e) {}
+      try {
+        deployments = (await state.ds.listDeployments()).map(function (d) {
+          return { g: "Deployments", label: d.name, desc: d.environment + " · " + (d.region || ""), href: "#/deployments/" + d.id, icon: iconServer() };
+        });
+        all = all.concat(deployments);
+        if (backdrop.isConnected) paint();
+      } catch (e) {}
+    }());
 
     input.addEventListener("input", function () { selected = 0; paint(); });
     input.addEventListener("keydown", function (e) {
