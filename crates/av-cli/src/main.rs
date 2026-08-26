@@ -368,7 +368,14 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent).with_context(|| format!("create key directory {}", parent.display()))?;
+    // Same rationale as harness main.rs `install_seed_exclusive`:
+    // route through `create_dir_all_synced` so newly-created ancestor
+    // dirents are fsynced (a bare `create_dir_all` leaves them
+    // volatile — power loss after install can drop the whole `keys/`
+    // directory even though the seed itself was fsynced) and so the
+    // leaf dir mode is 0o700 atomically at mkdir on Unix.
+    av_core::fsutil::create_dir_all_synced(parent)
+        .with_context(|| format!("create key directory {}", parent.display()))?;
     let temporary = parent.join(format!(".avctl-key-{}.tmp", av_core::new_event_uid()));
     // Parity with setup.rs, harness main.rs, and
     // cold_store.rs — arm an RAII guard so a transient IO failure

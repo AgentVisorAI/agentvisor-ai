@@ -990,12 +990,34 @@ async fn sync_session_journal(directory: &std::path::Path, session: &Session) ->
     let digest = av_core::digest::sha256_hex(session.id.as_bytes());
     let stem = digest.get(..32).unwrap_or(&digest);
     let path = directory.join(format!("{stem}.events.ndjson"));
-    tokio::task::spawn_blocking(move || match std::fs::File::open(&path) {
-        Ok(journal) => journal.sync_data().map_err(|error| error.to_string()),
-        // No journal file: every job in the batch was skipped by the
-        // capture-failed guard before appending anything.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.to_string()),
+    tokio::task::spawn_blocking(move || {
+        // Single-invariant discipline: EVERY open on a spool-derived
+        // path uses `O_NOFOLLOW`. The events-journal append path
+        // (worker.rs `append_active_event_journal`), torn-tail
+        // `set_len` reopen (reconciler.rs), broker segment reopen
+        // (av-bridge/embedded.rs), and sidecar reopen all pass
+        // `O_NOFOLLOW`; this group-commit sync was the last outlier.
+        // In the current 0o700 daemon-owned threat model a symlink
+        // plant is not reachable; but a future refactor that widened
+        // spool group permissions would silently regress durability
+        // of group-committed batches (the sync would flush a decoy
+        // inode instead of the real journal-fd). Close the surface
+        // preemptively so the invariant "spool open ⇒ O_NOFOLLOW"
+        // holds uniformly.
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(av_core::fsutil::unix_o_nofollow());
+        }
+        match options.open(&path) {
+            Ok(journal) => journal.sync_data().map_err(|error| error.to_string()),
+            // No journal file: every job in the batch was skipped by
+            // the capture-failed guard before appending anything.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
     })
     .await
     .map_err(|error| error.to_string())?
