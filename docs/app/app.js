@@ -45,7 +45,9 @@
 
   function parseHash() {
     var h = (location.hash || "#/overview").replace(/^#/, "");
-    var parts = h.split("/").filter(Boolean);
+    // Strip a query fragment (`#/reset?token=…&email=…`) before splitting.
+    var pathPart = h.split("?")[0];
+    var parts = pathPart.split("/").filter(Boolean);
     return { path: parts, hash: h };
   }
   function navigate(hash) {
@@ -144,10 +146,14 @@
   async function render() {
     state.route = parseHash();
     var path = state.route.path;
-    var publicRoutes = ["login", "signup"];
+    var publicRoutes = ["login", "signup", "reset"];
     if (!state.session && !publicRoutes.includes(path[0])) return navigate("#/login");
     if (state.session && publicRoutes.includes(path[0])) return navigate("#/overview");
-    if (!state.session) return path[0] === "signup" ? renderSignup() : renderLogin();
+    if (!state.session) {
+      if (path[0] === "signup") return renderSignup();
+      if (path[0] === "reset") return renderReset();
+      return renderLogin();
+    }
 
     renderShell();
     var main = $("#view");
@@ -392,7 +398,8 @@
             '<form id="authForm">' +
               (isSignup ? '<div class="field"><label for="orgName">Company name</label><input id="orgName" type="text" required placeholder="Acme Corp" autocomplete="organization" /></div>' : "") +
               '<div class="field"><label for="email">Work email</label><input id="email" type="email" required autocomplete="email" placeholder="you@company.com" /></div>' +
-              '<div class="field"><label for="password">Password' + (isSignup ? " (min 8 characters)" : "") + '</label><input id="password" type="password" required ' + (isSignup ? 'minlength="8" autocomplete="new-password"' : 'autocomplete="current-password"') + ' /></div>' +
+              '<div class="field"><label for="password">Password' + (isSignup ? " (min 12 characters)" : "") + '</label><input id="password" type="password" required ' + (isSignup ? 'minlength="12" autocomplete="new-password"' : 'autocomplete="current-password"') + ' /></div>' +
+              (isSignup ? "" : '<div style="margin-top: -4px; text-align: right;"><a href="#/reset" style="font-size: 12px; color: var(--fg-3);">Forgot password?</a></div>') +
               '<div id="authErr"></div>' +
               '<button class="primary" type="submit">' + (isSignup ? "Create account" : "Sign in") + '</button>' +
             "</form>" +
@@ -454,6 +461,101 @@
       '<span class="msg">' + msg + '</span>' +
       '<span class="t">' + t + 'm</span>' +
       '</div>';
+  }
+
+  /* ============================================================
+   * PASSWORD RESET (two-step)
+   * ============================================================ */
+
+  function renderReset() {
+    // Optional inline second step: if the URL is #/reset?email=...&token=...
+    // (delivered by the reset email) skip straight to the "set new password"
+    // form; otherwise start with the "enter your email" form.
+    var qs = (location.hash.split("?")[1] || "");
+    var params = new URLSearchParams(qs);
+    var prefillEmail = params.get("email") || "";
+    var prefillToken = params.get("token") || "";
+    var stage = prefillToken ? "confirm" : "request";
+
+    app.innerHTML = "";
+    app.appendChild(h(
+      '<div class="auth-shell">' +
+        '<section class="auth-form">' +
+          '<div class="auth-form-inner">' +
+            '<div class="auth-brand"><span class="auth-brand-mark">A</span> AgentVisor</div>' +
+            (stage === "request"
+              ? '<h1>Reset your password</h1>' +
+                '<p class="sub">We\'ll email you a link to pick a new one.</p>' +
+                '<form id="resetReqForm">' +
+                  '<div class="field"><label for="email">Work email</label><input id="email" type="email" required autocomplete="email" placeholder="you@company.com" value="' + esc(prefillEmail) + '"/></div>' +
+                  '<div id="resetErr"></div>' +
+                  '<button class="primary" type="submit">Send reset link</button>' +
+                "</form>"
+              : '<h1>Choose a new password</h1>' +
+                '<p class="sub">Reset link verified. Pick something at least 12 characters.</p>' +
+                '<form id="resetConfirmForm">' +
+                  '<div class="field"><label for="email">Work email</label><input id="email" type="email" required autocomplete="email" value="' + esc(prefillEmail) + '"/></div>' +
+                  '<input type="hidden" id="token" value="' + esc(prefillToken) + '"/>' +
+                  '<div class="field"><label for="newPassword">New password</label><input id="newPassword" type="password" minlength="12" required autocomplete="new-password" /></div>' +
+                  '<div id="resetErr"></div>' +
+                  '<button class="primary" type="submit">Save new password</button>' +
+                "</form>"
+            ) +
+            '<div class="auth-alt"><a href="#/login">← Back to sign in</a></div>' +
+            (state.ds.mode === "mock"
+              ? '<div class="mock-badge">Demo — the token is displayed inline after "Send reset link".</div>'
+              : "") +
+          "</div>" +
+        "</section>" +
+        '<aside class="auth-panel"><div class="panel-inner">' +
+          '<h2>One reset link per address, valid for 24 hours.</h2>' +
+          '<p>The token is argon2-hashed at rest and single-use. Rotate a compromised password and every prior session cookie stops working at next check-in.</p>' +
+        "</div></aside>" +
+      "</div>"
+    ));
+
+    var reqForm = $("#resetReqForm");
+    if (reqForm) reqForm.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var email = $("#email").value.trim();
+      var btn = e.target.querySelector("button");
+      btn.disabled = true;
+      state.ds.requestPasswordReset({ email: email }).then(function (r) {
+        // In mock mode surface the token inline so a reviewer can complete
+        // the flow without an email server.
+        if (state.ds.mode === "mock" && r.mockToken) {
+          $("#resetErr").innerHTML =
+            '<div class="mock-badge" style="margin-top: 0; text-align:left; padding: 10px 12px;">' +
+              '<div style="margin-bottom: 6px;">Reset email sent. Demo token below:</div>' +
+              '<div class="mono" style="word-break:break-all; padding: 6px 8px; background: var(--surface-hover); border-radius: 4px;">' + esc(r.mockToken) + '</div>' +
+              '<div style="margin-top: 8px;"><a href="#/reset?email=' + encodeURIComponent(email) + '&token=' + encodeURIComponent(r.mockToken) + '">Continue →</a></div>' +
+            '</div>';
+        } else {
+          $("#resetErr").innerHTML = '<div class="mock-badge" style="margin-top: 0;">If that email exists, a reset link is on the way.</div>';
+        }
+      }).catch(function (err) {
+        btn.disabled = false;
+        $("#resetErr").innerHTML = '<div class="auth-err">' + esc(err.message) + "</div>";
+      });
+    });
+
+    var confirmForm = $("#resetConfirmForm");
+    if (confirmForm) confirmForm.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var email = $("#email").value.trim();
+      var token = $("#token").value;
+      var newPassword = $("#newPassword").value;
+      var btn = e.target.querySelector("button");
+      btn.disabled = true;
+      state.ds.confirmPasswordReset({ email: email, token: token, newPassword: newPassword }).then(function () {
+        toast("Password updated — please sign in");
+        navigate("#/login");
+      }).catch(function (err) {
+        btn.disabled = false;
+        var msg = err.status === 401 ? "This link is invalid or has expired." : (err.message || "Reset failed");
+        $("#resetErr").innerHTML = '<div class="auth-err">' + esc(msg) + "</div>";
+      });
+    });
   }
 
   /* ============================================================
@@ -810,6 +912,10 @@
         toast("Receipt copied");
       });
     });
+
+    // Fire the real Ed25519 verification. When it lands, the "Verifying…"
+    // header flips to ✓ verified, ✗ INVALID, or ? not-supported.
+    applyReceiptVerification(receipt);
   }
 
   function renderEventDrawer(root, ev) {
@@ -854,15 +960,17 @@
     if (!r || r.note) {
       return '<div class="card"><h2>Signed receipt</h2><p style="color: var(--fg-2); font-size: var(--t-sec); margin:0">' + esc(r && r.note || "No receipt yet.") + "</p></div>";
     }
-    var verified = r.verificationStatus === "verified";
     var policies = (r.policiesEnforced || []).map(function (p) {
       return '<span class="pill accent status-dot">' + esc(p) + "</span>";
     }).join(" ");
+    // Placeholder verifier state — the real answer arrives after the async
+    // Web Crypto verify call. Marked "verifying" so the UI doesn't lie
+    // about the outcome while we're still waiting.
     return '<div class="receipt-card card">' +
-      '<div class="receipt-head">' +
-        '<span class="check">✓</span>' +
-        '<div><div class="title">' + (verified ? "Signature verified" : "Unverified") + '</div>' +
-             '<div style="font-size: 11px; color: var(--success)">ed25519 · ' + esc(r.signingKeyFingerprint || "") + '</div></div>' +
+      '<div class="receipt-head" data-verify-state="pending">' +
+        '<span class="check">…</span>' +
+        '<div><div class="title">Verifying signature…</div>' +
+             '<div style="font-size: 11px;">ed25519 · ' + esc(r.signingKeyFingerprint || "") + '</div></div>' +
         '<span class="kf">' + esc((r.receiptId || "").slice(0, 24)) + '…</span>' +
       "</div>" +
       '<div class="receipt-body">' +
@@ -879,6 +987,38 @@
         "</details>" +
       "</div>" +
       "</div>";
+  }
+
+  // Run the real Ed25519 verify and update the receipt-head with the result.
+  // Kept out of receiptCard() because that runs synchronously as innerHTML.
+  async function applyReceiptVerification(r) {
+    var head = document.querySelector('.receipt-head[data-verify-state="pending"]');
+    if (!head) return;
+    if (!window.avVerifyReceipt) return;
+    var res = await window.avVerifyReceipt(r.publicKeyHex, r.rawSignatureB64, r.rawBody);
+    var check = head.querySelector('.check');
+    var title = head.querySelector('.title');
+    var sub = head.querySelector('div > div:last-child');
+    if (!res.supported) {
+      head.setAttribute("data-verify-state", "unsupported");
+      head.classList.add("unsupported");
+      check.textContent = "?";
+      title.textContent = "Signature not verified";
+      if (sub) sub.textContent = "This browser cannot verify Ed25519 signatures.";
+      return;
+    }
+    if (res.ok) {
+      head.setAttribute("data-verify-state", "verified");
+      check.textContent = "✓";
+      title.textContent = "Signature verified";
+      if (sub) sub.textContent = "ed25519 · " + (r.signingKeyFingerprint || "");
+    } else {
+      head.setAttribute("data-verify-state", "invalid");
+      head.classList.add("invalid");
+      check.textContent = "✗";
+      title.textContent = "Signature INVALID";
+      if (sub) sub.textContent = "The receipt does not match the deployment's public key.";
+    }
   }
 
   /* ============================================================

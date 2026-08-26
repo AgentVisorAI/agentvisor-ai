@@ -6,6 +6,7 @@ import {
   SESSION_COOKIE_OPTS,
   hashPassword,
   mintSession,
+  randomToken,
   verifyPassword,
 } from "../lib/auth.js";
 import {
@@ -171,5 +172,59 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         role: active.role,
       },
     });
+  });
+
+  // Password reset — two-step flow. The first endpoint always returns 202,
+  // regardless of whether the email exists, so we don't leak account
+  // membership. In production the mailer replaces this stubbed log with a
+  // Postmark/Resend/SES call.
+  app.post("/reset-request", async (req, reply) => {
+    const body = z.object({ email: emailSchema }).safeParse(req.body);
+    // Uniform response even on malformed input — no oracle for enumeration.
+    if (!body.success) return reply.code(202).send({ ok: true });
+    const user = await db.user.findUnique({ where: { email: body.data.email } });
+    if (user) {
+      const plaintextToken = randomToken(32);
+      const resetTokenHash = await hashPassword(plaintextToken);
+      await db.user.update({
+        where: { id: user.id },
+        data: { resetTokenHash, resetTokenAt: new Date() },
+      });
+      // In production this becomes an email. For now log it so ops can
+      // hand it to the user manually — better than a silent 202 during dev.
+      req.log.info(
+        { userId: user.id, resetLinkHint: `<console>/reset?token=${plaintextToken}` },
+        "password reset token issued",
+      );
+    }
+    return reply.code(202).send({ ok: true });
+  });
+
+  const resetTtlMs = 24 * 60 * 60 * 1000;
+  app.post("/reset-confirm", async (req, reply) => {
+    const body = z
+      .object({
+        email: emailSchema,
+        token: z.string().min(16).max(256),
+        newPassword: passwordSchema,
+      })
+      .safeParse(req.body);
+    if (!body.success) return reply.code(400).send({ error: "invalid_input" });
+    const user = await db.user.findUnique({ where: { email: body.data.email } });
+    if (!user || !user.resetTokenHash || !user.resetTokenAt) {
+      return reply.code(401).send({ error: "invalid_token" });
+    }
+    if (Date.now() - user.resetTokenAt.getTime() > resetTtlMs) {
+      return reply.code(401).send({ error: "expired_token" });
+    }
+    const ok = await verifyPassword(user.resetTokenHash, body.data.token);
+    if (!ok) return reply.code(401).send({ error: "invalid_token" });
+    const passwordHash = await hashPassword(body.data.newPassword);
+    await db.user.update({
+      where: { id: user.id },
+      // Clear the reset fields — one-shot use.
+      data: { passwordHash, resetTokenHash: null, resetTokenAt: null },
+    });
+    return reply.send({ ok: true });
   });
 }

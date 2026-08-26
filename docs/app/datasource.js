@@ -11,13 +11,92 @@
 (function () {
   "use strict";
 
-  var mockState = { session: null };
+  var mockState = {
+    session: null,
+    // Ed25519 keypair for the mock signing key — generated once at module
+    // load so the "Signature verified" badge on the pitch demo is
+    // cryptographically real, not a lie. If Web Crypto doesn't support
+    // Ed25519 in this browser we fall back to a placeholder signature and
+    // the verify step will honestly report "unsupported curve".
+    mockKeyPair: null,
+    mockPublicKeyHex: null,
+  };
 
   var NOW = Date.now();
   var HOUR = 3600000;
   var MIN = 60000;
   function iso(delta) { return new Date(NOW - delta).toISOString(); }
   function isoMinsAgo(m) { return iso(m * MIN); }
+
+  function bytesToHex(bytes) {
+    var s = "";
+    for (var i = 0; i < bytes.length; i++) s += bytes[i].toString(16).padStart(2, "0");
+    return s;
+  }
+  function hexToBytes(hex) {
+    var out = new Uint8Array(hex.length / 2);
+    for (var i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+    return out;
+  }
+  function bytesToB64(bytes) {
+    var s = ""; for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s);
+  }
+  function b64ToBytes(b64) {
+    var s = atob(b64); var out = new Uint8Array(s.length);
+    for (var i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+    return out;
+  }
+
+  async function ensureMockKey() {
+    if (mockState.mockKeyPair) return;
+    try {
+      var pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+      var pubRaw = await crypto.subtle.exportKey("raw", pair.publicKey);
+      mockState.mockKeyPair = pair;
+      mockState.mockPublicKeyHex = bytesToHex(new Uint8Array(pubRaw));
+    } catch (e) {
+      // Browser doesn't support Ed25519 — leave as null. The receipt panel
+      // will detect this and honestly say verification isn't available.
+      mockState.mockPublicKeyHex = null;
+    }
+  }
+  async function signBodyEd25519(bodyStr) {
+    if (!mockState.mockKeyPair) return null;
+    var enc = new TextEncoder().encode(bodyStr);
+    var sig = await crypto.subtle.sign("Ed25519", mockState.mockKeyPair.privateKey, enc);
+    return bytesToB64(new Uint8Array(sig));
+  }
+
+  // Publicly exposed verifier so app.js can produce the real green/red badge
+  // instead of a hardcoded string. Cached results per (pubKey, sig, body)
+  // so re-rendering a session doesn't re-run the crypto. Cache key uses the
+  // full sig + a SHA-256 digest of the body so a one-byte flip anywhere
+  // still produces a miss.
+  var verifyCache = new Map();
+  async function _cacheKey(pub, sig, body) {
+    var digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body));
+    return pub + "|" + sig + "|" + bytesToHex(new Uint8Array(digest));
+  }
+  async function verifyReceiptSignature(publicKeyHex, sigB64, bodyStr) {
+    if (!publicKeyHex || !sigB64 || !bodyStr) return { supported: false, ok: false };
+    var cacheKey;
+    try { cacheKey = await _cacheKey(publicKeyHex, sigB64, bodyStr); } catch (e) {}
+    if (cacheKey && verifyCache.has(cacheKey)) return verifyCache.get(cacheKey);
+    try {
+      var pub = await crypto.subtle.importKey("raw", hexToBytes(publicKeyHex), { name: "Ed25519" }, false, ["verify"]);
+      var ok = await crypto.subtle.verify("Ed25519", pub, b64ToBytes(sigB64), new TextEncoder().encode(bodyStr));
+      var result = { supported: true, ok: !!ok };
+      if (cacheKey) verifyCache.set(cacheKey, result);
+      return result;
+    } catch (e) {
+      var errResult = { supported: false, ok: false, error: (e && e.message) || String(e) };
+      if (cacheKey) verifyCache.set(cacheKey, errResult);
+      return errResult;
+    }
+  }
+  window.avVerifyReceipt = verifyReceiptSignature;
+
 
   /* ============================================================
    * ORG + USERS (mock)
@@ -600,6 +679,22 @@
       try { localStorage.setItem("av_mock_signed_out", "1"); } catch (e) {}
       mockState.session = null;
     },
+    async requestPasswordReset(input) {
+      await delay(500);
+      // Store a deterministic mock token in-memory so confirm can verify it.
+      mockState.mockResetToken = "mocktok_" + Math.random().toString(36).slice(2, 18);
+      mockState.mockResetEmail = input.email;
+      return { ok: true, mockToken: mockState.mockResetToken };
+    },
+    async confirmPasswordReset(input) {
+      await delay(400);
+      if (!mockState.mockResetToken || input.email !== mockState.mockResetEmail || input.token !== mockState.mockResetToken) {
+        var err = new Error("invalid_token"); err.status = 401; throw err;
+      }
+      mockState.mockResetToken = null;
+      mockState.mockResetEmail = null;
+      return { ok: true };
+    },
 
     async listDeployments() { await delay(120); return MOCK_DEPLOYMENTS.slice(); },
     async getDeployment(id) {
@@ -674,12 +769,15 @@
     },
     async getReceipt(sessionId) {
       await delay(120);
-      if (sessionId === "sess_01H9K") return MOCK_RECEIPT_FEATURED;
+      await ensureMockKey();
+      // Build the canonical body, then actually sign it with the mock key
+      // so the console's client-side Ed25519 verifier passes on real crypto.
       var s = MOCK_SESSIONS.find(function (x) { return x.id === sessionId; });
       if (!s) throw new Error("not_found");
-      return {
+      var isFeatured = sessionId === "sess_01H9K";
+      var body = {
         schemaVersion: "1.0",
-        receiptId: "rcpt_" + s.externalId + "_finalized",
+        receiptId: isFeatured ? "rcpt_01H9K7GRPX_finalized" : "rcpt_" + s.externalId + "_finalized",
         sessionId: s.externalId,
         orgId: "org_northwind",
         deploymentId: s.deploymentId,
@@ -688,12 +786,22 @@
         eventCount: s.events,
         tools: { allowed: s.toolsAllowed, blocked: s.toolsBlocked },
         spend: { llmUsdMicros: s.costUsdMicros, blockedActionsUsdMicros: s.blockedPayoutUsdMicros },
-        policiesEnforced: ["procurement.allowed_vendors", "runtime.write_scope", "rate.per_session_usd:10"],
-        contentHash: "sha256:" + Math.random().toString(16).slice(2).padEnd(64, "0"),
-        signature: "ed25519:example-signature-for-mock-mode==",
-        signingKeyFingerprint: "kf_mock01234abcd",
-        verificationStatus: "verified",
+        policiesEnforced: isFeatured
+          ? ["procurement.allowed_vendors", "runtime.write_scope", "rate.per_session_usd:10", "runtime.pii_redaction"]
+          : ["procurement.allowed_vendors", "runtime.write_scope", "rate.per_session_usd:10"],
+        contentHash: "sha256:" + bytesToHex(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s.externalId + "|" + s.events)))).slice(0, 64),
       };
+      var rawBody = JSON.stringify(body);
+      var sigB64 = await signBodyEd25519(rawBody);
+      var fp = mockState.mockPublicKeyHex ? "kf_" + mockState.mockPublicKeyHex.slice(0, 16) : "kf_mock_unsupported";
+      return Object.assign({}, body, {
+        signature: sigB64 ? "ed25519:" + sigB64 : "ed25519:example-signature",
+        signingKeyFingerprint: fp,
+        // Everything the verifier needs
+        rawBody: rawBody,
+        rawSignatureB64: sigB64,
+        publicKeyHex: mockState.mockPublicKeyHex,
+      });
     },
 
     async listPolicies() { await delay(100); return MOCK_POLICIES.slice(); },
@@ -819,6 +927,19 @@
     },
     async logout() { await apiFetch("/api/v1/auth/logout", { method: "POST" }); },
 
+    async requestPasswordReset(input) {
+      // Always resolves — even on invalid email — so the UI doesn't leak
+      // whether the address is registered.
+      await apiFetch("/api/v1/auth/reset-request", { method: "POST", body: { email: input.email } });
+      return { ok: true };
+    },
+    async confirmPasswordReset(input) {
+      return apiFetch("/api/v1/auth/reset-confirm", {
+        method: "POST",
+        body: { email: input.email, token: input.token, newPassword: input.newPassword },
+      });
+    },
+
     async listDeployments() {
       var r = await apiFetch("/api/v1/deployments");
       return (r.deployments || []).map(function (d) {
@@ -923,7 +1044,11 @@
           policiesEnforced: body.policiesEnforced || [],
           contentHash: body.contentHash, signature: rec.sigB64,
           signingKeyFingerprint: rec.keyIdHint,
-          verificationStatus: "verified",
+          // Everything the client needs to independently verify — no blind
+          // trust in a server-side "verified" flag.
+          rawBody: rec.body,
+          rawSignatureB64: rec.sigB64,
+          publicKeyHex: rec.publicKeyHex || (rec.session && rec.session.deployment && rec.session.deployment.publicKeyHex) || null,
         };
       } catch (e) {
         if (e.status === 404) return { note: "No signed receipt yet — the daemon posts one at session seal.", sessionId: sessionId };

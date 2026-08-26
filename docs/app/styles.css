@@ -960,7 +960,30 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   background: var(--success-bg);
   border-bottom: 1px solid var(--success-border);
   display: flex; align-items: center; gap: var(--s-2);
+  transition: background 160ms, border-color 160ms;
 }
+.receipt-head[data-verify-state="pending"] {
+  background: var(--surface-hover);
+  border-bottom-color: var(--border);
+}
+.receipt-head[data-verify-state="pending"] .check {
+  background: var(--fg-3);
+  animation: verifyPulse 900ms ease-in-out infinite;
+}
+.receipt-head[data-verify-state="pending"] .title { color: var(--fg-2); }
+.receipt-head[data-verify-state="unsupported"] {
+  background: var(--warning-bg);
+  border-bottom-color: var(--warning-border);
+}
+.receipt-head[data-verify-state="unsupported"] .check { background: var(--warning); }
+.receipt-head[data-verify-state="unsupported"] .title { color: var(--warning); }
+.receipt-head[data-verify-state="invalid"] {
+  background: var(--danger-bg);
+  border-bottom-color: var(--danger-border);
+}
+.receipt-head[data-verify-state="invalid"] .check { background: var(--danger-solid); }
+.receipt-head[data-verify-state="invalid"] .title { color: var(--danger); }
+@keyframes verifyPulse { 0%,100% { opacity: 1; } 50% { opacity: 0.55; } }
 .receipt-head .check {
   width: 22px; height: 22px; border-radius: 50%;
   background: var(--success-solid); color: white;
@@ -969,6 +992,9 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 .receipt-head .title { font-weight: 600; color: var(--success); font-size: var(--t-body); }
 .receipt-head .kf { margin-left: auto; font-family: "SF Mono", ui-monospace, monospace; color: var(--success); font-size: 11px; }
+.receipt-head[data-verify-state="pending"] .kf { color: var(--fg-3); }
+.receipt-head[data-verify-state="unsupported"] .kf { color: var(--warning); }
+.receipt-head[data-verify-state="invalid"] .kf { color: var(--danger); }
 .receipt-body { padding: var(--s-3) var(--s-4); }
 .receipt-body .kv {
   display: grid; grid-template-columns: 130px 1fr;

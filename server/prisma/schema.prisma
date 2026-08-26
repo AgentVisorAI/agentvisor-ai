@@ -20,6 +20,10 @@ model User {
   email        String   @unique
   passwordHash String
   displayName  String?
+  // Short-lived password-reset token (argon2-hashed). Both the token and the
+  // "issuedAt" timestamp are cleared on successful use or expiry (24h).
+  resetTokenHash String?
+  resetTokenAt   DateTime?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 

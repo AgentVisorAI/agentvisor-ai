@@ -133,7 +133,9 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
     });
     if (!receipt) return reply.code(404).send({ error: "not_found" });
     // Prisma includes BigInt cost fields on the joined session — coerce to
-    // strings so Fastify's JSON serializer doesn't choke.
+    // strings so Fastify's JSON serializer doesn't choke. Also hoist the
+    // deployment's public key to a top-level field so the console can
+    // verify the Ed25519 signature client-side (no server-side blind trust).
     const safe = {
       ...receipt,
       session: receipt.session
@@ -144,6 +146,7 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
             blockedPayoutUsdMicros: receipt.session.blockedPayoutUsdMicros.toString(),
           }
         : receipt.session,
+      publicKeyHex: receipt.session?.deployment?.publicKeyHex ?? null,
     };
     return reply.send({ receipt: safe });
   });
