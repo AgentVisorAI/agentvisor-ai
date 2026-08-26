@@ -815,6 +815,8 @@ vector_backend = "memory"
         "av_bridge_maintenance_panics_total",
         "av_bridge_maintenance_errors_total",
         "av_bridge_maintenance_join_errors_total",
+        "av_atif_retention_panics_total",
+        "av_atif_retention_errors_total",
         "av_stream_abort_panics_total",
         "av_ephemeral_close_panics_total",
         "av_admission_refund_panics_total",

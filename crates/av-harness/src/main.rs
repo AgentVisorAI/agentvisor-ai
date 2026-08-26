@@ -231,23 +231,63 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
-                match finalizer.prune_sealed_atif(max_age).await {
-                    Ok(0) => {}
-                    Ok(n) => {
-                        pruned_total.add(n as u64);
-                        tracing::info!(
-                            pruned = n,
-                            retention_days = days,
-                            "ATIF retention sweep removed sealed evidence pairs"
-                        );
+                // Supervise the tick body: a panic here (allocator OOM,
+                // a Display panic on a non-UTF8 error chain, a
+                // parking_lot poison-on-unwind) would otherwise silently
+                // terminate the retention sweep under Tokio's default
+                // UnhandledPanic::Ignore. The 1 h cadence means one
+                // panic invisibly loses one hour of retention — a
+                // persistent panic condition drops retention entirely
+                // until the daemon restarts, and the spool grows
+                // unbounded until it fills the disk. Mirrors the
+                // bridge-maintenance and JWKS-refresh discipline.
+                let pruned_total = pruned_total.clone();
+                let metrics_tick = Arc::clone(&metrics);
+                let finalizer_tick = finalizer.clone();
+                let outcome = std::panic::AssertUnwindSafe(async move {
+                    match finalizer_tick.prune_sealed_atif(max_age).await {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            pruned_total.add(n as u64);
+                            tracing::info!(
+                                pruned = n,
+                                retention_days = days,
+                                "ATIF retention sweep removed sealed evidence pairs"
+                            );
+                        }
+                        Err(error) => {
+                            metrics_tick
+                                .counter(
+                                    "av_atif_retention_errors_total",
+                                    "ATIF retention sweep tick returned an error",
+                                )
+                                .inc();
+                            tracing::warn!(
+                                %error,
+                                retention_days = days,
+                                "ATIF retention sweep failed; will retry next hour"
+                            );
+                        }
                     }
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            retention_days = days,
-                            "ATIF retention sweep failed; will retry next hour"
-                        );
-                    }
+                })
+                .catch_unwind()
+                .await;
+                if let Err(panic) = outcome {
+                    let msg = panic
+                        .downcast_ref::<&'static str>()
+                        .copied()
+                        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("panic payload was not a string");
+                    metrics
+                        .counter(
+                            "av_atif_retention_panics_total",
+                            "ATIF retention sweep tick panicked; loop supervised via catch_unwind",
+                        )
+                        .inc();
+                    tracing::error!(
+                        panic = %msg,
+                        "ATIF retention sweep tick panicked; continuing"
+                    );
                 }
             }
         })

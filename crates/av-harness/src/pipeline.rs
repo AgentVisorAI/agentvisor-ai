@@ -1095,6 +1095,21 @@ impl AppState {
             "Bridge maintenance tick's spawned task failed to join (panic \
              or cancellation); the loop continues on the next interval",
         );
+        // ATIF retention loop: same supervision discipline. A silent
+        // panic in the hourly sweep would let the spool grow unbounded
+        // until it fills the disk (retention is the only in-process
+        // reclaim path). Pre-register both counters so `rate() > 0`
+        // alerts see the FIRST fire.
+        metrics.counter(
+            "av_atif_retention_panics_total",
+            "ATIF retention sweep tick panicked and was caught; the loop \
+             continues on the next hour",
+        );
+        metrics.counter(
+            "av_atif_retention_errors_total",
+            "ATIF retention sweep tick returned an error; the loop continues \
+             on the next hour",
+        );
         // Drop-spawned close-session and admission-refund panics —
         // same rationale. Each is written only from a Drop-spawned
         // background task on the panic arm.
