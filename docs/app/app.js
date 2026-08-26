@@ -58,6 +58,21 @@
 
   /* ---------- session bootstrap ---------- */
 
+  // Called after a successful login/signup to restore whatever route
+  // the user was trying to visit before we bounced them to /login. We
+  // only accept hash routes that start with # so an attacker can't
+  // stash `javascript:` in sessionStorage from another tab.
+  function consumeReturnTo() {
+    try {
+      var t = sessionStorage.getItem("av_return_to");
+      sessionStorage.removeItem("av_return_to");
+      if (typeof t === "string" && t.charAt(0) === "#" && t !== "#/login" && t !== "#/signup") {
+        return t;
+      }
+    } catch (e) {}
+    return null;
+  }
+
   async function boot() {
     initTheme();
     try { state.session = await state.ds.getSession(); } catch (e) { console.error("session", e); }
@@ -158,7 +173,16 @@
     state.route = parseHash();
     var path = state.route.path;
     var publicRoutes = ["login", "signup", "reset"];
-    if (!state.session && !publicRoutes.includes(path[0])) return navigate("#/login");
+    if (!state.session && !publicRoutes.includes(path[0])) {
+      // Remember where the user was trying to go so we can restore
+      // after login. A deep-link from a Slack notification / email
+      // shouldn't dump the user on Overview after they authenticate.
+      try {
+        var full = location.hash || "";
+        if (full && full !== "#/login") sessionStorage.setItem("av_return_to", full);
+      } catch (e) {}
+      return navigate("#/login");
+    }
     if (state.session && publicRoutes.includes(path[0])) return navigate("#/overview");
     if (!state.session) {
       if (path[0] === "signup") return renderSignup();
@@ -478,7 +502,8 @@
           return;
         }
         state.ds.loginWithProvider(p).then(function (s) {
-          state.session = s; startLiveStream(); navigate("#/overview");
+          state.session = s; startLiveStream();
+          navigate(consumeReturnTo() || "#/overview");
         }).catch(function (e) {
           $("#authErr").innerHTML = '<div class="auth-err">' + esc(e.message) + "</div>";
         });
@@ -495,7 +520,11 @@
       var promise = isSignup
         ? state.ds.signup({ email: email, password: pw, orgName: ($("#orgName") || {}).value })
         : state.ds.login({ email: email, password: pw });
-      promise.then(function (s) { state.session = s; startLiveStream(); navigate("#/overview"); })
+      promise.then(function (s) {
+        state.session = s;
+        startLiveStream();
+        navigate(consumeReturnTo() || "#/overview");
+      })
         .catch(function (err) {
           btn.disabled = false;
           // 429 rate-limit → surface friendly message + countdown so

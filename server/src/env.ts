@@ -44,10 +44,17 @@ const Env = z.object({
   JWT_ISSUER: z.string().default("agentvisor-ai"),
   JWT_AUDIENCE: z.string().default("agentvisor-console"),
   SESSION_COOKIE_NAME: z.string().default("av_session"),
+  // Explicit override wins. Otherwise: Secure in production, plain in
+  // dev so devs can use localhost without HTTPS. Guards against the
+  // footgun of forgetting to set this in a real deployment.
   SESSION_COOKIE_SECURE: z
     .string()
-    .default("false")
-    .transform((v) => v === "true"),
+    .optional()
+    .transform((v) => {
+      if (v === "true") return true;
+      if (v === "false") return false;
+      return process.env.NODE_ENV === "production";
+    }),
   DATABASE_URL: z.string().min(1),
   ALLOWED_ORIGINS: z
     .string()
