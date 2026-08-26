@@ -121,6 +121,7 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       },
       create: {
         deploymentId: daemon.deploymentId,
+        orgId: daemon.orgId,
         externalId: s.externalId,
         agent: s.agent,
         workflow: s.workflow,

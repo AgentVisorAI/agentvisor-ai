@@ -94,6 +94,12 @@ model Deployment {
 model Session {
   id             String   @id @default(cuid())
   deploymentId   String
+  // Denormalized from Deployment.orgId. Populated on insert/upsert so
+  // org-scoped queries (list, count, aggregate) can use a single index
+  // instead of joining via deployments. At 1M+ sessions the join +
+  // sort was O(N log N); the compound (orgId, openedAt DESC, id DESC)
+  // index below turns cursor pagination into O(log N).
+  orgId          String
   externalId     String   // the daemon's own session id
   agent          String   // charter.name
   workflow       String   @default("signed") // "signed" | "unsigned"
@@ -118,6 +124,11 @@ model Session {
 
   @@unique([deploymentId, externalId])
   @@index([deploymentId, openedAt])
+  // Primary index for org-wide session listing + counters. openedAt +
+  // id are both DESC so cursor pagination is a straight index scan.
+  @@index([orgId, openedAt, id])
+  // Fast filter: "blocked only" across the whole org.
+  @@index([orgId, toolsBlocked])
   @@map("sessions")
 }
 

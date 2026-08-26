@@ -709,36 +709,69 @@
 
   var sessionsFilter = { q: "", deploymentId: "", agent: "", blockedOnly: false, sinceHours: 24 };
   var sessionsPageSize = 50;
-  var sessionsShown = sessionsPageSize;
+  // Hard cap on DOM rows. At 1M sessions the API pages 50 at a time,
+  // and "Load more" keeps appending — but we stop at 1000 rendered so
+  // the browser never has to reflow 100k+ rows. Past this point the
+  // filter bar is the correct escape hatch (search, date range, etc).
+  var SESSIONS_DOM_CAP = 1000;
+  var sessionsLoaded = []; // { sessions: [...], nextCursor }
+  var sessionsCursor = null;
 
   async function renderSessionsList(main) {
     main.innerHTML = pageHeader("Sessions", "Every agent session policed by AgentVisor.") + filterBar() + loadingBlock("table");
-    var res, deps;
+    var deps;
     try {
       deps = await state.ds.listDeployments();
-      res = await state.ds.listSessions(sessionsFilter);
+      // Reset accumulator on every top-level render (filter change etc).
+      sessionsLoaded = [];
+      sessionsCursor = null;
+      var firstPage = await state.ds.listSessions(Object.assign({ limit: sessionsPageSize }, sessionsFilter));
+      sessionsLoaded = firstPage.sessions;
+      sessionsCursor = firstPage.nextCursor;
     } catch (e) { return renderError(main, e); }
     installFilters(main, deps);
-
-    var visible = res.sessions.slice(0, sessionsShown);
+    renderSessionsBody(main, deps);
+  }
+  function renderSessionsBody(main, deps) {
     var body;
-    if (res.sessions.length === 0) {
+    if (sessionsLoaded.length === 0) {
       body = emptyState("No sessions match your filters", "Try widening the date range or clearing the search.", null);
     } else {
-      body = '<div class="card" style="padding:0">' + sessionsTable(visible) + '</div>';
-      if (res.sessions.length > sessionsShown) {
+      body = '<div class="card" style="padding:0">' + sessionsTable(sessionsLoaded) + '</div>';
+      if (sessionsCursor && sessionsLoaded.length < SESSIONS_DOM_CAP) {
         body += '<div style="margin-top:12px; text-align:center;">' +
-          '<button class="btn" id="loadMore">Load more (' + (res.sessions.length - sessionsShown) + ' remaining)</button>' +
+          '<button class="btn" id="loadMore">Load more</button>' +
+          "</div>";
+      } else if (sessionsCursor) {
+        // Hit the DOM cap. Nudge users toward narrower filters.
+        body += '<div style="margin-top:12px; text-align:center; color: var(--fg-2); font-size: var(--t-sec);">' +
+          "Showing the newest " + sessionsLoaded.length.toLocaleString() + " sessions. " +
+          "Narrow the date range or search to see older matches." +
           "</div>";
       }
     }
-    var totalChip = res.sessions.length > 0
-      ? " · Showing " + visible.length + " of " + res.total
-      : "";
-    main.innerHTML = pageHeader("Sessions", res.total + " sessions" + totalChip) + filterBar() + body;
+    var showingLabel = sessionsLoaded.length > 0
+      ? sessionsLoaded.length.toLocaleString() + " session" + (sessionsLoaded.length === 1 ? "" : "s") + " shown"
+      : "no sessions";
+    main.innerHTML = pageHeader("Sessions", showingLabel) + filterBar() + body;
     installFilters(main, deps);
     var lm = $("#loadMore");
-    if (lm) lm.addEventListener("click", function () { sessionsShown += sessionsPageSize; renderSessionsList(main); });
+    if (lm) {
+      lm.addEventListener("click", async function () {
+        lm.disabled = true;
+        lm.textContent = "Loading…";
+        try {
+          var page = await state.ds.listSessions(Object.assign({ limit: sessionsPageSize, cursor: sessionsCursor }, sessionsFilter));
+          sessionsLoaded = sessionsLoaded.concat(page.sessions);
+          sessionsCursor = page.nextCursor;
+          renderSessionsBody(main, deps);
+        } catch (err) {
+          toast(err.message || "Failed to load", true);
+          lm.disabled = false;
+          lm.textContent = "Load more";
+        }
+      });
+    }
   }
 
   function filterBar() {

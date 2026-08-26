@@ -765,7 +765,17 @@
         var cutoff = Date.now() - params.sinceHours * HOUR;
         results = results.filter(function (s) { return new Date(s.startedAt).getTime() >= cutoff; });
       }
-      return { sessions: results, total: results.length };
+      // Mock cursor pagination to match the real API shape. Cursor is
+      // the numeric offset serialized. The console renders "Load more"
+      // via nextCursor exactly like the api-mode datasource.
+      var limit = Math.min((params.limit || 50), 100);
+      var offset = 0;
+      if (params.cursor) {
+        try { offset = parseInt(atob(params.cursor), 10) || 0; } catch (e) { offset = 0; }
+      }
+      var page = results.slice(offset, offset + limit);
+      var nextCursor = (offset + limit) < results.length ? btoa(String(offset + limit)) : null;
+      return { sessions: page, nextCursor: nextCursor };
     },
     async getSessionById(id) {
       await delay(180);
@@ -1043,22 +1053,25 @@
       };
     },
     async listSessions(params) {
-      var qs = "?limit=200";
-      if (params && params.deploymentId) qs += "&deploymentId=" + encodeURIComponent(params.deploymentId);
-      var r = await apiFetch("/api/v1/overview" + qs);
-      var out = (r.sessions || []).map(normalizeSession);
+      // Uses the new cursor-paginated /sessions endpoint (see
+      // server/src/routes/read.ts). Filters + free-text search run
+      // server-side so the SPA never has to load a whole 1M-row
+      // fleet just to filter down to a few dozen matching sessions.
+      var qs = new URLSearchParams();
       if (params) {
-        if (params.q) {
-          var q = params.q.toLowerCase();
-          out = out.filter(function (s) {
-            return (s.externalId && s.externalId.toLowerCase().indexOf(q) >= 0) ||
-                   (s.agent && s.agent.toLowerCase().indexOf(q) >= 0) ||
-                   (s.user && s.user.toLowerCase().indexOf(q) >= 0);
-          });
-        }
-        if (params.blockedOnly) out = out.filter(function (s) { return s.toolsBlocked > 0; });
+        if (params.deploymentId) qs.set("deploymentId", params.deploymentId);
+        if (params.q) qs.set("q", params.q);
+        if (params.blockedOnly) qs.set("blockedOnly", "true");
+        if (params.sinceHours) qs.set("sinceHours", String(params.sinceHours));
+        if (params.cursor) qs.set("cursor", params.cursor);
+        if (params.limit) qs.set("limit", String(Math.min(params.limit, 100)));
       }
-      return { sessions: out, total: out.length };
+      var qstr = qs.toString();
+      var r = await apiFetch("/api/v1/sessions" + (qstr ? "?" + qstr : ""));
+      return {
+        sessions: (r.sessions || []).map(normalizeSession),
+        nextCursor: r.nextCursor || null,
+      };
     },
     async getSessionById(id) {
       var r = await apiFetch("/api/v1/sessions/" + id);
