@@ -354,13 +354,15 @@ impl RecoveryPass for QuarantineOrphanJsonPass {
                 Err(error) => return Err(FinalizeError::atif_source(error)),
             };
             let mut examined = 0usize;
+            let mut dirents_seen = 0usize;
             while let Some(entry) = entries.next_entry().await.map_err(FinalizeError::atif_source)? {
-                examined = examined.saturating_add(1);
-                if examined > crate::reconciler::MAX_RECOVERY_ENTRIES_PER_TICK {
+                dirents_seen = dirents_seen.saturating_add(1);
+                if dirents_seen > crate::reconciler::MAX_RECOVERY_DIRENTS_PER_TICK {
                     crate::reconciler::bump_recovery_scan_cap(
                         ctx.metrics,
                         "quarantine_orphan_json",
                         examined,
+                        dirents_seen,
                     );
                     break;
                 }
@@ -385,6 +387,16 @@ impl RecoveryPass for QuarantineOrphanJsonPass {
                     .is_some_and(|stem| known_stems.contains(stem))
                 {
                     continue;
+                }
+                examined = examined.saturating_add(1);
+                if examined > crate::reconciler::MAX_RECOVERY_ENTRIES_PER_TICK {
+                    crate::reconciler::bump_recovery_scan_cap(
+                        ctx.metrics,
+                        "quarantine_orphan_json",
+                        examined,
+                        dirents_seen,
+                    );
+                    break;
                 }
                 if path.with_extension("atif-auth").exists() {
                     continue;
