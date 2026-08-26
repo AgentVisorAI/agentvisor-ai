@@ -1,0 +1,86 @@
+# Nightly Postgres backup — off-provider escape hatch.
+#
+# Why this exists
+#   Neon (and every other managed PG we might use) already has PITR +
+#   snapshots. This workflow adds a SECOND, off-provider copy so we can
+#   restore even if the primary provider vanishes overnight — same
+#   guarantee that keeps the whole stack unlocked from any single vendor.
+#
+#   The dump is standard `pg_dump --format=custom`, restorable to any
+#   Postgres-compatible target with `pg_restore`. No proprietary format,
+#   no proprietary tool.
+#
+# Retention
+#   30 days on GitHub-hosted artifact storage (free for public repos).
+#   Longer horizons should push to S3 / R2 / any object store.
+#
+# Configuration
+#   Requires a repository secret `BACKUP_DATABASE_URL` pointing at a
+#   read-only replica or the primary. If the secret isn't set the job
+#   is a no-op (fork-friendly).
+name: Nightly PG backup
+
+on:
+  schedule:
+    # 04:17 UTC — off the top-of-hour rush that free-tier providers
+    # sometimes throttle. Cron in GitHub Actions is best-effort but
+    # very reliable for once-a-day cadence.
+    - cron: "17 4 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Guard on BACKUP_DATABASE_URL
+        id: guard
+        run: |
+          if [ -z "${{ secrets.BACKUP_DATABASE_URL }}" ]; then
+            echo "BACKUP_DATABASE_URL not set; skipping." >&2
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install postgres-client-16
+        if: steps.guard.outputs.run == 'true'
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client-16
+
+      - name: pg_dump (custom format, compressed)
+        if: steps.guard.outputs.run == 'true'
+        env:
+          DATABASE_URL: ${{ secrets.BACKUP_DATABASE_URL }}
+        run: |
+          ts=$(date -u +%Y%m%d-%H%M)
+          out="agentvisor-${ts}.dump"
+          pg_dump \
+            --format=custom \
+            --compress=9 \
+            --no-owner \
+            --no-privileges \
+            --file "$out" \
+            "$DATABASE_URL"
+          # Show size + a short manifest so the artifact is greppable.
+          ls -lh "$out"
+          echo "BACKUP_FILE=$out" >> "$GITHUB_ENV"
+
+      - name: Upload backup artifact (30-day retention)
+        if: steps.guard.outputs.run == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pg-backup-${{ github.run_id }}
+          path: ${{ env.BACKUP_FILE }}
+          retention-days: 30
+          if-no-files-found: error
+          # Compression level 0 — pg_dump already used gzip -9 internally.
+          compression-level: 0

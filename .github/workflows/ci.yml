@@ -20,6 +20,13 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Least-privilege default: read-only. No job in this workflow needs
+# `contents: write`, packages, or deployments — running with the default
+# broad token would violate GitHub's supply-chain hardening guidance
+# (SLSA build L2). Per-job overrides opt in to more only where needed.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings

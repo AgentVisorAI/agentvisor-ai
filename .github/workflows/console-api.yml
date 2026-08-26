@@ -21,6 +21,10 @@ concurrency:
   group: console-${{ github.ref }}
   cancel-in-progress: true
 
+# Least-privilege default: read-only. See ci.yml for rationale.
+permissions:
+  contents: read
+
 jobs:
   # ────────────────────────────────────────────────────────────────────
   # Frontend — static SPA at docs/app/. No build step; just syntax-check

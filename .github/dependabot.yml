@@ -41,3 +41,41 @@ updates:
     labels:
       - dependencies
       - docker
+
+  # Base image for the hosted API. Same weekly cadence — CVE bumps land
+  # as security PRs and bypass the grouping.
+  - package-ecosystem: docker
+    directory: /server
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - docker
+      - server
+
+  # Hosted API (Fastify + Prisma). Group non-security minor+patch so a
+  # single weekly PR sweeps in the whole ecosystem; security updates
+  # bypass the group and land individually for fast review.
+  - package-ecosystem: npm
+    directory: /server
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - npm
+      - server
+    groups:
+      npm-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+    versioning-strategy: increase-if-necessary
