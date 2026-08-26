@@ -1864,12 +1864,137 @@ pub(crate) async fn inflight_response_sessions(
                 );
                 continue;
             }
+            // CRASH-WINDOW FALSE-POSITIVE GUARD (R63 Finding 1).
+            // `journal_step_completion` fsyncs the terminal response
+            // record BEFORE `clear_response_marker` runs, and the
+            // interval between the two is broker publish
+            // (spawn_blocking) + persist_broker_ack (spool write) +
+            // apply_to_totals — hundreds of milliseconds to seconds
+            // under load. A crash inside that window leaves this
+            // marker on disk even though the journal already
+            // witnesses the response as terminal. Without this
+            // consultation the downstream quarantine paths at
+            // reconciler.rs:1982/2458/2709 flip the session to
+            // `capture_failed`: signed sessions never mint receipts,
+            // unsigned sessions never write ATIF trajectories — a
+            // silent-data-loss on a properly-fsynced completion.
+            // Consult the journal (MAC-verified per line, so a
+            // hostile local process cannot inject a fake terminal
+            // to mask a real capture failure); if it records a
+            // terminal `response_attempt` for this attempt_id, the
+            // marker is a crash-window artifact — opportunistically
+            // delete it and skip.
+            match journal_witnesses_terminal_attempt(
+                &spool_dir,
+                &journal_key,
+                &marker.session_id,
+                &marker.attempt_id,
+            ) {
+                Ok(true) => {
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => tracing::info!(
+                            session = %marker.session_id,
+                            attempt = %marker.attempt_id,
+                            "cleared stale in-flight response marker (journal witnesses terminal record)"
+                        ),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => tracing::warn!(
+                            marker = %av_core::fsutil::basename(&path),
+                            %error,
+                            "failed to clear stale in-flight response marker after journal witness"
+                        ),
+                    }
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    // Journal may itself be torn or MAC-mismatched
+                    // (a separate quarantine path will handle that).
+                    // Do NOT silently drop the marker on a witness
+                    // failure — fall through and let downstream
+                    // quarantine treat this session as capture_failed
+                    // (the safe default: false-positive quarantine
+                    // preserves evidence; missed quarantine loses it).
+                    tracing::warn!(
+                        session = %marker.session_id,
+                        attempt = %marker.attempt_id,
+                        %error,
+                        "in-flight response journal-witness check failed; retaining marker"
+                    );
+                }
+            }
             sessions.insert(marker.session_id);
         }
         Ok(sessions)
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+/// Consult `<stem>.events.ndjson` for a MAC-verified `response_attempt`
+/// record with `terminal=true` and matching `attempt_id`. Used to
+/// distinguish a crash-window stale in-flight marker from a genuinely
+/// interrupted response. Truncates at the last complete newline so a
+/// torn tail (a common crash pattern) doesn't cause a MAC-open error
+/// on garbage; complete records earlier in the file are still
+/// verified.
+fn journal_witnesses_terminal_attempt(
+    spool_dir: &std::path::Path,
+    journal_key: &[u8; 32],
+    session_id: &str,
+    attempt_id: &str,
+) -> Result<bool, String> {
+    let digest = av_core::digest::sha256_hex(session_id.as_bytes());
+    let stem = digest.get(..32).unwrap_or(&digest);
+    let journal_path = spool_dir.join(format!("{stem}.events.ndjson"));
+    let bytes = match av_core::fsutil::read_capped(&journal_path, av_core::fsutil::MAX_ATIF_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    };
+    if bytes.is_empty() {
+        return Ok(false);
+    }
+    let complete_len = if bytes.last() == Some(&b'\n') {
+        bytes.len()
+    } else {
+        bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1)
+    };
+    let domain = format!("{session_id}:active");
+    let mut index: u64 = 0;
+    let mut cursor = 0usize;
+    while cursor < complete_len {
+        let Some(remaining) = bytes.get(cursor..complete_len) else {
+            break;
+        };
+        let Some(newline_offset) = remaining.iter().position(|byte| *byte == b'\n') else {
+            break;
+        };
+        let Some(line) = remaining.get(..newline_offset) else {
+            break;
+        };
+        cursor += newline_offset + 1;
+        if line.is_empty() {
+            index = index
+                .checked_add(1)
+                .ok_or_else(|| "active journal index overflow".to_owned())?;
+            continue;
+        }
+        let record: ActiveJournalRecord = crate::journal::open(journal_key, &domain, index, line)
+            .map_err(|error| format!("active journal record open failed: {error}"))?;
+        if let Some(attempt) = record.response_attempt {
+            if attempt.terminal && attempt.id == attempt_id {
+                return Ok(true);
+            }
+        }
+        index = index
+            .checked_add(1)
+            .ok_or_else(|| "active journal index overflow".to_owned())?;
+    }
+    Ok(false)
 }
 
 async fn clear_response_marker(
