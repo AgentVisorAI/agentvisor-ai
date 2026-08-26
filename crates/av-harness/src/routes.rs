@@ -2310,7 +2310,11 @@ async fn close_session(
         {
             return pipeline_error(error);
         }
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "unknown session"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(openai_error_body(StatusCode::NOT_FOUND, "unknown session")),
+        )
+            .into_response();
     };
     if let Err(error) = state.authorize_session(&headers, &session, &state.config.session_close_scope) {
         return pipeline_error(error);
@@ -2338,7 +2342,11 @@ async fn promote_session(
         {
             return pipeline_error(error);
         }
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "unknown session"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(openai_error_body(StatusCode::NOT_FOUND, "unknown session")),
+        )
+            .into_response();
     };
     if let Err(error) = state.authorize_session(&headers, &session, &state.config.session_promote_scope) {
         return pipeline_error(error);
@@ -2383,7 +2391,10 @@ fn finalize_error_response(error: &crate::reconciler::FinalizeError) -> Response
     if error.is_transient_io() {
         let mut response = (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": error.to_string()})),
+            Json(openai_error_body(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &error.to_string(),
+            )),
         )
             .into_response();
         response
@@ -2409,7 +2420,7 @@ fn finalize_error_response(error: &crate::reconciler::FinalizeError) -> Response
         // Everything else is a genuine internal fault.
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    let mut response = (status, Json(json!({"error": error.to_string()}))).into_response();
+    let mut response = (status, Json(openai_error_body(status, &error.to_string()))).into_response();
     if status == StatusCode::SERVICE_UNAVAILABLE {
         // Same advisory as pipeline_error's retryable class.
         response
@@ -2417,6 +2428,34 @@ fn finalize_error_response(error: &crate::reconciler::FinalizeError) -> Response
             .insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("5"));
     }
     response
+}
+
+/// OpenAI-shape error body used by `pipeline_error`,
+/// `lifecycle_error`, and `finalize_error_response` (R66 F1).
+/// SDKs dispatch on `error.type` / `error.code`
+/// (`openai.APIError.code`); the flat `{"error": <string>}` shape the
+/// close/promote handlers previously emitted left retry classifiers
+/// dead, silently retrying `409 CaptureIncomplete` and `409
+/// Promotion(...)` until the SDK's request budget expired against a
+/// permanently-quarantined session. Centralising the body construction
+/// here also fixes the earlier five-different-shapes drift across
+/// sibling routes.
+fn openai_error_body(status: StatusCode, message: &str) -> serde_json::Value {
+    let error_type = match status.as_u16() {
+        400 | 404 | 409 | 413 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        429 => "rate_limit_error",
+        _ => "api_error",
+    };
+    json!({
+        "error": {
+            "message": message,
+            "type": error_type,
+            "param": null,
+            "code": status.as_u16(),
+        }
+    })
 }
 
 /// `pipeline_error` plus the `X-AV-Session` echo. Once a request is
@@ -2441,31 +2480,7 @@ fn pipeline_error(error: crate::pipeline::PipelineError) -> Response {
     use crate::pipeline::PipelineError;
     let close = matches!(error, PipelineError::Abort(_));
     let status = error.status();
-    // OpenAI-shaped error body. SDKs dispatch on
-    // `error.type` / `error.code` (`openai.APIError.code`), and the
-    // previous bare `{"error": "<string>"}` left that handling dead —
-    // five inconsistent shapes across sibling routes. `message` keeps
-    // the exact text the old shape carried; `type` follows OpenAI's
-    // taxonomy so stock retry/backoff classifiers behave correctly.
-    let error_type = match status.as_u16() {
-        400 | 404 | 409 | 413 => "invalid_request_error",
-        401 => "authentication_error",
-        403 => "permission_error",
-        429 => "rate_limit_error",
-        _ => "api_error",
-    };
-    let mut response = (
-        status,
-        Json(json!({
-            "error": {
-                "message": error.to_string(),
-                "type": error_type,
-                "param": null,
-                "code": status.as_u16(),
-            }
-        })),
-    )
-        .into_response();
+    let mut response = (status, Json(openai_error_body(status, &error.to_string()))).into_response();
     if close {
         response
             .headers_mut()
@@ -2503,18 +2518,12 @@ fn pipeline_error(error: crate::pipeline::PipelineError) -> Response {
 }
 
 fn lifecycle_error(error: String) -> Response {
-    // Same OpenAI-shaped body as `pipeline_error` so
-    // the two sibling routes agree on one error contract.
+    // Same OpenAI-shaped body as `pipeline_error` and
+    // `finalize_error_response` so all four sibling routes agree on
+    // one error contract. Central via `openai_error_body` (R66 F1).
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({
-            "error": {
-                "message": error,
-                "type": "api_error",
-                "param": null,
-                "code": 500,
-            }
-        })),
+        Json(openai_error_body(StatusCode::INTERNAL_SERVER_ERROR, &error)),
     )
         .into_response()
 }
