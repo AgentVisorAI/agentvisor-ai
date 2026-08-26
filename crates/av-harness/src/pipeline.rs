@@ -1111,10 +1111,18 @@ impl AppState {
             "Reconciler tick body panicked and was caught; the reconciler \
              continues on the next tick",
         );
+        // `av_worker_shard_panics_total` fires from the OUTER
+        // envelope-routing supervisor in worker.rs — NOT from the
+        // inner job body (that path uses `av_worker_panics_total`).
+        // The distinction is load-bearing during incident triage:
+        // a routing/dispatcher panic points at the shard task
+        // structure (backlog, channel, batch-boundary logic), while
+        // a job-body panic points at the specific request that
+        // panicked. HELP text and comment kept aligned with the
+        // write site at worker.rs:864.
         metrics.counter(
             "av_worker_shard_panics_total",
-            "Worker shard job body panicked and was caught; the shard \
-             continues serving subsequent jobs",
+            "Worker shard driver panicked outside a job; supervised via catch_unwind",
         );
         metrics.counter(
             "av_bridge_maintenance_panics_total",
