@@ -113,18 +113,21 @@ async function main(): Promise<void> {
   // Force HTTPS in production. The proxy in front of us (Fly LB / Cloud
   // Run / Cloudflare) terminates TLS and forwards on http, setting
   // X-Forwarded-Proto to record the original scheme. Reject anything
-  // that arrives without proto=https so a customer with a stale http://
-  // bookmark doesn't accidentally send credentials in the clear.
-  // trustProxy in the Fastify config means req.protocol already reflects
-  // the forwarded value.
+  // that arrives with X-Forwarded-Proto=http so a customer with a stale
+  // http:// bookmark doesn't accidentally send credentials in the clear.
+  //
+  // Requests without ANY X-Forwarded-Proto header are on the internal
+  // pod network (loopback healthchecks, container-to-container smoke
+  // tests) — we let those through because there is no external hop that
+  // could have downgraded the scheme.
   if (env.NODE_ENV === "production") {
     app.addHook("onRequest", async (req, reply) => {
-      // Health checks + well-known paths are allowed either way — some
-      // orchestrators call them over the pod network without TLS.
       if (req.url === "/healthz" || req.url === "/readyz" || req.url.startsWith("/.well-known/")) {
         return;
       }
-      if (req.protocol !== "https") {
+      const xfp = req.headers["x-forwarded-proto"];
+      const forwarded = Array.isArray(xfp) ? xfp[0] : xfp;
+      if (typeof forwarded === "string" && forwarded !== "https") {
         return reply.code(400).send({ error: "https_required" });
       }
     });
