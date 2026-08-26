@@ -1350,30 +1350,33 @@ impl HarnessConfig {
         if self.bridge_data_dir.is_empty() {
             errors.push("bridge_data_dir must not be empty".into());
         }
-        if self.payout_field.is_empty() || self.payout_field.trim() != self.payout_field {
-            // Every peer field in the "wire-format is a bare identifier"
-            // class is checked non-empty; payout_field was the outlier.
-            // Its own doc-comment explicitly warns "a tool using
-            // `amount`, `value`, or `total_usd` silently bypassed the
-            // payout cap with no warning" — so it exists to close a
-            // silent-bypass class of bug. But an empty string here
-            // silently REOPENED the same class: `arguments.get("")`
-            // returns None for every JSON object, so
-            // `extract_payout_micros` returned 0, ActionBudget::try_tool_call
-            // skipped the payout dimension entirely (both the `> 0`
-            // charge branch AND the fail-closed "unbounded payout must
-            // never spend" branch), and a config with
-            // `max_payout_usd_micros = 50_000_000` accepted every
-            // `amount_usd: 999999999` call for zero cost. Refuse.
-            // Whitespace-only or leading/trailing whitespace ("  " or
-            // " amount_usd") is the same class — extremely unlikely
-            // to match a real tool's JSON key and almost certainly a
-            // paste typo. Refuse those too.
+        // Refuse any payout_field that isn't visible ASCII. This closes:
+        //   - empty and whitespace-only cases
+        //   - leading/trailing whitespace
+        //   - control characters
+        //   - non-ASCII (accents, smart quotes)
+        //   - AND the invisible-format class (BOM `\u{FEFF}`, zero-width
+        //     space `\u{200B}`, U+2060 word-joiner, ...) that Rust's
+        //     `trim()` misses because Unicode `White_Space` does not
+        //     include them.
+        // The invisible-format class is precisely what a browser or
+        // rich-editor paste can inject into a config value, and
+        // precisely the class where `serde_json::Value::get(field)`
+        // silently misses the real JSON key — the same silent-bypass
+        // class this field exists to prevent (see the field-level
+        // doc-comment). Real tool schemas' payout field names are
+        // always plain identifiers, so operator UX cost is zero.
+        // `is_ascii_graphic()` is the visible-ASCII predicate
+        // (0x21..=0x7E) shared with `SessionId::parse` and
+        // `InstanceUid::parse`.
+        if self.payout_field.is_empty() || !self.payout_field.chars().all(|c| c.is_ascii_graphic()) {
             errors.push(
-                "payout_field must not be empty and must not carry leading/trailing whitespace \
-                 (empty or whitespace-typo strings match no argument key, silently disabling \
-                 max_payout_usd_micros); omit the key to use the default, or set it to your \
-                 tool schema's payout argument name"
+                "payout_field must be non-empty visible ASCII (letters, digits, and \
+                 common punctuation only). An empty, whitespace, or invisible-format \
+                 (BOM / zero-width) value would match no argument key, silently disabling \
+                 max_payout_usd_micros — the very silent-bypass class this field exists \
+                 to prevent. Omit the key to use the default, or set it to your tool \
+                 schema's payout argument name."
                     .into(),
             );
         }
@@ -2871,12 +2874,33 @@ spec:
     /// never spend" refusal. Every peer field in the same class
     /// (atif_spool_dir, bridge_data_dir, upstream_auth_header, …) is
     /// checked non-empty; this was the outlier. Refuse at startup.
-    /// Whitespace-only and leading/trailing whitespace variants
-    /// ("  ", " amount_usd") are the same class — extremely unlikely
-    /// to match a real tool's JSON key and almost certainly a paste typo.
+    /// Whitespace, control, non-ASCII, and invisible-format (BOM,
+    /// zero-width space) variants are the same class — extremely
+    /// unlikely to match a real tool's JSON key and almost certainly
+    /// a paste typo from a rich-editor or Windows/UTF-8 signature.
+    /// `is_ascii_graphic()` covers all of these in one check.
     #[test]
     fn empty_or_whitespace_payout_field_is_rejected() {
-        for hostile in ["", " ", "  ", "\t", " amount_usd", "amount_usd "] {
+        for hostile in [
+            "",
+            " ",
+            "  ",
+            "\t",
+            " amount_usd",
+            "amount_usd ",
+            // Invisible-format class — the exact one browser paste
+            // injects and that `trim()` misses because Unicode's
+            // White_Space property does not cover these.
+            "\u{FEFF}amount_usd", // BOM at start (UTF-8 signature)
+            "amount_usd\u{FEFF}", // BOM at end
+            "\u{200B}amount_usd", // zero-width space
+            "amount\u{200B}_usd", // zero-width space in the middle
+            "\u{2060}amount_usd", // word-joiner
+            "amount_usd\u{00A0}", // NBSP (a Unicode whitespace)
+            // Non-ASCII: smart quotes / accents / emoji / RTL text.
+            "amount_usd\u{201D}", // right double-quote
+            "amóunt_usd",         // accented Latin
+        ] {
             let toml = format!("upstream_url = \"https://api.openai.com\"\npayout_field = {hostile:?}\n");
             let err = match HarnessConfig::from_toml(&toml) {
                 Err(e) => e,
