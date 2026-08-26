@@ -945,7 +945,8 @@
         (sessions.length ? sessionsTable(sessions) : emptyState("No sessions yet", "This deployment has not streamed any sessions.")) +
       "</div>";
 
-    $("#depRotate").addEventListener("click", function () {
+    var rotBtn = $("#depRotate");
+    if (rotBtn) rotBtn.addEventListener("click", function () {
       confirmModal({
         title: "Rotate ingest token?",
         body: "The old token stops working immediately.",
@@ -956,7 +957,8 @@
         },
       });
     });
-    $("#depDelete").addEventListener("click", function () {
+    var delBtn = $("#depDelete");
+    if (delBtn) delBtn.addEventListener("click", function () {
       confirmModal({
         title: "Delete deployment?",
         body: "Sessions remain, the daemon can no longer connect.",

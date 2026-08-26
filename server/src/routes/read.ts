@@ -132,6 +132,19 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
       },
     });
     if (!receipt) return reply.code(404).send({ error: "not_found" });
-    return reply.send({ receipt });
+    // Prisma includes BigInt cost fields on the joined session — coerce to
+    // strings so Fastify's JSON serializer doesn't choke.
+    const safe = {
+      ...receipt,
+      session: receipt.session
+        ? {
+            ...receipt.session,
+            costUsdMicros: receipt.session.costUsdMicros.toString(),
+            payoutUsdMicros: receipt.session.payoutUsdMicros.toString(),
+            blockedPayoutUsdMicros: receipt.session.blockedPayoutUsdMicros.toString(),
+          }
+        : receipt.session,
+    };
+    return reply.send({ receipt: safe });
   });
 }
