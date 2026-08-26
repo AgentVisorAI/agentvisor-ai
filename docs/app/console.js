@@ -72,11 +72,14 @@
 
   function caps() {
     return {
+      tpm: Number($("cap-tpm").value || 0),
+      rpm: Number($("cap-rpm").value || 0),
       payout: Number($("cap-payout").value || 0),
       llm: Number($("cap-llm").value || 0),
       tools: Number($("cap-tools").value || 0),
       refunds: Number($("cap-refunds").value || 0),
       loop: $("opt-loop").checked,
+      compress: $("opt-compress").checked,
       signed: $("opt-signed").checked
     };
   }
@@ -91,14 +94,26 @@
       '<span class="k">upstream_url</span> = <span class="s">"' + state.providerUrl + '"</span>',
       '<span class="k">upstream_api_key_file</span> = <span class="s">"~/.agentvisor/keys/' + state.provider + '"</span> <span class="c"># chmod 600</span>',
       "",
-      '[<span class="k">budget</span>]',
+      '[<span class="k">budget</span>] <span class="c"># session ledger</span>',
+      '<span class="k">per_min_tokens</span> = <span class="n">' + c.tpm + "</span>",
+      '<span class="k">per_min_requests</span> = <span class="n">' + c.rpm + "</span>",
+      '<span class="k">max_total_tool_calls</span> = <span class="n">' + c.tools + "</span>",
       '<span class="k">max_payout_usd_micros</span> = <span class="n">' + (c.payout * 1e6) + "</span> <span class=\"c\"># $" + c.payout + "</span>",
       '<span class="k">max_tokens</span> = <span class="n">' + (c.llm * 4000000) + "</span> <span class=\"c\"># ≈ $" + c.llm + " at gpt-4o-mini rates</span>",
-      '<span class="k">max_total_tool_calls</span> = <span class="n">' + c.tools + "</span>",
       "",
-      '[<span class="k">budget.max_tool_calls</span>] <span class="c"># per-tool ceilings (protects issue_refund…)</span>',
-      '<span class="k">issue_refund</span> = <span class="n">' + c.refunds + "</span>"
+      '[<span class="k">budget.max_tool_calls</span>] <span class="c"># per-tool ceilings</span>',
+      '<span class="k">issue_refund</span> = <span class="n">' + c.refunds + "</span>",
+      '<span class="k">execute_query</span> = <span class="n">' + c.refunds + "</span>",
+      '<span class="k">send_email</span> = <span class="n">' + c.refunds + "</span>"
     ];
+    if (c.compress) {
+      lines = lines.concat([
+        "",
+        '[<span class="k">compression</span>]',
+        '<span class="k">summarize_middle_at</span> = <span class="n">50000</span> <span class="c"># prompt tokens</span>',
+        '<span class="k">target_reduction_millis</span> = <span class="n">300</span> <span class="c"># 30% reduction</span>'
+      ]);
+    }
     if (c.loop) {
       lines = lines.concat([
         "",
@@ -127,7 +142,7 @@
     });
   });
 
-  ["cap-payout", "cap-llm", "cap-tools", "cap-refunds", "opt-loop", "opt-signed"].forEach(function (id) {
+  ["cap-tpm", "cap-rpm", "cap-payout", "cap-llm", "cap-tools", "cap-refunds", "opt-loop", "opt-compress", "opt-signed"].forEach(function (id) {
     $(id).addEventListener("input", function () {
       renderToml();
       renderPolicies();
@@ -492,10 +507,13 @@
   function renderPolicies() {
     var c = caps();
     var items = [
+      ["Tokens / minute", c.tpm.toLocaleString(), "sliding-window rate limit"],
+      ["Requests / minute", c.rpm.toLocaleString(), "not triggered in the last 24h"],
       ["Payout cap / session", "$" + c.payout.toLocaleString(), "last enforced 09:13 today · sess-8412 · $8,400 refused"],
       ["LLM spend cap / session", "$" + c.llm, "not triggered in the last 7 days"],
       ["Tool calls / session", String(c.tools), "not triggered in the last 7 days"],
-      ["Per-tool call cap / session", String(c.refunds), "ceiling for any single tool — protects issue_refund"],
+      ["Per-tool cap / session", String(c.refunds), "ceiling for any single tool"],
+      ["Context compression", c.compress ? "on · 50k prompt tokens" : "off", "engages on long histories"],
       ["Loop breaker", c.loop ? "on · 3 steps ≥ 92% similar" : "off", "tripped today in sess-8412 and sess-8340"],
       ["Receipts", c.signed ? "signed (Ed25519)" : "unsigned trajectories", "7 issued today · all verifiable offline"]
     ];
@@ -621,11 +639,14 @@
       b.classList.toggle("selected", b.getAttribute("data-provider") === "openai");
     });
     $("flow-provider").textContent = "OpenAI";
+    $("cap-tpm").value = "120000";
+    $("cap-rpm").value = "600";
     $("cap-payout").value = "500";
     $("cap-llm").value = "10";
     $("cap-tools").value = "100";
     $("cap-refunds").value = "5";
     $("opt-loop").checked = true;
+    $("opt-compress").checked = true;
     $("opt-signed").checked = true;
     // Code tab back to Python.
     codeLang = "python";
