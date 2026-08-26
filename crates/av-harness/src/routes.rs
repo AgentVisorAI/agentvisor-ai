@@ -111,7 +111,12 @@ async fn explain_body_limit(
                 ),
                 "type": "invalid_request_error",
                 "param": serde_json::Value::Null,
-                "code": "payload_too_large",
+                // Numeric, matching `pipeline_error`'s 413 and the
+                // documented contract ("`code` is the numeric HTTP
+                // status"): the same 413 class must not have two
+                // incompatible shapes depending on whether axum's body
+                // limit or the compression floor tripped first.
+                "code": StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
             }
         })),
     )
@@ -490,7 +495,7 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
     let middleware_us = prepared.middleware_us;
     let forwarded = match state.forward_chat(prepared).await {
         Ok(response) => response,
-        Err(error) => return pipeline_error(error),
+        Err(error) => return pipeline_error_for_session(error, &session_id),
     };
     let crate::pipeline::ForwardedResponse {
         response: upstream,
@@ -522,7 +527,13 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
         {
             capture_session.mark_capture_failed();
         }
-        return lifecycle_error("durable response capture permit is missing".to_owned());
+        let mut response = lifecycle_error("durable response capture permit is missing".to_owned());
+        if let Ok(value) = HeaderValue::from_str(&session_id) {
+            response
+                .headers_mut()
+                .insert(crate::pipeline::SESSION_HEADER, value);
+        }
+        return response;
     };
 
     let status = upstream.status();
@@ -583,12 +594,15 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
         {
             capture_session.mark_capture_failed();
         }
-        return pipeline_error(crate::pipeline::PipelineError::upstream(format!(
-            "upstream responded with unsupported Content-Encoding token {token:?} \
-             (full header: {raw:?}) — the proxy is built without decompression \
-             support; enable it upstream (Accept-Encoding: identity) or rebuild \
-             with the reqwest `gzip` feature"
-        )));
+        return pipeline_error_for_session(
+            crate::pipeline::PipelineError::upstream(format!(
+                "upstream responded with unsupported Content-Encoding token {token:?} \
+                 (full header: {raw:?}) — the proxy is built without decompression \
+                 support; enable it upstream (Accept-Encoding: identity) or rebuild \
+                 with the reqwest `gzip` feature"
+            )),
+            &session_id,
+        );
     }
     // RFC 7231 §3.1.1.1 says media type/subtype are
     // case-insensitive and the header value may carry parameters
@@ -680,7 +694,7 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
                 };
                 // Dropping the relay runs its finalization Drop
                 // (evidence capture + session seal).
-                return pipeline_error(mapped);
+                return pipeline_error_for_session(mapped, &session_id);
             }
             Some(Ok(first)) => {
                 let head = futures::stream::once(async move { Ok::<_, std::io::Error>(first) });
@@ -721,7 +735,7 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
                     // Dropping the relay here runs its finalization Drop
                     // (evidence capture + session seal), same as when a
                     // client observed the severed stream.
-                    return pipeline_error(mapped);
+                    return pipeline_error_for_session(mapped, &session_id);
                 }
                 None => break,
             }
@@ -2187,6 +2201,24 @@ fn finalize_error_response(error: &crate::reconciler::FinalizeError) -> Response
         response
             .headers_mut()
             .insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("5"));
+    }
+    response
+}
+
+/// `pipeline_error` plus the `X-AV-Session` echo. Once a request is
+/// admitted, its session is captured to the spool and finalizes into an
+/// audit artifact even when the upstream call fails — but the id of a
+/// server-generated session was only revealed on the success path, so
+/// `avctl receipt-locate` was impossible for exactly the failed calls
+/// an auditor most wants (the documented contract echoes the id so the
+/// artifact can be located later). Use this for every error return
+/// that occurs after admission bound a session.
+fn pipeline_error_for_session(error: crate::pipeline::PipelineError, session_id: &str) -> Response {
+    let mut response = pipeline_error(error);
+    if let Ok(value) = HeaderValue::from_str(session_id) {
+        response
+            .headers_mut()
+            .insert(crate::pipeline::SESSION_HEADER, value);
     }
     response
 }

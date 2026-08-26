@@ -350,10 +350,12 @@ pub struct PreparedRequest {
     pub payload: Value,
     /// Total local middleware time before upstream I/O.
     pub middleware_us: u64,
-    /// Prompt tokens debited from the session budget at admission
-    /// (`ActionBudget::try_tokens`), kept so a provably-not-forwarded
-    /// abort can refund exactly what was debited. Zeroed after refund.
-    debited_tokens: u64,
+    /// Prompt tokens debited from the session and principal budgets at
+    /// admission (`ActionBudget::try_tokens`), held as an RAII guard so
+    /// BOTH a provably-not-forwarded explicit abort and a cancelled
+    /// request future (client disconnect at any pre-dispatch await)
+    /// refund exactly what was debited. Disarmed at upstream dispatch.
+    admission_debit: AdmissionDebit,
     // Fields drop in declaration order. `capture_guard` MUST drop before
     // `lease` on a cancelled request future — the lease's Drop notifies
     // `wait_for_streams`, unblocking `close_session_locked`, which then
@@ -473,6 +475,87 @@ impl Drop for ResponseCaptureGuard {
         // silently.
         if self.worker.try_submit(job).is_err() {
             self.session.mark_capture_failed();
+        }
+    }
+}
+
+/// RAII owner of the admission-time token debit (session AND principal
+/// ledgers), from the post-compression charge in `prepare_chat` until
+/// the request is handed to the upstream HTTP client.
+///
+/// Every *explicit* pre-dispatch abort refunds via `abandon_prepared` —
+/// but axum drops the request future wholesale on client disconnect,
+/// running none of them. Without this guard, a cancellation between
+/// admission and `send()` (the `spawn_blocking` join in
+/// `prepare_chat_nonblocking`, or the awaited marker write in
+/// `forward_chat`) leaked the debit on both ledgers; the principal
+/// ledger persists across sessions and never heals, so a client that
+/// disconnected mid-admission drained its principal budget with zero
+/// LLM work.
+///
+/// [`Self::take_for_dispatch`] disarms the guard at the last
+/// pre-dispatch point: from there the request may reach the provider,
+/// and the debit conservatively stands (mirroring `forward_chat`'s
+/// `is_connect`-only refund on send errors).
+pub(crate) struct AdmissionDebit {
+    store: Arc<dyn StateStore>,
+    session_id: String,
+    budget: av_state::BudgetSpec,
+    principal: Option<(String, av_state::BudgetSpec)>,
+    tokens: u64,
+}
+
+impl AdmissionDebit {
+    /// Disarm and hand the debited amount to the dispatch path; the
+    /// debit stands from here (reconciled against provider usage, or
+    /// refunded by the explicit `is_connect` arm).
+    fn take_for_dispatch(&mut self) -> u64 {
+        std::mem::take(&mut self.tokens)
+    }
+
+    /// Refund both ledgers now, in the order they were spent. Zeroed so
+    /// a later drop (or a hypothetical double abandon) cannot
+    /// double-refund.
+    fn refund_now(&mut self) {
+        let tokens = std::mem::take(&mut self.tokens);
+        if tokens == 0 {
+            return;
+        }
+        ActionBudget::new(self.store.as_ref(), &self.session_id, &self.budget).refund_tokens(tokens);
+        if let Some((principal_id, spec)) = self.principal.as_ref() {
+            ActionBudget::for_principal(self.store.as_ref(), principal_id, spec).refund_tokens(tokens);
+        }
+    }
+}
+
+impl Drop for AdmissionDebit {
+    fn drop(&mut self) {
+        if self.tokens == 0 {
+            return;
+        }
+        // A refund is a synchronous store call (a network round-trip on
+        // the redis backend). A cancelled request future drops on an
+        // async worker thread, where that round-trip would stall every
+        // other stream polled there — move it to the blocking pool when
+        // a runtime is available (drops on the `spawn_blocking` path of
+        // `prepare_chat_nonblocking` already run on blocking threads,
+        // and unit tests may have no runtime at all: refund inline).
+        let tokens = std::mem::take(&mut self.tokens);
+        let store = Arc::clone(&self.store);
+        let session_id = std::mem::take(&mut self.session_id);
+        let budget = std::mem::take(&mut self.budget);
+        let principal = self.principal.take();
+        let refund = move || {
+            ActionBudget::new(store.as_ref(), &session_id, &budget).refund_tokens(tokens);
+            if let Some((principal_id, spec)) = principal.as_ref() {
+                ActionBudget::for_principal(store.as_ref(), principal_id, spec).refund_tokens(tokens);
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(refund);
+            }
+            Err(_) => refund(),
         }
     }
 }
@@ -1434,12 +1517,23 @@ impl AppState {
         );
         drop(admission);
 
+        let admission_debit = AdmissionDebit {
+            store: Arc::clone(&self.store),
+            session_id: session.id.clone(),
+            budget: self.config.budget.clone(),
+            principal: self
+                .config
+                .principal_budget
+                .as_ref()
+                .map(|spec| (principal_id_for_budget(&identity), spec.clone())),
+            tokens: billed_tokens,
+        };
         Ok(PreparedRequest {
             session,
             identity,
             payload: compression.payload,
             middleware_us: elapsed_us(total_started),
-            debited_tokens: billed_tokens,
+            admission_debit,
             lease,
             response_permit: Some(response_permit),
             capture_guard,
@@ -1563,19 +1657,10 @@ impl AppState {
         // Every abandon site runs strictly before upstream dispatch
         // (durable-capture failure, breaker-open, marker-write failure),
         // so the admission token debit provably bought no LLM work —
-        // refund it exactly once (zeroed so a hypothetical double
-        // abandon cannot double-refund). The admission debit landed on
-        // BOTH ledgers (see the post-compression charge in
-        // `prepare_chat`), so the refund must too: session-only
-        // refunding permanently drained principal tokens on every
-        // pre-dispatch abort.
-        let debited = std::mem::take(&mut prepared.debited_tokens);
-        ActionBudget::new(self.store.as_ref(), &prepared.session.id, &self.config.budget)
-            .refund_tokens(debited);
-        if let Some(spec) = self.config.principal_budget.as_ref() {
-            let principal_id = principal_id_for_budget(&prepared.identity);
-            ActionBudget::for_principal(self.store.as_ref(), &principal_id, spec).refund_tokens(debited);
-        }
+        // refund it exactly once on BOTH ledgers (the guard zeroes
+        // itself, so a hypothetical double abandon — or the guard's own
+        // Drop — cannot double-refund).
+        prepared.admission_debit.refund_now();
         let Some(permit) = prepared.response_permit.take() else {
             // Defensive: no permit means the guard's Drop is the only
             // resolver left. Leave it armed so the terminal record lands
@@ -1690,7 +1775,7 @@ impl AppState {
             capture_guard,
             client_authorization,
             upstream_passthrough_headers,
-            debited_tokens,
+            mut admission_debit,
             ..
         } = request;
         let url = format!(
@@ -1727,6 +1812,12 @@ impl AppState {
         // and error counters — the two failure-mode-table rows the
         // review marked "logs only, no metric".
         let upstream_started = Instant::now();
+        // Last pre-dispatch point: from here the request may reach the
+        // provider, so the admission debit stands (the `is_connect` arm
+        // below refunds the one provably-not-sent case). Disarming here
+        // also ends the cancellation-refund window — a disconnect
+        // during `send()` keeps the debit, deliberately.
+        let debited_tokens = admission_debit.take_for_dispatch();
         match upstream_request.send().await {
             Ok(response) => {
                 self.metrics
@@ -3070,8 +3161,13 @@ mod tests {
         headers_a.insert(SESSION_HEADER, HeaderValue::from_static("rotated-a"));
         let first = state.prepare_chat(&headers_a, payload());
         assert!(first.is_ok(), "first principal request must be admitted");
-        // Cancel the admission so the worker permit drops cleanly.
-        drop(first);
+        // Mark the admission dispatched before dropping: a dropped
+        // UNdispatched request now (correctly) refunds via
+        // `AdmissionDebit`'s cancellation guard, which would empty the
+        // very ledger this test needs to stay charged.
+        if let Ok(mut prepared) = first {
+            let _ = prepared.admission_debit.take_for_dispatch();
+        }
 
         // Second request under a DIFFERENT session id but the same
         // principal (anonymous — both requests unauthenticated). The
@@ -3127,6 +3223,83 @@ mod tests {
             second.is_ok(),
             "an abandoned request must not consume principal budget; got {:?}",
             second.err()
+        );
+    }
+
+    /// Axum drops the request future wholesale on client disconnect —
+    /// no explicit abort path runs. The admission debit must refund via
+    /// `AdmissionDebit`'s Drop (both ledgers), or every mid-admission
+    /// disconnect permanently drains the never-healing principal
+    /// ledger with zero LLM work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_a_prepared_request_refunds_both_ledgers() {
+        let mut config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        config.budget.max_tokens = Some(1_000_000);
+        // Fits ONE ~30-token payload; a leaked (unrefunded) debit makes
+        // the next same-principal request refuse.
+        config.principal_budget = Some(av_state::BudgetSpec {
+            max_tokens: Some(40),
+            ..av_state::BudgetSpec::default()
+        });
+        let state = state(config);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(SESSION_HEADER, HeaderValue::from_static("cancelled-a"));
+        let prepared = state.prepare_chat(&headers, payload()).unwrap();
+        // Simulate the cancelled future: drop with no explicit abort.
+        drop(prepared);
+
+        // The Drop refund runs on the blocking pool; poll until it lands.
+        let mut headers_b = HeaderMap::new();
+        headers_b.insert(SESSION_HEADER, HeaderValue::from_static("cancelled-b"));
+        let mut second = state.prepare_chat(&headers_b, payload());
+        for _ in 0..200 {
+            if second.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            second = state.prepare_chat(&headers_b, payload());
+        }
+        assert!(
+            second.is_ok(),
+            "a dropped (cancelled) prepared request must refund the principal ledger; got {:?}",
+            second.err()
+        );
+    }
+
+    /// The refund window ends at upstream dispatch: once
+    /// `take_for_dispatch` ran (immediately before `send()`), dropping
+    /// the request must NOT refund — the request may have reached the
+    /// provider, and the debit conservatively stands (mirroring the
+    /// `is_connect`-only refund on send errors).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatched_debit_stands_when_the_request_drops() {
+        let mut config = HarnessConfig::for_tests("http://127.0.0.1:9", "/tmp", "/tmp");
+        config.budget.max_tokens = Some(1_000_000);
+        config.principal_budget = Some(av_state::BudgetSpec {
+            max_tokens: Some(40),
+            ..av_state::BudgetSpec::default()
+        });
+        let state = state(config);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(SESSION_HEADER, HeaderValue::from_static("dispatched-a"));
+        let mut prepared = state.prepare_chat(&headers, payload()).unwrap();
+        let debited = prepared.admission_debit.take_for_dispatch();
+        assert!(debited > 0, "admission must have debited tokens");
+        drop(prepared);
+
+        // Give a hypothetical (buggy) Drop refund time to land, then
+        // verify the principal ledger still holds the debit.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut headers_b = HeaderMap::new();
+        headers_b.insert(SESSION_HEADER, HeaderValue::from_static("dispatched-b"));
+        assert!(
+            matches!(
+                state.prepare_chat(&headers_b, payload()),
+                Err(PipelineError::Blocked { .. })
+            ),
+            "a dispatched request's debit must stand after drop"
         );
     }
 
