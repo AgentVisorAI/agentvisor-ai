@@ -1350,7 +1350,7 @@ impl HarnessConfig {
         if self.bridge_data_dir.is_empty() {
             errors.push("bridge_data_dir must not be empty".into());
         }
-        if self.payout_field.is_empty() {
+        if self.payout_field.is_empty() || self.payout_field.trim() != self.payout_field {
             // Every peer field in the "wire-format is a bare identifier"
             // class is checked non-empty; payout_field was the outlier.
             // Its own doc-comment explicitly warns "a tool using
@@ -1365,10 +1365,16 @@ impl HarnessConfig {
             // never spend" branch), and a config with
             // `max_payout_usd_micros = 50_000_000` accepted every
             // `amount_usd: 999999999` call for zero cost. Refuse.
+            // Whitespace-only or leading/trailing whitespace ("  " or
+            // " amount_usd") is the same class — extremely unlikely
+            // to match a real tool's JSON key and almost certainly a
+            // paste typo. Refuse those too.
             errors.push(
-                "payout_field must not be empty (empty string matches no argument key, \
-                 silently disabling max_payout_usd_micros); omit the key to use the \
-                 default, or set it to your tool schema's payout argument name".into(),
+                "payout_field must not be empty and must not carry leading/trailing whitespace \
+                 (empty or whitespace-typo strings match no argument key, silently disabling \
+                 max_payout_usd_micros); omit the key to use the default, or set it to your \
+                 tool schema's payout argument name"
+                    .into(),
             );
         }
         // Backend selectors: the typed accessors (`bridge()`, `state()`,
@@ -2865,21 +2871,22 @@ spec:
     /// never spend" refusal. Every peer field in the same class
     /// (atif_spool_dir, bridge_data_dir, upstream_auth_header, …) is
     /// checked non-empty; this was the outlier. Refuse at startup.
+    /// Whitespace-only and leading/trailing whitespace variants
+    /// ("  ", " amount_usd") are the same class — extremely unlikely
+    /// to match a real tool's JSON key and almost certainly a paste typo.
     #[test]
-    fn empty_payout_field_is_rejected() {
-        let err = HarnessConfig::from_toml(
-            r#"upstream_url = "https://api.openai.com"
-               payout_field = """#,
-        )
-        .unwrap_err();
-        assert!(err.contains("payout_field"), "{err}");
-        assert!(
-            err.contains("silently disabling"),
-            "should point at the exact silent-bypass class: {err}"
-        );
+    fn empty_or_whitespace_payout_field_is_rejected() {
+        for hostile in ["", " ", "  ", "\t", " amount_usd", "amount_usd "] {
+            let toml = format!("upstream_url = \"https://api.openai.com\"\npayout_field = {hostile:?}\n");
+            let err = match HarnessConfig::from_toml(&toml) {
+                Err(e) => e,
+                Ok(_) => panic!("must refuse payout_field = {hostile:?}"),
+            };
+            assert!(err.contains("payout_field"), "{hostile:?} => {err}");
+        }
         // The default (omitted key) is fine.
         assert!(HarnessConfig::from_toml(r#"upstream_url = "https://api.openai.com""#).is_ok());
-        // An explicit non-empty name is fine.
+        // An explicit clean name is fine.
         assert!(HarnessConfig::from_toml(
             r#"upstream_url = "https://api.openai.com"
                payout_field = "amount_usd""#,
