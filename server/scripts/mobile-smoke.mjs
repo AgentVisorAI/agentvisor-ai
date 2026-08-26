@@ -1,0 +1,84 @@
+/*
+ * Mobile viewport smoke: iPhone 13 (390x844 CSS pixels) and iPad
+ * (768x1024). Investors will check the pitch on their phone during
+ * the walk back to the elevator; if the console is broken there the
+ * pitch is dead.
+ *
+ * Verifies:
+ *   1. Landing page renders without horizontal scroll.
+ *   2. Console login renders without horizontal scroll.
+ *   3. Overview page renders on mobile.
+ *   4. Sessions list on mobile — table stays inside viewport.
+ *   5. Settings tabs reachable on mobile.
+ */
+import { chromium, devices } from "playwright";
+
+const SITE = process.env.SITE ?? "https://agentvisorai.me/app/";
+const LANDING = new URL(SITE).origin + "/";
+
+const profiles = [
+  { name: "iPhone 13", device: devices["iPhone 13"] },
+  { name: "iPad (gen 7)", device: devices["iPad (gen 7)"] || devices["iPad Mini"] || devices["iPhone 13 Pro Max"] },
+];
+
+function fail(m) { console.log("❌", m); process.exit(1); }
+async function wait(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+const browser = await chromium.launch({ headless: true });
+for (const { name, device } of profiles) {
+  console.log("\n=== " + name + " (" + device.viewport.width + "x" + device.viewport.height + ") ===");
+  const context = await browser.newContext(device);
+  const page = await context.newPage();
+  const jsErrors = [];
+  page.on("pageerror", (e) => jsErrors.push(e.message));
+
+  // 1. Landing page
+  await page.goto(LANDING, { waitUntil: "networkidle" });
+  await wait(400);
+  const landingScrollX = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  if (landingScrollX > 8) fail(`${name} landing has horizontal scroll: ${landingScrollX}px overflow`);
+  console.log("✅ landing: no horizontal scroll");
+
+  // 2. Console login
+  await page.addInitScript(() => { try { localStorage.setItem("av_mock_signed_out", "1"); } catch {} });
+  await page.goto(SITE + "#/login", { waitUntil: "networkidle" });
+  await page.waitForSelector("input#email", { timeout: 15000 });
+  const loginScrollX = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  if (loginScrollX > 8) fail(`${name} login has horizontal scroll: ${loginScrollX}px overflow`);
+  console.log("✅ login: no horizontal scroll");
+
+  // 3. Overview
+  await page.locator("input#email").fill("olivia.tan@northwind.com");
+  await page.locator("input#password").fill("d3mo");
+  await page.locator("button[type='submit']").first().click();
+  await wait(1500);
+  const bodyText = await page.locator("body").innerText();
+  if (bodyText.length < 300) fail(`${name} overview nearly empty`);
+  const ovScrollX = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  if (ovScrollX > 8) fail(`${name} overview has horizontal scroll: ${ovScrollX}px`);
+  console.log("✅ overview: renders + no horizontal scroll");
+
+  // 4. Sessions list — the table is the most likely offender for horizontal scroll
+  await page.goto(SITE + "#/sessions");
+  await wait(1200);
+  const sessScrollX = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  // Tables inside .table-wrap are allowed to scroll, but the page body shouldn't.
+  if (sessScrollX > 8) fail(`${name} sessions page-wide scroll: ${sessScrollX}px`);
+  console.log("✅ sessions: no page-level horizontal scroll");
+
+  // 5. Settings navigation
+  await page.goto(SITE + "#/settings/general");
+  await wait(800);
+  await page.goto(SITE + "#/settings/webhooks");
+  await wait(800);
+  const setScrollX = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  if (setScrollX > 8) fail(`${name} settings has horizontal scroll: ${setScrollX}px`);
+  console.log("✅ settings: no horizontal scroll");
+
+  if (jsErrors.length) fail(`${name} JS errors: ${jsErrors.join(" | ")}`);
+  console.log("✅ zero JS errors on " + name);
+
+  await context.close();
+}
+await browser.close();
+console.log("\nAll mobile viewport smoke checks passed.");
