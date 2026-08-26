@@ -2901,7 +2901,24 @@ spec:
             "amount_usd\u{201D}", // right double-quote
             "amóunt_usd",         // accented Latin
         ] {
-            let toml = format!("upstream_url = \"https://api.openai.com\"\npayout_field = {hostile:?}\n");
+            // Interpolate the RAW hostile bytes into the TOML — not
+            // `{:?}` Debug format, which emits Rust's `\u{feff}`
+            // escape that TOML doesn't accept (only `\uXXXX` /
+            // `\UXXXXXXXX`, no braces). The prior version parse-
+            // failed at the toml crate for every invisible-format
+            // case, so the payout_field check never actually ran on
+            // the class the fix targets: the R12 review agent proved
+            // that reverting the check to R11's `trim()`-based
+            // predicate still passed 6 of the 8 test cases.
+            //
+            // The `[` / `]` / `{` / `}` / `#` in `hostile` cannot
+            // appear here (all our fixtures are payout-key shapes),
+            // and TOML basic strings interpret embedded `\` and `"`
+            // — but our fixtures contain neither. Raw interpolation
+            // is therefore safe AND correct for THIS test.
+            let toml = format!(
+                "upstream_url = \"https://api.openai.com\"\npayout_field = \"{hostile}\"\n"
+            );
             let err = match HarnessConfig::from_toml(&toml) {
                 Err(e) => e,
                 Ok(_) => panic!("must refuse payout_field = {hostile:?}"),
