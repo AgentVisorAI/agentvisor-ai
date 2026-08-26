@@ -1468,6 +1468,44 @@ impl EventBus for EmbeddedBroker {
         self.publish_with_uid(topic, key, value, Some(event_uid))
     }
 
+    /// O(1) event-UID lookup via the partition's in-memory
+    /// `seen_event_uids` map. The default trait impl at
+    /// `bus.rs::find_event_by_uid` linearly scans the segment from
+    /// offset 0 with `fetch`, which for `EmbeddedBroker` re-opens
+    /// the segment file each call and streams from the head with
+    /// a `BufReader` — so each fetch page for offset > 0 also walks
+    /// the whole prefix. `resolve_lifecycle_ack` in the harness
+    /// calls this on EVERY `emit_bridge_event` (twice per session
+    /// close — RECEIPT + SESSION_CLOSE), which meant close latency
+    /// grew O(total events per partition²) amortised. The Kafka
+    /// and NATS bus implementations both override with O(1) lookups;
+    /// only the embedded broker was still on the trait default.
+    fn find_event_by_uid(
+        &self,
+        topic: &str,
+        key: &str,
+        event_uid: &str,
+    ) -> Result<Option<PublishAck>, BusError> {
+        let parts = self
+            .partitions
+            .get(topic)
+            .ok_or_else(|| BusError::UnknownTopic(topic.to_owned()))?;
+        let partition = partition_for(key, u32::try_from(parts.len()).unwrap_or(u32::MAX));
+        let slot = parts
+            .get(partition as usize)
+            .ok_or_else(|| BusError::Backend(format!("partition {partition} out of range")))?;
+        let part = slot.lock();
+        Ok(part
+            .seen_event_uids
+            .get(event_uid)
+            .copied()
+            .map(|offset| PublishAck {
+                topic: topic.to_owned(),
+                partition,
+                offset,
+            }))
+    }
+
     fn fetch(
         &self,
         topic: &str,

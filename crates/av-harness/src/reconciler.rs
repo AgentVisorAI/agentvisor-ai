@@ -457,8 +457,23 @@ struct CloseClaim<'a> {
     committed: bool,
 }
 
+/// Schema-version discriminator for lifecycle outbox payloads. New
+/// on-disk records write this version; older files that lack the
+/// field decode via `#[serde(default)]` as `LIFECYCLE_OUTBOX_SCHEMA_V1`,
+/// keeping cross-upgrade reads correct. A future release adding a
+/// required payload field can gate the read arm on this version and
+/// migrate v1 records explicitly rather than failing MAC-verified
+/// decodes with an ambiguous serde error.
+const LIFECYCLE_OUTBOX_SCHEMA_V1: u16 = 1;
+
+fn lifecycle_outbox_schema_v1() -> u16 {
+    LIFECYCLE_OUTBOX_SCHEMA_V1
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct LifecycleOutbox {
+    #[serde(default = "lifecycle_outbox_schema_v1")]
+    schema_version: u16,
     session_id: String,
     kind: String,
     topic: String,
@@ -3428,6 +3443,7 @@ impl Finalizer {
             return Ok(());
         };
         let path = self.lifecycle_outbox_path(&session.id, kind);
+        let current_instance_uid = session.current_identity().instance_uid;
         let mut outbox = if path.exists() {
             let sealed = read_capped_async(path.clone(), av_core::fsutil::MAX_CONTROL_BYTES)
                 .await
@@ -3444,23 +3460,60 @@ impl Finalizer {
                     "lifecycle outbox does not match its session and kind".to_owned(),
                 ));
             }
-            // A crash between a prior successful emit and a subsequent one loses the
-            // in-memory seq advance for this outbox — recovery only restores seq from
-            // the journal length. Fast-forward past the persisted seq so a following
-            // lifecycle event (e.g., SESSION_CLOSE after a persisted RECEIPT_OUTBOX)
-            // cannot land on the same metadata.sequence value.
-            if let Some(persisted_seq) = outbox
-                .value
-                .get("metadata")
-                .and_then(|metadata| metadata.get("sequence"))
-                .and_then(serde_json::Value::as_u64)
-            {
-                if session.peek_seq() <= persisted_seq {
-                    session.advance_seq_past(persisted_seq);
+            // Recycled-id / stale-orphan guard: `outbox.key` is set at
+            // emit time to the session's `instance_uid` (see the fresh-
+            // emit branch below). If we encounter an outbox for
+            // `(session_id, kind)` whose recorded instance_uid does not
+            // match the CURRENT session's instance_uid, this file is a
+            // leftover from a PREVIOUS incarnation of a recycled
+            // session id (e.g., a race between `remove_lifecycle_outbox`
+            // during close and `replay_lifecycle_outboxes_in`
+            // re-persisting an acked copy after the unlink; the new
+            // incarnation opens under the same id but a fresh
+            // `instance_uid`). Under `outbox.ack.is_some()` the current
+            // code would silently return `Ok(())` without publishing,
+            // dropping the new incarnation's authoritative lifecycle
+            // event from the audit stream. Detect the mismatch, delete
+            // the stale file, and fall through to the fresh-emit path.
+            //
+            // The retention retention-rule at
+            // `remove_acked_lifecycle_outboxes` also RETAINS acked
+            // outboxes while their session is still registered and
+            // not close-complete — during a recycled-id window that
+            // means the leftover survives GC until the fresh close
+            // hits this branch.
+            if outbox.key != current_instance_uid {
+                remove_outbox(&path).await?;
+                // Fresh emit: fall through by returning to the outer
+                // async block via a boolean sentinel. Rust's `if let`
+                // doesn't allow re-entering the else arm from the
+                // if body, so structure the state via `None` and let
+                // the branch below take over.
+                None
+            } else {
+                // A crash between a prior successful emit and a subsequent one loses the
+                // in-memory seq advance for this outbox — recovery only restores seq from
+                // the journal length. Fast-forward past the persisted seq so a following
+                // lifecycle event (e.g., SESSION_CLOSE after a persisted RECEIPT_OUTBOX)
+                // cannot land on the same metadata.sequence value.
+                if let Some(persisted_seq) = outbox
+                    .value
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get("sequence"))
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    if session.peek_seq() <= persisted_seq {
+                        session.advance_seq_past(persisted_seq);
+                    }
                 }
+                Some(outbox)
             }
-            outbox
         } else {
+            None
+        };
+        // Fresh-emit branch (either no existing outbox, or the
+        // existing one was a recycled-id orphan we just deleted).
+        if outbox.is_none() {
             // Peek the seq without consuming it; a failed persist_outbox
             // below would otherwise burn a seq that recovery expects to see
             // at a later journal position, breaking the position-vs-seq
@@ -3475,17 +3528,29 @@ impl Finalizer {
             .payload(payload)
             .build()
             .map_err(FinalizeError::bridge_source)?;
-            let outbox = LifecycleOutbox {
+            let fresh = LifecycleOutbox {
+                schema_version: LIFECYCLE_OUTBOX_SCHEMA_V1,
                 session_id: session.id.clone(),
                 kind: kind.to_owned(),
                 topic: class.topic().to_owned(),
-                key: session.current_identity().instance_uid,
+                key: current_instance_uid.clone(),
                 value: serde_json::to_value(event).map_err(FinalizeError::bridge_source)?,
                 ack: None,
             };
-            persist_outbox(&path, &outbox, &self.journal_key).await?;
+            persist_outbox(&path, &fresh, &self.journal_key).await?;
             session.advance_seq_past(event_seq);
-            outbox
+            outbox = Some(fresh);
+        }
+        // `outbox` is Some at this point: the `if outbox.is_none()`
+        // arm above unconditionally set it. Use pattern rather than
+        // `.expect` to keep clippy's expect-used lint happy in
+        // production (Debug printing an internal invariant break
+        // isn't more informative than an early return here anyway).
+        let Some(mut outbox) = outbox else {
+            return Err(FinalizeError::bridge(
+                "internal invariant: emit_bridge_event fresh-emit branch left outbox unset"
+                    .to_owned(),
+            ));
         };
         if outbox.ack.is_some() {
             return Ok(());
@@ -4951,6 +5016,7 @@ mod tests {
             "topic": av_events::EventClass::Receipt.topic(),
         });
         let outbox = LifecycleOutbox {
+            schema_version: LIFECYCLE_OUTBOX_SCHEMA_V1,
             session_id: session.id.clone(),
             kind: crate::journal::RECEIPT_OUTBOX_KIND.to_owned(),
             topic: av_events::EventClass::Receipt.topic().to_owned(),
@@ -5580,6 +5646,7 @@ mod tests {
         let session_id = "promo-retain";
         let topic = av_events::EventClass::Receipt.topic();
         let outbox = LifecycleOutbox {
+            schema_version: LIFECYCLE_OUTBOX_SCHEMA_V1,
             session_id: session_id.to_owned(),
             kind: crate::journal::RECEIPT_OUTBOX_KIND.to_owned(),
             topic: topic.to_owned(),
@@ -5629,6 +5696,119 @@ mod tests {
         assert!(
             !outbox_path.exists(),
             "with no promotion pending, the orphan acked outbox must be collected"
+        );
+    }
+
+    /// Recycled-session-id + stale-outbox: when `emit_bridge_event`
+    /// finds an existing outbox at `(session_id, kind)` but the
+    /// outbox's stored `key` (which was set to the previous
+    /// incarnation's `instance_uid` at emit time) does not match
+    /// the CURRENT session's `instance_uid`, the outbox is a
+    /// leftover from a recycled id. Pre-R28 code silently returned
+    /// Ok(()) without publishing when `outbox.ack.is_some()`,
+    /// dropping the new incarnation's authoritative lifecycle event
+    /// from the audit stream. Post-fix: the stale file is removed
+    /// and a fresh outbox is emitted + published.
+    #[tokio::test]
+    async fn recycled_session_id_re_emits_lifecycle_event_over_stale_acked_outbox() {
+        let directory = tempfile::tempdir().unwrap();
+        let concrete_bus = Arc::new(FailFirstReceiptBus {
+            fail: std::sync::atomic::AtomicBool::new(false),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+        });
+        let bus_probe = Arc::clone(&concrete_bus);
+        let bus: Arc<dyn EventBus> = concrete_bus;
+        let finalizer = Finalizer::with_bridge(
+            Arc::new(Ed25519Signer::from_seed(&[7; 32])),
+            directory.path().to_path_buf(),
+            Arc::new(Registry::new()),
+            bus,
+        );
+
+        // Plant a stale acked outbox for the OLD incarnation
+        // (instance_uid = "instance-old"). Same session id + kind
+        // as the new incarnation will emit under.
+        let session_id = "recycled-id";
+        let topic = av_events::EventClass::Receipt.topic();
+        let stale = LifecycleOutbox {
+            schema_version: LIFECYCLE_OUTBOX_SCHEMA_V1,
+            session_id: session_id.to_owned(),
+            kind: crate::journal::RECEIPT_OUTBOX_KIND.to_owned(),
+            topic: topic.to_owned(),
+            key: "instance-old".to_owned(),
+            value: serde_json::json!({
+                "metadata": { "sequence": 0, "uid": av_core::new_event_uid() },
+                "topic": topic,
+            }),
+            ack: Some(av_bridge::PublishAck {
+                topic: topic.to_owned(),
+                partition: 0,
+                offset: 1,
+            }),
+        };
+        let outbox_path =
+            finalizer.lifecycle_outbox_path(session_id, crate::journal::RECEIPT_OUTBOX_KIND);
+        std::fs::create_dir_all(outbox_path.parent().unwrap()).unwrap();
+        let sealed = crate::journal::seal(
+            &finalizer.journal_key,
+            crate::journal::LIFECYCLE_OUTBOX_DOMAIN,
+            0,
+            &stale,
+        )
+        .unwrap();
+        std::fs::write(&outbox_path, sealed).unwrap();
+
+        // Fresh incarnation with a DIFFERENT instance_uid.
+        let session = Arc::new(Session::new(
+            session_id.to_owned(),
+            Workflow::Signed,
+            AgentIdentity {
+                version: "1".to_owned(),
+                charter: "test".into(),
+                instance_uid: "instance-fresh".to_owned(),
+                ttl_remaining_s: Some(600),
+            },
+            Default::default(),
+        ));
+        let payload = serde_json::json!({
+            "receipt_id": "01936000-0000-7000-8000-000000000001",
+            "chain_head": "0000",
+        });
+
+        finalizer
+            .emit_bridge_event(
+                &session,
+                av_events::EventClass::Receipt,
+                payload,
+                crate::journal::RECEIPT_OUTBOX_KIND,
+            )
+            .await
+            .expect("recycled-id emit succeeds");
+
+        // Downcast bus_probe (kept as concrete Arc) to inspect attempts.
+        let attempts = bus_probe.attempts.lock();
+        assert!(
+            attempts.iter().any(|(t, _)| t == topic),
+            "the fresh incarnation MUST publish a receipt lifecycle event even when a stale \
+             acked outbox for the recycled id exists (pre-R28 this silently returned Ok(()) \
+             without publishing, dropping the audit event); got attempts: {attempts:?}"
+        );
+
+        // The persisted outbox file must now reference the fresh
+        // instance_uid, not the stale one.
+        let bytes = std::fs::read(&outbox_path).unwrap();
+        let outbox: LifecycleOutbox = crate::journal::open(
+            &finalizer.journal_key,
+            crate::journal::LIFECYCLE_OUTBOX_DOMAIN,
+            0,
+            &bytes,
+        )
+        .unwrap();
+        assert_eq!(
+            outbox.key, "instance-fresh",
+            "persisted outbox key must reflect the fresh incarnation's instance_uid; \
+             stale key would let the next tick's `remove_acked_lifecycle_outboxes` see \
+             it as a valid ack and never re-publish"
         );
     }
 
