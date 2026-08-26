@@ -19,4 +19,4 @@ pub use model::{
     Product, StatusId, CATEGORY_UID, OCSF_VERSION, PRODUCT_NAME,
 };
 pub use stop_reason::StopReason;
-pub use validate::{validate_event, ValidationError};
+pub use validate::{validate_event, ValidationError, SCHEMA_TIME_MAX_MS};

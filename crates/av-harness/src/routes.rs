@@ -3896,7 +3896,7 @@ impl Drop for AbortFinalizingStream {
                                     .inc();
                                 tracing::warn!(
                                     %error,
-                                    %session_id,
+                                    session = %session_id,
                                     "auto-close of completed ephemeral session failed"
                                 );
                             }
@@ -3916,7 +3916,7 @@ impl Drop for AbortFinalizingStream {
                                     )
                                     .inc();
                                 tracing::warn!(
-                                    %session_id,
+                                    session = %session_id,
                                     panic = %msg,
                                     "auto-close of completed ephemeral session PANICKED (caught)"
                                 );
@@ -4053,7 +4053,7 @@ impl Drop for AbortFinalizingStream {
                                     .inc();
                                 tracing::warn!(
                                     %error,
-                                    %session_id,
+                                    session = %session_id,
                                     "background close on stream abort failed"
                                 );
                             }
@@ -4073,7 +4073,7 @@ impl Drop for AbortFinalizingStream {
                                     )
                                     .inc();
                                 tracing::warn!(
-                                    %session_id,
+                                    session = %session_id,
                                     panic = %msg,
                                     "background close on stream abort PANICKED (caught)"
                                 );
@@ -4097,7 +4097,7 @@ impl Drop for AbortFinalizingStream {
                         .inc();
                     tracing::warn!(
                         %error,
-                        %session_id,
+                        session = %session_id,
                         "no tokio runtime available for stream-abort close; marking capture failed for reconciler retry"
                     );
                     self.session.mark_capture_failed();
