@@ -1706,7 +1706,21 @@ fn install_seed_exclusive(path: &Path, encoded: &str) -> Result<bool> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)
+    // A bare `create_dir_all` fsyncs no dirent. If `parent` was newly
+    // created (first-boot install), the ancestor dirents stay
+    // volatile: the later `sync_directory(parent)` fsyncs the
+    // CONTENTS of `parent`, not the `parent` dirent inside the
+    // grandparent. A power loss immediately after install could drop
+    // the whole `keys/` directory even though the seed file itself
+    // was fsynced — the next boot would generate a fresh key with a
+    // different public identity and every already-issued receipt
+    // would fail signature verification. Route the mkdir through
+    // `create_dir_all_synced` (which fsyncs every newly-created
+    // ancestor and sets mode 0o700 atomically at mkdir on Unix,
+    // closing the shared-tenant enumeration window until the
+    // seed-file mode gets applied) — same posture as
+    // `av_core::fsutil::write_atomic`.
+    av_core::fsutil::create_dir_all_synced(parent)
         .with_context(|| format!("create signing seed directory {}", parent.display()))?;
     let temporary = parent.join(format!(".signing-seed-{}.tmp", av_core::new_event_uid()));
     // Previously an early `?` return from write_all or
