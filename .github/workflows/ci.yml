@@ -6,7 +6,8 @@ on:
     # No paths-ignore: prose and deploy manifests ARE CI-executed
     # inputs. The workspace `include_str!`s (and asserts against)
     # deploy/kubernetes/agentvisor-ai.yaml, docs/reference/*.md,
-    # docs/app/console.js + index.html, README.md and the shipped
+    # docs/app/pitch/console.js + pitch/index.html (the linear pitch
+    # walkthrough), README.md and the shipped
     # configs/schemas/manifests — a docs-only or deploy-only commit
     # that renames or breaks one of them fails compilation or the
     # contract tests, and a skipped pipeline would land that breakage

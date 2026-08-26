@@ -80,9 +80,18 @@ jobs:
           cp docs/style.css "$site/style.css"
           cp docs/logo.png "$site/logo.png"
           cp docs/social-preview.png "$site/social-preview.png"
-          # Product console (self-contained client-side app).
+          # Product console — the multi-tenant SaaS app.
           mkdir -p "$site/app"
-          cp docs/app/index.html docs/app/console.css docs/app/console.js "$site/app/"
+          cp docs/app/index.html "$site/app/"
+          cp docs/app/styles.css "$site/app/"
+          cp docs/app/app.js "$site/app/"
+          cp docs/app/datasource.js "$site/app/"
+          # The linear pitch walkthrough — investor demo links + video
+          # transcripts still reference the scripted flow at /app/pitch/.
+          mkdir -p "$site/app/pitch"
+          cp docs/app/pitch/index.html "$site/app/pitch/"
+          cp docs/app/pitch/console.css "$site/app/pitch/"
+          cp docs/app/pitch/console.js "$site/app/pitch/"
           # Custom-domain marker for GitHub Pages. Without a CNAME file in
           # the published artifact, Pages resets the configured custom
           # domain on each deploy.
