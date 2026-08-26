@@ -1,4 +1,10 @@
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+// Repo layout: <root>/server/ci/e2e.mjs — datasource.js is two levels up.
+const datasourcePath = resolve(__dirname, "..", "..", "docs", "app", "datasource.js");
 
 let cookies = {};
 const origFetch = globalThis.fetch;
@@ -16,7 +22,7 @@ globalThis.fetch = async (url, opts={}) => {
   return res;
 };
 
-const src = readFileSync("/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/app/datasource.js","utf8");
+const src = readFileSync(datasourcePath, "utf8");
 globalThis.window = { MOCK_MODE: false, API_BASE: "http://127.0.0.1:8985" };
 new Function(src)();
 const ds = globalThis.window.dataSource;
