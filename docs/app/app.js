@@ -1128,7 +1128,7 @@
     }).join("");
 
     main.innerHTML =
-      pageHeader("Session " + s.externalId, s.agent + " · " + (s.user || "—") + " · " + (s.model || ""), '<a href="#/sessions" class="btn">← All sessions</a> <button class="btn" id="copyRcpt">Copy receipt</button>') +
+      pageHeader("Session " + s.externalId, s.agent + " · " + (s.user || "—") + " · " + (s.model || ""), '<a href="#/sessions" class="btn">← All sessions</a> <button class="btn" id="copyRcpt">Copy receipt</button> <button class="btn accent" id="dlRcpt">↓ Download receipt</button>') +
       '<div class="session-summary">' +
         cell("Events", s.events, "streamed") +
         cell("Allowed", s.toolsAllowed, "tool calls") +
@@ -1202,6 +1202,53 @@
       navigator.clipboard.writeText(JSON.stringify(receipt, null, 2)).then(function () {
         toast("Receipt copied");
       });
+    });
+
+    // Download receipt as a portable verification bundle.
+    // The exported JSON is self-contained — payload + signature +
+    // public key + human-readable verification recipe. Anyone with
+    // the file (an auditor, an insurer, a court) can verify the
+    // signature offline without asking us or the customer for
+    // anything else.
+    $("#dlRcpt").addEventListener("click", async function () {
+      var bundle = {
+        format: "agentvisor.receipt.v1",
+        exportedAt: new Date().toISOString(),
+        session: {
+          id: s.id,
+          externalId: s.externalId,
+          agent: s.agent,
+          user: s.user,
+          model: s.model,
+          openedAt: s.openedAt,
+          closedAt: s.closedAt,
+          events: s.events,
+          toolsAllowed: s.toolsAllowed,
+          toolsBlocked: s.toolsBlocked,
+        },
+        receipt: receipt,
+        publicKey: receipt && receipt.publicKeyHex
+          ? { algorithm: "ed25519", hex: receipt.publicKeyHex }
+          : null,
+        verifyingInstructions: {
+          algorithm: "Ed25519",
+          message: "receipt.rawBody (UTF-8 bytes)",
+          signature: "base64-decode(receipt.rawSignatureB64)",
+          publicKey: "hex-decode(publicKey.hex)",
+          command: "node scripts/verify-receipt.mjs " + (s.externalId || s.id) + ".json",
+          docs: "https://agentvisorai.me/reference/receipts",
+        },
+      };
+      var blob = new Blob([JSON.stringify(bundle, null, 2)], { type: "application/json" });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href = url;
+      a.download = "agentvisor-receipt-" + (s.externalId || s.id) + ".json";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
+      toast("Receipt downloaded — verify offline with the bundled instructions.");
     });
 
     // Fire the real Ed25519 verification. When it lands, the "Verifying…"

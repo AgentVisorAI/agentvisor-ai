@@ -69,3 +69,15 @@ jobs:
         env:
           SITE: https://agentvisorai.me/app/
         run: node scripts/a11y-audit.mjs
+
+      - name: Receipt verification round-trip
+        working-directory: server
+        env:
+          SITE: https://agentvisorai.me/app/
+        run: node scripts/receipt-verify-drill.mjs
+
+      - name: Lighthouse audit (perf + a11y + best-practices)
+        working-directory: server
+        env:
+          SITE: https://agentvisorai.me/app/
+        run: node scripts/lighthouse-audit.mjs
