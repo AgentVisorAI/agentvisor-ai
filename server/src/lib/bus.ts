@@ -169,6 +169,16 @@ class Bus extends EventEmitter {
     }, delay);
   }
 
+  /**
+   * True when the pg LISTEN/NOTIFY bridge is up. Same-instance delivery
+   * still works when this is false — only cross-instance fan-out
+   * degrades. Used by /readyz to distinguish "fully healthy" from
+   * "degraded but serving".
+   */
+  isReady(): boolean {
+    return this.pgListener !== null && this.pgPublisher !== null;
+  }
+
   /** Close both pg sockets. Fastify graceful shutdown hook calls this. */
   async close(): Promise<void> {
     this.closed = true;

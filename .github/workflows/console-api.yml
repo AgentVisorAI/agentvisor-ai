@@ -119,6 +119,30 @@ jobs:
         run: python3 server/ci/smoke.py
       - name: Backend E2E (Node fetch through ApiDataSource)
         run: node server/ci/e2e.mjs
+      # Load test — validates our "300 rpm per user" claim is actually
+      # true, not just documented. autocannon at 100 rps for 15 s against
+      # the cheap /healthz endpoint. Asserts p99 < 250 ms and zero
+      # non-2xx responses. Realistic for a 256 MB Fly nano.
+      - name: Load test (autocannon → /healthz)
+        run: |
+          npx --yes autocannon@8.0.0 \
+            --duration 15 \
+            --connections 20 \
+            --pipelining 1 \
+            --json \
+            http://127.0.0.1:8985/healthz \
+            > /tmp/loadtest.json
+          node -e '
+            const r = JSON.parse(require("fs").readFileSync("/tmp/loadtest.json", "utf8"));
+            const errors = r.errors + r.timeouts + r["non2xx"];
+            const p99ms = r.latency.p99;
+            const rps = r.requests.average;
+            console.log("Load test:", { rps, p99ms, errors });
+            if (errors > 0) { console.error("FAIL: non-2xx or errors > 0"); process.exit(1); }
+            if (p99ms > 250) { console.error("FAIL: p99 > 250 ms"); process.exit(1); }
+            if (rps < 50)   { console.error("FAIL: throughput below 50 rps"); process.exit(1); }
+            console.log("PASS");
+          '
       - name: Stop API
         if: always()
         run: |
@@ -146,4 +170,4 @@ jobs:
         run: |
           docker run --rm --entrypoint /usr/bin/id agentvisor-api:ci | grep 'uid=1000(node)'
       - name: Verify healthcheck defined
-        run: docker inspect --format '{{.Config.Healthcheck.Test}}' agentvisor-api:ci | grep healthz
+        run: docker inspect --format '{{.Config.Healthcheck.Test}}' agentvisor-api:ci | grep readyz

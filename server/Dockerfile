@@ -70,9 +70,11 @@ ENV PORT=8080
 EXPOSE 8080
 
 # Cheap liveness probe. Container orchestrators (Fly checks, Cloud Run health,
-# k8s liveness) all understand this format.
+# k8s liveness) all understand this format. Uses /readyz — a 200 there means
+# both the API process and the database it depends on are healthy, so an
+# unhealthy DB drains traffic instead of returning 500s.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
-    CMD node -e "fetch('http://127.0.0.1:'+process.env.PORT+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+    CMD node -e "fetch('http://127.0.0.1:'+process.env.PORT+'/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 # dumb-init reaps zombies + forwards signals so `docker stop` and Fly's rolling
 # deploys finish in <100ms instead of the default 10s SIGKILL wait.

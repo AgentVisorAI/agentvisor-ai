@@ -3,8 +3,14 @@ import cookie from "@fastify/cookie";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
 import Fastify from "fastify";
+import { db } from "./db.js";
 import { env } from "./env.js";
 import { bus } from "./lib/bus.js";
+import {
+  httpRequestDurationSeconds,
+  httpRequestsTotal,
+  registry as metricsRegistry,
+} from "./lib/metrics.js";
 import { authenticate } from "./lib/session-middleware.js";
 import { authRoutes } from "./routes/auth.js";
 import { deploymentRoutes } from "./routes/deployments.js";
@@ -104,6 +110,26 @@ async function main(): Promise<void> {
     },
   });
 
+  // Force HTTPS in production. The proxy in front of us (Fly LB / Cloud
+  // Run / Cloudflare) terminates TLS and forwards on http, setting
+  // X-Forwarded-Proto to record the original scheme. Reject anything
+  // that arrives without proto=https so a customer with a stale http://
+  // bookmark doesn't accidentally send credentials in the clear.
+  // trustProxy in the Fastify config means req.protocol already reflects
+  // the forwarded value.
+  if (env.NODE_ENV === "production") {
+    app.addHook("onRequest", async (req, reply) => {
+      // Health checks + well-known paths are allowed either way — some
+      // orchestrators call them over the pod network without TLS.
+      if (req.url === "/healthz" || req.url === "/readyz" || req.url.startsWith("/.well-known/")) {
+        return;
+      }
+      if (req.protocol !== "https") {
+        return reply.code(400).send({ error: "https_required" });
+      }
+    });
+  }
+
   // Defense-in-depth CSRF check for state-changing methods. SameSite=Lax
   // cookies + JSON-only endpoints already block cross-site form posts,
   // but a strict Origin/Referer allow-list closes the remaining slivers
@@ -135,19 +161,222 @@ async function main(): Promise<void> {
       }
     }
     const rawSource = origin || refererOrigin;
-    if (!rawSource) return; // No cross-origin marker present.
+
+    // If neither Origin nor Referer is present the request is coming
+    // from a script or curl (browsers always attach one on cross-site
+    // requests). Allow — those requests don't ride ambient cookies
+    // unless the caller explicitly passed one, and if they did they're
+    // authenticated via the JWT anyway.
+    if (!rawSource) return;
 
     const allowed = env.ALLOWED_ORIGINS;
     // In dev with an empty allow-list we skip (matches the CORS choice).
     if (allowed.length === 0 && env.NODE_ENV !== "production") return;
-    if (allowed.includes(rawSource)) return;
+    if (!allowed.includes(rawSource)) {
+      return reply.code(403).send({ error: "forbidden_origin" });
+    }
 
-    return reply.code(403).send({ error: "forbidden_origin" });
+    // Sec-Fetch-Site defense-in-depth. Modern browsers set this to
+    // 'same-origin' or 'same-site' on legitimate SPA requests. A
+    // form-triggered CSRF from a different site would arrive as
+    // 'cross-site'. Older browsers omit the header entirely — those we
+    // still let through because the Origin check above already caught
+    // any cross-site attempt.
+    const secFetchSite = typeof req.headers["sec-fetch-site"] === "string"
+      ? req.headers["sec-fetch-site"]
+      : "";
+    if (secFetchSite === "cross-site") {
+      return reply.code(403).send({ error: "forbidden_cross_site" });
+    }
   });
 
   app.addHook("preHandler", authenticate);
 
+  // Echo the request-id back on every response (and every problem+json
+  // error body) so ops can grep the logs from a customer's browser
+  // console in one step. Fastify already generates req.id for logging;
+  // we surface it here.
+  //
+  // Also normalizes any legacy { error: "..." } response body on a 4xx/5xx
+  // into RFC 7807 problem+json. Routes still write the terse shape (less
+  // ceremony), and the wire stays consistent. Successful 2xx responses
+  // pass through untouched.
+  app.addHook("onSend", async (req, reply, payload) => {
+    reply.header("X-Request-Id", String(req.id));
+    if (reply.statusCode < 400) return payload;
+    if (typeof payload !== "string") return payload;
+    // Only transform JSON bodies — HTML error pages (helmet, static) pass through.
+    const ct = String(reply.getHeader("content-type") || "");
+    if (!ct.includes("json")) return payload;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      return payload;
+    }
+    // Already problem+json — nothing to do.
+    if (parsed && typeof parsed === "object" && "type" in parsed && "title" in parsed) return payload;
+    const legacy = parsed as { error?: string; issues?: unknown; [k: string]: unknown };
+    if (typeof legacy.error !== "string") return payload;
+    reply.type("application/problem+json");
+    const problem = {
+      type: "about:blank",
+      title: reply.statusCode === 500 ? "Internal Server Error" : "Request Failed",
+      status: reply.statusCode,
+      detail: legacy.error,
+      instance: req.url,
+      errorCode: legacy.error,
+      requestId: String(req.id),
+      ...(legacy.issues !== undefined ? { issues: legacy.issues } : {}),
+    };
+    return JSON.stringify(problem);
+  });
+
+  // RFC 7807 Problem+JSON error envelope. Every non-2xx response goes
+  // through this handler so clients see one stable shape:
+  //
+  //   { type, title, status, detail, instance, errorCode, requestId }
+  //
+  // The `errorCode` is a string clients can switch on without regexing
+  // the human-readable title. That gives us room to iterate on wording
+  // without breaking every SDK consumer.
+  app.setErrorHandler(async (rawErr: unknown, req, reply) => {
+    // Fastify's typings pass FastifyError but strict tsconfig treats
+    // it as `unknown` in the handler — assert the loose shape we need.
+    const err = rawErr as {
+      statusCode?: number;
+      code?: string;
+      message?: string;
+      name?: string;
+      validation?: unknown[];
+    };
+    const status = err.statusCode ?? 500;
+    // Zod / Fastify schema validation errors surface with err.validation.
+    const isValidation = Array.isArray(err.validation);
+    const errorCode = err.code ?? (isValidation ? "invalid_input" : status === 500 ? "internal_error" : "error");
+    const title = err.name && err.name !== "Error" ? err.name : status === 500 ? "Internal Server Error" : "Request Failed";
+
+    if (status >= 500) {
+      req.log.error({ err: rawErr }, "unhandled error");
+    } else {
+      req.log.warn({ err: rawErr }, "request rejected");
+    }
+
+    reply.header("X-Request-Id", String(req.id));
+    reply.type("application/problem+json");
+    return reply.status(status).send({
+      type: `about:blank`,
+      title,
+      status,
+      // Never leak internal error messages to the client on 5xx — those
+      // may reveal stack frames, table names, or config values. 4xx
+      // errors are safe to surface (we produced them deliberately).
+      detail: status >= 500 ? "An unexpected error occurred." : err.message ?? "Request failed",
+      instance: req.url,
+      errorCode,
+      requestId: String(req.id),
+      ...(isValidation ? { issues: err.validation } : {}),
+    });
+  });
+
+  // 404 fallback also uses the problem+json shape so a wrong path from
+  // an SDK debugging session lands consistently.
+  app.setNotFoundHandler(async (req, reply) => {
+    reply.header("X-Request-Id", String(req.id));
+    reply.type("application/problem+json");
+    return reply.status(404).send({
+      type: "about:blank",
+      title: "Not Found",
+      status: 404,
+      detail: `No route matches ${req.method} ${req.url}`,
+      instance: req.url,
+      errorCode: "not_found",
+      requestId: String(req.id),
+    });
+  });
+
   app.get("/healthz", async () => ({ ok: true, version: "0.1.0" }));
+
+  // Prometheus metrics endpoint. Emits process metrics (heap, event
+  // loop, GC) + our own HTTP counters and latency histogram. Gated
+  // behind ALLOW_METRICS_IPS so we don't leak traffic patterns to the
+  // public internet — allow-list contains the scraper's egress IPs
+  // (Grafana Cloud, Prometheus server, k8s cluster ranges, etc). Set
+  // ALLOW_METRICS_IPS="0.0.0.0/0" only if the metrics scraper is on the
+  // same private network.
+  app.get("/metrics", async (req, reply) => {
+    const allowed = env.ALLOW_METRICS_IPS;
+    if (allowed.length > 0) {
+      const ip = req.ip;
+      // Simple prefix match — good enough for a CIDR-less allow-list of
+      // exact IPs or subnets. For real CIDR ranges, front the endpoint
+      // with the platform's network policy (Fly private networking,
+      // Cloud Run internal ingress, k8s NetworkPolicy).
+      const ok = allowed.some((a) => ip === a || ip.startsWith(a));
+      if (!ok) return reply.code(403).send({ error: "forbidden" });
+    }
+    reply.header("Content-Type", metricsRegistry.contentType);
+    return reply.send(await metricsRegistry.metrics());
+  });
+
+  // Measure every request. Hooks fire around every route (including
+  // /healthz + /readyz) so we get a full picture without opting each
+  // handler in. Latency uses the `onRequest` -> `onResponse` diff which
+  // includes queueing, middleware, and handler time.
+  app.addHook("onRequest", async (req) => {
+    (req as unknown as { _startAt: [number, number] })._startAt = process.hrtime();
+  });
+  app.addHook("onResponse", async (req, reply) => {
+    const start = (req as unknown as { _startAt?: [number, number] })._startAt;
+    if (!start) return;
+    const diff = process.hrtime(start);
+    const seconds = diff[0] + diff[1] / 1e9;
+    // routerPath is the parameterized template (e.g. /api/v1/sessions/:id)
+    // so we don't blow cardinality on session-id-shaped URLs.
+    const routeLabel = (req as unknown as { routerPath?: string }).routerPath ?? "unmatched";
+    const labels = {
+      method: req.method,
+      route: routeLabel,
+      status: String(reply.statusCode),
+    };
+    httpRequestDurationSeconds.observe(labels, seconds);
+    httpRequestsTotal.inc(labels);
+  });
+
+  // /readyz separates process-alive (healthz) from ready-to-serve. Fly.io
+  // + Cloud Run + Kubernetes all recommend this pattern: liveness stays
+  // cheap so a hiccup doesn't restart the container; readiness probes the
+  // real dependencies and returns 503 so the platform stops routing
+  // traffic during an outage instead of serving 500s from every request.
+  //
+  // We probe Postgres directly (Prisma will lazily reconnect on a healthy
+  // pool, so a bare SELECT 1 is enough). Bus liveness is checked via the
+  // Bus.isReady() flag — the bridge auto-reconnects, but if it's DOWN we
+  // still serve READ traffic; only SSE fan-out degrades to same-instance.
+  app.get("/readyz", async (_req, reply) => {
+    const started = Date.now();
+    let dbOk = false;
+    let dbErr: string | undefined;
+    try {
+      await db.$queryRawUnsafe("SELECT 1");
+      dbOk = true;
+    } catch (err) {
+      dbErr = err instanceof Error ? err.message : String(err);
+    }
+    const busReady = bus.isReady();
+    const ok = dbOk;
+    const body = {
+      ok,
+      version: "0.1.0",
+      checks: {
+        db: dbOk ? "ok" : "fail",
+        bus: busReady ? "ok" : "degraded",
+      },
+      elapsedMs: Date.now() - started,
+      ...(dbErr ? { dbError: dbErr } : {}),
+    };
+    return reply.code(ok ? 200 : 503).send(body);
+  });
 
   // RFC 9116 — advertise a security contact + policy on the API too, not
   // just the static docs. Researchers scanning the origin should always

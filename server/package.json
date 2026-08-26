@@ -2,7 +2,7 @@
   "name": "@agentvisor/api",
   "version": "0.1.0",
   "private": true,
-  "description": "AgentVisor AI hosted API \u2014 multi-tenant control plane.",
+  "description": "AgentVisor AI hosted API — multi-tenant control plane.",
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -27,8 +27,9 @@
     "jose": "^5.10.0",
     "pg": "^8.23.0",
     "pino": "^9.7.0",
-    "zod": "^3.24.2",
-    "prisma": "6.12.0"
+    "prisma": "6.12.0",
+    "prom-client": "^15.1.3",
+    "zod": "^3.24.2"
   },
   "devDependencies": {
     "@types/node": "^22.13.5",

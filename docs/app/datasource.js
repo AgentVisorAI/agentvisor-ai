@@ -890,18 +890,33 @@
       opts.body = JSON.stringify(opts.body);
       headers["Content-Type"] = "application/json";
     }
+    // Belt-and-suspenders CSRF marker — the server accepts these
+    // requests only from allow-listed origins, but adding the header
+    // ensures forgery via a form POST fails even if a proxy strips
+    // Origin/Referer along the way.
+    headers["X-Requested-With"] = "fetch";
     var res = await fetch(apiUrl(path), {
       method: opts.method || "GET",
       credentials: "include",
       headers: headers,
       body: opts.body,
     });
+    // Capture the request-id for the crash card + support tickets.
+    try {
+      var rid = res.headers.get && res.headers.get("x-request-id");
+      if (rid) window.__lastRequestId = rid;
+    } catch (e) {}
     var text = await res.text();
+    // Server errors are now RFC 7807 problem+json. Fall back to legacy
+    // { error } shape gracefully.
     var data = text ? JSON.parse(text) : {};
     if (!res.ok) {
-      var err = new Error(data.error || "http_" + res.status);
+      var msg = data.detail || data.title || data.error || ("http_" + res.status);
+      var err = new Error(msg);
       err.status = res.status;
       err.data = data;
+      err.errorCode = data.errorCode;
+      err.requestId = data.requestId || window.__lastRequestId;
       throw err;
     }
     return data;

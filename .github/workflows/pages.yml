@@ -100,6 +100,10 @@ jobs:
           # root so security scanners can find it.
           mkdir -p "$site/.well-known"
           cp docs/.well-known/security.txt "$site/.well-known/"
+          # Legal pages — Terms + Privacy stubs so footer links resolve.
+          mkdir -p "$site/legal"
+          cp docs/legal/terms.html "$site/legal/"
+          cp docs/legal/privacy.html "$site/legal/"
           # Publish the assembled directory.
           rm -rf target/doc
           mv "$site" target/doc

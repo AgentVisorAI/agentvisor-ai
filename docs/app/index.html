@@ -32,6 +32,43 @@
     </div>
   </noscript>
 
+  <!--
+    Boot-time safety net. If anything below this comment throws before
+    or during the app's own error handler installs, the user sees a
+    small centered crash card with a Reload button + a request-id
+    (when known). This runs BEFORE the app scripts load so a syntax
+    error in either app.js or datasource.js doesn't leave a blank page.
+  -->
+  <script>
+    (function () {
+      function crashCard(msg, requestId) {
+        try {
+          var host = document.getElementById("app") || document.body;
+          host.innerHTML =
+            '<div style="max-width:520px;margin:96px auto;padding:24px 28px;font:14px/1.5 -apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;background:#fff;border:1px solid #e0e0e0;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.06)">' +
+              '<div style="font-size:15px;font-weight:600;margin-bottom:6px">The console hit an error</div>' +
+              '<div style="color:#4a4a4a;margin-bottom:16px">' + String(msg || "Unknown error").replace(/[<&"]/g, function (c) { return c === "<" ? "&lt;" : c === "&" ? "&amp;" : "&quot;"; }) + '</div>' +
+              (requestId ? '<div style="font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:#888;margin-bottom:16px">request-id: ' + String(requestId).replace(/[<&"]/g, "") + '</div>' : "") +
+              '<button style="border:0;background:#0a5c8b;color:#fff;padding:8px 16px;border-radius:8px;font-weight:500;cursor:pointer" onclick="location.reload()">Reload</button>' +
+              '<a style="margin-left:12px;color:#0a5c8b;text-decoration:none" href="mailto:hello@agentvisorai.me?subject=Console%20crash">Contact support</a>' +
+            '</div>';
+        } catch (e) {
+          // Truly wedged — fall back to a native alert.
+          alert("Console crashed: " + msg + (requestId ? " (request-id " + requestId + ")" : ""));
+        }
+      }
+      window.addEventListener("error", function (ev) {
+        var msg = (ev.error && ev.error.message) || ev.message || "Uncaught error";
+        crashCard(msg, window.__lastRequestId);
+      });
+      window.addEventListener("unhandledrejection", function (ev) {
+        var reason = ev.reason;
+        var msg = (reason && (reason.message || reason.detail || reason.toString && reason.toString())) || "Unhandled promise rejection";
+        crashCard(msg, window.__lastRequestId);
+      });
+    }());
+  </script>
+
   <script src="datasource.js"></script>
   <script src="app.js"></script>
 </body>

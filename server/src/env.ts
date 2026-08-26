@@ -58,6 +58,18 @@ const Env = z.object({
         .map((s) => s.trim())
         .filter(Boolean),
     ),
+  // IPs (or IP prefixes) allowed to scrape /metrics. Empty = allow
+  // everyone (dev). In production keep this scoped to the scraper's
+  // egress addresses so we don't leak traffic patterns.
+  ALLOW_METRICS_IPS: z
+    .string()
+    .default("")
+    .transform((v) =>
+      v
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
+    ),
 });
 
 const parsed = Env.safeParse(process.env);

@@ -54,7 +54,9 @@ kill_timeout = "10s"
   interval = "15s"
   timeout = "2s"
   method = "GET"
-  path = "/healthz"
+  # /readyz probes both process + DB. Fly stops routing traffic on 503,
+  # so a DB blip drains the pool instead of surfacing 500s on the LB.
+  path = "/readyz"
 
 # Cheapest tier that still handles a healthy demo load. Autoscale up in prod:
 #   fly scale vm shared-cpu-2x --memory 1024

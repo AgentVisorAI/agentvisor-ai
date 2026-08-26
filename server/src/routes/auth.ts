@@ -200,6 +200,109 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     });
   });
 
+  // GDPR data export. Returns everything the org has stored:
+  // deployments, sessions, events, receipts, memberships, users.
+  // Password hashes and reset tokens are excluded — the export is meant
+  // for the customer, not an attacker with a stolen session.
+  //
+  // Gated on a fresh password check so a stolen session cookie can't
+  // extract the whole org history in one call.
+  app.post("/me/export", {
+    config: { rateLimit: perIp(3, 60_000) },
+  }, async (req, reply) => {
+    const claims = requireSession(req, reply);
+    if (!claims) return;
+    const body = z
+      .object({ password: z.string().min(1).max(1024) })
+      .safeParse(req.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "password_required" });
+    }
+    const user = await db.user.findUnique({ where: { id: claims.sub } });
+    if (!user) return reply.code(401).send({ error: "unauthenticated" });
+    const ok = await verifyPassword(user.passwordHash, body.data.password);
+    if (!ok) return reply.code(401).send({ error: "invalid_password" });
+
+    // One transactional read so the export is a point-in-time snapshot.
+    const dump = await db.$transaction(async (tx) => {
+      const org = await tx.org.findUnique({
+        where: { id: claims.orgId },
+        include: {
+          members: { include: { user: { select: { id: true, email: true, displayName: true } } } },
+          deployments: {
+            include: {
+              sessions: {
+                include: {
+                  events: true,
+                  receipt: true,
+                },
+              },
+            },
+          },
+        },
+      });
+      return org;
+    });
+
+    reply.header(
+      "Content-Disposition",
+      `attachment; filename="agentvisor-export-${claims.orgId}-${Date.now()}.json"`,
+    );
+    return reply.send({
+      exportedAt: new Date().toISOString(),
+      schemaVersion: 1,
+      // Note: password hashes are intentionally NOT included.
+      org: dump,
+    });
+  });
+
+  // Account + org deletion. Owner-only. Requires password + explicit
+  // confirmation string to prevent a mis-click from nuking a whole
+  // tenant.
+  //
+  // Cascading deletes fire down the tree — Prisma's onDelete:Cascade
+  // handles deployments → sessions → events → receipts. Memberships
+  // and Users are removed last.
+  app.post("/me/delete-account", {
+    config: { rateLimit: perIp(3, 60_000) },
+  }, async (req, reply) => {
+    const claims = requireSession(req, reply);
+    if (!claims) return;
+    if (claims.membershipRole !== "owner") {
+      return reply.code(403).send({ error: "only_owner_can_delete" });
+    }
+    const body = z
+      .object({
+        password: z.string().min(1).max(1024),
+        confirm: z.literal("DELETE MY ACCOUNT"),
+      })
+      .safeParse(req.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "confirmation_required" });
+    }
+    const user = await db.user.findUnique({ where: { id: claims.sub } });
+    if (!user) return reply.code(401).send({ error: "unauthenticated" });
+    const ok = await verifyPassword(user.passwordHash, body.data.password);
+    if (!ok) return reply.code(401).send({ error: "invalid_password" });
+
+    await db.$transaction(async (tx) => {
+      // Delete the org first — cascades to deployments, sessions,
+      // events, receipts, memberships.
+      await tx.org.delete({ where: { id: claims.orgId } });
+      // Then remove the user. Other orgs they belonged to (unlikely
+      // at MVP; multi-org membership not exposed yet) would keep them.
+      const otherMemberships = await tx.membership.count({
+        where: { userId: claims.sub },
+      });
+      if (otherMemberships === 0) {
+        await tx.user.delete({ where: { id: claims.sub } });
+      }
+    });
+
+    clearSessionCookie(reply);
+    return reply.send({ ok: true });
+  });
+
   // Password reset — two-step flow. The first endpoint always returns 202,
   // regardless of whether the email exists, so we don't leak account
   // membership. The plaintext token is delivered ONLY via the configured
