@@ -294,7 +294,32 @@ impl Registry {
         self.reserve_base_kind(key, MetricKind::Counter);
         let mut m = self.metrics.lock();
         match m.get(key) {
-            Some((_, Metric::Counter(c))) => Arc::clone(c),
+            Some((existing_help, Metric::Counter(c))) => {
+                // R73 F4 (landed R74): warn on HELP-string drift
+                // across registration sites. `MetricRegistry` is
+                // first-wins on HELP, so a rich forensic HELP
+                // registered at the actual observation site
+                // (e.g. `reconciler.rs`) is silently shadowed by
+                // an earlier terse HELP at boot (e.g.
+                // `pipeline.rs`), quietly defeating alerting
+                // playbooks that key on the descriptive text.
+                // Debug-only warn (not panic) so a drifting
+                // refactor is visible in tracing output but doesn't
+                // break the boot path — the correct fix is to
+                // unify the HELP text across the two sites (extract
+                // to a `const`), and the warn surfaces exactly
+                // which pairs still drift.
+                if cfg!(debug_assertions) && existing_help != help {
+                    tracing::warn!(
+                        target: "av_core::metrics",
+                        metric = key,
+                        existing_help = %existing_help,
+                        new_help = %help,
+                        "counter registered with divergent HELP; first-wins semantic — extract HELP to a shared const to eliminate drift"
+                    );
+                }
+                Arc::clone(c)
+            }
             Some((_, Metric::Gauge(_))) => panic!(
                 "metric name conflict: {key:?} is already registered as a gauge, \
                  cannot register as a counter",
@@ -321,7 +346,18 @@ impl Registry {
         self.reserve_base_kind(key, MetricKind::Gauge);
         let mut m = self.metrics.lock();
         match m.get(key) {
-            Some((_, Metric::Gauge(g))) => Arc::clone(g),
+            Some((existing_help, Metric::Gauge(g))) => {
+                if cfg!(debug_assertions) && existing_help != help {
+                    tracing::warn!(
+                        target: "av_core::metrics",
+                        metric = key,
+                        existing_help = %existing_help,
+                        new_help = %help,
+                        "gauge registered with divergent HELP; first-wins semantic — extract HELP to a shared const to eliminate drift"
+                    );
+                }
+                Arc::clone(g)
+            }
             Some((_, Metric::Counter(_))) => panic!(
                 "metric name conflict: {key:?} is already registered as a counter, \
                  cannot register as a gauge",
@@ -366,7 +402,18 @@ impl Registry {
         self.reserve_base_kind(key, MetricKind::Histogram);
         let mut m = self.metrics.lock();
         match m.get(key) {
-            Some((_, Metric::Histogram(h))) => Arc::clone(h),
+            Some((existing_help, Metric::Histogram(h))) => {
+                if cfg!(debug_assertions) && existing_help != help {
+                    tracing::warn!(
+                        target: "av_core::metrics",
+                        metric = key,
+                        existing_help = %existing_help,
+                        new_help = %help,
+                        "histogram registered with divergent HELP; first-wins semantic — extract HELP to a shared const to eliminate drift"
+                    );
+                }
+                Arc::clone(h)
+            }
             Some((_, Metric::Counter(_))) => panic!(
                 "metric name conflict: {key:?} is already registered as a counter, \
                  cannot register as a histogram",

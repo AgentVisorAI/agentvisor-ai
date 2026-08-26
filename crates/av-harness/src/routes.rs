@@ -1054,17 +1054,11 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     let admission_permit = match Arc::clone(&state.mcp_admission).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
-            state
-                .metrics
-                .counter(
-                    "av_mcp_admission_refusals_total",
-                    "MCP admission was refused because `mcp_concurrency` was already at capacity — \
-                     each admitted call can buffer up to 16 MiB in `read_limited_tool_response`, \
-                     so the cap bounds worst-case MCP resident memory. Sustained > 0 indicates \
-                     tool-upstream slowdown, a burst-traffic event, or an undersized \
-                     `mcp_concurrency`.",
-                )
-                .inc();
+            // R72 review F2 (landed R74): direct `.inc()` on the
+            // pre-resolved handle in AppState — no registry mutex
+            // acquired on the refusal hot path. Matches HotMetrics
+            // discipline.
+            state.mcp_admission_refusals_counter.inc();
             let mut response = (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(openai_error_body(
