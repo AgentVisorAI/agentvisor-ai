@@ -575,6 +575,56 @@ fn child_without_nbf_at_parent_effective_start_is_accepted() {
     assert!(v.validate(&mint(&keys, &child)).is_ok());
 }
 
+/// R17 (review-of-R16): the `NbfEscalation.child` field carries the
+/// EFFECTIVE start (`child.nbf.unwrap_or(child.iat)`), not the raw
+/// `nbf`. Pin the semantic contract so downstream consumers who
+/// alert on this variant can trust the value's meaning — and so a
+/// future refactor that reverts to `child.nbf` would fail this test
+/// instead of silently corrupting the audit log.
+#[test]
+fn nbf_escalation_child_field_is_effective_start_not_raw_nbf() {
+    let keys = ed25519_keys("k1");
+    let v = validator(&keys);
+    let mut parent = claims(&["tool:read"], 600, None);
+    parent.nbf = Some(parent.iat + 10);
+    let parent_token = mint(&keys, &parent);
+    let mut child = claims(&["tool:read"], 300, Some(parent_token));
+    child.exp = parent.exp - 60;
+    child.nbf = None; // NO explicit nbf on the wire
+
+    match v.validate(&mint(&keys, &child)) {
+        Err(IdentityError::NbfEscalation { child: c, parent: p }) => {
+            assert_eq!(
+                c, child.iat,
+                "NbfEscalation.child MUST carry the effective start \
+                 (child.iat when child.nbf is None), not None/0 — audit \
+                 pipelines display this value alongside a message that \
+                 promises 'effective-start'; a mismatch would mislead \
+                 the operator"
+            );
+            assert_eq!(
+                p,
+                parent.nbf.unwrap(),
+                "NbfEscalation.parent carries parent.nbf.unwrap_or(iat) — \
+                 here parent.nbf is set, so this equals parent.nbf"
+            );
+        }
+        other => panic!("expected NbfEscalation, got {other:?}"),
+    }
+
+    // And its Display renders the effective-start label, not the
+    // stale pre-R17 "child nbf … predates parent nbf …" phrasing.
+    let err = IdentityError::NbfEscalation {
+        child: 100,
+        parent: 200,
+    };
+    let rendered = format!("{err}");
+    assert!(
+        rendered.contains("effective-start"),
+        "Display must reflect effective-start semantics: {rendered}"
+    );
+}
+
 /// The bidi/zero-width Trojan-Source guard must cover scopes[] too,
 /// not only the six primary identity strings. A scope like
 /// `payout\u{202E}elbast` (right-to-left override) renders as
