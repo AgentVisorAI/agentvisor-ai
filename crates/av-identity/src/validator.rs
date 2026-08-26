@@ -119,14 +119,23 @@ pub enum IdentityError {
         /// Parent issued-at.
         parent: u64,
     },
-    /// Child claims not-before earlier than its parent's not-before
-    /// (or than the parent's `iat` when the parent has no `nbf`) —
-    /// same forgery class as `IatEscalation`.
-    #[error("child nbf {child} predates parent nbf {parent}")]
+    /// Child's effective start (`nbf` when set, else `iat`) is
+    /// earlier than the parent's effective start (`nbf` when set,
+    /// else `iat`) — same forgery class as `IatEscalation`. The
+    /// carried `child` and `parent` values are the compared
+    /// EFFECTIVE starts, not the raw `nbf` fields (which may be
+    /// absent). See `IdentityValidator::validate` for the full
+    /// case matrix.
+    #[error("child effective-start {child} predates parent effective-start {parent}")]
     NbfEscalation {
-        /// Child not-before.
+        /// Child effective start: `child.nbf` when set, else
+        /// `child.iat`. R16 broadened this variant to cover the
+        /// input case where the child omits `nbf` but its `iat`
+        /// predates the parent's explicit `nbf` — a temporal
+        /// inversion the pre-R16 guard silently accepted.
         child: u64,
-        /// Parent not-before (or iat if nbf absent).
+        /// Parent effective start: `parent.nbf` when set, else
+        /// `parent.iat`.
         parent: u64,
     },
     /// Delegation chain deeper than permitted.
