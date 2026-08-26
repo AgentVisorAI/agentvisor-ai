@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::stream::BoxStream;
-use futures::{Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use serde_json::{json, Value};
 use std::future::Future as _;
 use std::pin::Pin;
@@ -3749,21 +3749,55 @@ impl Drop for AbortFinalizingStream {
                 let session_id = session.id.clone();
                 if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                     runtime.spawn(async move {
-                        if let Err(error) = finalizer.close_session(session, StopReason::SessionClosed).await
-                        {
-                            finalizer
-                                .metrics()
-                                .counter(
-                                    "av_ephemeral_close_failures_total",
-                                    "Auto-close of a completed ephemeral one-shot failed; \
-                                     the session is left open until the idle sweeper reaps it",
-                                )
-                                .inc();
-                            tracing::warn!(
-                                %error,
-                                %session_id,
-                                "auto-close of completed ephemeral session failed"
-                            );
+                        // Catch panics inside `close_session` (bridge
+                        // publish, receipt-signing JCS overflow, a
+                        // metric-registry collision on any lazy
+                        // `.counter(...)`, tracing Display allocator
+                        // failure): a panicking async body in a
+                        // detached `spawn` is silently swallowed by
+                        // tokio's default `UnhandledPanic::Ignore`,
+                        // so the operator would never see the class.
+                        // Emit the panic counter so
+                        // `rate(av_ephemeral_close_panics_total)`
+                        // catches it. Same discipline as the workspace's
+                        // long-lived loops (reconciler, worker, bridge).
+                        let outcome = std::panic::AssertUnwindSafe(
+                            finalizer.close_session(session, StopReason::SessionClosed),
+                        )
+                        .catch_unwind()
+                        .await;
+                        match outcome {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                finalizer
+                                    .metrics()
+                                    .counter(
+                                        "av_ephemeral_close_failures_total",
+                                        "Auto-close of a completed ephemeral one-shot failed; \
+                                         the session is left open until the idle sweeper reaps it",
+                                    )
+                                    .inc();
+                                tracing::warn!(
+                                    %error,
+                                    %session_id,
+                                    "auto-close of completed ephemeral session failed"
+                                );
+                            }
+                            Err(_) => {
+                                finalizer
+                                    .metrics()
+                                    .counter(
+                                        "av_ephemeral_close_panics_total",
+                                        "Auto-close of a completed ephemeral one-shot panicked \
+                                         and was caught; the session is left open until the idle \
+                                         sweeper reaps it",
+                                    )
+                                    .inc();
+                                tracing::warn!(
+                                    %session_id,
+                                    "auto-close of completed ephemeral session PANICKED (caught)"
+                                );
+                            }
                         }
                     });
                 }
@@ -3871,21 +3905,50 @@ impl Drop for AbortFinalizingStream {
                     // so a PromQL alert can catch the class — the
                     // fallback path is otherwise invisible until the
                     // idle sweeper reaps the "still open" session.
+                    // `catch_unwind`: an async body panicking inside
+                    // detached `tokio::spawn` is silently swallowed by
+                    // tokio's default `UnhandledPanic::Ignore`. Route
+                    // the panic to `av_stream_abort_panics_total` so
+                    // the class shows up on `/metrics` — matches the
+                    // discipline every other background-loop
+                    // supervisor in this workspace applies.
                     runtime.spawn(async move {
-                        if let Err(error) = finalizer.close_session(session, stop_reason).await {
-                            finalizer
-                                .metrics()
-                                .counter(
-                                    "av_stream_abort_close_failures_total",
-                                    "Background close after a stream abort failed; \
-                                     the session is left open until the idle sweeper reaps it",
-                                )
-                                .inc();
-                            tracing::warn!(
-                                %error,
-                                %session_id,
-                                "background close on stream abort failed"
-                            );
+                        let outcome =
+                            std::panic::AssertUnwindSafe(finalizer.close_session(session, stop_reason))
+                                .catch_unwind()
+                                .await;
+                        match outcome {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                finalizer
+                                    .metrics()
+                                    .counter(
+                                        "av_stream_abort_close_failures_total",
+                                        "Background close after a stream abort failed; \
+                                         the session is left open until the idle sweeper reaps it",
+                                    )
+                                    .inc();
+                                tracing::warn!(
+                                    %error,
+                                    %session_id,
+                                    "background close on stream abort failed"
+                                );
+                            }
+                            Err(_) => {
+                                finalizer
+                                    .metrics()
+                                    .counter(
+                                        "av_stream_abort_panics_total",
+                                        "Background close after a stream abort panicked and was \
+                                         caught; the session is left open until the idle sweeper \
+                                         reaps it",
+                                    )
+                                    .inc();
+                                tracing::warn!(
+                                    %session_id,
+                                    "background close on stream abort PANICKED (caught)"
+                                );
+                            }
                         }
                     });
                 }

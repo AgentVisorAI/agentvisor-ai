@@ -503,6 +503,18 @@ pub(crate) struct AdmissionDebit {
     budget: av_state::BudgetSpec,
     principal: Option<(String, av_state::BudgetSpec)>,
     tokens: u64,
+    /// Metrics registry for the Drop-path panic supervisor.
+    ///
+    /// If the refund closure panics inside the spawn_blocking pool (a
+    /// backend allocator failure, a parking_lot mutex panic during
+    /// unwind, a HashMap grow OOM), tokio's default
+    /// `UnhandledPanic::Ignore` swallows it silently. The debit then
+    /// stays permanent on BOTH the session ledger and — the material
+    /// consequence — the principal ledger, which persists across
+    /// sessions and never heals. Surface the panic via a bumped
+    /// counter and a tracing::error so `rate(av_admission_refund_panics_total)`
+    /// catches it.
+    metrics: Arc<Registry>,
 }
 
 impl AdmissionDebit {
@@ -545,10 +557,45 @@ impl Drop for AdmissionDebit {
         let session_id = std::mem::take(&mut self.session_id);
         let budget = std::mem::take(&mut self.budget);
         let principal = self.principal.take();
+        let metrics = Arc::clone(&self.metrics);
+        // `catch_unwind` around the refund body so a panic inside
+        // spawn_blocking (backend allocator OOM, parking_lot mutex
+        // panic during unwind, a HashMap grow at capacity) doesn't
+        // get swallowed by tokio's default `UnhandledPanic::Ignore`.
+        // The `store: Arc<dyn StateStore>` and `metrics: Arc<Registry>`
+        // captures are already `UnwindSafe` (Arc is UnwindSafe when
+        // its inner T is `RefUnwindSafe`, and the store trait's
+        // implementors are RefUnwindSafe by convention here).
+        // `session_id: String`, `budget: BudgetSpec`, and
+        // `principal: Option<(String, BudgetSpec)>` are all
+        // Send + UnwindSafe. Wrap the whole thing in
+        // `AssertUnwindSafe` to bypass the `RefUnwindSafe` check on
+        // the trait object rather than plumb the bound through the
+        // whole StateStore hierarchy — the invariant we care about
+        // (no shared mutable state leaked from the refund) is
+        // upheld by construction.
+        let sess_for_log = session_id.clone();
         let refund = move || {
-            ActionBudget::new(store.as_ref(), &session_id, &budget).refund_tokens(tokens);
-            if let Some((principal_id, spec)) = principal.as_ref() {
-                ActionBudget::for_principal(store.as_ref(), principal_id, spec).refund_tokens(tokens);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ActionBudget::new(store.as_ref(), &session_id, &budget).refund_tokens(tokens);
+                if let Some((principal_id, spec)) = principal.as_ref() {
+                    ActionBudget::for_principal(store.as_ref(), principal_id, spec).refund_tokens(tokens);
+                }
+            }));
+            if outcome.is_err() {
+                metrics
+                    .counter(
+                        "av_admission_refund_panics_total",
+                        "Admission-debit refund closure panicked in Drop; the session \
+                         and principal ledgers retain the debit until operator repair",
+                    )
+                    .inc();
+                tracing::error!(
+                    session_id = %sess_for_log,
+                    tokens,
+                    "admission-debit refund PANICKED (caught); \
+                     principal ledger drain persists until operator repair"
+                );
             }
         };
         match tokio::runtime::Handle::try_current() {
@@ -1003,6 +1050,62 @@ impl AppState {
             "av_stream_abort_no_runtime_total",
             "Stream abort observed no tokio runtime; capture marked failed for \
              reconciler retry",
+        );
+        // Panic-supervision counters — same lazy-series defect the
+        // stream-close counters above defeat, applied to every
+        // background loop's `catch_unwind` arm. Absent-series alerts
+        // (`absent(av_reconciler_panics_total)`) fire a false-positive
+        // on healthy nodes when the counter is registered only inside
+        // the panic arm, and `rate() > 0` alerts cannot distinguish
+        // "never panicked" from "never registered" — so the FIRST
+        // panic that the guardrail exists to catch slips past the
+        // alert. Pre-register the five outliers alongside the
+        // stream-close set. `av_jwks_refresh_panics_total` is
+        // already eagerly registered at its call site (main.rs
+        // beside its interval creation); the five below are the
+        // panic-arm-only stragglers.
+        metrics.counter(
+            "av_reconciler_panics_total",
+            "Reconciler tick body panicked and was caught; the reconciler \
+             continues on the next tick",
+        );
+        metrics.counter(
+            "av_worker_shard_panics_total",
+            "Worker shard job body panicked and was caught; the shard \
+             continues serving subsequent jobs",
+        );
+        metrics.counter(
+            "av_bridge_maintenance_panics_total",
+            "Bridge maintenance tick panicked and was caught; the loop \
+             continues on the next interval",
+        );
+        metrics.counter(
+            "av_bridge_maintenance_errors_total",
+            "Bridge maintenance tick returned an error; the loop continues \
+             on the next interval",
+        );
+        metrics.counter(
+            "av_bridge_maintenance_join_errors_total",
+            "Bridge maintenance tick's spawned task failed to join (panic \
+             or cancellation); the loop continues on the next interval",
+        );
+        // Drop-spawned close-session and admission-refund panics —
+        // same rationale. Each is written only from a Drop-spawned
+        // background task on the panic arm.
+        metrics.counter(
+            "av_stream_abort_panics_total",
+            "Background close after a stream abort panicked and was caught; \
+             the session is left open until the idle sweeper reaps it",
+        );
+        metrics.counter(
+            "av_ephemeral_close_panics_total",
+            "Auto-close of a completed ephemeral one-shot panicked and was \
+             caught; the session is left open until the idle sweeper reaps it",
+        );
+        metrics.counter(
+            "av_admission_refund_panics_total",
+            "Admission-debit refund closure panicked in Drop; the session \
+             and principal ledgers retain the debit until operator repair",
         );
         // Reconciler ticks scan the ATIF spool dir, which can be large;
         // finalisation waits for worker drain + broker publish. Wide
@@ -1527,6 +1630,7 @@ impl AppState {
                 .as_ref()
                 .map(|spec| (principal_id_for_budget(&identity), spec.clone())),
             tokens: billed_tokens,
+            metrics: Arc::clone(&self.metrics),
         };
         Ok(PreparedRequest {
             session,
