@@ -91,6 +91,7 @@ model Deployment {
   org      Org       @relation(fields: [orgId], references: [id], onDelete: Cascade)
   sessions Session[]
 
+  @@unique([orgId, name])
   @@index([orgId])
   @@map("deployments")
 }

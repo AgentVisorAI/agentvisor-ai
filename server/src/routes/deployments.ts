@@ -51,22 +51,37 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
     }
     const plaintextToken = randomToken(24);
     const ingestTokenHash = await hashPassword(plaintextToken);
-    const deployment = await db.deployment.create({
-      data: {
-        orgId: claims.orgId,
-        name: body.data.name,
-        environment: body.data.environment,
-        ingestTokenHash,
-        ingestTokenHint: tokenHint(plaintextToken),
-      },
-      select: {
-        id: true,
-        name: true,
-        environment: true,
-        ingestTokenHint: true,
-        createdAt: true,
-      },
-    });
+    let deployment;
+    try {
+      deployment = await db.deployment.create({
+        data: {
+          orgId: claims.orgId,
+          name: body.data.name,
+          environment: body.data.environment,
+          ingestTokenHash,
+          ingestTokenHint: tokenHint(plaintextToken),
+        },
+        select: {
+          id: true,
+          name: true,
+          environment: true,
+          ingestTokenHint: true,
+          createdAt: true,
+        },
+      });
+    } catch (err) {
+      // Compound unique (orgId, name) — friendlier 409 than a 500 with
+      // the Prisma error code leaked to the client. Two deployments
+      // named 'prod' in the same org would confuse the deployments list
+      // and the sessions filter dropdown, so we reject at write time.
+      if (
+        typeof err === "object" && err !== null &&
+        (err as { code?: string }).code === "P2002"
+      ) {
+        return reply.code(409).send({ error: "deployment_name_in_use" });
+      }
+      throw err;
+    }
     return reply.code(201).send({
       deployment,
       // Shown once. If lost, the user rotates.
