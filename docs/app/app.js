@@ -1337,6 +1337,8 @@
   }
 
   function openCreateDeploymentModal() {
+    // Guard against a rage-click / double-tap opening N stacked modals.
+    if (document.body.classList.contains("locked")) return;
     var backdrop = h(
       '<div class="modal-backdrop" role="dialog" aria-modal="true">' +
         '<div class="modal">' +
@@ -1376,6 +1378,7 @@
   }
 
   function showTokenModal(token, title) {
+    if (document.body.classList.contains("locked")) return;
     var backdrop = h(
       '<div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="tokTitle">' +
         '<div class="modal">' +
@@ -1578,6 +1581,7 @@
   }
 
   function openInputModal(opts) {
+    if (document.body.classList.contains("locked")) return;
     var backdrop = h(
       '<div class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal">' +
         "<h2>" + esc(opts.title) + "</h2>" +
@@ -1616,6 +1620,7 @@
   }
 
   function comingSoon(title, body) {
+    if (document.body.classList.contains("locked")) return;
     var backdrop = h(
       '<div class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal">' +
         "<h2>" + esc(title) + "</h2>" +
@@ -1820,6 +1825,7 @@
    * ============================================================ */
 
   function confirmModal(opts) {
+    if (document.body.classList.contains("locked")) return;
     var backdrop = h(
       '<div class="modal-backdrop" role="dialog" aria-modal="true">' +
         '<div class="modal ' + (opts.danger ? "confirm-danger" : "") + '">' +
@@ -1998,6 +2004,10 @@
       // ⌘K / Ctrl+K
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
+        // If any modal / overlay is open, don't stack the palette on top.
+        // The palette itself sets `.locked` so pressing ⌘K twice can't
+        // reopen it either.
+        if (document.body.classList.contains("locked")) return;
         openCmdK();
         return;
       }

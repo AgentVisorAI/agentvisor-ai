@@ -181,7 +181,20 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       });
       if (!session) continue; // ignore events for a session the daemon didn't upsert first
 
-      // Rollups.
+      // Idempotency: filter the batch down to *new* seqs before touching
+      // the rollup counters. A retrying daemon that sends the same events
+      // twice must not double-count tokens / cost / payout — this was a
+      // real bug where session totals grew every retry even though the
+      // event rows were skipped by createMany.skipDuplicates.
+      const existing = await db.event.findMany({
+        where: { sessionId: session.id, seq: { in: batch.map((e) => e.seq) } },
+        select: { seq: true },
+      });
+      const existingSeqs = new Set(existing.map((e) => e.seq));
+      const fresh = batch.filter((e) => !existingSeqs.has(e.seq));
+      if (fresh.length === 0) continue;
+
+      // Rollups computed from the *fresh* subset only.
       let dPrompt = 0;
       let dCompletion = 0;
       let dCost = 0;
@@ -189,7 +202,7 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       let dBlockedPayout = 0;
       let dToolsOk = 0;
       let dToolsBad = 0;
-      for (const e of batch) {
+      for (const e of fresh) {
         dPrompt += e.addPromptTokens;
         dCompletion += e.addCompletionTokens;
         dCost += e.addCostUsdMicros;
@@ -199,7 +212,7 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
         dToolsBad += e.addToolsBlocked;
       }
 
-      const rows = batch.map((e) => ({
+      const rows = fresh.map((e) => ({
         sessionId: session.id,
         seq: e.seq,
         kind: e.kind,
@@ -211,8 +224,10 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       }));
       const result = await db.event.createMany({
         data: rows,
-        // Postgres supports skipDuplicates natively — duplicate seq values
-        // from a daemon retry are dropped silently, keeping /events idempotent.
+        // Belt-and-suspenders: even after our pre-filter above, a
+        // concurrent request may have inserted the same seq before we
+        // ran, so keep skipDuplicates on the createMany itself. Postgres
+        // supports it natively.
         skipDuplicates: true,
       });
       inserted += result.count;
