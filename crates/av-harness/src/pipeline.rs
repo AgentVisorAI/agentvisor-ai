@@ -1154,10 +1154,19 @@ impl AppState {
         // option support). The tracing warn is dampened via
         // `std::sync::Once` to avoid a per-accept log storm; this
         // counter keeps operator visibility of the failure rate.
+        //
+        // Help string MUST match the main.rs registration site
+        // byte-exact: `Registry::counter` returns the pre-registered
+        // Arc<Counter> and discards subsequent `help` strings, so
+        // divergent HELP would silently drop the more informative
+        // one from `/metrics`. Same discipline as every sibling
+        // `*_panics_total` pre-registration.
         metrics.counter(
             "av_tcp_nodelay_failures_total",
             "TCP_NODELAY setsockopt failed on an accepted connection; the \
-             suboptimal-latency connection still serves",
+             suboptimal-latency connection still serves. Rate-limited to a \
+             single tracing warn per process to avoid a per-accept log storm \
+             under half-open flood / SYN flood.",
         );
         // Drop-spawned close-session and admission-refund panics —
         // same rationale. Each is written only from a Drop-spawned
