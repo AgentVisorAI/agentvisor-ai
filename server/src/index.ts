@@ -63,6 +63,10 @@ async function main(): Promise<void> {
       cb(null, env.ALLOWED_ORIGINS.includes(origin));
     },
     credentials: true,
+    // Include DELETE + PATCH + PUT in the preflight response — @fastify/cors
+    // defaults to just GET/POST/HEAD which silently breaks the console's
+    // deployment/token-rotation flows on cross-origin deploys.
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     exposedHeaders: ["X-Request-Id"],
   });
   await app.register(cookie);
