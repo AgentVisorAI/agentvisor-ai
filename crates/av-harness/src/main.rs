@@ -496,8 +496,8 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     // keeps running orphaned. The reconciler ticks 14 400× more
     // often than the retention loop below and does far more spool-
     // mutating work per tick; without Notify, orphan reconciler
-    // closures race `finalize_sessions` at :596-614 for the same
-    // session journal / bridge segment on process exit. Same
+    // closures race `finalize_sessions` (declared below) for the
+    // same session journal / bridge segment on process exit. Same
     // rationale as retention and bridge_maintenance below.
     reconciler_shutdown.notify_one();
     // Signal retention to stop instead of aborting.
@@ -570,6 +570,7 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     let flush_telemetry = || Ok(());
     let open_sessions = state.sessions.open_sessions();
     let shutdown_finalizer = state.finalizer.clone();
+    let post_finalize_worker = state.worker.clone();
     let finalize_sessions = async move {
         let mut failures = Vec::new();
         // Bound each per-session close so a stuck session (a leaked
@@ -629,6 +630,19 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
                 }
             }
         }
+        // R69 F2 (landed R70): `close_session` internally submits new
+        // worker jobs (SESSION_CLOSE bridge publish + journal writes).
+        // The outer `worker_drain` at :660 only wait_idle'd BEFORE
+        // this loop, so any close jobs still in flight raced process
+        // exit — a real "audit-stream discontinuity on every rollout"
+        // hazard where the on-disk `.close-complete` marker is
+        // durable but the wire-side SESSION_CLOSE receipt is lost,
+        // forcing next-boot recovery to synthesize it from spool.
+        // A second wait_idle after the per-session close loop covers
+        // those tail submissions. Runs under the SAME outer
+        // WORKER_FINALIZE_PHASE_SECS timeout the shutdown envelope
+        // is bounded by, so no new deadline surface is added.
+        post_finalize_worker.wait_idle().await;
         if failures.is_empty() {
             Ok(())
         } else {
