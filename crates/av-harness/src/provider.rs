@@ -153,7 +153,18 @@ impl ProviderAdapter for AnthropicAdapter {
         // redundant in the Anthropic dialect; require agreement when
         // both are present so a hostile frame cannot smuggle an error
         // payload under a content event name (or vice versa).
-        if is_sse && !event_type.is_empty() && event_type != frame_type {
+        //
+        // Exception: SSE §9.2.6 makes `message` the default event name
+        // — an empty `event:` field, or its absence, MUST behave as if
+        // `event: message` was set. Gateways (LiteLLM, OpenRouter,
+        // some enterprise OpenAI-compat proxies) commonly normalise
+        // Anthropic's named events under this default when relaying
+        // to a client that consumed the OpenAI shape. Treating
+        // `event: message` as SSE-default (equivalent to unset) here
+        // matches the OpenAI parser's ordering at routes.rs:3465, so
+        // an Anthropic wire that a gateway relabels under `message`
+        // does not fail-close where the same content on OpenAI passes.
+        if is_sse && !event_type.is_empty() && event_type != "message" && event_type != frame_type {
             return Err(format!(
                 "provider SSE event name {event_type:?} does not match payload type {frame_type:?}"
             ));
@@ -652,7 +663,7 @@ fn map_gemini_finish_reason(reason: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::expect_used)]
 
     use super::*;
 
@@ -993,6 +1004,40 @@ mod tests {
             "OpenAI-compat gateways append [DONE]; must not fail-close the stream tail"
         );
         assert!(adapter.parse_sse_chunk("data: [DONE]  ").unwrap().is_none());
+    }
+
+    /// R44 Finding 1: SSE §9.2.6 makes `message` the default event
+    /// name, so a gateway that relabels Anthropic's named events
+    /// under `event: message` (as LiteLLM's `--rewrite openai` mode
+    /// does when relaying to a client that consumed the OpenAI shape)
+    /// must NOT fail-close a well-formed Anthropic payload just
+    /// because the outer `event:` name is the SSE default. Matches
+    /// the OpenAI parser's ordering at routes.rs:3465 which already
+    /// treats `event: message` as unset.
+    #[test]
+    fn anthropic_event_default_message_accepts_any_payload_type() {
+        let adapter = adapter_for("anthropic").unwrap();
+        let frame = concat!(
+            "event: message\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+        );
+        let parsed = adapter
+            .parse_sse_chunk(frame)
+            .expect("SSE-default event: message must be accepted regardless of payload type");
+        assert!(
+            parsed.is_some(),
+            "content_block_delta under SSE-default event must produce a captured chunk"
+        );
+        // Non-default named events with mismatched payload type are STILL refused —
+        // the SSE-default carve-out doesn't relax the smuggle guard.
+        let hostile = concat!(
+            "event: content_block_delta\n",
+            r#"data: {"type":"error","error":{"message":"smuggled"}}"#,
+        );
+        assert!(
+            adapter.parse_sse_chunk(hostile).is_err(),
+            "non-default event with mismatched payload type must still fail-close"
+        );
     }
 
     /// R14: same adapter-parity properties for Gemini.
