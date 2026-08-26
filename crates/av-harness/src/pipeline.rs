@@ -102,6 +102,22 @@ pub struct AppState {
     /// `av_shutdown_session_close_timeouts_total` on an otherwise-
     /// recoverable session.
     pub mcp_inflight: Arc<crate::inflight::InflightTracker>,
+    /// Admission semaphore bounding concurrent `mcp_call_inner`
+    /// executions to `config.mcp_concurrency`. R70 F1 (landed R71):
+    /// without this limit a slow-tool-upstream attack + N
+    /// concurrent MCP callers each buffering up to
+    /// `MAX_TOOL_RESPONSE_BYTES = 16 MiB` in
+    /// `read_limited_tool_response` stacked N × 16 MiB unbounded.
+    /// `mcp_inflight` above is a shutdown-drain COUNTER — not a
+    /// limiter. Chat path already has admission via
+    /// `worker.try_reserve_pair`; MCP was the odd one out.
+    ///
+    /// Refused admissions increment `av_mcp_admission_refusals_
+    /// total` (see mcp_call in routes.rs) and respond 503 with a
+    /// Retry-After header — 503 not 429 because the refusal is a
+    /// server-side capacity signal (matches breaker-open 503-not-
+    /// 429 discipline documented in finalize_error_response.rs).
+    pub mcp_admission: Arc<tokio::sync::Semaphore>,
 }
 
 /// Pre-resolved metric handles for the request hot path so the
@@ -1735,6 +1751,7 @@ impl AppState {
             PipelineError::bad_request(format!("unsupported provider {:?}", config.provider))
         })?;
         tracing::info!(provider = provider_adapter.name(), "provider adapter selected");
+        let mcp_admission = Arc::new(tokio::sync::Semaphore::new(config.mcp_concurrency));
         Ok(Self {
             config,
             store,
@@ -1756,6 +1773,7 @@ impl AppState {
             identity_rejection_window: Arc::new(parking_lot::Mutex::new((Instant::now(), 0))),
             journal_key,
             mcp_inflight: Arc::new(crate::inflight::InflightTracker::new()),
+            mcp_admission,
         })
     }
 

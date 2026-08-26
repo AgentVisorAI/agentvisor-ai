@@ -81,6 +81,7 @@ impl HarnessConfig {
             qdrant_url: None,
             qdrant_collection: default_qdrant_collection(),
             worker_channel_capacity: 1024,
+            mcp_concurrency: 128,
             strict_stage_budget: false,
             breaker: av_loopdetect::BreakerConfig::default(),
             compression_enabled: true,

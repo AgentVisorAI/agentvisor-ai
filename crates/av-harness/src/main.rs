@@ -570,7 +570,6 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     let flush_telemetry = || Ok(());
     let open_sessions = state.sessions.open_sessions();
     let shutdown_finalizer = state.finalizer.clone();
-    let post_finalize_worker = state.worker.clone();
     let finalize_sessions = async move {
         let mut failures = Vec::new();
         // Bound each per-session close so a stuck session (a leaked
@@ -630,19 +629,22 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
                 }
             }
         }
-        // R69 F2 (landed R70): `close_session` internally submits new
-        // worker jobs (SESSION_CLOSE bridge publish + journal writes).
-        // The outer `worker_drain` at :660 only wait_idle'd BEFORE
-        // this loop, so any close jobs still in flight raced process
-        // exit — a real "audit-stream discontinuity on every rollout"
-        // hazard where the on-disk `.close-complete` marker is
-        // durable but the wire-side SESSION_CLOSE receipt is lost,
-        // forcing next-boot recovery to synthesize it from spool.
-        // A second wait_idle after the per-session close loop covers
-        // those tail submissions. Runs under the SAME outer
-        // WORKER_FINALIZE_PHASE_SECS timeout the shutdown envelope
-        // is bounded by, so no new deadline surface is added.
-        post_finalize_worker.wait_idle().await;
+        // R70 Track B misdiagnosis correction (R71 review): the
+        // previous shape appended `post_finalize_worker.wait_idle()`
+        // here on the claim that `close_session` internally submits
+        // new WORKER jobs (SESSION_CLOSE bridge publish). It does
+        // NOT — `close_session_locked` (`reconciler.rs:961`) awaits
+        // `emit_bridge_event → resolve_lifecycle_ack →
+        // spawn_blocking(bridge.publish_idempotent)` INLINE with no
+        // WorkerHandle::submit. `pending` (the counter `wait_idle`
+        // polls) is only incremented by `routes.rs`/`pipeline.rs`
+        // submissions — none from the finalizer path. The added
+        // `wait_idle` observed `pending == 0` on the first read and
+        // returned immediately: defensive dead-code. Removed to avoid
+        // future maintainers reasoning from a false comment. If a
+        // real "close job races exit" hazard emerges, it lives in the
+        // `spawn_blocking` layer (finalizer bridge publishes) and the
+        // fix is a JoinSet-style tracker, not `WorkerHandle::wait_idle`.
         if failures.is_empty() {
             Ok(())
         } else {

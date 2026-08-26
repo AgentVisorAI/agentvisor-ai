@@ -994,6 +994,43 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     if let Some(err) = refuse_non_json_content_type(&headers, "MCP") {
         return err;
     }
+    // R70 F1 (landed R71): admission cap before spawn. `mcp_call_inner`
+    // buffers up to `MAX_TOOL_RESPONSE_BYTES = 16 MiB` per call in
+    // `read_limited_tool_response`; without a limiter, N concurrent
+    // slow-tool-upstream callers stacked N × 16 MiB unbounded. Chat
+    // path is capped via `worker.try_reserve_pair`; the MCP path was
+    // the odd one out. `try_acquire_owned` is non-blocking: on
+    // capacity refusal we return 503 (server-side capacity signal,
+    // matches breaker-open discipline) with Retry-After: 1 so
+    // well-behaved SDKs pace themselves.
+    let admission_permit = match Arc::clone(&state.mcp_admission).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            state
+                .metrics
+                .counter(
+                    "av_mcp_admission_refusals_total",
+                    "MCP admission was refused because `mcp_concurrency` was already at capacity — \
+                     each admitted call can buffer up to 16 MiB in `read_limited_tool_response`, \
+                     so the cap bounds worst-case MCP resident memory. Sustained > 0 indicates \
+                     tool-upstream slowdown, a burst-traffic event, or an undersized \
+                     `mcp_concurrency`.",
+                )
+                .inc();
+            let mut response = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(openai_error_body(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "MCP admission at capacity; retry shortly",
+                )),
+            )
+                .into_response();
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+            return response;
+        }
+    };
     // The tool path mutates durable state at several awaits: the sandbox
     // gate debits the budget, `execution.claim()` claims the execution
     // key, the upstream call executes the tool, and persist/audit resolve
@@ -1017,6 +1054,7 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     // total` on an otherwise-recoverable session).
     let inflight_guard = state.mcp_inflight.enter();
     match tokio::spawn(async move {
+        let _admission_permit = admission_permit;
         let _inflight_guard = inflight_guard;
         mcp_call_inner(state, headers, body).await
     })
