@@ -1964,9 +1964,13 @@ async fn append_journal(
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         use std::io::Write as _;
         // Skip the mkdir when the spool dir already
-        // exists (every request after the first).
+        // exists (every request after the first). If the boot-time
+        // `acquire_spool_lock` root creation was undone (operator
+        // wipe, mount flip) at runtime, use `create_dir_all_synced`
+        // here so the recreated tree still lands at 0o700 — same
+        // discipline the boot path applies.
         if !directory.is_dir() {
-            std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+            av_core::fsutil::create_dir_all_synced(&directory).map_err(|error| error.to_string())?;
         }
         let digest = av_core::digest::sha256_hex(session_id.as_bytes());
         let stem = digest.get(..32).unwrap_or(&digest);
