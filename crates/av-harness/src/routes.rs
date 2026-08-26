@@ -491,7 +491,48 @@ fn spool_footprint(dir: &std::path::Path) -> (u64, u64) {
     (bytes, files)
 }
 
+/// Refuse an inbound request whose declared `Content-Type` is not
+/// `application/json`. Shared by `chat_completions` and `mcp_call`
+/// so both trust-boundary ingress points agree on the same rules —
+/// a client sending e.g. `Content-Type: multipart/form-data` with a
+/// JSON body would otherwise process successfully on a route that
+/// forgot the check. Missing Content-Type is tolerated (minimal
+/// clients skip it and JSON parsers accept the body's shape).
+///
+/// `context_label` is inlined into the client-facing 400 body so
+/// operators reading the message know which endpoint refused.
+fn refuse_non_json_content_type(headers: &HeaderMap, context_label: &str) -> Option<Response> {
+    let value = headers.get(axum::http::header::CONTENT_TYPE)?;
+    let is_json = value
+        .to_str()
+        .ok()
+        .and_then(|s| s.split(';').next())
+        .map(|main| main.trim().eq_ignore_ascii_case("application/json"))
+        .unwrap_or(false);
+    if is_json {
+        return None;
+    }
+    let display = value.to_str().unwrap_or("<non-ascii>");
+    Some(pipeline_error(crate::pipeline::PipelineError::bad_request(
+        format!("{context_label} requires Content-Type: application/json, got {display:?}"),
+    )))
+}
+
 async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    // Parity with the MCP path (routes.rs::mcp_call): refuse an
+    // inbound request whose declared `Content-Type` is not
+    // `application/json`. The chat endpoint historically accepted
+    // any Content-Type and relied on `serde_json::from_slice` to
+    // fail — that pattern falls back to a stringly-typed 400 on
+    // deserialise error instead of a specific "spec expects
+    // application/json" 400 the operator can triage. Missing
+    // Content-Type stays tolerated (minimal clients skip it and
+    // JSON parsers accept the body's shape anyway); an EXPLICIT
+    // non-JSON declaration is refused. Same helper as MCP for
+    // strictly one place to change the parsing rules.
+    if let Some(err) = refuse_non_json_content_type(&headers, "chat completions") {
+        return err;
+    }
     // Refuse duplicate top-level or
     // nested JSON keys before parsing. `Json<Value>` used
     // `serde_json` default "last-wins" semantics, so a hostile client
@@ -512,6 +553,19 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
         Ok(value) => value,
         Err(error) => return pipeline_error(crate::pipeline::PipelineError::bad_request_source(error)),
     };
+    // Parity with the MCP path (`av_sandbox::parse_tool_call`) which
+    // caps `MAX_JSON_DEPTH = 64`. serde_json's built-in
+    // `RECURSION_LIMIT = 128` prevents stack blowout, but the chat
+    // trust-boundary discipline is uneven relative to the tool-call
+    // gate: a 4 MiB nested payload that MCP would refuse silently
+    // parsed on chat. Apply the same cap so both trust-boundary
+    // ingress points agree on JSON-shape limits.
+    if av_sandbox::rpc::depth_of(&payload, 0) > av_sandbox::rpc::MAX_JSON_DEPTH {
+        return pipeline_error(crate::pipeline::PipelineError::bad_request(format!(
+            "chat request nesting depth exceeds {}",
+            av_sandbox::rpc::MAX_JSON_DEPTH
+        )));
+    }
     let admission_started = std::time::Instant::now();
     let mut prepared = match state
         .prepare_chat_nonblocking(&headers, payload, body.len())
@@ -936,19 +990,8 @@ async fn mcp_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     // no defensible use case. Missing Content-Type is tolerated
     // (some minimal clients skip it and JSON-RPC parsers accept the
     // body's shape).
-    if let Some(value) = headers.get(axum::http::header::CONTENT_TYPE) {
-        let is_json = value
-            .to_str()
-            .ok()
-            .and_then(|s| s.split(';').next())
-            .map(|main| main.trim().eq_ignore_ascii_case("application/json"))
-            .unwrap_or(false);
-        if !is_json {
-            let display = value.to_str().unwrap_or("<non-ascii>");
-            return pipeline_error(crate::pipeline::PipelineError::bad_request(format!(
-                "MCP requires Content-Type: application/json (spec: JSON-RPC 2.0), got {display:?}"
-            )));
-        }
+    if let Some(err) = refuse_non_json_content_type(&headers, "MCP") {
+        return err;
     }
     // The tool path mutates durable state at several awaits: the sandbox
     // gate debits the budget, `execution.claim()` claims the execution
@@ -1974,9 +2017,23 @@ impl ToolExecution {
         // sometimes merge duplicates on the wire and log aggregators
         // can then observe a comma-joined value that leaks a
         // client-desync into audit).
-        let session_id = crate::pipeline::single_header(headers, crate::pipeline::SESSION_HEADER)?
-            .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| crate::pipeline::PipelineError::bad_request("missing x-av-session".to_owned()))?;
+        // Distinguish "header not present" from "header value is not
+        // valid UTF-8 text" — the chat path at pipeline.rs::session_id
+        // emits the specific "X-AV-Session is not valid text" 400 for
+        // the non-UTF-8 case, and the tool path historically reported
+        // the same non-UTF-8 case as "missing" — misleading operator
+        // triage. Same discipline as the chat path now.
+        let raw_header = crate::pipeline::single_header(headers, crate::pipeline::SESSION_HEADER)?;
+        let session_id = match raw_header {
+            None => {
+                return Err(crate::pipeline::PipelineError::bad_request(
+                    "missing x-av-session".to_owned(),
+                ));
+            }
+            Some(value) => value.to_str().map_err(|_| {
+                crate::pipeline::PipelineError::bad_request("X-AV-Session is not valid text".to_owned())
+            })?,
+        };
         // Same validation as the pipeline's `session_id`: an id the intercept
         // path would reject must not key a tool-execution intent either.
         let session_id = av_core::SessionId::parse(session_id)
