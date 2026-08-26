@@ -1131,6 +1131,22 @@ impl HarnessConfig {
                     .into(),
             );
         }
+        // `atif_retention_days = Some(0)` would deploy a daemon whose
+        // hourly sweep computes `max_age = Duration::ZERO`; the sweep
+        // predicate is `age < max_age`, which is false for every sealed
+        // pair, so every sealed `<stem>.json` + `.atif-auth` +
+        // `.close-complete` triple is deleted on the first tick — total
+        // loss of the pre-signing evidence chain. `None` (the ship
+        // default) disables retention; the CLI `avctl spool-prune
+        // --retention-days 0` path is a separate, one-off decommission
+        // command and is intentionally not gated here.
+        if self.atif_retention_days == Some(0) {
+            errors.push(
+                "atif_retention_days = 0 would delete every sealed ATIF pair on the first hourly sweep; \
+                 omit the field to disable retention, or set >= 1 to enable an N-day window"
+                    .into(),
+            );
+        }
         if self.upstream_url.is_empty() {
             errors.push("upstream_url is required".into());
         }
@@ -2078,6 +2094,21 @@ mod tests {
         cfg = base();
         cfg.session_idle_close_s = 0;
         assert!(cfg.validate().unwrap_err().contains("session_idle_close_s"));
+
+        // `atif_retention_days = Some(0)` would nuke every sealed pair
+        // on the first hourly sweep (max_age = 0 → `age < 0` false for
+        // all mtimes → all pruned). Validate must reject it; `None`
+        // (disable) and `Some(1)`+ (real windows) stay legal.
+        cfg = base();
+        cfg.atif_retention_days = Some(0);
+        assert!(
+            cfg.validate().unwrap_err().contains("atif_retention_days = 0"),
+            "atif_retention_days = 0 should be rejected"
+        );
+        cfg.atif_retention_days = None;
+        cfg.validate().unwrap();
+        cfg.atif_retention_days = Some(1);
+        cfg.validate().unwrap();
 
         cfg = base();
         cfg.breaker.window = 0;
