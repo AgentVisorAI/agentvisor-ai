@@ -436,18 +436,27 @@ impl IdentityValidator {
                 });
             }
             // Same posture for `nbf`: a child cannot become usable
-            // before the parent that granted it did. Fall back to the
-            // parent's `iat` when the parent has no `nbf` — a child
-            // with `nbf` earlier than the parent's own start is still
-            // a temporal-inversion forgery.
+            // before the parent that granted it did. Compare
+            // EFFECTIVE start times uniformly — fall back to `iat`
+            // on either side that omits `nbf`. Pre-R16 this block
+            // was guarded by `if let Some(child_nbf) = child.nbf`,
+            // so a child that OMITTED `nbf` sailed past the check
+            // even when its raw `iat` predated the parent's explicit
+            // `nbf`: e.g. `parent{iat=t0, nbf=t0+15}` +
+            // `child{iat=t0+10, nbf=None}` was accepted, though the
+            // child asserts authority 5 seconds before the parent
+            // grant became active. The `IatEscalation` check on
+            // line 432 fires only for `child.iat < parent.iat` and
+            // does not cover this gap. Consumers treating
+            // `claims.iat` (or `nbf`) as "when this identity became
+            // authorized" saw an inverted causal ordering.
             let parent_start = parent.nbf.unwrap_or(parent.iat);
-            if let Some(child_nbf) = child.nbf {
-                if child_nbf < parent_start {
-                    return Err(IdentityError::NbfEscalation {
-                        child: child_nbf,
-                        parent: parent_start,
-                    });
-                }
+            let child_start = child.nbf.unwrap_or(child.iat);
+            if child_start < parent_start {
+                return Err(IdentityError::NbfEscalation {
+                    child: child_start,
+                    parent: parent_start,
+                });
             }
             parent_token = parent.parent_token.clone();
             child = parent;

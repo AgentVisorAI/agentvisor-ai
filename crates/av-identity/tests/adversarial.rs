@@ -522,6 +522,59 @@ fn child_nbf_predating_parent_is_rejected() {
     assert!(v.validate(&mint(&keys, &child)).is_ok());
 }
 
+/// R16 gap: the R12 `NbfEscalation` check was `if let Some(child_nbf)
+/// = child.nbf` — a child that OMITTED `nbf` sailed past the check
+/// even when its raw `iat` predated the parent's explicit `nbf`. The
+/// `IatEscalation` check (`child.iat < parent.iat`) only catches
+/// backdating past the parent's `iat`, not past the parent's later
+/// effective start (`nbf`). Fix compares EFFECTIVE start times
+/// (`nbf.unwrap_or(iat)`) uniformly on both sides, so this class
+/// closes even when the child omits `nbf`.
+///
+/// Reproducer (must be REFUSED post-R16):
+///  parent{iat=t, nbf=t+5, exp=t+600}
+///  child {iat=t, nbf=None, exp=t+300}
+/// Effective starts: parent=t+5, child=t. child_start < parent_start
+/// → temporal-inversion forgery.
+#[test]
+fn child_without_nbf_predating_parent_nbf_is_rejected() {
+    let keys = ed25519_keys("k1");
+    let v = validator(&keys);
+    let mut parent = claims(&["tool:read"], 600, None);
+    // Parent doesn't become active until 5s after its issue time.
+    parent.nbf = Some(parent.iat + 5);
+    let parent_token = mint(&keys, &parent);
+    // Child inherits parent.iat via `claims()` (both call `now_s()`),
+    // so child.iat == parent.iat < parent.nbf. Child omits `nbf`.
+    let mut child = claims(&["tool:read"], 300, Some(parent_token));
+    child.exp = parent.exp - 60;
+    child.nbf = None;
+    let outcome = v.validate(&mint(&keys, &child));
+    assert!(
+        matches!(outcome, Err(IdentityError::NbfEscalation { .. })),
+        "child.iat < parent.nbf with child.nbf=None must be refused as a \
+         temporal-inversion forgery — the R12 nbf guard missed this input case: {outcome:?}"
+    );
+}
+
+/// R16: the symmetric acceptance case — child omits `nbf`, but its
+/// `iat` is at-or-after the parent's effective start. Must be
+/// accepted (boundary is strict-less on effective starts).
+#[test]
+fn child_without_nbf_at_parent_effective_start_is_accepted() {
+    let keys = ed25519_keys("k1");
+    let v = validator(&keys);
+    let mut parent = claims(&["tool:read"], 600, None);
+    parent.nbf = Some(parent.iat); // effective start == iat
+    let parent_token = mint(&keys, &parent);
+    let mut child = claims(&["tool:read"], 300, Some(parent_token));
+    child.exp = parent.exp - 60;
+    child.nbf = None;
+    // child_start(iat) == parent_start(nbf == iat) → strict-less
+    // does NOT fire; accepted.
+    assert!(v.validate(&mint(&keys, &child)).is_ok());
+}
+
 /// The bidi/zero-width Trojan-Source guard must cover scopes[] too,
 /// not only the six primary identity strings. A scope like
 /// `payout\u{202E}elbast` (right-to-left override) renders as
