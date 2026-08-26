@@ -38,11 +38,16 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
     };
     const unsub = bus.subscribeOrg(claims.orgId, send);
 
-    // Comment-only keepalive every 25s to survive intermediary idle timeouts
-    // (Cloudflare defaults to 100s, Fly LB to 60s, Heroku to 55s).
+    // Named keepalive every 15s serves double duty: (1) survives intermediary
+    // idle timeouts (Cloudflare 100s, Fly 60s, Heroku 55s), and (2) fires a
+    // real EventSource listener on the client so the browser can detect
+    // "server crashed but TCP FIN never arrived" — Chromium can hold a dead
+    // EventSource in readyState=OPEN for tens of seconds after the peer dies.
+    // The client tracks last-heard time and force-closes if the interval
+    // between keepalives grows too long (default 30s stale threshold).
     const keepalive = setInterval(() => {
-      reply.raw.write(`: keepalive ${Date.now()}\n\n`);
-    }, 25_000);
+      reply.raw.write(`event: keepalive\ndata: ${JSON.stringify({ t: Date.now() })}\n\n`);
+    }, 15_000);
 
     req.raw.on("close", () => {
       clearInterval(keepalive);

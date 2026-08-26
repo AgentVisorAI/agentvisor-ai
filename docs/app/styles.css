@@ -809,6 +809,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .btn.ghost:hover { background: var(--surface-hover); }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn svg { width: 14px; height: 14px; }
+.btn.ok-flash { background: var(--success-bg); border-color: var(--success-border); color: var(--success); transition: background 120ms ease, color 120ms ease; }
 
 /* ============================================================
  * FILTER BAR

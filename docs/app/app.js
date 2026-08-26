@@ -1338,7 +1338,7 @@
 
   function openCreateDeploymentModal() {
     var backdrop = h(
-      '<div class="modal-backdrop">' +
+      '<div class="modal-backdrop" role="dialog" aria-modal="true">' +
         '<div class="modal">' +
           "<h2>New deployment</h2>" +
           '<p class="sub">Register a daemon. You\'ll get an ingest token — copy it now; it won\'t be shown again.</p>' +
@@ -1353,24 +1353,33 @@
     );
     document.body.appendChild(backdrop);
     document.body.classList.add("locked");
+    var previouslyFocused = document.activeElement;
+    var uninstall;
+    function close() {
+      backdrop.remove(); document.body.classList.remove("locked");
+      if (uninstall) uninstall();
+      if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {}
+    }
+    uninstall = installModalKeys(backdrop, close);
     backdrop.addEventListener("click", function (e) {
-      if (e.target === backdrop || e.target.hasAttribute("data-close")) { backdrop.remove(); document.body.classList.remove("locked"); }
+      if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
     });
     backdrop.querySelector("#depForm").addEventListener("submit", function (e) {
       e.preventDefault();
       var btn = e.target.querySelector('button[type="submit"]');
       btn.disabled = true;
       state.ds.createDeployment({ name: $("#depName").value.trim(), environment: $("#depEnv").value, region: $("#depRegion").value.trim() || undefined })
-        .then(function (r) { backdrop.remove(); document.body.classList.remove("locked"); showTokenModal(r.ingestToken, "Deployment created"); })
+        .then(function (r) { close(); showTokenModal(r.ingestToken, "Deployment created"); })
         .catch(function (err) { btn.disabled = false; toast(err.message || "Create failed", true); });
     });
+    setTimeout(function () { backdrop.querySelector('#depName').focus(); }, 20);
   }
 
   function showTokenModal(token, title) {
     var backdrop = h(
-      '<div class="modal-backdrop">' +
+      '<div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="tokTitle">' +
         '<div class="modal">' +
-          "<h2>" + esc(title || "Ingest token") + "</h2>" +
+          '<h2 id="tokTitle">' + esc(title || "Ingest token") + "</h2>" +
           '<p class="sub">Point your daemon at this console using the token below. Store it in your secret manager — it won\'t be shown again.</p>' +
           '<div class="token-display">' + esc(token) + "</div>" +
           '<div class="notice"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M8 1L15 14H1L8 1z"/><path d="M8 6v3M8 11v.5"/></svg>' +
@@ -1381,15 +1390,36 @@
     );
     document.body.appendChild(backdrop);
     document.body.classList.add("locked");
+    var previouslyFocused = document.activeElement;
+    var uninstall;
+    function close() {
+      backdrop.remove(); document.body.classList.remove("locked");
+      if (uninstall) uninstall();
+      if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {}
+      var main = $("#view"); if (main) renderDeployments(main);
+    }
+    uninstall = installModalKeys(backdrop, close);
     backdrop.addEventListener("click", function (e) {
-      if (e.target === backdrop || e.target.hasAttribute("data-close")) {
-        backdrop.remove(); document.body.classList.remove("locked");
-        var main = $("#view"); if (main) renderDeployments(main);
+      if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
+    });
+    var copyBtn = backdrop.querySelector("#copyTok");
+    copyBtn.addEventListener("click", function () {
+      var doneText = "Copied ✓";
+      var origText = copyBtn.textContent;
+      function markCopied() {
+        copyBtn.textContent = doneText;
+        copyBtn.classList.add("ok-flash");
+        setTimeout(function () { copyBtn.textContent = origText; copyBtn.classList.remove("ok-flash"); }, 1600);
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(token).then(markCopied).catch(function () {
+          toast("Copy blocked — select the token manually");
+        });
+      } else {
+        toast("Clipboard unavailable in this browser");
       }
     });
-    backdrop.querySelector("#copyTok").addEventListener("click", function () {
-      navigator.clipboard.writeText(token).then(function () { toast("Token copied"); });
-    });
+    setTimeout(function () { backdrop.querySelector('[data-close]').focus(); }, 20);
   }
 
   /* ============================================================
@@ -1526,9 +1556,30 @@
     var so = $("#signOut", root);
     if (so) so.addEventListener("click", signOut);
   }
+  // Wire Escape + Tab focus trap for a modal backdrop. Returns nothing;
+  // the caller is expected to append the backdrop first and pass its
+  // own close() so the same teardown path runs on Escape and on click.
+  function installModalKeys(backdrop, close) {
+    function focusables() {
+      return Array.from(backdrop.querySelectorAll('button, [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+        .filter(function (el) { return el.offsetParent !== null || el.tagName === "INPUT"; });
+    }
+    function onKey(e) {
+      if (e.key === "Escape") { e.preventDefault(); close(); return; }
+      if (e.key === "Tab") {
+        var els = focusables(); if (!els.length) return;
+        var first = els[0], last = els[els.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+      }
+    }
+    document.addEventListener("keydown", onKey);
+    return function uninstall() { document.removeEventListener("keydown", onKey); };
+  }
+
   function openInputModal(opts) {
     var backdrop = h(
-      '<div class="modal-backdrop"><div class="modal">' +
+      '<div class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal">' +
         "<h2>" + esc(opts.title) + "</h2>" +
         (opts.sub ? '<p class="sub">' + esc(opts.sub) + "</p>" : "") +
         '<form id="inpForm">' +
@@ -1543,9 +1594,14 @@
     );
     document.body.appendChild(backdrop);
     document.body.classList.add("locked");
-    function close() { backdrop.remove(); document.body.classList.remove("locked"); document.removeEventListener("keydown", onKey); }
-    function onKey(e) { if (e.key === "Escape") close(); }
-    document.addEventListener("keydown", onKey);
+    var previouslyFocused = document.activeElement;
+    var uninstall;
+    function close() {
+      backdrop.remove(); document.body.classList.remove("locked");
+      if (uninstall) uninstall();
+      if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {}
+    }
+    uninstall = installModalKeys(backdrop, close);
     backdrop.addEventListener("click", function (e) {
       if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
     });
@@ -1561,7 +1617,7 @@
 
   function comingSoon(title, body) {
     var backdrop = h(
-      '<div class="modal-backdrop"><div class="modal">' +
+      '<div class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal">' +
         "<h2>" + esc(title) + "</h2>" +
         '<p class="sub">' + esc(body) + "</p>" +
         '<div class="notice"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="6"/><path d="M8 5v3M8 11v.5"/></svg><span>This is a demo. Full flow will ship with the beta.</span></div>' +
@@ -1570,12 +1626,18 @@
     );
     document.body.appendChild(backdrop);
     document.body.classList.add("locked");
-    function close() { backdrop.remove(); document.body.classList.remove("locked"); document.removeEventListener("keydown", onKey); }
-    function onKey(ev) { if (ev.key === "Escape") close(); }
-    document.addEventListener("keydown", onKey);
+    var previouslyFocused = document.activeElement;
+    var uninstall;
+    function close() {
+      backdrop.remove(); document.body.classList.remove("locked");
+      if (uninstall) uninstall();
+      if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {}
+    }
+    uninstall = installModalKeys(backdrop, close);
     backdrop.addEventListener("click", function (e) {
       if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
     });
+    setTimeout(function () { backdrop.querySelector('[data-close]').focus(); }, 20);
   }
 
   async function renderSettingsMembers(root) {
@@ -1759,7 +1821,7 @@
 
   function confirmModal(opts) {
     var backdrop = h(
-      '<div class="modal-backdrop">' +
+      '<div class="modal-backdrop" role="dialog" aria-modal="true">' +
         '<div class="modal ' + (opts.danger ? "confirm-danger" : "") + '">' +
           "<h2>" + esc(opts.title) + "</h2>" +
           '<p class="sub">' + esc(opts.body) + "</p>" +
@@ -1772,9 +1834,14 @@
     );
     document.body.appendChild(backdrop);
     document.body.classList.add("locked");
-    function close() { backdrop.remove(); document.body.classList.remove("locked"); document.removeEventListener("keydown", onKey); }
-    function onKey(e) { if (e.key === "Escape") close(); }
-    document.addEventListener("keydown", onKey);
+    var previouslyFocused = document.activeElement;
+    var uninstall;
+    function close() {
+      backdrop.remove(); document.body.classList.remove("locked");
+      if (uninstall) uninstall();
+      if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {}
+    }
+    uninstall = installModalKeys(backdrop, close);
     backdrop.addEventListener("click", function (e) {
       if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
       if (e.target.hasAttribute("data-confirm")) { close(); opts.onConfirm && opts.onConfirm(); }

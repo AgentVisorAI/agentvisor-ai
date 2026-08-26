@@ -1144,10 +1144,38 @@
       // gives up on 401/403 or repeated connection errors. Wrap with
       // exponential backoff + an explicit "reconnecting" state so the UI
       // knows to dim the Live pill instead of silently going stale.
+      //
+      // Chromium quirk: when the server process is killed and no TCP FIN
+      // makes it out (some OS/socket configs), EventSource holds
+      // readyState=OPEN for tens of seconds. We defend with a freshness
+      // watchdog: the server emits a named `keepalive` event every 25s,
+      // and if we go >45s without ANY inbound message we force-close and
+      // reconnect. This bounds worst-case "stale Live pill" to 45 seconds.
       var url = apiUrl("/api/v1/stream");
       var closed = false;
       var es = null;
       var backoff = 1500;
+      var lastSeen = 0;
+      var watchdog = null;
+      var STALE_MS = 30_000;
+      function bumpSeen() { lastSeen = Date.now(); }
+      function startWatchdog() {
+        if (watchdog) return;
+        watchdog = setInterval(function () {
+          if (closed) return;
+          if (!lastSeen) return;
+          if (Date.now() - lastSeen > STALE_MS) {
+            // Force close and reconnect — EventSource is holding a dead socket.
+            callback({ type: "stream.closed", data: { willRetry: true, reason: "stale" } });
+            if (es) { try { es.close(); } catch (e) {} }
+            lastSeen = 0;
+            scheduleReconnect();
+          }
+        }, 5_000);
+      }
+      function stopWatchdog() {
+        if (watchdog) { clearInterval(watchdog); watchdog = null; }
+      }
       function connect() {
         if (closed) return;
         try { es = new EventSource(url, { withCredentials: true }); }
@@ -1156,10 +1184,14 @@
         es.addEventListener("open", function () {
           opened = true;
           backoff = 1500;
+          bumpSeen();
+          startWatchdog();
           callback({ type: "stream.open", data: {} });
         });
+        es.addEventListener("keepalive", function () { bumpSeen(); });
         ["hello", "session.upsert", "events.appended", "receipt.finalized"].forEach(function (name) {
           es.addEventListener(name, function (msg) {
+            bumpSeen();
             try { callback({ type: name, data: JSON.parse(msg.data) }); }
             catch (e) { /* malformed frame from a proxy */ }
           });
@@ -1190,7 +1222,7 @@
         }, backoff);
       }
       connect();
-      return function () { closed = true; if (es) { try { es.close(); } catch (e) {} } };
+      return function () { closed = true; stopWatchdog(); if (es) { try { es.close(); } catch (e) {} } };
     },
   };
 
