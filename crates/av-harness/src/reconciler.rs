@@ -8174,8 +8174,7 @@ mod tests {
                 }),
                 ack: None,
             };
-            let path = finalizer
-                .lifecycle_outbox_path(&session_id, crate::journal::RECEIPT_OUTBOX_KIND);
+            let path = finalizer.lifecycle_outbox_path(&session_id, crate::journal::RECEIPT_OUTBOX_KIND);
             let sealed = crate::journal::seal(
                 &finalizer.journal_key,
                 crate::journal::LIFECYCLE_OUTBOX_DOMAIN,
