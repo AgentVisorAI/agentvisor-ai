@@ -764,6 +764,19 @@ vector_backend = "memory"
         "av_ephemeral_close_failures_total",
         "av_stream_abort_close_failures_total",
         "av_stream_abort_no_runtime_total",
+        // Panic-supervision counters. Each is written only from the
+        // panic arm of a background task or Drop-spawned task; without
+        // pre-registration `rate() > 0` alerts silently miss the FIRST
+        // panic — exactly the incident the alert exists to catch.
+        // Documented in OPERATIONS.md.
+        "av_reconciler_panics_total",
+        "av_worker_shard_panics_total",
+        "av_bridge_maintenance_panics_total",
+        "av_bridge_maintenance_errors_total",
+        "av_bridge_maintenance_join_errors_total",
+        "av_stream_abort_panics_total",
+        "av_ephemeral_close_panics_total",
+        "av_admission_refund_panics_total",
     ] {
         assert!(
             body.contains(series),
