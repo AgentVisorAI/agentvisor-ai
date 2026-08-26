@@ -102,6 +102,15 @@ async function main(): Promise<void> {
     // busy daemons batching every second).
     max: 300,
     timeWindow: "1 minute",
+    // Never rate-limit the ops endpoints. LB health probes hit /healthz
+    // and /readyz on a 15-30s cadence; a metrics scraper hits /metrics
+    // every 15s. A dozen instances × a couple of probers would eat the
+    // 300/min budget and make the API look down. .well-known is also
+    // always public (RFC 9116 disclosure lookup).
+    allowList: (req) => {
+      const u = req.url ?? "";
+      return u === "/healthz" || u === "/readyz" || u === "/metrics" || u.startsWith("/.well-known/");
+    },
     keyGenerator: (req) => {
       // Prefer the authenticated user's ID for rate-limit accounting so a
       // shared NAT doesn't get punished for one abusive tenant. Falls back
