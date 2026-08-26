@@ -6,6 +6,12 @@ import { db } from "../db.js";
 /**
  * Populates `request.session` when a valid session cookie is present. Never
  * throws — routes that require auth call `requireSession()` below.
+ *
+ * Also confirms the (userId, orgId) pair in the token is still an active
+ * membership. This closes a real security gap where a user removed from
+ * an org would keep read/write access via their existing JWT for the
+ * remainder of the 7-day TTL. The extra findUnique is on the compound
+ * unique index so it stays sub-millisecond.
  */
 export async function authenticate(
   req: FastifyRequest,
@@ -15,6 +21,8 @@ export async function authenticate(
   if (!token) return;
   const claims = await verifySession(token);
   if (!claims) return;
+  const stillMember = await assertOrgMembership(claims.sub, claims.orgId);
+  if (!stillMember) return;
   req.session = claims;
 }
 
