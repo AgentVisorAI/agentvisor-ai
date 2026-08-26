@@ -1,0 +1,67 @@
+/* Verify-specific styles that layer on top of style.css.
+ * Extracted from the inline <style> in index.html so the page can
+ * ship with a strict CSP that doesn't require 'unsafe-inline' for
+ * style-src (dropping that is a future round; keeping unsafe-inline
+ * for now since <details> and dynamically-inserted result cards use
+ * a couple of style attributes). */
+.verify-shell { max-width: 56rem; margin: 0 auto; padding: 0 1.25rem; }
+.verify-hero { text-align: center; padding: 3rem 0 1.5rem; }
+.verify-hero h1 { font-size: clamp(1.75rem, 4vw, 2.5rem); margin: 0 0 0.5rem; }
+.verify-hero p { color: var(--fg-muted); font-size: 1.05rem; margin: 0 auto; max-width: 40rem; }
+.drop {
+  border: 2px dashed var(--border-strong);
+  border-radius: 12px;
+  padding: 3rem 1.5rem;
+  text-align: center;
+  background: var(--bg-alt);
+  transition: border-color 0.15s, background 0.15s;
+  cursor: pointer;
+  user-select: none;
+}
+.drop.hover { border-color: var(--accent); background: var(--bg); }
+.drop-icon { font-size: 2.5rem; line-height: 1; margin-bottom: 0.5rem; }
+.drop h2 { margin: 0 0 0.25rem; font-size: 1.2rem; font-weight: 600; }
+.drop p { color: var(--fg-muted); margin: 0.5rem 0 0; font-size: 0.95rem; }
+.drop .or { margin: 1rem 0 0.5rem; font-size: 0.85rem; color: var(--fg-muted); }
+.drop .browse {
+  display: inline-block;
+  background: var(--accent);
+  color: var(--accent-fg);
+  padding: 0.5rem 1.25rem;
+  border-radius: 8px;
+  font-weight: 600;
+  cursor: pointer;
+  border: 0;
+  font: inherit;
+}
+.drop .browse:hover { background: var(--accent-hover); }
+.example-row { margin-top: 1.25rem; text-align: center; font-size: 0.9rem; }
+.example-row .link { color: var(--accent); cursor: pointer; text-decoration: underline; background: none; border: 0; font: inherit; padding: 0; }
+.result { margin-top: 2rem; }
+.result-card {
+  border-radius: 12px;
+  padding: 1.5rem;
+  border-left: 4px solid var(--fg-muted);
+  background: var(--bg-alt);
+}
+.result-card.ok { border-left-color: var(--success); }
+.result-card.bad { border-left-color: var(--danger); }
+.result-card.pending { border-left-color: var(--accent); }
+.result-title { font-size: 1.3rem; font-weight: 600; margin: 0 0 0.25rem; }
+.result-card.ok .result-title { color: var(--success); }
+.result-card.bad .result-title { color: var(--danger); }
+.result-sub { color: var(--fg-muted); margin: 0 0 1rem; font-size: 0.9rem; }
+dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 0.35rem 0.75rem; font-size: 0.9rem; margin: 0; }
+dl.kv dt { color: var(--fg-muted); font-weight: 500; }
+dl.kv dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; overflow-wrap: anywhere; }
+.details { margin-top: 1rem; }
+.details summary { cursor: pointer; color: var(--fg-muted); font-size: 0.85rem; }
+.details pre {
+  background: var(--bg-code); color: var(--fg-strong);
+  padding: 1rem; border-radius: 8px; overflow: auto;
+  font-size: 0.75rem; margin-top: 0.5rem;
+}
+.how { margin: 3rem 0; padding: 2rem 0; border-top: 1px solid var(--border); }
+.how h3 { margin: 0 0 0.5rem; }
+.how p { color: var(--fg-muted); margin: 0.5rem 0; font-size: 0.95rem; }
+.how code { background: var(--bg-code); padding: 0.1rem 0.35rem; border-radius: 4px; font-size: 0.85rem; }
