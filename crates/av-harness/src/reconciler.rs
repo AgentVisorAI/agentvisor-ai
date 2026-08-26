@@ -355,7 +355,7 @@ pub struct Finalizer {
     /// client close behind a long recovery scan or an idle sweep of
     /// thousands of sessions.
     lifecycle_locks: Arc<SessionLockTable>,
-    quarantined_sessions: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    quarantined_sessions: Arc<parking_lot::Mutex<QuarantinedSessions>>,
     /// Artifacts already warned about during recovery scans, so a corrupt
     /// file left on disk as evidence does not repeat its warning every tick.
     /// Bounded by `warn_once` via FIFO
@@ -430,6 +430,76 @@ impl WarnedArtifacts {
 /// clear that would let a legitimate 4096-entry working set re-warn
 /// together every tick.
 const WARNED_ARTIFACTS_CAP: usize = 4096;
+
+/// Cap on `quarantined_sessions` — same rationale and FIFO
+/// discipline as `warned_artifacts`. `quarantined_sessions` was
+/// previously an unbounded `HashSet<String>` justified by comment as
+/// "bounded by real crash events", but the code enforced no cap and
+/// its sibling collection `warned_artifacts` in the same struct DID
+/// have an explicit cap. Persistent quarantine markers on disk plus
+/// the recovery scan (`recover_signed_sessions`,
+/// `recover_spooled_sessions`) that re-inserts on every restart
+/// meant the set could grow indefinitely across a long-lived
+/// process's lifetime — one `String` id per quarantine, paired with
+/// an `Arc<Session>` retained by `SessionRegistry` (see the coupled
+/// cap in `SessionRegistry::evict_finalized`). On insert-past-cap,
+/// ONE oldest id evicts (FIFO); the eviction is safe because the
+/// on-disk quarantine artifact is what fundamentally gates
+/// resurrection — the in-memory set is only a lookup accelerator.
+/// A subsequent recovery pass restores an evicted id if the
+/// artifact still lives on disk.
+pub(crate) const MAX_QUARANTINED_SESSIONS: usize = 4096;
+
+/// FIFO-evicting id-set used by the finalizer to track sessions
+/// whose recovery-time inconsistent-effects verdict quarantined
+/// them (unresolved tool marker, inflight-response marker, receipt
+/// verification failure). Same shape as [`WarnedArtifacts`] — FIFO
+/// rather than clear-on-overflow so a rotating-id attacker cannot
+/// force every legitimate quarantine to "un-quarantine" together on
+/// the same tick.
+pub(crate) struct QuarantinedSessions {
+    order: std::collections::VecDeque<String>,
+    set: std::collections::HashSet<String>,
+    cap: usize,
+}
+
+impl QuarantinedSessions {
+    pub(crate) fn new(cap: usize) -> Self {
+        // Clamp `cap` to a minimum of 1 for the same reason as
+        // `WarnedArtifacts::new` — `cap: 0` would oscillate the set
+        // at size 1 and silently break the quarantine-persistence
+        // contract for any working set above 1.
+        let cap = cap.max(1);
+        Self {
+            order: std::collections::VecDeque::new(),
+            set: std::collections::HashSet::new(),
+            cap,
+        }
+    }
+
+    pub(crate) fn insert(&mut self, id: String) -> bool {
+        if self.set.contains(&id) {
+            return false;
+        }
+        if self.order.len() >= self.cap {
+            if let Some(evicted) = self.order.pop_front() {
+                self.set.remove(&evicted);
+            }
+        }
+        self.order.push_back(id.clone());
+        self.set.insert(id);
+        true
+    }
+
+    pub(crate) fn contains(&self, id: &str) -> bool {
+        self.set.contains(id)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+}
 
 /// Per-session lifecycle mutex table.
 ///
@@ -615,7 +685,9 @@ impl Finalizer {
             state_store: None,
             recovery_lock: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle_locks: Arc::new(SessionLockTable::default()),
-            quarantined_sessions: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            quarantined_sessions: Arc::new(parking_lot::Mutex::new(QuarantinedSessions::new(
+                MAX_QUARANTINED_SESSIONS,
+            ))),
             warned_artifacts: Arc::new(parking_lot::Mutex::new(WarnedArtifacts::new(
                 WARNED_ARTIFACTS_CAP,
             ))),
@@ -640,7 +712,9 @@ impl Finalizer {
             state_store: None,
             recovery_lock: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle_locks: Arc::new(SessionLockTable::default()),
-            quarantined_sessions: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            quarantined_sessions: Arc::new(parking_lot::Mutex::new(QuarantinedSessions::new(
+                MAX_QUARANTINED_SESSIONS,
+            ))),
             warned_artifacts: Arc::new(parking_lot::Mutex::new(WarnedArtifacts::new(
                 WARNED_ARTIFACTS_CAP,
             ))),
@@ -7601,6 +7675,41 @@ mod tests {
         assert!(!warned.insert(PathBuf::from("c")));
         assert!(!warned.insert(PathBuf::from("d")));
         assert!(!warned.insert(PathBuf::from("a")));
+    }
+
+    /// R47 F1: `QuarantinedSessions` must share the FIFO+cap
+    /// discipline of `WarnedArtifacts` — previously an unbounded
+    /// `HashSet<String>` could grow indefinitely across a long-lived
+    /// process's lifetime as recovery passes re-inserted disk-persisted
+    /// quarantine markers on every restart.
+    #[test]
+    fn quarantined_sessions_clamps_zero_cap_and_evicts_fifo() {
+        let mut q = QuarantinedSessions::new(0);
+        assert!(q.insert("a".to_owned()));
+        assert!(q.contains("a"));
+        assert_eq!(q.len(), 1);
+        assert!(!q.insert("a".to_owned()), "duplicate must not re-insert");
+        // A distinct entry evicts the first — cap=1 (clamped from 0).
+        assert!(q.insert("b".to_owned()));
+        assert_eq!(q.len(), 1);
+        assert!(!q.contains("a"));
+        assert!(q.contains("b"));
+
+        // FIFO discipline: ONE eviction per insert past cap, not a
+        // full flush. A rotating-id attacker cannot cause all
+        // legitimate quarantines to disappear on a single insert.
+        let mut q = QuarantinedSessions::new(3);
+        assert!(q.insert("a".to_owned()));
+        assert!(q.insert("b".to_owned()));
+        assert!(q.insert("c".to_owned()));
+        assert_eq!(q.len(), 3);
+        assert!(q.insert("d".to_owned()));
+        assert_eq!(q.len(), 3);
+        assert!(!q.contains("a"), "a evicted");
+        assert!(q.contains("b") && q.contains("c") && q.contains("d"));
+        assert!(q.insert("e".to_owned()));
+        assert!(!q.contains("b"), "b evicted next");
+        assert!(q.contains("c") && q.contains("d") && q.contains("e"));
     }
 
     #[tokio::test]
