@@ -18,10 +18,13 @@
   "dependencies": {
     "@fastify/cookie": "^11.0.2",
     "@fastify/cors": "^11.0.1",
+    "@fastify/formbody": "^9.0.0",
     "@fastify/helmet": "^13.0.1",
     "@fastify/rate-limit": "^10.3.0",
     "@node-rs/argon2": "^2.0.2",
+    "@node-saml/node-saml": "^5.1.0",
     "@prisma/client": "6.12.0",
+    "@types/xml2js": "^0.4.14",
     "dotenv": "^17.2.3",
     "fastify": "^5.2.1",
     "jose": "^5.10.0",
@@ -32,6 +35,7 @@
     "prisma": "6.12.0",
     "prom-client": "^15.1.3",
     "resend": "^6.24.0",
+    "xml-crypto": "^6.1.2",
     "zod": "^3.24.2"
   },
   "devDependencies": {

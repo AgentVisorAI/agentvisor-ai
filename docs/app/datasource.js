@@ -574,6 +574,39 @@
     { at: iso(11 * 24 * HOUR), actor: "olivia.tan@northwind.com", event: "org.created", target: "Northwind Traders" },
   ];
 
+  // Northwind's Okta SAML config — realistic-looking sample so the settings
+  // page feels populated in the pitch demo.
+  var MOCK_SAML_CONFIGS = [
+    {
+      id: "saml_okta_prod",
+      displayName: "Okta production",
+      ssoUrl: "https://northwind.okta.com/app/agentvisor_prod_1/sso/saml",
+      sloUrl: "https://northwind.okta.com/app/agentvisor_prod_1/slo/saml",
+      entityIdIdp: "http://www.okta.com/exkA1B2C3D4E5F6G7H8",
+      x509Cert: "-----BEGIN CERTIFICATE-----\nMIIDpDCCAoygAwIBAgIGAX0EXAMPLE\n...(truncated)...\n-----END CERTIFICATE-----",
+      wantAssertionsSigned: true,
+      wantResponseSigned: false,
+      allowEncryptedAssertions: true,
+      signatureAlgorithm: "sha256",
+      digestAlgorithm: "sha256",
+      nameIdFormat: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+      jitEnabled: true,
+      jitDefaultRole: "member",
+      allowedDomains: "northwind.com,northwind-traders.com",
+      isActive: true,
+      hasSpKeypair: true,
+      spCertPem: "-----BEGIN CERTIFICATE-----\nMIIDazCCAlOgAwIBAgIUX9c5\n...(truncated)...\n-----END CERTIFICATE-----",
+      spEntityId: "https://agentvisorai.me/api/v1/auth/saml/saml_okta_prod",
+      spAcsUrl: "https://agentvisorai.me/api/v1/auth/saml/saml_okta_prod/acs",
+      spSloUrl: "https://agentvisorai.me/api/v1/auth/saml/saml_okta_prod/slo",
+      spLoginUrl: "https://agentvisorai.me/api/v1/auth/saml/saml_okta_prod/login",
+      spMetadataUrl: "https://agentvisorai.me/api/v1/auth/saml/saml_okta_prod/metadata.xml",
+      x509CertFingerprint: "d4:3f:6a:b2:81:29:57:83:19:04:af:c3:76:98:ea:d5:78:14:5c:7d",
+      createdAt: iso(20 * 24 * HOUR),
+      updatedAt: iso(3 * 24 * HOUR),
+    },
+  ];
+
   /* ============================================================
    * OVERVIEW
    * ============================================================ */
@@ -681,6 +714,56 @@
         { id: "google", displayName: "Google" },
         { id: "microsoft", displayName: "Microsoft" },
       ] };
+    },
+    async discoverSaml(_email) { return { ssoConfig: null }; },
+    async listSamlConfigs() {
+      return { configs: MOCK_SAML_CONFIGS.slice() };
+    },
+    async createSamlConfig(input) {
+      var cfg = Object.assign({
+        id: "saml_" + Math.random().toString(36).slice(2, 8),
+        sloUrl: null,
+        wantAssertionsSigned: true,
+        wantResponseSigned: false,
+        allowEncryptedAssertions: true,
+        signatureAlgorithm: "sha256",
+        digestAlgorithm: "sha256",
+        nameIdFormat: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+        jitEnabled: true,
+        jitDefaultRole: "member",
+        allowedDomains: "",
+        isActive: true,
+        hasSpKeypair: false,
+        spCertPem: null,
+        spEntityId: "https://mock/api/v1/auth/saml/new",
+        spAcsUrl: "https://mock/api/v1/auth/saml/new/acs",
+        spSloUrl: "https://mock/api/v1/auth/saml/new/slo",
+        spLoginUrl: "https://mock/api/v1/auth/saml/new/login",
+        spMetadataUrl: "https://mock/api/v1/auth/saml/new/metadata.xml",
+        x509CertFingerprint: "de:mo:fp",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      }, input);
+      MOCK_SAML_CONFIGS.push(cfg);
+      return { config: cfg };
+    },
+    async updateSamlConfig(id, input) {
+      var i = MOCK_SAML_CONFIGS.findIndex(function (c) { return c.id === id; });
+      if (i < 0) throw new Error("not_found");
+      MOCK_SAML_CONFIGS[i] = Object.assign({}, MOCK_SAML_CONFIGS[i], input, { updatedAt: new Date().toISOString() });
+      return { config: MOCK_SAML_CONFIGS[i] };
+    },
+    async deleteSamlConfig(id) {
+      MOCK_SAML_CONFIGS = MOCK_SAML_CONFIGS.filter(function (c) { return c.id !== id; });
+    },
+    async regenerateSamlSpKeypair(id) {
+      var i = MOCK_SAML_CONFIGS.findIndex(function (c) { return c.id === id; });
+      if (i < 0) throw new Error("not_found");
+      MOCK_SAML_CONFIGS[i] = Object.assign({}, MOCK_SAML_CONFIGS[i], {
+        hasSpKeypair: true,
+        spCertPem: "-----BEGIN CERTIFICATE-----\nMIIDazCCAlOgAwIBAgIUX9c5\n...(mock)...\n-----END CERTIFICATE-----",
+      });
+      return { config: MOCK_SAML_CONFIGS[i], spCertPem: MOCK_SAML_CONFIGS[i].spCertPem };
     },
     async logout() {
       try { localStorage.setItem("av_mock_signed_out", "1"); } catch (e) {}
@@ -994,6 +1077,33 @@
       } catch (e) {
         return { providers: [] };
       }
+    },
+    // Look up whether the caller's email has an SAML SSO config on file.
+    // Returns { ssoConfig: { id, displayName, loginUrl } } or
+    // { ssoConfig: null }. Anonymous — the login page calls this after
+    // the user types their email but before they enter a password.
+    async discoverSaml(email) {
+      try {
+        return await apiFetch("/api/v1/auth/saml/discover?email=" + encodeURIComponent(email));
+      } catch (e) {
+        return { ssoConfig: null };
+      }
+    },
+    // SAML config CRUD — owner/admin only. Consumed by the Settings > SSO tab.
+    async listSamlConfigs() {
+      return apiFetch("/api/v1/auth/saml");
+    },
+    async createSamlConfig(input) {
+      return apiFetch("/api/v1/auth/saml", { method: "POST", body: input });
+    },
+    async updateSamlConfig(id, input) {
+      return apiFetch("/api/v1/auth/saml/" + encodeURIComponent(id), { method: "PATCH", body: input });
+    },
+    async deleteSamlConfig(id) {
+      return apiFetch("/api/v1/auth/saml/" + encodeURIComponent(id), { method: "DELETE" });
+    },
+    async regenerateSamlSpKeypair(id) {
+      return apiFetch("/api/v1/auth/saml/" + encodeURIComponent(id) + "/keypair", { method: "POST", body: {} });
     },
     async logout() { await apiFetch("/api/v1/auth/logout", { method: "POST" }); },
 

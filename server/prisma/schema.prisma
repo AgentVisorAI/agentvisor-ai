@@ -48,8 +48,76 @@ model Org {
 
   members     Membership[]
   deployments Deployment[]
+  samlConfigs SamlConfig[]
+  samlReplayRecords SamlReplayRecord[]
 
   @@map("orgs")
+}
+
+// Enterprise SAML 2.0 SSO configuration. One per IdP: an org can have
+// multiple (e.g. Okta prod + Okta staging, or Okta + Auth0 for M&A).
+// Every field here is what an IdP admin pastes into their config.
+//
+// The workflow:
+//  1. Owner creates a config, gives its ACS URL + Entity ID + SP cert to
+//     the IdP administrator.
+//  2. IdP admin configures the app there and pastes the IdP metadata (or
+//     ssoUrl + x509Cert) back into our settings page.
+//  3. Enable jitEnabled and set allowedDomains so real users land safely.
+model SamlConfig {
+  id                       String    @id @default(cuid())
+  orgId                    String
+  displayName              String    // "Okta production", "Auth0 corporate", …
+  // IdP-side config the admin pastes:
+  ssoUrl                   String    // Where we redirect the browser to start authn.
+  sloUrl                   String?   // Optional Single Logout endpoint.
+  entityIdIdp              String    // IdP entity ID / issuer.
+  x509Cert                 String    // IdP signing cert (PEM-encoded, may hold multiple certs during rotation)
+  wantAssertionsSigned     Boolean   @default(true)  // Reject unsigned assertions.
+  wantResponseSigned       Boolean   @default(false) // Some IdPs sign response envelope too.
+  allowEncryptedAssertions Boolean   @default(true)  // Decrypt if IdP encrypted them.
+  signatureAlgorithm       String    @default("sha256")
+  digestAlgorithm          String    @default("sha256")
+  nameIdFormat             String    @default("urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress")
+  // JIT provisioning: on first successful SAML sign-in, create the user
+  // + membership if the assertion email is on an allowed domain. Without
+  // this, only pre-invited members can sign in via SSO.
+  jitEnabled               Boolean   @default(true)
+  jitDefaultRole           String    @default("member") // "member" | "admin"
+  // Comma-separated allowed email domains for JIT. Empty means "all domains
+  // this IdP asserts". Recommended to always set (e.g. "acme.com").
+  allowedDomains           String    @default("")
+  // If both are non-null we sign our AuthnRequests. Ops rotate these by
+  // regenerating a new keypair and posting the new cert to the IdP.
+  spPrivateKeyPem          String?
+  spCertPem                String?
+  isActive                 Boolean   @default(true)
+  createdAt                DateTime  @default(now())
+  updatedAt                DateTime  @updatedAt
+
+  org Org @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, displayName])
+  @@index([orgId])
+  @@map("saml_configs")
+}
+
+// One row per successfully consumed SAML Response ID. Prevents replay by
+// remembering assertion IDs until they naturally expire past
+// NotOnOrAfter. Rows are cleaned up by a periodic sweep or opportunistic
+// delete-if-expired at read time.
+model SamlReplayRecord {
+  id           String   @id @default(cuid())
+  orgId        String
+  assertionId  String   // The IdP-issued Response ID (or Assertion ID)
+  notOnOrAfter DateTime // When the assertion legitimately expires.
+  createdAt    DateTime @default(now())
+
+  org Org @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, assertionId])
+  @@index([notOnOrAfter])
+  @@map("saml_replay_records")
 }
 
 // User ↔ Org join with a role.

@@ -1,5 +1,6 @@
 import cors from "@fastify/cors";
 import cookie from "@fastify/cookie";
+import formbody from "@fastify/formbody";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
 import Fastify from "fastify";
@@ -18,6 +19,7 @@ import { deploymentRoutes } from "./routes/deployments.js";
 import { ingestRoutes } from "./routes/ingest.js";
 import { oauthRoutes } from "./routes/oauth.js";
 import { readRoutes } from "./routes/read.js";
+import { samlRoutes } from "./routes/saml.js";
 import { streamRoutes } from "./routes/stream.js";
 
 // `types.d.ts` declares the `request.session` typing. It's picked up by the
@@ -98,6 +100,9 @@ async function main(): Promise<void> {
     exposedHeaders: ["X-Request-Id"],
   });
   await app.register(cookie);
+  // application/x-www-form-urlencoded body parser — required for SAML
+  // Assertion Consumer Service (IdP posts SAMLResponse in this shape).
+  await app.register(formbody);
   await app.register(rateLimit, {
     // Global backstop against IP-level abuse. Per-user limits live at the
     // route level (auth/signup are tighter, ingest is looser to accommodate
@@ -120,7 +125,13 @@ async function main(): Promise<void> {
     allowList: (req) => {
       const u = req.url ?? "";
       return u === "/healthz" || u === "/readyz" || u === "/metrics" ||
-        u.startsWith("/.well-known/") || u.startsWith("/api/v1/ingest");
+        u.startsWith("/.well-known/") ||
+        u.startsWith("/api/v1/ingest") ||
+        // SAML ACS + login redirects should never hit rate limits. If the
+        // IdP posts a valid response it's a real user; if not, the SAML
+        // signature check itself is the DoS guard (no DB writes beyond
+        // that check).
+        /^\/api\/v1\/auth\/saml\/[^/]+\/(acs|slo|metadata\.xml|login)/.test(u);
     },
     keyGenerator: (req) => {
       // Prefer the authenticated user's ID for rate-limit accounting so a
@@ -172,6 +183,17 @@ async function main(): Promise<void> {
     const method = req.method.toUpperCase();
     if (method === "GET" || method === "HEAD" || method === "OPTIONS") return;
     if (typeof req.url === "string" && req.url.startsWith("/api/v1/ingest")) return;
+    // SAML endpoints receive form-encoded POSTs from the IdP itself
+    // (cross-site by definition — that's the point). Their crypto layer
+    // does the CSRF-equivalent check by verifying the IdP-signed
+    // assertion. The routes are also idempotent w.r.t. auth (they mint
+    // a fresh cookie); ambient cookies aren't consulted.
+    if (
+      typeof req.url === "string" &&
+      /^\/api\/v1\/auth\/saml\/[^/]+\/(acs|slo)(\?|$)/.test(req.url)
+    ) {
+      return;
+    }
 
     const origin = typeof req.headers.origin === "string" ? req.headers.origin : "";
     const referer = typeof req.headers.referer === "string" ? req.headers.referer : "";
@@ -424,6 +446,9 @@ async function main(): Promise<void> {
   });
   await app.register(async (r) => r.register(oauthRoutes), {
     prefix: "/api/v1/auth/oauth",
+  });
+  await app.register(async (r) => r.register(samlRoutes), {
+    prefix: "/api/v1/auth/saml",
   });
   await app.register(async (r) => r.register(deploymentRoutes), {
     prefix: "/api/v1/deployments",

@@ -516,9 +516,29 @@
       b.addEventListener("click", function () {
         var p = b.getAttribute("data-sso");
         if (p === "saml") {
-          // Enterprise SSO — SAML/Okta isn't shipped yet. Honest CTA
-          // instead of a fake button.
-          window.location.assign("mailto:sales@agentvisorai.me?subject=Enterprise%20SSO%20(SAML%2FOkta)");
+          // Prompt for the email so we can look up the org's SAML
+          // config, then redirect to its login endpoint. This is the
+          // "Sign in with SSO" flow — no OAuth involved.
+          openInputModal({
+            title: "Sign in with SAML SSO",
+            label: "Work email",
+            placeholder: "you@company.com",
+            confirmLabel: "Continue",
+            sub: "We'll look up your workspace's identity provider by email domain.",
+            onConfirm: function (email) {
+              state.ds.discoverSaml(email).then(function (r) {
+                if (!r.ssoConfig) {
+                  toast("No SSO configured for that domain. Ask your admin to add your IdP in Settings → Single sign-on.", true);
+                  return;
+                }
+                var relay = (sessionStorage.getItem("av_return_to") || "");
+                var url = r.ssoConfig.loginUrl + (relay ? "?RelayState=" + encodeURIComponent(relay) : "");
+                window.location.assign(url);
+              }).catch(function (err) {
+                toast(err.message || "SSO discovery failed", true);
+              });
+            },
+          });
           return;
         }
         state.ds.loginWithProvider(p).then(function (s) {
@@ -1785,31 +1805,239 @@
       }});
     });
   }
-  function renderSettingsSSO(root) {
-    root.innerHTML =
+  async function renderSettingsSSO(root) {
+    root.innerHTML = '<div class="card">' + loadingBlock("table") + "</div>";
+    var res;
+    try { res = await state.ds.listSamlConfigs(); }
+    catch (e) { root.innerHTML = '<div class="card empty"><h3>Could not load SSO</h3><p>' + esc(e.message || "Try again in a moment.") + '</p></div>'; return; }
+    var configs = res.configs || [];
+
+    var oauthCard =
       '<div class="card">' +
-        "<h2>Single sign-on</h2>" +
-        '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 var(--s-4)">Require SSO for all members. Supports Google Workspace, Microsoft Entra, Okta, and any SAML 2.0 IdP.</p>' +
+        '<h2>Social sign-in (OAuth)</h2>' +
+        '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 var(--s-4)">Anyone with a Google Workspace or Microsoft Entra account at your domain can sign in. Configured server-side via provider env vars.</p>' +
         '<div style="display:flex; gap:8px; flex-wrap:wrap">' +
-          '<button class="btn" data-sso="google">' + iconGoogle() + '<span style="margin-left:6px">Configure Google</span></button>' +
-          '<button class="btn" data-sso="microsoft">' + iconMicrosoft() + '<span style="margin-left:6px">Configure Microsoft</span></button>' +
-          '<button class="btn" data-sso="saml">' + iconKey() + '<span style="margin-left:6px">SAML 2.0</span></button>' +
+          '<span class="pill neutral">' + iconGoogle() + '<span style="margin-left:6px">Google Workspace</span></span>' +
+          '<span class="pill neutral">' + iconMicrosoft() + '<span style="margin-left:6px">Microsoft Entra</span></span>' +
         "</div>" +
-      "</div>" +
-      '<div class="card">' +
-        "<h2>Multi-factor auth</h2>" +
-        '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 var(--s-4)">Require WebAuthn (passkeys) or TOTP for all sign-ins.</p>' +
-        '<button class="btn accent" id="mfaBtn">Require MFA for all members</button>' +
       "</div>";
-    $$('[data-sso]', root).forEach(function (b) {
-      b.addEventListener("click", function () {
-        var p = b.getAttribute("data-sso");
-        var name = p === "google" ? "Google Workspace" : p === "microsoft" ? "Microsoft Entra" : "SAML 2.0";
-        comingSoon("Connect " + name, "Federate every workspace login through " + name + ". Members without a matching account will be denied.");
+
+    var samlList = configs.length
+      ? '<div class="table-wrap"><table>' +
+          '<thead><tr><th>Display name</th><th>IdP entity ID</th><th>Domains</th><th>JIT</th><th>Status</th><th><span class="sr-only">Actions</span></th></tr></thead>' +
+          '<tbody>' + configs.map(function (c) {
+            return '<tr data-id="' + esc(c.id) + '">' +
+              '<td><div style="font-weight:500">' + esc(c.displayName) + '</div><div class="id">' + esc((c.spEntityId || '').slice(-40)) + '</div></td>' +
+              '<td class="mono" style="font-size:11.5px">' + esc((c.entityIdIdp || '').slice(0, 50)) + (c.entityIdIdp && c.entityIdIdp.length > 50 ? '…' : '') + '</td>' +
+              '<td class="mono" style="font-size:11.5px">' + esc(c.allowedDomains || "(any)") + '</td>' +
+              '<td>' + (c.jitEnabled ? '<span class="pill ok">on · ' + esc(c.jitDefaultRole) + '</span>' : '<span class="pill neutral">off</span>') + '</td>' +
+              '<td>' + (c.isActive ? '<span class="pill ok status-dot">active</span>' : '<span class="pill neutral">disabled</span>') + '</td>' +
+              '<td>' +
+                '<button class="btn" data-act="details">Details</button> ' +
+                '<button class="btn" data-act="edit">Edit</button> ' +
+                '<button class="btn danger" data-act="delete">Delete</button>' +
+              '</td>' +
+            '</tr>';
+          }).join('') + '</tbody>' +
+        '</table></div>'
+      : emptyState("No SAML IdPs yet", "Wire an Okta / Auth0 / Microsoft Entra / Ping / any SAML 2.0 provider into the workspace.", "+ Add IdP", null, "addSamlBtn");
+
+    var samlCard =
+      '<div class="card" style="padding:0">' +
+        '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:baseline">' +
+          '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">SAML 2.0 identity providers</h2>' +
+          '<span style="margin-left:8px; color:var(--fg-3); font-size:var(--t-sec)">' + configs.length + ' configured</span>' +
+          (configs.length ? '<button class="btn accent" id="addSamlBtn" style="margin-left:auto">+ Add IdP</button>' : '') +
+        '</div>' +
+        '<div style="padding: 20px 16px">' + samlList + '</div>' +
+      '</div>';
+
+    var mfaCard =
+      '<div class="card">' +
+        '<h2>Multi-factor auth</h2>' +
+        '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 var(--s-4)">Require WebAuthn (passkeys) or TOTP for all sign-ins. Enforced at the mint-session boundary — SAML users inherit their IdP\'s MFA posture.</p>' +
+        '<button class="btn accent" id="mfaBtn">Require MFA for all members</button>' +
+      '</div>';
+
+    root.innerHTML = oauthCard + samlCard + mfaCard;
+
+    var addBtn = $("#addSamlBtn", root);
+    if (addBtn) addBtn.addEventListener("click", function () { openSamlEditor(root, null); });
+    var mfa = $("#mfaBtn", root);
+    if (mfa) mfa.addEventListener("click", function () {
+      comingSoon("Require MFA", "Every member will be required to enroll a passkey or TOTP at their next sign-in.");
+    });
+
+    var tbody = root.querySelector("tbody");
+    if (tbody) tbody.addEventListener("click", function (e) {
+      var tr = e.target.closest("tr[data-id]");
+      if (!tr) return;
+      var id = tr.getAttribute("data-id");
+      var cfg = configs.find(function (c) { return c.id === id; });
+      var act = (e.target.closest("[data-act]") || {}).getAttribute && (e.target.closest("[data-act]")).getAttribute("data-act");
+      if (!act || !cfg) return;
+      e.stopPropagation();
+      if (act === "details") openSamlDetails(cfg);
+      else if (act === "edit") openSamlEditor(root, cfg);
+      else if (act === "delete") {
+        confirmModal({
+          title: "Delete SSO config?",
+          body: "The '" + cfg.displayName + "' IdP will be removed. Members signed in via it will need to re-authenticate.",
+          confirmLabel: "Delete", danger: true,
+          onConfirm: function () {
+            state.ds.deleteSamlConfig(cfg.id).then(function () {
+              toast("SSO config deleted");
+              renderSettingsSSO(root);
+            }).catch(function (err) { toast(err.message || "Delete failed", true); });
+          },
+        });
+      }
+    });
+  }
+
+  // ---------- SAML details drawer ----------
+
+  function openSamlDetails(cfg) {
+    if (document.body.classList.contains("locked")) return;
+    var backdrop = h(
+      '<div class="modal-backdrop" role="dialog" aria-modal="true">' +
+        '<div class="modal" style="max-width: 640px">' +
+          '<h2>' + esc(cfg.displayName) + '</h2>' +
+          '<p class="sub">Give these values to your IdP administrator.</p>' +
+          '<dl class="kv" style="grid-template-columns: 200px 1fr; gap: 8px 14px;">' +
+            '<dt>SP Entity ID</dt><dd class="mono" style="font-size:11.5px; word-break:break-all;">' + esc(cfg.spEntityId) + '</dd>' +
+            '<dt>ACS (Reply) URL</dt><dd class="mono" style="font-size:11.5px; word-break:break-all;">' + esc(cfg.spAcsUrl) + '</dd>' +
+            '<dt>SLO URL</dt><dd class="mono" style="font-size:11.5px; word-break:break-all;">' + esc(cfg.spSloUrl) + '</dd>' +
+            '<dt>Metadata URL</dt><dd class="mono" style="font-size:11.5px; word-break:break-all;"><a href="' + esc(cfg.spMetadataUrl) + '" target="_blank">' + esc(cfg.spMetadataUrl) + '</a></dd>' +
+            '<dt>IdP cert fingerprint</dt><dd class="mono" style="font-size:11.5px; word-break:break-all;">' + esc(cfg.x509CertFingerprint || "(not parsed)") + '</dd>' +
+            '<dt>SP signing keypair</dt><dd>' + (cfg.hasSpKeypair ? '<span class="pill ok">present</span>' : '<span class="pill neutral">none — using unsigned AuthnRequests</span>') + '</dd>' +
+            '<dt>NameID format</dt><dd class="mono" style="font-size:11.5px">' + esc(cfg.nameIdFormat) + '</dd>' +
+            '<dt>JIT provisioning</dt><dd>' + (cfg.jitEnabled ? 'enabled · default role = ' + esc(cfg.jitDefaultRole) : 'disabled') + '</dd>' +
+            '<dt>Allowed domains</dt><dd class="mono" style="font-size:11.5px">' + esc(cfg.allowedDomains || "(any)") + '</dd>' +
+          '</dl>' +
+          '<div class="actions">' +
+            '<button class="btn" data-act="regen">Regenerate SP keypair</button>' +
+            '<button class="btn accent" data-close>Done</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>'
+    );
+    document.body.appendChild(backdrop);
+    document.body.classList.add("locked");
+    var previouslyFocused = document.activeElement;
+    var uninstall;
+    function close() { backdrop.remove(); document.body.classList.remove("locked"); if (uninstall) uninstall(); if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {} }
+    uninstall = installModalKeys(backdrop, close);
+    backdrop.addEventListener("click", function (e) {
+      if (e.target === backdrop || e.target.hasAttribute("data-close")) return close();
+      var act = e.target.closest("[data-act]");
+      if (act && act.getAttribute("data-act") === "regen") {
+        act.disabled = true;
+        state.ds.regenerateSamlSpKeypair(cfg.id).then(function (r) {
+          toast("SP keypair regenerated");
+          showTokenModal(r.spCertPem, "New SP certificate");
+        }).catch(function (err) { toast(err.message || "Regenerate failed", true); act.disabled = false; });
+      }
+    });
+    setTimeout(function () { backdrop.querySelector('[data-close]').focus(); }, 20);
+  }
+
+  // ---------- SAML editor ----------
+
+  function openSamlEditor(rootAfterSave, existing) {
+    if (document.body.classList.contains("locked")) return;
+    var c = existing || {
+      displayName: "", ssoUrl: "", sloUrl: "", entityIdIdp: "", x509Cert: "",
+      wantAssertionsSigned: true, wantResponseSigned: false, allowEncryptedAssertions: true,
+      signatureAlgorithm: "sha256", digestAlgorithm: "sha256",
+      nameIdFormat: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+      jitEnabled: true, jitDefaultRole: "member", allowedDomains: "",
+    };
+    var backdrop = h(
+      '<div class="modal-backdrop" role="dialog" aria-modal="true">' +
+        '<div class="modal" style="max-width:680px">' +
+          '<h2>' + (existing ? 'Edit SAML IdP' : 'New SAML IdP') + '</h2>' +
+          '<p class="sub">Paste values from your Okta / Auth0 / Entra / SAML IdP admin console.</p>' +
+          '<form id="samlForm">' +
+            '<div class="field"><label>Display name</label><input id="s_name" required maxlength="80" placeholder="Okta production" value="' + esc(c.displayName) + '"></div>' +
+            '<div class="field"><label>IdP SSO URL</label><input id="s_ssoUrl" required type="url" placeholder="https://acme.okta.com/app/agentvisor/sso/saml" value="' + esc(c.ssoUrl) + '"></div>' +
+            '<div class="field"><label>IdP SLO URL (optional)</label><input id="s_sloUrl" type="url" placeholder="https://acme.okta.com/app/agentvisor/slo/saml" value="' + esc(c.sloUrl || "") + '"></div>' +
+            '<div class="field"><label>IdP Entity ID</label><input id="s_entityIdIdp" required placeholder="http://www.okta.com/exkABCDE" value="' + esc(c.entityIdIdp) + '"></div>' +
+            '<div class="field"><label>IdP X.509 Certificate (PEM)</label><textarea id="s_x509" required rows="6" style="font-family: SF Mono, ui-monospace, monospace; font-size:11.5px" placeholder="-----BEGIN CERTIFICATE-----&#10;MIIDpDCC...&#10;-----END CERTIFICATE-----">' + esc(c.x509Cert) + '</textarea></div>' +
+            '<div style="display:grid; grid-template-columns:1fr 1fr; gap:12px">' +
+              '<div class="field"><label>NameID format</label><select id="s_nameIdFormat">' +
+                ["emailAddress","persistent","transient","unspecified"].map(function (n) {
+                  var v = "urn:oasis:names:tc:SAML:" + (n === "unspecified" ? "1.1:nameid-format:" : (n === "persistent" || n === "transient" ? "2.0:nameid-format:" : "1.1:nameid-format:")) + n;
+                  return '<option value="' + esc(v) + '"' + (c.nameIdFormat === v ? ' selected' : '') + '>' + esc(n) + '</option>';
+                }).join('') +
+              '</select></div>' +
+              '<div class="field"><label>Signature algorithm</label><select id="s_sig">' +
+                ["sha256","sha512","sha1"].map(function (a) { return '<option' + (c.signatureAlgorithm === a ? ' selected' : '') + '>' + a + '</option>'; }).join('') +
+              '</select></div>' +
+            '</div>' +
+            '<div class="field"><label class="toggle"><input type="checkbox" id="s_wantAssertionsSigned"' + (c.wantAssertionsSigned ? ' checked' : '') + '> Require signed assertions</label></div>' +
+            '<div class="field"><label class="toggle"><input type="checkbox" id="s_wantResponseSigned"' + (c.wantResponseSigned ? ' checked' : '') + '> Require signed response envelope</label></div>' +
+            '<div class="field"><label class="toggle"><input type="checkbox" id="s_allowEncrypted"' + (c.allowEncryptedAssertions ? ' checked' : '') + '> Accept encrypted assertions</label></div>' +
+            '<hr style="border:0; border-top:1px solid var(--border); margin:12px 0">' +
+            '<div class="field"><label class="toggle"><input type="checkbox" id="s_jit"' + (c.jitEnabled ? ' checked' : '') + '> Just-in-time provisioning</label></div>' +
+            '<div style="display:grid; grid-template-columns:1fr 1fr; gap:12px">' +
+              '<div class="field"><label>Default role for new users</label><select id="s_jitRole">' +
+                ["member","admin"].map(function (r) { return '<option' + (c.jitDefaultRole === r ? ' selected' : '') + '>' + r + '</option>'; }).join('') +
+              '</select></div>' +
+              '<div class="field"><label>Allowed email domains (comma-separated)</label><input id="s_domains" placeholder="acme.com,acme.co.uk" value="' + esc(c.allowedDomains) + '"></div>' +
+            '</div>' +
+            '<div class="actions"><button type="button" class="btn" data-close>Cancel</button><button type="submit" class="btn accent">' + (existing ? 'Save' : 'Create') + '</button></div>' +
+          '</form>' +
+        '</div>' +
+      '</div>'
+    );
+    document.body.appendChild(backdrop);
+    document.body.classList.add("locked");
+    var previouslyFocused = document.activeElement;
+    var uninstall;
+    var handled = false;
+    function close() { if (handled) return; handled = true; backdrop.remove(); document.body.classList.remove("locked"); if (uninstall) uninstall(); if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {} }
+    uninstall = installModalKeys(backdrop, close);
+    backdrop.addEventListener("click", function (e) {
+      if (handled) return;
+      if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
+    });
+    backdrop.querySelector("#samlForm").addEventListener("submit", function (e) {
+      e.preventDefault();
+      if (handled) return;
+      var input = {
+        displayName: backdrop.querySelector("#s_name").value.trim(),
+        ssoUrl: backdrop.querySelector("#s_ssoUrl").value.trim(),
+        sloUrl: backdrop.querySelector("#s_sloUrl").value.trim() || null,
+        entityIdIdp: backdrop.querySelector("#s_entityIdIdp").value.trim(),
+        x509Cert: backdrop.querySelector("#s_x509").value.trim(),
+        wantAssertionsSigned: backdrop.querySelector("#s_wantAssertionsSigned").checked,
+        wantResponseSigned: backdrop.querySelector("#s_wantResponseSigned").checked,
+        allowEncryptedAssertions: backdrop.querySelector("#s_allowEncrypted").checked,
+        signatureAlgorithm: backdrop.querySelector("#s_sig").value,
+        digestAlgorithm: backdrop.querySelector("#s_sig").value,
+        nameIdFormat: backdrop.querySelector("#s_nameIdFormat").value,
+        jitEnabled: backdrop.querySelector("#s_jit").checked,
+        jitDefaultRole: backdrop.querySelector("#s_jitRole").value,
+        allowedDomains: backdrop.querySelector("#s_domains").value.trim(),
+      };
+      var btn = e.target.querySelector('button[type="submit"]');
+      btn.disabled = true;
+      var promise = existing
+        ? state.ds.updateSamlConfig(existing.id, input)
+        : state.ds.createSamlConfig(input);
+      promise.then(function () {
+        close();
+        toast(existing ? "SSO config saved" : "SSO config created");
+        renderSettingsSSO(rootAfterSave);
+      }).catch(function (err) {
+        btn.disabled = false;
+        var msg = err.message || "Save failed";
+        if ((err.errorCode || err.detail) === "displayname_in_use") msg = "Another IdP already uses that display name.";
+        toast(msg, true);
       });
     });
-    var mfa = $("#mfaBtn", root);
-    if (mfa) mfa.addEventListener("click", function () { comingSoon("Require MFA", "Every member will be required to enroll a passkey or TOTP at their next sign-in."); });
+    setTimeout(function () { backdrop.querySelector("#s_name").focus(); }, 20);
   }
   function renderSettingsWebhooks(root) {
     root.innerHTML =

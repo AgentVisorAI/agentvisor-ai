@@ -62,6 +62,7 @@ Legend: **✅ verified** · **🟢 configured** · **📋 documented**
 |---|---|---|---|
 | 3.1 | Google SSO (OIDC) | ✅ | [server/src/routes/oauth.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/routes/oauth.ts) |
 | 3.2 | Microsoft SSO (OIDC / Entra multi-tenant) | ✅ | [server/src/routes/oauth.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/routes/oauth.ts) |
+| 3.2b | **SAML 2.0 SSO** (Okta / Auth0 / Entra / any) — full SP with signed AuthnRequests, XML-signature verify, replay guard, JIT, RelayState round-trip, metadata endpoint, SP keypair regen | ✅ | [server/src/routes/saml.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/routes/saml.ts) · [server/src/lib/saml.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/lib/saml.ts) · [server/src/lib/saml-cert.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/lib/saml-cert.ts) |
 | 3.3 | Password reset via mailer with token expiry | ✅ | [server/src/routes/auth.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/routes/auth.ts) |
 | 3.4 | Mailer supports Resend, SMTP, or dev-stub | ✅ | [server/src/lib/mail.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/lib/mail.ts) |
 | 3.5 | Ed25519 signed receipts, verified in-browser | ✅ | [docs/app/datasource.js](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/app/datasource.js) |
@@ -176,3 +177,4 @@ Legend: **✅ verified** · **🟢 configured** · **📋 documented**
 - **Log redaction**: pino redact + auth-handler discipline keeps passwords, ingest tokens, cookies out of every log line.
 - **Member role forbidden**: non-owner member gets 403 on POST /deployments and DELETE /deployments/:id; still 200 on GET /sessions.
 - **Big session perf**: 500-event mock session renders to DOM in 48ms.
+- **SAML 2.0 end-to-end**: mock IdP with real openssl-generated RSA keypair signs a SAMLResponse XML with xml-crypto → POST to `/saml/<configId>/acs` → 302 with `av_session` cookie, RelayState round-trips (`#/deployments` preserved), JIT provisioning creates user + membership. `/me` confirms mint (email + displayName from attributes). Replay same POST → `400 replay_detected` (saml_replay_records table). Metadata XML valid, discovery-by-email returns config for allowed domains and `null` for others.
