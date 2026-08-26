@@ -184,7 +184,7 @@
   async function render() {
     state.route = parseHash();
     var path = state.route.path;
-    var publicRoutes = ["login", "signup", "reset"];
+    var publicRoutes = ["login", "signup", "reset", "accept-invite"];
     if (!state.session && !publicRoutes.includes(path[0])) {
       // Remember where the user was trying to go so we can restore
       // after login. A deep-link from a Slack notification / email
@@ -199,6 +199,7 @@
     if (!state.session) {
       if (path[0] === "signup") return renderSignup();
       if (path[0] === "reset") return renderReset();
+      if (path[0] === "accept-invite") return renderAcceptInvite();
       return renderLogin();
     }
 
@@ -618,6 +619,60 @@
   /* ============================================================
    * PASSWORD RESET (two-step)
    * ============================================================ */
+
+  function renderAcceptInvite() {
+    var qs = (location.hash.split("?")[1] || "");
+    var params = new URLSearchParams(qs);
+    var email = params.get("email") || "";
+    var token = params.get("token") || "";
+    if (!token) {
+      app.innerHTML = "";
+      app.appendChild(h('<div class="auth-shell"><section class="auth-form"><div class="auth-form-inner"><h1>Invite link invalid</h1><p class="sub">This link is missing its token. Ask your teammate to resend the invite.</p><a class="btn accent" href="#/login">Back to sign in</a></div></section></div>'));
+      return;
+    }
+    app.innerHTML = "";
+    app.appendChild(h(
+      '<div class="auth-shell">' +
+        '<section class="auth-form">' +
+          '<div class="auth-form-inner">' +
+            '<div class="auth-brand"><span class="auth-brand-mark">A</span> AgentVisor</div>' +
+            '<h1>Join the workspace</h1>' +
+            '<p class="sub">Accept your invite for <b>' + esc(email) + '</b> and set a password.</p>' +
+            '<form id="acceptForm">' +
+              '<div class="field"><label for="displayName">Your name</label><input id="displayName" type="text" placeholder="First Last" autocomplete="name" /></div>' +
+              '<div class="field"><label for="password">Password (min 12)</label><input id="password" type="password" required minlength="12" autocomplete="new-password" /></div>' +
+              '<div id="acceptErr"></div>' +
+              '<button class="primary" type="submit">Accept invite</button>' +
+            '</form>' +
+            '<div class="auth-alt">Already have an account? <a href="#/login">Sign in</a> first, then click the invite link again.</div>' +
+          '</div>' +
+        '</section>' +
+        '<aside class="auth-panel"><div class="panel-inner">' +
+          '<h2>Team invites are single-use.</h2>' +
+          '<p>The token is argon2-hashed at rest and expires in 7 days. Only the email address on the invite can accept it.</p>' +
+        '</div></aside>' +
+      '</div>'
+    ));
+    $("#acceptForm").addEventListener("submit", function (e) {
+      e.preventDefault();
+      var btn = e.target.querySelector('button[type="submit"]');
+      btn.disabled = true;
+      state.ds.acceptInvite({
+        email: email,
+        token: token,
+        password: $("#password").value,
+        displayName: ($("#displayName") || {}).value || undefined,
+      }).then(function (s) {
+        state.session = { user: s.user, org: s.org };
+        startLiveStream();
+        toast("Welcome to " + (s.org && s.org.name ? s.org.name : "the workspace"));
+        navigate("#/overview");
+      }).catch(function (err) {
+        btn.disabled = false;
+        $("#acceptErr").innerHTML = '<div class="auth-err">' + esc(err.message || "Accept failed") + '</div>';
+      });
+    });
+  }
 
   function renderReset() {
     // Optional inline second step: if the URL is #/reset?email=...&token=...
@@ -1744,16 +1799,30 @@
 
   async function renderSettingsMembers(root) {
     root.innerHTML = '<div class="card">' + loadingBlock("table") + "</div>";
-    var members = await state.ds.listMembers();
-    var rows = members.map(function (m) {
-      return "<tr>" +
-        '<td><div class="actor"><span class="av">' + esc(initials(m.displayName)) + '</span><div><div style="font-weight:500">' + esc(m.displayName) + "</div><div class=\"id\">" + esc(m.email) + "</div></div></div></td>" +
-        '<td><span class="pill neutral">' + esc(m.role) + "</span></td>" +
-        '<td style="color:var(--fg-2)">' + esc(timeAgo(m.lastActive)) + "</td>" +
-        '<td><button class="btn ghost">Manage</button></td>' +
-      "</tr>";
+    var members, invitesRes;
+    try {
+      members = await state.ds.listMembers();
+      invitesRes = await state.ds.listInvites();
+    } catch (e) {
+      root.innerHTML = '<div class="card empty"><h3>Could not load members</h3><p>' + esc(e.message || "") + '</p></div>';
+      return;
+    }
+    var invites = (invitesRes && invitesRes.invites) || [];
+
+    var memberRows = members.map(function (m) {
+      var roles = ["owner", "admin", "member"];
+      var selector = '<select data-role-user="' + esc(m.userId || m.id) + '">' +
+        roles.map(function (r) { return '<option' + (m.role === r ? ' selected' : '') + '>' + r + '</option>'; }).join('') +
+        '</select>';
+      return '<tr data-user="' + esc(m.userId || m.id) + '">' +
+        '<td><div class="actor"><span class="av">' + esc(initials(m.displayName || m.email)) + '</span><div><div style="font-weight:500">' + esc(m.displayName || m.email) + '</div><div class="id">' + esc(m.email) + '</div></div></div></td>' +
+        '<td>' + selector + '</td>' +
+        '<td style="color:var(--fg-2)">' + esc(timeAgo(m.lastActive)) + '</td>' +
+        '<td><button class="btn danger" data-act="remove">Remove</button></td>' +
+      '</tr>';
     }).join("");
-    root.innerHTML =
+
+    var membersCard =
       '<div class="card" style="padding:0">' +
         '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:baseline">' +
           '<h2 style="margin:0; font-size: var(--t-section); font-weight:600">Members</h2>' +
@@ -1761,14 +1830,122 @@
           '<button class="btn accent" id="inviteBtn" style="margin-left:auto">+ Invite</button>' +
         "</div>" +
         '<div class="table-wrap"><table>' +
-          "<thead><tr><th>Person</th><th>Role</th><th>Last active</th><th><span class=\"sr-only\">Actions</span></th></tr></thead>" +
-          "<tbody>" + rows + "</tbody>" +
-        "</table></div>" +
-      "</div>";
+          '<thead><tr><th>Person</th><th>Role</th><th>Last active</th><th><span class="sr-only">Actions</span></th></tr></thead>' +
+          '<tbody>' + memberRows + '</tbody>' +
+        '</table></div>' +
+      '</div>';
+
+    var inviteRows = invites.map(function (i) {
+      return '<tr data-invite="' + esc(i.id) + '">' +
+        '<td><div style="font-weight:500">' + esc(i.email) + '</div><div class="id">by ' + esc(i.invitedByEmail || "?") + '</div></td>' +
+        '<td><span class="pill neutral">' + esc(i.role) + "</span></td>" +
+        '<td style="color:var(--fg-2)">expires ' + esc(timeAgo(i.expiresAt)) + '</td>' +
+        '<td><button class="btn danger" data-act="revoke">Revoke</button></td>' +
+      '</tr>';
+    }).join('');
+    var invitesCard = invites.length
+      ? ('<div class="card" style="padding:0">' +
+          '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:baseline">' +
+            '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">Pending invites</h2>' +
+            '<span style="margin-left:8px; color:var(--fg-3); font-size:var(--t-sec)">' + invites.length + '</span>' +
+          '</div>' +
+          '<div class="table-wrap"><table>' +
+            '<thead><tr><th>Email</th><th>Role</th><th>Expires</th><th><span class="sr-only">Actions</span></th></tr></thead>' +
+            '<tbody>' + inviteRows + '</tbody>' +
+          '</table></div>' +
+        '</div>')
+      : '';
+
+    root.innerHTML = membersCard + invitesCard;
+
     var ib = $("#inviteBtn", root);
-    if (ib) ib.addEventListener("click", function () {
-      openInputModal({ title: "Invite a teammate", label: "Work email", placeholder: "teammate@company.com", confirmLabel: "Send invite", onConfirm: function (v) { toast("Invite sent to " + v); } });
+    if (ib) ib.addEventListener("click", function () { openInviteModal(root); });
+
+    // Member row actions — role change + remove
+    var tables = root.querySelectorAll("table");
+    tables[0].addEventListener("change", function (e) {
+      var sel = e.target.closest("[data-role-user]");
+      if (!sel) return;
+      var uid = sel.getAttribute("data-role-user");
+      state.ds.changeMemberRole(uid, sel.value).then(function () {
+        toast("Role updated");
+      }).catch(function (err) {
+        toast(err.message || "Role change failed", true);
+        renderSettingsMembers(root);
+      });
     });
+    tables[0].addEventListener("click", function (e) {
+      var btn = e.target.closest("[data-act='remove']");
+      if (!btn) return;
+      var tr = e.target.closest("tr[data-user]");
+      var uid = tr.getAttribute("data-user");
+      confirmModal({
+        title: "Remove member?",
+        body: "They will lose access immediately. You can invite them again later.",
+        confirmLabel: "Remove", danger: true,
+        onConfirm: function () {
+          state.ds.removeMember(uid).then(function () {
+            toast("Member removed");
+            renderSettingsMembers(root);
+          }).catch(function (err) { toast(err.message || "Remove failed", true); });
+        },
+      });
+    });
+    if (tables[1]) tables[1].addEventListener("click", function (e) {
+      var btn = e.target.closest("[data-act='revoke']");
+      if (!btn) return;
+      var tr = e.target.closest("tr[data-invite]");
+      var invId = tr.getAttribute("data-invite");
+      state.ds.revokeInvite(invId).then(function () {
+        toast("Invite revoked");
+        renderSettingsMembers(root);
+      }).catch(function (err) { toast(err.message || "Revoke failed", true); });
+    });
+  }
+
+  function openInviteModal(rootAfterSave) {
+    if (document.body.classList.contains("locked")) return;
+    var backdrop = h(
+      '<div class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal">' +
+        '<h2>Invite a teammate</h2>' +
+        '<p class="sub">They\'ll get an email with a link to join. Links expire in 7 days.</p>' +
+        '<form id="inviteForm">' +
+          '<div class="field"><label>Work email</label><input id="inv_email" type="email" required placeholder="teammate@company.com"></div>' +
+          '<div class="field"><label>Role</label><select id="inv_role"><option value="member">member</option><option value="admin">admin</option><option value="owner">owner</option></select></div>' +
+          '<div class="actions"><button type="button" class="btn" data-close>Cancel</button><button type="submit" class="btn accent">Send invite</button></div>' +
+        '</form>' +
+      '</div></div>'
+    );
+    document.body.appendChild(backdrop);
+    document.body.classList.add("locked");
+    var previouslyFocused = document.activeElement;
+    var uninstall;
+    var handled = false;
+    function close() { if (handled) return; handled = true; backdrop.remove(); document.body.classList.remove("locked"); if (uninstall) uninstall(); if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {} }
+    uninstall = installModalKeys(backdrop, close);
+    backdrop.addEventListener("click", function (e) {
+      if (handled) return;
+      if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
+    });
+    backdrop.querySelector("#inviteForm").addEventListener("submit", function (e) {
+      e.preventDefault();
+      if (handled) return;
+      var email = backdrop.querySelector("#inv_email").value.trim();
+      var role = backdrop.querySelector("#inv_role").value;
+      var btn = e.target.querySelector('button[type="submit"]');
+      btn.disabled = true;
+      state.ds.inviteMember({ email: email, role: role }).then(function () {
+        close();
+        toast("Invite sent to " + email);
+        if (rootAfterSave) renderSettingsMembers(rootAfterSave);
+      }).catch(function (err) {
+        btn.disabled = false;
+        var msg = err.message || "Invite failed";
+        if (err.errorCode === "already_a_member") msg = "This person is already a member.";
+        toast(msg, true);
+      });
+    });
+    setTimeout(function () { backdrop.querySelector("#inv_email").focus(); }, 20);
   }
   async function renderSettingsKeys(root) {
     root.innerHTML = '<div class="card">' + loadingBlock("table") + "</div>";

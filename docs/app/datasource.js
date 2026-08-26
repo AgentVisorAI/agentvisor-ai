@@ -112,11 +112,15 @@
   };
 
   var MOCK_MEMBERS = [
-    { id: "usr_olivia", email: "olivia.tan@northwind.com", displayName: "Olivia Tan", role: "owner", lastActive: iso(2 * MIN) },
-    { id: "usr_raj", email: "raj.patel@northwind.com", displayName: "Raj Patel", role: "admin", lastActive: iso(18 * MIN) },
-    { id: "usr_sam", email: "sam.lee@northwind.com", displayName: "Sam Lee", role: "member", lastActive: iso(4 * HOUR) },
-    { id: "usr_priya", email: "priya.iyer@northwind.com", displayName: "Priya Iyer", role: "member", lastActive: iso(2 * 24 * HOUR) },
-    { id: "usr_marc", email: "marc.dubois@northwind.com", displayName: "Marc Dubois", role: "viewer", lastActive: iso(6 * 24 * HOUR) },
+    { id: "usr_olivia", userId: "usr_olivia", email: "olivia.tan@northwind.com", displayName: "Olivia Tan", role: "owner", lastActive: iso(2 * MIN) },
+    { id: "usr_raj", userId: "usr_raj", email: "raj.patel@northwind.com", displayName: "Raj Patel", role: "admin", lastActive: iso(18 * MIN) },
+    { id: "usr_sam", userId: "usr_sam", email: "sam.lee@northwind.com", displayName: "Sam Lee", role: "member", lastActive: iso(4 * HOUR) },
+    { id: "usr_priya", userId: "usr_priya", email: "priya.iyer@northwind.com", displayName: "Priya Iyer", role: "member", lastActive: iso(2 * 24 * HOUR) },
+    { id: "usr_marc", userId: "usr_marc", email: "marc.dubois@northwind.com", displayName: "Marc Dubois", role: "member", lastActive: iso(6 * 24 * HOUR) },
+  ];
+
+  var MOCK_INVITES = [
+    { id: "inv_kate", email: "kate.chen@northwind.com", role: "admin", invitedByEmail: "olivia.tan@northwind.com", expiresAt: iso(-5 * 24 * HOUR), createdAt: iso(2 * 24 * HOUR) },
   ];
 
   var MOCK_API_KEYS = [
@@ -950,6 +954,34 @@
     },
 
     async listMembers() { await delay(100); return MOCK_MEMBERS.slice(); },
+    async inviteMember(input) {
+      await delay(200);
+      MOCK_INVITES.push({
+        id: "inv_" + Math.random().toString(36).slice(2, 8),
+        email: input.email,
+        role: input.role || "member",
+        invitedByEmail: mockState.session && mockState.session.user ? mockState.session.user.email : "you",
+        expiresAt: new Date(Date.now() + 7 * 24 * HOUR).toISOString(),
+        createdAt: new Date().toISOString(),
+      });
+      return { invite: MOCK_INVITES[MOCK_INVITES.length - 1] };
+    },
+    async listInvites() { await delay(80); return { invites: MOCK_INVITES.slice() }; },
+    async revokeInvite(id) {
+      await delay(120);
+      MOCK_INVITES = MOCK_INVITES.filter(function (i) { return i.id !== id; });
+    },
+    async acceptInvite() { throw new Error("mock_no_accept_flow"); },
+    async changeMemberRole(userId, role) {
+      await delay(150);
+      var i = MOCK_MEMBERS.findIndex(function (m) { return m.userId === userId || m.email === userId; });
+      if (i >= 0) MOCK_MEMBERS[i] = Object.assign({}, MOCK_MEMBERS[i], { role: role });
+      return { ok: true };
+    },
+    async removeMember(userId) {
+      await delay(150);
+      MOCK_MEMBERS = MOCK_MEMBERS.filter(function (m) { return m.userId !== userId && m.email !== userId; });
+    },
     async listApiKeys() { await delay(100); return MOCK_API_KEYS.slice(); },
     async listAudit() { await delay(100); return MOCK_AUDIT.slice(); },
     subscribe(callback) {
@@ -1302,7 +1334,33 @@
     async listPolicies() { return MOCK_POLICIES.slice(); }, // no backend endpoint yet
     async getPolicy(id) { var p = MOCK_POLICIES.find(function (x) { return x.id === id; }); if (!p) throw new Error("not_found"); return p; },
     async togglePolicy(id) { return this.getPolicy(id); },
-    async listMembers() { return MOCK_MEMBERS.slice(); },
+    async listMembers() {
+      try {
+        var r = await apiFetch("/api/v1/members");
+        return (r.members || []).map(function (m) {
+          return { userId: m.userId, email: m.email, displayName: m.displayName, role: m.role, lastActive: m.joinedAt };
+        });
+      } catch (e) { return []; }
+    },
+    async inviteMember(input) {
+      return apiFetch("/api/v1/members/invites", { method: "POST", body: input });
+    },
+    async listInvites() {
+      try { return await apiFetch("/api/v1/members/invites"); }
+      catch (e) { return { invites: [] }; }
+    },
+    async revokeInvite(id) {
+      return apiFetch("/api/v1/members/invites/" + encodeURIComponent(id), { method: "DELETE" });
+    },
+    async acceptInvite(input) {
+      return apiFetch("/api/v1/members/invites/accept", { method: "POST", body: input });
+    },
+    async changeMemberRole(userId, role) {
+      return apiFetch("/api/v1/members/" + encodeURIComponent(userId), { method: "PATCH", body: { role: role } });
+    },
+    async removeMember(userId) {
+      return apiFetch("/api/v1/members/" + encodeURIComponent(userId), { method: "DELETE" });
+    },
     async listApiKeys() { return MOCK_API_KEYS.slice(); },
     async listAudit(opts) {
       // Real audit log — the SPA maps our normalized shape into the

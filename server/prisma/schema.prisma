@@ -79,6 +79,7 @@ model Org {
   samlConfigs SamlConfig[]
   samlReplayRecords SamlReplayRecord[]
   auditEntries AuditEntry[]
+  invites Invite[]
 
   @@map("orgs")
 }
@@ -109,6 +110,32 @@ model AuditEntry {
 
   @@index([orgId, at])
   @@map("audit_entries")
+}
+
+// Pending team invite. Owner/admin sends one; invitee clicks the link
+// in the email, sets a password if new, and lands as a member.
+//
+// Token is argon2-hashed at rest; only the plaintext is emailed. Every
+// invite has a 7-day TTL. Accepted invites keep the row (acceptedAt set)
+// so the audit log can show "accepted N days after sent".
+model Invite {
+  id            String    @id @default(cuid())
+  orgId         String
+  email         String
+  role          String    @default("member") // owner|admin|member
+  tokenHash     String
+  invitedById   String?   // FK-less snapshot — inviter may leave the org
+  invitedByEmail String?
+  expiresAt     DateTime
+  acceptedAt    DateTime?
+  revokedAt     DateTime?
+  createdAt     DateTime  @default(now())
+
+  org Org @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, email])
+  @@index([expiresAt])
+  @@map("invites")
 }
 
 // Enterprise SAML 2.0 SSO configuration. One per IdP: an org can have

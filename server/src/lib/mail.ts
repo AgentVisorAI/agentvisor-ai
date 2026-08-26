@@ -166,3 +166,28 @@ Questions? Reply to this email or hit us at hello@agentvisorai.me.
 </div>`;
   return { subject: "Welcome to AgentVisor AI", text, html };
 }
+
+export function inviteMail(
+  orgName: string,
+  inviterEmail: string,
+  link: string,
+): Pick<MailInput, "subject" | "text" | "html"> {
+  const text = `${inviterEmail} invited you to join ${orgName} on AgentVisor AI.
+
+Click the link below to accept the invite. If you already have an
+AgentVisor AI account with this email, we'll add you to ${orgName};
+otherwise you'll set a password to finish signing up.
+
+${link}
+
+This invite expires in 7 days. If you didn't expect this email,
+you can safely ignore it.
+`;
+  const html = `<div style="font:15px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#222;max-width:520px">
+  <h2 style="margin:0 0 12px;font-size:20px">Join ${orgName} on AgentVisor AI</h2>
+  <p><b>${inviterEmail}</b> invited you to their workspace.</p>
+  <p><a href="${link}" style="background:#4c6ef5;color:#fff;padding:10px 16px;border-radius:6px;text-decoration:none;display:inline-block">Accept invite</a></p>
+  <p style="font-size:13px;color:#666">This link expires in 7 days. If you didn't expect this email, you can safely ignore it.</p>
+</div>`;
+  return { subject: `Invite to join ${orgName} on AgentVisor AI`, text, html };
+}
