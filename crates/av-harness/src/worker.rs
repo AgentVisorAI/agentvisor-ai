@@ -200,45 +200,50 @@ impl ActiveJournalRecord {
 
     /// Apply this record's counted dimensions to a live session's
     /// atomic totals — the live-path twin of [`Self::fold_into`], with
-    /// the same JCS-bound discipline via `checked_atomic_add`. The
-    /// record's fields were conditionalized ONCE at construction
-    /// (compression carries prompt tokens; terminal responses carry
-    /// completion/cached/cost; tool records carry call outcomes), so
-    /// applying them unconditionally here is exactly the old
-    /// per-class branching, without the second copy of the rules.
+    /// the same JCS-bound discipline. The record's fields were
+    /// conditionalized ONCE at construction (compression carries
+    /// prompt tokens; terminal responses carry completion/cached/cost;
+    /// tool records carry call outcomes), so applying them
+    /// unconditionally here is exactly the old per-class branching,
+    /// without the second copy of the rules.
+    ///
+    /// All-or-nothing across fields (R64 F1). The previous shape was
+    /// a loop of `checked_atomic_add` + a trailing `fetch_update` —
+    /// each iteration COMMITTED its store before the next validated,
+    /// so a mid-record failure (JCS bound crossed on
+    /// `completion_tokens`; `prompt_token_correction` underflow) left
+    /// `session.totals` half-updated (e.g., `tool_calls` bumped but
+    /// `completion_tokens` not). The subsequent invariant
+    /// `allowed+blocked <= calls` could then fail spuriously, and a
+    /// clean-close receipt over the partial totals attested different
+    /// numbers than a `fold_into`-based recovery replay of the exact
+    /// same on-disk journal — reintroducing the pre-R59 "recovered
+    /// receipt differs from live receipt for identical traffic"
+    /// hazard the unified fold exists to prevent. Snapshot → fold →
+    /// store restores the discipline: fold_into runs on a local
+    /// `RecoveredTotals`, either all fields validate or the Err
+    /// bubbles up with no store; only on success do we publish.
+    ///
+    /// Safe under sequential-per-session semantics: the only
+    /// production caller is `journal_step_completion` (worker.rs
+    /// below), which runs one step at a time per session inside the
+    /// worker loop. Metrics scrape may still observe a mid-publish
+    /// window across the seven per-field stores in `store_on`, but
+    /// that is inherent to per-field atomics and unchanged from the
+    /// prior shape.
     pub(crate) fn apply_to_totals(&self, totals: &crate::session::Totals) -> Result<(), String> {
-        for (counter, value, field) in [
-            (&totals.tool_calls, self.tool_calls, "tool calls"),
-            (&totals.tool_allowed, self.tool_allowed, "allowed tools"),
-            (&totals.tool_blocked, self.tool_blocked, "blocked tools"),
-            (&totals.prompt_tokens, self.prompt_tokens, "prompt tokens"),
-            (
-                &totals.completion_tokens,
-                self.completion_tokens,
-                "completion tokens",
-            ),
-            (&totals.cached_tokens, self.cached_tokens, "cached tokens"),
-            (&totals.cost_usd_micros, self.cost_usd_micros, "cost"),
-        ] {
-            if value > 0 {
-                checked_atomic_add(counter, value, field)?;
-            }
-        }
-        if self.prompt_token_correction != 0 {
-            totals
-                .prompt_tokens
-                .fetch_update(
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Acquire,
-                    |current| {
-                        current
-                            .checked_add_signed(self.prompt_token_correction)
-                            .filter(|next| *next <= av_core::error::JCS_SAFE_MAX)
-                    },
-                )
-                .map(|_| ())
-                .map_err(|_| "prompt token correction underflow/overflow".to_owned())?;
-        }
+        use std::sync::atomic::Ordering;
+        let mut snapshot = RecoveredTotals {
+            tool_calls: totals.tool_calls.load(Ordering::Acquire),
+            tool_allowed: totals.tool_allowed.load(Ordering::Acquire),
+            tool_blocked: totals.tool_blocked.load(Ordering::Acquire),
+            prompt_tokens: totals.prompt_tokens.load(Ordering::Acquire),
+            completion_tokens: totals.completion_tokens.load(Ordering::Acquire),
+            cached_tokens: totals.cached_tokens.load(Ordering::Acquire),
+            cost_usd_micros: totals.cost_usd_micros.load(Ordering::Acquire),
+        };
+        self.fold_into(&mut snapshot)?;
+        snapshot.store_on(totals);
         Ok(())
     }
 }
@@ -1743,6 +1748,7 @@ async fn finish_job(
     Ok(())
 }
 
+#[cfg(test)]
 fn checked_atomic_add(counter: &std::sync::atomic::AtomicU64, value: u64, field: &str) -> Result<(), String> {
     counter
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -1938,6 +1944,29 @@ pub(crate) async fn inflight_response_sessions(
 /// torn tail (a common crash pattern) doesn't cause a MAC-open error
 /// on garbage; complete records earlier in the file are still
 /// verified.
+///
+/// **Concurrent-scan invariant** (R64 M1): `inflight_response_sessions`
+/// is called from EVERY reconciler tick (`recovery.rs:157`), not just
+/// at boot. Live workers can be actively appending to the same
+/// `events.ndjson` this helper reads. Safety today relies on THREE
+/// independent defenses that must all remain intact under future
+/// refactors:
+///   1. Newline-boundary truncation in this fn: the writer emits
+///      `line` then `\n` as two separate `write_all` calls
+///      (`append_journal` below), so a partial mid-race read whose
+///      tail lacks `\n` is truncated here — the still-fsyncing record
+///      is dropped from consideration and the next tick will see it.
+///   2. `clear_response_marker` is idempotent to `NotFound`
+///      (below): if a live worker races with our `remove_file` of
+///      the same marker, the loser observes `NotFound` and treats
+///      it as success.
+///   3. `QuarantineIncompleteEffectsPass` retains ONLY sessions
+///      absent from the live registry (`recovery.rs:165`), so
+///      even if our scan sees a live session's in-flight marker,
+///      that session cannot end up in `quarantined_sessions` while
+///      it is still owned by a worker.
+///
+/// Weaken ANY one of those and the helper silently regresses.
 fn journal_witnesses_terminal_attempt(
     spool_dir: &std::path::Path,
     journal_key: &[u8; 32],
@@ -1978,10 +2007,13 @@ fn journal_witnesses_terminal_attempt(
         };
         cursor += newline_offset + 1;
         if line.is_empty() {
-            index = index
-                .checked_add(1)
-                .ok_or_else(|| "active journal index overflow".to_owned())?;
-            continue;
+            // R64 L1: `append_journal` never emits an empty line
+            // (it writes a non-empty sealed record then `\n`), so
+            // an empty line mid-file is corruption. Refuse to
+            // silently skip it — Err defensively retains the
+            // marker rather than desyncing our per-record `index`
+            // from the writer's `session.journal_index()`.
+            return Err("active journal contains an empty line".to_owned());
         }
         let record: ActiveJournalRecord = crate::journal::open(journal_key, &domain, index, line)
             .map_err(|error| format!("active journal record open failed: {error}"))?;
