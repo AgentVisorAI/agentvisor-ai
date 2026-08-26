@@ -19,10 +19,24 @@ async function main(): Promise<void> {
   const app = Fastify({
     logger: {
       level: env.LOG_LEVEL,
+      // Belt-and-suspenders: even if a handler accidentally passes a
+      // request body to the logger, these paths get replaced with
+      // `[Redacted]` before serialization. Auth handlers are also
+      // audited to never pass `req.body` at all — this is defense in
+      // depth in case a future refactor slips.
       redact: [
         "req.headers.authorization",
         "req.headers.cookie",
         "res.headers[set-cookie]",
+        "*.password",
+        "*.newPassword",
+        "*.token",
+        "*.plaintextToken",
+        "*.devOnlyResetToken",
+        "*.resetLinkHint",
+        "req.body.password",
+        "req.body.newPassword",
+        "req.body.token",
       ],
     },
     // Trust one proxy hop in front of us — most PaaS providers add exactly one.
@@ -59,7 +73,12 @@ async function main(): Promise<void> {
     origin: (origin, cb) => {
       // Same-origin (server-to-server, curl, etc.) has no Origin header.
       if (!origin) return cb(null, true);
-      if (env.ALLOWED_ORIGINS.length === 0) return cb(null, true);
+      // In production an empty allow-list would fail-open — reject.
+      if (env.ALLOWED_ORIGINS.length === 0) {
+        if (env.NODE_ENV === "production") return cb(null, false);
+        // Dev: allow anything so `npm run dev` on any port works.
+        return cb(null, true);
+      }
       cb(null, env.ALLOWED_ORIGINS.includes(origin));
     },
     credentials: true,

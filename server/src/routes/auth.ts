@@ -47,8 +47,10 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       })
       .safeParse(req.body);
     if (!parsed.success) {
+      // Never log the request body — it contains the plaintext password.
+      // The flatten()'d issues describe field paths + messages only.
       req.log.warn(
-        { body: req.body, issues: parsed.error.issues, email_bytes: [...Buffer.from((req.body as any).email ?? "")].map(b => b.toString(16)).join(" ") },
+        { issues: parsed.error.flatten() },
         "signup_reject",
       );
       return reply
@@ -176,8 +178,9 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
   // Password reset — two-step flow. The first endpoint always returns 202,
   // regardless of whether the email exists, so we don't leak account
-  // membership. In production the mailer replaces this stubbed log with a
-  // Postmark/Resend/SES call.
+  // membership. The plaintext token is delivered ONLY via the configured
+  // email path; it is never logged in production (log-read access would
+  // otherwise be sufficient to take over any account).
   app.post("/reset-request", async (req, reply) => {
     const body = z.object({ email: emailSchema }).safeParse(req.body);
     // Uniform response even on malformed input — no oracle for enumeration.
@@ -190,12 +193,22 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         where: { id: user.id },
         data: { resetTokenHash, resetTokenAt: new Date() },
       });
-      // In production this becomes an email. For now log it so ops can
-      // hand it to the user manually — better than a silent 202 during dev.
-      req.log.info(
-        { userId: user.id, resetLinkHint: `<console>/reset?token=${plaintextToken}` },
-        "password reset token issued",
-      );
+      // TODO: send via mailer (Postmark/Resend/SES).
+      // Metadata-only in production; the plaintext token is emitted ONLY in
+      // non-production for local development. Logging it in production would
+      // hand any log-reader a one-shot account takeover, since /reset-confirm
+      // requires only {email, token, newPassword} — no session, no MFA.
+      if (env.NODE_ENV === "production") {
+        req.log.info(
+          { userId: user.id },
+          "password_reset_token_issued",
+        );
+      } else {
+        req.log.info(
+          { userId: user.id, devOnlyResetToken: plaintextToken },
+          "password_reset_token_issued (dev only — token in log)",
+        );
+      }
     }
     return reply.code(202).send({ ok: true });
   });
