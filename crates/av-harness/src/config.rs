@@ -1147,6 +1147,31 @@ impl HarnessConfig {
                     .into(),
             );
         }
+        // R69 F3 (landed R70): `BudgetSpec` numeric caps of `Some(0)`
+        // are silently accepted by the ledger — `try_spend` refuses
+        // every `amount > 0` against a `limit == 0`, so
+        // `budget.max_tokens = 0` under the default `require_identity
+        // = false` shape 429-storms every non-empty chat request; the
+        // operator symptom is "every request 429s" and the exact
+        // diagnostic hunt `avctl config-validate` is meant to
+        // short-circuit. `max_tool_calls["db_write"] = 0` silently
+        // disables that tool with no config warning. The unset-vs-
+        // zero divergence for `max_payout_usd_micros` produces two
+        // subtly different `BudgetDecision::Refused` messages with
+        // identical policy semantics — surface zero at config time.
+        //
+        // The campaign added the same `== 0` fail-loud check for
+        // every other numeric interval / capacity field
+        // (`identity_jwks_refresh_s`, `worker_channel_capacity`,
+        // `reconcile_tick_s`, `session_idle_close_s`,
+        // `upstream_read_timeout_s`, `shutdown_drain_timeout_s`,
+        // `atif_retention_days == Some(0)` above, `max_request_bytes`,
+        // `onnx_dimension`, `breaker.window`). BudgetSpec was the
+        // odd one out.
+        Self::validate_budget_spec(&self.budget, "budget", errors);
+        if let Some(pb) = &self.principal_budget {
+            Self::validate_budget_spec(pb, "principal_budget", errors);
+        }
         if self.upstream_url.is_empty() {
             errors.push("upstream_url is required".into());
         }
@@ -1643,6 +1668,40 @@ impl HarnessConfig {
         // allowlists live in the typed-backend block above, running
         // against the resolved companion values.
     }
+
+    /// R69 F3 (landed R70): reject a `BudgetSpec` with any `Some(0)`
+    /// numeric cap or a zero entry in `max_tool_calls`. See the
+    /// call-site comment in `collect_validation_errors` for
+    /// rationale; message shape matches the other `must be > 0`
+    /// errors elsewhere in that function.
+    fn validate_budget_spec(spec: &av_state::BudgetSpec, scope: &str, errors: &mut Vec<String>) {
+        if spec.max_tokens == Some(0) {
+            errors.push(format!(
+                "{scope}.max_tokens must be > 0 (Some(0) refuses every non-zero spend, 429-storming \
+                 every non-empty chat request); omit the field to disable the cap"
+            ));
+        }
+        if spec.max_total_tool_calls == Some(0) {
+            errors.push(format!(
+                "{scope}.max_total_tool_calls must be > 0 (Some(0) refuses every tool call); \
+                 omit the field to disable the cap"
+            ));
+        }
+        if spec.max_payout_usd_micros == Some(0) {
+            errors.push(format!(
+                "{scope}.max_payout_usd_micros must be > 0 (Some(0) refuses every non-zero payout); \
+                 omit the field to disable the cap"
+            ));
+        }
+        for (tool, cap) in &spec.max_tool_calls {
+            if *cap == 0 {
+                errors.push(format!(
+                    "{scope}.max_tool_calls[{tool:?}] must be > 0 (0 silently disables the tool with \
+                     no error surface); omit the entry to leave the tool uncapped, or set >= 1"
+                ));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2108,6 +2167,59 @@ mod tests {
         cfg.atif_retention_days = None;
         cfg.validate().unwrap();
         cfg.atif_retention_days = Some(1);
+        cfg.validate().unwrap();
+
+        // R69 F3 / R70: BudgetSpec `Some(0)` caps silently 429-storm
+        // every non-empty request against the ledger's refuse-any-
+        // spend semantics. Reject at config-validate; None (uncapped)
+        // and Some(>=1) (real cap) stay legal.
+        cfg = base();
+        cfg.budget.max_tokens = Some(0);
+        assert!(
+            cfg.validate().unwrap_err().contains("budget.max_tokens"),
+            "budget.max_tokens = 0 should be rejected"
+        );
+        cfg = base();
+        cfg.budget.max_total_tool_calls = Some(0);
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .contains("budget.max_total_tool_calls"),
+            "budget.max_total_tool_calls = 0 should be rejected"
+        );
+        cfg = base();
+        cfg.budget.max_payout_usd_micros = Some(0);
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .contains("budget.max_payout_usd_micros"),
+            "budget.max_payout_usd_micros = 0 should be rejected"
+        );
+        cfg = base();
+        cfg.budget.max_tool_calls = std::collections::BTreeMap::from([("db_write".to_owned(), 0u64)]);
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .contains("max_tool_calls[\"db_write\"]"),
+            "budget.max_tool_calls[db_write] = 0 should be rejected"
+        );
+        // Same discipline applies to the per-principal budget spec.
+        cfg = base();
+        cfg.require_identity = true;
+        cfg.identity_jwks_url = Some("https://example/.well-known/jwks.json".to_owned());
+        cfg.principal_budget = Some(av_state::BudgetSpec {
+            max_tokens: Some(0),
+            ..av_state::BudgetSpec::default()
+        });
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .contains("principal_budget.max_tokens"),
+            "principal_budget.max_tokens = 0 should be rejected"
+        );
+        // Uncapped (None) stays legal on both.
+        cfg = base();
+        cfg.budget = av_state::BudgetSpec::default();
         cfg.validate().unwrap();
 
         cfg = base();
