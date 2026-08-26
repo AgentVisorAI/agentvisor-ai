@@ -177,6 +177,21 @@ impl ActiveJournalRecord {
                 .filter(|total| *total <= av_core::error::JCS_SAFE_MAX)
                 .ok_or_else(|| format!("recovered {field} overflow"))
         }
+        // R64 F3 (landed R69): the cost dimension has a TIGHTER
+        // ceiling than the JCS-safe integer bound. `av_atif::validate::
+        // MAX_COST_USD` refuses any `total_cost_usd > 9e9` (== 9e15
+        // micros), while `JCS_SAFE_MAX = 2^53 = 9.007e15` micros —
+        // a $7.2M window in which the fold used to say "safe" while
+        // the next strict-write would refuse the trajectory, wedging
+        // recovery. Cap the cost fold at
+        // `av_core::units::COST_MICROS_MAX` so any cost that folds
+        // cleanly also passes ATIF strict validation.
+        fn checked_cost(current: u64, value: u64) -> Result<u64, String> {
+            current
+                .checked_add(value)
+                .filter(|total| *total <= av_core::units::COST_MICROS_MAX)
+                .ok_or_else(|| "recovered cost exceeds ATIF strict validator ceiling".to_owned())
+        }
         totals.tool_calls = checked(totals.tool_calls, self.tool_calls, "tool calls")?;
         totals.tool_allowed = checked(totals.tool_allowed, self.tool_allowed, "allowed tools")?;
         totals.tool_blocked = checked(totals.tool_blocked, self.tool_blocked, "blocked tools")?;
@@ -194,7 +209,7 @@ impl ActiveJournalRecord {
             "completion tokens",
         )?;
         totals.cached_tokens = checked(totals.cached_tokens, self.cached_tokens, "cached tokens")?;
-        totals.cost_usd_micros = checked(totals.cost_usd_micros, self.cost_usd_micros, "cost")?;
+        totals.cost_usd_micros = checked_cost(totals.cost_usd_micros, self.cost_usd_micros)?;
         Ok(())
     }
 
