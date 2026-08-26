@@ -107,6 +107,28 @@ pub enum IdentityError {
         /// Parent expiry.
         parent: u64,
     },
+    /// Child claims to be issued before its parent (the delegator).
+    /// A backdated child forges audit-trail causality: consumers that
+    /// treat `claims.iat` as "when this identity became authorized"
+    /// see the child asserting authority before the parent that
+    /// granted it existed.
+    #[error("child iat {child} predates parent iat {parent}")]
+    IatEscalation {
+        /// Child issued-at.
+        child: u64,
+        /// Parent issued-at.
+        parent: u64,
+    },
+    /// Child claims not-before earlier than its parent's not-before
+    /// (or than the parent's `iat` when the parent has no `nbf`) —
+    /// same forgery class as `IatEscalation`.
+    #[error("child nbf {child} predates parent nbf {parent}")]
+    NbfEscalation {
+        /// Child not-before.
+        child: u64,
+        /// Parent not-before (or iat if nbf absent).
+        parent: u64,
+    },
     /// Delegation chain deeper than permitted.
     #[error("delegation chain deeper than {0}")]
     ChainTooDeep(usize),
@@ -399,6 +421,34 @@ impl IdentityValidator {
                     parent: parent.exp,
                 });
             }
+            // Child must not be backdated before its parent. A
+            // hostile HMAC-shared-secret holder could otherwise mint
+            // a child with `iat` up to MAX_TTL_SECS BEFORE the parent
+            // that "delegated" it — asserting authorization causality
+            // that never happened. Consumers that treat `claims.iat`
+            // as "when this identity became authorized" (audit
+            // pipelines, revocation-cache pruning that keys eviction
+            // horizons on `iat + MAX_TTL_SECS`) are then lied to.
+            if child.iat < parent.iat {
+                return Err(IdentityError::IatEscalation {
+                    child: child.iat,
+                    parent: parent.iat,
+                });
+            }
+            // Same posture for `nbf`: a child cannot become usable
+            // before the parent that granted it did. Fall back to the
+            // parent's `iat` when the parent has no `nbf` — a child
+            // with `nbf` earlier than the parent's own start is still
+            // a temporal-inversion forgery.
+            let parent_start = parent.nbf.unwrap_or(parent.iat);
+            if let Some(child_nbf) = child.nbf {
+                if child_nbf < parent_start {
+                    return Err(IdentityError::NbfEscalation {
+                        child: child_nbf,
+                        parent: parent_start,
+                    });
+                }
+            }
             parent_token = parent.parent_token.clone();
             child = parent;
         }
@@ -546,7 +596,12 @@ impl IdentityValidator {
         // Trojan-Source guard: any bidi override or zero-width character in
         // a rendered identity field would spoof how it looks in operator
         // logs, receipts, and event chains while remaining part of the raw
-        // bytes on the wire.
+        // bytes on the wire. Scopes must be guarded too — they are the
+        // most audit-prominent identity strings and were the only one
+        // omitted from the original list, an inconsistency that let a
+        // scope like `payout\u{202E}elbast` render as visually-corrupt
+        // junk in operator logs while still surviving the length cap and
+        // the scope-subset check on raw bytes.
         for (name, value) in [
             ("instance_uid", claims.instance_uid.as_str()),
             ("charter", claims.charter.as_str()),
@@ -557,6 +612,11 @@ impl IdentityValidator {
         ] {
             if av_core::text::contains_bidi_or_zero_width(value) {
                 return Err(IdentityError::SpoofingCharacter(name));
+            }
+        }
+        for scope in &claims.scopes {
+            if av_core::text::contains_bidi_or_zero_width(scope) {
+                return Err(IdentityError::SpoofingCharacter("scopes[]"));
             }
         }
         if let Some(allowed) = &self.allowed_issuers {
