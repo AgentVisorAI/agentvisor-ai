@@ -18,6 +18,30 @@ export async function hashPassword(plaintext: string): Promise<string> {
   return hash(plaintext, ARGON2_OPTS);
 }
 
+// Precomputed dummy hash so login for a missing user still runs a real
+// argon2 verify — closes the timing side-channel that would otherwise
+// let an attacker distinguish "user exists" from "user missing" by
+// clocking a 12ms 401 vs a 100ms 401. The previous dummy was an
+// ill-formed argon2 string that argon2 threw on in <1ms, defeating the
+// entire uniform-response-time posture. See lib/auth.verifyPassword.
+//
+// Generated once at module load. The password we hash here is a fixed
+// throwaway; nobody ever tries to log in with it and it doesn't need
+// to be secret.
+let dummyHashPromise: Promise<string> | null = null;
+export function getDummyPasswordHash(): Promise<string> {
+  if (!dummyHashPromise) {
+    dummyHashPromise = hash(
+      "not-a-real-password-e5f2c7ac-timing-dummy",
+      ARGON2_OPTS,
+    );
+  }
+  return dummyHashPromise;
+}
+// Kick off the compute at import time so the first login isn't slower
+// than the second.
+void getDummyPasswordHash();
+
 export async function verifyPassword(
   hashStr: string,
   plaintext: string,

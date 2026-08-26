@@ -4,6 +4,7 @@ import { db } from "../db.js";
 import { env } from "../env.js";
 import {
   SESSION_COOKIE_OPTS,
+  getDummyPasswordHash,
   hashPassword,
   mintSession,
   randomToken,
@@ -175,10 +176,12 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       where: { email },
       include: { memberships: { include: { org: true } } },
     });
-    // Uniform response time by always running the verify, even on a miss.
-    const hashToCheck =
-      user?.passwordHash ??
-      "$argon2id$v=19$m=19456,t=2,p=1$aaaaaaaaaaaaaaaaaaaaaa$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    // Uniform response time by always running argon2 verify, even when
+    // the user doesn't exist. The dummy is a real precomputed argon2id
+    // hash (from getDummyPasswordHash) so verify actually spends its
+    // full ~100ms — the previous ill-formed dummy failed decode in
+    // <1ms and defeated the entire posture.
+    const hashToCheck = user?.passwordHash ?? (await getDummyPasswordHash());
     const ok = await verifyPassword(hashToCheck, password);
     if (!user || !ok) {
       return reply.code(401).send({ error: "invalid_credentials" });

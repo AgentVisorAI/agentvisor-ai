@@ -91,6 +91,18 @@
       toast("Your session expired — please sign in again");
       navigate("#/login");
     });
+    // Cross-tab sign-out: when another tab in this browser signs out,
+    // it writes localStorage.av_signed_out_at. The storage event fires
+    // in *other* tabs (not the writer). We drop our in-memory session
+    // and bounce to login without waiting for the next API 401.
+    window.addEventListener("storage", function (e) {
+      if (e.key !== "av_signed_out_at" || !e.newValue) return;
+      if (!state.session) return;
+      state.session = null;
+      stopLiveStream();
+      toast("Signed out in another tab");
+      navigate("#/login");
+    });
   }
 
   var liveUnsub = null;
@@ -344,7 +356,15 @@
       danger: false,
       onConfirm: function () {
         stopLiveStream();
-        state.ds.logout().then(function () { state.session = null; navigate("#/login"); });
+        state.ds.logout().then(function () {
+          state.session = null;
+          // Cross-tab sync: any other console tab open in this browser
+          // notices via a storage event and drops its own session state
+          // without waiting for the next API 401. The value is a
+          // timestamp so re-signing-out later fires the event again.
+          try { localStorage.setItem("av_signed_out_at", String(Date.now())); } catch (e) {}
+          navigate("#/login");
+        });
       },
     });
   }
