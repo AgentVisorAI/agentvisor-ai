@@ -22,6 +22,21 @@
 #   existing receipt fails verification against the operator's published
 #   pubkey. Back it up out of band (Vault, sealed-secret, KMS-encrypted
 #   backup).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agentvisor-ai
+  labels:
+    app: agentvisor-ai
+# The daemon never calls the Kubernetes API, so this SA has NO
+# RoleBinding / ClusterRoleBinding attached. Combined with
+# `automountServiceAccountToken: false` on the Pod template, no
+# token is projected into the container. If a future feature needs
+# API access (leader election, sidecar coordination), attach the
+# minimal RBAC binding here and set the Pod template's
+# `automountServiceAccountToken: true`.
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -60,6 +75,19 @@ data:
     # config. Omitting it inherits the zero-config serde default of
     # "unsigned" — clean traffic then produces zero signed receipts.
     default_workflow = "signed"
+    # Readiness-controlled pre-drain window. On SIGTERM the daemon
+    # flips /readyz to 503 and KEEPS ACCEPTING for this many seconds
+    # before its graceful drain begins, so the Kubernetes readiness
+    # probe can pull this pod out of the Service Endpoints before the
+    # listener closes. We do this daemon-side rather than via a
+    # preStop shell (`sh -c "sleep 5"`) because the runtime image is
+    # distroless (chainguard/glibc-dynamic) and has no /bin/sh — an
+    # exec-based preStop hook fails FailedPreStopHook and kubelet
+    # proceeds straight to SIGTERM, so the endpoint-reconciliation
+    # window it was supposed to provide never happens. This value
+    # counts against `terminationGracePeriodSeconds` ON TOP of the
+    # drain budget, so keep it well below the pod-level grace.
+    shutdown_ready_drain_s = 5
     # Bound the spool so a pod restart's recovery scan stays inside the
     # 1 Gi memory limit (~25 KB RSS per recovered session — see the PVC
     # sizing note). Sealed evidence pairs older than this are pruned
@@ -137,6 +165,17 @@ spec:
       # shipped_kubernetes_configmap_total_shutdown_fits_termination_
       # grace pin test now catches this class of drift at CI time.
       terminationGracePeriodSeconds: 150
+      # Dedicated ServiceAccount with token auto-mount OFF. The daemon
+      # never talks to the Kubernetes API (no leader election, no CRD
+      # reconciliation — this is a stateful app talking to its PVC,
+      # upstream provider, and OTLP collector). A projected default
+      # ServiceAccount token would give a compromised process
+      # authenticated access to self-subject reviews and — depending
+      # on how the namespace's default SA has been bound — more.
+      # Off by default. If a future feature needs the k8s API, create
+      # the SA explicitly with the minimal RBAC binding.
+      serviceAccountName: agentvisor-ai
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -153,6 +192,18 @@ spec:
       # pod is unreadable to any other uid because emptyDir mode 0700.
       initContainers:
         - name: install-signing-seed
+          # OPERATOR ACTION REQUIRED: pin to a content digest before
+          # deploying. Every other third-party dependency in this repo
+          # is SHA-pinned (GitHub Actions in .github/workflows/,
+          # cargo dependencies via Cargo.lock). This initContainer runs
+          # as UID 0 with CAP_CHOWN + CAP_FOWNER and directly handles
+          # the receipt trust anchor — a tag-rewrite attack against
+          # `busybox:1.36` (Docker Hub tag republish or namespace
+          # takeover) would land arbitrary code in that exact seam.
+          # Change the line below to
+          # `image: busybox@sha256:<digest> # 1.36`
+          # after `docker pull busybox:1.36 && docker inspect busybox:1.36`.
+          # Renovate/Dependabot can then track the trailing tag comment.
           image: busybox:1.36
           command:
             - sh
@@ -278,17 +329,18 @@ spec:
               port: http
             periodSeconds: 10
             failureThreshold: 3
-          # preStop gives the LB / Service the readiness-controlled drain
-          # window BEFORE SIGTERM. Without this, deleting a pod races
-          # kubelet's SIGTERM against the Service endpoint update — an
-          # in-flight request can arrive after the harness has stopped
-          # accepting. 5 s is enough for one Service reconciliation
-          # cycle; tune with `terminationGracePeriodSeconds` if the
-          # cluster's endpoint controller runs slower.
-          lifecycle:
-            preStop:
-              exec:
-                command: ["sh", "-c", "sleep 5"]
+          # NOTE: no preStop hook. The runtime image (chainguard/
+          # glibc-dynamic) is distroless — no /bin/sh, no /bin/sleep
+          # — so an exec-based preStop like `sh -c "sleep 5"` fails
+          # with FailedPreStopHook and kubelet proceeds straight to
+          # SIGTERM, defeating the endpoint-reconciliation window it
+          # was supposed to provide. The equivalent window lives in
+          # the ConfigMap above as `shutdown_ready_drain_s = 5`: on
+          # SIGTERM the daemon flips /readyz to 503 and keeps
+          # accepting for 5 s BEFORE the graceful drain, so the
+          # readiness probe pulls this pod out of the Service before
+          # the listener closes. Same behavioural outcome, no shell
+          # dependency.
           resources:
             requests:
               cpu: 250m
