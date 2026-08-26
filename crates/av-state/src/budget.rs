@@ -5,7 +5,7 @@
 //! Money is tracked in integer micro-USD; a payout of $12.34 spends
 //! 12_340_000. Fractional-cent dust can therefore never accumulate invisibly.
 
-use crate::store::{Spend, StateError, StateStore};
+use crate::store::{Refund, Spend, StateError, StateStore};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -227,14 +227,37 @@ impl<'a> ActionBudget<'a> {
     /// the compensation path must never turn a lost-race response
     /// into a 5xx.
     pub fn refund_tool_call(&self, tool: &str, payout_usd_micros: u64) {
+        // R66 F2: single atomic refund_many call so all three
+        // dimensions (total_calls / tool:{X} / payout) are refunded
+        // as one transaction under InMemoryStore's `transaction_lock`
+        // and one Lua EVAL under RedisStore. Prior shape was 3
+        // independent `store.refund` calls — a crash / connection
+        // drop between steps left partial refund state, and a
+        // concurrent `try_tool_call` on InMemoryStore could observe
+        // the mid-batch state (fresh `total_calls` headroom but
+        // still-charged per-tool cap), an ordering impossible on
+        // RedisStore's single-Lua path.
+        let mut refunds: Vec<Refund> = Vec::with_capacity(3);
         if self.spec.max_total_tool_calls.is_some() {
-            self.store.refund(&self.key("total_calls"), 1);
+            refunds.push(Refund {
+                key: self.key("total_calls"),
+                amount: 1,
+            });
         }
         if self.spec.max_tool_calls.contains_key(tool) {
-            self.store.refund(&self.key(&format!("tool:{tool}")), 1);
+            refunds.push(Refund {
+                key: self.key(&format!("tool:{tool}")),
+                amount: 1,
+            });
         }
         if payout_usd_micros > 0 && self.spec.max_payout_usd_micros.is_some() {
-            self.store.refund(&self.key("payout"), payout_usd_micros);
+            refunds.push(Refund {
+                key: self.key("payout"),
+                amount: payout_usd_micros,
+            });
+        }
+        if !refunds.is_empty() {
+            self.store.refund_many(&refunds);
         }
     }
 

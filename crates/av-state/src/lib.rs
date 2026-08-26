@@ -16,7 +16,7 @@ pub mod store;
 pub mod velocity;
 
 pub use budget::{ActionBudget, BudgetDecision, BudgetSpec};
-pub use store::{InMemoryStore, Spend, StateError, StateStore};
+pub use store::{InMemoryStore, Refund, Spend, StateError, StateStore};
 pub use velocity::TokenVelocity;
 
 #[cfg(feature = "redis")]
@@ -141,6 +141,49 @@ pub fn state_store_contract(store: &dyn StateStore, hash_tag: &str) {
         0,
         "refund after remove must not resurrect the counter"
     );
+
+    // -- refund_many: same semantics as per-key refund, one atomic
+    // transaction. Every backend MUST subtract each amount, saturate
+    // at 0, and never resurrect a removed cell.
+    let m_a = key("refund_many_a");
+    let m_b = key("refund_many_b");
+    let m_c = key("refund_many_c");
+    assert!(store.try_spend(&m_a, 7, 10).unwrap());
+    assert!(store.try_spend(&m_b, 5, 10).unwrap());
+    // c intentionally never spent — refund_many on a fresh key must
+    // NOT resurrect it (same "never resurrect" invariant as `refund`).
+    store.refund_many(&[
+        Refund {
+            key: m_a.clone(),
+            amount: 3,
+        },
+        Refund {
+            key: m_b.clone(),
+            amount: 100,
+        },
+        Refund {
+            key: m_c.clone(),
+            amount: 1,
+        },
+    ]);
+    assert_eq!(
+        store.get(&m_a).unwrap(),
+        4,
+        "refund_many must subtract every listed amount"
+    );
+    assert_eq!(
+        store.get(&m_b).unwrap(),
+        0,
+        "refund_many must clamp at 0 like per-key refund"
+    );
+    assert_eq!(
+        store.get(&m_c).unwrap(),
+        0,
+        "refund_many on a fresh key must not resurrect it"
+    );
+    // Empty batch is a no-op.
+    store.refund_many(&[]);
+    assert_eq!(store.get(&m_a).unwrap(), 4);
 
     // -- remove / remove_prefix: whole-session cleanup.
     store.remove(&counter);
