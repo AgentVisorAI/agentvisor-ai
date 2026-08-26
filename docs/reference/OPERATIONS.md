@@ -50,9 +50,12 @@ last 5 seconds of traffic drop off before the process actually
 terminates.
 
 The included Kubernetes manifest at
-`deploy/kubernetes/agentvisor-ai.yaml` wires all three, plus a
-`preStop` hook that sleeps 5 seconds so the endpoint churn overlaps
-the drain window.
+`deploy/kubernetes/agentvisor-ai.yaml` wires **liveness and readiness**
+(via `startupProbe`, `readinessProbe`, and `livenessProbe` against
+`/livez` and `/readyz`), plus a `preStop` hook that sleeps 5 seconds
+so the endpoint churn overlaps the drain window. `/health` exists
+only for pre-`/livez`/`/readyz` deployments and mirrors `/livez` — new
+deployments should probe `/livez` and `/readyz` directly.
 
 ## Shutdown
 
@@ -160,7 +163,11 @@ interaction.
 | `av_atif_retention_pruned_total` | Sudden increase | Retention sweep ran (usually just noise, but confirm the `atif_retention_days` you set). |
 | `av_reconciler_last_tick_completed_seconds` | `time() - value > 5 × tick interval` | The reconciler tick is stalled (hung filesystem, lifecycle-lock deadlock) or has never completed since boot. Closes, promotion retries, idle finalization and outbox replay are all stopped with it. The series exists from boot and reads 0 until the first tick completes. |
 | `av_atif_recovery_skipped_total{reason="unauthenticated"}` | Rate > 0 sustained | Someone/something is planting sidecar-less .json files. Escalate. |
-| `av_atif_recovery_skipped_total{reason="too_large"}` | Rate > 0 | Adversarial ATIF payload attempts. Investigate the spool contents. |
+| `av_atif_recovery_skipped_total{reason="too_large"}` | Rate > 0 | Adversarial ATIF payload attempts (> `MAX_ATIF_RECOVERY_BYTES`). Investigate the spool contents. |
+| `av_atif_recovery_skipped_total{reason="read_error"}` | Rate > 0 sustained | Recovery failed to open a spool file after `MAX_ATIF_RECOVERY_BYTES` metadata pre-check — disk / permission fault, or a symlink-plant beat the pre-check. Investigate the disk. |
+| `av_atif_recovery_skipped_total{reason="invalid_json"}` | Any occurrence | ATIF file bytes could not parse as JSON. Adversarial payload or bit-rot. Escalate. |
+| `av_atif_recovery_skipped_total{reason="nonconformant"}` | Any occurrence | ATIF parsed as JSON but failed strict-mode structural validation. Same class as `invalid_json` — either a hostile plant or a schema-version mismatch that the operator needs to reconcile. Escalate. |
+| `av_atif_recovery_skipped_total{reason="provenance"}` | Any occurrence | `.atif-auth` sidecar HMAC failed to verify against the current signer key. This is a cryptographic integrity failure — either a key rotation that missed the retirement window, or a tampered/planted trajectory. **Escalate immediately.** |
 | `av_incomplete_sessions_total` | Sudden increase | Sessions where `capture_failed` was set on the audit chain. After round 51 §6.2 (D7) this is genuinely rare and represents unrecoverable pipeline state, not client disconnects. Escalate. |
 | `av_events_dropped_total{stage="response_slot"}` | Rate > 0 sustained | Response capture backpressure — the worker pool is saturated or the state store is slow. Scale up workers or investigate the state backend. |
 | `av_http_shutdown_drain_timeouts_total` | Any increase | A graceful drain hit its timeout with requests still in flight; usually upstream latency. |

@@ -105,7 +105,8 @@ enum Command {
     ReceiptVerify {
         /// Receipt JSON file.
         path: PathBuf,
-        /// Trusted Ed25519 public key as 64 hexadecimal characters.
+        /// Trusted Ed25519 public key as 64 hexadecimal characters
+        /// or standard-alphabet base64 (32 bytes decoded).
         /// Repeatable: pass once per key you trust (rotation windows
         /// need both the retiring and the incoming key pinned; the
         /// receipt's `key_id` selects which one verifies it).
