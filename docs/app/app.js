@@ -71,9 +71,15 @@
     if (liveUnsub || !state.ds.subscribe) return;
     try {
       liveUnsub = state.ds.subscribe(function (msg) {
-        // Track a small ring for the pulse indicator and any listener on
-        // the current view. The Overview refreshes stats when new events
-        // land; the Session detail rerenders when its session is hit.
+        // Meta messages control the pill's connection state.
+        if (msg.type === "stream.open" || msg.type === "hello") {
+          setLiveState("live");
+          return;
+        }
+        if (msg.type === "stream.closed") {
+          setLiveState("reconnecting");
+          return;
+        }
         liveEventBuffer.push({ at: Date.now(), msg: msg });
         if (liveEventBuffer.length > 40) liveEventBuffer.shift();
         pulseLiveIndicator();
@@ -85,6 +91,16 @@
   }
   function stopLiveStream() {
     if (liveUnsub) { liveUnsub(); liveUnsub = null; }
+  }
+  function setLiveState(s) {
+    var el = document.querySelector('.env-pill.live-pulse');
+    if (!el) return;
+    el.classList.toggle('reconnecting', s === "reconnecting");
+    el.title = s === "reconnecting"
+      ? "Reconnecting to the daemon stream…"
+      : "Streaming events from the daemon";
+    var label = el.querySelector('.live-label');
+    if (label) label.textContent = s === "reconnecting" ? "Reconnecting" : "Live";
   }
   function pulseLiveIndicator() {
     var el = document.querySelector('.env-pill.live-pulse');
@@ -290,7 +306,7 @@
     var modeChip = state.ds.mode === "mock"
       ? '<span class="env-pill" title="Console is showing built-in demo data. Set MOCK_MODE=false to talk to a live backend.">Demo</span>'
       : '<span class="env-pill">Live</span>';
-    var liveChip = '<span class="env-pill live-pulse" title="Streaming events from the daemon"><span class="dot"></span>Live</span>';
+    var liveChip = '<span class="env-pill live-pulse" title="Streaming events from the daemon"><span class="live-label">Live</span></span>';
 
     app.innerHTML = "";
     app.appendChild(h(

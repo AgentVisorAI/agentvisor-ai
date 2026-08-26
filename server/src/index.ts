@@ -101,6 +101,21 @@ async function main(): Promise<void> {
   });
 
   await app.listen({ port: env.PORT, host: env.HOST });
+
+  // Graceful shutdown — Fly/Cloud Run/Kubernetes all send SIGTERM before
+  // the hard kill window. Close the HTTP server (drains in-flight requests),
+  // disconnect Prisma, then exit. Target: sub-second in the common case.
+  const shutdown = async (signal: string) => {
+    app.log.info({ signal }, "graceful shutdown starting");
+    try {
+      await app.close();
+    } catch (err) {
+      app.log.error({ err }, "shutdown error");
+    }
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
 }
 
 main().catch((err) => {

@@ -383,6 +383,19 @@ code, pre, .mono {
 }
 .topbar .env-pill.live-pulse::before { background: var(--success-solid); }
 .topbar .env-pill.live-pulse .dot { display: none; }
+.topbar .env-pill.live-pulse.reconnecting {
+  background: var(--warning-bg);
+  border-color: var(--warning-border);
+  color: var(--warning);
+}
+.topbar .env-pill.live-pulse.reconnecting::before {
+  background: var(--warning);
+  animation: reconnectPulse 1400ms ease-in-out infinite;
+}
+@keyframes reconnectPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
 .topbar .env-pill.live-pulse.pulsing::before {
   animation: livePulse 700ms cubic-bezier(.22,1,.36,1);
 }
@@ -516,6 +529,11 @@ code, pre, .mono {
   padding: var(--s-6) var(--s-6) var(--s-8);
   max-width: var(--max);
   width: 100%;
+  /* Grid children default to min-content sizing on their main axis, which
+   * lets wide tables push the column wider than the viewport. Constrain
+   * explicitly so mobile layouts don't get horizontal scroll. */
+  min-width: 0;
+  overflow-x: hidden;
 }
 
 .page-header {
@@ -1322,9 +1340,14 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
  * RESPONSIVE
  * ============================================================ */
 @media (max-width: 760px) {
-  .app-shell { grid-template-columns: 1fr; grid-template-areas: "topbar" "main"; }
+  .app-shell { grid-template-columns: minmax(0, 1fr); grid-template-areas: "topbar" "main"; }
   .sidebar { display: none; }
   .main { padding: var(--s-4); }
+  .topbar { overflow: hidden; }
   .topbar .cmdk-trigger { min-width: 0; }
   .topbar .cmdk-trigger span:not(.kbd) { display: none; }
+  /* Reclaim horizontal room on phone-width viewports. */
+  .topbar .env-pill { display: none; }
+  .topbar .user-btn { max-width: 40vw; overflow: hidden; }
+  .topbar .user-btn span:last-child { text-overflow: ellipsis; overflow: hidden; white-space: nowrap; }
 }

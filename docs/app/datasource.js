@@ -719,6 +719,9 @@
       // consumer would receive one from the backend.
       var stopped = false;
       var timer;
+      // Emit the same handshake the real SSE endpoint does so the UI's
+      // "Live" pill lights up immediately in demo mode too.
+      setTimeout(function () { if (!stopped) callback({ type: "stream.open", data: {} }); }, 200);
       function tick() {
         if (stopped) return;
         var kind = Math.random();
@@ -934,17 +937,57 @@
     async listApiKeys() { return MOCK_API_KEYS.slice(); },
     async listAudit() { return MOCK_AUDIT.slice(); },
     subscribe(callback) {
-      // EventSource always uses same-origin credentials — the console tab
-      // already carries the av_session cookie, so no extra plumbing.
+      // EventSource has built-in reconnect on clean close, but silently
+      // gives up on 401/403 or repeated connection errors. Wrap with
+      // exponential backoff + an explicit "reconnecting" state so the UI
+      // knows to dim the Live pill instead of silently going stale.
       var url = apiUrl("/api/v1/stream");
-      var es = new EventSource(url, { withCredentials: true });
-      ["hello", "session.upsert", "events.appended", "receipt.finalized"].forEach(function (name) {
-        es.addEventListener(name, function (msg) {
-          try { callback({ type: name, data: JSON.parse(msg.data) }); }
-          catch (e) { /* swallow — malformed frame from a proxy */ }
+      var closed = false;
+      var es = null;
+      var backoff = 1500;
+      function connect() {
+        if (closed) return;
+        try { es = new EventSource(url, { withCredentials: true }); }
+        catch (e) { scheduleReconnect(); return; }
+        var opened = false;
+        es.addEventListener("open", function () {
+          opened = true;
+          backoff = 1500;
+          callback({ type: "stream.open", data: {} });
         });
-      });
-      return function () { es.close(); };
+        ["hello", "session.upsert", "events.appended", "receipt.finalized"].forEach(function (name) {
+          es.addEventListener(name, function (msg) {
+            try { callback({ type: name, data: JSON.parse(msg.data) }); }
+            catch (e) { /* malformed frame from a proxy */ }
+          });
+        });
+        es.addEventListener("error", function () {
+          // EventSource has three readyStates: 0=connecting, 1=open, 2=closed.
+          // Any error means we're no longer OPEN. Show "reconnecting" whether
+          // EventSource is auto-retrying (readyState 0 or 1) or fully closed.
+          callback({ type: "stream.closed", data: { willRetry: !closed } });
+          if (es && es.readyState === 2) {
+            // EventSource gave up — kick off our own retry loop.
+            scheduleReconnect();
+          } else if (!opened) {
+            // Never got past the handshake — probably a 401. Force close
+            // and retry with a fresh EventSource.
+            try { es.close(); } catch (e) {}
+            scheduleReconnect();
+          }
+          // If we opened once and readyState is now 0/1, EventSource is
+          // retrying by itself; leave it to do that.
+        });
+      }
+      function scheduleReconnect() {
+        if (closed) return;
+        setTimeout(function () {
+          backoff = Math.min(backoff * 2, 30000);
+          connect();
+        }, backoff);
+      }
+      connect();
+      return function () { closed = true; if (es) { try { es.close(); } catch (e) {} } };
     },
   };
 
