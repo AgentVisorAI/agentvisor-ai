@@ -18,9 +18,20 @@ dur() {
 
 mkdir -p "$OUT/norm"
 
-# Title cards: just re-encode
+# Title cards: just re-encode.
+#
+# Scene 1 gets a 0.3s trim off the front to skip the brief
+# white flash Playwright emits while the data-URL card renders.
+# The first frame of the final video is the thumbnail everyone
+# sees when the URL is shared — it has to be the fully-composed
+# card, not a white flash.
 for name in 01-intro 02-problem 03-solution 07-close; do
-  ffmpeg -y -i "$SCENES/$name.webm" \
+  if [ "$name" = "01-intro" ]; then
+    trim="-ss 0.30"
+  else
+    trim=""
+  fi
+  ffmpeg -y $trim -i "$SCENES/$name.webm" \
     -vf "fps=30,scale=1920:1080:flags=lanczos,format=yuv420p" \
     -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p \
     "$OUT/norm/$name.mp4" 2>&1 | tail -1
@@ -91,7 +102,7 @@ ffmpeg -y \
     [v03][4:v]xfade=transition=fade:duration=$XF:offset=$O5[v04];
     [v04][5:v]xfade=transition=fade:duration=$XF:offset=$O6[v05];
     [v05][6:v]xfade=transition=fade:duration=$XF:offset=$O7[v06];
-    [v06]fade=t=in:st=0:d=0.6:color=black,fade=t=out:st=$(awk "BEGIN{printf \"%.3f\", $O7 + $D7 - 0.8}"):d=0.8:color=black[vout]
+    [v06]fade=t=out:st=$(awk "BEGIN{printf \"%.3f\", $O7 + $D7 - 0.8}"):d=0.8:color=black[vout]
   " \
   -map "[vout]" \
   -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p -movflags +faststart \
