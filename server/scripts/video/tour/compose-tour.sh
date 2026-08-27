@@ -65,14 +65,14 @@ add_caption "$SCENES/07-connect.webm" "$OUT/norm/07-connect.mp4" \
   "One install command. The daemon connects."
 
 add_caption "$SCENES/08-firstdata.webm" "$OUT/norm/08-firstdata.mp4" \
-  "First sessions stream in. First save: \$8,400." \
+  "Blocked: \$8,400 to an unapproved vendor." \
   "5.6"
 
 add_caption "$SCENES/09-sessions.webm" "$OUT/norm/09-sessions.mp4" \
   "Isolate the blocked one."
 
 add_caption "$SCENES/10-session.webm" "$OUT/norm/10-session.mp4" \
-  "Blocked at \$8,400. Every event inspectable."
+  "Tricked into a bad vendor. Blocked. Retried safely."
 
 add_caption "$SCENES/11-share.webm" "$OUT/norm/11-share.mp4" \
   "Share a verify link, or copy the receipt."

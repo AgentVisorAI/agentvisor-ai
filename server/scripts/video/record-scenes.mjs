@@ -331,7 +331,7 @@ await recordScene(browser, "01-problem", 4000, async (page, ms) => {
   await showCard(page, cardHtml({
     bg: "#0a5c8b",
     headline: `One wrong decision.<br><span class="accent-red">$8,400</span> gone.`,
-    sub: "No audit trail. No way to prove what happened.",
+    sub: "A buying agent, tricked into paying a fake vendor. No way to prove what happened.",
     staticHeadline: true,
   }), ms);
 });

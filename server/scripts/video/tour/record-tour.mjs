@@ -396,21 +396,21 @@ await recordScene(browser, "01-title", 6500, async (page, ms) => {
   }), ms);
 });
 
-await recordScene(browser, "02-problem", 6500, async (page, ms) => {
+await recordScene(browser, "02-problem", 7500, async (page, ms) => {
   await showCard(page, cardHtml({
     bg: "#0a5c8b",
     kicker: "The problem",
-    headline: `One wrong agent decision.<br><span class="accent-red">\$8,400</span> gone.`,
-    sub: "No audit trail. No spending limit. No way to prove what happened.",
+    headline: `Your buying agent just sent<br><span class="accent-red">\$8,400</span> to a fake vendor.`,
+    sub: "Companies let AI agents order stock, issue refunds, pay invoices. One manipulated decision and the money is gone — with no way to prove what happened.",
   }), ms);
 });
 
-await recordScene(browser, "03-solution", 7500, async (page, ms) => {
+await recordScene(browser, "03-solution", 9000, async (page, ms) => {
   await showCard(page, cardHtml({
     bg: "#0a5c8b",
     kicker: "The fix",
     headline: `Block bad actions<br>before money moves.<br><span class="accent-green">Prove it</span> afterwards.`,
-    sub: "What follows is the complete flow: a brand-new account, from zero to a verified audit trail.",
+    sub: "AgentVisor sits between the agent and the money. What follows is the complete flow: a brand-new account, from zero to a verified audit trail.",
   }), ms);
 });
 
