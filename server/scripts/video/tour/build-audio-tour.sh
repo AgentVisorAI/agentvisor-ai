@@ -19,28 +19,34 @@ gen_whoosh "$OUT/w-strong.wav" 0.65   # landing → signup (into the app)
 gen_whoosh "$OUT/w-soft.wav"   0.28   # settings → close (denouement)
 
 # Silent bed for 92 seconds (covers the ~89.3s tour).
-ffmpeg -y -f lavfi -i "anullsrc=r=44100:cl=stereo:d=125" \
+ffmpeg -y -f lavfi -i "anullsrc=r=44100:cl=stereo:d=140" \
   -c:a pcm_s16le "$OUT/silence.wav" 2>&1 | tail -1
 
 # Transition offsets in ms, from compose.sh `Offsets:` output.
-T1=5500
-T2=11366
-T3=16766
-T4=25299
-T5=35266
-T6=41799
-T7=51399
-T8=58332
-T9=61065
-T10=66898
-T11=74431
-T12=80964
-T13=86964
-T14=102531
+T1=5700
+T2=11300
+T3=17900
+T4=23400
+T5=29333
+T6=34933
+T7=43466
+T8=53466
+T9=59999
+T10=69532
+T11=76432
+T12=79165
+T13=84998
+T14=92498
+T15=99031
+T16=104998
+T17=120565
 
 ffmpeg -y \
   -i "$OUT/silence.wav" \
+  -i "$OUT/w-normal.wav" \
+  -i "$OUT/w-normal.wav" \
   -i "$OUT/w-strong.wav" \
+  -i "$OUT/w-normal.wav" \
   -i "$OUT/w-normal.wav" \
   -i "$OUT/w-normal.wav" \
   -i "$OUT/w-normal.wav" \
@@ -69,7 +75,10 @@ ffmpeg -y \
     [12]adelay=${T12}|${T12}[w12];
     [13]adelay=${T13}|${T13}[w13];
     [14]adelay=${T14}|${T14}[w14];
-    [0][w1][w2][w3][w4][w5][w6][w7][w8][w9][w10][w11][w12][w13][w14]amix=inputs=15:duration=first:normalize=0[mix];
+    [15]adelay=${T15}|${T15}[w15];
+    [16]adelay=${T16}|${T16}[w16];
+    [17]adelay=${T17}|${T17}[w17];
+    [0][w1][w2][w3][w4][w5][w6][w7][w8][w9][w10][w11][w12][w13][w14][w15][w16][w17]amix=inputs=18:duration=first:normalize=0[mix];
     [mix]loudnorm=I=-24:LRA=8:TP=-3.0[out]
   " \
   -map "[out]" -c:a aac -b:a 128k "$OUT/soundtrack-44s.aac" 2>&1 | tail -1
