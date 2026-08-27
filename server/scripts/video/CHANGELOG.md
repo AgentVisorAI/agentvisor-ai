@@ -1,5 +1,50 @@
 # Video pipeline changelog
 
+## v11 — voice narration + scene 4 money shot (2026-08-27)
+
+Two structural upgrades, both aimed at removing effort from the
+non-technical viewer.
+
+**Voice narration (`build-narration.sh`)**
+
+Non-technical investors can't read captions AND parse a UI at
+the same time. Adding a spoken track lets the eye handle the UI
+and the ear handle the story.
+
+* Per-scene narration script generated with macOS `say` (Samantha
+  voice, 175 wpm — slightly slower than default for warmth).
+* Each clip aligned to the scene-start offset in the composed
+  timeline (~300ms lead-in so the visual establishes first).
+* Voice bus processed with mild compression → `loudnorm -18 LUFS`
+  (broadcast dialog standard).
+* Whoosh bed from v9 is auto-ducked -6 dB under narration.
+
+Total narration: ~88 words over 44 seconds. Feels natural, not
+rushed. macOS built-in voice avoids any 3rd-party TTS licensing.
+
+**Scene 4 money shot zoom (`record-scenes.mjs`)**
+
+Scene 4 has been static-ish since v4. Upgraded `applyCinematic`
+to accept a `zoomToSelector` option. When present:
+
+* Reads the target element's viewport-relative center at record
+  time.
+* Sets `transform-origin` to that point (as a %).
+* Uses a stronger end-scale (1.35 instead of 1.055).
+
+Result: the dashboard establishes wide, then the Ken Burns lands
+tight on the `$31,840 Prevented losses` tile — the moment the
+narration says "thirty one thousand dollars saved". Numbers,
+words, and camera converge on the pitch's key metric.
+
+**Three cuts** ship from a single source:
+
+| Cut | Best for |
+|---|---|
+| `agentvisor-mockup-v11-narrated.mp4` | Pitch meetings (voice + whoosh) |
+| `agentvisor-mockup-v9-audio.mp4` | Social autoplay (subtle whoosh) |
+| `agentvisor-mockup-v4.mp4` | Pure silent fallback |
+
 ## v9 — subtle audio punctuation (2026-08-27)
 
 The silent v8 cut is defensible for muted viewing (which is how
