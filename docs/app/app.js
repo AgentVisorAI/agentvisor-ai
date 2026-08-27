@@ -271,17 +271,28 @@
     if (s < 86400) return Math.floor(s / 3600) + "h ago";
     return Math.floor(s / 86400) + "d ago";
   }
+  // All toasts land in one fixed stack so simultaneous toasts pile
+  // upward instead of overlapping, and the stack sits clear of (and
+  // above) the tour launcher pill.
+  function toastStack() {
+    var s = document.getElementById("toastStack");
+    if (!s) {
+      s = h('<div id="toastStack" role="status" aria-live="polite"></div>');
+      document.body.appendChild(s);
+    }
+    return s;
+  }
   function toast(msg, err) {
     var t = h('<div class="toast ' + (err ? "err" : "") + '">' + esc(msg) + "</div>");
-    document.body.appendChild(t);
-    setTimeout(function () { t.remove(); }, 2200);
+    toastStack().appendChild(t);
+    setTimeout(function () { t.remove(); }, 2600);
   }
   // Toast with a trailing action link; stays up longer so the link is
   // actually clickable. Used by the simulated-attack story.
   function toastLink(msg, href, label) {
-    var t = h('<div class="toast" style="display:flex; gap:10px; align-items:center">' + esc(msg) +
+    var t = h('<div class="toast">' + esc(msg) +
       ' <a href="' + esc(href) + '" style="color:inherit; font-weight:700; text-decoration:underline; white-space:nowrap">' + esc(label) + "</a></div>");
-    document.body.appendChild(t);
+    toastStack().appendChild(t);
     setTimeout(function () { t.remove(); }, 6500);
   }
   function loadingBlock(kind) {
