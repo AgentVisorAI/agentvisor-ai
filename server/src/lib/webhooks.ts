@@ -63,34 +63,92 @@ const BLOCKED_HOSTS_ALWAYS = new Set([
   "instance-data",
 ]);
 
+// R86 F1: parse an IPv6 hostname into its 16 raw bytes so we can
+// check for private / metadata prefixes across ALL forms —
+// dotted-quad `::ffff:169.254.169.254`, pure-hex `::ffff:a9fe:a9fe`,
+// expanded `0:0:0:0:0:ffff:169.254.169.254`, 6to4 tunnel
+// `2002:a9fe:a9fe::`, NAT64 well-known prefix `64:ff9b::a9fe:a9fe`.
+// R85 F1's regex-based unmap only caught the dotted-quad form; the
+// pure-hex, 6to4, and NAT64 forms all escaped. On dual-stack Linux
+// (default), GKE dual-stack, EKS IPv6-only, and AKS CNI Overlay
+// the kernel routes 6to4/NAT64 addresses transparently to their
+// embedded IPv4 quad, so IMDS (`169.254.169.254`) was reachable
+// via any of the escaped forms. Returns null if not a well-formed
+// IPv6.
+function parseIPv6Bytes(ip: string): Uint8Array | null {
+  const lc = ip.toLowerCase();
+  // Handle embedded IPv4 quad tail (::ffff:1.2.3.4, ::1.2.3.4).
+  const dotted = lc.match(/(.*:)(\d+\.\d+\.\d+\.\d+)$/);
+  let normalized = lc;
+  if (dotted) {
+    const parts = dotted[2]!.split(".").map((s) => parseInt(s, 10));
+    if (parts.length !== 4 || parts.some((n) => isNaN(n) || n < 0 || n > 255)) {
+      return null;
+    }
+    const hi = ((parts[0]! << 8) | parts[1]!).toString(16);
+    const lo = ((parts[2]! << 8) | parts[3]!).toString(16);
+    normalized = dotted[1]! + hi + ":" + lo;
+  }
+  // Expand `::` into the right number of zero groups.
+  const halves = normalized.split("::");
+  if (halves.length > 2) return null;
+  let groups: string[];
+  if (halves.length === 2) {
+    const left = halves[0]!.length ? halves[0]!.split(":") : [];
+    const right = halves[1]!.length ? halves[1]!.split(":") : [];
+    const zeros = 8 - left.length - right.length;
+    if (zeros < 0) return null;
+    groups = [...left, ...Array(zeros).fill("0"), ...right];
+  } else {
+    groups = normalized.split(":");
+  }
+  if (groups.length !== 8) return null;
+  const bytes = new Uint8Array(16);
+  for (let i = 0; i < 8; i++) {
+    if (!/^[0-9a-f]{1,4}$/.test(groups[i]!)) return null;
+    const n = parseInt(groups[i]!, 16);
+    bytes[i * 2] = (n >> 8) & 0xff;
+    bytes[i * 2 + 1] = n & 0xff;
+  }
+  return bytes;
+}
+
 function isBlockedIp(ip: string): boolean {
-  // R85 F1: IPv6 `::ffff:x.x.x.x` unmap. Prior shape only
-  // caught `::ffff:127.` and left `::ffff:169.254.169.254`
-  // (cloud IMDS), `::ffff:10.x`, `::ffff:172.16-31.x.x`,
-  // `::ffff:192.168.x.x`, `::ffff:100.64-127.x.x` all
-  // classified public. On dual-stack Linux a socket opened
-  // to `::ffff:169.254.169.254` is transparently routed to
-  // IPv4 169.254.169.254, so the metadata / RFC1918
-  // endpoint was reachable via the mapped form. The exact-
-  // match `host === "169.254.169.254"` gate in
-  // validateWebhookUrl / deliverOne also missed the mapped
-  // literal. Fold ANY `::ffff:` mapped form back to its
-  // IPv4 quad before applying IPv4 rules.
+  // R86 F1: IPv6 rules — parse to raw bytes and check
+  // (a) IPv4-mapped `::ffff:X.X.X.X` (any encoding)
+  // (b) 6to4 tunnel `2002::/16` (embedded IPv4 in bytes 2-5)
+  // (c) NAT64 well-known prefix `64:ff9b::/96` (embedded quad in bytes 12-15)
+  // (d) loopback `::1`, unspecified `::`
+  // (e) link-local `fe80::/10`, unique-local `fc00::/7`
   if (isIP(ip) === 6) {
-    const lc = ip.toLowerCase();
-    // ::ffff:X.X.X.X form — recurse with the IPv4 tail.
-    const mapped = lc.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-    if (mapped) {
-      return isBlockedIp(mapped[1]!);
+    const b = parseIPv6Bytes(ip);
+    if (!b) return true; // unparseable → treat as suspicious
+    let allZero = true;
+    for (let i = 0; i < 15; i++) if (b[i] !== 0) { allZero = false; break; }
+    if (allZero && b[15] === 0) return true; // ::
+    if (allZero && b[15] === 1) return true; // ::1
+    // (a) ::ffff:0:0/96 IPv4-mapped — recurse into IPv4 rules on the embedded quad
+    let mappedZero = true;
+    for (let i = 0; i < 10; i++) if (b[i] !== 0) { mappedZero = false; break; }
+    if (mappedZero && b[10] === 0xff && b[11] === 0xff) {
+      return isBlockedIp(`${b[12]}.${b[13]}.${b[14]}.${b[15]}`);
     }
-    // ::1 loopback
-    if (ip === "::1") return true;
-    // unspecified
-    if (ip === "::") return true;
-    // link-local fe80::/10 and unique-local fc00::/7
-    if (lc.startsWith("fe80:") || lc.startsWith("fc") || lc.startsWith("fd")) {
-      return true;
+    // (b) 2002::/16 6to4 — embedded IPv4 in bytes 2-5
+    if (b[0] === 0x20 && b[1] === 0x02) {
+      return isBlockedIp(`${b[2]}.${b[3]}.${b[4]}.${b[5]}`);
     }
+    // (c) 64:ff9b::/96 NAT64 WKP (RFC 6052) — embedded IPv4 in bytes 12-15
+    if (b[0] === 0x00 && b[1] === 0x64 && b[2] === 0xff && b[3] === 0x9b) {
+      let allZeroMid = true;
+      for (let i = 4; i < 12; i++) if (b[i] !== 0) { allZeroMid = false; break; }
+      if (allZeroMid) {
+        return isBlockedIp(`${b[12]}.${b[13]}.${b[14]}.${b[15]}`);
+      }
+    }
+    // (e) fe80::/10 link-local
+    if (b[0]! === 0xfe && (b[1]! & 0xc0) === 0x80) return true;
+    // (e) fc00::/7 unique-local
+    if ((b[0]! & 0xfe) === 0xfc) return true;
     return false;
   }
   // IPv4
@@ -107,13 +165,32 @@ function isBlockedIp(ip: string): boolean {
   return false;
 }
 
-// R85 F1: normalize an IPv4-mapped IPv6 literal down to its
-// IPv4 quad so the exact-match metadata blocks
-// (`host === "169.254.169.254"`) can catch `::ffff:169.254.169.254`.
-// Returns the original string for anything not mapped.
+// R86 F1: normalize any IPv6 encoding that carries an embedded
+// IPv4 quad down to that quad, so exact-match metadata blocks
+// catch every encoding of 169.254.169.254 (dotted-quad mapped,
+// pure-hex mapped, 6to4, NAT64). Returns the original string for
+// non-embedded addresses.
 function unmapV4(ip: string): string {
-  const m = ip.toLowerCase().match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-  return m ? m[1]! : ip;
+  if (isIP(ip) !== 6) return ip;
+  const b = parseIPv6Bytes(ip);
+  if (!b) return ip;
+  // Mapped `::ffff:X.X.X.X`
+  let mappedZero = true;
+  for (let i = 0; i < 10; i++) if (b[i] !== 0) { mappedZero = false; break; }
+  if (mappedZero && b[10] === 0xff && b[11] === 0xff) {
+    return `${b[12]}.${b[13]}.${b[14]}.${b[15]}`;
+  }
+  // 6to4 `2002:X.X:X.X::`
+  if (b[0] === 0x20 && b[1] === 0x02) {
+    return `${b[2]}.${b[3]}.${b[4]}.${b[5]}`;
+  }
+  // NAT64 `64:ff9b::X.X.X.X`
+  if (b[0] === 0x00 && b[1] === 0x64 && b[2] === 0xff && b[3] === 0x9b) {
+    let allZeroMid = true;
+    for (let i = 4; i < 12; i++) if (b[i] !== 0) { allZeroMid = false; break; }
+    if (allZeroMid) return `${b[12]}.${b[13]}.${b[14]}.${b[15]}`;
+  }
+  return ip;
 }
 
 export interface SsrfCheckResult {
@@ -570,26 +647,52 @@ export function startWebhookSweeper(logger?: FastifyBaseLogger): void {
       });
       const endpointMap = new Map(endpoints.map((e) => [e.id, e]));
       for (const d of claimed) {
-        const endpoint = endpointMap.get(d.endpointId);
-        if (!endpoint || !endpoint.isActive) {
-          await db.webhookDelivery.update({
-            where: { id: d.id },
-            data: { status: "failed", errorMessage: "endpoint_disabled" },
-          });
-          continue;
+        // R86 F2: wrap each per-row body in its own try/catch so
+        // one row's failure doesn't strand the rest of the batch
+        // in `status='pending'` (they'd be invisible to the next
+        // tick's `WHERE status='retrying'` filter → permanent
+        // silent delivery loss). Also handle the CASCADE-delete
+        // race: if an admin DELETEs an endpoint between our
+        // claim UPDATE and the followup findMany, the schema's
+        // `ON DELETE CASCADE` FK removes the delivery rows too
+        // — the update-to-failed then throws P2025 and, prior
+        // to R86 F2, the outer try/catch swallowed it while
+        // leaving every remaining claimed row stranded. Detect
+        // the deleted-endpoint case by checking the row still
+        // exists before writing; if it's gone, silently skip.
+        try {
+          const endpoint = endpointMap.get(d.endpointId);
+          if (!endpoint) {
+            // Endpoint was deleted mid-tick. CASCADE FK dropped
+            // this delivery row too — nothing to update. Skip.
+            continue;
+          }
+          if (!endpoint.isActive) {
+            await db.webhookDelivery.update({
+              where: { id: d.id },
+              data: { status: "failed", errorMessage: "endpoint_disabled" },
+            });
+            continue;
+          }
+          // deliverOne with existingDeliveryId reuses this row rather than
+          // creating a new one — attempt counter bumps in place.
+          void deliverOne(
+            d.endpointId,
+            endpoint.url,
+            endpoint.secret,
+            d.event,
+            d.payload,
+            d.attempt + 1,
+            logger,
+            d.id,
+          );
+        } catch (rowErr) {
+          // Don't let one row poison the whole batch.
+          logger?.warn(
+            { err: rowErr, deliveryId: d.id, endpointId: d.endpointId },
+            "webhook_sweeper_row_failed",
+          );
         }
-        // deliverOne with existingDeliveryId reuses this row rather than
-        // creating a new one — attempt counter bumps in place.
-        void deliverOne(
-          d.endpointId,
-          endpoint.url,
-          endpoint.secret,
-          d.event,
-          d.payload,
-          d.attempt + 1,
-          logger,
-          d.id,
-        );
       }
     } catch (e) {
       logger?.warn({ err: e }, "webhook_sweeper_iteration_failed");

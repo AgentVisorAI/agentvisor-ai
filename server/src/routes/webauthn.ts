@@ -308,12 +308,23 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
     // credential mismatch). Drop `hasCredential` from the
     // response.
     const realCreds = user?.webauthnCredentials ?? [];
+    // R86 F5: strip `transports` from the real-cred emission
+    // so real accounts and decoys look identical on the wire.
+    // Prior shape mapped `c.transports` to a non-empty array
+    // (`internal,hybrid` for platform passkeys, `usb` for
+    // security keys — virtually every modern registration is
+    // non-empty), while decoys always had `transports:
+    // undefined`. Attacker distinguishes decoy from real by
+    // inspecting `options.allowCredentials[i].transports` in
+    // the response. Dropping transports on both paths costs
+    // the client only the ability to filter by physical
+    // authenticator hint — SimpleWebAuthn still verifies
+    // correctly, browsers still show all registered
+    // authenticators. Small UX cost for a real enumeration
+    // fix.
     const allowCredentials = realCreds.length > 0
       ? realCreds.map((c) => ({
           id: bufferToB64u(c.credentialId),
-          transports: c.transports
-            ? (c.transports.split(",") as ("usb" | "nfc" | "ble" | "internal" | "hybrid")[])
-            : undefined,
         }))
       : await deriveDecoyCredentials(body.data.email);
     const options = await generateAuthenticationOptions({
@@ -344,8 +355,30 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: "malformed_challenge_cookie" });
     }
     if (!bag.userId) {
+      // R86 F4: decoy path — the challenge was issued against
+      // an unknown email or one with no real credentials. Prior
+      // shape returned `no_credential_bound` here, but the real-
+      // user + wrong-rawId path below returns `unknown_credential`;
+      // the two DIFFERENT error strings let an attacker
+      // enumerate "email exists AND has ≥1 passkey" via a single
+      // /authenticate/verify probe after any decoy challenge.
+      // Parse the body enough to burn the same latency, then
+      // return the same `unknown_credential` string so decoy and
+      // real-user-wrong-cred fail identically. Also clear the
+      // challenge cookie both paths.
+      const body = z
+        .object({ response: z.record(z.unknown()) })
+        .safeParse(req.body);
+      // Match the "real user + wrong cred" path's DB timing by
+      // running a lookup that always returns null.
+      await db.webauthnCredential.findFirst({
+        where: { userId: "__decoy__" },
+      }).catch(() => null);
       clearChallengeCookie(reply, AUTH_CHALLENGE_COOKIE);
-      return reply.code(400).send({ error: "no_credential_bound" });
+      if (!body.success) {
+        return reply.code(400).send({ error: "unknown_credential" });
+      }
+      return reply.code(400).send({ error: "unknown_credential" });
     }
     const body = z
       .object({ response: z.record(z.unknown()) })
