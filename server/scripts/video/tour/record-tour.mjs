@@ -248,8 +248,8 @@ async function applyCinematic(page, opts = {}) {
   // If a zoom target is provided, resolve its viewport-relative center
   // and use a stronger zoom that ENDS focused on that target (money
   // shot). Otherwise fall back to the subtle center Ken Burns.
-  let originX = "center";
-  let originY = "center";
+  let originX = opts.origin ? opts.origin.split(" ")[0] : "center";
+  let originY = opts.origin ? opts.origin.split(" ")[1] : "center";
   let endScale = 1.055;
   if (zoomToSel) {
     try {
@@ -573,7 +573,7 @@ await recordConsoleScene(
 await recordConsoleScene(
   browser,
   "12-settings",
-  13000,
+  15000,
   "#/settings/members",
   ['.settings-nav'],
   { origin: "0px 540px" },
@@ -589,7 +589,7 @@ await recordConsoleScene(
         if (btn) btn.click();
       }, tab);
       // Let the tab's data load past its skeleton before moving on.
-      await page.waitForTimeout(1750);
+      await page.waitForTimeout(2100);
     }
   },
 );
