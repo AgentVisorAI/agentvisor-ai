@@ -370,3 +370,31 @@
 }
 .pitch-qr-title { margin: 0 0 0.15rem; font-weight: 600; }
 .pitch-qr-sub { margin: 0; color: var(--fg-muted); font-size: 0.9rem; }
+
+/* ── Print: the pitch page doubles as a one-page handout. ──────────
+   Videos can't print, so they collapse; the QR + short links become
+   the centerpiece; the five beats and live-links sections carry the
+   story. Tested via Chromium's print-to-PDF. */
+@media print {
+  nav[aria-label="Primary"],
+  .pitch-video-wrap,
+  .pitch-video-meta,
+  .pitch-transcript,
+  .pitch-cta-arrow,
+  video { display: none !important; }
+  /* (Transcripts stay hidden: closed <details> can't be expanded from
+     CSS, and the Five Beats section already carries the story.) */
+  body { background: #fff !important; color: #000 !important; }
+  .pitch-hero, .pitch-story, .pitch-tour, .pitch-links { padding: 0.4in 0 !important; background: none !important; }
+  .pitch-qr {
+    border: 2px solid #000;
+    page-break-inside: avoid;
+    margin: 0.25in auto;
+  }
+  .pitch-qr img { width: 140px; height: 140px; }
+  .pitch-cta-grid a { border: 1px solid #bbb; text-decoration: none; }
+  a { color: #000 !important; }
+  .pitch-links-grid a::after { content: ""; }
+  h1, h2 { page-break-after: avoid; }
+  .pitch-footer { border-top: 1px solid #bbb; }
+}
