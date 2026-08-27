@@ -663,12 +663,15 @@
         ? state.ds.signup({ email: email, password: pw, orgName: ($("#orgName") || {}).value })
         : state.ds.login({ email: email, password: pw });
       promise.then(async function (s) {
-        // MFA gate. Server returned {mfaRequired: true, email}. Run the
-        // WebAuthn ceremony to complete auth.
+        // MFA gate. Server returned {mfaRequired: true} — no email is
+        // included in the response (R85 F3 closed the password-validity
+        // oracle by making /login's failure and mfaRequired responses
+        // indistinguishable in wire shape). We already have the email
+        // the user typed, so use that.
         if (s && s.mfaRequired) {
           errEl.innerHTML = '<div class="auth-hint" style="color: var(--fg-2); padding: 8px 12px;">Touch your passkey…</div>';
           try {
-            var full = await runPasskeyLogin(s.email);
+            var full = await runPasskeyLogin(s.email || email);
             state.session = full;
             startLiveStream();
             navigate(consumeReturnTo() || "#/overview");

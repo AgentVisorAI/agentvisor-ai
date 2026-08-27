@@ -64,12 +64,30 @@ const BLOCKED_HOSTS_ALWAYS = new Set([
 ]);
 
 function isBlockedIp(ip: string): boolean {
-  // IPv6
+  // R85 F1: IPv6 `::ffff:x.x.x.x` unmap. Prior shape only
+  // caught `::ffff:127.` and left `::ffff:169.254.169.254`
+  // (cloud IMDS), `::ffff:10.x`, `::ffff:172.16-31.x.x`,
+  // `::ffff:192.168.x.x`, `::ffff:100.64-127.x.x` all
+  // classified public. On dual-stack Linux a socket opened
+  // to `::ffff:169.254.169.254` is transparently routed to
+  // IPv4 169.254.169.254, so the metadata / RFC1918
+  // endpoint was reachable via the mapped form. The exact-
+  // match `host === "169.254.169.254"` gate in
+  // validateWebhookUrl / deliverOne also missed the mapped
+  // literal. Fold ANY `::ffff:` mapped form back to its
+  // IPv4 quad before applying IPv4 rules.
   if (isIP(ip) === 6) {
-    // ::1 loopback
-    if (ip === "::1" || ip.startsWith("::ffff:127.")) return true;
-    // link-local fe80::/10 and unique-local fc00::/7
     const lc = ip.toLowerCase();
+    // ::ffff:X.X.X.X form — recurse with the IPv4 tail.
+    const mapped = lc.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (mapped) {
+      return isBlockedIp(mapped[1]!);
+    }
+    // ::1 loopback
+    if (ip === "::1") return true;
+    // unspecified
+    if (ip === "::") return true;
+    // link-local fe80::/10 and unique-local fc00::/7
     if (lc.startsWith("fe80:") || lc.startsWith("fc") || lc.startsWith("fd")) {
       return true;
     }
@@ -87,6 +105,15 @@ function isBlockedIp(ip: string): boolean {
   if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT 100.64.0.0/10
   if (a === 0) return true;                  // 0.0.0.0/8
   return false;
+}
+
+// R85 F1: normalize an IPv4-mapped IPv6 literal down to its
+// IPv4 quad so the exact-match metadata blocks
+// (`host === "169.254.169.254"`) can catch `::ffff:169.254.169.254`.
+// Returns the original string for anything not mapped.
+function unmapV4(ip: string): string {
+  const m = ip.toLowerCase().match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  return m ? m[1]! : ip;
 }
 
 export interface SsrfCheckResult {
@@ -111,9 +138,14 @@ export async function validateWebhookUrl(rawUrl: string): Promise<SsrfCheckResul
   // Explicit IP literal — check directly. This is the most common attack
   // vector because it dodges DNS resolution.
   if (isIP(host)) {
+    // R85 F1: normalize IPv4-mapped IPv6 (`::ffff:169.254.169.254`)
+    // to `169.254.169.254` so the metadata literal check catches
+    // the mapped form (dual-stack Linux transparently routes to
+    // the IPv4 address).
+    const canonHost = unmapV4(host);
     // Metadata (169.254.169.254) is *always* refused, even in dev —
     // there's no legitimate reason a webhook target would live there.
-    if (host === "169.254.169.254" || host === "fd00:ec2::254") {
+    if (canonHost === "169.254.169.254" || canonHost === "fd00:ec2::254") {
       return { ok: false, reason: "blocked_metadata_ip" };
     }
     if (env.NODE_ENV === "production" && isBlockedIp(host)) {
@@ -319,7 +351,7 @@ async function deliverOne(
       });
       return;
     }
-    if (hostname === "169.254.169.254" || hostname === "fd00:ec2::254") {
+    if (hostname === "169.254.169.254" || hostname === "fd00:ec2::254" || unmapV4(hostname) === "169.254.169.254") {
       clearTimeout(timer);
       await db.webhookDelivery.update({
         where: { id: deliveryId },
@@ -503,24 +535,43 @@ export function startWebhookSweeper(logger?: FastifyBaseLogger): void {
   if (sweeperTimer) return;
   const tick = async () => {
     try {
-      const due = await db.webhookDelivery.findMany({
-        where: {
-          status: "retrying",
-          nextRetryAt: { lte: new Date() },
-        },
-        take: 20,
-        orderBy: { nextRetryAt: "asc" },
-        select: {
-          id: true,
-          endpointId: true,
-          event: true,
-          payload: true,
-          attempt: true,
-          endpoint: { select: { url: true, secret: true, isActive: true } },
-        },
+      // R85 F2: atomically CLAIM up to 20 rows using
+      // `FOR UPDATE SKIP LOCKED` inside the same UPDATE that
+      // flips status → 'pending'. Prior shape ran a plain
+      // findMany({status:'retrying', nextRetryAt<=now}) with
+      // no locking, so N replicas each picked the SAME rows
+      // on the same 15 s tick and each fired deliverOne —
+      // N× delivery per replica for non-idempotent customer
+      // endpoints. Postgres' SKIP LOCKED gives each replica
+      // a disjoint slice: the losing replica returns 0 rows
+      // and the winner runs deliverOne exactly once.
+      const claimed = await db.$queryRaw<Array<{
+        id: string;
+        endpointId: string;
+        event: string;
+        payload: string;
+        attempt: number;
+      }>>`
+        UPDATE "webhook_deliveries"
+        SET status = 'pending'
+        WHERE id IN (
+          SELECT id FROM "webhook_deliveries"
+          WHERE status = 'retrying' AND "nextRetryAt" <= now()
+          ORDER BY "nextRetryAt" ASC
+          LIMIT 20
+          FOR UPDATE SKIP LOCKED
+        )
+        RETURNING id, "endpointId", event, payload, attempt
+      `;
+      if (claimed.length === 0) return;
+      const endpoints = await db.webhookEndpoint.findMany({
+        where: { id: { in: claimed.map((c) => c.endpointId) } },
+        select: { id: true, url: true, secret: true, isActive: true },
       });
-      for (const d of due) {
-        if (!d.endpoint.isActive) {
+      const endpointMap = new Map(endpoints.map((e) => [e.id, e]));
+      for (const d of claimed) {
+        const endpoint = endpointMap.get(d.endpointId);
+        if (!endpoint || !endpoint.isActive) {
           await db.webhookDelivery.update({
             where: { id: d.id },
             data: { status: "failed", errorMessage: "endpoint_disabled" },
@@ -531,8 +582,8 @@ export function startWebhookSweeper(logger?: FastifyBaseLogger): void {
         // creating a new one — attempt counter bumps in place.
         void deliverOne(
           d.endpointId,
-          d.endpoint.url,
-          d.endpoint.secret,
+          endpoint.url,
+          endpoint.secret,
           d.event,
           d.payload,
           d.attempt + 1,

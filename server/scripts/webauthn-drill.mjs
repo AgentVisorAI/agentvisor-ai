@@ -211,7 +211,7 @@ async function main() {
   if (!gatedBody.mfaRequired) {
     throw new Error("MFA gate did not fire: " + JSON.stringify(gatedBody));
   }
-  console.log("  mfaRequired=true, email=", gatedBody.email);
+  console.log("  mfaRequired=true (R85 F3: email intentionally omitted from response)");
   if ((gated.headers.get("set-cookie") ?? "").includes("av_session=")) {
     // With MFA required, we should NOT have gotten a session cookie yet.
     throw new Error("session cookie leaked despite MFA gate!");

@@ -196,12 +196,39 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     // <1ms and defeated the entire posture.
     const hashToCheck = user?.passwordHash ?? (await getDummyPasswordHash());
     const ok = await verifyPassword(hashToCheck, password);
+    // R85 F3: close the password-validity oracle for MFA-enabled
+    // accounts. Prior shape returned 401 `invalid_credentials` on
+    // wrong-password / unknown-email but 200 `{mfaRequired:true,
+    // email}` on correct-password + MFA-enabled — a
+    // credential-stuffing attacker observing the response shape
+    // learned that a candidate password was CORRECT for a
+    // WebAuthn-protected account even though they couldn't
+    // complete the ceremony. The password is directly reusable
+    // as a credential-stuffing input against non-AgentVisor
+    // services. Post R85 F3: uniformly respond
+    // `{mfaRequired:true}` (no email leaked; client already
+    // has it) on unknown-email, wrong-password, no-membership,
+    // AND correct-password+MFA. The only response shape that
+    // reveals password validity is the FULL LOGIN SUCCESS shape
+    // — and that only occurs on correct-password + NO MFA, at
+    // which point the attacker has fully authenticated and the
+    // "password validity" bit is the least of the concerns.
+    // UX cost: users typing a wrong password on a no-MFA
+    // account still see 401 (this branch); users typing a wrong
+    // password on an MFA account will be routed into the
+    // WebAuthn ceremony, which fails at /authenticate/verify.
+    const mfaGateResponse = () => reply.send({ mfaRequired: true });
     if (!user || !ok) {
-      return reply.code(401).send({ error: "invalid_credentials" });
+      // Uniform shape whether email exists or not — closes the
+      // "does this account exist" oracle for callers who
+      // otherwise would try /authenticate/challenge (which
+      // returns decoys uniformly per R76 F4). Also closes the
+      // "did I get the password" oracle if the target has MFA.
+      return mfaGateResponse();
     }
     const membership = user.memberships[0];
     if (!membership) {
-      // R77 F4 (MEDIUM): return the SAME 401 shape as
+      // R77 F4 (MEDIUM): return the SAME shape as
       // `!user || !ok` above so a credential-stuffing attacker
       // cannot distinguish "password correct + user has no org"
       // from "email or password wrong". Prior shape returned 403
@@ -228,7 +255,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         { userId: user.id, email: user.email },
         "user_authenticated_password_but_has_no_membership",
       );
-      return reply.code(401).send({ error: "invalid_credentials" });
+      return mfaGateResponse();
     }
 
     // MFA gate — if the user has any WebAuthn credentials, we do NOT
@@ -250,10 +277,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         },
         req.log,
       );
-      return reply.send({
-        mfaRequired: true,
-        email: user.email,
-      });
+      return mfaGateResponse();
     }
 
     const token = await mintSession({
