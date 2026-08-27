@@ -1128,7 +1128,7 @@
     }).join("");
 
     main.innerHTML =
-      pageHeader("Session " + s.externalId, s.agent + " · " + (s.user || "—") + " · " + (s.model || ""), '<a href="#/sessions" class="btn">← All sessions</a> <button class="btn" id="copyRcpt">Copy receipt</button> <button class="btn accent" id="dlRcpt">↓ Download receipt</button>') +
+      pageHeader("Session " + s.externalId, s.agent + " · " + (s.user || "—") + " · " + (s.model || ""), '<a href="#/sessions" class="btn">← All sessions</a> <button class="btn" id="copyRcpt">Copy receipt</button> <button class="btn" id="shareRcpt">🔗 Share verify link</button> <button class="btn accent" id="dlRcpt">↓ Download receipt</button>') +
       '<div class="session-summary">' +
         cell("Events", s.events, "streamed") +
         cell("Allowed", s.toolsAllowed, "tool calls") +
@@ -1204,6 +1204,68 @@
       });
     });
 
+    // Share receipt: encode the full bundle into a URL fragment and
+    // copy the resulting agentvisorai.me/verify/#data=<...> to the
+    // clipboard. Recipient opens the link -> auto-verifies in their
+    // own browser. Fragment (not query) so the payload never touches
+    // any server.
+    $("#shareRcpt").addEventListener("click", function () {
+      var bundle = buildReceiptBundle(s, receipt);
+      var json = JSON.stringify(bundle);
+      // Convert UTF-8 string -> Uint8Array -> base64 -> base64url.
+      var bytes = new TextEncoder().encode(json);
+      var bin = "";
+      for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+      var b64 = btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      var origin = window.VERIFY_BASE || "https://agentvisorai.me";
+      var url = origin + "/verify/#data=" + b64;
+      // Warn if it's really big — many chat clients cap URLs around 8k.
+      if (url.length > 32000) {
+        toast("Receipt too large to share as a URL (" + url.length + " bytes). Use Download instead.", true);
+        return;
+      }
+      navigator.clipboard.writeText(url).then(function () {
+        toast("Verify link copied — recipient's browser will auto-verify it.");
+      }, function () {
+        // Fallback: show it in a modal so the user can copy manually.
+        showTokenModal(url, "Share this verify link");
+      });
+    });
+
+    // Build the portable verification bundle exactly once — used by
+    // both the Download and Share buttons so the recipient of either
+    // gets the same shape as the offline verifier expects.
+    function buildReceiptBundle(sess, rcpt) {
+      return {
+        format: "agentvisor.receipt.v1",
+        exportedAt: new Date().toISOString(),
+        session: {
+          id: sess.id,
+          externalId: sess.externalId,
+          agent: sess.agent,
+          user: sess.user,
+          model: sess.model,
+          openedAt: sess.openedAt,
+          closedAt: sess.closedAt,
+          events: sess.events,
+          toolsAllowed: sess.toolsAllowed,
+          toolsBlocked: sess.toolsBlocked,
+        },
+        receipt: rcpt,
+        publicKey: rcpt && rcpt.publicKeyHex
+          ? { algorithm: "ed25519", hex: rcpt.publicKeyHex }
+          : null,
+        verifyingInstructions: {
+          algorithm: "Ed25519",
+          message: "receipt.rawBody (UTF-8 bytes)",
+          signature: "base64-decode(receipt.rawSignatureB64)",
+          publicKey: "hex-decode(publicKey.hex)",
+          command: "node scripts/verify-receipt.mjs " + (sess.externalId || sess.id) + ".json",
+          docs: "https://agentvisorai.me/reference/receipts",
+        },
+      };
+    }
+
     // Download receipt as a portable verification bundle.
     // The exported JSON is self-contained — payload + signature +
     // public key + human-readable verification recipe. Anyone with
@@ -1211,34 +1273,7 @@
     // signature offline without asking us or the customer for
     // anything else.
     $("#dlRcpt").addEventListener("click", async function () {
-      var bundle = {
-        format: "agentvisor.receipt.v1",
-        exportedAt: new Date().toISOString(),
-        session: {
-          id: s.id,
-          externalId: s.externalId,
-          agent: s.agent,
-          user: s.user,
-          model: s.model,
-          openedAt: s.openedAt,
-          closedAt: s.closedAt,
-          events: s.events,
-          toolsAllowed: s.toolsAllowed,
-          toolsBlocked: s.toolsBlocked,
-        },
-        receipt: receipt,
-        publicKey: receipt && receipt.publicKeyHex
-          ? { algorithm: "ed25519", hex: receipt.publicKeyHex }
-          : null,
-        verifyingInstructions: {
-          algorithm: "Ed25519",
-          message: "receipt.rawBody (UTF-8 bytes)",
-          signature: "base64-decode(receipt.rawSignatureB64)",
-          publicKey: "hex-decode(publicKey.hex)",
-          command: "node scripts/verify-receipt.mjs " + (s.externalId || s.id) + ".json",
-          docs: "https://agentvisorai.me/reference/receipts",
-        },
-      };
+      var bundle = buildReceiptBundle(s, receipt);
       var blob = new Blob([JSON.stringify(bundle, null, 2)], { type: "application/json" });
       var url = URL.createObjectURL(blob);
       var a = document.createElement("a");
