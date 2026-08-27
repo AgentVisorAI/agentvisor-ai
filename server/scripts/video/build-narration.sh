@@ -43,13 +43,13 @@ done
 # Scene start offsets in the composed video (from compose.sh output).
 # We start each narration ~200-400ms into the scene so the visual
 # establishes just before the voice speaks.
-D1=400
-D2=5167
-D3=10133
-D4=13600
-D5=21867
-D6=31600
-D7=39433
+D1=100
+D2=4833
+D3=9700
+D4=13232
+D5=21532
+D6=31365
+D7=39398
 
 # Silent 46s base layer (extended from 44s to accommodate the
 # slightly longer scene 7 CTA reveal.)
