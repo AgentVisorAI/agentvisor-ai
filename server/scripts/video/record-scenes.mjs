@@ -65,9 +65,16 @@ function cardHtml(opts) {
       opacity: 1; transform: none; animation: none;
     }
     @keyframes revealText { to { opacity: 1; transform: translateY(0); } }
-    .accent-red { color: #ff6a58; }
-    .accent-yellow { color: #ffd54f; }
-    .accent-green { color: #6ecf8e; }
+    /* Palette aligned to the site's design tokens (dark-mode variants,
+     * since the cards sit on the site's --accent navy background).
+     *
+     *   --accent  #0a5c8b  navy card background
+     *   --danger  #e07b60  coral for the problem $8,400
+     *   --success #6ecf8e  green for the "auditor" callback + CTA
+     */
+    .accent-red    { color: #e07b60; }
+    .accent-green  { color: #6ecf8e; }
+    .accent-yellow { color: #6ecf8e; }
     .subline {
       font-size: 26px; font-weight: 400; margin-top: 2rem;
       opacity: 0; max-width: 900px; line-height: 1.4;
@@ -75,17 +82,17 @@ function cardHtml(opts) {
       transform: translateY(8px);
       animation: revealText 0.6s ${0.15 + lines.length * 0.18 + 0.15}s cubic-bezier(0.16,1,0.3,1) forwards;
     }
-    /* Big CTA URL for the closing card. Feels like a physical
-     * business card handed across the table — the URL is the whole
-     * point of the frame, not an afterthought. */
+    /* Big CTA URL for the closing card. Business-card treatment.
+     * Uses site --success green so the eye reads "proof / verified".
+     */
     .cta {
       display: inline-flex; align-items: center; gap: 18px;
       margin-top: 3rem; padding: 18px 34px;
       font-size: 44px; font-weight: 700; letter-spacing: -0.01em;
-      color: #ffd54f;
-      border: 2px solid rgba(255, 213, 79, 0.35);
+      color: #6ecf8e;
+      border: 2px solid rgba(110, 207, 142, 0.40);
       border-radius: 999px;
-      background: rgba(255, 213, 79, 0.06);
+      background: rgba(110, 207, 142, 0.06);
       opacity: 0; transform: translateY(10px);
       animation: revealText 0.7s ${0.15 + lines.length * 0.18 + 0.3}s cubic-bezier(0.16,1,0.3,1) forwards;
     }
@@ -265,8 +272,8 @@ async function applyCinematic(page, opts = {}) {
     }
     body { animation: kenburns ${zoomDuration}ms cubic-bezier(0.16, 1, 0.3, 1) forwards; transform-origin: ${originX} ${originY}; }
     @keyframes pulse-glow {
-      0%, 100% { box-shadow: 0 0 0 0 rgba(255, 213, 79, 0), 0 0 0 0 rgba(255, 213, 79, 0); }
-      50% { box-shadow: 0 0 0 6px rgba(255, 213, 79, 0.55), 0 0 40px 8px rgba(255, 213, 79, 0.35); }
+      0%, 100% { box-shadow: 0 0 0 0 rgba(110, 207, 142, 0), 0 0 0 0 rgba(110, 207, 142, 0); }
+      50%      { box-shadow: 0 0 0 6px rgba(110, 207, 142, 0.55), 0 0 40px 8px rgba(110, 207, 142, 0.35); }
     }
     .av-pulse-target { animation: pulse-glow 1.6s ease-in-out 3 !important; border-radius: 8px; }
   ` });
@@ -291,7 +298,7 @@ const browser = await chromium.launch({ headless: true });
 // ═════════════════════════════════════════════════════════════════
 await recordScene(browser, "01-problem", 4000, async (page, ms) => {
   await showCard(page, cardHtml({
-    bg: "#08111a",
+    bg: "#0a5c8b",
     headline: `One wrong decision.<br><span class="accent-red">$8,400</span> gone.`,
     sub: "No audit trail. No accountability. No way to prove what happened.",
     staticHeadline: true,
