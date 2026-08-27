@@ -35,8 +35,8 @@ gen() {
 }
 
 gen "$VOICE/s1" 4.1 "An A I agent just paid a fake vendor eight thousand four hundred dollars."
-gen "$VOICE/s2" 6.45 "Agent Visor watches every A I agent. Thirty one thousand, eight hundred forty dollars saved."
-gen "$VOICE/s3" 6.7 "Here is the order it stopped: a vendor not on the approved list. Blocked before the money moved, and signed."
+gen "$VOICE/s2" 5.6 "Agent Visor watches every A I agent. Thirty one thousand eight hundred forty dollars saved across blocked orders."
+gen "$VOICE/s3" 6.7 "Here is the order it stopped: a vendor not on the approved list. Blocked, signed, and the safe retry went through."
 gen "$VOICE/s4" 6.35 "Anyone can verify the receipt. Green tick. No account."
 gen "$VOICE/s5" 4.7 "A I agents you can hand to an auditor. agentvisor A I dot me."
 
