@@ -53,7 +53,7 @@ add_caption() {
 }
 
 add_caption "$SCENES/02-overview.webm" "$OUT/norm/02-overview.mp4" \
-  "\$31,840 in prevented losses."
+  "AgentVisor watches every AI agent. \$31,840 in prevented losses."
 
 add_caption "$SCENES/03-session.webm" "$OUT/norm/03-session.mp4" \
   "Blocked at \$8,400. Signed."
