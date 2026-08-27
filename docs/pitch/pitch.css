@@ -317,3 +317,35 @@
     font-size: 0.85rem;
   }
 }
+
+/* Video transcripts (a11y + skimmers): collapsed by default. */
+.pitch-transcript {
+  margin: 0.75rem auto 0;
+  max-width: 46rem;
+  font-size: 0.9rem;
+}
+.pitch-transcript summary {
+  cursor: pointer;
+  color: var(--fg-muted);
+  text-align: center;
+}
+.pitch-transcript summary:hover { color: var(--fg-strong); }
+.pitch-transcript ol {
+  list-style: none;
+  margin: 0.75rem 0 0;
+  padding: 1rem 1.25rem;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  display: grid;
+  gap: 0.5rem;
+  text-align: left;
+}
+.pitch-transcript li { color: var(--fg-muted); line-height: 1.5; }
+.pitch-transcript .tt {
+  display: inline-block;
+  min-width: 2.9rem;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
