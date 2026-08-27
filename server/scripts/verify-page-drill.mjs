@@ -75,7 +75,10 @@ await uploadJson(sampleText);
 
 // 4. Upload tampered
 const tampered = JSON.parse(sampleText);
-tampered.receipt.rawBody = tampered.receipt.rawBody.replace(/"agent"/, '"agnet"');
+// Flip a key that every receipt schema carries in the signed body, so
+// the mutation is never a silent no-op if the sample's schema evolves.
+if (!/"receiptId"/.test(tampered.receipt.rawBody)) fail("sample rawBody has no receiptId to tamper");
+tampered.receipt.rawBody = tampered.receipt.rawBody.replace(/"receiptId"/, '"receiptID"');
 await uploadJson(JSON.stringify(tampered));
 {
   const title = await page.locator(".result-title").innerText();
