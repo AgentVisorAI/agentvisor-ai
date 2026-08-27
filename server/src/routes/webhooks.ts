@@ -45,6 +45,18 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
   app.get("/", async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
+    // R89 F3: webhook URLs commonly ARE authentication material —
+    // Slack incoming-webhook tokens (`hooks.slack.com/services/…`),
+    // Discord tokens (`discord.com/api/webhooks/…/…`), PagerDuty
+    // integration URLs, etc. The module's header comment claims
+    // 'All routes are RBAC-gated: owners + admins only. Members:
+    // 403.' but the two GET routes were missing the check. A plain
+    // member could list every endpoint's URL and POST to it
+    // directly to bypass AgentVisor entirely (post as the org into
+    // Slack, fire fake pages, etc). Matches the CRUD gate.
+    if (!assertNotMember(claims)) {
+      return reply.code(403).send({ error: "forbidden" });
+    }
     const rows = await db.webhookEndpoint.findMany({
       where: { orgId: claims.orgId },
       orderBy: { createdAt: "desc" },
@@ -193,6 +205,14 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
     async (req, reply) => {
       const claims = requireSession(req, reply);
       if (!claims) return;
+      // R89 F3: deliveries include event names, error messages
+      // (may leak partial URL or secret material via HTTP-error
+      // bodies stored in errorMessage / responseBody), and
+      // response codes for the destination integration. Match
+      // GET / and CRUD RBAC.
+      if (!assertNotMember(claims)) {
+        return reply.code(403).send({ error: "forbidden" });
+      }
       const ep = await db.webhookEndpoint.findFirst({
         where: { id: req.params.id, orgId: claims.orgId },
       });

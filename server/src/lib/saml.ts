@@ -95,44 +95,69 @@ export function spUrls(cfg: SamlConfig): {
  * rewrapped payloads).
  */
 /**
- * Extract the ID of the actually-signed SAML element for replay-guard
- * bookkeeping. R76→R77 tried using the outer <Response ID> then the
- * FIRST <Assertion ID> in the raw XML; both fail against XML Signature
- * Wrapping (XSW) when wantResponseSigned defaults to false. An
- * attacker who rewraps a captured signed assertion inside a fresh
- * <Response> envelope AND prepends a bogus sibling
- * `<Assertion ID="attacker-nonce">` before it slips past the
- * first-match regex — the replay-guard's uniqueness key is the
- * attacker-controlled nonce, so the SAME signed assertion can be
- * replayed within the 5-min NotOnOrAfter skew window forever.
+ * Extract the ID of the actually-signed Assertion element for
+ * replay-guard bookkeeping. R76→R77→R88 tried three raw-body
+ * approaches; each fell to a different XSW variant:
+ *   • R76: `profile["ID"]` — that's the outer <Response ID>, which
+ *     is not signed under wantResponseSigned=false. Rewrapping the
+ *     same signed assertion in a fresh Response envelope gets a
+ *     fresh replay-key.
+ *   • R77: FIRST <Assertion ID> in raw XML. Attacker prepends a
+ *     bogus sibling <Assertion ID="attacker-nonce"> before the
+ *     signed one; regex picks the attacker's nonce.
+ *   • R88: FIRST <ds:Reference URI="#..."> in raw XML. Attacker
+ *     injects a decoy <ds:Signature> block with a fresh
+ *     Reference URI — or drops a <ds:Manifest>/<samlp:Extensions>
+ *     <ds:Reference URI="#attacker"/> earlier in the doc. Regex
+ *     picks the decoy. Also, when allowEncryptedAssertions=true
+ *     (default) the outer body contains NO <ds:Reference> at all
+ *     (they live inside the ciphertext), so R88's regex returns
+ *     null and BREAKS legitimate SSO for encrypted flows.
  *
- * R88 F1: the XMLDSig `<ds:Reference URI="#…">` element inside the
- * signature block identifies precisely which XML element got signed
- * — an XSW attacker who wants to substitute a different Assertion
- * has to either (a) match its ID to the URI (in which case the
- * digest breaks — signature verify fails) or (b) rewrite the URI
- * (in which case the signature over the SignedInfo block breaks).
- * Either way, extracting the ID from the first Reference URI gives
- * a replay-key that is bound to what node-saml actually verified.
+ * R89 F1/F2 fix: `@node-saml/node-saml`'s Profile exposes
+ * `getAssertionXml()`, which returns the VALIDATED assertion XML
+ * (post-decryption if the wire was encrypted). It's the exact
+ * element XMLDSig verified. Extract the Assertion's ID from THAT
+ * string — there's only one Assertion inside the returned XML, so
+ * the first-match regex is safe. This closes both the XSW replay
+ * (Finding 1) and the encrypted-assertion breakage (Finding 2)
+ * that R88's approach introduced.
  *
- * Handles namespaced (`ds:Reference`, `dsig:Reference`) and bare
- * (`Reference`) forms. Fails closed if no signed reference is found
- * (unsigned response — node-saml's verify would already have
- * refused it under wantAssertionsSigned=true, but be defensive).
+ * Falls back to profile.sessionIndex when getAssertionXml isn't
+ * available (older node-saml versions); if BOTH are missing, fails
+ * closed with null.
  */
-export function extractAssertionId(rawB64: string): string | null {
-  let xml: string;
-  try {
-    xml = Buffer.from(rawB64, "base64").toString("utf8");
-  } catch {
-    return null;
+export function extractAssertionId(
+  profile: { getAssertionXml?: () => string; sessionIndex?: string; ID?: string },
+): string | null {
+  const xml = typeof profile.getAssertionXml === "function"
+    ? profile.getAssertionXml()
+    : "";
+  if (xml) {
+    // Match `<Assertion ID="…">` or `<saml:Assertion ID="…">` /
+    // `<saml2:Assertion ID="…">`. Safe because the returned XML
+    // contains ONLY the validated Assertion element — no attacker
+    // wrapping can appear here.
+    const re = /<(?:[\w-]+:)?Assertion\b[^>]*?\bID\s*=\s*"([^"]+)"/;
+    const m = xml.match(re);
+    if (m?.[1]) return m[1];
   }
-  // Match `<ds:Reference URI="#…">` — the signed-element pointer.
-  // R88 F1: XSW-safe; must not match a decoy Assertion prepended
-  // before the real signed one.
-  const refRe = /<(?:[\w-]+:)?Reference\b[^>]*?\bURI\s*=\s*"#([^"]+)"/;
-  const m = xml.match(refRe);
-  return m?.[1] ?? null;
+  // Fallback #1: sessionIndex — IdP-generated per authentication,
+  // typically unique per login. Standardised as optional but Okta,
+  // Entra, Auth0 all emit it.
+  if (typeof profile.sessionIndex === "string" && profile.sessionIndex.length > 0) {
+    return `sess:${profile.sessionIndex}`;
+  }
+  // Fallback #2: profile.ID (the Response envelope ID). Only useful
+  // when wantResponseSigned=true — in which case the outer envelope
+  // is signed and this is a fine replay key. Under
+  // wantResponseSigned=false it's NOT XSW-safe, but at that point
+  // both getAssertionXml AND sessionIndex are missing which
+  // shouldn't happen with any modern IdP; be defensive.
+  if (typeof profile.ID === "string" && profile.ID.length > 0) {
+    return `resp:${profile.ID}`;
+  }
+  return null;
 }
 
 /** Construct the @node-saml/node-saml adapter from our stored config. */
@@ -262,18 +287,20 @@ export async function consumeSamlResponse(
   // ID until it expires so a captured SAMLResponse can't be re-posted
   // inside the 5-min skew window.
   //
-  // R76 MEDIUM #3 (landed R77) → R88 F1: extract the ID of the
-  // actually-signed element (via the ds:Reference URI in the
-  // XMLDSig block) rather than the first `<Assertion ID>` in the
-  // raw body. First-match regex is XSW-vulnerable — an attacker
-  // rewraps a captured signed assertion inside a fresh Response
-  // envelope AND prepends a bogus sibling `<Assertion ID="…">`
-  // before it; the regex matches the attacker nonce and the
-  // replay-guard sees fresh IDs indefinitely. The Reference URI
-  // is bound to the ACTUAL signed element via the digest and
-  // SignedInfo signature, so an XSW attacker who mutates it
-  // breaks the sig verify.
-  const assertionId = extractAssertionId(body.SAMLResponse);
+  // R76 MEDIUM #3 (landed R77) → R88 F1 → R89 F1/F2: use the
+  // Profile's `getAssertionXml()` — returns the VALIDATED (and
+  // decrypted if applicable) Assertion element. Prior raw-XML
+  // approaches all fell to XSW variants (bogus sibling Assertion,
+  // decoy ds:Signature block, ds:Manifest injection). Sourcing
+  // the ID from the node-saml-validated XML string means the ID
+  // is bound to what XMLDSig actually verified. Also fixes the
+  // R88 regression that broke encrypted-assertion flows (outer
+  // body contains no ds:Reference when EncryptedAssertion is
+  // used → R88 regex returned null → SSO broken for the default
+  // encrypted-assertion config).
+  const assertionId = extractAssertionId(
+    profile as { getAssertionXml?: () => string; sessionIndex?: string; ID?: string },
+  );
   if (!assertionId) {
     return { ok: false, error: "no_stable_assertion_id" };
   }
