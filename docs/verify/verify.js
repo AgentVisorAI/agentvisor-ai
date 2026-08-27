@@ -106,6 +106,27 @@
       const s = b.session || {};
       const r = b.receipt || {};
       const pub = b.publicKey || {};
+      // R8 claim audit: display facts from the SIGNED body, never from
+      // the unsigned envelope. The envelope's `session` / `eventCount`
+      // duplicates are convenience copies an attacker can edit freely
+      // without breaking the signature, so rendering them next to a
+      // green tick would let a tampered bundle show forged numbers.
+      let signed = {};
+      try { signed = JSON.parse(r.rawBody || "{}"); } catch { signed = {}; }
+      const displaySession = signed.sessionExternalId || signed.sessionId || s.externalId || s.id || "—";
+      const displayAgent = signed.agent || s.agent || "—";
+      const displayEvents = signed.eventCount ?? r.eventCount ?? "—";
+      const displayReceiptId = signed.receiptId || r.receiptId || "—";
+      // Surface envelope/signed-body drift so edited convenience copies
+      // are called out even though the signature itself still verifies.
+      const drift = [];
+      if (state.ok) {
+        if (s.externalId && signed.sessionExternalId && s.externalId !== signed.sessionExternalId) drift.push("session id");
+        if (s.agent && signed.agent && s.agent !== signed.agent) drift.push("agent");
+        if (r.eventCount != null && signed.eventCount != null && r.eventCount !== signed.eventCount) drift.push("event count");
+        if (s.events != null && signed.eventCount != null && s.events !== signed.eventCount) drift.push("session event count");
+        if (r.receiptId && signed.receiptId && r.receiptId !== signed.receiptId) drift.push("receipt id");
+      }
       // R78 HIGH #1 (landed R79): differentiate "signature verifies
       // against the pubkey embedded in the bundle" (internally
       // consistent. An attacker can trivially achieve this by
@@ -129,11 +150,12 @@
         <div class="result-card ${cls}">
           <p class="result-title">${titleText}</p>
           <p class="result-sub">${subText}</p>
+          ${drift.length ? `<p class="result-sub"><strong>Note:</strong> the bundle's unsigned metadata (${esc(drift.join(", "))}) does not match the signed body. The values below come from the signed body, which is what the signature attests. The unsigned copies were edited after signing.</p>` : ""}
           <dl class="kv">
-            <dt>Session</dt><dd>${esc(s.externalId || s.id || "—")}</dd>
-            <dt>Agent</dt><dd>${esc(s.agent || "—")}</dd>
-            <dt>Events sealed</dt><dd>${esc(r.eventCount ?? "—")}</dd>
-            <dt>Receipt ID</dt><dd>${esc(r.receiptId || "—")}</dd>
+            <dt>Session</dt><dd>${esc(displaySession)}</dd>
+            <dt>Agent</dt><dd>${esc(displayAgent)}</dd>
+            <dt>Events sealed</dt><dd>${esc(displayEvents)}</dd>
+            <dt>Receipt ID</dt><dd>${esc(displayReceiptId)}</dd>
             <dt>Public key</dt><dd>${esc(pub.hex || "—")}</dd>
             <dt>Signature bytes</dt><dd>${esc((r.rawSignatureB64 || "").length)} base64 chars (64 bytes decoded)</dd>
             <dt>Message bytes</dt><dd>${esc((r.rawBody || "").length)}</dd>
