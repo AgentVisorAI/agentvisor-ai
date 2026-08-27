@@ -35,15 +35,15 @@ gen() {
 }
 
 gen "$VOICE/s1" 5.4 "This is Agent Visor A I: the control plane for A I agents that touch real money and real systems."
-gen "$VOICE/s2" 5.5 "The problem: one wrong agent decision can cost thousands, with no way to prove what happened."
-gen "$VOICE/s3" 6.4 "Agent Visor blocks bad actions before money moves, and proves it afterwards. Here is the complete flow, from zero."
+gen "$VOICE/s2" 6.4 "Companies let A I agents order stock and pay invoices on their own. One tricked agent can send thousands to a fake vendor."
+gen "$VOICE/s3" 7.9 "Agent Visor sits between the agent and the money. Bad orders are blocked before they go out, and proven afterwards. Here is the complete flow, from zero."
 gen "$VOICE/s4" 4.6 "A brand new user lands on Agent Visor A I."
 gen "$VOICE/s5" 7.2 "They create a workspace. Company, email, password. That is the whole setup."
 gen "$VOICE/s6" 4.9 "A brand new workspace. Zero sessions, zero deployments. Nothing to audit, yet."
 gen "$VOICE/s7" 9.0 "One install command connects their first daemon. Agent Visor issues its signing key automatically."
-gen "$VOICE/s8" 9.6 "And the first sessions stream in. Within minutes, the first save: eight thousand four hundred dollars, blocked."
+gen "$VOICE/s8" 9.6 "And the first sessions stream in. Their buying agent just tried to pay a vendor that is not on the approved list. Blocked: eight thousand four hundred dollars kept."
 gen "$VOICE/s9" 5.9 "One click isolates the blocked session."
-gen "$VOICE/s10" 9.2 "Inside it: the A I tried to spend eight thousand four hundred dollars. Blocked. And every event is inspectable."
+gen "$VOICE/s10" 9.2 "Inside it: the agent was tricked into ordering from an unapproved vendor. Blocked before the money moved. Its retry, with the approved vendor, went through."
 gen "$VOICE/s11" 6.35 "Share a verification link, or copy the raw receipt. One click each."
 gen "$VOICE/s12" 2.8 "The receipt downloads in one click."
 gen "$VOICE/s13" 5.6 "Drop it into the public verifier. Green tick. No account."
@@ -61,23 +61,23 @@ done
 
 # Scene-start offsets + ~200ms lead, from compose.sh `Offsets:`.
 D1=300
-D2=6100
-D3=11700
-D4=18300
-D5=23800
-D6=29733
-D7=35333
-D8=43866
-D9=53866
-D10=60399
-D11=69932
-D12=76832
-D13=79565
-D14=85398
-D15=92898
-D16=99431
-D17=105398
-D18=120965
+D2=6000
+D3=12600
+D4=20733
+D5=26366
+D6=32399
+D7=37999
+D8=46532
+D9=56499
+D10=63032
+D11=72599
+D12=79499
+D13=82232
+D14=88165
+D15=95665
+D16=102232
+D17=108265
+D18=123832
 
 ffmpeg -y -f lavfi -i "anullsrc=r=44100:cl=stereo:d=140" \
   -c:a pcm_s16le "$OUT/silence-44s.wav" 2>&1 | tail -1
