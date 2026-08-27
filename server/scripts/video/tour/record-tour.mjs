@@ -250,7 +250,7 @@ async function applyCinematic(page, opts = {}) {
   // shot). Otherwise fall back to the subtle center Ken Burns.
   let originX = opts.origin ? opts.origin.split(" ")[0] : "center";
   let originY = opts.origin ? opts.origin.split(" ")[1] : "center";
-  let endScale = 1.055;
+  let endScale = opts.static ? 1.0 : 1.055;
   if (zoomToSel) {
     try {
       const rect = await page.evaluate((sel) => {
@@ -473,7 +473,7 @@ await recordConsoleScene(
   6500,
   "#/sessions/sess_01H9K",
   ['#shareRcpt', '#copyRcpt'],
-  { origin: "1900px 1060px" },
+  { static: true },
   async (page) => {
     await page.waitForTimeout(1000);
     const share = page.locator("#shareRcpt");
@@ -495,10 +495,10 @@ await recordConsoleScene(
 await recordConsoleScene(
   browser,
   "08-download",
-  3000,
+  3200,
   "#/sessions/sess_01H9K",
   ['#dlRcpt'],
-  { pulseSelector: "#dlRcpt", zoomMs: 2500 },
+  { pulseSelector: "#dlRcpt", zoomMs: 2500, static: true },
   async (page) => {
     const btn = page.locator("#dlRcpt");
     const bb = await btn.boundingBox();
@@ -573,7 +573,7 @@ await recordConsoleScene(
 await recordConsoleScene(
   browser,
   "12-settings",
-  15000,
+  16000,
   "#/settings/members",
   ['.settings-nav'],
   { origin: "0px 540px" },
@@ -589,7 +589,7 @@ await recordConsoleScene(
         if (btn) btn.click();
       }, tab);
       // Let the tab's data load past its skeleton before moving on.
-      await page.waitForTimeout(2100);
+      await page.waitForTimeout(2300);
     }
   },
 );
