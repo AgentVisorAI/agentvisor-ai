@@ -483,7 +483,7 @@ await recordConsoleScene(
   10500,
   "#/overview",
   ['text=SESSIONS'],
-  { freshOffset: 15200, pulseSelector: ".stat.savings", zoomMs: 10000 },
+  { freshOffset: 15200, zoomMs: 10000 },
   async (page) => {
     await page.waitForTimeout(2300);
     // First session has arrived — refresh the view.
@@ -491,7 +491,12 @@ await recordConsoleScene(
     await page.waitForTimeout(3400);
     // Second refresh: the featured blocked session lands, $8,400 appears.
     await page.evaluate(() => window.dispatchEvent(new HashChangeEvent("hashchange")));
-    await page.waitForTimeout(1600);
+    await page.waitForTimeout(1200);
+    // Only now pulse the tile — it finally has the first save in it.
+    await page.evaluate(() => {
+      const el = document.querySelector(".stat.savings");
+      if (el) el.classList.add("av-pulse-target");
+    });
     const tile = page.locator(".stat.savings");
     const tb = await tile.boundingBox().catch(() => null);
     if (tb) await page.mouse.move(tb.x + tb.width / 2, tb.y + tb.height / 2, { steps: 16 });
