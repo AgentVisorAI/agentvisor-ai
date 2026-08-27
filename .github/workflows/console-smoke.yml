@@ -99,6 +99,12 @@ jobs:
           SITE: https://agentvisorai.me/
         run: node scripts/verify-page-drill.mjs
 
+      - name: Shareable receipt URL drill
+        working-directory: server
+        env:
+          SITE: https://agentvisorai.me/app/
+        run: node scripts/share-receipt-drill.mjs
+
       - name: CSP + security-headers drill
         working-directory: server
         env:
