@@ -36,6 +36,10 @@ live mode):
   live blocked payment: an in-progress purchase session appears, the
   payment gets blocked ~3 s later, and every stat, chart, and receipt on
   screen catches up in real time.
+- **Onboarding checklist** (Overview, fresh workspaces) — after signup a
+  four-step "Getting started" card (workspace → daemon → sessions →
+  first block) ticks itself live as the fresh-workspace simulation
+  progresses, without a reload.
 
 ### Live mode
 

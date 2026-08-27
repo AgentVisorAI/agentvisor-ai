@@ -830,9 +830,9 @@
    * OVERVIEW. Stats with sparklines + a real chart
    * ============================================================ */
 
-  async function renderOverview(main) {
+  async function renderOverview(main, quiet) {
     var rangeLabel = { "1h": "the last hour", "24h": "the last 24 hours", "7d": "the last 7 days", "30d": "the last 30 days" }[state.range] || "the last 24 hours";
-    main.innerHTML = pageHeader("Overview", "Fleet activity for " + rangeLabel + ".", rangeGroup()) + loadingBlock("stats");
+    if (!quiet) main.innerHTML = pageHeader("Overview", "Fleet activity for " + rangeLabel + ".", rangeGroup()) + loadingBlock("stats");
     var stats, sessions;
     try {
       stats = await state.ds.getOverview(state.range);
@@ -854,6 +854,7 @@
 
     main.innerHTML =
       pageHeader("Overview", "Fleet activity for " + rangeLabel + ".", attackBtn() + rangeGroup()) +
+      onboardingCard(stats, sessions) +
       '<div class="stats">' +
         stat("Sessions", stats.sessions, stats.deployments + " deployment" + (stats.deployments === 1 ? "" : "s"), sparkline(series.map(function (b) { return b.allowed + b.blocked; }))) +
         stat("Tool calls allowed", stats.toolsAllowed.toLocaleString(), "policy pass", sparkline(allowedByHour)) +
@@ -885,6 +886,56 @@
     installChartHover(main, series);
     var sim = main.querySelector("#simAttack");
     if (sim) sim.addEventListener("click", runAttackDemo);
+    // Fresh-workspace onboarding: the checklist ticks itself live as
+    // the daemon connects and the first sessions stream in, so keep
+    // re-rendering (quietly — no skeleton swap) while it's on screen.
+    clearTimeout(overviewTimer);
+    if (freshT0() != null && (state.route.path[0] || "overview") === "overview") {
+      overviewTimer = setTimeout(function () {
+        var m = $("#view");
+        if (m && (state.route.path[0] || "overview") === "overview") renderOverview(m, true);
+      }, 2500);
+    }
+  }
+
+  /* ── Fresh-workspace onboarding checklist ────────────────────
+   * Day-one guidance for a brand-new org (the meeting-notes ask:
+   * "UI for onboarding"). Four steps that tick themselves as the
+   * fresh simulation progresses: workspace → daemon → sessions →
+   * first block. Invisible outside fresh mode. */
+  var overviewTimer = null;
+  function freshT0() {
+    try { var v = localStorage.getItem("av_mock_fresh_t0"); return v ? +v : null; } catch (e) { return null; }
+  }
+  function onboardingCard(stats, sessions) {
+    if (freshT0() == null) return "";
+    var hasDep = stats.deployments > 0;
+    var hasSess = stats.sessions > 0;
+    var hasBlock = sessions.some(function (s) { return s.toolsBlocked > 0; });
+    var blockedValue = sessions.reduce(function (a, s) { return a + (parseInt(s.blockedPayoutUsdMicros, 10) || 0) / 1e6; }, 0);
+    var steps = [
+      { done: true, label: "Create your workspace", sub: "Done — you're in" },
+      { done: hasDep, label: "Connect your first daemon", sub: hasDep ? "northwind-prod is connected" : "Run the install command. This page updates by itself.", href: "#/deployments" },
+      { done: hasSess, label: "Sessions stream in", sub: hasSess ? stats.sessions + " session" + (stats.sessions === 1 ? "" : "s") + " recorded so far" : "Waiting for your agent's first run…" },
+      { done: hasBlock, label: "First bad order blocked", sub: hasBlock ? "$" + blockedValue.toLocaleString() + " kept — open the session to see why" : "Starter policies are armed and waiting", href: hasBlock ? "#/sessions" : null },
+    ];
+    var doneCount = steps.filter(function (s) { return s.done; }).length;
+    var rows = steps.map(function (s, i) {
+      var inner =
+        '<span class="ob-tick' + (s.done ? " done" : "") + '">' + (s.done ? "✓" : i + 1) + "</span>" +
+        '<span class="ob-body"><span class="ob-label">' + esc(s.label) + "</span>" +
+        '<span class="ob-sub">' + esc(s.sub) + "</span></span>";
+      return s.href && !s.done
+        ? '<a class="ob-step" href="' + esc(s.href) + '">' + inner + "</a>"
+        : s.href
+          ? '<a class="ob-step done" href="' + esc(s.href) + '">' + inner + "</a>"
+          : '<div class="ob-step' + (s.done ? " done" : "") + '">' + inner + "</div>";
+    }).join("");
+    return '<div class="onboard-card card" role="region" aria-label="Getting started">' +
+      '<div class="ob-head"><h2>Getting started</h2><span class="ob-count">' + doneCount + " of " + steps.length + "</span>" +
+      '<div class="ob-bar"><span style="width:' + (doneCount / steps.length) * 100 + '%"></span></div></div>' +
+      '<div class="ob-steps">' + rows + "</div>" +
+    "</div>";
   }
 
   /* ── Simulated attack (mock mode) ────────────────────────────
