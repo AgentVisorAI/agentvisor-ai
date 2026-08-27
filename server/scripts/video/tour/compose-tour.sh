@@ -93,8 +93,32 @@ add_caption "$SCENES/15-palette.webm" "$OUT/norm/15-palette.mp4" \
 add_caption "$SCENES/16-deployments.webm" "$OUT/norm/16-deployments.mp4" \
   "Every deployment gets its own signing key."
 
-add_caption "$SCENES/17-settings.webm" "$OUT/norm/17-settings.mp4" \
-  "Members, API keys, SSO, webhooks, audit log, billing."
+# Scene 17 carries two narration beats: the admin-surface list, then
+# the wrap-up thesis. Muted viewers were missing the payoff line, so
+# it gets its own caption for the scene's back half.
+add_caption2_17() {
+  local input=$1
+  local output=$2
+  local rawdur=$(dur_any "$input")
+  local capend=$(awk "BEGIN{printf \"%.2f\", $rawdur - 0.70 - 0.65}")
+  local capA="Members, API keys, SSO, webhooks, audit log, billing."
+  local capB="That is day one — an empty workspace to a signed, verifiable audit trail."
+  local escA=$(printf '%s' "$capA" | sed "s/'/\\\\\\\\'/g; s/:/\\\\:/g")
+  local escB=$(printf '%s' "$capB" | sed "s/'/\\\\\\\\'/g; s/:/\\\\:/g")
+  local enA="between(t,0,7.40)"
+  local enB="between(t,7.60,$capend)"
+  ffmpeg -y -ss 0.70 -i "$input" -vf "
+    fps=30,
+    scale=1920:1080:flags=lanczos:out_color_matrix=bt709,
+    setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,
+    drawbox=x=0:y=ih-140:w=iw:h=140:color=black@0.72:t=fill:enable='$enA',
+    drawtext=fontfile='$FONT':text='$escA':fontsize=42:fontcolor=white:x=(w-text_w)/2:y=h-100:enable='$enA',
+    drawbox=x=0:y=ih-140:w=iw:h=140:color=black@0.72:t=fill:enable='$enB',
+    drawtext=fontfile='$FONT':text='$escB':fontsize=42:fontcolor=white:x=(w-text_w)/2:y=h-100:enable='$enB',
+    format=yuv420p
+  " -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p -colorspace bt709 -color_primaries bt709 -color_trc bt709 "$output" 2>&1 | tail -1
+}
+add_caption2_17 "$SCENES/17-settings.webm" "$OUT/norm/17-settings.mp4"
 
 D1=$(dur "$OUT/norm/01-title.mp4")
 D2=$(dur "$OUT/norm/02-problem.mp4")
