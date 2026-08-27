@@ -96,7 +96,7 @@ ls -lh "$OUT/agentvisor-mockup-v4.mp4"
 if [ -f "$OUT/audio/soundtrack-44s.aac" ]; then
   echo "→ Muxing subtle-audio cut (whooshes only)"
   ffmpeg -y -i "$OUT/agentvisor-mockup-v4.mp4" -i "$OUT/audio/soundtrack-44s.aac" \
-    -c:v copy -c:a aac -shortest \
+    -c:v copy -c:a aac -shortest -movflags +faststart \
     "$OUT/agentvisor-mockup-v9-audio.mp4" 2>&1 | tail -1
   ls -lh "$OUT/agentvisor-mockup-v9-audio.mp4"
 fi
@@ -104,7 +104,7 @@ fi
 if [ -f "$OUT/audio/narration-44s.aac" ]; then
   echo "→ Muxing narrated cut (definitive v21 distilled)"
   ffmpeg -y -i "$OUT/agentvisor-mockup-v4.mp4" -i "$OUT/audio/narration-44s.aac" \
-    -c:v copy -c:a aac -shortest \
+    -c:v copy -c:a aac -shortest -movflags +faststart \
     "$OUT/agentvisor-mockup-v21-distilled.mp4" 2>&1 | tail -1
   ls -lh "$OUT/agentvisor-mockup-v21-distilled.mp4"
 fi

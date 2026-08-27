@@ -9,7 +9,7 @@ VOICE="$OUT/voice"
 mkdir -p "$VOICE"
 
 say -r 175 -v Samantha -o "$VOICE/s1.aiff" "One wrong A I decision. Eight thousand four hundred dollars, gone."
-say -r 175 -v Samantha -o "$VOICE/s2.aiff" "Agent Visor watches every A I agent. Thirty one thousand, eight hundred forty dollars in prevented losses."
+say -r 175 -v Samantha -o "$VOICE/s2.aiff" "Agent Visor prevents this. Thirty one thousand, eight hundred forty dollars saved."
 say -r 175 -v Samantha -o "$VOICE/s3.aiff" "Here is the one it stopped. Blocked at eight thousand four hundred dollars. Signed."
 say -r 175 -v Samantha -o "$VOICE/s4.aiff" "Anyone can verify the receipt. Green tick. No account."
 say -r 175 -v Samantha -o "$VOICE/s5.aiff" "A I agents you can hand to an auditor. agentvisor A I dot me."
@@ -22,8 +22,8 @@ done
 
 # Scene starts + ~200ms lead, from compose.sh `Offsets:`.
 D1=300
-D2=3400
-D3=10233
+D2=4600
+D3=11200
 D4=18066
 D5=24599
 
