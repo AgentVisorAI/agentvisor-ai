@@ -191,14 +191,21 @@ async function main(): Promise<void> {
     const method = req.method.toUpperCase();
     if (method === "GET" || method === "HEAD" || method === "OPTIONS") return;
     if (typeof req.url === "string" && req.url.startsWith("/api/v1/ingest")) return;
-    // SAML endpoints receive form-encoded POSTs from the IdP itself
-    // (cross-site by definition — that's the point). Their crypto layer
+    // SAML ACS receives form-encoded POSTs from the IdP itself
+    // (cross-site by definition — that's the point). Its crypto layer
     // does the CSRF-equivalent check by verifying the IdP-signed
-    // assertion. The routes are also idempotent w.r.t. auth (they mint
+    // assertion. The route is also idempotent w.r.t. auth (it mints
     // a fresh cookie); ambient cookies aren't consulted.
+    //
+    // R88 F2/F4: SLO is NO LONGER exempt. The SLO handler previously
+    // did no signature check, no configId lookup, and no session
+    // check — any cross-origin POST forced a cookie-clear on any
+    // authenticated visitor. Enforcing CSRF on SLO forces the
+    // handler down the origin-verified path where it can safely
+    // require a session cookie + valid configId.
     if (
       typeof req.url === "string" &&
-      /^\/api\/v1\/auth\/saml\/[^/]+\/(acs|slo)(\?|$)/.test(req.url)
+      /^\/api\/v1\/auth\/saml\/[^/]+\/acs(\?|$)/.test(req.url)
     ) {
       return;
     }

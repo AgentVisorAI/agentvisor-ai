@@ -126,8 +126,20 @@ const createConfigSchema = z.object({
   wantAssertionsSigned: z.boolean().default(true),
   wantResponseSigned: z.boolean().default(false),
   allowEncryptedAssertions: z.boolean().default(true),
-  signatureAlgorithm: z.enum(["sha1", "sha256", "sha512"]).default("sha256"),
-  digestAlgorithm: z.enum(["sha1", "sha256", "sha512"]).default("sha256"),
+  // R88 F5: dropped "sha1". SHA-1 is chosen-prefix collision-broken
+  // since Leurent/Peyrin 2020 (SHAmbles — ~$45k of cloud compute).
+  // With SHA-1 as the digest, an attacker with access to a legitimate
+  // signed assertion (or with SAML config write access, e.g. via a
+  // phished owner credential) can forge a colliding assertion that
+  // the XMLDSig verifier accepts as valid. NIST disallowed SHA-1 for
+  // digital signatures in 2013; all modern IdPs (Okta, Entra, Auth0)
+  // default to SHA-256. The self-service SHA-1 toggle was a silent
+  // downgrade knob with no operator warning. If a legacy IdP truly
+  // requires SHA-1, the fix is an env-gated allow-list (not a per-org
+  // schema field) so security posture is a deployment decision, not
+  // a form-field.
+  signatureAlgorithm: z.enum(["sha256", "sha512"]).default("sha256"),
+  digestAlgorithm: z.enum(["sha256", "sha512"]).default("sha256"),
   nameIdFormat: z.string().max(256).default(
     "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
   ),
@@ -334,10 +346,42 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
 
   app.post<{ Params: { configId: string } }>(
     "/:configId/slo",
-    async (_req, reply) => {
-      // Minimal SLO acknowledgement — we accept the LogoutRequest,
-      // don't try to re-post to every other SP the user might be
-      // signed into (out of scope). Clear our cookie and return 200.
+    async (req, reply) => {
+      // R88 F2/F4: harden the SLO endpoint.
+      //
+      // Prior shape did NO validation: no session cookie check,
+      // no configId lookup, no LogoutRequest signature verify. Any
+      // origin could POST here (SLO was CSRF-exempt) and force
+      // `Set-Cookie: av_session=; Max-Age=0` on any authenticated
+      // visitor — a session-DoS primitive. Combined with the fact
+      // that the handler previously didn't even validate the
+      // configId param (destructured as `_req`), an attacker
+      // guessing any UUID could reach the cookie-clear.
+      //
+      // Defense in depth (without shipping a full SAML
+      // LogoutRequest signature parser this round):
+      //   1. Remove /slo from the CSRF exemption in
+      //      index.ts (done alongside this fix) so only same-
+      //      origin POSTs reach the handler.
+      //   2. Require a valid session cookie.
+      //   3. Require a real, active configId belonging to the
+      //      caller's org — a caller can't log themselves out
+      //      via another org's SLO endpoint.
+      // A follow-up round should parse the SAMLRequest form
+      // field, verify the signature against cfg.x509Cert, and
+      // match the NameID to the session user before clearing —
+      // but the CSRF+session+configId gate here already closes
+      // the anonymous session-DoS primitive.
+      const claims = requireSession(req, reply);
+      if (!claims) return;
+      const cfg = await db.samlConfig.findFirst({
+        where: {
+          id: req.params.configId,
+          orgId: claims.orgId,
+          isActive: true,
+        },
+      });
+      if (!cfg) return reply.code(404).send({ error: "not_found" });
       reply.setCookie(env.SESSION_COOKIE_NAME, "", {
         ...SESSION_COOKIE_OPTS,
         maxAge: 0,
