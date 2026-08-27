@@ -34,9 +34,9 @@ gen() {
   echo "  WARNING: $(basename "$out") ${d}s exceeds window ${window}s even at +40%"
 }
 
-gen "$VOICE/s1" 4.1 "One wrong A I decision. Eight thousand four hundred dollars, gone."
+gen "$VOICE/s1" 4.1 "An A I agent just paid a fake vendor eight thousand four hundred dollars."
 gen "$VOICE/s2" 6.45 "Agent Visor watches every A I agent. Thirty one thousand, eight hundred forty dollars saved."
-gen "$VOICE/s3" 6.7 "Here is the one it stopped. Blocked at eight thousand four hundred dollars. Signed."
+gen "$VOICE/s3" 6.7 "Here is the order it stopped: a vendor not on the approved list. Blocked before the money moved, and signed."
 gen "$VOICE/s4" 6.35 "Anyone can verify the receipt. Green tick. No account."
 gen "$VOICE/s5" 4.7 "A I agents you can hand to an auditor. agentvisor A I dot me."
 
@@ -49,9 +49,9 @@ done
 # Scene starts + ~200ms lead, from compose.sh `Offsets:`.
 D1=300
 D2=4567
-D3=11167
-D4=18033
-D5=24566
+D3=10334
+D4=17901
+D5=24401
 
 ffmpeg -y -f lavfi -i "anullsrc=r=44100:cl=stereo:d=32" \
   -c:a pcm_s16le "$OUT/silence-44s.wav" 2>&1 | tail -1
