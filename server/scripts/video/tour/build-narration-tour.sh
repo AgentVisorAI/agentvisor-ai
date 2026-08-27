@@ -8,22 +8,48 @@ OUT=/tmp/video-tour/audio
 VOICE="$OUT/voice"
 mkdir -p "$VOICE"
 
-say -r 175 -v Samantha -o "$VOICE/s1.aiff"  "A brand new user lands on Agent Visor A I."
-say -r 175 -v Samantha -o "$VOICE/s2.aiff"  "They create a workspace. Company, email, password. That is the whole setup."
-say -r 175 -v Samantha -o "$VOICE/s3.aiff"  "First view: the dashboard. Thirty two sessions. Seven blocked. Thirty one thousand, eight hundred forty dollars saved."
-say -r 175 -v Samantha -o "$VOICE/s4.aiff"  "A command palette jumps anywhere. Light or dark, your call."
-say -r 175 -v Samantha -o "$VOICE/s5.aiff"  "Every session is searchable. One click isolates the blocked ones."
-say -r 175 -v Samantha -o "$VOICE/s6.aiff"  "Inside a session, the A I tried to spend eight thousand four hundred dollars. Blocked. And every event is inspectable."
-say -r 175 -v Samantha -o "$VOICE/s7.aiff"  "Share a verification link, or copy the raw receipt. One click each."
-say -r 175 -v Samantha -o "$VOICE/s8.aiff"  "The receipt downloads in one click."
-say -r 175 -v Samantha -o "$VOICE/s9.aiff"  "Drop it into the public verifier. Green tick. No account."
-say -r 175 -v Samantha -o "$VOICE/s10.aiff" "Policies are plain rules. Readable, and enforced before the money moves."
-say -r 175 -v Samantha -o "$VOICE/s11.aiff" "Each deployment gets its own signing key and ingest token."
-say -r 175 -v Samantha -o "$VOICE/s12.aiff" "Members, A P I keys, single sign on, webhooks, audit log, billing. The whole workspace is self serve."
-say -r 175 -v Samantha -o "$VOICE/s13.aiff" "A I agents you can hand to an auditor. Try it live at agentvisor A I dot me."
+# Neural narration via edge-tts (en-US-AriaNeural). Each clip is
+# synthesized, tail-trimmed, and its rate auto-bumped until it fits
+# the scene window (see W* below) with margin, so narration can never
+# overlap the next scene's line.
+EDGE_TTS="${EDGE_TTS:-/tmp/tts-venv/bin/edge-tts}"
+VOICE_ID="en-US-AriaNeural"
+
+gen() {
+  local out=$1; local window=$2; shift 2
+  local text="$*"
+  local d rate
+  for rate in "+20%" "+25%" "+30%" "+35%" "+40%"; do
+    "$EDGE_TTS" --voice "$VOICE_ID" --rate="$rate" --text "$text" \
+      --write-media "$out.mp3" 2>/dev/null
+    ffmpeg -y -i "$out.mp3" \
+      -af "silenceremove=stop_periods=-1:stop_threshold=-45dB:stop_duration=0.25" \
+      -c:a pcm_s16le -ar 44100 "$out.raw.wav" 2>/dev/null
+    d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$out.raw.wav")
+    if awk "BEGIN{exit !($d <= $window)}"; then
+      echo "  $(basename "$out"): ${d}s @ $rate (window ${window}s)"
+      return 0
+    fi
+  done
+  echo "  WARNING: $(basename "$out") ${d}s exceeds window ${window}s even at +40%"
+}
+
+gen "$VOICE/s1" 5.4 "A brand new user lands on Agent Visor A I."
+gen "$VOICE/s2" 5.2 "They create a workspace. Company, email, password. That is the whole setup."
+gen "$VOICE/s3" 9.2 "First view: the dashboard. Thirty two sessions. Seven blocked. Thirty one thousand, eight hundred forty dollars saved."
+gen "$VOICE/s4" 6.85 "A command palette jumps anywhere. Light or dark, your call."
+gen "$VOICE/s5" 14.4 "Every session is searchable. One click isolates the blocked ones."
+gen "$VOICE/s6" 9.8 "Inside a session, the A I tried to spend eight thousand four hundred dollars. Blocked. And every event is inspectable."
+gen "$VOICE/s7" 6.35 "Share a verification link, or copy the raw receipt. One click each."
+gen "$VOICE/s8" 2.8 "The receipt downloads in one click."
+gen "$VOICE/s9" 5.6 "Drop it into the public verifier. Green tick. No account."
+gen "$VOICE/s10" 7.8 "Policies are plain rules. Readable, and enforced before the money moves."
+gen "$VOICE/s11" 6.35 "Each deployment gets its own signing key and ingest token."
+gen "$VOICE/s12" 14.9 "Members, A P I keys, single sign on, webhooks, audit log, billing. The whole workspace is self serve."
+gen "$VOICE/s13" 4.55 "A I agents you can hand to an auditor. agentvisor A I dot me."
 
 for i in $(seq 1 13); do
-  ffmpeg -y -i "$VOICE/s$i.aiff" \
+  ffmpeg -y -i "$VOICE/s$i.raw.wav" \
     -af "aformat=sample_rates=44100:channel_layouts=stereo,highpass=f=100,acompressor=threshold=-20dB:ratio=3:attack=5:release=50,loudnorm=I=-18:LRA=6:TP=-2.0" \
     -c:a pcm_s16le "$VOICE/s$i.wav" 2>&1 | tail -1
 done

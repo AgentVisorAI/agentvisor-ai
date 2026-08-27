@@ -8,14 +8,40 @@ OUT=/tmp/video-v4/audio
 VOICE="$OUT/voice"
 mkdir -p "$VOICE"
 
-say -r 175 -v Samantha -o "$VOICE/s1.aiff" "One wrong A I decision. Eight thousand four hundred dollars, gone."
-say -r 175 -v Samantha -o "$VOICE/s2.aiff" "Agent Visor watches every A I agent. Thirty one thousand, eight hundred forty dollars saved."
-say -r 175 -v Samantha -o "$VOICE/s3.aiff" "Here is the one it stopped. Blocked at eight thousand four hundred dollars. Signed."
-say -r 175 -v Samantha -o "$VOICE/s4.aiff" "Anyone can verify the receipt. Green tick. No account."
-say -r 175 -v Samantha -o "$VOICE/s5.aiff" "A I agents you can hand to an auditor. agentvisor A I dot me."
+# Neural narration via edge-tts (en-US-AriaNeural). Each clip is
+# synthesized, tail-trimmed, and its rate auto-bumped until it fits
+# the scene window (see W* below) with margin, so narration can never
+# overlap the next scene's line.
+EDGE_TTS="${EDGE_TTS:-/tmp/tts-venv/bin/edge-tts}"
+VOICE_ID="en-US-AriaNeural"
+
+gen() {
+  local out=$1; local window=$2; shift 2
+  local text="$*"
+  local d rate
+  for rate in "+20%" "+25%" "+30%" "+35%" "+40%"; do
+    "$EDGE_TTS" --voice "$VOICE_ID" --rate="$rate" --text "$text" \
+      --write-media "$out.mp3" 2>/dev/null
+    ffmpeg -y -i "$out.mp3" \
+      -af "silenceremove=stop_periods=-1:stop_threshold=-45dB:stop_duration=0.25" \
+      -c:a pcm_s16le -ar 44100 "$out.raw.wav" 2>/dev/null
+    d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$out.raw.wav")
+    if awk "BEGIN{exit !($d <= $window)}"; then
+      echo "  $(basename "$out"): ${d}s @ $rate (window ${window}s)"
+      return 0
+    fi
+  done
+  echo "  WARNING: $(basename "$out") ${d}s exceeds window ${window}s even at +40%"
+}
+
+gen "$VOICE/s1" 4.1 "One wrong A I decision. Eight thousand four hundred dollars, gone."
+gen "$VOICE/s2" 6.45 "Agent Visor watches every A I agent. Thirty one thousand, eight hundred forty dollars saved."
+gen "$VOICE/s3" 6.7 "Here is the one it stopped. Blocked at eight thousand four hundred dollars. Signed."
+gen "$VOICE/s4" 6.35 "Anyone can verify the receipt. Green tick. No account."
+gen "$VOICE/s5" 4.7 "A I agents you can hand to an auditor. agentvisor A I dot me."
 
 for i in 1 2 3 4 5; do
-  ffmpeg -y -i "$VOICE/s$i.aiff" \
+  ffmpeg -y -i "$VOICE/s$i.raw.wav" \
     -af "aformat=sample_rates=44100:channel_layouts=stereo,highpass=f=100,acompressor=threshold=-20dB:ratio=3:attack=5:release=50,loudnorm=I=-18:LRA=6:TP=-2.0" \
     -c:a pcm_s16le "$VOICE/s$i.wav" 2>&1 | tail -1
 done
