@@ -188,10 +188,21 @@ async function recordConsoleScene(browser, sceneName, durationMs, hash, waitFor,
     // Tailwind-red/green vs mint/coral clash between UI and cards.
     colorScheme: "dark",
   });
+  // First-user simulation clock: seed how far along the fresh
+  // workspace is when this scene opens (see datasource FRESH_*).
+  if (cinematicOpts && cinematicOpts.freshOffset != null) {
+    await ctx.addInitScript((off) => {
+      try { localStorage.setItem("av_mock_fresh_t0", String(Date.now() - off)); } catch {}
+    }, cinematicOpts.freshOffset);
+  }
   const page = await ctx.newPage();
   // Go directly to the target hash. Since the auth state is warmed,
   // no login round-trip is recorded.
-  await page.goto(SITE + hash, { waitUntil: "networkidle" });
+  // domcontentloaded, not networkidle: the fresh-workspace mode keeps
+  // a polling loop alive, so networkidle never fires and the recording
+  // captures ~30s of idle wait. The waitFor selectors below guarantee
+  // readiness.
+  await page.goto(SITE + hash, { waitUntil: "domcontentloaded" });
   // Belt-and-suspenders: wait for the specific selector(s) that prove
   // the data is rendered.
   for (const sel of waitFor) {
@@ -199,6 +210,7 @@ async function recordConsoleScene(browser, sceneName, durationMs, hash, waitFor,
   }
   // Tiny settle for CSS animations
   await page.waitForTimeout(200);
+  await injectCursor(page);
   // Apply cinematic layer (vignette + Ken Burns + optional pulse)
   await applyCinematic(page, {
     zoomMs: durationMs - 500,
@@ -240,6 +252,52 @@ async function showCard(page, html, holdMs) {
  *      breathing glow that draws attention to what the caption
  *      references, without hijacking it.
  */
+
+/**
+ * Inject a visible cursor that follows Playwright's mouse. The OS
+ * cursor is never captured by recordVideo, so we draw our own: an
+ * arrow that tracks mousemove and pulses on mousedown / synthetic
+ * clicks (av-click event).
+ */
+async function injectCursor(page) {
+  await page.evaluate(() => {
+    if (document.getElementById("av-cursor")) return;
+    const c = document.createElement("div");
+    c.id = "av-cursor";
+    c.innerHTML = '<svg width="26" height="26" viewBox="0 0 24 24"><path d="M4 1.5 L4 19.5 L8.9 15 L12.2 21.6 L15.2 20.1 L11.9 13.6 L18.5 13.2 Z" fill="#ffffff" stroke="#10161d" stroke-width="1.5" stroke-linejoin="round"/></svg>';
+    Object.assign(c.style, {
+      position: "fixed", left: "0px", top: "0px", zIndex: "2147483647",
+      pointerEvents: "none", opacity: "0",
+      transition: "opacity 0.25s ease",
+      filter: "drop-shadow(0 1px 3px rgba(0,0,0,0.55))",
+    });
+    document.documentElement.appendChild(c);
+    const svg = c.firstChild;
+    svg.style.transition = "transform 0.12s ease";
+    svg.style.transformOrigin = "5px 3px";
+    document.addEventListener("mousemove", (e) => {
+      c.style.opacity = "1";
+      c.style.left = e.clientX + "px";
+      c.style.top = e.clientY + "px";
+    }, true);
+    const pulse = () => {
+      svg.style.transform = "scale(0.75)";
+      setTimeout(() => { svg.style.transform = "scale(1)"; }, 140);
+    };
+    document.addEventListener("mousedown", pulse, true);
+    document.addEventListener("av-click", pulse, true);
+  });
+}
+
+/** Synthetic click with a cursor pulse so the click reads on camera. */
+async function cursorClick(page, selector) {
+  await page.evaluate((sel) => {
+    document.dispatchEvent(new CustomEvent("av-click"));
+    const el = typeof sel === "string" ? document.querySelector(sel) : sel;
+    if (el) el.click();
+  }, selector);
+}
+
 async function applyCinematic(page, opts = {}) {
   const zoomDuration = opts.zoomMs ?? 7000;
   const pulseSel = opts.pulseSelector ?? null;
@@ -327,137 +385,161 @@ await recordScene(browser, "01-landing", 5000, async (page, ms) => {
   await page.goto(LANDING + "/", { waitUntil: "networkidle" });
   await page.waitForSelector("h1", { timeout: 8000 });
   await page.waitForTimeout(200);
+  await injectCursor(page);
   await applyCinematic(page, { zoomMs: ms - 500, zoomToSelector: ".cta.primary" });
-  await page.waitForTimeout(ms - 500);
+  const cta = await page.locator(".cta.primary").boundingBox();
+  if (cta) await page.mouse.move(cta.x + cta.width / 2, cta.y + cta.height / 2, { steps: 24 });
+  await page.waitForTimeout(ms - 900);
 });
 
-// ── SCENE 2: SIGN UP. Novice user creates a workspace, live. ─────
-await recordScene(browser, "02-signup", 8000, async (page, ms) => {
+// ── SCENE 2: SIGN UP. The novice creates a workspace, live. ──────
+await recordScene(browser, "02-signup", 9000, async (page, ms) => {
   await page.addInitScript(() => {
     try { localStorage.setItem("av_mock_signed_out", "1"); } catch {}
   });
   await page.goto(SITE + "#/signup", { waitUntil: "networkidle" });
   await page.waitForSelector("input#orgName", { timeout: 10000 });
-  await page.waitForTimeout(400);
+  await page.waitForTimeout(300);
+  await injectCursor(page);
+  const move = async (sel) => {
+    const b = await page.locator(sel).boundingBox();
+    if (b) await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2, { steps: 12 });
+  };
+  await move("input#orgName");
   await page.locator("input#orgName").click();
   await page.locator("input#orgName").pressSequentially("Northwind Traders", { delay: 45 });
+  await move("input#email");
   await page.locator("input#email").click();
   await page.locator("input#email").pressSequentially("olivia.tan@northwind.com", { delay: 40 });
+  await move("input#password");
   await page.locator("input#password").click();
   await page.locator("input#password").pressSequentially("agents-you-trust", { delay: 30 });
   await page.waitForTimeout(300);
-  const btn = page.locator("#authForm button[type='submit']");
-  const box = await btn.boundingBox();
-  if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 14 });
+  await move("#authForm button[type='submit']");
   await page.waitForTimeout(250);
-  await btn.click();
-  // Land on the overview: hold so the viewer sees the transition.
-  await page.waitForTimeout(2400);
+  await page.locator("#authForm button[type='submit']").click();
+  // Land on the overview: EMPTY, because the workspace is brand new.
+  await page.waitForTimeout(2600);
 });
 
-// ── SCENE 3: OVERVIEW. Chart hover, then zoom to the money tile. ──
+// ── SCENE 3: EMPTY WORKSPACE. Zero everything. Nothing to audit. ──
 await recordConsoleScene(
   browser,
-  "03-overview",
-  8000,
+  "03-empty",
+  6500,
   "#/overview",
-  ['text=PREVENTED LOSSES', 'text=$31,840', 'text=Recent sessions'],
-  { zoomToSelector: ".stat.savings", zoomMs: 7000 },
+  ['text=SESSIONS'],
+  { freshOffset: 3000, static: true },
   async (page) => {
-    // Sweep the activity chart so the tooltip flickers to life.
-    const strips = page.locator(".hover-strip");
-    const n = await strips.count();
-    if (n > 8) {
-      for (const i of [4, 8, 12]) {
-        await strips.nth(Math.min(i, n - 1)).hover().catch(() => {});
-        await page.waitForTimeout(420);
+    await page.waitForTimeout(1200);
+    // Sweep the zeroed stat tiles so the emptiness registers.
+    const tiles = page.locator(".stat");
+    const n = await tiles.count();
+    for (const i of [0, 2, 4]) {
+      if (i < n) {
+        const b = await tiles.nth(i).boundingBox();
+        if (b) await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2, { steps: 14 });
+        await page.waitForTimeout(500);
       }
     }
+    // Head for Deployments — the onboarding path.
+    const nav = page.locator('a[href="#/deployments"]');
+    const nb = await nav.boundingBox();
+    if (nb) await page.mouse.move(nb.x + nb.width / 2, nb.y + nb.height / 2, { steps: 14 });
+    await page.waitForTimeout(300);
   },
 );
 
-
-// ── SCENE 4: COMMAND PALETTE + THEME. Keyboard-first console. ────
+// ── SCENE 4: CONNECT. Install command → the daemon connects. ─────
 await recordConsoleScene(
   browser,
-  "04-palette",
-  7000,
-  "#/overview",
-  ['#cmdkOpen'],
-  {},
+  "04-connect",
+  10000,
+  "#/deployments",
+  ['text=Connect your first agent'],
+  { freshOffset: 8000, static: true },
   async (page) => {
     await page.waitForTimeout(800);
-    const trigger = page.locator("#cmdkOpen");
-    const tb = await trigger.boundingBox();
-    if (tb) await page.mouse.move(tb.x + tb.width / 2, tb.y + tb.height / 2, { steps: 10 });
-    await page.waitForTimeout(250);
-    await page.evaluate(() => document.querySelector("#cmdkOpen")?.click());
-    await page.waitForTimeout(600);
-    await page.keyboard.type("sess", { delay: 110 });
-    await page.waitForTimeout(1400);
-    await page.keyboard.press("Escape");
-    await page.waitForTimeout(400);
-    // Theme round-trip: light for a beat, back to dark.
-    await page.evaluate(() => document.querySelector("#themeBtn")?.click());
-    await page.waitForTimeout(1700);
-    await page.evaluate(() => document.querySelector("#themeBtn")?.click());
+    // Hover the install command like a user reading it.
+    const cmd = page.locator("text=install.sh").first();
+    const cb = await cmd.boundingBox().catch(() => null);
+    if (cb) await page.mouse.move(cb.x + cb.width / 2, cb.y + cb.height / 2, { steps: 16 });
+    await page.waitForTimeout(2600);
+    // The daemon handshakes (elapsed passes FRESH_CONNECT_MS) —
+    // re-render the route so the connected deployment appears.
+    await page.evaluate(() => window.dispatchEvent(new HashChangeEvent("hashchange")));
+    await page.waitForSelector("text=northwind-prod", { timeout: 4000 }).catch(() => {});
+    const row = page.locator("text=northwind-prod").first();
+    const rb = await row.boundingBox().catch(() => null);
+    if (rb) await page.mouse.move(rb.x + rb.width / 2, rb.y + rb.height / 2, { steps: 14 });
     await page.waitForTimeout(600);
   },
 );
 
-// ── SCENE 5: SESSIONS LIST. Search, clear, isolate blocked. ──────
+// ── SCENE 5: FIRST DATA. Sessions stream in; the first $8,400 save.─
 await recordConsoleScene(
   browser,
-  "05-sessions",
-  9500,
+  "05-firstdata",
+  10500,
+  "#/overview",
+  ['text=SESSIONS'],
+  { freshOffset: 15200, pulseSelector: ".stat.savings", zoomMs: 10000 },
+  async (page) => {
+    await page.waitForTimeout(2300);
+    // First session has arrived — refresh the view.
+    await page.evaluate(() => window.dispatchEvent(new HashChangeEvent("hashchange")));
+    await page.waitForTimeout(3400);
+    // Second refresh: the featured blocked session lands, $8,400 appears.
+    await page.evaluate(() => window.dispatchEvent(new HashChangeEvent("hashchange")));
+    await page.waitForTimeout(1600);
+    const tile = page.locator(".stat.savings");
+    const tb = await tile.boundingBox().catch(() => null);
+    if (tb) await page.mouse.move(tb.x + tb.width / 2, tb.y + tb.height / 2, { steps: 16 });
+  },
+);
+
+// ── SCENE 6: SESSIONS. Isolate the blocked one. ──────────────────
+await recordConsoleScene(
+  browser,
+  "06-sessions",
+  7000,
   "#/sessions",
   ['tr[data-clickable]'],
-  { origin: "0px 540px" },
+  { freshOffset: 300000, origin: "0px 540px" },
   async (page) => {
-    const search = page.locator('input[placeholder*="Search" i]');
-    await search.click();
-    await search.pressSequentially("invoice", { delay: 55 });
-    // Hold the filtered state so the viewer SEES it narrow to
-    // invoice-reconciler rows before we clear.
-    await page.waitForTimeout(2100);
-    await search.fill("");
-    await page.waitForTimeout(450);
-    // Blocked-only toggle. Synthetic click: Playwright's trusted
-    // click never stabilizes under the continuous Ken Burns
-    // transform (it waits for two identical layout frames).
+    await page.waitForTimeout(1400);
     const toggle = page.locator('input[type="checkbox"]').first();
     const tb = await toggle.boundingBox();
-    if (tb) await page.mouse.move(tb.x + 4, tb.y + 4, { steps: 10 });
+    if (tb) await page.mouse.move(tb.x + 4, tb.y + 4, { steps: 14 });
+    await page.waitForTimeout(300);
     await page.evaluate(() => {
+      document.dispatchEvent(new CustomEvent("av-click"));
       const cb = document.querySelector('input[type="checkbox"]');
       if (cb && !cb.checked) cb.click();
     });
-    await page.waitForTimeout(1100);
-    // Cursor onto the top blocked row (the one we open next scene)
+    await page.waitForTimeout(1400);
     const row = page.locator("tr[data-clickable]").first();
     const rb = await row.boundingBox();
-    if (rb) await page.mouse.move(rb.x + rb.width / 3, rb.y + rb.height / 2, { steps: 12 });
+    if (rb) await page.mouse.move(rb.x + rb.width / 3, rb.y + rb.height / 2, { steps: 14 });
   },
 );
 
-// ── SCENE 5: SESSION DETAIL. Pulse $8,400, open the BLOCKED event.─
+// ── SCENE 7: SESSION DETAIL. Pulse $8,400, open the BLOCKED event.─
 await recordConsoleScene(
   browser,
-  "06-session",
+  "07-session",
   10000,
   "#/sessions/sess_01H9K",
   ['.session-summary', 'text=Signature verified', '.evt'],
-  { pulseSelector: ".session-summary > *:nth-child(5)", zoomMs: 9500, origin: "0px 540px" },
+  { pulseSelector: ".session-summary > *:nth-child(5)", zoomMs: 9500, origin: "0px 540px", freshOffset: 300000 },
   async (page) => {
     await page.waitForTimeout(2600);
-    // Click the BLOCKED event so the drawer fills with policy detail.
-    // Synthetic click (trusted clicks never stabilize under the
-    // running zoom animation).
     const blocked = page.locator(".evt", { hasText: "BLOCKED" }).first();
     const bb = await blocked.boundingBox();
     if (bb) await page.mouse.move(bb.x + bb.width / 2, bb.y + bb.height / 2, { steps: 14 });
     await page.waitForTimeout(250);
     await page.evaluate(() => {
+      document.dispatchEvent(new CustomEvent("av-click"));
       const ev = Array.from(document.querySelectorAll(".evt")).find(e => /BLOCKED/.test(e.textContent));
       if (ev) ev.click();
     });
@@ -465,57 +547,57 @@ await recordConsoleScene(
   },
 );
 
-
-// ── SCENE 7: SHARE + COPY. The receipt is portable in one click. ──
+// ── SCENE 8: SHARE + COPY. The receipt is portable in one click. ──
 await recordConsoleScene(
   browser,
-  "07-share",
+  "08-share",
   6500,
   "#/sessions/sess_01H9K",
   ['#shareRcpt', '#copyRcpt'],
-  { static: true },
+  { static: true, freshOffset: 300000 },
   async (page) => {
     await page.waitForTimeout(1000);
     const share = page.locator("#shareRcpt");
     const sb = await share.boundingBox();
     if (sb) await page.mouse.move(sb.x + sb.width / 2, sb.y + sb.height / 2, { steps: 12 });
     await page.waitForTimeout(300);
-    await page.evaluate(() => document.querySelector("#shareRcpt")?.click());
+    await cursorClick(page, "#shareRcpt");
     await page.waitForTimeout(1900);
     const copy = page.locator("#copyRcpt");
     const cb = await copy.boundingBox();
     if (cb) await page.mouse.move(cb.x + cb.width / 2, cb.y + cb.height / 2, { steps: 10 });
     await page.waitForTimeout(250);
-    await page.evaluate(() => document.querySelector("#copyRcpt")?.click());
+    await cursorClick(page, "#copyRcpt");
     await page.waitForTimeout(1600);
   },
 );
 
-// ── SCENE 8: DOWNLOAD RECEIPT. Pulse + click. ────────────────────
+// ── SCENE 9: DOWNLOAD RECEIPT. Pulse + click. ────────────────────
 await recordConsoleScene(
   browser,
-  "08-download",
+  "09-download",
   3200,
   "#/sessions/sess_01H9K",
   ['#dlRcpt'],
-  { pulseSelector: "#dlRcpt", zoomMs: 2500, static: true },
+  { pulseSelector: "#dlRcpt", zoomMs: 2500, static: true, freshOffset: 300000 },
   async (page) => {
     const btn = page.locator("#dlRcpt");
     const bb = await btn.boundingBox();
     if (bb) await page.mouse.move(bb.x + bb.width / 2, bb.y + bb.height / 2, { steps: 12 });
     await page.waitForTimeout(900);
-    await page.evaluate(() => document.querySelector("#dlRcpt")?.click());
+    await cursorClick(page, "#dlRcpt");
   },
 );
 
-// ── SCENE 7: VERIFY. Drop the receipt, green tick, no account. ───
-await recordScene(browser, "09-verify", 7000, async (page, ms) => {
+// ── SCENE 10: VERIFY. Drop the receipt, green tick, no account. ───
+await recordScene(browser, "10-verify", 7000, async (page, ms) => {
   await page.goto(LANDING + "/verify/", { waitUntil: "networkidle" });
   await page.waitForSelector("#loadExample", { timeout: 10000 });
+  await injectCursor(page);
   const btn = page.locator("#loadExample");
   const box = await btn.boundingBox();
   if (box) {
-    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 10 });
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 12 });
   }
   await page.waitForTimeout(400);
   await btn.click();
@@ -530,72 +612,99 @@ await recordScene(browser, "09-verify", 7000, async (page, ms) => {
   await page.waitForTimeout(4300);
 });
 
-// ── SCENE 8: POLICIES. Open the rule that blocked the $8,400. ────
+// ── SCENE 11: POLICIES. Starter rules, readable, enforced. ───────
 await recordConsoleScene(
   browser,
-  "10-policies",
+  "11-policies",
   8000,
   "#/policies",
   ['tr[data-clickable]'],
-  { origin: "0px 540px" },
+  { origin: "0px 540px", freshOffset: 300000 },
   async (page) => {
     await page.waitForTimeout(1400);
     const row = page.locator("tr[data-clickable]").first();
     const rb = await row.boundingBox();
-    if (rb) await page.mouse.move(rb.x + rb.width / 3, rb.y + rb.height / 2, { steps: 12 });
+    if (rb) await page.mouse.move(rb.x + rb.width / 3, rb.y + rb.height / 2, { steps: 14 });
     await page.waitForTimeout(300);
-    await page.evaluate(() => document.querySelector("tr[data-clickable]")?.click());
+    await cursorClick(page, "tr[data-clickable]");
     await page.waitForSelector(".policy-body", { timeout: 8000 }).catch(() => {});
     await page.waitForTimeout(400);
   },
 );
 
-// ── SCENE 9: DEPLOYMENTS. Per-deployment keys + tokens. ──────────
+// ── SCENE 12: COMMAND PALETTE + THEME. Keyboard-first console. ────
 await recordConsoleScene(
   browser,
-  "11-deployments",
+  "12-palette",
+  7000,
+  "#/overview",
+  ['#cmdkOpen'],
+  { freshOffset: 300000 },
+  async (page) => {
+    await page.waitForTimeout(800);
+    const trigger = page.locator("#cmdkOpen");
+    const tb = await trigger.boundingBox();
+    if (tb) await page.mouse.move(tb.x + tb.width / 2, tb.y + tb.height / 2, { steps: 12 });
+    await page.waitForTimeout(250);
+    await cursorClick(page, "#cmdkOpen");
+    await page.waitForTimeout(600);
+    await page.keyboard.type("sess", { delay: 110 });
+    await page.waitForTimeout(1400);
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(400);
+    await cursorClick(page, "#themeBtn");
+    await page.waitForTimeout(1700);
+    await cursorClick(page, "#themeBtn");
+    await page.waitForTimeout(600);
+  },
+);
+
+// ── SCENE 13: DEPLOYMENT DETAIL. Keys and tokens, rotatable. ─────
+await recordConsoleScene(
+  browser,
+  "13-deployments",
   6500,
   "#/deployments",
   ['tr[data-clickable]'],
-  { origin: "0px 540px" },
+  { origin: "0px 540px", freshOffset: 300000 },
   async (page) => {
     await page.waitForTimeout(1300);
     const row = page.locator("tr[data-clickable]").first();
     const rb = await row.boundingBox();
-    if (rb) await page.mouse.move(rb.x + rb.width / 3, rb.y + rb.height / 2, { steps: 12 });
+    if (rb) await page.mouse.move(rb.x + rb.width / 3, rb.y + rb.height / 2, { steps: 14 });
     await page.waitForTimeout(250);
-    await page.evaluate(() => document.querySelector("tr[data-clickable]")?.click());
+    await cursorClick(page, "tr[data-clickable]");
     await page.waitForTimeout(500);
   },
 );
 
-// ── SCENE 10: SETTINGS. Members, API keys, webhooks: self-serve. ──
+// ── SCENE 14: SETTINGS. Self-serve workspace, tab by tab. ────────
 await recordConsoleScene(
   browser,
-  "12-settings",
+  "14-settings",
   16000,
   "#/settings/members",
   ['.settings-nav'],
-  { origin: "0px 540px" },
+  { origin: "0px 540px", freshOffset: 300000 },
   async (page) => {
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(2300);
     for (const tab of ["API keys", "SSO", "Webhooks", "Audit log", "Billing"]) {
       const b = page.locator(`.settings-nav button:has-text("${tab}")`);
       const bb = await b.boundingBox();
       if (bb) await page.mouse.move(bb.x + bb.width / 2, bb.y + bb.height / 2, { steps: 10 });
       await page.waitForTimeout(250);
       await page.evaluate((label) => {
+        document.dispatchEvent(new CustomEvent("av-click"));
         const btn = Array.from(document.querySelectorAll(".settings-nav button")).find(x => x.textContent.trim() === label);
         if (btn) btn.click();
       }, tab);
-      // Let the tab's data load past its skeleton before moving on.
       await page.waitForTimeout(2300);
     }
   },
 );
 
-// ── SCENE 11: CLOSE. CTA card. ───────────────────────────────────
-await recordScene(browser, "13-close", 5500, async (page, ms) => {
+// ── SCENE 15: CLOSE. CTA card. ───────────────────────────────────
+await recordScene(browser, "15-close", 5500, async (page, ms) => {
   await showCard(page, cardHtml({
     bg: "#0a5c8b",
     headline: `AI agents you can<br>hand to an <span class="accent-yellow">auditor</span>.`,

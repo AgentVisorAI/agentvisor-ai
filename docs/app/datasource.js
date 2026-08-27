@@ -674,6 +674,78 @@
    * OVERVIEW
    * ============================================================ */
 
+  /* ── FRESH-WORKSPACE SIMULATION (first-user story) ───────────
+   * When av_mock_fresh_t0 is set (by signup), the org starts empty:
+   * no deployments until the daemon "connects" (FRESH_CONNECT_MS),
+   * then the first sessions stream in one at a time. The featured
+   * blocked session arrives second, bringing the first $8,400 save.
+   * The demo auto-signin clears the flag, so /app/ visitors still
+   * get the full showcase data. */
+  var FRESH_CONNECT_MS = 12000;
+  var FRESH_SESSION_AT = [16000, 21000, 26000];
+  function freshElapsed() {
+    try {
+      var v = localStorage.getItem("av_mock_fresh_t0");
+      return v ? Date.now() - +v : null;
+    } catch (e) { return null; }
+  }
+  function freshSessions() {
+    var el = freshElapsed();
+    if (el == null) return null;
+    var t0 = Date.now() - el;
+    // clean first, then the featured block, then one more
+    var order = [MOCK_SESSIONS[3], MOCK_SESSIONS[0], MOCK_SESSIONS[4]];
+    var out = [];
+    for (var i = 0; i < FRESH_SESSION_AT.length; i++) {
+      if (el >= FRESH_SESSION_AT[i] && order[i]) {
+        var s = Object.assign({}, order[i]);
+        // Times must read "just arrived", and receipts sign these
+        // values live, so display and signature stay consistent.
+        s.startedAt = new Date(t0 + FRESH_SESSION_AT[i] - 45000).toISOString();
+        s.endedAt = new Date(t0 + FRESH_SESSION_AT[i] - 4000).toISOString();
+        out.push(s);
+      }
+    }
+    out.sort(function (a, b) { return new Date(b.startedAt) - new Date(a.startedAt); });
+    return out;
+  }
+  function freshDeployments() {
+    var el = freshElapsed();
+    if (el == null) return null;
+    if (el < FRESH_CONNECT_MS) return [];
+    var d = Object.assign({}, MOCK_DEPLOYMENTS[0]);
+    d.lastSeenAt = new Date(Date.now() - 5000).toISOString();
+    d.createdAt = new Date(Date.now() - el).toISOString();
+    d.sessions24h = (freshSessions() || []).length;
+    d.spend24h = "$0.04";
+    return [d];
+  }
+  function freshOverview(range) {
+    var sess = freshSessions() || [];
+    var deps = freshDeployments() || [];
+    var series = bucketSessions(range || "24h");
+    series.forEach(function (b) { b.allowed = 0; b.blocked = 0; b.spendUsd = 0; b.blockedValueUsd = 0; });
+    var last = series[series.length - 1];
+    sess.forEach(function (s) {
+      last.allowed += s.toolsAllowed;
+      last.blocked += s.toolsBlocked;
+      last.spendUsd += (+s.costUsdMicros || 0) / 1e6;
+      last.blockedValueUsd += (+s.blockedPayoutUsdMicros || 0) / 1e6;
+    });
+    return {
+      period: range || "24h",
+      sessions: sess.length,
+      events: sess.reduce(function (a, s) { return a + s.events; }, 0),
+      toolsAllowed: last.allowed,
+      toolsBlocked: last.blocked,
+      llmSpendUsd: last.spendUsd.toFixed(2),
+      blockedSpendUsd: last.blockedValueUsd.toFixed(0),
+      deployments: deps.length,
+      deploymentsHealthy: deps.filter(function (d) { return d.status === "connected"; }).length,
+      series: series,
+    };
+  }
+
   function mockOverview(range) {
     var series = bucketSessions(range || "24h");
     var sessions24h = MOCK_SESSIONS.length;
@@ -746,7 +818,13 @@
     },
     async signup(input) {
       await delay(400);
-      try { localStorage.removeItem("av_mock_signed_out"); } catch (e) {}
+      try {
+        localStorage.removeItem("av_mock_signed_out");
+        // First-user story: a brand-new workspace starts EMPTY, the
+        // first deployment connects after the install step, and the
+        // first sessions stream in after that (see FRESH_* below).
+        localStorage.setItem("av_mock_fresh_t0", String(Date.now()));
+      } catch (e) {}
       mockState.session = {
         user: { id: "usr_new", email: input.email, displayName: input.email.split("@")[0] },
         org: MOCK_ORGS.org_northwind,
@@ -755,7 +833,10 @@
     },
     async login(input) {
       await delay(400);
-      try { localStorage.removeItem("av_mock_signed_out"); } catch (e) {}
+      try {
+        localStorage.removeItem("av_mock_signed_out");
+        localStorage.removeItem("av_mock_fresh_t0");
+      } catch (e) {}
       mockState.session = {
         user: { id: "usr_new", email: input.email, displayName: input.email.split("@")[0] },
         org: MOCK_ORGS.org_northwind,
@@ -861,7 +942,11 @@
       return { ok: true };
     },
 
-    async listDeployments() { await delay(120); return MOCK_DEPLOYMENTS.slice(); },
+    async listDeployments() {
+      await delay(120);
+      var f = freshDeployments();
+      return f !== null ? f : MOCK_DEPLOYMENTS.slice();
+    },
     async getDeployment(id) {
       await delay(100);
       var d = MOCK_DEPLOYMENTS.find(function (x) { return x.id === id; });
@@ -902,12 +987,17 @@
       if (i >= 0) MOCK_DEPLOYMENTS.splice(i, 1);
     },
 
-    async getOverview(range) { await delay(140); return mockOverview(range || "24h"); },
+    async getOverview(range) {
+      await delay(140);
+      if (freshElapsed() != null) return freshOverview(range || "24h");
+      return mockOverview(range || "24h");
+    },
 
     async listSessions(params) {
       await delay(160);
       params = params || {};
-      var results = MOCK_SESSIONS.slice();
+      var fresh = freshSessions();
+      var results = fresh !== null ? fresh : MOCK_SESSIONS.slice();
       if (params.deploymentId) results = results.filter(function (s) { return s.deploymentId === params.deploymentId; });
       if (params.agent) results = results.filter(function (s) { return s.agent === params.agent; });
       if (params.blockedOnly) results = results.filter(function (s) { return s.toolsBlocked > 0; });
@@ -993,7 +1083,11 @@
       return p;
     },
 
-    async listMembers() { await delay(100); return MOCK_MEMBERS.slice(); },
+    async listMembers() {
+      await delay(100);
+      if (freshElapsed() != null) return MOCK_MEMBERS.slice(0, 1);
+      return MOCK_MEMBERS.slice();
+    },
     async inviteMember(input) {
       await delay(200);
       MOCK_INVITES.push({
@@ -1006,7 +1100,11 @@
       });
       return { invite: MOCK_INVITES[MOCK_INVITES.length - 1] };
     },
-    async listInvites() { await delay(80); return { invites: MOCK_INVITES.slice() }; },
+    async listInvites() {
+      await delay(80);
+      if (freshElapsed() != null) return { invites: [] };
+      return { invites: MOCK_INVITES.slice() };
+    },
     async revokeInvite(id) {
       await delay(120);
       MOCK_INVITES = MOCK_INVITES.filter(function (i) { return i.id !== id; });
@@ -1022,7 +1120,11 @@
       await delay(150);
       MOCK_MEMBERS = MOCK_MEMBERS.filter(function (m) { return m.userId !== userId && m.email !== userId; });
     },
-    async listApiKeys() { await delay(100); return MOCK_API_KEYS.slice(); },
+    async listApiKeys() {
+      await delay(100);
+      if (freshElapsed() != null) return [];
+      return MOCK_API_KEYS.slice();
+    },
     async createApiKey(name) {
       await delay(120);
       var hint = "av_srv_" + Math.random().toString(36).slice(2, 10) + "…";
@@ -1035,7 +1137,11 @@
       await delay(120);
       MOCK_API_KEYS = MOCK_API_KEYS.filter(function (r) { return r.id !== id; });
     },
-    async listWebhooks() { await delay(80); return MOCK_WEBHOOKS.slice(); },
+    async listWebhooks() {
+      await delay(80);
+      if (freshElapsed() != null) return [];
+      return MOCK_WEBHOOKS.slice();
+    },
     async createWebhook(body) {
       await delay(180);
       var row = {
@@ -1068,7 +1174,19 @@
     async updateRetention() { await delay(80); },
     async retentionSweepNow() { await delay(120); return { result: { sessionsPurged: 0, auditPurged: 0, webhookDeliveriesPurged: 0 } }; },
     downloadAuditCsv: function () { /* no-op in mock */ },
-    async listAudit() { await delay(100); return MOCK_AUDIT.slice(); },
+    async listAudit() {
+      await delay(100);
+      var el = freshElapsed();
+      if (el != null) {
+        var t0 = Date.now() - el;
+        return [
+          { id: "aud_f3", ts: new Date(t0 + FRESH_CONNECT_MS).toISOString(), event: "deployment.connected", actor: "system", target: "northwind-prod", note: "Signing key issued" },
+          { id: "aud_f2", ts: new Date(t0 + 2000).toISOString(), event: "policies.defaults_seeded", actor: "system", target: "4 starter policies", note: "" },
+          { id: "aud_f1", ts: new Date(t0).toISOString(), event: "org.created", actor: (mockState.session && mockState.session.user ? mockState.session.user.email : "you"), target: "Northwind Traders", note: "" },
+        ];
+      }
+      return MOCK_AUDIT.slice();
+    },
     subscribe(callback) {
       // The demo needs to feel alive. Every 6-14 seconds we synthesize a new
       // event or session and hand it to the callback exactly like the SSE
