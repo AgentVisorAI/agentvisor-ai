@@ -24,13 +24,13 @@
     // anchor pinning. Without this, an attacker who generates their
     // own Ed25519 keypair, signs an arbitrary `rawBody`, and embeds
     // their pubkey in a fresh bundle gets the same "✅ authentic"
-    // verdict as a real AgentVisor-signed receipt — the verifier
+    // verdict as a real AgentVisor-signed receipt. The verifier
     // only ever proved self-consistency of (body, sig, pubkey),
     // not authorship. The trusted-anchors list below is the set of
     // Ed25519 pubkey hex strings the daemon publicly commits to.
     // If the bundle's pubkey is NOT in this list, `verifyBundle`
     // returns `trustedKey: false` and the UI displays "internally
-    // consistent — trust anchor NOT verified", NOT the word
+    // consistent. Trust anchor NOT verified", NOT the word
     // "authentic". Empty by default (no canonical anchor published
     // yet); populate via a release-hardening round or fetch from
     // `https://agentvisorai.me/.well-known/receipt-keys.json`
@@ -40,7 +40,7 @@
       //
       // The demo sample receipt bundled with this page
       // (sample-receipt.json). Its keypair was generated once at
-      // build time and the private half was discarded — this anchor
+      // build time and the private half was discarded. This anchor
       // exists so "Try it with a sample" shows the full green
       // trusted-verify experience investors will see with real
       // daemon-signed receipts.
@@ -72,7 +72,7 @@
     // Expose TRUSTED_RECEIPT_KEYS on `window` so the CI drill can
     // inject a per-test trusted pubkey via `page.evaluate` (see
     // server/scripts/verify-page-drill.mjs R79 regression guard).
-    // In production this is a no-op — the Set is closed over the
+    // In production this is a no-op. The Set is closed over the
     // verifyBundle closure and no page script adds to it.
     if (typeof window !== "undefined") {
       window.TRUSTED_RECEIPT_KEYS = TRUSTED_RECEIPT_KEYS;
@@ -102,7 +102,7 @@
       const pub = b.publicKey || {};
       // R78 HIGH #1 (landed R79): differentiate "signature verifies
       // against the pubkey embedded in the bundle" (internally
-      // consistent — an attacker can trivially achieve this by
+      // consistent. An attacker can trivially achieve this by
       // generating their own keypair) from "signature verifies AND
       // pubkey is in the trust anchor list" (actually attesting
       // AgentVisor authorship).
@@ -112,7 +112,7 @@
       const titleText = trusted
         ? "✅  Signature verifies against a trusted key"
         : internallyConsistent
-        ? "⚠️  Signature is internally consistent — trust anchor NOT verified"
+        ? "⚠️  Signature is internally consistent. Trust anchor NOT verified"
         : "❌  Signature does not verify";
       const subText = trusted
         ? "This receipt is authentic. It was signed by a key on the AgentVisor trust anchor list, and every byte of the payload matches the signature."
@@ -153,7 +153,7 @@
     }
     function handleFile(file) {
       if (!file) return;
-      if (file.size > 5_000_000) { render({ kind: "err", message: "File larger than 5 MB — probably not a receipt." }); return; }
+      if (file.size > 5_000_000) { render({ kind: "err", message: "File larger than 5 MB. Probably not a receipt." }); return; }
       const reader = new FileReader();
       reader.onload = () => handleText(reader.result);
       reader.onerror = () => render({ kind: "err", message: "Could not read file." });
@@ -195,7 +195,7 @@
     // The console's "Share this receipt" button generates this URL. When
     // the recipient opens the link, we base64url-decode the fragment and
     // auto-verify. Fragment (not query) so the payload never touches
-    // the server — GitHub Pages doesn't see the URL fragment, browser
+    // the server. GitHub Pages doesn't see the URL fragment, browser
     // history doesn't leak it beyond this tab.
     function tryFragment() {
       const raw = location.hash.slice(1); // strip leading #
