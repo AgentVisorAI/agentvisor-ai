@@ -19,7 +19,7 @@ gen() {
   local out=$1; local window=$2; shift 2
   local text="$*"
   local d rate
-  for rate in "+20%" "+25%" "+30%" "+35%" "+40%"; do
+  for rate in ${RATE_LADDER:-"+20%" "+25%" "+30%" "+35%" "+40%"}; do
     "$EDGE_TTS" --voice "$VOICE_ID" --rate="$rate" --text "$text" \
       --write-media "$out.mp3" 2>/dev/null
     ffmpeg -y -i "$out.mp3" \
@@ -38,7 +38,8 @@ gen "$VOICE/s1" 4.1 "An A I agent just paid a fake vendor eight thousand four hu
 gen "$VOICE/s2" 5.7 "Agent Visor watches every A I agent. Thirty one thousand eight hundred forty dollars saved from blocked orders."
 gen "$VOICE/s3" 6.7 "Here is the order it stopped: a vendor not on the approved list. Blocked, signed, and the safe retry went through."
 gen "$VOICE/s4" 6.35 "Anyone can verify the receipt. Green tick. No account."
-gen "$VOICE/s5" 4.7 "A I agents you can hand to an auditor. The address is on screen."
+# s5 runs at a slower rate so "you" doesn't elide; window has headroom.
+RATE_LADDER='+10% +15% +20%' gen "$VOICE/s5" 4.7 "A I agents you can hand to an auditor. The address is on screen."
 
 for i in 1 2 3 4 5; do
   ffmpeg -y -i "$VOICE/s$i.raw.wav" \
