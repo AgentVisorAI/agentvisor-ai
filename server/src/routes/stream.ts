@@ -56,21 +56,34 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
     // a "re-authenticate" prompt, then `.end()` the raw response,
     // which fires the `close` handler and cleans up bus + timer.
     //
-    // R81 F3: track consecutive DB errors. R80's commit-message
+    // R81 F3 (revised R82 F3): track consecutive DB errors + minimum
+    // elapsed time between failed revalidates. R80's commit-message
     // noted "silent bypass of R79 fix under partial DB
     // degradation" but the code kept failing OPEN on every DB
-    // exception. A revoked session on a node whose Prisma pool
-    // was momentarily saturated kept receiving `events.appended`
-    // / `receipt.finalized` payloads until the pool recovered —
-    // the exact insider-leak surface R79 was designed to close.
-    // After MAX_CONSECUTIVE_REVALIDATE_ERRORS the stream falls
-    // closed; the client's auto-reconnect will re-run
-    // `requireSession` at connection open (which correctly fails
-    // authoritative on revoked sessions). One transient error
-    // still keeps the stream open — pool blips shouldn't take
-    // down every tab.
+    // exception. R81 landed a plain consecutive-count threshold
+    // (>=2 errors → fail closed). R82 F3 audit surfaced a
+    // thundering-herd amplification: `consecutiveErrors` is
+    // per-connection, but the trigger (pool saturation) is
+    // per-node — under a real DB outage every open stream on a
+    // node hits errors on every 15 s tick, all cross the
+    // threshold within ~30 s, all `res.end()`, all clients
+    // auto-reconnect, all reconnects call `requireSession`
+    // against the same saturated pool → cascade AMPLIFYING the
+    // outage.
+    //
+    // Fix: require the two failures to be spaced apart by
+    // MIN_MS_BETWEEN_FAILED_REVALIDATES. A single-window pool
+    // blip (multiple 15 s ticks landing during one 30 s
+    // saturation) counts as ONE failure; only a sustained
+    // failure across a longer window trips the fail-closed
+    // path. R79's narrow insider-leak surface (revoked session
+    // during a genuine sustained DB outage) still closes;
+    // fleet-wide reconnect storms on transient pool
+    // saturation are avoided.
     const MAX_CONSECUTIVE_REVALIDATE_ERRORS = 2;
+    const MIN_MS_BETWEEN_FAILED_REVALIDATES = 60_000;
     let consecutiveErrors = 0;
+    let lastErrorAt = 0;
     const revalidate = async (): Promise<boolean> => {
       try {
         const user = await db.user.findUnique({
@@ -84,6 +97,7 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
           },
         });
         consecutiveErrors = 0;
+        lastErrorAt = 0;
         if (!user) return false;
         if (user.memberships.length === 0) return false;
         if (
@@ -94,6 +108,17 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
         }
         return true;
       } catch (err) {
+        const now = Date.now();
+        if (now - lastErrorAt < MIN_MS_BETWEEN_FAILED_REVALIDATES) {
+          // Same pool blip; don't count. Keep the stream open;
+          // the next tick will re-check.
+          req.log.debug(
+            { err, orgId: claims.orgId, userId: claims.sub, sinceLastMs: now - lastErrorAt },
+            "sse_revalidate_transient_error_within_window_keep_open",
+          );
+          return true;
+        }
+        lastErrorAt = now;
         consecutiveErrors += 1;
         if (consecutiveErrors >= MAX_CONSECUTIVE_REVALIDATE_ERRORS) {
           // Fall closed. The client auto-reconnects and its next

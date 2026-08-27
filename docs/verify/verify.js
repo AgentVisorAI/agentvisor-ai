@@ -196,13 +196,20 @@
       const body = r.rawBody || "";
       if (!body) return;
       let idx = -1, before = "", after = "", what = "";
-      // Prefer a meaningful byte: the first digit of eventCount.
-      const m = body.match(/"eventCount"\s*:\s*(\d)/);
+      // R82 F4: match the FULL run of digits and tamper the LAST one.
+      // Prior shape matched a single leading digit (`(\d)`) and
+      // incremented it — on `"eventCount":90` this produced
+      // `"eventCount":00` (JSON.parse rejects; UI shows "—") and
+      // on `12` it flipped to `22` (+10, not +1), undermining the
+      // "single byte matters" tamper narrative. Now `\d+` captures
+      // the full integer, we tamper the LAST digit only, and the
+      // JSON stays valid across any count.
+      const m = body.match(/"eventCount"\s*:\s*(\d+)/);
       if (m) {
         idx = m.index + m[0].length - 1;
-        before = m[1];
-        after = String((+m[1] + 1) % 10);
-        what = "eventCount digit";
+        before = body[idx];
+        after = String((+before + 1) % 10);
+        what = "eventCount last digit";
       } else {
         // Fallback: flip the case of the first ASCII letter.
         for (let i = 0; i < body.length; i++) {

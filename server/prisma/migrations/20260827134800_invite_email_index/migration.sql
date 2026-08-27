@@ -12,8 +12,14 @@
 -- closed via `take: 5`. `take: 5` caps argon2 CPU; this index
 -- caps the DB I/O.
 --
--- CREATE INDEX CONCURRENTLY keeps the table writable during
--- creation on production Postgres; the invites table is small
--- but the discipline matches other index migrations in this
--- schema.
+-- Plain `CREATE INDEX` (not CONCURRENTLY): `prisma migrate
+-- deploy` wraps each migration in a transaction, and
+-- CONCURRENTLY cannot run inside a transaction — using it here
+-- would break the deploy. This takes a SHARE lock on `invites`
+-- for the duration of the build, blocking writes until it
+-- completes. On an unbloated table the build is milliseconds;
+-- if the DoS class this closes has already partially succeeded
+-- before deploy, budget for INSERT/UPDATE stalls proportional
+-- to table size (or split into two migrations with an explicit
+-- transaction boundary and CONCURRENTLY on the second).
 CREATE INDEX IF NOT EXISTS "invites_email_idx" ON "invites"("email");
