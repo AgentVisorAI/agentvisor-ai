@@ -840,7 +840,7 @@
         stat("Tool calls allowed", stats.toolsAllowed.toLocaleString(), "policy pass", sparkline(allowedByHour)) +
         stat("Tool calls blocked", stats.toolsBlocked.toLocaleString(), pctBlocked + "% block rate", sparkline(blockedByHour, { color: "var(--danger-solid)", fill: "var(--danger-bg)" }), "blocks") +
         stat("LLM spend", "$" + stats.llmSpendUsd, "usage this window", sparkline(spendByHour)) +
-        stat("Prevented losses", "$" + Number(stats.blockedSpendUsd).toLocaleString(), "blocked action value", sparkline(blockedValueCumulative, { color: "var(--success-solid)", fill: "var(--success-bg)" }), "savings") +
+        stat("Prevented losses", "$" + Number(stats.blockedSpendUsd).toLocaleString(), "kept from bad orders", sparkline(blockedValueCumulative, { color: "var(--success-solid)", fill: "var(--success-bg)" }), "savings") +
       "</div>" +
       '<div class="chart-card">' +
         '<div class="head">' +
@@ -1160,7 +1160,7 @@
         cell("Allowed", s.toolsAllowed, "tool calls") +
         cell("Blocked", s.toolsBlocked, "policy hits", s.toolsBlocked > 0 ? "blocks" : "") +
         cell("LLM cost", usdMicros(s.costUsdMicros), "actual usage") +
-        cell("Blocked value", usdMicrosBig(s.blockedPayoutUsdMicros), "would-have-spent", parseInt(s.blockedPayoutUsdMicros, 10) > 0 ? "savings" : "") +
+        cell("Blocked value", usdMicrosBig(s.blockedPayoutUsdMicros), "would have been paid out", parseInt(s.blockedPayoutUsdMicros, 10) > 0 ? "savings" : "") +
       "</div>" +
       '<div class="detail-grid">' +
         '<div class="events-card card">' +
