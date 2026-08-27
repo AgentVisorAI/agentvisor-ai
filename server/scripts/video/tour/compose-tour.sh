@@ -188,7 +188,7 @@ ffmpeg -y \
     [v05][6:v]xfade=transition=fade:duration=$XF:offset=$O7[v06];
     [v06][7:v]xfade=transition=fade:duration=$XF:offset=$O8[v07];
     [v07][8:v]xfade=transition=fade:duration=$XF:offset=$O9[v08];
-    [v08][9:v]xfade=transition=fade:duration=$XF:offset=$O10[v09];
+    [v08][9:v]xfade=transition=fadeblack:duration=$XF:offset=$O10[v09];
     [v09][10:v]xfade=transition=fade:duration=$XF:offset=$O11[v10];
     [v10][11:v]xfade=transition=fade:duration=$XF:offset=$O12[v11];
     [v11][12:v]xfade=transition=fade:duration=$XF:offset=$O13[v12];
