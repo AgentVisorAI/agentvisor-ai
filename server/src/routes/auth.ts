@@ -635,16 +635,34 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         newPassword: passwordSchema,
       })
       .safeParse(req.body);
-    if (!body.success) return reply.code(400).send({ error: "invalid_input" });
+    if (!body.success) return reply.code(400).send({ error: "invalid_token" });
+    // R87 F2: close the "reset-in-progress ⇒ email is real"
+    // oracle. Prior shape had three distinct exits:
+    //   (a) !user || no reset outstanding → invalid_token, sub-ms
+    //   (b) reset > 24 h old              → expired_token, sub-ms
+    //   (c) reset within TTL, wrong token → invalid_token, ~100 ms
+    // Both the error-string (expired_token appears only when the
+    // account exists AND has a stale reset) and the argon2
+    // timing gap (~100 ms vs sub-ms) let an attacker detect
+    // "email is a real account with reset outstanding" — which
+    // /reset-request (3/h/IP but no per-account gate) can be
+    // used to INDUCE. Sibling of the R86 F3 /login oracle. Fix
+    // pattern is the same: always run argon2 verify against a
+    // valid PHC hash (dummy when the real state doesn't
+    // qualify), collapse all failure exits to a single
+    // invalid_token 401.
     const user = await db.user.findUnique({ where: { email: body.data.email } });
-    if (!user || !user.resetTokenHash || !user.resetTokenAt) {
+    const resetFresh =
+      !!(user?.resetTokenHash &&
+        user.resetTokenAt &&
+        Date.now() - user.resetTokenAt.getTime() <= resetTtlMs);
+    const hashForCompare = resetFresh
+      ? (user!.resetTokenHash as string)
+      : await getDummyPasswordHash();
+    const ok = await verifyPassword(hashForCompare, body.data.token);
+    if (!ok || !resetFresh || !user) {
       return reply.code(401).send({ error: "invalid_token" });
     }
-    if (Date.now() - user.resetTokenAt.getTime() > resetTtlMs) {
-      return reply.code(401).send({ error: "expired_token" });
-    }
-    const ok = await verifyPassword(user.resetTokenHash, body.data.token);
-    if (!ok) return reply.code(401).send({ error: "invalid_token" });
     const passwordHash = await hashPassword(body.data.newPassword);
     await db.user.update({
       where: { id: user.id },

@@ -135,8 +135,18 @@ async function deriveDecoyCredentials(
   h.update("webauthn:decoy:");
   h.update(email);
   const seed = h.digest();
-  // Count: 1-3 seeded by the first byte.
-  const count = 1 + ((seed[0] ?? 0) % 3);
+  // R87 F3: bump decoy count range 1–3 → 1–6 so power-users
+  // (admins with laptop platform passkey + phone hybrid +
+  // security key + backup key = 4+ real creds) can no longer
+  // be identified by array length. R76 F4 hid the individual-
+  // cred oracle; R86 F5 hid the transports oracle; R87 F3
+  // closes the count oracle for realistic real-user
+  // registrations. Real accounts with 7+ credentials remain
+  // technically distinguishable but that's a very rare tail
+  // and the real fix (cap real emissions too) would break
+  // authentication for users whose current authenticator is
+  // outside the emitted subset.
+  const count = 1 + ((seed[0] ?? 0) % 6);
   const out: { id: string; transports?: undefined }[] = [];
   for (let i = 0; i < count; i++) {
     const idHmac = crypto.createHmac("sha256", env.JWT_SECRET);
@@ -355,41 +365,55 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: "malformed_challenge_cookie" });
     }
     if (!bag.userId) {
-      // R86 F4: decoy path — the challenge was issued against
-      // an unknown email or one with no real credentials. Prior
-      // shape returned `no_credential_bound` here, but the real-
-      // user + wrong-rawId path below returns `unknown_credential`;
-      // the two DIFFERENT error strings let an attacker
-      // enumerate "email exists AND has ≥1 passkey" via a single
-      // /authenticate/verify probe after any decoy challenge.
-      // Parse the body enough to burn the same latency, then
-      // return the same `unknown_credential` string so decoy and
-      // real-user-wrong-cred fail identically. Also clear the
-      // challenge cookie both paths.
-      const body = z
+      // R86 F4 (revised R87 F1): decoy path — the challenge was
+      // issued against an unknown email or one with no real
+      // credentials. All exits must match the REAL path so decoy
+      // vs real is indistinguishable across every wire-visible
+      // outcome. Parse the body, burn a DB lookup, clear cookie,
+      // return the same `unknown_credential` string.
+      const bodyDecoy = z
         .object({ response: z.record(z.unknown()) })
         .safeParse(req.body);
-      // Match the "real user + wrong cred" path's DB timing by
-      // running a lookup that always returns null.
+      void bodyDecoy; // parsed for timing parity only
+      // Match the real path's DB timing by running a lookup that
+      // always returns null.
       await db.webauthnCredential.findFirst({
         where: { userId: "__decoy__" },
       }).catch(() => null);
       clearChallengeCookie(reply, AUTH_CHALLENGE_COOKIE);
-      if (!body.success) {
-        return reply.code(400).send({ error: "unknown_credential" });
-      }
       return reply.code(400).send({ error: "unknown_credential" });
     }
+    // R87 F1: real path early exits (malformed body, missing rawId)
+    // used to return `invalid_input` / `no_credential_id` while the
+    // decoy path returned `unknown_credential`. Same wire-visible
+    // input hitting both paths therefore leaked account existence:
+    //   body {"response":{}} → real:  no_credential_id
+    //                       → decoy: unknown_credential
+    //   body "garbage"       → real:  invalid_input
+    //                       → decoy: unknown_credential
+    // The R86 F4 commit message claimed decoy/real fail identically
+    // but only the "unknown cred" branch was collapsed. Fix: mirror
+    // the decoy path exactly (parse body, burn a DB lookup, clear
+    // cookie, return unknown_credential) whenever the real path
+    // would take an early exit before the credential lookup.
     const body = z
       .object({ response: z.record(z.unknown()) })
       .safeParse(req.body);
-    if (!body.success) return reply.code(400).send({ error: "invalid_input" });
-
-    // Look up the credential referenced in the assertion.
-    const rawId = (body.data.response as { rawId?: string; id?: string }).rawId
-      ?? (body.data.response as { id?: string }).id
-      ?? "";
-    if (!rawId) return reply.code(400).send({ error: "no_credential_id" });
+    const rawId = body.success
+      ? ((body.data.response as { rawId?: string; id?: string }).rawId
+        ?? (body.data.response as { id?: string }).id
+        ?? "")
+      : "";
+    if (!body.success || !rawId) {
+      // Burn the same DB round-trip the credential-lookup path
+      // would spend, so timing parity with the real "cred not
+      // found" branch is preserved.
+      await db.webauthnCredential.findFirst({
+        where: { userId: bag.userId },
+      }).catch(() => null);
+      clearChallengeCookie(reply, AUTH_CHALLENGE_COOKIE);
+      return reply.code(400).send({ error: "unknown_credential" });
+    }
     const cred = await db.webauthnCredential.findFirst({
       where: {
         userId: bag.userId,
