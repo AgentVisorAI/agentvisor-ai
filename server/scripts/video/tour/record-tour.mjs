@@ -383,8 +383,39 @@ const browser = await chromium.launch({ headless: true });
 // public verify, policies, deployments, and settings. ~75s.
 // ═════════════════════════════════════════════════════════════════
 
-// ── SCENE 1: LANDING. First frame = thumbnail, must be legible. ───
-await recordScene(browser, "01-landing", 5000, async (page, ms) => {
+// ── SCENES 1-3: CONTEXT. The tour file travels without the page
+// around it, so a cold viewer is told what this is, the problem, and
+// the fix BEFORE the detailed flow starts.
+await recordScene(browser, "01-title", 6500, async (page, ms) => {
+  await showCard(page, cardHtml({
+    bg: "#0a5c8b",
+    kicker: "AgentVisor AI",
+    headline: `The control plane<br>for <span class="accent-yellow">AI agents</span>.`,
+    sub: "For companies that let AI agents touch real money and real systems.",
+    staticHeadline: true,
+  }), ms);
+});
+
+await recordScene(browser, "02-problem", 6500, async (page, ms) => {
+  await showCard(page, cardHtml({
+    bg: "#0a5c8b",
+    kicker: "The problem",
+    headline: `One wrong agent decision.<br><span class="accent-red">\$8,400</span> gone.`,
+    sub: "No audit trail. No spending limit. No way to prove what happened.",
+  }), ms);
+});
+
+await recordScene(browser, "03-solution", 7500, async (page, ms) => {
+  await showCard(page, cardHtml({
+    bg: "#0a5c8b",
+    kicker: "The fix",
+    headline: `Block bad actions<br>before money moves.<br><span class="accent-green">Prove it</span> afterwards.`,
+    sub: "What follows is the complete flow: a brand-new account, from zero to a verified audit trail.",
+  }), ms);
+});
+
+// ── SCENE 4: LANDING. ────────────────────────────────────────────
+await recordScene(browser, "04-landing", 5000, async (page, ms) => {
   await page.goto(LANDING + "/", { waitUntil: "networkidle" });
   await page.waitForSelector("h1", { timeout: 8000 });
   await page.waitForTimeout(200);
@@ -396,7 +427,7 @@ await recordScene(browser, "01-landing", 5000, async (page, ms) => {
 });
 
 // ── SCENE 2: SIGN UP. The novice creates a workspace, live. ──────
-await recordScene(browser, "02-signup", 9000, async (page, ms) => {
+await recordScene(browser, "05-signup", 9000, async (page, ms) => {
   await page.addInitScript(() => {
     try {
       localStorage.setItem("av_mock_signed_out", "1");
@@ -431,7 +462,7 @@ await recordScene(browser, "02-signup", 9000, async (page, ms) => {
 // ── SCENE 3: EMPTY WORKSPACE. Zero everything. Nothing to audit. ──
 await recordConsoleScene(
   browser,
-  "03-empty",
+  "06-empty",
   6500,
   "#/overview",
   ['text=SESSIONS'],
@@ -459,7 +490,7 @@ await recordConsoleScene(
 // ── SCENE 4: CONNECT. Install command → the daemon connects. ─────
 await recordConsoleScene(
   browser,
-  "04-connect",
+  "07-connect",
   10000,
   "#/deployments",
   ['text=Connect your first agent'],
@@ -490,7 +521,7 @@ await recordConsoleScene(
 // ── SCENE 5: FIRST DATA. Sessions stream in; the first $8,400 save.─
 await recordConsoleScene(
   browser,
-  "05-firstdata",
+  "08-firstdata",
   10500,
   "#/overview",
   ['text=SESSIONS'],
@@ -524,7 +555,7 @@ await recordConsoleScene(
 // ── SCENE 6: SESSIONS. Isolate the blocked one. ──────────────────
 await recordConsoleScene(
   browser,
-  "06-sessions",
+  "09-sessions",
   7000,
   "#/sessions",
   ['tr[data-clickable]'],
@@ -550,7 +581,7 @@ await recordConsoleScene(
 // ── SCENE 7: SESSION DETAIL. Pulse $8,400, open the BLOCKED event.─
 await recordConsoleScene(
   browser,
-  "07-session",
+  "10-session",
   10000,
   "#/sessions/sess_01H9K",
   ['.session-summary', 'text=Signature verified', '.evt'],
@@ -573,7 +604,7 @@ await recordConsoleScene(
 // ── SCENE 8: SHARE + COPY. The receipt is portable in one click. ──
 await recordConsoleScene(
   browser,
-  "08-share",
+  "11-share",
   6500,
   "#/sessions/sess_01H9K",
   ['#shareRcpt', '#copyRcpt'],
@@ -598,7 +629,7 @@ await recordConsoleScene(
 // ── SCENE 9: DOWNLOAD RECEIPT. Pulse + click. ────────────────────
 await recordConsoleScene(
   browser,
-  "09-download",
+  "12-download",
   3200,
   "#/sessions/sess_01H9K",
   ['#dlRcpt'],
@@ -613,7 +644,7 @@ await recordConsoleScene(
 );
 
 // ── SCENE 10: VERIFY. Drop the receipt, green tick, no account. ───
-await recordScene(browser, "10-verify", 7000, async (page, ms) => {
+await recordScene(browser, "13-verify", 7000, async (page, ms) => {
   await page.goto(LANDING + "/verify/", { waitUntil: "networkidle" });
   await page.waitForSelector("#loadExample", { timeout: 10000 });
   await injectCursor(page);
@@ -638,7 +669,7 @@ await recordScene(browser, "10-verify", 7000, async (page, ms) => {
 // ── SCENE 11: POLICIES. Starter rules, readable, enforced. ───────
 await recordConsoleScene(
   browser,
-  "11-policies",
+  "14-policies",
   8000,
   "#/policies",
   ['tr[data-clickable]'],
@@ -658,7 +689,7 @@ await recordConsoleScene(
 // ── SCENE 12: COMMAND PALETTE + THEME. Keyboard-first console. ────
 await recordConsoleScene(
   browser,
-  "12-palette",
+  "15-palette",
   7000,
   "#/overview",
   ['#cmdkOpen'],
@@ -685,7 +716,7 @@ await recordConsoleScene(
 // ── SCENE 13: DEPLOYMENT DETAIL. Keys and tokens, rotatable. ─────
 await recordConsoleScene(
   browser,
-  "13-deployments",
+  "16-deployments",
   6500,
   "#/deployments",
   ['tr[data-clickable]'],
@@ -704,7 +735,7 @@ await recordConsoleScene(
 // ── SCENE 14: SETTINGS. Self-serve workspace, tab by tab. ────────
 await recordConsoleScene(
   browser,
-  "14-settings",
+  "17-settings",
   16000,
   "#/settings/members",
   ['.settings-nav'],
@@ -727,7 +758,7 @@ await recordConsoleScene(
 );
 
 // ── SCENE 15: CLOSE. CTA card. ───────────────────────────────────
-await recordScene(browser, "15-close", 5500, async (page, ms) => {
+await recordScene(browser, "18-close", 6500, async (page, ms) => {
   await showCard(page, cardHtml({
     bg: "#0a5c8b",
     headline: `AI agents you can<br>hand to an <span class="accent-yellow">auditor</span>.`,

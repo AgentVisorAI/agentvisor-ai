@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Stitch the 15 scenes of the first-user novice tour into one video
-# with crossfades and burned-in captions on the UI scenes.
+# Stitch the 18 scenes of the first-user novice tour (context intro +
+# full flow) with crossfades and burned-in captions on the UI scenes.
 set -euo pipefail
 
 SCENES=/tmp/video-tour/scenes
@@ -22,8 +22,8 @@ dur_any() {
 
 mkdir -p "$OUT/norm"
 
-for name in 01-landing 02-signup 15-close; do
-  if [ "$name" = "02-signup" ]; then
+for name in 01-title 02-problem 03-solution 04-landing 05-signup 18-close; do
+  if [ "$name" = "05-signup" ]; then
     trim="-ss 0.60"
   else
     trim="-ss 0.30"
@@ -58,60 +58,63 @@ add_caption() {
   " -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p -colorspace bt709 -color_primaries bt709 -color_trc bt709 "$output" 2>&1 | tail -1
 }
 
-add_caption "$SCENES/03-empty.webm" "$OUT/norm/03-empty.mp4" \
+add_caption "$SCENES/06-empty.webm" "$OUT/norm/06-empty.mp4" \
   "A brand-new workspace. Nothing to audit, yet."
 
-add_caption "$SCENES/04-connect.webm" "$OUT/norm/04-connect.mp4" \
+add_caption "$SCENES/07-connect.webm" "$OUT/norm/07-connect.mp4" \
   "One install command. The daemon connects."
 
-add_caption "$SCENES/05-firstdata.webm" "$OUT/norm/05-firstdata.mp4" \
+add_caption "$SCENES/08-firstdata.webm" "$OUT/norm/08-firstdata.mp4" \
   "First sessions stream in. First save: \$8,400." \
   "3.4"
 
-add_caption "$SCENES/06-sessions.webm" "$OUT/norm/06-sessions.mp4" \
+add_caption "$SCENES/09-sessions.webm" "$OUT/norm/09-sessions.mp4" \
   "Isolate the blocked one."
 
-add_caption "$SCENES/07-session.webm" "$OUT/norm/07-session.mp4" \
+add_caption "$SCENES/10-session.webm" "$OUT/norm/10-session.mp4" \
   "Blocked at \$8,400. Every event inspectable."
 
-add_caption "$SCENES/08-share.webm" "$OUT/norm/08-share.mp4" \
+add_caption "$SCENES/11-share.webm" "$OUT/norm/11-share.mp4" \
   "Share a verify link, or copy the receipt."
 
-add_caption "$SCENES/09-download.webm" "$OUT/norm/09-download.mp4" \
+add_caption "$SCENES/12-download.webm" "$OUT/norm/12-download.mp4" \
   "Downloadable. Portable. Provable."
 
-add_caption "$SCENES/10-verify.webm" "$OUT/norm/10-verify.mp4" \
+add_caption "$SCENES/13-verify.webm" "$OUT/norm/13-verify.mp4" \
   "Drop the receipt. Verified in the browser. No account." \
-  "1.6" ""
+  "1.6"
 
-add_caption "$SCENES/11-policies.webm" "$OUT/norm/11-policies.mp4" \
+add_caption "$SCENES/14-policies.webm" "$OUT/norm/14-policies.mp4" \
   "Starter policies, readable, enforced in real time."
 
-add_caption "$SCENES/12-palette.webm" "$OUT/norm/12-palette.mp4" \
+add_caption "$SCENES/15-palette.webm" "$OUT/norm/15-palette.mp4" \
   "Command palette. Theme toggle. Keyboard first."
 
-add_caption "$SCENES/13-deployments.webm" "$OUT/norm/13-deployments.mp4" \
+add_caption "$SCENES/16-deployments.webm" "$OUT/norm/16-deployments.mp4" \
   "Every deployment gets its own signing key."
 
-add_caption "$SCENES/14-settings.webm" "$OUT/norm/14-settings.mp4" \
+add_caption "$SCENES/17-settings.webm" "$OUT/norm/17-settings.mp4" \
   "Members, API keys, SSO, webhooks, audit log, billing."
 
-D1=$(dur "$OUT/norm/01-landing.mp4")
-D2=$(dur "$OUT/norm/02-signup.mp4")
-D3=$(dur "$OUT/norm/03-empty.mp4")
-D4=$(dur "$OUT/norm/04-connect.mp4")
-D5=$(dur "$OUT/norm/05-firstdata.mp4")
-D6=$(dur "$OUT/norm/06-sessions.mp4")
-D7=$(dur "$OUT/norm/07-session.mp4")
-D8=$(dur "$OUT/norm/08-share.mp4")
-D9=$(dur "$OUT/norm/09-download.mp4")
-D10=$(dur "$OUT/norm/10-verify.mp4")
-D11=$(dur "$OUT/norm/11-policies.mp4")
-D12=$(dur "$OUT/norm/12-palette.mp4")
-D13=$(dur "$OUT/norm/13-deployments.mp4")
-D14=$(dur "$OUT/norm/14-settings.mp4")
-D15=$(dur "$OUT/norm/15-close.mp4")
-echo "Durations: 1=$D1 2=$D2 3=$D3 4=$D4 5=$D5 6=$D6 7=$D7 8=$D8 9=$D9 10=$D10 11=$D11 12=$D12 13=$D13 14=$D14 15=$D15"
+D1=$(dur "$OUT/norm/01-title.mp4")
+D2=$(dur "$OUT/norm/02-problem.mp4")
+D3=$(dur "$OUT/norm/03-solution.mp4")
+D4=$(dur "$OUT/norm/04-landing.mp4")
+D5=$(dur "$OUT/norm/05-signup.mp4")
+D6=$(dur "$OUT/norm/06-empty.mp4")
+D7=$(dur "$OUT/norm/07-connect.mp4")
+D8=$(dur "$OUT/norm/08-firstdata.mp4")
+D9=$(dur "$OUT/norm/09-sessions.mp4")
+D10=$(dur "$OUT/norm/10-session.mp4")
+D11=$(dur "$OUT/norm/11-share.mp4")
+D12=$(dur "$OUT/norm/12-download.mp4")
+D13=$(dur "$OUT/norm/13-verify.mp4")
+D14=$(dur "$OUT/norm/14-policies.mp4")
+D15=$(dur "$OUT/norm/15-palette.mp4")
+D16=$(dur "$OUT/norm/16-deployments.mp4")
+D17=$(dur "$OUT/norm/17-settings.mp4")
+D18=$(dur "$OUT/norm/18-close.mp4")
+echo "Durations: 1=$D1 2=$D2 3=$D3 4=$D4 5=$D5 6=$D6 7=$D7 8=$D8 9=$D9 10=$D10 11=$D11 12=$D12 13=$D13 14=$D14 15=$D15 16=$D16 17=$D17 18=$D18"
 
 XF=0.5
 O2=$(awk "BEGIN{printf \"%.3f\", $D1 - $XF}")
@@ -128,24 +131,30 @@ O12=$(awk "BEGIN{printf \"%.3f\", $O11 + $D11 - $XF}")
 O13=$(awk "BEGIN{printf \"%.3f\", $O12 + $D12 - $XF}")
 O14=$(awk "BEGIN{printf \"%.3f\", $O13 + $D13 - $XF}")
 O15=$(awk "BEGIN{printf \"%.3f\", $O14 + $D14 - $XF}")
-echo "Offsets: 2=$O2 3=$O3 4=$O4 5=$O5 6=$O6 7=$O7 8=$O8 9=$O9 10=$O10 11=$O11 12=$O12 13=$O13 14=$O14 15=$O15"
+O16=$(awk "BEGIN{printf \"%.3f\", $O15 + $D15 - $XF}")
+O17=$(awk "BEGIN{printf \"%.3f\", $O16 + $D16 - $XF}")
+O18=$(awk "BEGIN{printf \"%.3f\", $O17 + $D17 - $XF}")
+echo "Offsets: 2=$O2 3=$O3 4=$O4 5=$O5 6=$O6 7=$O7 8=$O8 9=$O9 10=$O10 11=$O11 12=$O12 13=$O13 14=$O14 15=$O15 16=$O16 17=$O17 18=$O18"
 
 ffmpeg -y \
-  -i "$OUT/norm/01-landing.mp4" \
-  -i "$OUT/norm/02-signup.mp4" \
-  -i "$OUT/norm/03-empty.mp4" \
-  -i "$OUT/norm/04-connect.mp4" \
-  -i "$OUT/norm/05-firstdata.mp4" \
-  -i "$OUT/norm/06-sessions.mp4" \
-  -i "$OUT/norm/07-session.mp4" \
-  -i "$OUT/norm/08-share.mp4" \
-  -i "$OUT/norm/09-download.mp4" \
-  -i "$OUT/norm/10-verify.mp4" \
-  -i "$OUT/norm/11-policies.mp4" \
-  -i "$OUT/norm/12-palette.mp4" \
-  -i "$OUT/norm/13-deployments.mp4" \
-  -i "$OUT/norm/14-settings.mp4" \
-  -i "$OUT/norm/15-close.mp4" \
+  -i "$OUT/norm/01-title.mp4" \
+  -i "$OUT/norm/02-problem.mp4" \
+  -i "$OUT/norm/03-solution.mp4" \
+  -i "$OUT/norm/04-landing.mp4" \
+  -i "$OUT/norm/05-signup.mp4" \
+  -i "$OUT/norm/06-empty.mp4" \
+  -i "$OUT/norm/07-connect.mp4" \
+  -i "$OUT/norm/08-firstdata.mp4" \
+  -i "$OUT/norm/09-sessions.mp4" \
+  -i "$OUT/norm/10-session.mp4" \
+  -i "$OUT/norm/11-share.mp4" \
+  -i "$OUT/norm/12-download.mp4" \
+  -i "$OUT/norm/13-verify.mp4" \
+  -i "$OUT/norm/14-policies.mp4" \
+  -i "$OUT/norm/15-palette.mp4" \
+  -i "$OUT/norm/16-deployments.mp4" \
+  -i "$OUT/norm/17-settings.mp4" \
+  -i "$OUT/norm/18-close.mp4" \
   -filter_complex "
     [0:v][1:v]xfade=transition=fade:duration=$XF:offset=$O2[v01];
     [v01][2:v]xfade=transition=fade:duration=$XF:offset=$O3[v02];
@@ -160,8 +169,11 @@ ffmpeg -y \
     [v10][11:v]xfade=transition=fade:duration=$XF:offset=$O12[v11];
     [v11][12:v]xfade=transition=fade:duration=$XF:offset=$O13[v12];
     [v12][13:v]xfade=transition=fade:duration=$XF:offset=$O14[v13];
-    [v13][14:v]xfade=transition=fade:duration=$XF:offset=$O15[vlast];
-    [vlast]fade=t=out:st=$(awk "BEGIN{printf \"%.3f\", $O15 + $D15 - 0.8}"):d=0.8:color=black[vout]
+    [v13][14:v]xfade=transition=fade:duration=$XF:offset=$O15[v14];
+    [v14][15:v]xfade=transition=fade:duration=$XF:offset=$O16[v15];
+    [v15][16:v]xfade=transition=fade:duration=$XF:offset=$O17[v16];
+    [v16][17:v]xfade=transition=fade:duration=$XF:offset=$O18[vlast];
+    [vlast]fade=t=out:st=$(awk "BEGIN{printf \"%.3f\", $O18 + $D18 - 0.8}"):d=0.8:color=black[vout]
   " \
   -map "[vout]" \
   -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p -movflags +faststart \
