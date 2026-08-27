@@ -286,92 +286,142 @@ async function applyCinematic(page, opts = {}) {
 const browser = await chromium.launch({ headless: true });
 
 // ═════════════════════════════════════════════════════════════════
-// SCENE 1 — Title card. No kicker; "The problem" is meta-commentary.
-// Let the headline land alone. Two lines instead of three.
+// SCENE 1 — LANDING. A new user arrives at agentvisorai.me. We
+// show the marketing page briefly + a slow Ken Burns zoom that
+// ends near the "Open the console" CTA. This is the "first frame"
+// of the video (= social thumbnail) so it must be legible from
+// the very first pixel.
 // ═════════════════════════════════════════════════════════════════
-await recordScene(browser, "01-intro", 5500, async (page, ms) => {
-  await showCard(page, cardHtml({
-    bg: "#0a5c8b",
-    headline: `AI agents make<br>real decisions<br>with real money.`,
-    staticHeadline: true,
-  }), ms);
+await recordScene(browser, "01-landing", 5500, async (page, ms) => {
+  await page.goto(LANDING + "/", { waitUntil: "networkidle" });
+  // Wait for the hero H1 to be rendered so the first frame is
+  // never a partial-paint.
+  await page.waitForSelector("h1", { timeout: 8000 });
+  await page.waitForTimeout(200);
+  await applyCinematic(page, { zoomMs: ms - 500, zoomToSelector: ".cta.primary" });
+  await page.waitForTimeout(ms - 500);
 });
 
 // ═════════════════════════════════════════════════════════════════
-// SCENE 2 — Problem card. Tighter: two-line headline + subline.
-// "One wrong decision" links back to scene 1's "AI agents make real
-// decisions" — the payoff for that framing lands directly.
+// SCENE 2 — SIGN IN. Show the actual login form-fill happen live,
+// character-by-character. Cursor moves to fields, types email + a
+// short password, clicks Sign in.
 // ═════════════════════════════════════════════════════════════════
-await recordScene(browser, "02-problem", 5500, async (page, ms) => {
-  await showCard(page, cardHtml({
-    bg: "#08111a",
-    headline: `One wrong decision.<br><span class="accent-red">$8,400</span> gone.`,
-    sub: "No audit trail. No accountability. No way to prove what happened.",
-  }), ms);
+await recordScene(browser, "02-signin", 6500, async (page, ms) => {
+  // Make sure "you are signed OUT" so the login page renders.
+  await page.addInitScript(() => {
+    try { localStorage.setItem("av_mock_signed_out", "1"); } catch {}
+  });
+  await page.goto(SITE + "#/login", { waitUntil: "networkidle" });
+  await page.waitForSelector("input#email", { timeout: 10000 });
+  await page.waitForTimeout(600);
+
+  // Move cursor visibly to the email field, then type.
+  const emailInput = page.locator("input#email");
+  const emailBox = await emailInput.boundingBox();
+  if (emailBox) {
+    await page.mouse.move(emailBox.x + 40, emailBox.y + emailBox.height / 2, { steps: 20 });
+    await page.waitForTimeout(200);
+    await emailInput.click();
+  }
+  await emailInput.pressSequentially("alex@acme.co", { delay: 65 });
+  await page.waitForTimeout(300);
+
+  const passInput = page.locator("input#password");
+  const passBox = await passInput.boundingBox();
+  if (passBox) {
+    await page.mouse.move(passBox.x + 40, passBox.y + passBox.height / 2, { steps: 10 });
+    await page.waitForTimeout(150);
+    await passInput.click();
+  }
+  await passInput.pressSequentially("demo", { delay: 80 });
+  await page.waitForTimeout(400);
+
+  // Move to Sign in button, click. Do NOT wait for navigation —
+  // let the click land and pause so viewer sees the interaction.
+  const btn = page.locator("button[type='submit']").first();
+  const btnBox = await btn.boundingBox();
+  if (btnBox) {
+    await page.mouse.move(btnBox.x + btnBox.width / 2, btnBox.y + btnBox.height / 2, { steps: 15 });
+  }
+  await page.waitForTimeout(200);
+  await btn.click();
+  // Hold for the remaining time (page might navigate; that's OK).
+  await page.waitForTimeout(Math.max(0, ms - 4200));
 });
 
 // ═════════════════════════════════════════════════════════════════
-// SCENE 3 — Solution promise. No kicker (persistent brand at bottom
-// already says AgentVisor AI).
-// ═════════════════════════════════════════════════════════════════
-await recordScene(browser, "03-solution", 4000, async (page, ms) => {
-  await showCard(page, cardHtml({
-    bg: "#0a5c8b",
-    headline: `Every decision:<br>captured. enforced.<br><span class="accent-yellow">signed.</span>`,
-  }), ms);
-});
-
-// ═════════════════════════════════════════════════════════════════
-// SCENE 4 — Console: wide dashboard establishes → zoom lands on the
-// "Prevented losses $31,840" tile. This is the "money shot" — the
-// investor's eye is guided from the whole business (fleet of agents)
-// down to the single metric that funds the pitch.
+// SCENE 3 — OVERVIEW. After signing in, land on the dashboard.
+// Wide-establishing shot → zoom lands on "$31,840 Prevented losses"
+// tile (the metric that carries the pitch).
 // ═════════════════════════════════════════════════════════════════
 await recordConsoleScene(
   browser,
-  "04-console",
-  7500,
+  "03-overview",
+  6500,
   "#/overview",
   ['text=PREVENTED LOSSES', 'text=$31,840', 'text=Recent sessions'],
   { zoomToSelector: ".stat.savings" },
 );
 
 // ═════════════════════════════════════════════════════════════════
-// SCENE 5 — Session detail: pre-warm + wait for data, pulse the
-// $8,400 to close the callback from scene 2.
+// SCENE 4 — SESSIONS LIST. The user browses the sessions list and
+// notices the "1 blocked" row. Pulse-glow highlights the blocked
+// pill so their eye lands where the click is about to happen.
+// ═════════════════════════════════════════════════════════════════
+await recordConsoleScene(
+  browser,
+  "04-sessions",
+  5500,
+  "#/sessions",
+  ['text=Sessions', 'text=blocked'],
+  { pulseSelector: "tr[data-clickable] .pill-danger, tr[data-clickable] .pill-blocked, tr[data-clickable] td .pill" },
+);
+
+// ═════════════════════════════════════════════════════════════════
+// SCENE 5 — SESSION DETAIL. Drill into the blocked $8,400 session.
+// Yellow pulse on the BLOCKED VALUE tile so the callback lands.
 // ═════════════════════════════════════════════════════════════════
 await recordConsoleScene(
   browser,
   "05-session",
-  9000,
+  8500,
   "#/sessions/sess_01H9K",
   ['.session-summary', 'text=Signature verified'],
   { pulseSelector: ".session-summary > *:nth-child(5)" },
 );
 
 // ═════════════════════════════════════════════════════════════════
-// SCENE 6 — Verify page: watch the "click sample → verify" happen
-// LIVE. This is the "magic moment" — investors should see the click
-// happen, not arrive at a pre-verified state.
-//
-// Tighter than v6: cursor pre-positioned near the sample link so the
-// user's eye is already there when the click fires. Pre-click dwell
-// down from 1.4s to 0.8s. Verified state now holds for ~5s (was ~3.5s).
+// SCENE 6 — DOWNLOAD RECEIPT. Cursor moves to the Download receipt
+// button, hovers, then clicks. This is the moment that transitions
+// from "our product recorded this" to "you can now hand this to
+// anyone".
 // ═════════════════════════════════════════════════════════════════
-await recordScene(browser, "06-verify", 8500, async (page, ms) => {
+await recordConsoleScene(
+  browser,
+  "06-download",
+  4000,
+  "#/sessions/sess_01H9K",
+  ['#dlRcpt'],
+  { pulseSelector: "#dlRcpt" },
+);
+// This scene shares the console layout with scene 5 but focuses on
+// the download interaction. The pulse-glow on #dlRcpt draws the
+// eye; the whoosh transition into scene 7 covers the file save.
+
+// ═════════════════════════════════════════════════════════════════
+// SCENE 7 — VERIFY. The user drops the downloaded receipt into
+// the public verifier. Green tick, no account, no login.
+// ═════════════════════════════════════════════════════════════════
+await recordScene(browser, "07-verify", 8000, async (page, ms) => {
   await page.goto(LANDING + "/verify/", { waitUntil: "networkidle" });
   await page.waitForSelector("#loadExample", { timeout: 10000 });
-  // Pre-position cursor near the target so the eye tracks to it during
-  // the initial 0.8s dwell. Investor sees the cursor already hovering
-  // over "Try it with a sample receipt" and knows what's about to
-  // happen.
   const btn = page.locator("#loadExample");
   const box = await btn.boundingBox();
   if (box) {
     await page.mouse.move(box.x + box.width / 2 - 30, box.y - 8, { steps: 1 });
   }
-  await page.waitForTimeout(700);
-  // Small final micro-move for humanity, then click
+  await page.waitForTimeout(600);
   if (box) {
     await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 6 });
   }
@@ -379,21 +429,20 @@ await recordScene(browser, "06-verify", 8500, async (page, ms) => {
   await btn.click();
   await page.waitForSelector(".result-card", { timeout: 8000 });
   await page.waitForTimeout(350);
-  // Smooth-scroll to center the verified card
   await page.evaluate(() => {
     const card = document.querySelector(".result-card");
     if (card) card.scrollIntoView({ behavior: "smooth", block: "center" });
   });
   await page.waitForTimeout(700);
-  // Longer hold on the verified state — 4.5s of Ken Burns + pulse
   await applyCinematic(page, { zoomMs: 4500, pulseSelector: ".result-card" });
   await page.waitForTimeout(4500);
 });
 
 // ═════════════════════════════════════════════════════════════════
-// SCENE 7 — Closing card. No kicker (redundant with brand bar).
+// SCENE 8 — CTA card. The whole flow in one line + the URL to try
+// it live.
 // ═════════════════════════════════════════════════════════════════
-await recordScene(browser, "07-close", 5500, async (page, ms) => {
+await recordScene(browser, "08-close", 5500, async (page, ms) => {
   await showCard(page, cardHtml({
     bg: "#0a5c8b",
     headline: `AI agents you can<br>hand to an <span class="accent-yellow">auditor</span>.`,
