@@ -18,8 +18,9 @@
 /api/*  https://api.agentvisorai.me/api/:splat  200
 /healthz  https://api.agentvisorai.me/healthz  200
 
-# Legacy pitch walkthrough — keep the deep link so investor video
-# references stay valid.
-/pitch  /app/pitch/index.html  301
+# Legacy pitch walkthrough — keep old redirect valid but also serve
+# the new /pitch/ path directly (no redirect needed for that).
+/mockup   /pitch/  301
+/demo     /pitch/  301
 
 # App entrypoint stays as a hard-coded SPA — no history-mode router yet.

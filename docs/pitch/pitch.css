@@ -1,0 +1,268 @@
+/*
+ * Pitch page styles. Extends the main site's style.css.
+ * Everything here is scoped to .pitch-body so it doesn't leak.
+ */
+
+.pitch-body main {
+  padding-top: var(--nav-h);
+}
+
+.pitch-hero {
+  padding: 3rem 0 4rem;
+  background: var(--bg-alt);
+  border-bottom: 1px solid var(--border);
+}
+
+.pitch-kicker {
+  font-size: 0.85rem;
+  font-weight: 600;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+  margin: 0 0 1rem;
+}
+
+.pitch-hero h1 {
+  font-size: clamp(2rem, 5vw, 3rem);
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  margin: 0 0 2rem;
+  color: var(--fg-strong);
+}
+
+/* ── video ───────────────────────────────────────────────────── */
+
+.pitch-video-wrap {
+  margin: 0 0 2.5rem;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: #000;
+  box-shadow: 0 20px 60px -20px rgba(10, 92, 139, 0.25);
+  aspect-ratio: 16 / 9;
+  position: relative;
+}
+
+.pitch-video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #0a5c8b;
+}
+
+.pitch-video-meta {
+  margin: 0.75rem 0.25rem 0;
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.pitch-video-meta a { color: var(--accent); }
+
+/* ── CTA grid ────────────────────────────────────────────────── */
+
+.pitch-cta-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.pitch-cta {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-rows: auto auto;
+  grid-template-areas:
+    "title arrow"
+    "sub   arrow";
+  align-items: center;
+  gap: 0.4rem 1rem;
+  padding: 1.25rem 1.5rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg);
+  color: var(--fg);
+  text-decoration: none;
+  transition: border-color 150ms ease, transform 150ms ease, box-shadow 150ms ease;
+}
+
+.pitch-cta:hover {
+  border-color: var(--accent);
+  transform: translateY(-1px);
+  box-shadow: 0 10px 30px -12px rgba(10, 92, 139, 0.25);
+}
+
+.pitch-cta-primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-fg);
+}
+
+.pitch-cta-primary:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.pitch-cta-title {
+  grid-area: title;
+  font-weight: 700;
+  font-size: 1.05rem;
+  letter-spacing: -0.01em;
+}
+
+.pitch-cta-sub {
+  grid-area: sub;
+  font-size: 0.85rem;
+  opacity: 0.85;
+  line-height: 1.35;
+}
+
+.pitch-cta-arrow {
+  grid-area: arrow;
+  font-size: 1.5rem;
+  font-weight: 400;
+  opacity: 0.5;
+  transition: transform 150ms ease, opacity 150ms ease;
+}
+
+.pitch-cta:hover .pitch-cta-arrow {
+  transform: translateX(2px);
+  opacity: 1;
+}
+
+.pitch-cta-primary .pitch-cta-sub,
+.pitch-cta-primary .pitch-cta-arrow { opacity: 0.9; }
+
+/* ── story (scene-by-scene) ──────────────────────────────────── */
+
+.pitch-story {
+  padding: 4rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.pitch-story h2 {
+  font-size: 1.75rem;
+  letter-spacing: -0.02em;
+  margin: 0 0 2rem;
+}
+
+.pitch-scenes {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1.75rem;
+}
+
+.pitch-scenes > li {
+  display: grid;
+  grid-template-columns: 3rem 1fr;
+  gap: 1.25rem;
+  align-items: start;
+}
+
+.pitch-scene-num {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.75rem;
+  height: 2.75rem;
+  border-radius: 999px;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  color: var(--fg-muted);
+  font-weight: 700;
+  font-size: 0.95rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.pitch-scenes h3 {
+  font-size: 1.1rem;
+  margin: 0 0 0.35rem;
+  letter-spacing: -0.01em;
+}
+
+.pitch-scenes p {
+  margin: 0;
+  color: var(--fg-muted);
+  line-height: 1.5;
+}
+
+.pitch-scenes a { color: var(--accent); }
+
+/* ── links section ───────────────────────────────────────────── */
+
+.pitch-links {
+  padding: 4rem 0;
+  background: var(--bg-alt);
+  border-bottom: 1px solid var(--border);
+}
+
+.pitch-links h2 {
+  font-size: 1.75rem;
+  letter-spacing: -0.02em;
+  margin: 0 0 2rem;
+}
+
+.pitch-links-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 2rem;
+}
+
+.pitch-links-grid h3 {
+  font-size: 1.05rem;
+  margin: 0 0 0.5rem;
+  letter-spacing: -0.01em;
+}
+
+.pitch-links-grid p {
+  margin: 0 0 0.5rem;
+  line-height: 1.4;
+}
+
+.pitch-links-grid a {
+  color: var(--accent);
+  font-weight: 500;
+  word-break: break-all;
+}
+
+.pitch-links-grid .muted {
+  color: var(--fg-muted);
+  font-size: 0.9rem;
+}
+
+.pitch-links-grid code {
+  font-size: 0.85em;
+  padding: 0.1em 0.35em;
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+/* ── footer ──────────────────────────────────────────────────── */
+
+.pitch-footer {
+  padding: 2.5rem 0 4rem;
+  color: var(--fg-muted);
+}
+
+.pitch-footer p { margin: 0 0 0.75rem; line-height: 1.5; }
+.pitch-footer a { color: var(--accent); }
+.pitch-footer .muted { font-size: 0.85rem; }
+
+@media (max-width: 640px) {
+  .pitch-scenes > li {
+    grid-template-columns: 2.25rem 1fr;
+    gap: 0.85rem;
+  }
+  .pitch-scene-num {
+    width: 2rem;
+    height: 2rem;
+    font-size: 0.85rem;
+  }
+}
