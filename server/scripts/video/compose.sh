@@ -90,7 +90,8 @@ ffmpeg -y \
     [v02][3:v]xfade=transition=fade:duration=$XF:offset=$O4[v03];
     [v03][4:v]xfade=transition=fade:duration=$XF:offset=$O5[v04];
     [v04][5:v]xfade=transition=fade:duration=$XF:offset=$O6[v05];
-    [v05][6:v]xfade=transition=fade:duration=$XF:offset=$O7[vout]
+    [v05][6:v]xfade=transition=fade:duration=$XF:offset=$O7[v06];
+    [v06]fade=t=in:st=0:d=0.6:color=black,fade=t=out:st=$(awk "BEGIN{printf \"%.3f\", $O7 + $D7 - 0.8}"):d=0.8:color=black[vout]
   " \
   -map "[vout]" \
   -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p -movflags +faststart \

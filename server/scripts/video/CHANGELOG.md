@@ -75,3 +75,38 @@ fading in as a block.
   the overall pacing is unchanged)
 * Size: 7.4 MB (unchanged)
 
+
+## v7 — fade edges + 12s social teaser (2026-08-27)
+
+Two shippable cuts now.
+
+### Full v7 (44s)
+
+* **0.6s fade in from black** at start via
+  `fade=t=in:st=0:d=0.6:color=black`.
+* **0.8s fade out to black** at end via
+  `fade=t=out:st=$END-0.8:d=0.8:color=black`.
+* Sealed edges make it feel like a premium content piece, not a
+  raw screen record.
+
+### Social teaser (12s)
+
+`compose-teaser.sh` builds a purpose-cut version for
+LinkedIn / Twitter / X autoplay:
+
+* 0-3s: scene 2 truncated to just "$8,400 gone" hook
+* 3-7s: scene 5 with $8,400 pulse + Signature verified
+* 7-10s: scene 6 skipped past the click to the verified state
+* 10-12s: scene 7 close
+
+Cross-fades tightened from 0.5s to 0.35s to fit the 12s budget
+without feeling rushed.
+
+Under Twitter's 2:20 max, matches the ~10-15s attention window
+that dominates modern feed viewing.
+
+Both cuts share the same 7 source scenes. Change the SPA or
+branding, re-run `record-scenes.mjs`, then re-run both
+`compose.sh` and `compose-teaser.sh` to get fresh renders of both
+formats in ~5 minutes.
+
