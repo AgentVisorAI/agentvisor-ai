@@ -92,21 +92,52 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
     // EventSource in readyState=OPEN for tens of seconds after the peer dies.
     // The client tracks last-heard time and force-closes if the interval
     // between keepalives grows too long (default 30s stale threshold).
-    const keepalive = setInterval(async () => {
-      const stillAuthorized = await revalidate();
+    //
+    // R80 F2: guard against (a) re-entry (a slow `revalidate()` DB call
+    // >15 s used to let a second callback pile up in the event loop
+    // holding a DB connection) and (b) leaked interval + unsub after
+    // the revalidate=false branch tore down the response (prior shape
+    // relied entirely on `req.raw` firing 'close', which SSE keep-alive
+    // can delay tens of seconds while the interval keeps ticking and
+    // writes-after-end pollute error logs).
+    let closed = false;
+    let revalidateInFlight = false;
+    let keepalive: NodeJS.Timeout | undefined;
+    const teardown = (): void => {
+      if (closed) return;
+      closed = true;
+      if (keepalive !== undefined) clearInterval(keepalive);
+      unsub();
+    };
+    keepalive = setInterval(async () => {
+      if (closed || revalidateInFlight) return;
+      revalidateInFlight = true;
+      let stillAuthorized: boolean;
+      try {
+        stillAuthorized = await revalidate();
+      } finally {
+        revalidateInFlight = false;
+      }
+      if (closed) return;
       if (!stillAuthorized) {
-        reply.raw.write(
-          `event: stream_terminated\ndata: ${JSON.stringify({ reason: "session_revoked_or_membership_removed" })}\n\n`,
-        );
-        reply.raw.end();
+        try {
+          reply.raw.write(
+            `event: stream_terminated\ndata: ${JSON.stringify({ reason: "session_revoked_or_membership_removed" })}\n\n`,
+          );
+        } catch {
+          // Peer already gone; nothing to do.
+        }
+        teardown();
+        try { reply.raw.end(); } catch { /* already ended */ }
         return;
       }
-      reply.raw.write(`event: keepalive\ndata: ${JSON.stringify({ t: Date.now() })}\n\n`);
+      try {
+        reply.raw.write(`event: keepalive\ndata: ${JSON.stringify({ t: Date.now() })}\n\n`);
+      } catch {
+        teardown();
+      }
     }, 15_000);
 
-    req.raw.on("close", () => {
-      clearInterval(keepalive);
-      unsub();
-    });
+    req.raw.on("close", teardown);
   });
 }

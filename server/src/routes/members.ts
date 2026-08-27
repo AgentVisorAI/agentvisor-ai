@@ -401,6 +401,23 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       where: { orgId_email: { orgId: "n/a", email: body.data.email } },
     }).catch(() => null);
     // The orgId isn't in the request — look up by email + verify by token.
+    // R80 F3: cap the number of candidates to N to prevent an
+    // unauthenticated argon2-amplification DoS. Prior shape ran
+    // one argon2 verify per candidate — an attacker who convinced
+    // multiple orgs to invite the same email address could force
+    // N × ~50 ms of CPU per anonymous request. Argon2 is CPU-
+    // parking by design (memory + time cost tuned for password
+    // hashing), so N=100 candidates = ~5 s per request; global
+    // 300/min/IP rate limit permits ~1.5 s of CPU/s from one IP
+    // via that channel alone. Legitimate users typically have
+    // 1-3 pending invites; capping at 5 preserves the UX while
+    // bounding the argon2 spend at ~250 ms/request even before
+    // any additional rate limit kicks in.
+    //
+    // Take the 5 MOST RECENT candidates so a hostile
+    // pre-population by expired-first invites can't hide the
+    // legitimate one at the tail — real recent invites are
+    // what an actual user would be redeeming.
     const candidates = await db.invite.findMany({
       where: {
         email: body.data.email,
@@ -408,6 +425,8 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
         revokedAt: null,
         expiresAt: { gt: new Date() },
       },
+      orderBy: { createdAt: "desc" },
+      take: 5,
     });
     let matched: (typeof candidates)[number] | null = null;
     for (const c of candidates) {
@@ -425,13 +444,33 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
         return reply.code(400).send({ error: "password_required_for_new_user" });
       }
       const passwordHash = await hashPassword(body.data.password);
-      user = await db.user.create({
-        data: {
-          email: matched.email,
-          passwordHash,
-          displayName: body.data.displayName ?? null,
-        },
-      });
+      // R80 F5: two concurrent `/invites/accept` for the same
+      // NEW email both saw `findUnique === null`, both called
+      // `db.user.create`. One won the `email` unique constraint;
+      // the other threw uncaught P2002 → 500 to the losing
+      // caller. Same pattern the auth.ts signup handler
+      // explicitly handles. On P2002, re-query the winner and
+      // proceed — the invite `updateMany` null-guard below still
+      // prevents double session-mint.
+      try {
+        user = await db.user.create({
+          data: {
+            email: matched.email,
+            passwordHash,
+            displayName: body.data.displayName ?? null,
+          },
+        });
+      } catch (err) {
+        if (
+          typeof err === "object" && err !== null &&
+          (err as { code?: string }).code === "P2002"
+        ) {
+          user = await db.user.findUnique({ where: { email: matched.email } });
+          if (!user) throw err; // Should not happen; re-throw for observability.
+        } else {
+          throw err;
+        }
+      }
     }
 
     // R79 MEDIUM (Class B): mark the invite consumed atomically

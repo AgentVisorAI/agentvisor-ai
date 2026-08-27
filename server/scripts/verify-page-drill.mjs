@@ -36,16 +36,26 @@ await page.waitForSelector("#drop", { timeout: 10000 });
 await page.waitForSelector("#loadExample", { timeout: 5000 });
 console.log("✅ /verify page renders with drop zone + sample button");
 
-// 2. Try sample -> should verify
+// 2. Try sample -> should render as internally consistent (empty trust anchor)
 await page.locator("#loadExample").click();
 await wait(1500);
 {
   const title = await page.locator(".result-title").innerText();
-  if (!/verifies/i.test(title) || /does not/i.test(title)) fail("sample didn't verify. title=" + title);
+  // R78 HIGH #1 + R80 F1: with empty TRUSTED_RECEIPT_KEYS, any
+  // receipt (including the shipped sample) must render as
+  // INTERNALLY CONSISTENT, not TRUSTED. Assertion regression:
+  // commit 30e8085 reverted this from R78's `/internally
+  // consistent/` back to `/verifies/`, causing the drill to
+  // fail at step 2 in CI — which also made R79's positive
+  // trust-anchor guard at step 5 unreachable (dead-code
+  // regression test). This restores the correct assertion.
+  if (/does not verify/i.test(title)) fail("sample rendered as does-not-verify. title=" + title);
+  if (/verifies against a trusted key/i.test(title)) fail("sample falsely claimed TRUSTED (empty anchor list should show INTERNALLY CONSISTENT until anchors are populated): " + title);
+  if (!/internally consistent/i.test(title)) fail("sample missing INTERNALLY CONSISTENT string: " + title);
   const kvText = await page.locator(".result-card dl.kv").innerText();
   if (!/Session/.test(kvText)) fail("no session field in kv");
   if (!/supply-planner|northwind|demo/i.test(kvText)) fail("session content missing");
-  console.log("✅ sample receipt verifies via Web Crypto in the browser");
+  console.log("✅ sample receipt renders as INTERNALLY CONSISTENT via Web Crypto in the browser");
 }
 
 // 3. Fetch the same sample and upload via file input
@@ -69,8 +79,11 @@ async function uploadJson(text) {
 await uploadJson(sampleText);
 {
   const title = await page.locator(".result-title").innerText();
-  if (!/verifies/i.test(title) || /does not/i.test(title)) fail("uploaded legit didn't verify");
-  console.log("✅ upload path also verifies legit receipt");
+  // R78 HIGH #1 + R80 F1: same assertion as step 2 above.
+  if (/does not verify/i.test(title)) fail("uploaded legit rendered as does-not-verify");
+  if (/verifies against a trusted key/i.test(title)) fail("uploaded legit falsely claimed TRUSTED (empty anchor list should always give INTERNALLY CONSISTENT until anchors are populated)");
+  if (!/internally consistent/i.test(title)) fail("uploaded legit missing INTERNALLY CONSISTENT string: " + title);
+  console.log("✅ upload path renders legit receipt as INTERNALLY CONSISTENT (empty trust anchor)");
 }
 
 // 4. Upload tampered
