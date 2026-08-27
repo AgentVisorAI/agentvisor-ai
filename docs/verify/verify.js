@@ -37,6 +37,14 @@
     // over TLS.
     const TRUSTED_RECEIPT_KEYS = new Set([
       // Lowercased 64-hex Ed25519 pubkeys.
+      //
+      // The demo sample receipt bundled with this page
+      // (sample-receipt.json). Its keypair was generated once at
+      // build time and the private half was discarded — this anchor
+      // exists so "Try it with a sample" shows the full green
+      // trusted-verify experience investors will see with real
+      // daemon-signed receipts.
+      "9992e71fe6a6e5edc18129becef2ec640f9611a4e12a4b9a311bab943ab19467",
     ]);
 
     async function verifyBundle(bundle) {
