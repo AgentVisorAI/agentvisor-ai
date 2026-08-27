@@ -168,10 +168,15 @@
     card.classList.remove("centered");
     var r = target.getBoundingClientRect();
     var pad = 8;
+    // Clamp the spotlight to the viewport: targets inside horizontal
+    // scrollers (session rows on phones) can be wider than the screen,
+    // and the ring's right edge should stay visible.
+    var hLeft = Math.max(4, r.left - pad);
+    var hWidth = Math.min(r.width + pad * 2, window.innerWidth - hLeft - 4);
     hole.style.display = "block";
-    hole.style.left = (r.left - pad) + "px";
+    hole.style.left = hLeft + "px";
     hole.style.top = (r.top - pad) + "px";
-    hole.style.width = (r.width + pad * 2) + "px";
+    hole.style.width = hWidth + "px";
     hole.style.height = (r.height + pad * 2) + "px";
 
     // Card below the target when there's room, above otherwise;
