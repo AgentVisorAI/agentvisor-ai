@@ -12,6 +12,24 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
     const claims = requireSession(req, reply);
     if (!claims) return;
 
+    // R84 F3: reject API-key auth for /stream. The R79 revalidate
+    // loop queries `db.user.findUnique({ where: { id: claims.sub }})`;
+    // for API-key sessions the middleware sets
+    // `claims.sub = "apikey:" + apiKey.id` (see
+    // lib/session-middleware.ts:55), which never matches a user
+    // row. `revalidate()` therefore returns `false` on the FIRST
+    // 15 s tick and the stream sends a bogus
+    // `stream_terminated { reason: "session_revoked_or_membership_removed" }`
+    // then closes. Server-to-server API-key integrations that
+    // hit /stream would connect, receive `hello`, then get torn
+    // down 15 s later — reconnect churn, misleading revocation
+    // reason in client logs. SSE is designed for browser-tab
+    // affinity anyway; API-key consumers should poll the REST
+    // endpoints. Refuse cleanly instead of the confusing 15 s
+    // teardown loop.
+    if (claims.sub.startsWith("apikey:")) {
+      return reply.code(400).send({ error: "sse_requires_cookie_session" });
+    }
     // Set CORS headers ourselves — we're about to bypass Fastify's response
     // pipeline and stream to `reply.raw`, so the @fastify/cors plugin's
     // headers won't get flushed. Mirror the same allowlist logic here.
@@ -75,9 +93,31 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
         backpressureTimer = undefined;
       }
     };
+    // R84 F2: on drain, don't silently resume — the client
+    // already MISSED events (rawWrite dropped them while paused).
+    // If we resume streaming as if nothing happened, the tab's
+    // model drifts: missed `receipt.finalized` leaves sessions
+    // pending; missed `events.appended` drifts counters; missed
+    // `session.upsert` hides new rows. Force teardown on the
+    // first drain after a backpressure event so the client's
+    // EventSource auto-reconnect re-establishes through
+    // /stream open, where the client refetches org state
+    // authoritatively (the tab-open flow already reloads
+    // sessions and receipts on connect). Better than
+    // "silently drop, silently resume, silently show stale data".
+    let hadBackpressure = false;
     reply.raw.on("drain", () => {
       paused = false;
       clearBackpressureTimer();
+      if (hadBackpressure && !closed) {
+        try {
+          reply.raw.write(
+            `event: stream_reset\ndata: ${JSON.stringify({ reason: "backpressure_recovered_refetch_state" })}\n\n`,
+          );
+        } catch { /* peer gone */ }
+        teardown();
+        try { reply.raw.end(); } catch { /* already ended */ }
+      }
     });
 
     const rawWrite = (chunk: string): boolean => {
@@ -92,6 +132,7 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
       }
       if (!ok) {
         paused = true;
+        hadBackpressure = true;
         armBackpressureTimer();
       }
       return ok;
