@@ -22,10 +22,10 @@ ffmpeg -y -f lavfi -i "anullsrc=r=44100:cl=stereo:d=32" \
   -c:a pcm_s16le "$OUT/silence.wav" 2>&1 | tail -1
 
 # From compose.sh `Offsets:` output.
-T1=3167
-T2=9934
-T3=17701
-T4=24201
+T1=3467
+T2=10367
+T3=18234
+T4=24701
 
 ffmpeg -y \
   -i "$OUT/silence.wav" \
