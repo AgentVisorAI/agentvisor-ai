@@ -22,23 +22,59 @@ function cardHtml(opts) {
   const kicker = opts.kicker || "";
   const headline = opts.headline;
   const sub = opts.sub || "";
+  // Split headline into <span class="line"> per <br>-separated line so
+  // each one animates in on a stagger. Investors read the top line
+  // first, then each subsequent line reveals with a small delay — the
+  // eye's rhythm matches the text's rhythm.
+  const lines = headline.split("<br>");
+  const animatedHeadline = lines.map((line, i) =>
+    `<span class="line" style="animation-delay: ${0.15 + i * 0.18}s">${line}</span>`
+  ).join("");
   return `<!doctype html><html><head><meta charset="utf-8"><style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body { width: 100%; height: 100%; overflow: hidden; background: ${bg}; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
-    .stage { width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 4rem; opacity: 0; transform: translateY(12px); animation: fadeIn 0.7s 0.15s cubic-bezier(0.16,1,0.3,1) forwards; }
-    @keyframes fadeIn { to { opacity: 1; transform: translateY(0); } }
-    .kicker { font-size: 15px; font-weight: 600; letter-spacing: 0.35em; text-transform: uppercase; opacity: 0.6; margin-bottom: 2.5rem; }
-    .headline { font-size: 92px; font-weight: 800; letter-spacing: -0.035em; line-height: 1.02; max-width: 1250px; }
+    .stage { width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 4rem; }
+    .kicker {
+      font-size: 15px; font-weight: 600; letter-spacing: 0.35em;
+      text-transform: uppercase; opacity: 0; color: #fff;
+      margin-bottom: 2.5rem;
+      transform: translateY(8px);
+      animation: revealText 0.6s 0s cubic-bezier(0.16,1,0.3,1) forwards;
+    }
+    .kicker.dim { opacity: 0.6; }
+    .headline {
+      font-size: 92px; font-weight: 800; letter-spacing: -0.035em;
+      line-height: 1.02; max-width: 1250px;
+    }
+    .headline .line {
+      display: block; opacity: 0; transform: translateY(20px);
+      animation: revealText 0.7s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
+    @keyframes revealText { to { opacity: 1; transform: translateY(0); } }
     .accent-red { color: #ff6a58; }
     .accent-yellow { color: #ffd54f; }
     .accent-green { color: #6ecf8e; }
-    .subline { font-size: 26px; font-weight: 400; margin-top: 2rem; opacity: 0.85; max-width: 900px; line-height: 1.4; }
-    .brand { position: absolute; bottom: 40px; display: flex; align-items: center; gap: 12px; font-size: 15px; opacity: 0.6; letter-spacing: 0.02em; }
-    .brand-mark { width: 26px; height: 26px; background: #fff; color: #0a5c8b; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 15px; }
+    .subline {
+      font-size: 26px; font-weight: 400; margin-top: 2rem;
+      opacity: 0; max-width: 900px; line-height: 1.4;
+      color: rgba(255, 255, 255, 0.85);
+      transform: translateY(8px);
+      animation: revealText 0.6s ${0.15 + lines.length * 0.18 + 0.15}s cubic-bezier(0.16,1,0.3,1) forwards;
+    }
+    .brand {
+      position: absolute; bottom: 40px;
+      display: flex; align-items: center; gap: 12px;
+      font-size: 15px; opacity: 0.5; letter-spacing: 0.02em;
+    }
+    .brand-mark {
+      width: 26px; height: 26px; background: #fff; color: #0a5c8b;
+      border-radius: 6px; display: flex; align-items: center;
+      justify-content: center; font-weight: 800; font-size: 15px;
+    }
   </style></head><body>
     <div class="stage">
-      ${kicker ? `<div class="kicker">${kicker}</div>` : ""}
-      <div class="headline">${headline}</div>
+      ${kicker ? `<div class="kicker ${opts.dimKicker ? 'dim' : ''}">${kicker}</div>` : ""}
+      <div class="headline">${animatedHeadline}</div>
       ${sub ? `<div class="subline">${sub}</div>` : ""}
     </div>
     <div class="brand"><div class="brand-mark">A</div>AgentVisor AI · agentvisorai.me</div>
@@ -189,36 +225,35 @@ async function applyCinematic(page, opts = {}) {
 const browser = await chromium.launch({ headless: true });
 
 // ═════════════════════════════════════════════════════════════════
-// SCENE 1 — Title card
+// SCENE 1 — Title card. No kicker; "The problem" is meta-commentary.
+// Let the headline land alone. Two lines instead of three.
 // ═════════════════════════════════════════════════════════════════
 await recordScene(browser, "01-intro", 5500, async (page, ms) => {
   await showCard(page, cardHtml({
     bg: "#0a5c8b",
-    kicker: "The problem",
-    headline: `AI agents are making<br>real decisions&mdash;<br>with real money.`,
+    headline: `AI agents make<br>real decisions<br>with real money.`,
   }), ms);
 });
 
 // ═════════════════════════════════════════════════════════════════
-// SCENE 2 — Problem card
+// SCENE 2 — Problem card. Tighter: two-line headline + subline.
 // ═════════════════════════════════════════════════════════════════
 await recordScene(browser, "02-problem", 5500, async (page, ms) => {
   await showCard(page, cardHtml({
     bg: "#08111a",
-    kicker: "Today",
-    headline: `An agent buys the wrong vendor.<br><span class="accent-red">$8,400</span> gone.<br>Nobody signed off.`,
+    headline: `Bad tool call.<br><span class="accent-red">$8,400</span> gone.`,
     sub: "No audit trail. No accountability. No way to prove what happened.",
   }), ms);
 });
 
 // ═════════════════════════════════════════════════════════════════
-// SCENE 3 — Solution promise
+// SCENE 3 — Solution promise. No kicker (persistent brand at bottom
+// already says AgentVisor AI).
 // ═════════════════════════════════════════════════════════════════
 await recordScene(browser, "03-solution", 4000, async (page, ms) => {
   await showCard(page, cardHtml({
     bg: "#0a5c8b",
-    kicker: "AgentVisor AI",
-    headline: `Every agent decision,<br>captured. Enforced.<br><span class="accent-yellow">Signed.</span>`,
+    headline: `Every decision:<br>captured. enforced.<br><span class="accent-yellow">signed.</span>`,
   }), ms);
 });
 
@@ -284,12 +319,11 @@ await recordScene(browser, "06-verify", 8500, async (page, ms) => {
 });
 
 // ═════════════════════════════════════════════════════════════════
-// SCENE 7 — Closing card
+// SCENE 7 — Closing card. No kicker (redundant with brand bar).
 // ═════════════════════════════════════════════════════════════════
 await recordScene(browser, "07-close", 4500, async (page, ms) => {
   await showCard(page, cardHtml({
     bg: "#0a5c8b",
-    kicker: "AgentVisor AI",
     headline: `AI agents you can<br>hand to an <span class="accent-yellow">auditor</span>.`,
     sub: "agentvisorai.me",
   }), ms);

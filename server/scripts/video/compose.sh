@@ -45,7 +45,7 @@ add_caption() {
 }
 
 add_caption "$SCENES/04-console.webm" "$OUT/norm/04-console.mp4" \
-  "Every session — every tool call — captured in real time."
+  "32 sessions · 7 blocked · \$31,840 saved."
 
 add_caption "$SCENES/05-session.webm" "$OUT/norm/05-session.mp4" \
   "Blocked at \$8,400. Signed. Auditable."
