@@ -188,6 +188,35 @@ async function showCard(page, html, holdMs) {
 async function applyCinematic(page, opts = {}) {
   const zoomDuration = opts.zoomMs ?? 7000;
   const pulseSel = opts.pulseSelector ?? null;
+  const zoomToSel = opts.zoomToSelector ?? null;
+
+  // If a zoom target is provided, resolve its viewport-relative center
+  // and use a stronger zoom that ENDS focused on that target (money
+  // shot). Otherwise fall back to the subtle center Ken Burns.
+  let originX = "center";
+  let originY = "center";
+  let endScale = 1.055;
+  if (zoomToSel) {
+    try {
+      const rect = await page.evaluate((sel) => {
+        const el = document.querySelector(sel);
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return {
+          cx: r.left + r.width / 2,
+          cy: r.top + r.height / 2,
+          vw: window.innerWidth,
+          vh: window.innerHeight,
+        };
+      }, zoomToSel);
+      if (rect) {
+        originX = ((rect.cx / rect.vw) * 100).toFixed(2) + "%";
+        originY = ((rect.cy / rect.vh) * 100).toFixed(2) + "%";
+        endScale = 1.35;
+      }
+    } catch {}
+  }
+
   await page.addStyleTag({ content: `
     body { transition: none; will-change: transform; }
     body::after {
@@ -200,9 +229,9 @@ async function applyCinematic(page, opts = {}) {
     }
     @keyframes kenburns {
       from { transform: scale(1); }
-      to { transform: scale(1.055); }
+      to { transform: scale(${endScale}); }
     }
-    body { animation: kenburns ${zoomDuration}ms cubic-bezier(0.16, 1, 0.3, 1) forwards; transform-origin: center center; }
+    body { animation: kenburns ${zoomDuration}ms cubic-bezier(0.16, 1, 0.3, 1) forwards; transform-origin: ${originX} ${originY}; }
     @keyframes pulse-glow {
       0%, 100% { box-shadow: 0 0 0 0 rgba(255, 213, 79, 0), 0 0 0 0 rgba(255, 213, 79, 0); }
       50% { box-shadow: 0 0 0 6px rgba(255, 213, 79, 0.55), 0 0 40px 8px rgba(255, 213, 79, 0.35); }
@@ -260,7 +289,10 @@ await recordScene(browser, "03-solution", 4000, async (page, ms) => {
 });
 
 // ═════════════════════════════════════════════════════════════════
-// SCENE 4 — Console: pre-warm auth + wait for data, then record.
+// SCENE 4 — Console: wide dashboard establishes → zoom lands on the
+// "Prevented losses $31,840" tile. This is the "money shot" — the
+// investor's eye is guided from the whole business (fleet of agents)
+// down to the single metric that funds the pitch.
 // ═════════════════════════════════════════════════════════════════
 await recordConsoleScene(
   browser,
@@ -268,7 +300,7 @@ await recordConsoleScene(
   7500,
   "#/overview",
   ['text=PREVENTED LOSSES', 'text=$31,840', 'text=Recent sessions'],
-  { /* no pulse — hero is the whole dashboard */ },
+  { zoomToSelector: ".stat.savings" },
 );
 
 // ═════════════════════════════════════════════════════════════════
