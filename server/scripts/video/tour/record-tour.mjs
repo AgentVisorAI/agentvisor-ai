@@ -308,9 +308,13 @@ async function applyCinematic(page, opts = {}) {
 
   // If a zoom target is provided, resolve its viewport-relative center
   // and use a stronger zoom that ENDS focused on that target (money
-  // shot). Otherwise fall back to the subtle center Ken Burns.
-  let originX = opts.origin ? opts.origin.split(" ")[0] : "center";
-  let originY = opts.origin ? opts.origin.split(" ")[1] : "center";
+  // shot). Otherwise fall back to the subtle Ken Burns anchored at the
+  // TOP-LEFT: the console's main column is max-width'd, so the right
+  // and bottom of a 1920px frame are empty canvas — growing into them
+  // costs nothing, while the old center origin cropped the sidebar
+  // labels mid-word for the whole zoom.
+  let originX = opts.origin ? opts.origin.split(" ")[0] : "0px";
+  let originY = opts.origin ? opts.origin.split(" ")[1] : "0px";
   let endScale = opts.static ? 1.0 : 1.055;
   if (zoomToSel) {
     try {
