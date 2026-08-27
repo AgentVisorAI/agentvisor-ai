@@ -20,6 +20,7 @@ always reflects what an investor visiting the URL would see.
 cd server
 node scripts/video/record-scenes.mjs   # ~90s, writes /tmp/video-v4/scenes/*.webm
 bash scripts/video/build-audio.sh       # ~5s,  writes /tmp/video-v4/audio/soundtrack-44s.aac
+bash scripts/video/build-ambience.sh     # ~1s,  writes /tmp/video-v4/audio/ambience-46s.wav
 bash scripts/video/build-narration.sh    # ~15s, writes /tmp/video-v4/audio/narration-44s.aac (requires macOS `say`)
 bash scripts/video/compose.sh           # ~90s, writes 3 cuts (silent, whoosh, narrated)
 bash scripts/video/compose-teaser.sh    # ~30s, writes /tmp/video-v4/agentvisor-mockup-teaser.mp4
