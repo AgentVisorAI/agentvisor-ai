@@ -1279,7 +1279,7 @@
           message: "receipt.rawBody (UTF-8 bytes)",
           signature: "base64-decode(receipt.rawSignatureB64)",
           publicKey: "hex-decode(publicKey.hex)",
-          command: "node scripts/verify-receipt.mjs " + (sess.externalId || sess.id) + ".json",
+          command: "node server/scripts/verify-receipt.mjs " + (sess.externalId || sess.id) + ".json",
           docs: "https://agentvisorai.me/reference/receipts",
         },
       };
