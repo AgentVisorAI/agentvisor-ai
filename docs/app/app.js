@@ -2905,16 +2905,56 @@
       }
     });
   }
-  function renderSettingsBilling(root) {
+  async function renderSettingsBilling(root) {
+    root.innerHTML = '<div class="card">' + loadingBlock("table") + "</div>";
+    // Pull the org's real usage so the pricing story runs on the same
+    // numbers the investor just saw on the Overview.
+    var stats = null;
+    try { stats = await state.ds.getOverview("24h"); } catch (e) { /* tiers still render */ }
+    var calls = stats ? (stats.toolsAllowed + stats.toolsBlocked) : 0;
+    var meteredUsd = (calls / 1000) * 0.10;
+    var kept = stats ? Number(stats.blockedSpendUsd) : 0;
+    var tier = function (name, price, priceSub, items, cta, highlight) {
+      return '<div class="price-tier' + (highlight ? " highlight" : "") + '">' +
+        '<h3>' + esc(name) + "</h3>" +
+        '<div class="pt-price">' + price + "</div>" +
+        '<div class="pt-price-sub">' + esc(priceSub) + "</div>" +
+        "<ul>" + items.map(function (i) { return "<li>" + esc(i) + "</li>"; }).join("") + "</ul>" +
+        cta +
+      "</div>";
+    };
     root.innerHTML =
       '<div class="card">' +
         "<h2>Plan</h2>" +
-        '<div style="display:flex; align-items:baseline; gap:8px; margin-bottom: 12px"><span style="font-size:22px; font-weight:600">Free</span> <span class="pill accent">up to 10 deployments</span></div>' +
-        '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 var(--s-3)">All governance features included. Upgrade to Team for SSO enforcement, longer retention, and priority support.</p>' +
-        '<button class="btn accent" id="upgradeBtn">Upgrade to Team</button>' +
-      "</div>";
+        '<div style="display:flex; align-items:baseline; gap:8px; margin-bottom: 12px"><span style="font-size:22px; font-weight:600">Free</span> <span class="pill accent">current plan</span></div>' +
+        '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0">All governance features included while AgentVisor is in preview. Pricing below is what launches with the beta.</p>' +
+      "</div>" +
+      '<div class="pricing-grid">' +
+        tier("Free", "$0", "up to 10 deployments",
+          ["Every governance feature", "Signed receipts + offline verify", "90-day retention", "Community support"],
+          '<span class="pill ok">You are here</span>') +
+        tier("Team", "$99<span class=\"pt-per\">/mo</span>", "+ $0.10 per 1,000 policed tool calls",
+          ["Everything in Free", "SSO enforcement + SCIM", "1-year retention", "Priority support"],
+          '<button class="btn accent" id="upgradeBtn">Upgrade to Team</button>', true) +
+        tier("Enterprise", "Custom", "annual, self-hosted or dedicated",
+          ["Self-hosted control plane", "Custom receipt trust anchors", "SLAs + dedicated support", "Airgapped verify tooling"],
+          '<button class="btn" id="contactBtn">Contact us</button>') +
+      "</div>" +
+      (stats
+        ? '<div class="card" style="margin-top:12px">' +
+            "<h2>What Team pricing would cost this workspace</h2>" +
+            '<div class="billing-math">' +
+              '<div><div class="bm-num">' + calls.toLocaleString() + '</div><div class="bm-label">policed tool calls (24 h)</div></div>' +
+              '<div><div class="bm-num">$' + meteredUsd.toFixed(2) + '</div><div class="bm-label">metered cost of those calls</div></div>' +
+              '<div><div class="bm-num" style="color: var(--success-solid)">$' + kept.toLocaleString() + '</div><div class="bm-label">kept from bad orders in the same window</div></div>' +
+            "</div>" +
+            '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 12px 0 0">Policing an agent\'s tool call costs a fraction of a cent. One blocked bad order pays for years of it.</p>' +
+          "</div>"
+        : "");
     var b = $("#upgradeBtn", root);
     if (b) b.addEventListener("click", function () { comingSoon("Upgrade to Team", "Billing lands in the beta. In the meantime, ping the AgentVisor team to enable Team features on your workspace."); });
+    var c = $("#contactBtn", root);
+    if (c) c.addEventListener("click", function () { comingSoon("Enterprise", "Talk to us about a self-hosted control plane, custom trust anchors, and SLAs: hello@agentvisorai.me"); });
   }
   async function renderSettingsAudit(root) {
     root.innerHTML = '<div class="card">' + loadingBlock("table") + "</div>";
