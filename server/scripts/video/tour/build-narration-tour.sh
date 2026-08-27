@@ -47,7 +47,7 @@ gen "$VOICE/s10" 5.6 "Drop it into the public verifier. Green tick. No account."
 gen "$VOICE/s11" 7.6 "Starter policies come enabled on day one. Plain rules, enforced before the money moves."
 gen "$VOICE/s12" 6.6 "A command palette jumps anywhere. Light or dark, your call."
 gen "$VOICE/s13" 5.9 "Each deployment gets its own signing key and ingest token."
-gen "$VOICE/s14" 15.0 "Members, A P I keys, single sign on, webhooks, audit log, billing. The whole workspace is self serve."
+gen "$VOICE/s14" 15.0 "Members, A P I keys, single sign on, webhooks, audit log, billing. Everything an admin needs is self serve, from the very first day. No sales call required."
 gen "$VOICE/s15" 4.55 "A I agents you can hand to an auditor. agentvisor A I dot me."
 
 for i in $(seq 1 15); do
@@ -58,20 +58,20 @@ done
 
 # Scene-start offsets + ~200ms lead, from compose.sh `Offsets:`.
 D1=300
-D2=5900
-D3=11800
-D4=16800
-D5=25367
-D6=35334
-D7=42101
-D8=51868
-D9=59068
-D10=62035
-D11=67868
-D12=75435
-D13=81935
-D14=88068
-D15=103668
+D2=6133
+D3=12433
+D4=17433
+D5=26133
+D6=36133
+D7=42900
+D8=52733
+D9=59966
+D10=62933
+D11=68833
+D12=76400
+D13=83000
+D14=89133
+D15=104766
 
 ffmpeg -y -f lavfi -i "anullsrc=r=44100:cl=stereo:d=125" \
   -c:a pcm_s16le "$OUT/silence-44s.wav" 2>&1 | tail -1

@@ -709,6 +709,24 @@
     out.sort(function (a, b) { return new Date(b.startedAt) - new Date(a.startedAt); });
     return out;
   }
+  function freshPolicy(pol) {
+    var el = freshElapsed();
+    if (el == null) return pol;
+    var out = Object.assign({}, pol);
+    var t0 = Date.now() - el;
+    out.updatedAt = new Date(t0 + 2000).toISOString();
+    var sess = freshSessions() || [];
+    var blocked = sess.some(function (s) { return s.toolsBlocked > 0; });
+    if (out.id === "pol_procurement_allowed_vendors") {
+      out.hits24h = blocked ? 2 : 0;
+      out.blocks24h = blocked ? 1 : 0;
+    } else {
+      out.hits24h = Math.min(out.hits24h, sess.length * 9);
+      out.blocks24h = 0;
+    }
+    return out;
+  }
+
   function freshDeployments() {
     var el = freshElapsed();
     if (el == null) return null;
@@ -861,6 +879,7 @@
     },
     async discoverSaml(_email) { return { ssoConfig: null }; },
     async listSamlConfigs() {
+      if (freshElapsed() != null) return { configs: [] };
       return { configs: MOCK_SAML_CONFIGS.slice() };
     },
     async createSamlConfig(input) {
@@ -912,6 +931,7 @@
     // Mock passkeys. A fake yubikey + a fake iCloud passkey so the
     // settings page in the demo looks real.
     async webauthnListCredentials() {
+      if (freshElapsed() != null) return { credentials: [] };
       return { credentials: MOCK_PASSKEYS.slice() };
     },
     async webauthnRegisterStart() { throw new Error("mock_no_real_authenticator"); },
@@ -948,7 +968,13 @@
       return f !== null ? f : MOCK_DEPLOYMENTS.slice();
     },
     async getDeployment(id) {
-      await delay(100);
+      await delay(120);
+      var f = freshDeployments();
+      if (f !== null) {
+        var fd = f.find(function (x) { return x.id === id; });
+        if (!fd) throw new Error("not_found");
+        return fd;
+      }
       var d = MOCK_DEPLOYMENTS.find(function (x) { return x.id === id; });
       if (!d) throw new Error("not_found");
       return d;
@@ -1069,12 +1095,16 @@
       });
     },
 
-    async listPolicies() { await delay(100); return MOCK_POLICIES.slice(); },
+    async listPolicies() {
+      await delay(100);
+      if (freshElapsed() != null) return MOCK_POLICIES.slice(0, 4).map(freshPolicy);
+      return MOCK_POLICIES.slice();
+    },
     async getPolicy(id) {
       await delay(100);
       var p = MOCK_POLICIES.find(function (x) { return x.id === id; });
       if (!p) throw new Error("not_found");
-      return p;
+      return freshPolicy(p);
     },
     async togglePolicy(id) {
       await delay(120);
@@ -1180,9 +1210,9 @@
       if (el != null) {
         var t0 = Date.now() - el;
         return [
-          { id: "aud_f3", ts: new Date(t0 + FRESH_CONNECT_MS).toISOString(), event: "deployment.connected", actor: "system", target: "northwind-prod", note: "Signing key issued" },
-          { id: "aud_f2", ts: new Date(t0 + 2000).toISOString(), event: "policies.defaults_seeded", actor: "system", target: "4 starter policies", note: "" },
-          { id: "aud_f1", ts: new Date(t0).toISOString(), event: "org.created", actor: (mockState.session && mockState.session.user ? mockState.session.user.email : "you"), target: "Northwind Traders", note: "" },
+          { at: new Date(t0 + FRESH_CONNECT_MS).toISOString(), actor: "system", event: "deployment.connected", target: "northwind-prod", note: "Signing key issued" },
+          { at: new Date(t0 + 2000).toISOString(), actor: "system", event: "policies.defaults_seeded", target: "4 starter policies" },
+          { at: new Date(t0).toISOString(), actor: (mockState.session && mockState.session.user ? mockState.session.user.email : "you"), event: "org.created", target: "Northwind Traders" },
         ];
       }
       return MOCK_AUDIT.slice();
