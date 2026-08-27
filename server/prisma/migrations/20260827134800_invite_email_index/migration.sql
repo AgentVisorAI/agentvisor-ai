@@ -12,14 +12,15 @@
 -- closed via `take: 5`. `take: 5` caps argon2 CPU; this index
 -- caps the DB I/O.
 --
--- Plain `CREATE INDEX` (not CONCURRENTLY): `prisma migrate
--- deploy` wraps each migration in a transaction, and
--- CONCURRENTLY cannot run inside a transaction — using it here
--- would break the deploy. This takes a SHARE lock on `invites`
--- for the duration of the build, blocking writes until it
--- completes. On an unbloated table the build is milliseconds;
--- if the DoS class this closes has already partially succeeded
--- before deploy, budget for INSERT/UPDATE stalls proportional
--- to table size (or split into two migrations with an explicit
--- transaction boundary and CONCURRENTLY on the second).
+-- Plain `CREATE INDEX` (not CONCURRENTLY) is used because the
+-- invites table is small at launch and the SHARE lock the build
+-- takes is milliseconds. If the table grows large enough that
+-- this becomes an operational concern, we can switch to
+-- `CREATE INDEX CONCURRENTLY IF NOT EXISTS` in-place — Prisma
+-- Migrate does NOT wrap `.sql` migration files in an implicit
+-- transaction (upstream: prisma/prisma#6491), so CONCURRENTLY
+-- runs cleanly under `prisma migrate deploy`. (The R82 revision
+-- of this comment falsely claimed a transaction wrapper; the
+-- migration deploys correctly either way, but the false premise
+-- was misleading the next engineer's tool choice.)
 CREATE INDEX IF NOT EXISTS "invites_email_idx" ON "invites"("email");

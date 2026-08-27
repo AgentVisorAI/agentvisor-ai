@@ -60,6 +60,34 @@ export interface SessionClaims {
   iat: number; // JWT issued-at, seconds since epoch — checked against user.sessionRevokedAt
 }
 
+// R83 F1: role-hierarchy rank used to enforce "no grant above your own".
+// Prior shape gated role-mutating endpoints (PATCH /members/:userId,
+// POST /invites, POST /api/v1/keys) on `membershipRole !== "member"`
+// and then accepted an arbitrary `role: "owner" | "admin" | "member"`
+// from the request body. Result: any admin could (a) invite an
+// attacker-controlled address as OWNER, (b) promote an existing
+// member/admin to OWNER, or (c) mint an OWNER-scoped API key —
+// all three paths hand out roles STRICTLY GREATER than the caller's
+// own. Owner grants owner-only endpoints such as `POST
+// /me/delete-account` (whole-org cascade delete) and `POST
+// /saml/:configId/keypair` (DOSes SAML IdP trust). This helper
+// centralizes the "cannot grant above your rank" check so a caller
+// with role R can only grant roles ≤ R. Owners can grant any role;
+// admins can grant admin or member; members can't reach these
+// endpoints at all.
+const ROLE_RANK: Record<SessionClaims["membershipRole"], number> = {
+  owner: 3,
+  admin: 2,
+  member: 1,
+};
+
+export function canGrantRole(
+  callerRole: SessionClaims["membershipRole"],
+  targetRole: SessionClaims["membershipRole"],
+): boolean {
+  return ROLE_RANK[callerRole] >= ROLE_RANK[targetRole];
+}
+
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
 
 export async function mintSession(claims: Omit<SessionClaims, "iat">): Promise<string> {
