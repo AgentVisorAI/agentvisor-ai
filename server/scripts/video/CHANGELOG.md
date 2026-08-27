@@ -37,3 +37,41 @@ proper "click happens on-screen" moment for the /verify scene.
 ## v4 — initial pipeline (2026-08-27)
 
 First draft with title cards + UI scenes + basic captions.
+
+## v6 — copy + typography pass (2026-08-27)
+
+Lowered cognitive load per frame. Every title card now has less
+text, sharper copy, and stagger-animates line by line instead of
+fading in as a block.
+
+**Copy changes:**
+
+* Removed redundant "AGENTVISOR AI" kickers on scenes 1, 3, 7 —
+  the persistent brand bar at the bottom already says it.
+* Scene 1: "AI agents are making real decisions — with real money."
+  → "AI agents make real decisions with real money." (removed
+  em-dash + "are making" progressive tense).
+* Scene 2: "An agent buys the wrong vendor. $8,400 gone. Nobody
+  signed off." → "Bad tool call. $8,400 gone." (12 words → 5 + a
+  number). Punch lands harder.
+* Scene 3: "Every agent decision, captured. Enforced. Signed." →
+  "Every decision: captured. enforced. signed." (colon list
+  rhythm, lowercase for tenet feel).
+* Scene 4 caption: "Every session — every tool call — captured in
+  real time." (abstract) → "32 sessions · 7 blocked · $31,840
+  saved." (concrete numbers matching the KPI tiles on screen).
+
+**Typography:**
+
+* Line-by-line reveal animation. Each `<br>`-separated line in the
+  headline gets `<span class="line">` with a stagger animation-delay
+  (0.15s + 0.18s per line). Eye's rhythm matches text's rhythm.
+* Subline delay computed from `lines.length` so multi-line
+  headlines still land before the sub does.
+
+**Metrics:**
+
+* Duration: 44.1s (up 0.4s from v5 — line staggers cost nothing but
+  the overall pacing is unchanged)
+* Size: 7.4 MB (unchanged)
+
