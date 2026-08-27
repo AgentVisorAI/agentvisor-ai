@@ -513,7 +513,8 @@ code, pre, .mono {
    kbd-hint against that tint fails WCAG AA. Force a stronger color
    just for the active state. */
 .sidebar a.active .kbd-hint { color: var(--accent-hover); opacity: 0.75; }
-[data-theme="dark"] .sidebar a.active, @media (prefers-color-scheme: dark) { .sidebar a.active { color: var(--fg); } }
+[data-theme="dark"] .sidebar a.active { color: var(--fg); }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .sidebar a.active { color: var(--fg); } }
 .sidebar a svg { width: 15px; height: 15px; flex-shrink: 0; opacity: 0.9; }
 .sidebar a .badge {
   margin-left: auto;
@@ -1252,7 +1253,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 .cmdk .item .desc { color: var(--fg-3); font-size: 12px; margin-left: 6px; }
 .cmdk .item.selected { background: var(--accent-bg); color: var(--accent-hover); }
-[data-theme="dark"] .cmdk .item.selected, @media (prefers-color-scheme: dark) { .cmdk .item.selected { color: var(--fg); } }
+[data-theme="dark"] .cmdk .item.selected { color: var(--fg); }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .cmdk .item.selected { color: var(--fg); } }
 .cmdk .item svg { width: 15px; height: 15px; opacity: 0.8; }
 .cmdk .item .kbd { margin-left: auto; }
 .cmdk-footer {
@@ -1337,7 +1339,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 .settings-nav button:hover { background: var(--surface-hover); color: var(--fg); }
 .settings-nav button.active { background: var(--accent-bg); color: var(--accent-hover); }
-[data-theme="dark"] .settings-nav button.active, @media (prefers-color-scheme: dark) { .settings-nav button.active { color: var(--fg); } }
+[data-theme="dark"] .settings-nav button.active { color: var(--fg); }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .settings-nav button.active { color: var(--fg); } }
 .settings-panel .card { margin-bottom: var(--s-3); }
 
 /* ============================================================
