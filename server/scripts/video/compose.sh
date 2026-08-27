@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
-# Stitch the 7 scenes into one video with crossfades and burned-in
-# captions on the UI scenes.
+# Stitch the 8 scenes of the full-flow walkthrough into one video
+# with crossfades and burned-in captions on the UI scenes.
+#
+# Scene structure (v16 full-flow):
+#   01-landing  — marketing site, brief Ken Burns
+#   02-signin   — live login form fill
+#   03-overview — dashboard first-load, zoom to $31,840 tile
+#   04-sessions — sessions list, pulse blocked pill
+#   05-session  — session detail, pulse $8,400 blocked value
+#   06-download — hover + click Download receipt
+#   07-verify   — public verifier, drop file, green tick
+#   08-close    — CTA card
 set -euo pipefail
 
 SCENES=/tmp/video-v4/scenes
@@ -18,15 +28,15 @@ dur() {
 
 mkdir -p "$OUT/norm"
 
-# Title cards: just re-encode.
+# Scenes with no burned-in caption: landing, signin, close.
 #
-# Scene 1 gets a 0.3s trim off the front to skip the brief
-# white flash Playwright emits while the data-URL card renders.
-# The first frame of the final video is the thumbnail everyone
-# sees when the URL is shared — it has to be the fully-composed
-# card, not a white flash.
-for name in 01-intro 02-problem 03-solution 07-close; do
-  if [ "$name" = "01-intro" ]; then
+# Scene 1 (landing) gets a 0.3s trim off the front to skip the
+# brief white flash Playwright emits while the page loads. The
+# first frame of the final video is the thumbnail everyone sees
+# when the URL is shared — it has to be the fully-composed
+# landing page, not a white flash.
+for name in 01-landing 02-signin 08-close; do
+  if [ "$name" = "01-landing" ] || [ "$name" = "08-close" ]; then
     trim="-ss 0.30"
   else
     trim=""
@@ -55,28 +65,35 @@ add_caption() {
   " -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p "$output" 2>&1 | tail -1
 }
 
-add_caption "$SCENES/04-console.webm" "$OUT/norm/04-console.mp4" \
+add_caption "$SCENES/03-overview.webm" "$OUT/norm/03-overview.mp4" \
   "32 sessions · 7 blocked · \$31,840 saved."
+
+add_caption "$SCENES/04-sessions.webm" "$OUT/norm/04-sessions.mp4" \
+  "One session was blocked."
 
 add_caption "$SCENES/05-session.webm" "$OUT/norm/05-session.mp4" \
   "Blocked at \$8,400. Signed. Auditable."
 
-# Scene 6 is interactive — empty drop zone in the first ~1.5s (cursor
+add_caption "$SCENES/06-download.webm" "$OUT/norm/06-download.mp4" \
+  "Downloadable. Portable. Provable."
+
+# Scene 7 is interactive — empty drop zone in the first ~1.5s (cursor
 # pre-positioned near the sample link, so viewer's eye is already
 # there), then click, then verified state. Caption fades in at t=2.0s
 # once the verified card is centered on screen.
-add_caption "$SCENES/06-verify.webm" "$OUT/norm/06-verify.mp4" \
+add_caption "$SCENES/07-verify.webm" "$OUT/norm/07-verify.mp4" \
   "Drop the receipt. Verified in the browser. No account." \
   "gte(t,2.0)"
 
-D1=$(dur "$OUT/norm/01-intro.mp4")
-D2=$(dur "$OUT/norm/02-problem.mp4")
-D3=$(dur "$OUT/norm/03-solution.mp4")
-D4=$(dur "$OUT/norm/04-console.mp4")
+D1=$(dur "$OUT/norm/01-landing.mp4")
+D2=$(dur "$OUT/norm/02-signin.mp4")
+D3=$(dur "$OUT/norm/03-overview.mp4")
+D4=$(dur "$OUT/norm/04-sessions.mp4")
 D5=$(dur "$OUT/norm/05-session.mp4")
-D6=$(dur "$OUT/norm/06-verify.mp4")
-D7=$(dur "$OUT/norm/07-close.mp4")
-echo "Durations: 1=$D1 2=$D2 3=$D3 4=$D4 5=$D5 6=$D6 7=$D7"
+D6=$(dur "$OUT/norm/06-download.mp4")
+D7=$(dur "$OUT/norm/07-verify.mp4")
+D8=$(dur "$OUT/norm/08-close.mp4")
+echo "Durations: 1=$D1 2=$D2 3=$D3 4=$D4 5=$D5 6=$D6 7=$D7 8=$D8"
 
 XF=0.5
 O2=$(awk "BEGIN{printf \"%.3f\", $D1 - $XF}")
@@ -85,16 +102,18 @@ O4=$(awk "BEGIN{printf \"%.3f\", $O3 + $D3 - $XF}")
 O5=$(awk "BEGIN{printf \"%.3f\", $O4 + $D4 - $XF}")
 O6=$(awk "BEGIN{printf \"%.3f\", $O5 + $D5 - $XF}")
 O7=$(awk "BEGIN{printf \"%.3f\", $O6 + $D6 - $XF}")
-echo "Offsets: 2=$O2 3=$O3 4=$O4 5=$O5 6=$O6 7=$O7"
+O8=$(awk "BEGIN{printf \"%.3f\", $O7 + $D7 - $XF}")
+echo "Offsets: 2=$O2 3=$O3 4=$O4 5=$O5 6=$O6 7=$O7 8=$O8"
 
 ffmpeg -y \
-  -i "$OUT/norm/01-intro.mp4" \
-  -i "$OUT/norm/02-problem.mp4" \
-  -i "$OUT/norm/03-solution.mp4" \
-  -i "$OUT/norm/04-console.mp4" \
+  -i "$OUT/norm/01-landing.mp4" \
+  -i "$OUT/norm/02-signin.mp4" \
+  -i "$OUT/norm/03-overview.mp4" \
+  -i "$OUT/norm/04-sessions.mp4" \
   -i "$OUT/norm/05-session.mp4" \
-  -i "$OUT/norm/06-verify.mp4" \
-  -i "$OUT/norm/07-close.mp4" \
+  -i "$OUT/norm/06-download.mp4" \
+  -i "$OUT/norm/07-verify.mp4" \
+  -i "$OUT/norm/08-close.mp4" \
   -filter_complex "
     [0:v][1:v]xfade=transition=fade:duration=$XF:offset=$O2[v01];
     [v01][2:v]xfade=transition=fade:duration=$XF:offset=$O3[v02];
@@ -102,7 +121,8 @@ ffmpeg -y \
     [v03][4:v]xfade=transition=fade:duration=$XF:offset=$O5[v04];
     [v04][5:v]xfade=transition=fade:duration=$XF:offset=$O6[v05];
     [v05][6:v]xfade=transition=fade:duration=$XF:offset=$O7[v06];
-    [v06]fade=t=out:st=$(awk "BEGIN{printf \"%.3f\", $O7 + $D7 - 0.8}"):d=0.8:color=black[vout]
+    [v06][7:v]xfade=transition=fade:duration=$XF:offset=$O8[v07];
+    [v07]fade=t=out:st=$(awk "BEGIN{printf \"%.3f\", $O8 + $D8 - 0.8}"):d=0.8:color=black[vout]
   " \
   -map "[vout]" \
   -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p -movflags +faststart \
@@ -122,11 +142,11 @@ if [ -f "$OUT/audio/soundtrack-44s.aac" ]; then
 fi
 
 # Auto-mux narrated cut if the narration bed exists. This is the
-# definitive pitch cut (voice + whoosh bed).
+# definitive full-flow cut (voice + whoosh bed).
 if [ -f "$OUT/audio/narration-44s.aac" ]; then
-  echo "→ Muxing narrated cut (definitive pitch)"
+  echo "→ Muxing narrated cut (definitive full-flow)"
   ffmpeg -y -i "$OUT/agentvisor-mockup-v4.mp4" -i "$OUT/audio/narration-44s.aac" \
     -c:v copy -c:a aac -shortest \
-    "$OUT/agentvisor-mockup-v13-narrated.mp4" 2>&1 | tail -1
-  ls -lh "$OUT/agentvisor-mockup-v13-narrated.mp4"
+    "$OUT/agentvisor-mockup-v16-fullflow.mp4" 2>&1 | tail -1
+  ls -lh "$OUT/agentvisor-mockup-v16-fullflow.mp4"
 fi
