@@ -110,3 +110,32 @@ branding, re-run `record-scenes.mjs`, then re-run both
 `compose.sh` and `compose-teaser.sh` to get fresh renders of both
 formats in ~5 minutes.
 
+
+## v8 — universal language + tighter pacing (2026-08-27)
+
+Sixth iteration. Two small changes with disproportionate impact.
+
+### Scene 2 copy — "One wrong decision"
+
+v7: "Bad tool call. $8,400 gone."
+v8: **"One wrong decision. $8,400 gone."**
+
+* "Tool call" is domain jargon. CFO / generalist investor doesn't
+  know what a tool call is. "Decision" is universal.
+* Direct callback to scene 1's "AI agents make real decisions
+  with real money" — the pitch pays off its own setup in 8s.
+* "One" prefix emphasizes that a SINGLE failure cost real money.
+
+### Scene 6 pacing — pre-positioned cursor
+
+v7: 1.4s dwell → mouse move 500ms → click → 800ms → 3.5s hold.
+v8: **0.8s dwell** (cursor already hovering over the sample link)
+    → 120ms micro-move → click → 350ms → 700ms scroll → **4.5s hold**.
+
+Cognitive weight shifts from "waiting for something to happen" to
+"watching the proof land." The green trusted-key card dominates
+the scene for 4.5s instead of 3.5s.
+
+Caption gate adjusted: `enable='gte(t,2.5)'` → `enable='gte(t,2.0)'`
+because click happens 0.5s earlier.
+

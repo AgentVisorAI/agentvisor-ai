@@ -237,11 +237,13 @@ await recordScene(browser, "01-intro", 5500, async (page, ms) => {
 
 // ═════════════════════════════════════════════════════════════════
 // SCENE 2 — Problem card. Tighter: two-line headline + subline.
+// "One wrong decision" links back to scene 1's "AI agents make real
+// decisions" — the payoff for that framing lands directly.
 // ═════════════════════════════════════════════════════════════════
 await recordScene(browser, "02-problem", 5500, async (page, ms) => {
   await showCard(page, cardHtml({
     bg: "#08111a",
-    headline: `Bad tool call.<br><span class="accent-red">$8,400</span> gone.`,
+    headline: `One wrong decision.<br><span class="accent-red">$8,400</span> gone.`,
     sub: "No audit trail. No accountability. No way to prove what happened.",
   }), ms);
 });
@@ -286,36 +288,41 @@ await recordConsoleScene(
 // SCENE 6 — Verify page: watch the "click sample → verify" happen
 // LIVE. This is the "magic moment" — investors should see the click
 // happen, not arrive at a pre-verified state.
+//
+// Tighter than v6: cursor pre-positioned near the sample link so the
+// user's eye is already there when the click fires. Pre-click dwell
+// down from 1.4s to 0.8s. Verified state now holds for ~5s (was ~3.5s).
 // ═════════════════════════════════════════════════════════════════
 await recordScene(browser, "06-verify", 8500, async (page, ms) => {
   await page.goto(LANDING + "/verify/", { waitUntil: "networkidle" });
   await page.waitForSelector("#loadExample", { timeout: 10000 });
-  // Give the viewer 1.2s to see the empty drop zone and read the sample link
-  await page.waitForTimeout(1400);
-  // Move the mouse over the sample link visibly, then click
+  // Pre-position cursor near the target so the eye tracks to it during
+  // the initial 0.8s dwell. Investor sees the cursor already hovering
+  // over "Try it with a sample receipt" and knows what's about to
+  // happen.
   const btn = page.locator("#loadExample");
   const box = await btn.boundingBox();
   if (box) {
-    // Steady move so it feels human, not warp-teleported
-    await page.mouse.move(box.x + box.width - 20, box.y + box.height / 2 + 300, { steps: 15 });
-    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 20 });
-    await page.waitForTimeout(300);
+    await page.mouse.move(box.x + box.width / 2 - 30, box.y - 8, { steps: 1 });
   }
+  await page.waitForTimeout(700);
+  // Small final micro-move for humanity, then click
+  if (box) {
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 6 });
+  }
+  await page.waitForTimeout(120);
   await btn.click();
-  // Wait for the crypto verify to complete + card to appear
   await page.waitForSelector(".result-card", { timeout: 8000 });
-  await page.waitForTimeout(500);
-  // Scroll so the green verified card is centered — smooth camera move
+  await page.waitForTimeout(350);
+  // Smooth-scroll to center the verified card
   await page.evaluate(() => {
     const card = document.querySelector(".result-card");
     if (card) card.scrollIntoView({ behavior: "smooth", block: "center" });
   });
-  await page.waitForTimeout(800);
-  // Apply cinematic AFTER the interactive moment so the pulse doesn't
-  // interfere with the click; pulse the result-card border for
-  // emphasis.
-  await applyCinematic(page, { zoomMs: 3500, pulseSelector: ".result-card" });
-  await page.waitForTimeout(3500);
+  await page.waitForTimeout(700);
+  // Longer hold on the verified state — 4.5s of Ken Burns + pulse
+  await applyCinematic(page, { zoomMs: 4500, pulseSelector: ".result-card" });
+  await page.waitForTimeout(4500);
 });
 
 // ═════════════════════════════════════════════════════════════════
