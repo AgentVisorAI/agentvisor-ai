@@ -88,9 +88,15 @@ await wait(2200);
 await page.goto(SITE + "#/settings/audit");
 await wait(2800);
 
-// SCENE 7 — Back to overview to close the narrative (58-62s)
-await page.goto(SITE + "#/overview");
-await wait(2500);
+// SCENE 7 — Verify page as closing beat (58-70s)
+// This is the moment: no login, no signup — anyone can drop a
+// receipt in their browser and see the cryptographic guarantee
+// hold up.
+const verifyUrl = new URL(SITE).origin + "/verify/";
+await page.goto(verifyUrl, { waitUntil: "networkidle" });
+await wait(2000);
+await page.locator("#loadExample").click();
+await wait(4000);
 
 await context.close();
 await browser.close();

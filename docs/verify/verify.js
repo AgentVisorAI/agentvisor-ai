@@ -181,3 +181,32 @@
         render({ kind: "err", message: "Couldn't load sample: " + e.message });
       }
     });
+
+    // Shareable receipt URL:
+    //     agentvisorai.me/verify/#data=<base64url-encoded-JSON>
+    // The console's "Share this receipt" button generates this URL. When
+    // the recipient opens the link, we base64url-decode the fragment and
+    // auto-verify. Fragment (not query) so the payload never touches
+    // the server — GitHub Pages doesn't see the URL fragment, browser
+    // history doesn't leak it beyond this tab.
+    function tryFragment() {
+      const raw = location.hash.slice(1); // strip leading #
+      if (!raw) return;
+      const params = new URLSearchParams(raw);
+      const data = params.get("data");
+      if (!data) return;
+      try {
+        // base64url -> base64 -> bytes -> UTF-8 text.
+        const b64 = data.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((data.length + 3) % 4);
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        const text = new TextDecoder().decode(bytes);
+        handleText(text);
+      } catch (e) {
+        render({ kind: "err", message: "Couldn't decode shared receipt from URL: " + e.message });
+      }
+    }
+    tryFragment();
+    // Re-verify if the fragment changes (SPA-style navigation).
+    window.addEventListener("hashchange", tryFragment);
