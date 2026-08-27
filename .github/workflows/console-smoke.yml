@@ -99,6 +99,12 @@ jobs:
           SITE: https://agentvisorai.me/
         run: node scripts/verify-page-drill.mjs
 
+      - name: Interactive features drill (tour, attack demo, onboarding, billing, reset)
+        working-directory: server
+        env:
+          SITE: https://agentvisorai.me/app/
+        run: node scripts/interactive-drill.mjs
+
       - name: Shareable receipt URL drill
         working-directory: server
         env:
