@@ -1,5 +1,30 @@
 # Video pipeline changelog
 
+## v13 — closing CTA (2026-08-27)
+
+The v12 closing card used a 26px subtitle for the URL. Small enough
+to read but too small to screen-grab or memorize in a meeting.
+Investors who want to try the product need a **CTA that looks like
+a link**, not a footnote.
+
+**New closing card design:**
+
+* Headline unchanged: *"AI agents you can hand to an auditor."*
+* URL is now a 44px yellow pill button: **→ agentvisorai.me**
+  * Rounded (border-radius: 999px)
+  * Yellow accent border + soft yellow tint fill
+  * Arrow prefix reads as "call to action" not "subtitle"
+* Card animates in with a slight stagger (headline first, then CTA
+  reveals half a beat later — the eye lands on the promise, then
+  the invitation).
+
+**Scene 7 extended** from 4.5s → 5.5s to give the CTA time to
+breathe. Narration updated to include the invitation:
+*"AI agents you can hand to an auditor. Try it live at
+agentvisorai.me."*
+
+Total video: 44.7s (was 43.6s).
+
 ## v12 — narration/caption/card alignment (2026-08-27)
 
 Watching v11 end-to-end via frame extraction revealed a critical
