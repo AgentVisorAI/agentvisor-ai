@@ -240,13 +240,13 @@ code, pre, .mono {
   padding: 10px 14px;
   border: 0;
   border-radius: var(--r);
-  background: var(--fg);
-  color: var(--canvas);
+  background: var(--accent);
+  color: var(--accent-fg);
   font-weight: 500;
   margin-top: var(--s-2);
-  transition: opacity 100ms, transform 60ms;
+  transition: opacity 100ms, transform 60ms, background 100ms;
 }
-.auth-form button.primary:hover { opacity: 0.92; }
+.auth-form button.primary:hover { background: var(--accent-hover); opacity: 1; }
 .auth-form button.primary:active { transform: translateY(1px); }
 .auth-form button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
 .auth-form .sso {
