@@ -348,9 +348,10 @@ data/bridge/
           <p class="section-kicker">Get started</p>
           <h2>60 seconds, one prompt at a time.</h2>
           <p>
-            Requires <a href="https://rustup.rs/">Rust</a>, or a pre-built
-            binary from the
-            <a href="https://github.com/AgentVisorAI/agentvisor-ai/releases">releases page</a>.
+            Requires <a href="https://rustup.rs/">Rust</a>. Clone the
+            <a href="https://github.com/AgentVisorAI/agentvisor-ai">repo</a> and
+            install both binaries with <code>cargo install --path</code>
+            (two commands, shown in the README).
             The wizard asks one thing at a time and writes the config
             file for you. When it finishes, AgentVisor AI is running on
             <code>http://127.0.0.1:8484</code>.
@@ -361,7 +362,8 @@ data/bridge/
           </p>
         </div>
         <div>
-<pre class="code-shell" tabindex="0" role="region" aria-label="Shell output example"><code><span class="prompt">$</span> cargo install av-harness av-cli
+<pre class="code-shell" tabindex="0" role="region" aria-label="Shell output example"><code><span class="prompt">$</span> git clone https://github.com/AgentVisorAI/agentvisor-ai &amp;&amp; cd agentvisor-ai
+<span class="prompt">$</span> cargo install --path crates/av-harness &amp;&amp; cargo install --path crates/av-cli
 <span class="prompt">$</span> avctl
 
   <span class="c">1) OpenAI (GPT models)</span>
@@ -462,7 +464,7 @@ data/bridge/
       </p>
       <p class="muted">
         AgentVisor AI is open source and free to use. If it saves you
-        from a 3&nbsp;AM incident, please <a href="https://github.com/AgentVisorAI/agentvisor-ai/stargazers">star the repo</a>.
+        from a 3&nbsp;AM incident, please <a href="https://github.com/AgentVisorAI/agentvisor-ai">star the repo</a>.
       </p>
     </div>
   </footer>
