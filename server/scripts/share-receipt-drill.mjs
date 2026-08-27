@@ -132,6 +132,17 @@ const tamperedUrl = localizedUrl.split("#data=")[0] + "#data=" + tamperedB64u;
 
 await bob.goto(tamperedUrl, { waitUntil: "networkidle" });
 await bob.waitForSelector(".result-card", { timeout: 8000 });
+// R82 F5: same waitForFunction guard as the legit-URL branch above.
+// The tampered path renders the same async verify pipeline; without
+// this a busy CI runner reads the "Verifying signature…" loading
+// text and the /does not verify/ assertion misses silently.
+await bob.waitForFunction(
+  () => {
+    const t = document.querySelector(".result-title")?.textContent || "";
+    return t.length > 0 && !/verifying signature/i.test(t);
+  },
+  { timeout: 8000 },
+);
 {
   const title = await bob.locator(".result-title").innerText();
   if (!/does not verify/i.test(title)) fail("tampered URL still says verifies: " + title);

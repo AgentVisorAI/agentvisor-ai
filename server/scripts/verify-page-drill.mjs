@@ -24,6 +24,25 @@ const VERIFY_URL = new URL("verify/", SITE).href;
 function fail(m) { console.log("❌", m); process.exit(1); }
 async function wait(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
+// R81 F1 + R82 F1: helper — every `.result-title` read races the
+// async `crypto.subtle.verify` inside `verify.js`, and the transient
+// "Verifying signature…" loading card shares its `.pending` class
+// with the terminal "internally consistent" state. R81 F1 landed
+// this guard on ONE of eight title reads in this drill; without it
+// on every read, a busy CI runner reads the loading string and
+// falls into a silent fail. Call `waitVerifyStable(page)` after any
+// action that triggers a verify (loadExample click, uploadJson,
+// tamper/restore) and BEFORE reading .result-title.
+async function waitVerifyStable(pg, timeout = 8000) {
+  await pg.waitForFunction(
+    () => {
+      const t = document.querySelector(".result-title")?.textContent || "";
+      return t.length > 0 && !/verifying signature/i.test(t);
+    },
+    { timeout },
+  );
+}
+
 const browser = await chromium.launch({ headless: true });
 const context = await browser.newContext({ viewport: { width: 1200, height: 900 } });
 const page = await context.newPage();
@@ -43,18 +62,7 @@ console.log("✅ /verify page renders with drop zone + sample button");
 // a forged fresh-keypair bundle must NOT (step 4 guards that).
 await page.locator("#loadExample").click();
 await wait(1500);
-// R81 F1: guard against the "Verifying signature…" loading race —
-// the pending class is shared between the loading state and the
-// terminal "internally consistent" state, so a busy CI runner
-// can read the wrong text if we don't wait for the loading text
-// to leave.
-await page.waitForFunction(
-  () => {
-    const t = document.querySelector(".result-title")?.textContent || "";
-    return !/verifying signature/i.test(t);
-  },
-  { timeout: 8000 },
-);
+await waitVerifyStable(page);
 {
   const title = await page.locator(".result-title").innerText();
   if (/does not verify/i.test(title)) fail("sample rendered as does-not-verify. title=" + title);
@@ -70,12 +78,14 @@ await page.waitForFunction(
 {
   await page.locator("#tamperBtn").click();
   await wait(1200);
+  await waitVerifyStable(page);
   const title = await page.locator(".result-title").innerText();
   if (!/does not verify/i.test(title)) fail("tamper demo didn't flip to does-not-verify: " + title);
   const note = await page.locator(".tamper-note").innerText();
   if (!/one byte/i.test(note)) fail("tamper demo missing explainer note: " + note);
   await page.locator("#restoreBtn").click();
   await wait(1200);
+  await waitVerifyStable(page);
   const restored = await page.locator(".result-title").innerText();
   if (!/verifies against a trusted key/i.test(restored)) fail("restore didn't return to TRUSTED: " + restored);
   console.log("✅ tamper demo: one byte -> red, restore -> green");
@@ -101,6 +111,7 @@ async function uploadJson(text) {
 
 await uploadJson(sampleText);
 {
+  await waitVerifyStable(page);
   const title = await page.locator(".result-title").innerText();
   // Same rationale as step 2: the sample's key is a shipped anchor.
   if (/does not verify/i.test(title)) fail("uploaded legit rendered as does-not-verify");
@@ -116,6 +127,7 @@ if (!/"receiptId"/.test(tampered.receipt.rawBody)) fail("sample rawBody has no r
 tampered.receipt.rawBody = tampered.receipt.rawBody.replace(/"receiptId"/, '"receiptID"');
 await uploadJson(JSON.stringify(tampered));
 {
+  await waitVerifyStable(page);
   const title = await page.locator(".result-title").innerText();
   if (!/does not verify/i.test(title)) fail("tampered still says verifies: " + title);
   console.log("✅ tampered rawBody -> DOM shows 'Signature does not verify'");
@@ -145,6 +157,7 @@ await uploadJson(JSON.stringify(tampered));
   forged.receipt.rawSignatureB64 = forgedSig.toString("base64");
   forged.publicKey.hex = forgedPubHex;
   await uploadJson(JSON.stringify(forged));
+  await waitVerifyStable(page);
   const title = await page.locator(".result-title").innerText();
   if (/verifies against a trusted key/i.test(title)) fail("forged bundle rendered as TRUSTED — trust anchor gate bypassed: " + title);
   if (!/internally consistent/i.test(title)) fail("forged bundle didn't render as INTERNALLY CONSISTENT: " + title);
@@ -166,6 +179,7 @@ await uploadJson(JSON.stringify(tampered));
     window.TRUSTED_RECEIPT_KEYS.add(hex);
   }, forgedPubHex);
   await uploadJson(JSON.stringify(forged));
+  await waitVerifyStable(page);
   const trustedTitle = await page.locator(".result-title").innerText();
   if (!/verifies against a trusted key/i.test(trustedTitle)) fail("after injecting pubkey into TRUSTED_RECEIPT_KEYS, DOM still didn't render as TRUSTED — R78 destructure bug regressed?: " + trustedTitle);
   console.log("✅ forged bundle with pubkey in TRUSTED_RECEIPT_KEYS -> DOM shows TRUSTED (trustedKey threaded correctly)");
