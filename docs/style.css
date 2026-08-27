@@ -429,7 +429,7 @@ p:last-child { margin-bottom: 0; }
   font-size: 0.72rem;
   font-weight: 500;
 }
-.mock-pill.live   { background: rgba(26, 124, 59, 0.14);  color: #1a7c3b; }
+.mock-pill.live   { background: rgba(26, 124, 59, 0.14);  color: #14582c; }
 .mock-pill.closed { background: rgba(10, 92, 139, 0.12);  color: #0a5c8b; }
 .mock-pill.failed { background: rgba(181, 58, 27, 0.12);  color: #b53a1b; }
 
@@ -540,6 +540,12 @@ pre {
   font: 0.92rem/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace;
   margin: 0;
   border: 1px solid transparent;
+}
+/* Scrollable code regions are keyboard-focusable (tabindex=0); give
+ * keyboard users a visible focus indicator. */
+pre:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04),
               0 8px 24px rgba(0, 0, 0, 0.06);
 }
@@ -571,10 +577,13 @@ p code, li code {
 }
 
 /* Syntax colours */
-.k { color: var(--token-key); }
-.s { color: var(--token-str); }
-.n { color: var(--token-num); }
-.c { color: var(--token-comment); font-style: italic; }
+/* Syntax token colors. Code blocks are always dark, so use the
+ * dark-surface palette unconditionally; the light-theme variants
+ * fail WCAG contrast on var(--bg-code-dark). */
+.k { color: #d18ac5; }
+.s { color: #a5cef5; }
+.n { color: #e59b7c; }
+.c { color: #8a92a0; font-style: italic; }
 
 @media (prefers-color-scheme: dark) {
   pre {
@@ -583,10 +592,14 @@ p code, li code {
   }
 }
 
-/* Diff header + add lines */
+/* Diff header + add lines.
+ * Code blocks are always dark (var(--bg-code-dark)) even in the
+ * light theme, so these must use fixed dark-surface colors, not the
+ * theme tokens: the light-theme values fail WCAG contrast on the
+ * dark background. */
 .diff-header {
   display: block;
-  color: var(--fg-muted);
+  color: #a7b0ba;
   font-size: 0.78rem;
   text-transform: uppercase;
   letter-spacing: 0.1em;
@@ -596,14 +609,15 @@ p code, li code {
 .diff-add {
   display: inline-block;
   width: 100%;
-  color: var(--token-add);
-  background: var(--token-add-bg);
+  color: #6ecf8e;
+  background: rgba(110, 207, 142, 0.10);
   margin: 0 -1.25rem;
   padding: 0 1.25rem;
 }
 
 /* HTTP status highlight */
-.http-status { color: var(--status-fg); font-weight: 600; }
+/* Inside always-dark pre blocks: fixed dark-surface color for contrast. */
+.http-status { color: #e59b7c; font-weight: 600; }
 
 /* Shell prompt */
 .prompt { color: var(--token-comment); user-select: none; }

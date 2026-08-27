@@ -173,9 +173,9 @@
       if (f) handleFile(f);
     });
     drop.addEventListener("click", (ev) => { if (ev.target !== browseBtn) fileInput.click(); });
-    drop.addEventListener("keydown", (ev) => {
-      if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); fileInput.click(); }
-    });
+    // Keyboard access is provided by the real <button id="browseBtn">;
+    // the outer div is a pointer-only drop target (kept non-focusable
+    // to avoid nested-interactive a11y violations).
     browseBtn.addEventListener("click", (ev) => { ev.stopPropagation(); fileInput.click(); });
     fileInput.addEventListener("change", () => handleFile(fileInput.files?.[0]));
 
