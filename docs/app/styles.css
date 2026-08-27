@@ -1527,7 +1527,10 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 #avTourLauncher #avTourDismiss:hover { opacity: 1; }
 #avTourLauncher #avTourStart:hover { text-decoration: underline; }
 
-#avTour { position: fixed; inset: 0; z-index: 950; pointer-events: none; }
+/* The overlay absorbs every click outside the card so a stray click
+   can't navigate the app underneath a tour step (audit D1). Tour
+   advancement is via the card buttons / arrow keys. */
+#avTour { position: fixed; inset: 0; z-index: 950; pointer-events: auto; }
 .av-tour-hole {
   position: fixed;
   border-radius: 10px;
