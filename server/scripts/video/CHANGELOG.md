@@ -1,5 +1,40 @@
 # Video pipeline changelog
 
+## v15 — first-frame poster fix (2026-08-27)
+
+**Critical bug found by sampling the actual first frame.**
+
+v14's first frame was pure black. The video opened with a 0.6s
+fade-in from black. That means every URL preview thumbnail —
+LinkedIn, Twitter, GitHub, WhatsApp — showed a black rectangle.
+Nobody clicks a black rectangle.
+
+Testing revealed an additional problem: Playwright's `page.goto`
+briefly rendered white while the data-URL loaded, so even with
+the fade-in removed, the first ~0.3s of scene 1 was a white
+flash.
+
+**Two-part fix in compose.sh + record-scenes.mjs:**
+
+1. **Remove the fade-in-from-black.** The `fade=t=in:st=0:d=0.6:
+   color=black` filter is gone. The video now starts on scene 1's
+   composed pixels — no black frames.
+
+2. **Trim 0.3s off the front of scene 1** during normalization
+   (`ffmpeg -ss 0.30`) to skip the Playwright page-load flash.
+
+3. **Static intro headline.** Added a `staticHeadline: true`
+   option to `cardHtml` that renders the intro text at its final
+   position from frame 1 (no reveal animation). Scene 1 is the
+   thumbnail — it can't wait 0.7s to become legible.
+
+Verified via frame extraction: the new first frame shows the
+fully-composed "AI agents make real decisions with real money"
+card in navy blue. Ready to be a thumbnail.
+
+Narration delays retimed to match the new offsets (scene 1 is
+now 0.3s shorter, so scenes 2-7 shift ~330ms earlier).
+
 ## v14 — subtle ambient pad (2026-08-27)
 
 The v13 audio track was voice + whooshes with silence between

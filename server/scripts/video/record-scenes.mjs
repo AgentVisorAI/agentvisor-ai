@@ -26,9 +26,17 @@ function cardHtml(opts) {
   // each one animates in on a stagger. Investors read the top line
   // first, then each subsequent line reveals with a small delay — the
   // eye's rhythm matches the text's rhythm.
+  //
+  // When `staticHeadline: true`, the reveal is baked in — text is at
+  // its final position from frame 1. Used on scene 1 (the intro card)
+  // because its first frame is the thumbnail everyone sees when the
+  // URL is shared. A blank fade-in makes for a terrible thumbnail.
   const lines = headline.split("<br>");
+  const staticHead = opts.staticHeadline === true;
   const animatedHeadline = lines.map((line, i) =>
-    `<span class="line" style="animation-delay: ${0.15 + i * 0.18}s">${line}</span>`
+    staticHead
+      ? `<span class="line static">${line}</span>`
+      : `<span class="line" style="animation-delay: ${0.15 + i * 0.18}s">${line}</span>`
   ).join("");
   return `<!doctype html><html><head><meta charset="utf-8"><style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -49,6 +57,12 @@ function cardHtml(opts) {
     .headline .line {
       display: block; opacity: 0; transform: translateY(20px);
       animation: revealText 0.7s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
+    /* Static variant used on scene 1 so the first frame is
+     * already the fully-composed poster (used as the thumbnail
+     * everywhere the URL is shared). */
+    .headline .line.static {
+      opacity: 1; transform: none; animation: none;
     }
     @keyframes revealText { to { opacity: 1; transform: translateY(0); } }
     .accent-red { color: #ff6a58; }
@@ -279,6 +293,7 @@ await recordScene(browser, "01-intro", 5500, async (page, ms) => {
   await showCard(page, cardHtml({
     bg: "#0a5c8b",
     headline: `AI agents make<br>real decisions<br>with real money.`,
+    staticHeadline: true,
   }), ms);
 });
 
