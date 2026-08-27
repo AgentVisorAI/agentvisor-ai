@@ -30,7 +30,7 @@ say -r 175 -v Samantha -o "$VOICE/s3.aiff" "Every decision. Captured. Enforced. 
 say -r 175 -v Samantha -o "$VOICE/s4.aiff" "Thirty two sessions today. Seven blocked. Thirty one thousand, eight hundred forty dollars saved."
 say -r 175 -v Samantha -o "$VOICE/s5.aiff" "An A I tried to spend eight thousand four hundred dollars. Agent Visor blocked it. Signed. Auditable."
 say -r 175 -v Samantha -o "$VOICE/s6.aiff" "Drop the receipt. Verified in the browser. No account needed."
-say -r 175 -v Samantha -o "$VOICE/s7.aiff" "A I agents you can hand to an auditor. Agent Visor."
+say -r 175 -v Samantha -o "$VOICE/s7.aiff" "A I agents you can hand to an auditor. Try it live at agentvisor A I dot me."
 
 # Process each aiff to a stereo 44.1kHz wav with mild compression
 # and per-clip loudnorm to -18 LUFS (broadcast dialog standard).
@@ -44,15 +44,16 @@ done
 # We start each narration ~200-400ms into the scene so the visual
 # establishes just before the voice speaks.
 D1=400
-D2=5133
-D3=10000
-D4=13566
-D5=21833
-D6=31533
-D7=39400
+D2=5167
+D3=10133
+D4=13600
+D5=21867
+D6=31600
+D7=39433
 
-# Silent 44s base layer
-ffmpeg -y -f lavfi -i "anullsrc=r=44100:cl=stereo:d=44" \
+# Silent 46s base layer (extended from 44s to accommodate the
+# slightly longer scene 7 CTA reveal.)
+ffmpeg -y -f lavfi -i "anullsrc=r=44100:cl=stereo:d=46" \
   -c:a pcm_s16le "$OUT/silence-44s.wav" 2>&1 | tail -1
 
 # Voice bus: delay each scene's clip to its start offset, then sum
@@ -83,6 +84,6 @@ ffmpeg -y \
     [0][bed]amix=inputs=2:duration=longest:normalize=0[mix];
     [mix]loudnorm=I=-18:LRA=8:TP=-2.0[out]
   " \
-  -map "[out]" -c:a aac -b:a 192k -t 44 "$OUT/narration-44s.aac" 2>&1 | tail -1
+  -map "[out]" -c:a aac -b:a 192k -t 46 "$OUT/narration-44s.aac" 2>&1 | tail -1
 
 ls -lh "$OUT/narration-44s.aac"

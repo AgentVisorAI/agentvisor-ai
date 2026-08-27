@@ -61,6 +61,23 @@ function cardHtml(opts) {
       transform: translateY(8px);
       animation: revealText 0.6s ${0.15 + lines.length * 0.18 + 0.15}s cubic-bezier(0.16,1,0.3,1) forwards;
     }
+    /* Big CTA URL for the closing card. Feels like a physical
+     * business card handed across the table — the URL is the whole
+     * point of the frame, not an afterthought. */
+    .cta {
+      display: inline-flex; align-items: center; gap: 18px;
+      margin-top: 3rem; padding: 18px 34px;
+      font-size: 44px; font-weight: 700; letter-spacing: -0.01em;
+      color: #ffd54f;
+      border: 2px solid rgba(255, 213, 79, 0.35);
+      border-radius: 999px;
+      background: rgba(255, 213, 79, 0.06);
+      opacity: 0; transform: translateY(10px);
+      animation: revealText 0.7s ${0.15 + lines.length * 0.18 + 0.3}s cubic-bezier(0.16,1,0.3,1) forwards;
+    }
+    .cta .arrow {
+      display: inline-block; transition: transform 200ms ease-out;
+    }
     .brand {
       position: absolute; bottom: 40px;
       display: flex; align-items: center; gap: 12px;
@@ -76,6 +93,7 @@ function cardHtml(opts) {
       ${kicker ? `<div class="kicker ${opts.dimKicker ? 'dim' : ''}">${kicker}</div>` : ""}
       <div class="headline">${animatedHeadline}</div>
       ${sub ? `<div class="subline">${sub}</div>` : ""}
+      ${opts.cta ? `<div class="cta"><span class="arrow">→</span> ${opts.cta}</div>` : ""}
     </div>
     <div class="brand"><div class="brand-mark">A</div>AgentVisor AI · agentvisorai.me</div>
   </body></html>`;
@@ -360,11 +378,11 @@ await recordScene(browser, "06-verify", 8500, async (page, ms) => {
 // ═════════════════════════════════════════════════════════════════
 // SCENE 7 — Closing card. No kicker (redundant with brand bar).
 // ═════════════════════════════════════════════════════════════════
-await recordScene(browser, "07-close", 4500, async (page, ms) => {
+await recordScene(browser, "07-close", 5500, async (page, ms) => {
   await showCard(page, cardHtml({
     bg: "#0a5c8b",
     headline: `AI agents you can<br>hand to an <span class="accent-yellow">auditor</span>.`,
-    sub: "agentvisorai.me",
+    cta: "agentvisorai.me",
   }), ms);
 });
 
