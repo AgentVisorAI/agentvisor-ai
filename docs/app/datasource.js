@@ -734,8 +734,9 @@
     var d = Object.assign({}, MOCK_DEPLOYMENTS[0]);
     d.lastSeenAt = new Date(Date.now() - 5000).toISOString();
     d.createdAt = new Date(Date.now() - el).toISOString();
-    d.sessions24h = (freshSessions() || []).length;
-    d.spend24h = "$0.04";
+    var fs = freshSessions() || [];
+    d.sessions24h = fs.length;
+    d.spend24h = "$" + fs.reduce(function (a, s) { return a + (+s.costUsdMicros || 0) / 1e6; }, 0).toFixed(2);
     return [d];
   }
   function freshOverview(range) {
