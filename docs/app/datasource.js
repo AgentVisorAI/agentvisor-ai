@@ -51,10 +51,20 @@
   async function ensureMockKey() {
     if (mockState.mockKeyPair) return;
     try {
-      var pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
-      var pubRaw = await crypto.subtle.exportKey("raw", pair.publicKey);
-      mockState.mockKeyPair = pair;
-      mockState.mockPublicKeyHex = bytesToHex(new Uint8Array(pubRaw));
+      // Fixed demo keypair, NOT a secret. The private key below is
+      // intentionally public: this is a mock console signing fake demo
+      // data, and pinning the key lets receipts downloaded from the demo
+      // verify GREEN ("trusted key") on /verify/, which ships the same
+      // public key in its trust anchor list. Anything signed by this key
+      // proves nothing except "came from the public demo".
+      var DEMO_PRIV_PKCS8_B64 = "MC4CAQAwBQYDK2VwBCIEILgB0YgZaAezId215njwdk9j+ZyR8Kz/gYV2oIQnZh8W";
+      var DEMO_PUB_HEX = "573c8f249012fbb08b3d79973411bb93141f32719c86ada25306fde5e59e8d57";
+      var priv = await crypto.subtle.importKey(
+        "pkcs8", b64ToBytes(DEMO_PRIV_PKCS8_B64), { name: "Ed25519" }, false, ["sign"]);
+      var pub = await crypto.subtle.importKey(
+        "raw", hexToBytes(DEMO_PUB_HEX), { name: "Ed25519" }, true, ["verify"]);
+      mockState.mockKeyPair = { privateKey: priv, publicKey: pub };
+      mockState.mockPublicKeyHex = DEMO_PUB_HEX;
     } catch (e) {
       // Browser doesn't support Ed25519. Leave as null. The receipt panel
       // will detect this and honestly say verification isn't available.
