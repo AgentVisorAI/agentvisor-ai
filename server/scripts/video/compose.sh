@@ -99,3 +99,13 @@ ffmpeg -y \
 
 ffprobe "$OUT/agentvisor-mockup-v4.mp4" 2>&1 | grep -E "Duration|Stream" | head -3
 ls -lh "$OUT/agentvisor-mockup-v4.mp4"
+
+# Auto-mux audio if a soundtrack exists. Silent video feels like a
+# screen recording; even minimal punctuation makes it feel produced.
+if [ -f "$OUT/audio/soundtrack-44s.aac" ]; then
+  echo "→ Muxing audio bed"
+  ffmpeg -y -i "$OUT/agentvisor-mockup-v4.mp4" -i "$OUT/audio/soundtrack-44s.aac" \
+    -c:v copy -c:a aac -shortest \
+    "$OUT/agentvisor-mockup-v9-audio.mp4" 2>&1 | tail -1
+  ls -lh "$OUT/agentvisor-mockup-v9-audio.mp4"
+fi
