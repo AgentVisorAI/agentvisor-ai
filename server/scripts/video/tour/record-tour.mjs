@@ -127,6 +127,7 @@ async function recordScene(browser, sceneName, durationMs, fn) {
   const ctx = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
     recordVideo: { dir: sceneDir, size: { width: 1920, height: 1080 } },
+    permissions: ["clipboard-read", "clipboard-write"],
     deviceScaleFactor: 1,
     // Force dark mode so the app's dark-mode tokens (mint --success,
     // coral --danger) match the video's card palette. Without this,
@@ -179,6 +180,7 @@ async function recordConsoleScene(browser, sceneName, durationMs, hash, waitFor,
   const ctx = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
     recordVideo: { dir: sceneDir, size: { width: 1920, height: 1080 } },
+    permissions: ["clipboard-read", "clipboard-write"],
     deviceScaleFactor: 1,
     storageState: storage,
     // Force dark mode so the app's dark-mode tokens (mint --success,
@@ -369,10 +371,39 @@ await recordConsoleScene(
   },
 );
 
-// ── SCENE 4: SESSIONS LIST. Search, clear, isolate blocked. ──────
+
+// ── SCENE 4: COMMAND PALETTE + THEME. Keyboard-first console. ────
 await recordConsoleScene(
   browser,
-  "04-sessions",
+  "04-palette",
+  7000,
+  "#/overview",
+  ['#cmdkOpen'],
+  {},
+  async (page) => {
+    await page.waitForTimeout(800);
+    const trigger = page.locator("#cmdkOpen");
+    const tb = await trigger.boundingBox();
+    if (tb) await page.mouse.move(tb.x + tb.width / 2, tb.y + tb.height / 2, { steps: 10 });
+    await page.waitForTimeout(250);
+    await page.evaluate(() => document.querySelector("#cmdkOpen")?.click());
+    await page.waitForTimeout(600);
+    await page.keyboard.type("blocked", { delay: 90 });
+    await page.waitForTimeout(1400);
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(400);
+    // Theme round-trip: light for a beat, back to dark.
+    await page.evaluate(() => document.querySelector("#themeBtn")?.click());
+    await page.waitForTimeout(1200);
+    await page.evaluate(() => document.querySelector("#themeBtn")?.click());
+    await page.waitForTimeout(600);
+  },
+);
+
+// ── SCENE 5: SESSIONS LIST. Search, clear, isolate blocked. ──────
+await recordConsoleScene(
+  browser,
+  "05-sessions",
   8000,
   "#/sessions",
   ['tr[data-clickable]'],
@@ -405,7 +436,7 @@ await recordConsoleScene(
 // ── SCENE 5: SESSION DETAIL. Pulse $8,400, open the BLOCKED event.─
 await recordConsoleScene(
   browser,
-  "05-session",
+  "06-session",
   10000,
   "#/sessions/sess_01H9K",
   ['.session-summary', 'text=Signature verified', '.evt'],
@@ -427,10 +458,36 @@ await recordConsoleScene(
   },
 );
 
-// ── SCENE 6: DOWNLOAD RECEIPT. Pulse + click. ────────────────────
+
+// ── SCENE 7: SHARE + COPY. The receipt is portable in one click. ──
 await recordConsoleScene(
   browser,
-  "06-download",
+  "07-share",
+  6500,
+  "#/sessions/sess_01H9K",
+  ['#shareRcpt', '#copyRcpt'],
+  {},
+  async (page) => {
+    await page.waitForTimeout(1000);
+    const share = page.locator("#shareRcpt");
+    const sb = await share.boundingBox();
+    if (sb) await page.mouse.move(sb.x + sb.width / 2, sb.y + sb.height / 2, { steps: 12 });
+    await page.waitForTimeout(300);
+    await page.evaluate(() => document.querySelector("#shareRcpt")?.click());
+    await page.waitForTimeout(1900);
+    const copy = page.locator("#copyRcpt");
+    const cb = await copy.boundingBox();
+    if (cb) await page.mouse.move(cb.x + cb.width / 2, cb.y + cb.height / 2, { steps: 10 });
+    await page.waitForTimeout(250);
+    await page.evaluate(() => document.querySelector("#copyRcpt")?.click());
+    await page.waitForTimeout(1600);
+  },
+);
+
+// ── SCENE 8: DOWNLOAD RECEIPT. Pulse + click. ────────────────────
+await recordConsoleScene(
+  browser,
+  "08-download",
   3000,
   "#/sessions/sess_01H9K",
   ['#dlRcpt'],
@@ -445,7 +502,7 @@ await recordConsoleScene(
 );
 
 // ── SCENE 7: VERIFY. Drop the receipt, green tick, no account. ───
-await recordScene(browser, "07-verify", 7000, async (page, ms) => {
+await recordScene(browser, "09-verify", 7000, async (page, ms) => {
   await page.goto(LANDING + "/verify/", { waitUntil: "networkidle" });
   await page.waitForSelector("#loadExample", { timeout: 10000 });
   const btn = page.locator("#loadExample");
@@ -469,7 +526,7 @@ await recordScene(browser, "07-verify", 7000, async (page, ms) => {
 // ── SCENE 8: POLICIES. Open the rule that blocked the $8,400. ────
 await recordConsoleScene(
   browser,
-  "08-policies",
+  "10-policies",
   8000,
   "#/policies",
   ['tr[data-clickable]'],
@@ -489,7 +546,7 @@ await recordConsoleScene(
 // ── SCENE 9: DEPLOYMENTS. Per-deployment keys + tokens. ──────────
 await recordConsoleScene(
   browser,
-  "09-deployments",
+  "11-deployments",
   6500,
   "#/deployments",
   ['tr[data-clickable]'],
@@ -508,14 +565,14 @@ await recordConsoleScene(
 // ── SCENE 10: SETTINGS. Members, API keys, webhooks: self-serve. ──
 await recordConsoleScene(
   browser,
-  "10-settings",
-  9000,
+  "12-settings",
+  13000,
   "#/settings/members",
   ['.settings-nav'],
   {},
   async (page) => {
-    await page.waitForTimeout(2400);
-    for (const tab of ["API keys", "Webhooks"]) {
+    await page.waitForTimeout(2000);
+    for (const tab of ["API keys", "SSO", "Webhooks", "Audit log", "Billing"]) {
       const b = page.locator(`.settings-nav button:has-text("${tab}")`);
       const bb = await b.boundingBox();
       if (bb) await page.mouse.move(bb.x + bb.width / 2, bb.y + bb.height / 2, { steps: 10 });
@@ -525,13 +582,13 @@ await recordConsoleScene(
         if (btn) btn.click();
       }, tab);
       // Let the tab's data load past its skeleton before moving on.
-      await page.waitForTimeout(2300);
+      await page.waitForTimeout(1750);
     }
   },
 );
 
 // ── SCENE 11: CLOSE. CTA card. ───────────────────────────────────
-await recordScene(browser, "11-close", 5500, async (page, ms) => {
+await recordScene(browser, "13-close", 5500, async (page, ms) => {
   await showCard(page, cardHtml({
     bg: "#0a5c8b",
     headline: `AI agents you can<br>hand to an <span class="accent-yellow">auditor</span>.`,
