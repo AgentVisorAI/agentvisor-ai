@@ -43,12 +43,17 @@ jobs:
             echo "→ $f"
             node --check "$f"
           done
-      - name: Verify MOCK_MODE flag present in entry HTML
-        run: grep -q 'window.MOCK_MODE' docs/app/index.html
+      - name: Verify MOCK_MODE flag present in config
+        # r57 extracted the inline MOCK_MODE script from index.html to
+        # config.js so a strict CSP (script-src 'self') can be enforced.
+        run: |
+          grep -q 'window.MOCK_MODE' docs/app/config.js
+          grep -q 'src="config.js"' docs/app/index.html
       - name: Verify datasource + app scripts loaded
         run: |
           grep -q 'src="datasource.js"' docs/app/index.html
           grep -q 'src="app.js"' docs/app/index.html
+          grep -q 'src="crash-guard.js"' docs/app/index.html
       - name: Verify pitch demo is preserved at /app/pitch/
         run: |
           test -f docs/app/pitch/index.html
@@ -107,6 +112,12 @@ jobs:
         working-directory: server
         env:
           NODE_ENV: production
+          # Prod mode fail-fasts without a mailer (by design — silently
+          # swallowing password resets is the wrong failure mode). The
+          # SmtpMailer constructs lazily so a dummy URL satisfies boot;
+          # the only mail path CI hits is the fire-and-forget welcome
+          # email whose failure is caught + logged, never surfaced.
+          SMTP_URL: smtp://ci:ci@127.0.0.1:2525
         run: |
           npx tsx src/index.ts &
           echo $! > /tmp/api.pid
