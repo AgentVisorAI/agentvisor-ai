@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { requireSession } from "../lib/session-middleware.js";
 import { bus, type EventPayload } from "../lib/bus.js";
+import { db } from "../db.js";
 import { env } from "../env.js";
 
 export async function streamRoutes(app: FastifyInstance): Promise<void> {
@@ -38,6 +39,52 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
     };
     const unsub = bus.subscribeOrg(claims.orgId, send);
 
+    // R79 MEDIUM (Class D): periodically re-verify authorization
+    // so a session revoked AFTER the SSE connection opened (logout,
+    // password reset via `user.sessionRevokedAt` bump at
+    // `auth.ts:635`, or membership removal via `DELETE /members/
+    // :userId`) actually stops the stream. `requireSession`
+    // ran ONCE at connection open; prior shape left an open tab
+    // streaming `session.upsert` / `events.appended` /
+    // `receipt.finalized` events to a revoked / ex-member session
+    // until the tab was closed or the server restarted —
+    // insider data-leak on removed members.
+    //
+    // Re-check on every 15 s keepalive tick (piggybacks on the
+    // liveness ping, no extra DB round-trip cadence). On revoke:
+    // write a `stream_terminated` event so the client can render
+    // a "re-authenticate" prompt, then `.end()` the raw response,
+    // which fires the `close` handler and cleans up bus + timer.
+    const revalidate = async (): Promise<boolean> => {
+      try {
+        const user = await db.user.findUnique({
+          where: { id: claims.sub },
+          select: {
+            sessionRevokedAt: true,
+            memberships: {
+              where: { orgId: claims.orgId },
+              select: { id: true },
+            },
+          },
+        });
+        if (!user) return false;
+        if (user.memberships.length === 0) return false;
+        if (
+          user.sessionRevokedAt &&
+          claims.iat * 1000 < user.sessionRevokedAt.getTime()
+        ) {
+          return false;
+        }
+        return true;
+      } catch {
+        // Transient DB error — err on the side of keeping the
+        // stream open. A permanent DB outage would surface via
+        // other endpoints; SSE isn't the right layer to
+        // signal it.
+        return true;
+      }
+    };
+
     // Named keepalive every 15s serves double duty: (1) survives intermediary
     // idle timeouts (Cloudflare 100s, Fly 60s, Heroku 55s), and (2) fires a
     // real EventSource listener on the client so the browser can detect
@@ -45,7 +92,15 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
     // EventSource in readyState=OPEN for tens of seconds after the peer dies.
     // The client tracks last-heard time and force-closes if the interval
     // between keepalives grows too long (default 30s stale threshold).
-    const keepalive = setInterval(() => {
+    const keepalive = setInterval(async () => {
+      const stillAuthorized = await revalidate();
+      if (!stillAuthorized) {
+        reply.raw.write(
+          `event: stream_terminated\ndata: ${JSON.stringify({ reason: "session_revoked_or_membership_removed" })}\n\n`,
+        );
+        reply.raw.end();
+        return;
+      }
       reply.raw.write(`event: keepalive\ndata: ${JSON.stringify({ t: Date.now() })}\n\n`);
     }, 15_000);
 
