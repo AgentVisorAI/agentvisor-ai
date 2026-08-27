@@ -66,7 +66,7 @@ add_caption "$SCENES/07-connect.webm" "$OUT/norm/07-connect.mp4" \
 
 add_caption "$SCENES/08-firstdata.webm" "$OUT/norm/08-firstdata.mp4" \
   "First sessions stream in. First save: \$8,400." \
-  "3.4"
+  "5.6"
 
 add_caption "$SCENES/09-sessions.webm" "$OUT/norm/09-sessions.mp4" \
   "Isolate the blocked one."
