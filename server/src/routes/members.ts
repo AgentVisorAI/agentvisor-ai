@@ -99,6 +99,24 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       where: { userId: req.params.userId, orgId: claims.orgId },
     });
     if (!existing) return reply.code(404).send({ error: "not_found" });
+    // R84 F1: block admins from MUTATING owners. R83 F1 only
+    // checked the requested NEW role, so an admin could still
+    // `PATCH /members/<owner> {role:"member"}` — canGrantRole
+    // (admin, member) = true, and the R79 last-owner tx only
+    // fires when the target is the LAST owner. Net effect: an
+    // admin could quietly demote every-owner-but-one, stripping
+    // the victim of manage-members/mint-owner-key/cascade-delete
+    // /SAML-keypair-rotate rights, and (because R79's
+    // cannot_change_own_role forbids self-elevation) the victim
+    // could not recover on their own. Threat model is symmetric
+    // to R83 F1: stripping owner is nearly as damaging as
+    // granting it. Requires: the caller's rank ≥ the target's
+    // current rank too. Owners can mutate anyone; admins can
+    // only mutate admin/member rows; owner rows are immutable
+    // to admins.
+    if (!canGrantRole(claims.membershipRole, existing.role as "owner" | "admin" | "member")) {
+      return reply.code(403).send({ error: "cannot_mutate_target_above_own_rank" });
+    }
     // R79 HIGH (Class B): serialize the last-owner check with the
     // role update so two concurrent PATCH-to-non-owner or one
     // PATCH+one DELETE can't both pass the `count() <= 1` guard
@@ -170,6 +188,21 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       include: { user: true },
     });
     if (!existing) return reply.code(404).send({ error: "not_found" });
+    // R84 F1: DELETE has the same target-rank hole as PATCH.
+    // Admin removing an owner via DELETE was gated only by the
+    // R79 last-owner check, which fires only when the removed
+    // member is the LAST remaining owner. So an admin could
+    // remove every-owner-but-one and (after leaving the "last
+    // owner" alone or racing with them) starve the org of
+    // higher-privilege recovery. Self-removal is always
+    // allowed — the last-owner tx below still catches the
+    // "you'd be the last owner leaving" case.
+    if (
+      claims.sub !== req.params.userId &&
+      !canGrantRole(claims.membershipRole, existing.role as "owner" | "admin" | "member")
+    ) {
+      return reply.code(403).send({ error: "cannot_mutate_target_above_own_rank" });
+    }
     // R79 HIGH (Class B): same serializable transaction discipline
     // as the PATCH path above. Two concurrent owner-leaves (or one
     // PATCH-demote + one DELETE-leave) must not both pass the
