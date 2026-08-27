@@ -22,10 +22,12 @@
 import type { FastifyInstance } from "fastify";
 import * as oidc from "openid-client";
 import { z } from "zod";
+import crypto from "node:crypto";
 import { db } from "../db.js";
 import { env } from "../env.js";
 import {
   SESSION_COOKIE_OPTS,
+  hashPassword,
   mintSession,
   randomToken,
 } from "../lib/auth.js";
@@ -267,10 +269,19 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
         data: {
           email,
           displayName,
-          // Password hash is required by the schema. Use a
-          // cryptographically random unreachable value — the user
-          // can /reset-request later if they want a password too.
-          passwordHash: `oidc:${p.id}:${randomToken(32)}`,
+          // R86 F3: use a real argon2 hash of random bytes so
+          // that verifyPassword timing matches password-set
+          // users. Prior shape stored `oidc:${provider}:${hex}`
+          // — @node-rs/argon2 threw on the malformed PHC
+          // header in sub-ms and gave the login endpoint a
+          // wire-visible timing oracle for OAuth-registered
+          // accounts. verifyPassword now falls back to the
+          // dummy hash for non-argon2 strings (defensive layer);
+          // this line stores a real argon2 string so the fallback
+          // isn't exercised.
+          passwordHash: await hashPassword(
+            crypto.randomUUID() + crypto.randomUUID(),
+          ),
           memberships: {
             create: { orgId: org.id, role: "owner" },
           },

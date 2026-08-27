@@ -46,6 +46,27 @@ export async function verifyPassword(
   hashStr: string,
   plaintext: string,
 ): Promise<boolean> {
+  // R86 F3: burn full argon2 time even when hashStr isn't a
+  // valid argon2 PHC string. Prior shape called `verify(hashStr,
+  // …)` and let @node-rs/argon2 throw immediately on a
+  // non-argon2 header — dropping the ~50-120 ms cost down to
+  // sub-ms. That's a WIRE-VISIBLE timing oracle: OAuth-
+  // provisioned users had `passwordHash = "oidc:google:<hex>"`
+  // (see oauth.ts:273) that failed decode instantly, so a
+  // credential-stuffing attacker observing round-trip time on
+  // /login could enumerate which addresses were OAuth-
+  // registered users and target them with a fake consent-screen
+  // phishing pack. Detect the non-argon2 case and run the
+  // verify against the timing dummy so the response spends the
+  // full argon2 budget regardless of the persistence detail.
+  if (!hashStr.startsWith("$argon2")) {
+    try {
+      await verify(await getDummyPasswordHash(), plaintext);
+    } catch {
+      // ignored
+    }
+    return false;
+  }
   try {
     return await verify(hashStr, plaintext);
   } catch {
