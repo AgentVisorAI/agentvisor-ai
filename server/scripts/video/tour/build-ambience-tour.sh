@@ -19,8 +19,8 @@ OUT=/tmp/video-tour/audio
 # Fade in over 3s from silence (so scene 1 opens clean), fade out
 # over 4s at the end (CTA breathe).
 ffmpeg -y \
-  -f lavfi -i "sine=frequency=65:duration=92" \
-  -f lavfi -i "sine=frequency=131:duration=92" \
+  -f lavfi -i "sine=frequency=65:duration=115" \
+  -f lavfi -i "sine=frequency=131:duration=115" \
   -filter_complex "
     [0]volume=0.65[b1];
     [1]volume=0.40[b2];
