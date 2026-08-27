@@ -1,5 +1,36 @@
 # Video pipeline changelog
 
+## v14 — subtle ambient pad (2026-08-27)
+
+The v13 audio track was voice + whooshes with silence between
+narration lines. A pitch video with 40%+ silence still reads as
+"screen recording with commentary" rather than "produced piece."
+
+**Design constraint**: nothing tonal that could sound cheap or
+compete with the voice. Just presence.
+
+**New `build-ambience.sh`:**
+
+* Two sine waves at C2 (65 Hz) + C3 (131 Hz) — an octave pair,
+  no harmonics, no dissonance
+* Bandpass-filtered (45 Hz - 800 Hz) so it sits below voice
+  frequency range and doesn't muddy consonants
+* Slow tremolo (0.15 Hz = 6.7-second breathing cycle) so it
+  moves gently rather than droning statically
+* Fade in over 3s, fade out over 4s (scene 1 opens clean, CTA
+  ends clean)
+* -30 LUFS integrated — a full 12dB below voice, 6dB below
+  whooshes. Voice dominates, whooshes punctuate, pad adds
+  presence.
+
+**`build-narration.sh`** now optionally mixes the pad into the
+final bus if `ambience-46s.wav` is present (backward-compatible:
+missing file just skips the layer).
+
+Waveform verification: v14 shows the same voice bursts as v13,
+plus a continuous low baseline underneath. Voice/whoosh peaks
+unchanged; timeline is now 100% "signal" instead of ~40%.
+
 ## v13 — closing CTA (2026-08-27)
 
 The v12 closing card used a 26px subtitle for the URL. Small enough
