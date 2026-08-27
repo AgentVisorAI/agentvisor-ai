@@ -899,7 +899,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 .evt:last-child { border-bottom: 0; }
 .evt:hover { background: var(--surface-hover); }
-.evt .seq { color: var(--fg-4); font-family: "SF Mono", ui-monospace, monospace; font-size: 11px; }
+.evt .seq { color: var(--fg-3); font-family: "SF Mono", ui-monospace, monospace; font-size: 11px; }
 .evt .icon {
   width: 18px; height: 18px; border-radius: 4px;
   display: grid; place-items: center;
