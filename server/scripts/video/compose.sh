@@ -50,13 +50,13 @@ add_caption "$SCENES/04-console.webm" "$OUT/norm/04-console.mp4" \
 add_caption "$SCENES/05-session.webm" "$OUT/norm/05-session.mp4" \
   "Blocked at \$8,400. Signed. Auditable."
 
-# Scene 6 is interactive — empty drop zone in the first 2 seconds, then
-# the verified state. Caption should only appear AFTER the click, when
-# the verified state is on screen. Use enable='gte(t,2.5)' so the
-# caption fades in only from t=2.5s onward within scene 6.
+# Scene 6 is interactive — empty drop zone in the first ~1.5s (cursor
+# pre-positioned near the sample link, so viewer's eye is already
+# there), then click, then verified state. Caption fades in at t=2.0s
+# once the verified card is centered on screen.
 add_caption "$SCENES/06-verify.webm" "$OUT/norm/06-verify.mp4" \
   "Drop the receipt. Verified in the browser. No account." \
-  "gte(t,2.5)"
+  "gte(t,2.0)"
 
 D1=$(dur "$OUT/norm/01-intro.mp4")
 D2=$(dur "$OUT/norm/02-problem.mp4")
