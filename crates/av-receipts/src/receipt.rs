@@ -382,9 +382,30 @@ impl Receipt {
         Ok(())
     }
 
-    /// Verify self-contained (trusting the embedded public key). Suitable when
-    /// the verifier obtained the receipt over an authenticated channel or
-    /// pins key ids separately. Prefer [`Receipt::verify`] with a ring.
+    /// **SECURITY WARNING — proves internal consistency, NOT authenticity.**
+    ///
+    /// Verifies the signature under the receipt's OWN embedded
+    /// `public_key_b64`. An attacker who generates a fresh Ed25519 keypair
+    /// and signs an arbitrary body with it will pass this check. The
+    /// result is equivalent to "this JSON blob is syntactically a
+    /// well-formed receipt whose signature is consistent with the key it
+    /// embeds"; it says nothing about whether the KEY is one the verifier
+    /// should trust.
+    ///
+    /// This method is safe ONLY when:
+    ///   1. The receipt was obtained over an authenticated channel that
+    ///      binds it to a trusted origin (e.g. a mutually-authenticated
+    ///      TLS connection to a known signer), **and/or**
+    ///   2. The caller separately pins `receipt.body.key_id` against a
+    ///      known-good allowlist and rejects any mismatch BEFORE reading
+    ///      any receipt content.
+    ///
+    /// For general receipt verification, use [`Receipt::verify`] with a
+    /// [`Keyring`] pre-populated with trusted keys. The browser `/verify`
+    /// page enforces the same discipline via `TRUSTED_RECEIPT_KEYS`
+    /// (docs/verify/verify.js) and shows an "internally consistent — trust
+    /// anchor NOT verified" warning without a pinned key; downstream Rust
+    /// callers must maintain the same distinction.
     pub fn verify_embedded(&self) -> Result<(), ReceiptError> {
         self.verify_semantic_invariants()?;
         let embedded = base64::engine::general_purpose::STANDARD
