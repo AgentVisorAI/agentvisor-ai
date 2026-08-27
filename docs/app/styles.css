@@ -1607,3 +1607,62 @@ tr.av-new-row td { animation: avStatPulse 1.2s ease 2; }
   .stat.av-pulse, tr.av-new-row td { animation: none; }
   .toast, #avTourLauncher { animation: none; }
 }
+
+/* ============================================================
+ * FRESH-WORKSPACE ONBOARDING CHECKLIST (overview, fresh mode only)
+ * ============================================================ */
+.onboard-card { padding: var(--s-4) var(--s-5); margin-bottom: var(--s-4); }
+.ob-head { display: flex; align-items: center; gap: var(--s-3); margin-bottom: var(--s-3); }
+.ob-head h2 { margin: 0; font-size: var(--t-section); font-weight: 600; }
+.ob-count { color: var(--fg-3); font-size: var(--t-sec); }
+.ob-bar {
+  flex: 1;
+  max-width: 220px;
+  margin-left: auto;
+  height: 6px;
+  background: var(--surface-hover);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.ob-bar span {
+  display: block;
+  height: 100%;
+  background: var(--success-solid);
+  border-radius: 999px;
+  transition: width 400ms ease;
+}
+.ob-steps {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: var(--s-3);
+}
+.ob-step {
+  display: flex;
+  gap: var(--s-2);
+  align-items: flex-start;
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  text-decoration: none;
+  color: inherit;
+  background: var(--surface-2);
+}
+.ob-step.done { border-color: var(--success-border, var(--border)); background: var(--success-bg); }
+a.ob-step:hover { border-color: var(--accent); }
+.ob-tick {
+  flex: none;
+  width: 22px; height: 22px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  background: var(--surface-hover);
+  color: var(--fg-3);
+  margin-top: 1px;
+}
+.ob-tick.done { background: var(--success-solid); color: #fff; }
+.ob-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ob-label { font-weight: 600; font-size: var(--t-sec); }
+.ob-sub { color: var(--fg-3); font-size: var(--t-min); }
