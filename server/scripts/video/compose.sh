@@ -25,9 +25,17 @@ mkdir -p "$OUT/norm"
 
 # Cards (no captions). Head-trim skips the Playwright load flash;
 # the first frame of the final video is the share thumbnail.
+# Cards are STATIC, and the recorder's encoder can trim their tail
+# unpredictably (scene 01 once came back 2.2s for a 4s request,
+# squeezing the opening narration) — so clone the last frame out and
+# cut each card to its intended length deterministically.
+CARD_LEN_01=4.0
+CARD_LEN_05=5.2
 for name in 01-problem 05-close; do
+  len_var="CARD_LEN_${name%%-*}"
   ffmpeg -y -ss 0.30 -i "$SCENES/$name.webm" \
-    -vf "fps=30,scale=1920:1080:flags=lanczos:out_color_matrix=bt709,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,format=yuv420p" \
+    -vf "fps=30,scale=1920:1080:flags=lanczos:out_color_matrix=bt709,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,tpad=stop_mode=clone:stop_duration=8,format=yuv420p" \
+    -t "${!len_var}" \
     -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p \
     -colorspace bt709 -color_primaries bt709 -color_trc bt709 \
     "$OUT/norm/$name.mp4" 2>&1 | tail -1

@@ -479,8 +479,10 @@ await recordConsoleScene(
         await page.waitForTimeout(500);
       }
     }
-    // Head for Deployments — the onboarding path.
-    const nav = page.locator('a[href="#/deployments"]');
+    // Head for Deployments — the onboarding path. Scoped to the
+    // sidebar: the Getting-started checklist's step 2 links to the
+    // same route, and an unscoped locator matches both.
+    const nav = page.locator('.sidebar a[href="#/deployments"]');
     const nb = await nav.boundingBox();
     if (nb) await page.mouse.move(nb.x + nb.width / 2, nb.y + nb.height / 2, { steps: 14 });
     await page.waitForTimeout(300);
