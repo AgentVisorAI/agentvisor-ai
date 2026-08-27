@@ -307,143 +307,53 @@ async function applyCinematic(page, opts = {}) {
 const browser = await chromium.launch({ headless: true });
 
 // ═════════════════════════════════════════════════════════════════
-// THE NOVICE TOUR (v20). A completely new user walks through every
-// functionality: landing, signup, dashboard, sessions (search +
-// filters), session detail (event inspection + receipt), download,
-// public verify, policies, deployments, and settings. ~75s.
+// v21: THE DISTILLED MOCK. Five scenes, ~29 seconds total, so the
+// ENTIRE video fits inside the judges' 30-second Immediate
+// Understanding window.
+//
+// Storyboard rules this cut follows (from the pitch guidance):
+//   * Narrow and precise: core problem + primitive features ONLY.
+//     No signup, no filters, no settings, no policy DSL. Those all
+//     exist in the live mockup for anyone who clicks; the video's
+//     job is the problem and the value, not the feature tour.
+//   * Immediate Understanding: problem stated by t=4s, value by
+//     t=10s, proof by t=25s.
+//   * The mock proves we understood the problem and the way to
+//     solve it. Not that we built everything.
 // ═════════════════════════════════════════════════════════════════
 
-// ── SCENE 1: LANDING. First frame = thumbnail, must be legible. ───
-await recordScene(browser, "01-landing", 5000, async (page, ms) => {
-  await page.goto(LANDING + "/", { waitUntil: "networkidle" });
-  await page.waitForSelector("h1", { timeout: 8000 });
-  await page.waitForTimeout(200);
-  await applyCinematic(page, { zoomMs: ms - 500, zoomToSelector: ".cta.primary" });
-  await page.waitForTimeout(ms - 500);
+// ── SCENE 1: THE PROBLEM. First frame = share thumbnail. ─────────
+await recordScene(browser, "01-problem", 4000, async (page, ms) => {
+  await showCard(page, cardHtml({
+    bg: "#0a5c8b",
+    headline: `One wrong decision.<br><span class="accent-red">$8,400</span> gone.`,
+    sub: "No audit trail. No way to prove what happened.",
+    staticHeadline: true,
+  }), ms);
 });
 
-// ── SCENE 2: SIGN UP. Novice user creates a workspace, live. ─────
-await recordScene(browser, "02-signup", 8000, async (page, ms) => {
-  await page.addInitScript(() => {
-    try { localStorage.setItem("av_mock_signed_out", "1"); } catch {}
-  });
-  await page.goto(SITE + "#/signup", { waitUntil: "networkidle" });
-  await page.waitForSelector("input#orgName", { timeout: 10000 });
-  await page.waitForTimeout(400);
-  await page.locator("input#orgName").click();
-  await page.locator("input#orgName").pressSequentially("Acme Robotics", { delay: 45 });
-  await page.locator("input#email").click();
-  await page.locator("input#email").pressSequentially("alex@acme.co", { delay: 40 });
-  await page.locator("input#password").click();
-  await page.locator("input#password").pressSequentially("agents-you-trust", { delay: 30 });
-  await page.waitForTimeout(300);
-  const btn = page.locator("#authForm button[type='submit']");
-  const box = await btn.boundingBox();
-  if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 14 });
-  await page.waitForTimeout(250);
-  await btn.click();
-  // Land on the overview: hold so the viewer sees the transition.
-  await page.waitForTimeout(2400);
-});
-
-// ── SCENE 3: OVERVIEW. Chart hover, then zoom to the money tile. ──
+// ── SCENE 2: THE VALUE. Dashboard, camera lands on $31,840. ──────
 await recordConsoleScene(
   browser,
-  "03-overview",
-  8000,
+  "02-overview",
+  6000,
   "#/overview",
-  ['text=PREVENTED LOSSES', 'text=$31,840', 'text=Recent sessions'],
-  { zoomToSelector: ".stat.savings", zoomMs: 7000 },
-  async (page) => {
-    // Sweep the activity chart so the tooltip flickers to life.
-    const strips = page.locator(".hover-strip");
-    const n = await strips.count();
-    if (n > 8) {
-      for (const i of [4, 8, 12]) {
-        await strips.nth(Math.min(i, n - 1)).hover().catch(() => {});
-        await page.waitForTimeout(420);
-      }
-    }
-  },
+  ['text=PREVENTED LOSSES', 'text=$31,840'],
+  { zoomToSelector: ".stat.savings", zoomMs: 5500 },
 );
 
-// ── SCENE 4: SESSIONS LIST. Search, clear, isolate blocked. ──────
+// ── SCENE 3: THE MECHANISM. The blocked $8,400, signed. ──────────
 await recordConsoleScene(
   browser,
-  "04-sessions",
-  8000,
-  "#/sessions",
-  ['tr[data-clickable]'],
-  {},
-  async (page) => {
-    const search = page.locator('input[placeholder*="Search" i]');
-    await search.click();
-    await search.pressSequentially("invoice", { delay: 55 });
-    await page.waitForTimeout(900);
-    await search.fill("");
-    await page.waitForTimeout(450);
-    // Blocked-only toggle. Synthetic click: Playwright's trusted
-    // click never stabilizes under the continuous Ken Burns
-    // transform (it waits for two identical layout frames).
-    const toggle = page.locator('input[type="checkbox"]').first();
-    const tb = await toggle.boundingBox();
-    if (tb) await page.mouse.move(tb.x + 4, tb.y + 4, { steps: 10 });
-    await page.evaluate(() => {
-      const cb = document.querySelector('input[type="checkbox"]');
-      if (cb && !cb.checked) cb.click();
-    });
-    await page.waitForTimeout(1100);
-    // Cursor onto the top blocked row (the one we open next scene)
-    const row = page.locator("tr[data-clickable]").first();
-    const rb = await row.boundingBox();
-    if (rb) await page.mouse.move(rb.x + rb.width / 3, rb.y + rb.height / 2, { steps: 12 });
-  },
-);
-
-// ── SCENE 5: SESSION DETAIL. Pulse $8,400, open the BLOCKED event.─
-await recordConsoleScene(
-  browser,
-  "05-session",
-  10000,
+  "03-session",
+  7000,
   "#/sessions/sess_01H9K",
-  ['.session-summary', 'text=Signature verified', '.evt'],
-  { pulseSelector: ".session-summary > *:nth-child(5)", zoomMs: 9500 },
-  async (page) => {
-    await page.waitForTimeout(2600);
-    // Click the BLOCKED event so the drawer fills with policy detail.
-    // Synthetic click (trusted clicks never stabilize under the
-    // running zoom animation).
-    const blocked = page.locator(".evt", { hasText: "BLOCKED" }).first();
-    const bb = await blocked.boundingBox();
-    if (bb) await page.mouse.move(bb.x + bb.width / 2, bb.y + bb.height / 2, { steps: 14 });
-    await page.waitForTimeout(250);
-    await page.evaluate(() => {
-      const ev = Array.from(document.querySelectorAll(".evt")).find(e => /BLOCKED/.test(e.textContent));
-      if (ev) ev.click();
-    });
-    await page.waitForTimeout(600);
-  },
+  ['.session-summary', 'text=Signature verified'],
+  { pulseSelector: ".session-summary > *:nth-child(5)", zoomMs: 6500 },
 );
 
-// ── SCENE 6: DOWNLOAD RECEIPT. Pulse + click. ────────────────────
-await recordConsoleScene(
-  browser,
-  "06-download",
-  3000,
-  "#/sessions/sess_01H9K",
-  ['#dlRcpt'],
-  { pulseSelector: "#dlRcpt", zoomMs: 2500 },
-  async (page) => {
-    const btn = page.locator("#dlRcpt");
-    const bb = await btn.boundingBox();
-    if (bb) await page.mouse.move(bb.x + bb.width / 2, bb.y + bb.height / 2, { steps: 12 });
-    await page.waitForTimeout(900);
-    await page.evaluate(() => document.querySelector("#dlRcpt")?.click());
-  },
-);
-
-// ── SCENE 7: VERIFY. Drop the receipt, green tick, no account. ───
-await recordScene(browser, "07-verify", 7000, async (page, ms) => {
+// ── SCENE 4: THE PROOF. Receipt verifies in the browser. ─────────
+await recordScene(browser, "04-verify", 6500, async (page, ms) => {
   await page.goto(LANDING + "/verify/", { waitUntil: "networkidle" });
   await page.waitForSelector("#loadExample", { timeout: 10000 });
   const btn = page.locator("#loadExample");
@@ -460,76 +370,12 @@ await recordScene(browser, "07-verify", 7000, async (page, ms) => {
     if (card) card.scrollIntoView({ behavior: "smooth", block: "center" });
   });
   await page.waitForTimeout(500);
-  await applyCinematic(page, { zoomMs: 4300, pulseSelector: ".result-card" });
-  await page.waitForTimeout(4300);
+  await applyCinematic(page, { zoomMs: 3800, pulseSelector: ".result-card" });
+  await page.waitForTimeout(3800);
 });
 
-// ── SCENE 8: POLICIES. Open the rule that blocked the $8,400. ────
-await recordConsoleScene(
-  browser,
-  "08-policies",
-  8000,
-  "#/policies",
-  ['tr[data-clickable]'],
-  {},
-  async (page) => {
-    await page.waitForTimeout(1400);
-    const row = page.locator("tr[data-clickable]").first();
-    const rb = await row.boundingBox();
-    if (rb) await page.mouse.move(rb.x + rb.width / 3, rb.y + rb.height / 2, { steps: 12 });
-    await page.waitForTimeout(300);
-    await page.evaluate(() => document.querySelector("tr[data-clickable]")?.click());
-    await page.waitForSelector(".policy-body", { timeout: 8000 }).catch(() => {});
-    await page.waitForTimeout(400);
-  },
-);
-
-// ── SCENE 9: DEPLOYMENTS. Per-deployment keys + tokens. ──────────
-await recordConsoleScene(
-  browser,
-  "09-deployments",
-  6500,
-  "#/deployments",
-  ['tr[data-clickable]'],
-  {},
-  async (page) => {
-    await page.waitForTimeout(1300);
-    const row = page.locator("tr[data-clickable]").first();
-    const rb = await row.boundingBox();
-    if (rb) await page.mouse.move(rb.x + rb.width / 3, rb.y + rb.height / 2, { steps: 12 });
-    await page.waitForTimeout(250);
-    await page.evaluate(() => document.querySelector("tr[data-clickable]")?.click());
-    await page.waitForTimeout(500);
-  },
-);
-
-// ── SCENE 10: SETTINGS. Members, API keys, webhooks: self-serve. ──
-await recordConsoleScene(
-  browser,
-  "10-settings",
-  9000,
-  "#/settings/members",
-  ['.settings-nav'],
-  {},
-  async (page) => {
-    await page.waitForTimeout(2400);
-    for (const tab of ["API keys", "Webhooks"]) {
-      const b = page.locator(`.settings-nav button:has-text("${tab}")`);
-      const bb = await b.boundingBox();
-      if (bb) await page.mouse.move(bb.x + bb.width / 2, bb.y + bb.height / 2, { steps: 10 });
-      await page.waitForTimeout(250);
-      await page.evaluate((label) => {
-        const btn = Array.from(document.querySelectorAll(".settings-nav button")).find(x => x.textContent.trim() === label);
-        if (btn) btn.click();
-      }, tab);
-      // Let the tab's data load past its skeleton before moving on.
-      await page.waitForTimeout(2300);
-    }
-  },
-);
-
-// ── SCENE 11: CLOSE. CTA card. ───────────────────────────────────
-await recordScene(browser, "11-close", 5500, async (page, ms) => {
+// ── SCENE 5: THE ASK. One line + the URL. ────────────────────────
+await recordScene(browser, "05-close", 5500, async (page, ms) => {
   await showCard(page, cardHtml({
     bg: "#0a5c8b",
     headline: `AI agents you can<br>hand to an <span class="accent-yellow">auditor</span>.`,

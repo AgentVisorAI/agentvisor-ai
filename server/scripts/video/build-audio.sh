@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Subtle whoosh bed for the v20 novice tour (~90s).
-# 11 scenes = 10 transitions. Pink-noise whooshes only; no music.
+# Whoosh bed for the v21 distilled mock (~30s). 5 scenes = 4
+# transitions. Pink-noise punctuation only; no music.
 set -euo pipefail
 
 OUT=/tmp/video-v4/audio
@@ -15,34 +15,21 @@ gen_whoosh() {
 }
 
 gen_whoosh "$OUT/w-normal.wav" 0.42
-gen_whoosh "$OUT/w-strong.wav" 0.65   # landing → signup (into the app)
-gen_whoosh "$OUT/w-soft.wav"   0.28   # settings → close (denouement)
+gen_whoosh "$OUT/w-strong.wav" 0.65   # problem -> value
+gen_whoosh "$OUT/w-soft.wav"   0.28   # proof -> close
 
-# Silent bed for 92 seconds (covers the ~89.3s tour).
-ffmpeg -y -f lavfi -i "anullsrc=r=44100:cl=stereo:d=92" \
+ffmpeg -y -f lavfi -i "anullsrc=r=44100:cl=stereo:d=32" \
   -c:a pcm_s16le "$OUT/silence.wav" 2>&1 | tail -1
 
-# Transition offsets in ms, from compose.sh `Offsets:` output.
-T1=5600     # 1  → 2  landing → signup
-T2=11033    # 2  → 3  signup → overview
-T3=20599    # 3  → 4  overview → sessions
-T4=33466    # 4  → 5  sessions → session
-T5=44299    # 5  → 6  session → download
-T6=48132    # 6  → 7  download → verify
-T7=55032    # 7  → 8  verify → policies
-T8=63865    # 8  → 9  policies → deployments
-T9=71165    # 9  → 10 deployments → settings
-T10=81032   # 10 → 11 settings → close
+# From compose.sh `Offsets:` output.
+T1=3200
+T2=10033
+T3=17866
+T4=24399
 
 ffmpeg -y \
   -i "$OUT/silence.wav" \
   -i "$OUT/w-strong.wav" \
-  -i "$OUT/w-normal.wav" \
-  -i "$OUT/w-normal.wav" \
-  -i "$OUT/w-normal.wav" \
-  -i "$OUT/w-normal.wav" \
-  -i "$OUT/w-normal.wav" \
-  -i "$OUT/w-normal.wav" \
   -i "$OUT/w-normal.wav" \
   -i "$OUT/w-normal.wav" \
   -i "$OUT/w-soft.wav" \
@@ -51,13 +38,7 @@ ffmpeg -y \
     [2]adelay=${T2}|${T2}[w2];
     [3]adelay=${T3}|${T3}[w3];
     [4]adelay=${T4}|${T4}[w4];
-    [5]adelay=${T5}|${T5}[w5];
-    [6]adelay=${T6}|${T6}[w6];
-    [7]adelay=${T7}|${T7}[w7];
-    [8]adelay=${T8}|${T8}[w8];
-    [9]adelay=${T9}|${T9}[w9];
-    [10]adelay=${T10}|${T10}[w10];
-    [0][w1][w2][w3][w4][w5][w6][w7][w8][w9][w10]amix=inputs=11:duration=first:normalize=0[mix];
+    [0][w1][w2][w3][w4]amix=inputs=5:duration=first:normalize=0[mix];
     [mix]loudnorm=I=-24:LRA=8:TP=-3.0[out]
   " \
   -map "[out]" -c:a aac -b:a 128k "$OUT/soundtrack-44s.aac" 2>&1 | tail -1
