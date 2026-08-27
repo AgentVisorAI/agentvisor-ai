@@ -783,7 +783,13 @@
     };
   }
 
-  function delay(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function delay(ms) {
+    // Video-recording aid: av_mock_fastload collapses the simulated
+    // network latency so re-renders never flash skeletons on camera.
+    // Never set in normal browsing.
+    try { if (localStorage.getItem("av_mock_fastload")) ms = Math.min(ms, 15); } catch (e) {}
+    return new Promise(function (r) { setTimeout(r, ms); });
+  }
 
   function synthesizeEvents(s) {
     var out = [
