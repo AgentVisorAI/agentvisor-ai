@@ -23,6 +23,6 @@
 # static meta-refresh stubs (docs/mockup/, docs/demo/). These rules
 # only take effect if the site moves to Cloudflare Pages.
 /mockup   /pitch/  301
-/demo     /pitch/  301
+/demo     /app/    301
 
 # App entrypoint stays as a hard-coded SPA — no history-mode router yet.
