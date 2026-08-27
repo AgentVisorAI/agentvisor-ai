@@ -1,0 +1,19 @@
+-- R81 F2: index the anonymous `/invites/accept` lookup path.
+--
+-- The endpoint runs `WHERE email = ? AND acceptedAt IS NULL AND
+-- revokedAt IS NULL AND expiresAt > now()` for every anonymous
+-- POST. The composite UNIQUE (orgId, email) cannot serve
+-- `email = ?` on its own (leftmost prefix is `orgId`), so
+-- Postgres seq-scans the whole invites table per request. An
+-- attacker who mass-invites the same email address (self-signup
+-- is cheap) can bloat the table to millions of rows, then
+-- hammer /invites/accept from any IP to force seq-scan-per-
+-- request — I/O amplification sibling of the CPU DoS R80 F3
+-- closed via `take: 5`. `take: 5` caps argon2 CPU; this index
+-- caps the DB I/O.
+--
+-- CREATE INDEX CONCURRENTLY keeps the table writable during
+-- creation on production Postgres; the invites table is small
+-- but the discipline matches other index migrations in this
+-- schema.
+CREATE INDEX IF NOT EXISTS "invites_email_idx" ON "invites"("email");

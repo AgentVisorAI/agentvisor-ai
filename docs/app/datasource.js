@@ -1113,14 +1113,33 @@
         s.blockedPayoutUsdMicros = String(value * 1e6);
         s.policiesFired = ["pol_procurement_allowed_vendors"];
       }, BLOCK_AT);
-      setTimeout(function () {
+      setTimeout(async function () {
         s.status = "completed";
         s.endedAt = new Date().toISOString();
         s.events = 12;
         s.toolsAllowed = 5;
         s.costUsdMicros = "38000";
         s.payoutUsdMicros = "38000";
-        s.receiptHash = "sha256:" + rngHex(mulberry32(now % 7919), 12) + "…";
+        // R81 F4: compute the SAME sha256 the receipt-detail page
+        // renders (docs/app/datasource.js line ~1168 uses
+        // `sha256(externalId + "|" + events)`) so the list-view
+        // truncation matches the detail-view full digest. Prior
+        // shape used a distinct rng-derived hex string that a
+        // sharp investor comparing list vs detail would notice
+        // as a mismatch on the "everything is signed and
+        // reproducible" pitch.
+        try {
+          var hashBuf = await crypto.subtle.digest(
+            "SHA-256",
+            new TextEncoder().encode(s.externalId + "|" + s.events),
+          );
+          var fullHex = bytesToHex(new Uint8Array(hashBuf));
+          s.receiptHash = "sha256:" + fullHex.slice(0, 12) + "…";
+        } catch {
+          // WebCrypto unavailable — fall back to the deterministic
+          // rng path so the demo still shows a receipt hash.
+          s.receiptHash = "sha256:" + rngHex(mulberry32(now % 7919), 12) + "…";
+        }
         var t = s.startedAt, te = s.endedAt;
         s._events = [
           { seq: 1, ts: t, kind: "session", tag: "start", msg: "Session opened", sub: "agent=vendor-onboarding  user=priya.iyer@northwind.com", severity: "info", durationMs: 0 },

@@ -93,6 +93,18 @@ await wait(2500); // allow async crypto verify to complete
 // .result-card.pending (crypto verified, mock key isn't in
 // production trust anchor list — that's the correct outcome).
 await bob.waitForSelector(".result-card.ok, .result-card.pending", { timeout: 8000 });
+// R81 F1: `.result-card.pending` is ALSO the transient "Verifying
+// signature…" loading state. Wait for the title to leave the
+// loading state before reading it — otherwise a busy CI runner
+// races the async `crypto.subtle.verify` and reads the loading
+// text.
+await bob.waitForFunction(
+  () => {
+    const t = document.querySelector(".result-title")?.textContent || "";
+    return !/verifying signature/i.test(t);
+  },
+  { timeout: 8000 },
+);
 {
   const title = await bob.locator(".result-title").innerText();
   // "verifies" (trusted anchor) or "internally consistent" both prove
