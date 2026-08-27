@@ -3039,11 +3039,18 @@
       if (window.AVTour) actions.unshift({ g: "Actions", label: "See the full flow", desc: "Guided tour of the money story", run: function () { window.AVTour.start(); } });
       if (typeof state.ds.simulateAttack === "function") actions.push({ g: "Actions", label: "Simulate an agent attack", desc: "Stage a live blocked payment", run: function () { navigate("#/overview"); setTimeout(runAttackDemo, 250); } });
     }
+    // Sibling pages: the verifier and the pitch live outside the SPA,
+    // so open them as real navigations instead of hash routes.
+    var pages = [
+      { g: "Pages", label: "Verify a receipt", desc: "Public offline verifier — green tick, no account", run: function () { window.open("../verify/", "_blank", "noopener"); } },
+      { g: "Pages", label: "Watch the pitch", desc: "30 s hero + 130 s full tour, with transcripts", run: function () { window.open("../pitch/", "_blank", "noopener"); } },
+      { g: "Pages", label: "Read the code", desc: "github.com/AgentVisorAI/agentvisor-ai", run: function () { window.open("https://github.com/AgentVisorAI/agentvisor-ai", "_blank", "noopener"); } },
+    ];
     // Dynamic targets get filled in when the async datasource calls
     // resolve. Palette shell is already interactive. User can navigate
     // + search static entries with zero latency.
     var sessions = [], policies = [], deployments = [];
-    var all = routes.concat(actions);
+    var all = routes.concat(actions).concat(pages);
 
     var backdrop = h(
       '<div class="cmdk-backdrop">' +
