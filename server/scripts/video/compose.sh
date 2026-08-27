@@ -60,11 +60,18 @@ add_caption() {
     -colorspace bt709 -color_primaries bt709 -color_trc bt709 "$output" 2>&1 | tail -1
 }
 
+# Scene 2's caption must clear the frame before the crossfade into
+# scene 3 begins, and scene 3's must not appear until the fade is
+# done — at similar opacity mid-fade the two captions superimpose
+# into illegible text-on-text right where the money claim lands.
+D2W=$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 "$SCENES/02-overview.webm")
 add_caption "$SCENES/02-overview.webm" "$OUT/norm/02-overview.mp4" \
-  "AgentVisor watches every AI agent. \$31,840 saved from blocked orders."
+  "AgentVisor watches every AI agent. \$31,840 saved from blocked orders." \
+  "lt(t,$(awk "BEGIN{printf \"%.2f\", $D2W - 0.65}"))"
 
 add_caption "$SCENES/03-session.webm" "$OUT/norm/03-session.mp4" \
-  "Unapproved vendor: blocked, signed. The safe retry went through."
+  "Unapproved vendor: blocked, signed. The safe retry went through." \
+  "gte(t,0.60)"
 
 add_caption "$SCENES/04-verify.webm" "$OUT/norm/04-verify.mp4" \
   "Verified in the browser. No account." \
