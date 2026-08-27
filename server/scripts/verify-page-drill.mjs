@@ -83,6 +83,56 @@ await uploadJson(JSON.stringify(tampered));
   console.log("✅ tampered rawBody -> DOM shows 'Signature does not verify'");
 }
 
+// R78 F2: fresh-keypair forgery test on the DOM path.
+// Generate a fresh Ed25519 keypair in a Node subshell (the
+// browser can generate too but we already have the utilities
+// server-side), sign attacker-chosen contents, embed the
+// pubkey, upload, and assert the DOM does NOT render the
+// "authentic" / "verifies against a trusted key" wording.
+{
+  const { generateKeyPairSync, sign } = await import("node:crypto");
+  const forgedKeys = generateKeyPairSync("ed25519");
+  const forgedRaw = JSON.stringify({
+    version: 1,
+    sessionExternalId: "attacker-controlled",
+    eventCount: 0,
+    toolsBlocked: 0,
+    blockedPayoutUsdMicros: 0,
+  });
+  const forgedSig = sign(null, Buffer.from(forgedRaw, "utf8"), forgedKeys.privateKey);
+  const forgedSpki = forgedKeys.publicKey.export({ format: "der", type: "spki" });
+  const forgedPubHex = forgedSpki.slice(-32).toString("hex");
+  const forged = JSON.parse(sampleText);
+  forged.receipt.rawBody = forgedRaw;
+  forged.receipt.rawSignatureB64 = forgedSig.toString("base64");
+  forged.publicKey.hex = forgedPubHex;
+  await uploadJson(JSON.stringify(forged));
+  const title = await page.locator(".result-title").innerText();
+  if (/verifies against a trusted key/i.test(title)) fail("forged bundle rendered as TRUSTED — trust anchor gate bypassed: " + title);
+  if (!/internally consistent/i.test(title)) fail("forged bundle didn't render as INTERNALLY CONSISTENT: " + title);
+  console.log("✅ fresh-keypair forgery -> DOM shows INTERNALLY CONSISTENT (not TRUSTED)");
+
+  // R79 review guard: inject the forged pubkey into
+  // `window.TRUSTED_RECEIPT_KEYS` at runtime and re-upload the
+  // same forged bundle. The DOM MUST now render "verifies
+  // against a trusted key". This asserts (a) `verifyBundle`
+  // returns `trustedKey: true` when the pubkey is on the anchor
+  // list, (b) the outer render pipeline correctly THREADS
+  // `trustedKey` through the destructure. R78 shipped a bug
+  // where the destructure dropped `trustedKey` — the pre-R79
+  // drill's negative assertion (`!/trusted key/`) was vacuously
+  // true because the code path was unreachable. Regression
+  // guard: this positive assertion MUST fail if the outer
+  // render loses `trustedKey` again.
+  await page.evaluate((hex) => {
+    window.TRUSTED_RECEIPT_KEYS.add(hex);
+  }, forgedPubHex);
+  await uploadJson(JSON.stringify(forged));
+  const trustedTitle = await page.locator(".result-title").innerText();
+  if (!/verifies against a trusted key/i.test(trustedTitle)) fail("after injecting pubkey into TRUSTED_RECEIPT_KEYS, DOM still didn't render as TRUSTED — R78 destructure bug regressed?: " + trustedTitle);
+  console.log("✅ forged bundle with pubkey in TRUSTED_RECEIPT_KEYS -> DOM shows TRUSTED (trustedKey threaded correctly)");
+}
+
 // 5. Upload malformed JSON
 await uploadJson("this is not JSON at all {");
 {
@@ -107,4 +157,4 @@ if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors))
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 7 /verify page drill checks passed.");
+console.log("\nAll 9 /verify page drill checks passed.");
