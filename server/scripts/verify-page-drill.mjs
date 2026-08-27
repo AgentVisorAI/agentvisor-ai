@@ -43,6 +43,18 @@ console.log("✅ /verify page renders with drop zone + sample button");
 // a forged fresh-keypair bundle must NOT (step 4 guards that).
 await page.locator("#loadExample").click();
 await wait(1500);
+// R81 F1: guard against the "Verifying signature…" loading race —
+// the pending class is shared between the loading state and the
+// terminal "internally consistent" state, so a busy CI runner
+// can read the wrong text if we don't wait for the loading text
+// to leave.
+await page.waitForFunction(
+  () => {
+    const t = document.querySelector(".result-title")?.textContent || "";
+    return !/verifying signature/i.test(t);
+  },
+  { timeout: 8000 },
+);
 {
   const title = await page.locator(".result-title").innerText();
   if (/does not verify/i.test(title)) fail("sample rendered as does-not-verify. title=" + title);

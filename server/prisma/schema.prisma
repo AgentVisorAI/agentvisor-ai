@@ -187,6 +187,18 @@ model Invite {
 
   @@unique([orgId, email])
   @@index([expiresAt])
+  // R81 F2: `POST /invites/accept` runs a `WHERE email = ?`
+  // scan. The composite `@@unique([orgId, email])` cannot serve
+  // this (leftmost prefix is `orgId`), so the anonymous accept
+  // endpoint used to seq-scan the whole invites table per
+  // request. An attacker who mass-invites the same email
+  // (self-signup is cheap) can bloat the table to millions of
+  // rows and then hammer /invites/accept from any IP to force
+  // seq-scan-per-request — I/O amplification. `email` is a
+  // low-cardinality index on a table that grows with
+  // invite volume; add it explicitly so the anonymous lookup
+  // is O(log n) instead of O(n).
+  @@index([email])
   @@map("invites")
 }
 

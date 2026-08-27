@@ -134,9 +134,27 @@ console.log("\n=== Functional: /verify sample still verifies under strict CSP ==
   // as INTERNALLY CONSISTENT — result-card class is `pending`,
   // not `ok`. Prior shape waited for `.result-card.ok` and
   // timed out at 8 s → unhandled TimeoutError → process.exit(1)
-  // → CI red on every push. Wait for either shape so the drill
-  // is robust across trust-anchor-populated vs empty states.
+  // → CI red on every push.
+  //
+  // R81 F1: `.result-card.pending` is ALSO the class used by
+  // the transient "Verifying signature…" loading card in
+  // `verify.js`. Waiting on the selector alone races with the
+  // async `await crypto.subtle.verify(...)` — on a busy CI
+  // runner the drill wins and reads "Verifying signature…"
+  // → all three assertions miss ("Verifying" ≠ "verifies";
+  // no "internally consistent"; no "does not verify") →
+  // silently falls into the fail branch. Fix: wait for the
+  // title to LEAVE the loading state before reading it. The
+  // async verify resolves within a few ms in practice; a 8s
+  // ceiling covers any pathological runner.
   await page.waitForSelector(".result-card.ok, .result-card.pending", { timeout: 8000 });
+  await page.waitForFunction(
+    () => {
+      const t = document.querySelector(".result-title")?.textContent || "";
+      return !/verifying signature/i.test(t);
+    },
+    { timeout: 8000 },
+  );
   const title = await page.locator(".result-title").innerText();
   // Accept EITHER a "verifies against a trusted key" (once the
   // trust anchor list is populated) OR "internally consistent"
