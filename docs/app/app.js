@@ -450,7 +450,7 @@
       '<div class="app-shell">' +
         '<header class="topbar" role="banner">' +
           '<a class="brand" href="#/overview">' +
-            '<span class="brand-mark">A</span>' +
+            '<img class="brand-mark" src="../logo.png" alt="" width="22" height="22" />' +
             '<span>AgentVisor</span>' +
           "</a>" +
           statusChip +

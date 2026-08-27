@@ -384,10 +384,8 @@ code, pre, .mono {
 }
 .topbar .brand-mark {
   width: 22px; height: 22px;
-  border-radius: 5px;
-  background: linear-gradient(135deg, var(--accent), var(--accent-hover));
-  display: grid; place-items: center;
-  color: #fff; font-weight: 700; font-size: 11px; letter-spacing: -0.02em;
+  display: block;
+  object-fit: contain;
 }
 .topbar .env-pill {
   padding: 3px 8px;
