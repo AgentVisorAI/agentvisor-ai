@@ -13,7 +13,7 @@ mkdir -p "$VOICE"
 # the scene window (see W* below) with margin, so narration can never
 # overlap the next scene's line.
 EDGE_TTS="${EDGE_TTS:-/tmp/tts-venv/bin/edge-tts}"
-VOICE_ID="en-US-AriaNeural"
+VOICE_ID="en-US-AndrewMultilingualNeural"
 
 gen() {
   local out=$1; local window=$2; shift 2
@@ -41,7 +41,7 @@ gen "$VOICE/s4" 4.6 "A brand new user lands on Agent Visor A I."
 gen "$VOICE/s5" 7.2 "They create a workspace. Company, email, password. That is the whole setup."
 gen "$VOICE/s6" 4.9 "A brand new workspace. Zero sessions, zero deployments. Nothing to audit, yet."
 gen "$VOICE/s7" 9.0 "One install command connects their first daemon. Agent Visor issues its signing key automatically."
-gen "$VOICE/s8" 9.6 "And the first sessions stream in. Their buying agent just tried to pay a vendor that is not on the approved list. Blocked: eight thousand four hundred dollars kept."
+gen "$VOICE/s8" 9.6 "And the first sessions stream in. Their buying agent just tried to pay a vendor that is not on the approved list. The order is blocked: eight thousand four hundred dollars kept."
 gen "$VOICE/s9" 5.9 "One click isolates the blocked session."
 gen "$VOICE/s10" 9.2 "Inside it: the agent was tricked into ordering from an unapproved vendor. Blocked before the money moved. Its retry, with the approved vendor, went through."
 gen "$VOICE/s11" 6.35 "Share a verification link, or copy the raw receipt. One click each."
@@ -51,7 +51,7 @@ gen "$VOICE/s14" 7.6 "Starter policies come enabled on day one. Plain rules, enf
 gen "$VOICE/s15" 6.6 "A command palette jumps anywhere. Light or dark, your call."
 gen "$VOICE/s16" 5.9 "Each deployment gets its own signing key and ingest token."
 gen "$VOICE/s17" 15.0 "Members, A P I keys, single sign on, webhooks, audit log, billing. Everything an admin needs is self serve, from the very first day. That is day one: from an empty workspace to a signed, verifiable audit trail."
-gen "$VOICE/s18" 4.55 "A I agents you can hand to an auditor. agentvisor A I dot me."
+gen "$VOICE/s18" 4.55 "A I agents you can hand to an auditor. The address is on screen."
 
 for i in $(seq 1 18); do
   ffmpeg -y -i "$VOICE/s$i.raw.wav" \
