@@ -130,9 +130,21 @@ console.log("\n=== Functional: /verify sample still verifies under strict CSP ==
   await page.goto(VERIFY, { waitUntil: "networkidle" });
   await page.waitForSelector("#loadExample");
   await page.locator("#loadExample").click();
-  await page.waitForSelector(".result-card.ok", { timeout: 8000 });
+  // R80 F1: with empty TRUSTED_RECEIPT_KEYS, the sample renders
+  // as INTERNALLY CONSISTENT — result-card class is `pending`,
+  // not `ok`. Prior shape waited for `.result-card.ok` and
+  // timed out at 8 s → unhandled TimeoutError → process.exit(1)
+  // → CI red on every push. Wait for either shape so the drill
+  // is robust across trust-anchor-populated vs empty states.
+  await page.waitForSelector(".result-card.ok, .result-card.pending", { timeout: 8000 });
   const title = await page.locator(".result-title").innerText();
-  if (!/verifies/i.test(title)) fail("sample didn't verify under CSP: " + title);
+  // Accept EITHER a "verifies against a trusted key" (once the
+  // trust anchor list is populated) OR "internally consistent"
+  // (empty anchor list, R78 default state). Fail only on the
+  // does-not-verify shape.
+  if (/does not verify/i.test(title) || (!/verifies/i.test(title) && !/internally consistent/i.test(title))) {
+    fail("sample didn't verify under CSP: " + title);
+  }
   if (cspViolations.length) fail("CSP violations during verify: " + JSON.stringify(cspViolations));
   console.log("✅ sample still verifies under strict CSP (no violations)");
   await ctx.close();
