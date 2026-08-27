@@ -150,6 +150,7 @@
         <div class="result-card ${cls}">
           <p class="result-title">${titleText}</p>
           <p class="result-sub">${subText}</p>
+          ${state.tamper ? `<p class="result-sub tamper-note"><strong>What just happened:</strong> one byte of the signed body changed (${esc(state.tamper.what)}: <code>${esc(state.tamper.before)}</code> → <code>${esc(state.tamper.after)}</code>) and the signature broke. That is the guarantee — nothing in a receipt can be edited after the fact without detection.</p>` : ""}
           ${drift.length ? `<p class="result-sub"><strong>Note:</strong> the bundle's unsigned metadata (${esc(drift.join(", "))}) does not match the signed body. The values below come from the signed body, which is what the signature attests. The unsigned copies were edited after signing.</p>` : ""}
           <dl class="kv">
             <dt>Session</dt><dd>${esc(displaySession)}</dd>
@@ -160,21 +161,69 @@
             <dt>Signature bytes</dt><dd>${esc((r.rawSignatureB64 || "").length)} base64 chars (64 bytes decoded)</dd>
             <dt>Message bytes</dt><dd>${esc((r.rawBody || "").length)}</dd>
           </dl>
+          ${state.ok && !state.tamper ? `<div class="tamper-row">
+            <button type="button" id="tamperBtn" class="tamper-btn">🧪 Now tamper with one byte</button>
+            <span class="tamper-hint">See what happens when a single byte of the signed body changes.</span>
+          </div>` : ""}
+          ${state.tamper ? `<div class="tamper-row">
+            <button type="button" id="restoreBtn" class="tamper-btn">↩ Restore the original</button>
+            <span class="tamper-hint">Re-verify the untouched receipt — back to green.</span>
+          </div>` : ""}
           <details class="details">
             <summary>Show raw signed body</summary>
             <pre>${esc(r.rawBody || "")}</pre>
           </details>
         </div>`;
+      const tamperBtn = result.querySelector("#tamperBtn");
+      if (tamperBtn) tamperBtn.addEventListener("click", tamperLastGood);
+      const restoreBtn = result.querySelector("#restoreBtn");
+      if (restoreBtn) restoreBtn.addEventListener("click", () => { if (lastGood) handleText(lastGood); });
     }
 
-    async function handleText(text) {
+    // ── One-click tamper demo ─────────────────────────────────────
+    // The pitch line is "edit one byte → red". Doing that by hand
+    // means downloading the JSON and opening an editor, so nobody
+    // does it. This flips a single byte of the *signed body* of the
+    // last successfully verified receipt and re-runs the exact same
+    // verification path. Nothing else changes — same key, same
+    // signature, one different byte.
+    let lastGood = null;
+    function tamperLastGood() {
+      if (!lastGood) return;
+      let bundle;
+      try { bundle = JSON.parse(lastGood); } catch { return; }
+      const r = bundle.receipt || {};
+      const body = r.rawBody || "";
+      if (!body) return;
+      let idx = -1, before = "", after = "", what = "";
+      // Prefer a meaningful byte: the first digit of eventCount.
+      const m = body.match(/"eventCount"\s*:\s*(\d)/);
+      if (m) {
+        idx = m.index + m[0].length - 1;
+        before = m[1];
+        after = String((+m[1] + 1) % 10);
+        what = "eventCount digit";
+      } else {
+        // Fallback: flip the case of the first ASCII letter.
+        for (let i = 0; i < body.length; i++) {
+          const c = body[i];
+          if (/[a-zA-Z]/.test(c)) { idx = i; before = c; after = c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase(); what = "one character"; break; }
+        }
+      }
+      if (idx < 0) return;
+      r.rawBody = body.slice(0, idx) + after + body.slice(idx + 1);
+      handleText(JSON.stringify(bundle), { what, before, after });
+    }
+
+    async function handleText(text, tamper) {
       render({ kind: "pending" });
       let bundle;
       try { bundle = JSON.parse(text); }
       catch (e) { render({ kind: "err", message: "Not valid JSON: " + e.message }); return; }
       try {
         const { ok, trustedKey, bundle: b } = await verifyBundle(bundle);
-        render({ kind: "result", ok, trustedKey, bundle: b });
+        if (ok && !tamper) lastGood = text;
+        render({ kind: "result", ok, trustedKey, bundle: b, tamper: tamper || null });
       } catch (e) {
         render({ kind: "err", message: e.message });
       }
