@@ -4,17 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <!--
-    Strict CSP: pure static landing page — no JS, no third-party
+    Strict CSP: pure static landing page. No JS, no third-party
     origins, images/fonts self only, OG image on same host.
   -->
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'none'; base-uri 'none'; form-action 'none'; script-src 'none'; script-src-attr 'none'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; font-src 'self' data:; object-src 'none'; frame-src 'none'">
-  <title>AgentVisor AI — AI agents you can hand to an auditor</title>
+  <title>AgentVisor AI. AI agents you can hand to an auditor</title>
   <meta name="description" content="AgentVisor AI sits in front of your AI agent's LLM and tool calls. Point your OpenAI client at it, and every session can end with a signed receipt anyone can verify offline.">
   <link rel="stylesheet" href="style.css">
   <link rel="icon" type="image/png" href="logo.png">
   <link rel="canonical" href="https://agentvisorai.me/">
-  <meta property="og:title" content="AgentVisor AI — AI agents you can hand to an auditor">
+  <meta property="og:title" content="AgentVisor AI. AI agents you can hand to an auditor">
   <meta property="og:description" content="One line of code. Every session recorded, capped, and verifiable.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://agentvisorai.me/">
@@ -45,7 +45,7 @@
         AgentVisor AI is a small server you drop in front of your agent&rsquo;s LLM
         and tool calls. Every request is recorded. Every limit you set is
         enforced before the call goes out. Every session can end with a signed
-        receipt anyone can verify offline &mdash; without asking you or us for
+        receipt anyone can verify offline. Without asking you or us for
         anything except a public key.
       </p>
       <p class="cta-row">
@@ -70,14 +70,14 @@
             AgentVisor AI speaks OpenAI&rsquo;s <code>chat/completions</code> and
             MCP over plain HTTP. Change the base URL your client points at.
             Nothing else in your app moves. (Long histories are compacted
-            by default before forwarding &mdash; auditable, and one config
+            by default before forwarding. Auditable, and one config
             line to disable.)
           </p>
           <p class="muted">
             Works the same way for Ollama, LM&nbsp;Studio, Azure OpenAI,
             vLLM, LiteLLM, and anything else that speaks the OpenAI
             <code>chat/completions</code> wire format. (Anthropic&rsquo;s
-            native API is not OpenAI-shaped &mdash; front it with a
+            native API is not OpenAI-shaped. Front it with a
             LiteLLM-style shim.)
           </p>
         </div>
@@ -107,8 +107,8 @@
           <div class="feature-copy">
             <h3>A signed record of every session</h3>
             <p>
-              When the agent&rsquo;s session finishes &mdash; whether that&rsquo;s a single
-              chat completion or a 40-step tool-using conversation &mdash; AgentVisor AI
+              When the agent&rsquo;s session finishes, whether that&rsquo;s a single
+              chat completion or a 40-step tool-using conversation, AgentVisor AI
               hands back a receipt like the one on the right. It commits to
               the full event chain, the cost, and how many tool calls were
               allowed vs blocked.
@@ -192,7 +192,7 @@ Content-Type: application/json
           <div class="feature-copy">
             <h3>Evidence you can send anywhere</h3>
             <p>
-              Every event is written as OCSF-shaped JSON &mdash; the same
+              Every event is written as OCSF-shaped JSON. The same
               schema your SIEM already speaks. Every session that never
               finishes becomes an ATIF trajectory file compatible with the
               Harbor validator. Every artifact is just a file on
@@ -241,8 +241,8 @@ data/bridge/
           <ul class="check-list">
             <li>Live session table with cost, tokens, tool&nbsp;calls, stop reason</li>
             <li>Click a session to see its receipt as raw JSON, live</li>
-            <li>Filter by open, closed, or capture&#8209;failed &mdash; and by workflow</li>
-            <li>No JavaScript framework, no phone&#8209;home &mdash; served straight from the binary</li>
+            <li>Filter by open, closed, or capture&#8209;failed. And by workflow</li>
+            <li>No JavaScript framework, no phone&#8209;home. Served straight from the binary</li>
           </ul>
         </div>
         <aside class="dashboard-preview" aria-label="Dashboard preview">
@@ -427,7 +427,7 @@ data/bridge/
               Every fix is regression-tested. The full suite runs on
               every code push; supply-chain policy is enforced by
               <code>cargo&#8209;deny</code>. Read the security model
-              before you deploy it &mdash; it&rsquo;s honest about what it
+              before you deploy it. It&rsquo;s honest about what it
               does and does not defend against.
             </p>
           </div>
@@ -440,14 +440,14 @@ data/bridge/
         <p class="section-kicker">Read more</p>
         <h2>Everything else.</h2>
         <ul class="link-columns">
-          <li><a href="https://github.com/AgentVisorAI/agentvisor-ai#readme">README</a> &mdash; full setup, configuration, CLI reference.</li>
-          <li><a href="https://github.com/AgentVisorAI/agentvisor-ai/blob/main/ARCHITECTURE.md">Architecture</a> &mdash; how the pipeline fits together.</li>
-          <li><a href="https://github.com/AgentVisorAI/agentvisor-ai/blob/main/SECURITY.md">Security model</a> &mdash; trust boundaries and threat model.</li>
-          <li><a href="https://github.com/AgentVisorAI/agentvisor-ai/blob/main/docs/reference/VERIFYING-A-RECEIPT.md">Verifying a receipt</a> &mdash; verifying a receipt from scratch.</li>
-          <li><a href="https://github.com/AgentVisorAI/agentvisor-ai/blob/main/CONFORMANCE-STATUS.md">Conformance status</a> &mdash; the compliance / MVP verdict record.</li>
-          <li><a href="https://github.com/AgentVisorAI/agentvisor-ai/blob/main/BENCHMARKS.md">Benchmarks</a> &mdash; hot-path latency and 10&#x00A0;000-connection SLA.</li>
-          <li><a href="https://github.com/AgentVisorAI/agentvisor-ai/releases">Releases</a> &mdash; pre-built binaries with SHA-256 checksums.</li>
-          <li><a href="api/">API documentation</a> &mdash; Rust crate reference. Skip unless you&rsquo;re embedding AgentVisor AI as a library.</li>
+          <li><a href="https://github.com/AgentVisorAI/agentvisor-ai#readme">README</a>. Full setup, configuration, CLI reference.</li>
+          <li><a href="https://github.com/AgentVisorAI/agentvisor-ai/blob/main/ARCHITECTURE.md">Architecture</a>. How the pipeline fits together.</li>
+          <li><a href="https://github.com/AgentVisorAI/agentvisor-ai/blob/main/SECURITY.md">Security model</a>. Trust boundaries and threat model.</li>
+          <li><a href="https://github.com/AgentVisorAI/agentvisor-ai/blob/main/docs/reference/VERIFYING-A-RECEIPT.md">Verifying a receipt</a>. Verifying a receipt from scratch.</li>
+          <li><a href="https://github.com/AgentVisorAI/agentvisor-ai/blob/main/CONFORMANCE-STATUS.md">Conformance status</a>. The compliance / MVP verdict record.</li>
+          <li><a href="https://github.com/AgentVisorAI/agentvisor-ai/blob/main/BENCHMARKS.md">Benchmarks</a>. Hot-path latency and 10&#x00A0;000-connection SLA.</li>
+          <li><a href="https://github.com/AgentVisorAI/agentvisor-ai/releases">Releases</a>. Pre-built binaries with SHA-256 checksums.</li>
+          <li><a href="api/">API documentation</a>. Rust crate reference. Skip unless you&rsquo;re embedding AgentVisor AI as a library.</li>
         </ul>
       </div>
     </section>
