@@ -1,5 +1,5 @@
 /*
- * AgentVisor AI console — data source layer.
+ * AgentVisor AI console. Data source layer.
  *
  * MockDataSource (Northwind Traders fixtures) and ApiDataSource (real API
  * adapter). Choice driven by window.MOCK_MODE from index.html.
@@ -13,7 +13,7 @@
 
   var mockState = {
     session: null,
-    // Ed25519 keypair for the mock signing key — generated once at module
+    // Ed25519 keypair for the mock signing key. Generated once at module
     // load so the "Signature verified" badge on the pitch demo is
     // cryptographically real, not a lie. If Web Crypto doesn't support
     // Ed25519 in this browser we fall back to a placeholder signature and
@@ -56,7 +56,7 @@
       mockState.mockKeyPair = pair;
       mockState.mockPublicKeyHex = bytesToHex(new Uint8Array(pubRaw));
     } catch (e) {
-      // Browser doesn't support Ed25519 — leave as null. The receipt panel
+      // Browser doesn't support Ed25519. Leave as null. The receipt panel
       // will detect this and honestly say verification isn't available.
       mockState.mockPublicKeyHex = null;
     }
@@ -447,7 +447,7 @@
       buckets[i].label = spec.fmt(d);
     }
     // For ranges longer than the fixture spans, we probabilistically extend the
-    // signal so the chart isn't all zeros — the fixture only covers ~24h.
+    // signal so the chart isn't all zeros. The fixture only covers ~24h.
     MOCK_SESSIONS.forEach(function (s) {
       var t = new Date(s.startedAt).getTime();
       var age = now - t;
@@ -608,7 +608,7 @@
     { at: iso(11 * 24 * HOUR), actor: "olivia.tan@northwind.com", event: "org.created", target: "Northwind Traders" },
   ];
 
-  // Northwind's Okta SAML config — realistic-looking sample so the settings
+  // Northwind's Okta SAML config. Realistic-looking sample so the settings
   // page feels populated in the pitch demo.
   var MOCK_SAML_CONFIGS = [
     {
@@ -818,7 +818,7 @@
       });
       return { config: MOCK_SAML_CONFIGS[i], spCertPem: MOCK_SAML_CONFIGS[i].spCertPem };
     },
-    // Mock passkeys — a fake yubikey + a fake iCloud passkey so the
+    // Mock passkeys. A fake yubikey + a fake iCloud passkey so the
     // settings page in the demo looks real.
     async webauthnListCredentials() {
       return { credentials: MOCK_PASSKEYS.slice() };
@@ -1128,7 +1128,7 @@
       opts.body = JSON.stringify(opts.body);
       headers["Content-Type"] = "application/json";
     }
-    // Belt-and-suspenders CSRF marker — the server accepts these
+    // Belt-and-suspenders CSRF marker. The server accepts these
     // requests only from allow-listed origins, but adding the header
     // ensures forgery via a form POST fails even if a proxy strips
     // Origin/Referer along the way.
@@ -1155,7 +1155,7 @@
       err.data = data;
       err.errorCode = data.errorCode;
       err.requestId = data.requestId || window.__lastRequestId;
-      // Rate limit — surface Retry-After so callers can render an
+      // Rate limit. Surface Retry-After so callers can render an
       // actionable "try again in Xs" instead of a generic error. The
       // Fastify rate-limit plugin sets Retry-After (seconds) + a
       // human-readable message; we keep both.
@@ -1218,7 +1218,7 @@
     },
     // Look up whether the caller's email has an SAML SSO config on file.
     // Returns { ssoConfig: { id, displayName, loginUrl } } or
-    // { ssoConfig: null }. Anonymous — the login page calls this after
+    // { ssoConfig: null }. Anonymous. The login page calls this after
     // the user types their email but before they enter a password.
     async discoverSaml(email) {
       try {
@@ -1227,7 +1227,7 @@
         return { ssoConfig: null };
       }
     },
-    // SAML config CRUD — owner/admin only. Consumed by the Settings > SSO tab.
+    // SAML config CRUD. Owner/admin only. Consumed by the Settings > SSO tab.
     async listSamlConfigs() {
       return apiFetch("/api/v1/auth/saml");
     },
@@ -1271,7 +1271,7 @@
     async logout() { await apiFetch("/api/v1/auth/logout", { method: "POST" }); },
 
     async requestPasswordReset(input) {
-      // Always resolves — even on invalid email — so the UI doesn't leak
+      // Always resolves. Even on invalid email. So the UI doesn't leak
       // whether the address is registered.
       await apiFetch("/api/v1/auth/reset-request", { method: "POST", body: { email: input.email } });
       return { ok: true };
@@ -1395,14 +1395,14 @@
           policiesEnforced: body.policiesEnforced || [],
           contentHash: body.contentHash, signature: rec.sigB64,
           signingKeyFingerprint: rec.keyIdHint,
-          // Everything the client needs to independently verify — no blind
+          // Everything the client needs to independently verify. No blind
           // trust in a server-side "verified" flag.
           rawBody: rec.body,
           rawSignatureB64: rec.sigB64,
           publicKeyHex: rec.publicKeyHex || (rec.session && rec.session.deployment && rec.session.deployment.publicKeyHex) || null,
         };
       } catch (e) {
-        if (e.status === 404) return { note: "No signed receipt yet — the daemon posts one at session seal.", sessionId: sessionId };
+        if (e.status === 404) return { note: "No signed receipt yet. The daemon posts one at session seal.", sessionId: sessionId };
         throw e;
       }
     },
@@ -1499,7 +1499,7 @@
       return apiFetch("/api/v1/org/retention/sweep-now", { method: "POST" });
     },
     downloadAuditCsv: function () {
-      // Redirect to the CSV endpoint — cookies auto-attach, browser
+      // Redirect to the CSV endpoint. Cookies auto-attach, browser
       // saves the response using the Content-Disposition filename.
       var link = document.createElement("a");
       link.href = "/api/v1/audit.csv";
@@ -1509,7 +1509,7 @@
       link.remove();
     },
     async listAudit(opts) {
-      // Real audit log — the SPA maps our normalized shape into the
+      // Real audit log. The SPA maps our normalized shape into the
       // audit table. If the server returns 4xx/5xx we fall through to
       // an empty array so the settings page doesn't crash.
       opts = opts || {};
@@ -1553,7 +1553,7 @@
           if (closed) return;
           if (!lastSeen) return;
           if (Date.now() - lastSeen > STALE_MS) {
-            // Force close and reconnect — EventSource is holding a dead socket.
+            // Force close and reconnect. EventSource is holding a dead socket.
             callback({ type: "stream.closed", data: { willRetry: true, reason: "stale" } });
             if (es) { try { es.close(); } catch (e) {} }
             lastSeen = 0;
@@ -1590,10 +1590,10 @@
           // EventSource is auto-retrying (readyState 0 or 1) or fully closed.
           callback({ type: "stream.closed", data: { willRetry: !closed } });
           if (es && es.readyState === 2) {
-            // EventSource gave up — kick off our own retry loop.
+            // EventSource gave up. Kick off our own retry loop.
             scheduleReconnect();
           } else if (!opened) {
-            // Never got past the handshake — probably a 401. Force close
+            // Never got past the handshake. Probably a 401. Force close
             // and retry with a fresh EventSource.
             try { es.close(); } catch (e) {}
             scheduleReconnect();

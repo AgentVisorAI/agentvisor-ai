@@ -3,11 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>AgentVisor AI — Console</title>
+  <title>AgentVisor AI. Console</title>
   <meta name="description" content="The AgentVisor AI operator console: set up the checkpoint, connect your agent, watch sessions live, manage policies, and verify signed receipts.">
   <link rel="stylesheet" href="console.css">
   <link rel="icon" type="image/png" href="../../logo.png">
-  <meta property="og:title" content="AgentVisor AI — Console">
+  <meta property="og:title" content="AgentVisor AI. Console">
   <meta property="og:description" content="Set up the checkpoint, connect your agent, watch sessions live, and verify signed receipts.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://agentvisorai.me/app/">
@@ -45,7 +45,7 @@
         <h1>Set up your checkpoint</h1>
         <p class="lede">AgentVisor AI is a policy checkpoint for LLM and tool traffic. Every request
           runs through identity, quota, size, and safety gates <em>before</em> it leaves your
-          network — so an agent can never call a model or a tool you did not authorize.</p>
+          network. So an agent can never call a model or a tool you did not authorize.</p>
 
         <div class="wizard-grid">
           <div class="wizard card">
@@ -64,7 +64,7 @@
               </fieldset>
 
               <fieldset class="wstep" id="wstep-key">
-                <legend><span class="wnum">2</span> Paste the provider API key — once.</legend>
+                <legend><span class="wnum">2</span> Paste the provider API key. Once.</legend>
                 <div class="key-row">
                   <input type="password" id="api-key" value="sk-proj-live-4Xk9…" autocomplete="off" spellcheck="false">
                   <span class="key-note">stored owner-only under <code>~/.agentvisor/keys/</code> · never shown again · never leaves your infrastructure</span>
@@ -74,7 +74,7 @@
               <fieldset class="wstep" id="wstep-guardrails">
                 <legend><span class="wnum">3</span> Set the policy. Enforced <em>before</em> every call.</legend>
                 <p class="wstep-help">The checkpoint runs identity, quota, size, policy, compression and loop
-                  detection on every LLM and tool call. Below are the defaults — tune per session or
+                  detection on every LLM and tool call. Below are the defaults. Tune per session or
                   per principal.</p>
                 <div class="policy-group">
                   <div class="policy-group-label">Rate limits <span class="policy-group-tag">tokens &amp; requests</span></div>
@@ -94,7 +94,7 @@
                     <span class="g-ctl"><input type="number" id="cap-tools" value="100" min="1"></span>
                   </label>
                   <label class="g-row">
-                    <span class="g-name">Per-tool call cap <span class="g-help">ceiling for any single tool — bounds high-impact tools like <code>issue_refund</code>, <code>send_email</code>, <code>execute_query</code></span></span>
+                    <span class="g-name">Per-tool call cap <span class="g-help">ceiling for any single tool. Bounds high-impact tools like <code>issue_refund</code>, <code>send_email</code>, <code>execute_query</code></span></span>
                     <span class="g-ctl"><input type="number" id="cap-refunds" value="5" min="0"></span>
                   </label>
                   <label class="g-row">
@@ -150,7 +150,7 @@
       <div class="wrap">
         <p class="kicker">Connect</p>
         <h1>Connect your application</h1>
-        <p class="lede">Point your OpenAI-compatible client at the checkpoint's base URL — that is
+        <p class="lede">Point your OpenAI-compatible client at the checkpoint's base URL. That is
           the entire integration. No SDK required.</p>
 
         <div class="two-col">
@@ -173,7 +173,7 @@
                 <span class="flow-node" id="flow-provider">OpenAI</span>
               </div>
               <p class="muted">Every LLM call and every tool call passes a checkpoint that
-                records it, checks it against your caps, and — only then — lets it through.</p>
+                records it, checks it against your caps, and. Only then. Lets it through.</p>
             </div>
             <button type="button" class="btn primary big guide" id="btn-first-request">Test the connection</button>
             <div class="first-request mono card dark" id="first-request-log" hidden></div>
@@ -273,7 +273,7 @@
           <div class="dash-body" id="dtab-policies" hidden>
             <div class="policy-grid" id="policy-grid"></div>
             <p class="muted policy-note">Changes apply to new sessions atomically. Every policy
-              decision — allow or block — is journaled with the policy version that made it.</p>
+              decision. Allow or block. Is journaled with the policy version that made it.</p>
           </div>
 
           <div class="dash-body" id="dtab-keys" hidden>
@@ -308,7 +308,7 @@
         <p class="kicker">Receipts &rsaquo; sess-8412</p>
         <h1>Signed receipt <span class="h1-sub">84a3f01c…</span></h1>
         <p class="lede">Issued when the session sealed. Verifiable offline by anyone holding this
-          deployment's public key — no access to this system required.</p>
+          deployment's public key. No access to this system required.</p>
 
         <div class="receipt-grid">
           <div class="card dark">
@@ -328,7 +328,7 @@
             </div>
             <p class="muted verify-note">Verification is ~30 lines of any language's Ed25519
               library. The signature covers every field of the receipt, and the receipt commits
-              to the full event chain — change anything, anywhere, and verification fails.</p>
+              to the full event chain. Change anything, anywhere, and verification fails.</p>
           </aside>
         </div>
 
@@ -344,13 +344,13 @@
         <p class="kicker">Data</p>
         <h1>Evidence &amp; export</h1>
         <p class="lede">Everything this deployment produces is a plain file on disk in an open,
-          industry-standard format — readable by your SIEM, your auditors, and your customers.</p>
+          industry-standard format. Readable by your SIEM, your auditors, and your customers.</p>
 
         <div class="two-col">
           <div class="card dark">
             <p class="filename">$ ls -R spool/ data/</p>
             <pre class="mono evidence-tree">spool/atif/
-├─ 84a3f01c….json         <span class="c"># ATIF v1.7 trajectory — the whole session</span>
+├─ 84a3f01c….json         <span class="c"># ATIF v1.7 trajectory. The whole session</span>
 ├─ 84a3f01c….atif-auth    <span class="c"># provenance sidecar (MAC)</span>
 ├─ receipts/
 │   └─ 84a3f01c….json     <span class="c"># signed receipt (the one you verified)</span>
@@ -362,18 +362,18 @@ data/bridge/topics/
           <div class="vision-cards">
             <article class="card vision">
               <h3>SIEM export</h3>
-              <p>Events are OCSF-shaped JSON — the schema your security stack already speaks.
+              <p>Events are OCSF-shaped JSON. The schema your security stack already speaks.
                 Stream them to Splunk, Sentinel, or a plain S3 bucket. Nothing phones home.</p>
             </article>
             <article class="card vision">
               <h3>Retention</h3>
               <p>Every trajectory, receipt, and archived session is kept as audit evidence until
-                <em>you</em> prune it. Move the files anywhere — they stay verifiable offline.</p>
+                <em>you</em> prune it. Move the files anywhere. They stay verifiable offline.</p>
             </article>
             <article class="card vision accent">
               <h3>Audit export</h3>
               <p>A directory of receipts plus one public key is a complete, independently
-                verifiable audit package — including this morning's blocked $8,400.</p>
+                verifiable audit package. Including this morning's blocked $8,400.</p>
             </article>
           </div>
         </div>
