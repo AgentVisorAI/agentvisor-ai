@@ -94,6 +94,32 @@ export function spUrls(cfg: SamlConfig): {
  * whitespace re-encoding, and gives false uniqueness for
  * rewrapped payloads).
  */
+/**
+ * Extract the ID of the actually-signed SAML element for replay-guard
+ * bookkeeping. R76→R77 tried using the outer <Response ID> then the
+ * FIRST <Assertion ID> in the raw XML; both fail against XML Signature
+ * Wrapping (XSW) when wantResponseSigned defaults to false. An
+ * attacker who rewraps a captured signed assertion inside a fresh
+ * <Response> envelope AND prepends a bogus sibling
+ * `<Assertion ID="attacker-nonce">` before it slips past the
+ * first-match regex — the replay-guard's uniqueness key is the
+ * attacker-controlled nonce, so the SAME signed assertion can be
+ * replayed within the 5-min NotOnOrAfter skew window forever.
+ *
+ * R88 F1: the XMLDSig `<ds:Reference URI="#…">` element inside the
+ * signature block identifies precisely which XML element got signed
+ * — an XSW attacker who wants to substitute a different Assertion
+ * has to either (a) match its ID to the URI (in which case the
+ * digest breaks — signature verify fails) or (b) rewrite the URI
+ * (in which case the signature over the SignedInfo block breaks).
+ * Either way, extracting the ID from the first Reference URI gives
+ * a replay-key that is bound to what node-saml actually verified.
+ *
+ * Handles namespaced (`ds:Reference`, `dsig:Reference`) and bare
+ * (`Reference`) forms. Fails closed if no signed reference is found
+ * (unsigned response — node-saml's verify would already have
+ * refused it under wantAssertionsSigned=true, but be defensive).
+ */
 export function extractAssertionId(rawB64: string): string | null {
   let xml: string;
   try {
@@ -101,20 +127,31 @@ export function extractAssertionId(rawB64: string): string | null {
   } catch {
     return null;
   }
-  // Match `<Assertion ID="…">` or `<saml:Assertion ID="…">` or
-  // `<saml2:Assertion ID="…">`. The `ID` attribute is REQUIRED
-  // on Assertion elements per SAML 2.0 §2.3.3, so a well-
-  // formed assertion always has one. `[^>]*?` allows other
-  // attributes (Version, IssueInstant) to appear in any order
-  // before the ID.
-  const re = /<(?:[\w-]+:)?Assertion\b[^>]*?\bID\s*=\s*"([^"]+)"/;
-  const m = xml.match(re);
+  // Match `<ds:Reference URI="#…">` — the signed-element pointer.
+  // R88 F1: XSW-safe; must not match a decoy Assertion prepended
+  // before the real signed one.
+  const refRe = /<(?:[\w-]+:)?Reference\b[^>]*?\bURI\s*=\s*"#([^"]+)"/;
+  const m = xml.match(refRe);
   return m?.[1] ?? null;
 }
 
 /** Construct the @node-saml/node-saml adapter from our stored config. */
 function buildAdapter(cfg: SamlConfig): SAML {
   const urls = spUrls(cfg);
+  // R88 F5: reject pre-R88 rows still storing "sha1" — the
+  // schema enum was tightened to {sha256, sha512} in R88, but
+  // Postgres stores the column as String so legacy rows persist.
+  // SHA-1 with XMLDSig is chosen-prefix collision-broken; treat
+  // any surviving sha1 config as inactive so a colliding forgery
+  // can't be accepted at /acs. Operators must PATCH the config
+  // to sha256 or sha512 explicitly.
+  const sig = cfg.signatureAlgorithm === "sha1" ? "sha256" : cfg.signatureAlgorithm;
+  const dig = cfg.digestAlgorithm === "sha1" ? "sha256" : cfg.digestAlgorithm;
+  if (cfg.signatureAlgorithm === "sha1" || cfg.digestAlgorithm === "sha1") {
+    throw new Error(
+      `saml_config_uses_sha1_${cfg.id}_reject_until_operator_patches_to_sha256`,
+    );
+  }
   return new SAML({
     // Endpoint metadata.
     issuer: urls.entityId,
@@ -125,8 +162,8 @@ function buildAdapter(cfg: SamlConfig): SAML {
     idpCert: cfg.x509Cert,
     wantAssertionsSigned: cfg.wantAssertionsSigned,
     wantAuthnResponseSigned: cfg.wantResponseSigned,
-    signatureAlgorithm: cfg.signatureAlgorithm as "sha1" | "sha256" | "sha512",
-    digestAlgorithm: cfg.digestAlgorithm as "sha1" | "sha256" | "sha512",
+    signatureAlgorithm: sig as "sha256" | "sha512",
+    digestAlgorithm: dig as "sha256" | "sha512",
     identifierFormat: cfg.nameIdFormat,
     // SP-side crypto (optional — signs AuthnRequests + decrypts encrypted
     // assertions when both are provided).
@@ -225,18 +262,17 @@ export async function consumeSamlResponse(
   // ID until it expires so a captured SAMLResponse can't be re-posted
   // inside the 5-min skew window.
   //
-  // R76 MEDIUM #3 (landed R77): parse the actual `<Assertion ID>`
-  // from the raw XML rather than trusting `profile["ID"]` (which is
-  // the outer `<Response ID>`). A captured signed assertion can be
-  // re-wrapped inside a FRESH Response envelope with a new Response
-  // `ID` — the (orgId, response.id) uniqueness check misses. The
-  // schema's `wantAuthnResponseSigned` default is FALSE (see
-  // routes/saml.ts:127), so re-wrapping is a signature-agnostic
-  // replay primitive against the 5-min skew window. Fail closed
-  // when neither the assertion ID nor a stable derivative is
-  // extractable — never fall back to a body-tail hash (unstable
-  // across whitespace / re-encoding, and doesn't survive Response-
-  // envelope rewrap).
+  // R76 MEDIUM #3 (landed R77) → R88 F1: extract the ID of the
+  // actually-signed element (via the ds:Reference URI in the
+  // XMLDSig block) rather than the first `<Assertion ID>` in the
+  // raw body. First-match regex is XSW-vulnerable — an attacker
+  // rewraps a captured signed assertion inside a fresh Response
+  // envelope AND prepends a bogus sibling `<Assertion ID="…">`
+  // before it; the regex matches the attacker nonce and the
+  // replay-guard sees fresh IDs indefinitely. The Reference URI
+  // is bound to the ACTUAL signed element via the digest and
+  // SignedInfo signature, so an XSW attacker who mutates it
+  // breaks the sig verify.
   const assertionId = extractAssertionId(body.SAMLResponse);
   if (!assertionId) {
     return { ok: false, error: "no_stable_assertion_id" };

@@ -163,6 +163,23 @@ async function deriveDecoyCredentials(
 // ---------------------------------------------------------------------------
 
 export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
+  // R88 F3: rate-limit siblings match /login (10/min/IP) and
+  // /reset-request (3/hr/IP) patterns. R76/R86/R87 spent three
+  // fixes hardening decoy indistinguishability for per-request
+  // enumeration — but without a per-endpoint budget, an
+  // attacker sharing the global 300 rpm/IP cap can still burn
+  // ~299 probes/min at the /authenticate/challenge and
+  // /authenticate/verify endpoints (which have no argon2 cost
+  // to slow them down). Adding 10/min/IP matches the /login
+  // sibling. Registration endpoints are session-gated so
+  // don't need per-endpoint rate limits (the session cost
+  // already blocks unauthenticated abuse).
+  const perIp = (max: number, windowMs: number) => ({
+    max,
+    timeWindow: windowMs,
+    keyGenerator: (req: { ip: string }) => `ip:${req.ip}`,
+  });
+
   // -----------------------------------------------------------------------
   // Registration ceremony — signed-in user adds a new passkey.
   // -----------------------------------------------------------------------
@@ -289,7 +306,10 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
   // login when the account has at least one credential.
   // -----------------------------------------------------------------------
 
-  app.post("/authenticate/challenge", async (req, reply) => {
+  app.post("/authenticate/challenge", {
+    // R88 F3: 10/min per IP matches /login.
+    config: { rateLimit: perIp(10, 60_000) },
+  }, async (req, reply) => {
     const body = z
       .object({ email: z.string().min(3).max(320).toLowerCase().trim() })
       .safeParse(req.body);
@@ -355,7 +375,10 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
     return reply.send({ options });
   });
 
-  app.post("/authenticate/verify", async (req, reply) => {
+  app.post("/authenticate/verify", {
+    // R88 F3: 10/min per IP matches /login.
+    config: { rateLimit: perIp(10, 60_000) },
+  }, async (req, reply) => {
     const cookieRaw = req.cookies[AUTH_CHALLENGE_COOKIE];
     if (!cookieRaw) return reply.code(400).send({ error: "no_challenge_cookie" });
     let bag: { challenge: string; userId: string | null };
