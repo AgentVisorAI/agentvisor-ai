@@ -3103,6 +3103,17 @@
       { g: "Pages", label: "Watch the pitch", desc: "30 s hero + 130 s full tour, with transcripts", run: function () { window.open("../pitch/", "_blank", "noopener"); } },
       { g: "Pages", label: "Read the code", desc: "github.com/AgentVisorAI/agentvisor-ai", run: function () { window.open("https://github.com/AgentVisorAI/agentvisor-ai", "_blank", "noopener"); } },
     ];
+    if (state.ds.mode === "mock") {
+      // Demo-table reset: judges hand the laptop around; this returns
+      // the console to the pristine Northwind showcase in one action.
+      pages.push({ g: "Pages", label: "Reset demo data", desc: "Back to the pristine showcase workspace", run: function () {
+        try {
+          ["av_mock_fresh_t0", "av_mock_fresh_identity", "av_mock_signed_out", "av_tour_dismissed"].forEach(function (k) { localStorage.removeItem(k); });
+        } catch (e) {}
+        location.hash = "#/overview";
+        location.reload();
+      } });
+    }
     // Dynamic targets get filled in when the async datasource calls
     // resolve. Palette shell is already interactive. User can navigate
     // + search static entries with zero latency.
@@ -3128,9 +3139,27 @@
     var selected = 0;
 
     function fuzzyMatch(q, s) { s = s.toLowerCase(); q = q.toLowerCase(); var i = 0; for (var c of s) if (c === q[i]) i++; return i === q.length; }
+    // Rank: label prefix < label substring < desc substring < scattered
+    // subsequence. Without this, "reset" selected "SeTtings" (its
+    // letters appear in order) above the literal "Reset demo data".
+    function matchRank(q, it) {
+      q = q.toLowerCase();
+      var label = String(it.label || "").toLowerCase();
+      var desc = String(it.desc || "").toLowerCase();
+      if (label.indexOf(q) === 0) return 0;
+      if (label.indexOf(q) >= 0) return 1;
+      if (desc.indexOf(q) >= 0) return 2;
+      return 3;
+    }
     function paint() {
       var q = input.value.trim();
       var filtered = q ? all.filter(function (it) { return fuzzyMatch(q, it.label + " " + (it.desc || "")); }) : all;
+      if (q) {
+        filtered = filtered
+          .map(function (it, i) { return { it: it, rank: matchRank(q, it), i: i }; })
+          .sort(function (a, b) { return a.rank - b.rank || a.i - b.i; })
+          .map(function (x) { return x.it; });
+      }
       selected = Math.min(selected, filtered.length - 1);
       if (selected < 0) selected = 0;
       if (filtered.length === 0) {
