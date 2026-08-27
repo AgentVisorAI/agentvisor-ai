@@ -90,19 +90,52 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       where: { userId: req.params.userId, orgId: claims.orgId },
     });
     if (!existing) return reply.code(404).send({ error: "not_found" });
-    // Refuse to demote the last owner.
-    if (existing.role === "owner" && body.data.role !== "owner") {
-      const ownerCount = await db.membership.count({
-        where: { orgId: claims.orgId, role: "owner" },
-      });
-      if (ownerCount <= 1) {
+    // R79 HIGH (Class B): serialize the last-owner check with the
+    // role update so two concurrent PATCH-to-non-owner or one
+    // PATCH+one DELETE can't both pass the `count() <= 1` guard
+    // and leave the org with ZERO owners. Prior shape ran
+    // count() and update() as separate statements; two concurrent
+    // owner-demotions each read count=2, each pass the check,
+    // each mutate → tenant silently bricked (owner-only endpoints
+    // become unreachable). Prisma's Serializable isolation
+    // catches the read-write dependency and aborts one of the
+    // transactions; caller sees a retryable error surface.
+    let updated;
+    try {
+      updated = await db.$transaction(
+        async (tx) => {
+          const stillOwner =
+            (await tx.membership.findUnique({ where: { id: existing.id } }))?.role ===
+            "owner";
+          if (stillOwner && body.data.role !== "owner") {
+            const ownerCount = await tx.membership.count({
+              where: { orgId: claims.orgId, role: "owner" },
+            });
+            if (ownerCount <= 1) {
+              throw new Error("last_owner");
+            }
+          }
+          return await tx.membership.update({
+            where: { id: existing.id },
+            data: { role: body.data.role },
+          });
+        },
+        { isolationLevel: "Serializable" },
+      );
+    } catch (e) {
+      if (e instanceof Error && e.message === "last_owner") {
         return reply.code(400).send({ error: "last_owner" });
       }
+      // Serializable isolation aborts with P2034 (write conflict);
+      // client retries the whole flow safely.
+      if (
+        typeof e === "object" && e !== null &&
+        (e as { code?: string }).code === "P2034"
+      ) {
+        return reply.code(409).send({ error: "concurrent_modification_retry" });
+      }
+      throw e;
     }
-    const updated = await db.membership.update({
-      where: { id: existing.id },
-      data: { role: body.data.role },
-    });
     writeAudit(
       {
         orgId: claims.orgId,
@@ -128,16 +161,44 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       include: { user: true },
     });
     if (!existing) return reply.code(404).send({ error: "not_found" });
-    // Refuse to remove the last owner (would orphan the org).
-    if (existing.role === "owner") {
-      const ownerCount = await db.membership.count({
-        where: { orgId: claims.orgId, role: "owner" },
-      });
-      if (ownerCount <= 1) {
+    // R79 HIGH (Class B): same serializable transaction discipline
+    // as the PATCH path above. Two concurrent owner-leaves (or one
+    // PATCH-demote + one DELETE-leave) must not both pass the
+    // `count() <= 1` guard.
+    try {
+      await db.$transaction(
+        async (tx) => {
+          const current = await tx.membership.findUnique({
+            where: { id: existing.id },
+          });
+          if (!current) throw new Error("not_found");
+          if (current.role === "owner") {
+            const ownerCount = await tx.membership.count({
+              where: { orgId: claims.orgId, role: "owner" },
+            });
+            if (ownerCount <= 1) {
+              throw new Error("last_owner");
+            }
+          }
+          await tx.membership.delete({ where: { id: existing.id } });
+        },
+        { isolationLevel: "Serializable" },
+      );
+    } catch (e) {
+      if (e instanceof Error && e.message === "last_owner") {
         return reply.code(400).send({ error: "last_owner" });
       }
+      if (e instanceof Error && e.message === "not_found") {
+        return reply.code(404).send({ error: "not_found" });
+      }
+      if (
+        typeof e === "object" && e !== null &&
+        (e as { code?: string }).code === "P2034"
+      ) {
+        return reply.code(409).send({ error: "concurrent_modification_retry" });
+      }
+      throw e;
     }
-    await db.membership.delete({ where: { id: existing.id } });
     writeAudit(
       {
         orgId: claims.orgId,
@@ -373,8 +434,21 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       });
     }
 
-    // Attach the membership + mark invite consumed.
-    await db.$transaction([
+    // R79 MEDIUM (Class B): mark the invite consumed atomically
+    // via `updateMany({ where: { id, acceptedAt: null } })` and
+    // abort on `count === 0`. Prior shape ran the membership
+    // upsert and `invite.update` inside a transaction but the
+    // update's where-clause only matched by `id` — no
+    // `acceptedAt: null` guard. Two concurrent `/invites/accept`
+    // calls with the same token both pass `verifyPassword` (same
+    // hash), both enter the transaction, both flip `acceptedAt`,
+    // both mint session cookies. Combined with a phished/stolen
+    // invite link, both attacker and legitimate invitee end up
+    // with authenticated sessions before the invite is marked
+    // consumed. `updateMany` with the null-guard makes the second
+    // caller's UPDATE affect 0 rows; we detect that and abort
+    // the whole flow.
+    const [_, inviteConsumed] = await db.$transaction([
       db.membership.upsert({
         where: { userId_orgId: { userId: user.id, orgId: matched.orgId } },
         create: {
@@ -384,11 +458,21 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
         },
         update: {}, // Already a member? Fine, just proceed.
       }),
-      db.invite.update({
-        where: { id: matched.id },
+      db.invite.updateMany({
+        where: {
+          id: matched.id,
+          acceptedAt: null,
+          revokedAt: null,
+        },
         data: { acceptedAt: new Date() },
       }),
     ]);
+    if (inviteConsumed.count === 0) {
+      // Lost the race with another concurrent /invites/accept.
+      // The other call has already accepted this invite and
+      // minted its own session. Refuse to mint a duplicate.
+      return reply.code(409).send({ error: "invite_already_consumed" });
+    }
 
     const token = await mintSession({
       sub: user.id,
