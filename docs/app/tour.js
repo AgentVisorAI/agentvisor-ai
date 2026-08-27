@@ -58,8 +58,9 @@
       target: ".receipt-card",
       title: "Sealed into a signed receipt",
       body: "The whole session — every prompt, tool call, and block — is " +
-        "sealed under an <b>Ed25519 signature</b>. Change one byte and the " +
-        "signature breaks. This is the audit trail you hand to an auditor.",
+        "sealed under a <b>tamper-evident cryptographic signature</b>. " +
+        "Change one byte and the signature breaks. This is the audit " +
+        "trail you hand to an auditor.",
     },
     {
       route: "#/sessions/sess_01H9K",
