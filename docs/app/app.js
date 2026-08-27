@@ -276,6 +276,14 @@
     document.body.appendChild(t);
     setTimeout(function () { t.remove(); }, 2200);
   }
+  // Toast with a trailing action link; stays up longer so the link is
+  // actually clickable. Used by the simulated-attack story.
+  function toastLink(msg, href, label) {
+    var t = h('<div class="toast" style="display:flex; gap:10px; align-items:center">' + esc(msg) +
+      ' <a href="' + esc(href) + '" style="color:inherit; font-weight:700; text-decoration:underline; white-space:nowrap">' + esc(label) + "</a></div>");
+    document.body.appendChild(t);
+    setTimeout(function () { t.remove(); }, 6500);
+  }
   function loadingBlock(kind) {
     if (kind === "stats") {
       var boxes = "";
@@ -834,7 +842,7 @@
       ? Math.round((stats.toolsBlocked / (stats.toolsAllowed + stats.toolsBlocked)) * 100) : 0;
 
     main.innerHTML =
-      pageHeader("Overview", "Fleet activity for " + rangeLabel + ".", rangeGroup()) +
+      pageHeader("Overview", "Fleet activity for " + rangeLabel + ".", attackBtn() + rangeGroup()) +
       '<div class="stats">' +
         stat("Sessions", stats.sessions, stats.deployments + " deployment" + (stats.deployments === 1 ? "" : "s"), sparkline(series.map(function (b) { return b.allowed + b.blocked; }))) +
         stat("Tool calls allowed", stats.toolsAllowed.toLocaleString(), "policy pass", sparkline(allowedByHour)) +
@@ -864,6 +872,47 @@
 
     installRangeGroup(main);
     installChartHover(main, series);
+    var sim = main.querySelector("#simAttack");
+    if (sim) sim.addEventListener("click", runAttackDemo);
+  }
+
+  /* ── Simulated attack (mock mode) ────────────────────────────
+   * Stages the blocked-payment story live: an in_progress purchase
+   * session appears, the payment gets blocked ~3 s later, the session
+   * seals, and every stat on screen catches up. Pure fixture theater —
+   * the datasource owns the state changes, this owns the pacing. */
+  var attackRunning = false;
+  function attackBtn() {
+    if (state.ds.mode !== "mock" || typeof state.ds.simulateAttack !== "function") return "";
+    try { if (localStorage.getItem("av_mock_fresh_t0")) return ""; } catch (e) {}
+    return '<button class="btn" id="simAttack"' + (attackRunning ? " disabled" : "") +
+      ' title="Stage a live blocked payment in this demo org">⚡ Simulate an attack</button> ';
+  }
+  async function runAttackDemo() {
+    if (attackRunning || state.ds.mode !== "mock" || typeof state.ds.simulateAttack !== "function") return;
+    attackRunning = true;
+    var rerender = function () {
+      var p = state.route.path[0] || "overview";
+      if (p === "overview" || (p === "sessions" && !state.route.path[1])) render();
+    };
+    toast("vendor-onboarding picked up an invoice email…");
+    var info = await state.ds.simulateAttack();
+    setTimeout(rerender, 250);
+    setTimeout(function () {
+      toast('create_payment("' + info.vendor + '") — vendor not on the approved list. BLOCKED', true);
+      rerender();
+    }, info.blockAtMs + 200);
+    setTimeout(function () {
+      rerender();
+      setTimeout(function () {
+        var st = document.querySelector(".stat.savings");
+        if (st) st.classList.add("av-pulse");
+        var row = document.querySelector('tr[data-id="' + info.id + '"]');
+        if (row) row.classList.add("av-new-row");
+      }, 700);
+      toastLink("Blocked before the money moved — $" + info.valueUsd.toLocaleString() + " kept. Receipt signed.", "#/sessions/" + info.id, "View session →");
+      attackRunning = false;
+    }, info.sealAtMs + 300);
   }
 
   function installChartHover(root, series) {
@@ -2867,6 +2916,10 @@
       { g: "Actions", label: "New deployment", desc: "Register an agentvisord daemon", run: function () { navigate("#/deployments"); setTimeout(openCreateDeploymentModal, 100); } },
       { g: "Actions", label: "Sign out", desc: "Leave this workspace", run: signOut },
     ];
+    if (state.ds.mode === "mock") {
+      if (window.AVTour) actions.unshift({ g: "Actions", label: "See the full flow", desc: "Guided tour of the money story", run: function () { window.AVTour.start(); } });
+      if (typeof state.ds.simulateAttack === "function") actions.push({ g: "Actions", label: "Simulate an agent attack", desc: "Stage a live blocked payment", run: function () { navigate("#/overview"); setTimeout(runAttackDemo, 250); } });
+    }
     // Dynamic targets get filled in when the async datasource calls
     // resolve. Palette shell is already interactive. User can navigate
     // + search static entries with zero latency.
