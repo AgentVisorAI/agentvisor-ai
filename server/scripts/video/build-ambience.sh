@@ -19,8 +19,8 @@ OUT=/tmp/video-v4/audio
 # Fade in over 3s from silence (so scene 1 opens clean), fade out
 # over 4s at the end (CTA breathe).
 ffmpeg -y \
-  -f lavfi -i "sine=frequency=65:duration=52" \
-  -f lavfi -i "sine=frequency=131:duration=52" \
+  -f lavfi -i "sine=frequency=65:duration=40" \
+  -f lavfi -i "sine=frequency=131:duration=40" \
   -filter_complex "
     [0]volume=0.65[b1];
     [1]volume=0.40[b2];
@@ -28,7 +28,7 @@ ffmpeg -y \
     [mix]lowpass=f=800,highpass=f=45,
          tremolo=f=0.15:d=0.35,
          afade=t=in:st=0:d=3.0,
-         afade=t=out:st=47:d=4.0,
+         afade=t=out:st=35:d=4.0,
          volume=0.90
     [out]
   " \
