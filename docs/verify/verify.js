@@ -45,6 +45,12 @@
       // trusted-verify experience investors will see with real
       // daemon-signed receipts.
       "9992e71fe6a6e5edc18129becef2ec640f9611a4e12a4b9a311bab943ab19467",
+      // The mock console's fixed demo signing key (docs/app/
+      // datasource.js). Receipts downloaded from the /app/ demo are
+      // signed with it, so dropping one here verifies GREEN, the same
+      // end-to-end flow the pitch video shows. The private half is
+      // intentionally public; it signs only fake demo data.
+      "573c8f249012fbb08b3d79973411bb93141f32719c86ada25306fde5e59e8d57",
     ]);
 
     async function verifyBundle(bundle) {
