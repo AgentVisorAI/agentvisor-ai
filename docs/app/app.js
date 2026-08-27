@@ -1898,19 +1898,41 @@
 
   async function renderPolicyDetail(main, id) {
     main.innerHTML = pageHeader("Policy", "", '<a href="#/policies" class="btn">← All policies</a>') + loadingBlock("stats");
-    var p;
+    var p, fired = [];
     try { p = await state.ds.getPolicy(id); } catch (e) { return renderError(main, e); }
+    // Close the loop policy → session → receipt: list the sessions
+    // this policy actually fired on, so "plain rules" lead straight
+    // to the evidence.
+    try {
+      var resp = await state.ds.listSessions({ limit: 100 });
+      fired = (resp.sessions || []).filter(function (s) { return (s.policiesFired || []).indexOf(id) >= 0; });
+    } catch (e) { /* the policy page still renders without the list */ }
     var switchCls = p.enabled ? "on" : "";
+    // Keep the headline consistent with the evidence below it: when we
+    // have the fired-session list, derive the block count from it
+    // instead of the fixture's static number.
+    var blocks24 = fired.length
+      ? fired.reduce(function (a, s) { return a + (s.toolsBlocked || 0); }, 0)
+      : p.blocks24h;
     main.innerHTML =
       pageHeader(p.name, p.kind + " · " + p.scope, '<a href="#/policies" class="btn">← All policies</a> <button class="switch ' + switchCls + '" id="polSwitch" title="Toggle enabled" aria-label="Toggle policy enabled" role="switch" aria-checked="' + (p.enabled ? "true" : "false") + '"></button>') +
       '<div class="dep-summary">' +
         depCell("Status", p.enabled ? '<span class="pill ok status-dot">enabled</span>' : '<span class="pill neutral">disabled</span>') +
         depCell("Hits (24h)", p.hits24h.toLocaleString()) +
-        depCell("Blocks (24h)", p.blocks24h > 0 ? '<span style="color: var(--danger-solid)">' + p.blocks24h + "</span>" : p.blocks24h) +
+        depCell("Blocks (24h)", blocks24 > 0 ? '<span style="color: var(--danger-solid)">' + blocks24 + "</span>" : blocks24) +
         depCell("Updated", timeAgo(p.updatedAt)) +
       "</div>" +
       '<div class="card"><h2>Description</h2><p style="margin:0;color:var(--fg-2);font-size:var(--t-body)">' + esc(p.description) + '</p></div>' +
-      '<div class="card" style="margin-top:12px"><h2>Definition</h2><pre class="policy-body">' + syntaxPolicy(p.body) + "</pre></div>";
+      '<div class="card" style="margin-top:12px"><h2>Definition</h2><pre class="policy-body">' + syntaxPolicy(p.body) + "</pre></div>" +
+      (fired.length
+        ? '<div class="card" style="margin-top:12px; padding:0">' +
+            '<div style="padding:12px 16px; border-bottom: 1px solid var(--border); display:flex; align-items:baseline; gap:8px;">' +
+              '<h2 style="margin:0; font-size: var(--t-section); font-weight:600">Sessions this policy fired on</h2>' +
+              '<span style="color: var(--fg-3); font-size: var(--t-sec)">' + fired.length + ' in the last 24 h · click one to see the block</span>' +
+            "</div>" +
+            sessionsTable(fired.slice(0, 8)) +
+          "</div>"
+        : "");
     on("#polSwitch", "click", function () {
       state.ds.togglePolicy(id).then(function () { renderPolicyDetail(main, id); });
     });
