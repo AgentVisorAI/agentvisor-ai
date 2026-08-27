@@ -10,7 +10,7 @@
   -->
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'none'; base-uri 'none'; form-action 'none'; script-src 'self'; script-src-attr 'none'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; font-src 'self' data:; manifest-src 'self'; object-src 'none'; frame-src 'none'">
-  <title>Verify a receipt — AgentVisor AI</title>
+  <title>Verify a receipt. AgentVisor AI</title>
   <meta name="description" content="Drop an AgentVisor session receipt into your browser. The Ed25519 signature verifies right here, offline, against the receipt's embedded public key. No account, no upload.">
   <link rel="stylesheet" href="../style.css">
   <link rel="stylesheet" href="verify.css">
@@ -44,7 +44,7 @@
       <p>
         Drop an AgentVisor receipt JSON in your browser. The Ed25519 signature
         verifies right here, offline, against the receipt's embedded public
-        key. No account, no upload — nothing leaves this page.
+        key. No account, no upload. Nothing leaves this page.
       </p>
     </section>
 
@@ -52,7 +52,7 @@
       <div class="drop-icon">📄</div>
       <h2 id="dropHead">Drop a receipt JSON here</h2>
       <p>Or paste a receipt file into this page (⌘V / Ctrl-V works too).</p>
-      <div class="or">— or —</div>
+      <div class="or">or</div>
       <input type="file" id="fileInput" accept="application/json,.json" hidden>
       <button type="button" class="browse" id="browseBtn">Choose a file</button>
     </div>
@@ -72,8 +72,8 @@
       </p>
       <p>
         Your browser here runs Web Crypto's Ed25519 verify against the
-        embedded key and the raw signed body. If a single byte changed —
-        anywhere — the verification fails.
+        embedded key and the raw signed body. If a single byte changed
+        anywhere, the verification fails.
       </p>
       <p>
         The same check runs offline in Node too:

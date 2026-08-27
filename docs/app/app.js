@@ -1,5 +1,5 @@
 /*
- * AgentVisor AI console — application.
+ * AgentVisor AI console. Application.
  *
  * Hash-routed vanilla SPA. All data flows through window.dataSource
  * (mock or api). Views: /login /signup /overview /sessions /sessions/:id
@@ -88,7 +88,7 @@
       if (!state.session) return; // already logged out; ignore
       state.session = null;
       stopLiveStream();
-      toast("Your session expired — please sign in again");
+      toast("Your session expired. Please sign in again");
       navigate("#/login");
     });
     // Cross-tab sign-out: when another tab in this browser signs out,
@@ -159,7 +159,7 @@
     else if (path[0] === "sessions" && path[1] && msg.type === "events.appended" && msg.data.sessionId === path[1]) {
       scheduleSessionDetailRefresh(path[1]);
     } else if (path[0] === "sessions" && !path[1] && (msg.type === "session.upsert" || msg.type === "events.appended")) {
-      // A new session or a batch of events came in — refresh the list
+      // A new session or a batch of events came in. Refresh the list
       // so the operator sees new rows appear without hitting reload.
       // Debounced so a burst of events doesn't cause a re-render on
       // every message.
@@ -267,7 +267,7 @@
     return '<div class="page-header"><div><h1>Page not found</h1>' +
       '<div class="sub">The URL you followed doesn\'t point at anything in this workspace.</div></div></div>' +
       '<div class="empty">' +
-        '<h3>404 — nothing here</h3>' +
+        '<h3>404. Nothing here</h3>' +
         '<p>The page you\'re looking for might have been renamed, or the link that brought you here is stale.</p>' +
         '<a class="btn accent" href="#/overview">Go to overview</a> ' +
         '<a class="btn" href="#/sessions">Or view sessions</a>' +
@@ -393,7 +393,7 @@
     // One status chip in the topbar, not two. In mock mode we surface
     // the "Demo" label so investors instantly see the data is fixtures.
     // In live/api mode a single pulsing "Live" pill doubles as SSE
-    // stream health — it flips to "Reconnecting" when the EventSource
+    // stream health. It flips to "Reconnecting" when the EventSource
     // drops. Rendering both a mode chip AND a stream chip in live mode
     // duplicated the word "Live" next to itself.
     var statusChip = state.ds.mode === "mock"
@@ -459,7 +459,7 @@
   function iconKey() { return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="5.5" cy="8.5" r="3"/><path d="M8.5 8.5H14M13 8.5V11M11 8.5V10"/></svg>'; }
 
   /* ============================================================
-   * LOGIN / SIGNUP — split-screen with SSO
+   * LOGIN / SIGNUP. Split-screen with SSO
    * ============================================================ */
 
   function renderLogin() { renderAuth("login"); }
@@ -509,13 +509,13 @@
               (isSignup ? "Already have an account? " + '<a href="#/login">Sign in</a>' : "New here? " + '<a href="#/signup">Create an account</a>') +
             "</div>" +
             (state.ds.mode === "mock"
-              ? '<div class="mock-badge">Demo — any credentials work</div>'
+              ? '<div class="mock-badge">Demo. Any credentials work</div>'
               : "") +
           "</div>" +
         "</section>" +
         '<aside class="auth-panel"><div class="panel-inner">' +
           '<h2>Ship autonomous agents your compliance team trusts.</h2>' +
-          '<p>Every LLM call, every tool call, every policy hit — captured, evaluated, and signed. In production, in real time.</p>' +
+          '<p>Every LLM call, every tool call, every policy hit. Captured, evaluated, and signed. In production, in real time.</p>' +
           '<div class="demo-stream">' +
             demoStreamRow(1, 6, '<b>tool.call</b> search_inventory(sku=\"NW-1240\")') +
             demoStreamRow(2, 5, '<b class="ok">TOOL ✓ allow</b> policy: read-only ✓') +
@@ -535,7 +535,7 @@
         if (p === "saml") {
           // Prompt for the email so we can look up the org's SAML
           // config, then redirect to its login endpoint. This is the
-          // "Sign in with SSO" flow — no OAuth involved.
+          // "Sign in with SSO" flow. No OAuth involved.
           openInputModal({
             title: "Sign in with SAML SSO",
             label: "Work email",
@@ -578,7 +578,7 @@
         ? state.ds.signup({ email: email, password: pw, orgName: ($("#orgName") || {}).value })
         : state.ds.login({ email: email, password: pw });
       promise.then(async function (s) {
-        // MFA gate — server returned {mfaRequired: true, email}. Run the
+        // MFA gate. Server returned {mfaRequired: true, email}. Run the
         // WebAuthn ceremony to complete auth.
         if (s && s.mfaRequired) {
           errEl.innerHTML = '<div class="auth-hint" style="color: var(--fg-2); padding: 8px 12px;">Touch your passkey…</div>';
@@ -726,7 +726,7 @@
             ) +
             '<div class="auth-alt"><a href="#/login">← Back to sign in</a></div>' +
             (state.ds.mode === "mock"
-              ? '<div class="mock-badge">Demo — the token is displayed inline after "Send reset link".</div>'
+              ? '<div class="mock-badge">Demo. The token is displayed inline after "Send reset link".</div>'
               : "") +
           "</div>" +
         "</section>" +
@@ -771,7 +771,7 @@
       var btn = e.target.querySelector("button");
       btn.disabled = true;
       state.ds.confirmPasswordReset({ email: email, token: token, newPassword: newPassword }).then(function () {
-        toast("Password updated — please sign in");
+        toast("Password updated. Please sign in");
         navigate("#/login");
       }).catch(function (err) {
         btn.disabled = false;
@@ -782,7 +782,7 @@
   }
 
   /* ============================================================
-   * OVERVIEW — stats with sparklines + a real chart
+   * OVERVIEW. Stats with sparklines + a real chart
    * ============================================================ */
 
   async function renderOverview(main) {
@@ -900,13 +900,13 @@
   }
 
   /* ============================================================
-   * SESSIONS LIST — with filter bar
+   * SESSIONS LIST. With filter bar
    * ============================================================ */
 
   var sessionsFilter = { q: "", deploymentId: "", agent: "", blockedOnly: false, sinceHours: 24 };
   var sessionsPageSize = 50;
   // Hard cap on DOM rows. At 1M sessions the API pages 50 at a time,
-  // and "Load more" keeps appending — but we stop at 1000 rendered so
+  // and "Load more" keeps appending. But we stop at 1000 rendered so
   // the browser never has to reflow 100k+ rows. Past this point the
   // filter bar is the correct escape hatch (search, date range, etc).
   var SESSIONS_DOM_CAP = 1000;
@@ -1075,7 +1075,7 @@
   });
 
   /* ============================================================
-   * SESSION DETAIL — compact rows + right drawer + verified receipt
+   * SESSION DETAIL. Compact rows + right drawer + verified receipt
    * ============================================================ */
 
   async function renderSessionDetail(main, id, initial) {
@@ -1181,7 +1181,7 @@
           // Merge the fresh page into the current data snapshot and
           // re-render *without re-fetching*. Threading data through
           // renderSessionDetail as `initial` preserves the appended
-          // events across renders — the previous version called
+          // events across renders. The previous version called
           // renderSessionDetail without an argument, which re-fetched
           // from scratch and threw away every appended page.
           var merged = Object.assign({}, data, {
@@ -1219,20 +1219,20 @@
       var b64 = btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
       var origin = window.VERIFY_BASE || "https://agentvisorai.me";
       var url = origin + "/verify/#data=" + b64;
-      // Warn if it's really big — many chat clients cap URLs around 8k.
+      // Warn if it's really big. Many chat clients cap URLs around 8k.
       if (url.length > 32000) {
         toast("Receipt too large to share as a URL (" + url.length + " bytes). Use Download instead.", true);
         return;
       }
       navigator.clipboard.writeText(url).then(function () {
-        toast("Verify link copied — recipient's browser will auto-verify it.");
+        toast("Verify link copied. Recipient's browser will auto-verify it.");
       }, function () {
         // Fallback: show it in a modal so the user can copy manually.
         showTokenModal(url, "Share this verify link");
       });
     });
 
-    // Build the portable verification bundle exactly once — used by
+    // Build the portable verification bundle exactly once. Used by
     // both the Download and Share buttons so the recipient of either
     // gets the same shape as the offline verifier expects.
     function buildReceiptBundle(sess, rcpt) {
@@ -1267,7 +1267,7 @@
     }
 
     // Download receipt as a portable verification bundle.
-    // The exported JSON is self-contained — payload + signature +
+    // The exported JSON is self-contained. Payload + signature +
     // public key + human-readable verification recipe. Anyone with
     // the file (an auditor, an insurer, a court) can verify the
     // signature offline without asking us or the customer for
@@ -1283,7 +1283,7 @@
       a.click();
       a.remove();
       setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
-      toast("Receipt downloaded — verify offline with the bundled instructions.");
+      toast("Receipt downloaded. Verify offline with the bundled instructions.");
     });
 
     // Fire the real Ed25519 verification. When it lands, the "Verifying…"
@@ -1296,7 +1296,7 @@
     // tuple element only when we control the markup (like the Policy
     // link below). Otherwise ev.tag / ev.policyId would carry any
     // <script>/<img onerror> the daemon put there straight into the
-    // DOM — high-signal XSS surface since the daemon is customer code
+    // DOM. High-signal XSS surface since the daemon is customer code
     // and event tags flow through the console for every viewer of
     // that session.
     var meta = [
@@ -1349,7 +1349,7 @@
     var policies = (r.policiesEnforced || []).map(function (p) {
       return '<span class="pill accent status-dot">' + esc(p) + "</span>";
     }).join(" ");
-    // Placeholder verifier state — the real answer arrives after the async
+    // Placeholder verifier state. The real answer arrives after the async
     // Web Crypto verify call. Marked "verifying" so the UI doesn't lie
     // about the outcome while we're still waiting.
     return '<div class="receipt-card card">' +
@@ -1408,7 +1408,7 @@
   }
 
   /* ============================================================
-   * DEPLOYMENTS — list + detail + install snippet
+   * DEPLOYMENTS. List + detail + install snippet
    * ============================================================ */
 
   async function renderDeployments(main) {
@@ -1587,7 +1587,7 @@
       '<div class="modal-backdrop" role="dialog" aria-modal="true">' +
         '<div class="modal">' +
           "<h2>New deployment</h2>" +
-          '<p class="sub">Register a daemon. You\'ll get an ingest token — copy it now; it won\'t be shown again.</p>' +
+          '<p class="sub">Register a daemon. You\'ll get an ingest token. Copy it now; it won\'t be shown again.</p>' +
           '<form id="depForm">' +
             '<div class="field"><label>Name</label><input id="depName" required placeholder="acme-prod" pattern="[a-zA-Z0-9\\-_]+" /></div>' +
             '<div class="field"><label>Environment</label><select id="depEnv"><option>production</option><option>staging</option><option>development</option></select></div>' +
@@ -1627,7 +1627,7 @@
       '<div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="tokTitle">' +
         '<div class="modal">' +
           '<h2 id="tokTitle">' + esc(title || "Ingest token") + "</h2>" +
-          '<p class="sub">Point your daemon at this console using the token below. Store it in your secret manager — it won\'t be shown again.</p>' +
+          '<p class="sub">Point your daemon at this console using the token below. Store it in your secret manager. It won\'t be shown again.</p>' +
           '<div class="token-display">' + esc(token) + "</div>" +
           '<div class="notice"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M8 1L15 14H1L8 1z"/><path d="M8 6v3M8 11v.5"/></svg>' +
             '<span>This is the only time you\'ll see the full token. If you lose it, rotate to get a new one.</span></div>' +
@@ -1660,7 +1660,7 @@
       }
       if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(token).then(markCopied).catch(function () {
-          toast("Copy blocked — select the token manually");
+          toast("Copy blocked. Select the token manually");
         });
       } else {
         toast("Clipboard unavailable in this browser");
@@ -1745,7 +1745,7 @@
   }
 
   /* ============================================================
-   * SETTINGS — tabs
+   * SETTINGS. Tabs
    * ============================================================ */
 
   var SETTINGS_TABS = [
@@ -2021,7 +2021,7 @@
     var ib = $("#inviteBtn", root);
     if (ib) ib.addEventListener("click", function () { openInviteModal(root); });
 
-    // Member row actions — role change + remove
+    // Member row actions. Role change + remove
     var tables = root.querySelectorAll("table");
     tables[0].addEventListener("change", function (e) {
       var sel = e.target.closest("[data-role-user]");
@@ -2276,7 +2276,7 @@
     if (addPk) addPk.addEventListener("click", function () { addPasskey(root); });
 
     // Passkey row actions
-    var pkTbody = $$("main .table-wrap tbody", root)[1] || null; // sometimes there are two tables — SSO + MFA
+    var pkTbody = $$("main .table-wrap tbody", root)[1] || null; // sometimes there are two tables. SSO + MFA
     var pkTables = root.querySelectorAll("table");
     for (var pi = 0; pi < pkTables.length; pi++) {
       pkTables[pi].addEventListener("click", function (e) {
@@ -2342,7 +2342,7 @@
             '<dt>SLO URL</dt><dd class="mono" style="font-size:11.5px; word-break:break-all;">' + esc(cfg.spSloUrl) + '</dd>' +
             '<dt>Metadata URL</dt><dd class="mono" style="font-size:11.5px; word-break:break-all;"><a href="' + esc(cfg.spMetadataUrl) + '" target="_blank">' + esc(cfg.spMetadataUrl) + '</a></dd>' +
             '<dt>IdP cert fingerprint</dt><dd class="mono" style="font-size:11.5px; word-break:break-all;">' + esc(cfg.x509CertFingerprint || "(not parsed)") + '</dd>' +
-            '<dt>SP signing keypair</dt><dd>' + (cfg.hasSpKeypair ? '<span class="pill ok">present</span>' : '<span class="pill neutral">none — using unsigned AuthnRequests</span>') + '</dd>' +
+            '<dt>SP signing keypair</dt><dd>' + (cfg.hasSpKeypair ? '<span class="pill ok">present</span>' : '<span class="pill neutral">none. Using unsigned AuthnRequests</span>') + '</dd>' +
             '<dt>NameID format</dt><dd class="mono" style="font-size:11.5px">' + esc(cfg.nameIdFormat) + '</dd>' +
             '<dt>JIT provisioning</dt><dd>' + (cfg.jitEnabled ? 'enabled · default role = ' + esc(cfg.jitDefaultRole) : 'disabled') + '</dd>' +
             '<dt>Allowed domains</dt><dd class="mono" style="font-size:11.5px">' + esc(cfg.allowedDomains || "(any)") + '</dd>' +
@@ -2813,7 +2813,7 @@
     cmdkOpen_ = true;
     document.body.classList.add("locked");
 
-    // Gather static targets synchronously — these render immediately so
+    // Gather static targets synchronously. These render immediately so
     // the palette shell is on screen the same tick as the ⌘K keystroke.
     var routes = [
       { g: "Navigate", label: "Overview", desc: "Fleet 24h dashboard", kbd: "G O", href: "#/overview", icon: iconChart() },
@@ -2828,7 +2828,7 @@
       { g: "Actions", label: "Sign out", desc: "Leave this workspace", run: signOut },
     ];
     // Dynamic targets get filled in when the async datasource calls
-    // resolve. Palette shell is already interactive — user can navigate
+    // resolve. Palette shell is already interactive. User can navigate
     // + search static entries with zero latency.
     var sessions = [], policies = [], deployments = [];
     var all = routes.concat(actions);
@@ -2884,7 +2884,7 @@
     paint();
     setTimeout(function () { input.focus(); }, 10);
 
-    // Populate dynamic entries in the background — palette is already
+    // Populate dynamic entries in the background. Palette is already
     // interactive with the 8 static routes/actions above. When the data
     // arrives we extend `all` and repaint (throttled to the current
     // query). Any error is silently absorbed; the palette stays useful
@@ -3034,7 +3034,7 @@
 
   function renderError(main, err) {
     // Log the original once so ops can grep the browser console (or
-    // Sentry when we wire it) — but don't render the raw message; a
+    // Sentry when we wire it). But don't render the raw message; a
     // customer-facing "Something went wrong" is a better UX than
     // "not_found" for a stale bookmark.
     console.error(err);
