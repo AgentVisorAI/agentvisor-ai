@@ -19,11 +19,17 @@ always reflects what an investor visiting the URL would see.
 # From server/ so playwright resolves.
 cd server
 node scripts/video/record-scenes.mjs   # ~90s, writes /tmp/video-v4/scenes/*.webm
+bash scripts/video/build-audio.sh       # ~5s,  writes /tmp/video-v4/audio/soundtrack-44s.aac
 bash scripts/video/compose.sh           # ~90s, writes /tmp/video-v4/agentvisor-mockup-v4.mp4
+                                        #        and  /tmp/video-v4/agentvisor-mockup-v9-audio.mp4
+bash scripts/video/compose-teaser.sh    # ~30s, writes /tmp/video-v4/agentvisor-mockup-teaser.mp4
 ```
 
-Result: `/tmp/video-v4/agentvisor-mockup-v4.mp4` — 43s @ 1920×1080 H.264,
-~3.4 MB.
+Result:
+
+* `agentvisor-mockup-v4.mp4` — 43s @ 1920×1080 H.264, silent (for muted playback).
+* `agentvisor-mockup-v9-audio.mp4` — same, with subtle transition punctuation.
+* `agentvisor-mockup-teaser.mp4` — 12s social cut.
 
 ## Uploading to GitHub for a shareable URL
 
