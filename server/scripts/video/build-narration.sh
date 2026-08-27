@@ -13,7 +13,7 @@ mkdir -p "$VOICE"
 # the scene window (see W* below) with margin, so narration can never
 # overlap the next scene's line.
 EDGE_TTS="${EDGE_TTS:-/tmp/tts-venv/bin/edge-tts}"
-VOICE_ID="en-US-AriaNeural"
+VOICE_ID="en-US-AndrewMultilingualNeural"
 
 gen() {
   local out=$1; local window=$2; shift 2
@@ -35,10 +35,10 @@ gen() {
 }
 
 gen "$VOICE/s1" 4.1 "An A I agent just paid a fake vendor eight thousand four hundred dollars."
-gen "$VOICE/s2" 5.6 "Agent Visor watches every A I agent. Thirty one thousand eight hundred forty dollars saved across blocked orders."
+gen "$VOICE/s2" 5.7 "Agent Visor watches every A I agent. Thirty one thousand eight hundred forty dollars saved from blocked orders."
 gen "$VOICE/s3" 6.7 "Here is the order it stopped: a vendor not on the approved list. Blocked, signed, and the safe retry went through."
 gen "$VOICE/s4" 6.35 "Anyone can verify the receipt. Green tick. No account."
-gen "$VOICE/s5" 4.7 "A I agents you can hand to an auditor. agentvisor A I dot me."
+gen "$VOICE/s5" 4.7 "A I agents you can hand to an auditor. The address is on screen."
 
 for i in 1 2 3 4 5; do
   ffmpeg -y -i "$VOICE/s$i.raw.wav" \
