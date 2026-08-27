@@ -66,48 +66,130 @@ async function recordScene(browser, sceneName, durationMs, fn) {
   console.log(`  ✓ Wrote ${dst}`);
 }
 
+/*
+ * Two-phase console-scene helper.
+ *
+ * The Playwright recording starts the moment newContext(recordVideo)
+ * fires. So any login+navigation+waitForSelector-for-data time gets
+ * baked into the front of the clip as "loading spinner" footage.
+ *
+ * Fix: log in + navigate + wait for data in a SEPARATE preload
+ * context whose recording is discarded. Then reopen a fresh context
+ * with the same localStorage state, whose recording IS kept — that
+ * one starts already on the target page with data ready.
+ */
+async function recordConsoleScene(browser, sceneName, durationMs, hash, waitFor, cinematicOpts) {
+  console.log(`\n▶ Recording console scene "${sceneName}" (${durationMs}ms)…`);
+  // ── Phase 1: warm up in an unrecorded context, capture its state ──
+  const warmCtx = await browser.newContext({ viewport: { width: 1920, height: 1080 } });
+  const warm = await warmCtx.newPage();
+  await warm.addInitScript(() => { try { localStorage.setItem("av_mock_signed_out", "1"); } catch {} });
+  await warm.goto(SITE + "#/login", { waitUntil: "networkidle" });
+  await warm.waitForSelector("input#email", { timeout: 15000 });
+  await warm.locator("input#email").fill("olivia.tan@northwind.com");
+  await warm.locator("input#password").fill("demo");
+  await warm.locator("button[type='submit']").first().click();
+  await warm.waitForTimeout(1500);
+  const storage = await warmCtx.storageState();
+  await warmCtx.close();
+
+  // ── Phase 2: fresh RECORDED context with the storage restored ─────
+  const sceneDir = join(OUT, sceneName);
+  mkdirSync(sceneDir, { recursive: true });
+  const ctx = await browser.newContext({
+    viewport: { width: 1920, height: 1080 },
+    recordVideo: { dir: sceneDir, size: { width: 1920, height: 1080 } },
+    deviceScaleFactor: 1,
+    storageState: storage,
+  });
+  const page = await ctx.newPage();
+  // Go directly to the target hash. Since the auth state is warmed,
+  // no login round-trip is recorded.
+  await page.goto(SITE + hash, { waitUntil: "networkidle" });
+  // Belt-and-suspenders: wait for the specific selector(s) that prove
+  // the data is rendered.
+  for (const sel of waitFor) {
+    await page.waitForSelector(sel, { timeout: 10000 });
+  }
+  // Tiny settle for CSS animations
+  await page.waitForTimeout(200);
+  // Apply cinematic layer (vignette + Ken Burns + optional pulse)
+  await applyCinematic(page, {
+    zoomMs: durationMs - 500,
+    ...cinematicOpts,
+  });
+  // Hold for the remainder of the requested duration
+  await page.waitForTimeout(durationMs - 500);
+  await ctx.close();
+
+  const files = readdirSync(sceneDir).filter((f) => f.endsWith(".webm"));
+  if (files.length === 0) throw new Error(`no video for ${sceneName}`);
+  const src = join(sceneDir, files[0]);
+  const dst = join(OUT, `${sceneName}.webm`);
+  renameSync(src, dst);
+  rmSync(sceneDir, { recursive: true, force: true });
+  console.log(`  ✓ Wrote ${dst}`);
+}
+
 async function showCard(page, html, holdMs) {
   const dataUrl = "data:text/html;base64," + Buffer.from(html).toString("base64");
   await page.goto(dataUrl, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(holdMs);
 }
 
-// Inject a subtle vignette + focus mask onto the SPA. This is what
-// makes the console scenes feel cinematic instead of "here's a
-// dashboard, good luck reading it".
-async function applyFocusEffect(page, focusSelector, zoom = 1.05) {
+/*
+ * Cinematic layer — added to every UI scene:
+ *
+ *   1. Radial vignette (dark corners, spotlight middle) drawing the
+ *      eye to the center.
+ *   2. Ken Burns slow zoom — the SPA <body> scales from 1.0 to 1.05
+ *      over the scene duration. Camera moves = not a slideshow.
+ *   3. Optional highlight-pulse on a target element (the $8,400, the
+ *      Signature-verified pill, the green trusted-key card). A slow
+ *      breathing glow that draws attention to what the caption
+ *      references, without hijacking it.
+ */
+async function applyCinematic(page, opts = {}) {
+  const zoomDuration = opts.zoomMs ?? 7000;
+  const pulseSel = opts.pulseSelector ?? null;
   await page.addStyleTag({ content: `
-    body { transition: transform 0.6s cubic-bezier(0.16,1,0.3,1); }
+    body { transition: none; will-change: transform; }
     body::after {
       content: "";
       position: fixed;
       inset: 0;
       pointer-events: none;
-      background: radial-gradient(ellipse at center, transparent 0%, transparent 40%, rgba(6, 10, 16, 0.28) 90%);
+      background: radial-gradient(ellipse at center, transparent 0%, transparent 45%, rgba(6, 10, 16, 0.32) 92%);
       z-index: 999;
     }
+    @keyframes kenburns {
+      from { transform: scale(1); }
+      to { transform: scale(1.055); }
+    }
+    body { animation: kenburns ${zoomDuration}ms cubic-bezier(0.16, 1, 0.3, 1) forwards; transform-origin: center center; }
+    @keyframes pulse-glow {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(255, 213, 79, 0), 0 0 0 0 rgba(255, 213, 79, 0); }
+      50% { box-shadow: 0 0 0 6px rgba(255, 213, 79, 0.55), 0 0 40px 8px rgba(255, 213, 79, 0.35); }
+    }
+    .av-pulse-target { animation: pulse-glow 1.6s ease-in-out 3 !important; border-radius: 8px; }
   ` });
-  if (focusSelector) {
-    await page.evaluate(({ sel, zoom }) => {
-      const el = document.querySelector(sel);
-      if (!el) return;
-      const rect = el.getBoundingClientRect();
-      const cx = rect.left + rect.width / 2;
-      const cy = rect.top + rect.height / 2;
-      const vw = window.innerWidth;
-      const vh = window.innerHeight;
-      const dx = vw / 2 - cx;
-      const dy = vh / 2 - cy;
-      document.body.style.transformOrigin = `${cx}px ${cy}px`;
-      document.body.style.transform = `translate(${dx * 0.35}px, ${dy * 0.35}px) scale(${zoom})`;
-    }, { sel: focusSelector, zoom });
+  if (pulseSel) {
+    // Give the zoom half a beat to breathe, then trigger the pulse
+    setTimeout(async () => {
+      try {
+        await page.evaluate((sel) => {
+          const el = document.querySelector(sel);
+          if (el) el.classList.add("av-pulse-target");
+        }, pulseSel);
+      } catch {}
+    }, 1000);
   }
 }
 
 const browser = await chromium.launch({ headless: true });
 
 // ═════════════════════════════════════════════════════════════════
-// SCENE 1 — Title card: "AI agents are making real decisions."
+// SCENE 1 — Title card
 // ═════════════════════════════════════════════════════════════════
 await recordScene(browser, "01-intro", 5500, async (page, ms) => {
   await showCard(page, cardHtml({
@@ -118,7 +200,7 @@ await recordScene(browser, "01-intro", 5500, async (page, ms) => {
 });
 
 // ═════════════════════════════════════════════════════════════════
-// SCENE 2 — Problem card: "$8,400 problem"
+// SCENE 2 — Problem card
 // ═════════════════════════════════════════════════════════════════
 await recordScene(browser, "02-problem", 5500, async (page, ms) => {
   await showCard(page, cardHtml({
@@ -130,7 +212,7 @@ await recordScene(browser, "02-problem", 5500, async (page, ms) => {
 });
 
 // ═════════════════════════════════════════════════════════════════
-// SCENE 3 — Solution promise card
+// SCENE 3 — Solution promise
 // ═════════════════════════════════════════════════════════════════
 await recordScene(browser, "03-solution", 4000, async (page, ms) => {
   await showCard(page, cardHtml({
@@ -141,57 +223,64 @@ await recordScene(browser, "03-solution", 4000, async (page, ms) => {
 });
 
 // ═════════════════════════════════════════════════════════════════
-// SCENE 4 — Console overview with camera on the KPIs + activity chart
+// SCENE 4 — Console: pre-warm auth + wait for data, then record.
 // ═════════════════════════════════════════════════════════════════
-await recordScene(browser, "04-console", 7500, async (page, ms) => {
-  await page.addInitScript(() => { try { localStorage.setItem("av_mock_signed_out", "1"); } catch {} });
-  await page.goto(SITE + "#/login", { waitUntil: "networkidle" });
-  await page.waitForSelector("input#email", { timeout: 15000 });
-  await page.locator("input#email").fill("olivia.tan@northwind.com");
-  await page.locator("input#password").fill("demo");
-  await page.locator("button[type='submit']").first().click();
-  await page.waitForTimeout(1500);
-  await page.goto(SITE + "#/overview", { waitUntil: "networkidle" });
-  await page.waitForTimeout(600);
-  // Cinematic vignette focusing attention on the KPI row + chart
-  await applyFocusEffect(page, null);
-  await page.waitForTimeout(ms - 2100);
-});
+await recordConsoleScene(
+  browser,
+  "04-console",
+  7500,
+  "#/overview",
+  ['text=PREVENTED LOSSES', 'text=$31,840', 'text=Recent sessions'],
+  { /* no pulse — hero is the whole dashboard */ },
+);
 
 // ═════════════════════════════════════════════════════════════════
-// SCENE 5 — Session detail: highlight the BLOCKED $8,400 + green
-// signature-verified pill by zooming in slightly.
+// SCENE 5 — Session detail: pre-warm + wait for data, pulse the
+// $8,400 to close the callback from scene 2.
 // ═════════════════════════════════════════════════════════════════
-await recordScene(browser, "05-session", 8500, async (page, ms) => {
-  await page.addInitScript(() => { try { localStorage.setItem("av_mock_signed_out", "1"); } catch {} });
-  await page.goto(SITE + "#/login", { waitUntil: "networkidle" });
-  await page.waitForSelector("input#email", { timeout: 15000 });
-  await page.locator("input#email").fill("olivia.tan@northwind.com");
-  await page.locator("input#password").fill("demo");
-  await page.locator("button[type='submit']").first().click();
-  await page.waitForTimeout(1200);
-  await page.goto(SITE + "#/sessions/sess_01H9K", { waitUntil: "networkidle" });
-  await page.waitForTimeout(600);
-  await applyFocusEffect(page, null);
-  await page.waitForTimeout(ms - 1800);
-});
+await recordConsoleScene(
+  browser,
+  "05-session",
+  9000,
+  "#/sessions/sess_01H9K",
+  ['.session-summary', 'text=Signature verified'],
+  { pulseSelector: ".session-summary > *:nth-child(5)" },
+);
 
 // ═════════════════════════════════════════════════════════════════
-// SCENE 6 — Anyone can verify
+// SCENE 6 — Verify page: watch the "click sample → verify" happen
+// LIVE. This is the "magic moment" — investors should see the click
+// happen, not arrive at a pre-verified state.
 // ═════════════════════════════════════════════════════════════════
-await recordScene(browser, "06-verify", 7500, async (page, ms) => {
+await recordScene(browser, "06-verify", 8500, async (page, ms) => {
   await page.goto(LANDING + "/verify/", { waitUntil: "networkidle" });
   await page.waitForSelector("#loadExample", { timeout: 10000 });
-  await page.waitForTimeout(1000);
-  await page.locator("#loadExample").click();
+  // Give the viewer 1.2s to see the empty drop zone and read the sample link
+  await page.waitForTimeout(1400);
+  // Move the mouse over the sample link visibly, then click
+  const btn = page.locator("#loadExample");
+  const box = await btn.boundingBox();
+  if (box) {
+    // Steady move so it feels human, not warp-teleported
+    await page.mouse.move(box.x + box.width - 20, box.y + box.height / 2 + 300, { steps: 15 });
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 20 });
+    await page.waitForTimeout(300);
+  }
+  await btn.click();
+  // Wait for the crypto verify to complete + card to appear
   await page.waitForSelector(".result-card", { timeout: 8000 });
-  await page.waitForTimeout(800);
-  // Scroll so the green verify card is centered
+  await page.waitForTimeout(500);
+  // Scroll so the green verified card is centered — smooth camera move
   await page.evaluate(() => {
     const card = document.querySelector(".result-card");
     if (card) card.scrollIntoView({ behavior: "smooth", block: "center" });
   });
-  await page.waitForTimeout(ms - 2800);
+  await page.waitForTimeout(800);
+  // Apply cinematic AFTER the interactive moment so the pulse doesn't
+  // interfere with the click; pulse the result-card border for
+  // emphasis.
+  await applyCinematic(page, { zoomMs: 3500, pulseSelector: ".result-card" });
+  await page.waitForTimeout(3500);
 });
 
 // ═════════════════════════════════════════════════════════════════
