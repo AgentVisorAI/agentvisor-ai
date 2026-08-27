@@ -1,5 +1,38 @@
 # Video pipeline changelog
 
+## v9 — subtle audio punctuation (2026-08-27)
+
+The silent v8 cut is defensible for muted viewing (which is how
+most investors watch social clips). But when unmuted, it feels
+like a screen recording, not a produced piece.
+
+**New: `build-audio.sh`**
+
+Adds a minimal, safe-by-construction audio bed:
+
+* **No music.** Nothing tonal. Nothing that could sound cheap or
+  age badly.
+* **6 short whooshes** — bandpass-filtered pink noise (180Hz–
+  2200Hz), 400ms each, at the 6 crossfade points. They punctuate
+  each scene transition without competing with the imagery.
+* **Broadcast loudness**: mixed to -24 LUFS integrated with -3
+  dBTP true-peak ceiling. Loud enough to register on laptop
+  speakers, quiet enough not to intrude on headphones.
+* **Different intensity per transition**: the scene 1 → 2
+  "problem" impact is 0.70, the scene 6 → 7 denouement is 0.30.
+
+**Why this is safe:**
+
+Pink noise cannot sound "wrong" the way music can — no pitch, no
+key, no rhythm to clash. The only risks are "too loud" or "too
+quiet", and both are cheap to iterate on.
+
+**Composition change:**
+
+`compose.sh` now auto-detects `audio/soundtrack-44s.aac` and
+produces a second output `agentvisor-mockup-v9-audio.mp4` (the
+silent v8 cut remains as `agentvisor-mockup-v4.mp4`).
+
 ## v5 — cinematic edit (2026-08-27)
 
 Iteration on the raw v4 walkthrough. Adds motion, focus, and a
