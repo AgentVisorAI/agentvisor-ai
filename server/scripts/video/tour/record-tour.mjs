@@ -265,10 +265,15 @@ async function applyCinematic(page, opts = {}) {
         };
       }, zoomToSel);
       if (rect) {
-        // Clamp horizontal origin so left-edge labels never crop mid-word
-        const px = Math.min(65, Math.max(35, (rect.cx / rect.vw) * 100));
-        originX = px.toFixed(2) + "%";
-        originY = ((rect.cy / rect.vh) * 100).toFixed(2) + "%";
+        // Percentage origins resolve against the FULL BODY height, not
+        // the viewport, so on scrollable pages (the landing page) they
+        // anchor thousands of px down and fake a scroll. Use px origins
+        // in viewport coords (scrollY is 0 when we record), clamped so
+        // edge labels never crop mid-word.
+        const cx = Math.min(0.65 * rect.vw, Math.max(0.35 * rect.vw, rect.cx));
+        const cy = Math.min(0.70 * rect.vh, Math.max(0.30 * rect.vh, rect.cy));
+        originX = cx.toFixed(0) + "px";
+        originY = cy.toFixed(0) + "px";
         endScale = 1.2;
       }
     } catch {}
@@ -335,9 +340,9 @@ await recordScene(browser, "02-signup", 8000, async (page, ms) => {
   await page.waitForSelector("input#orgName", { timeout: 10000 });
   await page.waitForTimeout(400);
   await page.locator("input#orgName").click();
-  await page.locator("input#orgName").pressSequentially("Acme Robotics", { delay: 45 });
+  await page.locator("input#orgName").pressSequentially("Northwind Traders", { delay: 45 });
   await page.locator("input#email").click();
-  await page.locator("input#email").pressSequentially("alex@acme.co", { delay: 40 });
+  await page.locator("input#email").pressSequentially("olivia.tan@northwind.com", { delay: 40 });
   await page.locator("input#password").click();
   await page.locator("input#password").pressSequentially("agents-you-trust", { delay: 30 });
   await page.waitForTimeout(300);
@@ -388,13 +393,13 @@ await recordConsoleScene(
     await page.waitForTimeout(250);
     await page.evaluate(() => document.querySelector("#cmdkOpen")?.click());
     await page.waitForTimeout(600);
-    await page.keyboard.type("blocked", { delay: 90 });
+    await page.keyboard.type("sess", { delay: 110 });
     await page.waitForTimeout(1400);
     await page.keyboard.press("Escape");
     await page.waitForTimeout(400);
     // Theme round-trip: light for a beat, back to dark.
     await page.evaluate(() => document.querySelector("#themeBtn")?.click());
-    await page.waitForTimeout(1200);
+    await page.waitForTimeout(1700);
     await page.evaluate(() => document.querySelector("#themeBtn")?.click());
     await page.waitForTimeout(600);
   },
@@ -404,15 +409,17 @@ await recordConsoleScene(
 await recordConsoleScene(
   browser,
   "05-sessions",
-  8000,
+  9500,
   "#/sessions",
   ['tr[data-clickable]'],
-  {},
+  { origin: "0px 540px" },
   async (page) => {
     const search = page.locator('input[placeholder*="Search" i]');
     await search.click();
     await search.pressSequentially("invoice", { delay: 55 });
-    await page.waitForTimeout(900);
+    // Hold the filtered state so the viewer SEES it narrow to
+    // invoice-reconciler rows before we clear.
+    await page.waitForTimeout(2100);
     await search.fill("");
     await page.waitForTimeout(450);
     // Blocked-only toggle. Synthetic click: Playwright's trusted
@@ -440,7 +447,7 @@ await recordConsoleScene(
   10000,
   "#/sessions/sess_01H9K",
   ['.session-summary', 'text=Signature verified', '.evt'],
-  { pulseSelector: ".session-summary > *:nth-child(5)", zoomMs: 9500 },
+  { pulseSelector: ".session-summary > *:nth-child(5)", zoomMs: 9500, origin: "0px 540px" },
   async (page) => {
     await page.waitForTimeout(2600);
     // Click the BLOCKED event so the drawer fills with policy detail.
@@ -466,7 +473,7 @@ await recordConsoleScene(
   6500,
   "#/sessions/sess_01H9K",
   ['#shareRcpt', '#copyRcpt'],
-  {},
+  { origin: "1900px 1060px" },
   async (page) => {
     await page.waitForTimeout(1000);
     const share = page.locator("#shareRcpt");
@@ -530,7 +537,7 @@ await recordConsoleScene(
   8000,
   "#/policies",
   ['tr[data-clickable]'],
-  {},
+  { origin: "0px 540px" },
   async (page) => {
     await page.waitForTimeout(1400);
     const row = page.locator("tr[data-clickable]").first();
@@ -550,7 +557,7 @@ await recordConsoleScene(
   6500,
   "#/deployments",
   ['tr[data-clickable]'],
-  {},
+  { origin: "0px 540px" },
   async (page) => {
     await page.waitForTimeout(1300);
     const row = page.locator("tr[data-clickable]").first();
@@ -569,7 +576,7 @@ await recordConsoleScene(
   13000,
   "#/settings/members",
   ['.settings-nav'],
-  {},
+  { origin: "0px 540px" },
   async (page) => {
     await page.waitForTimeout(2000);
     for (const tab of ["API keys", "SSO", "Webhooks", "Audit log", "Billing"]) {
