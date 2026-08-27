@@ -1664,3 +1664,21 @@ a.ob-step:hover { border-color: var(--accent); }
 .ob-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .ob-label { font-weight: 600; font-size: var(--t-sec); }
 .ob-sub { color: var(--fg-3); font-size: var(--t-min); }
+
+/* Plain-language recap on blocked-session pages */
+.story-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  padding: var(--s-3) var(--s-4);
+  margin-bottom: var(--s-3);
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  border-radius: var(--r-md);
+}
+.story-banner .sb-icon { font-size: 20px; flex: none; }
+.story-banner p { margin: 0; font-size: var(--t-sec); line-height: 1.5; color: var(--fg); }
+.story-banner .btn { flex: none; white-space: nowrap; }
+@media (max-width: 760px) {
+  .story-banner { flex-wrap: wrap; }
+}
