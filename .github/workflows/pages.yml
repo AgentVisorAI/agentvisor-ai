@@ -113,6 +113,15 @@ jobs:
           cp docs/app/pitch/index.html "$site/app/pitch/"
           cp docs/app/pitch/console.css "$site/app/pitch/"
           cp docs/app/pitch/console.js "$site/app/pitch/"
+          # Public /pitch/ investor landing page — the 44-second video
+          # + CTAs. Self-hosted MP4 + JPG so it works under strict CSP.
+          mkdir -p "$site/pitch"
+          cp docs/pitch/index.html "$site/pitch/"
+          cp docs/pitch/pitch.css "$site/pitch/"
+          cp docs/pitch/pitch.mp4 "$site/pitch/"
+          cp docs/pitch/pitch-muted.mp4 "$site/pitch/"
+          cp docs/pitch/poster.jpg "$site/pitch/"
+          cp docs/pitch/social.jpg "$site/pitch/"
           # Custom-domain marker for GitHub Pages. Without a CNAME file in
           # the published artifact, Pages resets the configured custom
           # domain on each deploy.
