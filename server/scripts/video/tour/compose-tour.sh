@@ -21,10 +21,11 @@ mkdir -p "$OUT/norm"
 # Scenes with no burned-in caption. Landing + close get a 0.3s
 # head-trim to skip the Playwright load flash.
 for name in 01-landing 02-signup 13-close; do
-  if [ "$name" = "01-landing" ] || [ "$name" = "13-close" ]; then
-    trim="-ss 0.30"
+  if [ "$name" = "02-signup" ]; then
+    # skip the dark first-paint before the auth screen renders
+    trim="-ss 0.60"
   else
-    trim=""
+    trim="-ss 0.30"
   fi
   ffmpeg -y $trim -i "$SCENES/$name.webm" \
     -vf "fps=30,scale=1920:1080:flags=lanczos:out_color_matrix=bt709,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,format=yuv420p" \
@@ -37,10 +38,11 @@ add_caption() {
   local output=$2
   local caption=$3
   local enable=${4:-1}
+  local trim=${5:--ss 0.70}
   local escaped=$(printf '%s' "$caption" | sed "s/'/\\\\\\\\'/g; s/:/\\\\:/g")
   local drawbox="drawbox=x=0:y=ih-140:w=iw:h=140:color=black@0.72:t=fill:enable='$enable'"
   local drawtext="drawtext=fontfile='$FONT':text='$escaped':fontsize=42:fontcolor=white:x=(w-text_w)/2:y=h-100:enable='$enable'"
-  ffmpeg -y -i "$input" -vf "
+  ffmpeg -y $trim -i "$input" -vf "
     fps=30,
     scale=1920:1080:flags=lanczos:out_color_matrix=bt709,
     setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,
@@ -70,7 +72,7 @@ add_caption "$SCENES/08-download.webm" "$OUT/norm/08-download.mp4" \
 
 add_caption "$SCENES/09-verify.webm" "$OUT/norm/09-verify.mp4" \
   "Drop the receipt. Verified in the browser. No account." \
-  "gte(t,1.6)"
+  "gte(t,1.6)" ""
 
 add_caption "$SCENES/10-policies.webm" "$OUT/norm/10-policies.mp4" \
   "Policies are readable rules, enforced in real time."

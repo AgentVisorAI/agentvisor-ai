@@ -263,11 +263,12 @@ async function applyCinematic(page, opts = {}) {
         };
       }, zoomToSel);
       if (rect) {
-        // Clamp the horizontal origin: past ~65% the scaled frame crops
-        // the left sidebar labels mid-word (R13 fresh-eyes audit).
-        const px = Math.min(65, Math.max(35, (rect.cx / rect.vw) * 100));
-        originX = px.toFixed(2) + "%";
-        originY = ((rect.cy / rect.vh) * 100).toFixed(2) + "%";
+        // px origins in viewport coords: % origins resolve against the
+        // full body height and fake a scroll on scrollable pages.
+        const cx = Math.min(0.65 * rect.vw, Math.max(0.35 * rect.vw, rect.cx));
+        const cy = Math.min(0.70 * rect.vh, Math.max(0.30 * rect.vh, rect.cy));
+        originX = cx.toFixed(0) + "px";
+        originY = cy.toFixed(0) + "px";
         endScale = opts.endScale ?? 1.2;
       }
     } catch {}
