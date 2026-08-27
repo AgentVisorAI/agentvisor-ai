@@ -84,7 +84,7 @@
   flex-wrap: wrap;
 }
 
-.pitch-video-meta a { color: var(--accent); }
+.pitch-video-meta a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
 
 /* ── CTA grid ────────────────────────────────────────────────── */
 
@@ -226,7 +226,7 @@
   line-height: 1.5;
 }
 
-.pitch-scenes a { color: var(--accent); }
+.pitch-scenes a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
 
 /* ── links section ───────────────────────────────────────────── */
 
@@ -263,6 +263,8 @@
   color: var(--accent);
   font-weight: 500;
   word-break: break-all;
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 .pitch-links-grid .muted {
@@ -286,7 +288,7 @@
 }
 
 .pitch-footer p { margin: 0 0 0.75rem; line-height: 1.5; }
-.pitch-footer a { color: var(--accent); }
+.pitch-footer a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
 .pitch-footer .muted { font-size: 0.85rem; }
 
 @media (max-width: 640px) {
