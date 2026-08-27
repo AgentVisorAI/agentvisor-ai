@@ -411,7 +411,7 @@
     out[0].costUsdMicros = "184000";
     out[0].payoutUsdMicros = "184000";
     out[0].blockedPayoutUsdMicros = "8400000000";
-    out[0].receiptHash = "sha256:8f2c4e…";
+    out[0].receiptHash = "sha256:90db55…";
     out[0].policiesFired = ["pol_procurement_allowed_vendors"];
 
     out.sort(function (a, b) { return new Date(b.startedAt) - new Date(a.startedAt); });
@@ -577,7 +577,7 @@
     },
     {
       seq: 13, ts: isoMinsAgo(2), kind: "session", tag: "end",
-      msg: "Sealed · 42 events · receipt sha256:8f2c4e…",
+      msg: "Sealed · 42 events · receipt sha256:90db55…",
       severity: "ok", durationMs: 0,
     },
   ];
@@ -599,7 +599,7 @@
       "rate.per_session_usd:10",
       "runtime.pii_redaction",
     ],
-    contentHash: "sha256:8f2c4e2b71b0a1d3e5c6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8",
+    contentHash: "sha256:90db551a2a7330b4aeeead934c8fc584da8f70a659e91a489a0fb0b331467baf",
     signature: "ed25519:LmZk3TpJ2r0aQxvXbYc7WdRnSfE1UgHkO0pIiV8mAcNyBt6Zh4uFj9zKlP+g/ExampleSignature==",
     signingKeyFingerprint: "kf_3a5f7e2d1b8c9a4e",
     verificationStatus: "verified",

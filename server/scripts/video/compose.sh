@@ -108,7 +108,7 @@ fi
 if [ -f "$OUT/audio/narration-44s.aac" ]; then
   echo "→ Muxing narrated cut (definitive v21 distilled)"
   ffmpeg -y -i "$OUT/agentvisor-mockup-v4.mp4" -i "$OUT/audio/narration-44s.aac" \
-    -c:v copy -c:a aac -ar 48000 -shortest -movflags +faststart \
+    -c:v copy -af "volume=4dB" -c:a aac -ar 48000 -shortest -movflags +faststart \
     "$OUT/agentvisor-mockup-v21-distilled.mp4" 2>&1 | tail -1
   ls -lh "$OUT/agentvisor-mockup-v21-distilled.mp4"
 fi
