@@ -24,17 +24,17 @@ ffmpeg -y -f lavfi -i "anullsrc=r=44100:cl=stereo:d=115" \
 
 # Transition offsets in ms, from compose.sh `Offsets:` output.
 T1=5433
-T2=10766
-T3=20099
-T4=27099
-T5=41632
-T6=51599
-T7=58099
-T8=61032
-T9=66799
-T10=74766
-T11=81266
-T12=96299
+T2=10900
+T3=19733
+T4=26833
+T5=36333
+T6=46333
+T7=53733
+T8=56866
+T9=62699
+T10=70666
+T11=77166
+T12=93266
 
 ffmpeg -y \
   -i "$OUT/silence.wav" \
