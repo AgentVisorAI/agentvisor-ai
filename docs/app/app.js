@@ -255,6 +255,14 @@
   function h(html) { var t = document.createElement("template"); t.innerHTML = html.trim(); return t.content.firstChild; }
   function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
   function initials(name) { return String(name || "?").trim().slice(0, 1).toUpperCase(); }
+  function timeUntil(iso) {
+    if (!iso) return "—";
+    var s = (new Date(iso).getTime() - Date.now()) / 1000;
+    if (s <= 0) return "expired";
+    if (s < 3600) return "in " + Math.ceil(s / 60) + "m";
+    if (s < 86400) return "in " + Math.ceil(s / 3600) + "h";
+    return "in " + Math.ceil(s / 86400) + "d";
+  }
   function timeAgo(iso) {
     if (!iso) return "—";
     var s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
@@ -2031,7 +2039,7 @@
       return '<tr data-invite="' + esc(i.id) + '">' +
         '<td><div style="font-weight:500">' + esc(i.email) + '</div><div class="id">by ' + esc(i.invitedByEmail || "?") + '</div></td>' +
         '<td><span class="pill neutral">' + esc(i.role) + "</span></td>" +
-        '<td style="color:var(--fg-2)">expires ' + esc(timeAgo(i.expiresAt)) + '</td>' +
+        '<td style="color:var(--fg-2)">expires ' + esc(timeUntil(i.expiresAt)) + '</td>' +
         '<td><button class="btn danger" data-act="revoke">Revoke</button></td>' +
       '</tr>';
     }).join('');
