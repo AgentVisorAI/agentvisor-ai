@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <!--
+    Strict CSP: static page, no JS, no third-party origins. Media is
+    served from same origin so it composes cleanly under this policy.
+  -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; base-uri 'none'; form-action 'none'; script-src 'none'; script-src-attr 'none'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; media-src 'self'; font-src 'self' data:; object-src 'none'; frame-src 'none'">
+  <title>AgentVisor AI — 44-second pitch</title>
+  <meta name="description" content="AI agents you can hand to an auditor. A 44-second walkthrough of what AgentVisor does, and links to try every part of it live.">
+  <link rel="stylesheet" href="../style.css">
+  <link rel="stylesheet" href="pitch.css">
+  <link rel="icon" type="image/png" href="../logo.png">
+  <link rel="canonical" href="https://agentvisorai.me/pitch/">
+  <meta property="og:title" content="AgentVisor AI — AI agents you can hand to an auditor">
+  <meta property="og:description" content="44-second walkthrough. 32 sessions · 7 blocked · $31,840 saved. Try it live.">
+  <meta property="og:type" content="video.other">
+  <meta property="og:url" content="https://agentvisorai.me/pitch/">
+  <meta property="og:image" content="https://agentvisorai.me/pitch/social.jpg">
+  <meta property="og:image:width" content="1920">
+  <meta property="og:image:height" content="1080">
+  <meta property="og:video" content="https://agentvisorai.me/pitch/pitch.mp4">
+  <meta property="og:video:type" content="video/mp4">
+  <meta property="og:video:width" content="1920">
+  <meta property="og:video:height" content="1080">
+  <meta name="twitter:card" content="player">
+  <meta name="twitter:player" content="https://agentvisorai.me/pitch/">
+  <meta name="twitter:player:width" content="1920">
+  <meta name="twitter:player:height" content="1080">
+  <meta name="twitter:image" content="https://agentvisorai.me/pitch/social.jpg">
+</head>
+<body class="pitch-body">
+
+  <nav aria-label="Primary">
+    <div class="wrap nav-inner">
+      <a class="brand" href="../"><img src="../logo.png" alt="" width="26" height="26" style="vertical-align:-6px;margin-right:8px">AgentVisor AI</a>
+      <div class="nav-links">
+        <a href="../">Home</a>
+        <a href="../app/">Console</a>
+        <a href="../verify/">Verify</a>
+        <a href="https://github.com/AgentVisorAI/agentvisor-ai">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <main>
+
+    <header class="pitch-hero">
+      <div class="wrap">
+        <p class="pitch-kicker">44 seconds · watch it, then try it</p>
+        <h1>AI agents you can hand to an auditor.</h1>
+
+        <!--
+          The video is served self-hosted so autoplay-muted works
+          under any browser policy. Loop keeps it playing while the
+          page is on screen; controls stay available for anyone
+          who wants to scrub or unmute.
+        -->
+        <div class="pitch-video-wrap">
+          <video
+            class="pitch-video"
+            controls
+            autoplay
+            muted
+            loop
+            playsinline
+            preload="metadata"
+            poster="poster.jpg"
+            aria-label="AgentVisor AI 44-second walkthrough"
+          >
+            <source src="pitch-muted.mp4" type="video/mp4">
+            <p>
+              Your browser can’t play this video.
+              <a href="pitch.mp4">Download it here</a> (8.4&nbsp;MB, 44&nbsp;seconds).
+            </p>
+          </video>
+          <p class="pitch-video-meta">
+            <a href="pitch.mp4">Download narrated version</a>
+            &middot;
+            <span>44&nbsp;s · 1080p · 8.4&nbsp;MB</span>
+          </p>
+        </div>
+
+        <div class="pitch-cta-grid">
+          <a class="pitch-cta pitch-cta-primary" href="../app/">
+            <span class="pitch-cta-title">Open the console</span>
+            <span class="pitch-cta-sub">Live mockup with 32 sessions, 7 blocked, $31,840 saved</span>
+            <span class="pitch-cta-arrow">→</span>
+          </a>
+          <a class="pitch-cta" href="../verify/">
+            <span class="pitch-cta-title">Verify a receipt</span>
+            <span class="pitch-cta-sub">Drop a receipt JSON — see the signature check in the browser</span>
+            <span class="pitch-cta-arrow">→</span>
+          </a>
+          <a class="pitch-cta" href="../verify/sample-receipt.json" download>
+            <span class="pitch-cta-title">Sample receipt</span>
+            <span class="pitch-cta-sub">Download the sealed receipt shown in the video</span>
+            <span class="pitch-cta-arrow">↓</span>
+          </a>
+        </div>
+      </div>
+    </header>
+
+    <section class="pitch-story">
+      <div class="wrap">
+        <h2>What the video shows</h2>
+
+        <ol class="pitch-scenes">
+          <li>
+            <span class="pitch-scene-num">1</span>
+            <div>
+              <h3>The problem, in one line</h3>
+              <p>“AI agents make real decisions. With real money.” Nobody signs anything. Nobody keeps the tape. If something goes wrong, there’s no way to prove what the agent did.</p>
+            </div>
+          </li>
+          <li>
+            <span class="pitch-scene-num">2</span>
+            <div>
+              <h3>One wrong decision. $8,400 gone.</h3>
+              <p>An agent tried to buy from an off-list vendor. In a normal setup that money leaves the door, and the CFO finds out on the invoice.</p>
+            </div>
+          </li>
+          <li>
+            <span class="pitch-scene-num">3</span>
+            <div>
+              <h3>Every decision: captured, enforced, signed.</h3>
+              <p>Every request and every tool call goes through AgentVisor first. The record is cryptographic, not a log file.</p>
+            </div>
+          </li>
+          <li>
+            <span class="pitch-scene-num">4</span>
+            <div>
+              <h3>Console: 32 sessions · 7 blocked · $31,840 saved.</h3>
+              <p>The overview reads like a fleet dashboard. Every metric is per-tenant. The right-most tile — <em>Prevented losses</em> — is what actually funds the pitch.</p>
+            </div>
+          </li>
+          <li>
+            <span class="pitch-scene-num">5</span>
+            <div>
+              <h3>The blocked session, in detail.</h3>
+              <p>Full event stream. The blocked line is highlighted. The receipt panel on the right shows the Ed25519 signature — this is what an auditor gets, not a log they have to trust.</p>
+            </div>
+          </li>
+          <li>
+            <span class="pitch-scene-num">6</span>
+            <div>
+              <h3>Anyone verifies it — in-browser.</h3>
+              <p>Drop the receipt onto <a href="../verify/">agentvisorai.me/verify</a>. Web Crypto checks the signature client-side. No account. No login. Green tick if it matches; red if a single byte changed.</p>
+            </div>
+          </li>
+          <li>
+            <span class="pitch-scene-num">7</span>
+            <div>
+              <h3>AI agents you can hand to an auditor.</h3>
+              <p>That’s the whole pitch: the decisions, the record, the proof — in that order, in 44 seconds.</p>
+            </div>
+          </li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="pitch-links">
+      <div class="wrap">
+        <h2>Everything the video mentions is live</h2>
+        <div class="pitch-links-grid">
+          <div>
+            <h3>The console</h3>
+            <p><a href="../app/">agentvisorai.me/app/</a></p>
+            <p class="muted">Log in with any email + password <code>demo</code>. Data is deterministic mock data — same 32 sessions and $31,840 you saw in the video.</p>
+          </div>
+          <div>
+            <h3>The verifier</h3>
+            <p><a href="../verify/">agentvisorai.me/verify/</a></p>
+            <p class="muted">Drop the sample receipt to see the green tick. Try editing one byte — you’ll get red.</p>
+          </div>
+          <div>
+            <h3>The code</h3>
+            <p><a href="https://github.com/AgentVisorAI/agentvisor-ai">github.com/AgentVisorAI/agentvisor-ai</a></p>
+            <p class="muted">Rust server, Apache-2.0. Also ships a <code>verify-receipt.mjs</code> CLI that runs the same check.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <footer class="pitch-footer">
+      <div class="wrap">
+        <p>
+          Built by <a href="https://github.com/AgentVisorAI">AgentVisor AI</a>.
+          Apache&#8209;2.0 &middot; Rust &middot; runs on your machine, your VM, or your cluster.
+        </p>
+        <p class="muted">
+          Cover video: 44&nbsp;s, 1920×1080, H.264 + AAC. Pipeline lives at
+          <a href="https://github.com/AgentVisorAI/agentvisor-ai/tree/main/server/scripts/video">server/scripts/video</a>
+          and regenerates deterministically against this site.
+        </p>
+      </div>
+    </footer>
+
+  </main>
+
+</body>
+</html>
