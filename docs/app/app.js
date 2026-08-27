@@ -14,6 +14,16 @@
 
   var $ = function (sel, root) { return (root || document).querySelector(sel); };
   var $$ = function (sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); };
+  // Null-safe listener attach for async render paths. If the user
+  // navigates away while a renderer is awaiting data, the target
+  // element may already be gone by the time listeners attach; a raw
+  // $(sel).addEventListener would throw and leave the new route with
+  // a broken half-initialized handler set.
+  var on = function (sel, evt, fn, root) {
+    var el = typeof sel === "string" ? $(sel, root) : sel;
+    if (el) el.addEventListener(evt, fn);
+    return el;
+  };
   var app = $("#app");
 
   var state = {
@@ -1159,6 +1169,7 @@
     // event click → drawer
     var evList = $("#eventList");
     var drawer = $("#eventDrawer");
+    if (!evList || !drawer) return; // user navigated away mid-await
     evList.addEventListener("click", function (e) {
       var row = e.target.closest(".evt");
       if (!row) return;
@@ -1198,7 +1209,7 @@
     }
 
     // Copy receipt button
-    $("#copyRcpt").addEventListener("click", function () {
+    on("#copyRcpt", "click", function () {
       navigator.clipboard.writeText(JSON.stringify(receipt, null, 2)).then(function () {
         toast("Receipt copied");
       });
@@ -1209,7 +1220,7 @@
     // clipboard. Recipient opens the link -> auto-verifies in their
     // own browser. Fragment (not query) so the payload never touches
     // any server.
-    $("#shareRcpt").addEventListener("click", function () {
+    on("#shareRcpt", "click", function () {
       var bundle = buildReceiptBundle(s, receipt);
       var json = JSON.stringify(bundle);
       // Convert UTF-8 string -> Uint8Array -> base64 -> base64url.
@@ -1272,7 +1283,7 @@
     // the file (an auditor, an insurer, a court) can verify the
     // signature offline without asking us or the customer for
     // anything else.
-    $("#dlRcpt").addEventListener("click", async function () {
+    on("#dlRcpt", "click", async function () {
       var bundle = buildReceiptBundle(s, receipt);
       var blob = new Blob([JSON.stringify(bundle, null, 2)], { type: "application/json" });
       var url = URL.createObjectURL(blob);
@@ -1733,7 +1744,7 @@
       "</div>" +
       '<div class="card"><h2>Description</h2><p style="margin:0;color:var(--fg-2);font-size:var(--t-body)">' + esc(p.description) + '</p></div>' +
       '<div class="card" style="margin-top:12px"><h2>Definition</h2><pre class="policy-body">' + syntaxPolicy(p.body) + "</pre></div>";
-    $("#polSwitch").addEventListener("click", function () {
+    on("#polSwitch", "click", function () {
       state.ds.togglePolicy(id).then(function () { renderPolicyDetail(main, id); });
     });
   }
@@ -2606,7 +2617,7 @@
       installModalKeys(backdrop);
       backdrop.querySelectorAll("[data-close]").forEach(function (b) { b.addEventListener("click", function () { backdrop.remove(); }); });
       backdrop.addEventListener("click", function (e) { if (e.target === backdrop) backdrop.remove(); });
-      $("#whSave", backdrop).addEventListener("click", async function () {
+      on($("#whSave", backdrop), "click", async function () {
         var name = $("#whName", backdrop).value.trim();
         var url = $("#whUrl", backdrop).value.trim();
         var events = Array.from(backdrop.querySelectorAll("#whEventsPicker input:checked")).map(function (i) { return i.value; });
@@ -2633,7 +2644,7 @@
           '<div style="padding: 24px 16px">' +
           emptyState("No webhooks yet", "Wire AgentVisor to Slack / PagerDuty / Datadog / your own service. Payloads are HMAC-SHA256 signed.", "+ Add webhook", null, "whAdd") +
           "</div></div>";
-      $("#whAdd", root).addEventListener("click", openAddModal);
+      on($("#whAdd", root), "click", openAddModal);
       return;
     }
 
@@ -2664,7 +2675,7 @@
         "</table></div>" +
       "</div>";
 
-    $("#whAdd", root).addEventListener("click", openAddModal);
+    on($("#whAdd", root), "click", openAddModal);
 
     root.addEventListener("click", async function (e) {
       var btn = e.target.closest("button[data-act]");
