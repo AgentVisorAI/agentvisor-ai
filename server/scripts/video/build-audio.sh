@@ -1,32 +1,18 @@
 #!/usr/bin/env bash
-# Build a subtle audio bed for the 44s full video.
+# Build a subtle audio bed for the full-flow walkthrough (~50s).
 #
 # Design principles:
 #   * NO music. Nothing tonal. Nothing that could sound cheap.
 #   * Just soft "punctuation" — a short bandpass-filtered noise
-#     whoosh at each of the 6 scene transitions.
+#     whoosh at each scene crossfade.
 #   * Very low volume — barely perceptible individually.
-#   * Total soundtrack budget: silence + 6 whooshes ~= 2 seconds of
-#     actual audible content over 44s.
 #
-# The point: silent video feels like a screen record. Even the
-# barest punctuation feels like produced content.
+# 8 scenes = 7 transitions. First transition (landing → signin)
+# is slightly stronger; last transition (verify → close) is soft.
 set -euo pipefail
 
 OUT=/tmp/video-v4/audio
 mkdir -p "$OUT"
-
-# ── Transition timeline (calculated from scene durations) ─────────
-# Crossfades happen at:
-#   scene 1 -> 2 at 5.48 - 0.25 = 5.23s
-#   scene 2 -> 3 at ~10.42s
-#   scene 3 -> 4 at ~13.88s
-#   scene 4 -> 5 at ~22.18s
-#   scene 5 -> 6 at ~31.92s
-#   scene 6 -> 7 at ~39.86s
-#
-# We fire the whoosh at the START of each crossfade so it "punctuates"
-# the transition rather than trailing behind it.
 
 # Generate a single whoosh (~400ms)
 gen_whoosh() {
@@ -37,29 +23,27 @@ gen_whoosh() {
     -c:a pcm_s16le -ar 44100 -ac 2 "$out" 2>&1 | tail -1
 }
 
-# Slightly different tones for different transitions — the impact
-# whoosh at the "problem" moment is more intense.
 gen_whoosh "$OUT/w-normal.wav" 0.42
-gen_whoosh "$OUT/w-problem.wav" 0.70   # scene 1 → 2 (impact)
-gen_whoosh "$OUT/w-soft.wav" 0.30      # scene 6 → 7 (denouement)
+gen_whoosh "$OUT/w-strong.wav" 0.65   # scene 1 → 2 (into the app)
+gen_whoosh "$OUT/w-soft.wav"   0.28   # last transition (into close)
 
-# Silent bed for 46 seconds (extended for v13 scene 7 CTA reveal)
-ffmpeg -y -f lavfi -i "anullsrc=r=44100:cl=stereo:d=46" \
+# Silent bed for 52 seconds (covers ~50s expected total).
+ffmpeg -y -f lavfi -i "anullsrc=r=44100:cl=stereo:d=52" \
   -c:a pcm_s16le "$OUT/silence.wav" 2>&1 | tail -1
 
-# Overlay whooshes at transition points using amix + adelay
-# Transition offsets in ms:
-# Transition offsets in ms (from actual compose.sh output):
-T1=5230    # scene 1 → 2 (problem impact)
-T2=10420   # scene 2 → 3
-T3=13880   # scene 3 → 4
-T4=22180   # scene 4 → 5
-T5=31920   # scene 5 → 6
-T6=39860   # scene 6 → 7 (soft denouement)
+# Transition offsets in ms — from compose.sh's `Offsets:` output.
+T1=6367    # 1 → 2  (landing → signin)
+T2=12934   # 2 → 3  (signin → overview)
+T3=20267   # 3 → 4  (overview → sessions)
+T4=26534   # 4 → 5  (sessions → session)
+T5=35767   # 5 → 6  (session → download)
+T6=40500   # 6 → 7  (download → verify)
+T7=48233   # 7 → 8  (verify → close)
 
 ffmpeg -y \
   -i "$OUT/silence.wav" \
-  -i "$OUT/w-problem.wav" \
+  -i "$OUT/w-strong.wav" \
+  -i "$OUT/w-normal.wav" \
   -i "$OUT/w-normal.wav" \
   -i "$OUT/w-normal.wav" \
   -i "$OUT/w-normal.wav" \
@@ -72,7 +56,8 @@ ffmpeg -y \
     [4]adelay=${T4}|${T4}[w4];
     [5]adelay=${T5}|${T5}[w5];
     [6]adelay=${T6}|${T6}[w6];
-    [0][w1][w2][w3][w4][w5][w6]amix=inputs=7:duration=first:normalize=0[mix];
+    [7]adelay=${T7}|${T7}[w7];
+    [0][w1][w2][w3][w4][w5][w6][w7]amix=inputs=8:duration=first:normalize=0[mix];
     [mix]loudnorm=I=-24:LRA=8:TP=-3.0[out]
   " \
   -map "[out]" -c:a aac -b:a 128k "$OUT/soundtrack-44s.aac" 2>&1 | tail -2

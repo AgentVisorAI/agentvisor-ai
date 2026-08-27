@@ -149,6 +149,16 @@
   margin: 0 0 2rem;
 }
 
+.pitch-story-lede {
+  font-size: 1.05rem;
+  color: var(--fg-muted);
+  max-width: 42rem;
+  margin: 0 0 2.5rem;
+  line-height: 1.55;
+}
+.pitch-story-lede em { color: var(--fg); font-style: italic; }
+.pitch-story-lede strong { color: var(--fg); }
+
 .pitch-scenes {
   list-style: none;
   padding: 0;

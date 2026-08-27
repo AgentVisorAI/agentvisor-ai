@@ -9,14 +9,14 @@
   -->
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'none'; base-uri 'none'; form-action 'none'; script-src 'none'; script-src-attr 'none'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; media-src 'self'; font-src 'self' data:; object-src 'none'; frame-src 'none'">
-  <title>AgentVisor AI — 44-second pitch</title>
-  <meta name="description" content="AI agents you can hand to an auditor. A 44-second walkthrough of what AgentVisor does, and links to try every part of it live.">
+  <title>AgentVisor AI — the full flow, in 52 seconds</title>
+  <meta name="description" content="Watch a brand-new user go from landing page to signed, verified receipt in 52 seconds. Then try every part of it live.">
   <link rel="stylesheet" href="../style.css">
   <link rel="stylesheet" href="pitch.css">
   <link rel="icon" type="image/png" href="../logo.png">
   <link rel="canonical" href="https://agentvisorai.me/pitch/">
-  <meta property="og:title" content="AgentVisor AI — AI agents you can hand to an auditor">
-  <meta property="og:description" content="44-second walkthrough. 32 sessions · 7 blocked · $31,840 saved. Try it live.">
+  <meta property="og:title" content="AgentVisor AI — the full flow, in 52 seconds">
+  <meta property="og:description" content="Land, sign in, watch a session get blocked, download the receipt, verify it. 52 seconds end-to-end.">
   <meta property="og:type" content="video.other">
   <meta property="og:url" content="https://agentvisorai.me/pitch/">
   <meta property="og:image" content="https://agentvisorai.me/pitch/social.jpg">
@@ -50,8 +50,8 @@
 
     <header class="pitch-hero">
       <div class="wrap">
-        <p class="pitch-kicker">44 seconds · watch it, then try it</p>
-        <h1>AI agents you can hand to an auditor.</h1>
+        <p class="pitch-kicker">The full flow · in 52 seconds</p>
+        <h1>From landing page to signed receipt — one take, no cuts.</h1>
 
         <!--
           The video is served self-hosted so autoplay-muted works
@@ -69,25 +69,25 @@
             playsinline
             preload="metadata"
             poster="poster.jpg"
-            aria-label="AgentVisor AI 44-second walkthrough"
+            aria-label="AgentVisor AI — a new user's full flow, 52 seconds"
           >
             <source src="pitch-muted.mp4" type="video/mp4">
             <p>
               Your browser can’t play this video.
-              <a href="pitch.mp4">Download it here</a> (8.4&nbsp;MB, 44&nbsp;seconds).
+              <a href="pitch.mp4">Download it here</a> (14&nbsp;MB, 52&nbsp;seconds).
             </p>
           </video>
           <p class="pitch-video-meta">
             <a href="pitch.mp4">Download narrated version</a>
             &middot;
-            <span>44&nbsp;s · 1080p · 8.4&nbsp;MB</span>
+            <span>52&nbsp;s · 1080p · 14&nbsp;MB</span>
           </p>
         </div>
 
         <div class="pitch-cta-grid">
           <a class="pitch-cta pitch-cta-primary" href="../app/">
             <span class="pitch-cta-title">Open the console</span>
-            <span class="pitch-cta-sub">Live mockup with 32 sessions, 7 blocked, $31,840 saved</span>
+            <span class="pitch-cta-sub">Live mockup — same 32 sessions, 7 blocked, $31,840 saved you just watched</span>
             <span class="pitch-cta-arrow">→</span>
           </a>
           <a class="pitch-cta" href="../verify/">
@@ -106,56 +106,69 @@
 
     <section class="pitch-story">
       <div class="wrap">
-        <h2>What the video shows</h2>
+        <h2>The 8 scenes</h2>
+        <p class="pitch-story-lede">
+          One take, no cuts. A brand-new user goes from the marketing landing
+          page all the way to a verified receipt in their browser. Nothing is
+          skipped — no “imagine you have an account”, no “imagine you just
+          downloaded this”. Every screen is the real screen.
+        </p>
 
         <ol class="pitch-scenes">
           <li>
             <span class="pitch-scene-num">1</span>
             <div>
-              <h3>The problem, in one line</h3>
-              <p>“AI agents make real decisions. With real money.” Nobody signs anything. Nobody keeps the tape. If something goes wrong, there’s no way to prove what the agent did.</p>
+              <h3>Landing.</h3>
+              <p>The user arrives at <a href="../">agentvisorai.me</a> — the marketing site. Hero, promise, three call-to-actions, one primary: <em>Open the console</em>.</p>
             </div>
           </li>
           <li>
             <span class="pitch-scene-num">2</span>
             <div>
-              <h3>One wrong decision. $8,400 gone.</h3>
-              <p>An agent tried to buy from an off-list vendor. In a normal setup that money leaves the door, and the CFO finds out on the invoice.</p>
+              <h3>Sign in.</h3>
+              <p>They type an email, then <code>demo</code> as the password. Google / Microsoft / SAML SSO are visible too. Any credentials work in the mockup.</p>
             </div>
           </li>
           <li>
             <span class="pitch-scene-num">3</span>
             <div>
-              <h3>Every decision: captured, enforced, signed.</h3>
-              <p>Every request and every tool call goes through AgentVisor first. The record is cryptographic, not a log file.</p>
+              <h3>Overview.</h3>
+              <p>First view after sign-in: fleet dashboard. Sessions today, tool calls allowed, tool calls blocked, LLM spend, and <em>Prevented losses</em>. The camera zooms into <strong>$31,840 saved</strong>.</p>
             </div>
           </li>
           <li>
             <span class="pitch-scene-num">4</span>
             <div>
-              <h3>Console: 32 sessions · 7 blocked · $31,840 saved.</h3>
-              <p>The overview reads like a fleet dashboard. Every metric is per-tenant. The right-most tile — <em>Prevented losses</em> — is what actually funds the pitch.</p>
+              <h3>Sessions list.</h3>
+              <p>Every agent session, filterable by deployment / agent / “blocked only”. Three rows are marked <em>blocked</em>. The eye lands on the topmost — <code>supply-planner</code>, 1&nbsp;blocked, 6&nbsp;m ago.</p>
             </div>
           </li>
           <li>
             <span class="pitch-scene-num">5</span>
             <div>
-              <h3>The blocked session, in detail.</h3>
-              <p>Full event stream. The blocked line is highlighted. The receipt panel on the right shows the Ed25519 signature — this is what an auditor gets, not a log they have to trust.</p>
+              <h3>Blocked session in detail.</h3>
+              <p>42 events. Event #8 is a <strong>BLOCKED</strong> row: vendor NexusParts wasn't in the procurement allowlist. Blocked value: $8,400. The receipt panel on the right shows a <em>Signature verified</em> Ed25519 signature.</p>
             </div>
           </li>
           <li>
             <span class="pitch-scene-num">6</span>
             <div>
-              <h3>Anyone verifies it — in-browser.</h3>
-              <p>Drop the receipt onto <a href="../verify/">agentvisorai.me/verify</a>. Web Crypto checks the signature client-side. No account. No login. Green tick if it matches; red if a single byte changed.</p>
+              <h3>Download the receipt.</h3>
+              <p>The <em>Download receipt</em> button pulses; the user clicks. What comes down is a signed JSON — no server, no account, portable to anyone.</p>
             </div>
           </li>
           <li>
             <span class="pitch-scene-num">7</span>
             <div>
-              <h3>AI agents you can hand to an auditor.</h3>
-              <p>That’s the whole pitch: the decisions, the record, the proof — in that order, in 44 seconds.</p>
+              <h3>Verify anywhere.</h3>
+              <p>They open <a href="../verify/">agentvisorai.me/verify</a>, drop the receipt, and the browser checks the Ed25519 signature client-side. Green tick. No account. No login. If a single byte changed, red.</p>
+            </div>
+          </li>
+          <li>
+            <span class="pitch-scene-num">8</span>
+            <div>
+              <h3>The one-line pitch.</h3>
+              <p>“AI agents you can hand to an auditor.” Try it live at <a href="../">agentvisorai.me</a>.</p>
             </div>
           </li>
         </ol>
