@@ -74,16 +74,31 @@ ffmpeg -y \
   " \
   -map "[voice]" -c:a pcm_s16le "$OUT/voice-bus.wav" 2>&1 | tail -1
 
-# Mix voice bus + whoosh bed. Bed is auto-attenuated -6dB so voice
-# stays clear on top. Final loudnorm to -18 LUFS.
-ffmpeg -y \
-  -i "$OUT/voice-bus.wav" \
-  -i "$OUT/soundtrack-44s.aac" \
-  -filter_complex "
-    [1]volume=0.5[bed];
-    [0][bed]amix=inputs=2:duration=longest:normalize=0[mix];
-    [mix]loudnorm=I=-18:LRA=8:TP=-2.0[out]
-  " \
-  -map "[out]" -c:a aac -b:a 192k -t 46 "$OUT/narration-44s.aac" 2>&1 | tail -1
+# Mix voice bus + whoosh bed + ambient pad if present.
+# Whoosh bed: -6dB under voice. Pad: -3dB (already very quiet at
+# -30 LUFS integrated). Voice stays clear on top of both.
+if [ -f "$OUT/ambience-46s.wav" ]; then
+  ffmpeg -y \
+    -i "$OUT/voice-bus.wav" \
+    -i "$OUT/soundtrack-44s.aac" \
+    -i "$OUT/ambience-46s.wav" \
+    -filter_complex "
+      [1]volume=0.5[bed];
+      [2]volume=0.7[pad];
+      [0][bed][pad]amix=inputs=3:duration=longest:normalize=0[mix];
+      [mix]loudnorm=I=-18:LRA=8:TP=-2.0[out]
+    " \
+    -map "[out]" -c:a aac -b:a 192k -t 46 "$OUT/narration-44s.aac" 2>&1 | tail -1
+else
+  ffmpeg -y \
+    -i "$OUT/voice-bus.wav" \
+    -i "$OUT/soundtrack-44s.aac" \
+    -filter_complex "
+      [1]volume=0.5[bed];
+      [0][bed]amix=inputs=2:duration=longest:normalize=0[mix];
+      [mix]loudnorm=I=-18:LRA=8:TP=-2.0[out]
+    " \
+    -map "[out]" -c:a aac -b:a 192k -t 46 "$OUT/narration-44s.aac" 2>&1 | tail -1
+fi
 
 ls -lh "$OUT/narration-44s.aac"
