@@ -116,6 +116,6 @@ if [ -f "$OUT/audio/narration-44s.aac" ]; then
   echo "→ Muxing narrated cut (definitive pitch)"
   ffmpeg -y -i "$OUT/agentvisor-mockup-v4.mp4" -i "$OUT/audio/narration-44s.aac" \
     -c:v copy -c:a aac -shortest \
-    "$OUT/agentvisor-mockup-v12-narrated.mp4" 2>&1 | tail -1
-  ls -lh "$OUT/agentvisor-mockup-v12-narrated.mp4"
+    "$OUT/agentvisor-mockup-v13-narrated.mp4" 2>&1 | tail -1
+  ls -lh "$OUT/agentvisor-mockup-v13-narrated.mp4"
 fi

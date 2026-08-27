@@ -43,12 +43,13 @@ gen_whoosh "$OUT/w-normal.wav" 0.42
 gen_whoosh "$OUT/w-problem.wav" 0.70   # scene 1 → 2 (impact)
 gen_whoosh "$OUT/w-soft.wav" 0.30      # scene 6 → 7 (denouement)
 
-# Silent bed for 44 seconds
-ffmpeg -y -f lavfi -i "anullsrc=r=44100:cl=stereo:d=44" \
+# Silent bed for 46 seconds (extended for v13 scene 7 CTA reveal)
+ffmpeg -y -f lavfi -i "anullsrc=r=44100:cl=stereo:d=46" \
   -c:a pcm_s16le "$OUT/silence.wav" 2>&1 | tail -1
 
 # Overlay whooshes at transition points using amix + adelay
 # Transition offsets in ms:
+# Transition offsets in ms (from actual compose.sh output):
 T1=5230    # scene 1 → 2 (problem impact)
 T2=10420   # scene 2 → 3
 T3=13880   # scene 3 → 4
