@@ -30,18 +30,18 @@ done
 
 # Scene-start offsets + ~200ms lead, from compose.sh `Offsets:`.
 D1=300
-D2=5700
-D3=11033
-D4=20200
-D5=27133
-D6=40966
-D7=50933
-D8=57366
-D9=60333
-D10=66233
-D11=74200
-D12=80600
-D13=93633
+D2=5833
+D3=11166
+D4=20499
+D5=27499
+D6=42032
+D7=51999
+D8=58499
+D9=61432
+D10=67199
+D11=75166
+D12=81666
+D13=96699
 
 ffmpeg -y -f lavfi -i "anullsrc=r=44100:cl=stereo:d=115" \
   -c:a pcm_s16le "$OUT/silence-44s.wav" 2>&1 | tail -1

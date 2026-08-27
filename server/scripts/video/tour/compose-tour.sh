@@ -16,6 +16,10 @@ dur() {
   ffprobe -v error -select_streams v:0 -show_entries stream=duration -of default=nokey=1:noprint_wrappers=1 "$1"
 }
 
+dur_any() {
+  ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 "$1"
+}
+
 mkdir -p "$OUT/norm"
 
 # Scenes with no burned-in caption. Landing + close get a 0.3s
@@ -37,8 +41,15 @@ add_caption() {
   local input=$1
   local output=$2
   local caption=$3
-  local enable=${4:-1}
+  local gate=${4:-0}
   local trim=${5:--ss 0.70}
+  # Fade the caption out before the crossfade so two captions never
+  # blend during scene transitions. gate = earliest show time (s).
+  local rawdur=$(dur_any "$input")
+  local ts=0
+  case "$trim" in *0.70*) ts=0.70;; esac
+  local capend=$(awk "BEGIN{printf \"%.2f\", $rawdur - $ts - 0.65}")
+  local enable="between(t,$gate,$capend)"
   local escaped=$(printf '%s' "$caption" | sed "s/'/\\\\\\\\'/g; s/:/\\\\:/g")
   local drawbox="drawbox=x=0:y=ih-140:w=iw:h=140:color=black@0.72:t=fill:enable='$enable'"
   local drawtext="drawtext=fontfile='$FONT':text='$escaped':fontsize=42:fontcolor=white:x=(w-text_w)/2:y=h-100:enable='$enable'"
@@ -72,7 +83,7 @@ add_caption "$SCENES/08-download.webm" "$OUT/norm/08-download.mp4" \
 
 add_caption "$SCENES/09-verify.webm" "$OUT/norm/09-verify.mp4" \
   "Drop the receipt. Verified in the browser. No account." \
-  "gte(t,1.6)" ""
+  "1.6" ""
 
 add_caption "$SCENES/10-policies.webm" "$OUT/norm/10-policies.mp4" \
   "Policies are readable rules, enforced in real time."
