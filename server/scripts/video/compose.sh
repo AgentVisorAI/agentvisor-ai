@@ -27,8 +27,9 @@ mkdir -p "$OUT/norm"
 # the first frame of the final video is the share thumbnail.
 for name in 01-problem 05-close; do
   ffmpeg -y -ss 0.30 -i "$SCENES/$name.webm" \
-    -vf "fps=30,scale=1920:1080:flags=lanczos,format=yuv420p" \
+    -vf "fps=30,scale=1920:1080:flags=lanczos:out_color_matrix=bt709,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,format=yuv420p" \
     -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p \
+    -colorspace bt709 -color_primaries bt709 -color_trc bt709 \
     "$OUT/norm/$name.mp4" 2>&1 | tail -1
 done
 
@@ -42,11 +43,13 @@ add_caption() {
   local drawtext="drawtext=fontfile='$FONT':text='$escaped':fontsize=42:fontcolor=white:x=(w-text_w)/2:y=h-100:enable='$enable'"
   ffmpeg -y -i "$input" -vf "
     fps=30,
-    scale=1920:1080:flags=lanczos,
+    scale=1920:1080:flags=lanczos:out_color_matrix=bt709,
+    setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,
     $drawbox,
     $drawtext,
     format=yuv420p
-  " -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p "$output" 2>&1 | tail -1
+  " -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p \
+    -colorspace bt709 -color_primaries bt709 -color_trc bt709 "$output" 2>&1 | tail -1
 }
 
 add_caption "$SCENES/02-overview.webm" "$OUT/norm/02-overview.mp4" \
@@ -88,6 +91,7 @@ ffmpeg -y \
   " \
   -map "[vout]" \
   -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p -movflags +faststart \
+  -colorspace bt709 -color_primaries bt709 -color_trc bt709 \
   "$OUT/agentvisor-mockup-v4.mp4" 2>&1 | tail -3
 
 ffprobe "$OUT/agentvisor-mockup-v4.mp4" 2>&1 | grep -E "Duration|Stream" | head -3
@@ -96,7 +100,7 @@ ls -lh "$OUT/agentvisor-mockup-v4.mp4"
 if [ -f "$OUT/audio/soundtrack-44s.aac" ]; then
   echo "→ Muxing subtle-audio cut (whooshes only)"
   ffmpeg -y -i "$OUT/agentvisor-mockup-v4.mp4" -i "$OUT/audio/soundtrack-44s.aac" \
-    -c:v copy -c:a aac -shortest -movflags +faststart \
+    -c:v copy -c:a aac -ar 48000 -shortest -movflags +faststart \
     "$OUT/agentvisor-mockup-v9-audio.mp4" 2>&1 | tail -1
   ls -lh "$OUT/agentvisor-mockup-v9-audio.mp4"
 fi
@@ -104,7 +108,7 @@ fi
 if [ -f "$OUT/audio/narration-44s.aac" ]; then
   echo "→ Muxing narrated cut (definitive v21 distilled)"
   ffmpeg -y -i "$OUT/agentvisor-mockup-v4.mp4" -i "$OUT/audio/narration-44s.aac" \
-    -c:v copy -c:a aac -shortest -movflags +faststart \
+    -c:v copy -c:a aac -ar 48000 -shortest -movflags +faststart \
     "$OUT/agentvisor-mockup-v21-distilled.mp4" 2>&1 | tail -1
   ls -lh "$OUT/agentvisor-mockup-v21-distilled.mp4"
 fi
