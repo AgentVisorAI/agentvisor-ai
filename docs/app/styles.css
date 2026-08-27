@@ -729,7 +729,13 @@ code, pre, .mono {
 /* ============================================================
  * TABLES
  * ============================================================ */
-.table-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden; }
+.table-wrap {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden;
+  /* Positioning context so absolutely-positioned .sr-only table headers
+     stay inside the (possibly scrolling) wrap instead of extending the
+     document's scroll width on phones. */
+  position: relative;
+}
 /* table-layout: fixed prevents any single evil-long cell from stretching
    the whole table. Combined with the per-cell truncation below, hostile
    or accidentally-long user data stays contained. */
@@ -1271,6 +1277,20 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 /* ============================================================
  * TOAST
  * ============================================================ */
+#toastStack {
+  position: fixed;
+  right: var(--s-6);
+  /* Clear of the tour launcher pill (bottom-right, ~64px tall zone). */
+  bottom: 76px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  z-index: 1000;
+  pointer-events: none;
+  max-width: min(420px, calc(100vw - 32px));
+}
+#toastStack .toast { position: static; pointer-events: auto; }
 .toast {
   position: fixed;
   bottom: var(--s-6); right: var(--s-6);
@@ -1444,6 +1464,20 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   .topbar .env-pill { display: none; }
   .topbar .user-btn { max-width: 40vw; overflow: hidden; }
   .topbar .user-btn span:last-child { text-overflow: ellipsis; overflow: hidden; white-space: nowrap; }
+  /* Tables scroll inside their card instead of inflating the page
+     width (overflow:hidden let the table force the whole console
+     wider than the phone screen). min-width keeps rows readable. */
+  .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .table-wrap table { min-width: 640px; }
+  /* Header actions wrap under the title instead of overflowing. */
+  .page-header { flex-wrap: wrap; row-gap: var(--s-2); }
+  .page-header .actions { flex-wrap: wrap; row-gap: var(--s-2); }
+  /* Event rows: drop the waterfall column so message + duration fit. */
+  .evt { grid-template-columns: 32px auto minmax(0, 1fr) auto; }
+  .evt .waterfall { display: none; }
+  /* Keep the tour launcher compact so it covers less content. */
+  #avTourLauncher button { padding: 9px 6px 9px 14px; font-size: 13px; }
+  #avTourLauncher #avTourDismiss { padding: 9px 12px 9px 4px; }
 }
 
 /* ============================================================
@@ -1507,8 +1541,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   position: fixed;
   width: 380px;
   max-width: calc(100vw - 24px);
-  background: var(--bg-1, #fff);
-  color: var(--fg-1, #111);
+  background: var(--surface);
+  color: var(--fg);
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 16px 18px;
@@ -1537,8 +1571,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .av-tour-spacer { flex: 1; }
 .av-tour-actions button {
   border: 1px solid var(--border);
-  background: var(--bg-2, transparent);
-  color: var(--fg-1);
+  background: var(--surface-2);
+  color: var(--fg);
   border-radius: 8px;
   padding: 7px 14px;
   font: inherit;
@@ -1567,3 +1601,9 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 .stat.av-pulse { animation: avStatPulse 1.2s ease 2; }
 tr.av-new-row td { animation: avStatPulse 1.2s ease 2; }
+
+@media (prefers-reduced-motion: reduce) {
+  .av-tour-hole, .av-tour-card { transition: none; }
+  .stat.av-pulse, tr.av-new-row td { animation: none; }
+  .toast, #avTourLauncher { animation: none; }
+}

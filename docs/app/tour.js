@@ -225,7 +225,10 @@
     }
 
     var target = step.target ? (document.querySelector(step.target) || anchor) : null;
-    if (target && target.scrollIntoView) target.scrollIntoView({ block: "center", behavior: "smooth" });
+    if (target && target.scrollIntoView) {
+      var reduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      target.scrollIntoView({ block: "center", behavior: reduced ? "auto" : "smooth" });
+    }
 
     // Wait one frame for the scroll to start, then track the target so
     // the spotlight follows smooth-scrolling and window resizes.
