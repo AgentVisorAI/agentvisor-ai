@@ -128,6 +128,11 @@ async function recordScene(browser, sceneName, durationMs, fn) {
     viewport: { width: 1920, height: 1080 },
     recordVideo: { dir: sceneDir, size: { width: 1920, height: 1080 } },
     deviceScaleFactor: 1,
+    // Force dark mode so the app's dark-mode tokens (mint --success,
+    // coral --danger) match the video's card palette. Without this,
+    // the app renders in light mode with Tailwind red/green while the
+    // cards use dark-mode mint/coral, and the two clash visually.
+    colorScheme: "dark",
   });
   const page = await ctx.newPage();
   await fn(page, durationMs);
@@ -176,6 +181,10 @@ async function recordConsoleScene(browser, sceneName, durationMs, hash, waitFor,
     recordVideo: { dir: sceneDir, size: { width: 1920, height: 1080 } },
     deviceScaleFactor: 1,
     storageState: storage,
+    // Force dark mode so the app's dark-mode tokens (mint --success,
+    // coral --danger) match the video's card palette. Prevents the
+    // Tailwind-red/green vs mint/coral clash between UI and cards.
+    colorScheme: "dark",
   });
   const page = await ctx.newPage();
   // Go directly to the target hash. Since the auth state is warmed,
