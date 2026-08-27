@@ -68,7 +68,9 @@
       title: "Don't trust us — verify it",
       body: "Download this receipt and drop it into our public verifier. " +
         "It checks the real cryptography in your browser — green tick, " +
-        "no account, works offline.",
+        "no account, works offline. And when you're back: hit " +
+        "<b>⚡ Simulate an attack</b> on the Overview to watch a live " +
+        "block happen in front of you.",
       cta: { label: "Open the verifier ↗", href: "../verify/", blank: true },
     },
   ];

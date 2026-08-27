@@ -329,6 +329,29 @@
     return "$" + v.toFixed(2);
   }
 
+  // Plain-language recap for blocked sessions. Visitors arrive here
+  // from the tour, the attack-demo toast, and the onboarding
+  // checklist — before showing them 13 raw events, say what the
+  // session means in one sentence a non-technical person can read.
+  function storyBanner(s, events) {
+    if (!(s.toolsBlocked > 0)) return "";
+    var blk = null;
+    for (var i = 0; i < events.length; i++) { if (events[i].kind === "block") { blk = events[i]; break; } }
+    var value = usdMicrosBig(s.blockedPayoutUsdMicros);
+    var recovered = blk && events.some(function (ev) {
+      return ev.kind === "guard" && /allow/i.test(ev.tag || "") && ev.seq > blk.seq;
+    });
+    var reason = blk && /allowlist|vendor/i.test(blk.msg || "") ? "a vendor that isn't approved" : "somewhere policy forbids";
+    return '<div class="story-banner" role="note">' +
+      '<span class="sb-icon" aria-hidden="true">🛡</span>' +
+      '<p><b>What happened here:</b> the <b>' + esc(s.agent) + '</b> agent tried to send <b>' + esc(value) + "</b> to " + reason + ". " +
+      "AgentVisor blocked the payment before any money moved" + (blk ? " (event #" + esc(blk.seq) + ")" : "") +
+      (recovered ? ", the agent recovered safely," : "") +
+      " and the whole session is sealed under the signed receipt on this page.</p>" +
+      (blk ? '<button class="btn" id="jumpToBlock">Jump to the block ↓</button>' : "") +
+    "</div>";
+  }
+
   /* ============================================================
    * SVG CHART GENERATORS
    * ============================================================ */
@@ -1273,6 +1296,7 @@
         cell("LLM cost", usdMicros(s.costUsdMicros), "actual usage") +
         cell("Blocked value", usdMicrosBig(s.blockedPayoutUsdMicros), "would have been paid out", parseInt(s.blockedPayoutUsdMicros, 10) > 0 ? "savings" : "") +
       "</div>" +
+      storyBanner(s, events) +
       '<div class="detail-grid">' +
         '<div class="events-card card">' +
           '<div class="events-head"><h2>Event stream</h2><span class="count">' + events.length + " event" + (events.length === 1 ? "" : "s") +
@@ -1304,6 +1328,17 @@
       row.classList.add("selected");
       var ev = events[parseInt(row.getAttribute("data-i"), 10)];
       renderEventDrawer(drawer, ev);
+    });
+
+    // Story banner "Jump to the block": scroll the BLOCKED row into
+    // view and open it in the drawer, so a non-technical visitor gets
+    // straight to the moment that matters.
+    var jump = main.querySelector("#jumpToBlock");
+    if (jump) jump.addEventListener("click", function () {
+      var row = evList.querySelector(".evt.err");
+      if (!row) return;
+      row.scrollIntoView({ block: "center", behavior: "smooth" });
+      row.click();
     });
 
     // Load-more events for long sessions. The server caps at 500 per
