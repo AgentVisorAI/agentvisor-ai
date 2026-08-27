@@ -190,6 +190,9 @@ async function recordConsoleScene(browser, sceneName, durationMs, hash, waitFor,
   });
   // First-user simulation clock: seed how far along the fresh
   // workspace is when this scene opens (see datasource FRESH_*).
+  await ctx.addInitScript(() => {
+    try { localStorage.setItem("av_mock_fastload", "1"); } catch {}
+  });
   if (cinematicOpts && cinematicOpts.freshOffset != null) {
     await ctx.addInitScript((off) => {
       try { localStorage.setItem("av_mock_fresh_t0", String(Date.now() - off)); } catch {}
@@ -395,7 +398,10 @@ await recordScene(browser, "01-landing", 5000, async (page, ms) => {
 // ── SCENE 2: SIGN UP. The novice creates a workspace, live. ──────
 await recordScene(browser, "02-signup", 9000, async (page, ms) => {
   await page.addInitScript(() => {
-    try { localStorage.setItem("av_mock_signed_out", "1"); } catch {}
+    try {
+      localStorage.setItem("av_mock_signed_out", "1");
+      localStorage.setItem("av_mock_fastload", "1");
+    } catch {}
   });
   await page.goto(SITE + "#/signup", { waitUntil: "networkidle" });
   await page.waitForSelector("input#orgName", { timeout: 10000 });
@@ -465,10 +471,15 @@ await recordConsoleScene(
     const cb = await cmd.boundingBox().catch(() => null);
     if (cb) await page.mouse.move(cb.x + cb.width / 2, cb.y + cb.height / 2, { steps: 16 });
     await page.waitForTimeout(2600);
-    // The daemon handshakes (elapsed passes FRESH_CONNECT_MS) —
-    // re-render the route so the connected deployment appears.
-    await page.evaluate(() => window.dispatchEvent(new HashChangeEvent("hashchange")));
-    await page.waitForSelector("text=northwind-prod", { timeout: 4000 }).catch(() => {});
+    // The daemon handshakes: advance the simulation clock past
+    // FRESH_CONNECT_MS deterministically, then re-render the route so
+    // the connected deployment appears (wall-clock waits proved
+    // flaky under recording load).
+    await page.evaluate(() => {
+      localStorage.setItem("av_mock_fresh_t0", String(Date.now() - 13500));
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    await page.waitForSelector("text=northwind-prod", { timeout: 6000 });
     const row = page.locator("text=northwind-prod").first();
     const rb = await row.boundingBox().catch(() => null);
     if (rb) await page.mouse.move(rb.x + rb.width / 2, rb.y + rb.height / 2, { steps: 14 });
@@ -486,12 +497,19 @@ await recordConsoleScene(
   { freshOffset: 15200, zoomMs: 10000 },
   async (page) => {
     await page.waitForTimeout(2300);
-    // First session has arrived — refresh the view.
-    await page.evaluate(() => window.dispatchEvent(new HashChangeEvent("hashchange")));
+    // First session has arrived — advance the clock, refresh the view.
+    await page.evaluate(() => {
+      localStorage.setItem("av_mock_fresh_t0", String(Date.now() - 17500));
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
     await page.waitForTimeout(3400);
     // Second refresh: the featured blocked session lands, $8,400 appears.
-    await page.evaluate(() => window.dispatchEvent(new HashChangeEvent("hashchange")));
-    await page.waitForTimeout(1200);
+    await page.evaluate(() => {
+      localStorage.setItem("av_mock_fresh_t0", String(Date.now() - 22500));
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    await page.waitForSelector("text=$8,400", { timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(1000);
     // Only now pulse the tile — it finally has the first save in it.
     await page.evaluate(() => {
       const el = document.querySelector(".stat.savings");
