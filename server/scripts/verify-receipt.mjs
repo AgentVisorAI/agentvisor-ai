@@ -11,8 +11,8 @@
  * (plus the trust-anchor list this script ships with).
  *
  * Usage:
- *   node scripts/verify-receipt.mjs path/to/agentvisor-receipt-<sessId>.json
- *   node scripts/verify-receipt.mjs --allow-untrusted-key <bundle.json>
+ *   node server/scripts/verify-receipt.mjs path/to/agentvisor-receipt-<sessId>.json
+ *   node server/scripts/verify-receipt.mjs --allow-untrusted-key <bundle.json>
  *
  * Exit codes:
  *   0 — signature verifies AND the pubkey is on the trust anchor list
@@ -41,7 +41,11 @@ import { createPublicKey, verify } from "node:crypto";
 // lowercased 64-hex Ed25519 pubkeys of the AgentVisor deployment(s).
 // Empty list defaults to REQUIRING `--allow-untrusted-key`.
 const TRUSTED_RECEIPT_KEYS = new Set([
-  // Example: "0011223344...ff00" (32 bytes = 64 hex chars).
+  // Keep in sync with docs/verify/verify.js TRUSTED_RECEIPT_KEYS.
+  // Sample/shared receipts signing key (legacy demo exports).
+  "9992e71fe6a6e5edc18129becef2ec640f9611a4e12a4b9a311bab943ab19467",
+  // Demo console signing key (docs/app/datasource.js fixed keypair).
+  "573c8f249012fbb08b3d79973411bb93141f32719c86ada25306fde5e59e8d57",
 ]);
 
 const argv = process.argv.slice(2);

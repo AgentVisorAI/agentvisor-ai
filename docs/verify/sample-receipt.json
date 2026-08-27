@@ -50,7 +50,7 @@
         "message": "receipt.rawBody (UTF-8 bytes)",
         "signature": "base64-decode(receipt.rawSignatureB64)",
         "publicKey": "hex-decode(publicKey.hex)",
-        "command": "node scripts/verify-receipt.mjs sess_01H9K7GRPX.json",
+        "command": "node server/scripts/verify-receipt.mjs sess_01H9K7GRPX.json",
         "docs": "https://agentvisorai.me/reference/receipts"
     }
 }
