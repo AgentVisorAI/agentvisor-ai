@@ -34,21 +34,23 @@ gen() {
   echo "  WARNING: $(basename "$out") ${d}s exceeds window ${window}s even at +40%"
 }
 
-gen "$VOICE/s1" 5.4 "A brand new user lands on Agent Visor A I."
-gen "$VOICE/s2" 5.2 "They create a workspace. Company, email, password. That is the whole setup."
-gen "$VOICE/s3" 9.2 "First view: the dashboard. Thirty two sessions. Seven blocked. Thirty one thousand, eight hundred forty dollars saved."
-gen "$VOICE/s4" 6.85 "A command palette jumps anywhere. Light or dark, your call."
-gen "$VOICE/s5" 14.4 "Every session is searchable. One click isolates the blocked ones."
-gen "$VOICE/s6" 9.8 "Inside a session, the A I tried to spend eight thousand four hundred dollars. Blocked. And every event is inspectable."
-gen "$VOICE/s7" 6.35 "Share a verification link, or copy the raw receipt. One click each."
-gen "$VOICE/s8" 2.8 "The receipt downloads in one click."
-gen "$VOICE/s9" 5.6 "Drop it into the public verifier. Green tick. No account."
-gen "$VOICE/s10" 7.8 "Policies are plain rules. Readable, and enforced before the money moves."
-gen "$VOICE/s11" 6.35 "Each deployment gets its own signing key and ingest token."
-gen "$VOICE/s12" 14.9 "Members, A P I keys, single sign on, webhooks, audit log, billing. The whole workspace is self serve."
-gen "$VOICE/s13" 4.55 "A I agents you can hand to an auditor. agentvisor A I dot me."
+gen "$VOICE/s1" 4.6 "A brand new user lands on Agent Visor A I."
+gen "$VOICE/s2" 7.2 "They create a workspace. Company, email, password. That is the whole setup."
+gen "$VOICE/s3" 4.9 "A brand new workspace. Zero sessions, zero deployments. Nothing to audit, yet."
+gen "$VOICE/s4" 9.0 "One install command connects their first daemon. Agent Visor issues its signing key automatically."
+gen "$VOICE/s5" 9.6 "And the first sessions stream in. Within minutes, the first save: eight thousand four hundred dollars, blocked."
+gen "$VOICE/s6" 5.9 "One click isolates the blocked session."
+gen "$VOICE/s7" 9.2 "Inside it: the A I tried to spend eight thousand four hundred dollars. Blocked. And every event is inspectable."
+gen "$VOICE/s8" 6.35 "Share a verification link, or copy the raw receipt. One click each."
+gen "$VOICE/s9" 2.8 "The receipt downloads in one click."
+gen "$VOICE/s10" 5.6 "Drop it into the public verifier. Green tick. No account."
+gen "$VOICE/s11" 7.6 "Starter policies come enabled on day one. Plain rules, enforced before the money moves."
+gen "$VOICE/s12" 6.6 "A command palette jumps anywhere. Light or dark, your call."
+gen "$VOICE/s13" 5.9 "Each deployment gets its own signing key and ingest token."
+gen "$VOICE/s14" 15.0 "Members, A P I keys, single sign on, webhooks, audit log, billing. The whole workspace is self serve."
+gen "$VOICE/s15" 4.55 "A I agents you can hand to an auditor. agentvisor A I dot me."
 
-for i in $(seq 1 13); do
+for i in $(seq 1 15); do
   ffmpeg -y -i "$VOICE/s$i.raw.wav" \
     -af "aformat=sample_rates=44100:channel_layouts=stereo,highpass=f=100,acompressor=threshold=-20dB:ratio=3:attack=5:release=50,loudnorm=I=-18:LRA=6:TP=-2.0" \
     -c:a pcm_s16le "$VOICE/s$i.wav" 2>&1 | tail -1
@@ -56,20 +58,22 @@ done
 
 # Scene-start offsets + ~200ms lead, from compose.sh `Offsets:`.
 D1=300
-D2=5833
-D3=11300
-D4=20133
-D5=27233
-D6=36733
-D7=46733
-D8=54133
-D9=57266
-D10=63099
-D11=71066
-D12=77566
-D13=93666
+D2=5900
+D3=11800
+D4=16800
+D5=25367
+D6=35334
+D7=42101
+D8=51868
+D9=59068
+D10=62035
+D11=67868
+D12=75435
+D13=81935
+D14=88068
+D15=103668
 
-ffmpeg -y -f lavfi -i "anullsrc=r=44100:cl=stereo:d=115" \
+ffmpeg -y -f lavfi -i "anullsrc=r=44100:cl=stereo:d=125" \
   -c:a pcm_s16le "$OUT/silence-44s.wav" 2>&1 | tail -1
 
 ffmpeg -y \
@@ -87,6 +91,8 @@ ffmpeg -y \
   -i "$VOICE/s11.wav" \
   -i "$VOICE/s12.wav" \
   -i "$VOICE/s13.wav" \
+  -i "$VOICE/s14.wav" \
+  -i "$VOICE/s15.wav" \
   -filter_complex "
     [1]adelay=${D1}|${D1}[v1];
     [2]adelay=${D2}|${D2}[v2];
@@ -101,7 +107,9 @@ ffmpeg -y \
     [11]adelay=${D11}|${D11}[v11];
     [12]adelay=${D12}|${D12}[v12];
     [13]adelay=${D13}|${D13}[v13];
-    [0][v1][v2][v3][v4][v5][v6][v7][v8][v9][v10][v11][v12][v13]amix=inputs=14:duration=first:normalize=0[voice]
+    [14]adelay=${D14}|${D14}[v14];
+    [15]adelay=${D15}|${D15}[v15];
+    [0][v1][v2][v3][v4][v5][v6][v7][v8][v9][v10][v11][v12][v13][v14][v15]amix=inputs=16:duration=first:normalize=0[voice]
   " \
   -map "[voice]" -c:a pcm_s16le "$OUT/voice-bus.wav" 2>&1 | tail -1
 
@@ -116,7 +124,7 @@ if [ -f "$OUT/ambience-46s.wav" ]; then
       [0][bed][pad]amix=inputs=3:duration=longest:normalize=0[mix];
       [mix]loudnorm=I=-18:LRA=8:TP=-2.0[out]
     " \
-    -map "[out]" -c:a aac -b:a 192k -t 108 "$OUT/narration-44s.aac" 2>&1 | tail -1
+    -map "[out]" -c:a aac -b:a 192k -t 122 "$OUT/narration-44s.aac" 2>&1 | tail -1
 else
   ffmpeg -y \
     -i "$OUT/voice-bus.wav" \
@@ -126,7 +134,7 @@ else
       [0][bed]amix=inputs=2:duration=longest:normalize=0[mix];
       [mix]loudnorm=I=-18:LRA=8:TP=-2.0[out]
     " \
-    -map "[out]" -c:a aac -b:a 192k -t 108 "$OUT/narration-44s.aac" 2>&1 | tail -1
+    -map "[out]" -c:a aac -b:a 192k -t 122 "$OUT/narration-44s.aac" 2>&1 | tail -1
 fi
 
 ls -lh "$OUT/narration-44s.aac"
