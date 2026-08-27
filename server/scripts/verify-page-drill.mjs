@@ -36,26 +36,37 @@ await page.waitForSelector("#drop", { timeout: 10000 });
 await page.waitForSelector("#loadExample", { timeout: 5000 });
 console.log("✅ /verify page renders with drop zone + sample button");
 
-// 2. Try sample -> should render as internally consistent (empty trust anchor)
+// 2. Try sample -> the sample's pubkey ships on the page's trust
+// anchor list (a deliberate product decision from #44: investors
+// clicking "Try it with a sample" must see the full green TRUSTED
+// experience), so it must render as TRUSTED — and, critically,
+// a forged fresh-keypair bundle must NOT (step 4 guards that).
 await page.locator("#loadExample").click();
 await wait(1500);
 {
   const title = await page.locator(".result-title").innerText();
-  // R78 HIGH #1 + R80 F1: with empty TRUSTED_RECEIPT_KEYS, any
-  // receipt (including the shipped sample) must render as
-  // INTERNALLY CONSISTENT, not TRUSTED. Assertion regression:
-  // commit 30e8085 reverted this from R78's `/internally
-  // consistent/` back to `/verifies/`, causing the drill to
-  // fail at step 2 in CI — which also made R79's positive
-  // trust-anchor guard at step 5 unreachable (dead-code
-  // regression test). This restores the correct assertion.
   if (/does not verify/i.test(title)) fail("sample rendered as does-not-verify. title=" + title);
-  if (/verifies against a trusted key/i.test(title)) fail("sample falsely claimed TRUSTED (empty anchor list should show INTERNALLY CONSISTENT until anchors are populated): " + title);
-  if (!/internally consistent/i.test(title)) fail("sample missing INTERNALLY CONSISTENT string: " + title);
+  if (!/verifies against a trusted key/i.test(title)) fail("sample did not render as TRUSTED (its pubkey ships on the page's anchor list; did TRUSTED_RECEIPT_KEYS lose the sample key?): " + title);
   const kvText = await page.locator(".result-card dl.kv").innerText();
   if (!/Session/.test(kvText)) fail("no session field in kv");
   if (!/supply-planner|northwind|demo/i.test(kvText)) fail("session content missing");
-  console.log("✅ sample receipt renders as INTERNALLY CONSISTENT via Web Crypto in the browser");
+  console.log("✅ sample receipt renders as TRUSTED via Web Crypto in the browser");
+}
+
+// 2b. One-click tamper demo: green -> tamper one byte -> red ->
+// restore -> green. Guards the #tamperBtn/#restoreBtn feature.
+{
+  await page.locator("#tamperBtn").click();
+  await wait(1200);
+  const title = await page.locator(".result-title").innerText();
+  if (!/does not verify/i.test(title)) fail("tamper demo didn't flip to does-not-verify: " + title);
+  const note = await page.locator(".tamper-note").innerText();
+  if (!/one byte/i.test(note)) fail("tamper demo missing explainer note: " + note);
+  await page.locator("#restoreBtn").click();
+  await wait(1200);
+  const restored = await page.locator(".result-title").innerText();
+  if (!/verifies against a trusted key/i.test(restored)) fail("restore didn't return to TRUSTED: " + restored);
+  console.log("✅ tamper demo: one byte -> red, restore -> green");
 }
 
 // 3. Fetch the same sample and upload via file input
@@ -79,11 +90,10 @@ async function uploadJson(text) {
 await uploadJson(sampleText);
 {
   const title = await page.locator(".result-title").innerText();
-  // R78 HIGH #1 + R80 F1: same assertion as step 2 above.
+  // Same rationale as step 2: the sample's key is a shipped anchor.
   if (/does not verify/i.test(title)) fail("uploaded legit rendered as does-not-verify");
-  if (/verifies against a trusted key/i.test(title)) fail("uploaded legit falsely claimed TRUSTED (empty anchor list should always give INTERNALLY CONSISTENT until anchors are populated)");
-  if (!/internally consistent/i.test(title)) fail("uploaded legit missing INTERNALLY CONSISTENT string: " + title);
-  console.log("✅ upload path renders legit receipt as INTERNALLY CONSISTENT (empty trust anchor)");
+  if (!/verifies against a trusted key/i.test(title)) fail("uploaded legit did not render as TRUSTED: " + title);
+  console.log("✅ upload path renders legit receipt as TRUSTED");
 }
 
 // 4. Upload tampered
@@ -173,4 +183,4 @@ if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors))
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 9 /verify page drill checks passed.");
+console.log("\nAll 10 /verify page drill checks passed.");
