@@ -21,7 +21,7 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { db } from "../db.js";
-import { hashPassword, randomToken } from "../lib/auth.js";
+import { canGrantRole, hashPassword, randomToken } from "../lib/auth.js";
 import { writeAudit } from "../lib/audit.js";
 import { requireSession } from "../lib/session-middleware.js";
 
@@ -70,6 +70,11 @@ export async function apiKeyRoutes(app: FastifyInstance): Promise<void> {
       })
       .safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: "invalid_input" });
+    // R83 F1: block admin minting an OWNER-scoped API key
+    // (owner unlocks whole-org delete + SAML keypair rotate).
+    if (!canGrantRole(claims.membershipRole, body.data.role)) {
+      return reply.code(403).send({ error: "cannot_grant_role_above_own" });
+    }
 
     const plaintextBody = randomToken(28); // 224 bits of randomness
     const plaintext = "av_srv_" + plaintextBody;

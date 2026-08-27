@@ -27,6 +27,7 @@ import { db } from "../db.js";
 import { env } from "../env.js";
 import {
   SESSION_COOKIE_OPTS,
+  canGrantRole,
   hashPassword,
   mintSession,
   randomToken,
@@ -80,6 +81,14 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       .object({ role: roleSchema })
       .safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: "invalid_input" });
+    // R83 F1: reject role escalation. Prior shape let an admin
+    // grant OWNER to any target because the only gate was
+    // `membershipRole !== "member"`. See lib/auth.ts canGrantRole
+    // for the full attack surface (owner unlocks whole-org delete
+    // + SAML keypair rotate).
+    if (!canGrantRole(claims.membershipRole, body.data.role)) {
+      return reply.code(403).send({ error: "cannot_grant_role_above_own" });
+    }
     if (claims.sub === req.params.userId && body.data.role !== claims.membershipRole) {
       // Prevent an owner from demoting themselves and locking out the
       // org. If they want to leave, use DELETE /members/:userId — that
@@ -230,6 +239,11 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       })
       .safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: "invalid_input" });
+    // R83 F1: block admin inviting an attacker-controlled email as
+    // OWNER (attacker accepts, gains org-delete power).
+    if (!canGrantRole(claims.membershipRole, body.data.role)) {
+      return reply.code(403).send({ error: "cannot_grant_role_above_own" });
+    }
 
     const inviter = await db.user.findUnique({ where: { id: claims.sub } });
     const org = await db.org.findUnique({ where: { id: claims.orgId } });
@@ -397,9 +411,6 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       .safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: "invalid_input" });
 
-    const inv = await db.invite.findUnique({
-      where: { orgId_email: { orgId: "n/a", email: body.data.email } },
-    }).catch(() => null);
     // The orgId isn't in the request — look up by email + verify by token.
     // R80 F3: cap the number of candidates to N to prevent an
     // unauthenticated argon2-amplification DoS. Prior shape ran
