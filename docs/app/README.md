@@ -24,7 +24,18 @@ URL sees a fully populated workspace: 2 deployments, 7 sessions with events
 and receipts, headline KPIs. Any email + password combination signs you in.
 
 This is what powers the investor pitch until the backend is deployed to
-production.
+production. Mock mode also ships two investor-facing extras (both inert in
+live mode):
+
+- **Guided tour** ([`tour.js`](./tour.js)) — a six-step spotlight walkthrough
+  of the money story: prevented losses → the blocked session → the exact
+  blocked event → the signed receipt → the public verifier. Launched from
+  the floating "See the full flow" pill, the command palette, or the
+  `/app/?tour=1` deep link used by the landing-page CTA.
+- **Simulate an attack** (Overview header, also in the palette) — stages a
+  live blocked payment: an in-progress purchase session appears, the
+  payment gets blocked ~3 s later, and every stat, chart, and receipt on
+  screen catches up in real time.
 
 ### Live mode
 
