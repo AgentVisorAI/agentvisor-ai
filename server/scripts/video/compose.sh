@@ -53,7 +53,7 @@ add_caption() {
 }
 
 add_caption "$SCENES/02-overview.webm" "$OUT/norm/02-overview.mp4" \
-  "AgentVisor watches every AI agent. \$31,840 saved across all blocked orders."
+  "AgentVisor watches every AI agent. \$31,840 saved from blocked orders."
 
 add_caption "$SCENES/03-session.webm" "$OUT/norm/03-session.mp4" \
   "Unapproved vendor: blocked, signed. The safe retry went through."
