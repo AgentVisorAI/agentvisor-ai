@@ -295,6 +295,21 @@
     toastStack().appendChild(t);
     setTimeout(function () { t.remove(); }, 6500);
   }
+  // Click-to-copy affordance for credential-ish values (fingerprints,
+  // pubkeys, tokens). One delegated handler serves every instance.
+  function copyable(value) {
+    if (!value) return "—";
+    return '<span class="copyable">' + esc(value) +
+      '<button type="button" class="copy-btn" data-copy="' + esc(value) + '" title="Copy" aria-label="Copy to clipboard">⧉</button></span>';
+  }
+  document.addEventListener("click", function (e) {
+    var b = e.target.closest("[data-copy]");
+    if (!b) return;
+    navigator.clipboard.writeText(b.getAttribute("data-copy")).then(
+      function () { toast("Copied to clipboard"); },
+      function () { toast("Copy failed", true); }
+    );
+  });
   function loadingBlock(kind) {
     if (kind === "stats") {
       var boxes = "";
@@ -1704,9 +1719,9 @@
       '<div class="card" style="margin-bottom:12px">' +
         "<h2>Signing key</h2>" +
         '<dl class="kv" style="display:grid;grid-template-columns:140px 1fr;gap:5px 12px;font-size:13px">' +
-          '<dt style="color:var(--fg-3)">Fingerprint</dt><dd class="mono">' + esc(d.keyFingerprint || "—") + "</dd>" +
-          '<dt style="color:var(--fg-3)">Public key</dt><dd class="mono" style="word-break:break-all">' + esc(d.publicKeyHex || "—") + "</dd>" +
-          '<dt style="color:var(--fg-3)">Ingest token</dt><dd class="mono">' + esc(d.ingestTokenHint || "—") + "</dd>" +
+          '<dt style="color:var(--fg-3)">Fingerprint</dt><dd class="mono">' + copyable(d.keyFingerprint) + "</dd>" +
+          '<dt style="color:var(--fg-3)">Public key</dt><dd class="mono" style="word-break:break-all">' + copyable(d.publicKeyHex) + "</dd>" +
+          '<dt style="color:var(--fg-3)">Ingest token</dt><dd class="mono">' + copyable(d.ingestTokenHint) + "</dd>" +
         "</dl>" +
         '<div style="margin-top: 12px; display:flex; gap:8px">' +
           '<button class="btn" id="depRotate">Rotate token</button>' +

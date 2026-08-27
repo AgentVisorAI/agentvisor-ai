@@ -1724,3 +1724,18 @@ a.ob-step:hover { border-color: var(--accent); }
 }
 .billing-math .bm-num { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .billing-math .bm-label { color: var(--fg-3); font-size: var(--t-min); margin-top: 2px; }
+
+/* Click-to-copy for credential values */
+.copyable { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; min-width: 0; }
+.copy-btn {
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--fg-3);
+  border-radius: var(--r-sm);
+  padding: 1px 5px;
+  font-size: 11px;
+  line-height: 1.5;
+  cursor: pointer;
+  flex: none;
+}
+.copy-btn:hover { color: var(--fg); border-color: var(--border-strong); }
