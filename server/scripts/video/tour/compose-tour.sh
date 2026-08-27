@@ -65,7 +65,8 @@ add_caption "$SCENES/04-connect.webm" "$OUT/norm/04-connect.mp4" \
   "One install command. The daemon connects."
 
 add_caption "$SCENES/05-firstdata.webm" "$OUT/norm/05-firstdata.mp4" \
-  "First sessions stream in. First save: \$8,400."
+  "First sessions stream in. First save: \$8,400." \
+  "3.4"
 
 add_caption "$SCENES/06-sessions.webm" "$OUT/norm/06-sessions.mp4" \
   "Isolate the blocked one."
