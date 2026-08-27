@@ -18,8 +18,10 @@
 /api/*  https://api.agentvisorai.me/api/:splat  200
 /healthz  https://api.agentvisorai.me/healthz  200
 
-# Legacy pitch walkthrough — keep old redirect valid but also serve
-# the new /pitch/ path directly (no redirect needed for that).
+# Short-link aliases. NOTE: the site currently deploys to GitHub
+# Pages, which ignores this file; /mockup and /demo actually work via
+# static meta-refresh stubs (docs/mockup/, docs/demo/). These rules
+# only take effect if the site moves to Cloudflare Pages.
 /mockup   /pitch/  301
 /demo     /pitch/  301
 
