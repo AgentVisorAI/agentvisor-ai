@@ -1,12 +1,6 @@
 #!/usr/bin/env bash
-# Build a subtle audio bed for the v17 flow-with-hook walkthrough
-# (~35s target). 7 scenes = 6 transitions.
-#
-# Design principles:
-#   * NO music. Nothing tonal.
-#   * Just soft "punctuation" — bandpass-filtered pink noise
-#     whoosh at each scene crossfade.
-#   * Very low volume.
+# Subtle whoosh bed for the v20 novice tour (~90s).
+# 11 scenes = 10 transitions. Pink-noise whooshes only; no music.
 set -euo pipefail
 
 OUT=/tmp/video-v4/audio
@@ -21,25 +15,32 @@ gen_whoosh() {
 }
 
 gen_whoosh "$OUT/w-normal.wav" 0.42
-gen_whoosh "$OUT/w-strong.wav" 0.70   # scene 1 → 2 (problem-to-product impact)
-gen_whoosh "$OUT/w-soft.wav"   0.28   # last transition (into close)
+gen_whoosh "$OUT/w-strong.wav" 0.65   # landing → signup (into the app)
+gen_whoosh "$OUT/w-soft.wav"   0.28   # settings → close (denouement)
 
-# Silent bed for 40 seconds (covers ~35s expected total).
-ffmpeg -y -f lavfi -i "anullsrc=r=44100:cl=stereo:d=40" \
+# Silent bed for 92 seconds (covers the ~89.3s tour).
+ffmpeg -y -f lavfi -i "anullsrc=r=44100:cl=stereo:d=92" \
   -c:a pcm_s16le "$OUT/silence.wav" 2>&1 | tail -1
 
-# Transition offsets in ms — retimed from compose.sh's `Offsets:`
-# after first record.
-T1=3167    # 1 → 2  (problem → signin)
-T2=6900    # 2 → 3  (signin → overview)
-T3=13800   # 3 → 4  (overview → session)
-T4=21533   # 4 → 5  (session → download)
-T5=24866   # 5 → 6  (download → verify)
-T6=31499   # 6 → 7  (verify → close)
+# Transition offsets in ms, from compose.sh `Offsets:` output.
+T1=5600     # 1  → 2  landing → signup
+T2=11033    # 2  → 3  signup → overview
+T3=20599    # 3  → 4  overview → sessions
+T4=33466    # 4  → 5  sessions → session
+T5=44299    # 5  → 6  session → download
+T6=48132    # 6  → 7  download → verify
+T7=55032    # 7  → 8  verify → policies
+T8=63865    # 8  → 9  policies → deployments
+T9=71165    # 9  → 10 deployments → settings
+T10=81032   # 10 → 11 settings → close
 
 ffmpeg -y \
   -i "$OUT/silence.wav" \
   -i "$OUT/w-strong.wav" \
+  -i "$OUT/w-normal.wav" \
+  -i "$OUT/w-normal.wav" \
+  -i "$OUT/w-normal.wav" \
+  -i "$OUT/w-normal.wav" \
   -i "$OUT/w-normal.wav" \
   -i "$OUT/w-normal.wav" \
   -i "$OUT/w-normal.wav" \
@@ -52,7 +53,11 @@ ffmpeg -y \
     [4]adelay=${T4}|${T4}[w4];
     [5]adelay=${T5}|${T5}[w5];
     [6]adelay=${T6}|${T6}[w6];
-    [0][w1][w2][w3][w4][w5][w6]amix=inputs=7:duration=first:normalize=0[mix];
+    [7]adelay=${T7}|${T7}[w7];
+    [8]adelay=${T8}|${T8}[w8];
+    [9]adelay=${T9}|${T9}[w9];
+    [10]adelay=${T10}|${T10}[w10];
+    [0][w1][w2][w3][w4][w5][w6][w7][w8][w9][w10]amix=inputs=11:duration=first:normalize=0[mix];
     [mix]loudnorm=I=-24:LRA=8:TP=-3.0[out]
   " \
   -map "[out]" -c:a aac -b:a 128k "$OUT/soundtrack-44s.aac" 2>&1 | tail -1
