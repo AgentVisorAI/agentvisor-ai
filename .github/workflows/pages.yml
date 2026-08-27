@@ -104,6 +104,9 @@ jobs:
           npx --yes terser@5 docs/app/datasource.js \
             --compress passes=2 --mangle --keep-fnames --keep-classnames \
             -o "$site/app/datasource.js"
+          npx --yes terser@5 docs/app/tour.js \
+            --compress passes=2 --mangle --keep-fnames --keep-classnames \
+            -o "$site/app/tour.js"
           echo "SPA sizes (raw → minified):"
           ls -la docs/app/app.js "$site/app/app.js"
           ls -la docs/app/datasource.js "$site/app/datasource.js"

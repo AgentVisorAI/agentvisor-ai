@@ -1459,3 +1459,111 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
   border: 0;
 }
+
+/* ============================================================
+ * GUIDED FLOW TOUR (tour.js)
+ * ============================================================ */
+#avTourLauncher {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 900;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 999px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.25);
+  animation: toastIn 200ms cubic-bezier(.22,1,.36,1);
+}
+#avTourLauncher button {
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  padding: 11px 8px 11px 18px;
+  font-weight: 600;
+  font-size: var(--t-body, 14px);
+}
+#avTourLauncher #avTourDismiss {
+  padding: 11px 14px 11px 6px;
+  opacity: 0.75;
+  font-weight: 400;
+}
+#avTourLauncher #avTourDismiss:hover { opacity: 1; }
+#avTourLauncher #avTourStart:hover { text-decoration: underline; }
+
+#avTour { position: fixed; inset: 0; z-index: 950; pointer-events: none; }
+.av-tour-hole {
+  position: fixed;
+  border-radius: 10px;
+  /* The spotlight: everything but the hole is dimmed. */
+  box-shadow: 0 0 0 9999px rgba(8, 15, 24, 0.55), 0 0 0 2px var(--accent);
+  transition: left 200ms ease, top 200ms ease, width 200ms ease, height 200ms ease;
+}
+.av-tour-card {
+  position: fixed;
+  width: 380px;
+  max-width: calc(100vw - 24px);
+  background: var(--bg-1, #fff);
+  color: var(--fg-1, #111);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px 18px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.35);
+  pointer-events: auto;
+  transition: left 200ms ease, top 200ms ease;
+}
+.av-tour-card.centered {
+  left: 50% !important;
+  top: 50% !important;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 0 0 9999px rgba(8, 15, 24, 0.55), 0 16px 48px rgba(0, 0, 0, 0.35);
+}
+.av-tour-step {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+.av-tour-card h3 { margin: 0 0 6px; font-size: 16px; }
+.av-tour-card p { margin: 0 0 14px; font-size: 13.5px; line-height: 1.55; color: var(--fg-2); }
+.av-tour-card p code { font-size: 12px; }
+.av-tour-actions { display: flex; align-items: center; gap: 8px; }
+.av-tour-spacer { flex: 1; }
+.av-tour-actions button {
+  border: 1px solid var(--border);
+  background: var(--bg-2, transparent);
+  color: var(--fg-1);
+  border-radius: 8px;
+  padding: 7px 14px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.av-tour-actions .av-tour-next {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+.av-tour-actions .av-tour-skip {
+  border: 0;
+  background: none;
+  color: var(--fg-3);
+  padding-left: 0;
+}
+.av-tour-actions .av-tour-skip:hover { color: var(--fg-1); }
+
+/* Simulated-attack: the savings stat pulses when new money is kept. */
+@keyframes avStatPulse {
+  0% { box-shadow: 0 0 0 0 var(--success-bg); }
+  50% { box-shadow: 0 0 0 10px transparent; background: var(--success-bg); }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+.stat.av-pulse { animation: avStatPulse 1.2s ease 2; }
+tr.av-new-row td { animation: avStatPulse 1.2s ease 2; }
