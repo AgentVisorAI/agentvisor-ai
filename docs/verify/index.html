@@ -59,6 +59,7 @@
 
     <div class="example-row">
       <button type="button" class="link" id="loadExample">Try it with a sample receipt</button>
+      <span style="color: var(--fg-muted)"> — then tamper with one byte and watch it fail</span>
     </div>
 
     <div class="result" id="result" hidden></div>
@@ -73,7 +74,9 @@
       <p>
         Your browser here runs Web Crypto's Ed25519 verify against the
         embedded key and the raw signed body. If a single byte changed
-        anywhere, the verification fails.
+        anywhere, the verification fails. Don't take our word for it —
+        after a green verify, click <em>Now tamper with one byte</em>
+        and watch the same receipt turn red.
       </p>
       <p>
         The same check runs offline in Node too:
