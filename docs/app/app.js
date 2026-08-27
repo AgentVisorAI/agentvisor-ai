@@ -65,6 +65,14 @@
     else location.hash = hash;
   }
   window.addEventListener("hashchange", render);
+  // Safety net: modals live on <body>, outside the #view container
+  // the router re-renders. If any modal misses the hashchange-close
+  // in installModalKeys, remove stray backdrops so they can't block
+  // clicks on the new page.
+  window.addEventListener("hashchange", function () {
+    $$(".modal-backdrop").forEach(function (b) { b.remove(); });
+    document.body.classList.remove("locked");
+  });
 
   /* ---------- session bootstrap ---------- */
 
@@ -1654,7 +1662,12 @@
       backdrop.remove(); document.body.classList.remove("locked");
       if (uninstall) uninstall();
       if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {}
-      var main = $("#view"); if (main) renderDeployments(main);
+      // Re-render whatever route the user is actually on. This modal
+      // opens from five different contexts (deployment created, token
+      // rotated, API key created, share-verify-link); hardcoding one
+      // renderer here used to teleport session detail / settings users
+      // to the Deployments page on close.
+      render();
     }
     uninstall = installModalKeys(backdrop, close);
     backdrop.addEventListener("click", function (e) {
@@ -1893,8 +1906,16 @@
         else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
       }
     }
+    // Close on navigation too. Modals are body-level; a route change
+    // re-renders #view underneath them but would otherwise leave the
+    // backdrop up, blocking every click on the new page.
+    function onNav() { if (close) close(); }
     document.addEventListener("keydown", onKey);
-    return function uninstall() { document.removeEventListener("keydown", onKey); };
+    window.addEventListener("hashchange", onNav);
+    return function uninstall() {
+      document.removeEventListener("keydown", onKey);
+      window.removeEventListener("hashchange", onNav);
+    };
   }
 
   function openInputModal(opts) {
