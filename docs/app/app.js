@@ -402,7 +402,9 @@
     var gap = n <= 24 ? 3 : (n <= 30 ? 2 : 1);
     var barW = Math.max(2, chartW / n - gap);
     var max = Math.max.apply(null, series.map(function (s) { return s.allowed + s.blocked; }).concat([1]));
-    max = Math.ceil(max / 5) * 5 || 5;
+    // Multiple of 4, because the axis draws quarter ticks — a multiple
+    // of 5 produced fractional ticks that rounded into "5 4 3 1 0".
+    max = Math.ceil(max / 4) * 4 || 4;
     var bars = "";
     var hoverRects = "";
     for (var i = 0; i < n; i++) {
