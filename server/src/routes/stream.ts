@@ -55,6 +55,22 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
     // write a `stream_terminated` event so the client can render
     // a "re-authenticate" prompt, then `.end()` the raw response,
     // which fires the `close` handler and cleans up bus + timer.
+    //
+    // R81 F3: track consecutive DB errors. R80's commit-message
+    // noted "silent bypass of R79 fix under partial DB
+    // degradation" but the code kept failing OPEN on every DB
+    // exception. A revoked session on a node whose Prisma pool
+    // was momentarily saturated kept receiving `events.appended`
+    // / `receipt.finalized` payloads until the pool recovered —
+    // the exact insider-leak surface R79 was designed to close.
+    // After MAX_CONSECUTIVE_REVALIDATE_ERRORS the stream falls
+    // closed; the client's auto-reconnect will re-run
+    // `requireSession` at connection open (which correctly fails
+    // authoritative on revoked sessions). One transient error
+    // still keeps the stream open — pool blips shouldn't take
+    // down every tab.
+    const MAX_CONSECUTIVE_REVALIDATE_ERRORS = 2;
+    let consecutiveErrors = 0;
     const revalidate = async (): Promise<boolean> => {
       try {
         const user = await db.user.findUnique({
@@ -67,6 +83,7 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
             },
           },
         });
+        consecutiveErrors = 0;
         if (!user) return false;
         if (user.memberships.length === 0) return false;
         if (
@@ -76,11 +93,22 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
           return false;
         }
         return true;
-      } catch {
-        // Transient DB error — err on the side of keeping the
-        // stream open. A permanent DB outage would surface via
-        // other endpoints; SSE isn't the right layer to
-        // signal it.
+      } catch (err) {
+        consecutiveErrors += 1;
+        if (consecutiveErrors >= MAX_CONSECUTIVE_REVALIDATE_ERRORS) {
+          // Fall closed. The client auto-reconnects and its next
+          // /stream request runs `requireSession` at connection
+          // open — the authoritative path.
+          req.log.warn(
+            { err, orgId: claims.orgId, userId: claims.sub, consecutiveErrors },
+            "sse_revalidate_fail_closed",
+          );
+          return false;
+        }
+        req.log.debug(
+          { err, orgId: claims.orgId, userId: claims.sub, consecutiveErrors },
+          "sse_revalidate_transient_error_keep_open",
+        );
         return true;
       }
     };
