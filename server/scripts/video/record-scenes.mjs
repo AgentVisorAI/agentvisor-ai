@@ -246,8 +246,8 @@ async function applyCinematic(page, opts = {}) {
   // If a zoom target is provided, resolve its viewport-relative center
   // and use a stronger zoom that ENDS focused on that target (money
   // shot). Otherwise fall back to the subtle center Ken Burns.
-  let originX = "center";
-  let originY = "center";
+  let originX = opts.origin ? opts.origin.split(" ")[0] : "center";
+  let originY = opts.origin ? opts.origin.split(" ")[1] : "center";
   let endScale = 1.055;
   if (zoomToSel) {
     try {
@@ -263,9 +263,12 @@ async function applyCinematic(page, opts = {}) {
         };
       }, zoomToSel);
       if (rect) {
-        originX = ((rect.cx / rect.vw) * 100).toFixed(2) + "%";
+        // Clamp the horizontal origin: past ~65% the scaled frame crops
+        // the left sidebar labels mid-word (R13 fresh-eyes audit).
+        const px = Math.min(65, Math.max(35, (rect.cx / rect.vw) * 100));
+        originX = px.toFixed(2) + "%";
         originY = ((rect.cy / rect.vh) * 100).toFixed(2) + "%";
-        endScale = 1.35;
+        endScale = opts.endScale ?? 1.2;
       }
     } catch {}
   }
@@ -349,7 +352,7 @@ await recordConsoleScene(
   7000,
   "#/sessions/sess_01H9K",
   ['.session-summary', 'text=Signature verified'],
-  { pulseSelector: ".session-summary > *:nth-child(5)", zoomMs: 6500 },
+  { pulseSelector: ".session-summary > *:nth-child(5)", zoomMs: 6500, origin: "0% 50%" },
 );
 
 // ── SCENE 4: THE PROOF. Receipt verifies in the browser. ─────────
