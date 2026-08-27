@@ -21,20 +21,13 @@ cd server
 node scripts/video/record-scenes.mjs   # ~90s, writes /tmp/video-v4/scenes/*.webm
 bash scripts/video/build-audio.sh       # ~5s,  writes /tmp/video-v4/audio/soundtrack-44s.aac
 bash scripts/video/build-narration.sh    # ~15s, writes /tmp/video-v4/audio/narration-44s.aac (requires macOS `say`)
-bash scripts/video/compose.sh           # ~90s, writes /tmp/video-v4/agentvisor-mockup-v4.mp4
-                                        #        and  /tmp/video-v4/agentvisor-mockup-v9-audio.mp4
+bash scripts/video/compose.sh           # ~90s, writes 3 cuts (silent, whoosh, narrated)
 bash scripts/video/compose-teaser.sh    # ~30s, writes /tmp/video-v4/agentvisor-mockup-teaser.mp4
-
-# Final narrated cut (manual mux after compose):
-ffmpeg -y -i /tmp/video-v4/agentvisor-mockup-v4.mp4 \
-       -i /tmp/video-v4/audio/narration-44s.aac \
-       -c:v copy -c:a aac -shortest \
-       /tmp/video-v4/agentvisor-mockup-v11-narrated.mp4
 ```
 
 Result:
 
-* `agentvisor-mockup-v11-narrated.mp4` — 44s @ 1920×1080 H.264, narration + subtle whoosh. **Definitive pitch cut.**
+* `agentvisor-mockup-v12-narrated.mp4` — 44s @ 1920×1080 H.264, narration + subtle whoosh. **Definitive pitch cut.**
 * `agentvisor-mockup-v9-audio.mp4` — same visuals, subtle whoosh only (social autoplay).
 * `agentvisor-mockup-v4.mp4` — same visuals, silent (safe fallback).
 * `agentvisor-mockup-teaser.mp4` — 12s social cut.
