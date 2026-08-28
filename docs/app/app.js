@@ -2562,18 +2562,9 @@
               },
             });
           } else if (btn.getAttribute("data-action") === "delete") {
-            confirmModal({
-              title: "Delete deployment?",
-              body: "Existing sessions remain in the workspace, but the daemon can no longer connect.",
-              confirmLabel: "Delete",
-              danger: true,
-              onConfirm: function () {
-                state.ds.deleteDeployment(id).then(function () {
-                  toast("Deployment removed");
-                  renderDeployments(main);
-                }).catch(function (err) { toast(err.message || "Delete failed", true); });
-              },
-            });
+            // R127 F1: use the shared helper so LIST + DETAIL
+            // pages stay in sync on cascade copy + 409 handling.
+            openDeleteDeploymentModal(id, function () { renderDeployments(main); });
           }
           return;
         }
@@ -2663,50 +2654,48 @@
     });
     var delBtn = $("#depDelete");
     if (delBtn) delBtn.addEventListener("click", function () {
-      // R126 F1: prior copy claimed "Sessions remain, the daemon
-      // can no longer connect." — false. The server's R94 F4 tx
-      // cascade-deletes every Session, Event, and Receipt for
-      // the deployment (schema.prisma Cascade FKs on
-      // Session.deploymentId, Event.sessionId, Receipt.sessionId)
-      // AND destroys deployment.publicKeyHex, breaking offline
-      // verification of any previously exported bundle. Also
-      // the .then had no .catch, so the 409
-      // deployment_has_sealed_receipts refusal was swallowed
-      // silently — Delete on a sealed-receipt deployment looked
-      // like a no-op with no explanation.
-      confirmModal({
-        title: "Delete deployment?",
-        body: "This deletes the deployment AND every session, event, and signed receipt it produced. The verify anchor (publicKeyHex) is destroyed too — previously exported receipt bundles will no longer verify. This cannot be undone.",
-        confirmLabel: "Delete", danger: true,
-        onConfirm: function () {
-          state.ds.deleteDeployment(d.id).then(function () {
-            toast("Deployment and all sessions/receipts removed");
-            navigate("#/deployments");
-          }).catch(function (err) {
-            // R94 F4 sealed-receipt guard: server returns 409
-            // { error: "deployment_has_sealed_receipts",
-            //   receiptCount, hint }. Surface the count and
-            // let the user opt into ?force=1.
-            var body = (err && err.data) || {};
-            if (body.error === "deployment_has_sealed_receipts") {
-              var n = body.receiptCount || 0;
-              confirmModal({
-                title: "Force delete " + n + " signed receipt" + (n === 1 ? "" : "s") + "?",
-                body: "This deployment has " + n + " signed receipt" + (n === 1 ? "" : "s") + " on record. Force-deleting destroys them permanently and revokes the deployment's public verify key — any auditor holding a previously exported bundle will see it fail signature verification.",
-                confirmLabel: "Force delete", danger: true,
-                onConfirm: function () {
-                  state.ds.deleteDeployment(d.id, { force: true }).then(function () {
-                    toast("Deployment force-deleted");
-                    navigate("#/deployments");
-                  }).catch(function (err2) { toast(err2.message || "Force delete failed", true); });
-                },
-              });
-            } else {
-              toast(err.message || "Delete failed", true);
-            }
-          });
-        },
-      });
+      // R126 F1 / R127 F1: shared helper handles the cascade
+      // copy + 409 deployment_has_sealed_receipts force flow.
+      openDeleteDeploymentModal(d.id, function () { navigate("#/deployments"); });
+    });
+  }
+  // R127 F1: shared confirm-and-delete flow for a deployment.
+  // R126 F1 replaced misleading "sessions remain" copy and added
+  // the 409 deployment_has_sealed_receipts → force flow on the
+  // deployment DETAIL page. The deployment LIST page shipped the
+  // same button but was missed — same lying copy, same swallowed
+  // 409. Extract the flow into one place so future callers can't
+  // regress the pattern; both the DETAIL page ($#depDelete) and
+  // the LIST row-action button now call this.
+  function openDeleteDeploymentModal(depId, onSuccess) {
+    confirmModal({
+      title: "Delete deployment?",
+      body: "This deletes the deployment AND every session, event, and signed receipt it produced. The verify anchor (publicKeyHex) is destroyed too — previously exported receipt bundles will no longer verify. This cannot be undone.",
+      confirmLabel: "Delete", danger: true,
+      onConfirm: function () {
+        state.ds.deleteDeployment(depId).then(function () {
+          toast("Deployment and all sessions/receipts removed");
+          if (onSuccess) onSuccess();
+        }).catch(function (err) {
+          var body = (err && err.data) || {};
+          if (body.error === "deployment_has_sealed_receipts") {
+            var n = body.receiptCount || 0;
+            confirmModal({
+              title: "Force delete " + n + " signed receipt" + (n === 1 ? "" : "s") + "?",
+              body: "This deployment has " + n + " signed receipt" + (n === 1 ? "" : "s") + " on record. Force-deleting destroys them permanently and revokes the deployment's public verify key — any auditor holding a previously exported bundle will see it fail signature verification.",
+              confirmLabel: "Force delete", danger: true,
+              onConfirm: function () {
+                state.ds.deleteDeployment(depId, { force: true }).then(function () {
+                  toast("Deployment force-deleted");
+                  if (onSuccess) onSuccess();
+                }).catch(function (err2) { toast(err2.message || "Force delete failed", true); });
+              },
+            });
+          } else {
+            toast(err.message || "Delete failed", true);
+          }
+        });
+      },
     });
   }
   function depCell(label, value, mono, trustedHtml) {
@@ -3410,7 +3399,57 @@
       var sel = e.target.closest("[data-role-user]");
       if (!sel) return;
       var uid = sel.getAttribute("data-role-user");
-      state.ds.changeMemberRole(uid, sel.value).then(function () {
+      var newRole = sel.value;
+      // Cache the pre-change value so we can restore the <select>
+      // if the user cancels the confirm on the self-demote path.
+      var prevRole = sel.getAttribute("data-prev-role") || sel.dataset.prevRole || (sel.options[sel.selectedIndex] && sel.getAttribute("data-role-current")) || "";
+      // Actually the simplest way to get the old value is to read
+      // from the last known role on the row (server ownership).
+      // Walk membersData: not available here — fallback: re-render
+      // on cancel. That's what we'll do.
+
+      // R127 F2: role-change PATCH on the caller's OWN row is a
+      // sibling break-glass event: server-side R103 F1 bumps
+      // sessionRevokedAt AND revokes every ApiKey the target
+      // created whose role exceeds the new role (owner→member
+      // self-demote revokes every owner+admin key). Prior shape
+      // fired the PATCH silently — no confirm, no warning, no
+      // purposeful signout on success. Result was the same
+      // stacked-toast + no-cross-tab-sync UX R125 F1 (passkey)
+      // and R126 F2 (self-remove) already closed. Extend the
+      // pattern here.
+      var isSelf = uid === ((state.session && state.session.user && state.session.user.id) || null);
+      if (isSelf) {
+        confirmModal({
+          title: "Change your own role to " + newRole + "?",
+          body: "You'll be signed out on every device, every API key you created above the '" + newRole + "' tier will be revoked, and you'll have to sign in again to continue. Automation tokens at higher tiers will need to be re-issued. This cannot be undone from here without another owner or admin — if you demote yourself from owner and there's no other owner, no one can restore your role.",
+          confirmLabel: "Change role",
+          danger: true,
+          onConfirm: function () {
+            state.ds.changeMemberRole(uid, newRole).then(function () {
+              // Purposeful signout matching R125 F1 (passkey
+              // revoke) + R126 F2 (self-remove) — sibling
+              // break-glass flow.
+              stopLiveStream();
+              rolePreview = null;
+              state.session = null;
+              try { localStorage.setItem("av_signed_out_at", String(Date.now())); } catch (e) {}
+              toast("Role changed to " + newRole + ". Sign in again to continue.");
+              navigate("#/login");
+            }).catch(function (err) {
+              toast(err.message || "Role change failed", true);
+              renderSettingsMembers(root);
+            });
+          },
+          onCancel: function () {
+            // User declined — restore the <select> so it doesn't
+            // silently reflect the un-applied change.
+            renderSettingsMembers(root);
+          },
+        });
+        return;
+      }
+      state.ds.changeMemberRole(uid, newRole).then(function () {
         toast("Role updated");
       }).catch(function (err) {
         toast(err.message || "Role change failed", true);
@@ -4496,18 +4535,30 @@
     var previouslyFocused = document.activeElement;
     var uninstall;
     var handled = false;
+    var confirmed = false;
     function close() {
       if (handled) return;
       handled = true;
       backdrop.remove(); document.body.classList.remove("locked");
       if (uninstall) uninstall();
       if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {}
+      // R127 F2: onCancel fires on ESC / navigation / backdrop /
+      // Cancel button. Only a data-confirm click sets `confirmed`,
+      // so all other close paths are cancellations from the
+      // user's perspective. Callers use this hook to restore
+      // pre-modal state (e.g., a <select> whose change event
+      // opened the modal).
+      if (!confirmed && opts.onCancel) opts.onCancel();
     }
     uninstall = installModalKeys(backdrop, close);
     backdrop.addEventListener("click", function (e) {
       if (handled) return;
-      if (e.target === backdrop || e.target.hasAttribute("data-close")) { close(); return; }
+      if (e.target === backdrop || e.target.hasAttribute("data-close")) {
+        close();
+        return;
+      }
       if (e.target.hasAttribute("data-confirm")) {
+        confirmed = true;
         var cb = opts.onConfirm;
         close();
         if (cb) cb();
