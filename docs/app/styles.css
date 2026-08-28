@@ -1563,7 +1563,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   .app-shell { grid-template-columns: minmax(0, 1fr); grid-template-areas: "topbar" "main"; }
   .app-shell.has-preview { grid-template-rows: auto var(--topbar-h) 1fr; grid-template-areas: "pbanner" "topbar" "main"; }
   .sidebar { display: none; }
-  .main { padding: var(--s-4) var(--s-4) 84px; }
+  /* Bottom padding clears both the tab bar (56px) and the tour pill. */
+  .main { padding: var(--s-4) var(--s-4) 132px; }
   .topbar { overflow: hidden; }
   .topbar .cmdk-trigger { min-width: 0; }
   .topbar .cmdk-trigger span:not(.kbd) { display: none; }
@@ -1922,3 +1923,35 @@ a.ob-step:hover { border-color: var(--accent); }
 #accountMenu .am-danger { color: var(--danger); }
 #accountMenu .am-sep { border-top: 1px solid var(--border); margin: 6px 0; }
 @media (prefers-reduced-motion: reduce) { #accountMenu { animation: none; } }
+
+/* Bottom tab bar — phone-width primary navigation (hidden on desktop,
+ * where the sidebar handles it). Fixed, safe-area aware. */
+.tabbar {
+  display: none;
+  position: fixed;
+  left: 0; right: 0; bottom: 0;
+  z-index: 400;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  padding-bottom: env(safe-area-inset-bottom, 0);
+}
+.tabbar a {
+  flex: 1;
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+  padding: 8px 4px 6px;
+  font-size: 10.5px; font-weight: 500;
+  color: var(--fg-3); text-decoration: none;
+}
+.tabbar a svg { width: 20px; height: 20px; }
+.tabbar a.active { color: var(--accent); }
+.tabbar a:active { background: var(--surface-hover); }
+@media (max-width: 760px) {
+  .tabbar { display: flex; }
+  /* Lift the floating tour pill and toasts above the tab bar. These
+     overrides live here, after the tour/toast base rules — putting
+     them in the main responsive block (earlier in the file) silently
+     lost to source order at equal specificity. */
+  #avTourLauncher { bottom: 68px; }
+  #toastStack { bottom: 120px; }
+}
+@media print { .tabbar { display: none !important; } }
