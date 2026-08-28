@@ -332,6 +332,16 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
   }>("/audit", async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
+    // R91 F2: audit log entries expose every owner/admin's email
+    // + IP + timeline of privileged actions (SAML config
+    // rotations, member-invite events, deployment token
+    // rotations, IP-allowlist updates). Strictly more sensitive
+    // than the API-key inventory that R90 F2 gated. Match the
+    // same posture. R91 F2 also updates docs/app/app.js to
+    // hide the audit tab from members via SETTINGS_TABS.
+    if (claims.membershipRole === "member") {
+      return reply.code(403).send({ error: "forbidden" });
+    }
     const query = z
       .object({
         cursor: z.string().optional(),
@@ -408,6 +418,12 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
     async (req, reply) => {
       const claims = requireSession(req, reply);
       if (!claims) return;
+      // R91 F2: same posture as /audit — the CSV export is
+      // strictly more portable (attackers exfil once, keep
+      // forever) so gate member access.
+      if (claims.membershipRole === "member") {
+        return reply.code(403).send({ error: "forbidden" });
+      }
       const before = req.query.before ? new Date(req.query.before) : new Date();
       if (isNaN(before.getTime())) {
         return reply.code(400).send({ error: "invalid_before" });

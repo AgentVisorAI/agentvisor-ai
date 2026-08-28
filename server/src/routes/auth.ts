@@ -377,6 +377,21 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   }, async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
+    // R91 F1: gate on owner only. This endpoint streams the ENTIRE
+    // org history: every deployment (with publicKeyHex), every
+    // member (email + displayName), every session, every event
+    // body (up to 8000 chars of daemon-forwarded LLM prompts/
+    // responses) and sub, every receipt. A plain member could
+    // supply their own password and exfil the whole org.
+    // Compare the sibling /me/delete-account which correctly
+    // owner-only-gates at auth.ts:538. GDPR data-portability is
+    // an org-level right exercised by the owner; a per-user
+    // export would need to filter by actorId on every table
+    // (out of scope for this hardening — this endpoint is
+    // whole-org by design and should be owner-only accordingly).
+    if (claims.membershipRole !== "owner") {
+      return reply.code(403).send({ error: "only_owner_can_export" });
+    }
     const body = z
       .object({ password: z.string().min(1).max(1024) })
       .safeParse(req.body);
