@@ -437,7 +437,12 @@
       xLabels += '<text x="' + xx.toFixed(1) + '" y="' + (hh - 6) + '" text-anchor="middle">' + esc(series[xi].label || "") + '</text>';
     }
     var cursor = '<line class="cursor" id="chartCursor" x1="0" y1="' + padT + '" x2="0" y2="' + (padT + chartH) + '" style="opacity:0"/>';
-    return '<svg class="chart-svg" viewBox="0 0 ' + w + ' ' + hh + '" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="none">' +
+    // Text alternative: the tooltips are mouse-only, so summarize the
+    // series for screen-reader users instead of leaving a silent image.
+    var sumAllowed = 0, sumBlocked = 0;
+    series.forEach(function (s) { sumAllowed += s.allowed; sumBlocked += s.blocked; });
+    var chartLabel = "Bar chart of tool calls per interval: " + sumAllowed + " allowed and " + sumBlocked + " blocked across " + n + " intervals.";
+    return '<svg class="chart-svg" viewBox="0 0 ' + w + ' ' + hh + '" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="none" role="img" aria-label="' + esc(chartLabel) + '">' +
       '<g class="grid">' + grid + '</g>' +
       '<g class="axis">' + yLabels + xLabels + '</g>' +
       bars +
@@ -1293,7 +1298,7 @@
       var iconChar = ev.kind === "llm" ? "L" : ev.kind === "tool" ? "T" : ev.kind === "block" ? "!" : ev.kind === "guard" ? "✓" : ev.kind === "session" ? "S" : "•";
       var durTxt = ev.durationMs ? ev.durationMs + " ms" : "";
       var barColor = ev.severity === "err" ? "var(--danger-solid)" : (ev.severity === "ok" ? "var(--success-solid)" : "var(--accent)");
-      return '<div class="evt ' + sev + '" data-i="' + i + '" style="--depth: ' + ev.layout.depth + ';">' +
+      return '<div class="evt ' + sev + '" data-i="' + i + '" tabindex="0" role="option" aria-selected="false" style="--depth: ' + ev.layout.depth + ';">' +
         '<span class="seq">#' + esc(ev.seq) + "</span>" +
         '<span class="icon ' + iconClass + '">' + iconChar + "</span>" +
         '<span class="body"><b>' + esc(ev.tag || ev.kind) + '</b> ' + esc(ev.msg || "") +
@@ -1321,7 +1326,7 @@
         '<div class="events-card card">' +
           '<div class="events-head"><h2>Event stream</h2><span class="count">' + events.length + " event" + (events.length === 1 ? "" : "s") +
             (data.nextEventCursor != null ? " (more available)" : "") + "</span></div>" +
-          '<div id="eventList">' + eventsHtml + "</div>" +
+          '<div id="eventList" role="listbox" aria-label="Event stream. Use the arrow keys to browse events and Enter to inspect one.">' + eventsHtml + "</div>" +
           (data.nextEventCursor != null
             ? '<div style="padding: 12px 16px; text-align:center; border-top:1px solid var(--border);">' +
                 '<button class="btn" id="loadMoreEv">Load more events</button>' +
@@ -1330,7 +1335,7 @@
         "</div>" +
         '<div>' +
           receiptCard(receipt) +
-          '<div class="event-drawer" id="eventDrawer" style="margin-top: 12px;">' +
+          '<div class="event-drawer" id="eventDrawer" style="margin-top: 12px;" role="region" aria-label="Event detail" aria-live="polite">' +
             '<h3>Event detail</h3>' +
             '<div class="empty-mini">Click an event to inspect.</div>' +
           "</div>" +
@@ -1346,8 +1351,12 @@
     var drawer = $("#eventDrawer");
     if (!evList || !drawer) return; // user navigated away mid-await
     function selectEvent(row) {
-      $$('.evt', evList).forEach(function (r) { r.classList.remove("selected"); });
+      $$('.evt', evList).forEach(function (r) {
+        r.classList.remove("selected");
+        r.setAttribute("aria-selected", "false");
+      });
       row.classList.add("selected");
+      row.setAttribute("aria-selected", "true");
       var ev = events[parseInt(row.getAttribute("data-i"), 10)];
       var deepHash = "#/sessions/" + encodeURIComponent(id) + "?evt=" + ev.seq;
       try { history.replaceState(null, "", deepHash); } catch (e2) {}
@@ -1356,6 +1365,28 @@
     evList.addEventListener("click", function (e) {
       var row = e.target.closest(".evt");
       if (row) selectEvent(row);
+    });
+    // Keyboard support: the rows are custom divs, so without this a
+    // keyboard user could reach the list but never inspect an event.
+    // Same interaction model as the clickable table rows: arrows move,
+    // Enter/Space selects, Home/End jump.
+    evList.addEventListener("keydown", function (e) {
+      var row = e.target.closest(".evt");
+      if (!row) return;
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        selectEvent(row);
+        return;
+      }
+      if (!/^(ArrowDown|ArrowUp|Home|End)$/.test(e.key)) return;
+      e.preventDefault();
+      var rows = $$('.evt', evList);
+      var idx = rows.indexOf(row);
+      var target = e.key === "ArrowDown" ? rows[idx + 1]
+        : e.key === "ArrowUp" ? rows[idx - 1]
+        : e.key === "Home" ? rows[0]
+        : rows[rows.length - 1];
+      if (target) target.focus();
     });
 
     // Honor an `?evt=<seq>` deep link (fresh visit, shared link, or a
