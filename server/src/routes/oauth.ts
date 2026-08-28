@@ -351,9 +351,16 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
         },
         req.log,
       );
-      return reply.code(403).send({
-        error: "mfa_required_use_password_login",
-      });
+      // R121 F2: OAuth callback is a top-level browser
+      // navigation, so a bare `reply.code(403).send({...})`
+      // renders as raw JSON in an otherwise-blank tab — a dead
+      // end for every passkey-enrolled user who tries SSO. The
+      // success path at the bottom uses reply.redirect, so
+      // mirror it here: redirect to /#/login?err=... where the
+      // SPA renders a friendly banner explaining the fallback.
+      return reply.redirect(
+        `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/login?err=mfa_required_use_password_login`,
+      );
     }
     const token = await mintSession({
       sub: user.id,

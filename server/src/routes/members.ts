@@ -521,9 +521,25 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
     return reply.code(204).send();
   });
 
+  // R121 F3: per-route rate limit matches /login (auth.ts:264) and
+  // /webauthn/authenticate/verify (webauthn.ts:421). Prior shape
+  // inherited the global 300/min/IP; combined with R80 F3's cap of
+  // 5 argon2 verifies per request, an unauthenticated attacker
+  // could burn 300 x 5 = 1500 argon2 verifies/min/IP as cheap
+  // amplification. F1 raised the value of this endpoint to
+  // attackers (any invite token + any existing user email = mint
+  // gate), so a tight per-route cap is now table stakes.
+  const perIp = (max: number, windowMs: number) => ({
+    max,
+    timeWindow: windowMs,
+    keyGenerator: (req: { ip: string }) => `ip:${req.ip}`,
+  });
+
   // Anonymous — the invitee accepts. If they don't have an account we
   // create one with the provided password.
-  app.post("/invites/accept", async (req, reply) => {
+  app.post("/invites/accept", {
+    config: { rateLimit: perIp(10, 60_000) },
+  }, async (req, reply) => {
     const body = z
       .object({
         token: z.string().min(16).max(256),
@@ -573,6 +589,31 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
 
     // Look up existing user; create if missing.
     let user = await db.user.findUnique({ where: { email: matched.email } });
+    // R121 F1: an invite token authenticates only the INVITEE'S
+    // right to be added to `matched.orgId`. It MUST NOT double as
+    // authentication of the user's identity — that requires
+    // password + (if enrolled) WebAuthn. If we mint a session
+    // cookie for a PRE-EXISTING user just because they hold a
+    // valid invite token, ANY attacker who can invite the target
+    // email to any org (attacker's own org, self-created, one
+    // click) walks away with a cookie in `claims.sub =
+    // target.id`. From there /webauthn/register/challenge binds
+    // to target.id and the attacker registers THEIR OWN device
+    // as a passkey on the TARGET'S user row → target's home org
+    // is compromised at the next /login → mfaGateResponse →
+    // /webauthn/authenticate/verify → session for target's HOME
+    // org. Same defeat-of-passkey class R120 F2 just closed on
+    // OAuth, but this variant needs only an attacker-controlled
+    // AV account. Fix: refuse the cookie mint on the existing-
+    // user branch. Consume the invite (membership grant is still
+    // legitimate — a real invitee can complete the flow via
+    // /login with their existing password) and return
+    // requiresLogin so the SPA routes to /#/login. On the
+    // new-user branch we KEEP the mint: the user was created THIS
+    // request from body.data.password (they own the credential
+    // they just set) and cannot have prior passkeys by
+    // construction.
+    const isPreexistingUser = user !== null;
     if (!user) {
       if (!body.data.password) {
         return reply.code(400).send({ error: "password_required_for_new_user" });
@@ -645,6 +686,31 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       // The other call has already accepted this invite and
       // minted its own session. Refuse to mint a duplicate.
       return reply.code(409).send({ error: "invite_already_consumed" });
+    }
+
+    // R121 F1: refuse to mint a session cookie for a pre-existing
+    // user (see the isPreexistingUser comment block above). Return
+    // requiresLogin so the SPA routes to /#/login where the user
+    // supplies their real password (and, if enrolled, completes
+    // the WebAuthn ceremony).
+    if (isPreexistingUser) {
+      writeAudit(
+        {
+          orgId: matched.orgId,
+          event: "member.invite_accepted_requires_login",
+          actorId: user.id,
+          actorEmail: user.email,
+          target: user.email,
+          metadata: { role: matched.role, inviteId: matched.id },
+          req,
+        },
+        req.log,
+      );
+      return reply.send({
+        user: { id: user.id, email: user.email, displayName: user.displayName },
+        org: { id: matched.orgId, role: matched.role },
+        requiresLogin: true,
+      });
     }
 
     const token = await mintSession({

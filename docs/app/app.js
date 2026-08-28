@@ -934,6 +934,20 @@
   }
   function renderAuthWithProviders(kind, providers) {
     var isSignup = kind === "signup";
+    // R121 F2: read err/joined query params so we can render a
+    // friendly banner for users bounced here by the OAuth MFA
+    // gate (R120 F2) or the /invites/accept requiresLogin path
+    // (R121 F1). Neither is an "error" from the user's POV.
+    var authQs = (location.hash.split("?")[1] || "");
+    var authParams = new URLSearchParams(authQs);
+    var errCode = authParams.get("err") || "";
+    var joinedFlag = authParams.get("joined") || "";
+    var noteHtml = "";
+    if (errCode === "mfa_required_use_password_login") {
+      noteHtml = '<div class="auth-note">This account has a passkey enrolled. Sign in with your password so we can complete the WebAuthn step — SSO alone can\'t satisfy MFA.</div>';
+    } else if (joinedFlag) {
+      noteHtml = '<div class="auth-note">You were added to the workspace. Sign in with your existing password to continue.</div>';
+    }
     var byId = {};
     providers.forEach(function (p) { byId[p.id] = p; });
     var ssoButtons = "";
@@ -952,6 +966,7 @@
             '<div class="auth-brand"><span class="auth-brand-mark">A</span> AgentVisor AI</div>' +
             '<h1>' + (isSignup ? "Create your workspace" : "Sign in") + '</h1>' +
             '<p class="sub">' + (isSignup ? "Governance for every AI agent in your fleet." : "Access your agent control plane.") + '</p>' +
+            noteHtml +
             (showSsoBlock ? '<div class="sso">' + ssoButtons + "</div>" + '<div class="divider">or with email</div>' : '') +
             '<form id="authForm">' +
               (isSignup ? '<div class="field"><label for="orgName">Company name</label><input id="orgName" type="text" required placeholder="Acme Corp" autocomplete="organization" /></div>' : "") +
@@ -1150,6 +1165,18 @@
         password: $("#password").value,
         displayName: ($("#displayName") || {}).value || undefined,
       }).then(function (s) {
+        // R121 F1: server now returns { requiresLogin: true } on
+        // the existing-user branch instead of minting a session
+        // cookie — an invite token can't double as identity
+        // authentication (would enable target-account takeover
+        // via any attacker with a valid invite). Route the user
+        // to /#/login with a friendly banner explaining they
+        // were added to the org and need to sign in normally.
+        if (s.requiresLogin) {
+          toast("You were added to " + (s.org && s.org.name ? s.org.name : "the workspace") + ". Sign in with your existing password to continue.");
+          navigate("#/login?joined=1");
+          return;
+        }
         state.session = { user: s.user, org: s.org };
         state.authedAt = Date.now();
         announceSignIn();
