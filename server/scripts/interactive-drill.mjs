@@ -302,8 +302,11 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
 // paging / sort-across-pages only execute with av_mock_bigdata on.
 // This shipped untested once; keep it exercised.
 {
-  await page.evaluate(() => { localStorage.setItem("av_mock_bigdata", "1"); location.hash = "#/sessions?range=720"; });
-  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.evaluate(() => localStorage.setItem("av_mock_bigdata", "1"));
+  // goto a clean URL (no ?tour=1): the drill boots with the tour param,
+  // which survives page.reload() and re-arms the tour autostart — the
+  // tour's start() then yanks the hash to #/overview mid-check.
+  await page.goto(SITE + "#/sessions?range=720", { waitUntil: "domcontentloaded" });
   await page.waitForFunction(() => document.querySelectorAll("tr[data-clickable]").length === 50 && !!document.getElementById("loadMore"), { timeout: 15000 });
   await page.click("#loadMore");
   await page.waitForFunction(() => document.querySelectorAll("tr[data-clickable]").length === 100, { timeout: 10000 });
@@ -312,8 +315,19 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
     const c = [...document.querySelectorAll("tbody tr")].map((r) => parseFloat(r.cells[5].textContent.replace(/[^0-9.]/g, "")));
     return c.length === 100 && c.every((v, i) => !i || v <= c[i - 1] + 1e-9);
   }, { timeout: 10000 });
+  // Event-stream paging on the 700-event mega-session: the page merge
+  // had a documented bug once (re-fetch threw away appended pages) —
+  // keep the path executed, and assert a selection survives the merge.
+  await page.evaluate(() => { location.hash = "#/sessions/sess_bd_mega"; });
+  await page.waitForSelector("#loadMoreEv", { timeout: 15000 });
+  await page.click('.evt[data-i="3"]');
+  await page.waitForTimeout(300);
+  await page.click("#loadMoreEv");
+  await page.waitForFunction(() => document.querySelectorAll(".evt").length === 700, { timeout: 15000 });
+  const megaSel = await page.evaluate(() => document.querySelector(".evt.selected .seq")?.textContent);
+  if (megaSel !== "#4") fail("event-page merge lost the selection: " + megaSel);
   await page.evaluate(() => localStorage.removeItem("av_mock_bigdata"));
-  console.log("✅ pagination: 50 → Load more → 100, sort re-sorts the loaded set");
+  console.log("✅ pagination: sessions 50→100 + sort; events 500→700 with selection kept");
 }
 
 // ── 11. Listener-leak soak ─────────────────────────────────────────
