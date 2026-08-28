@@ -151,7 +151,7 @@ catalog at the bottom.
 | `mobile-smoke.mjs` | phone/tablet: tab bar, taps, modals fit + hittable + stacking, static pages |
 | `verify-page-drill.mjs` | 12 checks incl. download→drop→green / tamper→red |
 | `receipt-verify-drill.mjs` | download → CLI verifier + tamper matrix |
-| `full-flow-rehearsal.mjs` | ONE continuous session in narrative order: landing CTA → tour → verify finale → attack → receipt → fresh signup → reset |
+| `full-flow-rehearsal.mjs` | ONE continuous session in narrative order: landing CTA → tour → verify finale → attack → receipt → fresh signup → reset. `PROFILE=phone` reruns it as the QR-code path on an iPhone profile |
 | `engine-matrix.mjs` | nightly: 8 features × chromium/webkit/firefox |
 | `lighthouse-audit.mjs` | budgets, re-measures once on a miss (runner variance ±23) |
 

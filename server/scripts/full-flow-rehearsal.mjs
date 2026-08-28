@@ -16,15 +16,23 @@
  *
  * Mock-mode only (as deployed). SITE env overrides the target root.
  */
-import { chromium } from "playwright";
+import { chromium, devices } from "playwright";
 
 const SITE = process.env.SITE ?? "https://agentvisorai.me/";
 const ROOT = SITE.replace(/app\/?$/, "");
+// PROFILE=phone rehearses the QR-code path: the printed handout's QR
+// lands investors on the site on their phones — same narrative, tap
+// interactions, 390px layout.
+const PHONE = process.env.PROFILE === "phone";
 
 function fail(m) { console.log("❌", m); process.exit(1); }
 
 const browser = await chromium.launch({ headless: true });
-const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, acceptDownloads: true });
+const context = await browser.newContext(
+  PHONE
+    ? { ...devices["iPhone 13"], acceptDownloads: true }
+    : { viewport: { width: 1440, height: 900 }, acceptDownloads: true },
+);
 const page = await context.newPage();
 const jsErrors = [];
 page.on("pageerror", (e) => jsErrors.push(e.message.slice(0, 120)));
@@ -121,5 +129,5 @@ await page.waitForFunction(() => document.querySelector(".org-switcher")?.textCo
 beat("palette reset → pristine Northwind restored");
 
 if (jsErrors.length) fail("JS errors during rehearsal: " + JSON.stringify([...new Set(jsErrors)]));
-console.log("\nFull investor-flow rehearsal passed in " + ((Date.now() - t0) / 1000).toFixed(1) + "s — the Saturday narrative holds end to end.");
+console.log("\nFull investor-flow rehearsal (" + (PHONE ? "phone/QR path" : "desktop") + ") passed in " + ((Date.now() - t0) / 1000).toFixed(1) + "s — the Saturday narrative holds end to end.");
 await browser.close();
