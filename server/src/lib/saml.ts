@@ -128,7 +128,7 @@ export function spUrls(cfg: SamlConfig): {
  * closed with null.
  */
 export function extractAssertionId(
-  profile: { getAssertionXml?: () => string; sessionIndex?: string; ID?: string },
+  profile: { getAssertionXml?: () => string; sessionIndex?: string },
 ): string | null {
   const xml = typeof profile.getAssertionXml === "function"
     ? profile.getAssertionXml()
@@ -148,15 +148,16 @@ export function extractAssertionId(
   if (typeof profile.sessionIndex === "string" && profile.sessionIndex.length > 0) {
     return `sess:${profile.sessionIndex}`;
   }
-  // Fallback #2: profile.ID (the Response envelope ID). Only useful
-  // when wantResponseSigned=true — in which case the outer envelope
-  // is signed and this is a fine replay key. Under
-  // wantResponseSigned=false it's NOT XSW-safe, but at that point
-  // both getAssertionXml AND sessionIndex are missing which
-  // shouldn't happen with any modern IdP; be defensive.
-  if (typeof profile.ID === "string" && profile.ID.length > 0) {
-    return `resp:${profile.ID}`;
-  }
+  // R90 F4: removed the profile.ID (`resp:`) fallback. It was only
+  // XSW-safe when wantResponseSigned=true, which isn't visible to
+  // this helper (SamlConfig isn't in scope). Accepting it here
+  // silently exposed exactly the replay class R76→R89 tried to
+  // close — a future node-saml version that omits
+  // getAssertionXml, or an IdP that emits no sessionIndex, would
+  // silently degrade to an XSW-forgeable replay key. Fail closed
+  // instead so the caller returns no_stable_assertion_id (a
+  // rejected login is far better than a forgeable one). Ops
+  // should get an alert on the audit trail if this ever fires.
   return null;
 }
 
@@ -299,7 +300,7 @@ export async function consumeSamlResponse(
   // used → R88 regex returned null → SSO broken for the default
   // encrypted-assertion config).
   const assertionId = extractAssertionId(
-    profile as { getAssertionXml?: () => string; sessionIndex?: string; ID?: string },
+    profile as { getAssertionXml?: () => string; sessionIndex?: string },
   );
   if (!assertionId) {
     return { ok: false, error: "no_stable_assertion_id" };

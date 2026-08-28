@@ -2038,16 +2038,31 @@
   var SETTINGS_TABS = [
     { id: "general", label: "General" },
     { id: "members", label: "Members" },
-    { id: "keys", label: "API keys" },
+    { id: "keys", label: "API keys", ownerAdminOnly: true },
     { id: "sso", label: "SSO" },
-    { id: "webhooks", label: "Webhooks" },
+    { id: "webhooks", label: "Webhooks", ownerAdminOnly: true },
     { id: "audit", label: "Audit log" },
     { id: "billing", label: "Billing" },
   ];
 
   async function renderSettings(main, tab) {
     state.settingsTab = tab;
-    var nav = SETTINGS_TABS.map(function (t) {
+    // R90 F3: hide owner/admin-only tabs from members. The API
+    // routes gate on membershipRole !== 'member' (see R89 F3
+    // for webhooks, R90 F2 for keys); without a client-side
+    // filter, members saw the tab, clicked it, and got a
+    // "Could not load … — Forbidden" empty state. Now the
+    // tab isn't rendered at all, and deep-linking a hidden
+    // tab redirects to /general.
+    var role = (state.session && state.session.org && state.session.org.role) || "member";
+    var visibleTabs = SETTINGS_TABS.filter(function (t) {
+      return !t.ownerAdminOnly || role !== "member";
+    });
+    var visibleIds = visibleTabs.map(function (t) { return t.id; });
+    if (visibleIds.indexOf(tab) === -1) {
+      return navigate("#/settings/general");
+    }
+    var nav = visibleTabs.map(function (t) {
       return '<button data-tab="' + t.id + '"' + (tab === t.id ? ' class="active"' : "") + ">" + esc(t.label) + "</button>";
     }).join("");
     main.innerHTML =
