@@ -184,7 +184,6 @@
   }
 
   var liveUnsub = null;
-  var liveEventBuffer = [];
   function startLiveStream() {
     if (liveUnsub || !state.ds.subscribe) return;
     try {
@@ -198,8 +197,6 @@
           setLiveState("reconnecting");
           return;
         }
-        liveEventBuffer.push({ at: Date.now(), msg: msg });
-        if (liveEventBuffer.length > 40) liveEventBuffer.shift();
         pulseLiveIndicator();
         onLiveEvent(msg);
       });
@@ -295,6 +292,23 @@
       } catch (e) { console.warn("sessions refresh skipped", e); }
     }, 400);
   }
+
+  // Catch-up after a hidden stretch: background tabs throttle timers,
+  // so after a lid-close/sleep the live views sit stale until the next
+  // stream event happens to arrive. Returning to the tab (or the
+  // network coming back) quietly refreshes whatever is on screen —
+  // all three paths are fetch-first, so a failure just skips.
+  function refreshCurrentView() {
+    var path = state.route && state.route.path;
+    if (!state.session || !path || !path[0]) return;
+    if (path[0] === "overview") scheduleOverviewRefresh();
+    else if (path[0] === "sessions" && path[1]) scheduleSessionDetailRefresh(path[1]);
+    else if (path[0] === "sessions") scheduleSessionsListRefresh();
+  }
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden) refreshCurrentView();
+  });
+  window.addEventListener("online", refreshCurrentView);
 
   /* ---------- main render ---------- */
 

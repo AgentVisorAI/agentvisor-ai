@@ -496,7 +496,24 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   }));
   await restore("getOverview");
   if (!quiet.stats || quiet.errUi) fail("quiet overview refresh replaced the live dashboard on a transient failure: " + JSON.stringify(quiet));
-  console.log("✅ failure paths: 5 routes show the error card + recover; background refresh keeps the stale dashboard");
+  // Catch-up after sleep: tab-visible and network-online must trigger a
+  // quiet refresh of the on-screen route (background tabs throttle
+  // timers, so without this the dashboard sits stale after lid-close).
+  await page.evaluate(() => {
+    const ds = window.dataSource;
+    window.__ovCalls = 0;
+    if (!ds.__origOv2) ds.__origOv2 = ds.getOverview.bind(ds);
+    ds.getOverview = (...a) => { window.__ovCalls++; return ds.__origOv2(...a); };
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => true });
+    document.dispatchEvent(new Event("visibilitychange"));
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => false });
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  await page.waitForTimeout(1400);
+  const catchUp = await page.evaluate(() => window.__ovCalls);
+  await page.evaluate(() => { window.dataSource.getOverview = window.dataSource.__origOv2; });
+  if (!catchUp) fail("tab-visible catch-up refresh did not fire");
+  console.log("✅ failure paths: 5 routes show the error card + recover; background refresh keeps the stale dashboard; visibility catch-up fires");
 }
 
 // ── 14. Cross-tab sync ─────────────────────────────────────────────
