@@ -1677,8 +1677,26 @@
         return '<button class="evt-chip' + (c.id === "block" ? " chip-danger" : "") + '" data-kind="' + c.id + '" aria-pressed="false">' + c.label + ' <span class="n">' + kindCounts[c.id] + "</span></button>";
       }).join("");
 
+    // Prev/next triage: when this session is part of the list the
+    // user was just browsing (sessionsLoaded, in its current sort),
+    // offer paging through that exact set — review blocked sessions
+    // one after another without bouncing back to the list. Hidden on
+    // direct visits (shared links) where there's no list context.
+    var nav = "";
+    var siblings = sortedSessionsView();
+    var sidx = -1;
+    for (var si = 0; si < siblings.length; si++) if (siblings[si].id === id) { sidx = si; break; }
+    if (sidx >= 0 && siblings.length > 1) {
+      var prevS = siblings[sidx - 1], nextS = siblings[sidx + 1];
+      nav = '<span class="sess-nav">' +
+        '<button class="btn" id="prevSess" title="Previous session in your list ( [ )"' + (prevS ? ' data-id="' + esc(prevS.id) + '"' : " disabled") + ">‹</button>" +
+        '<span class="sess-nav-pos">' + (sidx + 1) + " / " + siblings.length + "</span>" +
+        '<button class="btn" id="nextSess" title="Next session in your list ( ] )"' + (nextS ? ' data-id="' + esc(nextS.id) + '"' : " disabled") + ">›</button>" +
+      "</span> ";
+    }
+
     main.innerHTML =
-      pageHeader("Session " + s.externalId, s.agent + " · " + (s.user || "—") + " · " + (s.model || ""), '<a href="' + esc(backToListUrl("sessions")) + '" class="btn">← All sessions</a> <button class="btn" id="printPack" title="Print this page as a clean evidence pack — receipt and event trail included">🖨 Print evidence pack</button> <button class="btn" id="copyRcpt">Copy receipt</button> <button class="btn" id="shareRcpt">🔗 Share verify link</button> <button class="btn accent" id="dlRcpt">↓ Download receipt</button>') +
+      pageHeader("Session " + s.externalId, s.agent + " · " + (s.user || "—") + " · " + (s.model || ""), '<a href="' + esc(backToListUrl("sessions")) + '" class="btn">← All sessions</a> ' + nav + '<button class="btn" id="printPack" title="Print this page as a clean evidence pack — receipt and event trail included">🖨 Print evidence pack</button> <button class="btn" id="copyRcpt">Copy receipt</button> <button class="btn" id="shareRcpt">🔗 Share verify link</button> <button class="btn accent" id="dlRcpt">↓ Download receipt</button>') +
       '<div class="session-summary">' +
         cell("Events", s.events, "streamed") +
         cell("Allowed", s.toolsAllowed, "tool calls") +
@@ -1870,6 +1888,16 @@
     // Print evidence pack: the @media print stylesheet strips chrome
     // and forces the light palette, so this is just window.print().
     on("#printPack", "click", function () { window.print(); });
+
+    // Prev/next paging through the browsed list ( [ and ] also work).
+    on("#prevSess", "click", function (e) {
+      var pid = e.currentTarget.getAttribute("data-id");
+      if (pid) navigate("#/sessions/" + pid);
+    });
+    on("#nextSess", "click", function (e) {
+      var nid = e.currentTarget.getAttribute("data-id");
+      if (nid) navigate("#/sessions/" + nid);
+    });
 
     on("#copyRcpt", "click", function () {
       navigator.clipboard.writeText(JSON.stringify(receipt, null, 2)).then(function () {
@@ -4100,6 +4128,11 @@
         var target = document.getElementById("fSearch") || document.getElementById("evtSearch") || document.getElementById("auditSearch");
         if (target) { e.preventDefault(); target.focus(); target.select(); }
       }
+      // "[" / "]" page through the browsed session list from a detail.
+      if (e.key === "[" || e.key === "]") {
+        var pn = document.getElementById(e.key === "[" ? "prevSess" : "nextSess");
+        if (pn && !pn.disabled) { e.preventDefault(); pn.click(); }
+      }
     });
   }
 
@@ -4115,6 +4148,7 @@
       ]},
       { title: "Lists & tables", items: [
         ["↑ ↓", "Move between rows"], ["Enter", "Open the focused row"], ["/", "Focus the search field"],
+        ["[ ]", "Previous / next session (on a detail page)"],
       ]},
       { title: "Event stream", items: [
         ["↑ ↓", "Move between events"], ["Home / End", "Jump to first / last"],

@@ -1955,3 +1955,10 @@ a.ob-step:hover { border-color: var(--accent); }
   #toastStack { bottom: 120px; }
 }
 @media print { .tabbar { display: none !important; } }
+
+/* Prev/next session pager on the detail header. */
+.sess-nav { display: inline-flex; align-items: center; gap: 4px; }
+.sess-nav .btn { padding: 5px 10px; font-weight: 600; }
+.sess-nav .btn[disabled] { opacity: 0.4; cursor: default; }
+.sess-nav-pos { color: var(--fg-3); font-size: var(--t-sec); min-width: 44px; text-align: center; font-variant-numeric: tabular-nums; }
+@media print { .sess-nav { display: none !important; } }
