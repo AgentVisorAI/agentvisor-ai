@@ -88,7 +88,7 @@
   // in installModalKeys, remove stray backdrops so they can't block
   // clicks on the new page.
   window.addEventListener("hashchange", function () {
-    $$(".modal-backdrop").forEach(function (b) { b.remove(); });
+    $$(".modal-backdrop, .cmdk-backdrop").forEach(function (b) { b.remove(); });
     document.body.classList.remove("locked");
   });
 
@@ -404,12 +404,33 @@
     return '<span class="copyable">' + esc(value) +
       '<button type="button" class="copy-btn" data-copy="' + esc(value) + '" title="Copy" aria-label="Copy to clipboard">⧉</button></span>';
   }
+  // Clipboard writes must survive origins where the async Clipboard
+  // API is missing (the documented offline fallback serves over plain
+  // http on a LAN, where navigator.clipboard is undefined) — fall back
+  // to the legacy hidden-textarea + execCommand path there.
+  function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text);
+    }
+    return new Promise(function (resolve, reject) {
+      var ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.cssText = "position:fixed;top:-1000px;left:0;opacity:0";
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = false;
+      try { ok = document.execCommand("copy"); } catch (e) {}
+      ta.remove();
+      if (ok) resolve(); else reject(new Error("clipboard unavailable"));
+    });
+  }
   document.addEventListener("click", function (e) {
     var b = e.target.closest("[data-copy]");
     if (!b) return;
-    navigator.clipboard.writeText(b.getAttribute("data-copy")).then(
+    copyText(b.getAttribute("data-copy")).then(
       function () { toast("Copied to clipboard"); },
-      function () { toast("Copy failed", true); }
+      function () { toast("Copy failed — select the text manually", true); }
     );
   });
   function loadingBlock(kind) {
@@ -2010,8 +2031,10 @@
     });
 
     on("#copyRcpt", "click", function () {
-      navigator.clipboard.writeText(JSON.stringify(receipt, null, 2)).then(function () {
+      copyText(JSON.stringify(receipt, null, 2)).then(function () {
         toast("Receipt copied");
+      }, function () {
+        toast("Copy failed — use ⬇ Download instead", true);
       });
     });
 
@@ -2035,7 +2058,7 @@
         toast("Receipt too large to share as a URL (" + url.length + " bytes). Use Download instead.", true);
         return;
       }
-      navigator.clipboard.writeText(url).then(function () {
+      copyText(url).then(function () {
         toast("Verify link copied. Recipient's browser will auto-verify it.");
       }, function () {
         // Fallback: show it in a modal so the user can copy manually.
@@ -2513,13 +2536,9 @@
         copyBtn.classList.add("ok-flash");
         setTimeout(function () { copyBtn.textContent = origText; copyBtn.classList.remove("ok-flash"); }, 1600);
       }
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(token).then(markCopied).catch(function () {
-          toast("Copy blocked. Select the token manually");
-        });
-      } else {
-        toast("Clipboard unavailable in this browser");
-      }
+      copyText(token).then(markCopied, function () {
+        toast("Copy blocked. Select the token manually");
+      });
     });
     setTimeout(function () { backdrop.querySelector('[data-close]').focus(); }, 20);
   }
@@ -4237,6 +4256,7 @@
 
     function close() {
       cmdkOpen_ = false;
+      window.removeEventListener("hashchange", close);
       backdrop.remove();
       document.body.classList.remove("locked");
     }
@@ -4246,6 +4266,10 @@
       else if (it.run) { close(); it.run(); }
     }
     backdrop.addEventListener("click", function (e) { if (e.target === backdrop) close(); });
+    // Browser Back (or any route change) while the palette is open:
+    // without this the backdrop outlived the navigation and ate every
+    // click on the new page, and cmdkOpen_ stayed stuck at true.
+    window.addEventListener("hashchange", close);
   }
 
   /* ============================================================
