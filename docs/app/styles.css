@@ -1754,6 +1754,17 @@ body.locked #avTourLauncher { display: none; }
 tr.av-new-row td { animation: avStatPulse 1.2s ease 2; }
 
 @media (prefers-reduced-motion: reduce) {
+  /* Global kill-switch (WCAG 2.3.3): 18 animation/transition sites and
+   * counting — enumerating them drifted (modals, palette, skeleton
+   * shimmer, and live-pulse all shipped after the original list).
+   * Near-zero durations instead of `none` so any future animationend
+   * listeners still fire. */
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
   .av-tour-hole, .av-tour-card { transition: none; }
   .stat.av-pulse, tr.av-new-row td { animation: none; }
   .toast, #avTourLauncher { animation: none; }

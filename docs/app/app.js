@@ -840,11 +840,14 @@
       if (btn) btn.focus();
       return;
     }
-    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Home" || e.key === "End") {
       e.preventDefault();
       var items = Array.prototype.slice.call(m.querySelectorAll("[role=menuitem]"));
       var i = items.indexOf(document.activeElement);
-      var next = e.key === "ArrowDown" ? items[i + 1] || items[0] : items[i - 1] || items[items.length - 1];
+      var next = e.key === "ArrowDown" ? items[i + 1] || items[0]
+        : e.key === "ArrowUp" ? items[i - 1] || items[items.length - 1]
+        : e.key === "Home" ? items[0]
+        : items[items.length - 1];
       if (next) next.focus();
     }
   }
