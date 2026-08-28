@@ -668,9 +668,17 @@
     if (btn) btn.setAttribute("aria-expanded", "false");
     document.removeEventListener("click", onAccountMenuOutside, true);
     document.removeEventListener("keydown", onAccountMenuKey, true);
+    document.removeEventListener("focusin", onAccountMenuFocus, true);
   }
   function onAccountMenuOutside(e) {
     if (e.target.closest("#accountMenu") || e.target.closest("#userBtn")) return;
+    closeAccountMenu();
+  }
+  // Menus close when focus leaves them (Tab-out) — without this the
+  // dropdown floated orphaned over the page while the user tabbed
+  // through content behind it.
+  function onAccountMenuFocus(e) {
+    if (e.target.closest && (e.target.closest("#accountMenu") || e.target.closest("#userBtn"))) return;
     closeAccountMenu();
   }
   function onAccountMenuKey(e) {
@@ -729,6 +737,7 @@
     });
     document.addEventListener("click", onAccountMenuOutside, true);
     document.addEventListener("keydown", onAccountMenuKey, true);
+    document.addEventListener("focusin", onAccountMenuFocus, true);
     var first = menu.querySelector("[role=menuitem]");
     if (first) first.focus();
   }
