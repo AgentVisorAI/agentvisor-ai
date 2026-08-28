@@ -24,6 +24,11 @@ const ROOT = SITE.replace(/app\/?$/, "");
 // lands investors on the site on their phones — same narrative, tap
 // interactions, 390px layout.
 const PHONE = process.env.PROFILE === "phone";
+// SLOW=1 simulates venue WiFi: every datasource call gains 300–700 ms
+// of jittered latency, injected right after the console boots. The
+// narrative must still hold — skeletons, in-flight guards, fetch-first
+// refreshes, and race tokens all under realistic timing.
+const SLOW = process.env.SLOW === "1";
 
 function fail(m) { console.log("❌", m); process.exit(1); }
 
@@ -43,24 +48,49 @@ const beat = (m) => console.log("✅ [" + ((Date.now() - t0) / 1000).toFixed(1) 
 await page.goto(ROOT, { waitUntil: "domcontentloaded" });
 await page.click('a.cta.primary[href="app/?tour=1"]');
 await page.waitForSelector(".av-tour-card", { timeout: 20000 });
+if (SLOW) {
+  await page.evaluate(() => {
+    const ds = window.dataSource;
+    for (const k of Object.keys(Object.getOwnPropertyDescriptors(ds))) {
+      if (typeof ds[k] !== "function" || k === "subscribe") continue;
+      const orig = ds[k].bind(ds);
+      ds[k] = (...a) => new Promise((r) => setTimeout(r, 300 + Math.random() * 400)).then(() => orig(...a));
+    }
+  });
+  console.log("   (venue-wifi mode: 300–700ms jitter on every datasource call)");
+}
 beat("landing CTA → console, tour auto-started");
 
 // ── 2. Tour: advance through all steps on their real targets
+// Sync with the tour's own pacing: the card's step counter only
+// updates after the tour's waitFor() anchors the target — under
+// venue-wifi latency that can take a second per step. Fixed sleeps
+// here produced false "target missing" failures.
 const tourTargets = [".stat.savings", ".stat.blocks", 'tr[data-id="sess_01H9K"]', ".evt.err", ".receipt-card"];
 for (let step = 0; step < tourTargets.length; step++) {
+  await page.waitForFunction((n) => document.querySelector(".av-tour-step")?.textContent.includes("Step " + n + " of"), step + 1, { timeout: 20000 });
   const onTarget = await page.evaluate((sel) => {
     const t = document.querySelector(sel);
     if (!t) return false;
     const r = t.getBoundingClientRect();
     return r.width > 0 && r.height > 0;
   }, tourTargets[step]);
-  if (!onTarget) fail("tour step " + step + " target missing: " + tourTargets[step]);
+  if (!onTarget) {
+    console.log("DEBUG", await page.evaluate(() => ({
+      hash: location.hash,
+      stepTxt: document.querySelector(".av-tour-step")?.textContent,
+      rows: document.querySelectorAll("tr[data-clickable]").length,
+      ids: [...document.querySelectorAll("tr[data-clickable]")].slice(0, 3).map((r) => r.getAttribute("data-id")),
+      skl: !!document.querySelector("#view .skl"),
+    })));
+    fail("tour step " + step + " target missing: " + tourTargets[step]);
+  }
   await page.evaluate(() => {
     const btns = [...document.querySelectorAll(".av-tour-card button")];
     (btns.find((x) => /next|→/i.test(x.textContent)) || btns[btns.length - 1]).click();
   });
-  await page.waitForTimeout(800);
 }
+await page.waitForFunction(() => document.querySelector(".av-tour-step")?.textContent.includes("Step 6 of"), { timeout: 20000 });
 beat("tour: all 6 steps landed on live targets");
 
 // ── 3. Finale CTA → verifier in a new tab → sample verifies green
@@ -129,5 +159,5 @@ await page.waitForFunction(() => document.querySelector(".org-switcher")?.textCo
 beat("palette reset → pristine Northwind restored");
 
 if (jsErrors.length) fail("JS errors during rehearsal: " + JSON.stringify([...new Set(jsErrors)]));
-console.log("\nFull investor-flow rehearsal (" + (PHONE ? "phone/QR path" : "desktop") + ") passed in " + ((Date.now() - t0) / 1000).toFixed(1) + "s — the Saturday narrative holds end to end.");
+console.log("\nFull investor-flow rehearsal (" + (PHONE ? "phone/QR path" : "desktop") + (SLOW ? ", venue-wifi latency" : "") + ") passed in " + ((Date.now() - t0) / 1000).toFixed(1) + "s — the Saturday narrative holds end to end.");
 await browser.close();

@@ -209,7 +209,18 @@
     var step = STEPS[i];
     ensureLauncher();
 
-    if (location.hash !== step.route) location.hash = step.route;
+    if (location.hash !== step.route) {
+      location.hash = step.route;
+      // hashchange dispatches asynchronously: without this yield the
+      // first waitFor() poll runs against the OUTGOING view and can
+      // anchor to a same-selector element there (the overview's copy
+      // of the session row), which the incoming route's skeleton then
+      // destroys — leaving the spotlight on a stale rect for as long
+      // as the data takes to load. Invisible on fast networks; obvious
+      // on venue WiFi.
+      await new Promise(function (r) { setTimeout(r, 80); });
+      if (state.i !== i) return; // user moved on during the yield
+    }
     var anchor = await waitFor(step.waitFor);
     if (state.i !== i) return; // user skipped ahead while we were waiting
 
