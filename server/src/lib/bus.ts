@@ -26,6 +26,7 @@
  */
 
 import { EventEmitter } from "node:events";
+import { randomBytes } from "node:crypto";
 import { Client as PgClient } from "pg";
 import { env } from "../env.js";
 
@@ -33,6 +34,27 @@ export type EventPayload =
   | { type: "session.upsert"; orgId: string; deploymentId: string; sessionId: string; externalId: string; agent: string }
   | { type: "events.appended"; orgId: string; deploymentId: string; sessionId: string; count: number; blocked: number; allowed: number }
   | { type: "receipt.finalized"; orgId: string; deploymentId: string; sessionId: string; receiptId: string };
+
+// R110 F3: per-process origin id, tagged onto every NOTIFY payload so
+// the LISTEN sidecar can skip its own instance's fan-out. Prior shape:
+// publish() emitted locally AND fired pg_notify, then the LISTEN
+// callback on the SAME instance re-emitted locally — every event was
+// delivered to every same-org SSE subscriber TWICE on the origin
+// instance (once from publish's local emit at line 52-53, once from
+// the LISTEN callback's re-emit at 109-110). Console list views that
+// don't dedupe on id showed doubled rows; downstream metric collectors
+// summing SSE payloads over-counted 1x on origin.
+//
+// Wire shape stays backward compatible — any existing consumer that
+// deserializes into EventPayload ignores the extra field, and a new
+// instance receiving an old (untagged) NOTIFY will simply not skip
+// it (delivers as legacy would). Rolling deploy safe.
+interface WirePayload {
+  ev: EventPayload;
+  originId: string;
+}
+
+const PROCESS_ORIGIN_ID = randomBytes(8).toString("hex");
 
 const NOTIFY_CHANNEL = "av_bus";
 // Postgres NOTIFY payload cap is 8000 bytes. Our payloads are small
@@ -56,7 +78,8 @@ class Bus extends EventEmitter {
     // Fire-and-forget — the local deliver above is authoritative for the
     // caller's tenant on this node.
     if (this.pgPublisher) {
-      const payload = JSON.stringify(ev);
+      const wire: WirePayload = { ev, originId: PROCESS_ORIGIN_ID };
+      const payload = JSON.stringify(wire);
       if (Buffer.byteLength(payload) > MAX_PAYLOAD_BYTES) {
         // Skip cross-instance for oversized payloads; local delivery
         // already succeeded so the origin tenant still sees the update.
@@ -102,7 +125,21 @@ class Bus extends EventEmitter {
     listener.on("notification", (msg) => {
       if (msg.channel !== NOTIFY_CHANNEL || !msg.payload) return;
       try {
-        const ev = JSON.parse(msg.payload) as EventPayload;
+        // R110 F3: skip re-emit when the NOTIFY originated on THIS
+        // process — publish() already delivered locally. Backward-
+        // compatible: an old-format payload without originId
+        // deserializes as { originId: undefined } which won't equal
+        // PROCESS_ORIGIN_ID, so a rolling deploy still delivers.
+        // We accept both {ev, originId} (R110+) and bare EventPayload
+        // (pre-R110) shapes.
+        const parsed = JSON.parse(msg.payload) as WirePayload | EventPayload;
+        const ev: EventPayload =
+          "ev" in parsed && "originId" in parsed ? parsed.ev : (parsed as EventPayload);
+        const originId =
+          "ev" in parsed && "originId" in parsed
+            ? (parsed as WirePayload).originId
+            : undefined;
+        if (originId === PROCESS_ORIGIN_ID) return;
         // Re-emit locally so any SSE subscribers on THIS node see the
         // cross-instance update. Skip the fan-out back to pg by not
         // going through publish() — we're already inside a NOTIFY.
