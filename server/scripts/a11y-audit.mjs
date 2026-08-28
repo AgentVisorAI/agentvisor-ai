@@ -49,8 +49,19 @@ await new Promise((r) => setTimeout(r, 1000));
 
 let anyFail = false;
 
+// Both themes: the tokens differ (dark's accent/success solids are
+// light tints needing dark ink), so contrast must be audited per
+// theme — the launcher's white-on-light-blue dark-theme failure
+// shipped invisibly while this audit only covered one theme.
+for (const theme of ["light", "dark"]) {
+  await page.evaluate((t) => {
+    try { localStorage.setItem("av_theme", t); } catch {}
+    document.documentElement.setAttribute("data-theme", t);
+  }, theme);
+
 for (const route of routes) {
   await page.goto(SITE + route, { waitUntil: "networkidle" });
+  await page.evaluate((t) => document.documentElement.setAttribute("data-theme", t), theme);
   await new Promise((r) => setTimeout(r, 800));
 
   const results = await new AxeBuilder({ page })
@@ -63,10 +74,10 @@ for (const route of routes) {
   );
 
   if (serious.length === 0) {
-    console.log("✅ " + route + ": 0 serious/critical violations");
+    console.log("✅ [" + theme + "] " + route + ": 0 serious/critical violations");
   } else {
     anyFail = true;
-    console.log("❌ " + route + ": " + serious.length + " serious/critical violations");
+    console.log("❌ [" + theme + "] " + route + ": " + serious.length + " serious/critical violations");
     for (const v of serious) {
       console.log("   - " + v.id + " (" + v.impact + "): " + v.help);
       console.log("     Nodes: " + v.nodes.length);
@@ -77,6 +88,7 @@ for (const route of routes) {
     }
   }
 }
+}
 
 await browser.close();
 
@@ -84,4 +96,4 @@ if (anyFail) {
   console.log("\nA11y audit FAILED. Fix the serious+critical violations above.");
   process.exit(1);
 }
-console.log("\nA11y audit passed — all " + routes.length + " routes clear.");
+console.log("\nA11y audit passed — all " + routes.length + " routes clear in both themes.");
