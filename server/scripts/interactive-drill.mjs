@@ -533,7 +533,59 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ cross-tab sync: sign-out bounces, sign-in un-strands the login tab, theme follows");
 }
 
-// ── 15. Listener-leak soak ─────────────────────────────────────────
+// ── 15. Focus rings + hostile data ─────────────────────────────────
+// (a) WCAG 2.4.7: every keyboard focus stop must show a visible
+// indicator (outline or box-shadow) — axe can't verify this, only a
+// real Tab walk can. (b) Garbage API fields (bad dates, non-numeric
+// money) must render as dashes/$0.00, never "NaNd ago" / "$NaN" /
+// "Invalid Date" — in the table OR the CSV export.
+{
+  let stops = 0; const naked = [];
+  for (const r of ["#/sessions", "#/settings/webhooks"]) {
+    await page.evaluate((r) => { location.hash = r; }, r);
+    await page.waitForTimeout(900);
+    for (let i = 0; i < 25; i++) {
+      await page.keyboard.press("Tab");
+      const info = await page.evaluate(() => {
+        const el = document.activeElement;
+        if (!el || el === document.body || el === document.documentElement) return null;
+        const cs = getComputedStyle(el);
+        const visible = (parseFloat(cs.outlineWidth) > 0 && cs.outlineStyle !== "none") || cs.boxShadow !== "none";
+        const rr = el.getBoundingClientRect();
+        return { visible, onscreen: rr.width > 0 && rr.height > 0, id: el.id || el.tagName };
+      });
+      if (!info) break;
+      stops++;
+      if (info.onscreen && !info.visible) naked.push(r + "→" + info.id);
+    }
+  }
+  if (naked.length) fail("focus stops without a visible ring: " + [...new Set(naked)].join(", "));
+  await page.evaluate(() => {
+    const ds = window.dataSource;
+    if (!ds.__origList) ds.__origList = ds.listSessions.bind(ds);
+    ds.listSessions = async (...a) => {
+      const r = await ds.__origList(...a);
+      r.sessions = [{ id: "sess_garbage", externalId: "sess_garbage", agent: "bad-agent", user: null, model: undefined, startedAt: "not-a-date", lastEventAt: "also-garbage", events: "many", toolsAllowed: null, toolsBlocked: undefined, costUsdMicros: "garbage", blockedPayoutUsdMicros: {}, status: "weird_status", deploymentId: "dep_nope", policiesFired: null }, ...r.sessions];
+      return r;
+    };
+  });
+  await page.goto(SITE + "#/sessions", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("tr[data-clickable]", { timeout: 10000 });
+  const leak = await page.evaluate(() => {
+    const t = document.getElementById("view").textContent;
+    return ["NaN", "Invalid Date", "undefined"].filter((x) => t.includes(x));
+  });
+  if (leak.length) fail("garbage session row leaked into the UI: " + leak.join(","));
+  const dl = page.waitForEvent("download", { timeout: 8000 });
+  await page.click("#exportCsv");
+  const csv = (await import("fs")).readFileSync(await (await dl).path(), "utf8");
+  const csvLeak = ["NaN", "Invalid Date", "undefined"].filter((x) => csv.includes(x));
+  if (csvLeak.length) fail("garbage session row leaked into the CSV: " + csvLeak.join(","));
+  await page.evaluate(() => { window.dataSource.listSessions = window.dataSource.__origList; });
+  console.log("✅ " + stops + " focus stops all show a ring; garbage API fields render clean in table + CSV");
+}
+
+// ── 16. Listener-leak soak ─────────────────────────────────────────
 // Every earlier check opened modals, ran the tour, refreshed the
 // overview, and re-rendered lists dozens of times. If any of that
 // leaked document/window listeners (the webhook modal once leaked a
@@ -559,4 +611,4 @@ if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors))
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 16 interactive-features drill checks passed.");
+console.log("\nAll 17 interactive-features drill checks passed.");
