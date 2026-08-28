@@ -135,8 +135,20 @@ jobs:
       # the cheap /healthz endpoint. Asserts p99 < 250 ms and zero
       # non-2xx responses. Realistic for a 256 MB Fly nano.
       - name: Load test (autocannon → /healthz)
+        working-directory: server
         run: |
-          npx --yes autocannon@8.0.0 \
+          # R129 F1: use the version pinned in server/package.json
+          # + package-lock.json. Prior shape ran
+          # `npx --yes autocannon@8.0.0` — top-level pin OK, but the
+          # transitive graph resolved with ^ on every CI run. A
+          # compromised transitive publish would execute in the same
+          # job step that has access to JWT_SECRET, POSTGRES_PASSWORD,
+          # the running local API, and GITHUB_TOKEN. Direct sibling
+          # to R128 F3 (terser). `npm ci` at line 101 already
+          # installed autocannon into server/node_modules; invoke
+          # the local binary so integrity is enforced from the
+          # lockfile.
+          ./node_modules/.bin/autocannon \
             --duration 15 \
             --connections 20 \
             --pipelining 1 \

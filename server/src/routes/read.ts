@@ -190,36 +190,51 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
       ];
     }
 
-    // Fetch one extra so we can decide whether nextCursor is present
-    // without a second COUNT query.
-    const rows = await db.session.findMany({
-      where: where as never,
-      orderBy: [{ openedAt: "desc" }, { id: "desc" }],
-      take: query.data.limit + 1,
-      ...(cursor
-        ? {
-            skip: 1,
-            cursor: { id: cursor.id },
-          }
-        : {}),
-      select: {
-        id: true,
-        externalId: true,
-        agent: true,
-        status: true,
-        openedAt: true,
-        closedAt: true,
-        promptTokens: true,
-        completionTokens: true,
-        costUsdMicros: true,
-        payoutUsdMicros: true,
-        blockedPayoutUsdMicros: true,
-        toolsAllowed: true,
-        toolsBlocked: true,
-        stopReason: true,
-        deployment: { select: { id: true, name: true, environment: true } },
-      },
-    });
+    // R129 F3: same cursor guard as the audit endpoint below —
+    // Prisma throws P2016/P2032 when the cursor `id` doesn't
+    // exist, which surfaces as an uncaught 500 through
+    // setErrorHandler. Stale cursors are legitimate user input
+    // (rows purged by retention, deployment deleted, org
+    // rotated) — return 400 invalid_cursor to match the decode-
+    // failure shape at line 172.
+    let rows;
+    try {
+      rows = await db.session.findMany({
+        where: where as never,
+        orderBy: [{ openedAt: "desc" }, { id: "desc" }],
+        take: query.data.limit + 1,
+        ...(cursor
+          ? {
+              skip: 1,
+              cursor: { id: cursor.id },
+            }
+          : {}),
+        select: {
+          id: true,
+          externalId: true,
+          agent: true,
+          status: true,
+          openedAt: true,
+          closedAt: true,
+          promptTokens: true,
+          completionTokens: true,
+          costUsdMicros: true,
+          payoutUsdMicros: true,
+          blockedPayoutUsdMicros: true,
+          toolsAllowed: true,
+          toolsBlocked: true,
+          stopReason: true,
+          deployment: { select: { id: true, name: true, environment: true } },
+        },
+      });
+    } catch (err) {
+      const code = (err as { code?: string } | null)?.code;
+      const msg = (err as { message?: string } | null)?.message ?? "";
+      if (code === "P2016" || code === "P2032" || /cursor/i.test(msg)) {
+        return reply.code(400).send({ error: "invalid_cursor" });
+      }
+      throw err;
+    }
 
     const hasMore = rows.length > query.data.limit;
     const page = hasMore ? rows.slice(0, query.data.limit) : rows;
@@ -445,26 +460,46 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
         return reply.code(400).send({ error: "invalid_cursor" });
       }
     }
-    const rows = await db.auditEntry.findMany({
-      where: {
-        orgId: claims.orgId,
-        ...(query.data.event ? { event: query.data.event } : {}),
-      },
-      orderBy: [{ at: "desc" }, { id: "desc" }],
-      take: query.data.limit + 1,
-      ...(cursorPart ? { skip: 1, cursor: cursorPart } : {}),
-      select: {
-        id: true,
-        event: true,
-        actorId: true,
-        actorEmail: true,
-        target: true,
-        note: true,
-        metadata: true,
-        ip: true,
-        at: true,
-      },
-    });
+    // R129 F3: wrap findMany so a forged cursor pointing at a
+    // non-existent id maps to 400 invalid_cursor instead of
+    // Prisma throwing an uncaught 500 through setErrorHandler.
+    // Cross-org isolation is still enforced by the outer
+    // `where: orgId` — this only affects the ergonomics of a
+    // stale/forged cursor.
+    let rows;
+    try {
+      rows = await db.auditEntry.findMany({
+        where: {
+          orgId: claims.orgId,
+          ...(query.data.event ? { event: query.data.event } : {}),
+        },
+        orderBy: [{ at: "desc" }, { id: "desc" }],
+        take: query.data.limit + 1,
+        ...(cursorPart ? { skip: 1, cursor: cursorPart } : {}),
+        select: {
+          id: true,
+          event: true,
+          actorId: true,
+          actorEmail: true,
+          target: true,
+          note: true,
+          metadata: true,
+          ip: true,
+          at: true,
+        },
+      });
+    } catch (err) {
+      // Prisma's cursor-not-found: message contains "cursor" or
+      // is a P2016/P2032-family error. Fall through to 400 so a
+      // stale cursor (row deleted, org rotated, forged bytes)
+      // gets the same shape as an unparseable one at line ~442.
+      const code = (err as { code?: string } | null)?.code;
+      const msg = (err as { message?: string } | null)?.message ?? "";
+      if (code === "P2016" || code === "P2032" || /cursor/i.test(msg)) {
+        return reply.code(400).send({ error: "invalid_cursor" });
+      }
+      throw err;
+    }
     const hasMore = rows.length > query.data.limit;
     const page = hasMore ? rows.slice(0, query.data.limit) : rows;
     const last = page[page.length - 1];
