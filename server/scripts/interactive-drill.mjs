@@ -686,10 +686,30 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await goF("?range=720&sort=cost.asc");
   const seq = (await page.evaluate(() => [...document.querySelectorAll("tr[data-clickable]")].map((r) => r.getAttribute("data-id")))).map((id) => m[id]?.cost);
   if (!seq.every((v, i) => i === 0 || seq[i - 1] <= v)) fail("sort cost.asc not monotone");
+  // Filter-race: a slow stale query must never paint over a newer one,
+  // and keystrokes typed while a fetch is in flight must survive (the
+  // old repaint-then-fetch flow dropped them with the listeners).
+  await goF("?range=720");
+  await page.evaluate(() => {
+    const ds = window.dataSource;
+    if (!ds.__origListRace) ds.__origListRace = ds.listSessions.bind(ds);
+    ds.listSessions = (p) => new Promise((r) => setTimeout(r, p && p.q ? 1000 : 80)).then(() => ds.__origListRace(p));
+  });
+  await page.fill("#fSearch", "planner");
+  await page.waitForTimeout(300); // slow q-fetch in flight
+  await page.fill("#fSearch", ""); // fast unfiltered fetch supersedes it
+  await page.waitForTimeout(2200);
+  const race = await page.evaluate(() => ({
+    box: document.querySelector("#fSearch")?.value,
+    q: /q=/.test(location.hash),
+    rows: document.querySelectorAll("tr[data-clickable]").length,
+  }));
+  if (race.q || race.box !== "" || race.rows !== 50) fail("stale filter fetch painted over the newer one: " + JSON.stringify(race));
+  await page.evaluate(() => { window.dataSource.listSessions = window.dataSource.__origListRace; });
   await page.evaluate(() => localStorage.removeItem("av_mock_bigdata"));
   await page.evaluate(() => { location.hash = "#/overview"; });
   await page.waitForTimeout(500);
-  console.log("✅ filter/sort semantics: q (case-insens), blocked, composition all match ground truth; cost sort monotone");
+  console.log("✅ filter/sort semantics: q (case-insens), blocked, composition all match ground truth; cost sort monotone; stale fetch never paints");
 }
 
 // ── 18. Listener-leak soak ─────────────────────────────────────────

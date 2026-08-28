@@ -284,8 +284,10 @@
       // transient failure skips the refresh instead of nuking the list
       // (renderSessionsBody restores in-flight search keystrokes).
       try {
+        var mySeq = ++_sessionsFetchSeq;
         var deps = await state.ds.listDeployments();
         var firstPage = await state.ds.listSessions(Object.assign({ limit: sessionsPageSize }, sessionsFilter));
+        if (mySeq !== _sessionsFetchSeq) return;
         if (!(state.route && state.route.path[0] === "sessions" && !state.route.path[1])) return;
         sessionsLoaded = firstPage.sessions;
         sessionsCursor = firstPage.nextCursor;
@@ -345,14 +347,15 @@
   var _scrollPrevHash = null;
   function restoreScrollFor(key) {
     var y = scrollMemory[key];
-    if (y == null) return;
     delete scrollMemory[key];
+    if (!y) return; // restoring to 0 is a no-op that can race (and cancel) a user scroll
     requestAnimationFrame(function () { window.scrollTo(0, y); });
   }
   async function render() {
     var _hashNow = location.hash || "#/overview";
     if (_scrollPrevHash !== null && _scrollPrevHash !== _hashNow) {
-      scrollMemory[_scrollPrevHash] = window.scrollY;
+      if (window.scrollY > 0) scrollMemory[_scrollPrevHash] = window.scrollY;
+      else delete scrollMemory[_scrollPrevHash];
     }
     _scrollPrevHash = _hashNow;
     state.route = parseHash();
@@ -1534,26 +1537,34 @@
   var sessionsLoaded = []; // { sessions: [...], nextCursor }
   var sessionsCursor = null;
 
+  // Monotonic token: every sessions-list fetch bumps it, and only the
+  // continuation holding the latest token may mutate the shared
+  // sessionsLoaded/sessionsCursor accumulators or paint. Without this,
+  // two rapid filter changes raced: the SLOWER (stale) response landed
+  // last and painted rows that didn't match the filter bar or URL.
+  var _sessionsFetchSeq = 0;
   async function renderSessionsList(main) {
     readSessionsFilterFromHash();
-    // If the user is mid-keystroke in the search box, a full innerHTML
-    // swap would destroy the input and eat their focus. Remember and
-    // restore it (cursor at the end) across the re-render.
-    var searchHadFocus = document.activeElement && document.activeElement.id === "fSearch";
-    var searchVal = searchHadFocus ? document.activeElement.value : null;
-    main.innerHTML = pageHeader("Sessions", "Every agent session policed by AgentVisor.") + filterBar() + loadingBlock("table");
-    if (searchHadFocus) restoreSearchFocus(main, searchVal);
+    var mySeq = ++_sessionsFetchSeq;
+    var firstPaint = !main.querySelector("#fSearch");
+    if (firstPaint) {
+      // Fresh entry to the route: paint the frame + skeleton. On filter
+      // re-renders the existing bar stays live (repainting it killed
+      // its listeners mid-debounce and dropped keystrokes) — the fetch
+      // happens first and only a winning response repaints.
+      main.innerHTML = pageHeader("Sessions", "Every agent session policed by AgentVisor.") + filterBar() + loadingBlock("table");
+    }
     var deps;
     try {
       deps = await state.ds.listDeployments();
-      // Reset accumulator on every top-level render (filter change etc).
-      sessionsLoaded = [];
-      sessionsCursor = null;
       var firstPage = await state.ds.listSessions(Object.assign({ limit: sessionsPageSize }, sessionsFilter));
+      if (mySeq !== _sessionsFetchSeq) return; // a newer filter/render superseded this fetch
       sessionsLoaded = firstPage.sessions;
       sessionsCursor = firstPage.nextCursor;
-    } catch (e) { return renderError(main, e); }
-    installFilters(main, deps);
+    } catch (e) {
+      if (mySeq !== _sessionsFetchSeq) return;
+      return renderError(main, e);
+    }
     renderSessionsBody(main, deps);
   }
   function restoreSearchFocus(root, val) {
@@ -1624,12 +1635,15 @@
       lm.addEventListener("click", async function () {
         lm.disabled = true;
         lm.textContent = "Loading…";
+        var mySeq = _sessionsFetchSeq; // abandon if a filter change lands mid-fetch
         try {
           var page = await state.ds.listSessions(Object.assign({ limit: sessionsPageSize, cursor: sessionsCursor }, sessionsFilter));
+          if (mySeq !== _sessionsFetchSeq) return;
           sessionsLoaded = sessionsLoaded.concat(page.sessions);
           sessionsCursor = page.nextCursor;
           renderSessionsBody(main, deps);
         } catch (err) {
+          if (mySeq !== _sessionsFetchSeq) return;
           toast(err.message || "Failed to load", true);
           lm.disabled = false;
           lm.textContent = "Load more";
