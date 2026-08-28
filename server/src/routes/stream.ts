@@ -33,9 +33,22 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
     // Set CORS headers ourselves — we're about to bypass Fastify's response
     // pipeline and stream to `reply.raw`, so the @fastify/cors plugin's
     // headers won't get flushed. Mirror the same allowlist logic here.
+    //
+    // R105 F3: honor the CORS plugin's dev-mode empty-list fallback.
+    // Prior shape only echoed the origin when
+    // ALLOWED_ORIGINS.includes(origin) — so in dev with an unset
+    // ALLOWED_ORIGINS, fetch() from a Vite SPA on a different origin
+    // worked (CORS plugin allows-any) but `new EventSource(...)`
+    // silently failed with no Access-Control-Allow-Origin header.
+    // Same allow-any-in-dev-if-empty fallback the plugin at
+    // index.ts:104-114 applies.
     const origin = req.headers.origin;
-    if (typeof origin === "string" && env.ALLOWED_ORIGINS.includes(origin)) {
-      reply.raw.setHeader("Access-Control-Allow-Origin", origin);
+    const allowByAllowlist = typeof origin === "string" && env.ALLOWED_ORIGINS.includes(origin);
+    const allowByDevFallback = typeof origin === "string" &&
+      env.ALLOWED_ORIGINS.length === 0 &&
+      env.NODE_ENV !== "production";
+    if (allowByAllowlist || allowByDevFallback) {
+      reply.raw.setHeader("Access-Control-Allow-Origin", origin!);
       reply.raw.setHeader("Access-Control-Allow-Credentials", "true");
       reply.raw.setHeader("Vary", "Origin");
     }
