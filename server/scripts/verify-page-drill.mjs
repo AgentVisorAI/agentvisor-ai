@@ -210,8 +210,50 @@ await uploadJson(JSON.stringify(wrongFormat));
   console.log("✅ wrong format tag -> clean error message");
 }
 
+// 7. File paths: picker + drag-drop verify green; tampered file red.
+// Auditors receive receipt.json as a FILE — these gestures matter as
+// much as paste, and were never exercised before this check.
+{
+  const os = await import("node:os");
+  const fsp = await import("node:fs/promises");
+  const pathm = await import("node:path");
+  const dir = await fsp.mkdtemp(pathm.join(os.tmpdir(), "av-verify-"));
+  const good = pathm.join(dir, "receipt.json");
+  await fsp.writeFile(good, sampleText);
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForSelector("#fileInput", { state: "attached", timeout: 10000 });
+  await page.setInputFiles("#fileInput", good);
+  await page.waitForSelector(".result-card", { timeout: 10000 });
+  let head = await page.locator(".result-card").innerText();
+  if (!/verifies|TRUSTED/i.test(head)) fail("file-picker verify failed: " + head.slice(0, 60));
+
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForSelector("#drop", { timeout: 10000 });
+  await page.evaluate((content) => {
+    const dt = new DataTransfer();
+    dt.items.add(new File([content], "receipt.json", { type: "application/json" }));
+    document.getElementById("drop").dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: dt }));
+  }, sampleText);
+  await page.waitForSelector(".result-card", { timeout: 10000 });
+  head = await page.locator(".result-card").innerText();
+  if (!/verifies|TRUSTED/i.test(head)) fail("drag-drop verify failed: " + head.slice(0, 60));
+
+  const tampered = JSON.parse(sampleText);
+  tampered.receipt.rawBody = tampered.receipt.rawBody.replace(/7/, "8");
+  const bad = pathm.join(dir, "tampered.json");
+  await fsp.writeFile(bad, JSON.stringify(tampered));
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForSelector("#fileInput", { state: "attached", timeout: 10000 });
+  await page.setInputFiles("#fileInput", bad);
+  await page.waitForSelector(".result-card", { timeout: 10000 });
+  head = await page.locator(".result-card").innerText();
+  if (!/does not verify|invalid/i.test(head)) fail("tampered file not rejected: " + head.slice(0, 60));
+  await fsp.rm(dir, { recursive: true, force: true });
+  console.log("✅ file picker + drag-drop verify green; tampered file -> red");
+}
+
 if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors));
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 10 /verify page drill checks passed.");
+console.log("\nAll 11 /verify page drill checks passed.");
