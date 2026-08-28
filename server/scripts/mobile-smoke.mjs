@@ -132,6 +132,45 @@ for (const { name, device } of profiles) {
     console.log("✅ chart: tap pins the bucket tooltip");
   }
 
+  // Modal usability on a phone: the deliveries table, the long SAML
+  // form, and the token modal must fit the viewport with their action
+  // buttons hittable (the sticky-actions bar keeps Save/Cancel on
+  // screen even when a 9-field form scrolls internally). This probe
+  // also guards the skeleton-phase dead-button class: #addDep paints
+  // before its data resolves and must respond via the delegated
+  // handler immediately.
+  if (device.viewport.width <= 760) {
+    const modals = [
+      ["deliveries", "#/settings/webhooks", async () => { await page.waitForSelector("#whAdd", { timeout: 10000 }); await page.tap("tbody tr[data-id] td:nth-child(2)"); } ],
+      ["saml-add", "#/settings/sso", async () => { await page.waitForSelector("#addSamlBtn", { timeout: 10000 }); await page.tap("#addSamlBtn"); } ],
+      ["deployment-create", "#/deployments", async () => { await page.waitForSelector("#addDep", { timeout: 10000 }); await page.tap("#addDep"); } ],
+    ];
+    for (const [mname, route, open] of modals) {
+      await page.evaluate((r) => { location.hash = r; }, route);
+      await page.waitForTimeout(700);
+      await open();
+      await page.waitForSelector(".modal-backdrop .modal", { timeout: 6000 });
+      await page.waitForTimeout(400);
+      const m = await page.evaluate(() => {
+        const modal = document.querySelector(".modal-backdrop .modal");
+        const r = modal.getBoundingClientRect();
+        const bad = [];
+        for (const bn of modal.querySelectorAll(".actions button")) {
+          const br = bn.getBoundingClientRect();
+          if (br.width === 0) continue;
+          const el = document.elementFromPoint(br.left + Math.min(br.width / 2, 20), br.top + br.height / 2);
+          if (!(el && (bn === el || bn.contains(el) || bn === el.closest("button")))) bad.push(bn.textContent.trim() + " hit=" + (el ? el.tagName + "." + String(el.className).slice(0, 24) : "none") );
+          if (br.bottom > innerHeight || br.top < 0) bad.push(bn.textContent.trim() + " offscreen");
+        }
+        return { fits: r.right <= innerWidth + 1 && r.left >= -1, hOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth, bad };
+      });
+      if (!m.fits || m.hOverflow > 0 || m.bad.length) fail(mname + " modal unusable at " + device.viewport.width + "px: " + JSON.stringify(m));
+      await page.keyboard.press("Escape");
+      await page.waitForTimeout(300);
+    }
+    console.log("✅ modals fit + action buttons hittable on phone (deliveries, saml-add, deployment-create)");
+  }
+
   if (jsErrors.length) fail(`${name} JS errors: ${jsErrors.join(" | ")}`);
   console.log("✅ zero JS errors on " + name);
 
