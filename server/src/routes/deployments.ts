@@ -154,31 +154,63 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
     return reply.send({ ingestToken: plaintextToken });
   });
 
-  app.delete("/:id", async (req, reply) => {
-    const claims = requireSession(req, reply);
-    if (!claims) return;
-    if (claims.membershipRole === "member") {
-      return reply.code(403).send({ error: "forbidden" });
-    }
-    const params = z.object({ id: z.string() }).safeParse(req.params);
-    if (!params.success) return reply.code(400).send({ error: "invalid_id" });
-    const owned = await db.deployment.findFirst({
-      where: { id: params.data.id, orgId: claims.orgId },
-      select: { id: true, name: true },
-    });
-    if (!owned) return reply.code(404).send({ error: "not_found" });
-    await db.deployment.delete({ where: { id: owned.id } });
-    writeAudit(
-      {
-        orgId: claims.orgId,
-        event: "deployment.delete",
-        actorId: claims.sub,
-        target: owned.name,
-        metadata: { deploymentId: owned.id },
-        req,
-      },
-      req.log,
-    );
-    return reply.code(204).send();
-  });
+  app.delete<{ Params: { id: string }; Querystring: { force?: string } }>(
+    "/:id",
+    async (req, reply) => {
+      const claims = requireSession(req, reply);
+      if (!claims) return;
+      if (claims.membershipRole === "member") {
+        return reply.code(403).send({ error: "forbidden" });
+      }
+      const params = z.object({ id: z.string() }).safeParse(req.params);
+      if (!params.success) return reply.code(400).send({ error: "invalid_id" });
+      const owned = await db.deployment.findFirst({
+        where: { id: params.data.id, orgId: claims.orgId },
+        select: { id: true, name: true },
+      });
+      if (!owned) return reply.code(404).send({ error: "not_found" });
+      // R94 F4: refuse to cascade-delete a deployment that still
+      // has sealed receipts unless the caller passes ?force=1.
+      // The schema has ON DELETE CASCADE all the way through
+      // Deployment → Session → Event/Receipt, so a single admin
+      // DELETE (or a phished admin's DELETE, or a compromised-
+      // owner's DELETE) atomically vaporizes every signed receipt
+      // for the deployment plus deployment.publicKeyHex — external
+      // verifier bundles are then unverifiable (no anchor to
+      // pin against), so this is a compliance-story downgrade
+      // sibling of the R93 F4 receipt-overwrite path. Refusing
+      // by default forces the operator to opt in with a
+      // force=1 query flag AND we audit-log the force decision
+      // with the receipt count so the trail shows the intent.
+      const receiptCount = await db.receipt.count({
+        where: { session: { deploymentId: owned.id } },
+      });
+      const force = req.query.force === "1" || req.query.force === "true";
+      if (receiptCount > 0 && !force) {
+        return reply.code(409).send({
+          error: "deployment_has_sealed_receipts",
+          receiptCount,
+          hint: "pass ?force=1 to acknowledge cascade-deletion of receipts",
+        });
+      }
+      await db.deployment.delete({ where: { id: owned.id } });
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "deployment.delete",
+          actorId: claims.sub,
+          target: owned.name,
+          metadata: {
+            deploymentId: owned.id,
+            forceDeletedReceipts: force && receiptCount > 0
+              ? receiptCount
+              : undefined,
+          },
+          req,
+        },
+        req.log,
+      );
+      return reply.code(204).send();
+    },
+  );
 }

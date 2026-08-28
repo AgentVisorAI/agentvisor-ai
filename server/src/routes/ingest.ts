@@ -360,27 +360,22 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       // round trips per batch, but ingest batches are small (10-100
       // events typical) and event throughput is bounded by the
       // daemon's tick anyway.
+      // R93 F2 + R94 F1: wrap the per-row inserts AND the rollup
+      // update in ONE transaction so a mid-batch failure (P1001
+      // connection lost, P2024 pool timeout, statement timeout,
+      // DB restart) rolls back every row that already succeeded.
+      // Prior R93 shape ran the per-row create() loop OUTSIDE any
+      // transaction — a failure at row 6/10 committed rows 1..5
+      // and skipped the rollup update, so the daemon's next retry
+      // pulled rows 1..5 into `existingSeqs`, skipped their
+      // deltas as "already applied", and PERMANENTLY under-
+      // counted promptTokens/costUsdMicros/toolsBlocked. The
+      // sealed receipt then signed the undercount, breaking the
+      // compliance story from the OTHER direction. With the tx
+      // wrapper, either every fresh row + the rollup increment
+      // commit together, or nothing does — the daemon retries a
+      // clean slate.
       const insertedSeqs = new Set<number>();
-      for (const row of rows) {
-        try {
-          await db.event.create({ data: row });
-          insertedSeqs.add(row.seq);
-        } catch (err) {
-          if (
-            typeof err === "object" &&
-            err !== null &&
-            (err as { code?: string }).code === "P2002"
-          ) {
-            // Concurrent batch already inserted this seq. Skip
-            // silently — matches prior skipDuplicates behavior.
-            continue;
-          }
-          throw err;
-        }
-      }
-      inserted += insertedSeqs.size;
-
-      // Recompute deltas from the actually-inserted subset.
       let dPrompt = 0;
       let dCompletion = 0;
       let dCost = 0;
@@ -388,34 +383,53 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       let dBlockedPayout = 0;
       let dToolsOk = 0;
       let dToolsBad = 0;
-      for (const e of fresh) {
-        if (!insertedSeqs.has(e.seq)) continue;
-        dPrompt += e.addPromptTokens;
-        dCompletion += e.addCompletionTokens;
-        dCost += e.addCostUsdMicros;
-        dPayout += e.addPayoutUsdMicros;
-        dBlockedPayout += e.addBlockedPayoutUsdMicros;
-        dToolsOk += e.addToolsAllowed;
-        dToolsBad += e.addToolsBlocked;
-      }
-
-      if (
-        dPrompt || dCompletion || dCost || dPayout || dBlockedPayout ||
-        dToolsOk || dToolsBad
-      ) {
-        await db.session.update({
-          where: { id: session.id },
-          data: {
-            promptTokens: { increment: dPrompt },
-            completionTokens: { increment: dCompletion },
-            costUsdMicros: { increment: BigInt(dCost) },
-            payoutUsdMicros: { increment: BigInt(dPayout) },
-            blockedPayoutUsdMicros: { increment: BigInt(dBlockedPayout) },
-            toolsAllowed: { increment: dToolsOk },
-            toolsBlocked: { increment: dToolsBad },
-          },
-        });
-      }
+      await db.$transaction(async (tx) => {
+        for (const row of rows) {
+          try {
+            await tx.event.create({ data: row });
+            insertedSeqs.add(row.seq);
+          } catch (err) {
+            if (
+              typeof err === "object" &&
+              err !== null &&
+              (err as { code?: string }).code === "P2002"
+            ) {
+              // Concurrent batch already inserted this seq. Skip
+              // silently — matches prior skipDuplicates behavior.
+              continue;
+            }
+            throw err;
+          }
+        }
+        for (const e of fresh) {
+          if (!insertedSeqs.has(e.seq)) continue;
+          dPrompt += e.addPromptTokens;
+          dCompletion += e.addCompletionTokens;
+          dCost += e.addCostUsdMicros;
+          dPayout += e.addPayoutUsdMicros;
+          dBlockedPayout += e.addBlockedPayoutUsdMicros;
+          dToolsOk += e.addToolsAllowed;
+          dToolsBad += e.addToolsBlocked;
+        }
+        if (
+          dPrompt || dCompletion || dCost || dPayout || dBlockedPayout ||
+          dToolsOk || dToolsBad
+        ) {
+          await tx.session.update({
+            where: { id: session.id },
+            data: {
+              promptTokens: { increment: dPrompt },
+              completionTokens: { increment: dCompletion },
+              costUsdMicros: { increment: BigInt(dCost) },
+              payoutUsdMicros: { increment: BigInt(dPayout) },
+              blockedPayoutUsdMicros: { increment: BigInt(dBlockedPayout) },
+              toolsAllowed: { increment: dToolsOk },
+              toolsBlocked: { increment: dToolsBad },
+            },
+          });
+        }
+      });
+      inserted += insertedSeqs.size;
 
       if (insertedSeqs.size > 0 || dToolsOk || dToolsBad) {
         bus.publish({
@@ -490,59 +504,90 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
     // idempotency. A different receiptId means an intentional
     // rewrite → refuse with 409 + audit so a compromised token
     // surfaces in the trail.
+    // R93 F4 + R94 F2: same-receiptId path must be BYTE-EXACT
+    // idempotent — a legitimate daemon retry sends the SAME body
+    // + sigB64 + keyIdHex, so a value-equal re-post is a no-op.
+    // Prior R93 shape guarded only on receiptId inequality; an
+    // attacker who observed the legitimate receiptId (via CI log,
+    // Dockerfile leak, or an insider's own prior sealing) could
+    // then POST {receiptId: <same>, body: <forged>,
+    // sigB64: attacker_sign(forged)} — the guard passed, upsert
+    // rewrote all payload fields, verifier now returns 'signature
+    // does not verify' against the pinned pubkey for a sessionId
+    // the customer already accepted. Downgrade attack that R93 F4
+    // was supposed to close. Now: on any existing receipt, fetch
+    // ALL fields and reject with 409 if any of {receiptId, body,
+    // sigB64, keyIdHint, eventCount, issuedAt} differ from the
+    // stored row. Byte-exact re-post → 200 (idempotent no-op).
     const existingReceipt = await db.receipt.findUnique({
       where: { sessionId: session.id },
-      select: { receiptId: true },
+      select: {
+        receiptId: true,
+        body: true,
+        sigB64: true,
+        keyIdHint: true,
+        eventCount: true,
+        issuedAt: true,
+      },
     });
-    if (existingReceipt && existingReceipt.receiptId !== r.receiptId) {
-      req.log.warn(
-        {
-          deploymentId: daemon.deploymentId,
-          sessionId: session.id,
-          existingReceiptId: existingReceipt.receiptId,
-          proposedReceiptId: r.receiptId,
-        },
-        "ingest_receipt_overwrite_refused",
-      );
-      writeAudit(
-        {
-          orgId: daemon.orgId,
-          event: "deployment.receipt_overwrite_refused",
-          actorId: `daemon:${daemon.deploymentId}`,
-          actorEmail: `daemon@${daemon.deploymentId}`,
-          target: session.id,
-          metadata: {
+    if (existingReceipt) {
+      const proposedKeyIdHint = r.keyIdHex.slice(0, 8);
+      const differs =
+        existingReceipt.receiptId !== r.receiptId ||
+        existingReceipt.body !== r.body ||
+        existingReceipt.sigB64 !== r.sigB64 ||
+        existingReceipt.keyIdHint !== proposedKeyIdHint ||
+        existingReceipt.eventCount !== r.eventCount ||
+        existingReceipt.issuedAt.getTime() !== r.issuedAt.getTime();
+      if (differs) {
+        req.log.warn(
+          {
             deploymentId: daemon.deploymentId,
             sessionId: session.id,
-            currentReceiptId: existingReceipt.receiptId,
+            existingReceiptId: existingReceipt.receiptId,
             proposedReceiptId: r.receiptId,
           },
-          req,
+          "ingest_receipt_overwrite_refused",
+        );
+        writeAudit(
+          {
+            orgId: daemon.orgId,
+            event: "deployment.receipt_overwrite_refused",
+            actorId: `daemon:${daemon.deploymentId}`,
+            actorEmail: `daemon@${daemon.deploymentId}`,
+            target: session.id,
+            metadata: {
+              deploymentId: daemon.deploymentId,
+              sessionId: session.id,
+              currentReceiptId: existingReceipt.receiptId,
+              proposedReceiptId: r.receiptId,
+              // Distinguish 'different-id' from 'same-id-different-payload'
+              // in the trail so ops sees the exact bypass class.
+              sameReceiptIdDifferentPayload:
+                existingReceipt.receiptId === r.receiptId,
+            },
+            req,
+          },
+          req.log,
+        );
+        return reply.code(409).send({ error: "receipt_already_sealed" });
+      }
+      // Byte-exact idempotent re-post. Fall through to the
+      // session.update below (which is also idempotent) and
+      // succeed — no receipt row rewrite needed.
+    } else {
+      await db.receipt.create({
+        data: {
+          sessionId: session.id,
+          receiptId: r.receiptId,
+          body: r.body,
+          sigB64: r.sigB64,
+          keyIdHint: r.keyIdHex.slice(0, 8),
+          eventCount: r.eventCount,
+          issuedAt: r.issuedAt,
         },
-        req.log,
-      );
-      return reply.code(409).send({ error: "receipt_already_sealed" });
+      });
     }
-    await db.receipt.upsert({
-      where: { sessionId: session.id },
-      create: {
-        sessionId: session.id,
-        receiptId: r.receiptId,
-        body: r.body,
-        sigB64: r.sigB64,
-        keyIdHint: r.keyIdHex.slice(0, 8),
-        eventCount: r.eventCount,
-        issuedAt: r.issuedAt,
-      },
-      update: {
-        receiptId: r.receiptId,
-        body: r.body,
-        sigB64: r.sigB64,
-        keyIdHint: r.keyIdHex.slice(0, 8),
-        eventCount: r.eventCount,
-        issuedAt: r.issuedAt,
-      },
-    });
     await db.session.update({
       where: { id: session.id },
       data: {

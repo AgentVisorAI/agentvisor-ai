@@ -259,6 +259,11 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
     dispatchEvent({
       orgId: claims.orgId,
       event: "test",
+      // R94 F3: scope to the target endpoint. Prior shape fanned
+      // out to every endpoint subscribing to 'test'/'*' — an
+      // admin clicking 'Send test' on webhook A woke up on-call
+      // via PagerDuty webhook B.
+      onlyEndpointId: ep.id,
       data: { message: "This is a test event from AgentVisor.", endpointId: ep.id },
       logger: req.log,
     });
