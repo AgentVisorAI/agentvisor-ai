@@ -49,7 +49,7 @@ async function waitVerifyStable(pg, timeout = 8000) {
 }
 
 const browser = await chromium.launch({ headless: true });
-const context = await browser.newContext({ viewport: { width: 1200, height: 900 } });
+const context = await browser.newContext({ viewport: { width: 1200, height: 900 }, acceptDownloads: true });
 const page = await context.newPage();
 const jsErrors = [];
 page.on("pageerror", (e) => jsErrors.push(e.message));
@@ -252,8 +252,45 @@ await uploadJson(JSON.stringify(wrongFormat));
   console.log("✅ file picker + drag-drop verify green; tampered file -> red");
 }
 
+// 12. The REAL downloaded bundle round-trips through the web verifier.
+// The receipt drill proves download → CLI verifier; this closes the
+// seam the print footer actually instructs auditors to use: download
+// the receipt in the console, drop that exact file on /verify/ →
+// green; tamper one byte of rawBody → red.
+{
+  const os = await import("node:os");
+  const fsp = await import("node:fs/promises");
+  const pathm = await import("node:path");
+  const dir = await fsp.mkdtemp(pathm.join(os.tmpdir(), "av-dlverify-"));
+  const appPage = await context.newPage();
+  await appPage.goto(new URL("app/#/sessions/sess_01H9K", SITE).href, { waitUntil: "domcontentloaded" });
+  await appPage.waitForSelector("#dlRcpt", { timeout: 15000 });
+  const [dl] = await Promise.all([appPage.waitForEvent("download"), appPage.click("#dlRcpt")]);
+  const bundlePath = pathm.join(dir, "bundle.json");
+  await dl.saveAs(bundlePath);
+  await appPage.close();
+  await page.goto(VERIFY_URL, { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("#fileInput", { state: "attached", timeout: 10000 });
+  await page.setInputFiles("#fileInput", bundlePath);
+  await waitVerifyStable(page);
+  let title = await page.locator(".result-title").innerText();
+  if (!/verifies/i.test(title)) fail("downloaded bundle did not verify green on /verify/: " + title.slice(0, 60));
+  const obj = JSON.parse(await fsp.readFile(bundlePath, "utf8"));
+  obj.receipt.rawBody = obj.receipt.rawBody.replace(/[0-9]/, (d) => String((+d + 1) % 10));
+  const tamperedPath = pathm.join(dir, "tampered.json");
+  await fsp.writeFile(tamperedPath, JSON.stringify(obj));
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForSelector("#fileInput", { state: "attached", timeout: 10000 });
+  await page.setInputFiles("#fileInput", tamperedPath);
+  await waitVerifyStable(page);
+  title = await page.locator(".result-title").innerText();
+  if (!/does not verify|invalid/i.test(title)) fail("tampered downloaded bundle not rejected: " + title.slice(0, 60));
+  await fsp.rm(dir, { recursive: true, force: true });
+  console.log("✅ console download → /verify/ drop → green; tampered rawBody → red (the auditor path, end-to-end)");
+}
+
 if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors));
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 11 /verify page drill checks passed.");
+console.log("\nAll 12 /verify page drill checks passed.");
