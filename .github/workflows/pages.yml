@@ -127,6 +127,9 @@ jobs:
           cp docs/pitch/social.jpg "$site/pitch/"
           cp docs/pitch/tour.mp4 "$site/pitch/"
           cp docs/pitch/tour-poster.jpg "$site/pitch/"
+          # Caption tracks (WebVTT) for both videos — a11y (WCAG 1.2)
+          cp docs/pitch/pitch.vtt "$site/pitch/"
+          cp docs/pitch/tour.vtt "$site/pitch/"
           cp docs/pitch/qr-mockup.svg "$site/pitch/"
           # Short-link aliases (/mockup, /demo) + branded 404. GitHub
           # Pages ignores the Cloudflare-style _redirects file, so the
