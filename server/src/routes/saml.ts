@@ -206,21 +206,38 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
   app.post<{ Params: { configId: string } }>(
     "/:configId/acs",
     async (req, reply) => {
+      // R122 F2: SAML ACS is a top-level browser navigation (the
+      // IdP autosubmits SAMLResponse via HTML form to this URL
+      // with `_top` target). Success path already reply.redirects
+      // (line 367); prior shape returned bare JSON on every
+      // error exit, dead-ending the user in an otherwise-blank
+      // tab with no CTA. Same UX class R121 F2 closed on
+      // /api/v1/auth/oauth/callback. Redirect to the auth screen
+      // with a slug so the SPA can render a friendly banner
+      // via .auth-note. Machine consumers of /acs are always
+      // browsers (SAML AuthnResponse posters — no API clients
+      // hit /acs) so JSON→redirect is a safe transition.
+      const errRedirect = (slug: string) =>
+        reply.redirect(
+          `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/login?err=${slug}`,
+        );
       const cfg = await db.samlConfig.findUnique({
         where: { id: req.params.configId },
       });
       if (!cfg || !cfg.isActive) {
-        return reply.code(404).send({ error: "config_not_found" });
+        return errRedirect("saml_config_not_found");
       }
       // R114 F1: same sha1-legacy gate — the IdP gets a specific
       // 410 slug it can surface to its admin instead of a bare
-      // 500 with no forensic signal.
+      // 500 with no forensic signal. R122 F2: redirect for
+      // browser-UX consistency; the log line still preserves
+      // the forensic signal.
       if (isSha1Legacy(cfg)) {
         req.log.warn(
           { orgId: cfg.orgId, configId: cfg.id },
           "saml_acs_rejected_sha1_legacy",
         );
-        return reply.code(410).send({ error: "saml_config_uses_sha1_reject" });
+        return errRedirect("saml_config_uses_sha1_reject");
       }
       const result = await consumeSamlResponse(cfg, req.body as never);
       if (!result.ok) {
@@ -228,7 +245,7 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
           { orgId: cfg.orgId, configId: cfg.id, error: result.error },
           "saml_acs_rejected",
         );
-        return reply.code(400).send({ error: result.error });
+        return errRedirect(`saml_assertion_${result.error}`);
       }
 
       // Resolve or JIT-provision the user.
@@ -241,7 +258,7 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
       let membership = user?.memberships.find((m) => m.orgId === cfg.orgId);
       if (!membership) {
         if (!cfg.jitEnabled) {
-          return reply.code(403).send({ error: "jit_disabled" });
+          return errRedirect("saml_jit_disabled");
         }
         // R76 HIGH #1: refuse JIT attach-across-orgs. Prior
         // shape allowed the SAML ACS to silently create a
@@ -267,7 +284,7 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
             },
             "saml_jit_refused_existing_user_in_other_org",
           );
-          return reply.code(403).send({ error: "user_exists_in_other_org" });
+          return errRedirect("saml_user_exists_in_other_org");
         }
         // Domain check: only allow provisioning within the configured
         // domains (defense against a misconfigured IdP asserting a
@@ -290,12 +307,10 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
             { orgId: cfg.orgId, configId: cfg.id },
             "saml_jit_refused_empty_domain_allowlist",
           );
-          return reply
-            .code(403)
-            .send({ error: "domain_allowlist_required_for_jit" });
+          return errRedirect("saml_domain_allowlist_required");
         }
         if (!domains.includes(domain)) {
-          return reply.code(403).send({ error: "domain_not_allowed" });
+          return errRedirect("saml_domain_not_allowed");
         }
 
         // Create the user + membership atomically.

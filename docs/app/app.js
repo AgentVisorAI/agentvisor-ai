@@ -945,6 +945,45 @@
     var noteHtml = "";
     if (errCode === "mfa_required_use_password_login") {
       noteHtml = '<div class="auth-note">This account has a passkey enrolled. Sign in with your password so we can complete the WebAuthn step — SSO alone can\'t satisfy MFA.</div>';
+    } else if (errCode.indexOf("oauth_") === 0) {
+      // R122 F2: OAuth callback error paths now redirect here
+      // instead of dead-ending in a raw-JSON tab. Slug map:
+      //   oauth_provider_not_found      — bad :provider param
+      //   oauth_provider_not_configured — env vars missing
+      //   oauth_provider_mismatch       — state cookie provider drift
+      //   oauth_missing_state_cookie    — cookie missing/tampered
+      //   oauth_malformed_state_cookie  — JSON parse failed
+      //   oauth_exchange_failed         — IdP code exchange rejected
+      //   oauth_no_email_in_id_token    — IdP omitted email claim
+      //   oauth_email_not_verified      — email_verified !== true
+      //   oauth_no_membership           — server-side invariant
+      var oauthMsg = errCode === "oauth_email_not_verified"
+        ? "Your identity provider did not confirm the email address. Verify it with the provider and try again."
+        : errCode === "oauth_no_email_in_id_token"
+          ? "Your identity provider did not return an email address. Ask an admin to configure the OpenID email scope."
+          : errCode === "oauth_exchange_failed"
+            ? "Sign-in with your identity provider failed. Try again."
+            : "Sign-in with your identity provider could not complete. Try again or use password sign-in.";
+      noteHtml = '<div class="auth-note">' + esc(oauthMsg) + '</div>';
+    } else if (errCode.indexOf("saml_") === 0) {
+      // R122 F2: SAML ACS error paths redirect here. Slug map:
+      //   saml_config_not_found          — config missing/inactive
+      //   saml_config_uses_sha1_reject   — R114 F1 legacy sha1 guard
+      //   saml_assertion_<err>           — consumeSamlResponse failure
+      //   saml_jit_disabled              — new email, JIT off
+      //   saml_user_exists_in_other_org  — R76 HIGH #1 cross-org guard
+      //   saml_domain_allowlist_required — R76 HIGH #1 empty allowlist
+      //   saml_domain_not_allowed        — email domain not on list
+      var samlMsg = errCode === "saml_domain_not_allowed" || errCode === "saml_domain_allowlist_required"
+        ? "Your identity provider asserted an email that isn't on this workspace's allowlist. Ask an admin to add your domain."
+        : errCode === "saml_jit_disabled"
+          ? "Your workspace does not auto-provision users. Ask an admin to add your account."
+          : errCode === "saml_user_exists_in_other_org"
+            ? "An account already exists for that email in another workspace. Contact support to consolidate."
+            : errCode === "saml_config_uses_sha1_reject"
+              ? "Your identity provider is signing with SHA-1 which we no longer accept. Ask your IdP admin to switch to SHA-256."
+              : "SAML sign-in could not complete. Ask an admin to check the IdP configuration.";
+      noteHtml = '<div class="auth-note">' + esc(samlMsg) + '</div>';
     } else if (joinedFlag) {
       noteHtml = '<div class="auth-note">You were added to the workspace. Sign in with your existing password to continue.</div>';
     }
