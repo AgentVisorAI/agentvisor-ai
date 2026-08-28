@@ -324,6 +324,20 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
           status: "retrying",
           nextRetryAt: new Date(),
           errorMessage: null,
+          // R100 F3 + R101 F1: reset the attempt counter. Prior
+          // R100 shape flipped status to 'retrying' but left
+          // attempt at its final value (up to MAX_ATTEMPT=6 for
+          // exhausted rows). The sweeper's deliverOne branch
+          // then invoked with attempt+1=7 and scheduleRetry saw
+          // 7 >= MAX_ATTEMPT → immediate re-fail with zero
+          // backoff cycles. Net: the 'Retry delivery' button
+          // gave the operator exactly one dead-end attempt with
+          // no automatic follow-up, defeating the primary use
+          // case (recovering from a transient failure that
+          // exhausted the budget while the destination was
+          // down). Reset to 0 so the sweeper drives a full
+          // fresh backoff ladder.
+          attempt: 0,
         },
       });
       writeAudit(

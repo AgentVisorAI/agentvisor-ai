@@ -24,21 +24,20 @@ concurrency:
 # `contents: write`, packages, or deployments — running with the default
 # broad token would violate GitHub's supply-chain hardening guidance
 # (SLSA build L2). Per-job overrides opt in to more only where needed.
+#
+# R101 F3: consolidated. Prior shape had two identical `permissions:`
+# mappings back-to-back — YAML forbids duplicate mapping keys and
+# GitHub Actions silently resolved to the last one. A future
+# tightening edit that touched only one block would silently land
+# the wrong policy. Combined with `persist-credentials: false` on
+# the checkout below, a malicious `build.rs` from any transitive
+# dependency cannot exfiltrate the token from disk.
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-
-# Least-privilege default token: this workflow only needs to read
-# the repo. Every other GitHub Action call runs against the
-# already-SHA-pinned actions above; nothing here writes back to
-# GitHub. Combined with `persist-credentials: false` on the
-# checkout below, a malicious `build.rs` from any transitive
-# dependency cannot exfiltrate the token from disk.
-permissions:
-  contents: read
 
 jobs:
   check:

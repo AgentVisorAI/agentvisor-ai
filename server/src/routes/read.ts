@@ -266,10 +266,31 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
     const lastEvent = eventsPage[eventsPage.length - 1];
     const nextEventCursor = hasMoreEvents && lastEvent ? lastEvent.seq : null;
 
+    // R101 F2: redact event.body and event.sub for member callers.
+    // The /me/export and /audit paths are correctly owner-only /
+    // non-member because Event.body (up to 8000 chars) is
+    // daemon-forwarded LLM prompt/response payloads and
+    // Event.sub (2000 chars) is the secondary line — sensitive
+    // data. But /read/sessions/:id gated only on orgId match,
+    // so a demoted-to-member insider (or any non-privileged
+    // teammate) could walk /read/sessions → /read/sessions/:id
+    // and scrape the same content /me/export refuses. Members
+    // still need session metadata to do their work (view
+    // session status, tool-call counts, block/allow deltas),
+    // so redact only the payload fields and keep the rest.
+    const isMember = claims.membershipRole === "member";
+    const displayedEvents = isMember
+      ? eventsPage.map((e) => ({
+          ...e,
+          body: "[redacted-member-view]",
+          sub: e.sub == null ? null : "[redacted-member-view]",
+        }))
+      : eventsPage;
+
     return reply.send({
       session: {
         ...session,
-        events: eventsPage,
+        events: displayedEvents,
         costUsdMicros: session.costUsdMicros.toString(),
         payoutUsdMicros: session.payoutUsdMicros.toString(),
         blockedPayoutUsdMicros: session.blockedPayoutUsdMicros.toString(),
