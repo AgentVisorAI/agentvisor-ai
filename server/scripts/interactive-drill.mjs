@@ -326,8 +326,15 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await page.waitForFunction(() => document.querySelectorAll(".evt").length === 700, { timeout: 15000 });
   const megaSel = await page.evaluate(() => document.querySelector(".evt.selected .seq")?.textContent);
   if (megaSel !== "#4") fail("event-page merge lost the selection: " + megaSel);
+  // Deep link to an event beyond page 1: renderSessionDetail must
+  // auto-load pages until the target arrives and select it (a shared
+  // link to event #600 landed silently unselected before this).
+  await page.goto(SITE + "#/sessions/sess_bd_mega?evt=600", { waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => document.querySelector(".evt.selected .seq")?.textContent === "#600", { timeout: 20000 });
+  const deepCount = await page.evaluate(() => document.querySelectorAll(".evt").length);
+  if (deepCount !== 700) fail("deep-link auto-paging stopped early: " + deepCount + " events");
   await page.evaluate(() => localStorage.removeItem("av_mock_bigdata"));
-  console.log("✅ pagination: sessions 50→100 + sort; events 500→700 with selection kept");
+  console.log("✅ pagination: sessions 50→100 + sort; events 500→700 with selection kept; ?evt=600 auto-pages");
 }
 
 // ── 11. Listener-leak soak ─────────────────────────────────────────
