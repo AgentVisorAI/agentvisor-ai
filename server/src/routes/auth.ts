@@ -506,12 +506,27 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     const SESSION_PAGE = 500;
     const EVENT_PAGE = 1000;
 
-    reply.header(
+    // R110 F2: set Content-Type and Content-Disposition directly
+    // on reply.raw before flushHeaders(). Prior R109 F1 shape
+    // called reply.header('Content-Disposition') and reply.type()
+    // which stash into Fastify's kReplyHeaders — those only
+    // reach the wire when reply.send() calls safeWriteHead().
+    // After reply.raw.end() runs, reply.sent becomes true, so
+    // the follow-up reply.send(reply) from wrap-thenable
+    // short-circuits with a warn log and writeHead never
+    // fires. Effect: only Cache-Control (set on raw directly)
+    // reached the client — no Content-Type / Content-Disposition,
+    // so browsers rendered NDJSON inline as plain text, the
+    // .jsonl filename hint was missing, and consumers that
+    // content-negotiate on application/x-ndjson (data-portability
+    // tooling, SOC-2 audit ingesters) rejected the download.
+    // Same class R110 F1 closed at /audit.csv; correct hijack
+    // pattern matches stream.ts.
+    reply.raw.setHeader("Content-Type", "application/x-ndjson");
+    reply.raw.setHeader(
       "Content-Disposition",
       `attachment; filename="agentvisor-export-${claims.orgId}-${Date.now()}.jsonl"`,
     );
-    reply.type("application/x-ndjson");
-    // Hijack Fastify's response pipeline so we can push line-by-line.
     reply.raw.setHeader("Cache-Control", "no-store");
     reply.raw.flushHeaders();
     // R109 F1: honor socket back-pressure. Prior write() discarded
