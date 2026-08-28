@@ -75,6 +75,28 @@ for (const { name, device } of profiles) {
   if (setScrollX > 8) fail(`${name} settings has horizontal scroll: ${setScrollX}px`);
   console.log("✅ settings: no horizontal scroll");
 
+  // Phone-width navigation: the sidebar is hidden ≤760px, so the
+  // bottom tab bar is the ONLY way to switch sections. It shipped
+  // missing once — phones could render pages but never leave them.
+  // (Tablets keep the sidebar, so this only applies under 760px.)
+  if (device.viewport.width <= 760) {
+    await page.goto(SITE + "#/overview", { waitUntil: "domcontentloaded" });
+    await page.waitForSelector(".tabbar", { timeout: 10000 });
+    const tb = await page.evaluate(() => ({
+      visible: getComputedStyle(document.querySelector(".tabbar")).display !== "none",
+      tabs: document.querySelectorAll(".tabbar a").length,
+    }));
+    if (!tb.visible || tb.tabs !== 5) fail(`${name}: tab bar missing/incomplete: ${JSON.stringify(tb)}`);
+    await page.click('.tabbar a[href="#/sessions"]');
+    await new Promise((r) => setTimeout(r, 700));
+    const nav = await page.evaluate(() => ({
+      hash: location.hash,
+      active: document.querySelector(".tabbar a.active")?.getAttribute("href"),
+    }));
+    if (nav.hash !== "#/sessions" || nav.active !== "#/sessions") fail(`${name}: tab navigation broken: ${JSON.stringify(nav)}`);
+    console.log("✅ bottom tab bar: 5 tabs, tap navigates, active state follows");
+  }
+
   if (jsErrors.length) fail(`${name} JS errors: ${jsErrors.join(" | ")}`);
   console.log("✅ zero JS errors on " + name);
 
