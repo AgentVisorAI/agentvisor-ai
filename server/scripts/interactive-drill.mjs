@@ -499,7 +499,41 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ failure paths: 5 routes show the error card + recover; background refresh keeps the stale dashboard");
 }
 
-// ── 14. Listener-leak soak ─────────────────────────────────────────
+// ── 14. Cross-tab sync ─────────────────────────────────────────────
+// Ops users keep multiple console tabs open. Sign-out already synced
+// via a storage event; sign-IN did not — a tab parked on the login
+// page after a cross-tab sign-out stayed stranded there forever. The
+// theme now follows explicit toggles too, so side-by-side windows
+// don't end up half dark, half light.
+{
+  await page.goto(SITE + "#/overview", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector(".stat", { timeout: 15000 });
+  const tabB = await context.newPage();
+  await tabB.goto(SITE + "#/sessions", { waitUntil: "domcontentloaded" });
+  await tabB.waitForSelector("tr[data-clickable], input#email", { timeout: 15000 });
+  // another-tab sign-out (what signOut() writes, minus the modal walk)
+  await tabB.evaluate(() => {
+    localStorage.setItem("av_mock_signed_out", "1");
+    localStorage.setItem("av_signed_out_at", String(Date.now()));
+  });
+  await page.waitForSelector("input#email", { timeout: 8000 }).catch(() => fail("tab did not react to a cross-tab sign-out"));
+  // another-tab sign-IN lets the stranded login tab back in
+  await tabB.evaluate(async () => {
+    await window.dataSource.login({ email: "demo@agentvisor.ai", password: "drill-pass-1" });
+    localStorage.setItem("av_signed_in_at", String(Date.now()));
+  });
+  await page.waitForSelector(".stat", { timeout: 8000 }).catch(() => fail("login tab stayed stranded after a cross-tab sign-in"));
+  // explicit theme toggle in one tab follows in the other
+  await tabB.evaluate(() => localStorage.setItem("av_theme", "dark"));
+  await page.waitForFunction(() => document.documentElement.getAttribute("data-theme") === "dark", { timeout: 5000 })
+    .catch(() => fail("theme toggle did not sync across tabs"));
+  await tabB.evaluate(() => localStorage.setItem("av_theme", "light"));
+  await page.waitForFunction(() => document.documentElement.getAttribute("data-theme") === "light", { timeout: 5000 });
+  await tabB.close();
+  console.log("✅ cross-tab sync: sign-out bounces, sign-in un-strands the login tab, theme follows");
+}
+
+// ── 15. Listener-leak soak ─────────────────────────────────────────
 // Every earlier check opened modals, ran the tour, refreshed the
 // overview, and re-rendered lists dozens of times. If any of that
 // leaked document/window listeners (the webhook modal once leaked a
@@ -525,4 +559,4 @@ if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors))
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 15 interactive-features drill checks passed.");
+console.log("\nAll 16 interactive-features drill checks passed.");
