@@ -97,22 +97,25 @@ const Env = z.object({
       return process.env.NODE_ENV === "production";
     }),
   DATABASE_URL: z.string().min(1),
-  // R96 F1 + R97 F-C: number of proxy hops in front of the
-  // API. Cloudflare + LB stacks use 2; Fly.io / Cloud Run /
-  // Heroku bare are 1; local dev is 0. R95 hardcoded a
+  // R96 F1 + R97 F-C + R98 F4: number of proxy hops in front
+  // of the API. Cloudflare + LB stacks use 2; Fly.io / Cloud
+  // Run / Heroku bare are 1; local dev is 0. R95 hardcoded a
   // single-hop function which silently regressed 2+ hop
-  // deploys (real users bucketed into Cloudflare edge IPs).
+  // deploys.
   //
-  // Fail-fast on typos: prior R96 shape silently clamped any
-  // non-numeric or out-of-range value to 1, so a typo like
-  // TRUSTED_PROXY_HOP_COUNT=9 (or 'three') on a 3-hop deploy
-  // silently reinstated the exact R95 regression. Now: refine
-  // rejects the config with a clear error at boot rather than
-  // quietly running with a wrong hop count.
+  // R98 F4 hardens the parse: parseInt(v, 10) partial-parses
+  // digit-prefixed strings — `parseInt("2 hops", 10) === 2`,
+  // `parseInt("2.9", 10) === 2`, `parseInt("3abc", 10) === 3`
+  // — all passed the R97 F-C refine and booted at a value
+  // the operator never wrote. Ops dropping a comment into the
+  // .env like TRUSTED_PROXY_HOP_COUNT="2 (CF+LB)" would load
+  // as 2 with no signal. Number(v) is strict full-string
+  // parse: Number("3abc") is NaN, Number("2.9") is 2.9;
+  // Number.isInteger refine then rejects both.
   TRUSTED_PROXY_HOP_COUNT: z
     .string()
     .default("1")
-    .transform((v) => parseInt(v, 10))
+    .transform((v) => Number(v.trim()))
     .refine(
       (n) => Number.isInteger(n) && n >= 0 && n <= 8,
       "TRUSTED_PROXY_HOP_COUNT must be an integer 0..8",
