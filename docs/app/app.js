@@ -937,6 +937,10 @@
    * ============================================================ */
 
   async function renderOverview(main, quiet) {
+    // Range lives in the URL (#/overview?range=7d) like the sessions
+    // filters, so a specific dashboard window is shareable.
+    var rm = (location.hash.split("?")[1] || "").match(/(?:^|&)range=(1h|24h|7d|30d)/);
+    if (rm) state.range = rm[1];
     var rangeLabel = { "1h": "the last hour", "24h": "the last 24 hours", "7d": "the last 7 days", "30d": "the last 30 days" }[state.range] || "the last 24 hours";
     if (!quiet) main.innerHTML = pageHeader("Overview", "Fleet activity for " + rangeLabel + ".", rangeGroup()) + loadingBlock("stats");
     var stats, sessions;
@@ -1124,6 +1128,7 @@
     $$('.range-group button', root).forEach(function (b) {
       b.addEventListener("click", function () {
         state.range = b.getAttribute("data-range");
+        try { history.replaceState(null, "", "#/overview" + (state.range === "24h" ? "" : "?range=" + state.range)); } catch (e) {}
         render();
       });
     });
@@ -3599,6 +3604,7 @@
       if (typeof state.ds.simulateAttack === "function") actions.push({ g: "Actions", label: "Simulate an agent attack", desc: "Stage a live blocked payment", run: function () { navigate("#/overview"); setTimeout(runAttackDemo, 250); } });
     }
     actions.push({ g: "Actions", label: "New policy", desc: "Create a spend cap, vendor allowlist, or PII guard", run: function () { navigate("#/policies"); setTimeout(openCreatePolicyModal, 250); } });
+    actions.push({ g: "Actions", label: "Keyboard shortcuts", desc: "Everything the keyboard can do", kbd: "?", run: function () { setTimeout(openShortcutSheet, 250); } });
     if (rolePreview) actions.push({ g: "Actions", label: "Exit member preview", desc: "Back to your own role", run: exitRolePreview });
     else if (state.session && state.session.org && state.session.org.role !== "member")
       actions.push({ g: "Actions", label: "Preview as member", desc: "See the console the way a member does", run: enterRolePreview });
@@ -3791,10 +3797,24 @@
   }
 
   function openShortcutSheet() {
+    // Same stacking rule as every other modal: don't pile a second
+    // sheet (or a sheet over the palette) — pressing ? twice used to
+    // stack two copies with no way to close the bottom one.
+    if (document.body.classList.contains("locked")) return;
     var groups = [
       { title: "Navigate", items: [
         ["G O", "Overview"], ["G S", "Sessions"], ["G P", "Policies"],
         ["G D", "Deployments"], ["G ,", "Settings"],
+      ]},
+      { title: "Lists & tables", items: [
+        ["↑ ↓", "Move between rows"], ["Enter", "Open the focused row"],
+      ]},
+      { title: "Event stream", items: [
+        ["↑ ↓", "Move between events"], ["Home / End", "Jump to first / last"],
+        ["Enter / Space", "Inspect the event (updates the shareable URL)"],
+      ]},
+      { title: "Guided tour", items: [
+        ["→ / Enter", "Next step"], ["←", "Previous step"], ["Esc", "Exit the tour"],
       ]},
       { title: "Actions", items: [
         ["⌘ K", "Open command palette"], ["Esc", "Close dialogs"], ["?", "Show this sheet"],
@@ -3812,8 +3832,8 @@
       "</div>";
     }).join("");
     var backdrop = h(
-      '<div class="modal-backdrop"><div class="modal">' +
-        "<h2>Keyboard shortcuts</h2>" +
+      '<div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="shortcutsTitle"><div class="modal">' +
+        '<h2 id="shortcutsTitle">Keyboard shortcuts</h2>' +
         '<p class="sub">Move around without a mouse.</p>' +
         html +
         '<div class="actions"><button type="button" class="btn primary" data-close>Done</button></div>' +
@@ -3821,12 +3841,17 @@
     );
     document.body.appendChild(backdrop);
     document.body.classList.add("locked");
-    function close() { backdrop.remove(); document.body.classList.remove("locked"); document.removeEventListener("keydown", onKey); }
+    var previouslyFocused = document.activeElement;
+    function close() {
+      backdrop.remove(); document.body.classList.remove("locked"); document.removeEventListener("keydown", onKey);
+      if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {}
+    }
     function onKey(ev) { if (ev.key === "Escape") close(); }
     document.addEventListener("keydown", onKey);
     backdrop.addEventListener("click", function (e) {
       if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
     });
+    setTimeout(function () { var d = backdrop.querySelector("[data-close]"); if (d) d.focus(); }, 20);
   }
 
   /* ============================================================
