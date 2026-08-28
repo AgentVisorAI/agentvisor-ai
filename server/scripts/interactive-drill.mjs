@@ -107,7 +107,20 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
     drawer: /BLOCKED/i.test(document.querySelector("#eventDrawer").textContent),
   }));
   if (!ok.selected || !ok.drawer) fail("Jump to the block did not select the BLOCKED event: " + JSON.stringify(ok));
-  console.log("✅ story banner: jump-to-block selects the event and fills the drawer");
+  // Event deep links: selecting mirrors into the hash, and a fresh
+  // load of that URL restores the selection + drawer + copy-link.
+  const deepHash = await page.evaluate(() => location.hash);
+  if (!/^#\/sessions\/sess_01H9K\?evt=\d+$/.test(deepHash)) fail("selection not mirrored into hash: " + deepHash);
+  await page.reload();
+  await page.waitForSelector(".evt.selected", { timeout: 10000 });
+  const restored = await page.evaluate(() => ({
+    hash: location.hash,
+    err: !!document.querySelector(".evt.err.selected"),
+    copyLink: (document.querySelector("#eventDrawer .evt-link-btn") || {}).getAttribute?.("data-copy") || "",
+  }));
+  if (restored.hash !== deepHash || !restored.err) fail("deep link did not restore selection: " + JSON.stringify(restored));
+  if (!restored.copyLink.includes(deepHash)) fail("drawer copy-link wrong: " + restored.copyLink);
+  console.log("✅ story banner: jump-to-block selects the event, deep link survives reload");
 }
 
 // ── 4. Onboarding checklist + signup identity ─────────────────────
