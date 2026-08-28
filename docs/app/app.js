@@ -1592,8 +1592,8 @@
         ? '<span class="pill err">' + s.toolsBlocked + " blocked</span>"
         : '<span class="pill ok">clean</span>';
       return '<tr data-clickable data-id="' + esc(s.id) + '" data-nav="#/sessions/" tabindex="0">' +
-        '<td><div style="font-weight:500">' + esc(s.agent) + '</div><div class="id">' + esc(s.externalId) + "</div></td>" +
-        '<td><div class="actor"><span class="av">' + esc(initials(s.user)) + '</span>' + esc(s.user || "—") + '</div></td>' +
+        '<td title="' + esc(s.agent + " · " + s.externalId) + '"><div style="font-weight:500">' + esc(s.agent) + '</div><div class="id">' + esc(s.externalId) + "</div></td>" +
+        '<td title="' + esc(s.user || "") + '"><div class="actor"><span class="av">' + esc(initials(s.user)) + '</span>' + esc(s.user || "—") + '</div></td>' +
         '<td class="num tabular">' + s.events + "</td>" +
         '<td class="num tabular">' + s.toolsAllowed + "</td>" +
         "<td>" + blocks + "</td>" +
@@ -2639,7 +2639,7 @@
       var switchCls = p.enabled ? "on" : "";
       return '<tr data-clickable data-id="' + esc(p.id) + '" data-nav="#/policies/" tabindex="0">' +
         '<td class="policy-row"><div class="name">' + esc(p.name) + '</div><div class="kind">' + esc(p.kind) + " · " + esc(p.scope) + "</div></td>" +
-        "<td>" + esc(p.description) + "</td>" +
+        '<td title="' + esc(p.description) + '">' + esc(p.description) + "</td>" +
         '<td class="num tabular">' + esc(p.hits24h) + "</td>" +
         '<td class="num tabular">' + (p.blocks24h > 0 ? '<span style="color: var(--danger-solid); font-weight:500">' + esc(p.blocks24h) + "</span>" : esc(p.blocks24h)) + "</td>" +
         '<td style="color:var(--fg-2)">' + timeAgoCell(p.updatedAt) + "</td>" +
@@ -3693,7 +3693,7 @@
     var rows = endpoints.map(function (e) {
       return '<tr data-id="' + esc(e.id) + '">' +
         '<td><div style="font-weight:500">' + esc(e.name) + '</div><div class="id">' + esc(e.id) + '</div></td>' +
-        '<td class="mono" style="font-size:11.5px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(e.url) + '</td>' +
+        '<td class="mono" style="font-size:11.5px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(e.url) + '">' + esc(e.url) + '</td>' +
         '<td style="font-size:12px">' + (e.events || []).map(function (ev) { return '<span class="pill neutral" style="margin-right:4px">' + esc(ev) + '</span>'; }).join("") + '</td>' +
         '<td>' + (e.isActive ? '<span class="pill ok status-dot">active</span>' : '<span class="pill neutral">paused</span>') + '</td>' +
         '<td>' +
