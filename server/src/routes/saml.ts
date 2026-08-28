@@ -463,6 +463,20 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
   app.get("/", async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
+    // R108 F1: gate on non-member matching the CRUD siblings
+    // (POST, PATCH, DELETE, /:configId/keypair all already
+    // reject membershipRole === 'member'). Module docblock:
+    // 'Owner/admin CRUD (session-cookie protected)'. The list
+    // response includes IdP ssoUrl/sloUrl/entityIdIdp,
+    // x509CertFingerprint, jitEnabled/jitDefaultRole,
+    // allowedDomains, wantAssertionsSigned, spCertPem,
+    // signatureAlgorithm — recon material for targeting or
+    // for correlating a cert fingerprint to a known
+    // compromised IdP tenant. Same class R89 F3 closed for
+    // webhooks list.
+    if (claims.membershipRole === "member") {
+      return reply.code(403).send({ error: "forbidden" });
+    }
     const configs = await db.samlConfig.findMany({
       where: { orgId: claims.orgId },
       orderBy: { createdAt: "asc" },

@@ -48,17 +48,24 @@ impl TokenVelocity {
         let mut samples = self.samples.lock();
         samples.push_back((now_ms, tokens));
         let cutoff = now_ms.saturating_sub(self.window_ms);
-        while samples.front().is_some_and(|(t, _)| *t < cutoff) {
-            samples.pop_front();
-        }
-        // `Iterator::sum` on `u64` panics in debug and
-        // silently wraps in release on overflow. Every other counter
-        // and spend site in av_state uses `checked_add` or
-        // `saturating_add` — velocity was the last inconsistent
-        // site. Realistically requires ~2^64 windowed tokens, but
-        // the discipline gap means a future refactor that turns
-        // `window_ms` into a `Duration::MAX` sentinel could reach
-        // it. Cheap to fix.
+        // R108 F4: filter across the WHOLE deque (retain), not just
+        // the front. Prior shape assumed monotonically-increasing
+        // `now_ms` and only evicted via `while front < cutoff`.
+        // Under NTP slew / VM live-migration a caller can produce
+        // a strictly-earlier now_ms than a previously recorded
+        // sample, leaving that older sample stranded mid-deque —
+        // subsequent evictions stop as soon as they hit a
+        // "future" front, so the stranded sample keeps
+        // contributing to the windowed sum long after its own
+        // timestamp fell out of the window. Realistically only
+        // visible under clock skew, but the crate is `pub` and
+        // the module header explicitly frames the sliding-window
+        // arithmetic as "reusable ground for the future breaker-
+        // integrated window when someone builds it" — future
+        // wire-up would inherit the bug. `retain` is O(n) but the
+        // deque is small by construction (few samples per window)
+        // and this is not on any hot path today.
+        samples.retain(|(t, _)| *t >= cutoff);
         samples.iter().fold(0u64, |acc, (_, n)| acc.saturating_add(*n))
     }
 
