@@ -969,6 +969,23 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await page.keyboard.press("Enter");
   await page.waitForFunction(() => document.querySelectorAll(".redacted-pill").length > 0, { timeout: 10000 })
     .catch(() => fail("member preview did not redact LLM bodies"));
+  // While previewing member: admin-only tabs redirect on deep link,
+  // and the member-visible SSO tab is VIEW-only (Add/Edit/Delete and
+  // the details modal's keypair-regen hit admin routes that would 403).
+  await page.evaluate(() => { location.hash = "#/settings/webhooks"; });
+  await page.waitForTimeout(800);
+  if ((await page.evaluate(() => location.hash)) !== "#/settings/general") fail("member deep link to webhooks tab was not redirected");
+  await page.evaluate(() => { location.hash = "#/settings/sso"; });
+  await page.waitForSelector("#setPanel table", { timeout: 10000 });
+  const ssoBtns = await page.evaluate(() => [...document.querySelectorAll("#setPanel .table-wrap button, #addSamlBtn")].map((x) => x.textContent.trim()));
+  if (ssoBtns.some((t) => /Add IdP|Edit|Delete/.test(t))) fail("member SSO view still shows mutating controls: " + ssoBtns.join(","));
+  await page.click('#setPanel [data-act="details"]');
+  await page.waitForSelector(".modal-backdrop", { timeout: 5000 });
+  if (await page.$('.modal-backdrop [data-act="regen"]')) fail("member details modal still offers keypair regeneration");
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(300);
+  await page.evaluate(() => { location.hash = "#/sessions/sess_01H9K"; });
+  await page.waitForSelector("#eventList .evt", { timeout: 10000 });
   await page.click(".cmdk-trigger");
   await page.waitForSelector(".cmdk-backdrop input", { timeout: 5000 });
   await page.fill(".cmdk-backdrop input", "exit member preview");
@@ -990,7 +1007,7 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
     return { ok: view.includes(p.name) && view.includes(String(blocks)) && rows === Math.min(fired.length, 8), fired: fired.length, blocks, rows };
   });
   if (!pd.ok || !pd.fired) fail("policy detail derivation wrong: " + JSON.stringify(pd));
-  console.log("✅ reset flow (issue/reject/confirm/single-use); member preview redacts + restores; policy blocks derived from " + pd.fired + " fired sessions");
+  console.log("✅ reset flow (issue/reject/confirm/single-use); member preview redacts + is view-only (tabs, SSO, keypair); policy blocks derived from " + pd.fired + " fired sessions");
 }
 
 // ── 22. Listener-leak soak ─────────────────────────────────────────
