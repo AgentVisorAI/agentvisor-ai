@@ -304,6 +304,15 @@
     toastStack().appendChild(t);
     setTimeout(function () { t.remove(); }, 2600);
   }
+  // Toast with an inline action — the Undo pattern for low-stakes
+  // destructive operations (cheaper than a confirm dialog, safer than
+  // nothing). Longer-lived than a plain toast so there's time to react.
+  function toastAction(msg, label, fn) {
+    var t = h('<div class="toast">' + esc(msg) + ' <button type="button" class="toast-undo">' + esc(label) + "</button></div>");
+    t.querySelector(".toast-undo").addEventListener("click", function () { t.remove(); fn(); });
+    toastStack().appendChild(t);
+    setTimeout(function () { t.remove(); }, 6500);
+  }
   // Toast with a trailing action link; stays up longer so the link is
   // actually clickable. Used by the simulated-attack story.
   function toastLink(msg, href, label) {
@@ -2689,9 +2698,19 @@
       if (!btn) return;
       var tr = e.target.closest("tr[data-invite]");
       var invId = tr.getAttribute("data-invite");
+      var inv = invites.filter(function (x) { return x.id === invId; })[0];
       state.ds.revokeInvite(invId).then(function () {
-        toast("Invite revoked");
         renderSettingsMembers(root);
+        // Undo instead of a confirm dialog: revoking an invite is
+        // low-stakes (nothing is lost but the email link), so don't
+        // interrupt — offer the way back for 6 seconds.
+        if (inv) toastAction("Invite to " + inv.email + " revoked", "Undo", function () {
+          state.ds.inviteMember({ email: inv.email, role: inv.role }).then(function () {
+            toast("Invite restored");
+            renderSettingsMembers(root);
+          }).catch(function (err) { toast(err.message || "Could not restore the invite", true); });
+        });
+        else toast("Invite revoked");
       }).catch(function (err) { toast(err.message || "Revoke failed", true); });
     });
   }
@@ -2997,9 +3016,29 @@
       if (e.target === backdrop || e.target.hasAttribute("data-close")) return close();
       var act = e.target.closest("[data-act]");
       if (act && act.getAttribute("data-act") === "regen") {
+        // Rotating the SP keypair invalidates the cert the IdP has on
+        // file — SSO breaks until the IdP side is updated. confirmModal
+        // can't stack on this modal (body is locked), so use an inline
+        // arm-then-confirm: first click arms, second fires, 5s revert.
+        if (act.getAttribute("data-armed") !== "1") {
+          act.setAttribute("data-armed", "1");
+          act.classList.add("danger");
+          act.textContent = "Click again to confirm — SSO breaks until the IdP is updated";
+          setTimeout(function () {
+            if (!act.isConnected || act.disabled) return;
+            act.removeAttribute("data-armed");
+            act.classList.remove("danger");
+            act.textContent = "Regenerate SP keypair";
+          }, 5000);
+          return;
+        }
         act.disabled = true;
         state.ds.regenerateSamlSpKeypair(cfg.id).then(function (r) {
           toast("SP keypair regenerated");
+          // Close this modal BEFORE showing the cert: showTokenModal
+          // no-ops while body is locked, so the new SP cert was
+          // silently never displayed (pre-existing bug).
+          close();
           showTokenModal(r.spCertPem, "New SP certificate");
         }).catch(function (err) { toast(err.message || "Regenerate failed", true); act.disabled = false; });
       }
