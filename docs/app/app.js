@@ -260,7 +260,9 @@
 
   function h(html) { var t = document.createElement("template"); t.innerHTML = html.trim(); return t.content.firstChild; }
   function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
-  function initials(name) { return String(name || "?").trim().slice(0, 1).toUpperCase(); }
+  // Array.from splits by code point, not UTF-16 unit — .slice(0,1) on
+  // an emoji-leading name ("🚀 Rocket Corp") rendered a broken "�".
+  function initials(name) { return (Array.from(String(name || "?").trim())[0] || "?").toUpperCase(); }
   function timeUntil(iso) {
     if (!iso) return "—";
     var s = (new Date(iso).getTime() - Date.now()) / 1000;
@@ -572,7 +574,7 @@
         "</header>" +
         '<nav class="sidebar" aria-label="Primary navigation">' +
           '<div class="org-switcher">' +
-            '<span class="avatar">' + esc(org.name.slice(0, 1).toUpperCase()) + "</span>" +
+            '<span class="avatar">' + esc(initials(org.name)) + "</span>" +
             "<span>" + esc(org.name) + "</span>" +
             '<span class="env">Production</span>' +
           "</div>" +
