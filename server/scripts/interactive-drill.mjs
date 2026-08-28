@@ -260,8 +260,34 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ table action buttons: all inside their cells and hittable (5 routes)");
 }
 
+// ── 9. Corrupted-storage resilience ───────────────────────────────
+// A persisted fresh identity that parses as JSON but has the wrong
+// shape (or a NaN/future fresh t0) used to brick the app on boot with
+// a TypeError in renderShell. The datasource must shape-check and
+// self-heal instead.
+{
+  for (const kv of [
+    { av_mock_fresh_identity: "42", av_mock_fresh_t0: String(Date.now()) },
+    { av_mock_fresh_identity: '{"user":{"email":"x@y.z"}}', av_mock_fresh_t0: String(Date.now()) },
+    { av_mock_fresh_t0: "not-a-number" },
+  ]) {
+    await page.evaluate((k) => { localStorage.clear(); for (const [a, b2] of Object.entries(k)) localStorage.setItem(a, b2); }, kv);
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(1500);
+    const st = await page.evaluate(() => ({
+      shell: !!document.querySelector(".app-shell, .auth"),
+      len: (document.getElementById("view")?.innerText || "").trim().length,
+    }));
+    if (!st.shell || st.len < 30) fail("corrupted storage bricked the app: " + JSON.stringify(kv) + " → " + JSON.stringify(st));
+  }
+  await page.evaluate(() => localStorage.clear());
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(1200);
+  console.log("✅ corrupted-storage fuzz: bad identity shapes + NaN t0 all self-heal");
+}
+
 if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors));
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 9 interactive-features drill checks passed.");
+console.log("\nAll 10 interactive-features drill checks passed.");
