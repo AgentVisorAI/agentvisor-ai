@@ -1949,12 +1949,20 @@ a.ob-step:hover { border-color: var(--accent); }
 @media (prefers-reduced-motion: reduce) { #accountMenu { animation: none; } }
 
 /* Bottom tab bar — phone-width primary navigation (hidden on desktop,
- * where the sidebar handles it). Fixed, safe-area aware. */
+ * where the sidebar handles it). Fixed, safe-area aware.
+ *
+ * Stacking scale (bottom → top): topbar 20 · tabbar 90 ·
+ * modal-backdrop 100 · cmdk-backdrop 200 · shortcut hint 300 ·
+ * account menu 500 · tour launcher 900 (hidden while body.locked) ·
+ * tour overlay 950 · toasts 1000 (pointer-events none).
+ * The tab bar sits BELOW every overlay: it used to be z 400, above
+ * open modals — a mid-form tab tap navigated and destroyed the modal
+ * with no confirmation. */
 .tabbar {
   display: none;
   position: fixed;
   left: 0; right: 0; bottom: 0;
-  z-index: 400;
+  z-index: 90;
   background: var(--surface);
   border-top: 1px solid var(--border);
   padding-bottom: env(safe-area-inset-bottom, 0);
