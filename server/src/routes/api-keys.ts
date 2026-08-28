@@ -31,6 +31,20 @@ export async function apiKeyRoutes(app: FastifyInstance): Promise<void> {
   app.get("/", async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
+    // R90 F2: API keys are more sensitive than webhook URLs
+    // (R89 F3): they are the org's non-user auth material.
+    // Prior shape gated only POST / and DELETE /:id on
+    // membershipRole !== 'member'; GET / would return, to a
+    // plain member: every key's name, role (including
+    // owner/admin), tokenHint (8-char plaintext prefix —
+    // enough to match a leaked key in a public gist against
+    // the org's inventory), createdByEmail, lastUsedAt. Recon
+    // for social-engineering ("please rotate the prod-CI key
+    // you own") and for correlating leaks to specific
+    // creators. Same RBAC posture as the CRUD path.
+    if (claims.membershipRole === "member") {
+      return reply.code(403).send({ error: "forbidden" });
+    }
     const rows = await db.apiKey.findMany({
       where: { orgId: claims.orgId, revokedAt: null },
       orderBy: { createdAt: "desc" },
