@@ -831,9 +831,22 @@ mod tests {
                     || script.contains(&format!("EXPIRE', key, {ttl}")),
                 "{name} must EXPIRE with BUDGET_COUNTER_TTL_SECS: {script}"
             );
+            // R111 F1: the R69 review-L3 guard was `!script.contains('{')`
+            // — designed to catch unexpanded `{BUDGET_COUNTER_TTL_SECS}`
+            // format placeholders left over from the format!() template.
+            // But TRY_SPEND_LUA legitimately contains literal `{`
+            // characters: the raw-string template writes `{{-1, i}}`
+            // and `{{min_remaining, 0}}` for Lua-return-table syntax
+            // (double-braces escape in format!()), producing literal
+            // `{...}` in the compiled script. The blanket contains-'{'
+            // scan panicked on every run — the guard has been silently
+            // broken since it landed. Fix: check for the ONLY
+            // placeholder name we actually use (BUDGET_COUNTER_TTL_SECS)
+            // — any surviving occurrence of the identifier means the
+            // format!() expansion didn't happen.
             assert!(
-                !script.contains('{'),
-                "{name} has an unexpanded format placeholder"
+                !script.contains("BUDGET_COUNTER_TTL_SECS"),
+                "{name} has an unexpanded BUDGET_COUNTER_TTL_SECS placeholder"
             );
         }
     }
