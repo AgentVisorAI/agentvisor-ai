@@ -1020,7 +1020,7 @@
               '<div class="field"><label for="email">Work email</label><input id="email" type="email" required autocomplete="email" placeholder="you@company.com" /></div>' +
               '<div class="field"><label for="password">Password' + (isSignup ? " (min 12 characters)" : "") + '</label><input id="password" type="password" required ' + (isSignup ? 'minlength="12" autocomplete="new-password"' : 'autocomplete="current-password"') + ' /></div>' +
               (isSignup ? "" : '<div style="margin-top: -4px; text-align: right;"><a href="#/reset" style="font-size: 12px; color: var(--fg-3);">Forgot password?</a></div>') +
-              '<div id="authErr"></div>' +
+              '<div id="authErr" role="alert"></div>' +
               '<button class="primary" type="submit">' + (isSignup ? "Create account" : "Sign in") + '</button>' +
             "</form>" +
             '<div class="auth-alt">' +
@@ -1190,7 +1190,7 @@
             '<form id="acceptForm">' +
               '<div class="field"><label for="displayName">Your name</label><input id="displayName" type="text" placeholder="First Last" autocomplete="name" /></div>' +
               '<div class="field"><label for="password">Password (min 12)</label><input id="password" type="password" required minlength="12" autocomplete="new-password" /></div>' +
-              '<div id="acceptErr"></div>' +
+              '<div id="acceptErr" role="alert"></div>' +
               '<button class="primary" type="submit">Accept invite</button>' +
             '</form>' +
             '<div class="auth-alt">Already have an account? <a href="#/login">Sign in</a> first, then click the invite link again.</div>' +
@@ -1258,7 +1258,7 @@
                 '<p class="sub">We\'ll email you a link to pick a new one.</p>' +
                 '<form id="resetReqForm">' +
                   '<div class="field"><label for="email">Work email</label><input id="email" type="email" required autocomplete="email" placeholder="you@company.com" value="' + esc(prefillEmail) + '"/></div>' +
-                  '<div id="resetErr"></div>' +
+                  '<div id="resetErr" role="alert"></div>' +
                   '<button class="primary" type="submit">Send reset link</button>' +
                 "</form>"
               : '<h1>Choose a new password</h1>' +
@@ -1267,7 +1267,7 @@
                   '<div class="field"><label for="email">Work email</label><input id="email" type="email" required autocomplete="email" value="' + esc(prefillEmail) + '"/></div>' +
                   '<input type="hidden" id="token" value="' + esc(prefillToken) + '"/>' +
                   '<div class="field"><label for="newPassword">New password</label><input id="newPassword" type="password" minlength="12" required autocomplete="new-password" /></div>' +
-                  '<div id="resetErr"></div>' +
+                  '<div id="resetErr" role="alert"></div>' +
                   '<button class="primary" type="submit">Save new password</button>' +
                 "</form>"
             ) +
@@ -2042,7 +2042,7 @@
       storyBanner(s, events) +
       '<div class="detail-grid">' +
         '<div class="events-card card">' +
-          '<div class="events-head"><h2>Event stream</h2><span class="count" id="evtCount">' + events.length + " event" + (events.length === 1 ? "" : "s") +
+          '<div class="events-head"><h2>Event stream</h2><span class="count" id="evtCount" role="status" aria-live="polite">' + events.length + " event" + (events.length === 1 ? "" : "s") +
             (data.nextEventCursor != null ? " (more available)" : "") + "</span>" +
             '<div class="evt-filters">' + evtChips +
               '<input id="evtSearch" type="search" placeholder="Filter events…" aria-label="Filter events by text" />' +
@@ -4429,7 +4429,7 @@
       '<div class="card" style="padding:0">' +
         '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:8px; flex-wrap:wrap">' +
           '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">Audit log</h2>' +
-          '<span style="color:var(--fg-3); font-size:var(--t-sec)" id="auditCount">' + audit.length + " events</span>" +
+          '<span style="color:var(--fg-3); font-size:var(--t-sec)" id="auditCount" role="status" aria-live="polite">' + audit.length + " events</span>" +
           '<div class="evt-filters" style="margin-left:auto">' + chips +
             '<input id="auditSearch" type="search" placeholder="Filter by actor, event, target…" aria-label="Filter audit entries" style="width:180px" />' +
           "</div>" +
