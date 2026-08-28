@@ -228,6 +228,46 @@
 
   /* ---------- main render ---------- */
 
+  // SPA navigation a11y: hash routing means the browser never
+  // announces page changes, every history entry shares one static
+  // <title>, and focus stays on whatever (now-removed) node had it.
+  // On each real route change (not quiet refreshes, which bypass
+  // render()): update document.title, announce the page politely,
+  // and move focus to the content region.
+  var _lastRouteKey = null;
+  function routeTitle(path) {
+    var names = {
+      overview: "Overview", sessions: "Sessions", policies: "Policies",
+      deployments: "Deployments", settings: "Settings", login: "Sign in",
+      signup: "Create account", reset: "Reset password", "accept-invite": "Accept invite",
+    };
+    var base = names[path[0]] || "Console";
+    if (path[0] === "sessions" && path[1]) base = "Session " + path[1];
+    else if (path[0] === "policies" && path[1]) base = "Policy · " + path[1].replace(/^pol_/, "");
+    else if (path[0] === "deployments" && path[1]) base = "Deployment · " + path[1];
+    else if (path[0] === "settings" && path[1]) base = "Settings · " + path[1].charAt(0).toUpperCase() + path[1].slice(1);
+    return base;
+  }
+  function announceRoute(path) {
+    var key = path.join("/") || "overview";
+    var title = routeTitle(path);
+    document.title = title + " · AgentVisor AI";
+    if (key === _lastRouteKey) return; // re-render of the same route
+    var first = _lastRouteKey === null;
+    _lastRouteKey = key;
+    if (first) return; // initial load announces itself natively
+    var live = document.getElementById("routeAnnouncer");
+    if (!live) {
+      live = h('<div id="routeAnnouncer" class="sr-only" aria-live="polite"></div>');
+      document.body.appendChild(live);
+    }
+    live.textContent = title;
+    // Focus the content region so keyboard/SR users start at the new
+    // page instead of a removed node. #view carries tabindex="-1".
+    var main = document.getElementById("view");
+    if (main) { main.setAttribute("tabindex", "-1"); try { main.focus({ preventScroll: true }); } catch (e) { main.focus(); } }
+  }
+
   async function render() {
     state.route = parseHash();
     var path = state.route.path;
@@ -244,6 +284,7 @@
     }
     if (state.session && publicRoutes.includes(path[0])) return navigate("#/overview");
     if (!state.session) {
+      announceRoute(path);
       if (path[0] === "signup") return renderSignup();
       if (path[0] === "reset") return renderReset();
       if (path[0] === "accept-invite") return renderAcceptInvite();
@@ -251,6 +292,7 @@
     }
 
     renderShell();
+    announceRoute(path);
     var main = $("#view");
     if (path[0] === "overview" || !path[0]) return renderOverview(main);
     if (path[0] === "sessions" && path[1]) return renderSessionDetail(main, path[1]);

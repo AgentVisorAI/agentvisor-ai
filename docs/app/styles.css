@@ -1962,3 +1962,7 @@ a.ob-step:hover { border-color: var(--accent); }
 .sess-nav .btn[disabled] { opacity: 0.4; cursor: default; }
 .sess-nav-pos { color: var(--fg-3); font-size: var(--t-sec); min-width: 44px; text-align: center; font-variant-numeric: tabular-nums; }
 @media print { .sess-nav { display: none !important; } }
+
+/* Programmatic focus target for route changes — no ring on the whole
+ * content column (focus is managed deliberately; SR still announces). */
+.main:focus { outline: none; box-shadow: none; }
