@@ -294,7 +294,28 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await page.evaluate(() => localStorage.clear());
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.waitForTimeout(1200);
-  console.log("✅ corrupted-storage fuzz: bad identity shapes + NaN t0 all self-heal");
+  // Quota-exhaustion fuzz (Safari private mode): every Storage write
+  // throws. Walk the write-heavy paths — any unwrapped setItem call
+  // surfaces as an uncaught error in the final zero-errors check.
+  const qPage = await context.newPage();
+  const qErrs = [];
+  qPage.on("pageerror", (e) => qErrs.push(e.message.slice(0, 120)));
+  await qPage.addInitScript(() => {
+    Object.getPrototypeOf(localStorage).setItem = function () { throw new DOMException("QuotaExceededError", "QuotaExceededError"); };
+  });
+  await qPage.goto(SITE + "#/overview", { waitUntil: "domcontentloaded" });
+  await qPage.waitForFunction(() => document.querySelector(".stat")?.textContent.trim().length > 0, { timeout: 15000 });
+  for (const r of ["#/sessions?q=x", "#/sessions/sess_01H9K?evt=8", "#/policies"]) {
+    await qPage.evaluate((h) => { location.hash = h; }, r);
+    await qPage.waitForTimeout(700);
+  }
+  await qPage.click(".user-btn");
+  await qPage.waitForTimeout(200);
+  await qPage.click('#accountMenu [data-act="theme"]');
+  await qPage.waitForTimeout(400);
+  await qPage.close();
+  if (qErrs.length) fail("storage-quota fuzz: unguarded setItem crashed: " + qErrs.join("; "));
+  console.log("✅ corrupted-storage fuzz: bad identity shapes + NaN t0 self-heal; quota-exhausted writes all guarded");
 }
 
 // ── 10. Pagination under the big-data mode ─────────────────────────
@@ -1204,7 +1225,28 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   if ((await page.evaluate(() => location.hash.split("?")[0].split("/")[2])) !== blockedIds[0]) fail("[ pager did not return");
   const pos = await page.evaluate(() => document.querySelector(".sess-nav-pos")?.textContent);
   if (pos !== "1 / " + blockedIds.length) fail("pager position label wrong: " + pos);
-  console.log("✅ audit trail records live mutations; webhook toggle round-trips; menu items act; [ ] pager honors filters (" + blockedIds.length + " blocked)");
+  // Webhook deliveries view: row click opens the per-endpoint history,
+  // rows equal listWebhookDeliveries ground truth, the retry case
+  // carries its error note, latency is computed.
+  await page.goto(SITE + "#/settings/webhooks", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("#whAdd", { timeout: 15000 });
+  await page.click("tbody tr[data-id] td:nth-child(2)");
+  await page.waitForSelector("#whdBody table", { timeout: 8000 });
+  const del = await page.evaluate(async () => {
+    const gt = await window.dataSource.listWebhookDeliveries(document.querySelector("tbody tr[data-id]").getAttribute("data-id"));
+    const rows = [...document.querySelectorAll("#whdBody tbody tr")];
+    return {
+      ok: rows.length === gt.length &&
+        rows.filter((r) => r.textContent.includes("delivered")).length === gt.filter((d) => d.status === "delivered").length &&
+        rows.some((r) => /server_error/.test(r.textContent)) &&
+        rows.every((r) => /ms| s/.test(r.cells[4].textContent)),
+      n: rows.length,
+    };
+  });
+  if (!del.ok || !del.n) fail("webhook deliveries view vs ground truth: " + JSON.stringify(del));
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(300);
+  console.log("✅ audit trail records live mutations; webhook toggle round-trips; deliveries view matches ground truth; menu items act; [ ] pager honors filters (" + blockedIds.length + " blocked)");
 }
 
 // ── 25. Listener-leak soak ─────────────────────────────────────────
