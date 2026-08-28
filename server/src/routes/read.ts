@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { db } from "../db.js";
+import { env } from "../env.js";
 import { requireSession } from "../lib/session-middleware.js";
 import { MEMBER_REDACTED } from "../lib/redaction.js";
 
@@ -497,15 +498,29 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
     async (req, reply) => {
       const claims = requireSession(req, reply);
       if (!claims) return;
+      // R124 F2: /audit.csv is invoked via a synthesized
+      // <a href>.click() in docs/app/datasource.js
+      // downloadAuditCsv (no target attribute) — the browser
+      // treats it as a top-level navigation because there's no
+      // Content-Disposition on error responses, so a raw JSON
+      // 403 body renders inline in an otherwise-blank tab.
+      // Same UX class R121 F2 / R122 F2 / R123 F1 closed for
+      // OAuth / SAML nav endpoints. Redirect to the audit
+      // settings page with an err slug so the SPA banner
+      // surfaces friendly copy.
+      const errRedirect = (slug: string) =>
+        reply.redirect(
+          `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/settings/audit?err=${slug}`,
+        );
       // R91 F2: same posture as /audit — the CSV export is
       // strictly more portable (attackers exfil once, keep
       // forever) so gate member access.
       if (claims.membershipRole === "member") {
-        return reply.code(403).send({ error: "forbidden" });
+        return errRedirect("audit_forbidden_member");
       }
       const before = req.query.before ? new Date(req.query.before) : new Date();
       if (isNaN(before.getTime())) {
-        return reply.code(400).send({ error: "invalid_before" });
+        return errRedirect("audit_invalid_before");
       }
       const rows = await db.auditEntry.findMany({
         where: { orgId: claims.orgId, at: { lt: before } },
