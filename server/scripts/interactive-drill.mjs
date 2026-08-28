@@ -337,7 +337,58 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ pagination: sessions 50→100 + sort; events 500→700 with selection kept; ?evt=600 auto-pages");
 }
 
-// ── 11. Listener-leak soak ─────────────────────────────────────────
+// ── 11. Browser Back vs overlays + copy feedback ───────────────────
+// Browser Back while the command palette was open used to strand its
+// full-screen backdrop, which then ate every click on the new page
+// (the hashchange sweep only knew about .modal-backdrop). Same walk
+// for a modal, and copy buttons must always give toast feedback —
+// including when navigator.clipboard is missing entirely (the
+// documented offline fallback serves over plain http on a LAN).
+{
+  await page.goto(SITE + "#/policies", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("#addPol", { timeout: 15000 });
+  // modal → Back
+  await page.click("#addPol");
+  await page.waitForSelector(".modal-backdrop", { timeout: 5000 });
+  await page.goBack();
+  await page.waitForTimeout(500);
+  let o = await page.evaluate(() => ({ m: document.querySelectorAll(".modal-backdrop").length, locked: document.body.classList.contains("locked") }));
+  if (o.m || o.locked) fail("browser Back left a modal backdrop/lock: " + JSON.stringify(o));
+  await page.keyboard.press("Escape"); // leaked-listener canary (caught the webhook modal once)
+  // palette → Back
+  await page.goto(SITE + "#/policies", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector(".cmdk-trigger", { timeout: 15000 });
+  await page.click(".cmdk-trigger");
+  await page.waitForSelector(".cmdk-backdrop", { timeout: 5000 });
+  await page.goBack();
+  await page.waitForTimeout(500);
+  o = await page.evaluate(() => ({ p: document.querySelectorAll(".cmdk-backdrop").length, locked: document.body.classList.contains("locked") }));
+  if (o.p || o.locked) fail("browser Back left the palette backdrop up: " + JSON.stringify(o));
+  // ...and the palette must still open afterwards (cmdkOpen_ reset)
+  await page.click(".cmdk-trigger");
+  await page.waitForSelector(".cmdk-backdrop", { timeout: 5000 });
+  await page.waitForTimeout(300);
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(300);
+  if (await page.$(".cmdk-backdrop")) fail("palette did not close via Escape after a Back-close cycle");
+  // copy feedback with NO clipboard API at all (execCommand fallback)
+  const noClip = await context.newPage();
+  await noClip.addInitScript(() => Object.defineProperty(navigator, "clipboard", { value: undefined }));
+  await noClip.goto(SITE + "#/sessions/sess_01H9K?evt=8", { waitUntil: "domcontentloaded" });
+  await noClip.waitForSelector(".evt.selected", { timeout: 15000 });
+  await noClip.click("#eventDrawer .evt-link-btn");
+  await noClip.waitForFunction(() => !!document.querySelector(".toast"), { timeout: 5000 });
+  const toastTxt = await noClip.evaluate(() => document.querySelector(".toast").textContent);
+  const clipErrs = [];
+  noClip.on("pageerror", (e) => clipErrs.push(e.message));
+  await noClip.click("#copyRcpt");
+  await noClip.waitForTimeout(400);
+  await noClip.close();
+  if (clipErrs.length) fail("copy without clipboard API threw: " + clipErrs.join("; "));
+  console.log("✅ browser Back sweeps modal + palette overlays; copy gives feedback without clipboard API (" + toastTxt.trim().slice(0, 30) + ")");
+}
+
+// ── 12. Listener-leak soak ─────────────────────────────────────────
 // Every earlier check opened modals, ran the tour, refreshed the
 // overview, and re-rendered lists dozens of times. If any of that
 // leaked document/window listeners (the webhook modal once leaked a
@@ -363,4 +414,4 @@ if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors))
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 12 interactive-features drill checks passed.");
+console.log("\nAll 13 interactive-features drill checks passed.");
