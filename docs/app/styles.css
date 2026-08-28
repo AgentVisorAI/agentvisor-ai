@@ -866,6 +866,19 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   margin-bottom: var(--s-3);
   flex-wrap: wrap;
 }
+/* Applied-filter pill for filters that arrive via cross-links (no
+   widget in the bar), e.g. policy — dismissible. */
+.filter-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 10px; border-radius: 999px;
+  background: var(--accent-bg); border: 1px solid var(--accent-border);
+  font-size: var(--t-sec); color: var(--fg);
+}
+.filter-pill button {
+  background: none; border: 0; cursor: pointer; padding: 0 2px;
+  color: var(--fg-2); font-size: 12px; line-height: 1;
+}
+.filter-pill button:hover { color: var(--fg); }
 .filter-bar .search {
   position: relative; flex: 1; min-width: 220px;
 }
