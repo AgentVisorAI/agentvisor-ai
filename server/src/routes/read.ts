@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { db } from "../db.js";
 import { requireSession } from "../lib/session-middleware.js";
+import { MEMBER_REDACTED } from "../lib/redaction.js";
 
 // Opaque cursor encoding for session pagination. Base64(JSON) of the
 // last row's (openedAt, id) so pagination is stable even as new
@@ -297,8 +298,8 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
     const displayedEvents = isMember
       ? eventsPage.map((e) => ({
           ...e,
-          body: "[redacted-member-view]",
-          sub: e.sub == null ? null : "[redacted-member-view]",
+          body: MEMBER_REDACTED,
+          sub: e.sub == null ? null : MEMBER_REDACTED,
         }))
       : eventsPage;
 
@@ -331,8 +332,8 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
           session.receipt && isMember
             ? {
                 ...session.receipt,
-                body: "[redacted-member-view]",
-                sigB64: "[redacted-member-view]",
+                body: MEMBER_REDACTED,
+                sigB64: MEMBER_REDACTED,
               }
             : session.receipt,
       },
@@ -381,8 +382,8 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
     const isMember = claims.membershipRole === "member";
     const safe = {
       ...receipt,
-      body: isMember ? "[redacted-member-view]" : receipt.body,
-      sigB64: isMember ? "[redacted-member-view]" : receipt.sigB64,
+      body: isMember ? MEMBER_REDACTED : receipt.body,
+      sigB64: isMember ? MEMBER_REDACTED : receipt.sigB64,
       session: receipt.session
         ? {
             ...receipt.session,
