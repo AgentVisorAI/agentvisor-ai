@@ -126,6 +126,12 @@ jobs:
           SITE: https://agentvisorai.me/app/
         run: node scripts/interactive-drill.mjs
 
+      - name: Full investor-flow rehearsal (landing → tour → verify → attack → receipt → signup → reset)
+        working-directory: server
+        env:
+          SITE: https://agentvisorai.me/
+        run: node scripts/full-flow-rehearsal.mjs
+
       - name: Cross-engine feature matrix (nightly — Chromium/WebKit/Firefox)
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         working-directory: server
