@@ -285,7 +285,17 @@ async function main(): Promise<void> {
     // require a session cookie + valid configId.
     if (
       typeof req.url === "string" &&
-      /^\/api\/v1\/auth\/saml\/[^/]+\/acs(\?|$)/.test(req.url)
+      // R114 F2: tail group includes '/' so a trailing-slash
+      // variant '/api/v1/auth/saml/<cfg>/acs/' also matches.
+      // Currently safe because Fastify's default ignoreTrailingSlash
+      // is false — the ACS route wouldn't match the trailing-slash
+      // URL and Fastify replies 404 before the CSRF gate even runs
+      // — but a future refactor enabling ignoreTrailingSlash (or a
+      // proxy that appends '/') would silently 403 legitimate
+      // IdP-posted assertions with 'forbidden_origin' since IdP
+      // Origin isn't in ALLOWED_ORIGINS. Cheap defense-in-depth.
+      // Matches the sibling ingest anchor at index.ts:270.
+      /^\/api\/v1\/auth\/saml\/[^/]+\/acs(\/|\?|$)/.test(req.url)
     ) {
       return;
     }
