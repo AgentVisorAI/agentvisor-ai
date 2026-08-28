@@ -1804,3 +1804,46 @@ a.ob-step:hover { border-color: var(--accent); }
   flex: none;
 }
 .copy-btn:hover { color: var(--fg); border-color: var(--border-strong); }
+
+/* ============================================================
+ * PRINT — the session page doubles as an evidence pack.
+ * "Hand it to an auditor" should survive a printer: light palette
+ * regardless of theme, chrome and controls gone, receipt + event
+ * trail intact with their status colors.
+ * ============================================================ */
+@media print {
+  :root, [data-theme="dark"], [data-theme="light"] {
+    color-scheme: light;
+    --canvas: #ffffff; --surface: #ffffff; --surface-2: #fafafa; --surface-hover: #f4f4f5;
+    --border: #d4d4d8; --border-strong: #a1a1aa;
+    --fg: #0f0f13; --fg-2: #3f3f46; --fg-3: #52525b; --fg-4: #71717a;
+    --accent: #0a5c8b; --accent-2: #0d78b3; --accent-hover: #084264; --accent-fg: #ffffff;
+    --accent-bg: rgba(10,92,139,0.09); --accent-border: rgba(10,92,139,0.25);
+    --success: #166534; --success-bg: #f0fdf4; --success-border: #bbf7d0; --success-solid: #16a34a;
+    --warning: #92400e; --warning-bg: #fffbeb; --warning-border: #fde68a;
+    --danger: #991b1b; --danger-solid: #dc2626; --danger-bg: #fef2f2; --danger-border: #fecaca;
+    --shadow-focus: none; --shadow-lg: none;
+  }
+  * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  html, body { background: #fff; }
+  /* Chrome + every interactive control off the page. */
+  .topbar, .sidebar, .preview-banner, #toastStack, #avTour, #avTourLauncher,
+  .filter-bar, .evt-filters, .page-header .actions, button, .modal-backdrop,
+  .onboard-card, .range-group { display: none !important; }
+  .app-shell { display: block; min-height: 0; }
+  .main { padding: 0; max-width: none; }
+  /* Stack the detail grid; keep blocks whole across page breaks. */
+  .detail-grid { display: block; }
+  .detail-grid > div { margin-top: 12px; }
+  .card, .receipt-card, .event-drawer, .evt, .session-summary, .story-banner { break-inside: avoid; box-shadow: none; }
+  a { color: inherit; text-decoration: none; }
+  /* Payloads should not truncate in evidence. */
+  .evt .body { white-space: normal; overflow: visible; text-overflow: clip; }
+  .event-drawer .payload { max-height: none; overflow: visible; }
+  .policy-preview, .policy-body { max-height: none; overflow: visible; }
+  /* Printed-only provenance footer (rendered by the session page). */
+  .print-only { display: block !important; }
+  /* An empty inspector ("Click an event to inspect") is noise on paper. */
+  .event-drawer:has(.empty-mini) { display: none !important; }
+}
+.print-only { display: none; }
