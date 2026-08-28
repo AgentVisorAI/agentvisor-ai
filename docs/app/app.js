@@ -250,6 +250,9 @@
     if (path[0] === "policies" && path[1]) return renderPolicyDetail(main, path[1]);
     if (path[0] === "policies") return renderPolicies(main);
     if (path[0] === "settings") return renderSettings(main, path[1] || "general");
+    // Alias: billing is a settings tab, but "/billing" is what people
+    // type. Redirect keeps the canonical URL in the address bar.
+    if (path[0] === "billing") return navigate("#/settings/billing");
     main.innerHTML = notFound();
   }
 
