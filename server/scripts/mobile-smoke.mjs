@@ -165,6 +165,17 @@ for (const { name, device } of profiles) {
         return { fits: r.right <= innerWidth + 1 && r.left >= -1, hOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth, bad };
       });
       if (!m.fits || m.hOverflow > 0 || m.bad.length) fail(mname + " modal unusable at " + device.viewport.width + "px: " + JSON.stringify(m));
+      // Stacking: the tab bar must sit BELOW the open modal's backdrop
+      // (it used to float above it — a mid-form tab tap navigated and
+      // destroyed the modal without confirmation).
+      const tabUnder = await page.evaluate(() => {
+        const tb = document.querySelector(".tabbar");
+        if (!tb || getComputedStyle(tb).display === "none") return true;
+        const tr = tb.getBoundingClientRect();
+        const el = document.elementFromPoint(tr.left + 40, tr.top + tr.height / 2);
+        return !!el && !!el.closest(".modal-backdrop");
+      });
+      if (!tabUnder) fail(mname + ": tab bar floats above the open modal");
       await page.keyboard.press("Escape");
       await page.waitForTimeout(300);
     }
