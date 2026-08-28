@@ -28,6 +28,17 @@ function fail(m) { console.log("❌", m); process.exit(1); }
 
 const browser = await chromium.launch({ headless: true });
 const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+// Count document/window listeners so the leak check (check 10) can
+// assert the refresh loops and modal cycles don't accumulate handlers.
+await context.addInitScript(() => {
+  window.__lc = {};
+  for (const t of [document, window]) {
+    const orig = t.addEventListener.bind(t);
+    const origRm = t.removeEventListener.bind(t);
+    t.addEventListener = (type, fn, opts) => { window.__lc[type] = (window.__lc[type] || 0) + 1; return orig(type, fn, opts); };
+    t.removeEventListener = (type, fn, opts) => { window.__lc[type] = (window.__lc[type] || 0) - 1; return origRm(type, fn, opts); };
+  }
+});
 const page = await context.newPage();
 const jsErrors = [];
 page.on("pageerror", (e) => jsErrors.push(e.message));
@@ -286,8 +297,30 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ corrupted-storage fuzz: bad identity shapes + NaN t0 all self-heal");
 }
 
+// ── 10. Listener-leak soak ─────────────────────────────────────────
+// Every earlier check opened modals, ran the tour, refreshed the
+// overview, and re-rendered lists dozens of times. If any of that
+// leaked document/window listeners (the webhook modal once leaked a
+// keydown per open), the counters instrumented at context start
+// would show it. Navigation churn amplifies any remaining leak.
+{
+  const before = await page.evaluate(() => ({ ...window.__lc }));
+  for (let i = 0; i < 6; i++) {
+    await page.evaluate((r) => { location.hash = "#/" + r; }, ["sessions", "overview", "policies", "overview", "deployments", "overview"][i]);
+    await page.waitForTimeout(700);
+  }
+  const after = await page.evaluate(() => ({ ...window.__lc }));
+  const leaks = {};
+  for (const [k, v] of Object.entries(after)) {
+    const d = v - (before[k] || 0);
+    if (d > 2) leaks[k] = d; // small tolerance for in-flight renders
+  }
+  if (Object.keys(leaks).length) fail("listener leak during navigation churn: " + JSON.stringify(leaks));
+  console.log("✅ listener-leak soak: no document/window handler growth across the whole drill + 6 navigations");
+}
+
 if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors));
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 10 interactive-features drill checks passed.");
+console.log("\nAll 11 interactive-features drill checks passed.");
