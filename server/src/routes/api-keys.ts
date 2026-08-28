@@ -21,7 +21,7 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { db } from "../db.js";
-import { canGrantRole, hashPassword, randomToken } from "../lib/auth.js";
+import { canGrantRole, hashPassword, randomToken, type SessionClaims } from "../lib/auth.js";
 import { writeAudit } from "../lib/audit.js";
 import { requireSession } from "../lib/session-middleware.js";
 
@@ -177,6 +177,21 @@ export async function apiKeyRoutes(app: FastifyInstance): Promise<void> {
       where: { id: req.params.id, orgId: claims.orgId, revokedAt: null },
     });
     if (!existing) return reply.code(404).send({ error: "not_found" });
+    // R118 F1: rung parity with POST / (R83 F1). The create path
+    // blocks admin from MINTING an owner-scoped key; the delete
+    // path must symmetrically block admin from REVOKING one.
+    // Otherwise an admin can DoS the owner's CI/automation
+    // credentials (breaking their prod-CI pipeline) and force
+    // an owner reissue — same tier-boundary breach as R84 F1 on
+    // members and R103 F1 on session-revoked-at bumps.
+    if (
+      !canGrantRole(
+        claims.membershipRole,
+        existing.role as SessionClaims["membershipRole"],
+      )
+    ) {
+      return reply.code(403).send({ error: "cannot_revoke_role_above_own" });
+    }
     await db.apiKey.update({
       where: { id: existing.id },
       data: { revokedAt: new Date() },

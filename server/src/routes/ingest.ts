@@ -603,9 +603,29 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
         );
         return reply.code(409).send({ error: "receipt_already_sealed" });
       }
-      // Byte-exact idempotent re-post. Fall through to the
-      // session.update below (which is also idempotent) and
-      // succeed — no receipt row rewrite needed.
+      // R118 F2: byte-exact idempotent re-post. Return the
+      // idempotent 200 WITHOUT touching session.stopReason /
+      // stopReasonId — those aren't part of the byte-equality
+      // check above (which only compares receiptId, body,
+      // sigB64, keyIdHint, eventCount, issuedAt per R93 F4), so
+      // an ingest-token holder could otherwise re-POST the
+      // byte-identical receipt payload with a mutated top-level
+      // stopReason to flip an already-sealed session's stop
+      // reason indefinitely (e.g., relabel a legitimate
+      // 'normal' completion as 'policy_block'). The signed
+      // receipt.body is unchanged so the crypto verifier still
+      // passes, but session.stopReason is what the SPA session
+      // drawer + /me/export display — post-seal audit-trail
+      // defacement, same class as R93 F4 at a sibling scope.
+      // First-write-wins matches the receipt-row posture.
+      bus.publish({
+        type: "receipt.finalized",
+        orgId: daemon.orgId,
+        deploymentId: daemon.deploymentId,
+        sessionId: session.id,
+        receiptId: r.receiptId,
+      });
+      return reply.send({ ok: true });
     } else {
       await db.receipt.create({
         data: {
