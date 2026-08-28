@@ -442,6 +442,52 @@
 
   var MOCK_SESSIONS = generateMockSessions();
 
+  // Big-data demo: 250 extra synthetic sessions spread across the
+  // last 30 days, toggled by av_mock_bigdata. Exists to exercise the
+  // code paths the 32-session fixture can never reach — Load more
+  // pagination, sort across pages, the DOM cap — and to answer the
+  // investor question "what does this look like at scale?".
+  var BIGDATA_CACHE = null;
+  function bigDataOn() {
+    try { return localStorage.getItem("av_mock_bigdata") === "1"; } catch (e) { return false; }
+  }
+  function bigDataSessions() {
+    if (BIGDATA_CACHE) return BIGDATA_CACHE;
+    var rng = mulberry32(1337);
+    var out = [];
+    for (var i = 0; i < 250; i++) {
+      var agent = AGENTS[Math.floor(rng() * AGENTS.length)];
+      var dep = MOCK_DEPLOYMENTS[Math.floor(rng() * 3)];
+      var mins = 24 * 60 + Math.floor(rng() * 29 * 24 * 60); // 1d..30d ago
+      var events = 8 + Math.floor(rng() * 40);
+      var allowed = Math.floor(events * 0.35 + rng() * 3);
+      var blocked = rng() < 0.12 ? 1 + Math.floor(rng() * 2) : 0;
+      var cost = Math.floor(20000 + rng() * 260000);
+      out.push({
+        id: "sess_bd" + (1000 + i),
+        externalId: ("sess_" + rngHex(rng, 10)).toUpperCase(),
+        deploymentId: dep.id,
+        deploymentName: dep.name,
+        agent: agent.name,
+        user: agent.user,
+        model: agent.model,
+        status: "completed",
+        startedAt: isoMinsAgo(mins),
+        endedAt: isoMinsAgo(Math.max(0, mins - 4)),
+        events: events,
+        toolsAllowed: allowed,
+        toolsBlocked: blocked,
+        costUsdMicros: String(cost),
+        payoutUsdMicros: String(cost),
+        blockedPayoutUsdMicros: String(blocked > 0 ? Math.floor((800 + rng() * 6000) * 1e6) : 0),
+        receiptHash: "sha256:" + rngHex(rng, 12) + "…",
+        policiesFired: blocked > 0 ? ["pol_procurement_allowed_vendors"] : [],
+      });
+    }
+    BIGDATA_CACHE = out;
+    return out;
+  }
+
   /* ============================================================
    * TIMESERIES for charts
    * ============================================================ */
@@ -1099,6 +1145,12 @@
       params = params || {};
       var fresh = freshSessions();
       var results = fresh !== null ? fresh : MOCK_SESSIONS.slice();
+      if (fresh === null && bigDataOn()) {
+        results = results.concat(bigDataSessions());
+        // keep the newest-first invariant the console's default sort
+        // and cursor pagination both assume
+        results.sort(function (a, b2) { return new Date(b2.startedAt) - new Date(a.startedAt); });
+      }
       if (params.deploymentId) results = results.filter(function (s) { return s.deploymentId === params.deploymentId; });
       if (params.agent) results = results.filter(function (s) { return s.agent === params.agent; });
       if (params.blockedOnly) results = results.filter(function (s) { return s.toolsBlocked > 0; });
@@ -1129,7 +1181,8 @@
     },
     async getSessionById(id) {
       await delay(180);
-      var s = MOCK_SESSIONS.find(function (x) { return x.id === id; });
+      var s = MOCK_SESSIONS.find(function (x) { return x.id === id; }) ||
+        (bigDataOn() ? bigDataSessions().find(function (x) { return x.id === id; }) : null);
       if (!s) throw new Error("not_found");
       var events = s._events || (id === "sess_01H9K" ? MOCK_EVENTS_FEATURED : synthesizeEvents(s));
       return { session: s, events: events };
@@ -1231,7 +1284,8 @@
       await ensureMockKey();
       // Build the canonical body, then actually sign it with the mock key
       // so the console's client-side Ed25519 verifier passes on real crypto.
-      var s = MOCK_SESSIONS.find(function (x) { return x.id === sessionId; });
+      var s = MOCK_SESSIONS.find(function (x) { return x.id === sessionId; }) ||
+        (bigDataOn() ? bigDataSessions().find(function (x) { return x.id === sessionId; }) : null);
       if (!s) throw new Error("not_found");
       var isFeatured = sessionId === "sess_01H9K";
       var body = {
