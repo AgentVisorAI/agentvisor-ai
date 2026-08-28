@@ -222,7 +222,24 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       // ever joined' is the stable landing pad; the console
       // will need an org-switcher UI to move between them,
       // but at least the login pin is deterministic.
-      include: { memberships: { include: { org: true }, orderBy: { createdAt: "asc" } } },
+      //
+      // R109 F2: also pull the passkey count in the SAME query
+      // so both the wrong-password branch and the correct-
+      // password+MFA branch pay identical DB cost. Prior
+      // shape ran an ADDITIONAL webauthnCredential.count only
+      // on the correct-password branch — that extra ~5-30 ms
+      // Postgres RTT re-opened the wall-clock 'did I guess
+      // the password?' oracle R85 F3 closed on the wire-shape
+      // dimension. Now the count is present regardless of
+      // hit/miss (for a missing user Prisma's findUnique
+      // returns null so the _count is moot — but the join
+      // cost is paid on the DB either way and the wrong-
+      // password branch has to enter the same code path
+      // below).
+      include: {
+        memberships: { include: { org: true }, orderBy: { createdAt: "asc" } },
+        _count: { select: { webauthnCredentials: true } },
+      },
     });
     // Uniform response time by always running argon2 verify, even when
     // the user doesn't exist. The dummy is a real precomputed argon2id
@@ -297,9 +314,16 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     // mint the session cookie here. Instead we return { mfaRequired:
     // true } and the SPA runs the WebAuthn ceremony to complete auth.
     // Password alone is not sufficient once a passkey exists.
-    const credentialCount = await db.webauthnCredential.count({
-      where: { userId: user.id },
-    });
+    //
+    // R109 F2: credentialCount comes from the SAME findUnique above
+    // via Prisma's _count-select, so no additional round trip fires
+    // on the correct-password + MFA branch. That equalizes the
+    // wall-clock time between wrong-password (returns from
+    // mfaGateResponse above) and correct-password + MFA (returns
+    // here) — both paths spend the same argon2 + Prisma budget
+    // and can't be timed apart. R85 F3's wire-shape unification
+    // now has matching wall-clock unification.
+    const credentialCount = user._count.webauthnCredentials;
     if (credentialCount > 0) {
       writeAudit(
         {
@@ -490,8 +514,40 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     // Hijack Fastify's response pipeline so we can push line-by-line.
     reply.raw.setHeader("Cache-Control", "no-store");
     reply.raw.flushHeaders();
-    const write = (obj: unknown) => {
-      reply.raw.write(JSON.stringify(obj) + "\n");
+    // R109 F1: honor socket back-pressure. Prior write() discarded
+    // the reply.raw.write(...) return value; when the socket
+    // write buffer exceeds highWaterMark (16 KiB default),
+    // Node's writable stream returns false but keeps queueing
+    // bytes. A slow / throttled client (or a hostile
+    // owner-tier session; perIp(3,60_000) is the only gate)
+    // therefore causes RSS to grow linearly with tenant size —
+    // OOMs a small pod. Mirror the stream.ts R83 F3 pattern:
+    // on write()=false, await 'drain' before the next write.
+    // Also honor client close so we stop mid-loop instead of
+    // buffering the rest of the org into memory.
+    let clientClosed = false;
+    reply.raw.on("close", () => {
+      clientClosed = true;
+    });
+    const write = async (obj: unknown): Promise<void> => {
+      if (clientClosed) return;
+      const ok = reply.raw.write(JSON.stringify(obj) + "\n");
+      if (!ok) {
+        await new Promise<void>((resolve) => {
+          const onDrain = () => {
+            reply.raw.off("drain", onDrain);
+            reply.raw.off("close", onClose);
+            resolve();
+          };
+          const onClose = () => {
+            reply.raw.off("drain", onDrain);
+            reply.raw.off("close", onClose);
+            resolve();
+          };
+          reply.raw.once("drain", onDrain);
+          reply.raw.once("close", onClose);
+        });
+      }
     };
 
     try {
@@ -516,7 +572,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
           },
         },
       });
-      write({
+      await write({
         type: "header",
         exportedAt: new Date().toISOString(),
         schemaVersion: 2,
@@ -530,6 +586,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       // sanity cap on iterations — 1M sessions / SESSION_PAGE = 2000
       // pages, and even 10M would be 20k pages, well below this.
       for (let iter = 0; iter < 200_000; iter++) {
+        if (clientClosed) break;
         // Typed as any-ish: Prisma infers the generic from the where,
         // and TS complains about self-referential inference in the
         // control-flow analysis. The runtime type is
@@ -555,7 +612,8 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         });
         if (sessions.length === 0) break;
         for (const s of sessions) {
-          write({
+          if (clientClosed) break;
+          await write({
             type: "session",
             session: {
               ...s,
@@ -567,6 +625,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
           // Events for this session in EVENT_PAGE-sized pages.
           let lastEventSeq: number | null = null;
           for (let ei = 0; ei < 20_000; ei++) {
+            if (clientClosed) break;
             const events: Array<{ seq: number; [k: string]: unknown }> = await db.event.findMany({
               where: {
                 sessionId: s.id,
@@ -579,7 +638,8 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
             const nextLast = events[events.length - 1];
             if (!nextLast) break;
             for (const ev of events) {
-              write({ type: "event", sessionId: s.id, event: ev });
+              if (clientClosed) break;
+              await write({ type: "event", sessionId: s.id, event: ev });
             }
             lastEventSeq = nextLast.seq;
             if (events.length < EVENT_PAGE) break;
@@ -589,18 +649,18 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         if (!last || sessions.length < SESSION_PAGE) break;
         lastKey = { openedAt: last.openedAt, id: last.id };
       }
-      write({ type: "trailer", exportCompleteAt: new Date().toISOString() });
+      await write({ type: "trailer", exportCompleteAt: new Date().toISOString() });
     } catch (err) {
       // Write a trailer so consumers can distinguish a truncated
       // download from a completed one. Then close.
       req.log.error({ err, orgId: claims.orgId }, "export_stream_failed");
-      write({
+      await write({
         type: "error",
         message: err instanceof Error ? err.message : "export_failed",
         exportFailedAt: new Date().toISOString(),
       });
     } finally {
-      reply.raw.end();
+      try { reply.raw.end(); } catch { /* already ended */ }
     }
     return reply;
   });

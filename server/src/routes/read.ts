@@ -491,13 +491,51 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
         }
         // RFC 4180: any field containing " , or newline must be quoted;
         // embedded quotes are doubled.
-        if (/[",\n\r]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+        if (/[",\n\r]/.test(s)) return '"' + s.replace(/[\"]/g, '""') + '"';
         return s;
       };
-      let out = "at,event,actor,target,ip,note,metadata\n";
+      // R109 F3: actually stream row-by-row, honoring
+      // socket back-pressure. The prior code's docblock
+      // claimed 'stream row-by-row rather than accumulate a
+      // big string' but built `let out = ""` and `out += ...`
+      // for every row, then called reply.send(out). On a busy
+      // tenant (~10 000 rows × ~2 KB each) that materialized
+      // ~20 MB in a single heap string per concurrent caller
+      // — the exact spike the comment claimed to avoid. Now:
+      // hijack reply.raw, flush headers, write() the header
+      // + one row at a time, and await 'drain' when the
+      // socket buffer fills.
+      reply.raw.setHeader("Cache-Control", "no-store");
+      reply.raw.flushHeaders();
+      let clientClosed = false;
+      reply.raw.on("close", () => {
+        clientClosed = true;
+      });
+      const writeChunk = async (chunk: string): Promise<void> => {
+        if (clientClosed) return;
+        const ok = reply.raw.write(chunk);
+        if (!ok) {
+          await new Promise<void>((resolve) => {
+            const onDrain = () => {
+              reply.raw.off("drain", onDrain);
+              reply.raw.off("close", onClose);
+              resolve();
+            };
+            const onClose = () => {
+              reply.raw.off("drain", onDrain);
+              reply.raw.off("close", onClose);
+              resolve();
+            };
+            reply.raw.once("drain", onDrain);
+            reply.raw.once("close", onClose);
+          });
+        }
+      };
+      await writeChunk("at,event,actor,target,ip,note,metadata\n");
       for (const r of rows) {
+        if (clientClosed) break;
         const actor = r.actorEmail || (r.actorId ? "user:" + r.actorId : "system");
-        out += [
+        const row = [
           r.at.toISOString(),
           escape(r.event),
           escape(actor),
@@ -505,10 +543,11 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
           escape(r.ip),
           escape(r.note),
           escape(r.metadata),
-        ].join(",");
-        out += "\n";
+        ].join(",") + "\n";
+        await writeChunk(row);
       }
-      return reply.send(out);
+      try { reply.raw.end(); } catch { /* already ended */ }
+      return reply;
     },
   );
 }
