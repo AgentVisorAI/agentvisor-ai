@@ -150,6 +150,37 @@
       toast("Signed out in another tab");
       navigate("#/login");
     });
+    // Cross-tab sign-IN: the mirror image. A tab parked on the login
+    // page after a cross-tab sign-out stayed stranded there even after
+    // the user signed back in elsewhere. Re-check the session and let
+    // the tab in.
+    window.addEventListener("storage", function (e) {
+      if (e.key !== "av_signed_in_at" || !e.newValue) return;
+      if (state.session) return;
+      state.ds.getSession().then(function (s) {
+        if (!s || state.session) return;
+        state.session = s;
+        state.authedAt = Date.now();
+        startLiveStream();
+        toast("Signed in in another tab");
+        navigate("#/overview");
+      }).catch(function () { /* stay on login */ });
+    });
+    // Cross-tab theme: follow an explicit toggle made in another tab so
+    // side-by-side windows don't end up half dark, half light.
+    window.addEventListener("storage", function (e) {
+      if (e.key !== "av_theme") return;
+      if (e.newValue !== "light" && e.newValue !== "dark") return;
+      if (state.theme === e.newValue) return;
+      applyTheme(e.newValue);
+      try { render(); } catch (err) { /* pre-boot */ }
+    });
+  }
+
+  // Written on every successful login/signup so other tabs (parked on
+  // the login page after a cross-tab sign-out) can let themselves in.
+  function announceSignIn() {
+    try { localStorage.setItem("av_signed_in_at", String(Date.now())); } catch (e) {}
   }
 
   var liveUnsub = null;
@@ -924,7 +955,7 @@
           return;
         }
         state.ds.loginWithProvider(p).then(function (s) {
-          state.session = s; state.authedAt = Date.now(); startLiveStream();
+          state.session = s; state.authedAt = Date.now(); startLiveStream(); announceSignIn();
           navigate(consumeReturnTo() || "#/overview");
         }).catch(function (e) {
           $("#authErr").innerHTML = '<div class="auth-err">' + esc(e.message) + "</div>";
@@ -953,6 +984,8 @@
           try {
             var full = await runPasskeyLogin(s.email || email);
             state.session = full;
+            state.authedAt = Date.now();
+            announceSignIn();
             startLiveStream();
             navigate(consumeReturnTo() || "#/overview");
             return;
@@ -964,6 +997,7 @@
         }
         state.session = s;
         state.authedAt = Date.now();
+        announceSignIn();
         startLiveStream();
         if (isSignup) {
           // A brand-new workspace has none of the data behind whatever
@@ -1058,6 +1092,7 @@
       }).then(function (s) {
         state.session = { user: s.user, org: s.org };
         state.authedAt = Date.now();
+        announceSignIn();
         startLiveStream();
         toast("Welcome to " + (s.org && s.org.name ? s.org.name : "the workspace"));
         navigate("#/overview");
