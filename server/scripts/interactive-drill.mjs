@@ -74,8 +74,12 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
 {
   await page.evaluate(() => { location.hash = "#/overview"; });
   await page.waitForSelector("#simAttack", { timeout: 10000 });
-  const before = await page.evaluate(() =>
-    parseInt(document.querySelector(".stat.savings .value").textContent.replace(/[^0-9]/g, ""), 10));
+  // waitForFunction (not a bare evaluate): a live-stream refresh can
+  // swap the stats between our wait and a read.
+  const before = await (await page.waitForFunction(() => {
+    const v = document.querySelector(".stat.savings .value");
+    return v ? parseInt(v.textContent.replace(/[^0-9]/g, ""), 10) : false;
+  }, { timeout: 10000 })).jsonValue();
   await page.evaluate(() => document.getElementById("simAttack").click());
   await page.waitForTimeout(6000);
   const link = await page.evaluate(() => {
@@ -85,13 +89,23 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   if (!link || !/#\/sessions\/sess_live/.test(link)) fail("attack demo link toast missing; got " + link);
   await page.evaluate((h) => { location.hash = h.slice(1); }, link);
   await page.waitForSelector(".story-banner", { timeout: 10000 });
-  const banner = await page.evaluate(() => document.querySelector(".story-banner p").textContent);
+  const banner = await (await page.waitForFunction(() => {
+    const p = document.querySelector(".story-banner p");
+    return p ? p.textContent : false;
+  }, { timeout: 10000 })).jsonValue();
   if (!/tried to send \$[\d,]+ to/.test(banner)) fail("attack session story banner wrong: " + banner.slice(0, 80));
   await page.evaluate(() => { location.hash = "#/overview"; });
   await page.waitForSelector(".stat.savings", { timeout: 10000 });
   await page.waitForTimeout(800);
-  const after = await page.evaluate(() =>
-    parseInt(document.querySelector(".stat.savings .value").textContent.replace(/[^0-9]/g, ""), 10));
+  let after = before;
+  try {
+    after = await (await page.waitForFunction((b) => {
+      const v = document.querySelector(".stat.savings .value");
+      if (!v) return false;
+      const n = parseInt(v.textContent.replace(/[^0-9]/g, ""), 10);
+      return n > b ? n : false;
+    }, before, { timeout: 10000 })).jsonValue();
+  } catch (e) { /* leaves after === before → the fail() below fires */ }
   if (!(after > before)) fail(`prevented losses did not grow after attack (${before} -> ${after})`);
   console.log(`✅ attack demo: toast link, story banner, savings ${before} -> ${after}`);
 }
