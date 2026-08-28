@@ -313,6 +313,28 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
         blockedPayoutUsdMicros: isMember
           ? "0"
           : session.blockedPayoutUsdMicros.toString(),
+        // R117 F1: the numeric BigInt spend columns above are
+        // zeroed for members, but session.receipt is spread via
+        // `...session` and the receipt body is the canonical
+        // Ed25519-signed JSON blob that INCLUDES
+        // cost.cost_usd_micros. A demoted-to-member insider could
+        // JSON.parse(receipt.body).cost.cost_usd_micros and read
+        // the exact per-session LLM spend R114 F3 / R115 F1
+        // zeroed one level up. Same class as R91/R101/R114/R115.
+        // Rewriting the JSON would invalidate the signature, so
+        // blank body + sigB64 with the same sentinel used for
+        // event.body in R101 F2 — the SPA recognizes it in
+        // applyReceiptVerification and renders a member-role
+        // notice instead of the misleading "INVALID" state that
+        // a sentinel-vs-signature mismatch would otherwise show.
+        receipt:
+          session.receipt && isMember
+            ? {
+                ...session.receipt,
+                body: "[redacted-member-view]",
+                sigB64: "[redacted-member-view]",
+              }
+            : session.receipt,
       },
       nextEventCursor,
     });
@@ -351,9 +373,16 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
     // but this receipt endpoint on the same file was missed —
     // any member could read the exact per-session spend via
     // GET /receipts/:sessionId. Same rationale as R114 F3.
+    // R117 F1: the numeric BigInt columns above are the
+    // hoisted view — the raw signed-JSON body itself contains
+    // cost.cost_usd_micros. Redact receipt.body + receipt.sigB64
+    // for members so the `...spread` doesn't leak it verbatim.
+    // See sibling patch in the /sessions/:id branch above.
     const isMember = claims.membershipRole === "member";
     const safe = {
       ...receipt,
+      body: isMember ? "[redacted-member-view]" : receipt.body,
+      sigB64: isMember ? "[redacted-member-view]" : receipt.sigB64,
       session: receipt.session
         ? {
             ...receipt.session,
