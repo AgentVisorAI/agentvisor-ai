@@ -2443,10 +2443,11 @@
     }
     main.innerHTML = pageHeader("Deployments", "Each daemon streams events and signed receipts to this console.", actions) + body;
 
-    var addBtn = $("#addDep");
-    if (addBtn) addBtn.addEventListener("click", openCreateDeploymentModal);
-    var addBtn2 = $("#addDep2");
-    if (addBtn2) addBtn2.addEventListener("click", openCreateDeploymentModal);
+    // #addDep / #addDep2 are handled by the delegated listener below —
+    // same skeleton-phase fix as #addPol: the header button paints
+    // before the async list resolves, and a fast click/tap during load
+    // used to hit a button with no listener yet (found by a flaky
+    // 390px tap in the mobile-modal probe).
 
     var tbody = main.querySelector("tbody");
     if (tbody) {
@@ -2861,6 +2862,7 @@
   // no listener yet.
   document.addEventListener("click", function (e) {
     if (e.target.closest("#addPol, #addPolCta")) openCreatePolicyModal();
+    if (e.target.closest("#addDep, #addDep2")) openCreateDeploymentModal();
   });
 
   async function renderPolicies(main) {

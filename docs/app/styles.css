@@ -1286,6 +1286,15 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   display: flex; gap: var(--s-2);
   justify-content: flex-end;
   margin-top: var(--s-3);
+  /* Long forms (SAML add-IdP) scroll inside the modal on phones —
+     keep Save/Cancel reachable without scrolling a 9-field form.
+     The negative offsets counter the modal's own padding so the bar
+     hugs the true bottom edge; short modals are unaffected. */
+  position: sticky;
+  bottom: calc(-1 * var(--s-5));
+  margin-bottom: calc(-1 * var(--s-5));
+  padding: var(--s-3) 0 var(--s-5);
+  background: var(--surface);
 }
 .confirm-danger h2 { color: var(--danger); }
 .token-display {
@@ -1615,6 +1624,11 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 /* ============================================================
  * GUIDED FLOW TOUR (tour.js)
  * ============================================================ */
+/* Never float the launcher over an open modal / palette: at phone
+ * heights it sat exactly on a long form's Save/Cancel row (z 900 vs
+ * the backdrop's 100). While anything locks the body, the user's
+ * intent is the dialog. */
+body.locked #avTourLauncher { display: none; }
 #avTourLauncher {
   position: fixed;
   right: 20px;
