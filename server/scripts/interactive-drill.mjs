@@ -928,18 +928,28 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   if (!dyn.some((d) => /sess_01H9K/.test(d))) fail("palette dynamic session entries missing");
   await page.keyboard.press("Escape");
   await page.waitForTimeout(200);
-  // print evidence pack
+  // print evidence pack — and it must be COMPLETE: an active kind-chip
+  // filter hides rows on screen, but a printed audit document missing
+  // events would look complete while being cropped.
   await page.evaluate(() => { location.hash = "#/sessions/sess_01H9K"; });
   await page.waitForSelector("#eventList .evt", { timeout: 10000 });
+  await page.click('.evt-chip[data-kind="block"]');
+  await page.waitForTimeout(300);
   await page.emulateMedia({ media: "print" });
   await page.waitForTimeout(300);
   const pr = await page.evaluate(() => ({
     sidebarHidden: getComputedStyle(document.querySelector(".sidebar")).display === "none",
     provenance: getComputedStyle(document.querySelector(".print-only")).display === "block" && /receipt/i.test(document.querySelector(".print-only").textContent),
+    eventCount: /13 events/.test(document.querySelector(".print-only").textContent),
+    printedRows: [...document.querySelectorAll("#eventList .evt")].filter((r) => getComputedStyle(r).display !== "none").length,
+    totalRows: document.querySelectorAll("#eventList .evt").length,
   }));
   await page.emulateMedia({ media: "screen" });
+  await page.click('.evt-chip[data-kind=""]');
+  await page.waitForTimeout(200);
   if (!pr.sidebarHidden || !pr.provenance) fail("print evidence pack broken: " + JSON.stringify(pr));
-  console.log("✅ audit log matches ground truth (chips/search/CSV WYSIWYG); palette ranks + loads dynamic entries; print pack intact");
+  if (pr.printedRows !== pr.totalRows || !pr.eventCount) fail("print pack incomplete under an active filter: " + JSON.stringify(pr));
+  console.log("✅ audit log matches ground truth (chips/search/CSV WYSIWYG); palette ranks + loads dynamic entries; print pack complete even when filtered");
 }
 
 // ── 21. Password reset + member redaction + policy derivation ──────
