@@ -393,7 +393,22 @@ async function main(): Promise<void> {
     const status = err.statusCode ?? 500;
     // Zod / Fastify schema validation errors surface with err.validation.
     const isValidation = Array.isArray(err.validation);
-    const errorCode = err.code ?? (isValidation ? "invalid_input" : status === 500 ? "internal_error" : "error");
+    // R108 F3: don't leak upstream error codes (Prisma
+    // P2003/P2025/P2028/P2034, Node ECONNREFUSED/ETIMEDOUT/
+    // EACCES, etc.) on 5xx. R107 F1 closed the same class at
+    // the WebAuthn verify site — but any unhandled Prisma
+    // throw elsewhere routes through this handler. An
+    // attacker distinguishing P2025 (record not found) from
+    // P2003 (FK violation) from P2028 (tx timeout) by hitting
+    // various endpoints and inspecting errorCode leaks
+    // internal schema/state semantics. On 5xx we force
+    // 'internal_error' regardless of err.code so the wire
+    // response mirrors the sanitized `detail` field. 4xx and
+    // validation errors deliberately produced by our own code
+    // stay as-is (safe to surface).
+    const errorCode = status >= 500
+      ? "internal_error"
+      : err.code ?? (isValidation ? "invalid_input" : "error");
     const title = err.name && err.name !== "Error" ? err.name : status === 500 ? "Internal Server Error" : "Request Failed";
 
     if (status >= 500) {
