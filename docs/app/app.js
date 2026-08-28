@@ -2352,6 +2352,26 @@
     var head = document.querySelector('.receipt-head[data-verify-state="pending"]');
     if (!head) return;
     if (!window.avVerifyReceipt) return;
+    // R117 F1: server redacts receipt.body + sigB64 to
+    // '[redacted-member-view]' for member-role callers so the
+    // signed JSON's cost.cost_usd_micros doesn't leak. Skip the
+    // verifier here — otherwise avVerifyReceipt returns
+    // {supported:true, ok:false} on the sentinel and the head
+    // flips to "Signature INVALID", which is UX-misleading (the
+    // signature isn't invalid, it's simply not visible to
+    // members). Show an "unsupported"-styled note instead.
+    var REDACT = "[redacted-member-view]";
+    if (r && (r.rawBody === REDACT || r.rawSignatureB64 === REDACT)) {
+      head.setAttribute("data-verify-state", "unsupported");
+      head.classList.add("unsupported");
+      var checkR = head.querySelector('.check');
+      var titleR = head.querySelector('.title');
+      var subR = head.querySelector('div > div:last-child');
+      if (checkR) checkR.textContent = "🔒";
+      if (titleR) titleR.textContent = "Signature hidden — member view";
+      if (subR) subR.textContent = "Ask an admin for signed-receipt access.";
+      return;
+    }
     var res = await window.avVerifyReceipt(r.publicKeyHex, r.rawSignatureB64, r.rawBody);
     var check = head.querySelector('.check');
     var title = head.querySelector('.title');
