@@ -1521,11 +1521,24 @@
       var iconChar = ev.kind === "llm" ? "L" : ev.kind === "tool" ? "T" : ev.kind === "block" ? "!" : ev.kind === "guard" ? "✓" : ev.kind === "session" ? "S" : "•";
       var durTxt = ev.durationMs ? ev.durationMs + " ms" : "";
       var barColor = ev.severity === "err" ? "var(--danger-solid)" : (ev.severity === "ok" ? "var(--success-solid)" : "var(--accent)");
+      // R101 F2 + R102 F1: recognize the '[redacted-member-view]'
+      // sentinel returned by the server for role=member on
+      // /read/sessions/:id. Prior shape rendered the literal
+      // sentinel string as if it were the LLM content — confusing
+      // UX (users opened support tickets thinking the daemon was
+      // broken). Now show a 🔒 pill.
+      var REDACT = "[redacted-member-view]";
+      var msgHtml = ev.msg === REDACT
+        ? '<span class="redacted-pill" title="LLM prompt/response hidden for member role — ask an admin for access">🔒 redacted</span>'
+        : esc(ev.msg || "");
+      var subHtml = ev.sub === REDACT
+        ? '<span class="sub redacted-pill" title="LLM sub-line hidden for member role">🔒 redacted</span>'
+        : (ev.sub ? '<span class="sub">· ' + esc(ev.sub) + "</span>" : "");
       return '<div class="evt ' + sev + '" data-i="' + i + '" tabindex="0" role="option" aria-selected="false" style="--depth: ' + ev.layout.depth + ';">' +
         '<span class="seq">#' + esc(ev.seq) + "</span>" +
         '<span class="icon ' + iconClass + '">' + iconChar + "</span>" +
-        '<span class="body"><b>' + esc(ev.tag || ev.kind) + '</b> ' + esc(ev.msg || "") +
-          (ev.sub ? '<span class="sub">· ' + esc(ev.sub) + "</span>" : "") +
+        '<span class="body"><b>' + esc(ev.tag || ev.kind) + '</b> ' + msgHtml +
+          subHtml +
         "</span>" +
         '<span class="waterfall">' +
           '<span class="wf-track"></span>' +
@@ -1858,6 +1871,7 @@
     if (ev.blockedValueUsd) meta.push(["Would-have-spent", "$" + Number(ev.blockedValueUsd).toLocaleString()]);
     if (deepLink) meta.push(["Share", '<button type="button" class="btn evt-link-btn" data-copy="' + esc(deepLink) + '" title="Copy a direct link to this event">🔗 Copy link to this event</button>', true]);
 
+    var REDACT_D = "[redacted-member-view]";
     var payload = "";
     if (ev.details) {
       payload = '<pre class="payload">' +
@@ -1867,7 +1881,12 @@
         '<b>Response</b>\n' + esc(ev.details.response) +
         "</pre>";
     } else if (ev.severity === "err") {
-      payload = '<pre class="payload">' + esc(JSON.stringify({ severity: ev.severity, msg: ev.msg, sub: ev.sub, policy: ev.policyId }, null, 2)) + "</pre>";
+      payload = '<pre class="payload">' + esc(JSON.stringify({
+        severity: ev.severity,
+        msg: ev.msg === REDACT_D ? "[hidden for member role]" : ev.msg,
+        sub: ev.sub === REDACT_D ? "[hidden for member role]" : ev.sub,
+        policy: ev.policyId,
+      }, null, 2)) + "</pre>";
     } else {
       payload = '<div class="empty-mini">No payload attached.</div>';
     }

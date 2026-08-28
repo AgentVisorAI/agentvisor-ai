@@ -143,6 +143,19 @@ const Env = z.object({
       v
         .split(",")
         .map((s) => s.trim())
+        // R102 F2: strip any trailing slash. Browsers send Origin
+        // per RFC 6454 as scheme+host+port with NO trailing slash
+        // and no path. An operator who pastes a URL from the
+        // browser bar (e.g. 'https://console.example.com/') would
+        // otherwise store an entry that never matches the
+        // browser-sent Origin — every downstream gate
+        // (CORS at index.ts, SSE at stream.ts, WebAuthn RP at
+        // webauthn.ts, CSRF preHandler at index.ts) uses
+        // env.ALLOWED_ORIGINS.includes(origin), so ALL four
+        // silently 403 every request from the legitimate origin.
+        // Normalize on parse so operator config errors are
+        // shrugged off.
+        .map((s) => s.replace(/\/+$/, ""))
         .filter(Boolean),
     ),
   // IPs (or IP prefixes) allowed to scrape /metrics. Empty = allow
