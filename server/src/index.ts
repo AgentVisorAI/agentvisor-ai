@@ -166,7 +166,15 @@ async function main(): Promise<void> {
       // require a following /, ?, or end for the exemption; and
       // escape the regex dot.
       return u === "/healthz" || u === "/readyz" || u === "/metrics" ||
-        u.startsWith("/.well-known/") ||
+        // R105 F2: replace unanchored startsWith('/.well-known/')
+        // with an explicit allowlist of the well-known suffixes
+        // we actually publish. Same class as R104 F3's ingest
+        // anchoring: any future route added under /.well-known/
+        // (openid-configuration, apple-app-site-association, etc.)
+        // would otherwise silently inherit the rate-limit AND the
+        // HTTPS-force exemptions with no operator review. If we
+        // add another well-known route, add it here explicitly.
+        /^\/\.well-known\/(security\.txt)(\/|\?|$)/.test(u) ||
         u === "/api/v1/ingest" ||
         /^\/api\/v1\/ingest(\/|\?|$)/.test(u) ||
         // SAML ACS + login redirects should never hit rate limits. If the
@@ -214,7 +222,15 @@ async function main(): Promise<void> {
   // could have downgraded the scheme.
   if (env.NODE_ENV === "production") {
     app.addHook("onRequest", async (req, reply) => {
-      if (req.url === "/healthz" || req.url === "/readyz" || req.url.startsWith("/.well-known/")) {
+      // R105 F2: use the same explicit .well-known allowlist as
+      // the rate-limit exemption above. Prior shape used
+      // unanchored startsWith('/.well-known/') so a future route
+      // added under the prefix would silently inherit the
+      // HTTPS-force exemption.
+      if (
+        req.url === "/healthz" || req.url === "/readyz" ||
+        /^\/\.well-known\/(security\.txt)(\/|\?|$)/.test(req.url)
+      ) {
         return;
       }
       const xfp = req.headers["x-forwarded-proto"];

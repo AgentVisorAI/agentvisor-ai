@@ -260,9 +260,14 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
     } catch (err) {
       req.log.warn({ err }, "webauthn_register_verify_failed");
       clearChallengeCookie(reply, REG_CHALLENGE_COOKIE);
-      return reply
-        .code(400)
-        .send({ error: "verify_failed", detail: err instanceof Error ? err.message : String(err) });
+      // R105 F1: don't echo the internal library error message to
+      // the wire. SimpleWebAuthn throws descriptive messages
+      // like 'Unexpected registration response origin "X",
+      // expected "Y"' — leaks the operator's canonical RP
+      // origin / APP_BASE_URL to any unauthenticated caller
+      // probing the ceremony. Server-side warn log already
+      // captures err for ops.
+      return reply.code(400).send({ error: "verify_failed" });
     }
     if (!verified.verified || !verified.registrationInfo) {
       clearChallengeCookie(reply, REG_CHALLENGE_COOKIE);
@@ -488,9 +493,9 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
     } catch (err) {
       req.log.warn({ err }, "webauthn_auth_verify_failed");
       clearChallengeCookie(reply, AUTH_CHALLENGE_COOKIE);
-      return reply
-        .code(400)
-        .send({ error: "verify_failed", detail: err instanceof Error ? err.message : String(err) });
+      // R105 F1: see webauthn_register_verify_failed above —
+      // don't echo the internal library error message.
+      return reply.code(400).send({ error: "verify_failed" });
     }
     if (!verified.verified) {
       clearChallengeCookie(reply, AUTH_CHALLENGE_COOKIE);
@@ -521,7 +526,8 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
     // Mint the session — same shape as password login.
     const user = await db.user.findUnique({
       where: { id: cred.userId },
-      include: { memberships: { include: { org: true } } },
+      // R105 F4: deterministic membership ordering (see auth.ts).
+      include: { memberships: { include: { org: true }, orderBy: { createdAt: "asc" } } },
     });
     if (!user) return reply.code(401).send({ error: "user_disappeared" });
     const membership = user.memberships[0];

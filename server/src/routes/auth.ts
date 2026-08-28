@@ -187,7 +187,17 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     const { email, password } = body.data;
     const user = await db.user.findUnique({
       where: { email },
-      include: { memberships: { include: { org: true } } },
+      // R105 F4: deterministic membership ordering. Prior shape
+      // used Prisma's default DB row order which is unstable
+      // across Postgres restarts / VACUUM / replica failover.
+      // A multi-org user (rare today but on-trajectory as SAML
+      // JIT lands users in additional orgs) could log in and
+      // land in a different org each restart. Prefer the
+      // OLDEST membership (createdAt asc) so 'the first org I
+      // ever joined' is the stable landing pad; the console
+      // will need an org-switcher UI to move between them,
+      // but at least the login pin is deterministic.
+      include: { memberships: { include: { org: true }, orderBy: { createdAt: "asc" } } },
     });
     // Uniform response time by always running argon2 verify, even when
     // the user doesn't exist. The dummy is a real precomputed argon2id
