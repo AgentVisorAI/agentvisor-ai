@@ -1,5 +1,9 @@
 # AgentVisor AI Console
 
+> **Changing this code?** Read [HANDBOOK.md](./HANDBOOK.md) first — the
+> invariants, bug classes, and harness traps from the hardening campaign,
+> each backed by a CI guard.
+
 The console served at `agentvisorai.me/app/` is a real multi-tenant SPA:
 sign in, view your fleet of policed agent sessions, add & rotate deployment
 ingest tokens, and inspect any session's event stream and signed receipt.
