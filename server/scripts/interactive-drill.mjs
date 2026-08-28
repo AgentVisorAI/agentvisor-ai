@@ -568,7 +568,28 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await tabB.evaluate(() => localStorage.setItem("av_theme", "light"));
   await page.waitForFunction(() => document.documentElement.getAttribute("data-theme") === "light", { timeout: 5000 });
   await tabB.close();
-  console.log("✅ cross-tab sync: sign-out bounces, sign-in un-strands the login tab, theme follows");
+  // No dark-mode FOUC: with an explicit theme saved, config.js applies
+  // data-theme BEFORE first paint (a dark chooser on a light-OS
+  // machine used to get a white flash every load). Assert the first
+  // painted frame is already dark.
+  await page.evaluate(() => localStorage.setItem("av_theme", "dark"));
+  const foucPage = await context.newPage();
+  await foucPage.addInitScript(() => {
+    window.__firstFrame = null;
+    const grab = () => requestAnimationFrame(() => {
+      window.__firstFrame = document.documentElement.getAttribute("data-theme");
+    });
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", grab); else grab();
+  });
+  await foucPage.goto(SITE + "#/overview", { waitUntil: "domcontentloaded" });
+  await foucPage.waitForFunction(() => window.__firstFrame !== null, { timeout: 8000 });
+  const firstFrame = await foucPage.evaluate(() => window.__firstFrame);
+  await foucPage.close();
+  if (firstFrame !== "dark") fail("dark-mode FOUC: first painted frame theme was " + firstFrame);
+  await page.evaluate(() => localStorage.removeItem("av_theme"));
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => document.querySelector(".stat")?.textContent.trim().length > 0, { timeout: 15000 });
+  console.log("✅ cross-tab sync: sign-out bounces, sign-in un-strands the login tab, theme follows; no dark-mode FOUC");
 }
 
 // ── 15. Focus rings + hostile data ─────────────────────────────────
