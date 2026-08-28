@@ -3325,6 +3325,7 @@
     catch (e) { root.innerHTML = '<div class="card empty"><h3>Could not load webhooks</h3><p>' + esc(e.message || "Try again in a moment.") + '</p></div>'; return; }
 
     function openAddModal() {
+      if (document.body.classList.contains("locked")) return;
       var events = ["policy.block", "member.invited", "apikey.created", "apikey.revoked", "webhook.test_fired", "*"];
       var backdrop = h(
         '<div class="modal-backdrop" role="dialog" aria-modal="true">' +
@@ -3356,6 +3357,8 @@
         '</div>',
       );
       document.body.appendChild(backdrop);
+      document.body.classList.add("locked");
+      var previouslyFocused = document.activeElement;
       // The standard modal contract: a real close() that also
       // uninstalls the document-level key handler. This modal used to
       // call installModalKeys(backdrop) with NO close callback —
@@ -3365,7 +3368,9 @@
       var uninstallWh;
       function closeWh() {
         backdrop.remove();
+        document.body.classList.remove("locked");
         if (uninstallWh) uninstallWh();
+        if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e2) {}
       }
       uninstallWh = installModalKeys(backdrop, closeWh);
       backdrop.querySelectorAll("[data-close]").forEach(function (b) { b.addEventListener("click", closeWh); });
