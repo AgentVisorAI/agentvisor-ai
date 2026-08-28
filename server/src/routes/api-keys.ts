@@ -118,16 +118,33 @@ export async function apiKeyRoutes(app: FastifyInstance): Promise<void> {
     let hops = 0;
     while (effectiveCreatorId && effectiveCreatorId.startsWith("apikey:") && hops < 8) {
       const parentId: string = effectiveCreatorId.slice("apikey:".length);
-      const parent: { createdById: string | null } | null = await db.apiKey.findUnique({
-        where: { id: parentId },
+      // R130 F2: scope the parent-chain walk to the caller's
+      // orgId. claims.sub is trusted from the JWT so today the
+      // resolved chain stays within one org — no live bug — but
+      // findUnique-by-id would happily walk a cross-org apikey
+      // row if a future JWT-issuer bug, an org-migration script,
+      // or an api-key row moved during a merge ever produced a
+      // cross-org claims.sub. That would burn a different org's
+      // user id/email into this key's createdById/createdByEmail
+      // audit trail — a forensic-integrity primitive.
+      // findFirst with orgId constraint fails closed if the
+      // parent isn't in the caller's org.
+      const parent: { createdById: string | null } | null = await db.apiKey.findFirst({
+        where: { id: parentId, orgId: claims.orgId },
         select: { createdById: true },
       });
       effectiveCreatorId = parent?.createdById ?? null;
       hops++;
     }
+    // R130 F2: same posture — the resolved user must be a
+    // member of the caller's org. Belt-and-suspenders against
+    // the same cross-org drift class as the chain walk above.
     const creatorUser = effectiveCreatorId
-      ? await db.user.findUnique({
-          where: { id: effectiveCreatorId },
+      ? await db.user.findFirst({
+          where: {
+            id: effectiveCreatorId,
+            memberships: { some: { orgId: claims.orgId } },
+          },
           select: { id: true, email: true },
         })
       : null;
