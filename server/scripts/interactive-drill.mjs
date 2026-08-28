@@ -649,6 +649,35 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   if (csvLeak.length) fail("garbage session row leaked into the CSV: " + csvLeak.join(","));
   await page.evaluate(() => { window.dataSource.listSessions = window.dataSource.__origList; });
   console.log("✅ " + stops + " focus stops all show a ring; garbage API fields render clean in table + CSV");
+  // Reduced motion (WCAG 2.3.3): under prefers-reduced-motion, NO
+  // element may keep a real animation/transition duration — the old
+  // enumerated list drifted as new animated surfaces shipped.
+  const rmPage = await context.newPage();
+  await rmPage.emulateMedia({ reducedMotion: "reduce" });
+  await rmPage.goto(SITE + "#/overview", { waitUntil: "domcontentloaded" });
+  await rmPage.waitForFunction(() => document.querySelector(".stat")?.textContent.trim().length > 0, { timeout: 15000 });
+  const residual = await rmPage.evaluate(() => {
+    const out = [];
+    for (const el of document.querySelectorAll("*")) {
+      const cs = getComputedStyle(el);
+      if (cs.animationName !== "none" && parseFloat(cs.animationDuration) > 0.01) out.push((el.className || el.tagName).toString().slice(0, 30));
+      if (parseFloat(cs.transitionDuration) > 0.01 && cs.transitionProperty !== "none") out.push((el.className || el.tagName).toString().slice(0, 30));
+    }
+    return [...new Set(out)].slice(0, 6);
+  });
+  await rmPage.close();
+  if (residual.length) fail("elements still animate under prefers-reduced-motion: " + residual.join(", "));
+  // account menu: full keyboard contract (arrows wrap + Home/End)
+  await page.click(".user-btn");
+  await page.waitForSelector("#accountMenu", { timeout: 3000 });
+  await page.keyboard.press("End");
+  const endAct = await page.evaluate(() => document.activeElement.getAttribute("data-act"));
+  await page.keyboard.press("ArrowDown"); // wraps to first
+  const wrapAct = await page.evaluate(() => document.activeElement.getAttribute("data-act"));
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(200);
+  if (endAct !== "signout" || wrapAct !== "shortcuts") fail("account menu keyboard contract broken: End=" + endAct + " wrap=" + wrapAct);
+  console.log("✅ reduced-motion kill-switch total; account menu End/wrap keyboard contract");
 }
 
 // ── 16. Tactile polish ─────────────────────────────────────────────
