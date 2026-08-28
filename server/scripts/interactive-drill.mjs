@@ -388,7 +388,60 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ browser Back sweeps modal + palette overlays; copy gives feedback without clipboard API (" + toastTxt.trim().slice(0, 30) + ")");
 }
 
-// ── 12. Listener-leak soak ─────────────────────────────────────────
+// ── 12. Double-submit guards ───────────────────────────────────────
+// The mock datasource answers near-instantly, so these races never
+// showed locally — but with real latency a double-click on "Save"
+// created two identical webhook endpoints (each with its own secret),
+// and rapid clicks on a policy switch queued interleaved toggles.
+// Inject 400ms latency + a call counter around the datasource methods
+// and hammer each control; exactly one call must go through.
+{
+  const slow = (m) => page.evaluate((m) => {
+    const ds = window.dataSource;
+    window.__calls = window.__calls || {};
+    window.__calls[m] = 0;
+    if (ds[m].__wrapped) return;
+    const orig = ds[m].bind(ds);
+    ds[m] = (...a) => { window.__calls[m]++; return new Promise((r) => setTimeout(r, 400)).then(() => orig(...a)); };
+    ds[m].__wrapped = true;
+  }, m);
+  const calls = (m) => page.evaluate((m) => window.__calls[m], m);
+  // webhook create
+  await page.goto(SITE + "#/settings/webhooks", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("#whAdd", { timeout: 15000 });
+  const rowsBefore = await page.evaluate(() => document.querySelectorAll("tbody tr").length);
+  await page.click("#whAdd");
+  await page.waitForSelector(".modal-backdrop", { timeout: 5000 });
+  await page.fill("#whName", "Drill Dbl");
+  await page.fill("#whUrl", "https://example.dev/drill-hook");
+  await page.evaluate(() => { const c = document.querySelector("#whEventsPicker input"); if (c && !c.checked) c.click(); });
+  await slow("createWebhook");
+  await page.evaluate(() => { const s = document.querySelector("#whSave"); s.click(); s.click(); s.click(); });
+  await page.waitForTimeout(1400);
+  const whCalls = await calls("createWebhook");
+  const rowsAfter = await page.evaluate(() => document.querySelectorAll("tbody tr").length);
+  if (whCalls !== 1 || rowsAfter !== rowsBefore + 1) fail("webhook double-submit: " + whCalls + " calls, rows " + rowsBefore + "→" + rowsAfter);
+  await page.keyboard.press("Escape");
+  // policy switch (list + detail)
+  await page.goto(SITE + "#/policies", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector(".switch", { timeout: 10000 });
+  await slow("togglePolicy");
+  await page.evaluate(() => { const s = document.querySelector(".switch"); s.click(); s.click(); s.click(); });
+  await page.waitForTimeout(1200);
+  if ((await calls("togglePolicy")) !== 1) fail("policy list switch fired " + (await calls("togglePolicy")) + " toggles on a triple-click");
+  // invite revoke row action
+  await page.goto(SITE + "#/settings/members", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("tbody tr", { timeout: 10000 });
+  if (await page.$("tr[data-invite] [data-act='revoke']")) {
+    await slow("revokeInvite");
+    await page.evaluate(() => { const r = document.querySelector("tr[data-invite] [data-act='revoke']"); r.click(); r.click(); r.click(); });
+    await page.waitForTimeout(1200);
+    if ((await calls("revokeInvite")) !== 1) fail("invite revoke fired " + (await calls("revokeInvite")) + " times on a triple-click");
+  }
+  console.log("✅ double-submit guards: webhook create, policy toggle, invite revoke — one call each under 400ms latency");
+}
+
+// ── 13. Listener-leak soak ─────────────────────────────────────────
 // Every earlier check opened modals, ran the tour, refreshed the
 // overview, and re-rendered lists dozens of times. If any of that
 // leaked document/window listeners (the webhook modal once leaked a
@@ -414,4 +467,4 @@ if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors))
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 13 interactive-features drill checks passed.");
+console.log("\nAll 14 interactive-features drill checks passed.");
