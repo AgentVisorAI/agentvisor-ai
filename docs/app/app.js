@@ -3606,42 +3606,102 @@
   async function renderSettingsAudit(root) {
     root.innerHTML = '<div class="card">' + loadingBlock("table") + "</div>";
     var audit = await state.ds.listAudit();
-    var header =
-      '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:baseline">' +
-        '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">Audit log</h2>' +
-        '<span style="margin-left:8px; color:var(--fg-3); font-size:var(--t-sec)">' + (audit.length || 0) + " event" + (audit.length === 1 ? "" : "s") + "</span>" +
-        '<button class="btn" id="auditExportBtn" style="margin-left:auto">↓ Export CSV</button>' +
-      "</div>";
     if (!audit.length) {
       root.innerHTML =
-        '<div class="card" style="padding:0">' + header +
+        '<div class="card" style="padding:0">' +
+          '<div style="padding:12px 16px; border-bottom:1px solid var(--border)"><h2 style="margin:0; font-size:var(--t-section); font-weight:600">Audit log</h2></div>' +
           '<div style="padding: 24px 16px">' +
           emptyState("No audit entries yet", "Sign-ins, deployment rotations, policy changes, and receipt verifications will appear here as your team uses the console.") +
           "</div></div>";
-    } else {
-      var rows = audit.map(function (a) {
+      return;
+    }
+
+    // Category chips from event prefixes actually present (policy.*,
+    // member.*, auth.* …) — same interaction model as the event-stream
+    // triage chips on session detail.
+    var catCounts = {};
+    audit.forEach(function (a) { var c = a.event.split(".")[0]; catCounts[c] = (catCounts[c] || 0) + 1; });
+    var cats = Object.keys(catCounts).sort();
+    var chips = '<button class="evt-chip active" data-cat="" aria-pressed="true">All <span class="n">' + audit.length + "</span></button>" +
+      cats.map(function (c) {
+        return '<button class="evt-chip" data-cat="' + esc(c) + '" aria-pressed="false">' + esc(c) + ' <span class="n">' + catCounts[c] + "</span></button>";
+      }).join("");
+
+    var rowsHtml = function (list) {
+      return list.map(function (a) {
         return '<tr><td class="mono" style="color:var(--fg-3); font-size:11.5px; white-space:nowrap">' + esc(new Date(a.at).toLocaleString()) + '</td>' +
           '<td><span style="font-weight:500">' + esc(a.event) + "</span></td>" +
           "<td>" + esc(a.actor) + "</td>" +
           "<td>" + esc(a.target || "—") + "</td>" +
           '<td style="color: var(--fg-2)">' + esc(a.note || "") + "</td></tr>";
       }).join("");
-      root.innerHTML =
-        '<div class="card" style="padding:0">' + header +
-          '<div class="table-wrap"><table>' +
-            "<thead><tr><th>When</th><th>Event</th><th>Actor</th><th>Target</th><th>Note</th></tr></thead>" +
-            "<tbody>" + rows + "</tbody>" +
-          "</table></div>" +
-        "</div>";
+    };
+
+    root.innerHTML =
+      '<div class="card" style="padding:0">' +
+        '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:8px; flex-wrap:wrap">' +
+          '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">Audit log</h2>' +
+          '<span style="color:var(--fg-3); font-size:var(--t-sec)" id="auditCount">' + audit.length + " events</span>" +
+          '<div class="evt-filters" style="margin-left:auto">' + chips +
+            '<input id="auditSearch" type="search" placeholder="Filter by actor, event, target…" aria-label="Filter audit entries" style="width:180px" />' +
+          "</div>" +
+          '<button class="btn" id="auditExportBtn" title="Download the entries shown below as CSV">↓ Export CSV</button>' +
+        "</div>" +
+        '<div class="table-wrap"><table>' +
+          "<thead><tr><th>When</th><th>Event</th><th>Actor</th><th>Target</th><th>Note</th></tr></thead>" +
+          '<tbody id="auditBody">' + rowsHtml(audit) + "</tbody>" +
+        "</table></div>" +
+        '<div class="empty-mini" id="auditNone" style="padding:16px; display:none">No entries match — clear the filter to see all ' + audit.length + ".</div>" +
+      "</div>";
+
+    var activeCat = "";
+    var search = $("#auditSearch", root);
+    function filtered() {
+      var q = ((search && search.value) || "").trim().toLowerCase();
+      return audit.filter(function (a) {
+        if (activeCat && a.event.split(".")[0] !== activeCat) return false;
+        if (!q) return true;
+        return (a.event + " " + a.actor + " " + (a.target || "") + " " + (a.note || "")).toLowerCase().indexOf(q) >= 0;
+      });
     }
+    function apply() {
+      var list = filtered();
+      // tbody-only update: the search input keeps focus, nothing blinks.
+      $("#auditBody", root).innerHTML = rowsHtml(list);
+      $("#auditCount", root).textContent = list.length === audit.length
+        ? audit.length + " events" : list.length + " of " + audit.length + " shown";
+      $("#auditNone", root).style.display = list.length ? "none" : "";
+    }
+    if (search) search.addEventListener("input", apply);
+    root.querySelector(".evt-filters").addEventListener("click", function (e) {
+      var chip = e.target.closest(".evt-chip");
+      if (!chip) return;
+      $$(".evt-chip", root).forEach(function (c) {
+        c.classList.toggle("active", c === chip);
+        c.setAttribute("aria-pressed", c === chip ? "true" : "false");
+      });
+      activeCat = chip.getAttribute("data-cat");
+      apply();
+    });
+
     var exp = $("#auditExportBtn", root);
     if (exp) exp.addEventListener("click", function () {
-      // Real download in api mode; toast in mock.
-      if (state.ds.downloadAuditCsv) {
-        state.ds.downloadAuditCsv();
-      } else {
-        toast("CSV export not available in demo mode.");
-      }
+      // Server-side stream when the API offers it; otherwise build the
+      // CSV client-side from the filtered view (WYSIWYG, works in demo
+      // mode too — this used to toast 'not available in demo mode').
+      if (state.ds.downloadAuditCsv) return state.ds.downloadAuditCsv();
+      var list = filtered();
+      var lines = [["at", "event", "actor", "target", "note"].join(",")].concat(list.map(function (a) {
+        return [a.at, a.event, a.actor, a.target || "", a.note || ""].map(csvField).join(",");
+      }));
+      var stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-");
+      var blob = new Blob(["\ufeff" + lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
+      var a2 = document.createElement("a");
+      a2.href = URL.createObjectURL(blob);
+      a2.download = "agentvisor-audit-" + stamp + ".csv";
+      document.body.appendChild(a2); a2.click(); a2.remove();
+      setTimeout(function () { URL.revokeObjectURL(a2.href); }, 4000);
+      toast(list.length + " audit entr" + (list.length === 1 ? "y" : "ies") + " exported");
     });
   }
   function renderSettingsBilling_OLD_UNUSED(root) {

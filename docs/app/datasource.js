@@ -621,11 +621,19 @@
    * ============================================================ */
 
   var MOCK_AUDIT = [
+    { at: iso(3 * MIN), actor: "olivia.tan@northwind.com", event: "auth.signed_in", target: "google-workspace", note: "SSO · Chrome on macOS" },
     { at: iso(8 * MIN), actor: "raj.patel@northwind.com", event: "policy.updated", target: "procurement.allowed_vendors", note: "Added Fabrikam to vendor allowlist." },
+    { at: iso(42 * MIN), actor: "raj.patel@northwind.com", event: "apikey.created", target: "CI runner", note: "role: member" },
     { at: iso(2 * HOUR), actor: "olivia.tan@northwind.com", event: "member.role_changed", target: "sam.lee@northwind.com", note: "member → viewer" },
+    { at: iso(5 * HOUR), actor: "olivia.tan@northwind.com", event: "member.invited", target: "kate.chen@northwind.com", note: "role: admin" },
     { at: iso(6 * HOUR), actor: "system", event: "deployment.token_rotated", target: "northwind-prod" },
+    { at: iso(9 * HOUR), actor: "sam.lee@northwind.com", event: "receipt.verified", target: "sess_01H9K7GRPX", note: "offline verifier · signature good" },
     { at: iso(1 * 24 * HOUR), actor: "olivia.tan@northwind.com", event: "policy.created", target: "runtime.pii_redaction" },
+    { at: iso(1 * 24 * HOUR + 2 * HOUR), actor: "raj.patel@northwind.com", event: "webhook.created", target: "Slack #ops", note: "events: policy.block" },
+    { at: iso(2 * 24 * HOUR), actor: "system", event: "auth.session_expired", target: "marc.dubois@northwind.com", note: "7-day TTL" },
     { at: iso(3 * 24 * HOUR), actor: "olivia.tan@northwind.com", event: "settings.sso_configured", target: "google-workspace" },
+    { at: iso(5 * 24 * HOUR), actor: "olivia.tan@northwind.com", event: "deployment.created", target: "northwind-staging", note: "environment: staging" },
+    { at: iso(8 * 24 * HOUR), actor: "raj.patel@northwind.com", event: "apikey.revoked", target: "Ops dashboard (legacy)", note: "superseded by CI runner" },
     { at: iso(11 * 24 * HOUR), actor: "olivia.tan@northwind.com", event: "org.created", target: "Northwind Traders" },
   ];
 
@@ -1384,7 +1392,10 @@
     async getRetention() { await delay(80); return { retention: { sessionRetentionDays: 90, auditRetentionDays: 365 } }; },
     async updateRetention() { await delay(80); },
     async retentionSweepNow() { await delay(120); return { result: { sessionsPurged: 0, auditPurged: 0, webhookDeliveriesPurged: 0 } }; },
-    downloadAuditCsv: function () { /* no-op in mock */ },
+    // No downloadAuditCsv here on purpose: without it the console
+    // builds the CSV client-side from the loaded entries, which works
+    // offline and respects the active filter (the old no-op silently
+    // swallowed the export in demo mode).
     async listAudit() {
       await delay(100);
       var el = freshElapsed();
