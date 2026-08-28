@@ -19,16 +19,26 @@
  */
 import type { FastifyBaseLogger } from "fastify";
 import { db } from "../db.js";
+import { env } from "../env.js";
 
-const DEFAULT_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6h
 const CHUNK = 1000;
 const WEBHOOK_DELIVERY_RETENTION_DAYS = 30;
 
 let sweeperTimer: NodeJS.Timeout | null = null;
 
-const RETENTION_INTERVAL_MS = Number(
-  process.env.RETENTION_SWEEPER_INTERVAL_MS ?? DEFAULT_INTERVAL_MS,
-);
+// R99 F3: read the interval from env (validated at boot via
+// zod refine) instead of Number(process.env.X). Prior shape
+// used lenient Number(process.env.RETENTION_SWEEPER_INTERVAL_MS
+// ?? DEFAULT) which had two DoS-class failure modes:
+//   • '' (env var set but empty in a .env file) → Number('') = 0
+//     → setInterval(fn, 0) fires as fast as the event loop
+//     drains, hammering Postgres with a full org scan every ms.
+//   • '6h' or '21600000ms' (operator adds units) → Number(...)
+//     = NaN → Node clamps setInterval NaN to 1 ms, same DoS.
+// Now: env.ts validates the value is an integer in [60_000,
+// 86_400_000] (1 minute to 24 hours) and rejects bad input at
+// boot with a zod error.
+const RETENTION_INTERVAL_MS = env.RETENTION_SWEEPER_INTERVAL_MS;
 
 export interface RetentionSweepResult {
   orgId: string;
