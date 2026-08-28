@@ -1337,18 +1337,49 @@
         "</div>" +
       "</div>";
 
-    // event click → drawer
+    // event click → drawer. Selection is mirrored into the hash as
+    // `#/sessions/<id>?evt=<seq>` via replaceState (no re-render, no
+    // history spam) so a specific decision is directly linkable — and
+    // so the selection survives the live-stream refresh, which
+    // re-renders this whole page whenever a new event arrives.
     var evList = $("#eventList");
     var drawer = $("#eventDrawer");
     if (!evList || !drawer) return; // user navigated away mid-await
-    evList.addEventListener("click", function (e) {
-      var row = e.target.closest(".evt");
-      if (!row) return;
+    function selectEvent(row) {
       $$('.evt', evList).forEach(function (r) { r.classList.remove("selected"); });
       row.classList.add("selected");
       var ev = events[parseInt(row.getAttribute("data-i"), 10)];
-      renderEventDrawer(drawer, ev);
+      var deepHash = "#/sessions/" + encodeURIComponent(id) + "?evt=" + ev.seq;
+      try { history.replaceState(null, "", deepHash); } catch (e2) {}
+      renderEventDrawer(drawer, ev, location.origin + location.pathname + deepHash);
+    }
+    evList.addEventListener("click", function (e) {
+      var row = e.target.closest(".evt");
+      if (row) selectEvent(row);
     });
+
+    // Honor an `?evt=<seq>` deep link (fresh visit, shared link, or a
+    // live-refresh re-render restoring the previous selection). Scroll
+    // only the first time we land on this session+seq so streaming
+    // events don't yank the viewport back mid-read.
+    var qm = (location.hash.split("?")[1] || "").match(/(?:^|&)evt=(\d+)/);
+    if (qm) {
+      var wantSeq = parseInt(qm[1], 10);
+      for (var wi = 0; wi < events.length; wi++) {
+        if (events[wi].seq === wantSeq) {
+          var wantRow = evList.querySelector('.evt[data-i="' + wi + '"]');
+          if (wantRow) {
+            selectEvent(wantRow);
+            var scrollKey = id + ":" + wantSeq;
+            if (_evtScrolledFor !== scrollKey) {
+              _evtScrolledFor = scrollKey;
+              wantRow.scrollIntoView({ block: "center" });
+            }
+          }
+          break;
+        }
+      }
+    }
 
     // Story banner "Jump to the block": scroll the BLOCKED row into
     // view and open it in the drawer, so a non-technical visitor gets
@@ -1484,7 +1515,11 @@
     applyReceiptVerification(receipt);
   }
 
-  function renderEventDrawer(root, ev) {
+  // Which session:seq we already auto-scrolled to, so live-stream
+  // re-renders restore the selection without re-scrolling the page.
+  var _evtScrolledFor = null;
+
+  function renderEventDrawer(root, ev, deepLink) {
     // Values are plain-text by default; opt into HTML via a third
     // tuple element only when we control the markup (like the Policy
     // link below). Otherwise ev.tag / ev.policyId would carry any
@@ -1500,6 +1535,7 @@
     ];
     if (ev.policyId) meta.push(["Policy", '<a href="#/policies/' + encodeURIComponent(ev.policyId) + '">' + esc(ev.policyId) + "</a>", true]);
     if (ev.blockedValueUsd) meta.push(["Would-have-spent", "$" + Number(ev.blockedValueUsd).toLocaleString()]);
+    if (deepLink) meta.push(["Share", '<button type="button" class="btn evt-link-btn" data-copy="' + esc(deepLink) + '" title="Copy a direct link to this event">🔗 Copy link to this event</button>', true]);
 
     var payload = "";
     if (ev.details) {
