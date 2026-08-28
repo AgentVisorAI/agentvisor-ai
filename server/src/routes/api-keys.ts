@@ -93,6 +93,44 @@ export async function apiKeyRoutes(app: FastifyInstance): Promise<void> {
     const plaintextBody = randomToken(28); // 224 bits of randomness
     const plaintext = "av_srv_" + plaintextBody;
     const tokenHash = await hashPassword(plaintext);
+    // R104 F1 + F2: resolve claims.sub to the ULTIMATE human user
+    // id before persisting createdById. For a cookie session
+    // claims.sub is already the user's cuid; for an API-key
+    // session claims.sub is the string 'apikey:<K1.id>' — the
+    // literal parent-key id. Prior shape stored the 'apikey:...'
+    // literal, which meant:
+    //   (F1 HIGH) R103's revocation query filtered on
+    //     createdById: userId, which never matched sub-keys →
+    //     every K2 minted via K1 survived K1's creator's
+    //     demotion/removal → persistent-privilege primitive
+    //     survived the R103 fence.
+    //   (F2 LOW-MED) The subsequent user.findUnique lookup by
+    //     'apikey:...' returned null → createdByEmail stayed
+    //     null → Console list rendered every sub-key as
+    //     unknown-creator, breaking forensic chain-of-custody.
+    // Walk the chain: at each step, if claims.sub starts with
+    // 'apikey:', look up the parent key by id and take its
+    // createdById; loop until we hit a real user id or a null
+    // (bounded to 8 hops for safety against a pathological
+    // cycle from historical data). Also snapshot the ultimate
+    // user's email at create time.
+    let effectiveCreatorId: string | null = claims.sub;
+    let hops = 0;
+    while (effectiveCreatorId && effectiveCreatorId.startsWith("apikey:") && hops < 8) {
+      const parentId: string = effectiveCreatorId.slice("apikey:".length);
+      const parent: { createdById: string | null } | null = await db.apiKey.findUnique({
+        where: { id: parentId },
+        select: { createdById: true },
+      });
+      effectiveCreatorId = parent?.createdById ?? null;
+      hops++;
+    }
+    const creatorUser = effectiveCreatorId
+      ? await db.user.findUnique({
+          where: { id: effectiveCreatorId },
+          select: { id: true, email: true },
+        })
+      : null;
     const key = await db.apiKey.create({
       data: {
         orgId: claims.orgId,
@@ -100,22 +138,11 @@ export async function apiKeyRoutes(app: FastifyInstance): Promise<void> {
         tokenHash,
         tokenHint: plaintextBody.slice(0, 8),
         role: body.data.role,
-        createdById: claims.sub,
+        createdById: creatorUser?.id ?? null,
+        createdByEmail: creatorUser?.email ?? null,
       },
       select: { id: true, name: true, tokenHint: true, role: true, createdAt: true },
     });
-    // Snapshot the creator's email now (so a later user delete doesn't
-    // blank the audit trail label).
-    const me = await db.user.findUnique({
-      where: { id: claims.sub },
-      select: { email: true },
-    });
-    if (me) {
-      await db.apiKey.update({
-        where: { id: key.id },
-        data: { createdByEmail: me.email },
-      });
-    }
     writeAudit(
       {
         orgId: claims.orgId,
