@@ -280,4 +280,68 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
     );
     return reply.send({ ok: true });
   });
+
+  // R100 F3: implement the redeliver endpoint documented in the
+  // header docblock. Prior state was: docblock claimed the route
+  // existed but no handler was registered → operators wiring a
+  // "Retry delivery" button in the console received 404, failed
+  // deliveries silently stayed in `failed`. Reuse the retry
+  // sweeper's mechanism: flip the delivery row to
+  // status='retrying' with nextRetryAt=now() so the next tick
+  // picks it up cleanly. This avoids double-fire semantics
+  // (dispatching a fresh event would fan out to ALL subscribers
+  // of that event's name, wrong for a single-endpoint replay).
+  app.post<{ Params: { id: string; deliveryId: string } }>(
+    "/:id/redeliver/:deliveryId",
+    async (req, reply) => {
+      const claims = requireSession(req, reply);
+      if (!claims) return;
+      if (!assertNotMember(claims)) {
+        return reply.code(403).send({ error: "forbidden" });
+      }
+      const ep = await db.webhookEndpoint.findFirst({
+        where: { id: req.params.id, orgId: claims.orgId, isActive: true },
+      });
+      if (!ep) return reply.code(404).send({ error: "not_found" });
+      const delivery = await db.webhookDelivery.findFirst({
+        where: {
+          id: req.params.deliveryId,
+          endpointId: ep.id,
+        },
+        select: { id: true, status: true, event: true },
+      });
+      if (!delivery) return reply.code(404).send({ error: "delivery_not_found" });
+      // Only failed / delivered deliveries can be manually
+      // redelivered. Retrying is already the sweeper's job; a
+      // pending row is mid-flight. Guarding here prevents an
+      // impatient operator from stacking retries.
+      if (delivery.status === "pending" || delivery.status === "retrying") {
+        return reply.code(409).send({ error: "delivery_already_in_flight" });
+      }
+      await db.webhookDelivery.update({
+        where: { id: delivery.id },
+        data: {
+          status: "retrying",
+          nextRetryAt: new Date(),
+          errorMessage: null,
+        },
+      });
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "webhook.delivery_redelivered",
+          actorId: claims.sub,
+          target: ep.name,
+          metadata: {
+            endpointId: ep.id,
+            deliveryId: delivery.id,
+            originalEvent: delivery.event,
+          },
+          req,
+        },
+        req.log,
+      );
+      return reply.send({ ok: true });
+    },
+  );
 }

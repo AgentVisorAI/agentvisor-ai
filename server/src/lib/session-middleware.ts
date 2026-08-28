@@ -63,7 +63,19 @@ export async function authenticate(
         .catch(() => void 0);
       return;
     }
-    return;
+    // R100 F2: fall through to the cookie path when the API-key
+    // lookup finds no match. Prior shape returned early here —
+    // any Authorization header carrying the av_srv_ prefix
+    // (attacker-injected via a compromised browser extension,
+    // a misconfigured API gateway that appends a stale bearer,
+    // or an attacker-controlled fetch from same-site) suppressed
+    // the cookie fallback and silently downgraded an
+    // authenticated user to 401. Session-DoS primitive against
+    // any victim whose Authorization header can be forced.
+    // Now: if the presented api key hint yields no live match,
+    // continue to the cookie path so a valid cookie still
+    // authenticates. A legitimate API-key consumer never sends
+    // a cookie alongside, so no ambiguity is introduced.
   }
 
   // ---------- Cookie path ----------
