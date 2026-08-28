@@ -596,6 +596,16 @@
           navLink("settings", current, "Settings", iconGear(), "G ,") +
         "</nav>" +
         '<main class="main" id="view" aria-label="Main content"></main>' +
+        // Phone-width navigation: the sidebar is display:none ≤760px,
+        // so without this bar phones could render pages but never
+        // switch sections. Standard bottom tab bar, same routes.
+        '<nav class="tabbar" aria-label="Primary navigation (mobile)">' +
+          tabLink("overview", current, "Overview", iconChart()) +
+          tabLink("sessions", current, "Sessions", iconActivity()) +
+          tabLink("policies", current, "Policies", iconShield()) +
+          tabLink("deployments", current, "Deploys", iconServer()) +
+          tabLink("settings", current, "Settings", iconGear()) +
+        "</nav>" +
       "</div>"
     ));
     $("#cmdkOpen").addEventListener("click", openCmdK);
@@ -686,6 +696,11 @@
     var active = current === key ? ' class="active"' : "";
     return '<a href="#/' + key + '"' + active + ">" + icon + "<span>" + label + "</span>" +
       (kbd ? '<span class="kbd-hint">' + kbd + "</span>" : "") + "</a>";
+  }
+  function tabLink(key, current, label, icon) {
+    var active = current === key;
+    return '<a href="#/' + key + '"' + (active ? ' class="active" aria-current="page"' : "") + ">" +
+      icon + "<span>" + label + "</span></a>";
   }
 
   /* ---------- icons ---------- */
