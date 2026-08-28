@@ -1069,7 +1069,82 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ deployment lifecycle: create→token→pending row, detail truth (env/status/sessions/View-all), rotate; billing math exact");
 }
 
-// ── 23. Listener-leak soak ─────────────────────────────────────────
+// ── 23. Onboarding truth, members RBAC, key lifecycle ──────────────
+// (a) The checklist's four items must tick for the RIGHT reasons at
+// controlled simulation ages (t0 rewound), matching the datasource's
+// own stats — not just the count. (b) The members panel is view-only
+// for members: no Remove, no Invite, and no invite-Revoke (that one
+// leaked). (c) API key create → one-time token → row; revoke → gone.
+{
+  for (const [age, wantCount] of [[2000, 1], [13500, 2], [17500, 3], [30000, 4]]) {
+    await page.evaluate((a) => {
+      localStorage.setItem("av_mock_fresh_t0", String(Date.now() - a));
+      localStorage.setItem("av_mock_fresh_identity", JSON.stringify({ user: { id: "u", email: "drill@x.dev", displayName: "Drill" }, org: { id: "org_d", name: "Drill Co", slug: "drill", createdAt: new Date().toISOString(), role: "owner" } }));
+    }, age);
+    await page.goto(SITE + "#/overview", { waitUntil: "domcontentloaded" });
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector(".onboard-card", { timeout: 15000 });
+    const r = await page.evaluate(async () => {
+      const stats = await window.dataSource.getOverview("24h");
+      const sessions = (await window.dataSource.listSessions()).sessions;
+      const want = [true, stats.deployments > 0, stats.sessions > 0, sessions.some((s) => s.toolsBlocked > 0)];
+      const got = [...document.querySelectorAll(".ob-tick")].map((t) => t.classList.contains("done"));
+      return { ok: JSON.stringify(want) === JSON.stringify(got), got, want };
+    });
+    if (!r.ok) fail("checklist items wrong at age " + age + "ms: got " + JSON.stringify(r.got) + " want " + JSON.stringify(r.want));
+    if (r.got.filter(Boolean).length !== wantCount) fail("checklist schedule drifted at age " + age + "ms: " + JSON.stringify(r.got));
+  }
+  await page.evaluate(() => { localStorage.removeItem("av_mock_fresh_t0"); localStorage.removeItem("av_mock_fresh_identity"); });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => document.querySelector(".stat")?.textContent.trim().length > 0, { timeout: 15000 });
+  // members panel under member preview: zero management controls
+  await page.click(".cmdk-trigger");
+  await page.waitForSelector(".cmdk-backdrop input", { timeout: 5000 });
+  await page.fill(".cmdk-backdrop input", "preview as member");
+  await page.waitForTimeout(300);
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(800);
+  await page.evaluate(() => { location.hash = "#/settings/members"; });
+  await page.waitForSelector("tbody tr", { timeout: 10000 });
+  await page.waitForTimeout(400);
+  const mm = await page.evaluate(() => ({
+    remove: document.querySelectorAll("[data-act='remove']").length,
+    revoke: document.querySelectorAll("[data-act='revoke']").length,
+    invite: !![...document.querySelectorAll("#setPanel button")].find((x) => /invite/i.test(x.textContent)),
+    rows: document.querySelectorAll("tbody tr").length,
+  }));
+  if (mm.remove || mm.revoke || mm.invite || !mm.rows) fail("members panel not view-only for members: " + JSON.stringify(mm));
+  await page.click(".cmdk-trigger");
+  await page.waitForSelector(".cmdk-backdrop input", { timeout: 5000 });
+  await page.fill(".cmdk-backdrop input", "exit member preview");
+  await page.waitForTimeout(300);
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(800);
+  // API key lifecycle
+  await page.evaluate(() => { location.hash = "#/settings/keys"; });
+  await page.waitForSelector("#setPanel", { timeout: 10000 });
+  await page.waitForTimeout(800);
+  const kb = await page.evaluate(() => document.querySelectorAll("tbody tr").length);
+  await page.evaluate(() => [...document.querySelectorAll("#setPanel button")].find((x) => /create/i.test(x.textContent)).click());
+  await page.waitForSelector("#inpVal", { timeout: 5000 });
+  await page.fill("#inpVal", "drill-ci-key");
+  await page.click("#inpForm button[type=submit]");
+  await page.waitForSelector(".token-display", { timeout: 8000 });
+  await page.evaluate(() => document.querySelector(".modal-backdrop [data-close]").click());
+  await page.waitForFunction((n) => document.querySelectorAll("tbody tr").length === n + 1, kb, { timeout: 8000 })
+    .catch(() => fail("created API key did not appear"));
+  await page.evaluate(() => {
+    const tr = [...document.querySelectorAll("tbody tr")].find((r) => r.textContent.includes("drill-ci-key"));
+    (tr.querySelector("button[data-act='revoke']") || tr.querySelector(".btn.danger")).click();
+  });
+  const conf = await page.waitForSelector(".modal-backdrop [data-confirm]", { timeout: 5000 }).catch(() => null);
+  if (conf) await page.click(".modal-backdrop [data-confirm]");
+  await page.waitForFunction(() => !document.getElementById("view").textContent.includes("drill-ci-key"), { timeout: 8000 })
+    .catch(() => fail("revoked API key still listed"));
+  console.log("✅ onboarding items tick for the right reasons at 4 sim ages; members panel view-only for members; key create→revoke round-trip");
+}
+
+// ── 24. Listener-leak soak ─────────────────────────────────────────
 // Every earlier check opened modals, ran the tour, refreshed the
 // overview, and re-rendered lists dozens of times. If any of that
 // leaked document/window listeners (the webhook modal once leaked a
@@ -1095,4 +1170,4 @@ if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors))
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 24 interactive-features drill checks passed.");
+console.log("\nAll 25 interactive-features drill checks passed.");
