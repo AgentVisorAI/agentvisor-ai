@@ -35,24 +35,18 @@ export type EventPayload =
   | { type: "events.appended"; orgId: string; deploymentId: string; sessionId: string; count: number; blocked: number; allowed: number }
   | { type: "receipt.finalized"; orgId: string; deploymentId: string; sessionId: string; receiptId: string };
 
-// R110 F3: per-process origin id, tagged onto every NOTIFY payload so
-// the LISTEN sidecar can skip its own instance's fan-out. Prior shape:
-// publish() emitted locally AND fired pg_notify, then the LISTEN
-// callback on the SAME instance re-emitted locally — every event was
-// delivered to every same-org SSE subscriber TWICE on the origin
-// instance (once from publish's local emit at line 52-53, once from
-// the LISTEN callback's re-emit at 109-110). Console list views that
-// don't dedupe on id showed doubled rows; downstream metric collectors
-// summing SSE payloads over-counted 1x on origin.
-//
-// Wire shape stays backward compatible — any existing consumer that
-// deserializes into EventPayload ignores the extra field, and a new
-// instance receiving an old (untagged) NOTIFY will simply not skip
-// it (delivers as legacy would). Rolling deploy safe.
-interface WirePayload {
-  ev: EventPayload;
-  originId: string;
-}
+// R110 F3 + R111 F3: NOTIFY payload wire format. The R110 F3 shape
+// was `{ev, originId}` which broke pre-R110 receivers (they did
+// `parsed.orgId` and got undefined, silently dropping cross-
+// instance events during any rolling deploy window). Symmetric
+// backward-compat: embed the EventPayload fields at the TOP LEVEL
+// alongside originId, so pre-R110 receivers keep parsing
+// `parsed.orgId` correctly and R110+ receivers use the extra
+// originId field to skip self-delivery. An old sender's untagged
+// payload deserializes with originId=undefined, doesn't match
+// PROCESS_ORIGIN_ID, so a new receiver still re-emits it.
+// Symmetric in both directions across the rolling window.
+type WirePayload = EventPayload & { originId?: string };
 
 const PROCESS_ORIGIN_ID = randomBytes(8).toString("hex");
 
@@ -78,7 +72,11 @@ class Bus extends EventEmitter {
     // Fire-and-forget — the local deliver above is authoritative for the
     // caller's tenant on this node.
     if (this.pgPublisher) {
-      const wire: WirePayload = { ev, originId: PROCESS_ORIGIN_ID };
+      // R111 F3: flat wire shape — EventPayload fields at top level
+      // + originId sibling. Pre-R110 receivers reading `payload.orgId`
+      // still work; R110+ receivers use `payload.originId` to skip
+      // self-delivery. See WirePayload type comment.
+      const wire: WirePayload = { ...ev, originId: PROCESS_ORIGIN_ID };
       const payload = JSON.stringify(wire);
       if (Buffer.byteLength(payload) > MAX_PAYLOAD_BYTES) {
         // Skip cross-instance for oversized payloads; local delivery
@@ -125,26 +123,25 @@ class Bus extends EventEmitter {
     listener.on("notification", (msg) => {
       if (msg.channel !== NOTIFY_CHANNEL || !msg.payload) return;
       try {
-        // R110 F3: skip re-emit when the NOTIFY originated on THIS
-        // process — publish() already delivered locally. Backward-
-        // compatible: an old-format payload without originId
-        // deserializes as { originId: undefined } which won't equal
-        // PROCESS_ORIGIN_ID, so a rolling deploy still delivers.
-        // We accept both {ev, originId} (R110+) and bare EventPayload
-        // (pre-R110) shapes.
-        const parsed = JSON.parse(msg.payload) as WirePayload | EventPayload;
-        const ev: EventPayload =
-          "ev" in parsed && "originId" in parsed ? parsed.ev : (parsed as EventPayload);
-        const originId =
-          "ev" in parsed && "originId" in parsed
-            ? (parsed as WirePayload).originId
-            : undefined;
-        if (originId === PROCESS_ORIGIN_ID) return;
+        // R110 F3 + R111 F3: flat wire shape — EventPayload fields
+        // at top level + optional originId sibling. Pre-R110 senders
+        // send bare EventPayload with no originId; those come through
+        // as originId=undefined and are re-emitted. R110+ senders
+        // include their PROCESS_ORIGIN_ID; if it matches this
+        // process's own id, we skip re-emit (publish() already
+        // delivered locally). Symmetric backward-compat across a
+        // rolling deploy.
+        const parsed = JSON.parse(msg.payload) as WirePayload;
+        if (parsed.originId === PROCESS_ORIGIN_ID) return;
         // Re-emit locally so any SSE subscribers on THIS node see the
         // cross-instance update. Skip the fan-out back to pg by not
         // going through publish() — we're already inside a NOTIFY.
-        this.emit(`org:${ev.orgId}`, ev);
-        this.emit("*", ev);
+        // Extract the raw EventPayload (strip the originId key so
+        // downstream consumers keying on `ev` fields don't see a
+        // spurious originId).
+        const { originId: _ignored, ...ev } = parsed;
+        this.emit(`org:${ev.orgId}`, ev as EventPayload);
+        this.emit("*", ev as EventPayload);
       } catch {
         // Ignore malformed payloads — a future protocol bump would
         // be shipped with an explicit version tag, not silently.
