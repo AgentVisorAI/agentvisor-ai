@@ -52,6 +52,14 @@
     document.documentElement.setAttribute("data-theme", t);
     state.theme = t;
     try { localStorage.setItem("av_theme", t); } catch (e) {}
+    // The in-app toggle overrides the OS scheme, so the scheme-paired
+    // theme-color metas would keep tinting the browser chrome for the
+    // wrong theme — collapse them to the explicit choice.
+    var tint = t === "dark" ? "#0a0a0c" : "#f7f7f8";
+    document.querySelectorAll('meta[name="theme-color"]').forEach(function (m) {
+      m.setAttribute("content", tint);
+      m.removeAttribute("media");
+    });
   }
   function initTheme() {
     var saved;
