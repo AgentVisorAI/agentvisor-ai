@@ -103,7 +103,7 @@
 
   async function boot() {
     initTheme();
-    try { state.session = await state.ds.getSession(); } catch (e) { console.error("session", e); }
+    try { state.session = await state.ds.getSession(); state.authedAt = Date.now(); } catch (e) { console.error("session", e); }
     if (!location.hash) location.hash = state.session ? "#/overview" : "#/login";
     else render();
     installKeyboardShortcuts();
@@ -112,10 +112,21 @@
     // isn't from the boot-time /me probe kicks the user to /login with
     // a toast so they know why. Redirect is a full navigate() so the
     // hash-router picks up "no session" cleanly.
+    // A 401 from a request that was already in flight when the user
+    // re-authenticated must not boot the FRESH session. Any expiry
+    // event within 5s of a login is treated as stale.
     window.addEventListener("av-session-expired", function () {
       if (!state.session) return; // already logged out; ignore
+      if (Date.now() - (state.authedAt || 0) < 5000) return; // stale 401 racing a fresh login
       state.session = null;
       stopLiveStream();
+      // Remember where they were: a 7-day-TTL expiry mid-investigation
+      // shouldn't dump the user on Overview after re-auth. Same
+      // machinery the router's login-redirect uses.
+      try {
+        var full = location.hash || "";
+        if (full && full !== "#/login") sessionStorage.setItem("av_return_to", full);
+      } catch (e) {}
       toast("Your session expired. Please sign in again");
       navigate("#/login");
     });
@@ -866,7 +877,7 @@
           return;
         }
         state.ds.loginWithProvider(p).then(function (s) {
-          state.session = s; startLiveStream();
+          state.session = s; state.authedAt = Date.now(); startLiveStream();
           navigate(consumeReturnTo() || "#/overview");
         }).catch(function (e) {
           $("#authErr").innerHTML = '<div class="auth-err">' + esc(e.message) + "</div>";
@@ -905,6 +916,7 @@
           }
         }
         state.session = s;
+        state.authedAt = Date.now();
         startLiveStream();
         navigate(consumeReturnTo() || "#/overview");
       })
@@ -990,6 +1002,7 @@
         displayName: ($("#displayName") || {}).value || undefined,
       }).then(function (s) {
         state.session = { user: s.user, org: s.org };
+        state.authedAt = Date.now();
         startLiveStream();
         toast("Welcome to " + (s.org && s.org.name ? s.org.name : "the workspace"));
         navigate("#/overview");
