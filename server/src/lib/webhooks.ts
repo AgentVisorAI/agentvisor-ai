@@ -291,6 +291,12 @@ interface DispatchOpts {
   orgId: string;
   event: string;
   data: Record<string, unknown>;
+  // R94 F3: optional endpoint scoping. When set, ONLY the given
+  // endpointId receives the dispatch — used by /:id/test so a
+  // smoke test doesn't fan out to every unrelated subscriber
+  // (Slack, PagerDuty, Datadog). Without it, a "Send test"
+  // click on webhook A woke up on-call responders on webhook B.
+  onlyEndpointId?: string;
   logger?: FastifyBaseLogger;
 }
 
@@ -302,13 +308,24 @@ interface DispatchOpts {
 export function dispatchEvent(opts: DispatchOpts): void {
   void (async () => {
     try {
+      // R94 F3: when scoping to a specific endpoint (the /:id/test
+      // path), don't filter by the events array — the operator
+      // explicitly clicked "Send test" on THIS endpoint. Without
+      // this override, an endpoint that subscribes to
+      // ["policy.block"] but not "test"/"*" would silently drop
+      // its own test click.
       const endpoints = await db.webhookEndpoint.findMany({
-        where: {
-          orgId: opts.orgId,
-          isActive: true,
-          // Postgres array `?|` operator via Prisma's `hasSome`.
-          OR: [{ events: { hasSome: [opts.event, "*"] } }],
-        },
+        where: opts.onlyEndpointId
+          ? {
+              id: opts.onlyEndpointId,
+              orgId: opts.orgId,
+              isActive: true,
+            }
+          : {
+              orgId: opts.orgId,
+              isActive: true,
+              OR: [{ events: { hasSome: [opts.event, "*"] } }],
+            },
         select: { id: true, url: true, secret: true },
       });
       if (endpoints.length === 0) return;
