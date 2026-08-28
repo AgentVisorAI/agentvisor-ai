@@ -120,16 +120,23 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
   // Sets a short-lived signed cookie with the state + verifier, then
   // redirects the browser to the provider's authorize endpoint.
   app.get("/:provider/start", async (req, reply) => {
+    // R123 F1: kickoff endpoint is a top-level browser navigation
+    // (docs/app/datasource.js window.location.assign to /start).
+    // R122 F2 fixed /callback; this closes the sibling error paths.
+    const errRedirect = (slug: string) =>
+      reply.redirect(
+        `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/login?err=${slug}`,
+      );
     const params = z
       .object({ provider: z.enum(["google", "microsoft"]) })
       .safeParse(req.params);
     if (!params.success) {
-      return reply.code(404).send({ error: "provider_not_found" });
+      return errRedirect("oauth_provider_not_found");
     }
     const providers = providerConfigs();
     const p = providers.find((x) => x.id === params.data.provider);
     if (!p) {
-      return reply.code(404).send({ error: "provider_not_configured" });
+      return errRedirect("oauth_provider_not_configured");
     }
 
     const cfg = await getConfig(p);

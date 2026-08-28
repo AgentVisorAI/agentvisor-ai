@@ -901,19 +901,38 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(401).send({ error: "invalid_token" });
     }
     const passwordHash = await hashPassword(body.data.newPassword);
-    await db.user.update({
-      where: { id: user.id },
-      // Clear the reset fields — one-shot use. Also bump the
-      // sessionRevokedAt fence so any live cookie minted before this
-      // password change is invalidated on next request. A leaked
-      // cookie should stop working the moment the password is reset.
-      data: {
-        passwordHash,
-        resetTokenHash: null,
-        resetTokenAt: null,
-        sessionRevokedAt: new Date(),
-      },
-    });
+    // R123 F3: password reset is a break-glass event. R90 F1
+    // bumps sessionRevokedAt to fence every live cookie JWT, but
+    // session-middleware's API-key auth path (lib/session-middleware.ts)
+    // does NOT consult user.sessionRevokedAt when synthesizing a
+    // membershipRole from ApiKey.role — so a leaked `av_srv_`
+    // token that predates the reset still authenticates at prior
+    // privilege indefinitely. Same fence gap R103 F1 closed for
+    // /members PATCH+DELETE role changes, at the reset-confirm
+    // scope. Concrete threat: victim's laptop is compromised with
+    // browser autofill + a checked-in av_srv_ token in dotfiles →
+    // attacker forces a password reset via the compromised
+    // mailbox → all cookies die → victim believes account is
+    // safe → attacker keeps hitting the API with the pre-reset
+    // token until the victim manually revokes each one.
+    // Auto-revoke the user's active-created API keys inside the
+    // same transaction so a crash between the two writes can't
+    // leave the passwordHash rotated but the tokens still live.
+    await db.$transaction([
+      db.user.update({
+        where: { id: user.id },
+        data: {
+          passwordHash,
+          resetTokenHash: null,
+          resetTokenAt: null,
+          sessionRevokedAt: new Date(),
+        },
+      }),
+      db.apiKey.updateMany({
+        where: { createdById: user.id, revokedAt: null },
+        data: { revokedAt: new Date() },
+      }),
+    ]);
     return reply.send({ ok: true });
   });
 }
