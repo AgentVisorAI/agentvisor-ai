@@ -32,6 +32,13 @@ const context = await browser.newContext({ viewport: { width: 1440, height: 900 
 // assert the refresh loops and modal cycles don't accumulate handlers.
 await context.addInitScript(() => {
   window.__lc = {};
+  // Interval accounting for the soak: navigation churn must not
+  // accumulate live intervals (the tago refresher + tour launcher
+  // poll are the only long-lived ones).
+  window.__iv = new Set();
+  const oi = window.setInterval, oc = window.clearInterval;
+  window.setInterval = (...a) => { const id = oi(...a); window.__iv.add(id); return id; };
+  window.clearInterval = (id) => { window.__iv.delete(id); return oc(id); };
   for (const t of [document, window]) {
     const orig = t.addEventListener.bind(t);
     const origRm = t.removeEventListener.bind(t);
@@ -1313,19 +1320,43 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
 // keydown per open), the counters instrumented at context start
 // would show it. Navigation churn amplifies any remaining leak.
 {
-  const before = await page.evaluate(() => ({ ...window.__lc }));
+  const before = await page.evaluate(() => ({ lc: { ...window.__lc }, iv: window.__iv.size }));
   for (let i = 0; i < 6; i++) {
     await page.evaluate((r) => { location.hash = "#/" + r; }, ["sessions", "overview", "policies", "overview", "deployments", "overview"][i]);
     await page.waitForTimeout(700);
   }
-  const after = await page.evaluate(() => ({ ...window.__lc }));
+  // Rapid open/close cycling: 10x modal + 10x palette. A fast
+  // ⌘K→Escape once hit the pre-autofocus window and left the palette
+  // backdrop stuck (Escape only lived on the input); the capture-phase
+  // Escape now closes it regardless of focus.
+  await page.evaluate(() => { location.hash = "#/policies"; });
+  await page.waitForSelector("#addPol", { timeout: 10000 });
+  for (let i = 0; i < 10; i++) {
+    await page.click("#addPol");
+    await page.waitForSelector(".modal-backdrop", { timeout: 3000 });
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(60);
+  }
+  for (let i = 0; i < 10; i++) {
+    await page.click(".cmdk-trigger");
+    await page.waitForSelector(".cmdk-backdrop", { timeout: 3000 });
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(40);
+  }
+  const residue = await page.evaluate(() => ({
+    backdrops: document.querySelectorAll(".modal-backdrop, .cmdk-backdrop").length,
+    locked: document.body.classList.contains("locked"),
+  }));
+  if (residue.backdrops || residue.locked) fail("open/close cycling left residue: " + JSON.stringify(residue));
+  const after = await page.evaluate(() => ({ lc: { ...window.__lc }, iv: window.__iv.size }));
   const leaks = {};
-  for (const [k, v] of Object.entries(after)) {
-    const d = v - (before[k] || 0);
+  for (const [k, v] of Object.entries(after.lc)) {
+    const d = v - (before.lc[k] || 0);
     if (d > 2) leaks[k] = d; // small tolerance for in-flight renders
   }
   if (Object.keys(leaks).length) fail("listener leak during navigation churn: " + JSON.stringify(leaks));
-  console.log("✅ listener-leak soak: no document/window handler growth across the whole drill + 6 navigations");
+  if (after.iv > before.iv + 1) fail("interval leak: " + before.iv + " → " + after.iv);
+  console.log("✅ leak soak: no listener/interval growth across the drill + 6 navigations + 20 open/close cycles");
 }
 
 if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors));
