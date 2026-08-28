@@ -466,6 +466,7 @@
       danger: false,
       onConfirm: function () {
         stopLiveStream();
+        rolePreview = null; // a fresh login gets its real role, not a stale banner
         state.ds.logout().then(function () {
           state.session = null;
           // Cross-tab sync: any other console tab open in this browser
@@ -479,11 +480,33 @@
     });
   }
 
+  /* ── Role preview. Owners/admins can see the console exactly as a
+   *    member does — RBAC-hidden tabs and disabled management actions
+   *    included — without a second account. In-memory only; a reload
+   *    restores the real role. ─────────────────────────────────── */
+  var rolePreview = null; // the real role while the preview is active
+
+  function enterRolePreview() {
+    if (rolePreview || !state.session) return;
+    var real = (state.session.org && state.session.org.role) || "owner";
+    if (real === "member") return;
+    rolePreview = real;
+    state.session.org.role = "member";
+    render();
+    toast("Previewing as member — admin-only areas are hidden");
+  }
+  function exitRolePreview() {
+    if (!rolePreview || !state.session) return;
+    state.session.org.role = rolePreview;
+    rolePreview = null;
+    render();
+    toast("Preview ended — you're back to your own view");
+  }
+
   function renderShell() {
     var current = state.route.path[0] || "overview";
     var org = state.session.org;
-    var user = state.session.user;
-    // One status chip in the topbar, not two. In mock mode we surface
+    var user = state.session.user;    // One status chip in the topbar, not two. In mock mode we surface
     // the "Demo" label so investors instantly see the data is fixtures.
     // In live/api mode a single pulsing "Live" pill doubles as SSE
     // stream health. It flips to "Reconnecting" when the EventSource
@@ -495,7 +518,14 @@
 
     app.innerHTML = "";
     app.appendChild(h(
-      '<div class="app-shell">' +
+      '<div class="app-shell' + (rolePreview ? " has-preview" : "") + '">' +
+        (rolePreview
+          ? '<div class="preview-banner" role="status">' +
+              '<span aria-hidden="true">👁</span>' +
+              '<span>Previewing as <b>member</b> — admin-only tabs and management actions are hidden.</span>' +
+              '<button class="btn" id="exitPreview">Exit preview</button>' +
+            "</div>"
+          : "") +
         '<header class="topbar" role="banner">' +
           '<a class="brand" href="#/overview">' +
             '<img class="brand-mark" src="../logo.png" alt="" width="22" height="22" />' +
@@ -533,6 +563,8 @@
     $("#cmdkOpen").addEventListener("click", openCmdK);
     $("#themeBtn").addEventListener("click", toggleTheme);
     $("#userBtn").addEventListener("click", signOut);
+    var xp = $("#exitPreview");
+    if (xp) xp.addEventListener("click", exitRolePreview);
   }
   function navLink(key, current, label, icon, kbd) {
     var active = current === key ? ' class="active"' : "";
@@ -2506,26 +2538,36 @@
       return;
     }
     var invites = (invitesRes && invitesRes.invites) || [];
+    // Members can see who's in the org but not manage anyone — same
+    // rule the API enforces, mirrored here so the role preview (and
+    // real member accounts) don't show buttons that would only 403.
+    var myRole = (state.session.org && state.session.org.role) || "member";
+    var canManage = myRole === "owner" || myRole === "admin";
 
     var memberRows = members.map(function (m) {
       var roles = ["owner", "admin", "member"];
-      var selector = '<select data-role-user="' + esc(m.userId || m.id) + '">' +
-        roles.map(function (r) { return '<option' + (m.role === r ? ' selected' : '') + '>' + r + '</option>'; }).join('') +
-        '</select>';
+      var selector = canManage
+        ? '<select data-role-user="' + esc(m.userId || m.id) + '" aria-label="Role for ' + esc(m.email) + '">' +
+            roles.map(function (r) { return '<option' + (m.role === r ? ' selected' : '') + '>' + r + '</option>'; }).join('') +
+          '</select>'
+        : '<span class="pill neutral">' + esc(m.role) + '</span>';
       return '<tr data-user="' + esc(m.userId || m.id) + '">' +
         '<td><div class="actor"><span class="av">' + esc(initials(m.displayName || m.email)) + '</span><div><div style="font-weight:500">' + esc(m.displayName || m.email) + '</div><div class="id">' + esc(m.email) + '</div></div></div></td>' +
         '<td>' + selector + '</td>' +
         '<td style="color:var(--fg-2)">' + esc(timeAgo(m.lastActive)) + '</td>' +
-        '<td><button class="btn danger" data-act="remove">Remove</button></td>' +
+        '<td>' + (canManage ? '<button class="btn danger" data-act="remove">Remove</button>' : '') + '</td>' +
       '</tr>';
     }).join("");
 
     var membersCard =
       '<div class="card" style="padding:0">' +
-        '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:baseline">' +
+        '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:baseline; gap:8px">' +
           '<h2 style="margin:0; font-size: var(--t-section); font-weight:600">Members</h2>' +
-          '<span style="margin-left:8px; color:var(--fg-3); font-size:var(--t-sec)">' + members.length + " people</span>" +
-          '<button class="btn accent" id="inviteBtn" style="margin-left:auto">+ Invite</button>' +
+          '<span style="color:var(--fg-3); font-size:var(--t-sec)">' + members.length + " people</span>" +
+          (canManage
+            ? '<button class="btn" id="previewRoleBtn" style="margin-left:auto" title="See the console exactly as a member does">👁 Preview as member</button>' +
+              '<button class="btn accent" id="inviteBtn">+ Invite</button>'
+            : '<span style="margin-left:auto; color:var(--fg-3); font-size:var(--t-sec)">Ask an owner or admin to manage members</span>') +
         "</div>" +
         '<div class="table-wrap"><table>' +
           '<thead><tr><th>Person</th><th>Role</th><th>Last active</th><th><span class="sr-only">Actions</span></th></tr></thead>' +
@@ -2558,6 +2600,8 @@
 
     var ib = $("#inviteBtn", root);
     if (ib) ib.addEventListener("click", function () { openInviteModal(root); });
+    var pv = $("#previewRoleBtn", root);
+    if (pv) pv.addEventListener("click", enterRolePreview);
 
     // Member row actions. Role change + remove
     var tables = root.querySelectorAll("table");
@@ -3410,6 +3454,9 @@
       if (typeof state.ds.simulateAttack === "function") actions.push({ g: "Actions", label: "Simulate an agent attack", desc: "Stage a live blocked payment", run: function () { navigate("#/overview"); setTimeout(runAttackDemo, 250); } });
     }
     actions.push({ g: "Actions", label: "New policy", desc: "Create a spend cap, vendor allowlist, or PII guard", run: function () { navigate("#/policies"); setTimeout(openCreatePolicyModal, 250); } });
+    if (rolePreview) actions.push({ g: "Actions", label: "Exit member preview", desc: "Back to your own role", run: exitRolePreview });
+    else if (state.session && state.session.org && state.session.org.role !== "member")
+      actions.push({ g: "Actions", label: "Preview as member", desc: "See the console the way a member does", run: enterRolePreview });
     // Sibling pages: the verifier and the pitch live outside the SPA,
     // so open them as real navigations instead of hash routes.
     var pages = [

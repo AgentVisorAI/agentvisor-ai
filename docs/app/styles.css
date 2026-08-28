@@ -364,6 +364,20 @@ code, pre, .mono {
   grid-template-areas: "topbar topbar" "sidebar main";
   min-height: 100vh;
 }
+/* Role preview adds a full-width banner row above the topbar. */
+.app-shell.has-preview {
+  grid-template-rows: auto var(--topbar-h) 1fr;
+  grid-template-areas: "pbanner pbanner" "topbar topbar" "sidebar main";
+}
+.preview-banner {
+  grid-area: pbanner;
+  display: flex; align-items: center; gap: var(--s-2);
+  padding: 6px var(--s-4);
+  background: var(--warning-bg, var(--accent-bg));
+  border-bottom: 1px solid var(--border);
+  color: var(--fg); font-size: var(--t-sec);
+}
+.preview-banner .btn { margin-left: auto; padding: 3px 10px; font-size: 11.5px; }
 
 .topbar {
   grid-area: topbar;
@@ -1474,6 +1488,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
  * ============================================================ */
 @media (max-width: 760px) {
   .app-shell { grid-template-columns: minmax(0, 1fr); grid-template-areas: "topbar" "main"; }
+  .app-shell.has-preview { grid-template-rows: auto var(--topbar-h) 1fr; grid-template-areas: "pbanner" "topbar" "main"; }
   .sidebar { display: none; }
   .main { padding: var(--s-4); }
   .topbar { overflow: hidden; }
