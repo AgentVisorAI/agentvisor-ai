@@ -185,7 +185,29 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
   app.get<{
     Params: { configId: string };
     Querystring: { RelayState?: string };
-  }>("/:configId/login", async (req, reply) => {
+  }>("/:configId/login", {
+    // R133 F1: perIp(30, 60_000) per-route rate limit. Direct
+    // SAML analog to the /oauth/:provider/start bucket added in
+    // R132 F2. Strictly worse amplification than the OAuth
+    // sibling: per hit does findUnique + buildAdapter (no
+    // caching) + getAuthorizeUrlAsync, which RSA-signs the
+    // AuthnRequest XML when cfg.spPrivateKeyPem is set (common;
+    // ADFS/Okta require signed AuthnRequests) — ~1-2 ms of CPU
+    // vs oauth /start's microseconds of SHA-256 PKCE. A lone
+    // attacker looping this on a corp NAT eats the 300/min/IP
+    // global quota AND burns real CPU. 30/min/IP matches
+    // /discover (R131 F3) and /oauth/start (R132 F2).
+    // Sibling /:configId/acs stays on the global bucket — the
+    // SAMLResponse signature check fast-fails on malformed
+    // input, same rationale as /oauth/callback.
+    config: {
+      rateLimit: {
+        max: 30,
+        timeWindow: 60_000,
+        keyGenerator: (req: { ip: string }) => `ip:${req.ip}`,
+      },
+    },
+  }, async (req, reply) => {
     // R123 F1: kickoff endpoint is a top-level browser navigation
     // (docs/app/app.js:1063 does window.location.assign(loginUrl)).
     // R122 F2 fixed the ACS side but missed this — same dead-end

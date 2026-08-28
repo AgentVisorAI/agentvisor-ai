@@ -41,7 +41,12 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
     if (!claims) return;
     const query = z
       .object({
-        deploymentId: z.string().optional(),
+        // R133 F2: cap deploymentId length. Deployment IDs are
+        // cuid2 (~30 chars); 64 is generous. R131 F1 + R132 F1
+        // capped cursor + before on hot GETs; deploymentId is
+        // the last uncapped .optional() field on this endpoint
+        // and its /sessions sibling.
+        deploymentId: z.string().max(64).optional(),
         limit: z.coerce.number().int().min(1).max(OVERVIEW_LIMIT_MAX).default(50),
       })
       .safeParse(req.query);
@@ -162,7 +167,8 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
         // per authenticated call.
         cursor: z.string().max(128).optional(),
         limit: z.coerce.number().int().min(1).max(SESSIONS_LIST_LIMIT_MAX).default(50),
-        deploymentId: z.string().optional(),
+        // R133 F2: same cap as /overview above.
+        deploymentId: z.string().max(64).optional(),
         // Free-text filter. Server-side so filtering over the whole
         // fleet works at 1M+ sessions (not just the visible page).
         q: z.string().max(200).optional(),
