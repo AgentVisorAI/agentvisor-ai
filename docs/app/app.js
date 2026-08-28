@@ -189,7 +189,10 @@
     clearTimeout(_ovT);
     _ovT = setTimeout(function () {
       var main = document.getElementById("view");
-      if (main && (!state.route || state.route.path[0] === "overview")) renderOverview(main);
+      // quiet: this fires on every streamed event — repainting the
+      // loading skeleton here made the whole dashboard blink (and any
+      // DOM read between paint and data resolve hit a skeleton).
+      if (main && (!state.route || state.route.path[0] === "overview")) renderOverview(main, true);
     }, 700);
   }
   var _sdT;
