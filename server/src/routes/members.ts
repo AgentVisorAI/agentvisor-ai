@@ -354,6 +354,41 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(409).send({ error: "already_a_member" });
     }
 
+    // R122 F1: rung parity on the UPSERT PATH. R83 F1 above only
+    // gates the caller's REQUESTED role — but the upsert can
+    // silently rewrite an existing pending invite that was
+    // minted at a higher tier. Chain:
+    //   1. Outgoing owner O1 invites bob@x as role="owner",
+    //      row stored with tokenHash=H_owner, invitedById=O1.
+    //   2. Admin A1 invites bob@x as role="admin" —
+    //      canGrantRole(admin,admin) passes → upsert hits UPDATE
+    //      → row overwritten with role="admin", tokenHash=H_new,
+    //      invitedById=A1. Bob's original owner-token
+    //      argon2-fails at /invites/accept (silent DoS), the
+    //      invite trail attributes to A1 (audit-laundering), and
+    //      the role is silently downgraded to admin.
+    // Same tier-boundary breach class as R84 F1 (member PATCH),
+    // R118 F1 (api-keys DELETE), R119 F1 (invites DELETE) —
+    // this is the CREATE/UPDATE-via-upsert leg. Fix: symmetric
+    // rank check against the existing row's role. Consumed
+    // (acceptedAt) or revoked (revokedAt) rows are inert — safe
+    // to refresh regardless of prior rank.
+    const existingInv = await db.invite.findUnique({
+      where: { orgId_email: { orgId: claims.orgId, email: body.data.email } },
+      select: { role: true, acceptedAt: true, revokedAt: true },
+    });
+    if (
+      existingInv &&
+      !existingInv.acceptedAt &&
+      !existingInv.revokedAt &&
+      !canGrantRole(
+        claims.membershipRole,
+        existingInv.role as "owner" | "admin" | "member",
+      )
+    ) {
+      return reply.code(403).send({ error: "cannot_mutate_invite_above_own_rank" });
+    }
+
     const plaintextToken = randomToken(32);
     const tokenHash = await hashPassword(plaintextToken);
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
@@ -693,7 +728,15 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
     // requiresLogin so the SPA routes to /#/login where the user
     // supplies their real password (and, if enrolled, completes
     // the WebAuthn ceremony).
+    // R122 track A cosmetic: include org.name so the SPA toast
+    // ("Welcome to <name>") renders the workspace name instead of
+    // silently falling to "the workspace". `org` was already
+    // loaded upstream at line 345 for the create-path email.
     if (isPreexistingUser) {
+      const targetOrg = await db.org.findUnique({
+        where: { id: matched.orgId },
+        select: { name: true },
+      });
       writeAudit(
         {
           orgId: matched.orgId,
@@ -708,11 +751,19 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       );
       return reply.send({
         user: { id: user.id, email: user.email, displayName: user.displayName },
-        org: { id: matched.orgId, role: matched.role },
+        org: {
+          id: matched.orgId,
+          role: matched.role,
+          name: targetOrg?.name ?? null,
+        },
         requiresLogin: true,
       });
     }
 
+    const targetOrgForMint = await db.org.findUnique({
+      where: { id: matched.orgId },
+      select: { name: true },
+    });
     const token = await mintSession({
       sub: user.id,
       orgId: matched.orgId,
@@ -733,7 +784,11 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
     );
     return reply.send({
       user: { id: user.id, email: user.email, displayName: user.displayName },
-      org: { id: matched.orgId, role: matched.role },
+      org: {
+        id: matched.orgId,
+        role: matched.role,
+        name: targetOrgForMint?.name ?? null,
+      },
     });
   });
 }
