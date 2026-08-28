@@ -772,6 +772,15 @@ td, th { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 th.act-1 { width: 110px; }
 th.act-2 { width: 180px; }
 th.act-3 { width: 264px; }
+/* Sortable column headers: the whole label is a button. Inherits the
+   th typography so sortable and plain headers read identically. */
+th .th-sort {
+  background: none; border: 0; padding: 0; cursor: pointer;
+  font: inherit; color: inherit; text-transform: inherit; letter-spacing: inherit;
+}
+th .th-sort:hover { color: var(--fg); }
+th .th-sort.active { color: var(--fg); }
+th[aria-sort] { white-space: nowrap; }
 /* Cells that hold two lines (deployment name + subhead) opt back in. */
 td > div:first-child { overflow: hidden; text-overflow: ellipsis; }
 th {
