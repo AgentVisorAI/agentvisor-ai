@@ -105,13 +105,29 @@ jobs:
           cp docs/app/crash-guard.js "$site/app/"
           # Minify JS. keep_classnames + keep_fnames stay on so the
           # in-app error boundary can still show a legible stack.
-          npx --yes terser@5 docs/app/app.js \
+          #
+          # R128 F3: pin terser via docs/app/package.json +
+          # package-lock.json and install with `npm ci`. Prior
+          # shape ran `npx --yes terser@5` three times — fresh
+          # unpinned npm fetches on every build, so a single
+          # compromised terser 5.x publish would inject arbitrary
+          # code into the minified SPA served under
+          # credentials: "include" against the API cookie: whole-
+          # tenant account-takeover primitive. R116 F1's own
+          # comment named this as motivation to shrink workflow
+          # scope but the fetch itself was never pinned. `npm ci`
+          # enforces the exact tree in package-lock.json (with
+          # integrity hashes) so a hostile republish would break
+          # the build loudly, not run silently.
+          (cd docs/app && npm ci --silent)
+          TERSER_BIN=docs/app/node_modules/.bin/terser
+          "$TERSER_BIN" docs/app/app.js \
             --compress passes=2 --mangle --keep-fnames --keep-classnames \
             -o "$site/app/app.js"
-          npx --yes terser@5 docs/app/datasource.js \
+          "$TERSER_BIN" docs/app/datasource.js \
             --compress passes=2 --mangle --keep-fnames --keep-classnames \
             -o "$site/app/datasource.js"
-          npx --yes terser@5 docs/app/tour.js \
+          "$TERSER_BIN" docs/app/tour.js \
             --compress passes=2 --mangle --keep-fnames --keep-classnames \
             -o "$site/app/tour.js"
           echo "SPA sizes (raw → minified):"
