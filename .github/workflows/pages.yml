@@ -12,10 +12,17 @@ on:
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
+# R116 F1: least-privilege at workflow root; per-job overrides
+# below grant the specific scopes each job needs. Prior shape
+# gave the whole workflow (including the build matrix that runs
+# cargo doc against transitive crates.io deps + build.rs surface,
+# plus 3× npx --yes terser@5 fresh unpinned npm fetches)
+# pages: write + id-token: write — id-token: write can mint OIDC
+# federation tokens for external clouds. Only the deploy job
+# (actions/deploy-pages) actually needs those two scopes. Sibling
+# discipline to R115 F3 on release.yml.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: pages
@@ -171,6 +178,11 @@ jobs:
     name: Deploy to GitHub Pages
     needs: build
     runs-on: ubuntu-latest
+    # R116 F1: only the deploy job needs pages:write + id-token:write
+    # (id-token minting for the deploy-pages OIDC handshake).
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
