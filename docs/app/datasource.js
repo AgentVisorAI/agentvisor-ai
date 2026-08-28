@@ -1253,6 +1253,28 @@
       if (p) p.enabled = !p.enabled;
       return p;
     },
+    async createPolicy(input) {
+      await delay(300);
+      var base = "pol_" + (input.name || "custom").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 40);
+      var id = base;
+      if (MOCK_POLICIES.some(function (x) { return x.id === id; })) id = base + "_" + Date.now().toString(36);
+      var by = (mockState.session && mockState.session.user && mockState.session.user.email) || "olivia.tan@northwind.com";
+      var p = {
+        id: id,
+        name: input.name,
+        kind: input.kind || "guardrail",
+        scope: input.scope || "tool.*",
+        enabled: true,
+        hits24h: 0,
+        blocks24h: 0,
+        updatedAt: new Date().toISOString(),
+        updatedBy: by,
+        description: input.description || "",
+        body: input.body || "",
+      };
+      MOCK_POLICIES.unshift(p);
+      return p;
+    },
 
     async listMembers() {
       await delay(100);
@@ -1708,6 +1730,15 @@
     async listPolicies() { return MOCK_POLICIES.slice(); }, // no backend endpoint yet
     async getPolicy(id) { var p = MOCK_POLICIES.find(function (x) { return x.id === id; }); if (!p) throw new Error("not_found"); return p; },
     async togglePolicy(id) { return this.getPolicy(id); },
+    async createPolicy(input) { // no backend endpoint yet — local-only, mirrors the mock
+      var p = Object.assign({
+        id: "pol_" + Date.now().toString(36),
+        enabled: true, hits24h: 0, blocks24h: 0,
+        updatedAt: new Date().toISOString(), updatedBy: "",
+      }, input);
+      MOCK_POLICIES.unshift(p);
+      return p;
+    },
     async listMembers() {
       try {
         var r = await apiFetch("/api/v1/members");
