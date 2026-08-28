@@ -1896,3 +1896,29 @@ a.ob-step:hover { border-color: var(--accent); }
   .event-drawer:has(.empty-mini) { display: none !important; }
 }
 .print-only { display: none; }
+
+/* Account menu (topbar avatar dropdown). */
+#accountMenu {
+  position: fixed;
+  min-width: 240px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-lg);
+  padding: 6px;
+  z-index: 500;
+  animation: modalIn 120ms cubic-bezier(.22,1,.36,1);
+}
+#accountMenu .am-head { padding: 8px 10px 10px; border-bottom: 1px solid var(--border); margin-bottom: 6px; font-size: var(--t-sec); }
+#accountMenu .am-head .am-sub { color: var(--fg-3); font-size: 11.5px; margin-top: 2px; }
+#accountMenu [role=menuitem] {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  width: 100%; text-align: left;
+  background: none; border: 0; cursor: pointer;
+  padding: 8px 10px; border-radius: var(--r-sm);
+  font: inherit; font-size: var(--t-sec); color: var(--fg);
+}
+#accountMenu [role=menuitem]:hover, #accountMenu [role=menuitem]:focus-visible { background: var(--surface-hover); }
+#accountMenu .am-danger { color: var(--danger); }
+#accountMenu .am-sep { border-top: 1px solid var(--border); margin: 6px 0; }
+@media (prefers-reduced-motion: reduce) { #accountMenu { animation: none; } }

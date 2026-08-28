@@ -577,7 +577,7 @@
             '<span class="kbd">⌘K</span>' +
           "</button>" +
           '<button class="theme-btn" id="themeBtn" title="Toggle theme" aria-label="Toggle light/dark theme">' + iconTheme() + "</button>" +
-          '<button class="user-btn" id="userBtn" aria-label="Account menu">' +
+          '<button class="user-btn" id="userBtn" aria-label="Account menu" aria-haspopup="menu" aria-expanded="false">' +
             '<span class="avatar" aria-hidden="true">' + esc(initials(user.displayName || user.email)) + "</span>" +
             "<span>" + esc(user.email) + "</span>" +
           "</button>" +
@@ -600,10 +600,88 @@
     ));
     $("#cmdkOpen").addEventListener("click", openCmdK);
     $("#themeBtn").addEventListener("click", toggleTheme);
-    $("#userBtn").addEventListener("click", signOut);
+    $("#userBtn").addEventListener("click", toggleAccountMenu);
     var xp = $("#exitPreview");
     if (xp) xp.addEventListener("click", exitRolePreview);
   }
+
+  /* ── Account menu. The avatar used to be a straight shortcut to the
+   *    sign-out confirm — an account button should offer the account
+   *    actions. Anchored dropdown, ARIA menu semantics, Escape /
+   *    click-outside / navigation all close it. ─────────────────── */
+  function closeAccountMenu() {
+    var m = document.getElementById("accountMenu");
+    if (m) m.remove();
+    var btn = document.getElementById("userBtn");
+    if (btn) btn.setAttribute("aria-expanded", "false");
+    document.removeEventListener("click", onAccountMenuOutside, true);
+    document.removeEventListener("keydown", onAccountMenuKey, true);
+  }
+  function onAccountMenuOutside(e) {
+    if (e.target.closest("#accountMenu") || e.target.closest("#userBtn")) return;
+    closeAccountMenu();
+  }
+  function onAccountMenuKey(e) {
+    var m = document.getElementById("accountMenu");
+    if (!m) return;
+    if (e.key === "Escape") {
+      e.preventDefault(); e.stopPropagation();
+      closeAccountMenu();
+      var btn = document.getElementById("userBtn");
+      if (btn) btn.focus();
+      return;
+    }
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      var items = Array.prototype.slice.call(m.querySelectorAll("[role=menuitem]"));
+      var i = items.indexOf(document.activeElement);
+      var next = e.key === "ArrowDown" ? items[i + 1] || items[0] : items[i - 1] || items[items.length - 1];
+      if (next) next.focus();
+    }
+  }
+  function toggleAccountMenu() {
+    if (document.getElementById("accountMenu")) return closeAccountMenu();
+    var user = state.session.user, org = state.session.org;
+    var canPreview = !rolePreview && org && org.role !== "member";
+    var menu = h(
+      '<div id="accountMenu" role="menu" aria-label="Account">' +
+        '<div class="am-head">' +
+          '<div style="font-weight:600">' + esc(user.displayName || user.email) + "</div>" +
+          '<div class="am-sub">' + esc(user.email) + " · " + esc((org && org.role) || "member") + " @ " + esc(org.name) + "</div>" +
+        "</div>" +
+        '<button role="menuitem" data-act="shortcuts">Keyboard shortcuts <span class="kbd">?</span></button>' +
+        '<button role="menuitem" data-act="theme">Switch to ' + (state.theme === "dark" ? "light" : "dark") + " theme</button>" +
+        (canPreview ? '<button role="menuitem" data-act="preview">👁 Preview as member</button>' : "") +
+        (rolePreview ? '<button role="menuitem" data-act="exitPreview">Exit member preview</button>' : "") +
+        '<div class="am-sep"></div>' +
+        '<button role="menuitem" data-act="signout" class="am-danger">Sign out…</button>' +
+      "</div>"
+    );
+    document.body.appendChild(menu);
+    var btn = document.getElementById("userBtn");
+    btn.setAttribute("aria-expanded", "true");
+    // anchor under the button, right-aligned
+    var r = btn.getBoundingClientRect();
+    menu.style.top = (r.bottom + 6) + "px";
+    menu.style.right = Math.max(8, window.innerWidth - r.right) + "px";
+    menu.addEventListener("click", function (e) {
+      var it = e.target.closest("[data-act]");
+      if (!it) return;
+      var act = it.getAttribute("data-act");
+      closeAccountMenu();
+      if (act === "shortcuts") openShortcutSheet();
+      else if (act === "theme") toggleTheme();
+      else if (act === "preview") enterRolePreview();
+      else if (act === "exitPreview") exitRolePreview();
+      else if (act === "signout") signOut();
+    });
+    document.addEventListener("click", onAccountMenuOutside, true);
+    document.addEventListener("keydown", onAccountMenuKey, true);
+    var first = menu.querySelector("[role=menuitem]");
+    if (first) first.focus();
+  }
+  // route changes rebuild the shell — never leave a floating menu behind
+  window.addEventListener("hashchange", closeAccountMenu);
   function navLink(key, current, label, icon, kbd) {
     var active = current === key ? ' class="active"' : "";
     return '<a href="#/' + key + '"' + active + ">" + icon + "<span>" + label + "</span>" +
