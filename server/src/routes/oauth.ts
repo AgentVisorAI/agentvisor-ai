@@ -154,10 +154,13 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
         ...SESSION_COOKIE_OPTS,
         maxAge: OAUTH_STATE_TTL_S,
         path: "/api/v1/auth/oauth",
-        // signed: true — @fastify/cookie can HMAC-sign if a secret is set.
-        // We omit here to keep parity with the main session cookie which
-        // is a JWT (self-signed). Short TTL + httpOnly + strict CSRF
-        // handling upstream covers the attack surface.
+        // R95 F4: HMAC-signed via the @fastify/cookie secret
+        // registered at index.ts. Closes the login-CSRF /
+        // OIDC-fixation variant where an attacker with a
+        // parent-domain cookie primitive plants a valid
+        // state bag in the victim's browser. Read path uses
+        // req.unsignCookie() to verify + strip the signature.
+        signed: true,
       },
     );
 
@@ -175,10 +178,20 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
     if (!params.success) {
       return reply.code(404).send({ error: "provider_not_found" });
     }
-    const stateRaw = req.cookies[OAUTH_STATE_COOKIE];
-    if (!stateRaw) {
+    // R95 F4: signed cookies arrive via req.cookies as-is; use
+    // req.unsignCookie to verify + strip the HMAC. On tamper the
+    // valid flag is false; treat that as missing_state_cookie so
+    // the wire response doesn't distinguish 'no cookie' from
+    // 'forged cookie'.
+    const stateRawSigned = req.cookies[OAUTH_STATE_COOKIE];
+    if (!stateRawSigned) {
       return reply.code(400).send({ error: "missing_state_cookie" });
     }
+    const unsigned = req.unsignCookie(stateRawSigned);
+    if (!unsigned.valid || unsigned.value == null) {
+      return reply.code(400).send({ error: "missing_state_cookie" });
+    }
+    const stateRaw = unsigned.value;
     let stateBag: {
       state: string;
       codeVerifier: string;

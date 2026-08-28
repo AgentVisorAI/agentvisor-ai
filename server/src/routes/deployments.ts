@@ -182,18 +182,51 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
       // by default forces the operator to opt in with a
       // force=1 query flag AND we audit-log the force decision
       // with the receipt count so the trail shows the intent.
-      const receiptCount = await db.receipt.count({
-        where: { session: { deploymentId: owned.id } },
-      });
+      // R94 F4 + R95 F2: run the receipt-count check + the delete
+      // inside ONE serializable transaction so a mid-flight
+      // /receipts seal that lands BETWEEN the count and the
+      // delete can't slip through the guard and get vaporized by
+      // the CASCADE. Prior R94 shape ran count() → check → delete
+      // as three independent queries; the race window was
+      // milliseconds but real, and the operator had NO signal in
+      // the audit trail that a receipt had been destroyed
+      // (forceDeletedReceipts: undefined because receiptCount at
+      // check time was 0). Now: recount inside the tx immediately
+      // before the delete, and refuse the whole tx if a fresh
+      // seal landed. The audit metadata is always accurate.
       const force = req.query.force === "1" || req.query.force === "true";
-      if (receiptCount > 0 && !force) {
-        return reply.code(409).send({
-          error: "deployment_has_sealed_receipts",
-          receiptCount,
-          hint: "pass ?force=1 to acknowledge cascade-deletion of receipts",
-        });
+      let receiptCount = 0;
+      try {
+        receiptCount = await db.$transaction(async (tx) => {
+          const n = await tx.receipt.count({
+            where: { session: { deploymentId: owned.id } },
+          });
+          if (n > 0 && !force) {
+            throw new Error(`__has_sealed_receipts__${n}`);
+          }
+          await tx.deployment.delete({ where: { id: owned.id } });
+          return n;
+        }, { isolationLevel: "Serializable" });
+      } catch (e) {
+        if (e instanceof Error && e.message.startsWith("__has_sealed_receipts__")) {
+          const n = Number(e.message.split("__")[2] ?? "0");
+          return reply.code(409).send({
+            error: "deployment_has_sealed_receipts",
+            receiptCount: n,
+            hint: "pass ?force=1 to acknowledge cascade-deletion of receipts",
+          });
+        }
+        if (
+          typeof e === "object" && e !== null &&
+          (e as { code?: string }).code === "P2034"
+        ) {
+          // Serializable write conflict — some other writer
+          // touched Deployment/Session/Receipt concurrently.
+          // Caller can retry.
+          return reply.code(409).send({ error: "concurrent_modification_retry" });
+        }
+        throw e;
       }
-      await db.deployment.delete({ where: { id: owned.id } });
       writeAudit(
         {
           orgId: claims.orgId,

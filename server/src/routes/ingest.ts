@@ -428,6 +428,21 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
             },
           });
         }
+      }, {
+        // R95 F1: Prisma's default \$transaction timeout is 5 s.
+        // The route's zod cap is .max(500), and each event.create
+        // is a serial round trip inside the tx. On hosted Postgres
+        // (Neon, Supabase, RDS) with 10-20 ms RTT the tx spans
+        // 5-10 s for a full 500-row single-session batch and
+        // consistently throws P2028 'Transaction already closed'.
+        // The route re-raises → 500 → daemon retries the same
+        // batch → hits the same timeout → session livelocked
+        // FOREVER. Exchanging the R93 F2 double-count for hard
+        // stuck is worse. Bump the tx timeout to 30 s (covers
+        // 500 rows × 60 ms RTT × 2 safety) and maxWait to 10 s
+        // (default 2 s risks queue-storm 429s under contention).
+        timeout: 30_000,
+        maxWait: 10_000,
       });
       inserted += insertedSeqs.size;
 
