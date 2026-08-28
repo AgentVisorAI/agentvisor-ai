@@ -6,8 +6,15 @@ on:
       - "v[0-9]+.[0-9]+.[0-9]+"
       - "v[0-9]+.[0-9]+.[0-9]+-*"
 
+# R115 F3: least-privilege at workflow root. Prior shape set
+# `contents: write` at the workflow level, so every job — including
+# the build matrix that runs `cargo build --release` against
+# potentially-poisoned transitive crates.io deps and third-party
+# actions — got a write-scoped GITHUB_TOKEN it did not need. Only
+# the `publish` job actually calls `gh release create`. Per-job
+# permission overrides below tighten each job to what it needs.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   # A pushed tag is immutable, but keep the group so re-runs do not race.
@@ -80,6 +87,11 @@ jobs:
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    # R115 F3: only the publish job needs contents:write to call
+    # `gh release create`. Every other job runs with the
+    # workflow-root contents:read scope.
+    permissions:
+      contents: write
     steps:
       # Round-29 F2: pin every third-party action by commit SHA.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

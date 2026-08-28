@@ -345,14 +345,23 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
     // strings so Fastify's JSON serializer doesn't choke. Also hoist the
     // deployment's public key to a top-level field so the console can
     // verify the Ed25519 signature client-side (no server-side blind trust).
+    //
+    // R115 F1: redact spend counters for members. R114 F3 closed
+    // this exposure on /overview, /sessions LIST, /sessions/:id
+    // but this receipt endpoint on the same file was missed —
+    // any member could read the exact per-session spend via
+    // GET /receipts/:sessionId. Same rationale as R114 F3.
+    const isMember = claims.membershipRole === "member";
     const safe = {
       ...receipt,
       session: receipt.session
         ? {
             ...receipt.session,
-            costUsdMicros: receipt.session.costUsdMicros.toString(),
-            payoutUsdMicros: receipt.session.payoutUsdMicros.toString(),
-            blockedPayoutUsdMicros: receipt.session.blockedPayoutUsdMicros.toString(),
+            costUsdMicros: isMember ? "0" : receipt.session.costUsdMicros.toString(),
+            payoutUsdMicros: isMember ? "0" : receipt.session.payoutUsdMicros.toString(),
+            blockedPayoutUsdMicros: isMember
+              ? "0"
+              : receipt.session.blockedPayoutUsdMicros.toString(),
           }
         : receipt.session,
       publicKeyHex: receipt.session?.deployment?.publicKeyHex ?? null,

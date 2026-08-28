@@ -271,9 +271,21 @@
     fileInput.addEventListener("change", () => handleFile(fileInput.files?.[0]));
 
     // Paste anywhere on the page.
+    // R115 F2: cap the paste size to match the file-drop 5 MB
+    // limit. Prior shape passed raw clipboard bytes to
+    // handleText → JSON.parse on the main thread — a recipient
+    // who accidentally pasted a giant blob (a copied file, a
+    // large log, hostile data from a link) would freeze the
+    // tab on the synchronous parse. File-drop and URL fragment
+    // paths already have this cap; paste was the missing spot.
     window.addEventListener("paste", (ev) => {
       const text = ev.clipboardData?.getData("text");
-      if (text && text.trim().startsWith("{")) handleText(text);
+      if (!text || !text.trim().startsWith("{")) return;
+      if (text.length > 5_000_000) {
+        render({ kind: "err", message: "Pasted input larger than 5 MB. Probably not a receipt." });
+        return;
+      }
+      handleText(text);
     });
 
     loadExample.addEventListener("click", async () => {
