@@ -224,6 +224,22 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       },
       select: { status: true },
     });
+    // R119 F2: post-seal metadata freeze. R93 F4 + R118 F2
+    // locked the receipt row and session.stopReason once sealed.
+    // Prior shape here only locked `status` (via nextStatus) —
+    // an ingest-token holder could re-POST /ingest/sessions with
+    // status:"sealed" (satisfies the gate) and mutated agent /
+    // workflow / policyVersion / closedAt to relabel a sealed
+    // session. The signed receipt.body is unchanged so the
+    // Ed25519 verifier at /verify still passes, but the SPA
+    // session list + /me/export render session.agent /
+    // session.workflow / session.policyVersion — post-seal
+    // audit-trail defacement (e.g. mutating workflow to
+    // "unsigned" makes a legitimately signed session appear
+    // unsigned in the list). Same threat model as R92 F2 / R93
+    // F4 / R118 F2 (leaked AV_INGEST_TOKEN). First-write-wins
+    // matches the sealed-receipt posture across the file.
+    const isSealed = existing?.status === "sealed";
     const nextStatus =
       existing?.status === "sealed" && s.status !== "sealed" ? existing.status : s.status;
     const session = await db.session.upsert({
@@ -244,13 +260,15 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
         openedAt: s.openedAt,
         closedAt: s.closedAt,
       },
-      update: {
-        agent: s.agent,
-        workflow: s.workflow,
-        status: nextStatus,
-        policyVersion: s.policyVersion,
-        closedAt: s.closedAt,
-      },
+      update: isSealed
+        ? {}
+        : {
+            agent: s.agent,
+            workflow: s.workflow,
+            status: nextStatus,
+            policyVersion: s.policyVersion,
+            closedAt: s.closedAt,
+          },
       select: { id: true, externalId: true },
     });
     bus.publish({

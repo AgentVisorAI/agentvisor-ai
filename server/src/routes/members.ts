@@ -486,6 +486,24 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       where: { id: req.params.id, orgId: claims.orgId },
     });
     if (!existing) return reply.code(404).send({ error: "not_found" });
+    // R119 F1: rung parity with POST /members/invites (R83 F1)
+    // and DELETE /keys/:id (R118 F1). The create path blocks an
+    // admin from MINTING an owner-scoped invite; the revoke path
+    // must symmetrically block an admin from KILLING a pending
+    // owner-scoped invite. Otherwise a departing-owner scenario
+    // where the outgoing owner mailed an invite role="owner" to
+    // the incoming owner can be sabotaged by an admin — the
+    // magic-link 401s at /invites/accept (revokedAt filter) and
+    // owner onboarding stalls. Same tier-boundary breach as R84
+    // F1 / R103 F1 / R118 F1.
+    if (
+      !canGrantRole(
+        claims.membershipRole,
+        existing.role as "owner" | "admin" | "member",
+      )
+    ) {
+      return reply.code(403).send({ error: "cannot_revoke_role_above_own" });
+    }
     await db.invite.update({
       where: { id: existing.id },
       data: { revokedAt: new Date() },
