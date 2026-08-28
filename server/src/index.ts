@@ -378,8 +378,20 @@ async function main(): Promise<void> {
     // `err.data.receiptCount` was undefined post-transform.
     // Strip the `error` field (already promoted to `detail` +
     // `errorCode`) and pass the rest through.
+    // R129 F2: invert the spread order so the eight RFC 7807
+    // standard fields WIN over any route-supplied `extra`. Today
+    // no route emits a body with type/status/errorCode/etc. (grep
+    // -rn 'send(' server/src | grep -E "(status|title):" → 0
+    // hits), but future contributor shipping
+    // reply.code(4xx).send({error:"x", errorCode:"y"}) would
+    // silently overwrite the transform's authoritative errorCode
+    // with the caller's — breaking SDK consumers that switch on
+    // body.errorCode. Standard-last was fragile; standard-wins
+    // is the RFC 7807 contract.
     const { error: _legacyError, issues: legacyIssues, ...extra } = legacy;
     const problem = {
+      ...extra,
+      ...(legacyIssues !== undefined ? { issues: legacyIssues } : {}),
       type: "about:blank",
       title: reply.statusCode === 500 ? "Internal Server Error" : "Request Failed",
       status: reply.statusCode,
@@ -387,8 +399,6 @@ async function main(): Promise<void> {
       instance: req.url,
       errorCode: legacy.error,
       requestId: String(req.id),
-      ...(legacyIssues !== undefined ? { issues: legacyIssues } : {}),
-      ...extra,
     };
     return JSON.stringify(problem);
   });
