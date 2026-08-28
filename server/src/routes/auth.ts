@@ -324,6 +324,38 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     // cryptographically valid until its 7-day exp. authenticate()
     // checks jwt.iat < user.sessionRevokedAt and rejects.
     if (req.session) {
+      // R106 F3: API-key sessions have no cookie to clear and no
+      // user row to fence — the auth identity is the plaintext
+      // av_srv_ token in the Authorization header, which the
+      // holder still has. Clearing the client's av_session
+      // cookie is a no-op for them. Prior shape (a) called
+      // user.update on 'apikey:<id>' → threw P2025 → swallowed
+      // by .catch(), noisy log line for every API-key /logout
+      // hit; (b) wrote an audit entry with
+      // actorId='apikey:<id>' but no correlation to a real
+      // ApiKey row for forensics. Fix: sniff the prefix. For
+      // an API-key session, log a warn breadcrumb, write an
+      // audit entry that carries the apiKeyId as metadata
+      // (correlates to a real row), and skip the user.update
+      // + cookie clear entirely.
+      if (req.session.sub.startsWith("apikey:")) {
+        const apiKeyId = req.session.sub.slice("apikey:".length);
+        req.log.warn(
+          { apiKeyId, orgId: req.session.orgId },
+          "logout_called_on_apikey_session",
+        );
+        writeAudit(
+          {
+            orgId: req.session.orgId,
+            event: "auth.logout.apikey_noop",
+            actorId: req.session.sub,
+            metadata: { apiKeyId },
+            req,
+          },
+          req.log,
+        );
+        return reply.send({ ok: true, message: "api_key_session_no_cookie_to_clear" });
+      }
       await db.user
         .update({
           where: { id: req.session.sub },
