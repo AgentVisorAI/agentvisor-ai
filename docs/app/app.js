@@ -2681,7 +2681,17 @@
           if (onSuccess) onSuccess();
         }).catch(function (err) {
           var body = (err && err.data) || {};
-          if (body.error === "deployment_has_sealed_receipts") {
+          // R128 F1: check BOTH the legacy `error` field AND the
+          // post-transform `errorCode` field. The RFC 7807 onSend
+          // in server/src/index.ts renames legacy.error to
+          // detail+errorCode; err.errorCode is populated by
+          // apiFetch (datasource.js:1703). Server-side fix in
+          // R128 F1 preserves receiptCount + hint, so this branch
+          // now activates correctly. Two-way check keeps the
+          // helper working during any rolling deploy where the
+          // server hasn't shipped the R128 F1 fix yet.
+          var code = body.errorCode || err.errorCode || body.error;
+          if (code === "deployment_has_sealed_receipts") {
             var n = body.receiptCount || 0;
             confirmModal({
               title: "Force delete " + n + " signed receipt" + (n === 1 ? "" : "s") + "?",
@@ -3337,11 +3347,24 @@
 
     var memberRows = members.map(function (m) {
       var roles = ["owner", "admin", "member"];
-      var selector = canManage
-        ? '<select data-role-user="' + esc(m.userId || m.id) + '" aria-label="Role for ' + esc(m.email) + '">' +
+      // R128 F2: server refuses same-user role changes with 400
+      // cannot_change_own_role (members.ts:92-97). R127 F2's
+      // client-side confirm+signout branch was dead code — the
+      // PATCH never succeeded. Render the caller's own row as a
+      // disabled pill with a hint pointing to "Leave workspace"
+      // (Remove Self button below) for the actual exit path.
+      var selfId = (state.session && state.session.user && state.session.user.id) || null;
+      var isSelf = (m.userId || m.id) === selfId;
+      var selector;
+      if (!canManage) {
+        selector = '<span class="pill neutral">' + esc(m.role) + '</span>';
+      } else if (isSelf) {
+        selector = '<span class="pill neutral" title="You cannot change your own role. Ask another owner/admin, or use the Remove button to leave the workspace.">' + esc(m.role) + '</span>';
+      } else {
+        selector = '<select data-role-user="' + esc(m.userId || m.id) + '" aria-label="Role for ' + esc(m.email) + '">' +
             roles.map(function (r) { return '<option' + (m.role === r ? ' selected' : '') + '>' + r + '</option>'; }).join('') +
-          '</select>'
-        : '<span class="pill neutral">' + esc(m.role) + '</span>';
+          '</select>';
+      }
       return '<tr data-user="' + esc(m.userId || m.id) + '">' +
         '<td><div class="actor"><span class="av">' + esc(initials(m.displayName || m.email)) + '</span><div><div style="font-weight:500">' + esc(m.displayName || m.email) + '</div><div class="id">' + esc(m.email) + '</div></div></div></td>' +
         '<td>' + selector + '</td>' +
@@ -3403,55 +3426,14 @@
       if (!sel) return;
       var uid = sel.getAttribute("data-role-user");
       var newRole = sel.value;
-      // Cache the pre-change value so we can restore the <select>
-      // if the user cancels the confirm on the self-demote path.
-      var prevRole = sel.getAttribute("data-prev-role") || sel.dataset.prevRole || (sel.options[sel.selectedIndex] && sel.getAttribute("data-role-current")) || "";
-      // Actually the simplest way to get the old value is to read
-      // from the last known role on the row (server ownership).
-      // Walk membersData: not available here — fallback: re-render
-      // on cancel. That's what we'll do.
-
-      // R127 F2: role-change PATCH on the caller's OWN row is a
-      // sibling break-glass event: server-side R103 F1 bumps
-      // sessionRevokedAt AND revokes every ApiKey the target
-      // created whose role exceeds the new role (owner→member
-      // self-demote revokes every owner+admin key). Prior shape
-      // fired the PATCH silently — no confirm, no warning, no
-      // purposeful signout on success. Result was the same
-      // stacked-toast + no-cross-tab-sync UX R125 F1 (passkey)
-      // and R126 F2 (self-remove) already closed. Extend the
-      // pattern here.
-      var isSelf = uid === ((state.session && state.session.user && state.session.user.id) || null);
-      if (isSelf) {
-        confirmModal({
-          title: "Change your own role to " + newRole + "?",
-          body: "You'll be signed out on every device, every API key you created above the '" + newRole + "' tier will be revoked, and you'll have to sign in again to continue. Automation tokens at higher tiers will need to be re-issued. This cannot be undone from here without another owner or admin — if you demote yourself from owner and there's no other owner, no one can restore your role.",
-          confirmLabel: "Change role",
-          danger: true,
-          onConfirm: function () {
-            state.ds.changeMemberRole(uid, newRole).then(function () {
-              // Purposeful signout matching R125 F1 (passkey
-              // revoke) + R126 F2 (self-remove) — sibling
-              // break-glass flow.
-              stopLiveStream();
-              rolePreview = null;
-              state.session = null;
-              try { localStorage.setItem("av_signed_out_at", String(Date.now())); } catch (e) {}
-              toast("Role changed to " + newRole + ". Sign in again to continue.");
-              navigate("#/login");
-            }).catch(function (err) {
-              toast(err.message || "Role change failed", true);
-              renderSettingsMembers(root);
-            });
-          },
-          onCancel: function () {
-            // User declined — restore the <select> so it doesn't
-            // silently reflect the un-applied change.
-            renderSettingsMembers(root);
-          },
-        });
-        return;
-      }
+      // R128 F2: self-role-change is guarded server-side with 400
+      // cannot_change_own_role — the R127 F2 client-side confirm
+      // + purposeful-signout branch was dead code (PATCH never
+      // succeeded, .then never ran, user saw scary modal followed
+      // by opaque toast). The isSelf row now renders a disabled
+      // pill instead of a <select>, so this handler only fires
+      // for cross-user role changes. Simple flow: PATCH, toast on
+      // success, re-render on error.
       state.ds.changeMemberRole(uid, newRole).then(function () {
         toast("Role updated");
       }).catch(function (err) {

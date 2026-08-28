@@ -369,6 +369,16 @@ async function main(): Promise<void> {
     const legacy = parsed as { error?: string; issues?: unknown; [k: string]: unknown };
     if (typeof legacy.error !== "string") return payload;
     reply.type("application/problem+json");
+    // R128 F1: preserve non-standard fields the route deliberately
+    // attached (e.g., `receiptCount` + `hint` on the R94 F4 sealed-
+    // receipt 409; `hint` on the R99 F2 delete-timeout 503). Prior
+    // shape spread only `issues`, silently dropping every other
+    // per-route detail. R126 F1's SPA force-delete branch and R99 F2's
+    // client-side retry copy both went unreachable because
+    // `err.data.receiptCount` was undefined post-transform.
+    // Strip the `error` field (already promoted to `detail` +
+    // `errorCode`) and pass the rest through.
+    const { error: _legacyError, issues: legacyIssues, ...extra } = legacy;
     const problem = {
       type: "about:blank",
       title: reply.statusCode === 500 ? "Internal Server Error" : "Request Failed",
@@ -377,7 +387,8 @@ async function main(): Promise<void> {
       instance: req.url,
       errorCode: legacy.error,
       requestId: String(req.id),
-      ...(legacy.issues !== undefined ? { issues: legacy.issues } : {}),
+      ...(legacyIssues !== undefined ? { issues: legacyIssues } : {}),
+      ...extra,
     };
     return JSON.stringify(problem);
   });
