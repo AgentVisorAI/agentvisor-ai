@@ -859,7 +859,69 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ chart matches series ground truth; budgets: " + budgets.join(", "));
 }
 
-// ── 20. Listener-leak soak ─────────────────────────────────────────
+// ── 20. Audit log truth, palette ranking, print pack ───────────────
+// (a) Audit chips/search/CSV must agree with listAudit ground truth
+// (CSV is WYSIWYG of the filtered view). (b) Palette: literal-match
+// ranking beats scattered-subsequence ("reset" → Reset demo data
+// first, not SeTtings) and async dynamic entries arrive. (c) Print
+// emulation: chrome stripped, provenance footer visible.
+{
+  await page.goto(SITE + "#/settings/audit", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("#auditBody tr", { timeout: 15000 });
+  const a = await page.evaluate(async () => {
+    const gt = await window.dataSource.listAudit();
+    const problems = [];
+    if (document.querySelectorAll("#auditBody tr").length !== gt.length) problems.push("row count wrong");
+    const cc = {}; gt.forEach((x) => { const c = x.event.split(".")[0]; cc[c] = (cc[c] || 0) + 1; });
+    for (const chip of document.querySelectorAll(".evt-chip")) {
+      const c = chip.getAttribute("data-cat");
+      if (parseInt(chip.querySelector(".n").textContent, 10) !== (c === "" ? gt.length : cc[c])) problems.push("chip " + (c || "All") + " wrong");
+    }
+    const cat = Object.keys(cc).sort()[0];
+    document.querySelector('.evt-chip[data-cat="' + cat + '"]').click();
+    const s = document.querySelector("#auditSearch");
+    s.value = "a"; s.dispatchEvent(new Event("input"));
+    await new Promise((r) => setTimeout(r, 120));
+    const want = gt.filter((x) => x.event.split(".")[0] === cat && (x.event + " " + x.actor + " " + (x.target || "") + " " + (x.note || "")).toLowerCase().includes("a")).length;
+    if (!want) problems.push("audit compose probe trivial — fixture drift");
+    if (document.querySelectorAll("#auditBody tr").length !== want) problems.push("audit chip+search compose wrong");
+    return { problems, want };
+  });
+  if (a.problems.length) fail("audit log vs ground truth: " + a.problems.join("; "));
+  const dl = page.waitForEvent("download", { timeout: 8000 });
+  await page.click("#auditExportBtn");
+  const csvLines = (await import("fs")).readFileSync(await (await dl).path(), "utf8").trim().split(/\r?\n/).length - 1;
+  if (csvLines !== a.want) fail("audit CSV not WYSIWYG: " + csvLines + " rows, filtered view " + a.want);
+  // palette ranking + dynamic entries
+  await page.evaluate(() => { location.hash = "#/overview"; });
+  await page.waitForTimeout(500);
+  await page.click(".cmdk-trigger");
+  await page.waitForSelector(".cmdk-backdrop input", { timeout: 5000 });
+  await page.fill(".cmdk-backdrop input", "reset");
+  await page.waitForTimeout(300);
+  const first = await page.evaluate(() => document.querySelector("#cmdkList .item")?.textContent || "");
+  if (!/Reset demo data/.test(first)) fail("palette ranking: 'reset' first hit is " + first.slice(0, 40));
+  await page.fill(".cmdk-backdrop input", "sess_01H9K");
+  await page.waitForTimeout(700);
+  const dyn = await page.evaluate(() => [...document.querySelectorAll("#cmdkList .item")].map((i) => i.textContent));
+  if (!dyn.some((d) => /sess_01H9K/.test(d))) fail("palette dynamic session entries missing");
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(200);
+  // print evidence pack
+  await page.evaluate(() => { location.hash = "#/sessions/sess_01H9K"; });
+  await page.waitForSelector("#eventList .evt", { timeout: 10000 });
+  await page.emulateMedia({ media: "print" });
+  await page.waitForTimeout(300);
+  const pr = await page.evaluate(() => ({
+    sidebarHidden: getComputedStyle(document.querySelector(".sidebar")).display === "none",
+    provenance: getComputedStyle(document.querySelector(".print-only")).display === "block" && /receipt/i.test(document.querySelector(".print-only").textContent),
+  }));
+  await page.emulateMedia({ media: "screen" });
+  if (!pr.sidebarHidden || !pr.provenance) fail("print evidence pack broken: " + JSON.stringify(pr));
+  console.log("✅ audit log matches ground truth (chips/search/CSV WYSIWYG); palette ranks + loads dynamic entries; print pack intact");
+}
+
+// ── 21. Listener-leak soak ─────────────────────────────────────────
 // Every earlier check opened modals, ran the tour, refreshed the
 // overview, and re-rendered lists dozens of times. If any of that
 // leaked document/window listeners (the webhook modal once leaked a
@@ -885,4 +947,4 @@ if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors))
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 21 interactive-features drill checks passed.");
+console.log("\nAll 22 interactive-features drill checks passed.");
