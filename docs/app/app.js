@@ -3185,12 +3185,12 @@
           '<div style="display:grid;grid-template-columns:200px 1fr;gap:12px 16px;font-size:13px;align-items:center">' +
             '<label for="retSess">Sessions + events</label>' +
             '<div style="display:flex;gap:8px;align-items:center">' +
-              '<input id="retSess" type="number" min="0" max="3650" value="' + r.sessionRetentionDays + '" style="width:100px"' + (editable ? '' : ' disabled') + '>' +
+              '<input id="retSess" type="number" min="0" max="3650" value="' + esc(r.sessionRetentionDays) + '" style="width:100px"' + (editable ? '' : ' disabled') + '>' +
               '<span style="color:var(--fg-3)">days</span>' +
             '</div>' +
             '<label for="retAudit">Audit log</label>' +
             '<div style="display:flex;gap:8px;align-items:center">' +
-              '<input id="retAudit" type="number" min="0" max="3650" value="' + r.auditRetentionDays + '" style="width:100px"' + (editable ? '' : ' disabled') + '>' +
+              '<input id="retAudit" type="number" min="0" max="3650" value="' + esc(r.auditRetentionDays) + '" style="width:100px"' + (editable ? '' : ' disabled') + '>' +
               '<span style="color:var(--fg-3)">days</span>' +
             '</div>' +
           '</div>' +
