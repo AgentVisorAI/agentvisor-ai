@@ -1514,6 +1514,15 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   transition: transform 120ms;
   box-shadow: 0 1px 2px rgba(0,0,0,0.2);
 }
+/* Windows High Contrast: backgrounds are stripped, which erased the
+   track and knob entirely (white-on-white). Borders survive forced
+   colors, so draw the control with them; the knob position (left vs
+   right) plus the filled knob on 'on' carries the state. */
+@media (forced-colors: active) {
+  .switch { border: 1px solid ButtonText; }
+  .switch::after { background: ButtonText; box-shadow: none; border: 1px solid ButtonText; }
+  .switch:not(.on)::after { background: Canvas; }
+}
 .switch.on { background: var(--success-solid); }
 .switch.on::after { transform: translateX(13px); }
 
