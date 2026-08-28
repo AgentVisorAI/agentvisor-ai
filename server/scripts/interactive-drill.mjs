@@ -1144,7 +1144,70 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ onboarding items tick for the right reasons at 4 sim ages; members panel view-only for members; key create→revoke round-trip");
 }
 
-// ── 24. Listener-leak soak ─────────────────────────────────────────
+// ── 24. Live audit trail, webhook toggle, menu, pager ──────────────
+// (a) Admin mutations must land in the audit log as they happen (the
+// demo's log used to be static fixtures — an investor's own actions
+// never appeared). (b) Webhook pause/resume round-trip with the label
+// following state. (c) Account-menu items do what they say. (d) The
+// [ / ] pager walks the FILTERED list, not the full set.
+{
+  await page.goto(SITE + "#/settings/webhooks", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("#whAdd", { timeout: 15000 });
+  const at = await page.evaluate(async () => {
+    const before = (await window.dataSource.listAudit()).length;
+    await window.dataSource.testWebhook((await window.dataSource.listWebhooks())[0].id);
+    const after = await window.dataSource.listAudit();
+    return { d: after.length - before, ev: after[0].event, actor: after[0].actor };
+  });
+  if (at.d !== 1 || at.ev !== "webhook.test_fired" || !at.actor.includes("@")) fail("mutation did not land in the audit trail: " + JSON.stringify(at));
+  const w0 = await page.evaluate(async () => (await window.dataSource.listWebhooks())[0].isActive);
+  await page.evaluate(() => { const tr = document.querySelector("tbody tr"); [...tr.querySelectorAll("button")].find((x) => /Pause|Resume/.test(x.textContent)).click(); });
+  await page.waitForTimeout(1000);
+  const w1 = await page.evaluate(async () => ({
+    active: (await window.dataSource.listWebhooks())[0].isActive,
+    label: [...document.querySelector("tbody tr").querySelectorAll("button")].map((x) => x.textContent.trim()).find((t) => /Pause|Resume/.test(t)),
+  }));
+  if (w1.active !== !w0 || w1.label !== (w1.active ? "Pause" : "Resume")) fail("webhook toggle round-trip broken: " + JSON.stringify(w1));
+  await page.evaluate(() => { const tr = document.querySelector("tbody tr"); [...tr.querySelectorAll("button")].find((x) => /Pause|Resume/.test(x.textContent)).click(); });
+  await page.waitForTimeout(800);
+  // account menu: theme + shortcuts sheet
+  await page.evaluate(() => { location.hash = "#/overview"; });
+  await page.waitForFunction(() => document.querySelector(".stat")?.textContent.trim().length > 0, { timeout: 10000 });
+  const th0 = await page.evaluate(() => document.documentElement.getAttribute("data-theme") || "light");
+  await page.click(".user-btn");
+  await page.waitForSelector("#accountMenu", { timeout: 3000 });
+  await page.click('#accountMenu [data-act="theme"]');
+  await page.waitForTimeout(400);
+  if ((await page.evaluate(() => document.documentElement.getAttribute("data-theme"))) === th0) fail("menu theme toggle did nothing");
+  await page.click(".user-btn");
+  await page.waitForSelector("#accountMenu", { timeout: 3000 });
+  await page.click('#accountMenu [data-act="theme"]');
+  await page.waitForTimeout(300);
+  await page.click(".user-btn");
+  await page.waitForSelector("#accountMenu", { timeout: 3000 });
+  await page.click('#accountMenu [data-act="shortcuts"]');
+  await page.waitForSelector(".modal-backdrop", { timeout: 3000 });
+  if (!(await page.evaluate(() => /shortcut/i.test(document.querySelector(".modal-backdrop").textContent)))) fail("menu shortcuts item opened the wrong thing");
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(300);
+  // [ / ] pager honors the filtered set
+  await page.evaluate(() => { location.hash = "#/sessions?status=blocked"; });
+  await page.waitForSelector("tr[data-clickable]", { timeout: 10000 });
+  const blockedIds = await page.evaluate(() => [...document.querySelectorAll("tr[data-clickable]")].map((r) => r.getAttribute("data-id")));
+  await page.click("tr[data-clickable]");
+  await page.waitForSelector("#eventList", { timeout: 10000 });
+  await page.keyboard.press("]");
+  await page.waitForTimeout(800);
+  if ((await page.evaluate(() => location.hash.split("?")[0].split("/")[2])) !== blockedIds[1]) fail("] pager left the filtered set");
+  await page.keyboard.press("[");
+  await page.waitForTimeout(800);
+  if ((await page.evaluate(() => location.hash.split("?")[0].split("/")[2])) !== blockedIds[0]) fail("[ pager did not return");
+  const pos = await page.evaluate(() => document.querySelector(".sess-nav-pos")?.textContent);
+  if (pos !== "1 / " + blockedIds.length) fail("pager position label wrong: " + pos);
+  console.log("✅ audit trail records live mutations; webhook toggle round-trips; menu items act; [ ] pager honors filters (" + blockedIds.length + " blocked)");
+}
+
+// ── 25. Listener-leak soak ─────────────────────────────────────────
 // Every earlier check opened modals, ran the tour, refreshed the
 // overview, and re-rendered lists dozens of times. If any of that
 // leaked document/window listeners (the webhook modal once leaked a
@@ -1170,4 +1233,4 @@ if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors))
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 25 interactive-features drill checks passed.");
+console.log("\nAll 26 interactive-features drill checks passed.");
