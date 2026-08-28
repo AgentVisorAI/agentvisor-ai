@@ -101,6 +101,15 @@ export async function orgRoutes(app: FastifyInstance): Promise<void> {
   app.get("/ip-allowlist", async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
+    // R93 F3: same read/write asymmetry as R92 F1 (invites) and
+    // R91 F2 (audit). Members were able to read the org's trusted
+    // CIDR blocks (recon: which corp VPN/bastion do admins egress
+    // from) and their own detected req.ip (confirms whether their
+    // stolen cookie would work from anywhere without alarm). The
+    // sibling PATCH at line 117 already gates on non-member.
+    if (claims.membershipRole === "member") {
+      return reply.code(403).send({ error: "forbidden" });
+    }
     const org = await db.org.findUnique({
       where: { id: claims.orgId },
       select: { ipAllowlist: true },

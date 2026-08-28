@@ -4,6 +4,7 @@ import formbody from "@fastify/formbody";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
 import Fastify from "fastify";
+import crypto from "node:crypto";
 import { db } from "./db.js";
 import { env } from "./env.js";
 import { bus } from "./lib/bus.js";
@@ -142,10 +143,31 @@ async function main(): Promise<void> {
         /^\/api\/v1\/auth\/saml\/[^/]+\/(acs|slo|metadata\.xml|login)/.test(u);
     },
     keyGenerator: (req) => {
-      // Prefer the authenticated user's ID for rate-limit accounting so a
-      // shared NAT doesn't get punished for one abusive tenant. Falls back
-      // to IP when the request is unauthenticated.
-      return (req as unknown as { session?: { sub: string } }).session?.sub ?? req.ip;
+      // R93 F1: `authenticate` runs as a preHandler; @fastify/rate-limit
+      // invokes keyGenerator in onRequest. `req.session` was ALWAYS
+      // undefined here, so every request keyed on req.ip regardless of
+      // the (stated) intent to key per-user. That silently made every
+      // corp-NAT/CGNAT tenant share ONE bucket — well-behaved users
+      // hit 429s alongside a single abuser, and a single hostile user
+      // rotating IPv6 privacy addresses had infinite per-user quota.
+      // Fix without moving hook order (which would touch every other
+      // route's expectations): derive a stable bucket key from the
+      // session cookie or API-key header ourselves, pre-auth. We
+      // don't verify the JWT here (async verify + secret access is
+      // too heavy for every request); the opaque cookie's sha256 is
+      // enough for stable per-user bucketing because a stolen cookie
+      // is per-user by definition. Same for API-key Authorization
+      // headers.
+      const cookieHdr = req.headers.cookie ?? "";
+      const m = /(?:^|;\s*)av_session=([^;]+)/.exec(cookieHdr);
+      if (m) {
+        return "s:" + crypto.createHash("sha256").update(m[1]!).digest("hex").slice(0, 16);
+      }
+      const auth = req.headers.authorization ?? "";
+      if (typeof auth === "string" && auth.startsWith("Bearer ")) {
+        return "a:" + crypto.createHash("sha256").update(auth.slice(7)).digest("hex").slice(0, 16);
+      }
+      return "ip:" + req.ip;
     },
   });
 
