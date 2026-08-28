@@ -34,7 +34,17 @@
     theme: null,
     gPrefixAt: 0,
     settingsTab: "general",
+    // Last list-page URL (with its filter/sort query) per section, so
+    // "← All sessions" on a detail page returns to the view the user
+    // actually came from instead of a reset list.
+    lastList: {},
   };
+  function rememberListUrl(section) {
+    state.lastList[section] = location.hash || ("#/" + section);
+  }
+  function backToListUrl(section) {
+    return state.lastList[section] || ("#/" + section);
+  }
 
   /* ---------- theme ---------- */
 
@@ -1264,6 +1274,7 @@
     try { el.setSelectionRange(end, end); } catch (e) {}
   }
   function renderSessionsBody(main, deps) {
+    rememberListUrl("sessions");
     var searchHadFocus = document.activeElement && document.activeElement.id === "fSearch";
     var searchVal = searchHadFocus ? document.activeElement.value : null;
     var body;
@@ -1498,7 +1509,7 @@
    * ============================================================ */
 
   async function renderSessionDetail(main, id, initial) {
-    main.innerHTML = pageHeader("Session", "", '<a href="#/sessions" class="btn">← All sessions</a>') + loadingBlock("stats");
+    main.innerHTML = pageHeader("Session", "", '<a href="' + esc(backToListUrl("sessions")) + '" class="btn">← All sessions</a>') + loadingBlock("stats");
     var data, receipt;
     try {
       data = initial && initial.data ? initial.data : await state.ds.getSessionById(id);
@@ -1574,7 +1585,7 @@
       }).join("");
 
     main.innerHTML =
-      pageHeader("Session " + s.externalId, s.agent + " · " + (s.user || "—") + " · " + (s.model || ""), '<a href="#/sessions" class="btn">← All sessions</a> <button class="btn" id="printPack" title="Print this page as a clean evidence pack — receipt and event trail included">🖨 Print evidence pack</button> <button class="btn" id="copyRcpt">Copy receipt</button> <button class="btn" id="shareRcpt">🔗 Share verify link</button> <button class="btn accent" id="dlRcpt">↓ Download receipt</button>') +
+      pageHeader("Session " + s.externalId, s.agent + " · " + (s.user || "—") + " · " + (s.model || ""), '<a href="' + esc(backToListUrl("sessions")) + '" class="btn">← All sessions</a> <button class="btn" id="printPack" title="Print this page as a clean evidence pack — receipt and event trail included">🖨 Print evidence pack</button> <button class="btn" id="copyRcpt">Copy receipt</button> <button class="btn" id="shareRcpt">🔗 Share verify link</button> <button class="btn accent" id="dlRcpt">↓ Download receipt</button>') +
       '<div class="session-summary">' +
         cell("Events", s.events, "streamed") +
         cell("Allowed", s.toolsAllowed, "tool calls") +
@@ -1992,6 +2003,7 @@
    * ============================================================ */
 
   async function renderDeployments(main) {
+    rememberListUrl("deployments");
     var actions = '<button class="btn accent" id="addDep">+ New deployment</button>';
     main.innerHTML = pageHeader("Deployments", "Each daemon streams events and signed receipts to this console.", actions) + loadingBlock("table");
     var deps;
@@ -2087,7 +2099,7 @@
   }
 
   async function renderDeploymentDetail(main, id) {
-    main.innerHTML = pageHeader("Deployment", "", '<a href="#/deployments" class="btn">← All deployments</a>') + loadingBlock("stats");
+    main.innerHTML = pageHeader("Deployment", "", '<a href="' + esc(backToListUrl("deployments")) + '" class="btn">← All deployments</a>') + loadingBlock("stats");
     var d, sessions;
     try {
       d = await state.ds.getDeployment(id);
@@ -2100,7 +2112,7 @@
       : '<span class="pill neutral status-dot">' + esc(d.status) + "</span>";
 
     main.innerHTML =
-      pageHeader(d.name, d.environment + " · " + (d.region || ""), '<a href="#/deployments" class="btn">← All deployments</a>') +
+      pageHeader(d.name, d.environment + " · " + (d.region || ""), '<a href="' + esc(backToListUrl("deployments")) + '" class="btn">← All deployments</a>') +
       '<div class="dep-summary">' +
         depCell("Status", statusPill) +
         depCell("Version", d.version || "—", true) +
@@ -2440,6 +2452,7 @@
   });
 
   async function renderPolicies(main) {
+    rememberListUrl("policies");
     main.innerHTML = pageHeader("Policies", "Rules the daemon enforces before any tool call or LLM egress.", '<button class="btn accent" id="addPol">+ New policy</button>') + loadingBlock("table");
     var pols;
     try { pols = await state.ds.listPolicies(); } catch (e) { return renderError(main, e); }
@@ -2478,7 +2491,7 @@
   }
 
   async function renderPolicyDetail(main, id) {
-    main.innerHTML = pageHeader("Policy", "", '<a href="#/policies" class="btn">← All policies</a>') + loadingBlock("stats");
+    main.innerHTML = pageHeader("Policy", "", '<a href="' + esc(backToListUrl("policies")) + '" class="btn">← All policies</a>') + loadingBlock("stats");
     var p, fired = [];
     try { p = await state.ds.getPolicy(id); } catch (e) { return renderError(main, e); }
     // Close the loop policy → session → receipt: list the sessions
@@ -2496,7 +2509,7 @@
       ? fired.reduce(function (a, s) { return a + (s.toolsBlocked || 0); }, 0)
       : p.blocks24h;
     main.innerHTML =
-      pageHeader(p.name, p.kind + " · " + p.scope, '<a href="#/policies" class="btn">← All policies</a> <button class="switch ' + switchCls + '" id="polSwitch" title="Toggle enabled" aria-label="Toggle policy enabled" role="switch" aria-checked="' + (p.enabled ? "true" : "false") + '"></button>') +
+      pageHeader(p.name, p.kind + " · " + p.scope, '<a href="' + esc(backToListUrl("policies")) + '" class="btn">← All policies</a> <button class="switch ' + switchCls + '" id="polSwitch" title="Toggle enabled" aria-label="Toggle policy enabled" role="switch" aria-checked="' + (p.enabled ? "true" : "false") + '"></button>') +
       '<div class="dep-summary">' +
         depCell("Status", p.enabled ? '<span class="pill ok status-dot">enabled</span>' : '<span class="pill neutral">disabled</span>') +
         depCell("Hits (24h)", p.hits24h.toLocaleString()) +
@@ -3988,6 +4001,12 @@
       if (e.key === "?") {
         openShortcutSheet();
       }
+      // "/" focuses the page's search/filter input (sessions search,
+      // event-stream filter, audit search) — standard list-page UX.
+      if (e.key === "/") {
+        var target = document.getElementById("fSearch") || document.getElementById("evtSearch") || document.getElementById("auditSearch");
+        if (target) { e.preventDefault(); target.focus(); target.select(); }
+      }
     });
   }
 
@@ -4002,7 +4021,7 @@
         ["G D", "Deployments"], ["G ,", "Settings"],
       ]},
       { title: "Lists & tables", items: [
-        ["↑ ↓", "Move between rows"], ["Enter", "Open the focused row"],
+        ["↑ ↓", "Move between rows"], ["Enter", "Open the focused row"], ["/", "Focus the search field"],
       ]},
       { title: "Event stream", items: [
         ["↑ ↓", "Move between events"], ["Home / End", "Jump to first / last"],
