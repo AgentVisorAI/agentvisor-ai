@@ -189,8 +189,33 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ reset demo data: pristine Northwind restored");
 }
 
+// ── 7. Policy creation: template → live DSL → enforcing ──────────
+{
+  // Check 6's reload kept ?tour=1 in the query string, so the tour
+  // auto-restarted and its overlay would swallow our clicks.
+  await page.evaluate(() => window.AVTour && window.AVTour.stop());
+  await page.evaluate(() => { location.hash = "#/policies"; });
+  await page.waitForSelector("#addPol", { timeout: 10000 });
+  await page.click("#addPol");
+  await page.waitForSelector(".modal-wide #polPreview", { timeout: 5000 });
+  await page.fill("#polParam", "1250");
+  await page.waitForTimeout(200);
+  const dsl = await page.evaluate(() => document.querySelector("#polPreview").textContent);
+  if (!dsl.includes("arg.amount_usd > 1250")) fail("policy preview not live: " + dsl.slice(0, 80));
+  await page.click('button:has-text("Create & enable")');
+  await page.waitForSelector("#polSwitch", { timeout: 10000 });
+  const pol = await page.evaluate(() => ({
+    hash: location.hash,
+    name: document.querySelector("h1").textContent,
+    enabled: document.querySelector("#polSwitch").getAttribute("aria-checked"),
+  }));
+  if (!pol.hash.startsWith("#/policies/pol_") || pol.name !== "finance.payment_cap_usd:1250" || pol.enabled !== "true")
+    fail("policy creation broken: " + JSON.stringify(pol));
+  console.log("✅ policy creation: spend-cap template → live DSL → enabled detail page");
+}
+
 if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors));
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 7 interactive-features drill checks passed.");
+console.log("\nAll 8 interactive-features drill checks passed.");

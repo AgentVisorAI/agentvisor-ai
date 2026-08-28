@@ -2002,6 +2002,174 @@
    * POLICIES
    * ============================================================ */
 
+  /* ── Policy creation. Template-driven: pick what to protect, tune
+   *    one parameter, watch the DSL write itself. ───────────────── */
+
+  var POLICY_TEMPLATES = [
+    {
+      id: "spend_cap",
+      label: "💸 Spend cap",
+      hint: "Block any payment above a dollar limit",
+      kind: "budget",
+      scope: "tool.create_payment",
+      param: { label: "Maximum per payment (USD)", type: "number", value: "500", min: 1 },
+      build: function (v) {
+        var n = Math.max(1, parseInt(v, 10) || 500);
+        return {
+          name: "finance.payment_cap_usd:" + n,
+          description: "Block any single payment above $" + n.toLocaleString() + " USD.",
+          body: [
+            'policy "finance.payment_cap_usd:' + n + '" {',
+            '  applies_to = tool("create_payment")',
+            "  when { arg.amount_usd > " + n + " }",
+            "  effect = block",
+            '  reason = "Payment of {{arg.amount_usd}} USD exceeds the $' + n + ' cap."',
+            "}",
+          ].join("\n"),
+        };
+      },
+    },
+    {
+      id: "vendor_allowlist",
+      label: "🏷 Vendor allowlist",
+      hint: "Only named vendors can receive orders",
+      kind: "allowlist",
+      scope: "tool.create_purchase_order",
+      param: { label: "Allowed vendors (comma-separated)", type: "text", value: "Contoso, Fabrikam" },
+      build: function (v) {
+        var vendors = String(v || "").split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+        if (!vendors.length) vendors = ["Contoso"];
+        var list = vendors.map(function (s) { return '"' + s.replace(/["\\]/g, "") + '"'; }).join(", ");
+        return {
+          name: "procurement.vendors:" + vendors.length,
+          description: "Purchase orders may only go to: " + vendors.join(", ") + ".",
+          body: [
+            'policy "procurement.vendors:' + vendors.length + '" {',
+            '  applies_to = tool("create_purchase_order")',
+            "  when { arg.vendor not in [" + list + "] }",
+            "  effect = block",
+            '  reason = "Vendor {{arg.vendor}} is not on the allowlist."',
+            "}",
+          ].join("\n"),
+        };
+      },
+    },
+    {
+      id: "pii_guard",
+      label: "🔒 PII egress guard",
+      hint: "Stop SSNs and card numbers leaving via the LLM",
+      kind: "guardrail",
+      scope: "llm.egress",
+      param: null,
+      build: function () {
+        return {
+          name: "privacy.pii_egress",
+          description: "Block LLM responses that contain SSNs or payment card numbers.",
+          body: [
+            'policy "privacy.pii_egress" {',
+            "  applies_to = llm.egress",
+            "  when { response matches pii(ssn) or response matches pii(card_number) }",
+            "  effect = block",
+            '  reason = "Response contains PII ({{match.kind}}) — blocked before egress."',
+            "}",
+          ].join("\n"),
+        };
+      },
+    },
+  ];
+
+  function openCreatePolicyModal() {
+    if (document.body.classList.contains("locked")) return;
+    var chips = POLICY_TEMPLATES.map(function (t, i) {
+      return '<label class="tpl-chip"><input type="radio" name="polTpl" value="' + t.id + '"' + (i === 0 ? " checked" : "") + ' />' +
+        '<span class="tpl-body"><span class="tpl-label">' + t.label + '</span><span class="tpl-hint">' + esc(t.hint) + "</span></span></label>";
+    }).join("");
+    var backdrop = h(
+      '<div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="polTitle">' +
+        '<div class="modal modal-wide">' +
+          '<h2 id="polTitle">New policy</h2>' +
+          '<p class="sub">Start from a template — the rule writes itself and enforces on the next tool call. You can refine it any time.</p>' +
+          '<form id="polForm">' +
+            '<div class="tpl-row" role="radiogroup" aria-label="Policy template">' + chips + "</div>" +
+            '<div class="field" id="polParamField"></div>' +
+            '<div class="field"><label for="polPreview">Definition (generated)</label>' +
+              '<pre class="policy-body policy-preview" id="polPreview" tabindex="0" aria-live="polite"></pre></div>' +
+            '<div class="actions"><button type="button" class="btn" data-close>Cancel</button><button class="btn accent" type="submit">Create &amp; enable</button></div>' +
+          "</form>" +
+        "</div>" +
+      "</div>"
+    );
+    document.body.appendChild(backdrop);
+    document.body.classList.add("locked");
+    var previouslyFocused = document.activeElement;
+    var uninstall;
+    function close() {
+      backdrop.remove(); document.body.classList.remove("locked");
+      if (uninstall) uninstall();
+      if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {}
+    }
+    uninstall = installModalKeys(backdrop, close);
+    backdrop.addEventListener("click", function (e) {
+      if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
+    });
+
+    function currentTemplate() {
+      var v = backdrop.querySelector('input[name="polTpl"]:checked').value;
+      return POLICY_TEMPLATES.find(function (t) { return t.id === v; });
+    }
+    function paramValue() {
+      var inp = backdrop.querySelector("#polParam");
+      return inp ? inp.value : null;
+    }
+    function renderParam(t) {
+      var f = backdrop.querySelector("#polParamField");
+      if (!t.param) { f.innerHTML = ""; f.style.display = "none"; return; }
+      f.style.display = "";
+      f.innerHTML = '<label for="polParam">' + esc(t.param.label) + "</label>" +
+        '<input id="polParam" type="' + t.param.type + '"' +
+        (t.param.min ? ' min="' + t.param.min + '"' : "") +
+        ' value="' + esc(t.param.value) + '" required />';
+      f.querySelector("#polParam").addEventListener("input", refresh);
+    }
+    function refresh() {
+      var t = currentTemplate();
+      var built = t.build(paramValue());
+      backdrop.querySelector("#polPreview").innerHTML = syntaxPolicy(built.body);
+    }
+    $$('input[name="polTpl"]', backdrop).forEach(function (r) {
+      r.addEventListener("change", function () { renderParam(currentTemplate()); refresh(); });
+    });
+    renderParam(currentTemplate());
+    refresh();
+
+    backdrop.querySelector("#polForm").addEventListener("submit", function (e) {
+      e.preventDefault();
+      var btn = e.target.querySelector('button[type="submit"]');
+      btn.disabled = true;
+      var t = currentTemplate();
+      var built = t.build(paramValue());
+      state.ds.createPolicy({
+        name: built.name, kind: t.kind, scope: t.scope,
+        description: built.description, body: built.body,
+      }).then(function (p) {
+        close();
+        toastLink("Policy created and enforcing — the daemon picks it up on its next sync.", "#/policies/" + p.id, "View policy →");
+        navigate("#/policies/" + p.id);
+      }).catch(function (err) {
+        btn.disabled = false;
+        toast(err.message || "Create failed", true);
+      });
+    });
+  }
+
+  // Delegated so the button works the instant it's painted — the
+  // header (with #addPol) renders before the async policy list
+  // resolves, and a fast click during load used to hit a button with
+  // no listener yet.
+  document.addEventListener("click", function (e) {
+    if (e.target.closest("#addPol, #addPolCta")) openCreatePolicyModal();
+  });
+
   async function renderPolicies(main) {
     main.innerHTML = pageHeader("Policies", "Rules the daemon enforces before any tool call or LLM egress.", '<button class="btn accent" id="addPol">+ New policy</button>') + loadingBlock("table");
     var pols;
@@ -2009,10 +2177,7 @@
     if (!pols.length) {
       main.innerHTML = pageHeader("Policies", "0 policies · none enabled", '<button class="btn accent" id="addPol">+ New policy</button>') +
         emptyState("No policies yet", "Write your first policy to start blocking risky prompts, tool calls, or PII egress. The daemon evaluates policies before any request reaches your model.", "+ Write a policy", null, "addPolCta");
-      var addP = $("#addPol") || $("#addPolCta");
-      if (addP) addP.addEventListener("click", function () {
-        comingSoon("Write a new policy", "The policy editor supports a Rego-style DSL with autocomplete, dry-run against past sessions, and a shareable review link before rollout.");
-      });
+      // #addPol / #addPolCta are handled by the delegated listener above.
       return;
     }
     var rows = pols.map(function (p) {
@@ -2040,10 +2205,6 @@
       }
       var tr = e.target.closest("tr[data-id]");
       if (tr) navigate("#/policies/" + tr.getAttribute("data-id"));
-    });
-    var addBtn = $("#addPol");
-    if (addBtn) addBtn.addEventListener("click", function () {
-      comingSoon("Write a new policy", "The policy editor supports a Rego-style DSL with autocomplete, dry-run against past sessions, and a shareable review link before rollout.");
     });
   }
 
@@ -3245,6 +3406,7 @@
       if (window.AVTour) actions.unshift({ g: "Actions", label: "See the full flow", desc: "Guided tour of the money story", run: function () { window.AVTour.start(); } });
       if (typeof state.ds.simulateAttack === "function") actions.push({ g: "Actions", label: "Simulate an agent attack", desc: "Stage a live blocked payment", run: function () { navigate("#/overview"); setTimeout(runAttackDemo, 250); } });
     }
+    actions.push({ g: "Actions", label: "New policy", desc: "Create a spend cap, vendor allowlist, or PII guard", run: function () { navigate("#/policies"); setTimeout(openCreatePolicyModal, 250); } });
     // Sibling pages: the verifier and the pitch live outside the SPA,
     // so open them as real navigations instead of hash routes.
     var pages = [
