@@ -269,7 +269,16 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
             policyVersion: s.policyVersion,
             closedAt: s.closedAt,
           },
-      select: { id: true, externalId: true },
+      // R123 F2: include `agent` in the returned selection so
+      // the bus.publish below uses the PERSISTED value (which
+      // is the pre-seal canonical agent on a sealed session)
+      // rather than the caller-supplied s.agent. Prior shape
+      // forwarded attacker-controlled s.agent verbatim in the
+      // SSE payload on the isSealed branch — a webhook / CLI
+      // subscriber consuming msg.data.agent broke the R119 F2
+      // "sealed = immutable" invariant even though the DB
+      // stayed canonical.
+      select: { id: true, externalId: true, agent: true },
     });
     bus.publish({
       type: "session.upsert",
@@ -277,7 +286,7 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       deploymentId: daemon.deploymentId,
       sessionId: session.id,
       externalId: session.externalId,
-      agent: s.agent,
+      agent: session.agent,
     });
     return reply.send({ session });
   });
