@@ -47,6 +47,24 @@ const Env = z.object({
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
   LOG_LEVEL: z.string().default("info"),
   JWT_SECRET: z.string().min(32, "JWT_SECRET must be at least 32 chars"),
+  // R96 F3: optional comma-separated list of cookie-signing
+  // secrets. First entry signs; all entries verify. Enables key
+  // rotation without breaking in-flight OAuth flows (users
+  // mid-Google-consent otherwise get missing_state_cookie on
+  // callback). Also decouples cookie HMAC from JWT_SECRET
+  // (defense-in-depth — a JWT-key disclosure no longer
+  // simultaneously compromises cookie signatures). If unset,
+  // falls back to JWT_SECRET (single entry) so existing
+  // deployments don't need to change env config.
+  COOKIE_SECRETS: z
+    .string()
+    .optional()
+    .transform((v) =>
+      (v ?? "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => s.length >= 32),
+    ),
   JWT_ISSUER: z.string().default("agentvisor-ai"),
   JWT_AUDIENCE: z.string().default("agentvisor-console"),
   SESSION_COOKIE_NAME: z.string().default("av_session"),
@@ -62,6 +80,18 @@ const Env = z.object({
       return process.env.NODE_ENV === "production";
     }),
   DATABASE_URL: z.string().min(1),
+  // R96 F1: number of proxy hops in front of the API. Cloudflare
+  // + LB stacks use 2; Fly.io / Cloud Run / Heroku bare are 1;
+  // local dev is 0. R95 hardcoded a single-hop function which
+  // silently regressed 2+ hop deploys (real users bucketed into
+  // Cloudflare edge IPs). Configurable now.
+  TRUSTED_PROXY_HOP_COUNT: z
+    .string()
+    .default("1")
+    .transform((v) => {
+      const n = parseInt(v, 10);
+      return isNaN(n) || n < 0 || n > 8 ? 1 : n;
+    }),
   ALLOWED_ORIGINS: z
     .string()
     .default("")

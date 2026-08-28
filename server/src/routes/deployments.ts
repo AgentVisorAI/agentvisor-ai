@@ -223,6 +223,24 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
           // Serializable write conflict — some other writer
           // touched Deployment/Session/Receipt concurrently.
           // Caller can retry.
+          // R96 F4: audit the near-miss so investigators can
+          // reconstruct that the operator was warned mid-flight
+          // — the compliance-story concern R95 F2 raised
+          // (concurrent seal race) leaves NO trail if we only
+          // audit the eventual force-delete. The
+          // deployment.delete_conflict event carries just the
+          // deploymentId + timestamp; no leaky metadata.
+          writeAudit(
+            {
+              orgId: claims.orgId,
+              event: "deployment.delete_conflict",
+              actorId: claims.sub,
+              target: owned.name,
+              metadata: { deploymentId: owned.id },
+              req,
+            },
+            req.log,
+          );
           return reply.code(409).send({ error: "concurrent_modification_retry" });
         }
         throw e;

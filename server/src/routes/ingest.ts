@@ -326,8 +326,24 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
         select: { seq: true },
       });
       const existingSeqs = new Set(existing.map((e) => e.seq));
+      // R96 F2: dedupe within the batch itself before touching the
+      // rollup. Prior shape filtered ONLY against DB-existing seqs
+      // — an intra-batch duplicate seq passed the guard, hit
+      // event.create (first succeeds, second throws P2002 caught +
+      // continue), then the rollup loop ran twice for the same seq
+      // because `insertedSeqs.has(e.seq)` was true for both
+      // iterations. A daemon (buggy or malicious with a compromised
+      // ingest token) that posts [{seq:5, addCostUsdMicros:1000},
+      // {seq:5, addCostUsdMicros:9000}] committed one event row but
+      // inflated session.costUsdMicros by 10 000. The receipt then
+      // signed the inflated total — same compliance-story downgrade
+      // class R93 F2 / R94 F1 closed for the inter-batch race,
+      // just via the intra-batch vector. Keep first occurrence.
+      const seenSeqs = new Set<number>();
       const fresh = batch.filter((e) => {
         if (existingSeqs.has(e.seq)) return false;
+        if (seenSeqs.has(e.seq)) return false;
+        seenSeqs.add(e.seq);
         const t = e.occurredAt.getTime();
         if (t > now + maxFutureMs) { droppedSkewed++; return false; }
         if (t < minPastMs) { droppedAncient++; return false; }
