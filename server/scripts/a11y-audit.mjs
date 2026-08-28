@@ -90,10 +90,41 @@ for (const route of routes) {
 }
 }
 
+// The static pages (landing, verifier, pitch) live outside the SPA and
+// follow prefers-color-scheme instead of the data-theme toggle — audit
+// them in both schemes too, or they'd stay a blind spot.
+const ROOT = SITE.replace(/app\/?$/, "");
+for (const scheme of ["light", "dark"]) {
+  const sctx = await browser.newContext({ colorScheme: scheme });
+  const spage = await sctx.newPage();
+  for (const path of ["", "verify/", "pitch/"]) {
+    await spage.goto(ROOT + path, { waitUntil: "networkidle" });
+    await new Promise((r) => setTimeout(r, 500));
+    const results = await new AxeBuilder({ page: spage })
+      .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
+      .disableRules(IGNORE_RULES)
+      .analyze();
+    const serious = results.violations.filter(
+      (v) => v.impact === "serious" || v.impact === "critical",
+    );
+    if (serious.length === 0) {
+      console.log("✅ [" + scheme + "] /" + path + ": 0 serious/critical violations");
+    } else {
+      anyFail = true;
+      console.log("❌ [" + scheme + "] /" + path + ": " + serious.length + " serious/critical violations");
+      for (const v of serious) {
+        console.log("   - " + v.id + " (" + v.impact + "): " + v.help);
+        if (v.nodes[0]) console.log("     Example: " + v.nodes[0].html.slice(0, 140));
+      }
+    }
+  }
+  await sctx.close();
+}
+
 await browser.close();
 
 if (anyFail) {
   console.log("\nA11y audit FAILED. Fix the serious+critical violations above.");
   process.exit(1);
 }
-console.log("\nA11y audit passed — all " + routes.length + " routes clear in both themes.");
+console.log("\nA11y audit passed — all " + routes.length + " console routes (both themes) + 3 static pages (both schemes) clear.");
