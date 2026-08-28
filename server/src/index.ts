@@ -59,28 +59,20 @@ async function main(): Promise<void> {
         "req.body.token",
       ],
     },
-    // R95 F3: trust EXACTLY ONE proxy hop. Prior `trustProxy: true`
-    // trusted unbounded XFF hops, so a caller reaching the API
-    // through a co-located dev proxy, a misconfigured PaaS, or
-    // directly (single-container prod) could send
-    // `X-Forwarded-For: 10.0.0.1, <attacker>` and have req.ip
-    // return `10.0.0.1`. Downstream fallout:
-    //   • session-middleware.ts IP allowlist bypass (member
-    //     spoofs a corp-VPN CIDR entry to defeat R91 F3's
-    //     RBAC gate — sees the org's admin egress ranges).
-    //   • audit.ts writes AuditEntry.ip from req.ip; forged
-    //     audit-log IP invalidates SOC-2 evidence.
-    //   • index.ts rate-limit keyGenerator falls back to
-    //     `ip:req.ip`; per-IP lockouts on /login, SAML
-    //     endpoints, /reset-request evadable by rotating the
-    //     spoofed XFF entry.
-    // Function form: proxy-addr calls this once per hop and
-    // trusts the addr only when we return true. `(addr, hop)
-    // => hop === 0` trusts the immediate first hop and no
-    // further, which matches the "PaaS + one LB in front"
-    // deploy shape. Operators running multiple hops need to
-    // adjust the predicate per their topology.
-    trustProxy: (_addr: string, hop: number): boolean => hop === 0,
+    // R95 F3 + R96 F1: trust EXACTLY `TRUSTED_PROXY_HOP_COUNT`
+    // hops. R95 hardcoded a single-hop function which silently
+    // regressed Cloudflare + ALB deployments (real users
+    // bucketed into cf_edge_ip because the second hop wasn't
+    // trusted → session-middleware.ts IP allowlist, rate-limit
+    // key, and audit.ts AuditEntry.ip all recorded the edge IP
+    // instead of the client). Now configurable via env; default
+    // 1 covers 'PaaS + one LB in front' (Fly, Cloud Run, Heroku
+    // bare). Set TRUSTED_PROXY_HOP_COUNT=2 for CF+LB;
+    // TRUSTED_PROXY_HOP_COUNT=0 for local dev with no proxy.
+    // Function form: proxy-addr calls this once per hop; return
+    // true iff the hop index is inside the trusted range.
+    trustProxy: (_addr: string, hop: number): boolean =>
+      hop < env.TRUSTED_PROXY_HOP_COUNT,
     bodyLimit: 4 * 1024 * 1024, // 4 MiB — matches the daemon's own request cap
   });
 
@@ -128,23 +120,19 @@ async function main(): Promise<void> {
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     exposedHeaders: ["X-Request-Id"],
   });
-  // R95 F4: sign the OAuth state cookie so its integrity is
-  // enforced. Prior shape stored JSON.stringify({state,
-  // codeVerifier, nonce, provider}) unsigned. HttpOnly +
-  // SameSite=Lax + short TTL limit the classic exploit surface
-  // but don't cover the login-CSRF variant where an attacker
-  // with a parent-domain cookie primitive (bordering-subdomain
-  // XSS, on-path adversary with Set-Cookie for .example.com)
-  // plants their own valid state bag in the victim's browser
-  // and then triggers /callback — result is a session minted
-  // for the ATTACKER's identity into the VICTIM's browser.
-  // @fastify/cookie's HMAC signing closes this; the attacker
-  // can't produce a valid signature for a bag bound to the
-  // victim's browser. Reuses JWT_SECRET (already required
-  // production-min-32 chars); the OAuth setCookie / callback
-  // read paths pass signed: true and req.unsignCookie
-  // respectively.
-  await app.register(cookie, { secret: env.JWT_SECRET });
+  // R95 F4 + R96 F3: HMAC-signed OAuth state cookie via
+  // @fastify/cookie. Accept a comma-separated COOKIE_SECRETS
+  // env var (first entry signs, all verify) for key rotation
+  // without breaking in-flight OAuth flows. Falls back to
+  // JWT_SECRET for backward-compat with deployments that
+  // haven't set COOKIE_SECRETS yet. Defense-in-depth: a
+  // dedicated COOKIE_SECRETS decouples cookie HMAC from
+  // JWT signing key so a disclosure of one doesn't
+  // automatically compromise the other.
+  const cookieSecrets = env.COOKIE_SECRETS.length > 0
+    ? env.COOKIE_SECRETS
+    : [env.JWT_SECRET];
+  await app.register(cookie, { secret: cookieSecrets });
   // application/x-www-form-urlencoded body parser — required for SAML
   // Assertion Consumer Service (IdP posts SAMLResponse in this shape).
   await app.register(formbody);
