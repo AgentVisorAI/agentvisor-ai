@@ -186,15 +186,24 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
     Params: { configId: string };
     Querystring: { RelayState?: string };
   }>("/:configId/login", async (req, reply) => {
+    // R123 F1: kickoff endpoint is a top-level browser navigation
+    // (docs/app/app.js:1063 does window.location.assign(loginUrl)).
+    // R122 F2 fixed the ACS side but missed this — same dead-end
+    // raw-JSON class. Redirect to the SPA banner so admin misconfigs
+    // (deactivated config, SHA-1 legacy) surface as friendly text.
+    const errRedirect = (slug: string) =>
+      reply.redirect(
+        `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/login?err=${slug}`,
+      );
     const cfg = await db.samlConfig.findUnique({
       where: { id: req.params.configId },
     });
     if (!cfg || !cfg.isActive) {
-      return reply.code(404).send({ error: "config_not_found" });
+      return errRedirect("saml_config_not_found");
     }
     // R114 F1: same sha1-legacy gate as /metadata.xml.
     if (isSha1Legacy(cfg)) {
-      return reply.code(410).send({ error: "saml_config_uses_sha1_reject" });
+      return errRedirect("saml_config_uses_sha1_reject");
     }
     const relayState = typeof req.query.RelayState === "string"
       ? req.query.RelayState.slice(0, 1024)
