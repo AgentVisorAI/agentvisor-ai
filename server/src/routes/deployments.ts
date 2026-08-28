@@ -206,7 +206,24 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
           }
           await tx.deployment.delete({ where: { id: owned.id } });
           return n;
-        }, { isolationLevel: "Serializable" });
+        }, {
+          isolationLevel: "Serializable",
+          // R99 F2: Prisma's default $transaction timeout is 5 s
+          // which the cascade tree (Deployment → Session →
+          // Event/Receipt, all ON DELETE CASCADE) doesn't fit on
+          // realistic tenants. Same shape R95 F1 fixed for
+          // /events and R98 F1 for /me/delete-account. This
+          // sibling call site was missed. Prior behavior on a
+          // busy deployment: P2028 escaped the catch block
+          // (which only handled __has_sealed_receipts__ and
+          // P2034), returning an uninformative 500 while the
+          // tx rolled back. Owner retries → same result → the
+          // deployment is effectively un-deletable. Bump to 60 s
+          // to match R98 F1's shape; maxWait 10 s prevents
+          // queue-storm 429s.
+          timeout: 60_000,
+          maxWait: 10_000,
+        });
       } catch (e) {
         if (e instanceof Error && e.message.startsWith("__has_sealed_receipts__")) {
           const n = Number(e.message.split("__")[2] ?? "0");
@@ -242,6 +259,25 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
             req.log,
           );
           return reply.code(409).send({ error: "concurrent_modification_retry" });
+        }
+        if (
+          typeof e === "object" && e !== null &&
+          (e as { code?: string }).code === "P2028"
+        ) {
+          // R99 F2: tx exceeded the 60 s budget. Surface a
+          // retryable 409 with guidance rather than a generic
+          // 500 so the operator (or CLI) knows to retry with
+          // a lull between ingest bursts, or contact us for
+          // a batched-delete path if the tenant is genuinely
+          // too large for one tx.
+          req.log.warn(
+            { deploymentId: owned.id, orgId: claims.orgId },
+            "deployment_delete_tx_timeout",
+          );
+          return reply.code(409).send({
+            error: "deployment_delete_timeout",
+            hint: "the cascade exceeded the transaction budget; retry, or contact support for a batched-delete path",
+          });
         }
         throw e;
       }
