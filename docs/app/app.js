@@ -2105,7 +2105,7 @@
     { id: "keys", label: "API keys", ownerAdminOnly: true },
     { id: "sso", label: "SSO" },
     { id: "webhooks", label: "Webhooks", ownerAdminOnly: true },
-    { id: "audit", label: "Audit log" },
+    { id: "audit", label: "Audit log", ownerAdminOnly: true },
     { id: "billing", label: "Billing" },
   ];
 

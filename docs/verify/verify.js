@@ -75,12 +75,25 @@
       return { ok, trustedKey, bundle };
     }
 
-    // Expose TRUSTED_RECEIPT_KEYS on `window` so the CI drill can
-    // inject a per-test trusted pubkey via `page.evaluate` (see
-    // server/scripts/verify-page-drill.mjs R79 regression guard).
-    // In production this is a no-op. The Set is closed over the
-    // verifyBundle closure and no page script adds to it.
-    if (typeof window !== "undefined") {
+    // R91 F4: only expose the mutable Set when the ?ci-drill=1
+    // URL flag is set. Prior shape unconditionally exposed the
+    // Set on window so the Playwright CI drill (server/scripts/
+    // verify-page-drill.mjs) could `page.evaluate` a per-test
+    // trusted pubkey. But that exposure is a same-origin bypass
+    // for the R78/R79 trust-anchor pinning: any script loaded
+    // by the docs Pages source (persistent XSS, future
+    // analytics tag, marketing-snippet drop-in) could call
+    // window.TRUSTED_RECEIPT_KEYS.add("<attacker pubkey>") and
+    // verifyBundle would happily green-light a forged bundle.
+    // Fix: gate the exposure on ?ci-drill=1, which the drill
+    // script sets when it navigates the page and which is
+    // invisible in normal production traffic. Preserves the CI
+    // guard while shipping production without the exposure.
+    if (
+      typeof window !== "undefined" &&
+      typeof window.location !== "undefined" &&
+      /(?:\?|&)ci-drill=1(?:&|$)/.test(window.location.search || "")
+    ) {
       window.TRUSTED_RECEIPT_KEYS = TRUSTED_RECEIPT_KEYS;
     }
 

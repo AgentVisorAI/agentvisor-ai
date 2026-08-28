@@ -4,6 +4,7 @@ import { db } from "../db.js";
 import { verifyPassword } from "../lib/auth.js";
 import { bus } from "../lib/bus.js";
 import { dispatchEvent } from "../lib/webhooks.js";
+import { writeAudit } from "../lib/audit.js";
 
 // ── Auth for the ingest endpoint ────────────────────────────────────────────
 //
@@ -99,10 +100,83 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
     if (!daemon) return;
     const body = publicKeyPayload.safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: "invalid_input" });
-    await db.deployment.update({
+    // R91 F3: silent trust-anchor rotation is the exact class the
+    // R78 pinning + R79 verifier hardening tried to close, and
+    // this endpoint was silently ROTATING the anchor without any
+    // audit entry or admin approval flow. A stolen ingest token
+    // (or a routinely re-provisioned daemon) could:
+    //   1. POST /pubkey {publicKeyHex: <attacker key>}
+    //   2. All prior receipts for that deployment now fail verify
+    //      (the console + /verify page compare against the
+    //      current deployment.publicKeyHex, not the receipt's
+    //      own keyIdHex).
+    //   3. Forged sessions/events signed with the attacker's new
+    //      key verify GREEN.
+    // Fix: allow FIRST-SET (empty column → new key) without
+    // ceremony but require the ingest layer to reject any
+    // subsequent CHANGE to a different key. A legitimate rotation
+    // needs an owner/admin-authenticated console flow (out of
+    // scope for this hardening — the endpoint isn't wired up
+    // yet — so rejecting mid-flight rotation is the correct
+    // fail-closed posture). Always emit an audit entry so
+    // operators see first-set events.
+    const dep = await db.deployment.findUnique({
       where: { id: daemon.deploymentId },
-      data: { publicKeyHex: body.data.publicKeyHex },
+      select: { orgId: true, name: true, publicKeyHex: true },
     });
+    if (!dep) return reply.code(404).send({ error: "deployment_not_found" });
+    if (dep.publicKeyHex && dep.publicKeyHex !== body.data.publicKeyHex) {
+      // Refuse silent rotation. Log at warn so an operator can
+      // investigate a rogue daemon or a stolen token.
+      req.log.warn(
+        {
+          deploymentId: daemon.deploymentId,
+          orgId: dep.orgId,
+          old: dep.publicKeyHex,
+          proposed: body.data.publicKeyHex,
+        },
+        "ingest_pubkey_rotation_refused",
+      );
+      writeAudit(
+        {
+          orgId: dep.orgId,
+          event: "deployment.pubkey_rotation_refused",
+          actorId: `daemon:${daemon.deploymentId}`,
+          actorEmail: `daemon@${dep.name}`,
+          target: dep.name,
+          metadata: {
+            deploymentId: daemon.deploymentId,
+            currentPublicKeyHex: dep.publicKeyHex,
+            proposedPublicKeyHex: body.data.publicKeyHex,
+          },
+          req,
+        },
+        req.log,
+      );
+      return reply.code(409).send({ error: "pubkey_already_set" });
+    }
+    if (!dep.publicKeyHex) {
+      await db.deployment.update({
+        where: { id: daemon.deploymentId },
+        data: { publicKeyHex: body.data.publicKeyHex },
+      });
+      writeAudit(
+        {
+          orgId: dep.orgId,
+          event: "deployment.pubkey_first_set",
+          actorId: `daemon:${daemon.deploymentId}`,
+          actorEmail: `daemon@${dep.name}`,
+          target: dep.name,
+          metadata: {
+            deploymentId: daemon.deploymentId,
+            publicKeyHex: body.data.publicKeyHex,
+          },
+          req,
+        },
+        req.log,
+      );
+    }
+    // Idempotent same-key repost is a no-op.
     return reply.send({ ok: true });
   });
 

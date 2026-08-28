@@ -19,7 +19,12 @@
 import { chromium } from "playwright";
 
 const SITE = process.env.SITE ?? "https://agentvisorai.me/";
-const VERIFY_URL = new URL("verify/", SITE).href;
+// R91 F4: the /verify page's TRUSTED_RECEIPT_KEYS Set is only
+// exposed on `window` when the ?ci-drill=1 URL flag is set (see
+// docs/verify/verify.js R91 F4 comment). This drill mutates the
+// Set at runtime to inject a per-test trusted pubkey, so append
+// the flag to every /verify navigation.
+const VERIFY_URL = new URL("verify/?ci-drill=1", SITE).href;
 
 function fail(m) { console.log("❌", m); process.exit(1); }
 async function wait(ms) { return new Promise((r) => setTimeout(r, ms)); }
