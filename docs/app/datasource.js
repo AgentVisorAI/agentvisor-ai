@@ -484,6 +484,39 @@
         policiesFired: blocked > 0 ? ["pol_procurement_allowed_vendors"] : [],
       });
     }
+    // One mega-session with a paged 700-event trail (batch-import
+    // style). Cheap synthetic events, generated once.
+    var mega = Object.assign({}, out[0], {
+      id: "sess_bd_mega",
+      externalId: "SESS_BATCH_IMPORT_01",
+      agent: "invoice-reconciler",
+      user: "system@northwind.com",
+      status: "completed",
+      startedAt: isoMinsAgo(2 * 24 * 60),
+      endedAt: isoMinsAgo(2 * 24 * 60 - 45),
+      events: 700,
+      toolsAllowed: 331,
+      toolsBlocked: 0,
+      costUsdMicros: "412000",
+      blockedPayoutUsdMicros: "0",
+      policiesFired: [],
+    });
+    var megaEvents = [{ seq: 1, ts: mega.startedAt, kind: "session", tag: "start", msg: "invoice-reconciler opened session", severity: "info", durationMs: 0 }];
+    for (var j = 2; j <= 699; j++) {
+      var tool = j % 2 === 0;
+      megaEvents.push({
+        seq: j,
+        ts: new Date(new Date(mega.startedAt).getTime() + j * 3800).toISOString(),
+        kind: tool ? "tool" : "llm",
+        tag: tool ? "call" : "request",
+        msg: tool ? "reconcile_invoice(batch_row=" + j + ")" : "gpt-4o-mini · classify row " + j,
+        severity: "info",
+        durationMs: tool ? 40 + (j % 90) : 300 + (j % 400),
+      });
+    }
+    megaEvents.push({ seq: 700, ts: mega.endedAt, kind: "session", tag: "end", msg: "Sealed · 700 events", severity: "ok", durationMs: 0 });
+    mega._events = megaEvents;
+    out.push(mega);
     BIGDATA_CACHE = out;
     return out;
   }
@@ -1179,12 +1212,27 @@
       var nextCursor = (offset + limit) < results.length ? btoa(String(offset + limit)) : null;
       return { sessions: page, nextCursor: nextCursor };
     },
-    async getSessionById(id) {
+    async getSessionById(id, opts) {
       await delay(180);
       var s = MOCK_SESSIONS.find(function (x) { return x.id === id; }) ||
         (bigDataOn() ? bigDataSessions().find(function (x) { return x.id === id; }) : null);
       if (!s) throw new Error("not_found");
       var events = s._events || (id === "sess_01H9K" ? MOCK_EVENTS_FEATURED : synthesizeEvents(s));
+      // Long trails page like the real API: 500 events per request,
+      // cursor = serialized offset. The only session long enough is
+      // the big-data mega-session, which exists precisely so the
+      // Load-more-events path (and its historically buggy page-merge)
+      // gets executed somewhere.
+      var EV_PAGE = 500;
+      var off = 0;
+      if (opts && opts.eventCursor != null) {
+        try { off = parseInt(atob(String(opts.eventCursor)), 10) || 0; } catch (e) { off = 0; }
+      }
+      if (events.length > EV_PAGE) {
+        var page = events.slice(off, off + EV_PAGE);
+        var next = off + EV_PAGE < events.length ? btoa(String(off + EV_PAGE)) : null;
+        return { session: s, events: page, nextEventCursor: next };
+      }
       return { session: s, events: events };
     },
 
