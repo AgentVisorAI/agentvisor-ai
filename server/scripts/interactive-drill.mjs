@@ -1010,7 +1010,66 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ reset flow (issue/reject/confirm/single-use); member preview redacts + is view-only (tabs, SSO, keypair); policy blocks derived from " + pd.fired + " fired sessions");
 }
 
-// ── 22. Listener-leak soak ─────────────────────────────────────────
+// ── 22. Deployment lifecycle + billing math ────────────────────────
+// Create (modal → one-time token → pending row), detail ground truth
+// (env block carries the dep id, sessions table is that deployment's
+// sessions, View-all carries ?dep=), rotate (confirm → new token),
+// and the billing card's metered math (calls/1000 × $0.10).
+{
+  await page.goto(SITE + "#/deployments", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("tr[data-clickable]", { timeout: 15000 });
+  const rowsBefore = await page.evaluate(() => document.querySelectorAll("tr[data-clickable]").length);
+  await page.click("#addDep");
+  await page.waitForSelector("#depForm", { timeout: 5000 });
+  await page.fill("#depName", "drill-daemon");
+  await page.click("#depForm button[type=submit]");
+  await page.waitForSelector(".token-display", { timeout: 8000 });
+  const tok = await page.evaluate(() => document.querySelector(".token-display").textContent.trim());
+  if (!tok.startsWith("av_live_")) fail("create-deployment token wrong shape: " + tok.slice(0, 20));
+  await page.evaluate(() => document.querySelector(".modal-backdrop [data-close]").click());
+  await page.waitForFunction((n) => document.querySelectorAll("tr[data-clickable]").length === n + 1, rowsBefore, { timeout: 8000 })
+    .catch(() => fail("new deployment did not appear in the list"));
+  if (!(await page.evaluate(() => document.getElementById("view").textContent.includes("drill-daemon")))) fail("new deployment name missing");
+  const d = await page.evaluate(async () => {
+    const deps = await window.dataSource.listDeployments();
+    const dep = deps.find((x) => x.id === "dep_prod") || deps[0];
+    const sess = (await window.dataSource.listSessions({ deploymentId: dep.id })).sessions;
+    location.hash = "#/deployments/" + dep.id;
+    await new Promise((r) => setTimeout(r, 1200));
+    const view = document.getElementById("view");
+    const envBtn = view.querySelector('[data-copy*="AV_INGEST_URL"]');
+    const rows = [...view.querySelectorAll("tbody tr[data-clickable]")].map((r) => r.getAttribute("data-id"));
+    return {
+      envOk: envBtn && envBtn.getAttribute("data-copy").includes("AV_DEPLOYMENT=" + dep.id),
+      statusOk: view.textContent.includes(dep.status),
+      rowsOk: rows.length === Math.min(sess.length, 8) && rows.every((id) => sess.some((s) => s.id === id)),
+      viewAllOk: (view.querySelector('a[href*="dep="]')?.getAttribute("href") || "").includes("dep=" + dep.id),
+      nSess: sess.length,
+    };
+  });
+  if (!d.envOk || !d.statusOk || !d.rowsOk || !d.viewAllOk || !d.nSess) fail("deployment detail vs ground truth: " + JSON.stringify(d));
+  await page.evaluate(() => { location.hash = "#/deployments"; });
+  await page.waitForSelector('button[data-action="rotate"]', { timeout: 10000 });
+  await page.click('button[data-action="rotate"]');
+  await page.waitForSelector(".modal-backdrop [data-confirm]", { timeout: 5000 });
+  await page.click(".modal-backdrop [data-confirm]");
+  await page.waitForSelector(".token-display", { timeout: 8000 });
+  if (!(await page.evaluate(() => document.querySelector(".token-display").textContent.trim().startsWith("av_live_")))) fail("rotated token wrong shape");
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(300);
+  const bm = await page.evaluate(async () => {
+    const o = await window.dataSource.getOverview("24h");
+    const calls = o.toolsAllowed + o.toolsBlocked;
+    location.hash = "#/settings/billing";
+    await new Promise((r) => setTimeout(r, 1200));
+    const t = document.getElementById("view").textContent;
+    return { ok: t.includes(calls.toLocaleString("en-US")) && t.includes("$" + ((calls / 1000) * 0.10).toFixed(2)), calls };
+  });
+  if (!bm.ok) fail("billing card math wrong for " + bm.calls + " calls");
+  console.log("✅ deployment lifecycle: create→token→pending row, detail truth (env/status/sessions/View-all), rotate; billing math exact");
+}
+
+// ── 23. Listener-leak soak ─────────────────────────────────────────
 // Every earlier check opened modals, ran the tour, refreshed the
 // overview, and re-rendered lists dozens of times. If any of that
 // leaked document/window listeners (the webhook modal once leaked a
@@ -1036,4 +1095,4 @@ if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors))
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 23 interactive-features drill checks passed.");
+console.log("\nAll 24 interactive-features drill checks passed.");
