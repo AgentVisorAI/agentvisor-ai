@@ -120,6 +120,22 @@ const Env = z.object({
       (n) => Number.isInteger(n) && n >= 0 && n <= 8,
       "TRUSTED_PROXY_HOP_COUNT must be an integer 0..8",
     ),
+  // R99 F3: retention sweeper interval, in milliseconds.
+  // Prior shape (retention.ts:29) did Number(process.env.X)
+  // with no validation — Number('') = 0 and Number('6h') = NaN
+  // (which Node clamps to 1 ms), both causing setInterval to
+  // fire every ~1 ms and hammer Postgres with full org scans.
+  // Bounds: 1 min (safety floor — prevents DoS-by-typo) to 24 h
+  // (safety ceiling — retention must actually run). Default is
+  // 6 hours.
+  RETENTION_SWEEPER_INTERVAL_MS: z
+    .string()
+    .default(String(6 * 60 * 60 * 1000))
+    .transform((v) => Number(v.trim()))
+    .refine(
+      (n) => Number.isInteger(n) && n >= 60_000 && n <= 86_400_000,
+      "RETENTION_SWEEPER_INTERVAL_MS must be integer ms in [60000, 86400000]",
+    ),
   ALLOWED_ORIGINS: z
     .string()
     .default("")

@@ -120,6 +120,36 @@ export function getMailer(log: FastifyBaseLogger): Mailer {
   return cached;
 }
 
+// R99 F1: escape HTML special chars in email template
+// interpolations. Prior shape interpolated user-controlled
+// values (orgName from signup, displayName from signup/user
+// profile, inviterEmail from stored user row) RAW into HTML
+// string templates. Zod validators only bounded length, not
+// content. An attacker signing up with e.g. orgName =
+// 'Corp</h2><h2>Your invite has been re-issued: <a
+// href="https://attacker/phish">click here</a>' and then
+// inviting a victim would deliver an email containing a
+// working phishing link inline with the legit invite. Modern
+// webmail (Gmail, Outlook) strips <script> but renders <a>,
+// <img>, <div> freely, so payload injection is real.
+// Contrast the console UI which correctly funnels every
+// rendered value through esc() (docs/app/app.js). Now every
+// template interpolates via escHtml(). The password reset
+// link and invite link (both server-generated) are NOT run
+// through escHtml because they're trusted URLs; only user-
+// controlled fields (displayName, orgName, inviterEmail) are.
+// However the raw `link` interpolation into <code> was also
+// vulnerable to a broken URL displaying weirdly, so it's
+// escaped too for defense-in-depth.
+function escHtml(s: string): string {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 // Template helpers. Keep the HTML minimal — every mail client renders
 // tables differently, and password-reset emails are a security
 // sensitive path where a broken template shouldn't leak the token.
@@ -131,11 +161,12 @@ ${link}
 This link expires in 24 hours. If you didn't request a password reset,
 you can ignore this email — nothing has changed on your account.
 `;
+  const linkEsc = escHtml(link);
   const html = `<div style="font:15px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#222;max-width:520px">
   <h2 style="margin:0 0 12px;font-size:20px">Reset your password</h2>
   <p>Click the link below to choose a new password for your AgentVisor AI account.</p>
-  <p><a href="${link}" style="display:inline-block;background:#0a5c8b;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:500">Reset password</a></p>
-  <p style="font-size:13px;color:#666">Or copy this URL into your browser:<br><code style="word-break:break-all">${link}</code></p>
+  <p><a href="${linkEsc}" style="display:inline-block;background:#0a5c8b;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:500">Reset password</a></p>
+  <p style="font-size:13px;color:#666">Or copy this URL into your browser:<br><code style="word-break:break-all">${linkEsc}</code></p>
   <p style="font-size:13px;color:#666">This link expires in 24 hours. If you didn't request a reset, you can ignore this email — nothing has changed.</p>
 </div>`;
   return { subject: "Reset your AgentVisor AI password", text, html };
@@ -143,6 +174,7 @@ you can ignore this email — nothing has changed on your account.
 
 export function welcomeMail(displayName: string): Pick<MailInput, "subject" | "text" | "html"> {
   const name = displayName || "there";
+  const nameEsc = escHtml(name);
   const text = `Hi ${name},
 
 Welcome to AgentVisor AI. Your account is ready.
@@ -155,7 +187,7 @@ Next steps:
 Questions? Reply to this email or hit us at hello@agentvisorai.me.
 `;
   const html = `<div style="font:15px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#222;max-width:520px">
-  <h2 style="margin:0 0 12px;font-size:20px">Welcome, ${name} 👋</h2>
+  <h2 style="margin:0 0 12px;font-size:20px">Welcome, ${nameEsc} 👋</h2>
   <p>Your AgentVisor AI account is ready.</p>
   <ol>
     <li><a href="https://github.com/AgentVisorAI/agentvisor-ai#quickstart">Install the daemon</a></li>
@@ -183,10 +215,13 @@ ${link}
 This invite expires in 7 days. If you didn't expect this email,
 you can safely ignore it.
 `;
+  const orgEsc = escHtml(orgName);
+  const inviterEsc = escHtml(inviterEmail);
+  const linkEsc = escHtml(link);
   const html = `<div style="font:15px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#222;max-width:520px">
-  <h2 style="margin:0 0 12px;font-size:20px">Join ${orgName} on AgentVisor AI</h2>
-  <p><b>${inviterEmail}</b> invited you to their workspace.</p>
-  <p><a href="${link}" style="background:#4c6ef5;color:#fff;padding:10px 16px;border-radius:6px;text-decoration:none;display:inline-block">Accept invite</a></p>
+  <h2 style="margin:0 0 12px;font-size:20px">Join ${orgEsc} on AgentVisor AI</h2>
+  <p><b>${inviterEsc}</b> invited you to their workspace.</p>
+  <p><a href="${linkEsc}" style="background:#4c6ef5;color:#fff;padding:10px 16px;border-radius:6px;text-decoration:none;display:inline-block">Accept invite</a></p>
   <p style="font-size:13px;color:#666">This link expires in 7 days. If you didn't expect this email, you can safely ignore it.</p>
 </div>`;
   return { subject: `Invite to join ${orgName} on AgentVisor AI`, text, html };
