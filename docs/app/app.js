@@ -745,7 +745,7 @@
         '<header class="topbar" role="banner">' +
           '<a class="brand" href="#/overview">' +
             '<img class="brand-mark" src="../logo.png" alt="" width="22" height="22" />' +
-            '<span>AgentVisor</span>' +
+            '<span>AgentVisor AI</span>' +
           "</a>" +
           statusChip +
           '<div class="spacer"></div>' +
@@ -936,7 +936,7 @@
       '<div class="auth-shell">' +
         '<section class="auth-form">' +
           '<div class="auth-form-inner">' +
-            '<div class="auth-brand"><span class="auth-brand-mark">A</span> AgentVisor</div>' +
+            '<div class="auth-brand"><span class="auth-brand-mark">A</span> AgentVisor AI</div>' +
             '<h1>' + (isSignup ? "Create your workspace" : "Sign in") + '</h1>' +
             '<p class="sub">' + (isSignup ? "Governance for every AI agent in your fleet." : "Access your agent control plane.") + '</p>' +
             (showSsoBlock ? '<div class="sso">' + ssoButtons + "</div>" + '<div class="divider">or with email</div>' : '') +
@@ -1109,7 +1109,7 @@
       '<div class="auth-shell">' +
         '<section class="auth-form">' +
           '<div class="auth-form-inner">' +
-            '<div class="auth-brand"><span class="auth-brand-mark">A</span> AgentVisor</div>' +
+            '<div class="auth-brand"><span class="auth-brand-mark">A</span> AgentVisor AI</div>' +
             '<h1>Join the workspace</h1>' +
             '<p class="sub">Accept your invite for <b>' + esc(email) + '</b> and set a password.</p>' +
             '<form id="acceptForm">' +
@@ -1165,7 +1165,7 @@
       '<div class="auth-shell">' +
         '<section class="auth-form">' +
           '<div class="auth-form-inner">' +
-            '<div class="auth-brand"><span class="auth-brand-mark">A</span> AgentVisor</div>' +
+            '<div class="auth-brand"><span class="auth-brand-mark">A</span> AgentVisor AI</div>' +
             (stage === "request"
               ? '<h1>Reset your password</h1>' +
                 '<p class="sub">We\'ll email you a link to pick a new one.</p>' +
