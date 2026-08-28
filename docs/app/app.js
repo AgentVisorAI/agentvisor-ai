@@ -3646,13 +3646,31 @@
         var pkId = tr.getAttribute("data-pk");
         confirmModal({
           title: "Revoke passkey?",
-          body: "The passkey will stop working immediately. You'll need to sign in with password only, then register another passkey.",
+          // R125 F1: R124 F1 turned DELETE /credentials/:id into a
+          // session-wide fence (sessionRevokedAt bumped + all
+          // av_srv_ tokens the user created revoked). The prior
+          // body copy neglected both side-effects. Warn the user
+          // explicitly so a legitimate rotation ("swap yubikeys")
+          // isn't a surprise CI-tokens-broken incident.
+          body: "This passkey will stop working immediately. You'll be signed out on every device, and any API keys you created will be revoked. You'll need to sign in with your password, register a new passkey, and re-issue automation tokens.",
           confirmLabel: "Revoke",
           danger: true,
           onConfirm: function () {
             state.ds.webauthnRevoke(pkId).then(function () {
-              toast("Passkey revoked");
-              renderSettingsSSO(root);
+              // R125 F1: skip renderSettingsSSO(root) — the next
+              // fetch is guaranteed to 401 (cookie iat now < new
+              // sessionRevokedAt) which fires the generic
+              // "session expired" toast on top of "Passkey
+              // revoked" and boots the user to /#/login anyway.
+              // Do a purposeful sign-out matching signOut() at
+              // app.js:690-710 so the UX is one deliberate flow,
+              // not two stacked toasts.
+              stopLiveStream();
+              rolePreview = null;
+              state.session = null;
+              try { localStorage.setItem("av_signed_out_at", String(Date.now())); } catch (e) {}
+              toast("Passkey revoked. Sign in again to continue.");
+              navigate("#/login");
             }).catch(function (err) { toast(err.message || "Revoke failed", true); });
           },
         });
@@ -4258,6 +4276,18 @@
       toast("Only owner/admin roles can export the audit log.", true);
     } else if (auditErr === "audit_invalid_before") {
       toast("Invalid audit export cursor. Showing the current audit log.", true);
+    }
+    // R125 F2: drop the ?err=... fragment so a page refresh or a
+    // return visit doesn't re-fire the toast. history.replaceState
+    // is safe from a hash route because we only rewrite the hash
+    // portion, leaving pathname and search intact. Matches the
+    // "banner clears after read" pattern used for post-login
+    // redirects.
+    if (auditErr) {
+      try {
+        var auditBase = location.hash.split("?")[0];
+        history.replaceState(null, "", location.pathname + location.search + auditBase);
+      } catch (e) {}
     }
     root.innerHTML = '<div class="card">' + loadingBlock("table") + "</div>";
     var audit;
