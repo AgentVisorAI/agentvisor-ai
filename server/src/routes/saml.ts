@@ -773,6 +773,29 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
           spCertPem: certPem,
         },
       });
+      // R134 F1: rotating spPrivateKeyPem + spCertPem invalidates
+      // every pending signed AuthnRequest and forces IdP-side
+      // metadata re-upload — a stolen owner cookie can silently
+      // DoS SSO for the whole org or stage a downgrade against a
+      // future assertion-encryption push. This was the only
+      // mutating route in saml.ts without a writeAudit() call
+      // (sibling POST / at 618, PATCH /:configId at 688, DELETE
+      // /:configId at 719 all audit correctly). Mechanical
+      // omission of the same 12-line block; add it here so
+      // incident forensics has the breadcrumb. Direct parity
+      // with deployments.ts:143 (deployment.token_rotated) and
+      // webhooks.ts:425 (webhook.secret_rotated).
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "saml.keypair_rotated",
+          actorId: claims.sub,
+          target: existing.displayName,
+          metadata: { samlConfigId: existing.id },
+          req,
+        },
+        req.log,
+      );
       return reply.send({
         config: serializeConfig(cfg),
         spCertPem: certPem,
