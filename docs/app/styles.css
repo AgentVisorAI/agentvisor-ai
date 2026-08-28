@@ -579,7 +579,9 @@ code, pre, .mono {
 
 .main {
   grid-area: main;
-  padding: var(--s-6) var(--s-6) var(--s-8);
+  /* 84px bottom: the floating tour-launcher pill (fixed, bottom-right)
+   * must never cover the last row's action buttons at max scroll. */
+  padding: var(--s-6) var(--s-6) 84px;
   max-width: var(--max);
   width: 100%;
   /* Grid children default to min-content sizing on their main axis, which
@@ -761,6 +763,15 @@ th, td { padding: 10px var(--s-4); text-align: left; }
    available via a native tooltip (title attr, set by the renderer when
    worth doing) or by clicking into the row's detail view. */
 td, th { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Actions columns: under table-layout:fixed the sr-only header gets an
+   equal 1/n share regardless of content, so multi-button cells spilled
+   past their td into overflow:hidden dead space — the buttons rendered
+   clipped and mouse clicks landed on the td, not the button (found on
+   webhooks/SSO/deployments Delete). Explicit widths sized to the button
+   set fix both paint and hit-testing. */
+th.act-1 { width: 110px; }
+th.act-2 { width: 180px; }
+th.act-3 { width: 264px; }
 /* Cells that hold two lines (deployment name + subhead) opt back in. */
 td > div:first-child { overflow: hidden; text-overflow: ellipsis; }
 th {
@@ -1516,7 +1527,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   .app-shell { grid-template-columns: minmax(0, 1fr); grid-template-areas: "topbar" "main"; }
   .app-shell.has-preview { grid-template-rows: auto var(--topbar-h) 1fr; grid-template-areas: "pbanner" "topbar" "main"; }
   .sidebar { display: none; }
-  .main { padding: var(--s-4); }
+  .main { padding: var(--s-4) var(--s-4) 84px; }
   .topbar { overflow: hidden; }
   .topbar .cmdk-trigger { min-width: 0; }
   .topbar .cmdk-trigger span:not(.kbd) { display: none; }

@@ -1937,7 +1937,7 @@
           '<div class="snippet"><span class="prompt">$</span> <span class="cmd">curl -fsSL https://get.agentvisorai.me/install.sh | sh</span>\n<span class="prompt">$</span> <span class="cmd">agentvisord start --token=$AV_INGEST_TOKEN</span></div>' +
         "</div>" +
         '<div class="card" style="padding:0"><div class="table-wrap"><table>' +
-          "<thead><tr><th>Deployment</th><th>Environment</th><th>Region</th><th>Status</th><th>Version</th><th>Last seen</th><th><span class=\"sr-only\">Actions</span></th></tr></thead>" +
+          "<thead><tr><th>Deployment</th><th>Environment</th><th>Region</th><th>Status</th><th>Version</th><th>Last seen</th><th class=\"act-2\"><span class=\"sr-only\">Actions</span></th></tr></thead>" +
           "<tbody>" + rows + "</tbody></table></div></div>";
     }
     main.innerHTML = pageHeader("Deployments", "Each daemon streams events and signed receipts to this console.", actions) + body;
@@ -2360,7 +2360,7 @@
     }).join("");
     main.innerHTML = pageHeader("Policies", pols.length + " policies · " + pols.filter(function (p) { return p.enabled; }).length + " enabled", '<button class="btn accent" id="addPol">+ New policy</button>') +
       '<div class="card" style="padding:0"><div class="table-wrap"><table>' +
-        "<thead><tr><th>Policy</th><th>Description</th><th class=\"num\">Hits 24h</th><th class=\"num\">Blocks</th><th>Updated</th><th><span class=\"sr-only\">Actions</span></th></tr></thead>" +
+        "<thead><tr><th>Policy</th><th>Description</th><th class=\"num\">Hits 24h</th><th class=\"num\">Blocks</th><th>Updated</th><th class=\"act-1\"><span class=\"sr-only\">Actions</span></th></tr></thead>" +
         "<tbody>" + rows + "</tbody></table></div></div>";
     var tbody = main.querySelector("tbody");
     tbody.addEventListener("click", function (e) {
@@ -2702,7 +2702,7 @@
             : '<span style="margin-left:auto; color:var(--fg-3); font-size:var(--t-sec)">Ask an owner or admin to manage members</span>') +
         "</div>" +
         '<div class="table-wrap"><table>' +
-          '<thead><tr><th>Person</th><th>Role</th><th>Last active</th><th><span class="sr-only">Actions</span></th></tr></thead>' +
+          '<thead><tr><th>Person</th><th>Role</th><th>Last active</th><th class="act-1"><span class="sr-only">Actions</span></th></tr></thead>' +
           '<tbody>' + memberRows + '</tbody>' +
         '</table></div>' +
       '</div>';
@@ -2722,7 +2722,7 @@
             '<span style="margin-left:8px; color:var(--fg-3); font-size:var(--t-sec)">' + invites.length + '</span>' +
           '</div>' +
           '<div class="table-wrap"><table>' +
-            '<thead><tr><th>Email</th><th>Role</th><th>Expires</th><th><span class="sr-only">Actions</span></th></tr></thead>' +
+            '<thead><tr><th>Email</th><th>Role</th><th>Expires</th><th class="act-1"><span class="sr-only">Actions</span></th></tr></thead>' +
             '<tbody>' + inviteRows + '</tbody>' +
           '</table></div>' +
         '</div>')
@@ -2887,7 +2887,7 @@
           '<button class="btn accent" id="createKeyBtn" style="margin-left:auto">+ Create key</button>' +
         "</div>" +
         '<div class="table-wrap"><table>' +
-          "<thead><tr><th>Name</th><th>Prefix</th><th>Last used</th><th>Created</th><th><span class=\"sr-only\">Actions</span></th></tr></thead>" +
+          "<thead><tr><th>Name</th><th>Prefix</th><th>Last used</th><th>Created</th><th class=\"act-1\"><span class=\"sr-only\">Actions</span></th></tr></thead>" +
           "<tbody>" + rows + "</tbody>" +
         "</table></div>" +
       "</div>";
@@ -2934,7 +2934,7 @@
 
     var samlList = configs.length
       ? '<div class="table-wrap"><table>' +
-          '<thead><tr><th>Display name</th><th>IdP entity ID</th><th>Domains</th><th>JIT</th><th>Status</th><th><span class="sr-only">Actions</span></th></tr></thead>' +
+          '<thead><tr><th>Display name</th><th>IdP entity ID</th><th>Domains</th><th>JIT</th><th>Status</th><th class="act-3"><span class="sr-only">Actions</span></th></tr></thead>' +
           '<tbody>' + configs.map(function (c) {
             return '<tr data-id="' + esc(c.id) + '">' +
               '<td><div style="font-weight:500">' + esc(c.displayName) + '</div><div class="id">' + esc((c.spEntityId || '').slice(-40)) + '</div></td>' +
@@ -2969,7 +2969,7 @@
 
     var mfaRows = passkeys.length
       ? '<div class="table-wrap"><table>' +
-          '<thead><tr><th>Passkey</th><th>Transport</th><th>Last used</th><th>Registered</th><th><span class="sr-only">Actions</span></th></tr></thead>' +
+          '<thead><tr><th>Passkey</th><th>Transport</th><th>Last used</th><th>Registered</th><th class="act-1"><span class="sr-only">Actions</span></th></tr></thead>' +
           '<tbody>' + passkeys.map(function (p) {
             return '<tr data-pk="' + esc(p.id) + '">' +
               '<td><div style="font-weight:500">' + esc(p.label) + '</div><div class="id">' + esc((p.aaguid || 'aaguid unknown').slice(0, 24)) + '</div></td>' +
@@ -3403,7 +3403,7 @@
           '<button class="btn accent" id="whAdd" style="margin-left:auto">+ Add webhook</button>' +
         "</div>" +
         '<div class="table-wrap"><table>' +
-          "<thead><tr><th>Name</th><th>URL</th><th>Events</th><th>Status</th><th><span class=\"sr-only\">Actions</span></th></tr></thead>" +
+          "<thead><tr><th>Name</th><th>URL</th><th>Events</th><th>Status</th><th class=\"act-3\"><span class=\"sr-only\">Actions</span></th></tr></thead>" +
           "<tbody>" + rows + "</tbody>" +
         "</table></div>" +
       "</div>";
