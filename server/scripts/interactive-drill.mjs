@@ -638,7 +638,61 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ tactile polish: text-select doesn't navigate, Back restores scroll, toasts cap at 4");
 }
 
-// ── 17. Listener-leak soak ─────────────────────────────────────────
+// ── 17. Filter/sort semantic correctness ───────────────────────────
+// The URL plumbing is drilled elsewhere; this asserts the filters
+// return the RIGHT rows against ground truth computed from the
+// datasource itself — case-insensitive q across id/agent/actor,
+// status=blocked, dep, composition, and per-column sort monotonicity.
+// This logic graduates into the real product's list views.
+{
+  await page.evaluate(() => localStorage.setItem("av_mock_bigdata", "1"));
+  await page.goto(SITE + "#/sessions?range=720", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("tr[data-clickable]", { timeout: 15000 });
+  const all = await page.evaluate(async () => {
+    const out = []; let cursor = null;
+    do {
+      const r = await window.dataSource.listSessions({ limit: 100, sinceHours: 720, cursor });
+      out.push(...r.sessions); cursor = r.nextCursor;
+    } while (cursor);
+    return out.map((s) => ({ id: s.id, agent: s.agent, user: s.user || "", ext: s.externalId || s.id, blocked: s.toolsBlocked > 0, dep: s.deploymentId, started: s.startedAt, cost: parseInt(s.costUsdMicros, 10) || 0 }));
+  });
+  const uiIds = async () => {
+    for (let i = 0; i < 6; i++) {
+      const lm = await page.$("#loadMore");
+      if (!lm) break;
+      await lm.click();
+      await page.waitForTimeout(700);
+    }
+    return page.evaluate(() => [...document.querySelectorAll("tr[data-clickable]")].map((r) => r.getAttribute("data-id")));
+  };
+  const goF = async (qs) => {
+    await page.evaluate(() => { location.hash = "#/overview"; });
+    await page.waitForTimeout(300);
+    await page.evaluate((q) => { location.hash = "#/sessions" + q; }, qs);
+    await page.waitForSelector("tr[data-clickable], .empty", { timeout: 10000 });
+    await page.waitForTimeout(400);
+  };
+  const eq = (name, got, want) => {
+    if (want.length === 0) fail("filter check '" + name + "' matched 0 rows — probe is trivial, fixture changed?");
+    if ([...got].sort().join() !== [...want].sort().join()) fail("filter '" + name + "' wrong rows: ui=" + got.length + " truth=" + want.length);
+  };
+  await goF("?q=PLANNER&range=720");
+  eq("q case-insensitive", await uiIds(), all.filter((s) => [s.ext, s.agent, s.user].some((v) => v.toLowerCase().includes("planner"))).map((s) => s.id));
+  await goF("?status=blocked&range=720");
+  eq("status=blocked", await uiIds(), all.filter((s) => s.blocked).map((s) => s.id));
+  await goF("?q=NORTHWIND&status=blocked&range=720");
+  eq("q+blocked composition", await uiIds(), all.filter((s) => s.blocked && [s.ext, s.agent, s.user].some((v) => v.toLowerCase().includes("northwind"))).map((s) => s.id));
+  const m = Object.fromEntries(all.map((s) => [s.id, s]));
+  await goF("?range=720&sort=cost.asc");
+  const seq = (await page.evaluate(() => [...document.querySelectorAll("tr[data-clickable]")].map((r) => r.getAttribute("data-id")))).map((id) => m[id]?.cost);
+  if (!seq.every((v, i) => i === 0 || seq[i - 1] <= v)) fail("sort cost.asc not monotone");
+  await page.evaluate(() => localStorage.removeItem("av_mock_bigdata"));
+  await page.evaluate(() => { location.hash = "#/overview"; });
+  await page.waitForTimeout(500);
+  console.log("✅ filter/sort semantics: q (case-insens), blocked, composition all match ground truth; cost sort monotone");
+}
+
+// ── 18. Listener-leak soak ─────────────────────────────────────────
 // Every earlier check opened modals, ran the tour, refreshed the
 // overview, and re-rendered lists dozens of times. If any of that
 // leaked document/window listeners (the webhook modal once leaked a
@@ -664,4 +718,4 @@ if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors))
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 18 interactive-features drill checks passed.");
+console.log("\nAll 19 interactive-features drill checks passed.");
