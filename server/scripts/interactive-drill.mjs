@@ -783,7 +783,83 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ session detail matches ground truth: waterfall math, chip counts, chip+text filter, drawer");
 }
 
-// ── 19. Listener-leak soak ─────────────────────────────────────────
+// ── 19. Chart ground truth + interaction budgets ───────────────────
+// (a) The overview chart's bars must be the series data (heights
+// proportional, aria summary equal to the sums, tooltip showing the
+// hovered bucket). (b) Latency ceilings on the heavy interactions
+// under the 250-row dataset — generous enough for shared runners,
+// tight enough to catch an accidental O(n²) (locally these run
+// 30–800ms; budgets are 3–6x that).
+{
+  await page.evaluate(() => { location.hash = "#/overview"; });
+  await page.waitForFunction(() => document.querySelector(".chart-svg"), { timeout: 15000 });
+  const chartProblems = await page.evaluate(async () => {
+    const o = await window.dataSource.getOverview("24h");
+    const series = o.series || [];
+    const problems = [];
+    const svg = document.querySelector(".chart-svg");
+    const vb = svg.getAttribute("viewBox").split(" ").map(Number);
+    const chartH = vb[3] - 12 - 22;
+    let max = Math.max(...series.map((s) => s.allowed + s.blocked), 1);
+    max = Math.ceil(max / 4) * 4 || 4;
+    const bars = [...svg.querySelectorAll("rect.bar:not(.blocked)")];
+    const withAllowed = series.filter((s) => s.allowed);
+    if (bars.length !== withAllowed.length) problems.push("allowed bar count " + bars.length + " != " + withAllowed.length);
+    let bi = 0;
+    series.forEach((s, i) => {
+      if (!s.allowed) return;
+      const wantH = ((s.allowed + s.blocked) / max) * chartH - (s.blocked / max) * chartH;
+      if (Math.abs(parseFloat(bars[bi++].getAttribute("height")) - wantH) > 0.15) problems.push("bucket " + i + " height wrong");
+    });
+    const sumA = series.reduce((a, s) => a + s.allowed, 0), sumB = series.reduce((a, s) => a + s.blocked, 0);
+    const label = svg.getAttribute("aria-label");
+    if (!label.includes(sumA + " allowed") || !label.includes(sumB + " blocked")) problems.push("aria summary wrong");
+    const strip = svg.querySelectorAll(".hover-strip")[5];
+    strip.dispatchEvent(new MouseEvent("mousemove", { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 150));
+    const tip = document.querySelector(".chart-tip, #chartTip, [class*=tooltip]")?.textContent || "";
+    if (!(tip.includes(String(series[5].allowed)) && tip.includes(String(series[5].blocked)))) problems.push("tooltip bucket 5 wrong: " + tip.slice(0, 50));
+    return problems;
+  });
+  if (chartProblems.length) fail("chart vs ground truth: " + chartProblems.join("; "));
+  await page.evaluate(() => localStorage.setItem("av_mock_bigdata", "1"));
+  await page.goto(SITE + "#/sessions?range=720", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("tr[data-clickable]", { timeout: 15000 });
+  const budgets = [];
+  const timed = async (name, ceiling, fn) => {
+    const t0 = Date.now();
+    await fn();
+    const ms = Date.now() - t0;
+    budgets.push(name + " " + ms + "ms");
+    if (ms > ceiling) fail("interaction budget blown: " + name + " took " + ms + "ms (ceiling " + ceiling + ")");
+  };
+  await timed("loadMore→100rows", 3000, async () => {
+    await page.click("#loadMore");
+    await page.waitForFunction(() => document.querySelectorAll("tr[data-clickable]").length === 100, { timeout: 10000 });
+  });
+  await timed("sort 100 rows", 1500, async () => {
+    await page.click('.th-sort[data-sort="cost"]');
+    await page.waitForFunction(() => {
+      const c = [...document.querySelectorAll("tbody tr")].map((r) => parseFloat(r.cells[5].textContent.replace(/[^0-9.]/g, "")));
+      return c.length === 100 && c.every((v, i) => !i || v <= c[i - 1] + 1e-9);
+    }, { timeout: 10000 });
+  });
+  await timed("search→filtered", 3000, async () => {
+    await page.fill("#fSearch", "planner");
+    await page.waitForFunction(() => /q=planner/.test(location.hash) && document.querySelectorAll("tr[data-clickable]").length > 0 && document.querySelectorAll("tr[data-clickable]").length < 100, { timeout: 10000 });
+  });
+  await timed("mega 700-evt deep link", 8000, async () => {
+    await page.goto(SITE + "#/sessions/sess_bd_mega?evt=600", { waitUntil: "domcontentloaded" });
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForFunction(() => document.querySelector(".evt.selected .seq")?.textContent === "#600", { timeout: 25000 });
+  });
+  await page.evaluate(() => localStorage.removeItem("av_mock_bigdata"));
+  await page.goto(SITE + "#/overview", { waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => document.querySelector(".stat")?.textContent.trim().length > 0, { timeout: 15000 });
+  console.log("✅ chart matches series ground truth; budgets: " + budgets.join(", "));
+}
+
+// ── 20. Listener-leak soak ─────────────────────────────────────────
 // Every earlier check opened modals, ran the tour, refreshed the
 // overview, and re-rendered lists dozens of times. If any of that
 // leaked document/window listeners (the webhook modal once leaked a
@@ -809,4 +885,4 @@ if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors))
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 20 interactive-features drill checks passed.");
+console.log("\nAll 21 interactive-features drill checks passed.");
