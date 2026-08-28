@@ -261,7 +261,12 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
     const body = z
       .object({
         response: z.record(z.unknown()),
-        label: z.string().min(1).max(80).default("Passkey"),
+        // R113 F2: trim before min(1) so whitespace-only labels
+        // are rejected. Prior shape z.string().min(1).max(80)
+        // accepted '   ' (3 spaces, length 3) which passed
+        // validation but left a blank credential list row and
+        // uninformative audit metadata.
+        label: z.string().trim().min(1).max(80).default("Passkey"),
       })
       .safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: "invalid_input" });
@@ -585,6 +590,19 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
   app.get("/credentials", async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
+    // R113 F4: reject apikey sessions explicitly with the same
+    // slug as /register/* (R107 F1). Prior shape relied on the
+    // WHERE userId=claims.sub filter returning empty because
+    // 'apikey:<id>' matches no user — safe today, but the
+    // wire-visible error slug differed from /register/*
+    // ('200 []' here vs '400 cookie_session_required' there),
+    // and a future change that dropped the userId scope for an
+    // admin-visibility feature would silently violate the R107
+    // F1 invariant 'apikey holders cannot own passkeys'.
+    // Explicit guard locks the semantic in against refactors.
+    if (claims.sub.startsWith("apikey:")) {
+      return reply.code(400).send({ error: "cookie_session_required" });
+    }
     const rows = await db.webauthnCredential.findMany({
       where: { userId: claims.sub },
       orderBy: { createdAt: "asc" },
@@ -604,7 +622,12 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
   app.patch<{ Params: { id: string } }>("/credentials/:id", async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
-    const body = z.object({ label: z.string().min(1).max(80) }).safeParse(req.body);
+    // R113 F4: same guard as /credentials GET above.
+    if (claims.sub.startsWith("apikey:")) {
+      return reply.code(400).send({ error: "cookie_session_required" });
+    }
+    // R113 F2: trim to reject whitespace-only labels.
+    const body = z.object({ label: z.string().trim().min(1).max(80) }).safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: "invalid_input" });
     const cred = await db.webauthnCredential.findFirst({
       where: { id: req.params.id, userId: claims.sub },
@@ -643,6 +666,10 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
   app.delete<{ Params: { id: string } }>("/credentials/:id", async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
+    // R113 F4: same guard as GET and PATCH above.
+    if (claims.sub.startsWith("apikey:")) {
+      return reply.code(400).send({ error: "cookie_session_required" });
+    }
     const cred = await db.webauthnCredential.findFirst({
       where: { id: req.params.id, userId: claims.sub },
     });

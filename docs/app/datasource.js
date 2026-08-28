@@ -1417,6 +1417,11 @@
       MOCK_WEBHOOKS = MOCK_WEBHOOKS.filter(function (w) { return w.id !== id; });
     },
     async testWebhook() { await delay(90); },
+    async rotateWebhookSecret(id) {
+      await delay(120);
+      void id;
+      return { secret: "whsec_" + Math.random().toString(36).slice(2, 34) };
+    },
     async listWebhookDeliveries(id) {
       await delay(80);
       var now = Date.now();
@@ -1878,6 +1883,12 @@
     },
     async testWebhook(id) {
       return apiFetch("/api/v1/webhooks/" + encodeURIComponent(id) + "/test", { method: "POST" });
+    },
+    async rotateWebhookSecret(id) {
+      // R113 F1: POST /api/v1/webhooks/:id/rotate-secret; returns
+      // { secret: <plaintext>, shown once by the SPA in a
+      // copy-to-clipboard modal }.
+      return apiFetch("/api/v1/webhooks/" + encodeURIComponent(id) + "/rotate-secret", { method: "POST" });
     },
     async listWebhookDeliveries(id) {
       try {

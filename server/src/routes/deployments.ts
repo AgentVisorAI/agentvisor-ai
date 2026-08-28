@@ -298,9 +298,20 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
             // entirely when receiptCount was 0, making the two
             // cases indistinguishable in the audit log.
             forceRequested: force,
-            forceDeletedReceipts: force && receiptCount > 0
-              ? receiptCount
-              : 0,
+            // R107 F2 + R113 F3: distinguish 'operator asked
+            // to force-cascade an already-empty deployment'
+            // (force=true, count=0) from 'ordinary empty
+            // deployment cleanup' (force=false, count=0)
+            // when downstream audit consumers scan the
+            // numeric field only. Prior shape wrote 0 for
+            // both cases; a query like
+            // WHERE (metadata->>'forceDeletedReceipts')::int > 0
+            // missed force=true-count=0 which R107 F2's
+            // stated intent wanted surfaced. Now: null when
+            // force=false (nothing was force-deleted); real
+            // count otherwise (0 if empty, N if not). The
+            // null vs 0 distinction survives the query.
+            forceDeletedReceipts: force ? receiptCount : null,
           },
           req,
         },
