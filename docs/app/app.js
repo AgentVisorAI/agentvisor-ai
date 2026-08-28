@@ -1471,6 +1471,20 @@
       "</div>";
     }).join("");
 
+    // Kind filter chips: only for kinds actually present, with counts.
+    // "Blocked" is the chip a reviewer reaches for first, so it gets
+    // danger styling.
+    var kindCounts = {};
+    events.forEach(function (e2) { kindCounts[e2.kind] = (kindCounts[e2.kind] || 0) + 1; });
+    var chipDefs = [
+      { id: "llm", label: "LLM" }, { id: "tool", label: "Tools" },
+      { id: "guard", label: "Guards" }, { id: "block", label: "Blocked" },
+    ].filter(function (c) { return kindCounts[c.id]; });
+    var evtChips = '<button class="evt-chip active" data-kind="" aria-pressed="true">All <span class="n">' + events.length + "</span></button>" +
+      chipDefs.map(function (c) {
+        return '<button class="evt-chip' + (c.id === "block" ? " chip-danger" : "") + '" data-kind="' + c.id + '" aria-pressed="false">' + c.label + ' <span class="n">' + kindCounts[c.id] + "</span></button>";
+      }).join("");
+
     main.innerHTML =
       pageHeader("Session " + s.externalId, s.agent + " · " + (s.user || "—") + " · " + (s.model || ""), '<a href="#/sessions" class="btn">← All sessions</a> <button class="btn" id="copyRcpt">Copy receipt</button> <button class="btn" id="shareRcpt">🔗 Share verify link</button> <button class="btn accent" id="dlRcpt">↓ Download receipt</button>') +
       '<div class="session-summary">' +
@@ -1483,8 +1497,11 @@
       storyBanner(s, events) +
       '<div class="detail-grid">' +
         '<div class="events-card card">' +
-          '<div class="events-head"><h2>Event stream</h2><span class="count">' + events.length + " event" + (events.length === 1 ? "" : "s") +
-            (data.nextEventCursor != null ? " (more available)" : "") + "</span></div>" +
+          '<div class="events-head"><h2>Event stream</h2><span class="count" id="evtCount">' + events.length + " event" + (events.length === 1 ? "" : "s") +
+            (data.nextEventCursor != null ? " (more available)" : "") + "</span>" +
+            '<div class="evt-filters">' + evtChips +
+              '<input id="evtSearch" type="search" placeholder="Filter events…" aria-label="Filter events by text" />' +
+            "</div></div>" +
           '<div id="eventList" role="listbox" aria-label="Event stream. Use the arrow keys to browse events and Enter to inspect one.">' + eventsHtml + "</div>" +
           (data.nextEventCursor != null
             ? '<div style="padding: 12px 16px; text-align:center; border-top:1px solid var(--border);">' +
@@ -1539,7 +1556,7 @@
       }
       if (!/^(ArrowDown|ArrowUp|Home|End)$/.test(e.key)) return;
       e.preventDefault();
-      var rows = $$('.evt', evList);
+      var rows = $$(".evt:not(.evt-hidden)", evList); // skip filtered-out rows
       var idx = rows.indexOf(row);
       var target = e.key === "ArrowDown" ? rows[idx + 1]
         : e.key === "ArrowUp" ? rows[idx - 1]
@@ -1570,6 +1587,44 @@
         }
       }
     }
+
+    // Event triage: kind chips + free-text filter, all client-side.
+    // Production trails run hundreds of events — finding the one tool
+    // call that mattered shouldn't require scrolling.
+    var evtSearch = $("#evtSearch");
+    var activeKind = "";
+    function applyEvtFilter() {
+      var q = ((evtSearch && evtSearch.value) || "").trim().toLowerCase();
+      var shown = 0;
+      $$(".evt", evList).forEach(function (row) {
+        var ev = events[parseInt(row.getAttribute("data-i"), 10)];
+        var okKind = !activeKind || ev.kind === activeKind;
+        var hay = ((ev.tag || "") + " " + (ev.msg || "") + " " + (ev.sub || "") + " " + ev.kind).toLowerCase();
+        var show = okKind && (!q || hay.indexOf(q) >= 0);
+        row.classList.toggle("evt-hidden", !show);
+        if (show) shown++;
+      });
+      var count = $("#evtCount");
+      if (count) count.textContent = shown === events.length
+        ? events.length + " event" + (events.length === 1 ? "" : "s") + (data.nextEventCursor != null ? " (more available)" : "")
+        : shown + " of " + events.length + " shown";
+      var none = $("#evtNone");
+      if (shown === 0 && !none) {
+        evList.appendChild(h('<div class="empty-mini" id="evtNone" style="padding:16px">No events match — clear the filter to see all ' + events.length + ".</div>"));
+      } else if (shown > 0 && none) none.remove();
+    }
+    var filterWrap = main.querySelector(".evt-filters");
+    if (filterWrap) filterWrap.addEventListener("click", function (e) {
+      var chip = e.target.closest(".evt-chip");
+      if (!chip) return;
+      $$(".evt-chip", filterWrap).forEach(function (c) {
+        c.classList.toggle("active", c === chip);
+        c.setAttribute("aria-pressed", c === chip ? "true" : "false");
+      });
+      activeKind = chip.getAttribute("data-kind");
+      applyEvtFilter();
+    });
+    if (evtSearch) evtSearch.addEventListener("input", applyEvtFilter);
 
     // Story banner "Jump to the block": scroll the BLOCKED row into
     // view and open it in the drawer, so a non-technical visitor gets
