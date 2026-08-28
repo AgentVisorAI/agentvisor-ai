@@ -374,6 +374,18 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
       // the anonymous session-DoS primitive.
       const claims = requireSession(req, reply);
       if (!claims) return;
+      // R105 F5: reject API-key sessions up front. SLO is a
+      // cookie-session-only ceremony (there's no cookie to
+      // clear on an API-key request). Prior shape let the
+      // handler continue and then swallowed the resulting
+      // P2025 (user id 'apikey:<id>' doesn't exist in User)
+      // in the .catch() below, giving the caller a
+      // false-successful 200 while nothing was actually
+      // revoked. Match the same guard stream.ts already
+      // has.
+      if (claims.sub.startsWith("apikey:")) {
+        return reply.code(400).send({ error: "cookie_session_required" });
+      }
       const cfg = await db.samlConfig.findFirst({
         where: {
           id: req.params.configId,

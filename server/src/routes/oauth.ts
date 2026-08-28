@@ -275,7 +275,8 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
     // Upsert. Email owns the account.
     let user = await db.user.findUnique({
       where: { email },
-      include: { memberships: { include: { org: true } } },
+      // R105 F4: deterministic membership ordering (see auth.ts).
+      include: { memberships: { include: { org: true }, orderBy: { createdAt: "asc" } } },
     });
     if (!user) {
       const domain = email.split("@")[1] ?? "personal";
@@ -306,7 +307,7 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
             create: { orgId: org.id, role: "owner" },
           },
         },
-        include: { memberships: { include: { org: true } } },
+        include: { memberships: { include: { org: true }, orderBy: { createdAt: "asc" } } },
       });
     }
 
