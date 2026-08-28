@@ -2090,11 +2090,24 @@
           '<button class="btn danger" id="depDelete">Delete</button>' +
         "</div>" +
       "</div>" +
+      // "Now what?" — the first question after creating a deployment.
+      // A copyable env block that points a daemon at this workspace.
+      '<div class="card" style="margin-bottom:12px">' +
+        "<h2>Connect your daemon</h2>" +
+        '<p style="color:var(--fg-2); font-size:var(--t-sec); margin:0 0 10px">Drop these into the daemon\'s environment (or your secret manager) and restart it. It shows up as <b>connected</b> above within a few seconds.</p>' +
+        '<pre class="policy-body" style="margin:0 0 10px; user-select:all">' +
+          "AV_INGEST_URL=https://ingest.agentvisorai.me/v1\n" +
+          "AV_DEPLOYMENT=" + esc(d.id) + "\n" +
+          "AV_INGEST_TOKEN=" + esc(d.ingestTokenHint || "av_live_…") + "  # full token shown once at create/rotate" +
+        "</pre>" +
+        '<button type="button" class="btn" data-copy="AV_INGEST_URL=https://ingest.agentvisorai.me/v1\nAV_DEPLOYMENT=' + esc(d.id) + '\nAV_INGEST_TOKEN=<your-token>">⧉ Copy env block</button>' +
+        '<span style="margin-left:10px; color:var(--fg-3); font-size:11.5px">Lost the token? Rotate below — the old one stops working immediately.</span>' +
+      "</div>" +
       '<div class="card" style="padding:0">' +
         '<div style="padding:12px 16px; border-bottom: 1px solid var(--border); display:flex; align-items:baseline; gap:8px;">' +
           '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">Recent sessions</h2>' +
           '<span style="color:var(--fg-3); font-size:var(--t-sec)">' + sessions.length + " shown</span>" +
-          '<div style="margin-left:auto"><a href="#/sessions" style="font-size:var(--t-sec)">View all →</a></div>' +
+          '<div style="margin-left:auto"><a href="#/sessions?dep=' + encodeURIComponent(d.id) + '" style="font-size:var(--t-sec)">View all →</a></div>' +
         "</div>" +
         (sessions.length ? sessionsTable(sessions) : emptyState("No sessions yet", "This deployment has not streamed any sessions.")) +
       "</div>";
