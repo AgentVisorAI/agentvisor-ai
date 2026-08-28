@@ -217,34 +217,62 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
       if (!assertNotMember(claims)) {
         return reply.code(403).send({ error: "forbidden" });
       }
+      // R130 F3: swap the parseInt/manual clamp for a proper zod
+      // schema so we get invalid_input on garbage limit + a
+      // length cap on cursor. Matches the read.ts /audit shape.
+      // Also gates cursor length so a hostile client can't send
+      // a 10 MB string in the querystring.
+      const q = z
+        .object({
+          limit: z.coerce.number().int().min(1).max(200).default(25),
+          cursor: z.string().max(128).optional(),
+        })
+        .safeParse(req.query);
+      if (!q.success) return reply.code(400).send({ error: "invalid_input" });
       const ep = await db.webhookEndpoint.findFirst({
         where: { id: req.params.id, orgId: claims.orgId },
       });
       if (!ep) return reply.code(404).send({ error: "not_found" });
-      const limit = Math.min(Math.max(parseInt(req.query.limit ?? "25", 10) || 25, 1), 200);
-      const rows = await db.webhookDelivery.findMany({
-        where: { endpointId: ep.id },
-        orderBy: { createdAt: "desc" },
-        take: limit + 1,
-        ...(req.query.cursor
-          ? { cursor: { id: req.query.cursor }, skip: 1 }
-          : {}),
-        select: {
-          id: true,
-          event: true,
-          status: true,
-          attempt: true,
-          responseCode: true,
-          errorMessage: true,
-          createdAt: true,
-          deliveredAt: true,
-          nextRetryAt: true,
-        },
-      });
-      const hasMore = rows.length > limit;
-      const nextCursor = hasMore ? rows[limit - 1]?.id ?? null : null;
+      // R130 F1: same cursor guard as R129 F3. Stale cursor
+      // (retention purged, sweeper deleted the row, forged
+      // input) → Prisma P2016/P2032 → uncaught 500 through
+      // setErrorHandler. This endpoint is worse than R129 F3's
+      // sites because the console webhook-deliveries pane
+      // paginates on it — an owner scrolling past a retention
+      // deletion would hit it in normal use.
+      let rows;
+      try {
+        rows = await db.webhookDelivery.findMany({
+          where: { endpointId: ep.id },
+          orderBy: { createdAt: "desc" },
+          take: q.data.limit + 1,
+          ...(q.data.cursor
+            ? { cursor: { id: q.data.cursor }, skip: 1 }
+            : {}),
+          select: {
+            id: true,
+            event: true,
+            status: true,
+            attempt: true,
+            responseCode: true,
+            errorMessage: true,
+            createdAt: true,
+            deliveredAt: true,
+            nextRetryAt: true,
+          },
+        });
+      } catch (err) {
+        const code = (err as { code?: string } | null)?.code;
+        const msg = (err as { message?: string } | null)?.message ?? "";
+        if (code === "P2016" || code === "P2032" || /cursor/i.test(msg)) {
+          return reply.code(400).send({ error: "invalid_cursor" });
+        }
+        throw err;
+      }
+      const hasMore = rows.length > q.data.limit;
+      const nextCursor = hasMore ? rows[q.data.limit - 1]?.id ?? null : null;
       return reply.send({
-        deliveries: rows.slice(0, limit),
+        deliveries: rows.slice(0, q.data.limit),
         nextCursor,
       });
     },
