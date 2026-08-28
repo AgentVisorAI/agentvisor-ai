@@ -34,6 +34,7 @@ import {
   consumeSamlResponse,
   findConfigForEmail,
   generateMetadata,
+  isSha1Legacy,
   spUrls,
 } from "../lib/saml.js";
 
@@ -167,6 +168,15 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
       if (!cfg || !cfg.isActive) {
         return reply.code(404).send({ error: "config_not_found" });
       }
+      // R114 F1: treat legacy sha1 configs as inactive at the route
+      // layer so the IdP admin gets a clean 410 with a specific
+      // slug instead of a generic 500 from buildAdapter's throw
+      // propagating uncaught. Fixes the code/comment mismatch —
+      // the R88 F5 comment says 'treat any surviving sha1 config
+      // as inactive' but the throw was routed as a 500.
+      if (isSha1Legacy(cfg)) {
+        return reply.code(410).send({ error: "saml_config_uses_sha1_reject" });
+      }
       reply.type("application/xml");
       return reply.send(generateMetadata(cfg));
     },
@@ -181,6 +191,10 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
     });
     if (!cfg || !cfg.isActive) {
       return reply.code(404).send({ error: "config_not_found" });
+    }
+    // R114 F1: same sha1-legacy gate as /metadata.xml.
+    if (isSha1Legacy(cfg)) {
+      return reply.code(410).send({ error: "saml_config_uses_sha1_reject" });
     }
     const relayState = typeof req.query.RelayState === "string"
       ? req.query.RelayState.slice(0, 1024)
@@ -197,6 +211,16 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
       });
       if (!cfg || !cfg.isActive) {
         return reply.code(404).send({ error: "config_not_found" });
+      }
+      // R114 F1: same sha1-legacy gate — the IdP gets a specific
+      // 410 slug it can surface to its admin instead of a bare
+      // 500 with no forensic signal.
+      if (isSha1Legacy(cfg)) {
+        req.log.warn(
+          { orgId: cfg.orgId, configId: cfg.id },
+          "saml_acs_rejected_sha1_legacy",
+        );
+        return reply.code(410).send({ error: "saml_config_uses_sha1_reject" });
       }
       const result = await consumeSamlResponse(cfg, req.body as never);
       if (!result.ok) {

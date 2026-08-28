@@ -112,17 +112,30 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
       blockedPayoutUsdMicros: sums._sum.blockedPayoutUsdMicros ?? 0n,
     };
 
+    // R114 F3: redact spend/blocked-payout counters for members.
+    // The aggregate stats (fleet-wide costUsdMicros +
+    // blockedPayoutUsdMicros) and the per-session cost fields
+    // are the same business-sensitive dimensions R91 F2 gates
+    // on /audit and R99 F1 on /me/export. Sibling read
+    // surfaces already redact these for members; /overview was
+    // the missing spot. Members legitimately need session
+    // status + tool counts for their work, so we don't 403 —
+    // just zero the money fields.
+    const isMember = claims.membershipRole === "member";
+
     return reply.send({
       sessions: sessions.map((s) => ({
         ...s,
-        costUsdMicros: s.costUsdMicros.toString(),
-        payoutUsdMicros: s.payoutUsdMicros.toString(),
-        blockedPayoutUsdMicros: s.blockedPayoutUsdMicros.toString(),
+        costUsdMicros: isMember ? "0" : s.costUsdMicros.toString(),
+        payoutUsdMicros: isMember ? "0" : s.payoutUsdMicros.toString(),
+        blockedPayoutUsdMicros: isMember ? "0" : s.blockedPayoutUsdMicros.toString(),
       })),
       stats: {
         ...stats,
-        costUsdMicros: stats.costUsdMicros.toString(),
-        blockedPayoutUsdMicros: stats.blockedPayoutUsdMicros.toString(),
+        costUsdMicros: isMember ? "0" : stats.costUsdMicros.toString(),
+        blockedPayoutUsdMicros: isMember
+          ? "0"
+          : stats.blockedPayoutUsdMicros.toString(),
       },
     });
   });
@@ -213,12 +226,14 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
       ? encodeCursor({ openedAt: last.openedAt.toISOString(), id: last.id })
       : null;
 
+    // R114 F3: same member redaction as /overview.
+    const isMemberList = claims.membershipRole === "member";
     return reply.send({
       sessions: page.map((s) => ({
         ...s,
-        costUsdMicros: s.costUsdMicros.toString(),
-        payoutUsdMicros: s.payoutUsdMicros.toString(),
-        blockedPayoutUsdMicros: s.blockedPayoutUsdMicros.toString(),
+        costUsdMicros: isMemberList ? "0" : s.costUsdMicros.toString(),
+        payoutUsdMicros: isMemberList ? "0" : s.payoutUsdMicros.toString(),
+        blockedPayoutUsdMicros: isMemberList ? "0" : s.blockedPayoutUsdMicros.toString(),
       })),
       nextCursor,
     });
@@ -291,9 +306,13 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
       session: {
         ...session,
         events: displayedEvents,
-        costUsdMicros: session.costUsdMicros.toString(),
-        payoutUsdMicros: session.payoutUsdMicros.toString(),
-        blockedPayoutUsdMicros: session.blockedPayoutUsdMicros.toString(),
+        // R114 F3: redact spend counters for members matching
+        // /overview and /sessions LIST posture.
+        costUsdMicros: isMember ? "0" : session.costUsdMicros.toString(),
+        payoutUsdMicros: isMember ? "0" : session.payoutUsdMicros.toString(),
+        blockedPayoutUsdMicros: isMember
+          ? "0"
+          : session.blockedPayoutUsdMicros.toString(),
       },
       nextEventCursor,
     });
