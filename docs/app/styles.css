@@ -1167,6 +1167,22 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   animation: modalIn 140ms cubic-bezier(.22,1,.36,1);
 }
 @keyframes modalIn { from { opacity: 0; transform: translateY(6px) scale(0.98); } to { opacity: 1; transform: none; } }
+.modal.modal-wide { max-width: 640px; }
+/* Policy template picker: radio cards. */
+.tpl-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--s-2); }
+.tpl-chip { position: relative; cursor: pointer; }
+.tpl-chip input { position: absolute; opacity: 0; pointer-events: none; }
+.tpl-chip .tpl-body {
+  display: flex; flex-direction: column; gap: 3px; height: 100%;
+  padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--r-md);
+  background: var(--bg); transition: border-color 120ms, background 120ms;
+}
+.tpl-chip .tpl-label { font-size: var(--t-body); font-weight: 600; color: var(--fg); }
+.tpl-chip .tpl-hint { font-size: 11.5px; color: var(--fg-3); line-height: 1.35; }
+.tpl-chip input:checked + .tpl-body { border-color: var(--accent); background: var(--accent-bg); }
+.tpl-chip input:focus-visible + .tpl-body { outline: 2px solid var(--accent); outline-offset: 2px; }
+.policy-preview { margin: 0; max-height: 180px; overflow: auto; }
+@media (max-width: 640px) { .tpl-row { grid-template-columns: 1fr; } }
 .modal h2 { font-size: 17px; margin: 0 0 var(--s-1); font-weight: 600; letter-spacing: -0.01em; }
 .modal .sub { color: var(--fg-2); font-size: var(--t-body); margin: 0 0 var(--s-4); }
 .modal form { display: flex; flex-direction: column; gap: var(--s-3); }
