@@ -132,6 +132,13 @@ jobs:
           SITE: https://agentvisorai.me/
         run: node scripts/full-flow-rehearsal.mjs
 
+      - name: Full investor-flow rehearsal — phone/QR path (iPhone profile)
+        working-directory: server
+        env:
+          SITE: https://agentvisorai.me/
+          PROFILE: phone
+        run: node scripts/full-flow-rehearsal.mjs
+
       - name: Cross-engine feature matrix (nightly — Chromium/WebKit/Firefox)
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         working-directory: server
