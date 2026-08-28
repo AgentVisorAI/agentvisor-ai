@@ -376,8 +376,24 @@ export async function consumeSamlResponse(
 
   return {
     ok: true,
-    email: email.toLowerCase().trim(),
-    displayName: typeof displayName === "string" ? displayName : null,
+    // R134 F4: cap IdP-asserted email + displayName before
+    // returning them to the ACS handler that JIT-provisions
+    // db.user rows (routes/saml.ts:358). Prisma.User.email +
+    // displayName are unbounded String / String? per schema —
+    // a rogue-but-domain-verified IdP (attacker's own org +
+    // IdP appliance) could JIT-provision users with
+    // megabyte-sized displayName values that balloon every
+    // subsequent /members list render + /me/export bundle.
+    // R76 HIGH #1 blocks cross-tenant JIT, so the DoS is
+    // scoped to the attacker's own tenant — but the console
+    // members-list still breaks. RFC 5321 max email length
+    // is 320; console password signup already enforces
+    // displayName max(80), so 200 here gives IdP-asserted
+    // legitimate names some slack while still bounded.
+    email: email.toLowerCase().trim().slice(0, 320),
+    displayName: typeof displayName === "string"
+      ? displayName.slice(0, 200)
+      : null,
     nameID,
     nameIDFormat,
     relayState:

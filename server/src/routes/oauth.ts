@@ -107,7 +107,24 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
   // GET /providers — lets the login page know which SSO buttons to
   // show. Buttons for providers without env config are hidden — no
   // point clicking a button that will 404.
-  app.get("/providers", async () => {
+  app.get("/providers", {
+    // R134 F3: per-IP rate limit at 60/min (2× sibling cadence
+    // since the response is genuinely cheap — env-derived
+    // array, no DB, no crypto). Was the last anonymous auth-
+    // tree GET without a per-route bucket after R132 F2 patched
+    // /oauth/start and R133 F1 patched /saml/login. Cheap
+    // symmetry: 60/min doesn't break the SPA (one hit per
+    // login-page render) but denies a targeted attacker a
+    // low-cost heartbeat probe on the API during a targeted
+    // outage.
+    config: {
+      rateLimit: {
+        max: 60,
+        timeWindow: 60_000,
+        keyGenerator: (req: { ip: string }) => `ip:${req.ip}`,
+      },
+    },
+  }, async () => {
     return {
       providers: providerConfigs().map((p) => ({
         id: p.id,
@@ -408,6 +425,28 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
     reply.clearCookie(OAUTH_STATE_COOKIE, {
       path: "/api/v1/auth/oauth",
     });
+
+    // R134 F2: every other sign-in path emits an audit row
+    // (auth.ts login → auth.login, saml.ts ACS → saml.signin,
+    // webauthn.ts step-up → mfa.authenticate). OAuth was the
+    // only pipeline minting a session cookie without a
+    // forensic breadcrumb, so an admin investigating "who
+    // logged in via Google at 03:12 from IP X" found nothing.
+    // The MFA-refused sibling already audits
+    // auth.oauth_refused_mfa_required at line ~389, so the
+    // imports + call shape are already wired here.
+    writeAudit(
+      {
+        orgId: membership.orgId,
+        event: "auth.oauth_signin",
+        actorId: user.id,
+        actorEmail: user.email,
+        target: user.email,
+        metadata: { provider: params.data.provider },
+        req,
+      },
+      req.log,
+    );
 
     // Redirect the browser back into the SPA. The console picks up the
     // freshly-set session cookie on the next /me call.
