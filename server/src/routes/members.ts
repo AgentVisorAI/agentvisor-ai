@@ -142,10 +142,28 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
               throw new Error("last_owner");
             }
           }
-          return await tx.membership.update({
+          const upd = await tx.membership.update({
             where: { id: existing.id },
             data: { role: body.data.role },
           });
+          // R90 F1: invalidate the demoted/promoted user's live JWT.
+          // requireSession() populates req.session from the JWT
+          // membershipRole claim verbatim, so a demoted admin/owner
+          // holding a pre-change 7-day cookie retains prior
+          // privileges — enough to mint an owner-scoped API key
+          // (POST /api/v1/keys), invite a new admin, register a
+          // webhook that exfiltrates data on next event, or (if
+          // owner→member) rotate the SAML keypair / delete the
+          // org. The only fence that voids an outstanding JWT is
+          // user.sessionRevokedAt vs the JWT iat, so bump it
+          // inside the same serializable tx as the role change.
+          // Target must re-log in with the new role reflected in
+          // a fresh JWT.
+          await tx.user.update({
+            where: { id: existing.userId },
+            data: { sessionRevokedAt: new Date() },
+          });
+          return upd;
         },
         { isolationLevel: "Serializable" },
       );
