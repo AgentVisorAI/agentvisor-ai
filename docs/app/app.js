@@ -336,7 +336,25 @@
     if (main) { main.setAttribute("tabindex", "-1"); try { main.focus({ preventScroll: true }); } catch (e) { main.focus(); } }
   }
 
+  // Scroll restoration: leaving a route remembers where you were;
+  // returning to that exact URL (Back button, "← All sessions" links)
+  // puts you back instead of dumping you at the top of a long list.
+  // Keyed by full hash so a different filter set never inherits a
+  // stale offset. Restored once, after the async data paint.
+  var scrollMemory = {};
+  var _scrollPrevHash = null;
+  function restoreScrollFor(key) {
+    var y = scrollMemory[key];
+    if (y == null) return;
+    delete scrollMemory[key];
+    requestAnimationFrame(function () { window.scrollTo(0, y); });
+  }
   async function render() {
+    var _hashNow = location.hash || "#/overview";
+    if (_scrollPrevHash !== null && _scrollPrevHash !== _hashNow) {
+      scrollMemory[_scrollPrevHash] = window.scrollY;
+    }
+    _scrollPrevHash = _hashNow;
     state.route = parseHash();
     var path = state.route.path;
     var publicRoutes = ["login", "signup", "reset", "accept-invite"];
@@ -426,9 +444,17 @@
     }
     return s;
   }
+  // Newest-wins toast stack: rapid-fire events (bulk actions, streams)
+  // once stacked a dozen toasts to the top of the screen. Cap at 4 by
+  // evicting the oldest.
+  function pushToast(t) {
+    var st = toastStack();
+    while (st.children.length >= 4) st.firstChild.remove();
+    st.appendChild(t);
+  }
   function toast(msg, err) {
     var t = h('<div class="toast ' + (err ? "err" : "") + '">' + esc(msg) + "</div>");
-    toastStack().appendChild(t);
+    pushToast(t);
     setTimeout(function () { t.remove(); }, 2600);
   }
   // Toast with an inline action — the Undo pattern for low-stakes
@@ -437,7 +463,7 @@
   function toastAction(msg, label, fn) {
     var t = h('<div class="toast">' + esc(msg) + ' <button type="button" class="toast-undo">' + esc(label) + "</button></div>");
     t.querySelector(".toast-undo").addEventListener("click", function () { t.remove(); fn(); });
-    toastStack().appendChild(t);
+    pushToast(t);
     setTimeout(function () { t.remove(); }, 6500);
   }
   // Toast with a trailing action link; stays up longer so the link is
@@ -445,7 +471,7 @@
   function toastLink(msg, href, label) {
     var t = h('<div class="toast">' + esc(msg) +
       ' <a href="' + esc(href) + '" style="color:inherit; font-weight:700; text-decoration:underline; white-space:nowrap">' + esc(label) + "</a></div>");
-    toastStack().appendChild(t);
+    pushToast(t);
     setTimeout(function () { t.remove(); }, 6500);
   }
   // Click-to-copy affordance for credential-ish values (fingerprints,
@@ -1610,6 +1636,7 @@
         }
       });
     }
+    restoreScrollFor(location.hash);
   }
 
   // CSV export of the currently loaded (filtered) sessions. Built
@@ -1744,10 +1771,18 @@
   // Global click delegation: any <tr data-clickable data-id data-nav>
   // navigates to `${data-nav}${data-id}` when the click isn't on a nested
   // button/link that stopped propagation.
+  // Selecting text in a cell also ends with a click on the row —
+  // navigating away right after the user carefully selected an id to
+  // copy was hostile. A live selection suppresses row navigation.
+  function textSelActive() {
+    var s = window.getSelection && window.getSelection();
+    return !!(s && String(s).length);
+  }
   document.addEventListener("click", function (e) {
     var tr = e.target.closest("tr[data-clickable]");
     if (!tr) return;
     if (e.target.closest("button, a")) return;
+    if (textSelActive()) return;
     var id = tr.getAttribute("data-id");
     var prefix = tr.getAttribute("data-nav");
     if (id && prefix) navigate(prefix + id);
@@ -2401,9 +2436,11 @@
           }
           return;
         }
+        if (textSelActive()) return;
         navigate("#/deployments/" + id);
       });
     }
+    restoreScrollFor(location.hash);
   }
 
   function deploymentEmptyHero() {
@@ -2817,8 +2854,9 @@
         return;
       }
       var tr = e.target.closest("tr[data-id]");
-      if (tr) navigate("#/policies/" + tr.getAttribute("data-id"));
+      if (tr && !textSelActive()) navigate("#/policies/" + tr.getAttribute("data-id"));
     });
+    restoreScrollFor(location.hash);
   }
 
   async function renderPolicyDetail(main, id) {
