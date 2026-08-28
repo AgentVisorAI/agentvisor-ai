@@ -1177,7 +1177,8 @@
       recordAudit("deployment.token_rotated", d ? d.name : id);
       return { ingestToken: token };
     },
-    async deleteDeployment(id) {
+    async deleteDeployment(id, opts) {
+      opts = opts || {};
       await delay(200);
       var i = MOCK_DEPLOYMENTS.findIndex(function (x) { return x.id === id; });
       if (i >= 0) MOCK_DEPLOYMENTS.splice(i, 1);
@@ -1872,7 +1873,11 @@
       var r = await apiFetch("/api/v1/deployments/" + id + "/rotate-token", { method: "POST", body: {} });
       return { ingestToken: r.ingestToken };
     },
-    async deleteDeployment(id) { await apiFetch("/api/v1/deployments/" + id, { method: "DELETE" }); },
+    async deleteDeployment(id, opts) {
+      opts = opts || {};
+      var qs = opts.force ? "?force=1" : "";
+      await apiFetch("/api/v1/deployments/" + id + qs, { method: "DELETE" });
+    },
 
     async getOverview(range) {
       var r = await apiFetch("/api/v1/overview");

