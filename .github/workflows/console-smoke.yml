@@ -50,9 +50,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
-      - uses: actions/checkout@v4
+      # R106 F2: SHA-pin third-party actions (matches R29 F2 discipline
+      # applied elsewhere). Prior console-smoke.yml used mutable
+      # tag references (@v4), which a repo takeover of the actions
+      # org or a compromised publisher could rewrite to inject
+      # attacker code into this workflow — impact bounded by
+      # `permissions: contents: read` but the job runs `npm ci` and
+      # hits production console with Playwright, so a compromised
+      # checkout could inject test-time data-exfil.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version: "20"
           cache: "npm"
