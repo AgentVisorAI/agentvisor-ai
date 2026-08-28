@@ -95,6 +95,31 @@ for (const { name, device } of profiles) {
     }));
     if (nav.hash !== "#/sessions" || nav.active !== "#/sessions") fail(`${name}: tab navigation broken: ${JSON.stringify(nav)}`);
     console.log("✅ bottom tab bar: 5 tabs, tap navigates, active state follows");
+
+    // Tap interactions that keyboard-first desktop testing never
+    // exercises: the palette via the topbar search button, and the
+    // event drawer via a row tap.
+    await page.click("#cmdkOpen");
+    await page.waitForSelector(".cmdk input", { timeout: 5000 });
+    const palFits = await page.evaluate(() => {
+      const r = document.querySelector(".cmdk").getBoundingClientRect();
+      return r.left >= 0 && r.right <= innerWidth + 1;
+    });
+    if (!palFits) fail(`${name}: palette overflows the viewport`);
+    await page.fill(".cmdk input", "policies");
+    await new Promise((r) => setTimeout(r, 400));
+    await page.click("#cmdkList .item.selected");
+    await new Promise((r) => setTimeout(r, 700));
+    if ((await page.evaluate(() => location.hash)) !== "#/policies") fail(`${name}: palette tap-run broken`);
+    console.log("✅ palette: opens by tap, fits viewport, tap-run navigates");
+
+    await page.goto(SITE + "#/sessions/sess_01H9K", { waitUntil: "domcontentloaded" });
+    await page.waitForSelector(".evt", { timeout: 10000 });
+    await page.click('.evt[data-i="2"]');
+    await new Promise((r) => setTimeout(r, 500));
+    const drawerFilled = await page.evaluate(() => document.querySelectorAll("#eventDrawer .meta dt").length >= 4);
+    if (!drawerFilled) fail(`${name}: event tap does not fill the drawer`);
+    console.log("✅ event stream: row tap fills the inspector drawer");
   }
 
   if (jsErrors.length) fail(`${name} JS errors: ${jsErrors.join(" | ")}`);
