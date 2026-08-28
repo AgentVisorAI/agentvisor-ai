@@ -1329,7 +1329,43 @@
       await delay(120);
       MOCK_INVITES = MOCK_INVITES.filter(function (i) { return i.id !== id; });
     },
-    async acceptInvite() { throw new Error("mock_no_accept_flow"); },
+    async acceptInvite(input) {
+      await delay(400);
+      // The old stub threw 'mock_no_accept_flow' — a raw internal
+      // string in the UI and a dead end for anyone exploring the
+      // invite story in the demo. Behave like the real flow instead.
+      if (!input || !input.password || input.password.length < 12) {
+        throw new Error("Password must be at least 12 characters.");
+      }
+      try {
+        localStorage.removeItem("av_mock_signed_out");
+        localStorage.removeItem("av_mock_fresh_t0");
+        localStorage.removeItem("av_mock_fresh_identity");
+      } catch (e) {}
+      var email = input.email || "you@northwind.com";
+      var name = (input.displayName || "").trim() || email.split("@")[0];
+      // Role comes from the matching pending invite; the invite is
+      // consumed (single-use, like the real thing).
+      var role = "member";
+      for (var i = 0; i < MOCK_INVITES.length; i++) {
+        if (MOCK_INVITES[i].email === email) {
+          role = MOCK_INVITES[i].role || "member";
+          MOCK_INVITES.splice(i, 1);
+          break;
+        }
+      }
+      var uid = "usr_" + email.split("@")[0].toLowerCase().replace(/[^a-z0-9]+/g, "_").slice(0, 20);
+      if (!MOCK_MEMBERS.some(function (m) { return m.email === email; })) {
+        MOCK_MEMBERS.push({ id: uid, userId: uid, email: email, displayName: name, role: role, lastActive: new Date().toISOString() });
+      }
+      mockState.session = {
+        user: { id: uid, email: email, displayName: name },
+        // The invitee's OWN role — spreading org_northwind verbatim
+        // would hand every new member the owner's RBAC tabs.
+        org: Object.assign({}, MOCK_ORGS.org_northwind, { role: role }),
+      };
+      return mockState.session;
+    },
     async changeMemberRole(userId, role) {
       await delay(150);
       var i = MOCK_MEMBERS.findIndex(function (m) { return m.userId === userId || m.email === userId; });
