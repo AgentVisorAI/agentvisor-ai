@@ -306,6 +306,32 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
     // JSON round trip if a subset were persisted by mistake.
     const credentialId = b64uToBuffer(info.credential.id);
     const publicKey = Buffer.from(info.credential.publicKey);
+    // R135 F3: filter WebAuthn transports to the WebAuthn Level 3
+    // spec-defined enum and bound array length. Prior shape cast
+    // through `as { response?: { transports?: string[] } }` on
+    // body.data.response (which zod-typed as z.record(z.unknown())
+    // at line 264 — untyped nested object), then unconditionally
+    // .join(",")'d the raw values into an unbounded Prisma column.
+    // An authenticated attacker POSTing
+    // { response: { response: { transports: ["a".repeat(1e6), ...] } } }
+    // persists a multi-MB transports string that inflates every
+    // subsequent /register/challenge (line ~232 splits it back
+    // out into excludeCredentials[].transports echoed to the
+    // browser) + /credentials GET response for this user.
+    // Self-scoped DoS so severity is LOW, but exactly the
+    // "unbounded external string into unbounded Prisma column"
+    // class R134 F4 / R135 F2 close. Whitelist to
+    // SimpleWebAuthn/W3C's five transport values; cap array
+    // length at 8 (spec caps at ~4; 8 is future-proof).
+    const WEBAUTHN_TRANSPORTS = new Set(["usb", "nfc", "ble", "internal", "hybrid"]);
+    const rawTransports = (body.data.response as { response?: { transports?: unknown } })
+      ?.response?.transports;
+    const transports = Array.isArray(rawTransports)
+      ? rawTransports
+          .filter((t): t is string => typeof t === "string" && WEBAUTHN_TRANSPORTS.has(t))
+          .slice(0, 8)
+          .join(",")
+      : "";
     try {
       await db.webauthnCredential.create({
         data: {
@@ -313,8 +339,7 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
           credentialId,
           publicKey,
           counter: BigInt(info.credential.counter ?? 0),
-          transports: (body.data.response as { response?: { transports?: string[] } })
-            ?.response?.transports?.join(",") ?? "",
+          transports,
           label: body.data.label,
           aaguid: info.aaguid ?? null,
         },

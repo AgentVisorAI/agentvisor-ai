@@ -933,6 +933,38 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         data: { revokedAt: new Date() },
       }),
     ]);
+    // R135 F1: password reset is the strongest break-glass primitive
+    // in the auth pipeline (R123 F3 auto-revokes every av_srv_
+    // token org-wide + R90 F1 fences all cookies). Prior shape
+    // emitted zero writeAudit — an admin investigating "who reset
+    // user X's password at 03:12 from IP Y, and which av_srv_
+    // tokens just went dead" got nothing from audit_entries.
+    // Every other authentication-material mutation audits
+    // (auth.login, auth.signup, auth.oauth_signin,
+    // mfa.credential_registered, mfa.credential_revoked,
+    // saml.keypair_rotated) — the auth.reset_confirm slug was
+    // reserved in audit.ts:15 but never wired. Lightweight
+    // membership lookup for the orgId scope; fire-and-forget
+    // matches R134 F1/F2 shape.
+    const firstMembership = await db.membership.findFirst({
+      where: { userId: user.id },
+      orderBy: { createdAt: "asc" },
+      select: { orgId: true },
+    });
+    if (firstMembership) {
+      writeAudit(
+        {
+          orgId: firstMembership.orgId,
+          event: "auth.reset_confirm",
+          actorId: user.id,
+          actorEmail: user.email,
+          target: user.email,
+          metadata: { revokedApiKeys: true },
+          req,
+        },
+        req.log,
+      );
+    }
     return reply.send({ ok: true });
   });
 }

@@ -304,7 +304,21 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
 
     // id_token claims give us email + name without a second round-trip.
     const claims = tokens.claims();
-    const email = typeof claims?.email === "string" ? claims.email.toLowerCase() : null;
+    // R135 F2: cap IdP-asserted email + displayName before they
+    // hit db.user.create / db.user.findUnique (line ~337). Direct
+    // OIDC sibling of R134 F4's SAML fix — Prisma.User.email +
+    // displayName are unbounded String / String?. An attacker
+    // running their own IdP (self-hosted Keycloak / dev workspace)
+    // can JIT-provision users with megabyte email / name claims
+    // that balloon /members list render + /me/export bundles.
+    // RFC 5321 max email = 320; console signup enforces
+    // displayName max(80), so 200 gives IdP-asserted legitimate
+    // names some slack while still bounded. Also caps the
+    // `domain.split(".")[0]` slug feed at RFC 1035's 63-char
+    // label max so a 1 MB email doesn't produce a 1 MB org.name.
+    const email = typeof claims?.email === "string"
+      ? claims.email.toLowerCase().slice(0, 320)
+      : null;
     // R76 MEDIUM #5 (landed R77): only accept the JSON boolean
     // `true` for `email_verified`. Prior shape accepted the string
     // `"true"` too, which widened the acceptance surface to
@@ -319,7 +333,9 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
     // stringly-typed IdP is required, add a per-issuer allowlist
     // that opts THAT `iss` in explicitly.
     const emailVerified = claims?.email_verified === true;
-    const displayName = typeof claims?.name === "string" ? claims.name : null;
+    const displayName = typeof claims?.name === "string"
+      ? claims.name.slice(0, 200)
+      : null;
 
     if (!email) {
       return errRedirect("oauth_no_email_in_id_token");
@@ -340,12 +356,43 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
     });
     if (!user) {
       const domain = email.split("@")[1] ?? "personal";
+      // R135 F2: cap the org.name derived from `domain.split(".")[0]`
+      // at RFC 1035's 63-char DNS label maximum. Belt-and-suspenders
+      // against a 1 MB email producing a 1 MB org.name (the email
+      // itself is now capped at 320 above, so this is defense-in-
+      // depth for future-proofing).
       const org = await db.org.create({
         data: {
-          name: domain.split(".")[0] || "Personal",
+          name: (domain.split(".")[0] || "Personal").slice(0, 63),
           slug: orgSlug(domain),
         },
       });
+      // R135 F4: OAuth-JIT auto-provisions a fresh Org but emitted
+      // no forensic breadcrumb. R134 F2 added auth.oauth_signin to
+      // the callback but the auth.signup counterpart never fired
+      // on this branch — auth.ts:164 emits auth.signup only for
+      // the password-signup path. Consequence: an admin
+      // investigating "which orgs came into existence via
+      // unattended OAuth callback vs. explicit /signup" cannot
+      // distinguish the two in audit_entries. actorId is null
+      // (user row doesn't exist yet); the user.create below writes
+      // the user + membership atomically after this.
+      writeAudit(
+        {
+          orgId: org.id,
+          event: "org.created",
+          actorId: null,
+          actorEmail: email,
+          target: org.name,
+          metadata: {
+            provider: params.data.provider,
+            viaOauthJit: true,
+            orgSlug: org.slug,
+          },
+          req,
+        },
+        req.log,
+      );
       user = await db.user.create({
         data: {
           email,
