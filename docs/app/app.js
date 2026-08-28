@@ -3713,6 +3713,7 @@
         '<td>' +
           '<button class="btn" data-act="test">Send test</button> ' +
           '<button class="btn" data-act="toggle">' + (e.isActive ? "Pause" : "Resume") + '</button> ' +
+          '<button class="btn" data-act="rotate">Rotate secret</button> ' +
           '<button class="btn danger" data-act="delete">Delete</button>' +
         '</td>' +
       '</tr>';
@@ -3751,6 +3752,25 @@
           toast(current.isActive ? "Paused." : "Resumed.");
           await renderSettingsWebhooks(root);
         } catch (err) { toast(err.message || "Update failed"); }
+      } else if (act === "rotate") {
+        // R113 F1: mint a new signing secret. R112 F3 shipped
+        // the /rotate-secret endpoint but no console UI. The
+        // returned plaintext is shown once via showTokenModal
+        // matching the deployment rotate-token UX. Operators
+        // are warned via the modal body that the old secret
+        // is invalid immediately; they must swap on the
+        // receiving service before the next event fires.
+        confirmModal({
+          title: "Rotate this webhook's signing secret?",
+          body: "A new secret will be minted. The receiving service must be updated with the new value BEFORE the next event, or signature verification will fail on the consumer side.",
+          confirmLabel: "Rotate", danger: true,
+          onConfirm: async function () {
+            try {
+              var res = await state.ds.rotateWebhookSecret(id);
+              showTokenModal(res.secret, "New webhook secret");
+            } catch (err) { toast(err.message || "Rotate failed"); }
+          },
+        });
       } else if (act === "delete") {
         confirmModal({
           title: "Delete this webhook?",
