@@ -66,6 +66,19 @@
     try { saved = localStorage.getItem("av_theme"); } catch (e) {}
     if (saved === "light" || saved === "dark") applyTheme(saved);
     else state.theme = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    // Follow a LIVE OS scheme flip (sunset auto-dark etc.) while the
+    // app is open — but only when the user never chose explicitly.
+    // CSS already tracks prefers-color-scheme when data-theme is
+    // absent; re-render so JS-derived bits (menu label) catch up.
+    try {
+      matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function (ev) {
+        var s;
+        try { s = localStorage.getItem("av_theme"); } catch (e2) {}
+        if (s === "light" || s === "dark") return; // explicit choice wins
+        state.theme = ev.matches ? "dark" : "light";
+        try { render(); } catch (e2) {}
+      });
+    } catch (e) { /* older Safari: addListener-only — scheme still applies via CSS */ }
   }
   function toggleTheme() { applyTheme((state.theme === "dark") ? "light" : "dark"); render(); }
 
