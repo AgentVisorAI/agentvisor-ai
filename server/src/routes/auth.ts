@@ -91,7 +91,13 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const passwordHash = await hashPassword(password);
-    const salt = Math.random().toString(36).slice(2, 8);
+    // R108 F2: use randomToken (Node crypto CSPRNG) instead of
+    // Math.random() (~30 bits of predictable output). Matches
+    // sibling oauth.ts:96 signup slug salt. Prior shape was
+    // easy to guess for a slug-squatting attacker, and the
+    // salt only bought a small extra entropy budget on top of
+    // the base orgName.
+    const salt = randomToken(4).toLowerCase().slice(0, 6);
     const slug = orgSlug(orgName, salt);
 
     let user, org;
@@ -115,13 +121,32 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       user = result.user;
       org = result.org;
     } catch (err) {
-      // Prisma P2002 = unique constraint violation. Two concurrent signups
-      // with the same email hit this — one wins, the rest get 409 Conflict
-      // (not a 500 with the Prisma error code leaked to the client).
+      // R108 F2: distinguish P2002 by the unique constraint that
+      // fired (`err.meta.target`) — a slug collision is a
+      // different failure than an email collision, and previous
+      // shape mis-mapped BOTH to `email_in_use` (409). A signup
+      // with a brand-new email but a slug that clashed at the
+      // 40-char prefix was told 'email in use' and had no path
+      // to retry — only an org-name change or waiting helped,
+      // with no signal to the operator. Now: only User_email_key
+      // collisions map to email_in_use; slug collisions map to
+      // a distinct 409 org_slug_conflict slug so the client can
+      // retry with a fresh org name suggestion.
       if (
         typeof err === "object" && err !== null &&
         (err as { code?: string }).code === "P2002"
       ) {
+        const target = (err as { meta?: { target?: string[] | string } }).meta?.target;
+        const targetStr = Array.isArray(target) ? target.join(",") : (target ?? "");
+        if (targetStr.includes("email")) {
+          return reply.code(409).send({ error: "email_in_use" });
+        }
+        if (targetStr.includes("slug")) {
+          return reply.code(409).send({ error: "org_slug_conflict" });
+        }
+        // Unknown P2002 target: default to email-in-use to
+        // preserve the pre-R108 behavior for edge cases
+        // (avoids leaking Prisma internals via a generic slug).
         return reply.code(409).send({ error: "email_in_use" });
       }
       throw err;
