@@ -1218,6 +1218,20 @@
         (bigDataOn() ? bigDataSessions().find(function (x) { return x.id === id; }) : null);
       if (!s) throw new Error("not_found");
       var events = s._events || (id === "sess_01H9K" ? MOCK_EVENTS_FEATURED : synthesizeEvents(s));
+      // Honest member view: the real API redacts LLM prompt/response
+      // bodies for role=member (R101) and the console renders the
+      // sentinel as a 🔒 pill. The mock mirrors that — otherwise
+      // "Preview as member" showed full LLM content the real product
+      // would hide. mockState.session is the same object the console's
+      // role preview mutates, so the current (possibly previewed) role
+      // is visible here.
+      var role = mockState.session && mockState.session.org && mockState.session.org.role;
+      if (role === "member") {
+        events = events.map(function (e) {
+          if (e.kind !== "llm") return e;
+          return Object.assign({}, e, { msg: "[redacted-member-view]", sub: e.sub ? "[redacted-member-view]" : e.sub });
+        });
+      }
       // Long trails page like the real API: 500 events per request,
       // cursor = serialized offset. The only session long enough is
       // the big-data mega-session, which exists precisely so the
