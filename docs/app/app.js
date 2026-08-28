@@ -1243,9 +1243,7 @@
     var cursor = chart.querySelector("#chartCursor");
     var tip = h('<div class="chart-tip" style="display:none"></div>');
     root.querySelector(".chart-card").appendChild(tip);
-    chart.addEventListener("mousemove", function (e) {
-      var strip = e.target.closest(".hover-strip");
-      if (!strip) { tip.style.display = "none"; cursor.style.opacity = "0"; return; }
+    function showBucket(strip) {
       var idx = parseInt(strip.getAttribute("data-idx"), 10);
       var s = series[idx];
       var x = parseFloat(strip.getAttribute("x")) + parseFloat(strip.getAttribute("width")) / 2;
@@ -1262,10 +1260,22 @@
         '<div class="tip-row"><span class="d" style="background: var(--accent)"></span>Allowed <b>' + s.allowed + "</b></div>" +
         '<div class="tip-row"><span class="d" style="background: var(--danger-solid)"></span>Blocked <b>' + s.blocked + "</b></div>" +
         (s.spendUsd > 0 ? '<div class="tip-row muted">Spend $' + s.spendUsd.toFixed(2) + "</div>" : "");
+    }
+    function hideTip() { tip.style.display = "none"; cursor.style.opacity = "0"; }
+    chart.addEventListener("mousemove", function (e) {
+      var strip = e.target.closest(".hover-strip");
+      if (!strip) { hideTip(); return; }
+      showBucket(strip);
     });
-    chart.addEventListener("mouseleave", function () {
-      tip.style.display = "none";
-      cursor.style.opacity = "0";
+    chart.addEventListener("mouseleave", hideTip);
+    // Touch: tap a bucket to pin its tooltip, tap elsewhere to clear —
+    // hover-only meant the chart said nothing on phones and tablets.
+    chart.addEventListener("click", function (e) {
+      var strip = e.target.closest(".hover-strip");
+      if (!strip) { hideTip(); return; }
+      if (tip.style.display === "block" && strip.getAttribute("data-idx") === tip.getAttribute("data-idx")) { hideTip(); return; }
+      tip.setAttribute("data-idx", strip.getAttribute("data-idx"));
+      showBucket(strip);
     });
   }
   function rangeGroup() {
