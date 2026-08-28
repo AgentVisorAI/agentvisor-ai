@@ -393,7 +393,9 @@
   }
   function timeAgo(iso) {
     if (!iso) return "—";
-    var s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+    var t = new Date(iso).getTime();
+    if (isNaN(t)) return "—"; // garbage timestamp from the API → dash, not "NaNd ago"
+    var s = Math.max(0, (Date.now() - t) / 1000);
     if (s < 60) return Math.floor(s) + "s ago";
     if (s < 3600) return Math.floor(s / 60) + "m ago";
     if (s < 86400) return Math.floor(s / 3600) + "h ago";
@@ -507,10 +509,12 @@
   }
   function usdMicros(str) {
     var n = typeof str === "string" ? parseInt(str, 10) : (str || 0);
+    if (isNaN(n)) n = 0; // "$NaN" is worse than "$0.00" for garbage input
     return "$" + (n / 1e6).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
   function usdMicrosBig(str) {
     var n = typeof str === "string" ? parseInt(str, 10) : (str || 0);
+    if (isNaN(n)) n = 0;
     var v = n / 1e6;
     if (v >= 1000) return "$" + Math.round(v).toLocaleString();
     return "$" + v.toFixed(2);
@@ -1624,8 +1628,8 @@
       return [
         s.externalId || s.id, s.agent, s.user || "", s.model || "", s.startedAt || "",
         s.events, s.toolsAllowed, s.toolsBlocked,
-        (parseInt(s.costUsdMicros, 10) / 1e6).toFixed(4),
-        (parseInt(s.blockedPayoutUsdMicros || "0", 10) / 1e6).toFixed(2),
+        ((parseInt(s.costUsdMicros, 10) || 0) / 1e6).toFixed(4),
+        ((parseInt(s.blockedPayoutUsdMicros || "0", 10) || 0) / 1e6).toFixed(2),
       ].map(csvField).join(",");
     }));
     var stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-");
