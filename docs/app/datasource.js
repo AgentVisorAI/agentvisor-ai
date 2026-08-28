@@ -1102,6 +1102,7 @@
       if (params.deploymentId) results = results.filter(function (s) { return s.deploymentId === params.deploymentId; });
       if (params.agent) results = results.filter(function (s) { return s.agent === params.agent; });
       if (params.blockedOnly) results = results.filter(function (s) { return s.toolsBlocked > 0; });
+      if (params.policyId) results = results.filter(function (s) { return (s.policiesFired || []).indexOf(params.policyId) >= 0; });
       if (params.q) {
         var q = params.q.toLowerCase();
         results = results.filter(function (s) {
