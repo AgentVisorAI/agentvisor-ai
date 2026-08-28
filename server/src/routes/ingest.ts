@@ -125,6 +125,51 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       select: { orgId: true, name: true, publicKeyHex: true },
     });
     if (!dep) return reply.code(404).send({ error: "deployment_not_found" });
+    // R92 F3: fold the check + write into a conditional atomic
+    // updateMany scoped by `publicKeyHex: null` so that two
+    // concurrent /pubkey calls at first-set time can't both
+    // observe null and both silently win with last-writer
+    // semantics. The daemon-vs-stolen-token race (daemon on
+    // first boot, attacker holding the same ingest token) is
+    // real: whoever's write reached Postgres LAST previously
+    // won the trust anchor and BOTH would then log
+    // `deployment.pubkey_first_set`, letting an operator
+    // misread the audit trail as "the daemon just retried".
+    // With the conditional predicate, exactly one first-set
+    // wins; the loser gets `count === 0` and falls into the
+    // existing "already-set" branch (409 if different key,
+    // idempotent 200 if same key).
+    if (!dep.publicKeyHex) {
+      const upd = await db.deployment.updateMany({
+        where: { id: daemon.deploymentId, publicKeyHex: null },
+        data: { publicKeyHex: body.data.publicKeyHex },
+      });
+      if (upd.count === 1) {
+        writeAudit(
+          {
+            orgId: dep.orgId,
+            event: "deployment.pubkey_first_set",
+            actorId: `daemon:${daemon.deploymentId}`,
+            actorEmail: `daemon@${dep.name}`,
+            target: dep.name,
+            metadata: {
+              deploymentId: daemon.deploymentId,
+              publicKeyHex: body.data.publicKeyHex,
+            },
+            req,
+          },
+          req.log,
+        );
+        return reply.send({ ok: true });
+      }
+      // Lost the first-set race. Re-fetch the current key and
+      // fall through to the same-key vs different-key branch.
+      const refetched = await db.deployment.findUnique({
+        where: { id: daemon.deploymentId },
+        select: { publicKeyHex: true },
+      });
+      dep.publicKeyHex = refetched?.publicKeyHex ?? null;
+    }
     if (dep.publicKeyHex && dep.publicKeyHex !== body.data.publicKeyHex) {
       // Refuse silent rotation. Log at warn so an operator can
       // investigate a rogue daemon or a stolen token.
@@ -154,27 +199,6 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
         req.log,
       );
       return reply.code(409).send({ error: "pubkey_already_set" });
-    }
-    if (!dep.publicKeyHex) {
-      await db.deployment.update({
-        where: { id: daemon.deploymentId },
-        data: { publicKeyHex: body.data.publicKeyHex },
-      });
-      writeAudit(
-        {
-          orgId: dep.orgId,
-          event: "deployment.pubkey_first_set",
-          actorId: `daemon:${daemon.deploymentId}`,
-          actorEmail: `daemon@${dep.name}`,
-          target: dep.name,
-          metadata: {
-            deploymentId: daemon.deploymentId,
-            publicKeyHex: body.data.publicKeyHex,
-          },
-          req,
-        },
-        req.log,
-      );
     }
     // Idempotent same-key repost is a no-op.
     return reply.send({ ok: true });
