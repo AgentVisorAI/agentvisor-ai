@@ -1160,6 +1160,29 @@
    * ============================================================ */
 
   var sessionsFilter = { q: "", deploymentId: "", agent: "", blockedOnly: false, sinceHours: 24 };
+  // Column sort for the sessions list. Newest-first is the natural
+  // order the API returns; anything else is a client-side re-sort of
+  // the loaded set, mirrored into the URL like the filters.
+  var sessionsSort = { key: "started", dir: "desc" };
+  var SESSIONS_SORTERS = {
+    events: function (s) { return s.events; },
+    allowed: function (s) { return s.toolsAllowed; },
+    blocked: function (s) { return s.toolsBlocked; },
+    cost: function (s) { return parseInt(s.costUsdMicros, 10) || 0; },
+    started: function (s) { return new Date(s.startedAt).getTime() || 0; },
+  };
+  // The loaded set in display order (WYSIWYG for both the table and
+  // the CSV export). API order is newest-first already, so the
+  // default sort is a no-op copy.
+  function sortedSessionsView() {
+    var view = sessionsLoaded.slice();
+    var sorter = SESSIONS_SORTERS[sessionsSort.key];
+    if (sorter && !(sessionsSort.key === "started" && sessionsSort.dir === "desc")) {
+      var mul = sessionsSort.dir === "asc" ? 1 : -1;
+      view.sort(function (a, b) { return (sorter(a) - sorter(b)) * mul; });
+    }
+    return view;
+  }
 
   // The filter state lives in the URL (#/sessions?q=…&status=blocked&…)
   // so a filtered view is shareable, survives reload, and the back
@@ -1180,6 +1203,8 @@
       blockedOnly: p.status === "blocked",
       sinceHours: SESSIONS_RANGES.indexOf(range) >= 0 ? range : 24,
     };
+    var sm = /^(events|allowed|blocked|cost|started)\.(asc|desc)$/.exec(p.sort || "");
+    sessionsSort = sm ? { key: sm[1], dir: sm[2] } : { key: "started", dir: "desc" };
   }
   function writeSessionsFilterToHash() {
     var parts = [];
@@ -1188,6 +1213,7 @@
     if (sessionsFilter.sinceHours !== 24) parts.push("range=" + sessionsFilter.sinceHours);
     if (sessionsFilter.deploymentId) parts.push("dep=" + encodeURIComponent(sessionsFilter.deploymentId));
     if (sessionsFilter.agent) parts.push("agent=" + encodeURIComponent(sessionsFilter.agent));
+    if (sessionsSort.key !== "started" || sessionsSort.dir !== "desc") parts.push("sort=" + sessionsSort.key + "." + sessionsSort.dir);
     try { history.replaceState(null, "", "#/sessions" + (parts.length ? "?" + parts.join("&") : "")); } catch (e) {}
   }
   function sessionsFilterActive() {
@@ -1243,7 +1269,7 @@
       body = emptyState("No sessions match your filters", "Try widening the date range or clearing the search.",
         sessionsFilterActive() ? "Clear filters" : null, null, "clearFilters");
     } else {
-      body = '<div class="card" style="padding:0">' + sessionsTable(sessionsLoaded) + '</div>';
+      body = '<div class="card" style="padding:0">' + sessionsTable(sortedSessionsView(), true) + '</div>';
       if (sessionsCursor && sessionsLoaded.length < SESSIONS_DOM_CAP) {
         body += '<div style="margin-top:12px; text-align:center;">' +
           '<button class="btn" id="loadMore">Load more</button>' +
@@ -1266,7 +1292,22 @@
     installFilters(main, deps);
     if (searchHadFocus) restoreSearchFocus(main, searchVal);
     var xc = $("#exportCsv");
-    if (xc) xc.addEventListener("click", function () { exportSessionsCsv(sessionsLoaded); });
+    if (xc) xc.addEventListener("click", function () { exportSessionsCsv(sortedSessionsView()); });
+    // Column sort: click (or Enter on) a header button. Client-side
+    // re-render only — no refetch, keeps Load-more pages.
+    var thead = main.querySelector("thead");
+    if (thead) thead.addEventListener("click", function (e) {
+      var btn = e.target.closest(".th-sort");
+      if (!btn) return;
+      var key = btn.getAttribute("data-sort");
+      if (sessionsSort.key === key) sessionsSort.dir = sessionsSort.dir === "asc" ? "desc" : "asc";
+      else sessionsSort = { key: key, dir: key === "started" ? "desc" : "desc" };
+      writeSessionsFilterToHash();
+      renderSessionsBody(main, deps);
+      // put focus back on the same header so keyboard users can toggle
+      var again = main.querySelector('.th-sort[data-sort="' + key + '"]');
+      if (again) again.focus();
+    });
     var clr = $("#clearFilters");
     if (clr) clr.addEventListener("click", function () {
       try { history.replaceState(null, "", "#/sessions"); } catch (e) {}
@@ -1377,7 +1418,7 @@
     if (fB) fB.addEventListener("change", function () { sessionsFilter.blockedOnly = fB.checked; apply(); });
   }
 
-  function sessionsTable(sessions) {
+  function sessionsTable(sessions, sortable) {
     if (sessions.length === 0) return emptyState("No sessions yet", "Sessions from your daemons will appear here.");
     var rows = sessions.map(function (s) {
       var blocks = s.toolsBlocked > 0
@@ -1393,8 +1434,21 @@
         '<td style="color: var(--fg-2)">' + timeAgoCell(s.startedAt) + "</td>" +
       "</tr>";
     }).join("");
+    // Sortable headers only on the sessions list (the overview's
+    // recent-sessions card stays plain). Each sortable th is a real
+    // button with aria-sort on the th, per the ARIA sortable-table
+    // pattern; clicking toggles direction on the active column.
+    function th(label, key, num) {
+      if (!sortable || !key) return "<th" + (num ? ' class="num"' : "") + ">" + label + "</th>";
+      var active = sessionsSort.key === key;
+      var ariaSort = active ? (sessionsSort.dir === "asc" ? "ascending" : "descending") : "none";
+      var arrow = active ? (sessionsSort.dir === "asc" ? " ↑" : " ↓") : "";
+      return '<th' + (num ? ' class="num"' : "") + ' aria-sort="' + ariaSort + '">' +
+        '<button type="button" class="th-sort' + (active ? " active" : "") + '" data-sort="' + key + '" title="Sort by ' + esc(label.toLowerCase()) + '">' + label + arrow + "</button></th>";
+    }
     return '<div class="table-wrap"><table>' +
-      "<thead><tr><th>Session</th><th>Actor</th><th class=\"num\">Events</th><th class=\"num\">Allowed</th><th>Blocked</th><th class=\"num\">LLM cost</th><th>Started</th></tr></thead>" +
+      "<thead><tr>" + th("Session") + th("Actor") + th("Events", "events", true) + th("Allowed", "allowed", true) +
+        th("Blocked", "blocked") + th("LLM cost", "cost", true) + th("Started", "started") + "</tr></thead>" +
       "<tbody>" + rows + "</tbody></table></div>";
   }
 
