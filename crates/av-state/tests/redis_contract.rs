@@ -4,7 +4,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use av_state::redis_store::RedisStore;
-use av_state::{Spend, StateStore};
+use av_state::{Spend, StateStore, TrySpendOutcome};
 
 fn store() -> Option<RedisStore> {
     match std::env::var("AV_REDIS_URL") {
@@ -40,40 +40,51 @@ fn redis_contract_multi_key_spend_shares_one_slot() {
     let tag = av_core::new_event_uid();
     let tokens = format!("budget:{{{tag}}}:tokens");
     let tool = format!("budget:{{{tag}}}:tool:db_write");
-    assert_eq!(
-        s.try_spend_many(&[
-            Spend {
-                key: tokens.clone(),
-                amount: 7,
-                limit: 10,
-            },
-            Spend {
-                key: tool.clone(),
-                amount: 1,
-                limit: 3,
-            },
-        ])
-        .unwrap(),
-        None,
+    // R111 F2: assertions match the R66 F3 TrySpendOutcome API.
+    // Prior shape compared against Option<usize> ({None, Some(idx)})
+    // — the pre-R66 refactor return type. The compile error blocked
+    // every runtime invocation, including the AV_REDIS_URL-gated
+    // race regression suite this file names as its raison d'être
+    // ('D13.9: a budget must never over-spend by racing'). Silent
+    // coverage regression since R66 landed.
+    assert!(
+        matches!(
+            s.try_spend_many(&[
+                Spend {
+                    key: tokens.clone(),
+                    amount: 7,
+                    limit: 10,
+                },
+                Spend {
+                    key: tool.clone(),
+                    amount: 1,
+                    limit: 3,
+                },
+            ])
+            .unwrap(),
+            TrySpendOutcome::Committed { .. }
+        ),
         "first multi-key spend must commit"
     );
     // Second spend exceeds the token limit; the tool counter must not move
     // (atomicity across keys, not just per-key).
-    assert_eq!(
-        s.try_spend_many(&[
-            Spend {
-                key: tokens.clone(),
-                amount: 5,
-                limit: 10,
-            },
-            Spend {
-                key: tool.clone(),
-                amount: 1,
-                limit: 3,
-            },
-        ])
-        .unwrap(),
-        Some(0),
+    assert!(
+        matches!(
+            s.try_spend_many(&[
+                Spend {
+                    key: tokens.clone(),
+                    amount: 5,
+                    limit: 10,
+                },
+                Spend {
+                    key: tool.clone(),
+                    amount: 1,
+                    limit: 3,
+                },
+            ])
+            .unwrap(),
+            TrySpendOutcome::Refused { index: 0 }
+        ),
         "over-limit spend must report the failing index"
     );
     assert_eq!(s.get(&tokens).unwrap(), 7);
@@ -128,14 +139,16 @@ fn redis_contract_spend_many_guards_are_exact() {
     let tag = av_core::new_event_uid();
     // amount == limit == JCS_SAFE_MAX commits (kills > -> >=)…
     let key = format!("av-test-max:{{{tag}}}");
-    assert_eq!(
-        s.try_spend_many(&[Spend {
-            key: key.clone(),
-            amount: max,
-            limit: max,
-        }])
-        .unwrap(),
-        None
+    assert!(
+        matches!(
+            s.try_spend_many(&[Spend {
+                key: key.clone(),
+                amount: max,
+                limit: max,
+            }])
+            .unwrap(),
+            TrySpendOutcome::Committed { .. }
+        ),
     );
     s.remove(&key);
     // …and each side one past the cap is Overflow independently
