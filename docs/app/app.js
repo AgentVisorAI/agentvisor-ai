@@ -3454,6 +3454,10 @@
         "</div>" +
       "</div>";
 
+    // R90's rule, applied inside the member-visible SSO tab: viewing
+    // which IdPs exist is fine, but Add/Edit/Delete hit admin-gated
+    // API routes that would 403 — don't render dead controls.
+    var canManageSso = ((state.session && state.session.org && state.session.org.role) || "member") !== "member";
     var samlList = configs.length
       ? '<div class="table-wrap"><table>' +
           '<thead><tr><th>Display name</th><th>IdP entity ID</th><th>Domains</th><th>JIT</th><th>Status</th><th class="act-3"><span class="sr-only">Actions</span></th></tr></thead>' +
@@ -3465,21 +3469,25 @@
               '<td>' + (c.jitEnabled ? '<span class="pill ok">on · ' + esc(c.jitDefaultRole) + '</span>' : '<span class="pill neutral">off</span>') + '</td>' +
               '<td>' + (c.isActive ? '<span class="pill ok status-dot">active</span>' : '<span class="pill neutral">disabled</span>') + '</td>' +
               '<td>' +
-                '<button class="btn" data-act="details">Details</button> ' +
-                '<button class="btn" data-act="edit">Edit</button> ' +
-                '<button class="btn danger" data-act="delete">Delete</button>' +
+                '<button class="btn" data-act="details">Details</button>' +
+                (canManageSso
+                  ? ' <button class="btn" data-act="edit">Edit</button> ' +
+                    '<button class="btn danger" data-act="delete">Delete</button>'
+                  : '') +
               '</td>' +
             '</tr>';
           }).join('') + '</tbody>' +
         '</table></div>'
-      : emptyState("No SAML IdPs yet", "Wire an Okta / Auth0 / Microsoft Entra / Ping / any SAML 2.0 provider into the workspace.", "+ Add IdP", null, "addSamlBtn");
+      : (canManageSso
+          ? emptyState("No SAML IdPs yet", "Wire an Okta / Auth0 / Microsoft Entra / Ping / any SAML 2.0 provider into the workspace.", "+ Add IdP", null, "addSamlBtn")
+          : emptyState("No SAML IdPs yet", "Ask an owner or admin to wire your identity provider into the workspace."));
 
     var samlCard =
       '<div class="card" style="padding:0">' +
         '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:baseline">' +
           '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">SAML 2.0 identity providers</h2>' +
           '<span style="margin-left:8px; color:var(--fg-3); font-size:var(--t-sec)">' + configs.length + ' configured</span>' +
-          (configs.length ? '<button class="btn accent" id="addSamlBtn" style="margin-left:auto">+ Add IdP</button>' : '') +
+          (configs.length && canManageSso ? '<button class="btn accent" id="addSamlBtn" style="margin-left:auto">+ Add IdP</button>' : '') +
         '</div>' +
         '<div style="padding: 20px 16px">' + samlList + '</div>' +
       '</div>';
@@ -3594,7 +3602,11 @@
             '<dt>Allowed domains</dt><dd class="mono" style="font-size:11.5px">' + esc(cfg.allowedDomains || "(any)") + '</dd>' +
           '</dl>' +
           '<div class="actions">' +
-            '<button class="btn" data-act="regen">Regenerate SP keypair</button>' +
+            // Regenerating the SP keypair is an admin mutation (would
+            // 403 for members) — same rule as the list's Edit/Delete.
+            (((state.session && state.session.org && state.session.org.role) || "member") !== "member"
+              ? '<button class="btn" data-act="regen">Regenerate SP keypair</button>'
+              : '') +
             '<button class="btn accent" data-close>Done</button>' +
           '</div>' +
         '</div>' +
