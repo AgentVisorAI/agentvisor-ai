@@ -647,6 +647,10 @@ code, pre, .mono {
   overflow: hidden;
 }
 .stat .head { display: flex; align-items: center; gap: var(--s-1); }
+/* A stat rendered as a link (drill-down into a pre-filtered list). */
+a.stat { display: block; text-decoration: none; color: inherit; }
+a.stat.linked:hover { border-color: var(--accent); }
+a.stat.linked:hover .label::after { content: " →"; }
 .stat .label {
   font-size: 11.5px;
   color: var(--fg-2);
