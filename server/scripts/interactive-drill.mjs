@@ -921,7 +921,79 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ audit log matches ground truth (chips/search/CSV WYSIWYG); palette ranks + loads dynamic entries; print pack intact");
 }
 
-// ── 21. Listener-leak soak ─────────────────────────────────────────
+// ── 21. Password reset + member redaction + policy derivation ──────
+// (a) The #/reset flow end-to-end: token issued inline (mock), wrong
+// token rejected, correct token sets the password once, reuse fails
+// (single-use). (b) "Preview as member" must redact LLM bodies with
+// the 🔒 sentinel exactly like the real API (R101) — the mock used to
+// show full content, lying about redaction. (c) Policy detail derives
+// its block count from the fired-session list, not the fixture.
+{
+  // (a) reset flow — enter via reload-then-hash (in-memory session
+  // bounces public routes before a reload)
+  await page.evaluate(() => { localStorage.setItem("av_mock_signed_out", "1"); });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForSelector("input#email", { timeout: 10000 });
+  await page.evaluate(() => { location.hash = "#/reset"; });
+  await page.waitForSelector("#resetReqForm", { timeout: 10000 });
+  await page.fill("#email", "drill@northwind.com");
+  await page.click("#resetReqForm button[type=submit]");
+  await page.waitForSelector("#resetErr .mono", { timeout: 8000 });
+  const tok = await page.evaluate(() => document.querySelector("#resetErr .mono").textContent.trim());
+  await page.evaluate(() => { location.hash = "#/reset?email=drill%40northwind.com&token=WRONG"; });
+  await page.waitForSelector("#resetConfirmForm", { timeout: 8000 });
+  await page.fill("#newPassword", "drill-horse-battery!");
+  await page.click("#resetConfirmForm button[type=submit]");
+  await page.waitForFunction(() => /invalid or has expired/i.test(document.querySelector("#resetErr")?.textContent || ""), { timeout: 8000 });
+  await page.evaluate((t) => { location.hash = "#/reset?email=drill%40northwind.com&token=" + encodeURIComponent(t); }, tok);
+  await page.waitForFunction((t) => document.querySelector("#token")?.value === t, tok, { timeout: 8000 });
+  await page.fill("#newPassword", "drill-horse-battery!");
+  await page.click("#resetConfirmForm button[type=submit]");
+  await page.waitForSelector("#authForm", { timeout: 8000 });
+  await page.evaluate((t) => { location.hash = "#/reset?email=drill%40northwind.com&token=" + encodeURIComponent(t) + "&x=1"; }, tok);
+  await page.waitForFunction((t) => document.querySelector("#token")?.value === t, tok, { timeout: 8000 });
+  await page.fill("#newPassword", "second-reuse-attempt!");
+  await page.click("#resetConfirmForm button[type=submit]");
+  await page.waitForFunction(() => /invalid or has expired/i.test(document.querySelector("#resetErr")?.textContent || ""), { timeout: 8000 });
+  // (b) member redaction round-trip
+  await page.evaluate(() => localStorage.removeItem("av_mock_signed_out"));
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => document.querySelector(".stat"), { timeout: 15000 });
+  await page.evaluate(() => { location.hash = "#/sessions/sess_01H9K"; });
+  await page.waitForSelector("#eventList .evt", { timeout: 10000 });
+  if (await page.evaluate(() => document.querySelectorAll(".redacted-pill").length)) fail("owner view showed redaction pills");
+  await page.click(".cmdk-trigger");
+  await page.waitForSelector(".cmdk-backdrop input", { timeout: 5000 });
+  await page.fill(".cmdk-backdrop input", "preview as member");
+  await page.waitForTimeout(300);
+  await page.keyboard.press("Enter");
+  await page.waitForFunction(() => document.querySelectorAll(".redacted-pill").length > 0, { timeout: 10000 })
+    .catch(() => fail("member preview did not redact LLM bodies"));
+  await page.click(".cmdk-trigger");
+  await page.waitForSelector(".cmdk-backdrop input", { timeout: 5000 });
+  await page.fill(".cmdk-backdrop input", "exit member preview");
+  await page.waitForTimeout(300);
+  await page.keyboard.press("Enter");
+  await page.waitForFunction(() => document.querySelectorAll(".redacted-pill").length === 0, { timeout: 10000 })
+    .catch(() => fail("exiting preview did not restore LLM content"));
+  // (c) policy detail derivation
+  const pd = await page.evaluate(async () => {
+    const pols = await window.dataSource.listPolicies();
+    const p = pols.find((x) => (x.hits24h || 0) > 0) || pols[0];
+    const resp = await window.dataSource.listSessions({ limit: 100 });
+    const fired = (resp.sessions || []).filter((s) => (s.policiesFired || []).includes(p.id));
+    location.hash = "#/policies/" + p.id;
+    await new Promise((r) => setTimeout(r, 1200));
+    const view = document.getElementById("view").textContent;
+    const blocks = fired.length ? fired.reduce((a, s) => a + (s.toolsBlocked || 0), 0) : p.blocks24h;
+    const rows = document.querySelectorAll("tbody tr[data-clickable], tbody tr[data-id]").length;
+    return { ok: view.includes(p.name) && view.includes(String(blocks)) && rows === Math.min(fired.length, 8), fired: fired.length, blocks, rows };
+  });
+  if (!pd.ok || !pd.fired) fail("policy detail derivation wrong: " + JSON.stringify(pd));
+  console.log("✅ reset flow (issue/reject/confirm/single-use); member preview redacts + restores; policy blocks derived from " + pd.fired + " fired sessions");
+}
+
+// ── 22. Listener-leak soak ─────────────────────────────────────────
 // Every earlier check opened modals, ran the tour, refreshed the
 // overview, and re-rendered lists dozens of times. If any of that
 // leaked document/window listeners (the webhook modal once leaked a
@@ -947,4 +1019,4 @@ if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors))
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 22 interactive-features drill checks passed.");
+console.log("\nAll 23 interactive-features drill checks passed.");
