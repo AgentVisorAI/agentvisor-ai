@@ -699,6 +699,20 @@
    * AUDIT LOG
    * ============================================================ */
 
+  // Session-scoped runtime audit trail: the real product audits every
+  // admin mutation, so the demo must too — an investor who rotates a
+  // token or fires a test webhook should see their own action land in
+  // Settings → Audit log. Kept in memory (Reset demo data clears it).
+  var runtimeAudit = [];
+  function recordAudit(event, target, note) {
+    runtimeAudit.unshift({
+      at: new Date().toISOString(),
+      actor: (mockState.session && mockState.session.user && mockState.session.user.email) || "you",
+      event: event, target: target || "", note: note || "",
+    });
+    if (runtimeAudit.length > 50) runtimeAudit.pop();
+  }
+
   var MOCK_AUDIT = [
     { at: iso(3 * MIN), actor: "olivia.tan@northwind.com", event: "auth.signed_in", target: "google-workspace", note: "SSO · Chrome on macOS" },
     { at: iso(8 * MIN), actor: "raj.patel@northwind.com", event: "policy.updated", target: "procurement.allowed_vendors", note: "Added Fabrikam to vendor allowlist." },
@@ -1152,6 +1166,7 @@
         sessions24h: 0, spend24h: "$0.00",
       };
       MOCK_DEPLOYMENTS.push(dep);
+      recordAudit("deployment.created", dep.name, dep.environment + " · " + dep.region);
       return { deployment: dep, ingestToken: token };
     },
     async rotateDeploymentToken(id) {
@@ -1159,6 +1174,7 @@
       var token = "av_live_" + Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
       var d = MOCK_DEPLOYMENTS.find(function (x) { return x.id === id; });
       if (d) d.ingestTokenHint = "av_live_" + token.slice(8, 12) + "…";
+      recordAudit("deployment.token_rotated", d ? d.name : id);
       return { ingestToken: token };
     },
     async deleteDeployment(id) {
@@ -1393,7 +1409,7 @@
     async togglePolicy(id) {
       await delay(120);
       var p = MOCK_POLICIES.find(function (x) { return x.id === id; });
-      if (p) p.enabled = !p.enabled;
+      if (p) { p.enabled = !p.enabled; recordAudit(p.enabled ? "policy.enabled" : "policy.disabled", p.name); }
       return p;
     },
     async createPolicy(input) {
@@ -1416,6 +1432,7 @@
         body: input.body || "",
       };
       MOCK_POLICIES.unshift(p);
+      recordAudit("policy.created", p.name, p.kind + " · " + p.scope);
       return p;
     },
 
@@ -1434,6 +1451,7 @@
         expiresAt: new Date(Date.now() + 7 * 24 * HOUR).toISOString(),
         createdAt: new Date().toISOString(),
       });
+      recordAudit("member.invited", input.email, "role: " + (input.role || "member"));
       return { invite: MOCK_INVITES[MOCK_INVITES.length - 1] };
     },
     async listInvites() {
@@ -1443,7 +1461,9 @@
     },
     async revokeInvite(id) {
       await delay(120);
+      var inv = MOCK_INVITES.find(function (i) { return i.id === id; });
       MOCK_INVITES = MOCK_INVITES.filter(function (i) { return i.id !== id; });
+      recordAudit("invite.revoked", inv ? inv.email : id);
     },
     async acceptInvite(input) {
       await delay(400);
@@ -1490,7 +1510,9 @@
     },
     async removeMember(userId) {
       await delay(150);
+      var gone = MOCK_MEMBERS.find(function (m) { return m.userId === userId || m.email === userId; });
       MOCK_MEMBERS = MOCK_MEMBERS.filter(function (m) { return m.userId !== userId && m.email !== userId; });
+      recordAudit("member.removed", gone ? gone.email : userId);
     },
     async listApiKeys() {
       await delay(100);
@@ -1503,11 +1525,14 @@
       var plaintext = "av_srv_" + Math.random().toString(36).slice(2, 10).padEnd(28, "0");
       var row = { id: "key_" + Math.random().toString(36).slice(2, 8), name: name, createdAt: new Date().toISOString(), lastUsedAt: null, hint: hint };
       MOCK_API_KEYS.unshift(row);
+      recordAudit("apikey.created", name);
       return { key: row, plaintextToken: plaintext };
     },
     async revokeApiKey(id) {
       await delay(120);
+      var k = MOCK_API_KEYS.find(function (r) { return r.id === id; });
       MOCK_API_KEYS = MOCK_API_KEYS.filter(function (r) { return r.id !== id; });
+      recordAudit("apikey.revoked", k ? k.name : id);
     },
     async listWebhooks() {
       await delay(80);
@@ -1522,20 +1547,31 @@
         createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
       };
       MOCK_WEBHOOKS.unshift(row);
+      recordAudit("webhook.created", row.name, "events: " + (row.events || []).join(", "));
       return { endpoint: row, secret: "whsec_" + Math.random().toString(36).slice(2, 34) };
     },
     async updateWebhook(id, patch) {
       await delay(120);
       MOCK_WEBHOOKS = MOCK_WEBHOOKS.map(function (w) { return w.id === id ? Object.assign({}, w, patch, { updatedAt: new Date().toISOString() }) : w; });
+      var w2 = MOCK_WEBHOOKS.find(function (w) { return w.id === id; });
+      if (patch && "isActive" in patch) recordAudit(patch.isActive ? "webhook.resumed" : "webhook.paused", w2 ? w2.name : id);
+      else recordAudit("webhook.updated", w2 ? w2.name : id);
     },
     async deleteWebhook(id) {
       await delay(100);
+      var wd = MOCK_WEBHOOKS.find(function (w) { return w.id === id; });
       MOCK_WEBHOOKS = MOCK_WEBHOOKS.filter(function (w) { return w.id !== id; });
+      recordAudit("webhook.deleted", wd ? wd.name : id);
     },
-    async testWebhook() { await delay(90); },
+    async testWebhook(id) {
+      await delay(90);
+      var wt = MOCK_WEBHOOKS.find(function (w) { return w.id === id; });
+      recordAudit("webhook.test_fired", wt ? wt.name : id);
+    },
     async rotateWebhookSecret(id) {
       await delay(120);
-      void id;
+      var wr = MOCK_WEBHOOKS.find(function (w) { return w.id === id; });
+      recordAudit("webhook.secret_rotated", wr ? wr.name : id);
       return { secret: "whsec_" + Math.random().toString(36).slice(2, 34) };
     },
     async listWebhookDeliveries(id) {
@@ -1548,7 +1584,10 @@
       ];
     },
     async getRetention() { await delay(80); return { retention: { sessionRetentionDays: 90, auditRetentionDays: 365 } }; },
-    async updateRetention() { await delay(80); },
+    async updateRetention(input) {
+      await delay(80);
+      recordAudit("retention.updated", "", "sessions " + input.sessionRetentionDays + "d · audit " + input.auditRetentionDays + "d");
+    },
     async retentionSweepNow() { await delay(120); return { result: { sessionsPurged: 0, auditPurged: 0, webhookDeliveriesPurged: 0 } }; },
     // No downloadAuditCsv here on purpose: without it the console
     // builds the CSV client-side from the loaded entries, which works
@@ -1559,13 +1598,13 @@
       var el = freshElapsed();
       if (el != null) {
         var t0 = Date.now() - el;
-        return [
+        return runtimeAudit.concat([
           { at: new Date(t0 + FRESH_CONNECT_MS).toISOString(), actor: "system", event: "deployment.connected", target: "northwind-prod", note: "Signing key issued" },
           { at: new Date(t0 + 2000).toISOString(), actor: "system", event: "policies.defaults_seeded", target: "4 starter policies" },
           { at: new Date(t0).toISOString(), actor: (mockState.session && mockState.session.user ? mockState.session.user.email : "you"), event: "org.created", target: "Northwind Traders" },
-        ];
+        ]);
       }
-      return MOCK_AUDIT.slice();
+      return runtimeAudit.concat(MOCK_AUDIT);
     },
     subscribe(callback) {
       // The demo needs to feel alive. Every 6-14 seconds we synthesize a new
@@ -1924,6 +1963,7 @@
         updatedAt: new Date().toISOString(), updatedBy: "",
       }, input);
       MOCK_POLICIES.unshift(p);
+      recordAudit("policy.created", p.name, p.kind + " · " + p.scope);
       return p;
     },
     async listMembers() {
