@@ -906,7 +906,7 @@
       '<div class="stats">' +
         stat("Sessions", stats.sessions, stats.deployments + " deployment" + (stats.deployments === 1 ? "" : "s"), sparkline(series.map(function (b) { return b.allowed + b.blocked; }))) +
         stat("Tool calls allowed", stats.toolsAllowed.toLocaleString(), "policy pass", sparkline(allowedByHour)) +
-        stat("Tool calls blocked", stats.toolsBlocked.toLocaleString(), pctBlocked + "% block rate", sparkline(blockedByHour, { color: "var(--danger-solid)", fill: "var(--danger-bg)" }), "blocks") +
+        stat("Tool calls blocked", stats.toolsBlocked.toLocaleString(), pctBlocked + "% block rate", sparkline(blockedByHour, { color: "var(--danger-solid)", fill: "var(--danger-bg)" }), "blocks", "#/sessions?status=blocked") +
         stat("LLM spend", "$" + stats.llmSpendUsd, "usage this window", sparkline(spendByHour)) +
         stat("Prevented losses", "$" + Number(stats.blockedSpendUsd).toLocaleString(), "kept from bad orders", sparkline(blockedValueCumulative, { color: "var(--success-solid)", fill: "var(--success-bg)" }), "savings") +
       "</div>" +
@@ -1070,13 +1070,16 @@
       });
     });
   }
-  function stat(label, value, delta, spark, cls) {
-    return '<div class="stat ' + (cls || "") + '">' +
+  function stat(label, value, delta, spark, cls, href) {
+    var inner =
       '<div class="head"><div class="label">' + esc(label) + "</div></div>" +
       '<div class="value">' + esc(value) + "</div>" +
       (delta ? '<div class="delta">' + esc(delta) + "</div>" : "") +
-      (spark || "") +
-      "</div>";
+      (spark || "");
+    // With an href the stat becomes a drill-down (e.g. blocked calls →
+    // the pre-filtered sessions list). Same box, same classes.
+    if (href) return '<a class="stat linked ' + (cls || "") + '" href="' + esc(href) + '" title="' + esc(label) + ' — view matching sessions">' + inner + "</a>";
+    return '<div class="stat ' + (cls || "") + '">' + inner + "</div>";
   }
   function pageHeader(title, sub, actions) {
     return '<div class="page-header"><div><h1>' + esc(title) + "</h1>" +
@@ -1089,6 +1092,40 @@
    * ============================================================ */
 
   var sessionsFilter = { q: "", deploymentId: "", agent: "", blockedOnly: false, sinceHours: 24 };
+
+  // The filter state lives in the URL (#/sessions?q=…&status=blocked&…)
+  // so a filtered view is shareable, survives reload, and the back
+  // button works. Render reads from the hash; filter widgets write to
+  // it (replaceState — tweaking a filter shouldn't spam history).
+  var SESSIONS_RANGES = [1, 24, 168, 720];
+  function readSessionsFilterFromHash() {
+    var p = {};
+    (location.hash.split("?")[1] || "").split("&").forEach(function (kv) {
+      var i = kv.indexOf("=");
+      if (i > 0) { try { p[kv.slice(0, i)] = decodeURIComponent(kv.slice(i + 1)); } catch (e) {} }
+    });
+    var range = parseInt(p.range, 10);
+    sessionsFilter = {
+      q: p.q || "",
+      deploymentId: p.dep || "",
+      agent: p.agent || "",
+      blockedOnly: p.status === "blocked",
+      sinceHours: SESSIONS_RANGES.indexOf(range) >= 0 ? range : 24,
+    };
+  }
+  function writeSessionsFilterToHash() {
+    var parts = [];
+    if (sessionsFilter.q) parts.push("q=" + encodeURIComponent(sessionsFilter.q));
+    if (sessionsFilter.blockedOnly) parts.push("status=blocked");
+    if (sessionsFilter.sinceHours !== 24) parts.push("range=" + sessionsFilter.sinceHours);
+    if (sessionsFilter.deploymentId) parts.push("dep=" + encodeURIComponent(sessionsFilter.deploymentId));
+    if (sessionsFilter.agent) parts.push("agent=" + encodeURIComponent(sessionsFilter.agent));
+    try { history.replaceState(null, "", "#/sessions" + (parts.length ? "?" + parts.join("&") : "")); } catch (e) {}
+  }
+  function sessionsFilterActive() {
+    return !!(sessionsFilter.q || sessionsFilter.deploymentId || sessionsFilter.agent ||
+      sessionsFilter.blockedOnly || sessionsFilter.sinceHours !== 24);
+  }
   var sessionsPageSize = 50;
   // Hard cap on DOM rows. At 1M sessions the API pages 50 at a time,
   // and "Load more" keeps appending. But we stop at 1000 rendered so
@@ -1099,7 +1136,14 @@
   var sessionsCursor = null;
 
   async function renderSessionsList(main) {
+    readSessionsFilterFromHash();
+    // If the user is mid-keystroke in the search box, a full innerHTML
+    // swap would destroy the input and eat their focus. Remember and
+    // restore it (cursor at the end) across the re-render.
+    var searchHadFocus = document.activeElement && document.activeElement.id === "fSearch";
+    var searchVal = searchHadFocus ? document.activeElement.value : null;
     main.innerHTML = pageHeader("Sessions", "Every agent session policed by AgentVisor.") + filterBar() + loadingBlock("table");
+    if (searchHadFocus) restoreSearchFocus(main, searchVal);
     var deps;
     try {
       deps = await state.ds.listDeployments();
@@ -1113,10 +1157,23 @@
     installFilters(main, deps);
     renderSessionsBody(main, deps);
   }
+  function restoreSearchFocus(root, val) {
+    var el = $("#fSearch", root);
+    if (!el) return;
+    // `val` carries text typed after the last committed filter (a live
+    // refresh can land mid-debounce) so keystrokes are never dropped.
+    if (val != null && val !== el.value) el.value = val;
+    el.focus();
+    var end = el.value.length;
+    try { el.setSelectionRange(end, end); } catch (e) {}
+  }
   function renderSessionsBody(main, deps) {
+    var searchHadFocus = document.activeElement && document.activeElement.id === "fSearch";
+    var searchVal = searchHadFocus ? document.activeElement.value : null;
     var body;
     if (sessionsLoaded.length === 0) {
-      body = emptyState("No sessions match your filters", "Try widening the date range or clearing the search.", null);
+      body = emptyState("No sessions match your filters", "Try widening the date range or clearing the search.",
+        sessionsFilterActive() ? "Clear filters" : null, null, "clearFilters");
     } else {
       body = '<div class="card" style="padding:0">' + sessionsTable(sessionsLoaded) + '</div>';
       if (sessionsCursor && sessionsLoaded.length < SESSIONS_DOM_CAP) {
@@ -1136,6 +1193,12 @@
       : "no sessions";
     main.innerHTML = pageHeader("Sessions", showingLabel) + filterBar() + body;
     installFilters(main, deps);
+    if (searchHadFocus) restoreSearchFocus(main, searchVal);
+    var clr = $("#clearFilters");
+    if (clr) clr.addEventListener("click", function () {
+      try { history.replaceState(null, "", "#/sessions"); } catch (e) {}
+      renderSessionsList(main);
+    });
     var lm = $("#loadMore");
     if (lm) {
       lm.addEventListener("click", async function () {
@@ -1173,16 +1236,17 @@
       "</div>";
   }
   function installFilters(root, deps) {
+    function apply() { writeSessionsFilterToHash(); renderSessionsList(root); }
     var fS = $("#fSearch", root);
     if (fS) {
       var timer;
       fS.addEventListener("input", function () {
         clearTimeout(timer);
-        timer = setTimeout(function () { sessionsFilter.q = fS.value.trim(); renderSessionsList(root); }, 220);
+        timer = setTimeout(function () { sessionsFilter.q = fS.value.trim(); apply(); }, 220);
       });
     }
     var fR = $("#fRange", root);
-    if (fR) fR.addEventListener("change", function () { sessionsFilter.sinceHours = parseInt(fR.value, 10); renderSessionsList(root); });
+    if (fR) fR.addEventListener("change", function () { sessionsFilter.sinceHours = parseInt(fR.value, 10); apply(); });
     var fD = $("#fDep", root);
     if (fD && deps) {
       deps.forEach(function (d) {
@@ -1191,7 +1255,7 @@
         if (sessionsFilter.deploymentId === d.id) o.selected = true;
         fD.appendChild(o);
       });
-      fD.addEventListener("change", function () { sessionsFilter.deploymentId = fD.value; renderSessionsList(root); });
+      fD.addEventListener("change", function () { sessionsFilter.deploymentId = fD.value; apply(); });
     }
     var fA = $("#fAgent", root);
     if (fA) {
@@ -1202,10 +1266,10 @@
         if (sessionsFilter.agent === a) o.selected = true;
         fA.appendChild(o);
       });
-      fA.addEventListener("change", function () { sessionsFilter.agent = fA.value; renderSessionsList(root); });
+      fA.addEventListener("change", function () { sessionsFilter.agent = fA.value; apply(); });
     }
     var fB = $("#fBlocked", root);
-    if (fB) fB.addEventListener("change", function () { sessionsFilter.blockedOnly = fB.checked; renderSessionsList(root); });
+    if (fB) fB.addEventListener("change", function () { sessionsFilter.blockedOnly = fB.checked; apply(); });
   }
 
   function sessionsTable(sessions) {
