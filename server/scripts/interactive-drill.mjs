@@ -323,6 +323,34 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await qPage.close();
   if (qErrs.length) fail("storage-quota fuzz: unguarded setItem crashed: " + qErrs.join("; "));
   console.log("✅ corrupted-storage fuzz: bad identity shapes + NaN t0 self-heal; quota-exhausted writes all guarded");
+  // Router fuzz: malformed and hostile hashes (broken percent
+  // escapes, XSS payloads in path/query, traversal, absurd lengths,
+  // __proto__/constructor ids) must render an error card or a safe
+  // page — never crash, never inject, always recoverable.
+  const hostile = [
+    "#/sessions/%%%",
+    "#/sessions/<img src=x onerror=window.__xss=1>",
+    "#/sessions?q=%22%3E%3Cimg%20src%3Dx%20onerror%3Dwindow.__xss%3D1%3E",
+    "#/sessions?q=" + "a".repeat(5000),
+    "#/../../../etc/passwd",
+    "#/settings/__proto__",
+    "#/policies/constructor",
+    "#/%00null",
+  ];
+  for (const hz of hostile) {
+    await page.evaluate((x) => { location.hash = x; }, hz);
+    await page.waitForTimeout(500);
+    const st = await page.evaluate(() => ({
+      alive: !!document.querySelector(".sidebar, .tabbar, .topbar"),
+      rendered: (document.getElementById("view")?.textContent || "").trim().length > 20,
+      injected: !!document.querySelector('#view img[src="x"]') || !!window.__xss,
+    }));
+    if (!st.alive || !st.rendered || st.injected) fail("router fuzz broke on " + hz.slice(0, 50) + ": " + JSON.stringify(st));
+    await page.evaluate(() => { location.hash = "#/overview"; });
+    await page.waitForTimeout(300);
+  }
+  await page.waitForFunction(() => document.querySelector(".stat"), { timeout: 10000 });
+  console.log("✅ router fuzz: 8 hostile hashes render safely, zero injection, app recovers");
 }
 
 // ── 10. Pagination under the big-data mode ─────────────────────────
