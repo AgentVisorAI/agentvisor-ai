@@ -582,7 +582,18 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     // SOC-2 evidence for tenant erasure comes from those logs.
     req.log.warn(
       {
-        event: "org.deleted",
+        // R97 F-A + R98 F3: distinct 'initiated' vs 'committed'
+        // slugs. Prior R97 shape used event: 'org.deleted' for
+        // BOTH the pre-tx and post-commit lines; log-aggregator
+        // rules index on the typed `event` field and don't parse
+        // the freeform pino msg, so successful deletes emitted
+        // TWO 'org.deleted' records (metrics doubled) and failed
+        // txs emitted ONE (alerts fired for a delete that never
+        // happened; SOC-2 evidence claimed a still-present org
+        // was erased). Now: 'org.delete.initiated' pre-tx,
+        // 'org.delete.committed' post-commit. Each slug means
+        // exactly what it says.
+        event: "org.delete.initiated",
         orgId: claims.orgId,
         userId: claims.sub,
         actorEmail: user.email,
@@ -610,11 +621,24 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       if (otherMemberships === 0) {
         await tx.user.delete({ where: { id: claims.sub } });
       }
+    }, {
+      // R98 F1: Prisma's default $transaction timeout is 5 s, which
+      // is not survivable for the whole-org cascade tree on any
+      // realistic tenant (a month of steady ingest = 100k+ events,
+      // a handful of deployments). Prior shape tripped P2028 and
+      // rolled back — org survived, user got a 500, but the R97
+      // F-A org_delete_initiated warn line was already durable in
+      // Datadog/Loki. SOC-2 evidence for tenant erasure asserted
+      // a delete that never happened → worse than nothing. Bump
+      // to 60 s (matches R95 F1 shape); maxWait 10 s prevents
+      // queue-storm 429s under contention.
+      timeout: 60_000,
+      maxWait: 10_000,
     });
 
     req.log.warn(
       {
-        event: "org.deleted",
+        event: "org.delete.committed",
         orgId: claims.orgId,
         userId: claims.sub,
         at: new Date().toISOString(),
@@ -639,20 +663,37 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     const body = z.object({ email: emailSchema }).safeParse(req.body);
     // Uniform response even on malformed input — no oracle for enumeration.
     if (!body.success) return reply.code(202).send({ ok: true });
-    const user = await db.user.findUnique({ where: { email: body.data.email } });
-    if (user) {
-      const plaintextToken = randomToken(32);
-      const resetTokenHash = await hashPassword(plaintextToken);
-      await db.user.update({
-        where: { id: user.id },
-        data: { resetTokenHash, resetTokenAt: new Date() },
-      });
-      // Build the reset link the user will click.
-      const resetLink = `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/reset?token=${encodeURIComponent(plaintextToken)}&email=${encodeURIComponent(user.email)}`;
-      // Send it. Uses whichever mailer driver is configured (Resend,
-      // SMTP, or dev-stub). We never log the token itself — only the
-      // driver + message id — so a log leak can't lead to account takeover.
+    // R98 F2: return 202 IMMEDIATELY, then run the expensive
+    // work (findUnique + argon2 hashPassword + user.update +
+    // mail.send RTT) in a detached async block. Prior shape
+    // awaited the whole chain on the existing-user branch
+    // (~200-2000 ms) but not on the missing-user branch (~5-20
+    // ms), giving a wall-clock enumeration oracle that
+    // trivially defeated the perIp(3, 1h) rate limit via
+    // residential-proxy rotation. Sibling /signup at line 151
+    // already documents this exact pattern for welcome-email
+    // send. UX cost: the 202 fires before the mail actually
+    // lands in the target inbox, but that's already true from
+    // the user's perspective (Resend/SMTP take seconds), and
+    // the previous await didn't guarantee delivery either
+    // (the mailer try/catch swallowed failures).
+    const emailAddr = body.data.email;
+    void (async () => {
       try {
+        const user = await db.user.findUnique({ where: { email: emailAddr } });
+        if (!user) return;
+        const plaintextToken = randomToken(32);
+        const resetTokenHash = await hashPassword(plaintextToken);
+        await db.user.update({
+          where: { id: user.id },
+          data: { resetTokenHash, resetTokenAt: new Date() },
+        });
+        // Build the reset link the user will click.
+        const resetLink = `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/reset?token=${encodeURIComponent(plaintextToken)}&email=${encodeURIComponent(user.email)}`;
+        // Send it. Uses whichever mailer driver is configured
+        // (Resend, SMTP, or dev-stub). We never log the token
+        // itself — only the driver + message id — so a log
+        // leak can't lead to account takeover.
         const mail = getMailer(req.log);
         const template = passwordResetMail(resetLink);
         const result = await mail.send({
@@ -666,14 +707,12 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
           "password_reset_email_sent",
         );
       } catch (err) {
-        // Log — but still return 202 to the caller so we don't leak
-        // whether the email exists. Ops can investigate via the log.
         req.log.error(
-          { err, userId: user.id },
-          "password_reset_email_failed",
+          { err },
+          "password_reset_deferred_failed",
         );
       }
-    }
+    })();
     return reply.code(202).send({ ok: true });
   });
 
