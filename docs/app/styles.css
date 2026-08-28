@@ -772,6 +772,7 @@ td, th { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 th.act-1 { width: 110px; }
 th.act-2 { width: 180px; }
 th.act-3 { width: 264px; }
+th.act-4 { width: 376px; }
 /* Sortable column headers: the whole label is a button. Inherits the
    th typography so sortable and plain headers read identically. */
 th .th-sort {
