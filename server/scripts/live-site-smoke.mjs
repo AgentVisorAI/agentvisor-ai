@@ -122,5 +122,54 @@ const pillText = (await anyPill.first().innerText()).toLowerCase();
 if (!/(live|demo)/.test(pillText)) fail("pill text: " + pillText);
 console.log("✅ Environment pill present: " + pillText);
 
+// 8. Link + media integrity across the static pages: every internal
+// link resolves, every same-page anchor target exists, external
+// _blank links carry noopener, and both pitch videos load with a
+// parsed captions track. (/api/ is assembled by the Pages workflow,
+// so it only exists on the deployed site — skipped on localhost.)
+{
+  const origin = new URL(SITE).origin + "/";
+  const isLocal = /localhost|127\.0\.0\.1/.test(origin);
+  const problems = [];
+  for (const p of ["", "pitch/", "verify/"]) {
+    await page.goto(origin + p, { waitUntil: "domcontentloaded" });
+    await wait(500);
+    const links = await page.evaluate(() => [...document.querySelectorAll("a[href]")].map((a) => ({
+      href: a.getAttribute("href"), target: a.getAttribute("target"), rel: a.getAttribute("rel") || "", text: a.textContent.trim().slice(0, 30),
+    })));
+    const ids = await page.evaluate(() => [...document.querySelectorAll("[id]")].map((e) => e.id));
+    for (const l of links) {
+      if (!l.href || l.href.startsWith("mailto:")) continue;
+      if (l.href.startsWith("#")) {
+        if (l.href.length > 1 && !ids.includes(l.href.slice(1))) problems.push(`/${p}: dead anchor ${l.href}`);
+        continue;
+      }
+      if (/^https?:\/\//.test(l.href)) {
+        if (l.target === "_blank" && !/noopener/.test(l.rel)) problems.push(`/${p}: _blank without noopener: ${l.href}`);
+        continue;
+      }
+      if (isLocal && /^\.?\/?api\//.test(l.href)) continue;
+      const clean = new URL(l.href, origin + p).href.split("#")[0];
+      const st = await page.evaluate(async (u) => { try { return (await fetch(u)).status; } catch { return 0; } }, clean);
+      if (st !== 200) problems.push(`/${p}: ${l.href} -> HTTP ${st} ('${l.text}')`);
+    }
+  }
+  await page.goto(origin + "pitch/", { waitUntil: "domcontentloaded" });
+  await wait(800);
+  const media = await page.evaluate(async () => {
+    const out = [];
+    for (const v of document.querySelectorAll("video")) {
+      const t = v.textTracks[0];
+      if (t) t.mode = "hidden"; // force cue load
+      await new Promise((r) => setTimeout(r, 400));
+      out.push({ tracks: v.textTracks.length, cues: t && t.cues ? t.cues.length : 0 });
+    }
+    return out;
+  });
+  for (const m of media) if (!m.tracks || !m.cues) problems.push("pitch video captions missing/unparsed: " + JSON.stringify(m));
+  if (problems.length) fail("link/media integrity:\n  " + problems.join("\n  "));
+  console.log("✅ Link + media integrity: all internal links resolve, anchors exist, videos have parsed captions");
+}
+
 await browser.close();
-console.log("\nLive site smoke passed (7 checks against " + SITE + ").");
+console.log("\nLive site smoke passed (8 checks against " + SITE + ").");
