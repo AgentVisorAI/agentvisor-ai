@@ -81,6 +81,24 @@ class Bus extends EventEmitter {
       if (Buffer.byteLength(payload) > MAX_PAYLOAD_BYTES) {
         // Skip cross-instance for oversized payloads; local delivery
         // already succeeded so the origin tenant still sees the update.
+        //
+        // R132 F3: prior shape returned silently — no metric, no log,
+        // no signal. The originator sees local delivery succeed and
+        // moves on, so the drop stays invisible until a debugging
+        // session correlates "tab on instance A didn't see the event
+        // instance B fired." EventPayload shapes are 200-400 bytes
+        // today so this is unreachable in practice, but if a field
+        // grows (agent 80 + externalId 128 + a longer session URL
+        // + deployment name is not far off), cross-instance delivery
+        // starts silently failing on a rolling basis with zero
+        // telemetry. Emit a warn so ops has the signal.
+        // eslint-disable-next-line no-console
+        console.warn("bus: oversized payload dropped for cross-instance fanout", {
+          type: ev.type,
+          orgId: ev.orgId,
+          bytes: Buffer.byteLength(payload),
+          limit: MAX_PAYLOAD_BYTES,
+        });
         return;
       }
       this.pgPublisher
