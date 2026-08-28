@@ -173,11 +173,22 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
   // userinfo, then upsert the user + org and mint our own session
   // cookie.
   app.get("/:provider/callback", async (req, reply) => {
+    // R122 F2: OAuth callback is a top-level browser navigation
+    // (the IdP redirects the user-agent to this GET). Every
+    // reply.code(4xx).send({error}) below rendered as raw JSON
+    // in an otherwise-blank tab — dead-end UX. Sibling of the
+    // R121 F2 mfa-required refusal; convert all errors to
+    // redirects so the SPA .auth-note banner surfaces a
+    // friendly explanation. Log lines preserve forensic detail.
+    const errRedirect = (slug: string) =>
+      reply.redirect(
+        `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/login?err=${slug}`,
+      );
     const params = z
       .object({ provider: z.enum(["google", "microsoft"]) })
       .safeParse(req.params);
     if (!params.success) {
-      return reply.code(404).send({ error: "provider_not_found" });
+      return errRedirect("oauth_provider_not_found");
     }
     // R95 F4: signed cookies arrive via req.cookies as-is; use
     // req.unsignCookie to verify + strip the HMAC. On tamper the
@@ -186,11 +197,11 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
     // 'forged cookie'.
     const stateRawSigned = req.cookies[OAUTH_STATE_COOKIE];
     if (!stateRawSigned) {
-      return reply.code(400).send({ error: "missing_state_cookie" });
+      return errRedirect("oauth_missing_state_cookie");
     }
     const unsigned = req.unsignCookie(stateRawSigned);
     if (!unsigned.valid || unsigned.value == null) {
-      return reply.code(400).send({ error: "missing_state_cookie" });
+      return errRedirect("oauth_missing_state_cookie");
     }
     const stateRaw = unsigned.value;
     let stateBag: {
@@ -202,16 +213,16 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
     try {
       stateBag = JSON.parse(stateRaw);
     } catch {
-      return reply.code(400).send({ error: "malformed_state_cookie" });
+      return errRedirect("oauth_malformed_state_cookie");
     }
     if (stateBag.provider !== params.data.provider) {
-      return reply.code(400).send({ error: "provider_mismatch" });
+      return errRedirect("oauth_provider_mismatch");
     }
 
     const providers = providerConfigs();
     const p = providers.find((x) => x.id === params.data.provider);
     if (!p) {
-      return reply.code(404).send({ error: "provider_not_configured" });
+      return errRedirect("oauth_provider_not_configured");
     }
     const cfg = await getConfig(p);
 
@@ -240,7 +251,7 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
       });
     } catch (err) {
       req.log.warn({ err }, "oauth_code_exchange_failed");
-      return reply.code(400).send({ error: "oauth_exchange_failed" });
+      return errRedirect("oauth_exchange_failed");
     }
 
     // id_token claims give us email + name without a second round-trip.
@@ -263,14 +274,14 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
     const displayName = typeof claims?.name === "string" ? claims.name : null;
 
     if (!email) {
-      return reply.code(400).send({ error: "no_email_in_id_token" });
+      return errRedirect("oauth_no_email_in_id_token");
     }
     // Refuse unverified emails — otherwise an attacker who controls
     // an SMTP server can register with someone else's address.
     // Google always sets email_verified=true; Microsoft may not for
     // MSA accounts.
     if (!emailVerified) {
-      return reply.code(403).send({ error: "email_not_verified" });
+      return errRedirect("oauth_email_not_verified");
     }
 
     // Upsert. Email owns the account.
@@ -315,8 +326,9 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
     const membership = user.memberships[0];
     if (!membership) {
       // Shouldn't happen — every user has at least one membership by
-      // construction. Fail loudly rather than mint a partial session.
-      return reply.code(500).send({ error: "no_membership" });
+      // construction. R122 F2: redirect for browser-UX consistency
+      // (top-level nav, sibling of the other errors above).
+      return errRedirect("oauth_no_membership");
     }
     // R120 F2 (resolves the R110 F4 deferred item): OAuth login
     // MUST NOT bypass the WebAuthn MFA gate that /login enforces
@@ -351,16 +363,9 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
         },
         req.log,
       );
-      // R121 F2: OAuth callback is a top-level browser
-      // navigation, so a bare `reply.code(403).send({...})`
-      // renders as raw JSON in an otherwise-blank tab — a dead
-      // end for every passkey-enrolled user who tries SSO. The
-      // success path at the bottom uses reply.redirect, so
-      // mirror it here: redirect to /#/login?err=... where the
-      // SPA renders a friendly banner explaining the fallback.
-      return reply.redirect(
-        `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/login?err=mfa_required_use_password_login`,
-      );
+      // R121 F2 / R122 F2: use the shared errRedirect helper for
+      // consistency with the other callback error exits.
+      return errRedirect("mfa_required_use_password_login");
     }
     const token = await mintSession({
       sub: user.id,
