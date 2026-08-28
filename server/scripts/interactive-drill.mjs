@@ -678,6 +678,28 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await page.waitForTimeout(200);
   if (endAct !== "signout" || wrapAct !== "shortcuts") fail("account menu keyboard contract broken: End=" + endAct + " wrap=" + wrapAct);
   console.log("✅ reduced-motion kill-switch total; account menu End/wrap keyboard contract");
+  // Shortcut guards: with a modal open, g-nav must not navigate (the
+  // hashchange would destroy the open dialog mid-form), "?" must not
+  // stack the sheet, and "/" must not steal focus out of the trap.
+  await page.evaluate(() => { location.hash = "#/policies"; });
+  await page.waitForSelector("#addPol", { timeout: 10000 });
+  await page.click("#addPol");
+  await page.waitForSelector(".modal-backdrop", { timeout: 3000 });
+  await page.keyboard.press("g");
+  await page.keyboard.press("s");
+  await page.waitForTimeout(400);
+  const kb = await page.evaluate(() => ({ hash: location.hash, modal: !!document.querySelector(".modal-backdrop") }));
+  if (kb.hash !== "#/policies" || !kb.modal) fail("g-nav fired through an open modal: " + JSON.stringify(kb));
+  await page.keyboard.press("?");
+  await page.waitForTimeout(250);
+  if ((await page.evaluate(() => document.querySelectorAll(".modal-backdrop").length)) !== 1) fail("? stacked the sheet over an open modal");
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(300);
+  await page.keyboard.press("g");
+  await page.keyboard.press("s");
+  await page.waitForTimeout(500);
+  if ((await page.evaluate(() => location.hash)) !== "#/sessions") fail("g-nav dead after modal close");
+  console.log("✅ shortcut guards: g-nav / ? / focus-steal all blocked while a dialog is open, restored after");
 }
 
 // ── 16. Tactile polish ─────────────────────────────────────────────
