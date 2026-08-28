@@ -214,14 +214,21 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
     }
     const cfg = await getConfig(p);
 
-    // openid-client expects the full callback URL to parse the code +
-    // state out of the query string. We reconstruct from req.protocol
-    // (which is X-Forwarded-Proto-aware thanks to trustProxy) + host.
-    const proto = req.headers["x-forwarded-proto"] ?? (env.NODE_ENV === "production" ? "https" : "http");
-    const currentUrl = new URL(
-      req.url,
-      `${Array.isArray(proto) ? proto[0] : proto}://${req.headers.host}`,
-    );
+    // R97 F-D: reconstruct the callback URL from APP_BASE_URL,
+    // not from raw request headers. Prior shape read
+    // `req.headers['x-forwarded-proto']` and `req.headers.host`
+    // directly — the XFP header can legitimately arrive
+    // comma-joined ('https, http') on a multi-hop stack, which
+    // makes `new URL(req.url, 'https, http://host')` throw
+    // TypeError → uncaught 500. It also bypasses R96 F1's
+    // TRUSTED_PROXY_HOP_COUNT gate: even in dev with
+    // hopCount=0, a caller-supplied XFP flowed through
+    // untrusted. APP_BASE_URL is the same source that the
+    // /start endpoint's redirect_uri contract is anchored to
+    // (line 140), so the IdP's `redirect_uri` check requires
+    // this exact host anyway — no external-header dependency.
+    const base = env.APP_BASE_URL.replace(/\/$/, "");
+    const currentUrl = new URL(req.url, base);
 
     let tokens;
     try {
