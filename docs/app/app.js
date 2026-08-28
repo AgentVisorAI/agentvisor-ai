@@ -3340,7 +3340,11 @@
             '<div style="margin-top:12px"><div style="font-size:12px;color:var(--fg-2);margin-bottom:4px">Events</div>' +
               '<div style="display:flex;flex-wrap:wrap;gap:6px" id="whEventsPicker">' +
                 events.map(function (ev) {
-                  return '<label class="pill neutral" style="cursor:pointer;user-select:none"><input type="checkbox" value="' + esc(ev) + '" style="margin-right:6px">' + esc(ev) + '</label>';
+                  // policy.block pre-checked: it's why people add a
+                  // webhook, and an all-unchecked picker made the only
+                  // path to success a validation error.
+                  var checked = ev === "policy.block" ? " checked" : "";
+                  return '<label class="pill neutral" style="cursor:pointer;user-select:none"><input type="checkbox" value="' + esc(ev) + '"' + checked + ' style="margin-right:6px">' + esc(ev) + '</label>';
                 }).join("") +
               '</div>' +
             '</div>' +
@@ -3352,9 +3356,20 @@
         '</div>',
       );
       document.body.appendChild(backdrop);
-      installModalKeys(backdrop);
-      backdrop.querySelectorAll("[data-close]").forEach(function (b) { b.addEventListener("click", function () { backdrop.remove(); }); });
-      backdrop.addEventListener("click", function (e) { if (e.target === backdrop) backdrop.remove(); });
+      // The standard modal contract: a real close() that also
+      // uninstalls the document-level key handler. This modal used to
+      // call installModalKeys(backdrop) with NO close callback —
+      // Escape inside it threw ("close is not a function"), and the
+      // leaked keydown listener made every later Escape anywhere in
+      // the app throw too.
+      var uninstallWh;
+      function closeWh() {
+        backdrop.remove();
+        if (uninstallWh) uninstallWh();
+      }
+      uninstallWh = installModalKeys(backdrop, closeWh);
+      backdrop.querySelectorAll("[data-close]").forEach(function (b) { b.addEventListener("click", closeWh); });
+      backdrop.addEventListener("click", function (e) { if (e.target === backdrop) closeWh(); });
       on($("#whSave", backdrop), "click", async function () {
         var name = $("#whName", backdrop).value.trim();
         var url = $("#whUrl", backdrop).value.trim();
@@ -3363,7 +3378,7 @@
         if (!events.length) { toast("Pick at least one event"); return; }
         try {
           var res = await state.ds.createWebhook({ name: name, url: url, events: events });
-          backdrop.remove();
+          closeWh();
           showTokenModal(res.secret, "Webhook secret");
           await renderSettingsWebhooks(root);
         } catch (e) {
