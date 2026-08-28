@@ -12,7 +12,7 @@
  *   auth.login, auth.logout, auth.signup
  *   auth.reset_request, auth.reset_confirm, auth.account_deleted
  *   saml.signin, saml.config_created, saml.config_updated,
- *     saml.config_deleted, saml.keypair_regenerated
+ *     saml.config_deleted, saml.keypair_rotated
  *   deployment.create, deployment.delete, deployment.token_rotated
  *   member.invited, member.role_changed
  *
