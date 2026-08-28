@@ -4,7 +4,6 @@ import formbody from "@fastify/formbody";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
 import Fastify from "fastify";
-import crypto from "node:crypto";
 import { db } from "./db.js";
 import { env } from "./env.js";
 import { bus } from "./lib/bus.js";
@@ -167,30 +166,28 @@ async function main(): Promise<void> {
         /^\/api\/v1\/auth\/saml\/[^/]+\/(acs|slo|metadata\.xml|login)/.test(u);
     },
     keyGenerator: (req) => {
-      // R93 F1: `authenticate` runs as a preHandler; @fastify/rate-limit
-      // invokes keyGenerator in onRequest. `req.session` was ALWAYS
-      // undefined here, so every request keyed on req.ip regardless of
-      // the (stated) intent to key per-user. That silently made every
-      // corp-NAT/CGNAT tenant share ONE bucket — well-behaved users
-      // hit 429s alongside a single abuser, and a single hostile user
-      // rotating IPv6 privacy addresses had infinite per-user quota.
-      // Fix without moving hook order (which would touch every other
-      // route's expectations): derive a stable bucket key from the
-      // session cookie or API-key header ourselves, pre-auth. We
-      // don't verify the JWT here (async verify + secret access is
-      // too heavy for every request); the opaque cookie's sha256 is
-      // enough for stable per-user bucketing because a stolen cookie
-      // is per-user by definition. Same for API-key Authorization
-      // headers.
-      const cookieHdr = req.headers.cookie ?? "";
-      const m = /(?:^|;\s*)av_session=([^;]+)/.exec(cookieHdr);
-      if (m) {
-        return "s:" + crypto.createHash("sha256").update(m[1]!).digest("hex").slice(0, 16);
-      }
-      const auth = req.headers.authorization ?? "";
-      if (typeof auth === "string" && auth.startsWith("Bearer ")) {
-        return "a:" + crypto.createHash("sha256").update(auth.slice(7)).digest("hex").slice(0, 16);
-      }
+      // R93 F1 + R100 F1: bucket the global 300 rpm cap on IP,
+      // period. Prior R93 shape derived the key from sha256 of
+      // the raw av_session cookie value or Authorization token,
+      // pre-auth, without validating anything. An attacker could
+      // plant a fresh RANDOM cookie value per request → fresh
+      // bucket per request → the entire global backstop was
+      // bypassed. Unauth endpoints (/oauth/start,
+      // /webauthn/authenticate/challenge, /read/* rejects) had
+      // NO rate cap at all under this attack.
+      //
+      // Per-route perIp() overrides at /login, /signup,
+      // /reset-request, /webauthn/authenticate/*, etc. already
+      // handle credential-stuffing correctly (they get their
+      // own bucket that ignores keyGenerator). The R93 concern
+      // about corp-NAT shared bucket punishment is genuine but
+      // it's the LESSER evil compared to a completely bypassed
+      // global cap — and it's what per-route perIp() budgets
+      // already correctly grant per-authenticated-user quota.
+      //
+      // Prefix keeps this key-space disjoint from any route-
+      // local perIp() bucket names (which use their own
+      // keyGenerator).
       return "ip:" + req.ip;
     },
   });
