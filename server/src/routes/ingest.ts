@@ -645,26 +645,45 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       });
       return reply.send({ ok: true });
     } else {
-      await db.receipt.create({
-        data: {
-          sessionId: session.id,
-          receiptId: r.receiptId,
-          body: r.body,
-          sigB64: r.sigB64,
-          keyIdHint: r.keyIdHex.slice(0, 8),
-          eventCount: r.eventCount,
-          issuedAt: r.issuedAt,
-        },
+      // R120 F1: receipt.create + session.update MUST be atomic.
+      // Prior shape was two independent DB round trips with no
+      // $transaction wrapping. If the process died between them
+      // (P1001 connection lost, P2024 pool timeout, statement
+      // timeout, container SIGTERM during rolling deploy) or the
+      // second call threw, the receipt row would commit but the
+      // session would stay status="live" with stopReason=null.
+      // On the daemon's next retry, the byte-exact check at line
+      // ~590 would match the committed receipt → return idempotent
+      // 200 at line 646 WITHOUT re-running session.update, leaving
+      // the session permanently "live" with a fully-signed receipt.
+      // Downstream: POST /ingest/events (line ~332) only rejects on
+      // status==="sealed" so a "live" session accepts arbitrary
+      // post-seal events, drifting session.promptTokens /
+      // costUsdMicros away from the signed receipt.body's totals —
+      // compliance defect. Same class as R94 F1 (events tx) and
+      // R93 F4 / R118 F2 / R119 F2 (post-seal defacement).
+      await db.$transaction(async (tx) => {
+        await tx.receipt.create({
+          data: {
+            sessionId: session.id,
+            receiptId: r.receiptId,
+            body: r.body,
+            sigB64: r.sigB64,
+            keyIdHint: r.keyIdHex.slice(0, 8),
+            eventCount: r.eventCount,
+            issuedAt: r.issuedAt,
+          },
+        });
+        await tx.session.update({
+          where: { id: session.id },
+          data: {
+            status: "sealed",
+            stopReasonId: r.stopReasonId,
+            stopReason: r.stopReason,
+          },
+        });
       });
     }
-    await db.session.update({
-      where: { id: session.id },
-      data: {
-        status: "sealed",
-        stopReasonId: r.stopReasonId,
-        stopReason: r.stopReason,
-      },
-    });
     bus.publish({
       type: "receipt.finalized",
       orgId: daemon.orgId,
