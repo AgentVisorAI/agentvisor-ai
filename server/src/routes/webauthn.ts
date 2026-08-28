@@ -614,6 +614,29 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
       where: { id: cred.id },
       data: { label: body.data.label },
     });
+    // R112 F1: audit the relabel. Every other WebAuthn state
+    // change in this module calls writeAudit — /register/verify,
+    // DELETE /credentials/:id. The label-rename path did not,
+    // leaving a compliance/forensics gap: an owner scanning
+    // the trail can't see either the rename or the timeframe of
+    // a suspected passkey-confusion attack (attacker with a
+    // stolen cookie renames their own key to mimic the victim's
+    // existing label, then uses it — nothing to cross-reference
+    // with subsequent mfa.authenticate rows).
+    writeAudit(
+      {
+        orgId: claims.orgId,
+        event: "mfa.credential_relabeled",
+        actorId: claims.sub,
+        target: updated.label,
+        metadata: {
+          credentialId: updated.id,
+          previousLabel: cred.label,
+        },
+        req,
+      },
+      req.log,
+    );
     return reply.send({ credential: { id: updated.id, label: updated.label } });
   });
 

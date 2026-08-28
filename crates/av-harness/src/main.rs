@@ -1013,6 +1013,35 @@ fn load_sandbox(config: &HarnessConfig) -> Result<Sandbox> {
             WasmPolicy::from_bytes(path, &bytes).map_err(anyhow::Error::msg)?,
         ));
     }
+    // R112 F2: refuse to boot when `wasm_policy_paths = []` is
+    // explicit AND no tool-schema fail-closed guard is on. Prior
+    // shape silently accepted an empty policy chain: the
+    // Sandbox::check_with_principal for-loop over policies became
+    // a no-op → Gate 3 (policy check) disabled → combined with
+    // the default require_tool_schema=false → Gate 2 (tool schema
+    // check) also disabled → the daemon accepts arbitrary tool
+    // calls under a receipt that still claims policiesEnforced,
+    // silently defeating the compliance attestation. Compare
+    // require_tool_schema at line 964 which correctly warns on
+    // fail-closed; this branch needs a symmetric guard. Warn
+    // loudly on empty; hard-fail if BOTH gates are off (the
+    // catastrophic case).
+    if policies.is_empty() {
+        if !config.require_tool_schema {
+            anyhow::bail!(
+                "wasm_policy_paths is empty AND require_tool_schema is false; \
+                 refusing to boot with both Gate 3 (policy) and Gate 2 (schema) \
+                 disabled — receipts would attest 'policiesEnforced' while the \
+                 daemon accepted arbitrary tool calls. Set at least one \
+                 wasm_policy_path or set require_tool_schema=true."
+            );
+        }
+        tracing::warn!(
+            "wasm_policy_paths is empty; policy gate disabled — every tool \
+             call bypasses Gate 3. Only require_tool_schema fail-closed \
+             (Gate 2) remains active"
+        );
+    }
     Sandbox::new(
         SandboxConfig {
             schemas,

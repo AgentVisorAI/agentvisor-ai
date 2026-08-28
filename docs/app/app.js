@@ -2287,9 +2287,9 @@
     main.innerHTML =
       pageHeader(d.name, d.environment + " · " + (d.region || ""), '<a href="' + esc(backToListUrl("deployments")) + '" class="btn">← All deployments</a>') +
       '<div class="dep-summary">' +
-        depCell("Status", statusPill) +
+        depCell("Status", statusPill, false, true) +
         depCell("Version", d.version || "—", true) +
-        depCell("Last seen", timeAgoCell(d.lastSeenAt)) +
+        depCell("Last seen", timeAgoCell(d.lastSeenAt), false, true) +
         depCell("Sessions (24h)", d.sessions24h != null ? d.sessions24h : "—") +
         depCell("Spend (24h)", d.spend24h || "—") +
       "</div>" +
@@ -2354,8 +2354,22 @@
       });
     });
   }
-  function depCell(label, value, mono) {
-    return '<div class="cell"><div class="label">' + esc(label) + '</div><div class="value' + (mono ? " mono" : "") + '">' + value + "</div></div>";
+  function depCell(label, value, mono, trustedHtml) {
+    // R112 F4: escape `value` by default. Prior shape spliced
+    // `value` raw into innerHTML while `label` was escaped —
+    // asymmetric contract that the sibling helpers cell() and
+    // stat() already respected. Today's call sites are safe
+    // (all raw-string callers pass server-provided '—' or a
+    // number toLocaleString'd) but any future migration adding
+    // a daemon-supplied string to the deployment detail JSON
+    // would land daemon-controlled bytes in innerHTML — the
+    // daemon is customer code, so this is one refactor away
+    // from stored-XSS-per-viewer. Callers that legitimately
+    // pass pre-built HTML (statusPill, timeAgoCell,
+    // enabled/disabled pill) opt into the trusted path via
+    // the fourth parameter.
+    var rendered = trustedHtml ? value : esc(value == null ? "" : String(value));
+    return '<div class="cell"><div class="label">' + esc(label) + '</div><div class="value' + (mono ? " mono" : "") + '">' + rendered + "</div></div>";
   }
 
   function openCreateDeploymentModal() {
@@ -2684,10 +2698,10 @@
     main.innerHTML =
       pageHeader(p.name, p.kind + " · " + p.scope, '<a href="' + esc(backToListUrl("policies")) + '" class="btn">← All policies</a> <button class="switch ' + switchCls + '" id="polSwitch" title="Toggle enabled" aria-label="Toggle policy enabled" role="switch" aria-checked="' + (p.enabled ? "true" : "false") + '"></button>') +
       '<div class="dep-summary">' +
-        depCell("Status", p.enabled ? '<span class="pill ok status-dot">enabled</span>' : '<span class="pill neutral">disabled</span>') +
+        depCell("Status", p.enabled ? '<span class="pill ok status-dot">enabled</span>' : '<span class="pill neutral">disabled</span>', false, true) +
         depCell("Hits (24h)", p.hits24h.toLocaleString()) +
-        depCell("Blocks (24h)", blocks24 > 0 ? '<span style="color: var(--danger-solid)">' + blocks24 + "</span>" : blocks24) +
-        depCell("Updated", timeAgoCell(p.updatedAt)) +
+        depCell("Blocks (24h)", blocks24 > 0 ? '<span style="color: var(--danger-solid)">' + blocks24 + "</span>" : blocks24, false, true) +
+        depCell("Updated", timeAgoCell(p.updatedAt), false, true) +
       "</div>" +
       '<div class="card"><h2>Description</h2><p style="margin:0;color:var(--fg-2);font-size:var(--t-body)">' + esc(p.description) + '</p></div>' +
       '<div class="card" style="margin-top:12px"><h2>Definition</h2><pre class="policy-body">' + syntaxPolicy(p.body) + "</pre></div>" +

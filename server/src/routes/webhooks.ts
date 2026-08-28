@@ -12,6 +12,10 @@
  *   POST   /:id/redeliver/:deliveryId
  *                       retry a delivery immediately (bypass sweeper)
  *   POST   /:id/test    fire a test event through the full pipeline
+ *   POST   /:id/rotate-secret
+ *                       mint a new HMAC signing secret. Returns the
+ *                       plaintext ONE TIME. Old secret invalidated
+ *                       atomically — receiving service must swap.
  *
  * All routes are RBAC-gated: owners + admins only. Members: 403.
  */
@@ -356,6 +360,52 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
         req.log,
       );
       return reply.send({ ok: true });
+    },
+  );
+
+  // R112 F3: rotate the HMAC signing secret in place. Prior state:
+  // WebhookEndpoint.secret was minted once at create and was
+  // unrecoverable and immutable via the API. If a consumer's
+  // secret store was compromised (Slack/PagerDuty side, CI log
+  // leak, backup export), the ONLY remediation was DELETE +
+  // recreate — the new endpoint got a new id and URL binding,
+  // breaking every downstream integration referring to the old
+  // endpoint and losing WebhookDelivery history. Meanwhile
+  // attackers could continue forging X-AgentVisor-Signature
+  // payloads against consumers until the endpoint was destroyed.
+  // Compare the sibling deployment token which correctly exposes
+  // POST /:id/rotate-token. This adds the analog for webhooks:
+  // owner/admin only, atomic secret swap, plaintext returned
+  // exactly once, audited.
+  app.post<{ Params: { id: string } }>(
+    "/:id/rotate-secret",
+    async (req, reply) => {
+      const claims = requireSession(req, reply);
+      if (!claims) return;
+      if (!assertNotMember(claims)) {
+        return reply.code(403).send({ error: "forbidden" });
+      }
+      const ep = await db.webhookEndpoint.findFirst({
+        where: { id: req.params.id, orgId: claims.orgId },
+      });
+      if (!ep) return reply.code(404).send({ error: "not_found" });
+      const newSecret = generateWebhookSecret();
+      await db.webhookEndpoint.update({
+        where: { id: ep.id },
+        data: { secret: newSecret },
+      });
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "webhook.secret_rotated",
+          actorId: claims.sub,
+          target: ep.name,
+          metadata: { endpointId: ep.id },
+          req,
+        },
+        req.log,
+      );
+      return reply.send({ secret: newSecret });
     },
   );
 }
