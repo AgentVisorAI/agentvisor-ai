@@ -964,6 +964,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 .event-drawer .meta dt { color: var(--fg-3); }
 .event-drawer .meta dd { margin: 0; color: var(--fg); }
+.event-drawer .evt-link-btn { font-size: 11px; padding: 3px 8px; }
 .event-drawer .payload {
   background: var(--code-bg);
   color: var(--code-fg);
