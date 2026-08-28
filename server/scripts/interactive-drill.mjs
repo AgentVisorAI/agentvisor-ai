@@ -297,7 +297,26 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ corrupted-storage fuzz: bad identity shapes + NaN t0 all self-heal");
 }
 
-// ── 10. Listener-leak soak ─────────────────────────────────────────
+// ── 10. Pagination under the big-data mode ─────────────────────────
+// The 32-session fixture fits one page, so Load more / cursor
+// paging / sort-across-pages only execute with av_mock_bigdata on.
+// This shipped untested once; keep it exercised.
+{
+  await page.evaluate(() => { localStorage.setItem("av_mock_bigdata", "1"); location.hash = "#/sessions?range=720"; });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => document.querySelectorAll("tr[data-clickable]").length === 50 && !!document.getElementById("loadMore"), { timeout: 15000 });
+  await page.click("#loadMore");
+  await page.waitForFunction(() => document.querySelectorAll("tr[data-clickable]").length === 100, { timeout: 10000 });
+  await page.click('.th-sort[data-sort="cost"]');
+  await page.waitForFunction(() => {
+    const c = [...document.querySelectorAll("tbody tr")].map((r) => parseFloat(r.cells[5].textContent.replace(/[^0-9.]/g, "")));
+    return c.length === 100 && c.every((v, i) => !i || v <= c[i - 1] + 1e-9);
+  }, { timeout: 10000 });
+  await page.evaluate(() => localStorage.removeItem("av_mock_bigdata"));
+  console.log("✅ pagination: 50 → Load more → 100, sort re-sorts the loaded set");
+}
+
+// ── 11. Listener-leak soak ─────────────────────────────────────────
 // Every earlier check opened modals, ran the tour, refreshed the
 // overview, and re-rendered lists dozens of times. If any of that
 // leaked document/window listeners (the webhook modal once leaked a
@@ -323,4 +342,4 @@ if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors))
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 11 interactive-features drill checks passed.");
+console.log("\nAll 12 interactive-features drill checks passed.");
