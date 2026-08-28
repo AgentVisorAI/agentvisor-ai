@@ -4635,9 +4635,21 @@
     function close() {
       cmdkOpen_ = false;
       window.removeEventListener("hashchange", close);
+      document.removeEventListener("keydown", onGlobalEsc, true);
       backdrop.remove();
       document.body.classList.remove("locked");
     }
+    // Escape must close the palette even before the input's deferred
+    // autofocus lands (the input-level handler misses that window: a
+    // fast ⌘K→Esc left the backdrop up and ⌘K blocked). Capture-phase
+    // so an Escape typed anywhere while the palette is up closes it.
+    function onGlobalEsc(e) {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      e.stopPropagation();
+      close();
+    }
+    document.addEventListener("keydown", onGlobalEsc, true);
     function run(it) {
       if (!it) return;
       if (it.href) { close(); navigate(it.href); }
