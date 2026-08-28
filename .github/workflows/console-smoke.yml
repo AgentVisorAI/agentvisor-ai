@@ -48,7 +48,11 @@ jobs:
     # the old bits.
     if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name != 'workflow_run' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    # 22 min: the nightly/dispatch path additionally installs WebKit +
+    # Firefox and walks the 3-engine matrix (~8 min extra); the 12-min
+    # cap cancelled the first dispatch mid-suite after the matrix had
+    # already passed. Per-deploy runs still finish in ~4 min.
+    timeout-minutes: 22
     steps:
       # R106 F2: SHA-pin third-party actions (matches R29 F2 discipline
       # applied elsewhere). Prior console-smoke.yml used mutable
