@@ -926,7 +926,15 @@
         state.session = s;
         state.authedAt = Date.now();
         startLiveStream();
-        navigate(consumeReturnTo() || "#/overview");
+        if (isSignup) {
+          // A brand-new workspace has none of the data behind whatever
+          // deep link bounced the user to auth — drop the saved
+          // return-to and land on onboarding instead of a stale 404.
+          try { sessionStorage.removeItem("av_return_to"); } catch (e2) {}
+          navigate("#/overview");
+        } else {
+          navigate(consumeReturnTo() || "#/overview");
+        }
       })
         .catch(function (err) {
           btn.disabled = false;
@@ -1872,8 +1880,10 @@
     var qm = (location.hash.split("?")[1] || "").match(/(?:^|&)evt=(\d+)/);
     if (qm) {
       var wantSeq = parseInt(qm[1], 10);
+      var found = false;
       for (var wi = 0; wi < events.length; wi++) {
         if (events[wi].seq === wantSeq) {
+          found = true;
           var wantRow = evList.querySelector('.evt[data-i="' + wi + '"]');
           if (wantRow) {
             selectEvent(wantRow);
@@ -1885,6 +1895,24 @@
           }
           break;
         }
+      }
+      // Deep link to an event beyond the first page: auto-load pages
+      // until the target arrives (a shared link to event #600 of a
+      // 700-event trail must land selected, not silently unselected).
+      // The merge re-render re-runs this matcher; the cursor ending or
+      // the 5000-event cap terminates the walk.
+      if (!found && data.nextEventCursor != null && events.length < 5000) {
+        state.ds.getSessionById(id, { eventCursor: data.nextEventCursor }).then(function (more) {
+          // bail if the user navigated away while we fetched
+          if (!document.getElementById("eventList")) return;
+          renderSessionDetail(main, id, {
+            data: Object.assign({}, data, {
+              events: (data.events || []).concat(more.events || []),
+              nextEventCursor: more.nextEventCursor,
+            }),
+            receipt: receipt,
+          });
+        }).catch(function () { /* leave the first page rendered */ });
       }
     }
 
