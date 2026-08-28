@@ -729,7 +729,61 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ filter/sort semantics: q (case-insens), blocked, composition all match ground truth; cost sort monotone; stale fetch never paints");
 }
 
-// ── 18. Listener-leak soak ─────────────────────────────────────────
+// ── 18. Session detail vs ground truth ─────────────────────────────
+// The flagship page (tour, attack demo, and deep links all land
+// here). Waterfall offsets/widths must be the cumulative-duration
+// math over the datasource's own events; chip counts, chip+text
+// filter composition, and the drawer must all agree with the data.
+{
+  await page.evaluate(() => { location.hash = "#/sessions/sess_01H9K"; });
+  await page.waitForSelector("#eventList .evt", { timeout: 15000 });
+  const r = await page.evaluate(async () => {
+    const gt = (await window.dataSource.getSessionById("sess_01H9K")).events;
+    const rows = [...document.querySelectorAll("#eventList .evt")];
+    const problems = [];
+    if (rows.length !== gt.length) problems.push(`rows ${rows.length} != events ${gt.length}`);
+    const total = gt.reduce((a, e) => a + (e.durationMs || 0), 0) || 1;
+    let off = 0;
+    gt.forEach((e, i) => {
+      const row = rows[i];
+      if (row.querySelector(".seq").textContent !== "#" + e.seq) problems.push(`row ${i} seq mismatch`);
+      if (row.querySelector(".body b").textContent !== (e.tag || e.kind)) problems.push(`row ${i} tag mismatch`);
+      const bar = row.querySelector(".wf-bar");
+      if (Math.abs(parseFloat(bar.style.left) - (off / total) * 100) > 0.05) problems.push(`row ${i} waterfall offset wrong`);
+      if (Math.abs(parseFloat(bar.style.width) - Math.max(1, ((e.durationMs || 0) / total) * 100)) > 0.05) problems.push(`row ${i} waterfall width wrong`);
+      off += e.durationMs || 0;
+    });
+    const kc = {}; gt.forEach((e) => { kc[e.kind] = (kc[e.kind] || 0) + 1; });
+    for (const c of document.querySelectorAll(".evt-chip")) {
+      const k = c.getAttribute("data-kind");
+      const want = k === "" ? gt.length : (kc[k] || 0);
+      if (parseInt(c.querySelector(".n").textContent, 10) !== want) problems.push(`chip ${k || "All"} count wrong`);
+    }
+    // chip + text composition
+    document.querySelector('.evt-chip[data-kind="block"]').click();
+    const s = document.querySelector("#evtSearch");
+    s.value = "vendor"; s.dispatchEvent(new Event("input"));
+    await new Promise((res) => setTimeout(res, 120));
+    const vis = document.querySelectorAll("#eventList .evt:not(.evt-hidden)").length;
+    const want = gt.filter((e) => e.kind === "block" && ((e.tag || "") + " " + (e.msg || "") + " " + (e.sub || "") + " " + e.kind).toLowerCase().includes("vendor")).length;
+    if (!want) problems.push("compose probe matched 0 events — fixture drift");
+    if (vis !== want) problems.push(`chip+text filter shows ${vis}, truth ${want}`);
+    s.value = ""; s.dispatchEvent(new Event("input"));
+    document.querySelector('.evt-chip[data-kind=""]').click();
+    // drawer agrees with the selected event
+    document.querySelector('#eventList .evt[data-i="3"]').click();
+    await new Promise((res) => setTimeout(res, 150));
+    const ev = gt[3];
+    const drawer = document.getElementById("eventDrawer").textContent;
+    if (!drawer.includes("#" + ev.seq) || !drawer.includes(ev.tag || ev.kind)) problems.push("drawer content mismatch");
+    if (!document.querySelector("#eventDrawer .evt-link-btn")?.getAttribute("data-copy")?.includes("evt=" + ev.seq)) problems.push("drawer copy-link wrong seq");
+    return problems;
+  });
+  if (r.length) fail("session detail vs ground truth: " + r.join("; "));
+  console.log("✅ session detail matches ground truth: waterfall math, chip counts, chip+text filter, drawer");
+}
+
+// ── 19. Listener-leak soak ─────────────────────────────────────────
 // Every earlier check opened modals, ran the tour, refreshed the
 // overview, and re-rendered lists dozens of times. If any of that
 // leaked document/window listeners (the webhook modal once leaked a
@@ -755,4 +809,4 @@ if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors))
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 19 interactive-features drill checks passed.");
+console.log("\nAll 20 interactive-features drill checks passed.");
