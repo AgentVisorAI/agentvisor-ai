@@ -3727,7 +3727,7 @@
           '<button class="btn accent" id="whAdd" style="margin-left:auto">+ Add webhook</button>' +
         "</div>" +
         '<div class="table-wrap"><table>' +
-          "<thead><tr><th>Name</th><th>URL</th><th>Events</th><th>Status</th><th class=\"act-3\"><span class=\"sr-only\">Actions</span></th></tr></thead>" +
+          "<thead><tr><th>Name</th><th>URL</th><th>Events</th><th>Status</th><th class=\"act-4\"><span class=\"sr-only\">Actions</span></th></tr></thead>" +
           "<tbody>" + rows + "</tbody>" +
         "</table></div>" +
       "</div>";
