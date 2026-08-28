@@ -697,7 +697,15 @@
   function freshElapsed() {
     try {
       var v = localStorage.getItem("av_mock_fresh_t0");
-      return v ? Date.now() - +v : null;
+      if (!v) return null;
+      var el = Date.now() - +v;
+      // Corrupt (NaN) or future t0 would freeze fresh mode in a
+      // perpetual "connecting" state — self-heal instead.
+      if (!isFinite(el) || el < 0) {
+        try { localStorage.removeItem("av_mock_fresh_t0"); } catch (e2) {}
+        return null;
+      }
+      return el;
     } catch (e) { return null; }
   }
   // The signed-up user's identity (org name, email) — persisted so a
@@ -707,7 +715,17 @@
     if (freshElapsed() == null) return null;
     try {
       var raw = localStorage.getItem("av_mock_fresh_identity");
-      return raw ? JSON.parse(raw) : null;
+      var v = raw ? JSON.parse(raw) : null;
+      // Shape-check before trusting persisted state: a value that
+      // parses but isn't a session (renderShell reads user.displayName
+      // and org.name unconditionally) bricked the whole app on boot.
+      if (!v || typeof v !== "object" ||
+          !v.user || typeof v.user.email !== "string" ||
+          !v.org || typeof v.org.name !== "string") {
+        if (raw != null) try { localStorage.removeItem("av_mock_fresh_identity"); } catch (e2) {}
+        return null;
+      }
+      return v;
     } catch (e) { return null; }
   }
   function freshSessions() {
