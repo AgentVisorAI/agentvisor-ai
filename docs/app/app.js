@@ -3232,7 +3232,9 @@
         '<td><div style="font-weight:500">' + esc(i.email) + '</div><div class="id">by ' + esc(i.invitedByEmail || "?") + '</div></td>' +
         '<td><span class="pill neutral">' + esc(i.role) + "</span></td>" +
         '<td style="color:var(--fg-2)">expires ' + esc(timeUntil(i.expiresAt)) + '</td>' +
-        '<td><button class="btn danger" data-act="revoke">Revoke</button></td>' +
+        // Revoking an invite is admin-gated on the API — same rule as
+        // Remove above; members see the pending list without controls.
+        '<td>' + (canManage ? '<button class="btn danger" data-act="revoke">Revoke</button>' : '') + '</td>' +
       '</tr>';
     }).join('');
     var invitesCard = invites.length
