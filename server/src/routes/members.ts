@@ -401,6 +401,15 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
   app.get("/invites", async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
+    // R92 F1: same posture as R91 F2 (/audit gated to non-member)
+    // — a pending-invites list is target-selection material for a
+    // hostile member (upcoming admin/owner emails + roles + when
+    // their invite expires). Sibling POST /invites at line 283
+    // and DELETE /invites/:id at line 428 already require
+    // membershipRole !== 'member'. Match here.
+    if (claims.membershipRole === "member") {
+      return reply.code(403).send({ error: "forbidden" });
+    }
     const rows = await db.invite.findMany({
       where: {
         orgId: claims.orgId,

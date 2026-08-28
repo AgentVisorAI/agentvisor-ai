@@ -16,6 +16,7 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
   app.get("/", async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
+    const isMember = claims.membershipRole === "member";
     const deployments = await db.deployment.findMany({
       where: { orgId: claims.orgId },
       orderBy: { createdAt: "asc" },
@@ -24,8 +25,22 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
         name: true,
         environment: true,
         publicKeyHex: true,
-        ingestTokenHint: true,
-        lastIngestAt: true,
+        // R92 F2: `ingestTokenHint` is the first 8 chars of the
+        // plaintext ingest token — 48 bits of the auth material.
+        // R90 F2's rationale for hiding API-key hints from members
+        // applies verbatim: ingest tokens routinely leak via
+        // Dockerfiles, k8s manifests, CI logs; a hostile member
+        // who greps a public gist for `AV_INGEST_TOKEN=` and
+        // matches against the org's hint inventory can bind a
+        // leaked token to a specific deployment. Similarly
+        // `lastIngestAt` reveals "which deployment is currently
+        // quiet" — target-selection recon. Both fields are
+        // useful for owner/admin dashboards but not needed for
+        // a member's read-only session/receipt view. Members
+        // still see id/name/environment/publicKeyHex (needed
+        // to render receipt trust status).
+        ingestTokenHint: !isMember,
+        lastIngestAt: !isMember,
         createdAt: true,
       },
     });
