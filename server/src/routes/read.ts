@@ -464,11 +464,9 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
           metadata: true,
         },
       });
-      reply.header("Content-Type", "text/csv; charset=utf-8");
       const fname = `agentvisor-audit-${claims.orgId}-${new Date()
         .toISOString()
         .replace(/[:.]/g, "-")}.csv`;
-      reply.header("Content-Disposition", `attachment; filename="${fname}"`);
       const escape = (v: unknown): string => {
         if (v === null || v === undefined) return "";
         let s = typeof v === "string" ? v : JSON.stringify(v);
@@ -494,17 +492,24 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
         if (/[",\n\r]/.test(s)) return '"' + s.replace(/[\"]/g, '""') + '"';
         return s;
       };
-      // R109 F3: actually stream row-by-row, honoring
-      // socket back-pressure. The prior code's docblock
-      // claimed 'stream row-by-row rather than accumulate a
-      // big string' but built `let out = ""` and `out += ...`
-      // for every row, then called reply.send(out). On a busy
-      // tenant (~10 000 rows × ~2 KB each) that materialized
-      // ~20 MB in a single heap string per concurrent caller
-      // — the exact spike the comment claimed to avoid. Now:
-      // hijack reply.raw, flush headers, write() the header
-      // + one row at a time, and await 'drain' when the
-      // socket buffer fills.
+      // R109 F3 + R110 F1: hijack reply.raw for streaming
+      // AND set the response headers directly on reply.raw
+      // before flushHeaders(). Prior R109 F3 shape called
+      // reply.header('Content-Type') and reply.type() which
+      // stash into Fastify's kReplyHeaders map — those only
+      // reach the wire when reply.send() calls
+      // safeWriteHead(). But after reply.raw.end(), reply.sent
+      // becomes true, so the follow-up reply.send(reply) from
+      // wrap-thenable short-circuits with a warn log and
+      // writeHead never fires. Effect: only Cache-Control
+      // (set on raw directly) reached the client — no
+      // Content-Type, no Content-Disposition, so browsers
+      // rendered CSV inline as text/plain and download-hint
+      // tooling broke. Setting on reply.raw before
+      // flushHeaders() is the correct hijack pattern; matches
+      // stream.ts.
+      reply.raw.setHeader("Content-Type", "text/csv; charset=utf-8");
+      reply.raw.setHeader("Content-Disposition", `attachment; filename="${fname}"`);
       reply.raw.setHeader("Cache-Control", "no-store");
       reply.raw.flushHeaders();
       let clientClosed = false;
