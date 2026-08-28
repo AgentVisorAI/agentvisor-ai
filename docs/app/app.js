@@ -26,6 +26,11 @@
   };
   var app = $("#app");
 
+  // Platform-aware shortcut labels: Windows/Linux users were shown
+  // "⌘K" everywhere — the binding accepted Ctrl, but the UI never
+  // said so.
+  var IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || "");
+  var MOD_K = IS_MAC ? "⌘K" : "Ctrl K";
   var state = {
     session: null,
     route: null,
@@ -762,10 +767,10 @@
           "</a>" +
           statusChip +
           '<div class="spacer"></div>' +
-          '<button class="cmdk-trigger" id="cmdkOpen" aria-label="Open command palette (⌘K)">' +
+          '<button class="cmdk-trigger" id="cmdkOpen" aria-label="Open command palette (' + MOD_K + ')">' +
             '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>' +
             '<span>Search or run a command…</span>' +
-            '<span class="kbd">⌘K</span>' +
+            '<span class="kbd">' + MOD_K + '</span>' +
           "</button>" +
           '<button class="theme-btn" id="themeBtn" title="Toggle theme" aria-label="Toggle light/dark theme">' + iconTheme() + "</button>" +
           '<button class="user-btn" id="userBtn" aria-label="Account menu" aria-haspopup="menu" aria-expanded="false">' +
@@ -4788,6 +4793,10 @@
       }
       // Ignore keystrokes inside inputs
       if (/^(INPUT|TEXTAREA|SELECT)$/.test((e.target || {}).tagName || "")) return;
+      // ...and while any modal/palette is open: g-nav would navigate
+      // (the hashchange destroys the open dialog mid-form) and "/"
+      // would steal focus out of the dialog's focus trap.
+      if (document.body.classList.contains("locked")) return;
       // g-then-x shortcuts
       if (e.key.toLowerCase() === "g") {
         state.gPrefixAt = Date.now();
@@ -4840,7 +4849,7 @@
         ["→ / Enter", "Next step"], ["←", "Previous step"], ["Esc", "Exit the tour"],
       ]},
       { title: "Actions", items: [
-        ["⌘ K", "Open command palette"], ["Esc", "Close dialogs"], ["?", "Show this sheet"],
+        [IS_MAC ? "⌘ K" : "Ctrl K", "Open command palette"], ["Esc", "Close dialogs"], ["?", "Show this sheet"],
       ]},
     ];
     var html = groups.map(function (g) {
