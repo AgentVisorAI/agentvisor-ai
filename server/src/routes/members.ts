@@ -163,6 +163,32 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
             where: { id: existing.userId },
             data: { sessionRevokedAt: new Date() },
           });
+          // R103 F1: revoke every API key the target created that
+          // still bears their pre-change role. session-middleware's
+          // API-key auth path synthesizes membershipRole from
+          // ApiKey.role WITHOUT consulting Membership.role — so a
+          // demoted admin whose plaintext av_srv_ token is still
+          // known continues to authenticate at the prior privilege
+          // level, indefinitely. R90 F1 closes the JWT-cookie
+          // vector; this closes the sibling API-key vector.
+          // Only revoke keys whose role EXCEEDS the new role
+          // (privilege downgrade); a same-level or upgrade change
+          // doesn't need to invalidate.
+          const RANK: Record<string, number> = { owner: 3, admin: 2, member: 1 };
+          const newRank = RANK[body.data.role] ?? 0;
+          await tx.apiKey.updateMany({
+            where: {
+              orgId: claims.orgId,
+              createdById: existing.userId,
+              revokedAt: null,
+              role: {
+                in: (["owner", "admin", "member"] as const).filter(
+                  (r) => (RANK[r] ?? 0) > newRank,
+                ),
+              },
+            },
+            data: { revokedAt: new Date() },
+          });
           return upd;
         },
         { isolationLevel: "Serializable" },
@@ -241,6 +267,25 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
             }
           }
           await tx.membership.delete({ where: { id: existing.id } });
+          // R103 F1: revoke every API key the removed user
+          // created in this org. session-middleware's API-key
+          // auth path synthesizes membershipRole from ApiKey.role
+          // WITHOUT consulting Membership.role — the cookie path
+          // correctly fails on memberships.length === 0, but the
+          // API-key path has NO membership check, so an
+          // ex-member's still-known av_srv_ token continues to
+          // authenticate at the prior privilege level. Sibling
+          // of R90 F1's JWT invalidation. Revoke ALL keys the
+          // user created (not just above-rank) since they no
+          // longer belong to the org.
+          await tx.apiKey.updateMany({
+            where: {
+              orgId: claims.orgId,
+              createdById: existing.userId,
+              revokedAt: null,
+            },
+            data: { revokedAt: new Date() },
+          });
         },
         { isolationLevel: "Serializable" },
       );
