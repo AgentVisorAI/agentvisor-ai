@@ -47,24 +47,41 @@ const Env = z.object({
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
   LOG_LEVEL: z.string().default("info"),
   JWT_SECRET: z.string().min(32, "JWT_SECRET must be at least 32 chars"),
-  // R96 F3: optional comma-separated list of cookie-signing
-  // secrets. First entry signs; all entries verify. Enables key
-  // rotation without breaking in-flight OAuth flows (users
-  // mid-Google-consent otherwise get missing_state_cookie on
-  // callback). Also decouples cookie HMAC from JWT_SECRET
-  // (defense-in-depth — a JWT-key disclosure no longer
-  // simultaneously compromises cookie signatures). If unset,
-  // falls back to JWT_SECRET (single entry) so existing
-  // deployments don't need to change env config.
+  // R96 F3 + R97 F-B: optional comma-separated list of
+  // cookie-signing secrets. First entry signs; all entries
+  // verify. Enables key rotation without breaking in-flight
+  // OAuth flows. Also decouples cookie HMAC from JWT_SECRET
+  // (defense-in-depth). If unset OR unparseable, falls back to
+  // JWT_SECRET (single entry) so existing deployments don't
+  // need to change env config.
+  //
+  // Fail-fast on partial config: if COOKIE_SECRETS is set but
+  // every entry fails the min-32 length gate (common mistake:
+  // 20 raw bytes → 27 base64 chars, forgotten leading quotes),
+  // prior R96 shape silently dropped them all and fell back to
+  // JWT_SECRET — reinstating exactly the coupling this env
+  // was meant to break, with NO log line. Now: refine
+  // rejects the config so the process crashes at boot with a
+  // clear message.
   COOKIE_SECRETS: z
     .string()
     .optional()
-    .transform((v) =>
-      (v ?? "")
+    .transform((v) => ({
+      raw: v,
+      list: (v ?? "")
         .split(",")
         .map((s) => s.trim())
-        .filter((s) => s.length >= 32),
-    ),
+        .filter((s) => s.length > 0),
+    }))
+    .refine(
+      (o) => o.raw === undefined || o.list.every((s) => s.length >= 32),
+      "COOKIE_SECRETS entries must each be at least 32 chars",
+    )
+    .refine(
+      (o) => o.raw === undefined || o.list.length > 0,
+      "COOKIE_SECRETS was set but empty after parsing",
+    )
+    .transform((o) => o.list),
   JWT_ISSUER: z.string().default("agentvisor-ai"),
   JWT_AUDIENCE: z.string().default("agentvisor-console"),
   SESSION_COOKIE_NAME: z.string().default("av_session"),
@@ -80,18 +97,26 @@ const Env = z.object({
       return process.env.NODE_ENV === "production";
     }),
   DATABASE_URL: z.string().min(1),
-  // R96 F1: number of proxy hops in front of the API. Cloudflare
-  // + LB stacks use 2; Fly.io / Cloud Run / Heroku bare are 1;
-  // local dev is 0. R95 hardcoded a single-hop function which
-  // silently regressed 2+ hop deploys (real users bucketed into
-  // Cloudflare edge IPs). Configurable now.
+  // R96 F1 + R97 F-C: number of proxy hops in front of the
+  // API. Cloudflare + LB stacks use 2; Fly.io / Cloud Run /
+  // Heroku bare are 1; local dev is 0. R95 hardcoded a
+  // single-hop function which silently regressed 2+ hop
+  // deploys (real users bucketed into Cloudflare edge IPs).
+  //
+  // Fail-fast on typos: prior R96 shape silently clamped any
+  // non-numeric or out-of-range value to 1, so a typo like
+  // TRUSTED_PROXY_HOP_COUNT=9 (or 'three') on a 3-hop deploy
+  // silently reinstated the exact R95 regression. Now: refine
+  // rejects the config with a clear error at boot rather than
+  // quietly running with a wrong hop count.
   TRUSTED_PROXY_HOP_COUNT: z
     .string()
     .default("1")
-    .transform((v) => {
-      const n = parseInt(v, 10);
-      return isNaN(n) || n < 0 || n > 8 ? 1 : n;
-    }),
+    .transform((v) => parseInt(v, 10))
+    .refine(
+      (n) => Number.isInteger(n) && n >= 0 && n <= 8,
+      "TRUSTED_PROXY_HOP_COUNT must be an integer 0..8",
+    ),
   ALLOWED_ORIGINS: z
     .string()
     .default("")

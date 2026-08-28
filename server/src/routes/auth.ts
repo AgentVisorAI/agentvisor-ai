@@ -567,9 +567,40 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     const ok = await verifyPassword(user.passwordHash, body.data.password);
     if (!ok) return reply.code(401).send({ error: "invalid_password" });
 
+    // R97 F-A: emit a forensic breadcrumb BEFORE the tx runs. This
+    // is the most catastrophic action in the whole codebase — the
+    // org row + every child cascades (deployments, sessions,
+    // events, receipts, memberships, api keys, webhooks, saml
+    // configs, invites, saml replay records, AND every
+    // AuditEntry scoped to this org because AuditEntry.orgId is
+    // onDelete: Cascade). writeAudit() into audit_entries would
+    // itself be nuked by the same cascade, leaving zero
+    // server-side forensic trail. Log at 'warn' with a stable
+    // machine-parseable slug so external log retention (Datadog,
+    // Loki, CloudWatch) captures the event with an
+    // externally-durable record: who invoked, when, from where.
+    // SOC-2 evidence for tenant erasure comes from those logs.
+    req.log.warn(
+      {
+        event: "org.deleted",
+        orgId: claims.orgId,
+        userId: claims.sub,
+        actorEmail: user.email,
+        ip: req.ip,
+        userAgent: typeof req.headers["user-agent"] === "string"
+          ? req.headers["user-agent"].slice(0, 200)
+          : undefined,
+        at: new Date().toISOString(),
+      },
+      "org_delete_initiated",
+    );
+
     await db.$transaction(async (tx) => {
       // Delete the org first — cascades to deployments, sessions,
-      // events, receipts, memberships.
+      // events, receipts, receipts, memberships, api keys,
+      // webhooks (+ deliveries), saml configs, saml replay
+      // records, invites, and this org's audit_entries. The
+      // R97 F-A log line above is the durable forensic trace.
       await tx.org.delete({ where: { id: claims.orgId } });
       // Then remove the user. Other orgs they belonged to (unlikely
       // at MVP; multi-org membership not exposed yet) would keep them.
@@ -580,6 +611,16 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         await tx.user.delete({ where: { id: claims.sub } });
       }
     });
+
+    req.log.warn(
+      {
+        event: "org.deleted",
+        orgId: claims.orgId,
+        userId: claims.sub,
+        at: new Date().toISOString(),
+      },
+      "org_delete_committed",
+    );
 
     clearSessionCookie(reply);
     return reply.send({ ok: true });
