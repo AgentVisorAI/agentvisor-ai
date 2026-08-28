@@ -1750,9 +1750,9 @@
     if (sidx >= 0 && siblings.length > 1) {
       var prevS = siblings[sidx - 1], nextS = siblings[sidx + 1];
       nav = '<span class="sess-nav">' +
-        '<button class="btn" id="prevSess" title="Previous session in your list ( [ )"' + (prevS ? ' data-id="' + esc(prevS.id) + '"' : " disabled") + ">‹</button>" +
-        '<span class="sess-nav-pos">' + (sidx + 1) + " / " + siblings.length + "</span>" +
-        '<button class="btn" id="nextSess" title="Next session in your list ( ] )"' + (nextS ? ' data-id="' + esc(nextS.id) + '"' : " disabled") + ">›</button>" +
+        '<button class="btn" id="prevSess" aria-label="Previous session in your list" title="Previous session in your list ( [ )"' + (prevS ? ' data-id="' + esc(prevS.id) + '"' : " disabled") + ">‹</button>" +
+        '<span class="sess-nav-pos" aria-label="Session ' + (sidx + 1) + ' of ' + siblings.length + '">' + (sidx + 1) + " / " + siblings.length + "</span>" +
+        '<button class="btn" id="nextSess" aria-label="Next session in your list" title="Next session in your list ( ] )"' + (nextS ? ' data-id="' + esc(nextS.id) + '"' : " disabled") + ">›</button>" +
       "</span> ";
     }
 
