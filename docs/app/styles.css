@@ -292,6 +292,20 @@ code, pre, .mono {
   border-radius: var(--r);
   font-size: var(--t-sec);
 }
+/* R121 F2 / F1: informational (non-error) banner rendered by
+   renderAuthWithProviders when the user was bounced here by
+   the OAuth MFA gate or the /invites/accept requiresLogin
+   path. Same visual weight as .auth-err but blue/neutral so
+   it doesn't read as a failure. */
+.auth-note {
+  padding: var(--s-2) var(--s-3);
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  color: var(--fg);
+  border-radius: var(--r);
+  font-size: var(--t-sec);
+  margin-bottom: var(--s-3);
+}
 .mock-badge {
   margin-top: var(--s-4);
   padding: 6px var(--s-3);
