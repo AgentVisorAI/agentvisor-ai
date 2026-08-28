@@ -382,6 +382,39 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
         },
       });
       if (!cfg) return reply.code(404).send({ error: "not_found" });
+      // R103 F2: bump sessionRevokedAt so any captured JWT
+      // cookie for this user is immediately dead. Prior SLO
+      // shape only cleared the cookie in the CURRENT browser's
+      // response — a JWT captured from that user's browser
+      // (XSS on a compromised subdomain, session-fixation, or
+      // a stolen device before SLO) remained cryptographically
+      // valid for the whole 7-day exp, so the attacker held
+      // the user's session for a week after SLO. Sibling of
+      // /logout's own sessionRevokedAt bump (auth.ts) which
+      // R79 established. Catch is defensive — a user row that
+      // was already removed shouldn't fail the SLO response.
+      await db.user
+        .update({
+          where: { id: claims.sub },
+          data: { sessionRevokedAt: new Date() },
+        })
+        .catch((err) => {
+          req.log.warn(
+            { err, userId: claims.sub },
+            "saml_slo_session_revoke_failed",
+          );
+        });
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "auth.saml.slo",
+          actorId: claims.sub,
+          target: cfg.id,
+          metadata: { configId: cfg.id },
+          req,
+        },
+        req.log,
+      );
       reply.setCookie(env.SESSION_COOKIE_NAME, "", {
         ...SESSION_COOKIE_OPTS,
         maxAge: 0,

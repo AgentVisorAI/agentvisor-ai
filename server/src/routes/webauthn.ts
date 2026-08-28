@@ -60,9 +60,23 @@ function rpID(): string {
 }
 
 function acceptedOrigins(): string[] {
+  // R103 F3: strip trailing slash on the APP_BASE_URL fallback.
+  // R102 F2 normalized ALLOWED_ORIGINS but did NOT normalize
+  // the raw APP_BASE_URL used here. SimpleWebAuthn's
+  // verifyRegistrationResponse / verifyAuthenticationResponse
+  // compare expectedOrigin BYTE-EXACT against the browser-
+  // supplied origin field in the client-data JSON, and
+  // browsers emit origin as scheme://host[:port] with NO
+  // trailing slash. Operators who set
+  // APP_BASE_URL=https://x.com/ (matching the R102 F2
+  // motivating misconfig) with empty ALLOWED_ORIGINS would
+  // silently break every passkey ceremony with 'Unexpected
+  // registration response origin'. Trailing-slash strip
+  // applied per-call is defense-in-depth even if env.ts
+  // ever normalizes APP_BASE_URL upstream.
   return env.ALLOWED_ORIGINS.length
     ? env.ALLOWED_ORIGINS
-    : [env.APP_BASE_URL];
+    : [env.APP_BASE_URL.replace(/\/+$/, "")];
 }
 
 // Challenge cookies. Short-lived, HttpOnly. We split by ceremony so a
