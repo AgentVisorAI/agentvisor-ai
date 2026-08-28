@@ -180,6 +180,27 @@ for (const { name, device } of profiles) {
       await page.waitForTimeout(300);
     }
     console.log("✅ modals fit + action buttons hittable on phone (deliveries, saml-add, deployment-create)");
+    // Static pages on a phone: investors open these links from chat
+    // apps — no horizontal overflow, and the pitch video fits.
+    const ROOT = SITE.replace(/app\/?$/, "");
+    for (const sp of ["", "pitch/", "verify/"]) {
+      await page.goto(ROOT + sp, { waitUntil: "domcontentloaded" });
+      await page.waitForTimeout(600);
+      const ov = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+      if (ov > 0) fail("/" + sp + " overflows by " + ov + "px on phone");
+      if (sp === "pitch/") {
+        const vFits = await page.evaluate(() => {
+          const v = document.querySelector("video");
+          if (!v) return false;
+          const r = v.getBoundingClientRect();
+          return r.right <= innerWidth + 1 && r.left >= -1;
+        });
+        if (!vFits) fail("pitch video missing or overflows the phone viewport");
+      }
+    }
+    await page.goto(SITE + "#/overview", { waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(800);
+    console.log("✅ static pages (landing/pitch/verify) fit the phone viewport; video contained");
   }
 
   if (jsErrors.length) fail(`${name} JS errors: ${jsErrors.join(" | ")}`);
