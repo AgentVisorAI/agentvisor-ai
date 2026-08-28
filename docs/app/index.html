@@ -3,7 +3,12 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="theme-color" content="#0a5c8b" />
+  <!-- Browser-chrome tint follows the app canvas, not the accent: a
+       blue toolbar over a near-black dark console looked broken.
+       app.js updates these when the in-app theme toggle overrides
+       the OS scheme. -->
+  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f7f7f8" />
+  <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0a0a0c" />
   <!--
     Strict CSP: no inline scripts (they're extracted to config.js +
     crash-guard.js), no third-party origins, connect-src limited to
