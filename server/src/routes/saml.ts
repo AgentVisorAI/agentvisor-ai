@@ -487,11 +487,30 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
   // an SSO config it can bounce through. Anonymous so it works pre-auth.
   app.get<{ Querystring: { email?: string } }>(
     "/discover",
+    {
+      // R131 F3: rate-limit per IP + zod-validate the email so a
+      // 64 KB query string doesn't materialize + lowercase + hit
+      // every active SamlConfig org-wide per request. Not a data
+      // leak (response is at most { configId }, and IdP-initiated
+      // flows already expose that mapping publicly), but this
+      // was the only anonymous unvalidated GET in the auth tree.
+      // Match the /webauthn/authenticate/challenge cadence:
+      // 30/min/IP is generous for a pre-login "does my domain
+      // have SSO?" check.
+      config: {
+        rateLimit: {
+          max: 30,
+          timeWindow: 60_000,
+          keyGenerator: (req: { ip: string }) => `ip:${req.ip}`,
+        },
+      },
+    },
     async (req, reply) => {
-      if (typeof req.query.email !== "string") {
-        return reply.send({ ssoConfig: null });
-      }
-      const cfg = await findConfigForEmail(req.query.email);
+      const q = z
+        .object({ email: z.string().min(3).max(320) })
+        .safeParse(req.query);
+      if (!q.success) return reply.send({ ssoConfig: null });
+      const cfg = await findConfigForEmail(q.data.email.trim().toLowerCase());
       if (!cfg) return reply.send({ ssoConfig: null });
       const urls = spUrls(cfg);
       return reply.send({

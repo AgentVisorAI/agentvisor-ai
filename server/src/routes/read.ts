@@ -155,13 +155,30 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
     if (!claims) return;
     const query = z
       .object({
-        cursor: z.string().optional(),
+        // R131 F1: cap cursor length to match R130 F3 on
+        // webhooks.ts. Base64url of {openedAt, id} is well
+        // under 128 bytes; higher values are always garbage
+        // and shouldn't trigger a Buffer.from + JSON.parse
+        // per authenticated call.
+        cursor: z.string().max(128).optional(),
         limit: z.coerce.number().int().min(1).max(SESSIONS_LIST_LIMIT_MAX).default(50),
         deploymentId: z.string().optional(),
         // Free-text filter. Server-side so filtering over the whole
         // fleet works at 1M+ sessions (not just the visible page).
         q: z.string().max(200).optional(),
-        blockedOnly: z.coerce.boolean().optional(),
+        // R131 F2: z.coerce.boolean() is Boolean(v) — any
+        // non-empty string, INCLUDING the literal "false",
+        // coerces to true. GET .../read/sessions?blockedOnly=false
+        // silently enabled the filter, the opposite of what the
+        // caller asked. Today's SPA only appends the param when
+        // true (so no live bug), but any future SDK / curl /
+        // API-key script following the natural "always send the
+        // flag" convention would mis-serve. Parse an explicit
+        // "true"/"false" enum instead.
+        blockedOnly: z
+          .enum(["true", "false"])
+          .optional()
+          .transform((v) => v === "true"),
         sinceHours: z.coerce.number().int().min(1).max(24 * 90).optional(),
       })
       .safeParse(req.query);
@@ -439,7 +456,9 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
     }
     const query = z
       .object({
-        cursor: z.string().optional(),
+        // R131 F1: cap cursor length. Same rationale as the
+        // /read/sessions handler above.
+        cursor: z.string().max(128).optional(),
         limit: z.coerce.number().int().min(1).max(200).default(50),
         event: z.string().max(80).optional(),
       })
