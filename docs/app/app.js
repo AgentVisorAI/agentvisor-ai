@@ -3944,8 +3944,8 @@
     }
 
     var rows = endpoints.map(function (e) {
-      return '<tr data-id="' + esc(e.id) + '">' +
-        '<td><div style="font-weight:500">' + esc(e.name) + '</div><div class="id">' + esc(e.id) + '</div></td>' +
+      return '<tr data-id="' + esc(e.id) + '" tabindex="0" title="Click for recent deliveries">' +
+        '<td><div style="font-weight:500">' + esc(e.name) + '</div><div class="id">' + esc(e.id) + ' · click for deliveries</div></td>' +
         '<td class="mono" style="font-size:11.5px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(e.url) + '">' + esc(e.url) + '</td>' +
         '<td style="font-size:12px">' + (e.events || []).map(function (ev) { return '<span class="pill neutral" style="margin-right:4px">' + esc(ev) + '</span>'; }).join("") + '</td>' +
         '<td>' + (e.isActive ? '<span class="pill ok status-dot">active</span>' : '<span class="pill neutral">paused</span>') + '</td>' +
@@ -3973,9 +3973,76 @@
 
     on($("#whAdd", root), "click", openAddModal);
 
+    // Recent deliveries per endpoint (Stripe/GitHub-style): click the
+    // row (not its action buttons) for status, attempts, HTTP code,
+    // and latency of the last events. Keyboard: Enter/Space on a row.
+    async function openDeliveriesModal(id) {
+      if (document.body.classList.contains("locked")) return;
+      var ep = endpoints.find(function (x) { return x.id === id; });
+      var backdrop = h(
+        '<div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="whdTitle">' +
+          '<div class="modal" style="max-width:640px">' +
+            '<h2 id="whdTitle">Recent deliveries · ' + esc(ep ? ep.name : id) + '</h2>' +
+            '<div id="whdBody">' + loadingBlock("table") + '</div>' +
+            '<div class="actions"><button type="button" class="btn accent" data-close>Done</button></div>' +
+          '</div>' +
+        '</div>'
+      );
+      document.body.appendChild(backdrop);
+      document.body.classList.add("locked");
+      var previouslyFocused = document.activeElement;
+      var uninstall;
+      function close() {
+        backdrop.remove(); document.body.classList.remove("locked");
+        if (uninstall) uninstall();
+        if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e2) {}
+      }
+      uninstall = installModalKeys(backdrop, close);
+      backdrop.addEventListener("click", function (e) {
+        if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
+      });
+      setTimeout(function () { var c = backdrop.querySelector("[data-close]"); if (c) c.focus(); }, 20);
+      var list = [];
+      try { list = await state.ds.listWebhookDeliveries(id); }
+      catch (err) {
+        var bodyEl = backdrop.querySelector("#whdBody");
+        if (bodyEl) bodyEl.innerHTML = '<p class="sub">Could not load deliveries (' + esc(err.message || "network") + ').</p>';
+        return;
+      }
+      var bodyEl2 = backdrop.querySelector("#whdBody");
+      if (!bodyEl2) return; // closed while loading
+      bodyEl2.innerHTML = list.length
+        ? '<div class="table-wrap"><table>' +
+            '<thead><tr><th>Event</th><th>Status</th><th class="num">Attempts</th><th class="num">HTTP</th><th class="num">Latency</th><th>When</th></tr></thead>' +
+            '<tbody>' + list.map(function (d) {
+              var ms = d.deliveredAt ? (new Date(d.deliveredAt) - new Date(d.createdAt)) : null;
+              return '<tr>' +
+                '<td class="mono" style="font-size:11.5px">' + esc(d.event) + (d.errorMessage ? '<div class="id" title="' + esc(d.errorMessage) + '">' + esc(d.errorMessage) + '</div>' : '') + '</td>' +
+                '<td>' + (d.status === "delivered" ? '<span class="pill ok">delivered</span>' : '<span class="pill neutral">' + esc(d.status) + '</span>') + '</td>' +
+                '<td class="num">' + esc(d.attempt) + '</td>' +
+                '<td class="num">' + esc(d.responseCode || "—") + '</td>' +
+                '<td class="num">' + (ms != null ? (ms >= 1000 ? (ms / 1000).toFixed(1) + " s" : ms + " ms") : "—") + '</td>' +
+                '<td>' + timeAgoCell(d.createdAt) + '</td>' +
+              '</tr>';
+            }).join('') + '</tbody>' +
+          '</table></div>'
+        : '<p class="sub">No deliveries yet — fire a test event to see one here.</p>';
+    }
+
+    root.addEventListener("keydown", function (e) {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      var row = e.target.closest && e.target.closest("tr[data-id]");
+      if (!row || e.target.tagName === "BUTTON") return;
+      e.preventDefault();
+      openDeliveriesModal(row.getAttribute("data-id"));
+    });
     root.addEventListener("click", async function (e) {
       var btn = e.target.closest("button[data-act]");
-      if (!btn) return;
+      if (!btn) {
+        var row = e.target.closest("tr[data-id]");
+        if (row && !e.target.closest("button, a") && !textSelActive()) openDeliveriesModal(row.getAttribute("data-id"));
+        return;
+      }
       var tr = btn.closest("tr[data-id]");
       if (!tr) return;
       var id = tr.getAttribute("data-id");
