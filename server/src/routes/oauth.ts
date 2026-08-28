@@ -119,13 +119,35 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
   // GET /:provider/start — kicks off the auth code + PKCE flow.
   // Sets a short-lived signed cookie with the state + verifier, then
   // redirects the browser to the provider's authorize endpoint.
-  app.get("/:provider/start", async (req, reply) => {
+  // R132 F2: perIp(30, 60_000) per-route rate limit. Prior shape
+  // fell to the global 300/min/IP — every other anonymous
+  // auth-tree endpoint (login perIp(10), signup perIp(5),
+  // reset-request perIp(3, 1h), reset-confirm perIp(10),
+  // webauthn/authenticate perIp(10), members/invites/accept
+  // perIp(10), saml/discover 30/min after R131 F3) has one.
+  // Not currently exploitable but a lone attacker looping /start
+  // could pin an entire corporate NAT's IP quota. 30/min/IP
+  // matches the /discover cadence (both are cheap pre-login
+  // handshakes). Sibling /callback fast-fails on missing/
+  // tampered state cookie before any expensive work so it's fine
+  // on the global bucket.
+  app.get("/:provider/start", {
+    config: {
+      rateLimit: {
+        max: 30,
+        timeWindow: 60_000,
+        keyGenerator: (req: { ip: string }) => `ip:${req.ip}`,
+      },
+    },
+  }, async (req, reply) => {
     // R123 F1: kickoff endpoint is a top-level browser navigation
     // (docs/app/datasource.js window.location.assign to /start).
     // R122 F2 fixed /callback; this closes the sibling error paths.
+    // R132 F4: encodeURIComponent the slug so future callers that
+    // interpolate a value can't emit malformed URLs.
     const errRedirect = (slug: string) =>
       reply.redirect(
-        `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/login?err=${slug}`,
+        `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/login?err=${encodeURIComponent(slug)}`,
       );
     const params = z
       .object({ provider: z.enum(["google", "microsoft"]) })
@@ -187,9 +209,11 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
     // R121 F2 mfa-required refusal; convert all errors to
     // redirects so the SPA .auth-note banner surfaces a
     // friendly explanation. Log lines preserve forensic detail.
+    // R132 F4: encodeURIComponent the slug for consistency
+    // across every errRedirect helper.
     const errRedirect = (slug: string) =>
       reply.redirect(
-        `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/login?err=${slug}`,
+        `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/login?err=${encodeURIComponent(slug)}`,
       );
     const params = z
       .object({ provider: z.enum(["google", "microsoft"]) })

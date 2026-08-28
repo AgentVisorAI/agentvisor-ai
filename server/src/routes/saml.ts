@@ -191,9 +191,13 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
     // R122 F2 fixed the ACS side but missed this — same dead-end
     // raw-JSON class. Redirect to the SPA banner so admin misconfigs
     // (deactivated config, SHA-1 legacy) surface as friendly text.
+    // R132 F4: encodeURIComponent the slug — the acs handler
+    // below interpolates `saml_assertion_${result.error}` where
+    // result.error is caller-controlled through the SAMLResponse.
+    // Consistent shape across all errRedirect helpers.
     const errRedirect = (slug: string) =>
       reply.redirect(
-        `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/login?err=${slug}`,
+        `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/login?err=${encodeURIComponent(slug)}`,
       );
     const cfg = await db.samlConfig.findUnique({
       where: { id: req.params.configId },
@@ -226,9 +230,15 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
       // via .auth-note. Machine consumers of /acs are always
       // browsers (SAML AuthnResponse posters — no API clients
       // hit /acs) so JSON→redirect is a safe transition.
+      // R132 F4: encodeURIComponent the slug —
+      // `saml_assertion_${result.error}` below interpolates a
+      // caller-controlled value from consumeSamlResponse. Without
+      // the encoder, a hostile IdP could inject `#`/`&`/`?` into
+      // the slug and split the redirect into arbitrary hash
+      // fragments.
       const errRedirect = (slug: string) =>
         reply.redirect(
-          `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/login?err=${slug}`,
+          `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/login?err=${encodeURIComponent(slug)}`,
         );
       const cfg = await db.samlConfig.findUnique({
         where: { id: req.params.configId },

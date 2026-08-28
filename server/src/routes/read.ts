@@ -562,9 +562,14 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
       // OAuth / SAML nav endpoints. Redirect to the audit
       // settings page with an err slug so the SPA banner
       // surfaces friendly copy.
+      // R132 F4: encodeURIComponent the slug. All current
+      // callers pass compile-time-constant slugs, but the
+      // pattern is a footgun for future callers that might
+      // interpolate a caller-supplied value (see saml.ts
+      // errRedirect for `saml_assertion_${result.error}`).
       const errRedirect = (slug: string) =>
         reply.redirect(
-          `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/settings/audit?err=${slug}`,
+          `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/settings/audit?err=${encodeURIComponent(slug)}`,
         );
       // R91 F2: same posture as /audit — the CSV export is
       // strictly more portable (attackers exfil once, keep
@@ -572,7 +577,19 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
       if (claims.membershipRole === "member") {
         return errRedirect("audit_forbidden_member");
       }
-      const before = req.query.before ? new Date(req.query.before) : new Date();
+      // R132 F1: cap `before` before it reaches `new Date(...)`.
+      // Prior shape parsed unbounded req.query.before — Fastify's
+      // ~8 KB URL cap was the only bound, and new Date(<8KB>)
+      // allocates + scans per request before isNaN redirects to
+      // audit_invalid_before. ISO-8601 max is ~30 chars; 64 is
+      // generous. Sibling of R131 F1's cursor cap on /audit.
+      const q = z
+        .object({ before: z.string().max(64).optional() })
+        .safeParse(req.query);
+      if (!q.success) {
+        return errRedirect("audit_invalid_before");
+      }
+      const before = q.data.before ? new Date(q.data.before) : new Date();
       if (isNaN(before.getTime())) {
         return errRedirect("audit_invalid_before");
       }
