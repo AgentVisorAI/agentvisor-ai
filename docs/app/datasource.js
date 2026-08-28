@@ -120,6 +120,12 @@
       name: "Northwind Traders",
       slug: "northwind",
       createdAt: iso(42 * 24 * HOUR),
+      // The caller's role in this org, mirroring the real session
+      // payload. The demo identity is Olivia (owner) — R90's RBAC tab
+      // filter reads session.org.role and hides Webhooks/API keys
+      // from members, which silently emptied the investor demo's
+      // settings when this field was missing.
+      role: "owner",
     },
   };
 
@@ -853,6 +859,9 @@
         // the judge's own name must survive a reload — reverting to
         // Olivia was the one place the mock visibly lied).
         var saved = freshIdentity();
+        // Identities saved before org.role existed (older visits)
+        // must not demote the workspace creator to member.
+        if (saved && saved.org && !saved.org.role) saved.org.role = "owner";
         mockState.session = saved || {
           user: { id: "usr_olivia", email: "olivia.tan@northwind.com", displayName: "Olivia Tan" },
           org: MOCK_ORGS.org_northwind,
@@ -870,6 +879,7 @@
           name: orgName,
           slug: orgName.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 24),
           createdAt: new Date().toISOString(),
+          role: "owner", // the signer-upper owns the new workspace
         },
       };
       try {
