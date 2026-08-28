@@ -139,6 +139,13 @@ jobs:
           PROFILE: phone
         run: node scripts/full-flow-rehearsal.mjs
 
+      - name: Full investor-flow rehearsal — venue-wifi latency (300–700ms jitter)
+        working-directory: server
+        env:
+          SITE: https://agentvisorai.me/
+          SLOW: "1"
+        run: node scripts/full-flow-rehearsal.mjs
+
       - name: Cross-engine feature matrix (nightly — Chromium/WebKit/Firefox)
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         working-directory: server
