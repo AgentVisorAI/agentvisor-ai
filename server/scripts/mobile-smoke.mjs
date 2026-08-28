@@ -120,6 +120,16 @@ for (const { name, device } of profiles) {
     const drawerFilled = await page.evaluate(() => document.querySelectorAll("#eventDrawer .meta dt").length >= 4);
     if (!drawerFilled) fail(`${name}: event tap does not fill the drawer`);
     console.log("✅ event stream: row tap fills the inspector drawer");
+
+    // Chart tooltip on touch: hover-only meant the console's primary
+    // visualization said nothing on phones.
+    await page.goto(SITE + "#/overview", { waitUntil: "domcontentloaded" });
+    await page.waitForSelector(".hover-strip", { timeout: 10000 });
+    await page.click(".hover-strip >> nth=5");
+    await new Promise((r) => setTimeout(r, 300));
+    const tipShown = await page.evaluate(() => document.querySelector(".chart-tip")?.style.display === "block");
+    if (!tipShown) fail(`${name}: chart tap tooltip missing`);
+    console.log("✅ chart: tap pins the bucket tooltip");
   }
 
   if (jsErrors.length) fail(`${name} JS errors: ${jsErrors.join(" | ")}`);
