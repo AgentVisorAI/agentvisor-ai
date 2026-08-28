@@ -25,6 +25,7 @@ const routes = [
   "#/overview",
   "#/deployments",
   "#/sessions",
+  "#/sessions/sess_01H9K",
   "#/policies",
   "#/settings/general",
   "#/settings/keys",
