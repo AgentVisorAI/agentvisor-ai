@@ -490,6 +490,34 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       inserted += insertedSeqs.size;
 
       if (insertedSeqs.size > 0 || dToolsOk || dToolsBad) {
+        // R124 F3: cap dToolsBad / dBlockedPayout for the OUTBOUND
+        // webhook fan-out. Prior shape forwarded the raw sums
+        // verbatim, but they are integer accumulations of the
+        // request-supplied addToolsBlocked / addBlockedPayoutUsdMicros
+        // fields (line ~455) — NOT re-derived from the DB. On the
+        // ingest-token-leak threat model that R119 F2 / R123 F2 close
+        // for session.upsert, an attacker POSTing a batch with
+        // inflated blocked counts fans out policy.block webhooks
+        // to Slack / PagerDuty / Datadog with the poisoned numbers.
+        // Downstream consumers key blockedCount for severity and
+        // blockedPayoutUsdMicros for financial impact — a fake
+        // "blocked $9,999,999" wakes on-call and burns SIEM ingest.
+        // Sanity ceiling: you can't block more tools than events
+        // in the batch (one event = one tool call attempt), so
+        // clamp dToolsBad to insertedSeqs.size. blockedPayout is
+        // similarly clamped by insertedSeqs.size × a per-event
+        // payout ceiling; here we forward the smaller of the
+        // supplied sum and (blocked-count × MAX_PER_EVENT_PAYOUT)
+        // where MAX_PER_EVENT_PAYOUT is set high enough not to
+        // clip legitimate traffic (1e9 micros = $1000 per tool
+        // call, well above realistic single-call spend). SIEM
+        // consumers now can't be waked by a fabricated $9M block.
+        const clampedBlockedCount = Math.min(dToolsBad, insertedSeqs.size);
+        const MAX_PER_EVENT_BLOCKED_PAYOUT = 1_000_000_000;
+        const clampedBlockedPayout = Math.min(
+          dBlockedPayout,
+          clampedBlockedCount * MAX_PER_EVENT_BLOCKED_PAYOUT,
+        );
         bus.publish({
           type: "events.appended",
           orgId: daemon.orgId,
@@ -497,11 +525,11 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
           sessionId: session.id,
           count: insertedSeqs.size,
           allowed: dToolsOk,
-          blocked: dToolsBad,
+          blocked: clampedBlockedCount,
         });
         // Any block in this batch triggers policy.block webhooks so
         // Slack / PagerDuty / Datadog can wake an on-call responder.
-        if (dToolsBad > 0) {
+        if (clampedBlockedCount > 0) {
           dispatchEvent({
             orgId: daemon.orgId,
             event: "policy.block",
@@ -509,8 +537,8 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
               deploymentId: daemon.deploymentId,
               sessionId: session.id,
               sessionExternalId: externalId,
-              blockedCount: dToolsBad,
-              blockedPayoutUsdMicros: dBlockedPayout,
+              blockedCount: clampedBlockedCount,
+              blockedPayoutUsdMicros: clampedBlockedPayout,
             },
             logger: req.log,
           });

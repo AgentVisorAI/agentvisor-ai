@@ -4245,6 +4245,20 @@
     if (c) c.addEventListener("click", function () { comingSoon("Enterprise", "Talk to us about a self-hosted control plane, custom trust anchors, and SLAs: hello@agentvisorai.me"); });
   }
   async function renderSettingsAudit(root) {
+    // R124 F2: if the user was bounced here from a failed
+    // /audit.csv attempt (top-level nav dead-end), the URL
+    // will carry ?err=audit_forbidden_member or
+    // ?err=audit_invalid_before. Surface a toast so the user
+    // knows why they landed on the audit tab instead of
+    // getting a download.
+    var auditQs = (location.hash.split("?")[1] || "");
+    var auditParams = new URLSearchParams(auditQs);
+    var auditErr = auditParams.get("err") || "";
+    if (auditErr === "audit_forbidden_member") {
+      toast("Only owner/admin roles can export the audit log.", true);
+    } else if (auditErr === "audit_invalid_before") {
+      toast("Invalid audit export cursor. Showing the current audit log.", true);
+    }
     root.innerHTML = '<div class="card">' + loadingBlock("table") + "</div>";
     var audit;
     try { audit = await state.ds.listAudit(); }

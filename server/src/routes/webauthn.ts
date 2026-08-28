@@ -674,7 +674,42 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
       where: { id: req.params.id, userId: claims.sub },
     });
     if (!cred) return reply.code(404).send({ error: "not_found" });
-    await db.webauthnCredential.delete({ where: { id: cred.id } });
+    // R124 F1: passkey deletion is a physical-credential-loss
+    // break-glass signal — stronger than "I forgot my password"
+    // which R123 F3 correctly treats as break-glass. Threat
+    // model that this closes:
+    //   1. Attacker phishes/borrows the victim's cookie.
+    //   2. Attacker POSTs /webauthn/register/verify from that
+    //      cookie session (cookie is enough — no fresh-password
+    //      check on enrollment). Attacker's own hardware key is
+    //      now enrolled on the victim's user row.
+    //   3. If attacker's cookie role is admin+, they mint an
+    //      av_srv_ token as their persistence primitive.
+    //   4. Victim opens Settings, sees an unfamiliar passkey
+    //      label ("Yubikey #2" they never enrolled), clicks
+    //      Delete. Prior shape: only the credential row was
+    //      removed — victim's cookie still worked, attacker's
+    //      cookie still worked (up to 7-day exp), and any
+    //      av_srv_ token from step 3 kept authenticating.
+    // Fix mirrors R123 F3 (reset-confirm apikey fence): wrap
+    // the credential delete + sessionRevokedAt bump +
+    // apiKey.updateMany in one db.$transaction so a crash
+    // between the writes can't leave a mixed state. Also same
+    // trade-off R123 F3 baked in: a user swapping hardware
+    // keys legitimately has to re-log in on other devices and
+    // regenerate automation tokens — the correct posture, since
+    // the deletion signals possession compromise.
+    await db.$transaction([
+      db.webauthnCredential.delete({ where: { id: cred.id } }),
+      db.user.update({
+        where: { id: claims.sub },
+        data: { sessionRevokedAt: new Date() },
+      }),
+      db.apiKey.updateMany({
+        where: { createdById: claims.sub, revokedAt: null },
+        data: { revokedAt: new Date() },
+      }),
+    ]);
     writeAudit(
       {
         orgId: claims.orgId,
