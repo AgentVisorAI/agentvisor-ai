@@ -227,21 +227,39 @@
   var _sdT;
   function scheduleSessionDetailRefresh(id) {
     clearTimeout(_sdT);
-    _sdT = setTimeout(function () {
+    _sdT = setTimeout(async function () {
       var main = document.getElementById("view");
-      if (main && state.route && state.route.path[0] === "sessions" && state.route.path[1] === id) {
-        renderSessionDetail(main, id);
-      }
+      if (!(main && state.route && state.route.path[0] === "sessions" && state.route.path[1] === id)) return;
+      // Fetch BEFORE repainting: the old path re-rendered (skeleton
+      // first) and a failed fetch replaced a perfectly good detail
+      // page with the error card mid-stream. Now a failure just skips
+      // this refresh, and success repaints without a skeleton flash.
+      try {
+        var data = await state.ds.getSessionById(id);
+        var receipt = await state.ds.getReceipt(id);
+        if (state.route && state.route.path[0] === "sessions" && state.route.path[1] === id) {
+          renderSessionDetail(main, id, { data: data, receipt: receipt });
+        }
+      } catch (e) { console.warn("session refresh skipped", e); }
     }, 400);
   }
   var _slT;
   function scheduleSessionsListRefresh() {
     clearTimeout(_slT);
-    _slT = setTimeout(function () {
+    _slT = setTimeout(async function () {
       var main = document.getElementById("view");
-      if (main && state.route && state.route.path[0] === "sessions" && !state.route.path[1]) {
-        renderSessionsList(main);
-      }
+      if (!(main && state.route && state.route.path[0] === "sessions" && !state.route.path[1])) return;
+      // Fetch first, repaint on success only: no skeleton flash, and a
+      // transient failure skips the refresh instead of nuking the list
+      // (renderSessionsBody restores in-flight search keystrokes).
+      try {
+        var deps = await state.ds.listDeployments();
+        var firstPage = await state.ds.listSessions(Object.assign({ limit: sessionsPageSize }, sessionsFilter));
+        if (!(state.route && state.route.path[0] === "sessions" && !state.route.path[1])) return;
+        sessionsLoaded = firstPage.sessions;
+        sessionsCursor = firstPage.nextCursor;
+        renderSessionsBody(main, deps);
+      } catch (e) { console.warn("sessions refresh skipped", e); }
     }, 400);
   }
 
@@ -1157,7 +1175,13 @@
       stats = await state.ds.getOverview(state.range);
       var res = await state.ds.listSessions();
       sessions = res.sessions.slice(0, 8);
-    } catch (e) { return renderError(main, e); }
+    } catch (e) {
+      // A quiet (stream-driven) refresh must never replace a live
+      // dashboard with the error card on a transient blip — keep the
+      // stale view; the next refresh will catch up.
+      if (quiet) { console.warn("overview refresh skipped", e); return; }
+      return renderError(main, e);
+    }
 
     var series = stats.series || [];
     var allowedByHour = series.map(function (b) { return b.allowed; });
@@ -3933,7 +3957,9 @@
   }
   async function renderSettingsAudit(root) {
     root.innerHTML = '<div class="card">' + loadingBlock("table") + "</div>";
-    var audit = await state.ds.listAudit();
+    var audit;
+    try { audit = await state.ds.listAudit(); }
+    catch (e) { root.innerHTML = '<div class="card empty"><h3>Could not load the audit log</h3><p>' + esc(e.message || "Try again in a moment.") + '</p></div>'; return; }
     if (!audit.length) {
       root.innerHTML =
         '<div class="card" style="padding:0">' +

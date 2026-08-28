@@ -441,7 +441,65 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ double-submit guards: webhook create, policy toggle, invite revoke — one call each under 400ms latency");
 }
 
-// ── 13. Listener-leak soak ─────────────────────────────────────────
+// ── 13. Failure-path UX ────────────────────────────────────────────
+// The mock never fails, so the error paths never execute anywhere
+// else. Inject a rejecting datasource per route: every page must show
+// the graceful error card (never a stuck skeleton, never an uncaught
+// rejection — the audit tab once hung on skeletons forever), recover
+// on re-entry, and a failing background refresh must keep the stale
+// dashboard instead of replacing it with the error card.
+{
+  const failOnce = (m) => page.evaluate((m) => {
+    const ds = window.dataSource;
+    if (!ds["__orig_" + m]) ds["__orig_" + m] = ds[m].bind(ds);
+    ds[m] = () => Promise.reject(new Error("injected_network_failure"));
+  }, m);
+  const restore = (m) => page.evaluate((m) => {
+    const ds = window.dataSource;
+    if (ds["__orig_" + m]) ds[m] = ds["__orig_" + m];
+  }, m);
+  const cases = [
+    ["#/overview", "getOverview", ".stat"],
+    ["#/sessions", "listSessions", "tr[data-clickable]"],
+    ["#/policies", "listPolicies", ".switch"],
+    ["#/settings/audit", "listAudit", "tbody tr"],
+    ["#/settings/webhooks", "listWebhooks", "#whAdd"],
+  ];
+  await page.goto(SITE + "#/overview", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector(".stat", { timeout: 15000 });
+  for (const [route, method, okSel] of cases) {
+    const away = route === "#/overview" ? "#/policies" : "#/overview";
+    await page.evaluate((a) => { location.hash = a; }, away);
+    await page.waitForTimeout(300);
+    await failOnce(method);
+    await page.evaluate((r) => { location.hash = r; }, route);
+    await page.waitForTimeout(900);
+    const st = await page.evaluate(() => ({
+      errUi: /Something went wrong|Could not load|Not found/i.test(document.getElementById("view").textContent),
+      skeleton: !!document.querySelector("#view .skl"),
+    }));
+    await restore(method);
+    if (!st.errUi || st.skeleton) fail("failure path broken on " + route + " (" + method + "): " + JSON.stringify(st));
+    await page.evaluate((a) => { location.hash = a; }, away);
+    await page.waitForTimeout(250);
+    await page.evaluate((r) => { location.hash = r; }, route);
+    await page.waitForSelector(okSel, { timeout: 8000 }).catch(() => fail(route + " did not recover after the failure cleared"));
+  }
+  // background (quiet) refresh failure keeps the stale dashboard
+  await page.evaluate(() => { location.hash = "#/overview"; });
+  await page.waitForSelector(".stat", { timeout: 10000 });
+  await failOnce("getOverview");
+  await page.waitForTimeout(6000);
+  const quiet = await page.evaluate(() => ({
+    stats: document.querySelectorAll(".stat").length,
+    errUi: /Something went wrong/i.test(document.getElementById("view").textContent),
+  }));
+  await restore("getOverview");
+  if (!quiet.stats || quiet.errUi) fail("quiet overview refresh replaced the live dashboard on a transient failure: " + JSON.stringify(quiet));
+  console.log("✅ failure paths: 5 routes show the error card + recover; background refresh keeps the stale dashboard");
+}
+
+// ── 14. Listener-leak soak ─────────────────────────────────────────
 // Every earlier check opened modals, ran the tour, refreshed the
 // overview, and re-rendered lists dozens of times. If any of that
 // leaked document/window listeners (the webhook modal once leaked a
@@ -467,4 +525,4 @@ if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors))
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 14 interactive-features drill checks passed.");
+console.log("\nAll 15 interactive-features drill checks passed.");
