@@ -201,6 +201,17 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
   app.post("/register/challenge", async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
+    // R107 F1: API-key sessions have no user row and can't own a
+    // passkey (the auth material is the plaintext av_srv_ token,
+    // not a hardware credential). Reject up-front with the same
+    // slug siblings use — /saml/slo (R105 F5), /logout (R106 F2),
+    // stream (R100). The prior implicit guard here (findUnique
+    // → 401) worked but returned a misleading 'unauthenticated'
+    // slug; sibling /register/verify had no guard at all and
+    // returned P2003 → 500 to the caller.
+    if (claims.sub.startsWith("apikey:")) {
+      return reply.code(400).send({ error: "cookie_session_required" });
+    }
     const user = await db.user.findUnique({
       where: { id: claims.sub },
       include: { webauthnCredentials: true },
@@ -236,6 +247,13 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
   app.post("/register/verify", async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
+    // R107 F1: reject api-key sessions — see /register/challenge
+    // comment. Prior shape passed claims.sub through to
+    // webauthnCredential.create as the userId, which threw
+    // P2003 (FK violation) on 'apikey:<id>' → 500.
+    if (claims.sub.startsWith("apikey:")) {
+      return reply.code(400).send({ error: "cookie_session_required" });
+    }
     const cookieChallenge = req.cookies[REG_CHALLENGE_COOKIE];
     if (!cookieChallenge) {
       return reply.code(400).send({ error: "no_challenge_cookie" });

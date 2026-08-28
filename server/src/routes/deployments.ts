@@ -289,9 +289,18 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
           target: owned.name,
           metadata: {
             deploymentId: owned.id,
+            // R107 F2: persist the force flag unconditionally so
+            // forensics can distinguish 'operator explicitly
+            // acknowledged cascade' from 'ordinary empty
+            // deployment cleanup' even when receiptCount was 0
+            // at tx-open time. R94 F4's intent was 'the trail
+            // shows the intent'; prior shape omitted the field
+            // entirely when receiptCount was 0, making the two
+            // cases indistinguishable in the audit log.
+            forceRequested: force,
             forceDeletedReceipts: force && receiptCount > 0
               ? receiptCount
-              : undefined,
+              : 0,
           },
           req,
         },
