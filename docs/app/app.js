@@ -4000,6 +4000,22 @@
     }
     actions.push({ g: "Actions", label: "New policy", desc: "Create a spend cap, vendor allowlist, or PII guard", run: function () { navigate("#/policies"); setTimeout(openCreatePolicyModal, 250); } });
     actions.push({ g: "Actions", label: "Keyboard shortcuts", desc: "Everything the keyboard can do", kbd: "?", run: function () { setTimeout(openShortcutSheet, 250); } });
+    if (state.ds.mode === "mock") {
+      var big = false;
+      try { big = localStorage.getItem("av_mock_bigdata") === "1"; } catch (e) {}
+      actions.push({
+        g: "Actions",
+        label: big ? "Back to the 24h dataset" : "Load the 30-day dataset (280 sessions)",
+        desc: big ? "Return to the focused demo data" : "What the console looks like at scale — pagination, sort, exports",
+        run: function () {
+          try { localStorage.setItem("av_mock_bigdata", big ? "0" : "1"); } catch (e) {}
+          // navigate() renders (hashchange, or directly when the hash
+          // is unchanged) — an extra render() here raced it with two
+          // parallel renderSessionsList fetches clobbering each other.
+          navigate("#/sessions?range=720");
+        },
+      });
+    }
     if (rolePreview) actions.push({ g: "Actions", label: "Exit member preview", desc: "Back to your own role", run: exitRolePreview });
     else if (state.session && state.session.org && state.session.org.role !== "member")
       actions.push({ g: "Actions", label: "Preview as member", desc: "See the console the way a member does", run: enterRolePreview });
@@ -4015,7 +4031,7 @@
       // the console to the pristine Northwind showcase in one action.
       pages.push({ g: "Pages", label: "Reset demo data", desc: "Back to the pristine showcase workspace", run: function () {
         try {
-          ["av_mock_fresh_t0", "av_mock_fresh_identity", "av_mock_signed_out", "av_tour_dismissed"].forEach(function (k) { localStorage.removeItem(k); });
+          ["av_mock_fresh_t0", "av_mock_fresh_identity", "av_mock_signed_out", "av_tour_dismissed", "av_mock_bigdata"].forEach(function (k) { localStorage.removeItem(k); });
         } catch (e) {}
         location.hash = "#/overview";
         location.reload();
