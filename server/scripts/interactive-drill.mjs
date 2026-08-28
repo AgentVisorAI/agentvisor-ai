@@ -585,7 +585,60 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ " + stops + " focus stops all show a ring; garbage API fields render clean in table + CSV");
 }
 
-// ── 16. Listener-leak soak ─────────────────────────────────────────
+// ── 16. Tactile polish ─────────────────────────────────────────────
+// (a) Selecting text inside a clickable row must NOT navigate — users
+// select session ids to copy them. (b) Returning to a scrolled list
+// (Back button / ← All sessions) restores the scroll offset. (c) A
+// toast flood caps at 4 visible, newest wins.
+{
+  // Route away then back: check 15 left a stale garbage row painted,
+  // and a goto to the SAME hash URL is a same-document navigation —
+  // it re-renders nothing.
+  await page.evaluate(() => { location.hash = "#/overview"; });
+  await page.waitForTimeout(400);
+  await page.evaluate(() => { location.hash = "#/sessions"; });
+  await page.waitForSelector("tr[data-clickable]", { timeout: 15000 });
+  const cell = await page.$("tr[data-clickable] td:nth-child(2)");
+  const box = await cell.boundingBox();
+  await page.mouse.move(box.x + 4, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width - 8, box.y + box.height / 2, { steps: 8 });
+  await page.mouse.up();
+  await page.waitForTimeout(400);
+  const afterSel = await page.evaluate(() => location.hash);
+  if (afterSel !== "#/sessions") fail("selecting text in a row navigated to " + afterSel);
+  // ...but a plain click still navigates
+  await page.click("tr[data-clickable] td:nth-child(3)");
+  await page.waitForSelector("#eventList", { timeout: 10000 });
+  // scroll restoration through a Back round-trip
+  await page.goto(SITE + "#/sessions", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("tr[data-clickable]", { timeout: 10000 });
+  await page.evaluate(() => window.scrollTo(0, 600));
+  await page.waitForTimeout(200);
+  await page.evaluate(() => { const trs = document.querySelectorAll("tr[data-clickable]"); trs[trs.length - 1].click(); });
+  await page.waitForSelector("#eventList", { timeout: 10000 });
+  if ((await page.evaluate(() => window.scrollY)) !== 0) fail("detail page inherited the list's scroll offset");
+  await page.goBack();
+  await page.waitForSelector("tr[data-clickable]", { timeout: 10000 });
+  await page.waitForTimeout(800);
+  const restored = await page.evaluate(() => window.scrollY);
+  if (restored < 400) fail("Back did not restore the list scroll offset (got " + restored + ")");
+  // toast flood cap
+  await page.evaluate(() => {
+    for (let i = 0; i < 12; i++) {
+      const btn = document.createElement("button");
+      btn.setAttribute("data-copy", "x" + i);
+      document.body.appendChild(btn); btn.click(); btn.remove();
+    }
+  });
+  await page.waitForTimeout(400);
+  const toasts = await page.evaluate(() => document.querySelectorAll(".toast").length);
+  if (toasts > 4) fail("toast flood not capped: " + toasts + " visible");
+  await page.waitForTimeout(2600); // let them drain before the soak
+  console.log("✅ tactile polish: text-select doesn't navigate, Back restores scroll, toasts cap at 4");
+}
+
+// ── 17. Listener-leak soak ─────────────────────────────────────────
 // Every earlier check opened modals, ran the tour, refreshed the
 // overview, and re-rendered lists dozens of times. If any of that
 // leaked document/window listeners (the webhook modal once leaked a
@@ -611,4 +664,4 @@ if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors))
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 17 interactive-features drill checks passed.");
+console.log("\nAll 18 interactive-features drill checks passed.");
