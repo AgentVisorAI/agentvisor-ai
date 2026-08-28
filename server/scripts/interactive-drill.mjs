@@ -700,6 +700,45 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await page.waitForTimeout(500);
   if ((await page.evaluate(() => location.hash)) !== "#/sessions") fail("g-nav dead after modal close");
   console.log("✅ shortcut guards: g-nav / ? / focus-steal all blocked while a dialog is open, restored after");
+  // Focus-trap wrap (installModalKeys implements it; nothing asserted
+  // it): Tab from the modal's last focusable wraps to the first,
+  // Shift+Tab from the first wraps to the last, focus never escapes.
+  await page.evaluate(() => { location.hash = "#/policies"; });
+  await page.waitForSelector("#addPol", { timeout: 10000 });
+  await page.click("#addPol");
+  await page.waitForSelector(".modal-backdrop", { timeout: 3000 });
+  await page.waitForTimeout(300);
+  const focusables = () => page.evaluate(() => {
+    const modal = document.querySelector(".modal-backdrop");
+    return [...modal.querySelectorAll('button, [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')]
+      .filter((el) => el.offsetParent !== null || el.tagName === "INPUT").length;
+  });
+  const nF = await focusables();
+  if (nF < 3) fail("focus-trap probe found too few focusables: " + nF);
+  await page.evaluate(() => {
+    const modal = document.querySelector(".modal-backdrop");
+    const els = [...modal.querySelectorAll('button, [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')]
+      .filter((el) => el.offsetParent !== null || el.tagName === "INPUT");
+    els[els.length - 1].focus();
+  });
+  await page.keyboard.press("Tab");
+  if (!(await page.evaluate(() => !!document.activeElement.closest(".modal-backdrop")))) fail("Tab escaped the modal focus trap");
+  await page.keyboard.press("Shift+Tab");
+  await page.keyboard.press("Shift+Tab");
+  if (!(await page.evaluate(() => !!document.activeElement.closest(".modal-backdrop")))) fail("Shift+Tab escaped the modal focus trap");
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(300);
+  // aria-expanded round trip on the account menu button
+  await page.evaluate(() => { location.hash = "#/overview"; });
+  await page.waitForTimeout(600);
+  await page.click(".user-btn");
+  await page.waitForSelector("#accountMenu", { timeout: 3000 });
+  const exp1 = await page.evaluate(() => document.getElementById("userBtn").getAttribute("aria-expanded"));
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(200);
+  const exp0 = await page.evaluate(() => document.getElementById("userBtn").getAttribute("aria-expanded"));
+  if (exp1 !== "true" || exp0 !== "false") fail("aria-expanded round-trip broken: " + exp1 + "→" + exp0);
+  console.log("✅ modal focus trap wraps both directions; aria-expanded round-trips");
 }
 
 // ── 16. Tactile polish ─────────────────────────────────────────────
