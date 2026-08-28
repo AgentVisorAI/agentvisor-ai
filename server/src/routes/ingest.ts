@@ -335,24 +335,6 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       });
       if (fresh.length === 0) continue;
 
-      // Rollups computed from the *fresh* subset only.
-      let dPrompt = 0;
-      let dCompletion = 0;
-      let dCost = 0;
-      let dPayout = 0;
-      let dBlockedPayout = 0;
-      let dToolsOk = 0;
-      let dToolsBad = 0;
-      for (const e of fresh) {
-        dPrompt += e.addPromptTokens;
-        dCompletion += e.addCompletionTokens;
-        dCost += e.addCostUsdMicros;
-        dPayout += e.addPayoutUsdMicros;
-        dBlockedPayout += e.addBlockedPayoutUsdMicros;
-        dToolsOk += e.addToolsAllowed;
-        dToolsBad += e.addToolsBlocked;
-      }
-
       const rows = fresh.map((e) => ({
         sessionId: session.id,
         seq: e.seq,
@@ -363,15 +345,59 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
         occurredAt: e.occurredAt,
         journalCount: e.journalCount,
       }));
-      const result = await db.event.createMany({
-        data: rows,
-        // Belt-and-suspenders: even after our pre-filter above, a
-        // concurrent request may have inserted the same seq before we
-        // ran, so keep skipDuplicates on the createMany itself. Postgres
-        // supports it natively.
-        skipDuplicates: true,
-      });
-      inserted += result.count;
+      // R93 F2: prior shape ran createMany({skipDuplicates:true}) then
+      // computed rollup deltas over the FULL `fresh` array. Two
+      // concurrent POSTs (daemon retry vs live daemon, spool replay
+      // vs live) both saw existingSeqs=∅, both computed the full
+      // deltas, one won the unique-constraint insert, the other's
+      // createMany.count went to 0 — but BOTH called session.update
+      // with the full deltas. Session totals silently doubled; the
+      // finalized receipt then signed the inflated numbers, breaking
+      // the compliance story. Fix: replace createMany with per-row
+      // create() so P2002 unique violations identify which seqs are
+      // OURS. Rollup deltas are computed only over the actually-
+      // inserted subset; concurrent duplicates count once. Cost is N
+      // round trips per batch, but ingest batches are small (10-100
+      // events typical) and event throughput is bounded by the
+      // daemon's tick anyway.
+      const insertedSeqs = new Set<number>();
+      for (const row of rows) {
+        try {
+          await db.event.create({ data: row });
+          insertedSeqs.add(row.seq);
+        } catch (err) {
+          if (
+            typeof err === "object" &&
+            err !== null &&
+            (err as { code?: string }).code === "P2002"
+          ) {
+            // Concurrent batch already inserted this seq. Skip
+            // silently — matches prior skipDuplicates behavior.
+            continue;
+          }
+          throw err;
+        }
+      }
+      inserted += insertedSeqs.size;
+
+      // Recompute deltas from the actually-inserted subset.
+      let dPrompt = 0;
+      let dCompletion = 0;
+      let dCost = 0;
+      let dPayout = 0;
+      let dBlockedPayout = 0;
+      let dToolsOk = 0;
+      let dToolsBad = 0;
+      for (const e of fresh) {
+        if (!insertedSeqs.has(e.seq)) continue;
+        dPrompt += e.addPromptTokens;
+        dCompletion += e.addCompletionTokens;
+        dCost += e.addCostUsdMicros;
+        dPayout += e.addPayoutUsdMicros;
+        dBlockedPayout += e.addBlockedPayoutUsdMicros;
+        dToolsOk += e.addToolsAllowed;
+        dToolsBad += e.addToolsBlocked;
+      }
 
       if (
         dPrompt || dCompletion || dCost || dPayout || dBlockedPayout ||
@@ -391,13 +417,13 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
         });
       }
 
-      if (result.count > 0 || dToolsOk || dToolsBad) {
+      if (insertedSeqs.size > 0 || dToolsOk || dToolsBad) {
         bus.publish({
           type: "events.appended",
           orgId: daemon.orgId,
           deploymentId: daemon.deploymentId,
           sessionId: session.id,
-          count: result.count,
+          count: insertedSeqs.size,
           allowed: dToolsOk,
           blocked: dToolsBad,
         });
@@ -444,6 +470,59 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       select: { id: true },
     });
     if (!session) return reply.code(404).send({ error: "unknown_session" });
+    // R93 F4: first-write-wins on the receipt row. Prior shape ran
+    // an unconditional upsert, so an ingest-token holder (or an
+    // attacker with a leaked token — the same threat model R92 F2
+    // named for `ingestTokenHint`) could POST /receipts a second
+    // time for a session that already sealed and silently replace
+    // the body / sigB64 / keyIdHint / eventCount / receiptId.
+    // Because the session status was already 'sealed' and stayed
+    // 'sealed', no other guard fired. Overwriting a sealed
+    // receipt destroys the prior authentic row a customer/auditor
+    // may already have referenced, and can replace it with a
+    // body whose signature no longer verifies against the pinned
+    // pubkey — a downgrade attack on the compliance story
+    // (verifier now renders 'verify failed' against the same
+    // sessionId the customer trusted).
+    //
+    // Legitimate daemon retry semantics: mid-flight seal retries
+    // carry the SAME receiptId, so match by receiptId to preserve
+    // idempotency. A different receiptId means an intentional
+    // rewrite → refuse with 409 + audit so a compromised token
+    // surfaces in the trail.
+    const existingReceipt = await db.receipt.findUnique({
+      where: { sessionId: session.id },
+      select: { receiptId: true },
+    });
+    if (existingReceipt && existingReceipt.receiptId !== r.receiptId) {
+      req.log.warn(
+        {
+          deploymentId: daemon.deploymentId,
+          sessionId: session.id,
+          existingReceiptId: existingReceipt.receiptId,
+          proposedReceiptId: r.receiptId,
+        },
+        "ingest_receipt_overwrite_refused",
+      );
+      writeAudit(
+        {
+          orgId: daemon.orgId,
+          event: "deployment.receipt_overwrite_refused",
+          actorId: `daemon:${daemon.deploymentId}`,
+          actorEmail: `daemon@${daemon.deploymentId}`,
+          target: session.id,
+          metadata: {
+            deploymentId: daemon.deploymentId,
+            sessionId: session.id,
+            currentReceiptId: existingReceipt.receiptId,
+            proposedReceiptId: r.receiptId,
+          },
+          req,
+        },
+        req.log,
+      );
+      return reply.code(409).send({ error: "receipt_already_sealed" });
+    }
     await db.receipt.upsert({
       where: { sessionId: session.id },
       create: {
