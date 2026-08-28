@@ -228,8 +228,40 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ policy creation: spend-cap template → live DSL → enabled detail page");
 }
 
+// ── 8. Table action buttons are actually hittable ─────────────────
+// Regression guard for the fixed-layout overflow bug: the sr-only
+// actions column got an equal 1/n width share, so multi-button cells
+// (webhooks Pause/Delete, SSO Edit/Delete, deployments Delete)
+// spilled past their td into overflow:hidden dead space — rendered
+// clipped and unclickable by a real mouse.
+{
+  for (const route of ["deployments", "settings/webhooks", "settings/sso", "settings/members", "settings/keys"]) {
+    await page.evaluate((r) => { location.hash = "#/" + r; }, route);
+    await page.waitForTimeout(900);
+    const bad = await page.evaluate(async () => {
+      const out = [];
+      for (const el of document.querySelectorAll("td button, td select")) {
+        const td = el.closest("td");
+        // elementsFromPoint only works inside the viewport.
+        el.scrollIntoView({ block: "center" });
+        await new Promise((r2) => requestAnimationFrame(r2));
+        const er = el.getBoundingClientRect();
+        const tr2 = td.getBoundingClientRect();
+        const hit = document.elementsFromPoint(er.left + er.width / 2, er.top + er.height / 2)[0];
+        if (er.right > tr2.right + 0.5 || !(hit === el || el.contains(hit)))
+          out.push((el.textContent || el.getAttribute("aria-label") || "?").trim().slice(0, 16) +
+            " btn=" + JSON.stringify({ x: Math.round(er.x), r: Math.round(er.right), y: Math.round(er.y) }) +
+            " td_r=" + Math.round(tr2.right) + " hit=" + (hit ? hit.tagName + "." + String(hit.className).split(" ")[0] : "none"));
+      }
+      return out;
+    });
+    if (bad.length) fail(`unclickable/overflowing controls on ${route}: ${JSON.stringify(bad)}`);
+  }
+  console.log("✅ table action buttons: all inside their cells and hittable (5 routes)");
+}
+
 if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors));
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 8 interactive-features drill checks passed.");
+console.log("\nAll 9 interactive-features drill checks passed.");
