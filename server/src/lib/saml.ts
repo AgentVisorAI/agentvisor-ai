@@ -161,6 +161,20 @@ export function extractAssertionId(
   return null;
 }
 
+/**
+ * R88 F5 + R114 F1: detect a legacy SAML config still using SHA-1
+ * digest / signature. Prior R88 F5 shape threw inside buildAdapter,
+ * which propagated uncaught through /:configId/acs, /login, and
+ * /metadata.xml → generic 500 to the IdP, no clean audit line, and
+ * (worst) the throw message string surfaced via Fastify's default
+ * error handler unless setErrorHandler sanitized it. Now callers
+ * gate on `isSha1Legacy(cfg)` alongside the `isActive` check and
+ * respond with a specific 410 slug the IdP admin can act on.
+ */
+export function isSha1Legacy(cfg: SamlConfig): boolean {
+  return cfg.signatureAlgorithm === "sha1" || cfg.digestAlgorithm === "sha1";
+}
+
 /** Construct the @node-saml/node-saml adapter from our stored config. */
 function buildAdapter(cfg: SamlConfig): SAML {
   const urls = spUrls(cfg);
@@ -171,9 +185,14 @@ function buildAdapter(cfg: SamlConfig): SAML {
   // any surviving sha1 config as inactive so a colliding forgery
   // can't be accepted at /acs. Operators must PATCH the config
   // to sha256 or sha512 explicitly.
+  //
+  // R114 F1: still throw here as defense-in-depth — but the
+  // route handlers now gate on isSha1Legacy() and 410 upfront
+  // so this throw is only reached if a caller forgets the gate
+  // (never happens today).
   const sig = cfg.signatureAlgorithm === "sha1" ? "sha256" : cfg.signatureAlgorithm;
   const dig = cfg.digestAlgorithm === "sha1" ? "sha256" : cfg.digestAlgorithm;
-  if (cfg.signatureAlgorithm === "sha1" || cfg.digestAlgorithm === "sha1") {
+  if (isSha1Legacy(cfg)) {
     throw new Error(
       `saml_config_uses_sha1_${cfg.id}_reject_until_operator_patches_to_sha256`,
     );
