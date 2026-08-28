@@ -2590,9 +2590,9 @@
           "<h2>New deployment</h2>" +
           '<p class="sub">Register a daemon. You\'ll get an ingest token. Copy it now; it won\'t be shown again.</p>' +
           '<form id="depForm">' +
-            '<div class="field"><label>Name</label><input id="depName" required placeholder="acme-prod" pattern="[a-zA-Z0-9\\-_]+" /></div>' +
-            '<div class="field"><label>Environment</label><select id="depEnv"><option>production</option><option>staging</option><option>development</option></select></div>' +
-            '<div class="field"><label>Region (optional)</label><input id="depRegion" placeholder="us-east-1" /></div>' +
+            '<div class="field"><label for="depName">Name</label><input id="depName" required placeholder="acme-prod" pattern="[a-zA-Z0-9\\-_]+" /></div>' +
+            '<div class="field"><label for="depEnv">Environment</label><select id="depEnv"><option>production</option><option>staging</option><option>development</option></select></div>' +
+            '<div class="field"><label for="depRegion">Region (optional)</label><input id="depRegion" placeholder="us-east-1" /></div>' +
             '<div class="actions"><button type="button" class="btn" data-close>Cancel</button><button class="btn accent" type="submit">Create</button></div>' +
           "</form>" +
         "</div>" +
@@ -3115,7 +3115,7 @@
         "<h2>" + esc(opts.title) + "</h2>" +
         (opts.sub ? '<p class="sub">' + esc(opts.sub) + "</p>" : "") +
         '<form id="inpForm">' +
-          '<div class="field"><label>' + esc(opts.label || "Value") + "</label>" +
+          '<div class="field"><label for="inpVal">' + esc(opts.label || "Value") + "</label>" +
           '<input id="inpVal" type="text" required placeholder="' + esc(opts.placeholder || "") + '" /></div>' +
           '<div class="actions">' +
             '<button type="button" class="btn" data-close>Cancel</button>' +
@@ -3318,8 +3318,8 @@
         '<h2>Invite a teammate</h2>' +
         '<p class="sub">They\'ll get an email with a link to join. Links expire in 7 days.</p>' +
         '<form id="inviteForm">' +
-          '<div class="field"><label>Work email</label><input id="inv_email" type="email" required placeholder="teammate@company.com"></div>' +
-          '<div class="field"><label>Role</label><select id="inv_role"><option value="member">member</option><option value="admin">admin</option><option value="owner">owner</option></select></div>' +
+          '<div class="field"><label for="inv_email">Work email</label><input id="inv_email" type="email" required placeholder="teammate@company.com"></div>' +
+          '<div class="field"><label for="inv_role">Role</label><select id="inv_role"><option value="member">member</option><option value="admin">admin</option><option value="owner">owner</option></select></div>' +
           '<div class="actions"><button type="button" class="btn" data-close>Cancel</button><button type="submit" class="btn accent">Send invite</button></div>' +
         '</form>' +
       '</div></div>'
@@ -3769,19 +3769,19 @@
           '<h2>' + (existing ? 'Edit SAML IdP' : 'New SAML IdP') + '</h2>' +
           '<p class="sub">Paste values from your Okta / Auth0 / Entra / SAML IdP admin console.</p>' +
           '<form id="samlForm">' +
-            '<div class="field"><label>Display name</label><input id="s_name" required maxlength="80" placeholder="Okta production" value="' + esc(c.displayName) + '"></div>' +
-            '<div class="field"><label>IdP SSO URL</label><input id="s_ssoUrl" required type="url" placeholder="https://acme.okta.com/app/agentvisor/sso/saml" value="' + esc(c.ssoUrl) + '"></div>' +
-            '<div class="field"><label>IdP SLO URL (optional)</label><input id="s_sloUrl" type="url" placeholder="https://acme.okta.com/app/agentvisor/slo/saml" value="' + esc(c.sloUrl || "") + '"></div>' +
-            '<div class="field"><label>IdP Entity ID</label><input id="s_entityIdIdp" required placeholder="http://www.okta.com/exkABCDE" value="' + esc(c.entityIdIdp) + '"></div>' +
-            '<div class="field"><label>IdP X.509 Certificate (PEM)</label><textarea id="s_x509" required rows="6" style="font-family: SF Mono, ui-monospace, monospace; font-size:11.5px" placeholder="-----BEGIN CERTIFICATE-----&#10;MIIDpDCC...&#10;-----END CERTIFICATE-----">' + esc(c.x509Cert) + '</textarea></div>' +
+            '<div class="field"><label for="s_name">Display name</label><input id="s_name" required maxlength="80" placeholder="Okta production" value="' + esc(c.displayName) + '"></div>' +
+            '<div class="field"><label for="s_ssoUrl">IdP SSO URL</label><input id="s_ssoUrl" required type="url" placeholder="https://acme.okta.com/app/agentvisor/sso/saml" value="' + esc(c.ssoUrl) + '"></div>' +
+            '<div class="field"><label for="s_sloUrl">IdP SLO URL (optional)</label><input id="s_sloUrl" type="url" placeholder="https://acme.okta.com/app/agentvisor/slo/saml" value="' + esc(c.sloUrl || "") + '"></div>' +
+            '<div class="field"><label for="s_entityIdIdp">IdP Entity ID</label><input id="s_entityIdIdp" required placeholder="http://www.okta.com/exkABCDE" value="' + esc(c.entityIdIdp) + '"></div>' +
+            '<div class="field"><label for="s_x509">IdP X.509 Certificate (PEM)</label><textarea id="s_x509" required rows="6" style="font-family: SF Mono, ui-monospace, monospace; font-size:11.5px" placeholder="-----BEGIN CERTIFICATE-----&#10;MIIDpDCC...&#10;-----END CERTIFICATE-----">' + esc(c.x509Cert) + '</textarea></div>' +
             '<div style="display:grid; grid-template-columns:1fr 1fr; gap:12px">' +
-              '<div class="field"><label>NameID format</label><select id="s_nameIdFormat">' +
+              '<div class="field"><label for="s_nameIdFormat">NameID format</label><select id="s_nameIdFormat">' +
                 ["emailAddress","persistent","transient","unspecified"].map(function (n) {
                   var v = "urn:oasis:names:tc:SAML:" + (n === "unspecified" ? "1.1:nameid-format:" : (n === "persistent" || n === "transient" ? "2.0:nameid-format:" : "1.1:nameid-format:")) + n;
                   return '<option value="' + esc(v) + '"' + (c.nameIdFormat === v ? ' selected' : '') + '>' + esc(n) + '</option>';
                 }).join('') +
               '</select></div>' +
-              '<div class="field"><label>Signature algorithm</label><select id="s_sig">' +
+              '<div class="field"><label for="s_sig">Signature algorithm</label><select id="s_sig">' +
                 ["sha256","sha512","sha1"].map(function (a) { return '<option' + (c.signatureAlgorithm === a ? ' selected' : '') + '>' + a + '</option>'; }).join('') +
               '</select></div>' +
             '</div>' +
@@ -3791,10 +3791,10 @@
             '<hr style="border:0; border-top:1px solid var(--border); margin:12px 0">' +
             '<div class="field"><label class="toggle"><input type="checkbox" id="s_jit"' + (c.jitEnabled ? ' checked' : '') + '> Just-in-time provisioning</label></div>' +
             '<div style="display:grid; grid-template-columns:1fr 1fr; gap:12px">' +
-              '<div class="field"><label>Default role for new users</label><select id="s_jitRole">' +
+              '<div class="field"><label for="s_jitRole">Default role for new users</label><select id="s_jitRole">' +
                 ["member","admin"].map(function (r) { return '<option' + (c.jitDefaultRole === r ? ' selected' : '') + '>' + r + '</option>'; }).join('') +
               '</select></div>' +
-              '<div class="field"><label>Allowed email domains (comma-separated)</label><input id="s_domains" placeholder="acme.com,acme.co.uk" value="' + esc(c.allowedDomains) + '"></div>' +
+              '<div class="field"><label for="s_domains">Allowed email domains (comma-separated)</label><input id="s_domains" placeholder="acme.com,acme.co.uk" value="' + esc(c.allowedDomains) + '"></div>' +
             '</div>' +
             '<div class="actions"><button type="button" class="btn" data-close>Cancel</button><button type="submit" class="btn accent">' + (existing ? 'Save' : 'Create') + '</button></div>' +
           '</form>' +
