@@ -1491,7 +1491,7 @@
       }).join("");
 
     main.innerHTML =
-      pageHeader("Session " + s.externalId, s.agent + " · " + (s.user || "—") + " · " + (s.model || ""), '<a href="#/sessions" class="btn">← All sessions</a> <button class="btn" id="copyRcpt">Copy receipt</button> <button class="btn" id="shareRcpt">🔗 Share verify link</button> <button class="btn accent" id="dlRcpt">↓ Download receipt</button>') +
+      pageHeader("Session " + s.externalId, s.agent + " · " + (s.user || "—") + " · " + (s.model || ""), '<a href="#/sessions" class="btn">← All sessions</a> <button class="btn" id="printPack" title="Print this page as a clean evidence pack — receipt and event trail included">🖨 Print evidence pack</button> <button class="btn" id="copyRcpt">Copy receipt</button> <button class="btn" id="shareRcpt">🔗 Share verify link</button> <button class="btn accent" id="dlRcpt">↓ Download receipt</button>') +
       '<div class="session-summary">' +
         cell("Events", s.events, "streamed") +
         cell("Allowed", s.toolsAllowed, "tool calls") +
@@ -1521,6 +1521,14 @@
             '<div class="empty-mini">Click an event to inspect.</div>' +
           "</div>" +
         "</div>" +
+      "</div>" +
+      // Printed-only provenance footer. Screen never shows it; on
+      // paper it tells the recipient how to verify independently.
+      '<div class="print-only" style="margin-top:16px; padding-top:10px; border-top:1px solid var(--border); font-size:11px; color:var(--fg-2);">' +
+        "Evidence pack · session " + esc(s.externalId) + " · printed " + esc(new Date().toLocaleString()) +
+        (receipt && receipt.receiptId ? " · receipt " + esc(receipt.receiptId) : "") +
+        (receipt && receipt.signingKeyFingerprint ? " · signing key " + esc(receipt.signingKeyFingerprint) : "") +
+        "<br/>Verify this receipt offline at <b>agentvisorai.me/verify</b> — paste the downloaded receipt JSON; the Ed25519 signature check runs in the browser, no account needed." +
       "</div>";
 
     // event click → drawer. Selection is mirrored into the hash as
@@ -1672,6 +1680,10 @@
     }
 
     // Copy receipt button
+    // Print evidence pack: the @media print stylesheet strips chrome
+    // and forces the light palette, so this is just window.print().
+    on("#printPack", "click", function () { window.print(); });
+
     on("#copyRcpt", "click", function () {
       navigator.clipboard.writeText(JSON.stringify(receipt, null, 2)).then(function () {
         toast("Receipt copied");
