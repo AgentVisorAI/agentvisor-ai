@@ -2746,7 +2746,11 @@
       var sw = e.target.closest(".switch");
       if (sw) {
         e.stopPropagation();
-        state.ds.togglePolicy(sw.getAttribute("data-id")).then(function () { renderPolicies(main); });
+        // In-flight guard: rapid clicks queued concurrent toggles whose
+        // responses could interleave with the re-render out of order.
+        if (sw.getAttribute("aria-busy") === "true") return;
+        sw.setAttribute("aria-busy", "true");
+        state.ds.togglePolicy(sw.getAttribute("data-id")).then(function () { renderPolicies(main); }, function () { sw.removeAttribute("aria-busy"); });
         return;
       }
       var tr = e.target.closest("tr[data-id]");
@@ -2792,8 +2796,11 @@
             sessionsTable(fired.slice(0, 8)) +
           "</div>"
         : "");
-    on("#polSwitch", "click", function () {
-      state.ds.togglePolicy(id).then(function () { renderPolicyDetail(main, id); });
+    on("#polSwitch", "click", function (e) {
+      var sw = e.currentTarget;
+      if (sw.getAttribute("aria-busy") === "true") return;
+      sw.setAttribute("aria-busy", "true");
+      state.ds.togglePolicy(id).then(function () { renderPolicyDetail(main, id); }, function () { sw.removeAttribute("aria-busy"); });
     });
   }
   function syntaxPolicy(src) {
@@ -2911,14 +2918,18 @@
               '</div>'
             : '<p style="margin-top:12px;color:var(--fg-3);font-size:12px">Only owners and admins can change retention.</p>');
         if (editable) {
-          $("#retSave", card).addEventListener("click", async function () {
+          $("#retSave", card).addEventListener("click", async function (e) {
+            var saveBtn = e.currentTarget;
+            if (saveBtn.disabled) return;
             var s = parseInt($("#retSess", card).value, 10);
             var a = parseInt($("#retAudit", card).value, 10);
             if (isNaN(s) || isNaN(a) || s < 0 || a < 0) { toast("Invalid values"); return; }
+            saveBtn.disabled = true;
             try {
               await state.ds.updateRetention({ sessionRetentionDays: s, auditRetentionDays: a });
               toast("Retention updated.");
-            } catch (e) { toast(e.message || "Save failed"); }
+            } catch (e2) { toast(e2.message || "Save failed"); }
+            saveBtn.disabled = false;
           });
           $("#retSweepNow", card).addEventListener("click", function () {
             confirmModal({
@@ -3148,6 +3159,8 @@
     if (tables[1]) tables[1].addEventListener("click", function (e) {
       var btn = e.target.closest("[data-act='revoke']");
       if (!btn) return;
+      if (btn.disabled) return;
+      btn.disabled = true; // a double-click fired two revokes; the second errored
       var tr = e.target.closest("tr[data-invite]");
       var invId = tr.getAttribute("data-invite");
       var inv = invites.filter(function (x) { return x.id === invId; })[0];
@@ -3163,7 +3176,7 @@
           }).catch(function (err) { toast(err.message || "Could not restore the invite", true); });
         });
         else toast("Invite revoked");
-      }).catch(function (err) { toast(err.message || "Revoke failed", true); });
+      }).catch(function (err) { btn.disabled = false; toast(err.message || "Revoke failed", true); });
     });
   }
 
@@ -3750,19 +3763,25 @@
       uninstallWh = installModalKeys(backdrop, closeWh);
       backdrop.querySelectorAll("[data-close]").forEach(function (b) { b.addEventListener("click", closeWh); });
       backdrop.addEventListener("click", function (e) { if (e.target === backdrop) closeWh(); });
-      on($("#whSave", backdrop), "click", async function () {
+      on($("#whSave", backdrop), "click", async function (e) {
+        var saveBtn = e.currentTarget;
+        if (saveBtn.disabled) return;
         var name = $("#whName", backdrop).value.trim();
         var url = $("#whUrl", backdrop).value.trim();
         var events = Array.from(backdrop.querySelectorAll("#whEventsPicker input:checked")).map(function (i) { return i.value; });
         if (!name || !url) { toast("Name and URL are required"); return; }
         if (!events.length) { toast("Pick at least one event"); return; }
+        // Disable while in flight: a double-click here used to create
+        // two identical endpoints (each with its own secret).
+        saveBtn.disabled = true;
         try {
           var res = await state.ds.createWebhook({ name: name, url: url, events: events });
           closeWh();
           showTokenModal(res.secret, "Webhook secret");
           await renderSettingsWebhooks(root);
-        } catch (e) {
-          toast(e && e.message ? e.message : "Could not create webhook");
+        } catch (e2) {
+          saveBtn.disabled = false;
+          toast(e2 && e2.message ? e2.message : "Could not create webhook");
         }
       });
     }
