@@ -341,7 +341,21 @@ export function dispatchEvent(opts: DispatchOpts): void {
         // send.
         const adapter = pickAdapter(ep.url);
         const body = formatForAdapter(adapter, envelope);
-        void deliverOne(ep.id, ep.url, ep.secret, opts.event, body, 1, opts.logger);
+        // R116 F2: attach .catch. deliverOne does DB writes BEFORE
+        // entering its own try/catch (create the WebhookDelivery
+        // row, SSRF/DNS re-check updates), so a concurrent
+        // DELETE /:id (which cascades WebhookDelivery via the
+        // onDelete: Cascade FK) can throw P2003/P2025 out of
+        // deliverOne — the bare `void` prefix lets that rejection
+        // become an unhandledRejection. Node 15+ throws on
+        // unhandledRejection by default. Log at warn with the
+        // endpointId so ops can correlate.
+        void deliverOne(ep.id, ep.url, ep.secret, opts.event, body, 1, opts.logger).catch((err) => {
+          opts.logger?.warn(
+            { err, endpointId: ep.id, event: opts.event },
+            "webhook_dispatch_deliverOne_rejected",
+          );
+        });
       }
     } catch (e) {
       opts.logger?.warn({ err: e, event: opts.event }, "webhook_dispatch_failed");
@@ -693,6 +707,12 @@ export function startWebhookSweeper(logger?: FastifyBaseLogger): void {
           }
           // deliverOne with existingDeliveryId reuses this row rather than
           // creating a new one — attempt counter bumps in place.
+          // R116 F2: attach .catch — same rationale as
+          // dispatchEvent above. The sweeper's per-row try/catch
+          // wraps only the sync spawn; the async deliverOne
+          // rejection escapes it. Concurrent DELETE /:id cascade
+          // during the millisecond gap between claim and update
+          // yields P2025/P2003.
           void deliverOne(
             d.endpointId,
             endpoint.url,
@@ -702,7 +722,12 @@ export function startWebhookSweeper(logger?: FastifyBaseLogger): void {
             d.attempt + 1,
             logger,
             d.id,
-          );
+          ).catch((err) => {
+            logger?.warn(
+              { err, deliveryId: d.id, endpointId: d.endpointId },
+              "webhook_sweeper_deliverOne_rejected",
+            );
+          });
         } catch (rowErr) {
           // Don't let one row poison the whole batch.
           logger?.warn(
