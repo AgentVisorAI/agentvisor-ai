@@ -1886,6 +1886,11 @@ a.ob-step:hover { border-color: var(--accent); }
  * trail intact with their status colors.
  * ============================================================ */
 @media print {
+  /* An evidence pack must be COMPLETE: on-screen triage filters (kind
+   * chips / text search) hide rows via .evt-hidden, but a printed
+   * audit document silently missing events would look complete while
+   * being cropped. Print every event regardless of the live filter. */
+  .evt.evt-hidden { display: grid !important; }
   :root, [data-theme="dark"], [data-theme="light"] {
     color-scheme: light;
     --canvas: #ffffff; --surface: #ffffff; --surface-2: #fafafa; --surface-hover: #f4f4f5;

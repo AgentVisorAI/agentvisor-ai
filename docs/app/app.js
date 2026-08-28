@@ -1967,7 +1967,9 @@
       // Printed-only provenance footer. Screen never shows it; on
       // paper it tells the recipient how to verify independently.
       '<div class="print-only" style="margin-top:16px; padding-top:10px; border-top:1px solid var(--border); font-size:11px; color:var(--fg-2);">' +
-        "Evidence pack · session " + esc(s.externalId) + " · printed " + esc(new Date().toLocaleString()) +
+        "Evidence pack · session " + esc(s.externalId) + " · " + events.length + " event" + (events.length === 1 ? "" : "s") +
+        (data.nextEventCursor != null ? " (partial — more events not loaded; use Load more before printing for the full trail)" : "") +
+        " · printed " + esc(new Date().toLocaleString()) +
         (receipt && receipt.receiptId ? " · receipt " + esc(receipt.receiptId) : "") +
         (receipt && receipt.signingKeyFingerprint ? " · signing key " + esc(receipt.signingKeyFingerprint) : "") +
         "<br/>Verify this receipt offline at <b>agentvisorai.me/verify</b> — paste the downloaded receipt JSON; the Ed25519 signature check runs in the browser, no account needed." +
