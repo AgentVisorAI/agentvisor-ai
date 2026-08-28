@@ -169,6 +169,17 @@ console.log("✅ Environment pill present: " + pillText);
   for (const m of media) if (!m.tracks || !m.cues) problems.push("pitch video captions missing/unparsed: " + JSON.stringify(m));
   if (problems.length) fail("link/media integrity:\n  " + problems.join("\n  "));
   console.log("✅ Link + media integrity: all internal links resolve, anchors exist, videos have parsed captions");
+  // Alias stubs + branded 404: /mockup and /demo are meta-refresh
+  // shortcuts (printed on the QR handout), and the 404 page must keep
+  // its brand line + escape links — dead ends lose investors.
+  for (const [alias, want] of [["mockup/", "/pitch/"], ["demo/", "/app/"]]) {
+    const html = await page.evaluate(async (u) => (await fetch(u)).text(), origin + alias);
+    if (!html.includes('http-equiv="refresh"') || !html.includes(want)) fail("/" + alias + " alias stub broken (wants " + want + ")");
+  }
+  const h404 = await page.evaluate(async (u) => (await fetch(u)).text(), origin + "404.html");
+  if (!/AgentVisor/i.test(h404) || !h404.includes('href="/pitch/"') || !h404.includes('href="/app/"') || !h404.includes('href="/verify/"'))
+    fail("404 page missing brand line or escape links");
+  console.log("✅ Alias stubs (/mockup→/pitch, /demo→/app) + branded 404 with escape links");
 }
 
 await browser.close();
