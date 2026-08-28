@@ -274,6 +274,20 @@
     if (s < 86400) return Math.floor(s / 3600) + "h ago";
     return Math.floor(s / 86400) + "d ago";
   }
+  // Live relative timestamp: renders "2m ago" but keeps itself fresh —
+  // a table left open used to drift stale ("2m ago" forever). One
+  // interval updates every instance; title carries the absolute time.
+  function timeAgoCell(iso) {
+    if (!iso) return "—";
+    var d = new Date(iso);
+    return '<time datetime="' + esc(iso) + '" data-tago="' + esc(iso) + '" title="' + esc(d.toLocaleString()) + '">' + esc(timeAgo(iso)) + "</time>";
+  }
+  setInterval(function () {
+    $$("[data-tago]").forEach(function (el) {
+      var next = timeAgo(el.getAttribute("data-tago"));
+      if (el.textContent !== next) el.textContent = next;
+    });
+  }, 30000);
   // All toasts land in one fixed stack so simultaneous toasts pile
   // upward instead of overlapping, and the stack sits clear of (and
   // above) the tour launcher pill.
@@ -1226,9 +1240,14 @@
     var showingLabel = sessionsLoaded.length > 0
       ? sessionsLoaded.length.toLocaleString() + " session" + (sessionsLoaded.length === 1 ? "" : "s") + " shown"
       : "no sessions";
-    main.innerHTML = pageHeader("Sessions", showingLabel) + filterBar() + body;
+    var headerActions = sessionsLoaded.length > 0
+      ? '<button class="btn" id="exportCsv" title="Download the sessions shown below (current filters applied) as CSV">↓ Export CSV</button>'
+      : "";
+    main.innerHTML = pageHeader("Sessions", showingLabel, headerActions) + filterBar() + body;
     installFilters(main, deps);
     if (searchHadFocus) restoreSearchFocus(main, searchVal);
+    var xc = $("#exportCsv");
+    if (xc) xc.addEventListener("click", function () { exportSessionsCsv(sessionsLoaded); });
     var clr = $("#clearFilters");
     if (clr) clr.addEventListener("click", function () {
       try { history.replaceState(null, "", "#/sessions"); } catch (e) {}
@@ -1251,6 +1270,38 @@
         }
       });
     }
+  }
+
+  // CSV export of the currently loaded (filtered) sessions. Built
+  // client-side — no server round-trip, works offline. Fields are
+  // quoted, and values that could be interpreted as spreadsheet
+  // formulas (=+-@ leads) are prefixed with ' so a hostile agent name
+  // can't become an executing cell in Excel (CSV injection).
+  function csvField(v) {
+    var s = String(v == null ? "" : v);
+    if (/^[=+\-@\t]/.test(s)) s = "'" + s;
+    return '"' + s.replace(/"/g, '""') + '"';
+  }
+  function exportSessionsCsv(sessions) {
+    var head = ["session_id", "agent", "actor", "model", "started_at", "events", "tools_allowed", "tools_blocked", "llm_cost_usd", "blocked_value_usd"];
+    var lines = [head.join(",")].concat(sessions.map(function (s) {
+      return [
+        s.externalId || s.id, s.agent, s.user || "", s.model || "", s.startedAt || "",
+        s.events, s.toolsAllowed, s.toolsBlocked,
+        (parseInt(s.costUsdMicros, 10) / 1e6).toFixed(4),
+        (parseInt(s.blockedPayoutUsdMicros || "0", 10) / 1e6).toFixed(2),
+      ].map(csvField).join(",");
+    }));
+    var stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-");
+    var blob = new Blob(["\ufeff" + lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "agentvisor-sessions-" + stamp + ".csv";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 4000);
+    toast(sessions.length + " session" + (sessions.length === 1 ? "" : "s") + " exported");
   }
 
   function filterBar() {
@@ -1320,7 +1371,7 @@
         '<td class="num tabular">' + s.toolsAllowed + "</td>" +
         "<td>" + blocks + "</td>" +
         '<td class="num tabular">' + usdMicros(s.costUsdMicros) + "</td>" +
-        '<td style="color: var(--fg-2)">' + esc(timeAgo(s.startedAt)) + "</td>" +
+        '<td style="color: var(--fg-2)">' + timeAgoCell(s.startedAt) + "</td>" +
       "</tr>";
     }).join("");
     return '<div class="table-wrap"><table>' +
@@ -1791,7 +1842,7 @@
           '<td>' + esc(d.region || "—") + "</td>" +
           "<td>" + statusPill + "</td>" +
           '<td class="mono">' + esc(d.version || "—") + "</td>" +
-          '<td style="color: var(--fg-2)">' + esc(timeAgo(d.lastSeenAt)) + "</td>" +
+          '<td style="color: var(--fg-2)">' + timeAgoCell(d.lastSeenAt) + "</td>" +
           '<td>' +
             '<button class="btn" data-action="rotate">Rotate</button> ' +
             '<button class="btn danger" data-action="delete">Delete</button>' +
@@ -1883,7 +1934,7 @@
       '<div class="dep-summary">' +
         depCell("Status", statusPill) +
         depCell("Version", d.version || "—", true) +
-        depCell("Last seen", timeAgo(d.lastSeenAt)) +
+        depCell("Last seen", timeAgoCell(d.lastSeenAt)) +
         depCell("Sessions (24h)", d.sessions24h != null ? d.sessions24h : "—") +
         depCell("Spend (24h)", d.spend24h || "—") +
       "</div>" +
@@ -2222,7 +2273,7 @@
         "<td>" + esc(p.description) + "</td>" +
         '<td class="num tabular">' + esc(p.hits24h) + "</td>" +
         '<td class="num tabular">' + (p.blocks24h > 0 ? '<span style="color: var(--danger-solid); font-weight:500">' + esc(p.blocks24h) + "</span>" : esc(p.blocks24h)) + "</td>" +
-        '<td style="color:var(--fg-2)">' + esc(timeAgo(p.updatedAt)) + "</td>" +
+        '<td style="color:var(--fg-2)">' + timeAgoCell(p.updatedAt) + "</td>" +
         '<td><button class="switch ' + switchCls + '" data-id="' + esc(p.id) + '" aria-label="Toggle policy ' + esc(p.name) + '" role="switch" aria-checked="' + (p.enabled ? "true" : "false") + '"></button></td>' +
         "</tr>";
     }).join("");
@@ -2267,7 +2318,7 @@
         depCell("Status", p.enabled ? '<span class="pill ok status-dot">enabled</span>' : '<span class="pill neutral">disabled</span>') +
         depCell("Hits (24h)", p.hits24h.toLocaleString()) +
         depCell("Blocks (24h)", blocks24 > 0 ? '<span style="color: var(--danger-solid)">' + blocks24 + "</span>" : blocks24) +
-        depCell("Updated", timeAgo(p.updatedAt)) +
+        depCell("Updated", timeAgoCell(p.updatedAt)) +
       "</div>" +
       '<div class="card"><h2>Description</h2><p style="margin:0;color:var(--fg-2);font-size:var(--t-body)">' + esc(p.description) + '</p></div>' +
       '<div class="card" style="margin-top:12px"><h2>Definition</h2><pre class="policy-body">' + syntaxPolicy(p.body) + "</pre></div>" +
@@ -2554,7 +2605,7 @@
       return '<tr data-user="' + esc(m.userId || m.id) + '">' +
         '<td><div class="actor"><span class="av">' + esc(initials(m.displayName || m.email)) + '</span><div><div style="font-weight:500">' + esc(m.displayName || m.email) + '</div><div class="id">' + esc(m.email) + '</div></div></div></td>' +
         '<td>' + selector + '</td>' +
-        '<td style="color:var(--fg-2)">' + esc(timeAgo(m.lastActive)) + '</td>' +
+        '<td style="color:var(--fg-2)">' + timeAgoCell(m.lastActive) + '</td>' +
         '<td>' + (canManage ? '<button class="btn danger" data-act="remove">Remove</button>' : '') + '</td>' +
       '</tr>';
     }).join("");
@@ -2732,8 +2783,8 @@
       return '<tr data-id="' + esc(k.id) + '">' +
         '<td><div style="font-weight:500">' + esc(k.name) + '</div><div class="id">' + esc(k.id) + "</div></td>" +
         '<td class="mono">' + esc(k.hint) + "</td>" +
-        '<td style="color:var(--fg-2)">' + esc(timeAgo(k.lastUsedAt)) + "</td>" +
-        '<td style="color:var(--fg-2)">' + esc(timeAgo(k.createdAt)) + "</td>" +
+        '<td style="color:var(--fg-2)">' + timeAgoCell(k.lastUsedAt) + "</td>" +
+        '<td style="color:var(--fg-2)">' + timeAgoCell(k.createdAt) + "</td>" +
         '<td><button class="btn danger" data-act="revoke">Revoke</button></td>' +
       "</tr>";
     }).join("");
@@ -2832,8 +2883,8 @@
             return '<tr data-pk="' + esc(p.id) + '">' +
               '<td><div style="font-weight:500">' + esc(p.label) + '</div><div class="id">' + esc((p.aaguid || 'aaguid unknown').slice(0, 24)) + '</div></td>' +
               '<td>' + (p.transports || []).map(function (t) { return '<span class="pill neutral">' + esc(t) + '</span>'; }).join(' ') + '</td>' +
-              '<td style="color: var(--fg-2)">' + esc(p.lastUsedAt ? timeAgo(p.lastUsedAt) : "never") + '</td>' +
-              '<td style="color: var(--fg-2)">' + esc(timeAgo(p.createdAt)) + '</td>' +
+              '<td style="color: var(--fg-2)">' + (p.lastUsedAt ? timeAgoCell(p.lastUsedAt) : "never") + '</td>' +
+              '<td style="color: var(--fg-2)">' + timeAgoCell(p.createdAt) + '</td>' +
               '<td><button class="btn danger" data-pk-act="revoke">Revoke</button></td>' +
             '</tr>';
           }).join('') + '</tbody>' +
