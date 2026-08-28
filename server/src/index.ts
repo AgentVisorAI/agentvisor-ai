@@ -156,14 +156,24 @@ async function main(): Promise<void> {
     // is affected).
     allowList: (req) => {
       const u = req.url ?? "";
+      // R104 F3: anchor the prefix and escape the '.' in
+      // metadata\.xml. Prior startsWith('/api/v1/ingest') and
+      // unescaped '.' in /metadata.xml were latent traps — any
+      // future route named e.g. /api/v1/ingestion-preview or
+      // /api/v1/auth/saml/x/metadata_xml (unlikely but a real
+      // regex bug) would silently inherit the exemption without
+      // an operator noticing. Now: exact-match the ingest root,
+      // require a following /, ?, or end for the exemption; and
+      // escape the regex dot.
       return u === "/healthz" || u === "/readyz" || u === "/metrics" ||
         u.startsWith("/.well-known/") ||
-        u.startsWith("/api/v1/ingest") ||
+        u === "/api/v1/ingest" ||
+        /^\/api\/v1\/ingest(\/|\?|$)/.test(u) ||
         // SAML ACS + login redirects should never hit rate limits. If the
         // IdP posts a valid response it's a real user; if not, the SAML
         // signature check itself is the DoS guard (no DB writes beyond
         // that check).
-        /^\/api\/v1\/auth\/saml\/[^/]+\/(acs|slo|metadata\.xml|login)/.test(u);
+        /^\/api\/v1\/auth\/saml\/[^/]+\/(acs|slo|metadata\.xml|login)(\/|\?|$)/.test(u);
     },
     keyGenerator: (req) => {
       // R93 F1 + R100 F1: bucket the global 300 rpm cap on IP,
@@ -233,7 +243,18 @@ async function main(): Promise<void> {
   app.addHook("preHandler", async (req, reply) => {
     const method = req.method.toUpperCase();
     if (method === "GET" || method === "HEAD" || method === "OPTIONS") return;
-    if (typeof req.url === "string" && req.url.startsWith("/api/v1/ingest")) return;
+    // R104 F3: anchor the ingest prefix so a hypothetical
+    // sibling route like /api/v1/ingestion or
+    // /api/v1/ingest-legacy can't accidentally inherit the CSRF
+    // exemption. Same anchoring applied to the rate-limit
+    // allowList above.
+    if (
+      typeof req.url === "string" &&
+      (req.url === "/api/v1/ingest" ||
+        /^\/api\/v1\/ingest(\/|\?|$)/.test(req.url))
+    ) {
+      return;
+    }
     // SAML ACS receives form-encoded POSTs from the IdP itself
     // (cross-site by definition — that's the point). Its crypto layer
     // does the CSRF-equivalent check by verifying the IdP-signed
