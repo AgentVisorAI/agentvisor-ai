@@ -312,6 +312,24 @@
       const params = new URLSearchParams(raw);
       const data = params.get("data");
       if (!data) return;
+      // R120 F3: mirror the paste-path 5 MB cap (R115 F2).
+      // R115 F2's comment claimed the fragment path was already
+      // capped, but grep showed only file-drop (line 253) and
+      // paste (line 284) enforced 5_000_000. A hostile shared
+      // link (agentvisorai.me/verify/#data=<multi-MB base64>)
+      // synchronously blocked the main thread on atob + JSON.parse
+      // — same self-inflicted-tab-freeze class R115 F2 closed on
+      // paste. The base64 encoding is ~4/3 the raw byte length,
+      // and the sample-receipt is ~2 kB, so 5 MB base64 (~3.7 MB
+      // raw) is orders of magnitude above legitimate receipts.
+      if (data.length > 5_000_000) {
+        render({
+          kind: "err",
+          message:
+            "Shared receipt in URL is larger than 5 MB. Probably not a receipt.",
+        });
+        return;
+      }
       try {
         // base64url -> base64 -> bytes -> UTF-8 text.
         const b64 = data.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((data.length + 3) % 4);

@@ -31,6 +31,7 @@ import {
   mintSession,
   randomToken,
 } from "../lib/auth.js";
+import { writeAudit } from "../lib/audit.js";
 
 interface ProviderCfg {
   id: "google" | "microsoft";
@@ -316,6 +317,43 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
       // Shouldn't happen — every user has at least one membership by
       // construction. Fail loudly rather than mint a partial session.
       return reply.code(500).send({ error: "no_membership" });
+    }
+    // R120 F2 (resolves the R110 F4 deferred item): OAuth login
+    // MUST NOT bypass the WebAuthn MFA gate that /login enforces
+    // (auth.ts:326-340). Otherwise the whole point of a passkey
+    // — "password compromise ≠ account takeover" — is silently
+    // invalidated any time a user has a linked OAuth account:
+    //   1. User signs up with password + adds a hardware passkey.
+    //   2. User also links Google OAuth (email matches).
+    //   3. Attacker phishes / SIM-swaps the Google account.
+    //   4. Attacker hits /api/v1/auth/oauth/callback → email
+    //      verified → prior shape minted a full-role AV session
+    //      cookie with ZERO passkey ceremony.
+    // Fail-closed refusal is the smallest surgical change — the
+    // user is told to use password login (which will then trigger
+    // the R85 F3 mfaGateResponse flow and complete the passkey
+    // ceremony). Product-policy call (per R110 F4 deferred queue)
+    // resolved via ask_user; recommended safest-option chosen.
+    // SAML ACS in saml.ts is a sibling but SAML MFA is
+    // conventionally delegated to the IdP — out of scope here.
+    const credentialCount = await db.webauthnCredential.count({
+      where: { userId: user.id },
+    });
+    if (credentialCount > 0) {
+      writeAudit(
+        {
+          orgId: membership.orgId,
+          event: "auth.oauth_refused_mfa_required",
+          actorId: user.id,
+          actorEmail: user.email,
+          target: user.email,
+          req,
+        },
+        req.log,
+      );
+      return reply.code(403).send({
+        error: "mfa_required_use_password_login",
+      });
     }
     const token = await mintSession({
       sub: user.id,
