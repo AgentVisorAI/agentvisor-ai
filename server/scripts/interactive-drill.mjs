@@ -1007,6 +1007,32 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await page.fill("#newPassword", "second-reuse-attempt!");
   await page.click("#resetConfirmForm button[type=submit]");
   await page.waitForFunction(() => /invalid or has expired/i.test(document.querySelector("#resetErr")?.textContent || ""), { timeout: 8000 });
+  // (a2) auth error branches — dead code in the demo (mock login
+  // accepts anything) but the most-hit error paths in production.
+  // Inject failures: friendly message + button re-enable, and the 429
+  // countdown must tick, clear, and re-enable on expiry.
+  await page.evaluate(() => { location.hash = "#/login"; });
+  await page.waitForSelector("#authForm", { timeout: 8000 });
+  await page.evaluate(() => {
+    const ds = window.dataSource;
+    ds.__origLogin2 = ds.login.bind(ds);
+    ds.login = () => Promise.reject(Object.assign(new Error("invalid_credentials"), { friendlyMessage: "That email/password combination doesn't match.", status: 401 }));
+  });
+  await page.fill("input#email", "drill@northwind.com");
+  await page.fill("input#password", "wrong-password-1");
+  await page.click("button[type=submit]");
+  await page.waitForSelector(".auth-err", { timeout: 5000 });
+  if (!(await page.evaluate(() => /doesn't match/.test(document.querySelector(".auth-err").textContent) && !document.querySelector("button[type=submit]").disabled)))
+    fail("wrong-password branch broken (message or button re-enable)");
+  await page.evaluate(() => {
+    window.dataSource.login = () => Promise.reject(Object.assign(new Error("rate_limited"), { friendlyMessage: "Too many attempts. Try again in 2 seconds.", status: 429, retryAfterSec: 2 }));
+  });
+  await page.click("button[type=submit]");
+  await page.waitForSelector(".auth-err", { timeout: 5000 });
+  if (!(await page.evaluate(() => document.querySelector("button[type=submit]").disabled))) fail("429 did not lock the submit button");
+  await page.waitForFunction(() => !document.querySelector("button[type=submit]").disabled && !document.querySelector(".auth-err"), { timeout: 6000 })
+    .catch(() => fail("429 countdown did not re-enable + clear"));
+  await page.evaluate(() => { window.dataSource.login = window.dataSource.__origLogin2; });
   // (b) member redaction round-trip
   await page.evaluate(() => localStorage.removeItem("av_mock_signed_out"));
   await page.reload({ waitUntil: "domcontentloaded" });
@@ -1059,7 +1085,7 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
     return { ok: view.includes(p.name) && view.includes(String(blocks)) && rows === Math.min(fired.length, 8), fired: fired.length, blocks, rows };
   });
   if (!pd.ok || !pd.fired) fail("policy detail derivation wrong: " + JSON.stringify(pd));
-  console.log("✅ reset flow (issue/reject/confirm/single-use); member preview redacts + is view-only (tabs, SSO, keypair); policy blocks derived from " + pd.fired + " fired sessions");
+  console.log("✅ reset flow + auth error branches (401 msg, 429 countdown); member preview redacts + is view-only (tabs, SSO, keypair); policy blocks derived from " + pd.fired + " fired sessions");
 }
 
 // ── 22. Deployment lifecycle + billing math ────────────────────────
