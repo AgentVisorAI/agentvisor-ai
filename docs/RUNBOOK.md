@@ -91,16 +91,28 @@ docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
 
 **Signal:** Customer says "I never got the email."
 
-**Current state:** production only logs the userId, not the token. A
-real mailer is not wired yet (TODO in `server/src/routes/auth.ts`).
-Options:
+**Current state:** the mailer is wired (`server/src/lib/mail.ts`).
+Production requires `RESEND_API_KEY` or `SMTP_URL` at boot — the
+server refuses to start without one (`no_mailer_configured` at
+`mail.ts:115`) so a misconfigured deploy fails fast instead of
+silently swallowing resets. `auth.ts:1117` calls `getMailer()` and
+logs `{ userId, mailer, messageId }` on send.
 
-- Manual: query the DB for `resetTokenHash` timestamp, generate a fresh
-  token via the reset flow with a mailer bypass — do NOT hand out the
-  hash, it's non-reversible.
-- Wire the mailer. Recommended: Resend (10k emails/mo free) or Postmark.
-  Set `RESEND_API_KEY` / `POSTMARK_TOKEN`, replace the current `if (env.NODE_ENV === "production")` branch with a mailer call. Ship the
-  fix, add a smoke test, done.
+Triage:
+
+- Check the driver secrets in the deploy config: `RESEND_API_KEY` (or
+  `SMTP_URL`) plus `EMAIL_FROM`. `env.ts:287-292` documents the
+  precedence — Resend wins over SMTP.
+- Tail the server logs for `pw_reset_email_sent` at info and any
+  `pw_reset_email_error` at warn/error — the driver name and the
+  provider's message id / error surface there.
+- If Resend: verify the `EMAIL_FROM` domain is DNS-verified in the
+  Resend dashboard (unverified senders queue silently).
+- If SMTP: check the provider's dashboard (Postmark, SES, Mailgun) for
+  the message and any bounce.
+- Manual override: query the DB for the user's `resetTokenHash`
+  timestamp and re-send via the reset flow. Do NOT hand out the hash —
+  it's non-reversible; issue a fresh token instead.
 
 ### 6. Rate limit misconfigured — customer locked out
 
