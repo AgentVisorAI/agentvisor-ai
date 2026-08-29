@@ -18,7 +18,7 @@
  */
 import { chromium } from "playwright";
 
-const SITE = process.env.SITE ?? "https://agentvisorai.me/";
+const SITE = process.env.SITE ?? process.argv[2] ?? "https://agentvisorai.me/";
 // R91 F4: the /verify page's TRUSTED_RECEIPT_KEYS Set is only
 // exposed on `window` when the ?ci-drill=1 URL flag is set (see
 // docs/verify/verify.js R91 F4 comment). This drill mutates the

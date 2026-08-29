@@ -19,7 +19,7 @@ import { dirname, resolve, join } from "node:path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const VERIFIER = resolve(__dirname, "verify-receipt.mjs");
-const SITE = process.env.SITE ?? "https://agentvisorai.me/app/";
+const SITE = process.env.SITE ?? process.argv[2] ?? "https://agentvisorai.me/app/";
 
 function fail(m) { console.log("❌", m); process.exit(1); }
 async function wait(ms) { return new Promise((r) => setTimeout(r, ms)); }

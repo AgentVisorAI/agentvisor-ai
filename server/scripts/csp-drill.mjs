@@ -12,7 +12,7 @@
  */
 import { chromium } from "playwright";
 
-const SITE = process.env.SITE ?? "https://agentvisorai.me/";
+const SITE = process.env.SITE ?? process.argv[2] ?? "https://agentvisorai.me/";
 const APP = new URL("app/", SITE).href;
 const VERIFY = new URL("verify/", SITE).href;
 

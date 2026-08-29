@@ -13,7 +13,7 @@
  */
 import { chromium, devices } from "playwright";
 
-const SITE = process.env.SITE ?? "https://agentvisorai.me/app/";
+const SITE = process.env.SITE ?? process.argv[2] ?? "https://agentvisorai.me/app/";
 const LANDING = new URL(SITE).origin + "/";
 
 const profiles = [

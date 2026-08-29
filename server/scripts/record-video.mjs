@@ -17,7 +17,7 @@ import { join } from "node:path";
 const OUT_DIR = "/tmp/av-video";
 if (existsSync(OUT_DIR)) rmSync(OUT_DIR, { recursive: true, force: true });
 
-const SITE = process.env.SITE ?? "https://agentvisorai.me/app/";
+const SITE = process.env.SITE ?? process.argv[2] ?? "https://agentvisorai.me/app/";
 
 async function wait(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
