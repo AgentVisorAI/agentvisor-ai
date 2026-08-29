@@ -1625,6 +1625,21 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   }));
   if (sk.inputVal !== "returns" || !sk.rows || !sk.allMatch || !/q=returns/.test(sk.hash))
     fail("skeleton-phase typing was dropped: " + JSON.stringify(sk));
+  // Search-field Escape two-step: first press clears the query and
+  // re-applies the filter (focus kept), second press blurs. The
+  // palette's own Escape (type=text input) must stay untouched.
+  await skPage.keyboard.press("Escape");
+  await skPage.waitForTimeout(1200); // debounce (220ms) + mock fetch + repaint
+  const esc1 = await skPage.evaluate(() => ({
+    val: document.getElementById("fSearch").value,
+    rows: document.querySelectorAll("tbody tr").length,
+    focused: document.activeElement?.id,
+  }));
+  if (esc1.val !== "" || esc1.rows <= sk.rows || esc1.focused !== "fSearch")
+    fail("Escape did not clear the search and restore the list: " + JSON.stringify(esc1));
+  await skPage.keyboard.press("Escape");
+  await skPage.waitForTimeout(200);
+  if (await skPage.evaluate(() => document.activeElement?.id === "fSearch")) fail("second Escape did not blur the search field");
   await skPage.close();
   console.log("✅ skeleton-phase filter liveness: typing during the loading skeleton filters and syncs the URL");
   // Same class on the overview: the range group paints with the
