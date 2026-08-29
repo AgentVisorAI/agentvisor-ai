@@ -1,5 +1,5 @@
 # AgentVisor AI — Investor Mockup Video Storyboard
-# Duration: ~60 seconds. Target: 30-second understanding.
+# Duration: ~44 seconds (v21 distilled cut). Target: 30-second understanding.
 
 ## THE PITCH (in one line)
 "AI agents make real decisions. When one costs $8,400, you need a receipt."
@@ -45,4 +45,8 @@
 * Every scene has ONE thing to look at. No multi-panel dashboards.
 * Camera moves are slow crossfades (400ms) between scenes.
 * Captions overlay bottom-center, bold, 60% opacity black background.
-* No audio — investors watch muted 90% of the time. All info visual.
+* Two audio variants ship alongside a silent fallback: the definitive
+  cut (`v21-distilled.mp4`) carries narration + subtle whoosh, the
+  social cut (`v9-audio.mp4`) carries whoosh only, and the safe
+  fallback (`v4.mp4`) is silent. The visual arc is designed to read
+  fully without audio because investors watch muted ~90% of the time.

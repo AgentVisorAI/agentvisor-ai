@@ -28,7 +28,7 @@ bash scripts/video/compose-teaser.sh    # ~30s, writes /tmp/video-v4/agentvisor-
 
 Result:
 
-* `agentvisor-mockup-v13-narrated.mp4` — 44.7s @ 1920×1080 H.264, narration + subtle whoosh. **Definitive pitch cut.**
+* `agentvisor-mockup-v21-distilled.mp4` — 44.7s @ 1920×1080 H.264, narration + subtle whoosh. **Definitive pitch cut.**
 * `agentvisor-mockup-v9-audio.mp4` — same visuals, subtle whoosh only (social autoplay).
 * `agentvisor-mockup-v4.mp4` — same visuals, silent (safe fallback).
 * `agentvisor-mockup-teaser.mp4` — 12s social cut.
