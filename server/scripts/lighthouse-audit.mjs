@@ -21,6 +21,11 @@ const LANDING = new URL(SITE).origin + "/";
 const targets = [
   { name: "Landing", url: LANDING },
   { name: "Console (login)", url: SITE + "#/login" },
+  // The other two investor-facing surfaces: /pitch/ carries two MP4s
+  // (preload=metadata/none keeps them off the boot path — the budget
+  // guards that staying true) and /verify/ is the auditor's page.
+  { name: "Pitch", url: LANDING + "pitch/" },
+  { name: "Verify", url: LANDING + "verify/" },
 ];
 
 const budgets = {
