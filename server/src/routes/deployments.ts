@@ -58,7 +58,11 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
     }
     const body = z
       .object({
-        name: z.string().min(1).max(80).trim(),
+        // R211 F1: .max().trim().min() ordering — see auth.ts
+        // orgNameSchema. Deployment name is used as an
+        // identifier in the SPA picker; empty is especially
+        // bad UX.
+        name: z.string().max(80).trim().min(1),
         environment: envSchema.default("production"),
       })
       .safeParse(req.body);
