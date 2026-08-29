@@ -290,6 +290,10 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
     { av_mock_fresh_identity: "42", av_mock_fresh_t0: String(Date.now()) },
     { av_mock_fresh_identity: '{"user":{"email":"x@y.z"}}', av_mock_fresh_t0: String(Date.now()) },
     { av_mock_fresh_t0: "not-a-number" },
+    // every av_* key garbage at once — incl. the pre-paint theme
+    // whitelist in config.js (av_theme "banana" must not become
+    // data-theme="banana")
+    { av_theme: "banana", av_mock_fresh_t0: "not-a-number", av_mock_fresh_identity: "{broken", av_mock_bigdata: "yes{}", av_signed_in_at: "🦄", av_mock_fastload: "{}" },
   ]) {
     await page.evaluate((k) => { localStorage.clear(); for (const [a, b2] of Object.entries(k)) localStorage.setItem(a, b2); }, kv);
     await page.reload({ waitUntil: "domcontentloaded" });
@@ -297,8 +301,10 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
     const st = await page.evaluate(() => ({
       shell: !!document.querySelector(".app-shell, .auth"),
       len: (document.getElementById("view")?.innerText || "").trim().length,
+      theme: document.documentElement.getAttribute("data-theme"),
     }));
     if (!st.shell || st.len < 30) fail("corrupted storage bricked the app: " + JSON.stringify(kv) + " → " + JSON.stringify(st));
+    if (kv.av_theme && st.theme === kv.av_theme) fail("theme whitelist leaked a garbage value: " + st.theme);
   }
   await page.evaluate(() => localStorage.clear());
   await page.reload({ waitUntil: "domcontentloaded" });
