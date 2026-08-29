@@ -4922,6 +4922,23 @@
       var t = e.target;
       if (t && t.tagName === "INPUT" && t.type === "number" && document.activeElement === t) e.preventDefault();
     }, { passive: false });
+    // Search-field Escape, the standard two-step: first press clears
+    // the query (and re-applies the filter via the normal input
+    // pipeline), second press blurs. Capture phase + stopPropagation
+    // so a clearing Escape can't also trigger any other Escape sink.
+    document.addEventListener("keydown", function (e) {
+      if (e.key !== "Escape") return;
+      var t = e.target;
+      if (!t || t.tagName !== "INPUT" || t.type !== "search") return;
+      if (document.body.classList.contains("locked")) return; // modal Escape wins
+      if (t.value) {
+        e.preventDefault(); e.stopPropagation();
+        t.value = "";
+        t.dispatchEvent(new Event("input", { bubbles: true }));
+      } else {
+        t.blur();
+      }
+    }, true);
     document.addEventListener("keydown", function (e) {
       // ⌘K / Ctrl+K
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
