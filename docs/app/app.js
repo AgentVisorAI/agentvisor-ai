@@ -638,6 +638,20 @@
     var n = series.length;
     var gap = n <= 24 ? 3 : (n <= 30 ? 2 : 1);
     var barW = Math.max(2, chartW / n - gap);
+    var totalAll = 0;
+    series.forEach(function (s) { totalAll += s.allowed + s.blocked; });
+    // R202 F1: empty-state — if no activity across every bucket, the
+    // whole chart paints as empty axes and users get zero signal for
+    // WHY. Return a friendly card message routed through the same
+    // container so the surrounding legend + sub-heading still tell
+    // the story of what SHOULD be here.
+    if (totalAll === 0) {
+      return '<div class="chart-empty" role="status">' +
+        '<div class="chart-empty-icon" aria-hidden="true">📊</div>' +
+        '<div class="chart-empty-title">No tool calls in this window</div>' +
+        '<div class="chart-empty-sub">When your agents start making tool calls, this chart will show allowed vs. blocked buckets over time.</div>' +
+        '</div>';
+    }
     var max = Math.max.apply(null, series.map(function (s) { return s.allowed + s.blocked; }).concat([1]));
     // Multiple of 4, because the axis draws quarter ticks — a multiple
     // of 5 produced fractional ticks that rounded into "5 4 3 1 0".
@@ -651,8 +665,15 @@
       var blockedH = (s.blocked / max) * chartH;
       var yAllowedTop = padT + chartH - totalH;
       var yBlockedTop = padT + chartH - blockedH;
-      if (s.allowed) bars += '<rect class="bar" x="' + x.toFixed(1) + '" y="' + yAllowedTop.toFixed(1) + '" width="' + barW.toFixed(1) + '" height="' + (totalH - blockedH).toFixed(1) + '" rx="1.5"/>';
-      if (s.blocked) bars += '<rect class="bar blocked" x="' + x.toFixed(1) + '" y="' + yBlockedTop.toFixed(1) + '" width="' + barW.toFixed(1) + '" height="' + blockedH.toFixed(1) + '" rx="1.5"/>';
+      // R202 F1: data-idx on the visible bars too so the hover
+      // handler can add a `.hover` class that brightens the exact
+      // stack the cursor sits on (see .chart-svg .bar.hover in
+      // styles.css). Prior shape only highlighted via the cursor
+      // line + tooltip — on dense (720-wide, 60-bucket) renders
+      // the bar itself gave zero visual feedback for which bucket
+      // was under the pointer.
+      if (s.allowed) bars += '<rect class="bar" data-idx="' + i + '" x="' + x.toFixed(1) + '" y="' + yAllowedTop.toFixed(1) + '" width="' + barW.toFixed(1) + '" height="' + (totalH - blockedH).toFixed(1) + '" rx="1.5"/>';
+      if (s.blocked) bars += '<rect class="bar blocked" data-idx="' + i + '" x="' + x.toFixed(1) + '" y="' + yBlockedTop.toFixed(1) + '" width="' + barW.toFixed(1) + '" height="' + blockedH.toFixed(1) + '" rx="1.5"/>';
       // Wide hover strip covering each bucket for tooltip pickup
       hoverRects += '<rect class="hover-strip" x="' + x.toFixed(1) + '" y="' + padT + '" width="' + (barW + gap).toFixed(1) + '" height="' + chartH + '" fill="transparent" data-idx="' + i + '" />';
     }
@@ -1384,7 +1405,16 @@
       '<div class="chart-card">' +
         '<div class="head">' +
           '<h2>Tool call activity</h2>' +
-          '<span class="sub">' + esc(rangeLabel) + ' · ' + { "1h": "1-minute", "24h": "hourly", "7d": "daily", "30d": "daily" }[state.range] + ' buckets</span>' +
+          // R202 F1: promote the block-rate to the sub-heading so
+          // operators reading the chart get the ratio without
+          // reaching for a tooltip on every bucket. Falls back to
+          // "no activity" when the whole window is quiet so the
+          // empty-state chart below reads consistently.
+          '<span class="sub">' + esc(rangeLabel) + ' · ' + { "1h": "1-minute", "24h": "hourly", "7d": "daily", "30d": "daily" }[state.range] + ' buckets' +
+          ((stats.toolsAllowed + stats.toolsBlocked) > 0
+            ? ' · <b>' + pctBlocked + '% blocked</b>'
+            : ' · <span style="color: var(--fg-3)">no activity</span>') +
+          '</span>' +
           '<div class="legend">' +
             '<span><span class="dot" style="background: var(--accent)"></span> Allowed</span>' +
             '<span><span class="dot" style="background: var(--danger-solid)"></span> Blocked</span>' +
@@ -1501,6 +1531,17 @@
     var cursor = chart.querySelector("#chartCursor");
     var tip = h('<div class="chart-tip" style="display:none"></div>');
     root.querySelector(".chart-card").appendChild(tip);
+    function clearBarHover() {
+      // R202 F1: remove `.hover` from any previously-highlighted bar
+      // pair so a single hover class travels with the pointer.
+      var prev = chart.querySelectorAll(".bar.hover");
+      for (var i = 0; i < prev.length; i++) prev[i].classList.remove("hover");
+    }
+    function highlightBucket(idx) {
+      clearBarHover();
+      var bars = chart.querySelectorAll('.bar[data-idx="' + idx + '"]');
+      for (var i = 0; i < bars.length; i++) bars[i].classList.add("hover");
+    }
     function showBucket(strip) {
       var idx = parseInt(strip.getAttribute("data-idx"), 10);
       var s = series[idx];
@@ -1508,18 +1549,32 @@
       cursor.setAttribute("x1", x);
       cursor.setAttribute("x2", x);
       cursor.style.opacity = "1";
+      highlightBucket(idx);
       var box = chart.getBoundingClientRect();
       var relX = (x / 720) * box.width;
       tip.style.display = "block";
-      tip.style.left = Math.min(Math.max(0, relX - 60), box.width - 140) + "px";
+      var tipW = 160;
+      tip.style.left = Math.min(Math.max(0, relX - tipW / 2), box.width - tipW) + "px";
       tip.style.top = "-4px";
+      // R202 F1: also render a block-rate percentage per bucket
+      // (raw counts alone forced users to eyeball the ratio) and
+      // show a dedicated 0% pill on all-zero buckets so hovering
+      // a quiet slot returns something readable instead of blank
+      // "Allowed 0 / Blocked 0". The pointer arrow is a CSS
+      // pseudo-element on .chart-tip (see styles.css) so no
+      // extra markup lands here.
+      var total = s.allowed + s.blocked;
+      var blockPct = total > 0 ? Math.round((s.blocked / total) * 100) : 0;
+      var rateBadge = total > 0
+        ? '<span class="tip-rate' + (blockPct > 0 ? ' danger' : '') + '">' + blockPct + '% blocked</span>'
+        : '<span class="tip-rate quiet">quiet</span>';
       tip.innerHTML =
-        '<div class="tip-label">' + esc(s.label || "") + "</div>" +
-        '<div class="tip-row"><span class="d" style="background: var(--accent)"></span>Allowed <b>' + s.allowed + "</b></div>" +
-        '<div class="tip-row"><span class="d" style="background: var(--danger-solid)"></span>Blocked <b>' + s.blocked + "</b></div>" +
+        '<div class="tip-label">' + esc(s.label || "") + rateBadge + "</div>" +
+        '<div class="tip-row"><span class="d" style="background: var(--accent)"></span>Allowed <b>' + s.allowed.toLocaleString() + "</b></div>" +
+        '<div class="tip-row"><span class="d" style="background: var(--danger-solid)"></span>Blocked <b>' + s.blocked.toLocaleString() + "</b></div>" +
         (s.spendUsd > 0 ? '<div class="tip-row muted">Spend $' + s.spendUsd.toFixed(2) + "</div>" : "");
     }
-    function hideTip() { tip.style.display = "none"; cursor.style.opacity = "0"; }
+    function hideTip() { tip.style.display = "none"; cursor.style.opacity = "0"; clearBarHover(); }
     chart.addEventListener("mousemove", function (e) {
       var strip = e.target.closest(".hover-strip");
       if (!strip) { hideTip(); return; }
