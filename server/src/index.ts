@@ -602,12 +602,26 @@ async function main(): Promise<void> {
   app.get("/readyz", async (_req, reply) => {
     const started = Date.now();
     let dbOk = false;
-    let dbErr: string | undefined;
     try {
       await db.$queryRawUnsafe("SELECT 1");
       dbOk = true;
     } catch (err) {
-      dbErr = err instanceof Error ? err.message : String(err);
+      // R168 F1: log the raw error server-side but NEVER surface
+      // it in the response body. /readyz is public (exempt from
+      // rate limit, HTTPS-force, and auth per :168 & :231) so
+      // any probe during a DB outage returned strings like
+      //   "Can't reach database server at db.internal.corp:5432"
+      //   "Authentication failed for user 'postgres'"
+      //   "SSL connection required"
+      // to anyone on the internet — reveals internal DB hostname,
+      // user, SSL config, and driver semantics with no auth. This
+      // is the same class R108 F3 sanitized for setErrorHandler
+      // errorCode and R167 F1 sanitized for the problem+json title
+      // on 5xx; /readyz constructs its body manually and bypassed
+      // both. k8s / Fly.io / Cloud Run health probes only consume
+      // ok+checks, not dbError, so dropping the leaked message
+      // costs the platform nothing.
+      app.log.error({ err }, "readyz_db_probe_failed");
     }
     const busReady = bus.isReady();
     const ok = dbOk;
@@ -619,7 +633,6 @@ async function main(): Promise<void> {
         bus: busReady ? "ok" : "degraded",
       },
       elapsedMs: Date.now() - started,
-      ...(dbErr ? { dbError: dbErr } : {}),
     };
     return reply.code(ok ? 200 : 503).send(body);
   });
