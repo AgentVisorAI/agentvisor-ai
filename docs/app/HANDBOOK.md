@@ -48,11 +48,11 @@ catalog at the bottom.
    listeners until a *winning* response repaints (repaint-then-fetch dropped
    keystrokes mid-debounce).
 4. Buttons painted during a loading skeleton must be wired through a
-   **document-level delegated listener** (`#addPol`, `#addDep`, and the
+   **document-level delegated listener** (`#addPol`, `#addDep`, the
    whole sessions filter bar — `#fSearch`/`#fRange`/`#fDep`/`#fAgent`/
-   `#fBlocked`): direct wiring after the fetch left dead controls for
-   the first ~500 ms; typed text sat in the search box while the
-   unfiltered list painted below.
+   `#fBlocked` — and the overview `.range-group`): direct wiring after
+   the fetch left dead controls for the first ~500 ms; typed text sat
+   in the search box while the unfiltered list painted below.
    The static-page variant: buttons in `/verify/` HTML ship `disabled`
    and `verify.js` enables them once handlers attach — on a slow CDN the
    script arrives well after first paint, and a pre-wire click silently
