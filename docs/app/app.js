@@ -4269,7 +4269,21 @@
                 }).join('') +
               '</select></div>' +
               '<div class="field"><label for="s_sig">Signature algorithm</label><select id="s_sig">' +
-                ["sha256","sha512","sha1"].map(function (a) { return '<option' + (c.signatureAlgorithm === a ? ' selected' : '') + '>' + a + '</option>'; }).join('') +
+                (function () {
+                  // R229 F1: server rejects sha1 (saml.ts:144 —
+                  // signatureAlgorithm z.enum(["sha256","sha512"])).
+                  // Only surface sha1 in the dropdown when the
+                  // existing row is on the legacy sha1 (R114 F1
+                  // treats these as 410-inactive) so operators can
+                  // see + switch away; never offer sha1 for a fresh
+                  // config.
+                  var opts = ["sha256", "sha512"];
+                  if (c.signatureAlgorithm === "sha1") opts.push("sha1");
+                  return opts.map(function (a) {
+                    var label = a === "sha1" ? "sha1 (legacy — switch to sha256)" : a;
+                    return '<option value="' + esc(a) + '"' + (c.signatureAlgorithm === a ? ' selected' : '') + '>' + esc(label) + '</option>';
+                  }).join('');
+                })() +
               '</select></div>' +
             '</div>' +
             '<div class="field"><label class="toggle"><input type="checkbox" id="s_wantAssertionsSigned"' + (c.wantAssertionsSigned ? ' checked' : '') + '> Require signed assertions</label></div>' +
@@ -4330,7 +4344,14 @@
       }).catch(function (err) {
         btn.disabled = false;
         var msg = err.message || "Save failed";
-        if ((err.errorCode || err.detail) === "displayname_in_use") msg = "Another IdP already uses that display name.";
+        var code = err.errorCode || err.detail || "";
+        if (code === "displayname_in_use") msg = "Another IdP already uses that display name.";
+        else if (code === "saml_config_uses_sha1_reject" || /sha1/i.test(msg)) {
+          // R229 F1: server pins signatureAlgorithm/digestAlgorithm
+          // to {sha256, sha512}. Any sha1 select round-trips as
+          // invalid_input; make the fix discoverable.
+          msg = "sha1 is no longer accepted (SHA-1 is chosen-prefix collision-broken). Pick sha256 or sha512 in the Signature algorithm dropdown.";
+        }
         toast(msg, true);
       });
     });
