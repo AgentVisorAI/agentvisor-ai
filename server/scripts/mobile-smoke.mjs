@@ -321,8 +321,32 @@ await browser.close();
     await tourPage.waitForTimeout(1200);
   }
   await tourPage.close();
+  // Static pages at 280px: the pitch page's CTA grid (fixed 280px
+  // minmax floor) and QR row both overflowed the fold's content box.
+  const stPage = await (await b3.newContext({ viewport: { width: 280, height: 653 }, isMobile: true, hasTouch: true })).newPage();
+  const stRoot = SITE.replace(/app\/?$/, "");
+  for (const p of ["", "pitch/", "verify/"]) {
+    await stPage.goto(stRoot + p, { waitUntil: "domcontentloaded" });
+    await stPage.waitForTimeout(500);
+    const st = await stPage.evaluate(() => {
+      const scrollable = (el) => {
+        for (let q = el.parentElement; q; q = q.parentElement) {
+          const cs = getComputedStyle(q);
+          if (/(auto|scroll)/.test(cs.overflowX) && q.scrollWidth > q.clientWidth + 1) return true;
+        }
+        return false;
+      };
+      const bad = [...document.querySelectorAll("a, button, input, video")].filter((el) => {
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && (r.right > innerWidth + 2 || r.left < -2) && !scrollable(el);
+      }).length;
+      return { hOv: document.documentElement.scrollWidth - document.documentElement.clientWidth, bad };
+    });
+    if (st.hOv > 2 || st.bad) fail("static /" + p + " overflows at 280px: " + JSON.stringify(st));
+  }
+  await stPage.close();
   await b3.close();
-  console.log("✅ 280px foldable: topbar contains every control; account menu opens on-screen; all 6 tour cards fit");
+  console.log("✅ 280px foldable: topbar contains every control; account menu opens on-screen; all 6 tour cards fit; static pages contained");
 }
 
 console.log("\nAll mobile viewport smoke checks passed.");
