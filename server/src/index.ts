@@ -462,7 +462,29 @@ async function main(): Promise<void> {
     const errorCode = status >= 500
       ? "internal_error"
       : err.code ?? (isValidation ? "invalid_input" : "error");
-    const title = err.name && err.name !== "Error" ? err.name : status === 500 ? "Internal Server Error" : "Request Failed";
+    // R167 F1: force title to "Internal Server Error" on 5xx.
+    // Prior shape `err.name && err.name !== "Error" ? err.name : …`
+    // ran BEFORE the 5xx branch, so Prisma exceptions (name =
+    // "PrismaClientKnownRequestError" / "PrismaClientValidationError"
+    // / "PrismaClientRustPanicError"), Node natives (TypeError,
+    // ReferenceError, SyntaxError, RangeError), and third-party
+    // library errors (e.g. jose's JWSInvalid, ZodError from a stray
+    // schema.parse, samlify verification failures) all leaked
+    // through as the response title even after R108 F3 sanitized
+    // detail + errorCode. Signal to attackers distinguishing DB-
+    // layer failures from application-layer failures from token-
+    // parse failures — a probing chain (send malformed CBOR to
+    // /webauthn/verify, malformed SAML to /saml/acs, malformed JWT
+    // cookie to /me) enumerates which layer choked without touching
+    // logs. Same sanitization posture R108 F3 already established
+    // for errorCode on 5xx. 4xx titles retain err.name so deliberate
+    // application errors (validation, forbidden, not_found) still
+    // surface useful discrimination.
+    const title = status >= 500
+      ? "Internal Server Error"
+      : err.name && err.name !== "Error"
+        ? err.name
+        : "Request Failed";
 
     if (status >= 500) {
       req.log.error({ err: rawErr }, "unhandled error");
