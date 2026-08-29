@@ -1772,6 +1772,20 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
      their taps (elementFromPoint returned the TH over a data cell). */
   th { position: static; }
   .table-wrap table { min-width: 640px; }
+}
+/* Foldable cover displays (Galaxy Fold: 280px). The 760px tier still
+   overflowed the topbar by ~55px — the account button (the ONLY path
+   to sign-out/theme) was clipped clean off behind overflow:hidden.
+   Logo stands in for the wordmark; the email hides (the avatar initial
+   remains); gaps and padding tighten. */
+@media (max-width: 340px) {
+  .topbar { gap: var(--s-2); padding: 0 var(--s-3); }
+  .topbar .brand span { display: none; }
+  .topbar .user-btn span:last-child { display: none; }
+  .topbar .user-btn { max-width: none; }
+  .topbar .cmdk-trigger .kbd { display: none; }
+}
+@media (max-width: 760px) {
   /* Header actions wrap under the title instead of overflowing. */
   .page-header { flex-wrap: wrap; row-gap: var(--s-2); }
   .page-header .actions { flex-wrap: wrap; row-gap: var(--s-2); }

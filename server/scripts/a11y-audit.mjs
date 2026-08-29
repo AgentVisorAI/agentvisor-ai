@@ -176,6 +176,34 @@ for (const scheme of ["light", "dark"]) {
 
 await browser.close();
 
+// ── Forced colors (Windows High Contrast Mode) — common in the
+// enterprise/gov segment this product sells into. Backgrounds are
+// forced to system colors, so meaning carried by bg alone vanishes;
+// pills must keep borders + text labels, and the console must boot
+// without errors.
+{
+  const fcBrowser = await chromium.launch();
+  const fcCtx = await fcBrowser.newContext({ forcedColors: "active" });
+  const fcPage = await fcCtx.newPage();
+  const fcErrs = [];
+  fcPage.on("pageerror", (e) => fcErrs.push(e.message));
+  for (const r of ["#/overview", "#/sessions/sess_01H9K", "#/settings/sso"]) {
+    await fcPage.goto(SITE.replace(/#.*$/, "") + r, { waitUntil: "domcontentloaded" });
+    await fcPage.waitForSelector(".app-shell", { timeout: 15000 });
+    await fcPage.waitForTimeout(700);
+  }
+  const fcPills = await fcPage.evaluate(() =>
+    [...document.querySelectorAll(".pill")].slice(0, 8).map((p) => ({
+      border: parseFloat(getComputedStyle(p).borderTopWidth) >= 1,
+      text: p.textContent.trim().length > 0,
+    })));
+  const fcBad = fcPills.filter((p) => !p.border || !p.text).length;
+  if (!fcPills.length || fcBad) { anyFail = true; console.log("❌ forced-colors: " + fcBad + " pills lost their border/text (of " + fcPills.length + ")"); }
+  if (fcErrs.length) { anyFail = true; console.log("❌ forced-colors: JS errors: " + fcErrs.join("; ")); }
+  await fcBrowser.close();
+  if (!fcBad && !fcErrs.length) console.log("✅ forced-colors (Windows HCM): pills keep borders + text labels; 3 routes error-free");
+}
+
 if (anyFail) {
   console.log("\nA11y audit FAILED. Fix the serious+critical violations above.");
   process.exit(1);

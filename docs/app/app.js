@@ -372,8 +372,16 @@
     live.textContent = title;
     // Focus the content region so keyboard/SR users start at the new
     // page instead of a removed node. #view carries tabindex="-1".
+    // ONLY when focus has nowhere better to be: normal navigation
+    // detaches the old focus target (renderShell rebuilds #app), so
+    // activeElement has collapsed to <body> by now. But focus in a
+    // PERSISTENT body-level overlay (the tour card — its Next button
+    // survives route changes) must stay put: stealing it stranded
+    // keyboard users mid-tour on every cross-route step.
     var main = document.getElementById("view");
-    if (main) { main.setAttribute("tabindex", "-1"); try { main.focus({ preventScroll: true }); } catch (e) { main.focus(); } }
+    var ae = document.activeElement;
+    var stealable = !ae || ae === document.body || ae === document.documentElement || (main && main.contains(ae));
+    if (main && stealable) { main.setAttribute("tabindex", "-1"); try { main.focus({ preventScroll: true }); } catch (e) { main.focus(); } }
   }
 
   // Scroll restoration: leaving a route remembers where you were;
