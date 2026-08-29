@@ -167,8 +167,12 @@ capture = [];
   if (r1.status !== 200) fail(`deactivate -> ${r1.status}`);
   capture = [];
   const r2 = await jsonReq("POST", `/api/v1/webhooks/${epId}/test`);
-  // Deactivated endpoint returns 404 from the /test route (findFirst { isActive: true }).
-  if (r2.status !== 404) fail(`test on inactive -> ${r2.status}, expected 404`);
+  // R227 F2: deactivated endpoint returns 409 webhook_paused (distinct
+  // from 404 not_found) so the SPA can surface a helpful "resume
+  // first" nudge instead of an alarming "endpoint deleted" toast.
+  if (r2.status !== 409) fail(`test on inactive -> ${r2.status}, expected 409`);
+  const r2body = await r2.json().catch(() => ({}));
+  if (r2body.errorCode !== "webhook_paused") fail(`test on inactive body -> ${JSON.stringify(r2body)}, expected errorCode=webhook_paused`);
   await wait(500);
   if (capture.length !== 0) fail(`inactive endpoint got fired: ${capture.length}`);
   console.log("✅ inactive endpoint doesn't fire");
