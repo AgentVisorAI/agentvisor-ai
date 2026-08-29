@@ -1417,7 +1417,7 @@
       ? Math.round((stats.toolsBlocked / (stats.toolsAllowed + stats.toolsBlocked)) * 100) : 0;
 
     main.innerHTML =
-      pageHeader("Overview", "Fleet activity for " + rangeLabel + ".", attackBtn() + rangeGroup()) +
+      pageHeader("Overview", "Fleet activity" + (state.ds.mode === "mock" ? " for " + rangeLabel : "") + ".", attackBtn() + rangeGroup()) +
       onboardingCard(stats, sessions) +
       '<div class="stats">' +
         stat("Sessions", stats.sessions, stats.deployments + " deployment" + (stats.deployments === 1 ? "" : "s"), sparkline(series.map(function (b) { return b.allowed + b.blocked; }))) +
@@ -1434,10 +1434,20 @@
           // reaching for a tooltip on every bucket. Falls back to
           // "no activity" when the whole window is quiet so the
           // empty-state chart below reads consistently.
-          '<span class="sub">' + esc(rangeLabel) + ' · ' + { "1h": "1-minute", "24h": "hourly", "7d": "daily", "30d": "daily" }[state.range] + ' buckets' +
-          ((stats.toolsAllowed + stats.toolsBlocked) > 0
-            ? ' · <b>' + pctBlocked + '% blocked</b>'
-            : ' · <span style="color: var(--fg-3)">no activity</span>') +
+          '<span class="sub">' +
+            (state.ds.mode === "mock"
+              ? esc(rangeLabel) + ' · ' + { "1h": "1-minute", "24h": "hourly", "7d": "daily", "30d": "daily" }[state.range] + ' buckets' +
+                ((stats.toolsAllowed + stats.toolsBlocked) > 0
+                  ? ' · <b>' + pctBlocked + '% blocked</b>'
+                  : ' · <span style="color: var(--fg-3)">no activity</span>')
+              // R232 F1: server /overview returns aggregates only —
+              // no hourly buckets yet — so the chart below reads
+              // structurally empty in live mode regardless of actual
+              // fleet activity. Say so instead of implying idle
+              // fleet.
+              : (stats.toolsAllowed + stats.toolsBlocked) > 0
+                ? '<b>' + pctBlocked + '% blocked</b> · time-series preview'
+                : '<span style="color: var(--fg-3)">time-series preview — hourly buckets not wired yet</span>') +
           '</span>' +
           '<div class="legend">' +
             '<span><span class="dot" style="background: var(--accent)"></span> Allowed</span>' +
@@ -1640,6 +1650,13 @@
     });
   }
   function rangeGroup() {
+    // R232 F2: the server /overview endpoint doesn't accept `range` yet
+    // (read.ts:44-56 zod is {deploymentId, limit} only). Rendering the
+    // 1h/24h/7d/30d buttons in live mode produces a ghost filter — the
+    // click flips the pill but every response is the same aggregate.
+    // Mock mode honors range via bucketSessions() so keep the group
+    // for the marketing demo.
+    if (state.ds.mode !== "mock") return "";
     var opts = ["1h", "24h", "7d", "30d"];
     return '<div class="range-group">' + opts.map(function (o) {
       return '<button data-range="' + o + '"' + (state.range === o ? ' class="active"' : "") + '>' + o + '</button>';
@@ -3111,7 +3128,16 @@
         description: built.description, body: built.body,
       }).then(function (p) {
         close();
-        toastLink("Policy created and enforcing — the daemon picks it up on its next sync.", "#/policies/" + p.id, "View policy →");
+        // R232 F3: server-side policy CRUD isn't wired (no
+        // /api/v1/policies route). In live mode the policy is
+        // pushed to the local MOCK_POLICIES store and lost on
+        // reload; be honest about that so operators don't
+        // deploy expecting daemon enforcement. Mock mode
+        // (marketing demo) keeps the "and enforcing" copy.
+        var enforcedMsg = state.ds.mode === "mock"
+          ? "Policy created and enforcing — the daemon picks it up on its next sync."
+          : "Policy saved in this browser only. Server-side policy CRUD + daemon sync are preview — nothing is persisted or enforced yet.";
+        toastLink(enforcedMsg, "#/policies/" + p.id, "View policy →");
         navigate("#/policies/" + p.id);
       }).catch(function (err) {
         btn.disabled = false;
