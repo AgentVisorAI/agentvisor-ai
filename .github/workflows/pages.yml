@@ -141,7 +141,7 @@ jobs:
           cp docs/app/pitch/index.html "$site/app/pitch/"
           cp docs/app/pitch/console.css "$site/app/pitch/"
           cp docs/app/pitch/console.js "$site/app/pitch/"
-          # Public /pitch/ investor landing page — the 44-second video
+          # Public /pitch/ investor landing page — the 30-second video
           # + CTAs. Self-hosted MP4 + JPG so it works under strict CSP.
           mkdir -p "$site/pitch"
           cp docs/pitch/index.html "$site/pitch/"
