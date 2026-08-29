@@ -47,6 +47,7 @@ import {
   getDummyPasswordHash,
 } from "../lib/auth.js";
 import { writeAudit } from "../lib/audit.js";
+import { perIpCookieOnly } from "../lib/rate-limit.js";
 import { requireSession } from "../lib/session-middleware.js";
 
 // ---------------------------------------------------------------------------
@@ -261,7 +262,12 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
     // cookie with zero failure audit (mfa.credential_registered
     // fires only on success). Same primitive R86 F3 hardened
     // for /login. Also amplifies argon2 CPU spend for DoS.
-    config: { rateLimit: perIp(3, 60_000) },
+    // R142 F2: use perIpCookieOnly so a Bearer-header hammer
+    // from an attacker with any valid av_srv_ token can't burn
+    // the legitimate cookie caller's budget — R141 F4's
+    // covert lock-out primitive fix generalized to every
+    // step-up sibling.
+    config: { rateLimit: perIpCookieOnly(3, 60_000) },
   }, async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
@@ -746,43 +752,12 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.delete<{ Params: { id: string } }>("/credentials/:id", {
-    // R140 F2: perIp(3, 60_000) matches /register/verify (R139 F1)
-    // and the /me/{export,delete-account} step-up siblings. See
-    // password-body rationale in the handler comment below.
-    // R141 F4: keyGenerator skips the bucket when the caller
-    // has an Authorization header (api-key session) — those
-    // requests get rejected at the cookie_session_required
-    // branch below without touching argon2. Prior shape
-    // decremented the bucket on every api-key hit, letting an
-    // attacker with any valid av_srv_ token burn the legitimate
-    // owner's revoke budget from that IP by hammering DELETE
-    // with a bearer header — 3 requests → the real owner is
-    // locked out of revoking a compromised passkey for 60s.
-    // Combined with F1's failure audit, that would have been a
-    // covert lock-out primitive.
-    config: {
-      rateLimit: {
-        max: 3,
-        timeWindow: 60_000,
-        keyGenerator: (req: { ip: string }) => `ip:${req.ip}`,
-        // R141 F4: skip the rate limit for requests carrying an
-        // Authorization: Bearer <av_srv_> header — those are
-        // api-key sessions that we reject at the
-        // cookie_session_required branch below without touching
-        // argon2. Prior shape decremented the bucket on every
-        // api-key hit, letting an attacker with ANY valid av_srv_
-        // token burn the legitimate owner's revoke budget from
-        // that IP by hammering DELETE with a bearer header —
-        // 3 requests → real owner locked out of revoking a
-        // compromised passkey for 60s. Combined with F1's
-        // failure audit, that would have been a covert lock-out
-        // primitive.
-        allowList: (req: { headers: Record<string, unknown> }) => {
-          const auth = req.headers["authorization"];
-          return typeof auth === "string" && auth.toLowerCase().startsWith("bearer ");
-        },
-      },
-    },
+    // R140 F2 / R141 F4 / R142 F2: perIp(3, 60_000) with allowList
+    // that skips the bucket for Authorization: Bearer requests —
+    // extracted to lib/rate-limit.ts perIpCookieOnly and reused
+    // across every auth-tree step-up sibling to keep the four
+    // call-sites in sync.
+    config: { rateLimit: perIpCookieOnly(3, 60_000) },
   }, async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
