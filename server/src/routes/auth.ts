@@ -685,7 +685,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     // owner-check + password verify pass so no oracle leaks,
     // BEFORE reply.raw.flushHeaders so the audit fires whether
     // the stream completes or not. Distinct from /me/delete-
-    // account which is deliberately non-audited (auth.ts:718:
+    // account which is deliberately non-audited (auth.ts:962:
     // "would itself be nuked by the same cascade") — no
     // cascade concern applies here (nothing is deleted).
     writeAudit(

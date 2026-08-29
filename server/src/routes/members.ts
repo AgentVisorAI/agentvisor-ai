@@ -614,8 +614,8 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
     return reply.code(204).send();
   });
 
-  // R121 F3: per-route rate limit matches /login (auth.ts:264) and
-  // /webauthn/authenticate/verify (webauthn.ts:421). Prior shape
+  // R121 F3: per-route rate limit matches /login (auth.ts:274) and
+  // /webauthn/authenticate/verify (webauthn.ts:527). Prior shape
   // inherited the global 300/min/IP; combined with R80 F3's cap of
   // 5 argon2 verifies per request, an unauthenticated attacker
   // could burn 300 x 5 = 1500 argon2 verifies/min/IP as cheap
