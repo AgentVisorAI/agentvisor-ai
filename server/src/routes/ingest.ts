@@ -534,67 +534,123 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       let dBlockedPayout = 0;
       let dToolsOk = 0;
       let dToolsBad = 0;
-      await db.$transaction(async (tx) => {
-        for (const row of rows) {
-          try {
-            await tx.event.create({ data: row });
-            insertedSeqs.add(row.seq);
-          } catch (err) {
-            if (
-              typeof err === "object" &&
-              err !== null &&
-              (err as { code?: string }).code === "P2002"
-            ) {
-              // Concurrent batch already inserted this seq. Skip
-              // silently — matches prior skipDuplicates behavior.
-              continue;
+      // R152 F1: guard the rollup update on the sealed status
+      // via a DB-side WHERE clause, mirroring the R151 F1 shape
+      // used on POST /ingest/sessions. Prior shape checked
+      // `session.status === "sealed"` at :449 OUTSIDE any
+      // transaction, then created event rows + incremented
+      // rollup inside a tx that only pinned `{id: session.id}`
+      // — no `status` predicate. If /ingest/receipts committed
+      // `session.update({ status:"sealed" })` (via its own tx at
+      // :~810) between our findUnique (:434) and the rollup
+      // update, event.create rows AND the increment landed on
+      // the now-sealed row: signed `receipt.eventCount` /
+      // `receipt.body` totals then mismatched
+      // `session.events` / session totals, breaking the
+      // compliance story from the OTHER direction R144 F1 /
+      // R151 F1 closed for POST /ingest/sessions. Same
+      // threat model (leaked AV_INGEST_TOKEN or benign daemon
+      // racing its own seal). Fix: convert the rollup to
+      // updateMany with `status: { not: "sealed" }`, throw
+      // inside the tx when the guard fails so the whole batch
+      // (event.creates + rollup) rolls back atomically, and
+      // account the batch as `rejectedSealed` outside.
+      let sealedMidTx = false;
+      try {
+        await db.$transaction(async (tx) => {
+          for (const row of rows) {
+            try {
+              await tx.event.create({ data: row });
+              insertedSeqs.add(row.seq);
+            } catch (err) {
+              if (
+                typeof err === "object" &&
+                err !== null &&
+                (err as { code?: string }).code === "P2002"
+              ) {
+                // Concurrent batch already inserted this seq. Skip
+                // silently — matches prior skipDuplicates behavior.
+                continue;
+              }
+              throw err;
             }
-            throw err;
           }
-        }
-        for (const e of fresh) {
-          if (!insertedSeqs.has(e.seq)) continue;
-          dPrompt += e.addPromptTokens;
-          dCompletion += e.addCompletionTokens;
-          dCost += e.addCostUsdMicros;
-          dPayout += e.addPayoutUsdMicros;
-          dBlockedPayout += e.addBlockedPayoutUsdMicros;
-          dToolsOk += e.addToolsAllowed;
-          dToolsBad += e.addToolsBlocked;
-        }
+          for (const e of fresh) {
+            if (!insertedSeqs.has(e.seq)) continue;
+            dPrompt += e.addPromptTokens;
+            dCompletion += e.addCompletionTokens;
+            dCost += e.addCostUsdMicros;
+            dPayout += e.addPayoutUsdMicros;
+            dBlockedPayout += e.addBlockedPayoutUsdMicros;
+            dToolsOk += e.addToolsAllowed;
+            dToolsBad += e.addToolsBlocked;
+          }
+          if (insertedSeqs.size > 0) {
+            // Always call the guarded updateMany when we've
+            // inserted event rows — even when the rollup deltas
+            // are all zero (a pure-log batch). Increment-by-zero
+            // is still a valid UPDATE, so Postgres evaluates the
+            // `status: { not: "sealed" }` WHERE under the row
+            // lock; if the row is sealed we get upd.count===0
+            // and throw to abort the tx (event.create rows roll
+            // back too).
+            const upd = await tx.session.updateMany({
+              where: { id: session.id, status: { not: "sealed" } },
+              data: {
+                promptTokens: { increment: dPrompt },
+                completionTokens: { increment: dCompletion },
+                costUsdMicros: { increment: BigInt(dCost) },
+                payoutUsdMicros: { increment: BigInt(dPayout) },
+                blockedPayoutUsdMicros: { increment: BigInt(dBlockedPayout) },
+                toolsAllowed: { increment: dToolsOk },
+                toolsBlocked: { increment: dToolsBad },
+              },
+            });
+            if (upd.count === 0) {
+              // Session was sealed by a concurrent
+              // /ingest/receipts between our pre-tx status
+              // check at :449 and this update. Abort the tx
+              // so every event.create above rolls back.
+              throw new Error("__session_sealed_mid_tx__");
+            }
+          }
+        }, {
+          // R95 F1: Prisma's default $transaction timeout is 5 s.
+          // The route's zod cap is .max(500), and each event.create
+          // is a serial round trip inside the tx. On hosted Postgres
+          // (Neon, Supabase, RDS) with 10-20 ms RTT the tx spans
+          // 5-10 s for a full 500-row single-session batch and
+          // consistently throws P2028 'Transaction already closed'.
+          // The route re-raises → 500 → daemon retries the same
+          // batch → hits the same timeout → session livelocked
+          // FOREVER. Exchanging the R93 F2 double-count for hard
+          // stuck is worse. Bump the tx timeout to 30 s (covers
+          // 500 rows × 60 ms RTT × 2 safety) and maxWait to 10 s
+          // (default 2 s risks queue-storm 429s under contention).
+          timeout: 30_000,
+          maxWait: 10_000,
+        });
+      } catch (err) {
         if (
-          dPrompt || dCompletion || dCost || dPayout || dBlockedPayout ||
-          dToolsOk || dToolsBad
+          typeof err === "object" &&
+          err !== null &&
+          (err as { message?: string }).message === "__session_sealed_mid_tx__"
         ) {
-          await tx.session.update({
-            where: { id: session.id },
-            data: {
-              promptTokens: { increment: dPrompt },
-              completionTokens: { increment: dCompletion },
-              costUsdMicros: { increment: BigInt(dCost) },
-              payoutUsdMicros: { increment: BigInt(dPayout) },
-              blockedPayoutUsdMicros: { increment: BigInt(dBlockedPayout) },
-              toolsAllowed: { increment: dToolsOk },
-              toolsBlocked: { increment: dToolsBad },
-            },
-          });
+          // R152 F1: concurrent seal detected inside the tx.
+          // Tx already rolled back; treat the batch the same
+          // way as the pre-tx sealed check at :449 — surface
+          // via rejectedSealed and skip the rest of the loop
+          // body (inserted counter, bus.publish, policy.block
+          // dispatch — none of those effects landed).
+          sealedMidTx = true;
+        } else {
+          throw err;
         }
-      }, {
-        // R95 F1: Prisma's default \$transaction timeout is 5 s.
-        // The route's zod cap is .max(500), and each event.create
-        // is a serial round trip inside the tx. On hosted Postgres
-        // (Neon, Supabase, RDS) with 10-20 ms RTT the tx spans
-        // 5-10 s for a full 500-row single-session batch and
-        // consistently throws P2028 'Transaction already closed'.
-        // The route re-raises → 500 → daemon retries the same
-        // batch → hits the same timeout → session livelocked
-        // FOREVER. Exchanging the R93 F2 double-count for hard
-        // stuck is worse. Bump the tx timeout to 30 s (covers
-        // 500 rows × 60 ms RTT × 2 safety) and maxWait to 10 s
-        // (default 2 s risks queue-storm 429s under contention).
-        timeout: 30_000,
-        maxWait: 10_000,
-      });
+      }
+      if (sealedMidTx) {
+        rejectedSealed.push(externalId);
+        continue;
+      }
       inserted += insertedSeqs.size;
 
       if (insertedSeqs.size > 0 || dToolsOk || dToolsBad) {

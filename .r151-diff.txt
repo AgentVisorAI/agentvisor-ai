@@ -1,0 +1,291 @@
+commit 967cba9e2b863f4726f5360488d643e2f056848a
+Author: debugmode0 <318375212+debugmode0@users.noreply.github.com>
+Date:   Fri Aug 28 20:57:35 2026 -0700
+
+    R151: /ingest/sessions TOCTOU sealed-guard + webhook sweeper env validation
+    
+    Part 1 — verify R149 + R150 (b9f70eb, verify-only):
+    
+    * SAML config CREATE owner-only — confirmed. Gate at :608 fires before
+      createConfigSchema.safeParse; denial branch emits
+      auth.step_up_denied with metadata.endpoint="saml.config.create" via
+      resolveActor and returns 403 only_owner_can_create_saml_config.
+      CREATE / PATCH / DELETE / keypair now uniformly owner-only.
+    * R150 was verify-only (auditor returned <none>).
+    
+    Part 2 — R151 fixes:
+    
+    F1 — MEDIUM. server/src/routes/ingest.ts POST /ingest/sessions now
+    enforces the post-seal freeze via a DB-side WHERE clause instead of
+    a JS-side snapshot check. Prior shape:
+    
+      const existing = await db.session.findUnique(...);
+      const isSealed = existing?.status === "sealed";
+      ...
+      db.session.upsert({ ..., update: isSealed ? {} : {full-fields} });
+    
+    is a TOCTOU race against /ingest/receipts's concurrent seal at
+    :~763. If the receipts handler commits `session.update({status:
+    "sealed"})` between our findUnique (T0) and the upsert (T1):
+    
+      1. Our JS snapshot shows existing.status="live", isSealed=false.
+      2. Postgres' ON CONFLICT DO UPDATE has no sealed guard.
+      3. The row is blindly reverted from "sealed" back to "live" with
+         the attacker-supplied agent / workflow / policyVersion /
+         closedAt.
+      4. Signed receipt.eventCount mismatches session.events; the
+         /events guard at :402 stops rejecting further appends; SPA
+         and /me/export render the mutated fields.
+    
+    This is the same post-seal defacement class R119 F2 (metadata
+    freeze) / R141 F3 (pre-sealed CREATE) / R144 F1 (pre-sealed UPDATE)
+    closed for the non-concurrent paths. R144's own comment named the
+    invariant ("Same threat model as R141 F3; the invariant needs to
+    hold on UPDATE too") but enforced it only against attacker-
+    supplied s.status="sealed" — a race against a legitimate concurrent
+    seal slipped through. Threat model: compromised AV_INGEST_TOKEN,
+    same as R141 F3 / R144 F1.
+    
+    Fix moves the guard to the DB WHERE clause via updateMany:
+    
+      const upd = await db.session.updateMany({
+        where: { deploymentId, externalId, status: { not: "sealed" } },
+        data: { agent, workflow, status, policyVersion, closedAt },
+      });
+      if (upd.count === 0) {
+        // Row doesn't exist yet (CREATE branch) OR row is sealed
+        // (leave it alone). Upsert with update:{} handles both.
+        session = await db.session.upsert({..., update: {}, select:...});
+      } else {
+        session = await db.session.findUnique({..., select:...});
+      }
+    
+    Postgres evaluates `status: { not: "sealed" }` under the same row
+    lock the UPDATE takes, so no snapshot can lie about the sealed
+    state. R123 F2's "return persisted agent, not caller-supplied
+    s.agent" invariant preserved on both branches via the select clause.
+    
+    F2 — LOW. server/src/lib/webhooks.ts WEBHOOK_SWEEPER_INTERVAL_MS
+    now validated via Zod in server/src/env.ts. Prior shape:
+    
+      const SWEEPER_INTERVAL_MS =
+        Number(process.env.WEBHOOK_SWEEPER_INTERVAL_MS ?? 15_000);
+    
+    is the exact footgun R99 F3 closed for the sibling
+    RETENTION_SWEEPER_INTERVAL_MS. Number("") === 0, Number("15s") ===
+    NaN, Number("15_000") === NaN (underscores rejected), all of which
+    Node's setInterval clamps to ~1 ms — the sweeper fires every
+    event-loop tick and hammers Postgres with the FOR UPDATE SKIP LOCKED
+    claim UPDATE. Not attacker-triggered (ops-config typo only), but the
+    retention sibling got the full guard for the same failure mode and
+    this one was missed.
+    
+    Fix adds env.WEBHOOK_SWEEPER_INTERVAL_MS: z.string().default("15000")
+    .transform(Number).refine((n) => Number.isInteger(n) && n >= 1_000
+    && n <= 300_000) with docstring mirroring the retention entry.
+    Bounds: 1 s floor (retry latency ceiling — anything slower starves
+    customer endpoints on failed deliveries), 5 min ceiling (safety net
+    so operators don't silently disable retries by setting it enormous).
+    lib/webhooks.ts imports the validated value:
+    `const SWEEPER_INTERVAL_MS = env.WEBHOOK_SWEEPER_INTERVAL_MS;`.
+    
+    Grep for `Number(process.env.` across server/src now returns only
+    comment matches — no live sites remain.
+    
+    Convergence: R6:8 -> ... -> R148:3 -> R149:1 -> R150:0 -> R151:2.
+    Cumulative 450 fixes shipped across 142 fix-bearing rounds.
+    
+    Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+
+diff --git a/server/src/env.ts b/server/src/env.ts
+index e86dc9b..61133b7 100644
+--- a/server/src/env.ts
++++ b/server/src/env.ts
+@@ -136,6 +136,29 @@ const Env = z.object({
+       (n) => Number.isInteger(n) && n >= 60_000 && n <= 86_400_000,
+       "RETENTION_SWEEPER_INTERVAL_MS must be integer ms in [60000, 86400000]",
+     ),
++  // R151 F2: webhook retry sweeper interval, in milliseconds.
++  // Same footgun as RETENTION_SWEEPER_INTERVAL_MS above (R99 F3):
++  // prior shape (lib/webhooks.ts:635) did
++  // `Number(process.env.WEBHOOK_SWEEPER_INTERVAL_MS ?? 15_000)`
++  // with no validation — Number("") === 0, Number("15s") === NaN,
++  // Number("15_000") === NaN (underscores rejected), all of which
++  // Node's setInterval clamps to ~1 ms → sweeper hammers Postgres
++  // with the FOR UPDATE SKIP LOCKED claim UPDATE every event-loop
++  // tick. Ops-config typo only (not attacker-triggered) so LOW,
++  // but the retention sibling got the full guard for the same
++  // failure mode. Bounds: 1 s floor (retry latency ceiling for
++  // failed webhook deliveries — anything longer starves customer
++  // endpoints) to 5 min ceiling (safety net so operators don't
++  // silently disable retries by setting it enormous). Default is
++  // 15 s to match the historical constant.
++  WEBHOOK_SWEEPER_INTERVAL_MS: z
++    .string()
++    .default("15000")
++    .transform((v) => Number(v.trim()))
++    .refine(
++      (n) => Number.isInteger(n) && n >= 1_000 && n <= 300_000,
++      "WEBHOOK_SWEEPER_INTERVAL_MS must be integer ms in [1000, 300000]",
++    ),
+   ALLOWED_ORIGINS: z
+     .string()
+     .default("")
+diff --git a/server/src/lib/webhooks.ts b/server/src/lib/webhooks.ts
+index dc439fb..de4fe35 100644
+--- a/server/src/lib/webhooks.ts
++++ b/server/src/lib/webhooks.ts
+@@ -632,7 +632,7 @@ async function scheduleRetry(
+ 
+ let sweeperTimer: NodeJS.Timeout | null = null;
+ 
+-const SWEEPER_INTERVAL_MS = Number(process.env.WEBHOOK_SWEEPER_INTERVAL_MS ?? 15_000);
++const SWEEPER_INTERVAL_MS = env.WEBHOOK_SWEEPER_INTERVAL_MS;
+ 
+ /**
+  * Start the retry sweeper. Idempotent — safe to call multiple times
+diff --git a/server/src/routes/ingest.ts b/server/src/routes/ingest.ts
+index 20a5e81..cb6bdb2 100644
+--- a/server/src/routes/ingest.ts
++++ b/server/src/routes/ingest.ts
+@@ -239,7 +239,6 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
+     // unsigned in the list). Same threat model as R92 F2 / R93
+     // F4 / R118 F2 (leaked AV_INGEST_TOKEN). First-write-wins
+     // matches the sealed-receipt posture across the file.
+-    const isSealed = existing?.status === "sealed";
+     // R141 F3: refuse pre-sealed CREATE. The R119 F2 update-branch
+     // freeze covered rewrites of already-sealed rows, but the
+     // create branch (row didn't exist yet) had no such guard. If
+@@ -297,50 +296,98 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
+         .code(400)
+         .send({ error: "cannot_direct_seal_session" });
+     }
+-    // R144 F1: after refusing s.status === "sealed" above, the
+-    // only remaining case where nextStatus differs from s.status
+-    // is if `existing?.status === "sealed"` (row is already
+-    // sealed and we're being asked to revert it to live/blocked).
+-    // Keep the sealed row sealed.
+-    const nextStatus = existing?.status === "sealed" ? existing.status : s.status;
+-    const session = await db.session.upsert({
++    // R151 F1: atomic sealed-guard via conditional updateMany.
++    // Prior shape branched on `isSealed = existing?.status ===
++    // "sealed"` read from findUnique above, then chose
++    // `upsert.update = isSealed ? {} : {full field set}`. TOCTOU
++    // race with /ingest/receipts's concurrent seal at :~763:
++    // if the receipt handler commits `session.update({status:
++    // "sealed"})` between our findUnique and the upsert, our
++    // JS snapshot showed "live", `isSealed=false`, and Postgres'
++    // ON CONFLICT DO UPDATE has no sealed guard — it blindly
++    // overwrote the just-sealed row back to "live" with the
++    // attacker-supplied agent / workflow / policyVersion /
++    // closedAt fields. Signed receipt.eventCount then mismatched
++    // session.events, the /events guard at line 402 stopped
++    // rejecting further appends, and the SPA/exports rendered
++    // the mutated fields — the same post-seal defacement class
++    // R119 F2 / R141 F3 / R144 F1 closed for the non-concurrent
++    // paths. R144's own header comment named the invariant but
++    // enforced it only against attacker-supplied s.status ===
++    // "sealed"; a race against a legitimate concurrent seal
++    // slipped through. Fix: move the sealed guard onto the DB
++    // WHERE clause. Postgres evaluates `status: { not: "sealed" }`
++    // under the same row lock the UPDATE takes, so no snapshot
++    // can lie about the sealed state.
++    const upd = await db.session.updateMany({
+       where: {
+-        deploymentId_externalId: {
+-          deploymentId: daemon.deploymentId,
+-          externalId: s.externalId,
+-        },
+-      },
+-      create: {
+         deploymentId: daemon.deploymentId,
+-        orgId: daemon.orgId,
+         externalId: s.externalId,
++        status: { not: "sealed" },
++      },
++      data: {
+         agent: s.agent,
+         workflow: s.workflow,
+         status: s.status,
+         policyVersion: s.policyVersion,
+-        openedAt: s.openedAt,
+         closedAt: s.closedAt,
+       },
+-      update: isSealed
+-        ? {}
+-        : {
+-            agent: s.agent,
+-            workflow: s.workflow,
+-            status: nextStatus,
+-            policyVersion: s.policyVersion,
+-            closedAt: s.closedAt,
+-          },
+-      // R123 F2: include `agent` in the returned selection so
+-      // the bus.publish below uses the PERSISTED value (which
+-      // is the pre-seal canonical agent on a sealed session)
+-      // rather than the caller-supplied s.agent. Prior shape
+-      // forwarded attacker-controlled s.agent verbatim in the
+-      // SSE payload on the isSealed branch — a webhook / CLI
+-      // subscriber consuming msg.data.agent broke the R119 F2
+-      // "sealed = immutable" invariant even though the DB
+-      // stayed canonical.
+-      select: { id: true, externalId: true, agent: true },
+     });
++    let session: { id: string; externalId: string; agent: string };
++    if (upd.count === 0) {
++      // Two cases collapse here:
++      //   1. Row doesn't exist yet → CREATE branch.
++      //   2. Row exists AND is sealed → R119 F2 freeze; leave
++      //      it untouched via `update: {}`.
++      // Upsert.create handles case 1 atomically; if a concurrent
++      // writer wins the create race the `update: {}` no-op keeps
++      // us safe on case 2 as well.
++      session = await db.session.upsert({
++        where: {
++          deploymentId_externalId: {
++            deploymentId: daemon.deploymentId,
++            externalId: s.externalId,
++          },
++        },
++        create: {
++          deploymentId: daemon.deploymentId,
++          orgId: daemon.orgId,
++          externalId: s.externalId,
++          agent: s.agent,
++          workflow: s.workflow,
++          status: s.status,
++          policyVersion: s.policyVersion,
++          openedAt: s.openedAt,
++          closedAt: s.closedAt,
++        },
++        update: {},
++        // R123 F2: return the PERSISTED agent (which is the
++        // pre-seal canonical value on a sealed row) rather than
++        // the caller-supplied s.agent, so bus.publish below
++        // doesn't forward attacker-controlled agent on the
++        // no-op branch.
++        select: { id: true, externalId: true, agent: true },
++      });
++    } else {
++      const found = await db.session.findUnique({
++        where: {
++          deploymentId_externalId: {
++            deploymentId: daemon.deploymentId,
++            externalId: s.externalId,
++          },
++        },
++        // R123 F2: forward the persisted agent (matches the
++        // no-op branch above).
++        select: { id: true, externalId: true, agent: true },
++      });
++      if (!found) {
++        // updateMany reported 1 row updated but the row is gone
++        // by the time we look it up — a retention purge or a
++        // hard delete raced in between. Treat as no-op.
++        return reply.code(409).send({ error: "session_race" });
++      }
++      session = found;
++    }
+     bus.publish({
+       type: "session.upsert",
+       orgId: daemon.orgId,
