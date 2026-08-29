@@ -236,6 +236,18 @@ code, pre, .mono {
   transition: border-color 100ms, box-shadow 100ms;
 }
 .auth-form input:focus { outline: none; border-color: var(--accent); box-shadow: var(--shadow-focus); }
+/* Chrome/Safari autofill paints its own opaque yellow/white background,
+   which in dark mode floodlights the login card and clashes with the
+   theme tokens. -webkit-box-shadow inset is the standard override (the
+   UA background can't be set directly); -webkit-text-fill-color themes
+   the autofilled text itself. */
+.auth-form input:-webkit-autofill,
+.modal input:-webkit-autofill {
+  -webkit-box-shadow: 0 0 0 1000px var(--surface) inset;
+  -webkit-text-fill-color: var(--fg);
+  caret-color: var(--fg);
+  transition: background-color 9999s ease-out; /* stall the UA flash */
+}
 .auth-form button.primary {
   padding: 10px 14px;
   border: 0;
