@@ -153,13 +153,14 @@ mod tests {
         // caught deterministically.
         const N: usize = 64;
         let mut ids: Vec<_> = (0..N).map(|_| new_event_uid()).collect();
+        // Slice-pattern destructuring instead of pair[0]/pair[1]:
+        // clippy::indexing_slicing is denied workspace-wide and fires
+        // in tests too (the module allow-list covers panics, not
+        // indexing). windows(2) guarantees the shape.
         for pair in ids.windows(2) {
-            assert!(
-                pair[0] < pair[1],
-                "UUIDv7 must strictly sort by creation time: {} vs {}",
-                pair[0],
-                pair[1]
-            );
+            if let [a, b] = pair {
+                assert!(a < b, "UUIDv7 must strictly sort by creation time: {a} vs {b}");
+            }
         }
         // Also verify the batch itself is already sorted (no external
         // sort needed) — the shared-monotonic property under the
