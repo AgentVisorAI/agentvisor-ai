@@ -68,7 +68,10 @@ catalog at the bottom.
    Dirty-modal discard guard (in `installModalKeys`): Escape or a
    backdrop mis-click on a modal with unsaved edits blocks once +
    toasts; the second attempt within 2s discards. Explicit Cancel
-   (`data-close`) stays immediate. Dirtiness = value vs defaultValue /
+   (`data-close`) stays immediate. Navigation-forced closes (browser
+   Back / Android gesture → hashchange) can't be vetoed after the
+   fact — a dirty discard there toasts "unsaved changes … discarded"
+   instead of dying silently. Dirtiness = value vs defaultValue /
    defaultChecked / defaultSelected — prefill via HTML attributes, not
    post-render property writes, or the guard will false-positive.
 6. The palette closes on `hashchange` and on a **capture-phase document

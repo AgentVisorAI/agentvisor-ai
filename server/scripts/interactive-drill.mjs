@@ -469,6 +469,22 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await page.waitForTimeout(500);
   let o = await page.evaluate(() => ({ m: document.querySelectorAll(".modal-backdrop").length, locked: document.body.classList.contains("locked") }));
   if (o.m || o.locked) fail("browser Back left a modal backdrop/lock: " + JSON.stringify(o));
+  // Dirty modal + Back (the Android back gesture): navigation can't be
+  // vetoed after the fact, so the discard can't be blocked — but it
+  // must NEVER be silent. Pristine closes stay quiet.
+  await page.evaluate(() => { location.hash = "#/settings/members"; });
+  await page.waitForSelector("#inviteBtn", { timeout: 10000 });
+  await page.click("#inviteBtn");
+  await page.waitForSelector("#inv_email", { timeout: 5000 });
+  await page.fill("#inv_email", "typed@then.back");
+  await page.goBack();
+  await page.waitForTimeout(500);
+  const dirtyBack = await page.evaluate(() => ({
+    gone: !document.querySelector(".modal-backdrop"),
+    toasts: [...document.querySelectorAll(".toast")].map((t) => t.textContent),
+  }));
+  if (!dirtyBack.gone || !dirtyBack.toasts.some((t) => /discarded/i.test(t))) fail("dirty-modal Back was silent: " + JSON.stringify(dirtyBack));
+  await page.waitForTimeout(2400); // drain the toast before the next assertions
   await page.keyboard.press("Escape"); // leaked-listener canary (caught the webhook modal once)
   // palette → Back
   await page.goto(SITE + "#/policies", { waitUntil: "domcontentloaded" });
