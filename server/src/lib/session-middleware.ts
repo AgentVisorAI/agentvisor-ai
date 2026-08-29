@@ -100,7 +100,24 @@ export async function authenticate(
   if (user.memberships.length === 0) return;
   if (
     user.sessionRevokedAt &&
-    claims.iat * 1000 < user.sessionRevokedAt.getTime()
+    // R210 F1: compare in the same unit as claims.iat (unix
+    // seconds — jose's SignJWT.setIssuedAt() calls
+    // Math.floor(Date.now()/1000), see lib/auth.ts:119).
+    // sessionRevokedAt is written with `new Date()` at
+    // millisecond precision (logout, credential-revoke,
+    // saml SLO, member role change, password reset).
+    // Prior shape `claims.iat * 1000 < revokedAt.getTime()`
+    // compared a seconds-boundary iat against a
+    // millisecond-precision fence, so any JWT minted in the
+    // SAME wall-clock second as a revoke bump was strictly
+    // less than the fence and refused forever. Concrete
+    // scenario: /logout at t=10:00:00.100 bumps revokedAt
+    // to the millisecond; /login at t=10:00:00.500 mints a
+    // JWT with iat=10; next request compares
+    // `10*1000=10:00:00.000 < 10:00:00.100` → 401. The
+    // freshly-set cookie was DOA. Fix: floor revokedAt to
+    // the same second boundary before comparing.
+    claims.iat < Math.floor(user.sessionRevokedAt.getTime() / 1000)
   ) {
     return;
   }
