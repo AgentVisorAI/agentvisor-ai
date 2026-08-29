@@ -1720,7 +1720,7 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
     await window.dataSource.updateSamlConfig(cfg.id, { displayName: cfg.displayName }); // restore
     return ev;
   });
-  if (ssoAudit !== "sso.idp_updated") fail("SAML update did not land in the audit trail: " + ssoAudit);
+  if (ssoAudit !== "saml.config_updated") fail("SAML update did not land in the audit trail: " + ssoAudit);
   const w0 = await page.evaluate(async () => (await window.dataSource.listWebhooks())[0].isActive);
   await page.evaluate(() => { const tr = document.querySelector("tbody tr"); [...tr.querySelectorAll("button")].find((x) => /Pause|Resume/.test(x.textContent)).click(); });
   await page.waitForTimeout(1000);
