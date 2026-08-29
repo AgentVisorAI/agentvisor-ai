@@ -11,7 +11,7 @@ and signatures shown are illustrative, but the behavior mirrors the real Rust
 implementation 1:1 (receipt fields, 403 policy refusals, loop breaker, spool
 layout).
 
-- **Published at:** <https://agentvisorai.me/app/> (deployed by
+- **Published at:** <https://agentvisorai.me/app/pitch/> (deployed by
   `.github/workflows/pages.yml` together with the landing page).
 - **Run locally / offline:** open `index.html` in any browser.
 - **Presenter tour:** append `?tour=1` to the URL to reveal the
