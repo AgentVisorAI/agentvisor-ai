@@ -261,7 +261,14 @@
     ["dragleave", "drop"].forEach((e) => drop.addEventListener(e, (ev) => { ev.preventDefault(); drop.classList.remove("hover"); }));
     drop.addEventListener("drop", (ev) => {
       const f = ev.dataTransfer?.files?.[0];
-      if (f) handleFile(f);
+      if (f) { handleFile(f); return; }
+      // Dragged *text* (a receipt selected in a mail/Slack window)
+      // has no files — it used to be dropped silently. Treat it like
+      // a paste, with the same 5 MB cap.
+      const text = ev.dataTransfer?.getData("text") || "";
+      if (!text.trim()) return;
+      if (text.length > 5_000_000) { render({ kind: "err", message: "Dropped text larger than 5 MB. Probably not a receipt." }); return; }
+      handleText(text);
     });
     drop.addEventListener("click", (ev) => { if (ev.target !== browseBtn) fileInput.click(); });
     // Keyboard access is provided by the real <button id="browseBtn">;
