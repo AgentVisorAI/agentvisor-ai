@@ -225,7 +225,13 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
         if (user.memberships.length === 0) return false;
         if (
           user.sessionRevokedAt &&
-          claims.iat * 1000 < user.sessionRevokedAt.getTime()
+          // R210 F1: same second-precision fix as
+          // session-middleware.ts:102-105 — see that file for
+          // full rationale. Comparing seconds-boundary iat
+          // against millisecond-precision revokedAt refused
+          // same-wall-clock-second logouts→logins as dead JWTs
+          // until the next second ticked over.
+          claims.iat < Math.floor(user.sessionRevokedAt.getTime() / 1000)
         ) {
           return false;
         }
