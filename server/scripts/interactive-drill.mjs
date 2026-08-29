@@ -429,8 +429,19 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await page.waitForFunction(() => document.querySelector(".evt.selected .seq")?.textContent === "#600", { timeout: 20000 });
   const deepCount = await page.evaluate(() => document.querySelectorAll(".evt").length);
   if (deepCount !== 700) fail("deep-link auto-paging stopped early: " + deepCount + " events");
+  // Nonexistent target: the walk must terminate (bounded by the cursor
+  // end), explain itself, and clean the ?evt from the URL — a shared
+  // link that lands silently unselected reads as "the link is broken".
+  await page.goto(SITE + "#/sessions/sess_bd_mega?evt=99999", { waitUntil: "domcontentloaded" });
+  const missToast = await page.waitForFunction(() => {
+    const t = document.querySelector(".toast")?.textContent || "";
+    return /isn't in this session/i.test(t) ? t : null;
+  }, { timeout: 15000 }).then((h) => h.jsonValue()).catch(() => null);
+  if (!missToast) fail("nonexistent ?evt deep link gave no feedback");
+  await page.waitForTimeout(300);
+  if (await page.evaluate(() => /evt=99999/.test(location.hash))) fail("dead ?evt param not cleaned from the URL");
   await page.evaluate(() => localStorage.removeItem("av_mock_bigdata"));
-  console.log("✅ pagination: sessions 50→100 + sort; events 500→700 with selection kept; ?evt=600 auto-pages");
+  console.log("✅ pagination: sessions 50→100 + sort; events 500→700 with selection kept; ?evt=600 auto-pages; dead ?evt explains itself");
 }
 
 // ── 11. Browser Back vs overlays + copy feedback ───────────────────
