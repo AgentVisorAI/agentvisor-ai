@@ -439,7 +439,17 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       {
         orgId: claims.orgId,
         event: "member.invited",
-        ...(await resolveActor(claims.sub)),
+        // R148 F3: `inviter` is already loaded (used at :405/:406
+        // for invitedById/invitedByEmail on the upsert), and
+        // `claims.sub === inviter.id`, so the R147 F3 sed
+        // `actorId: claims.sub, → ...(await resolveActor(claims.sub)),`
+        // fetches the same user row and immediately discards
+        // its actorEmail via the `actorEmail: inviter.email`
+        // override below. Restore the direct pattern the 3
+        // auth.ts sites (:598/:631/:880) intentionally use
+        // when the user is already in hand — one fewer
+        // db.user.findUnique per invite.
+        actorId: inviter.id,
         actorEmail: inviter.email,
         target: inv.email,
         metadata: { role: inv.role, inviteId: inv.id },
