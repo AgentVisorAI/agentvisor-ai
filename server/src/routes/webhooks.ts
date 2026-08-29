@@ -249,7 +249,25 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
       try {
         rows = await db.webhookDelivery.findMany({
           where: { endpointId: ep.id },
-          orderBy: { createdAt: "desc" },
+          // R212 F1: id as secondary sort key so cursor pagination
+          // is stable across rows tied on `createdAt`. Prisma emits
+          // `ORDER BY "createdAt" DESC` with no tiebreaker on the
+          // prior shape, and this table's `createdAt` ties are
+          // routine: schema.prisma:443 sets `DateTime @default(now())`
+          // and the webhook fanout (dispatchEvent → bulk enqueue on
+          // policy.block etc.) plus the sweeper's 15 s batch inserts
+          // often land many rows in the same millisecond. Without
+          // the tiebreaker the cursor's `id` continues from an
+          // arbitrary tied row: siblings sharing the boundary
+          // `createdAt` are silently skipped (invisible to the
+          // console operator scrolling the deliveries pane) or
+          // reappear on the next page. Matches the sibling shape
+          // at read.ts:238 (sessions), auth.ts:808 (export),
+          // read.ts:537 (audit). No index change needed —
+          // @@index([endpointId, createdAt]) covers the where +
+          // first-key path; the id tiebreaker is a small
+          // in-memory sort per page.
+          orderBy: [{ createdAt: "desc" }, { id: "desc" }],
           take: q.data.limit + 1,
           ...(q.data.cursor
             ? { cursor: { id: q.data.cursor }, skip: 1 }
