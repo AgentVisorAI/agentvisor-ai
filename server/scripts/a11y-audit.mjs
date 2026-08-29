@@ -14,7 +14,7 @@
 import { chromium } from "playwright";
 import { AxeBuilder } from "@axe-core/playwright";
 
-const SITE = process.env.SITE ?? "https://agentvisorai.me/app/";
+const SITE = process.env.SITE ?? process.argv[2] ?? "https://agentvisorai.me/app/";
 const IGNORE_RULES = [
   // Known intentional decisions:
   //   * Nothing right now — every rule fires or is documented.
