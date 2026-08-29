@@ -606,11 +606,25 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
       clearChallengeCookie(reply, AUTH_CHALLENGE_COOKIE);
       // R105 F1: see webauthn_register_verify_failed above —
       // don't echo the internal library error message.
-      return reply.code(400).send({ error: "verify_failed" });
+      // R143 F1: uniform `unknown_credential` matching the decoy
+      // exit at line 537. R76 F4 / R86 F4 / R87 F1 spent three
+      // fixes collapsing the decoy-vs-real oracle on the EARLY-
+      // exit legs, but the post-findFirst failure legs kept
+      // three distinct wire strings (verify_failed /
+      // not_verified / clone_detected) — an attacker sending
+      // garbage clientDataJSON+signature learned account
+      // existence by comparing "verify_failed" (real) vs
+      // "unknown_credential" (decoy). Rate-limited at
+      // perIp(10, 60_000) but ~600/hr per proxy IP still
+      // efficient enumeration. Server-side req.log.warn keeps
+      // the forensic distinction; wire response uniformly
+      // "unknown_credential".
+      return reply.code(400).send({ error: "unknown_credential" });
     }
     if (!verified.verified) {
       clearChallengeCookie(reply, AUTH_CHALLENGE_COOKIE);
-      return reply.code(400).send({ error: "not_verified" });
+      // R143 F1: same wire uniformity as the catch above.
+      return reply.code(400).send({ error: "unknown_credential" });
     }
 
     // Clone detection — signCount must strictly increase.
@@ -621,7 +635,14 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
         "webauthn_clone_detected",
       );
       clearChallengeCookie(reply, AUTH_CHALLENGE_COOKIE);
-      return reply.code(400).send({ error: "clone_detected" });
+      // R143 F1: same wire uniformity. Clone detection is a
+      // real event that operators MUST see — the server-side
+      // req.log.warn ("webauthn_clone_detected") above lands
+      // in external log storage with credId + counters so ops
+      // can respond. Wire is uniform "unknown_credential" so
+      // an attacker replaying a stolen signature can't
+      // distinguish "counter regression" from "wrong email."
+      return reply.code(400).send({ error: "unknown_credential" });
     }
 
     // Bump the counter + last-used.
