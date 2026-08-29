@@ -228,6 +228,23 @@ export async function validateWebhookUrl(rawUrl: string): Promise<SsrfCheckResul
     if (env.NODE_ENV === "production" && isBlockedIp(host)) {
       return { ok: false, reason: "private_ip_blocked" };
     }
+    // R185 F1: block internal IPs in ALL non-production modes too
+    // unless explicitly opted out via ALLOW_INTERNAL_WEBHOOK_TARGETS.
+    // Prior shape (production-only) fell open when NODE_ENV was
+    // unset or set to "development"/"test" — an admin/owner in a
+    // dev-mode deploy could register `http://10.0.0.1/admin` as a
+    // webhook URL and the server would fetch it, SSRF into the
+    // private network. R176 warns operators when NODE_ENV was
+    // defaulted but the warning is soft; the SSRF-gate side needs
+    // to fail-closed by default so an unattended dev-mode deploy
+    // isn't a silent SSRF primitive.
+    if (
+      env.NODE_ENV !== "production" &&
+      !env.ALLOW_INTERNAL_WEBHOOK_TARGETS &&
+      isBlockedIp(host)
+    ) {
+      return { ok: false, reason: "private_ip_blocked_dev" };
+    }
     return { ok: true };
   }
   // Hostname — resolve to A/AAAA and check every result. Attackers can
@@ -240,6 +257,14 @@ export async function validateWebhookUrl(rawUrl: string): Promise<SsrfCheckResul
       for (const a of addrs) {
         if (isBlockedIp(a.address)) {
           return { ok: false, reason: "resolves_to_private_ip" };
+        }
+      }
+    } else if (!env.ALLOW_INTERNAL_WEBHOOK_TARGETS) {
+      // R185 F1: default-strict in non-production modes.
+      // See the IP-literal branch above for rationale.
+      for (const a of addrs) {
+        if (isBlockedIp(a.address)) {
+          return { ok: false, reason: "resolves_to_private_ip_dev" };
         }
       }
     }

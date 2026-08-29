@@ -176,6 +176,27 @@ const Env = z.object({
       (n) => Number.isInteger(n) && n >= 1_000 && n <= 300_000,
       "WEBHOOK_SWEEPER_INTERVAL_MS must be integer ms in [1000, 300000]",
     ),
+  // R185 F1: opt-in relaxation of the webhook SSRF gate for
+  // internal / RFC 1918 / loopback destinations. Prior shape at
+  // lib/webhooks.ts:228 & :239 checked `env.NODE_ENV ===
+  // "production"` — so any dev-mode deploy (or, worse, an
+  // operator who forgot to set NODE_ENV in production per
+  // R176's warning) fell open: an admin/owner could register
+  // `http://10.0.0.1/admin` or `http://internal.corp.svc/` as
+  // a webhook URL and the server would happily fetch it,
+  // turning the webhook endpoint into an SSRF primitive
+  // against the deployment's own private network. Fix: gate on
+  // this explicit env var instead of NODE_ENV. Default false
+  // (block internal IPs in ALL modes, including dev). Dev
+  // workflows that legitimately need to POST to localhost /
+  // 127.0.0.1 / an in-cluster address for testing set
+  // `ALLOW_INTERNAL_WEBHOOK_TARGETS=true` explicitly — same
+  // opt-in-to-danger discipline as any HTTPS-off, plaintext-
+  // cookie override. Never legitimately set in production.
+  ALLOW_INTERNAL_WEBHOOK_TARGETS: z
+    .string()
+    .optional()
+    .transform((v) => v === "true" || v === "1"),
   ALLOWED_ORIGINS: z
     .string()
     .default("")
