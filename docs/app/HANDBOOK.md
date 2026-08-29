@@ -48,8 +48,11 @@ catalog at the bottom.
    listeners until a *winning* response repaints (repaint-then-fetch dropped
    keystrokes mid-debounce).
 4. Buttons painted during a loading skeleton must be wired through a
-   **document-level delegated listener** (`#addPol`, `#addDep`): direct
-   wiring after the fetch left dead buttons for the first ~500 ms.
+   **document-level delegated listener** (`#addPol`, `#addDep`, and the
+   whole sessions filter bar — `#fSearch`/`#fRange`/`#fDep`/`#fAgent`/
+   `#fBlocked`): direct wiring after the fetch left dead controls for
+   the first ~500 ms; typed text sat in the search box while the
+   unfiltered list painted below.
    The static-page variant: buttons in `/verify/` HTML ship `disabled`
    and `verify.js` enables them once handlers attach — on a slow CDN the
    script arrives well after first paint, and a pre-wire click silently
@@ -155,7 +158,7 @@ catalog at the bottom.
 
 | Script | Guards |
 |---|---|
-| `interactive-drill.mjs` | 27 checks: tour, attack story, onboarding ages, billing math, reset flows, hit-tests, storage/router fuzz, pagination + deep links, Back/overlays, double-submit, failure paths + catch-up, cross-tab + FOUC, focus rings/traps + reduced motion + shortcut guards, garbage data, filter/sort/chart/audit/detail ground truth, deployment + key lifecycles, member RBAC, leak soak, form semantics (native validation + Enter submits) |
+| `interactive-drill.mjs` | 28 checks: tour, attack story, onboarding ages, billing math, reset flows, hit-tests, storage/router fuzz, pagination + deep links, Back/overlays, double-submit, failure paths + catch-up, cross-tab + FOUC, focus rings/traps + reduced motion + shortcut guards, garbage data, filter/sort/chart/audit/detail ground truth, deployment + key lifecycles, member RBAC, leak soak, form semantics (native validation + Enter submits), skeleton-phase filter liveness |
 | `live-site-smoke.mjs` | 9 checks incl. link/media crawl, captions, alias stubs, 404, OG/Twitter link previews |
 | `a11y-audit.mjs` | 46 axe scans: 11 routes + 9 modal states × 2 themes, 3 static pages × 2 schemes |
 | `mobile-smoke.mjs` | phone/tablet: tab bar, taps, modals fit + hittable + stacking, static pages |
