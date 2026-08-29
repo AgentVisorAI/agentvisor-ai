@@ -5209,7 +5209,8 @@
         ["G D", "Deployments"], ["G ,", "Settings"],
       ]},
       { title: "Lists & tables", items: [
-        ["↑ ↓", "Move between rows"], ["Enter", "Open the focused row"], ["/", "Focus the search field"],
+        ["↑ ↓", "Move between rows"], ["Enter", "Open the focused row"], [(IS_MAC ? "⌘" : "Ctrl") + " Click", "Open a row in a new tab"], ["/", "Focus the search field"],
+        ["Esc", "Clear the search, then unfocus"],
         ["[ ]", "Previous / next session (on a detail page)"],
       ]},
       { title: "Event stream", items: [
