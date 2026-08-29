@@ -1828,8 +1828,40 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ theme toggle: colors flip, widgets keep state (filter/selection/scroll, both tabs), menu label fresh");
 }
 
+// ── 31. Keyboard-only tour: Tab reaches Next, and Enter walks all six
+// steps with focus STAYING on Next across route changes — announceRoute
+// used to steal focus to #view on every cross-route step, stranding
+// keyboard users mid-tour (the tour card is a persistent body-level
+// overlay; its focus must survive navigation).
+{
+  const kbPage = await context.newPage();
+  await kbPage.goto(SITE + "?tour=1#/overview", { waitUntil: "domcontentloaded" });
+  await kbPage.waitForSelector(".av-tour-card", { timeout: 15000 });
+  let reached = false;
+  for (let i = 0; i < 30; i++) {
+    await kbPage.keyboard.press("Tab");
+    if (await kbPage.evaluate(() => document.activeElement?.classList?.contains("av-tour-next"))) { reached = true; break; }
+  }
+  if (!reached) fail("Tab could not reach the tour Next button");
+  for (let step = 0; step < 6; step++) {
+    await kbPage.keyboard.press("Enter");
+    await kbPage.waitForTimeout(1300);
+    const st = await kbPage.evaluate(() => ({
+      onNext: document.activeElement?.classList?.contains("av-tour-next"),
+      label: document.querySelector(".av-tour-next")?.textContent.trim() || "",
+    }));
+    if (/verifier/i.test(st.label)) break; // finale CTA reached
+    if (!st.onNext) fail("focus left the tour Next button after step " + (step + 1) + " (route-change steal)");
+  }
+  const finale = await kbPage.evaluate(() => document.querySelector(".av-tour-next")?.textContent.trim() || "");
+  if (!/verifier/i.test(finale)) fail("keyboard walk did not reach the finale CTA: " + finale);
+  await kbPage.keyboard.press("Escape");
+  await kbPage.close();
+  console.log("✅ keyboard-only tour: Tab to Next, Enter × steps, focus survives every route change, finale CTA reached");
+}
+
 if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors));
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 30 interactive-features drill checks passed.");
+console.log("\nAll 31 interactive-features drill checks passed.");

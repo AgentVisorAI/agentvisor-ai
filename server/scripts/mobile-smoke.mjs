@@ -276,4 +276,35 @@ await browser.close();
   console.log("✅ mid-width sweep (640/768/900px): every control inside the viewport or a scrollable wrap");
 }
 
+// ── Foldable cover display (280px): the topbar must CONTAIN all its
+// controls — the account button (the only path to sign-out/theme) was
+// once clipped off behind overflow:hidden, and clipping is invisible
+// to plain hOv checks.
+{
+  const b3 = await chromium.launch();
+  const page = await (await b3.newContext({ viewport: { width: 280, height: 653 }, isMobile: true, hasTouch: true })).newPage();
+  await page.goto(SITE + "#/overview", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector(".topbar", { timeout: 15000 });
+  const tb = await page.evaluate(() => {
+    const bar = document.querySelector(".topbar");
+    const user = document.querySelector(".user-btn");
+    const r = user.getBoundingClientRect();
+    return {
+      barOv: bar.scrollWidth - bar.clientWidth,
+      userVisible: r.width >= 24 && r.right <= innerWidth + 1,
+      hOv: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    };
+  });
+  if (tb.barOv > 2 || !tb.userVisible || tb.hOv > 0) fail("280px topbar clips controls: " + JSON.stringify(tb));
+  await page.tap(".user-btn");
+  await page.waitForTimeout(300);
+  const menu = await page.evaluate(() => {
+    const m = document.querySelector("#accountMenu")?.getBoundingClientRect();
+    return m ? m.right <= innerWidth + 1 && m.left >= -1 : false;
+  });
+  if (!menu) fail("280px: account menu missing or off-screen");
+  await b3.close();
+  console.log("✅ 280px foldable: topbar contains every control; account menu opens on-screen");
+}
+
 console.log("\nAll mobile viewport smoke checks passed.");

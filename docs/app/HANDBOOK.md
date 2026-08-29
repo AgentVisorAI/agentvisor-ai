@@ -133,6 +133,11 @@ catalog at the bottom.
 21. Cross-tab: sign-out (`av_signed_out_at`), sign-in (`av_signed_in_at` via
     `announceSignIn()` at every auth-success site), and theme all sync via
     storage events. Signup drops `av_return_to`; login honors it.
+22. `announceRoute` focuses `#view` after navigation ONLY when focus has
+    collapsed to `<body>` (or was inside the old `#view`). Focus sitting
+    in a persistent body-level overlay (tour card) must survive route
+    changes — the unconditional steal stranded keyboard users mid-tour
+    on every cross-route step (drill check 31).
 
 **Evidence & print**
 22. The printed evidence pack is COMPLETE: `@media print` forces
@@ -171,7 +176,7 @@ catalog at the bottom.
 
 | Script | Guards |
 |---|---|
-| `interactive-drill.mjs` | 30 checks: tour, attack story, onboarding ages, billing math, reset flows, hit-tests + unsized-svg blowouts, storage/router fuzz, pagination + deep links, Back/overlays, double-submit, failure paths + catch-up, cross-tab + FOUC, focus rings/traps + reduced motion + shortcut guards, garbage data, filter/sort/chart/audit/detail ground truth, deployment + key lifecycles, member RBAC, leak soak, form semantics (native validation + Enter submits), skeleton-phase filter liveness, dirty-modal discard guard, theme-toggle state preservation |
+| `interactive-drill.mjs` | 31 checks: tour, attack story, onboarding ages, billing math, reset flows, hit-tests + unsized-svg blowouts, storage/router fuzz, pagination + deep links, Back/overlays, double-submit, failure paths + catch-up, cross-tab + FOUC, focus rings/traps + reduced motion + shortcut guards, garbage data, filter/sort/chart/audit/detail ground truth, deployment + key lifecycles, member RBAC, leak soak, form semantics (native validation + Enter submits), skeleton-phase filter liveness, dirty-modal discard guard, theme-toggle state preservation, keyboard-only tour |
 | `live-site-smoke.mjs` | 9 checks incl. link/media crawl, captions, alias stubs, 404, OG/Twitter link previews |
 | `a11y-audit.mjs` | 46 axe scans: 11 routes + 9 modal states × 2 themes, 3 static pages × 2 schemes |
 | `mobile-smoke.mjs` | phone/tablet: tab bar, taps, modals fit + hittable + stacking, static pages |
