@@ -21,6 +21,7 @@
  * Mock-mode only (as deployed). SITE env overrides the target.
  */
 import { chromium } from "playwright";
+import { readFileSync } from "node:fs";
 
 // Accept the target as SITE env or first positional arg — a passed-but-
 // ignored argument once silently ran this whole drill against production.
@@ -29,7 +30,7 @@ const SITE = process.env.SITE ?? process.argv[2] ?? "https://agentvisorai.me/app
 function fail(m) { console.log("❌", m); process.exit(1); }
 
 const browser = await chromium.launch({ headless: true });
-const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, acceptDownloads: true });
 // Count document/window listeners so the leak check (check 10) can
 // assert the refresh loops and modal cycles don't accumulate handlers.
 await context.addInitScript(() => {
@@ -1325,7 +1326,32 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   if (!pr.sidebarHidden || !pr.provenance) fail("print evidence pack broken: " + JSON.stringify(pr));
   if (pr.printedRows !== pr.totalRows || !pr.eventCount) fail("print pack incomplete under an active filter: " + JSON.stringify(pr));
   if (!pr.lightForced) fail("dark theme leaked into print: " + JSON.stringify(pr));
-  console.log("✅ audit log matches ground truth (chips/search/CSV WYSIWYG); palette ranks + loads dynamic entries; print pack complete even when filtered, light-forced from dark theme");
+  // CSV formula injection, end-to-end: a webhook NAMED like a formula
+  // ('=HYPERLINK(…)') flows through the runtime audit into the export —
+  // the cell must land neutralized ('=… with the leading apostrophe,
+  // quotes doubled) or Excel executes it on the auditor's machine.
+  const injPage = await context.newPage();
+  await injPage.goto(SITE + "#/settings/webhooks", { waitUntil: "domcontentloaded" });
+  await injPage.waitForSelector("#whAdd", { timeout: 15000 });
+  await injPage.click("#whAdd");
+  await injPage.waitForSelector("#whForm", { timeout: 5000 });
+  await injPage.fill("#whName", '=HYPERLINK("http://evil")');
+  await injPage.fill("#whUrl", "https://example.dev/inj");
+  await injPage.press("#whUrl", "Enter");
+  await injPage.waitForTimeout(800);
+  await injPage.keyboard.press("Escape");
+  await injPage.waitForTimeout(250);
+  await injPage.evaluate(() => { location.hash = "#/settings/audit"; });
+  await injPage.waitForSelector("#auditExportBtn", { timeout: 10000 });
+  const [injDl] = await Promise.all([
+    injPage.waitForEvent("download", { timeout: 8000 }),
+    injPage.click("#auditExportBtn"),
+  ]);
+  const injCsv = readFileSync(await injDl.path(), "utf8");
+  const injLine = injCsv.split("\n").find((l) => l.includes("HYPERLINK")) || "";
+  if (!/"'=HYPERLINK/.test(injLine)) fail("CSV formula injection not neutralized: " + JSON.stringify(injLine.slice(0, 100)));
+  await injPage.close();
+  console.log("✅ audit log matches ground truth (chips/search/CSV WYSIWYG); palette ranks + loads dynamic entries; print pack complete even when filtered, light-forced from dark theme; formula-named webhook lands neutralized in the CSV");
 }
 
 // ── 21. Password reset + member redaction + policy derivation ──────
