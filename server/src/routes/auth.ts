@@ -11,6 +11,7 @@ import {
   verifyPassword,
 } from "../lib/auth.js";
 import { writeAudit } from "../lib/audit.js";
+import { authEventsTotal } from "../lib/metrics.js";
 import { perIpCookieOnly } from "../lib/rate-limit.js";
 import { getMailer, passwordResetMail, welcomeMail } from "../lib/mail.js";
 import {
@@ -218,6 +219,14 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       },
       req.log,
     );
+    // R213 F1: increment the previously-dead Prometheus
+    // `agentvisor_api_auth_events_total{event,result}` counter
+    // (declared at lib/metrics.ts:52 with the comment
+    // "high-signal for spotting brute-force sprays and
+    // organic-growth graphs alike" — nothing was wired up, so
+    // Grafana dashboards / brute-force alerts on this metric
+    // rendered flat zero forever).
+    authEventsTotal.inc({ event: "signup", result: "ok" });
     // R136 F2: also emit org.created so a forensic query
     // "which orgs came into existence via unattended OAuth
     // callback vs. explicit /signup" can distinguish the two
@@ -372,6 +381,12 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
           );
         }
       }
+      // R213 F1: fail-branch counter — see signup site above.
+      // Always incremented (regardless of whether we could
+      // attach a membership audit) so brute-force sprays
+      // against nonexistent emails are still visible in
+      // Prometheus.
+      authEventsTotal.inc({ event: "login", result: "fail" });
       return mfaGateResponse();
     }
     const membership = user.memberships[0];
@@ -457,6 +472,8 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       },
       req.log,
     );
+    // R213 F1: ok-branch counter for successful cookie mint.
+    authEventsTotal.inc({ event: "login", result: "ok" });
     return reply.send({
       user: { id: user.id, email: user.email, displayName: user.displayName },
       org: {
@@ -1085,6 +1102,12 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
             req.log,
           );
         }
+        // R213 F1: reset_request counter — see signup site
+        // above. Only incremented when a real user + membership
+        // exists (matching the audit posture) to preserve the
+        // R98 F2 no-enumeration-oracle guarantee against
+        // arbitrary email guessing.
+        authEventsTotal.inc({ event: "reset_request", result: "ok" });
         // Build the reset link the user will click.
         const resetLink = `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/reset?token=${encodeURIComponent(plaintextToken)}&email=${encodeURIComponent(user.email)}`;
         // Send it. Uses whichever mailer driver is configured
@@ -1249,6 +1272,8 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         req.log,
       );
     }
+    // R213 F1: reset_confirm counter — see signup site above.
+    authEventsTotal.inc({ event: "reset_confirm", result: "ok" });
     return reply.send({ ok: true });
   });
 }
