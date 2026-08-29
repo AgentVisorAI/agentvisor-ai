@@ -22,7 +22,9 @@
  */
 import { chromium } from "playwright";
 
-const SITE = process.env.SITE ?? "https://agentvisorai.me/app/";
+// Accept the target as SITE env or first positional arg — a passed-but-
+// ignored argument once silently ran this whole drill against production.
+const SITE = process.env.SITE ?? process.argv[2] ?? "https://agentvisorai.me/app/";
 
 function fail(m) { console.log("❌", m); process.exit(1); }
 
@@ -1512,8 +1514,58 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ leak soak: no listener/interval growth across the drill + 6 navigations + 20 open/close cycles");
 }
 
+// ── 27. Form semantics truth: HTML validation attributes must actually
+// run. The webhook modal was a click-wired div — type=url was dead
+// decoration ("not-a-url" created a garbage endpoint) and Enter (the
+// mobile keyboard's Go key) did nothing. Retention's max=3650 never
+// constrained typed values (99999 saved fine).
+{
+  // Dismiss anything the previous check left open (openAddModal
+  // no-ops while body.locked).
+  for (let i = 0; i < 4; i++) {
+    const locked = await page.evaluate(() => document.body.classList.contains("locked"));
+    if (!locked) break;
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(250);
+  }
+  // (a) webhook: garbage URL is rejected by native validation, modal stays open
+  await page.goto(SITE + "#/settings/webhooks", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("#whAdd", { timeout: 15000 });
+  const rowsBefore = await page.evaluate(() => document.querySelectorAll("tbody tr").length);
+  await page.click("#whAdd");
+  await page.waitForSelector("#whForm", { timeout: 5000 });
+  await page.fill("#whName", "Form Truth");
+  await page.fill("#whUrl", "not-a-url");
+  await page.click("#whSave");
+  await page.waitForTimeout(300);
+  const st = await page.evaluate(() => ({
+    open: !!document.querySelector(".modal-backdrop"),
+    valid: document.querySelector("#whUrl").checkValidity(),
+    rows: document.querySelectorAll("tbody tr").length,
+  }));
+  if (!st.open || st.valid || st.rows !== rowsBefore) fail("garbage webhook URL was not rejected: " + JSON.stringify(st));
+  // (b) Enter in the URL field submits the form (no Save click)
+  await page.fill("#whUrl", "https://example.dev/form-truth-hook");
+  await page.press("#whUrl", "Enter");
+  await page.waitForSelector(".modal-backdrop .mono, .modal-backdrop code", { timeout: 5000 }).catch(() => null);
+  await page.waitForFunction((n) => document.querySelectorAll("tbody tr").length === n + 1, rowsBefore, { timeout: 5000 })
+    .catch(() => fail("Enter in the webhook URL field did not submit the form"));
+  await page.keyboard.press("Escape"); // dismiss the secret modal
+  await page.waitForTimeout(200);
+  // (c) retention: typed out-of-range value must not save
+  await page.goto(SITE + "#/settings/general", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("#retSess", { timeout: 15000 });
+  const before = await page.evaluate(async () => (await window.dataSource.getRetention()).retention.sessionRetentionDays);
+  await page.fill("#retSess", "99999");
+  await page.click("#retSave");
+  await page.waitForTimeout(400);
+  const after = await page.evaluate(async () => (await window.dataSource.getRetention()).retention.sessionRetentionDays);
+  if (after !== before) fail("out-of-range retention (99999) saved: " + before + "→" + after);
+  console.log("✅ form semantics: type=url validates, Enter submits the webhook form, retention max enforced");
+}
+
 if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors));
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 26 interactive-features drill checks passed.");
+console.log("\nAll 27 interactive-features drill checks passed.");

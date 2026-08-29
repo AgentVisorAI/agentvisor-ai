@@ -3204,8 +3204,13 @@
           $("#retSave", card).addEventListener("click", async function (e) {
             var saveBtn = e.currentTarget;
             if (saveBtn.disabled) return;
-            var s = parseInt($("#retSess", card).value, 10);
-            var a = parseInt($("#retAudit", card).value, 10);
+            var sEl = $("#retSess", card), aEl = $("#retAudit", card);
+            // The min/max attrs don't constrain *typed* values —
+            // 99999 used to save fine. reportValidity enforces the
+            // declared 0–3650 range and shows the native bubble.
+            if (!sEl.reportValidity() || !aEl.reportValidity()) return;
+            var s = parseInt(sEl.value, 10);
+            var a = parseInt(aEl.value, 10);
             if (isNaN(s) || isNaN(a) || s < 0 || a < 0) { toast("Invalid values"); return; }
             saveBtn.disabled = true;
             try {
@@ -4142,11 +4147,16 @@
           '<div class="modal">' +
             '<h2>Add webhook</h2>' +
             '<p class="sub">Forward events to Slack, PagerDuty, Datadog, or your own endpoint. Payloads are signed with HMAC-SHA256.</p>' +
+            // A real <form>: Enter (and the mobile keyboard's Go key)
+            // submits, and required + type=url actually validate — as
+            // a click-wired div, "not-a-url" used to create a garbage
+            // endpoint that could never deliver.
+            '<form id="whForm">' +
             '<label style="display:block;margin-top:12px"><span style="display:block;font-size:12px;color:var(--fg-2);margin-bottom:4px">Name</span>' +
-              '<input type="text" id="whName" placeholder="e.g. Slack #ops" style="width:100%">' +
+              '<input type="text" id="whName" required placeholder="e.g. Slack #ops" style="width:100%">' +
             '</label>' +
             '<label style="display:block;margin-top:12px"><span style="display:block;font-size:12px;color:var(--fg-2);margin-bottom:4px">URL</span>' +
-              '<input type="url" id="whUrl" placeholder="https://hooks.slack.com/services/…" style="width:100%">' +
+              '<input type="url" id="whUrl" required placeholder="https://hooks.slack.com/services/…" style="width:100%">' +
             '</label>' +
             '<div style="margin-top:12px"><div style="font-size:12px;color:var(--fg-2);margin-bottom:4px">Events</div>' +
               '<div style="display:flex;flex-wrap:wrap;gap:6px" id="whEventsPicker">' +
@@ -4161,8 +4171,9 @@
             '</div>' +
             '<div class="actions">' +
               '<button type="button" class="btn" data-close>Cancel</button>' +
-              '<button type="button" class="btn primary" id="whSave">Create endpoint</button>' +
+              '<button type="submit" class="btn primary" id="whSave">Create endpoint</button>' +
             '</div>' +
+            '</form>' +
           '</div>' +
         '</div>',
       );
@@ -4185,8 +4196,9 @@
       uninstallWh = installModalKeys(backdrop, closeWh);
       backdrop.querySelectorAll("[data-close]").forEach(function (b) { b.addEventListener("click", closeWh); });
       backdrop.addEventListener("click", function (e) { if (e.target === backdrop) closeWh(); });
-      on($("#whSave", backdrop), "click", async function (e) {
-        var saveBtn = e.currentTarget;
+      backdrop.querySelector("#whForm").addEventListener("submit", async function (e) {
+        e.preventDefault();
+        var saveBtn = $("#whSave", backdrop);
         if (saveBtn.disabled) return;
         var name = $("#whName", backdrop).value.trim();
         var url = $("#whUrl", backdrop).value.trim();

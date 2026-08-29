@@ -18,7 +18,7 @@
  */
 import { chromium, devices } from "playwright";
 
-const SITE = process.env.SITE ?? "https://agentvisorai.me/";
+const SITE = process.env.SITE ?? process.argv[2] ?? "https://agentvisorai.me/";
 const ROOT = SITE.replace(/app\/?$/, "");
 // PROFILE=phone rehearses the QR-code path: the printed handout's QR
 // lands investors on the site on their phones — same narrative, tap

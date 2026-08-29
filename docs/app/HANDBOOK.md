@@ -144,12 +144,18 @@ catalog at the bottom.
   slow and the second fast to prove last-write-wins bugs.
 - Zero-match probes are worse than none: ground-truth checks must **fail
   loudly when a probe query matches nothing** (fixture drift tripwire).
+- Suites default `SITE` to **production**. A positional arg passed to a
+  script that only reads the env var is silently ignored — an entire
+  "local" drill once ran green against the live site while the local
+  changes under test were never exercised. The drills now accept the
+  target as env `SITE` or `argv[2]`; when a "local" failure makes no
+  sense, first check `location.href` inside the page.
 
 ## Test suite catalog (`server/scripts/`, run with `SITE=` override)
 
 | Script | Guards |
 |---|---|
-| `interactive-drill.mjs` | 26 checks: tour, attack story, onboarding ages, billing math, reset flows, hit-tests, storage/router fuzz, pagination + deep links, Back/overlays, double-submit, failure paths + catch-up, cross-tab + FOUC, focus rings/traps + reduced motion + shortcut guards, garbage data, filter/sort/chart/audit/detail ground truth, deployment + key lifecycles, member RBAC, leak soak |
+| `interactive-drill.mjs` | 27 checks: tour, attack story, onboarding ages, billing math, reset flows, hit-tests, storage/router fuzz, pagination + deep links, Back/overlays, double-submit, failure paths + catch-up, cross-tab + FOUC, focus rings/traps + reduced motion + shortcut guards, garbage data, filter/sort/chart/audit/detail ground truth, deployment + key lifecycles, member RBAC, leak soak, form semantics (native validation + Enter submits) |
 | `live-site-smoke.mjs` | 9 checks incl. link/media crawl, captions, alias stubs, 404, OG/Twitter link previews |
 | `a11y-audit.mjs` | 46 axe scans: 11 routes + 9 modal states × 2 themes, 3 static pages × 2 schemes |
 | `mobile-smoke.mjs` | phone/tablet: tab bar, taps, modals fit + hittable + stacking, static pages |

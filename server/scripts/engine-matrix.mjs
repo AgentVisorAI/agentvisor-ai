@@ -4,7 +4,7 @@ import { chromium, webkit, firefox } from "playwright";
 // policy-create preview, audit filters, mobile tab bar) exercised on
 // Chromium, WebKit, and Firefox. Engine-specific regressions (Safari
 // especially) don't show up in the chromium-only drills.
-const SITE = process.env.SITE ?? "https://agentvisorai.me/app/";
+const SITE = process.env.SITE ?? process.argv[2] ?? "https://agentvisorai.me/app/";
 const engines = { chromium, webkit, firefox };
 let anyFail = false;
 for (const [name, engine] of Object.entries(engines)) {

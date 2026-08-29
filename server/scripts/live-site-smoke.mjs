@@ -16,7 +16,7 @@
  */
 import { chromium } from "playwright";
 
-const SITE = process.env.SITE ?? "https://agentvisorai.me/app/";
+const SITE = process.env.SITE ?? process.argv[2] ?? "https://agentvisorai.me/app/";
 
 const browser = await chromium.launch({ headless: true });
 const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
