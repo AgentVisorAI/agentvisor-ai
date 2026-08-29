@@ -139,17 +139,15 @@ fn redis_contract_spend_many_guards_are_exact() {
     let tag = av_core::new_event_uid();
     // amount == limit == JCS_SAFE_MAX commits (kills > -> >=)…
     let key = format!("av-test-max:{{{tag}}}");
-    assert!(
-        matches!(
-            s.try_spend_many(&[Spend {
-                key: key.clone(),
-                amount: max,
-                limit: max,
-            }])
-            .unwrap(),
-            TrySpendOutcome::Committed { .. }
-        ),
-    );
+    assert!(matches!(
+        s.try_spend_many(&[Spend {
+            key: key.clone(),
+            amount: max,
+            limit: max,
+        }])
+        .unwrap(),
+        TrySpendOutcome::Committed { .. }
+    ),);
     s.remove(&key);
     // …and each side one past the cap is Overflow independently
     // (kills || -> && which would require BOTH to exceed).
