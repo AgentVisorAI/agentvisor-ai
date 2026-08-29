@@ -16,7 +16,7 @@
  *   deployment.create, deployment.delete, deployment.token_rotated
  *   member.invited, member.role_changed
  *   org.created, org.exported
- *   audit.exported_csv
+ *   audit.exported_csv, audit.viewed
  *
  * `target` is a human-readable label the log viewer shows.
  * `metadata` carries structured fields for machine consumption.

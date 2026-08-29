@@ -43,6 +43,8 @@ import { env } from "../env.js";
 import {
   SESSION_COOKIE_OPTS,
   mintSession,
+  verifyPassword,
+  getDummyPasswordHash,
 } from "../lib/auth.js";
 import { writeAudit } from "../lib/audit.js";
 import { requireSession } from "../lib/session-middleware.js";
@@ -267,9 +269,33 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
         // validation but left a blank credential list row and
         // uninformative audit metadata.
         label: z.string().trim().min(1).max(80).default("Passkey"),
+        // R138 F2: require the user's password as a step-up gate
+        // BEFORE minting a new passkey. Prior shape gated only
+        // on the session cookie, so an attacker who phished /
+        // borrowed the victim's cookie could POST here and enroll
+        // THEIR OWN hardware key on the victim's user row.
+        // R124 F1's DELETE-side revoke fires only when the
+        // victim notices; before that, and against an attacker
+        // who enrolls a SECOND key immediately, the persistence
+        // survives. Same reauth posture /me/export and
+        // /me/delete-account already require (auth.ts:520, 766)
+        // and /reset-confirm's token check (auth.ts:985).
+        password: z.string().min(1).max(1024),
       })
       .safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: "invalid_input" });
+
+    // R138 F2: uniform verifyPassword against dummy hash on the
+    // no-user branch so a credential-stuffing attacker with a
+    // stolen cookie can't distinguish "user gone" from "wrong
+    // password" by wall-clock. Same shape as /login and
+    // /reset-confirm.
+    const stepUpUser = await db.user.findUnique({ where: { id: claims.sub } });
+    const stepUpHash = stepUpUser?.passwordHash ?? (await getDummyPasswordHash());
+    const stepUpOk = await verifyPassword(stepUpHash, body.data.password);
+    if (!stepUpUser || !stepUpOk) {
+      return reply.code(401).send({ error: "invalid_password" });
+    }
 
     let verified;
     try {

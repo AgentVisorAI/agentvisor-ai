@@ -1801,10 +1801,15 @@
     async webauthnRegisterStart() {
       return apiFetch("/api/v1/auth/webauthn/register/challenge", { method: "POST", body: {} });
     },
-    async webauthnRegisterFinish(response, label) {
+    async webauthnRegisterFinish(response, label, password) {
       return apiFetch("/api/v1/auth/webauthn/register/verify", {
         method: "POST",
-        body: { response: response, label: label || "Passkey" },
+        // R138 F2: server requires the account password as a
+        // step-up gate. SPA prompts the user before the
+        // navigator.credentials.create() call so the password
+        // is captured while the tab is still focused (WebAuthn
+        // ceremonies steal focus).
+        body: { response: response, label: label || "Passkey", password: password },
       });
     },
     async webauthnRevoke(id) {
