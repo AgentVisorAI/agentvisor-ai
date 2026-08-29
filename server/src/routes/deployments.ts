@@ -252,11 +252,16 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
           // audit the eventual force-delete. The
           // deployment.delete_conflict event carries just the
           // deploymentId + timestamp; no leaky metadata.
+          // R146 F2: enrich actor email — the delete SUCCESS
+          // sibling already uses resolveActor per R145 F3; the
+          // conflict branch should match for consistent audit
+          // rendering.
+          const conflictActor = await resolveActor(claims.sub);
           writeAudit(
             {
               orgId: claims.orgId,
               event: "deployment.delete_conflict",
-              actorId: claims.sub,
+              ...conflictActor,
               target: owned.name,
               metadata: { deploymentId: owned.id },
               req,
