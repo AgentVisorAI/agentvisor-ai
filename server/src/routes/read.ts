@@ -532,6 +532,32 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
     const nextCursor = hasMore && last
       ? Buffer.from(JSON.stringify({ id: last.id }), "utf8").toString("base64url")
       : null;
+    // R138 F1: R137 F1 wired audit.exported_csv on /audit.csv but
+    // the JSON sibling /read/audit returns the same
+    // {event, actor, target, note, metadata, ip, at} shape and can
+    // be walked at limit=200 via nextCursor until the whole org
+    // history is drained, all under the same owner/admin cookie
+    // — effective bypass of R137 F1's invariant. Emit
+    // audit.viewed only when the caller supplied a cursor (bulk
+    // pull worth recording); the SPA's initial Audit-page render
+    // sends no cursor so single page loads stay unaudited.
+    // Fire-and-forget, same shape as R137 F1.
+    if (query.data.cursor) {
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "audit.viewed",
+          actorId: claims.sub,
+          target: claims.orgId,
+          metadata: {
+            paginated: true,
+            rowCount: page.length,
+          },
+          req,
+        },
+        req.log,
+      );
+    }
     return reply.send({
       entries: page.map((r) => ({
         id: r.id,

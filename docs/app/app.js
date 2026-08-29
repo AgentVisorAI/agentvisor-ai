@@ -3264,13 +3264,19 @@
 
   function openInputModal(opts) {
     if (document.body.classList.contains("locked")) return;
+    // R138 F2: accept opts.type so callers can request a password
+    // field (autocomplete="current-password") for step-up flows
+    // like passkey enrollment. Defaults to "text" for backward
+    // compatibility with existing callers.
+    var inputType = opts.type || "text";
+    var autoComplete = inputType === "password" ? "current-password" : "off";
     var backdrop = h(
       '<div class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal">' +
         "<h2>" + esc(opts.title) + "</h2>" +
         (opts.sub ? '<p class="sub">' + esc(opts.sub) + "</p>" : "") +
         '<form id="inpForm">' +
           '<div class="field"><label for="inpVal">' + esc(opts.label || "Value") + "</label>" +
-          '<input id="inpVal" type="text" required placeholder="' + esc(opts.placeholder || "") + '" /></div>' +
+          '<input id="inpVal" type="' + esc(inputType) + '" required placeholder="' + esc(opts.placeholder || "") + '" autocomplete="' + esc(autoComplete) + '" /></div>' +
           '<div class="actions">' +
             '<button type="button" class="btn" data-close>Cancel</button>' +
             '<button class="btn accent" type="submit">' + esc(opts.confirmLabel || "Save") + "</button>" +
@@ -3901,43 +3907,59 @@
       toast("This browser doesn't support WebAuthn.", true);
       return;
     }
-    // Ask for a label first
+    // R138 F2: server requires the account password as a step-up
+    // gate on /register/verify (closes the "stolen cookie enrolls
+    // attacker's own passkey" persistence primitive that R124 F1
+    // could only mitigate on delete). Ask for label first, then
+    // password, then run the WebAuthn ceremony — the password
+    // capture happens while the tab is focused (WebAuthn steals
+    // focus during navigator.credentials.create).
     openInputModal({
       title: "Add a passkey",
       label: "Name this passkey",
       placeholder: "iPhone 15 Pro, YubiKey 5C, laptop, …",
       confirmLabel: "Continue",
-      onConfirm: async function (label) {
-        try {
-          var opts = (await state.ds.webauthnRegisterStart()).options;
-          // Convert challenge + user.id + excludeCredentials[].id to ArrayBuffer.
-          opts.challenge = b64uToBuffer(opts.challenge);
-          opts.user.id = b64uToBuffer(opts.user.id);
-          if (opts.excludeCredentials) {
-            opts.excludeCredentials = opts.excludeCredentials.map(function (c) {
-              return Object.assign({}, c, { id: b64uToBuffer(c.id) });
-            });
-          }
-          var cred = await navigator.credentials.create({ publicKey: opts });
-          if (!cred) throw new Error("no_credential_returned");
-          var response = {
-            id: cred.id,
-            rawId: bufferToB64u(cred.rawId),
-            type: cred.type,
-            response: {
-              attestationObject: bufferToB64u(cred.response.attestationObject),
-              clientDataJSON: bufferToB64u(cred.response.clientDataJSON),
-              transports: cred.response.getTransports ? cred.response.getTransports() : [],
-            },
-            clientExtensionResults: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {},
-            authenticatorAttachment: cred.authenticatorAttachment || null,
-          };
-          await state.ds.webauthnRegisterFinish(response, label);
-          toast("Passkey added");
-          if (rootAfterAdd) renderSettingsSSO(rootAfterAdd);
-        } catch (err) {
-          toast(err.message || "Passkey registration failed", true);
-        }
+      onConfirm: function (label) {
+        openInputModal({
+          title: "Confirm your password",
+          sub: "Your account password is required to add a new passkey.",
+          label: "Account password",
+          type: "password",
+          placeholder: "",
+          confirmLabel: "Verify",
+          onConfirm: async function (password) {
+            try {
+              var opts = (await state.ds.webauthnRegisterStart()).options;
+              // Convert challenge + user.id + excludeCredentials[].id to ArrayBuffer.
+              opts.challenge = b64uToBuffer(opts.challenge);
+              opts.user.id = b64uToBuffer(opts.user.id);
+              if (opts.excludeCredentials) {
+                opts.excludeCredentials = opts.excludeCredentials.map(function (c) {
+                  return Object.assign({}, c, { id: b64uToBuffer(c.id) });
+                });
+              }
+              var cred = await navigator.credentials.create({ publicKey: opts });
+              if (!cred) throw new Error("no_credential_returned");
+              var response = {
+                id: cred.id,
+                rawId: bufferToB64u(cred.rawId),
+                type: cred.type,
+                response: {
+                  attestationObject: bufferToB64u(cred.response.attestationObject),
+                  clientDataJSON: bufferToB64u(cred.response.clientDataJSON),
+                  transports: cred.response.getTransports ? cred.response.getTransports() : [],
+                },
+                clientExtensionResults: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {},
+                authenticatorAttachment: cred.authenticatorAttachment || null,
+              };
+              await state.ds.webauthnRegisterFinish(response, label, password);
+              toast("Passkey added");
+              if (rootAfterAdd) renderSettingsSSO(rootAfterAdd);
+            } catch (err) {
+              toast(err.message || "Passkey registration failed", true);
+            }
+          },
+        });
       },
     });
   }
