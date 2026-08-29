@@ -2659,7 +2659,6 @@
         return '<tr data-clickable data-id="' + esc(d.id) + '" data-nav="#/deployments/" tabindex="0">' +
           '<td><div style="font-weight:500">' + esc(d.name) + '</div><div class="id">' + esc(d.id) + "</div></td>" +
           '<td><span class="pill neutral">' + esc(d.environment) + "</span></td>" +
-          '<td>' + esc(d.region || "—") + "</td>" +
           "<td>" + statusPill + "</td>" +
           '<td class="mono">' + esc(d.version || "—") + "</td>" +
           '<td style="color: var(--fg-2)">' + timeAgoCell(d.lastSeenAt) + "</td>" +
@@ -2676,7 +2675,7 @@
           '<div class="snippet"><span class="prompt">$</span> <span class="cmd">curl -fsSL https://get.agentvisorai.me/install.sh | sh</span>\n<span class="prompt">$</span> <span class="cmd">agentvisord start --token=$AV_INGEST_TOKEN</span></div>' +
         "</div>" +
         '<div class="card" style="padding:0"><div class="table-wrap"><table>' +
-          "<thead><tr><th>Deployment</th><th>Environment</th><th>Region</th><th>Status</th><th>Version</th><th>Last seen</th><th class=\"act-2\"><span class=\"sr-only\">Actions</span></th></tr></thead>" +
+          "<thead><tr><th>Deployment</th><th>Environment</th><th>Status</th><th>Version</th><th>Last seen</th><th class=\"act-2\"><span class=\"sr-only\">Actions</span></th></tr></thead>" +
           "<tbody>" + rows + "</tbody></table></div></div>";
     }
     main.innerHTML = pageHeader("Deployments", "Each daemon streams events and signed receipts to this console.", actions) + body;
@@ -2749,7 +2748,7 @@
       : '<span class="pill neutral status-dot">' + esc(d.status) + "</span>";
 
     main.innerHTML =
-      pageHeader(d.name, d.environment + " · " + (d.region || ""), '<a href="' + esc(backToListUrl("deployments")) + '" class="btn">← All deployments</a>') +
+      pageHeader(d.name, d.environment, '<a href="' + esc(backToListUrl("deployments")) + '" class="btn">← All deployments</a>') +
       '<div class="dep-summary">' +
         depCell("Status", statusPill, false, true) +
         depCell("Version", d.version || "—", true) +
@@ -2896,7 +2895,6 @@
           '<form id="depForm">' +
             '<div class="field"><label for="depName">Name</label><input id="depName" required placeholder="acme-prod" pattern="[a-zA-Z0-9\\-_]+" /></div>' +
             '<div class="field"><label for="depEnv">Environment</label><select id="depEnv"><option>production</option><option>staging</option><option>development</option></select></div>' +
-            '<div class="field"><label for="depRegion">Region (optional)</label><input id="depRegion" placeholder="us-east-1" /></div>' +
             '<div class="actions"><button type="button" class="btn" data-close>Cancel</button><button class="btn accent" type="submit">Create</button></div>' +
           "</form>" +
         "</div>" +
@@ -2919,7 +2917,7 @@
       e.preventDefault();
       var btn = e.target.querySelector('button[type="submit"]');
       btn.disabled = true;
-      state.ds.createDeployment({ name: $("#depName").value.trim(), environment: $("#depEnv").value, region: $("#depRegion").value.trim() || undefined })
+      state.ds.createDeployment({ name: $("#depName").value.trim(), environment: $("#depEnv").value })
         .then(function (r) {
           close();
           showTokenModal(r.ingestToken, "Deployment created", {
@@ -4365,7 +4363,16 @@
 
     function openAddModal() {
       if (document.body.classList.contains("locked")) return;
-      var events = ["policy.block", "member.invited", "apikey.created", "apikey.revoked", "webhook.test_fired", "*"];
+      // R230 F1: server-side dispatchEvent() only fires 3 event
+      // names — policy.block (ingest.ts), member.invited (members.ts),
+      // and the endpoint-scoped smoketest 'test' (webhooks.ts). Prior
+      // shape offered apikey.created, apikey.revoked, and
+      // webhook.test_fired too — those are audit-only slugs
+      // (writeAudit event field) that never round-trip through the
+      // webhook fanout. A user subscribing to any of them silently
+      // received zero deliveries forever. Trim to what the server
+      // actually emits + the '*' wildcard.
+      var events = ["policy.block", "member.invited", "*"];
       var backdrop = h(
         '<div class="modal-backdrop" role="dialog" aria-modal="true">' +
           '<div class="modal">' +
@@ -5031,7 +5038,7 @@
       } catch (e) {}
       try {
         deployments = (await state.ds.listDeployments()).map(function (d) {
-          return { g: "Deployments", label: d.name, desc: d.environment + " · " + (d.region || ""), href: "#/deployments/" + d.id, icon: iconServer() };
+          return { g: "Deployments", label: d.name, desc: d.environment, href: "#/deployments/" + d.id, icon: iconServer() };
         });
         all = all.concat(deployments);
         if (backdrop.isConnected) paint();
