@@ -749,7 +749,40 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
     // R140 F2: perIp(3, 60_000) matches /register/verify (R139 F1)
     // and the /me/{export,delete-account} step-up siblings. See
     // password-body rationale in the handler comment below.
-    config: { rateLimit: perIp(3, 60_000) },
+    // R141 F4: keyGenerator skips the bucket when the caller
+    // has an Authorization header (api-key session) — those
+    // requests get rejected at the cookie_session_required
+    // branch below without touching argon2. Prior shape
+    // decremented the bucket on every api-key hit, letting an
+    // attacker with any valid av_srv_ token burn the legitimate
+    // owner's revoke budget from that IP by hammering DELETE
+    // with a bearer header — 3 requests → the real owner is
+    // locked out of revoking a compromised passkey for 60s.
+    // Combined with F1's failure audit, that would have been a
+    // covert lock-out primitive.
+    config: {
+      rateLimit: {
+        max: 3,
+        timeWindow: 60_000,
+        keyGenerator: (req: { ip: string }) => `ip:${req.ip}`,
+        // R141 F4: skip the rate limit for requests carrying an
+        // Authorization: Bearer <av_srv_> header — those are
+        // api-key sessions that we reject at the
+        // cookie_session_required branch below without touching
+        // argon2. Prior shape decremented the bucket on every
+        // api-key hit, letting an attacker with ANY valid av_srv_
+        // token burn the legitimate owner's revoke budget from
+        // that IP by hammering DELETE with a bearer header —
+        // 3 requests → real owner locked out of revoking a
+        // compromised passkey for 60s. Combined with F1's
+        // failure audit, that would have been a covert lock-out
+        // primitive.
+        allowList: (req: { headers: Record<string, unknown> }) => {
+          const auth = req.headers["authorization"];
+          return typeof auth === "string" && auth.toLowerCase().startsWith("bearer ");
+        },
+      },
+    },
   }, async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
@@ -781,6 +814,23 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
     const stepUpHash = stepUpUser?.passwordHash ?? (await getDummyPasswordHash());
     const stepUpOk = await verifyPassword(stepUpHash, body.data.password);
     if (!stepUpUser || !stepUpOk) {
+      // R141 F1: audit the failure — same rationale R140 F3
+      // used on the enroll side. DELETE blast radius is LARGER
+      // than /register/verify (wipes MFA + fences sessions +
+      // revokes API keys per credential), so if failure audit is
+      // warranted on enroll it is warranted a fortiori here.
+      // Emit AFTER the uniform argon2 verify so wall-clock stays
+      // flat.
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "mfa.credential_revoke_denied",
+          actorId: claims.sub,
+          note: "invalid_password",
+          req,
+        },
+        req.log,
+      );
       return reply.code(401).send({ error: "invalid_password" });
     }
     const cred = await db.webauthnCredential.findFirst({
