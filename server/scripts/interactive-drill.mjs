@@ -1649,8 +1649,48 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ skeleton-phase range click lands; stale overview fetch cannot clobber the newer range");
 }
 
+// ── 29. Dirty-modal discard guard: a reflexive Escape or a backdrop
+// mis-click used to instantly wipe everything typed into a modal form.
+// First attempt on a dirty modal must block + explain; second attempt
+// discards; pristine modals and explicit Cancel stay immediate.
+{
+  const dmPage = await context.newPage();
+  const open = () => dmPage.evaluate(() => !!document.querySelector(".modal-backdrop"));
+  await dmPage.goto(SITE + "#/settings/members", { waitUntil: "domcontentloaded" });
+  await dmPage.waitForSelector("#inviteBtn", { timeout: 15000 });
+  // pristine: Escape closes immediately
+  await dmPage.click("#inviteBtn");
+  await dmPage.waitForSelector("#inviteForm", { timeout: 5000 });
+  await dmPage.keyboard.press("Escape");
+  await dmPage.waitForTimeout(250);
+  if (await open()) fail("pristine modal did not close on first Escape");
+  // dirty: Escape blocked + toast, second Escape discards
+  await dmPage.click("#inviteBtn");
+  await dmPage.waitForSelector("#inviteForm", { timeout: 5000 });
+  await dmPage.fill("#inv_email", "half-typed@acme.com");
+  await dmPage.keyboard.press("Escape");
+  await dmPage.waitForTimeout(250);
+  const toastTxt = await dmPage.evaluate(() => document.querySelector(".toast")?.textContent || "");
+  if (!(await open()) || !/unsaved/i.test(toastTxt)) fail("dirty modal not guarded on Escape: open=" + (await open()) + " toast=" + toastTxt.slice(0, 40));
+  await dmPage.keyboard.press("Escape");
+  await dmPage.waitForTimeout(250);
+  if (await open()) fail("second Escape did not discard the dirty modal");
+  // dirty: backdrop mis-click blocked; explicit Cancel immediate
+  await dmPage.click("#inviteBtn");
+  await dmPage.waitForSelector("#inviteForm", { timeout: 5000 });
+  await dmPage.fill("#inv_email", "oops@acme.com");
+  await dmPage.mouse.click(15, 400);
+  await dmPage.waitForTimeout(250);
+  if (!(await open())) fail("dirty modal closed on a backdrop mis-click");
+  await dmPage.click(".modal [data-close]");
+  await dmPage.waitForTimeout(250);
+  if (await open()) fail("explicit Cancel was blocked on a dirty modal");
+  await dmPage.close();
+  console.log("✅ dirty-modal discard guard: mis-close blocked + explained, second attempt discards, Cancel immediate");
+}
+
 if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors));
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 28 interactive-features drill checks passed.");
+console.log("\nAll 29 interactive-features drill checks passed.");

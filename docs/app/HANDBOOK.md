@@ -65,6 +65,12 @@ catalog at the bottom.
    `installModalKeys` without a close callback poisons every later Escape.
    `showTokenModal` **no-ops while the body is locked** — close your own
    modal first (the regenerated SP cert was silently never shown).
+   Dirty-modal discard guard (in `installModalKeys`): Escape or a
+   backdrop mis-click on a modal with unsaved edits blocks once +
+   toasts; the second attempt within 2s discards. Explicit Cancel
+   (`data-close`) stays immediate. Dirtiness = value vs defaultValue /
+   defaultChecked / defaultSelected — prefill via HTML attributes, not
+   post-render property writes, or the guard will false-positive.
 6. The palette closes on `hashchange` and on a **capture-phase document
    Escape** (the input-level Escape missed the pre-autofocus window and
    wedged the backdrop). The body-level hashchange sweep removes both
@@ -158,7 +164,7 @@ catalog at the bottom.
 
 | Script | Guards |
 |---|---|
-| `interactive-drill.mjs` | 28 checks: tour, attack story, onboarding ages, billing math, reset flows, hit-tests, storage/router fuzz, pagination + deep links, Back/overlays, double-submit, failure paths + catch-up, cross-tab + FOUC, focus rings/traps + reduced motion + shortcut guards, garbage data, filter/sort/chart/audit/detail ground truth, deployment + key lifecycles, member RBAC, leak soak, form semantics (native validation + Enter submits), skeleton-phase filter liveness |
+| `interactive-drill.mjs` | 29 checks: tour, attack story, onboarding ages, billing math, reset flows, hit-tests, storage/router fuzz, pagination + deep links, Back/overlays, double-submit, failure paths + catch-up, cross-tab + FOUC, focus rings/traps + reduced motion + shortcut guards, garbage data, filter/sort/chart/audit/detail ground truth, deployment + key lifecycles, member RBAC, leak soak, form semantics (native validation + Enter submits), skeleton-phase filter liveness, dirty-modal discard guard |
 | `live-site-smoke.mjs` | 9 checks incl. link/media crawl, captions, alias stubs, 404, OG/Twitter link previews |
 | `a11y-audit.mjs` | 46 axe scans: 11 routes + 9 modal states × 2 themes, 3 static pages × 2 schemes |
 | `mobile-smoke.mjs` | phone/tablet: tab bar, taps, modals fit + hittable + stacking, static pages |
