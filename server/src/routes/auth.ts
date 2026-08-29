@@ -170,6 +170,27 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       },
       req.log,
     );
+    // R136 F2: also emit org.created so a forensic query
+    // "which orgs came into existence via unattended OAuth
+    // callback vs. explicit /signup" can distinguish the two
+    // by event slug alone (rather than parsing the freeform
+    // note field). Post-R135 F4 the OAuth-JIT branch already
+    // emitted org.created — without this counterpart, the
+    // query would return only OAuth-JIT orgs and silently
+    // miss every password-signup org. Same double-emit shape
+    // R135 F4 established.
+    writeAudit(
+      {
+        orgId: org.id,
+        event: "org.created",
+        actorId: user.id,
+        actorEmail: user.email,
+        target: org.name,
+        metadata: { viaSignup: true, orgSlug: org.slug },
+        req,
+      },
+      req.log,
+    );
     // Fire-and-forget welcome email. Failures don't block the signup
     // response — a stuck mailer would otherwise turn a hot-path signup
     // into a 30s timeout.
@@ -493,6 +514,37 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     if (!user) return reply.code(401).send({ error: "unauthenticated" });
     const ok = await verifyPassword(user.passwordHash, body.data.password);
     if (!ok) return reply.code(401).send({ error: "invalid_password" });
+
+    // R136 F1: single largest-blast-radius endpoint in the tree.
+    // R91 F1 comment: "streams the ENTIRE org history: every
+    // deployment (with publicKeyHex), every member (email +
+    // displayName), every session, every event body (up to 8000
+    // chars of daemon-forwarded LLM prompts/responses) and sub,
+    // every receipt." Owner-only + password-reauthed, but a
+    // stolen owner cookie exfils the whole org in one JSONL
+    // stream. Prior shape emitted zero writeAudit and only a
+    // req.log.error on stream failure — an admin investigating
+    // "was our org's whole event stream siphoned via /me/export
+    // at 03:12" got nothing forensic. Sibling of R135 F1's
+    // /reset-confirm gap: emit the breadcrumb AFTER the
+    // owner-check + password verify pass so no oracle leaks,
+    // BEFORE reply.raw.flushHeaders so the audit fires whether
+    // the stream completes or not. Distinct from /me/delete-
+    // account which is deliberately non-audited (auth.ts:718:
+    // "would itself be nuked by the same cascade") — no
+    // cascade concern applies here (nothing is deleted).
+    writeAudit(
+      {
+        orgId: claims.orgId,
+        event: "org.exported",
+        actorId: claims.sub,
+        actorEmail: user.email,
+        target: claims.orgId,
+        metadata: { streamingStartedAt: new Date().toISOString() },
+        req,
+      },
+      req.log,
+    );
 
     // Streaming JSON-Lines export. Each line is a self-contained JSON
     // object; the first line is a header. Sessions and events are
@@ -830,6 +882,35 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
           where: { id: user.id },
           data: { resetTokenHash, resetTokenAt: new Date() },
         });
+        // R136 F3: forensic breadcrumb — R135 F1 wired the
+        // /reset-confirm audit; the /reset-request counterpart was
+        // reserved in audit.ts:13 docstring (auth.reset_request)
+        // but never emitted. An admin investigating "who initiated
+        // the reset flow from IP X at 03:12" needs BOTH sides to
+        // reconstruct the chain. Fire-and-forget inside the
+        // already-detached background block so the 202 response
+        // wall-clock is unchanged. Guarded by the `if (!user)
+        // return` above so an anonymous caller can't induce
+        // audit noise for arbitrary email guessing (also
+        // preserves the R98 F2 no-enumeration-oracle posture).
+        const firstMembership = await db.membership.findFirst({
+          where: { userId: user.id },
+          orderBy: { createdAt: "asc" },
+          select: { orgId: true },
+        });
+        if (firstMembership) {
+          writeAudit(
+            {
+              orgId: firstMembership.orgId,
+              event: "auth.reset_request",
+              actorId: user.id,
+              actorEmail: user.email,
+              target: user.email,
+              req,
+            },
+            req.log,
+          );
+        }
         // Build the reset link the user will click.
         const resetLink = `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/reset?token=${encodeURIComponent(plaintextToken)}&email=${encodeURIComponent(user.email)}`;
         // Send it. Uses whichever mailer driver is configured
