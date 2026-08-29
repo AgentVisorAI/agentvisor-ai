@@ -25,6 +25,15 @@ const CHUNK = 1000;
 const WEBHOOK_DELIVERY_RETENTION_DAYS = 30;
 
 let sweeperTimer: NodeJS.Timeout | null = null;
+// R208 F2: track the boot-jitter setTimeout handle separately so
+// (a) stopRetentionSweeper() during the 0-30 s jitter window can
+// clear the pending initial-sweep + interval-schedule instead of
+// silently no-op'ing, and (b) a second startRetentionSweeper()
+// call within that window can't schedule a duplicate setTimeout
+// (which would land two concurrent setInterval loops both
+// hammering the same rows on every tick). Prior shape only
+// guarded on sweeperTimer, which is null while jitter is pending.
+let jitterTimer: NodeJS.Timeout | null = null;
 
 // R99 F3: read the interval from env (validated at boot via
 // zod refine) instead of Number(process.env.X). Prior shape
@@ -160,9 +169,19 @@ export async function sweepRetentionAll(
  * sweeping simultaneously), then every RETENTION_INTERVAL_MS.
  */
 export function startRetentionSweeper(logger?: FastifyBaseLogger): void {
-  if (sweeperTimer) return;
+  // R208 F2: guard on BOTH the interval timer AND the pending
+  // jitter setTimeout. Prior guard `if (sweeperTimer) return`
+  // let a duplicate `start` during the boot-jitter window
+  // schedule a second setTimeout, materialising two concurrent
+  // setInterval loops.
+  if (sweeperTimer || jitterTimer) return;
   const jitter = Math.floor(Math.random() * 30_000);
-  setTimeout(() => {
+  jitterTimer = setTimeout(() => {
+    // R208 F2: null the handle before running the initial sweep
+    // so stopRetentionSweeper() during the sweep is still
+    // idempotent (interval hasn't been scheduled yet, but the
+    // jitter handle is done firing).
+    jitterTimer = null;
     void sweepRetentionAll(logger).catch((err) =>
       logger?.warn({ err }, "retention_sweep_initial_failed"),
     );
@@ -175,6 +194,17 @@ export function startRetentionSweeper(logger?: FastifyBaseLogger): void {
 }
 
 export function stopRetentionSweeper(): void {
+  // R208 F2: clear the pending jitter handle too. Prior shape
+  // only cleared the interval; a SIGTERM landing during the
+  // 0-30 s boot jitter window left the pending setTimeout to
+  // fire against a Prisma client that app.close() may already
+  // have started tearing down. In tests / hot-reload where the
+  // process persists, the leaked interval accumulated across
+  // start/stop cycles.
+  if (jitterTimer) {
+    clearTimeout(jitterTimer);
+    jitterTimer = null;
+  }
   if (sweeperTimer) {
     clearInterval(sweeperTimer);
     sweeperTimer = null;
