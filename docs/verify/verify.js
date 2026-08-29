@@ -152,6 +152,7 @@
       // have no body.key_id — skip the check to preserve backward
       // compat.
       let keyIdOk = true;
+      let pubkeyOk = true;
       if (ok) {
         try {
           const parsed = JSON.parse(r.rawBody);
@@ -159,13 +160,40 @@
             const derived = await deriveKeyIdFromPubHex(pub.hex.toLowerCase());
             if (derived !== parsed.key_id.toLowerCase()) keyIdOk = false;
           }
+          // R199 F1: enforce body.public_key_b64 ↔ bundle.publicKey.hex
+          // binding. Rust `verify_embedded()` at
+          // crates/av-receipts/src/receipt.rs:365-368 uses
+          // body.public_key_b64 AS the verifying pubkey (self-
+          // contained offline verification). Our JS verifier uses
+          // bundle.publicKey.hex (envelope). If those refer to
+          // different 32-byte keys, an attacker with signing key
+          // K_a can sign a body whose public_key_b64 claims
+          // K_victim while the bundle's pubkey hex is K_a — sig
+          // verifies (JS uses K_a from bundle), R193 passes if
+          // body.key_id = derive(K_a), but an auditor decoding
+          // body.public_key_b64 sees K_victim. Attribution split
+          // sibling of R193. Fix: refuse on mismatch. Legacy
+          // v1 receipts (sample-receipt.json) have no
+          // public_key_b64 in body — skip.
+          if (typeof parsed.public_key_b64 === "string" && parsed.public_key_b64.length > 0) {
+            try {
+              const bodyPubBytes = b64ToBytes(parsed.public_key_b64);
+              const bundlePubBytes = hex2bytes(pub.hex);
+              if (bodyPubBytes.length !== bundlePubBytes.length ||
+                  !bodyPubBytes.every((b, i) => b === bundlePubBytes[i])) {
+                pubkeyOk = false;
+              }
+            } catch {
+              pubkeyOk = false;
+            }
+          }
         } catch {
-          // Body not JSON — leave keyIdOk as true; sig either
-          // verified over structured bytes or it didn't.
+          // Body not JSON — sig either verified over structured
+          // bytes or it didn't. Leave both checks true.
         }
       }
-      const trustedKey = ok && keyIdOk && TRUSTED_RECEIPT_KEYS.has(pub.hex.toLowerCase());
-      return { ok: ok && keyIdOk, trustedKey, bundle };
+      const trustedKey = ok && keyIdOk && pubkeyOk && TRUSTED_RECEIPT_KEYS.has(pub.hex.toLowerCase());
+      return { ok: ok && keyIdOk && pubkeyOk, trustedKey, bundle };
     }
 
     // R91 F4: only expose the mutable Set when the ?ci-drill=1
