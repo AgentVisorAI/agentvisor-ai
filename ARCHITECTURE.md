@@ -53,15 +53,19 @@ A session is opened on first use and assigned `signed` or `unsigned` once. Close
 
 Tool forwarding holds a session lease through bounded response capture and completion auditing. JSON-RPC ids back durable execution claims; uncertain crash outcomes are never re-executed automatically. Shutdown bounds HTTP drain, worker drain, and OTLP flush independently.
 
-**Spool retention:** the ATIF spool (`atif_spool_dir`) has no built-in
+**Spool retention:** the ATIF spool (`atif_spool_dir`) has no *default*
 retention — every unsigned artifact (plus its provenance sidecar and
 close marker), every archived prior incarnation of a recycled session
-id, and every receipt is kept indefinitely as audit evidence. Operators
-own its lifecycle: archive and prune it externally (it is plain files;
-receipts and trajectories remain verifiable offline after being moved).
-Unbounded spool growth also grows the reconciler's periodic scan cost,
-so pruning is an operational requirement for long-lived, high-churn
-deployments, not merely a disk-space concern.
+id, and every receipt is kept indefinitely as audit evidence. Set
+`atif_retention_days = N` (config.rs refuses `0`) to opt into the
+built-in hourly sweep (`Finalizer::prune_sealed_atif`, wired at
+`main.rs:233`; also exposed as `avctl spool-prune`); only sealed
+(ATIF + receipt) pairs older than `N` days are eligible. Receipts and
+`.archived-*` collision-incarnation files are never retention targets
+— manage them externally. Unbounded spool growth also grows the
+reconciler's periodic scan cost, so pruning is an operational
+requirement for long-lived, high-churn deployments, not merely a
+disk-space concern.
 
 ## Portability
 

@@ -99,12 +99,19 @@ argument.
 authentic. It does not prove the receipt is *the one you expect*.
 Check at least:
 
-* `subject.session_id` matches the session you were audited for
-* `subject.workflow` is one of `Signed`, `Unsigned`
-* `subject.event_count` matches the number of ATIF steps you got
-* `subject.stop_reason` is one of the enumerated values
-  (see `av_events::StopReason`)
-* `subject.identity.charter` is the charter you intended
+* `session_id` (top-level) matches the session you were audited for
+* `ai_agent.charter` is the charter you intended (name / instance_uid /
+  charter contents)
+* `stop_reason_id` is one of the enumerated values and `stop_reason`
+  is its canonical caption (or a provider-native free-text caption
+  when the id is `0` "unspecified"); see `av_events::StopReason`
+* When `subject.kind == "event_chain"`: `subject.chain_head` (64-hex)
+  matches the head hash of the OCSF event chain you replayed and
+  `subject.event_count` matches the number of events folded in
+* When `subject.kind == "atif_trajectory"`: `subject.trajectory_digest`
+  (64-hex) matches `SHA-256` of the ATIF file bytes you hold,
+  `subject.step_count` matches the number of ATIF steps you got, and
+  `subject.retroactive` is `true`
 * the receipt's `key_id` (top level) matches the trusted key's
   `key_id` (the first 32 hex characters of the SHA-256 digest of the
   raw 32-byte public key)

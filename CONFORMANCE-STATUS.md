@@ -94,8 +94,11 @@ wrapper is `avctl receipt-verify <file> --public-key-hex <64-hex>`.
    `issued_at`, `issued_at_iso`, `ai_agent`, `subject`, `tool_calls`,
    `cost`, `stop_reason_id`, `stop_reason`, `key_id`,
    `public_key_b64`, `signature_b64`.
-2. **Semantic invariants.** `receipt_version` must be `1`.
-   `ai_agent.charter.type_id` must be `1` (OCSF Regular File). When
+2. **Semantic invariants.** `receipt_version` must be `1` or `2` (v1
+   was the initial format; v2 is the current format daemons emit —
+   the difference is only in the signature framing, described in
+   step 5). `ai_agent.charter.type_id` must be `1` (OCSF Regular
+   File). When
    `subject.kind == "atif_trajectory"`, `subject.retroactive` must be
    `true` and `subject.trajectory_digest` must be exactly 64 lowercase
    hex characters; when `subject.kind == "event_chain"`,
@@ -122,7 +125,15 @@ wrapper is `avctl receipt-verify <file> --public-key-hex <64-hex>`.
 5. **Signature.** Base64-decode `signature_b64` (64 bytes) and verify
    with Ed25519 in **strict** mode (reject small-order components and
    non-canonical scalars — RFC 8032 `verify` alone admits malleable
-   encodings; the reference uses ed25519-dalek `verify_strict`).
+   encodings; the reference uses ed25519-dalek `verify_strict`). The
+   signed *message* is version-dispatched:
+   * **v1** (legacy): the raw JCS canonical bytes from step 4.
+   * **v2** (current, what daemons emit): the concatenation
+     `"AV-RECEIPT-v2\n"` (14-byte ASCII domain tag) ‖
+     `u64_be(len(canonical_bytes))` (8-byte big-endian length prefix) ‖
+     `canonical_bytes`. Rejecting the framing is what stops a v1
+     signature over `body` from being replayed as a v2 signature over
+     `AV-RECEIPT-v2\n || len || body` and vice versa.
 
 Any step failing means the receipt does not attest anything. For
 `subject.kind == "atif_trajectory"`, additionally compare
