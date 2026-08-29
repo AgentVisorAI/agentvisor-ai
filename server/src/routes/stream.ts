@@ -165,7 +165,7 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
     // R79 MEDIUM (Class D): periodically re-verify authorization
     // so a session revoked AFTER the SSE connection opened (logout,
     // password reset via `user.sessionRevokedAt` bump at
-    // `auth.ts:635`, or membership removal via `DELETE /members/
+    // `auth.ts:529`, or membership removal via `DELETE /members/
     // :userId`) actually stops the stream. `requireSession`
     // ran ONCE at connection open; prior shape left an open tab
     // streaming `session.upsert` / `events.appended` /

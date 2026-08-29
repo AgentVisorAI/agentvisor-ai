@@ -252,8 +252,8 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post("/register/verify", {
-    // R139 F1: perIp(3, 60_000) matches /me/export (auth.ts:493)
-    // and /me/delete-account (auth.ts:748) — the other
+    // R139 F1: perIp(3, 60_000) matches /me/export (auth.ts:584)
+    // and /me/delete-account (auth.ts:897) — the other
     // owner-tier step-up siblings. R138 F2 introduced the
     // verifyPassword call which is a ~50-120 ms argon2 hit
     // gated only on the session cookie; without a per-route
@@ -300,8 +300,8 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
         // victim notices; before that, and against an attacker
         // who enrolls a SECOND key immediately, the persistence
         // survives. Same reauth posture /me/export and
-        // /me/delete-account already require (auth.ts:520, 766)
-        // and /reset-confirm's token check (auth.ts:985).
+        // /me/delete-account already require (auth.ts:646, 933)
+        // and /reset-confirm's token check (auth.ts:1177).
         password: z.string().min(1).max(1024),
       })
       .safeParse(req.body);
