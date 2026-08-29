@@ -43,13 +43,34 @@
       alert("Console crashed: " + msg + (requestId ? " (request-id " + requestId + ")" : ""));
     }
   }
-  window.addEventListener("error", function (ev) {
-    var msg = (ev.error && ev.error.message) || ev.message || "Uncaught error";
+  // Benign noise that must never nuke the app: Chrome fires
+  // ResizeObserver loop warnings as error events, and extensions
+  // regularly surface opaque cross-origin "Script error." events.
+  function benign(msg) {
+    return /ResizeObserver loop|^Script error\.?$/.test(String(msg || ""));
+  }
+  function handle(msg) {
+    if (benign(msg)) return;
+    // Once the app has booted (app.js sets __avBooted at the end of
+    // boot()), a stray error must NOT wipe a working console — an
+    // extension throwing mid-demo used to replace the whole UI with
+    // this card. Log it; the app keeps running.
+    if (window.__avBooted) { try { console.error("[post-boot]", msg); } catch (e) {} return; }
     crashCard(msg, window.__lastRequestId);
+  }
+  window.addEventListener("error", function (ev) {
+    handle((ev.error && ev.error.message) || ev.message || "Uncaught error");
   });
   window.addEventListener("unhandledrejection", function (ev) {
     var reason = ev.reason;
-    var msg = (reason && (reason.message || reason.detail || reason.toString && reason.toString())) || "Unhandled promise rejection";
-    crashCard(msg, window.__lastRequestId);
+    handle((reason && (reason.message || reason.detail || reason.toString && reason.toString())) || "Unhandled promise rejection");
   });
+  // Watchdog for the failure the listeners can't see: a script that
+  // never EXECUTES (404 mid-deploy, corporate proxy stripping JS)
+  // fires no window error — the page just stayed blank forever.
+  setTimeout(function () {
+    if (!window.__avBooted && !document.querySelector("#app > *")) {
+      crashCard("The console failed to load. A deploy may be mid-flight, or your network is blocking scripts.");
+    }
+  }, 6000);
 }());
