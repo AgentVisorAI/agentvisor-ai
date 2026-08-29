@@ -14,7 +14,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { db } from "../db.js";
 import { requireSession } from "../lib/session-middleware.js";
-import { writeAudit } from "../lib/audit.js";
+import { writeAudit, resolveActor } from "../lib/audit.js";
 import { sweepRetentionForOrg } from "../lib/retention.js";
 import { ipMatchesAny, tryParseCidr } from "../lib/cidr.js";
 
@@ -48,6 +48,50 @@ export async function orgRoutes(app: FastifyInstance): Promise<void> {
       })
       .safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: "invalid_input" });
+    // R145 F1: admins could historically wipe forensic evidence by
+    // (1) lowering auditRetentionDays to 1, (2) POST /retention/sweep-now
+    // to purge every auditEntry older than now-1day, (3) re-raising
+    // auditRetentionDays back to normal. Result: member.role_changed,
+    // deployment.token_rotated, saml.*, mfa.credential_revoked, etc.
+    // gone; the only telltale is a single org.retention_updated row
+    // showing "1", which the admin trivially explains away.
+    // Same "admin destroys compliance data" class R94 F4 gated for
+    // deployment.delete (?force=1) and R118 F1 gated for
+    // owner-scoped API-key DELETE — retention was the outstanding
+    // sibling. Require owner for RETENTION NARROWING (either
+    // dimension shrinking); loosening or holding steady still
+    // works at admin.
+    const currentRetention = await db.org.findUnique({
+      where: { id: claims.orgId },
+      select: { sessionRetentionDays: true, auditRetentionDays: true },
+    });
+    if (!currentRetention) return reply.code(404).send({ error: "not_found" });
+    const narrowingSession =
+      body.data.sessionRetentionDays !== undefined &&
+      body.data.sessionRetentionDays !== 0 &&
+      (currentRetention.sessionRetentionDays === 0 ||
+        body.data.sessionRetentionDays < currentRetention.sessionRetentionDays);
+    const narrowingAudit =
+      body.data.auditRetentionDays !== undefined &&
+      body.data.auditRetentionDays !== 0 &&
+      (currentRetention.auditRetentionDays === 0 ||
+        body.data.auditRetentionDays < currentRetention.auditRetentionDays);
+    if ((narrowingSession || narrowingAudit) && claims.membershipRole !== "owner") {
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "auth.step_up_denied",
+          actorId: claims.sub,
+          note: "not_owner",
+          metadata: { endpoint: "org.retention.narrow" },
+          req,
+        },
+        req.log,
+      );
+      return reply
+        .code(403)
+        .send({ error: "only_owner_can_narrow_retention" });
+    }
     const updated = await db.org.update({
       where: { id: claims.orgId },
       data: body.data,
@@ -56,15 +100,24 @@ export async function orgRoutes(app: FastifyInstance): Promise<void> {
         auditRetentionDays: true,
       },
     });
+    // R145 F3: enrich actor email — retention changes are exactly
+    // the class of admin action ops wants attributed by email.
+    const retentionActor = await resolveActor(claims.sub);
     writeAudit(
       {
         orgId: claims.orgId,
         event: "org.retention_updated",
-        actorId: claims.sub,
+        ...retentionActor,
         target: claims.orgId,
         metadata: {
           sessionRetentionDays: updated.sessionRetentionDays,
           auditRetentionDays: updated.auditRetentionDays,
+          // R145 F1: include prior values so a narrowing attempt
+          // is spelled out for reviewers grepping the audit trail
+          // — auditor can `SELECT * WHERE event='org.retention_updated'
+          // AND metadata->>'previousAuditRetentionDays' > metadata->>'auditRetentionDays'`.
+          previousSessionRetentionDays: currentRetention.sessionRetentionDays,
+          previousAuditRetentionDays: currentRetention.auditRetentionDays,
         },
         req,
       },
@@ -76,15 +129,35 @@ export async function orgRoutes(app: FastifyInstance): Promise<void> {
   app.post("/retention/sweep-now", async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
-    if (claims.membershipRole === "member") {
-      return reply.code(403).send({ error: "forbidden" });
+    // R145 F1: same rationale as PATCH /retention narrowing above.
+    // sweep-now is the destructive execution leg — admin who
+    // couldn't lower the window can't invoke the sweep either
+    // (without narrowing first, this is a no-op purge of already-
+    // expired rows, but by fencing owner-only we keep the primitive
+    // consistent with the retention control itself).
+    if (claims.membershipRole !== "owner") {
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "auth.step_up_denied",
+          actorId: claims.sub,
+          note: "not_owner",
+          metadata: { endpoint: "org.retention.sweep_now" },
+          req,
+        },
+        req.log,
+      );
+      return reply.code(403).send({ error: "only_owner_can_sweep" });
     }
     const result = await sweepRetentionForOrg(claims.orgId, req.log);
+    // R145 F3: enrich actor email — destructive purge deserves
+    // clear attribution.
+    const sweepActor = await resolveActor(claims.sub);
     writeAudit(
       {
         orgId: claims.orgId,
         event: "org.retention_swept",
-        actorId: claims.sub,
+        ...sweepActor,
         target: claims.orgId,
         metadata: {
           sessionsPurged: result.sessionsPurged,

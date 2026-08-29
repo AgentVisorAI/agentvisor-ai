@@ -2,7 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { db } from "../db.js";
 import { hashPassword, randomToken } from "../lib/auth.js";
-import { writeAudit } from "../lib/audit.js";
+import { writeAudit, resolveActor } from "../lib/audit.js";
 import { requireSession } from "../lib/session-middleware.js";
 
 const envSchema = z.enum(["production", "staging", "development"]);
@@ -98,11 +98,14 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
       }
       throw err;
     }
+    // R145 F3: enrich actor email via resolveActor so the audit
+    // renderer surfaces the operator's email instead of a raw cuid.
+    const actor = await resolveActor(claims.sub);
     writeAudit(
       {
         orgId: claims.orgId,
         event: "deployment.create",
-        actorId: claims.sub,
+        ...actor,
         target: deployment.name,
         metadata: {
           deploymentId: deployment.id,
@@ -140,11 +143,13 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
       where: { id: owned.id },
       data: { ingestTokenHash, ingestTokenHint: tokenHint(plaintextToken) },
     });
+    // R145 F3: enrich actor email.
+    const actor = await resolveActor(claims.sub);
     writeAudit(
       {
         orgId: claims.orgId,
         event: "deployment.token_rotated",
-        actorId: claims.sub,
+        ...actor,
         target: owned.name,
         metadata: { deploymentId: owned.id },
         req,
@@ -281,11 +286,15 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
         }
         throw e;
       }
+      // R145 F3: enrich actor email — the success path of
+      // deployment.delete is a headliner event operators want
+      // to see attributed by email.
+      const actor = await resolveActor(claims.sub);
       writeAudit(
         {
           orgId: claims.orgId,
           event: "deployment.delete",
-          actorId: claims.sub,
+          ...actor,
           target: owned.name,
           metadata: {
             deploymentId: owned.id,

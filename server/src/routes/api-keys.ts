@@ -22,7 +22,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { db } from "../db.js";
 import { canGrantRole, hashPassword, randomToken, type SessionClaims } from "../lib/auth.js";
-import { writeAudit } from "../lib/audit.js";
+import { writeAudit, resolveActor } from "../lib/audit.js";
 import { requireSession } from "../lib/session-middleware.js";
 
 const roleSchema = z.enum(["owner", "admin", "member"]);
@@ -160,11 +160,13 @@ export async function apiKeyRoutes(app: FastifyInstance): Promise<void> {
       },
       select: { id: true, name: true, tokenHint: true, role: true, createdAt: true },
     });
+    // R145 F3: enrich actor email via resolveActor.
+    const createActor = await resolveActor(claims.sub);
     writeAudit(
       {
         orgId: claims.orgId,
         event: "apikey.created",
-        actorId: claims.sub,
+        ...createActor,
         target: key.name,
         metadata: { apiKeyId: key.id, role: key.role },
         req,
@@ -213,11 +215,13 @@ export async function apiKeyRoutes(app: FastifyInstance): Promise<void> {
       where: { id: existing.id },
       data: { revokedAt: new Date() },
     });
+    // R145 F3: enrich actor email.
+    const revokeActor = await resolveActor(claims.sub);
     writeAudit(
       {
         orgId: claims.orgId,
         event: "apikey.revoked",
-        actorId: claims.sub,
+        ...revokeActor,
         target: existing.name,
         metadata: { apiKeyId: existing.id },
         req,
