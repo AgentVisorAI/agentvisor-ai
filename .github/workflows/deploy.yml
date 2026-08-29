@@ -7,8 +7,9 @@
 #                            app forward to the new digest.
 #   • pull_request         → build single-arch image, scan, push to GHCR
 #                            as ghcr.io/…:pr-<num>-sha-<7>, then sticky-
-#                            comment the PR with pull+run instructions and
-#                            a Deploy-to-Render blueprint URL.
+#                            comment the PR with docker pull+run
+#                            instructions and a Fly.io one-liner
+#                            preseeded with the freshly built image.
 #   • workflow_dispatch    → same as push, useful for a manual rebuild
 #                            after Dependabot lands a base-image bump.
 #
@@ -241,8 +242,8 @@ jobs:
               "$IMAGE_REF"
 
       # ─── Sticky PR comment ───
-      # Reviewers get pull-and-run instructions plus a one-click Render
-      # deploy URL preseeded with the freshly built image.
+      # Reviewers get docker pull-and-run instructions plus a Fly.io
+      # one-liner preseeded with the freshly built image digest.
       - name: Post PR preview comment
         if: github.event_name == 'pull_request'
         uses: marocchino/sticky-pull-request-comment@52423e01640425a022ef5fd42c6fb5f633a02728 # v2.9.1
