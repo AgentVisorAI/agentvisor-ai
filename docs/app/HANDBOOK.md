@@ -207,7 +207,21 @@ catalog at the bottom.
 
 | Script | Guards |
 |---|---|
-| `interactive-drill.mjs` | 33 checks: tour, attack story, onboarding ages, billing math, reset flows, hit-tests + unsized-svg blowouts, storage/router fuzz, pagination + deep links, Back/overlays, double-submit, failure paths + catch-up, cross-tab + FOUC, focus rings/traps + reduced motion + shortcut guards, garbage data, filter/sort/chart/audit/detail ground truth, deployment + key lifecycles, member RBAC, leak soak, form semantics (native validation + Enter submits), skeleton-phase filter liveness, dirty-modal discard guard, theme-toggle state preservation, keyboard-only tour, palette mutation-truth + bfcache eligibility (no unload handlers), fresh-workspace truth (org-named daemon, isolated mutations, founder identity, org audit story) |
+| `interactive-drill.mjs` | 33 checks: tour, attack story, onboarding ages, billing math, reset flows, hit-tests + unsized-svg blowouts, storage/router fuzz, pagination + deep links, Back/overlays, double-submit, failure paths + catch-up, cross-tab + FOUC, focus rings/traps + reduced motion + shortcut guards, garbage data, filter/sort/chart/audit/detail ground truth, deployment + key lifecycles, member RBAC, leak soak, form semantics (native validation + Enter submits), skeleton-phase filter liveness, dirty-modal discard guard, theme-toggle state preservation, keyboard-only tour, palette mutation-truth + bfcache eligibility (no unload handlers), fresh-workspace truth (org-named daemon, isolated mutations, founder identity, org audit story, showcase-affordance hiding) |
+
+**Audit-slug parity**: mock `recordAudit` slugs and the `MOCK_AUDIT`
+fixtures mirror the REAL taxonomy in `server/src/lib/audit.ts`
+(`deployment.create`/`.delete`, `saml.config_*`, `saml.keypair_rotated`,
+`member.invite_revoked`, `org.retention_updated`, `auth.login`/`.logout`,
+`audit.exported_csv`, `deployment.pubkey_first_set` for the fresh
+"daemon connected" moment). Webhook pause/resume records
+`webhook.updated` with a paused/resumed NOTE — the real PATCH writes no
+dedicated slug. Documented demo-forward exceptions (no server
+equivalent yet): `policy.created/updated/enabled/disabled` and
+`policies.defaults_seeded` (server has no policy CRUD routes).
+Never invent a slug — check audit.ts first; the audit chips
+self-generate from the category prefix, so a renamed slug silently
+re-files its rows.
 | `live-site-smoke.mjs` | 10 checks: link/media crawl, captions, alias stubs, 404, OG/Twitter link previews, video-metadata truth (durations + zero MediaErrors) |
 | `a11y-audit.mjs` | 46 axe scans: 11 routes + 9 modal states × 2 themes, 3 static pages × 2 schemes |
 | `mobile-smoke.mjs` | phone/tablet: tab bar, taps, modals fit + hittable + stacking, static pages |
