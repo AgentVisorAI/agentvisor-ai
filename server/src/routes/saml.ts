@@ -528,9 +528,13 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
       // leak (response is at most { configId }, and IdP-initiated
       // flows already expose that mapping publicly), but this
       // was the only anonymous unvalidated GET in the auth tree.
-      // Match the /webauthn/authenticate/challenge cadence:
-      // 30/min/IP is generous for a pre-login "does my domain
-      // have SSO?" check.
+      // Match the /saml/:configId/login (:207) and /oauth/:provider/
+      // start cadence — both are 30/min/IP, generous for a
+      // pre-login "does my domain have SSO?" check.
+      // /webauthn/authenticate/challenge is deliberately tighter
+      // at 10/min (webauthn.ts:441) because it gates the
+      // argon2/verifyPassword step-up branch; /discover is a
+      // pure lookup with no argon2 hit.
       config: {
         rateLimit: {
           max: 30,
