@@ -1718,10 +1718,8 @@
     sessionsFilter = {
       q: p.q || "",
       deploymentId: p.dep || "",
-      agent: p.agent || "",
       blockedOnly: p.status === "blocked",
       sinceHours: SESSIONS_RANGES.indexOf(range) >= 0 ? range : 24,
-      policyId: p.policy || "",
     };
     var sm = /^(events|allowed|blocked|cost|started)\.(asc|desc)$/.exec(p.sort || "");
     sessionsSort = sm ? { key: sm[1], dir: sm[2] } : { key: "started", dir: "desc" };
@@ -1732,14 +1730,12 @@
     if (sessionsFilter.blockedOnly) parts.push("status=blocked");
     if (sessionsFilter.sinceHours !== 24) parts.push("range=" + sessionsFilter.sinceHours);
     if (sessionsFilter.deploymentId) parts.push("dep=" + encodeURIComponent(sessionsFilter.deploymentId));
-    if (sessionsFilter.agent) parts.push("agent=" + encodeURIComponent(sessionsFilter.agent));
-    if (sessionsFilter.policyId) parts.push("policy=" + encodeURIComponent(sessionsFilter.policyId));
     if (sessionsSort.key !== "started" || sessionsSort.dir !== "desc") parts.push("sort=" + sessionsSort.key + "." + sessionsSort.dir);
     try { history.replaceState(null, "", "#/sessions" + (parts.length ? "?" + parts.join("&") : "")); } catch (e) {}
   }
   function sessionsFilterActive() {
-    return !!(sessionsFilter.q || sessionsFilter.deploymentId || sessionsFilter.agent ||
-      sessionsFilter.blockedOnly || sessionsFilter.sinceHours !== 24 || sessionsFilter.policyId);
+    return !!(sessionsFilter.q || sessionsFilter.deploymentId ||
+      sessionsFilter.blockedOnly || sessionsFilter.sinceHours !== 24);
   }
   var sessionsPageSize = 50;
   // Hard cap on DOM rows. At 1M sessions the API pages 50 at a time,
@@ -1922,15 +1918,7 @@
         '<option value="720"' + (sessionsFilter.sinceHours === 720 ? " selected" : "") + '>Last 30d</option>' +
       "</select>" +
       '<select id="fDep" aria-label="Filter by deployment"><option value="">All deployments</option></select>' +
-      '<select id="fAgent" aria-label="Filter by agent"><option value="">All agents</option></select>' +
       '<label class="toggle"><input id="fBlocked" type="checkbox"' + (sessionsFilter.blockedOnly ? " checked" : "") + '/> Blocked only</label>' +
-      // The policy filter arrives via cross-links (policy detail →
-      // "View all") rather than a widget, so an active one must show
-      // as a dismissible pill or the shortened list looks broken.
-      (sessionsFilter.policyId
-        ? '<span class="filter-pill">policy: <b>' + esc(sessionsFilter.policyId.replace(/^pol_/, "")) + '</b>' +
-          '<button type="button" id="clearPolicyFilter" aria-label="Remove the policy filter" title="Remove the policy filter">✕</button></span>'
-        : "") +
       "</div>";
   }
   function installFilters(root, deps) {
@@ -1943,16 +1931,6 @@
         o.value = d.id; o.textContent = d.name;
         if (sessionsFilter.deploymentId === d.id) o.selected = true;
         fD.appendChild(o);
-      });
-    }
-    var fA = $("#fAgent", root);
-    if (fA) {
-      var agents = ["supply-planner", "returns-triage", "vendor-onboarding", "customer-emailer", "invoice-reconciler"];
-      agents.forEach(function (a) {
-        var o = document.createElement("option");
-        o.value = a; o.textContent = a;
-        if (sessionsFilter.agent === a) o.selected = true;
-        fA.appendChild(o);
       });
     }
   }
@@ -1978,14 +1956,8 @@
     if (!t || !sessionsListActive()) return;
     if (t.id === "fRange") sessionsFilter.sinceHours = parseInt(t.value, 10);
     else if (t.id === "fDep") sessionsFilter.deploymentId = t.value;
-    else if (t.id === "fAgent") sessionsFilter.agent = t.value;
     else if (t.id === "fBlocked") sessionsFilter.blockedOnly = t.checked;
     else return;
-    applySessionsFilterChange();
-  });
-  document.addEventListener("click", function (e) {
-    if (!e.target || e.target.id !== "clearPolicyFilter" || !sessionsListActive()) return;
-    sessionsFilter.policyId = "";
     applySessionsFilterChange();
   });
 
@@ -3234,7 +3206,7 @@
             '<div style="padding:12px 16px; border-bottom: 1px solid var(--border); display:flex; align-items:baseline; gap:8px;">' +
               '<h2 style="margin:0; font-size: var(--t-section); font-weight:600">Sessions this policy fired on</h2>' +
               '<span style="color: var(--fg-3); font-size: var(--t-sec)">' + fired.length + ' in the last 24 h · click one to see the block</span>' +
-              '<div style="margin-left:auto"><a href="#/sessions?policy=' + encodeURIComponent(id) + '" style="font-size: var(--t-sec)">View all →</a></div>' +
+              '<div style="margin-left:auto"><a href="#/sessions" style="font-size: var(--t-sec)">View all sessions →</a></div>' +
             "</div>" +
             sessionsTable(fired.slice(0, 8)) +
           "</div>"
