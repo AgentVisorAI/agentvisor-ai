@@ -4029,7 +4029,7 @@
       else if (act === "delete") {
         confirmModal({
           title: "Delete SSO config?",
-          body: "The '" + cfg.displayName + "' IdP will be removed. Members signed in via it will need to re-authenticate.",
+          body: "This is permanent. Any member who joined via '" + cfg.displayName + "' (SAML JIT-provisioned) does NOT have a local password or passkey — once their current session expires, they will be locked out of this workspace with no way back in. Have them set a password or add a passkey BEFORE deleting the config.",
           confirmLabel: "Delete", danger: true,
           onConfirm: function () {
             state.ds.deleteSamlConfig(cfg.id).then(function () {
@@ -4686,7 +4686,7 @@
         '<div class="card" style="padding:0">' +
           '<div style="padding:12px 16px; border-bottom:1px solid var(--border)"><h2 style="margin:0; font-size:var(--t-section); font-weight:600">Audit log</h2></div>' +
           '<div style="padding: 24px 16px">' +
-          emptyState("No audit entries yet", "Sign-ins, deployment rotations, policy changes, and receipt verifications will appear here as your team uses the console.") +
+          emptyState("No audit entries yet", "Sign-ins, deployment rotations, policy changes, and webhook activity will appear here as your team uses the console.") +
           "</div></div>";
       return;
     }
