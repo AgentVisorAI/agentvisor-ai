@@ -1727,6 +1727,32 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   if (await open()) fail("explicit Cancel was blocked on a dirty modal");
   await dmPage.close();
   console.log("✅ dirty-modal discard guard: mis-close blocked + explained, second attempt discards, Cancel immediate");
+  // Hostile-length identity (real signups will have these): a long
+  // email once stretched the account menu to ~1040px wide. Topbar must
+  // not overflow; the menu stays capped and on-screen.
+  const lnPage = await context.newPage();
+  await lnPage.addInitScript(() => {
+    localStorage.setItem("av_mock_fresh_t0", String(Date.now() - 60000));
+    localStorage.setItem("av_mock_fresh_identity", JSON.stringify({
+      user: { id: "u_x", email: "maximilian.von.hohenzollern-sigmaringen@acme-international-holdings.example.com", displayName: "Maximilian Alexander von Hohenzollern-Sigmaringen III, Esq.", role: "owner" },
+      org: { id: "org_x", name: "Acme Corporation International Holdings & Consolidated Subsidiaries GmbH & Co. KGaA" },
+    }));
+  });
+  await lnPage.goto(SITE + "#/overview", { waitUntil: "domcontentloaded" });
+  await lnPage.waitForSelector(".user-btn", { timeout: 15000 });
+  await lnPage.click(".user-btn");
+  await lnPage.waitForTimeout(300);
+  const ln = await lnPage.evaluate(() => {
+    const m = document.querySelector("#accountMenu")?.getBoundingClientRect();
+    return {
+      hOv: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      menuW: Math.round(m?.width || 9999),
+      menuFits: !!m && m.right <= innerWidth + 1 && m.left >= -1,
+    };
+  });
+  if (ln.hOv > 0 || ln.menuW > 340 || !ln.menuFits) fail("hostile-length identity broke the chrome: " + JSON.stringify(ln));
+  await lnPage.close();
+  console.log("✅ hostile-length identity: topbar contained, account menu capped at " + ln.menuW + "px");
 }
 
 if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors));

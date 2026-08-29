@@ -209,4 +209,44 @@ for (const { name, device } of profiles) {
   await context.close();
 }
 await browser.close();
+
+// ── Mid-width sweep: tablet / split-screen (640–900px) sits between the
+// phone breakpoints and the desktop suites and used to be tested by
+// nobody — the session-detail receipt buttons were clipped unreachable
+// at 768–900px (no scrollbar; .main clips). Interactive elements must
+// stay inside the viewport unless a scrollable ancestor makes them
+// reachable.
+{
+  const b2 = await chromium.launch();
+  for (const w of [640, 768, 900]) {
+    const page = await (await b2.newContext({ viewport: { width: w, height: 900 } })).newPage();
+    await page.goto(SITE + "#/overview", { waitUntil: "domcontentloaded" });
+    await page.waitForSelector(".app-shell", { timeout: 15000 });
+    for (const r of ["#/overview", "#/sessions", "#/sessions/sess_01H9K", "#/policies", "#/deployments", "#/settings/general", "#/settings/webhooks", "#/settings/billing"]) {
+      await page.evaluate((h) => { location.hash = h; }, r);
+      await page.waitForTimeout(800);
+      const st = await page.evaluate(() => {
+        const scrollable = (el) => {
+          for (let p = el.parentElement; p; p = p.parentElement) {
+            const cs = getComputedStyle(p);
+            if (/(auto|scroll)/.test(cs.overflowX) && p.scrollWidth > p.clientWidth + 1) return true;
+          }
+          return false;
+        };
+        const bad = [];
+        for (const el of document.querySelectorAll("button, a.btn, input, select")) {
+          const r2 = el.getBoundingClientRect();
+          if (r2.width === 0) continue;
+          if ((r2.right > innerWidth + 1 || r2.left < -1) && !scrollable(el)) bad.push((el.id || el.textContent.trim().slice(0, 18)) + "@" + Math.round(r2.left) + "-" + Math.round(r2.right));
+        }
+        return { hOv: document.documentElement.scrollWidth - document.documentElement.clientWidth, bad: bad.slice(0, 5) };
+      });
+      if (st.hOv > 0 || st.bad.length) fail(`mid-width ${w}px ${r}: hOv=${st.hOv} unreachable=${JSON.stringify(st.bad)}`);
+    }
+    await page.close();
+  }
+  await b2.close();
+  console.log("✅ mid-width sweep (640/768/900px): every control inside the viewport or a scrollable wrap");
+}
+
 console.log("\nAll mobile viewport smoke checks passed.");
