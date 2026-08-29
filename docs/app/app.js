@@ -5001,12 +5001,21 @@
       { g: "Actions", label: "Sign out", desc: "Leave this workspace", run: signOut },
     ];
     if (state.ds.mode === "mock") {
-      if (window.AVTour) actions.unshift({ g: "Actions", label: "See the full flow", desc: "Guided tour of the money story", run: function () { window.AVTour.start(); } });
+      // The tour and the 30-day dataset narrate/serve the SHOWCASE
+      // fixtures — inside a fresh workspace the tour would tell
+      // Northwind's $31,840 story over ~zero stats, and the bigdata
+      // toggle is a silent no-op (fresh listSessions ignores it). The
+      // launcher pill already hides in fresh mode; the palette follows
+      // the same rule.
+      var freshNow = freshT0() != null;
+      if (window.AVTour && !freshNow) actions.unshift({ g: "Actions", label: "See the full flow", desc: "Guided tour of the money story", run: function () { window.AVTour.start(); } });
       if (typeof state.ds.simulateAttack === "function") actions.push({ g: "Actions", label: "Simulate an agent attack", desc: "Stage a live blocked payment", run: function () { navigate("#/overview"); setTimeout(runAttackDemo, 250); } });
     }
     actions.push({ g: "Actions", label: "New policy", desc: "Create a spend cap, vendor allowlist, or PII guard", run: function () { navigate("#/policies"); setTimeout(openCreatePolicyModal, 250); } });
     actions.push({ g: "Actions", label: "Keyboard shortcuts", desc: "Everything the keyboard can do", kbd: "?", run: function () { setTimeout(openShortcutSheet, 250); } });
-    if (state.ds.mode === "mock") {
+    if (state.ds.mode === "mock" && freshT0() == null) {
+      // Hidden in fresh mode with the tour: fresh listSessions ignores
+      // the bigdata flag entirely, so the entry would be a lying no-op.
       var big = false;
       try { big = localStorage.getItem("av_mock_bigdata") === "1"; } catch (e) {}
       actions.push({
