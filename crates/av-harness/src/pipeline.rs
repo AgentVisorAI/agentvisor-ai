@@ -348,7 +348,7 @@ impl StatusClass {
 
 /// Upstream error classifier used for `av_upstream_errors_total{kind}`.
 /// Mirrors `classify_upstream_error(err)` — same set as the boot
-/// pre-registration at pipeline.rs:1196.
+/// pre-registration in `Pipeline::new` at pipeline.rs:511.
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum UpstreamErrorKind {
     Timeout,

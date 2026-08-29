@@ -161,7 +161,7 @@ impl ProviderAdapter for AnthropicAdapter {
         // Anthropic's named events under this default when relaying
         // to a client that consumed the OpenAI shape. Treating
         // `event: message` as SSE-default (equivalent to unset) here
-        // matches the OpenAI parser's ordering at routes.rs:3465, so
+        // matches the OpenAI parser's ordering at routes.rs:3749, so
         // an Anthropic wire that a gateway relabels under `message`
         // does not fail-close where the same content on OpenAI passes.
         if is_sse && !event_type.is_empty() && event_type != "message" && event_type != frame_type {
@@ -282,7 +282,7 @@ fn parse_anthropic_payload(
                 //     non-empty streaming tool_use to
                 //     `{}{"city":"…"}` — invalid JSON, and the
                 //     `.unwrap_or_else(|_| json!({"raw": …}))`
-                //     fallback at routes.rs:2735 would attest the
+                //     fallback at routes.rs:4024 would attest the
                 //     mangled string. Emit `""` instead; the truly
                 //     zero-arg streaming case (no delta frames follow)
                 //     is normalised at that same finalize point,
@@ -451,7 +451,7 @@ impl ProviderAdapter for GoogleGeminiAdapter {
         }
         if is_sse && !event_type.is_empty() && event_type != "message" {
             // Same [DONE]-under-named-event carve-out as the OpenAI
-            // parser (routes.rs:3486) and the Anthropic parser's
+            // parser (routes.rs:3765) and the Anthropic parser's
             // ordering (`[DONE]` short-circuits before the event-
             // type check). `[DONE]` is a sentinel; a named event
             // carrying only [DONE] lines has no attributable content
@@ -1029,7 +1029,7 @@ mod tests {
     /// does when relaying to a client that consumed the OpenAI shape)
     /// must NOT fail-close a well-formed Anthropic payload just
     /// because the outer `event:` name is the SSE default. Matches
-    /// the OpenAI parser's ordering at routes.rs:3465 which already
+    /// the OpenAI parser's ordering at routes.rs:3749 which already
     /// treats `event: message` as unset.
     #[test]
     fn anthropic_event_default_message_accepts_any_payload_type() {
