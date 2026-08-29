@@ -197,9 +197,16 @@ async function main() {
     redirect: "manual",
   });
   const replayBody = await replay.text();
-  console.log("[6/6] replay:", replay.status, replayBody.slice(0, 120));
-  if (replay.status < 400 || !replayBody.includes("replay_detected")) {
-    throw new Error("replay guard did not fire");
+  const replayLocation = replay.headers.get("location") || "";
+  console.log("[6/6] replay:", replay.status, replayLocation.slice(0, 160));
+  // Replay guard behavior: browsers hitting ACS are redirected to
+  // /app/#/login?err=saml_assertion_replay_detected (302 with the slug
+  // in the Location header). Non-browser probes get the same envelope
+  // — the guard hangs off consumeSamlResponse() → errRedirect(). Prior
+  // drill shape looked for the slug in replayBody, but redirect
+  // responses have empty bodies; the slug lives in the Location URL.
+  if (replay.status !== 302 || !replayLocation.includes("saml_assertion_replay_detected")) {
+    throw new Error(`replay guard did not fire: status=${replay.status} location=${replayLocation}`);
   }
 
   console.log("\n✅  SAML full-flow drill: PASSED");
