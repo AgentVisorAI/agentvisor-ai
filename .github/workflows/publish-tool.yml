@@ -1,0 +1,98 @@
+name: Publish public tool
+
+# The monorepo is private; the Rust runtime + CLI ("the binary tool")
+# stays public. This workflow exports the public surface — an explicit
+# INCLUDE list, so nothing private can leak by default — and force-
+# pushes a content snapshot (no monorepo history) to
+# AgentVisorAI/agentvisor.
+#
+# The include list mirrors every path the crates reference at compile
+# time (include_str!/include_bytes!/rerun-if-changed audit):
+#   crates/ config/ deploy/ docker/ manifests/ schemas/ fuzz/
+#   docs/reference/ docs/app/pitch/ README.md Cargo.* rust-toolchain
+#   deny.toml LICENSE assets/ scripts/
+# plus tools/verify-receipt.mjs (the offline receipt verifier).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "config/**"
+      - "deploy/**"
+      - "docker/**"
+      - "manifests/**"
+      - "schemas/**"
+      - "fuzz/**"
+      - "docs/reference/**"
+      - "docs/app/pitch/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "deny.toml"
+      - "README.md"
+      - "CHANGELOG.md"
+      - "CONTRIBUTING.md"
+      - "SECURITY.md"
+      - "BENCHMARKS.md"
+      - "ARCHITECTURE.md"
+      - "CONFORMANCE-STATUS.md"
+      - "LICENSE"
+      - "assets/**"
+      - "scripts/**"
+      - "server/scripts/verify-receipt.mjs"
+      - ".github/workflows/publish-tool.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-tool
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Assemble public tree
+        run: |
+          out="$RUNNER_TEMP/public"
+          mkdir -p "$out"
+          # Directories (explicit include list — see header comment).
+          for d in crates config deploy docker manifests schemas fuzz assets scripts; do
+            cp -a "$d" "$out/$d"
+          done
+          mkdir -p "$out/docs/app"
+          cp -a docs/reference "$out/docs/reference"
+          cp -a docs/app/pitch "$out/docs/app/pitch"
+          # Root files.
+          for f in Cargo.toml Cargo.lock rust-toolchain.toml deny.toml LICENSE \
+                   README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md \
+                   BENCHMARKS.md CONFORMANCE-STATUS.md ARCHITECTURE.md; do
+            cp "$f" "$out/$f"
+          done
+          # The offline receipt verifier — the auditor-facing tool.
+          mkdir -p "$out/tools"
+          cp server/scripts/verify-receipt.mjs "$out/tools/verify-receipt.mjs"
+          # Monorepo workflow badges would 404 from the public repo —
+          # drop the badge block (lines linking actions/workflows).
+          sed -i '/actions\/workflows/d' "$out/README.md"
+      - name: Push to the public tool repo
+        env:
+          DEPLOY_KEY: ${{ secrets.TOOL_DEPLOY_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$DEPLOY_KEY" > "$RUNNER_TEMP/tool_key"
+          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/tool_key -o StrictHostKeyChecking=accept-new"
+          cd "$RUNNER_TEMP/public"
+          git init -q -b main
+          git config user.name "agentvisor-deploy"
+          git config user.email "deploy@agentvisorai.me"
+          git add -A
+          git commit -qm "Publish public tool from agentvisor-ai@${GITHUB_SHA}"
+          git push -f git@github.com:AgentVisorAI/agentvisor.git main
+          rm -f "$RUNNER_TEMP/tool_key"
