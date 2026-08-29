@@ -107,7 +107,35 @@ const spki = Buffer.concat([
 ]);
 const key = createPublicKey({ key: spki, format: "der", type: "spki" });
 
-const msg = Buffer.from(r.rawBody, "utf8");
+// R190 F1: match the Rust `av-receipts` signing framing.
+// crates/av-receipts/src/receipt.rs:50-64 `signing_message()`
+// dispatches on `receipt_version`:
+//   v1 → bare canonical bytes (legacy)
+//   v2 → RECEIPT_DOMAIN_TAG_V2 (b"agentvisor-receipt-v2\0") ||
+//        u64_be(canonical.len()) || canonical
+// Rust defaults RECEIPT_VERSION=2 (receipt.rs:30), so modern
+// daemons emit v2 receipts. Prior CLI used bare-body semantics
+// only and would fail every v2 receipt as "SIGNATURE DOES NOT
+// VERIFY" (exit 1) even though the sig was cryptographically
+// valid. Now: parse body, dispatch to correct framing.
+const RECEIPT_DOMAIN_TAG_V2 = Buffer.from("agentvisor-receipt-v2\0", "utf8");
+function receiptSigningMessage(rawBody) {
+  const canonical = Buffer.from(rawBody, "utf8");
+  let receiptVersion = 1;
+  try {
+    const parsed = JSON.parse(rawBody);
+    if (typeof parsed.receipt_version === "number") receiptVersion = parsed.receipt_version;
+  } catch { /* body not JSON — leave as v1 */ }
+  if (receiptVersion === 1) return canonical;
+  if (receiptVersion === 2) {
+    const lenBuf = Buffer.alloc(8);
+    lenBuf.writeBigUInt64BE(BigInt(canonical.length), 0);
+    return Buffer.concat([RECEIPT_DOMAIN_TAG_V2, lenBuf, canonical]);
+  }
+  // Unknown version — return empty to fail-closed.
+  return Buffer.alloc(0);
+}
+const msg = receiptSigningMessage(r.rawBody);
 const sig = Buffer.from(r.rawSignatureB64, "base64");
 
 const ok = verify(null, msg, key, sig);
