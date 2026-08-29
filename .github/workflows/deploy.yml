@@ -171,7 +171,15 @@ jobs:
       # GitHub's attest-build-provenance is the successor to
       # slsa-github-generator. It produces a signed OCI attestation
       # verifiable with `gh attestation verify oci://<image>@<digest>`.
+      # R262: the attestations API is NOT available to private repos on
+      # the org's current plan (the repo went private in the R228
+      # restructure) — the API returns 403 "Feature not available for
+      # the AgentVisorAI organization" and broke every main deploy.
+      # Buildkit's own provenance/SBOM markers (mode=max above) still
+      # ship with the image; re-enable these two steps when the repo is
+      # public again or the plan is upgraded.
       - name: Attest build provenance
+        if: ${{ !github.event.repository.private }}
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ghcr.io/${{ steps.owner.outputs.lc }}/agentvisor-api
@@ -182,6 +190,7 @@ jobs:
       # `gh attestation verify` will surface both provenance and SBOM
       # for anyone downloading the image.
       - name: Attest SBOM
+        if: ${{ !github.event.repository.private }}
         uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
           subject-name: ghcr.io/${{ steps.owner.outputs.lc }}/agentvisor-api
