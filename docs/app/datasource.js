@@ -1078,8 +1078,21 @@
     },
     async login(input) {
       await delay(400);
+      try { localStorage.removeItem("av_mock_signed_out"); } catch (e) {}
+      // Signing back in with the SAME email that created the fresh
+      // workspace resumes THAT workspace. login() used to wipe the
+      // fresh keys unconditionally — an investor who signed up, signed
+      // out, and signed back in silently lost their workspace and
+      // landed in the Northwind demo: reads as data loss.
+      var fid = freshIdentity();
+      if (fid && fid.user && typeof fid.user.email === "string" &&
+          fid.user.email.toLowerCase() === String(input.email || "").toLowerCase()) {
+        mockState.session = fid;
+        return mockState.session;
+      }
+      // Any other email: the Northwind showcase (and the abandoned
+      // fresh workspace is cleared so its onboarding sim stops).
       try {
-        localStorage.removeItem("av_mock_signed_out");
         localStorage.removeItem("av_mock_fresh_t0");
         localStorage.removeItem("av_mock_fresh_identity");
       } catch (e) {}
