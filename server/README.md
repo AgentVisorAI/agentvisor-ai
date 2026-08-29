@@ -97,7 +97,12 @@ In short:
 - Every read query is org-scoped through the session claim — no route
   accepts a user-supplied org id.
 - Ingest tokens are argon2-hashed at rest; plaintext returned only once.
-- Rate limit: 300 rpm per authenticated user (keyed off JWT `sub`).
+- Global rate limit: 300 rpm per client IP (not per user — the global
+  bucket keys on `req.ip` per R93 F1 / R100 F1 in `src/index.ts`;
+  a cookie/sub-derived key would let an attacker plant a fresh random
+  cookie per request and bypass the cap). Auth-tree endpoints
+  (`/login`, `/signup`, `/reset-*`, `/webauthn/*`) apply tighter
+  per-IP buckets on top.
 - CORS locked to `ALLOWED_ORIGINS`.
 - `helmet` sets HSTS 2y (preload), strict CSP, X-Frame-Options: deny.
 - Container runs as non-root under `dumb-init` PID 1.

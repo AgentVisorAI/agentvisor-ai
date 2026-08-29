@@ -46,7 +46,7 @@ Daemon        │                            ┌──────────�
                                             All traffic:  ──────────┘
                                             HSTS 2y, CSP strict,
                                             SameSite cookies, argon2id,
-                                            per-user rate limits,
+                                            per-IP rate limits,
                                             Origin-match CSRF check.
 ```
 
