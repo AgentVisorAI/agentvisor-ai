@@ -586,8 +586,41 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
   app.post("/", async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
-    if (claims.membershipRole === "member") {
-      return reply.code(403).send({ error: "forbidden" });
+    // R149 F1: owner-only. Prior gate blocked members but let
+    // admins CREATE a SAML config — the last admin-writable leg
+    // of the SAML config surface after R148 F1 closed PATCH and
+    // DELETE. This one is HIGH: an admin can register a config
+    // with `x509Cert`/`ssoUrl` pointing at an IdP they control,
+    // `allowedDomains` set to the owner's email domain, and
+    // `jitEnabled=true`. `isActive` defaults to true
+    // (schema.prisma). They then drive `POST /:configId/login`
+    // from their own browser; their IdP returns an AuthnResponse
+    // asserting `email=<owner@corp.com>`. ACS at :283 verifies
+    // the signature against the attacker-controlled cert
+    // (passes), looks up the owner by email, finds membership in
+    // this org (so the R76 HIGH #1 "existing user in other org"
+    // JIT-refuse leg at :318-329 does NOT fire), and mints a
+    // session cookie with `sub=owner.id, membershipRole="owner"`
+    // on the ATTACKER's browser. Admin → owner ATO with no
+    // password/passkey/step-up. Same class R148 F1 closed for
+    // PATCH's `idpSsoUrl`/`idpCertPem` swap, R145/R146/R147 F1
+    // for the "admin sabotages recovery / seizes control" class.
+    if (claims.membershipRole !== "owner") {
+      const samlCreateDeniedActor = await resolveActor(claims.sub);
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "auth.step_up_denied",
+          ...samlCreateDeniedActor,
+          note: "not_owner",
+          metadata: { endpoint: "saml.config.create" },
+          req,
+        },
+        req.log,
+      );
+      return reply
+        .code(403)
+        .send({ error: "only_owner_can_create_saml_config" });
     }
     const body = createConfigSchema.safeParse(req.body);
     if (!body.success) {
