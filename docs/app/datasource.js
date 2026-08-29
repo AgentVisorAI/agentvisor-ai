@@ -90,6 +90,32 @@
     var digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body));
     return pub + "|" + sig + "|" + bytesToHex(new Uint8Array(digest));
   }
+  // R190 F1: match the Rust `av-receipts` signing framing.
+  // See docs/verify/verify.js for the full rationale — Rust
+  // defaults to receipt_version=2 which prepends a domain tag
+  // and length prefix before the canonical body; prior JS
+  // verifier used bare-body semantics (v1 only) and would show
+  // every v2 receipt as INVALID.
+  var _RECEIPT_DOMAIN_TAG_V2 = new TextEncoder().encode("agentvisor-receipt-v2\0");
+  function _receiptSigningMessage(rawBody) {
+    var canonical = new TextEncoder().encode(rawBody);
+    var receiptVersion = 1;
+    try {
+      var parsed = JSON.parse(rawBody);
+      if (typeof parsed.receipt_version === "number") receiptVersion = parsed.receipt_version;
+    } catch (e) { /* body not JSON — leave as v1, verify will fail as expected */ }
+    if (receiptVersion === 1) return canonical;
+    if (receiptVersion === 2) {
+      var lenBytes = new Uint8Array(8);
+      new DataView(lenBytes.buffer).setBigUint64(0, BigInt(canonical.length), false);
+      var out = new Uint8Array(_RECEIPT_DOMAIN_TAG_V2.length + 8 + canonical.length);
+      out.set(_RECEIPT_DOMAIN_TAG_V2, 0);
+      out.set(lenBytes, _RECEIPT_DOMAIN_TAG_V2.length);
+      out.set(canonical, _RECEIPT_DOMAIN_TAG_V2.length + 8);
+      return out;
+    }
+    return new Uint8Array(0);
+  }
   async function verifyReceiptSignature(publicKeyHex, sigB64, bodyStr) {
     if (!publicKeyHex || !sigB64 || !bodyStr) return { supported: false, ok: false };
     var cacheKey;
@@ -97,7 +123,7 @@
     if (cacheKey && verifyCache.has(cacheKey)) return verifyCache.get(cacheKey);
     try {
       var pub = await crypto.subtle.importKey("raw", hexToBytes(publicKeyHex), { name: "Ed25519" }, false, ["verify"]);
-      var ok = await crypto.subtle.verify("Ed25519", pub, b64ToBytes(sigB64), new TextEncoder().encode(bodyStr));
+      var ok = await crypto.subtle.verify("Ed25519", pub, b64ToBytes(sigB64), _receiptSigningMessage(bodyStr));
       var result = { supported: true, ok: !!ok };
       if (cacheKey) verifyCache.set(cacheKey, result);
       return result;

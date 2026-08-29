@@ -20,6 +20,51 @@
       return out;
     }
 
+    // R190 F1: build the exact byte message the Rust `av-receipts`
+    // crate signs. Rust `signing_message(receipt_version, canonical)`
+    // (crates/av-receipts/src/receipt.rs:50-64) dispatches on
+    // `receipt_version`:
+    //   * v1 → bare canonical bytes (legacy wire format)
+    //   * v2 → RECEIPT_DOMAIN_TAG_V2 (b"agentvisor-receipt-v2\0",
+    //          22 bytes) || u64_be(canonical.len()) || canonical
+    // Rust defaults `RECEIPT_VERSION = 2` (receipt.rs:30), so every
+    // modern daemon posts v2 receipts. Prior JS verifier used
+    // TextEncoder().encode(rawBody) unconditionally — that's v1
+    // semantics only. A legitimately-signed v2 receipt would show
+    // "Signature does not verify" on this page. Now: parse
+    // receipt.body to find `receipt_version`, dispatch to the
+    // correct framing.
+    const RECEIPT_DOMAIN_TAG_V2 = new TextEncoder().encode("agentvisor-receipt-v2\0");
+    function receiptSigningMessage(rawBody) {
+      const canonical = new TextEncoder().encode(rawBody);
+      let receiptVersion = 1;
+      try {
+        const parsed = JSON.parse(rawBody);
+        if (typeof parsed.receipt_version === "number") {
+          receiptVersion = parsed.receipt_version;
+        }
+      } catch {
+        // Body not valid JSON — leave as v1. The Ed25519 verify
+        // will then fail and the UI will report "Signature does
+        // not verify" which is the correct verdict for garbage.
+      }
+      if (receiptVersion === 1) return canonical;
+      if (receiptVersion === 2) {
+        const lenBytes = new Uint8Array(8);
+        const view = new DataView(lenBytes.buffer);
+        view.setBigUint64(0, BigInt(canonical.length), false); // big-endian
+        const out = new Uint8Array(RECEIPT_DOMAIN_TAG_V2.length + 8 + canonical.length);
+        out.set(RECEIPT_DOMAIN_TAG_V2, 0);
+        out.set(lenBytes, RECEIPT_DOMAIN_TAG_V2.length);
+        out.set(canonical, RECEIPT_DOMAIN_TAG_V2.length + 8);
+        return out;
+      }
+      // Unknown version — return an obviously-wrong message so
+      // verify returns false. Better to fail-closed than to guess
+      // a future framing.
+      return new Uint8Array(0);
+    }
+
     // R78 HIGH #1 (landed R79 into the extracted verify.js): trust
     // anchor pinning. Without this, an attacker who generates their
     // own Ed25519 keypair, signs an arbitrary `rawBody`, and embeds
@@ -68,7 +113,7 @@
       } catch (e) {
         throw new Error("This browser doesn't support Web Crypto Ed25519. Try Chrome 113+, Firefox 130+, or Safari 17+. Or run the CLI: node tools/verify-receipt.mjs receipt.json");
       }
-      const msg = new TextEncoder().encode(r.rawBody);
+      const msg = receiptSigningMessage(r.rawBody);
       const sig = b64ToBytes(r.rawSignatureB64);
       const ok = await crypto.subtle.verify("Ed25519", key, sig, msg);
       const trustedKey = TRUSTED_RECEIPT_KEYS.has(pub.hex.toLowerCase());
