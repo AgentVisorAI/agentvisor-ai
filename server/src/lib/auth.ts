@@ -52,7 +52,7 @@ export async function verifyPassword(
   // non-argon2 header — dropping the ~50-120 ms cost down to
   // sub-ms. That's a WIRE-VISIBLE timing oracle: OAuth-
   // provisioned users had `passwordHash = "oidc:google:<hex>"`
-  // (see oauth.ts:273) that failed decode instantly, so a
+  // (see oauth.ts:393) that failed decode instantly, so a
   // credential-stuffing attacker observing round-trip time on
   // /login could enumerate which addresses were OAuth-
   // registered users and target them with a fake consent-screen
