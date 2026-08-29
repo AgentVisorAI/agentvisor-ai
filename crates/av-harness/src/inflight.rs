@@ -56,7 +56,7 @@ impl InflightTracker {
     /// Wait until every outstanding `InflightGuard` has been dropped.
     ///
     /// Uses the same pinned-Notified + `enable()`-before-load
-    /// discipline as `WorkerHandle::wait_idle` (`worker.rs:579`); a
+    /// discipline as `WorkerHandle::wait_idle` (`worker.rs:600`); a
     /// `notify_waiters()` firing in the interval between a fresh
     /// `notified()` and its first poll would otherwise be lost.
     pub async fn wait_drained(&self) {
