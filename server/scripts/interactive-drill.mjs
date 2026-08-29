@@ -945,7 +945,28 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   });
   if (wide) fail("long-token toast overflows: " + wide + "px wide");
   await page.waitForTimeout(2600); // let them drain before the soak
-  console.log("✅ tactile polish: text-select doesn't navigate, Back restores scroll, toasts cap at 4 and contain unbroken tokens");
+  // Modifier/middle clicks on rows: ⌘/Ctrl-click used to HIJACK the
+  // current tab into the detail page — it must open a NEW tab and
+  // leave the list alone (rows aren't anchors, so the browser can't
+  // do it natively).
+  await page.goto(SITE + "#/sessions", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("tr[data-clickable]", { timeout: 15000 });
+  // macOS synthesizes a context-menu from Ctrl+click — use the
+  // platform's open-in-new-tab modifier.
+  const modKey = process.platform === "darwin" ? "Meta" : "Control";
+  const [modTab] = await Promise.all([
+    context.waitForEvent("page", { timeout: 5000 }).catch(() => null),
+    page.click("tr[data-clickable]", { modifiers: [modKey] }),
+  ]);
+  await page.waitForTimeout(300);
+  const modSt = {
+    stayed: await page.evaluate(() => location.hash === "#/sessions"),
+    opened: !!modTab,
+    detail: modTab ? /#\/sessions\/.+/.test(await modTab.evaluate(() => location.hash).catch(() => "")) : false,
+  };
+  if (modTab) await modTab.close();
+  if (!modSt.stayed || !modSt.opened || !modSt.detail) fail("modifier-click row did not open a new tab cleanly: " + JSON.stringify(modSt));
+  console.log("✅ tactile polish: text-select doesn't navigate, Back restores scroll, toasts cap at 4 and contain unbroken tokens, ⌘/Ctrl-click rows open a new tab");
 }
 
 // ── 17. Filter/sort semantic correctness ───────────────────────────
