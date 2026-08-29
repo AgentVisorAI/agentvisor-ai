@@ -137,57 +137,75 @@ class Bus extends EventEmitter {
   private async openConnections(): Promise<void> {
     const listener = new PgClient({ connectionString: env.DATABASE_URL });
     await listener.connect();
-    await listener.query(`LISTEN ${NOTIFY_CHANNEL}`);
-    listener.on("notification", (msg) => {
-      if (msg.channel !== NOTIFY_CHANNEL || !msg.payload) return;
-      try {
-        // R110 F3 + R111 F3: flat wire shape — EventPayload fields
-        // at top level + optional originId sibling. Pre-R110 senders
-        // send bare EventPayload with no originId; those come through
-        // as originId=undefined and are re-emitted. R110+ senders
-        // include their PROCESS_ORIGIN_ID; if it matches this
-        // process's own id, we skip re-emit (publish() already
-        // delivered locally). Symmetric backward-compat across a
-        // rolling deploy.
-        const parsed = JSON.parse(msg.payload) as WirePayload;
-        if (parsed.originId === PROCESS_ORIGIN_ID) return;
-        // Re-emit locally so any SSE subscribers on THIS node see the
-        // cross-instance update. Skip the fan-out back to pg by not
-        // going through publish() — we're already inside a NOTIFY.
-        // Extract the raw EventPayload (strip the originId key so
-        // downstream consumers keying on `ev` fields don't see a
-        // spurious originId).
-        const { originId: _ignored, ...ev } = parsed;
-        this.emit(`org:${ev.orgId}`, ev as EventPayload);
-        this.emit("*", ev as EventPayload);
-      } catch {
-        // Ignore malformed payloads — a future protocol bump would
-        // be shipped with an explicit version tag, not silently.
-      }
-    });
-    listener.on("error", (err) => {
-      // eslint-disable-next-line no-console
-      console.warn("bus: pg listener error, reconnecting", err.message);
-      this.scheduleReconnect();
-    });
-    listener.on("end", () => {
-      if (!this.closed) this.scheduleReconnect();
-    });
+    // R145 F2: wrap everything after listener.connect() in try/catch
+    // so a partial-connect failure (Postgres briefly at
+    // max_connections, TLS renegotiation, transient DNS on the
+    // publisher's connect, .on wiring throwing synchronously)
+    // doesn't orphan the LISTEN-ing socket. Prior shape assigned
+    // this.pgListener only at the tail; if publisher.connect
+    // threw, the caller's catch called scheduleReconnect() which
+    // saw this.pgListener === null and ended nothing. Repeated
+    // flaps dripped permanent Postgres connections until the
+    // pool ceiling was hit.
+    try {
+      await listener.query(`LISTEN ${NOTIFY_CHANNEL}`);
+      listener.on("notification", (msg) => {
+        if (msg.channel !== NOTIFY_CHANNEL || !msg.payload) return;
+        try {
+          // R110 F3 + R111 F3: flat wire shape — EventPayload fields
+          // at top level + optional originId sibling. Pre-R110 senders
+          // send bare EventPayload with no originId; those come through
+          // as originId=undefined and are re-emitted. R110+ senders
+          // include their PROCESS_ORIGIN_ID; if it matches this
+          // process's own id, we skip re-emit (publish() already
+          // delivered locally). Symmetric backward-compat across a
+          // rolling deploy.
+          const parsed = JSON.parse(msg.payload) as WirePayload;
+          if (parsed.originId === PROCESS_ORIGIN_ID) return;
+          // Re-emit locally so any SSE subscribers on THIS node see the
+          // cross-instance update. Skip the fan-out back to pg by not
+          // going through publish() — we're already inside a NOTIFY.
+          // Extract the raw EventPayload (strip the originId key so
+          // downstream consumers keying on `ev` fields don't see a
+          // spurious originId).
+          const { originId: _ignored, ...ev } = parsed;
+          this.emit(`org:${ev.orgId}`, ev as EventPayload);
+          this.emit("*", ev as EventPayload);
+        } catch {
+          // Ignore malformed payloads — a future protocol bump would
+          // be shipped with an explicit version tag, not silently.
+        }
+      });
+      listener.on("error", (err) => {
+        // eslint-disable-next-line no-console
+        console.warn("bus: pg listener error, reconnecting", err.message);
+        this.scheduleReconnect();
+      });
+      listener.on("end", () => {
+        if (!this.closed) this.scheduleReconnect();
+      });
 
-    const publisher = new PgClient({ connectionString: env.DATABASE_URL });
-    await publisher.connect();
-    publisher.on("error", (err) => {
-      // eslint-disable-next-line no-console
-      console.warn("bus: pg publisher error, reconnecting", err.message);
-      this.scheduleReconnect();
-    });
-    publisher.on("end", () => {
-      if (!this.closed) this.scheduleReconnect();
-    });
+      const publisher = new PgClient({ connectionString: env.DATABASE_URL });
+      await publisher.connect();
+      publisher.on("error", (err) => {
+        // eslint-disable-next-line no-console
+        console.warn("bus: pg publisher error, reconnecting", err.message);
+        this.scheduleReconnect();
+      });
+      publisher.on("end", () => {
+        if (!this.closed) this.scheduleReconnect();
+      });
 
-    this.pgListener = listener;
-    this.pgPublisher = publisher;
-    this.reconnectDelayMs = 500; // reset backoff after a successful open
+      this.pgListener = listener;
+      this.pgPublisher = publisher;
+      this.reconnectDelayMs = 500; // reset backoff after a successful open
+    } catch (err) {
+      // Drain the already-connected listener socket before rethrowing
+      // so the caller can retry cleanly.
+      listener.removeAllListeners();
+      await listener.end().catch(() => void 0);
+      throw err;
+    }
   }
 
   private scheduleReconnect(): void {
