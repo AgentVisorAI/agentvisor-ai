@@ -4,7 +4,11 @@
 #   - Portable: standard Node 22 slim, deploys as-is to Fly.io, Cloud Run,
 #     Render, Railway, Kubernetes, or any Docker host.
 #   - Small: multi-stage build ships only compiled JS + runtime deps.
-#   - Secure: non-root user, no shell in the final layer's CMD, healthcheck.
+#   - Secure: non-root user; the final CMD does invoke `sh -c` for the
+#     migrate→exec chain, but runs under dumb-init as PID 1 (signals
+#     forwarded, zombies reaped) — no long-lived shell, and no shell
+#     access from a running container without an explicit `docker exec`.
+#     Healthcheck reads /readyz.
 #   - Deterministic: `npm ci` locks the tree, base image pinned to a digest.
 #
 # Rebuild the digest pins periodically to pull in patched base images:
