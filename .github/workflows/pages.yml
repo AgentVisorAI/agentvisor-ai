@@ -153,7 +153,7 @@ jobs:
           # Caption tracks (WebVTT) for both videos — a11y (WCAG 1.2)
           cp docs/pitch/pitch.vtt "$site/pitch/"
           cp docs/pitch/tour.vtt "$site/pitch/"
-          cp docs/pitch/qr-mockup.svg "$site/pitch/"
+          cp docs/pitch/qr-demo.svg "$site/pitch/"
           # Short-link aliases (/mockup, /demo) + branded 404. GitHub
           # Pages ignores the Cloudflare-style _redirects file, so the
           # aliases are static meta-refresh stubs, and 404.html is the

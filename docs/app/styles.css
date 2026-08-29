@@ -1601,8 +1601,13 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   .topbar { overflow: hidden; }
   .topbar .cmdk-trigger { min-width: 0; }
   .topbar .cmdk-trigger span:not(.kbd) { display: none; }
-  /* Reclaim horizontal room on phone-width viewports. */
-  .topbar .env-pill { display: none; }
+  /* Keep the Demo/Live pill visible: phones are exactly where the
+     demo-table QR code lands, and the pill is the only signal that
+     the data is fixtures. Trim its padding instead of hiding it. */
+  .topbar .env-pill { padding: 3px 6px; }
+  /* Brand stays on one line; the search trigger and user button
+     absorb the shrink instead. */
+  .topbar .brand { width: auto; white-space: nowrap; flex-shrink: 0; }
   .topbar .user-btn { max-width: 40vw; overflow: hidden; }
   .topbar .user-btn span:last-child { text-overflow: ellipsis; overflow: hidden; white-space: nowrap; }
   /* Tables scroll inside their card instead of inflating the page
