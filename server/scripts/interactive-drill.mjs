@@ -1159,6 +1159,10 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await page.waitForSelector("#eventList .evt", { timeout: 10000 });
   await page.click('.evt-chip[data-kind="block"]');
   await page.waitForTimeout(300);
+  // Print from DARK theme too: the print block force-overrides the
+  // theme tokens to light — a dark print would be an ink nightmare
+  // and unreadable on paper.
+  await page.evaluate(() => document.documentElement.setAttribute("data-theme", "dark"));
   await page.emulateMedia({ media: "print" });
   await page.waitForTimeout(300);
   const pr = await page.evaluate(() => ({
@@ -1167,13 +1171,16 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
     eventCount: /13 events/.test(document.querySelector(".print-only").textContent),
     printedRows: [...document.querySelectorAll("#eventList .evt")].filter((r) => getComputedStyle(r).display !== "none").length,
     totalRows: document.querySelectorAll("#eventList .evt").length,
+    lightForced: getComputedStyle(document.body).backgroundColor === "rgb(255, 255, 255)",
   }));
   await page.emulateMedia({ media: "screen" });
+  await page.evaluate(() => document.documentElement.removeAttribute("data-theme"));
   await page.click('.evt-chip[data-kind=""]');
   await page.waitForTimeout(200);
   if (!pr.sidebarHidden || !pr.provenance) fail("print evidence pack broken: " + JSON.stringify(pr));
   if (pr.printedRows !== pr.totalRows || !pr.eventCount) fail("print pack incomplete under an active filter: " + JSON.stringify(pr));
-  console.log("✅ audit log matches ground truth (chips/search/CSV WYSIWYG); palette ranks + loads dynamic entries; print pack complete even when filtered");
+  if (!pr.lightForced) fail("dark theme leaked into print: " + JSON.stringify(pr));
+  console.log("✅ audit log matches ground truth (chips/search/CSV WYSIWYG); palette ranks + loads dynamic entries; print pack complete even when filtered, light-forced from dark theme");
 }
 
 // ── 21. Password reset + member redaction + policy derivation ──────
