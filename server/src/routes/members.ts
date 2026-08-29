@@ -33,7 +33,7 @@ import {
   randomToken,
   verifyPassword,
 } from "../lib/auth.js";
-import { writeAudit } from "../lib/audit.js";
+import { writeAudit, resolveActor } from "../lib/audit.js";
 import { dispatchEvent } from "../lib/webhooks.js";
 import { getMailer, inviteMail } from "../lib/mail.js";
 import { requireSession } from "../lib/session-middleware.js";
@@ -211,7 +211,7 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       {
         orgId: claims.orgId,
         event: "member.role_changed",
-        actorId: claims.sub,
+        ...(await resolveActor(claims.sub)),
         target: (await db.user.findUnique({ where: { id: existing.userId }, select: { email: true } }))?.email ?? existing.userId,
         metadata: { fromRole: existing.role, toRole: updated.role },
         req,
@@ -308,7 +308,7 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       {
         orgId: claims.orgId,
         event: claims.sub === req.params.userId ? "member.left" : "member.removed",
-        actorId: claims.sub,
+        ...(await resolveActor(claims.sub)),
         target: existing.user.email,
         metadata: { removedUserId: existing.userId },
         req,
@@ -439,7 +439,7 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       {
         orgId: claims.orgId,
         event: "member.invited",
-        actorId: claims.sub,
+        ...(await resolveActor(claims.sub)),
         actorEmail: inviter.email,
         target: inv.email,
         metadata: { role: inv.role, inviteId: inv.id },
@@ -547,7 +547,7 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       {
         orgId: claims.orgId,
         event: "member.invite_revoked",
-        actorId: claims.sub,
+        ...(await resolveActor(claims.sub)),
         target: existing.email,
         req,
       },
