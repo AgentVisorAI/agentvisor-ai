@@ -136,6 +136,7 @@
       var pub = await crypto.subtle.importKey("raw", hexToBytes(publicKeyHex), { name: "Ed25519" }, false, ["verify"]);
       var sigOk = await crypto.subtle.verify("Ed25519", pub, b64ToBytes(sigB64), _receiptSigningMessage(bodyStr));
       var keyIdOk = true;
+      var pubkeyOk = true;
       if (sigOk) {
         try {
           var parsed = JSON.parse(bodyStr);
@@ -143,9 +144,23 @@
             var derived = await _deriveKeyIdFromPubHex(publicKeyHex.toLowerCase());
             if (derived !== parsed.key_id.toLowerCase()) keyIdOk = false;
           }
+          // R199 F1: body.public_key_b64 ↔ bundle pubkey binding.
+          if (typeof parsed.public_key_b64 === "string" && parsed.public_key_b64.length > 0) {
+            try {
+              var bodyPubBytes = b64ToBytes(parsed.public_key_b64);
+              var bundlePubBytes = hexToBytes(publicKeyHex);
+              var match = bodyPubBytes.length === bundlePubBytes.length;
+              if (match) {
+                for (var i = 0; i < bodyPubBytes.length; i++) {
+                  if (bodyPubBytes[i] !== bundlePubBytes[i]) { match = false; break; }
+                }
+              }
+              if (!match) pubkeyOk = false;
+            } catch (e2) { pubkeyOk = false; }
+          }
         } catch (e) { /* body not JSON — sig covers structured bytes */ }
       }
-      var result = { supported: true, ok: !!(sigOk && keyIdOk) };
+      var result = { supported: true, ok: !!(sigOk && keyIdOk && pubkeyOk) };
       if (cacheKey) verifyCache.set(cacheKey, result);
       return result;
     } catch (e) {

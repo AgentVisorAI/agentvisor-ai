@@ -147,6 +147,7 @@ function deriveKeyIdFromPubHex(hex) {
   return createHash("sha256").update(Buffer.from(hex, "hex")).digest("hex").slice(0, 32);
 }
 let keyIdOk = true;
+let pubkeyOk = true;
 let bodyKeyId = null;
 if (sigOk) {
   try {
@@ -156,9 +157,21 @@ if (sigOk) {
       const derived = deriveKeyIdFromPubHex(pubKeyHex.toLowerCase());
       if (derived !== bodyKeyId) keyIdOk = false;
     }
-  } catch { /* body not JSON — leave keyIdOk true */ }
+    // R199 F1: enforce body.public_key_b64 ↔ bundle pubkey binding.
+    // See docs/verify/verify.js for full rationale.
+    if (typeof parsed.public_key_b64 === "string" && parsed.public_key_b64.length > 0) {
+      try {
+        const bodyPubBytes = Buffer.from(parsed.public_key_b64, "base64");
+        const bundlePubBytes = Buffer.from(pubKeyHex, "hex");
+        if (bodyPubBytes.length !== bundlePubBytes.length ||
+            !bodyPubBytes.equals(bundlePubBytes)) {
+          pubkeyOk = false;
+        }
+      } catch { pubkeyOk = false; }
+    }
+  } catch { /* body not JSON — leave keyIdOk + pubkeyOk true */ }
 }
-const ok = sigOk && keyIdOk;
+const ok = sigOk && keyIdOk && pubkeyOk;
 const trustedKey = ok && TRUSTED_RECEIPT_KEYS.has(pubKeyHex.toLowerCase());
 
 console.log("Session:       ", bundle.session?.externalId || bundle.session?.id);
