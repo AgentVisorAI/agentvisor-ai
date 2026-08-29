@@ -2279,6 +2279,12 @@
             receipt: receipt,
           });
         }).catch(function () { /* leave the first page rendered */ });
+      } else if (!found) {
+        // The walk is over (trail fully loaded or cap hit) and the
+        // linked event isn't in it. Say so — a shared link that lands
+        // silently unselected reads as "the link is broken".
+        toast("Event #" + wantSeq + " isn't in this session's trail (" + events.length + " events loaded)", true);
+        try { history.replaceState(null, "", "#/sessions/" + encodeURIComponent(id)); } catch (e2) {}
       }
     }
 
