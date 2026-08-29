@@ -1234,7 +1234,6 @@
         id: id, orgId: "org_northwind",
         name: input.name,
         environment: input.environment || "production",
-        region: input.region || "us-east-1",
         status: "pending",
         version: null,
         lastSeenAt: null,
@@ -1245,7 +1244,7 @@
         sessions24h: 0, spend24h: "$0.00",
       };
       MOCK_DEPLOYMENTS.push(dep);
-      recordAudit("deployment.created", dep.name, dep.environment + " · " + dep.region);
+      recordAudit("deployment.created", dep.name, dep.environment);
       return { deployment: dep, ingestToken: token };
     },
     async rotateDeploymentToken(id) {
@@ -1930,7 +1929,6 @@
           orgId: d.orgId || "",
           name: d.name,
           environment: d.environment || "production",
-          region: d.region || null,
           status: d.lastIngestAt && (Date.now() - new Date(d.lastIngestAt).getTime() < 5 * 60 * 1000) ? "connected" : "pending",
           version: d.version || null,
           lastSeenAt: d.lastIngestAt || null,
@@ -1954,7 +1952,7 @@
       return { deployment: {
         id: dep.id, orgId: "", name: dep.name,
         environment: dep.environment || input.environment || "production",
-        region: input.region || null, status: "pending", version: null,
+        status: "pending", version: null,
         lastSeenAt: null, createdAt: dep.createdAt || new Date().toISOString(),
         ingestTokenHint: "av_live_" + (r.ingestToken || "").slice(8, 12) + "…",
         publicKeyHex: null, keyFingerprint: null, sessions24h: 0, spend24h: "$0.00",
