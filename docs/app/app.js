@@ -1511,24 +1511,48 @@
       var p = state.route.path[0] || "overview";
       if (p === "overview" || (p === "sessions" && !state.route.path[1])) render();
     };
-    toast("vendor-onboarding picked up an invoice email…");
-    var info = await state.ds.simulateAttack();
-    setTimeout(rerender, 250);
-    setTimeout(function () {
-      toast('create_payment("' + info.vendor + '") — vendor not on the approved list. BLOCKED', true);
-      rerender();
-    }, info.blockAtMs + 200);
-    setTimeout(function () {
-      rerender();
+    // R204 F1: wrap the async body in try/finally so `attackRunning`
+    // clears on every exit path — prior shape only cleared inside
+    // the third setTimeout callback (line 1524-ish). If
+    // `simulateAttack()` rejected, or any of the intervening lines
+    // threw synchronously, the flag stayed `true` for the tab's
+    // lifetime and the "⚡ Simulate an attack" button (gated on
+    // `attackRunning` in attackBtn()) went permanently disabled
+    // with no error toast. Mock/demo-only path, so LOW blast
+    // radius, but a real reproducible correctness bug that
+    // masquerades as a broken button. The finally clears the flag
+    // AFTER the last scheduled setTimeout fires (sealAtMs + 300ms)
+    // so the button stays disabled for the full stage-progression
+    // window on the happy path; catch surfaces a toast so demo
+    // presenters see WHY the simulation aborted.
+    try {
+      toast("vendor-onboarding picked up an invoice email…");
+      var info = await state.ds.simulateAttack();
+      setTimeout(rerender, 250);
       setTimeout(function () {
-        var st = document.querySelector(".stat.savings");
-        if (st) st.classList.add("av-pulse");
-        var row = document.querySelector('tr[data-id="' + info.id + '"]');
-        if (row) row.classList.add("av-new-row");
-      }, 700);
-      toastLink("Blocked before the money moved — $" + info.valueUsd.toLocaleString() + " kept. Receipt signed.", "#/sessions/" + info.id, "View session →");
+        toast('create_payment("' + info.vendor + '") — vendor not on the approved list. BLOCKED', true);
+        rerender();
+      }, info.blockAtMs + 200);
+      // Await the final stage before releasing the flag so the
+      // button stays disabled through the entire animation.
+      await new Promise(function (resolve) {
+        setTimeout(function () {
+          rerender();
+          setTimeout(function () {
+            var st = document.querySelector(".stat.savings");
+            if (st) st.classList.add("av-pulse");
+            var row = document.querySelector('tr[data-id="' + info.id + '"]');
+            if (row) row.classList.add("av-new-row");
+          }, 700);
+          toastLink("Blocked before the money moved — $" + info.valueUsd.toLocaleString() + " kept. Receipt signed.", "#/sessions/" + info.id, "View session →");
+          resolve();
+        }, info.sealAtMs + 300);
+      });
+    } catch (err) {
+      toast((err && err.message) || "Attack simulation failed", true);
+    } finally {
       attackRunning = false;
-    }, info.sealAtMs + 300);
+    }
   }
 
   function installChartHover(root, series) {
