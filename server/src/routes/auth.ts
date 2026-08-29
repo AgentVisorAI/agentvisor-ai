@@ -11,6 +11,7 @@ import {
   verifyPassword,
 } from "../lib/auth.js";
 import { writeAudit } from "../lib/audit.js";
+import { perIpCookieOnly } from "../lib/rate-limit.js";
 import { getMailer, passwordResetMail, welcomeMail } from "../lib/mail.js";
 import {
   clearSessionCookie,
@@ -297,6 +298,33 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       // otherwise would try /authenticate/challenge (which
       // returns decoys uniformly per R76 F4). Also closes the
       // "did I get the password" oracle if the target has MFA.
+      // R142 F3: emit auth.login_denied ONLY when user is real
+      // AND has a membership — preserves the R77 F4 / R85 F3
+      // no-enumeration wire uniformity (audit is server-internal,
+      // never surfaces to the attacker). Blast radius is
+      // higher than any of R140 F3 / R141 F1 / R141 F2's sites:
+      // /login is the primary credential-stuffing target and
+      // perIp(10, 60_000) still permits 600 guesses/min per
+      // victim account. Same shape R141 F2 used for
+      // /reset-confirm. Absent this audit, an admin
+      // investigating "who tried to log into ceo@corp on Nov 5"
+      // gets nothing from audit_entries.
+      if (user) {
+        const membership = user.memberships[0];
+        if (membership) {
+          writeAudit(
+            {
+              orgId: membership.orgId,
+              event: "auth.login_denied",
+              actorId: user.id,
+              actorEmail: user.email,
+              note: "invalid_password",
+              req,
+            },
+            req.log,
+          );
+        }
+      }
       return mfaGateResponse();
     }
     const membership = user.memberships[0];
@@ -490,7 +518,12 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   // Gated on a fresh password check so a stolen session cookie can't
   // extract the whole org history in one call.
   app.post("/me/export", {
-    config: { rateLimit: perIp(3, 60_000) },
+    // R142 F2: perIpCookieOnly skips the bucket for api-key
+    // requests so an attacker with any valid av_srv_ token on
+    // the same IP can't burn the legitimate owner's export
+    // budget by hammering with a Bearer header — see
+    // lib/rate-limit.ts for the shared helper rationale.
+    config: { rateLimit: perIpCookieOnly(3, 60_000) },
   }, async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
@@ -518,7 +551,31 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     const user = await db.user.findUnique({ where: { id: claims.sub } });
     if (!user) return reply.code(401).send({ error: "unauthenticated" });
     const ok = await verifyPassword(user.passwordHash, body.data.password);
-    if (!ok) return reply.code(401).send({ error: "invalid_password" });
+    if (!ok) {
+      // R142 F1: R141 F2's commit message documented three sites
+      // (/me/export, /me/delete-account, /reset-confirm) but the
+      // diff only patched the latter two. This is
+      // R136 F1's "single largest-blast-radius endpoint" (whole-
+      // org JSONL exfil) with R140 F2's perIp(3, 60_000) at
+      // line 493 — a proxy-pool attacker can grind ~5 argon2/sec
+      // against a stolen owner cookie with zero forensic
+      // breadcrumb until success (org.exported fires only on
+      // success). Same auth.step_up_denied slug as the other
+      // two siblings.
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "auth.step_up_denied",
+          actorId: claims.sub,
+          actorEmail: user.email,
+          note: "invalid_password",
+          metadata: { endpoint: "me.export" },
+          req,
+        },
+        req.log,
+      );
+      return reply.code(401).send({ error: "invalid_password" });
+    }
 
     // R136 F1: single largest-blast-radius endpoint in the tree.
     // R91 F1 comment: "streams the ENTIRE org history: every
@@ -745,7 +802,8 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   // handles deployments → sessions → events → receipts. Memberships
   // and Users are removed last.
   app.post("/me/delete-account", {
-    config: { rateLimit: perIp(3, 60_000) },
+    // R142 F2: perIpCookieOnly — same rationale as /me/export.
+    config: { rateLimit: perIpCookieOnly(3, 60_000) },
   }, async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;

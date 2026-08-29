@@ -9,7 +9,8 @@
  * catastrophic.
  *
  * `event` is a stable machine-readable slug:
- *   auth.login, auth.logout, auth.signup, auth.oauth_signin
+ *   auth.login, auth.logout, auth.signup, auth.oauth_signin,
+ *     auth.login_denied
  *   auth.reset_request, auth.reset_confirm, auth.account_deleted,
  *     auth.step_up_denied
  *   saml.signin, saml.config_created, saml.config_updated,
