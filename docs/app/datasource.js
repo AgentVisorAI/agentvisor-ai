@@ -2006,7 +2006,19 @@
       var r = await apiFetch("/api/v1/sessions/" + id + qs);
       var s = normalizeSession(r.session);
       var events = (r.session.events || []).map(normalizeEvent);
-      return { session: s, events: events, nextEventCursor: r.nextEventCursor || null };
+      // R208 F1: `?? null` preserves a legitimate 0 cursor. Prior
+      // `|| null` coerced any falsy value (including numeric 0)
+      // to null. read.ts:345 emits nextEventCursor = lastEvent.seq
+      // when more events exist; the ingest Zod schema at
+      // ingest.ts:81 accepts seq >= 0, so a session whose first
+      // page ends on a seq-0 event legitimately returns 0 as the
+      // "keep going from here" marker. The old idiom told the SPA
+      // "no more events" and silently truncated pagination. The
+      // sibling listSessions() at :1997 uses `|| null` on
+      // `nextCursor`, but there the cursor is an opaque
+      // base64-encoded {openedAt, id} — never a legitimate empty
+      // string — so that occurrence stays safe.
+      return { session: s, events: events, nextEventCursor: r.nextEventCursor ?? null };
     },
     async getReceipt(sessionId) {
       try {
