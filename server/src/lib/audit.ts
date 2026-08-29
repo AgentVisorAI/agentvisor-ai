@@ -9,11 +9,21 @@
  * catastrophic.
  *
  * `event` is a stable machine-readable slug. Comprehensive list
- * (regenerate via `grep -rh 'event: "' server/src | grep -oE 'event: "[a-z._]+"' | sort -u`):
+ * (regenerate via
+ *   grep -rhoE '"(auth|saml|mfa|deployment|member|apikey|webhook|org|audit|policy)\.[a-z._]+"' server/src \
+ *     | sort -u
+ * — note the pattern also catches non-slug string literals like the
+ * `webhook.office.com` hostname in webhook-adapters.ts and the
+ * `org.retention.narrow` / `org.retention.sweep_now` /
+ * `org.ip_allowlist.write` `metadata.endpoint` values in
+ * auth.step_up_denied rows; those are NOT event slugs. R145 F4's
+ * prior `grep -oE 'event: "[a-z._]+"'` regex missed slugs inside
+ * ternaries — e.g. members.ts:310 `event: sub === userId ? "member.left" : "member.removed"`
+ * — so the R146 F3 regen catches them.):
  *   auth.login, auth.login_denied, auth.logout, auth.logout.apikey_noop,
  *     auth.signup, auth.oauth_signin, auth.oauth_refused_mfa_required,
  *     auth.password_ok_mfa_required, auth.reset_request, auth.reset_confirm,
- *     auth.saml.slo, auth.step_up_denied, auth.account_deleted
+ *     auth.saml.slo, auth.step_up_denied
  *   saml.signin, saml.config_created, saml.config_updated,
  *     saml.config_deleted, saml.keypair_rotated
  *   mfa.authenticate, mfa.credential_registered, mfa.credential_revoked,
@@ -24,7 +34,7 @@
  *     deployment.pubkey_first_set, deployment.pubkey_rotation_refused,
  *     deployment.receipt_overwrite_refused
  *   member.invited, member.invite_accepted, member.invite_accepted_requires_login,
- *     member.invite_revoked, member.role_changed
+ *     member.invite_revoked, member.role_changed, member.left, member.removed
  *   apikey.created, apikey.revoked
  *   webhook.created, webhook.updated, webhook.deleted, webhook.test_fired,
  *     webhook.secret_rotated, webhook.delivery_redelivered
