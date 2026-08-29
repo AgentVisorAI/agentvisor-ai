@@ -310,6 +310,21 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
     const stepUpHash = stepUpUser?.passwordHash ?? (await getDummyPasswordHash());
     const stepUpOk = await verifyPassword(stepUpHash, body.data.password);
     if (!stepUpUser || !stepUpOk) {
+      // R140 F3: audit the failure so ops has a pre-success trail
+      // for the "how did the attacker's passkey get enrolled at
+      // 03:12?" investigation. R139 F1's rate-limit is the FIRST
+      // defense; this is the observability layer. Emit AFTER the
+      // uniform argon2 verify so wall-clock stays flat.
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "mfa.credential_register_denied",
+          actorId: claims.sub,
+          note: "invalid_password",
+          req,
+        },
+        req.log,
+      );
       return reply.code(401).send({ error: "invalid_password" });
     }
 
@@ -730,12 +745,43 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
     return reply.send({ credential: { id: updated.id, label: updated.label } });
   });
 
-  app.delete<{ Params: { id: string } }>("/credentials/:id", async (req, reply) => {
+  app.delete<{ Params: { id: string } }>("/credentials/:id", {
+    // R140 F2: perIp(3, 60_000) matches /register/verify (R139 F1)
+    // and the /me/{export,delete-account} step-up siblings. See
+    // password-body rationale in the handler comment below.
+    config: { rateLimit: perIp(3, 60_000) },
+  }, async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
     // R113 F4: same guard as GET and PATCH above.
     if (claims.sub.startsWith("apikey:")) {
       return reply.code(400).send({ error: "cookie_session_required" });
+    }
+    // R140 F2: password step-up gate. R138 F2 closed the ENROLL
+    // side of the same threat R124 F1 named — a stolen cookie
+    // couldn't add attacker's passkey without the account
+    // password. DELETE is the destructive symmetric leg and had
+    // no gate: same cookie primitive can enumerate GET
+    // /credentials + DELETE /credentials/:id for each row →
+    // wipes victim's MFA, bumps sessionRevokedAt (kills every
+    // cookie), and revokes every API key the user created
+    // (R124 F1's break-glass tx runs on ATTACKER-triggered
+    // deletion too). R124 F1's original comment assumed the
+    // deletion is victim-triggered ("Victim opens Settings…
+    // clicks Delete") but the same tx fires either way. Blast
+    // radius is LARGER than /register/verify (destroys MFA +
+    // sessions + tokens in one shot). Require the account
+    // password, matching R138 F2 shape exactly (uniform
+    // argon2 verify against dummy hash on the no-user branch).
+    const body = z
+      .object({ password: z.string().min(1).max(1024) })
+      .safeParse(req.body);
+    if (!body.success) return reply.code(400).send({ error: "invalid_input" });
+    const stepUpUser = await db.user.findUnique({ where: { id: claims.sub } });
+    const stepUpHash = stepUpUser?.passwordHash ?? (await getDummyPasswordHash());
+    const stepUpOk = await verifyPassword(stepUpHash, body.data.password);
+    if (!stepUpUser || !stepUpOk) {
+      return reply.code(401).send({ error: "invalid_password" });
     }
     const cred = await db.webauthnCredential.findFirst({
       where: { id: req.params.id, userId: claims.sub },

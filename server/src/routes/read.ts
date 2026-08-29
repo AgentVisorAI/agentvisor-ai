@@ -542,7 +542,17 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
     // pull worth recording); the SPA's initial Audit-page render
     // sends no cursor so single page loads stay unaudited.
     // Fire-and-forget, same shape as R137 F1.
-    if (query.data.cursor) {
+    // R140 F4: also fire on ?event=<slug> targeted pulls. R138 F1's
+    // rationale ("SPA's initial Audit-page render sends no cursor so
+    // single page loads stay unaudited") was scoped to the DEFAULT
+    // unfiltered render — but a stolen owner cookie can drain up to
+    // limit=200 per distinct event slug (e.g.
+    // ?event=deployment.token_rotated&limit=200) with no cursor, 200
+    // rows per pull × ~30 sensitive slugs = ~6k rows exfiltrated
+    // without a single audit.viewed entry. Keeps the SPA's initial
+    // render unaudited (no event filter) while forcing every
+    // targeted enumeration into the trail.
+    if (query.data.cursor || query.data.event) {
       writeAudit(
         {
           orgId: claims.orgId,
@@ -550,7 +560,8 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
           actorId: claims.sub,
           target: claims.orgId,
           metadata: {
-            paginated: true,
+            paginated: !!query.data.cursor,
+            filteredEvent: query.data.event ?? null,
             rowCount: page.length,
           },
           req,

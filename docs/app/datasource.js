@@ -1104,10 +1104,12 @@
     },
     async webauthnRegisterStart() { throw new Error("mock_no_real_authenticator"); },
     async webauthnRegisterFinish() { throw new Error("mock_no_real_authenticator"); },
-    async webauthnRevoke(id) {
+    async webauthnRevoke(id, _password) {
+      // R140 F2: mock accepts a password param for API parity but
+      // doesn't verify it (no auth in mock mode).
       MOCK_PASSKEYS = MOCK_PASSKEYS.filter(function (p) { return p.id !== id; });
     },
-    async webauthnAuthStart() { return { options: { challenge: "mock" }, hasCredential: false }; },
+    async webauthnAuthStart() { return { options: { challenge: "mock" } }; },
     async webauthnAuthFinish() { throw new Error("mock_no_real_authenticator"); },
     async logout() {
       try { localStorage.setItem("av_mock_signed_out", "1"); } catch (e) {}
@@ -1812,8 +1814,15 @@
         body: { response: response, label: label || "Passkey", password: password },
       });
     },
-    async webauthnRevoke(id) {
-      return apiFetch("/api/v1/auth/webauthn/credentials/" + encodeURIComponent(id), { method: "DELETE" });
+    async webauthnRevoke(id, password) {
+      // R140 F2: DELETE now requires password step-up matching
+      // R138 F2 shape on /register/verify. Body on DELETE is
+      // supported by fetch + Fastify. Password captured via
+      // openInputModal({type:"password"}) at the caller.
+      return apiFetch("/api/v1/auth/webauthn/credentials/" + encodeURIComponent(id), {
+        method: "DELETE",
+        body: { password: password },
+      });
     },
     async webauthnAuthStart(email) {
       return apiFetch("/api/v1/auth/webauthn/authenticate/challenge", { method: "POST", body: { email: email } });

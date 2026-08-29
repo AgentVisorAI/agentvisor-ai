@@ -3774,22 +3774,37 @@
           confirmLabel: "Revoke",
           danger: true,
           onConfirm: function () {
-            state.ds.webauthnRevoke(pkId).then(function () {
-              // R125 F1: skip renderSettingsSSO(root) — the next
-              // fetch is guaranteed to 401 (cookie iat now < new
-              // sessionRevokedAt) which fires the generic
-              // "session expired" toast on top of "Passkey
-              // revoked" and boots the user to /#/login anyway.
-              // Do a purposeful sign-out matching signOut() at
-              // app.js:690-710 so the UX is one deliberate flow,
-              // not two stacked toasts.
-              stopLiveStream();
-              rolePreview = null;
-              state.session = null;
-              try { localStorage.setItem("av_signed_out_at", String(Date.now())); } catch (e) {}
-              toast("Passkey revoked. Sign in again to continue.");
-              navigate("#/login");
-            }).catch(function (err) { toast(err.message || "Revoke failed", true); });
+            // R140 F2: server now requires account password on
+            // DELETE /credentials/:id (blocks stolen-cookie MFA
+            // wipe primitive). Prompt for it after the confirm
+            // modal so the user has already committed to the
+            // break-glass flow.
+            openInputModal({
+              title: "Confirm your password",
+              sub: "Your account password is required to revoke a passkey.",
+              label: "Account password",
+              type: "password",
+              placeholder: "",
+              confirmLabel: "Revoke passkey",
+              onConfirm: function (password) {
+                state.ds.webauthnRevoke(pkId, password).then(function () {
+                  // R125 F1: skip renderSettingsSSO(root) — the next
+                  // fetch is guaranteed to 401 (cookie iat now < new
+                  // sessionRevokedAt) which fires the generic
+                  // "session expired" toast on top of "Passkey
+                  // revoked" and boots the user to /#/login anyway.
+                  // Do a purposeful sign-out matching signOut() at
+                  // app.js:690-710 so the UX is one deliberate flow,
+                  // not two stacked toasts.
+                  stopLiveStream();
+                  rolePreview = null;
+                  state.session = null;
+                  try { localStorage.setItem("av_signed_out_at", String(Date.now())); } catch (e) {}
+                  toast("Passkey revoked. Sign in again to continue.");
+                  navigate("#/login");
+                }).catch(function (err) { toast(err.message || "Revoke failed", true); });
+              },
+            });
           },
         });
       });
@@ -3980,7 +3995,16 @@
       throw new Error("browser_no_webauthn");
     }
     var start = await state.ds.webauthnAuthStart(email);
-    if (!start.hasCredential) throw new Error("no_credential_for_email");
+    // R140 F1: prior shape gated on `start.hasCredential` but the
+    // server dropped that field in R76/R77 (webauthn.ts /authenticate/
+    // challenge comment: "hasCredential explicitly leaked account
+    // presence. Clients that gated their UI on it should switch to
+    // always calling /authenticate/verify"). Real-mode `hasCredential`
+    // was permanently undefined → `!undefined === true` → every
+    // passkey-MFA login threw before the ceremony started. Every
+    // user who enrolled a passkey and logged out was locked out.
+    // Delete the guard entirely and rely on the ceremony (server
+    // treats decoys uniformly per R76 MEDIUM #4).
     var opts = start.options;
     opts.challenge = b64uToBuffer(opts.challenge);
     if (opts.allowCredentials) {

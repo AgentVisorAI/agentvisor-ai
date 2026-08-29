@@ -17,6 +17,8 @@
  *   member.invited, member.role_changed
  *   org.created, org.exported
  *   audit.exported_csv, audit.viewed
+ *   mfa.credential_registered, mfa.credential_revoked,
+ *     mfa.credential_register_denied
  *
  * `target` is a human-readable label the log viewer shows.
  * `metadata` carries structured fields for machine consumption.
