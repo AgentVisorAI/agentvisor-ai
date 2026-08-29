@@ -256,13 +256,53 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
     // (/ingest/receipts sets status:"sealed" atomically with
     // the receipt) — an ingest client should never POST a new
     // session that's already sealed. Refuse cleanly.
-    if (!existing && s.status === "sealed") {
+    // R144 F1: refuse ANY POST /ingest/sessions with
+    // s.status === "sealed" — not just the CREATE case. R141 F3
+    // only guarded `!existing`; on an existing live session
+    // nextStatus would collapse to s.status="sealed" and the
+    // UPDATE branch flipped the row without ever running
+    // /ingest/receipts. Result: session.status="sealed" with NO
+    // Receipt row, stopReason/stopReasonId null, /events guard at
+    // ingest.ts:362 silently drops all further events for that
+    // session — a compromised AV_INGEST_TOKEN holder can race an
+    // in-flight session, force-seal it, and censor the rest of
+    // the trail. Same threat model as R141 F3; the invariant
+    // needs to hold on UPDATE too.
+    if (s.status === "sealed") {
+      req.log.warn(
+        {
+          deploymentId: daemon.deploymentId,
+          externalId: s.externalId,
+          existingStatus: existing?.status ?? null,
+        },
+        "ingest_session_direct_seal_refused",
+      );
+      writeAudit(
+        {
+          orgId: daemon.orgId,
+          event: "deployment.direct_seal_refused",
+          actorId: `daemon:${daemon.deploymentId}`,
+          actorEmail: `daemon@${daemon.deploymentId}`,
+          target: s.externalId,
+          metadata: {
+            deploymentId: daemon.deploymentId,
+            externalId: s.externalId,
+            existingStatus: existing?.status ?? null,
+          },
+          req,
+        },
+        req.log,
+      );
       return reply
         .code(400)
-        .send({ error: "cannot_create_prealsealed_session" });
+        .send({ error: "cannot_direct_seal_session" });
     }
-    const nextStatus =
-      existing?.status === "sealed" && s.status !== "sealed" ? existing.status : s.status;
+    // R144 F1: after refusing s.status === "sealed" above, the
+    // only remaining case where nextStatus differs from s.status
+    // is if `existing?.status === "sealed"` (row is already
+    // sealed and we're being asked to revert it to live/blocked).
+    // Keep the sealed row sealed.
+    const nextStatus = existing?.status === "sealed" ? existing.status : s.status;
     const session = await db.session.upsert({
       where: {
         deploymentId_externalId: {

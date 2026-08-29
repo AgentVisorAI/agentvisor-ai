@@ -548,12 +548,21 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       // password branch; note distinguishes the wire cause so
       // an owner audit trail can grep both "invalid_password"
       // and "not_owner" against the endpoint metadata.
+      // R144 F3: drop actorEmail=claims.sub. claims.sub is a
+      // user cuid (lib/auth.ts SessionClaims: "sub: string; //
+      // user id"), NOT an email. Downstream read.ts /audit
+      // renderers use `r.actorEmail || (r.actorId ? "user:" +
+      // r.actorId : "system")` — a non-null actorEmail skips
+      // the "user:" prefix and emits a raw cuid, breaking the
+      // "email | user:<id> | system" convention every peer
+      // step_up_denied row uses (after db.user.findUnique).
+      // Sibling R141 F1 on webauthn.ts:820 already omits
+      // actorEmail in this exact "no user loaded" case.
       writeAudit(
         {
           orgId: claims.orgId,
           event: "auth.step_up_denied",
           actorId: claims.sub,
-          actorEmail: claims.sub,
           note: "not_owner",
           metadata: { endpoint: "me.export" },
           req,
@@ -831,12 +840,13 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       // R143 F2: same forensic breadcrumb as /me/export non-owner
       // above — this endpoint deletes the whole org, so
       // non-owner attempts merit an audit row.
+      // R144 F3: drop actorEmail=claims.sub (was a cuid, not
+      // an email — see /me/export comment above).
       writeAudit(
         {
           orgId: claims.orgId,
           event: "auth.step_up_denied",
           actorId: claims.sub,
-          actorEmail: claims.sub,
           note: "not_owner",
           metadata: { endpoint: "me.delete_account" },
           req,

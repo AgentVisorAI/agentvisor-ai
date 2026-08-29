@@ -15,7 +15,8 @@
  *     auth.step_up_denied
  *   saml.signin, saml.config_created, saml.config_updated,
  *     saml.config_deleted, saml.keypair_rotated
- *   deployment.create, deployment.delete, deployment.token_rotated
+ *   deployment.create, deployment.delete, deployment.token_rotated,
+ *     deployment.direct_seal_refused
  *   member.invited, member.role_changed
  *   org.created, org.exported
  *   audit.exported_csv, audit.viewed
