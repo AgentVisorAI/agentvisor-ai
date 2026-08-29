@@ -2029,7 +2029,29 @@
     if (textSelActive()) return;
     var id = tr.getAttribute("data-id");
     var prefix = tr.getAttribute("data-nav");
-    if (id && prefix) navigate(prefix + id);
+    if (!id || !prefix) return;
+    // Power-user affordance: rows aren't anchors, so ⌘/Ctrl-click used
+    // to HIJACK the current tab into the detail page instead of the
+    // open-in-new-tab every table row on the web has trained people to
+    // expect. Honor the modifier (Shift too — new window falls back to
+    // a tab in most browsers; noopener always).
+    if (e.metaKey || e.ctrlKey || e.shiftKey) {
+      var href = location.href.split("#")[0] + prefix + id;
+      window.open(href, "_blank", "noopener");
+      return;
+    }
+    navigate(prefix + id);
+  });
+  // Middle-click (auxclick button 1) — same open-in-new-tab contract.
+  document.addEventListener("auxclick", function (e) {
+    if (e.button !== 1) return;
+    var tr = e.target.closest("tr[data-clickable]");
+    if (!tr || e.target.closest("button, a")) return;
+    var id = tr.getAttribute("data-id");
+    var prefix = tr.getAttribute("data-nav");
+    if (!id || !prefix) return;
+    e.preventDefault();
+    window.open(location.href.split("#")[0] + prefix + id, "_blank", "noopener");
   });
 
   // Global keyboard nav for tables: arrow keys move focus, Enter opens.
