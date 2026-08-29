@@ -139,7 +139,7 @@
       try {
         key = await crypto.subtle.importKey("raw", keyBytes, { name: "Ed25519" }, false, ["verify"]);
       } catch (e) {
-        throw new Error("This browser doesn't support Web Crypto Ed25519. Try Chrome 113+, Firefox 130+, or Safari 17+. Or run the CLI: node tools/verify-receipt.mjs receipt.json");
+        throw new Error("This browser doesn't support Web Crypto Ed25519. Try Chrome 113+, Firefox 130+, or Safari 17+. Or run the CLI: node server/scripts/verify-receipt.mjs receipt.json");
       }
       const msg = receiptSigningMessage(r.rawBody);
       const sig = b64ToBytes(r.rawSignatureB64);

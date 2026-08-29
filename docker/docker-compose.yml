@@ -225,8 +225,9 @@ services:
       # environment holds AV_UPSTREAM_API_KEY. The source has been
       # switched to OTLP-only (agentvisor-ai already sends OTel logs via
       # the compose network on 4318). If you need container-log
-      # discovery, put a docker-socket-proxy in front and remount only
-      # the proxy's socket. See docs/ops/vector.md.
+      # discovery, put a docker-socket-proxy (e.g.
+      # tecnativa/docker-socket-proxy) in front and remount ONLY the
+      # proxy's socket into Vector — never the raw docker.sock.
       # - /var/run/docker.sock:/var/run/docker.sock:ro
 
 volumes:
