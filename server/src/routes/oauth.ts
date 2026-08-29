@@ -361,61 +361,73 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
       // against a 1 MB email producing a 1 MB org.name (the email
       // itself is now capped at 320 above, so this is defense-in-
       // depth for future-proofing).
-      const org = await db.org.create({
-        data: {
-          name: (domain.split(".")[0] || "Personal").slice(0, 63),
-          slug: orgSlug(domain),
-        },
+      // R137 F2: wrap org.create + user.create in a single
+      // $transaction so a partial failure (P2024 pool timeout,
+      // connection loss, SIGTERM mid-rollout, or a concurrent
+      // /signup landing the same email in the sub-second window
+      // between findUnique above and here) can't leave:
+      //   (a) an orphan Org row with a burned unique slug that
+      //       blocks the next legitimate signup with that domain
+      //       (DoS primitive if attacker can trigger user.create
+      //       failures reliably), or
+      //   (b) a spurious org.created audit row for an org that
+      //       has no owner and can never be logged into — the
+      //       R135 F4 forensic query "which orgs came into
+      //       existence via OAuth-JIT" would then return lies.
+      // Also delay the org.created writeAudit until after the tx
+      // commits so a rollback doesn't leave a phantom breadcrumb.
+      // /signup at auth.ts:105 uses the same shape.
+      const created = await db.$transaction(async (tx) => {
+        const newOrg = await tx.org.create({
+          data: {
+            name: (domain.split(".")[0] || "Personal").slice(0, 63),
+            slug: orgSlug(domain),
+          },
+        });
+        const newUser = await tx.user.create({
+          data: {
+            email,
+            displayName,
+            // R86 F3: use a real argon2 hash of random bytes so
+            // that verifyPassword timing matches password-set
+            // users. Prior shape stored `oidc:${provider}:${hex}`
+            // — @node-rs/argon2 threw on the malformed PHC
+            // header in sub-ms and gave the login endpoint a
+            // wire-visible timing oracle for OAuth-registered
+            // accounts. verifyPassword now falls back to the
+            // dummy hash for non-argon2 strings (defensive layer);
+            // this line stores a real argon2 string so the fallback
+            // isn't exercised.
+            passwordHash: await hashPassword(
+              crypto.randomUUID() + crypto.randomUUID(),
+            ),
+            memberships: {
+              create: { orgId: newOrg.id, role: "owner" },
+            },
+          },
+          include: { memberships: { include: { org: true }, orderBy: { createdAt: "asc" } } },
+        });
+        return { org: newOrg, user: newUser };
       });
-      // R135 F4: OAuth-JIT auto-provisions a fresh Org but emitted
-      // no forensic breadcrumb. R134 F2 added auth.oauth_signin to
-      // the callback but the auth.signup counterpart never fired
-      // on this branch — auth.ts:164 emits auth.signup only for
-      // the password-signup path. Consequence: an admin
-      // investigating "which orgs came into existence via
-      // unattended OAuth callback vs. explicit /signup" cannot
-      // distinguish the two in audit_entries. actorId is null
-      // (user row doesn't exist yet); the user.create below writes
-      // the user + membership atomically after this.
+      // R135 F4 audit — post-commit so a rolled-back tx doesn't
+      // leave a phantom org.created audit row.
       writeAudit(
         {
-          orgId: org.id,
+          orgId: created.org.id,
           event: "org.created",
           actorId: null,
           actorEmail: email,
-          target: org.name,
+          target: created.org.name,
           metadata: {
             provider: params.data.provider,
             viaOauthJit: true,
-            orgSlug: org.slug,
+            orgSlug: created.org.slug,
           },
           req,
         },
         req.log,
       );
-      user = await db.user.create({
-        data: {
-          email,
-          displayName,
-          // R86 F3: use a real argon2 hash of random bytes so
-          // that verifyPassword timing matches password-set
-          // users. Prior shape stored `oidc:${provider}:${hex}`
-          // — @node-rs/argon2 threw on the malformed PHC
-          // header in sub-ms and gave the login endpoint a
-          // wire-visible timing oracle for OAuth-registered
-          // accounts. verifyPassword now falls back to the
-          // dummy hash for non-argon2 strings (defensive layer);
-          // this line stores a real argon2 string so the fallback
-          // isn't exercised.
-          passwordHash: await hashPassword(
-            crypto.randomUUID() + crypto.randomUUID(),
-          ),
-          memberships: {
-            create: { orgId: org.id, role: "owner" },
-          },
-        },
-        include: { memberships: { include: { org: true }, orderBy: { createdAt: "asc" } } },
-      });
+      user = created.user;
     }
 
     const membership = user.memberships[0];

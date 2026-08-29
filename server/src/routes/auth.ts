@@ -310,20 +310,25 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       // is a genuine data-integrity issue (every user should
       // have a membership by construction — SAML/OAuth JIT and
       // signup both provision one atomically), so surfacing the
-      // underlying reason to the operator via audit + logging
-      // is preserved, but the wire response reveals nothing.
-      writeAudit(
-        {
-          orgId: "system",
-          event: "auth.password_ok_no_membership",
-          actorId: user.id,
-          actorEmail: user.email,
-          target: user.email,
-          note: "user has no membership; refusing session mint",
-          req,
-        },
-        req.log,
-      );
+      // underlying reason to the operator via a durable log
+      // line is preserved, but the wire response reveals
+      // nothing.
+      // R137 F3: prior shape ALSO called writeAudit here with
+      // orgId: "system" — but AuditEntry.orgId is a required FK
+      // (schema.prisma:161 org Org @relation(fields: [orgId],
+      // references: [id], onDelete: Cascade)) and there is no
+      // bootstrap Org row with id "system" anywhere in the
+      // codebase or migrations. Every call landed a Prisma
+      // P2003 that audit.ts swallowed into audit_write_failed
+      // warn. The "audit + logging" invariant the R77 F4
+      // comment claimed was only ever satisfied by the log
+      // side; the audit was dead code. Same rationale
+      // /me/delete-account uses (auth.ts:777 "writeAudit into
+      // audit_entries would itself be nuked … SOC-2 evidence
+      // for tenant erasure comes from those logs") applies
+      // symmetrically here — no orgId to attach to by
+      // construction. Rely on the req.log.error below for
+      // durable forensic capture.
       req.log.error(
         { userId: user.id, email: user.email },
         "user_authenticated_password_but_has_no_membership",
