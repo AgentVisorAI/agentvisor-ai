@@ -80,6 +80,11 @@ jobs:
       owner_lc: ${{ steps.owner.outputs.lc }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # R225 F4: same rationale as ci.yml — docker build + Trivy
+          # scan + SBOM run against arbitrary transitive artifacts;
+          # keep GITHUB_TOKEN out of .git/config.
+          persist-credentials: false
 
       - id: short-sha
         run: echo "value=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
@@ -299,6 +304,9 @@ jobs:
       url: https://api.agentvisorai.me
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # R225 F4: same rationale as ci.yml.
+          persist-credentials: false
       - name: Check for FLY_API_TOKEN
         id: guard
         # No-op if the secret isn't set — deploys are opt-in. This lets
