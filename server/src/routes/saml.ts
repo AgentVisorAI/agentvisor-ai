@@ -691,7 +691,7 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
       // downgrades every fresh SAML signup, and swapping
       // `idpSsoUrl`/`idpCertPem` reroutes AuthnResponses to an
       // attacker-controlled IdP. Match the sibling /keypair
-      // rotate (:743) and the DELETE gate above. Members are
+      // rotate (:833) and the DELETE gate above. Members are
       // still blocked; admins are demoted to read-only via
       // GET /:configId (unchanged).
       if (claims.membershipRole !== "owner") {
@@ -778,7 +778,7 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
       // routes them through /saml/start), so removing the config
       // strands them at the login screen with no way back.
       // Matches the sibling /keypair rotate (already owner-only
-      // at :743) and the "admin sabotages recovery" class closed
+      // at :833) and the "admin sabotages recovery" class closed
       // by R145 F1 (retention narrow), R146 F1 (ip-allowlist),
       // R147 F1 (deployment force-delete).
       if (claims.membershipRole !== "owner") {
@@ -869,12 +869,12 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
       // DoS SSO for the whole org or stage a downgrade against a
       // future assertion-encryption push. This was the only
       // mutating route in saml.ts without a writeAudit() call
-      // (sibling POST / at 618, PATCH /:configId at 688, DELETE
-      // /:configId at 719 all audit correctly). Mechanical
+      // (sibling POST / at 588, PATCH /:configId at 680, DELETE
+      // /:configId at 770 all audit correctly). Mechanical
       // omission of the same 12-line block; add it here so
       // incident forensics has the breadcrumb. Direct parity
-      // with deployments.ts:143 (deployment.token_rotated) and
-      // webhooks.ts:425 (webhook.secret_rotated).
+      // with deployments.ts:155 (deployment.token_rotated) and
+      // webhooks.ts:451 (webhook.secret_rotated).
       writeAudit(
         {
           orgId: claims.orgId,
