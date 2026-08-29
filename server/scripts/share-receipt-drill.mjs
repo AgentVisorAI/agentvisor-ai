@@ -20,7 +20,7 @@
  */
 import { chromium } from "playwright";
 
-const SITE = process.env.SITE ?? "http://127.0.0.1:44125/app/";
+const SITE = process.env.SITE ?? process.argv[2] ?? "http://127.0.0.1:44125/app/";
 const VERIFY_URL = new URL("../verify/", SITE).href;
 
 function fail(m) { console.log("❌", m); process.exit(1); }
