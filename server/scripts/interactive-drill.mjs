@@ -326,6 +326,34 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
     if (!st.shell || st.len < 30) fail("corrupted storage bricked the app: " + JSON.stringify(kv) + " → " + JSON.stringify(st));
     if (kv.av_theme && st.theme === kv.av_theme) fail("theme whitelist leaked a garbage value: " + st.theme);
   }
+  // Stored-identity XSS: a hostile displayName/org.name persisted in
+  // localStorage (the one write an attacker with storage access
+  // controls) must render as literal text — never execute, never
+  // inject elements — across topbar, account menu, and settings.
+  {
+    await page.evaluate(() => {
+      localStorage.clear();
+      localStorage.setItem("av_mock_fresh_t0", String(Date.now() - 60000));
+      localStorage.setItem("av_mock_fresh_identity", JSON.stringify({
+        user: { id: "u", email: "x@y.dev", displayName: "<img src=x onerror=window.__xss1=1>", role: "owner" },
+        org: { id: "o", name: "<svg onload=window.__xss2=1>", slug: "s", createdAt: new Date().toISOString(), role: "owner" },
+      }));
+    });
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector(".app-shell", { timeout: 15000 });
+    await page.click(".user-btn");
+    await page.waitForTimeout(300);
+    const xs = await page.evaluate(() => ({
+      executed: !!(window.__xss1 || window.__xss2),
+      injected: !!document.querySelector('img[src="x"], svg[onload]'),
+      literal: document.body.textContent.includes("<img") && document.body.textContent.includes("<svg"),
+    }));
+    if (xs.executed || xs.injected || !xs.literal) fail("stored-identity XSS: " + JSON.stringify(xs));
+    await page.keyboard.press("Escape");
+    await page.evaluate(() => localStorage.clear());
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(1000);
+  }
   await page.evaluate(() => localStorage.clear());
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.waitForTimeout(1200);
@@ -411,6 +439,25 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   // which survives page.reload() and re-arms the tour autostart — the
   // tour's start() then yanks the hash to #/overview mid-check.
   await page.goto(SITE + "#/sessions?range=720", { waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => document.querySelectorAll("tr[data-clickable]").length === 50 && !!document.getElementById("loadMore"), { timeout: 15000 });
+  // Triple-click Load more under injected latency: overlapping page
+  // fetches must never double-append (zero duplicate row ids).
+  await page.evaluate(() => {
+    const orig = window.dataSource.listSessions.bind(window.dataSource);
+    let first = true;
+    window.dataSource.listSessions = (...a) => {
+      if (first) { first = false; return new Promise((r) => setTimeout(r, 700)).then(() => orig(...a)); }
+      return orig(...a);
+    };
+  });
+  await page.evaluate(() => { const b2 = document.getElementById("loadMore"); b2.click(); b2.click(); b2.click(); });
+  await page.waitForTimeout(2200);
+  const lmDup = await page.evaluate(() => {
+    const ids = [...document.querySelectorAll("tbody tr")].map((r) => r.getAttribute("data-id"));
+    return { rows: ids.length, dups: ids.length - new Set(ids).size };
+  });
+  if (lmDup.dups !== 0 || lmDup.rows !== 100) fail("Load-more triple-click duplicated rows: " + JSON.stringify(lmDup));
+  await page.reload({ waitUntil: "domcontentloaded" });
   await page.waitForFunction(() => document.querySelectorAll("tr[data-clickable]").length === 50 && !!document.getElementById("loadMore"), { timeout: 15000 });
   await page.click("#loadMore");
   await page.waitForFunction(() => document.querySelectorAll("tr[data-clickable]").length === 100, { timeout: 10000 });
