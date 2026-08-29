@@ -32,7 +32,7 @@
  *   deployment.create, deployment.delete, deployment.delete_conflict,
  *     deployment.token_rotated, deployment.direct_seal_refused,
  *     deployment.pubkey_first_set, deployment.pubkey_rotation_refused,
- *     deployment.receipt_overwrite_refused
+ *     deployment.receipt_overwrite_refused, deployment.receipt_key_id_mismatch
  *   member.invited, member.invite_accepted, member.invite_accepted_requires_login,
  *     member.invite_revoked, member.role_changed, member.left, member.removed
  *   apikey.created, apikey.revoked

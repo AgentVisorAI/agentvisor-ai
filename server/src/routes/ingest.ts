@@ -1,5 +1,6 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
+import { createHash } from "node:crypto";
 import { db } from "../db.js";
 import { verifyPassword } from "../lib/auth.js";
 import { bus } from "../lib/bus.js";
@@ -805,6 +806,71 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
     const body = receiptPayload.safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: "invalid_input" });
     const r = body.data;
+    // R195 F1: validate `keyIdHex` against the deployment's
+    // registered pubkey. `derive_key_id(pubkey)` = first 32 hex
+    // chars of SHA-256(pubkey_bytes) per Rust
+    // crates/av-receipts/src/keys.rs:115-118. The daemon signs
+    // receipts with the same keypair whose pubkey it posted via
+    // /ingest/pubkey (R91 F3 blocks silent rotation). If the
+    // daemon posts a receipt whose `keyIdHex` doesn't match the
+    // stored pubkey's derived id, that's either a daemon bug
+    // (wrong key material at signing time) or a compromised-
+    // token holder posting under a fake identity — either way,
+    // the resulting `keyIdHint` in the SPA session drawer (from
+    // ingest.ts:955 `r.keyIdHex.slice(0, 8)`) would display an
+    // attribution claim that doesn't match the pubkey the SPA
+    // client-verifier uses. R193 catches the sibling gap on the
+    // JS side (body.key_id must derive from pubkey), and this
+    // closes the wire-level sibling. If deployment.publicKeyHex
+    // isn't set yet (daemon hasn't posted /pubkey), we can't
+    // validate — refuse with 409 to force the boot-order (post
+    // /pubkey before /receipts).
+    const dep = await db.deployment.findUnique({
+      where: { id: daemon.deploymentId },
+      select: { publicKeyHex: true },
+    });
+    if (!dep?.publicKeyHex) {
+      req.log.warn(
+        {
+          deploymentId: daemon.deploymentId,
+          sessionExternalId: r.sessionExternalId,
+        },
+        "ingest_receipt_refused_pubkey_not_set",
+      );
+      return reply.code(409).send({ error: "pubkey_not_registered" });
+    }
+    const derivedKeyId = createHash("sha256")
+      .update(Buffer.from(dep.publicKeyHex, "hex"))
+      .digest("hex")
+      .slice(0, 32);
+    if (r.keyIdHex.toLowerCase().slice(0, 32) !== derivedKeyId) {
+      req.log.warn(
+        {
+          deploymentId: daemon.deploymentId,
+          proposedKeyIdHex: r.keyIdHex,
+          derivedKeyId,
+        },
+        "ingest_receipt_key_id_mismatch",
+      );
+      writeAudit(
+        {
+          orgId: daemon.orgId,
+          event: "deployment.receipt_key_id_mismatch",
+          actorId: `daemon:${daemon.deploymentId}`,
+          actorEmail: `daemon@${daemon.deploymentId}`,
+          target: r.sessionExternalId,
+          metadata: {
+            deploymentId: daemon.deploymentId,
+            sessionExternalId: r.sessionExternalId,
+            proposedKeyIdHex: r.keyIdHex,
+            derivedKeyId,
+          },
+          req,
+        },
+        req.log,
+      );
+      return reply.code(400).send({ error: "key_id_mismatch" });
+    }
     const session = await db.session.findUnique({
       where: {
         deploymentId_externalId: {
