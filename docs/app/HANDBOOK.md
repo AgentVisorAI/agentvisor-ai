@@ -77,7 +77,13 @@ catalog at the bottom.
 6. The palette closes on `hashchange` and on a **capture-phase document
    Escape** (the input-level Escape missed the pre-autofocus window and
    wedged the backdrop). The body-level hashchange sweep removes both
-   `.modal-backdrop` and `.cmdk-backdrop`.
+   `.modal-backdrop` and `.cmdk-backdrop`. It re-fetches its dynamic
+   entries (sessions/policies/deployments) on **every open** — never
+   cache the index, or deleted entities become ghost links (drill 32).
+   The app registers **no unload/beforeunload handlers** — that keeps
+   every engine's bfcache eligible; freshness after a Back-restore is
+   `visibilitychange` + `online` → `refreshCurrentView()` (drill 32
+   asserts the zero-handler invariant via the `__lc` listener census).
 7. Global shortcuts (`g`-nav, `/`, `?`, `[`/`]`) no-op while `body.locked` —
    g-nav's hashchange used to destroy an open form modal.
 8. Stacking scale (documented at the `.tabbar` rule): topbar 20 · tabbar 90 ·
@@ -141,6 +147,15 @@ catalog at the bottom.
     in a persistent body-level overlay (tour card) must survive route
     changes — the unconditional steal stranded keyboard users mid-tour
     on every cross-route step (drill check 31).
+23. Fresh-workspace truth: everything a fresh org sees or creates
+    belongs to THAT org. Mutations write to `freshRuntime()` (keyed on
+    the raw t0 value), never to the Northwind `MOCK_*` fixtures — a
+    fresh create that touches a fixture array is invisible in the
+    fresh list AND leaks into the showcase org. Identity surfaces
+    (sim-daemon name, `org.created` audit target, the members list,
+    the attack-sim user) derive from `freshIdentity()`; canned session
+    clones re-time their event trails via `_tsShift` and receipts sign
+    the DISPLAYED fresh values (drill check 33).
 
 **Evidence & print**
 22. The printed evidence pack is COMPLETE: `@media print` forces
@@ -172,7 +187,11 @@ catalog at the bottom.
   per-origin localStorage as every other check: a probe that sets
   `av_mock_signed_out` / fresh-mode keys and closes without cleanup
   breaks the NEXT check (empty webhooks in fresh mode, login bounces).
-  Always restore the keys before `page.close()` — this bit twice.
+  Always restore the keys before `page.close()` — this bit THRICE
+  (the third bite: check 29's `addInitScript` fresh keys put checks
+  30–32 into a fresh workspace; they "passed" there by coincidence
+  until the palette check created a deployment and it vanished —
+  which turned out to be a REAL fresh-mode bug, not just a leak).
 - Suites default `SITE` to **production**. A positional arg passed to a
   script that only reads the env var is silently ignored — an entire
   "local" drill once ran green against the live site while the local
@@ -184,7 +203,7 @@ catalog at the bottom.
 
 | Script | Guards |
 |---|---|
-| `interactive-drill.mjs` | 31 checks: tour, attack story, onboarding ages, billing math, reset flows, hit-tests + unsized-svg blowouts, storage/router fuzz, pagination + deep links, Back/overlays, double-submit, failure paths + catch-up, cross-tab + FOUC, focus rings/traps + reduced motion + shortcut guards, garbage data, filter/sort/chart/audit/detail ground truth, deployment + key lifecycles, member RBAC, leak soak, form semantics (native validation + Enter submits), skeleton-phase filter liveness, dirty-modal discard guard, theme-toggle state preservation, keyboard-only tour |
+| `interactive-drill.mjs` | 33 checks: tour, attack story, onboarding ages, billing math, reset flows, hit-tests + unsized-svg blowouts, storage/router fuzz, pagination + deep links, Back/overlays, double-submit, failure paths + catch-up, cross-tab + FOUC, focus rings/traps + reduced motion + shortcut guards, garbage data, filter/sort/chart/audit/detail ground truth, deployment + key lifecycles, member RBAC, leak soak, form semantics (native validation + Enter submits), skeleton-phase filter liveness, dirty-modal discard guard, theme-toggle state preservation, keyboard-only tour, palette mutation-truth + bfcache eligibility (no unload handlers), fresh-workspace truth (org-named daemon, isolated mutations, founder identity, org audit story) |
 | `live-site-smoke.mjs` | 10 checks: link/media crawl, captions, alias stubs, 404, OG/Twitter link previews, video-metadata truth (durations + zero MediaErrors) |
 | `a11y-audit.mjs` | 46 axe scans: 11 routes + 9 modal states × 2 themes, 3 static pages × 2 schemes |
 | `mobile-smoke.mjs` | phone/tablet: tab bar, taps, modals fit + hittable + stacking, static pages |
