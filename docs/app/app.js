@@ -3449,8 +3449,15 @@
     }
     // Close on navigation too. Modals are body-level; a route change
     // re-renders #view underneath them but would otherwise leave the
-    // backdrop up, blocking every click on the new page.
-    function onNav() { if (close) close(); }
+    // backdrop up, blocking every click on the new page. Navigation
+    // can't be vetoed after the fact (browser Back / Android back
+    // gesture already moved the hash), so a DIRTY modal can't get the
+    // two-step guard here — but the discard must never be silent.
+    function onNav() {
+      if (!close) return;
+      if (modalDirty(backdrop)) toast("Unsaved changes in the open dialog were discarded", true);
+      close();
+    }
     document.addEventListener("keydown", onKey);
     document.addEventListener("click", onDocClick, true);
     window.addEventListener("hashchange", onNav);
