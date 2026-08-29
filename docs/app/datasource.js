@@ -780,18 +780,18 @@
   }
 
   var MOCK_AUDIT = [
-    { at: iso(3 * MIN), actor: "olivia.tan@northwind.com", event: "auth.signed_in", target: "google-workspace", note: "SSO · Chrome on macOS" },
+    { at: iso(3 * MIN), actor: "olivia.tan@northwind.com", event: "auth.login", target: "Okta production", note: "SSO · Chrome on macOS" },
     { at: iso(8 * MIN), actor: "raj.patel@northwind.com", event: "policy.updated", target: "procurement.allowed_vendors", note: "Added Fabrikam to vendor allowlist." },
     { at: iso(42 * MIN), actor: "raj.patel@northwind.com", event: "apikey.created", target: "CI runner", note: "role: member" },
     { at: iso(2 * HOUR), actor: "olivia.tan@northwind.com", event: "member.role_changed", target: "sam.lee@northwind.com", note: "member → viewer" },
     { at: iso(5 * HOUR), actor: "olivia.tan@northwind.com", event: "member.invited", target: "kate.chen@northwind.com", note: "role: admin" },
     { at: iso(6 * HOUR), actor: "system", event: "deployment.token_rotated", target: "northwind-prod" },
-    { at: iso(9 * HOUR), actor: "sam.lee@northwind.com", event: "receipt.verified", target: "sess_01H9K7GRPX", note: "offline verifier · signature good" },
+    { at: iso(9 * HOUR), actor: "raj.patel@northwind.com", event: "audit.exported_csv", target: "audit.csv", note: "compliance export · 214 entries" },
     { at: iso(1 * 24 * HOUR), actor: "olivia.tan@northwind.com", event: "policy.created", target: "runtime.pii_redaction" },
     { at: iso(1 * 24 * HOUR + 2 * HOUR), actor: "raj.patel@northwind.com", event: "webhook.created", target: "Slack #ops", note: "events: policy.block" },
-    { at: iso(2 * 24 * HOUR), actor: "system", event: "auth.session_expired", target: "marc.dubois@northwind.com", note: "7-day TTL" },
-    { at: iso(3 * 24 * HOUR), actor: "olivia.tan@northwind.com", event: "settings.sso_configured", target: "google-workspace" },
-    { at: iso(5 * 24 * HOUR), actor: "olivia.tan@northwind.com", event: "deployment.created", target: "northwind-staging", note: "environment: staging" },
+    { at: iso(2 * 24 * HOUR), actor: "system", event: "auth.logout", target: "marc.dubois@northwind.com", note: "session expired (7-day TTL)" },
+    { at: iso(3 * 24 * HOUR), actor: "olivia.tan@northwind.com", event: "saml.config_created", target: "Okta production" },
+    { at: iso(5 * 24 * HOUR), actor: "olivia.tan@northwind.com", event: "deployment.create", target: "northwind-staging", note: "environment: staging" },
     { at: iso(8 * 24 * HOUR), actor: "raj.patel@northwind.com", event: "apikey.revoked", target: "Ops dashboard (legacy)", note: "superseded by CI runner" },
     { at: iso(11 * 24 * HOUR), actor: "olivia.tan@northwind.com", event: "org.created", target: "Northwind Traders" },
   ];
@@ -1212,7 +1212,7 @@
       // the showcase org. Same isolation as deployments.
       if (freshElapsed() != null) freshRuntime().samlConfigs.push(cfg);
       else MOCK_SAML_CONFIGS.push(cfg);
-      recordAudit("sso.idp_created", cfg.displayName || cfg.id);
+      recordAudit("saml.config_created", cfg.displayName || cfg.id);
       return { config: cfg };
     },
     async updateSamlConfig(id, input) {
@@ -1220,7 +1220,7 @@
       var i = pool.findIndex(function (c) { return c.id === id; });
       if (i < 0) throw new Error("not_found");
       pool[i] = Object.assign({}, pool[i], input, { updatedAt: new Date().toISOString() });
-      recordAudit("sso.idp_updated", pool[i].displayName || id);
+      recordAudit("saml.config_updated", pool[i].displayName || id);
       return { config: pool[i] };
     },
     async deleteSamlConfig(id) {
@@ -1228,12 +1228,12 @@
         var rt = freshRuntime();
         var goneF = rt.samlConfigs.find(function (c) { return c.id === id; });
         rt.samlConfigs = rt.samlConfigs.filter(function (c) { return c.id !== id; });
-        recordAudit("sso.idp_deleted", (goneF && goneF.displayName) || id);
+        recordAudit("saml.config_deleted", (goneF && goneF.displayName) || id);
         return;
       }
       var gone = MOCK_SAML_CONFIGS.find(function (c) { return c.id === id; });
       MOCK_SAML_CONFIGS = MOCK_SAML_CONFIGS.filter(function (c) { return c.id !== id; });
-      recordAudit("sso.idp_deleted", (gone && gone.displayName) || id);
+      recordAudit("saml.config_deleted", (gone && gone.displayName) || id);
     },
     async regenerateSamlSpKeypair(id) {
       var pool = freshElapsed() != null ? freshRuntime().samlConfigs : MOCK_SAML_CONFIGS;
@@ -1243,7 +1243,7 @@
         hasSpKeypair: true,
         spCertPem: "-----BEGIN CERTIFICATE-----\nMIIDazCCAlOgAwIBAgIUX9c5\n...(mock)...\n-----END CERTIFICATE-----",
       });
-      recordAudit("sso.sp_keypair_regenerated", pool[i].displayName || id);
+      recordAudit("saml.keypair_rotated", pool[i].displayName || id);
       return { config: pool[i], spCertPem: pool[i].spCertPem };
     },
     // Mock passkeys. A fake yubikey + a fake iCloud passkey so the
@@ -1323,7 +1323,7 @@
       // freshDeployments()) and leaked them into the Northwind org.
       if (freshMode) freshRuntime().deployments.push(dep);
       else MOCK_DEPLOYMENTS.push(dep);
-      recordAudit("deployment.created", dep.name, dep.environment);
+      recordAudit("deployment.create", dep.name, dep.environment);
       return { deployment: dep, ingestToken: token };
     },
     async rotateDeploymentToken(id) {
@@ -1352,7 +1352,7 @@
         var i = MOCK_DEPLOYMENTS.findIndex(function (x) { return x.id === id; });
         if (i >= 0) { name = MOCK_DEPLOYMENTS[i].name; MOCK_DEPLOYMENTS.splice(i, 1); }
       }
-      recordAudit("deployment.deleted", name);
+      recordAudit("deployment.delete", name);
     },
 
     async getOverview(range) {
@@ -1685,12 +1685,12 @@
         var rt = freshRuntime();
         var invF = rt.invites.find(function (i) { return i.id === id; });
         rt.invites = rt.invites.filter(function (i) { return i.id !== id; });
-        recordAudit("invite.revoked", invF ? invF.email : id);
+        recordAudit("member.invite_revoked", invF ? invF.email : id);
         return;
       }
       var inv = MOCK_INVITES.find(function (i) { return i.id === id; });
       MOCK_INVITES = MOCK_INVITES.filter(function (i) { return i.id !== id; });
-      recordAudit("invite.revoked", inv ? inv.email : id);
+      recordAudit("member.invite_revoked", inv ? inv.email : id);
     },
     async acceptInvite(input) {
       await delay(400);
@@ -1797,7 +1797,10 @@
       }
       var pool2 = freshW ? freshRuntime().webhooks : MOCK_WEBHOOKS;
       var w2 = pool2.find(function (w) { return w.id === id; });
-      if (patch && "isActive" in patch) recordAudit(patch.isActive ? "webhook.resumed" : "webhook.paused", w2 ? w2.name : id);
+      // Real-API parity: PATCH writes webhook.updated whatever the
+      // field — pause/resume is carried in the note, not an invented
+      // slug (webhook.paused/resumed don't exist server-side).
+      if (patch && "isActive" in patch) recordAudit("webhook.updated", w2 ? w2.name : id, patch.isActive ? "resumed" : "paused");
       else recordAudit("webhook.updated", w2 ? w2.name : id);
     },
     async deleteWebhook(id) {
@@ -1864,7 +1867,7 @@
     async getRetention() { await delay(80); return { retention: { sessionRetentionDays: 90, auditRetentionDays: 365 } }; },
     async updateRetention(input) {
       await delay(80);
-      recordAudit("retention.updated", "", "sessions " + input.sessionRetentionDays + "d · audit " + input.auditRetentionDays + "d");
+      recordAudit("org.retention_updated", "", "sessions " + input.sessionRetentionDays + "d · audit " + input.auditRetentionDays + "d");
     },
     async retentionSweepNow() { await delay(120); return { result: { sessionsPurged: 0, auditPurged: 0, webhookDeliveriesPurged: 0 } }; },
     // No downloadAuditCsv here on purpose: without it the console
@@ -1881,7 +1884,7 @@
         // The daemon-connected entry appears when the daemon actually
         // connects — an audit line about the future is a lie. Names
         // are THIS org's, not the showcase fixtures'.
-        if (el >= FRESH_CONNECT_MS) entries.push({ at: new Date(t0 + FRESH_CONNECT_MS).toISOString(), actor: "system", event: "deployment.connected", target: freshDaemonName(), note: "Signing key issued" });
+        if (el >= FRESH_CONNECT_MS) entries.push({ at: new Date(t0 + FRESH_CONNECT_MS).toISOString(), actor: "system", event: "deployment.pubkey_first_set", target: freshDaemonName(), note: "Signing key issued" });
         entries.push({ at: new Date(t0 + 2000).toISOString(), actor: "system", event: "policies.defaults_seeded", target: "4 starter policies" });
         entries.push({ at: new Date(t0).toISOString(), actor: (mockState.session && mockState.session.user ? mockState.session.user.email : "you"), event: "org.created", target: (fid && fid.org.name) || "your workspace" });
         return runtimeAudit.concat(entries);
