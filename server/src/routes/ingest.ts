@@ -54,14 +54,30 @@ const sessionUpsert = z.object({
   agent: z.string().min(1).max(80),
   workflow: z.enum(["signed", "unsigned"]).default("signed"),
   status: z.enum(["live", "sealed", "blocked"]).default("live"),
-  policyVersion: z.number().int().min(0).default(1),
+  // R161 F1: cap at 1M policy versions. Prior shape was
+  // unbounded — Session.policyVersion is Postgres int4 (max
+  // 2^31-1 ≈ 2.1e9), so an attacker or runaway daemon posting
+  // `policyVersion: 3_000_000_000` on the CREATE branch of the
+  // R151 F1 updateMany fallthrough at :~340 triggers
+  // numeric_value_out_of_range → same 500-livelock class R160
+  // F1 closed for the event rollup. Realistic policy versions
+  // increment 1 per config change; 1M is far above any realistic
+  // deployment's lifetime bumps.
+  policyVersion: z.number().int().min(0).max(1_000_000).default(1),
   openedAt: z.coerce.date(),
   closedAt: z.coerce.date().optional(),
 });
 
 const eventPayload = z.object({
   sessionExternalId: z.string().min(1).max(128),
-  seq: z.number().int().min(0),
+  // R161 F1: cap seq at 100M. Prior shape was unbounded —
+  // Event.seq is Postgres int4 and every batch's WHERE seq: {gt}
+  // /IN clauses and rollup writes flow through it. 100M is
+  // 6+ orders above any realistic session event count (typical
+  // is 10-1000); attacker sending `seq: 3_000_000_000` triggers
+  // numeric_value_out_of_range on event.create → same 500-
+  // livelock class R160 F1 closed for the rollup fields.
+  seq: z.number().int().min(0).max(100_000_000),
   kind: z.enum(["sys", "user", "llm", "tool", "block", "guard", "audit"]),
   tag: z.string().min(1).max(32),
   body: z.string().max(8000),
@@ -136,9 +152,22 @@ const receiptPayload = z.object({
   body: z.string().min(1).max(65_536),
   sigB64: z.string().min(1).max(4096),
   keyIdHex: z.string().min(1).max(128),
-  eventCount: z.number().int().min(0),
+  // R161 F1: cap eventCount at 100M. Prior shape was unbounded
+  // — Receipt.eventCount is Postgres int4. Same overflow vector
+  // as eventPayload.seq above; receipt.body's signed eventCount
+  // should match the row-count anyway, so bounding here also
+  // catches attacker/runaway daemons committing receipts with
+  // impossible counts (nonsense audit trail).
+  eventCount: z.number().int().min(0).max(100_000_000),
   issuedAt: z.coerce.date(),
-  stopReasonId: z.number().int().optional(),
+  // R161 F1: cap stopReasonId to [0, 1M]. Prior shape had NO
+  // min AND NO max — accepted negative numbers and the full
+  // MAX_SAFE_INTEGER range. Session.stopReasonId is Postgres
+  // int4?; a negative value would trip R79 F1's stopReason
+  // resolver logic in unexpected ways, and 3e9 would trip
+  // numeric_value_out_of_range. Realistic stop reason IDs are
+  // a small enum (<100 today); 1M is a safe outer envelope.
+  stopReasonId: z.number().int().min(0).max(1_000_000).optional(),
   stopReason: z.string().max(80).optional(),
 });
 
