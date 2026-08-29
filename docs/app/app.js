@@ -3962,7 +3962,7 @@
                   // "session expired" toast on top of "Passkey
                   // revoked" and boots the user to /#/login anyway.
                   // Do a purposeful sign-out matching signOut() at
-                  // app.js:690-710 so the UX is one deliberate flow,
+                  // app.js:730-750 so the UX is one deliberate flow,
                   // not two stacked toasts.
                   stopLiveStream();
                   rolePreview = null;
