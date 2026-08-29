@@ -614,7 +614,12 @@ code, pre, .mono {
    * lets wide tables push the column wider than the viewport. Constrain
    * explicitly so mobile layouts don't get horizontal scroll. */
   min-width: 0;
-  overflow-x: hidden;
+  /* clip, not hidden: overflow-x:hidden silently makes .main a scroll
+     container (computed overflow-y becomes auto), which retargets every
+     position:sticky descendant — the sticky table headers stuck to a
+     scrollport that never scrolls, i.e. never stuck at all. clip keeps
+     the horizontal containment without creating a scroll container. */
+  overflow-x: clip;
 }
 
 .page-header {
@@ -774,7 +779,12 @@ a.stat.linked:hover .label::after { content: " →"; }
  * TABLES
  * ============================================================ */
 .table-wrap {
-  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden;
+  /* overflow: clip (not hidden) keeps the border-radius clipping but
+     does NOT create a scroll container — position:sticky on th would
+     otherwise silently never stick (it would target this non-scrolling
+     clip box instead of the page). Phones override to overflow-x:auto,
+     which trades sticky headers for horizontal scroll. */
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md); overflow: clip;
   /* Positioning context so absolutely-positioned .sr-only table headers
      stay inside the (possibly scrolling) wrap instead of extending the
      document's scroll width on phones. */
@@ -818,6 +828,14 @@ th {
   border-bottom: 1px solid var(--border);
   text-transform: uppercase;
   letter-spacing: 0.04em;
+  /* Column context survives long lists (250-row bigdata sessions):
+     headers stick just below the sticky topbar. Opaque background so
+     rows scroll underneath; z below the topbar's 20. border-collapse
+     drops a stuck th's border, so the separator is an inset shadow. */
+  position: sticky;
+  top: var(--topbar-h);
+  z-index: 5;
+  box-shadow: inset 0 -1px 0 var(--border);
 }
 tbody tr { border-bottom: 1px solid var(--border); }
 tbody tr:last-child { border-bottom: 0; }
@@ -1480,6 +1498,11 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   gap: var(--s-4);
 }
 @media (max-width: 800px) { .settings-shell { grid-template-columns: 1fr; } }
+/* Grid children default to min-content sizing: a wide table inside the
+   panel blew the whole panel out to ~640px on a 390px phone, pushing
+   header buttons (+ Add IdP) off-viewport. The .main clip used to mask
+   it (scripts could still scroll there; thumbs could not). */
+.settings-panel { min-width: 0; }
 .settings-nav {
   background: var(--surface);
   border: 1px solid var(--border);
@@ -1626,6 +1649,10 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
      width (overflow:hidden let the table force the whole console
      wider than the phone screen). min-width keeps rows readable. */
   .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  /* No sticky headers on phones: the wrap above is a scroll container,
+     so a sticky th retargets to IT, hovers over the rows, and eats
+     their taps (elementFromPoint returned the TH over a data cell). */
+  th { position: static; }
   .table-wrap table { min-width: 640px; }
   /* Header actions wrap under the title instead of overflowing. */
   .page-header { flex-wrap: wrap; row-gap: var(--s-2); }
