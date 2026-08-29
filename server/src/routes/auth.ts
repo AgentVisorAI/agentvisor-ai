@@ -540,6 +540,26 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     // (out of scope for this hardening — this endpoint is
     // whole-org by design and should be owner-only accordingly).
     if (claims.membershipRole !== "owner") {
+      // R143 F2: forensic breadcrumb for non-owner attempts on
+      // R136 F1's "single largest-blast-radius endpoint." Prior
+      // shape returned 403 silently — an admin investigating
+      // "who tried to export our org history at 03:12 without
+      // owner rights" got nothing. Same slug as R142 F1's
+      // password branch; note distinguishes the wire cause so
+      // an owner audit trail can grep both "invalid_password"
+      // and "not_owner" against the endpoint metadata.
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "auth.step_up_denied",
+          actorId: claims.sub,
+          actorEmail: claims.sub,
+          note: "not_owner",
+          metadata: { endpoint: "me.export" },
+          req,
+        },
+        req.log,
+      );
       return reply.code(403).send({ error: "only_owner_can_export" });
     }
     const body = z
@@ -808,6 +828,21 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     const claims = requireSession(req, reply);
     if (!claims) return;
     if (claims.membershipRole !== "owner") {
+      // R143 F2: same forensic breadcrumb as /me/export non-owner
+      // above — this endpoint deletes the whole org, so
+      // non-owner attempts merit an audit row.
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "auth.step_up_denied",
+          actorId: claims.sub,
+          actorEmail: claims.sub,
+          note: "not_owner",
+          metadata: { endpoint: "me.delete_account" },
+          req,
+        },
+        req.log,
+      );
       return reply.code(403).send({ error: "only_owner_can_delete" });
     }
     const body = z
