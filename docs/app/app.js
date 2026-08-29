@@ -1822,17 +1822,8 @@
       "</div>";
   }
   function installFilters(root, deps) {
-    function apply() { writeSessionsFilterToHash(); renderSessionsList(root); }
     var fS = $("#fSearch", root);
-    if (fS) {
-      var timer;
-      fS.addEventListener("input", function () {
-        clearTimeout(timer);
-        timer = setTimeout(function () { sessionsFilter.q = fS.value.trim(); apply(); }, 220);
-      });
-    }
     var fR = $("#fRange", root);
-    if (fR) fR.addEventListener("change", function () { sessionsFilter.sinceHours = parseInt(fR.value, 10); apply(); });
     var fD = $("#fDep", root);
     if (fD && deps) {
       deps.forEach(function (d) {
@@ -1841,7 +1832,6 @@
         if (sessionsFilter.deploymentId === d.id) o.selected = true;
         fD.appendChild(o);
       });
-      fD.addEventListener("change", function () { sessionsFilter.deploymentId = fD.value; apply(); });
     }
     var fA = $("#fAgent", root);
     if (fA) {
@@ -1852,13 +1842,40 @@
         if (sessionsFilter.agent === a) o.selected = true;
         fA.appendChild(o);
       });
-      fA.addEventListener("change", function () { sessionsFilter.agent = fA.value; apply(); });
     }
-    var fB = $("#fBlocked", root);
-    if (fB) fB.addEventListener("change", function () { sessionsFilter.blockedOnly = fB.checked; apply(); });
-    var cp = $("#clearPolicyFilter", root);
-    if (cp) cp.addEventListener("click", function () { sessionsFilter.policyId = ""; apply(); });
   }
+
+  // Filter-bar liveness from FIRST paint: the bar renders with the
+  // loading skeleton, but its listeners used to be wired only after the
+  // fetch resolved (installFilters). Anything typed or changed in that
+  // window sat dead — the text survived the repaint while the list
+  // below silently ignored it. Document-level delegation (the #addPol
+  // pattern, invariant 4) keeps every control live; a skeleton-phase
+  // change simply supersedes the in-flight fetch via _sessionsFetchSeq.
+  function sessionsListActive() { return /^#\/sessions(\?|$)/.test(location.hash || ""); }
+  function applySessionsFilterChange() { writeSessionsFilterToHash(); renderSessionsList($("#view")); }
+  var _fSearchTimer;
+  document.addEventListener("input", function (e) {
+    if (!e.target || e.target.id !== "fSearch" || !sessionsListActive()) return;
+    var v = e.target.value;
+    clearTimeout(_fSearchTimer);
+    _fSearchTimer = setTimeout(function () { sessionsFilter.q = v.trim(); applySessionsFilterChange(); }, 220);
+  });
+  document.addEventListener("change", function (e) {
+    var t = e.target;
+    if (!t || !sessionsListActive()) return;
+    if (t.id === "fRange") sessionsFilter.sinceHours = parseInt(t.value, 10);
+    else if (t.id === "fDep") sessionsFilter.deploymentId = t.value;
+    else if (t.id === "fAgent") sessionsFilter.agent = t.value;
+    else if (t.id === "fBlocked") sessionsFilter.blockedOnly = t.checked;
+    else return;
+    applySessionsFilterChange();
+  });
+  document.addEventListener("click", function (e) {
+    if (!e.target || e.target.id !== "clearPolicyFilter" || !sessionsListActive()) return;
+    sessionsFilter.policyId = "";
+    applySessionsFilterChange();
+  });
 
   function sessionsTable(sessions, sortable) {
     if (sessions.length === 0) return emptyState("No sessions yet", "Sessions from your daemons will appear here.");

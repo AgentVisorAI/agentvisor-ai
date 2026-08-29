@@ -1570,8 +1570,44 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ form semantics: type=url validates, Enter submits the webhook form, retention max enforced");
 }
 
+// ── 28. Skeleton-phase filter liveness: the sessions filter bar paints
+// with the loading skeleton, but its listeners used to be wired only
+// after the fetch resolved — anything typed in that window sat dead in
+// the bar while the unfiltered list painted below. Delegated listeners
+// (invariant 4) must keep the bar live from first paint.
+{
+  const skPage = await context.newPage();
+  await skPage.addInitScript(() => {
+    window.__slowOnce = true;
+    const arm = () => {
+      if (!window.dataSource) return setTimeout(arm, 5);
+      const orig = window.dataSource.listSessions.bind(window.dataSource);
+      window.dataSource.listSessions = (...a) => {
+        if (window.__slowOnce) { window.__slowOnce = false; return new Promise((r) => setTimeout(r, 2000)).then(() => orig(...a)); }
+        return orig(...a);
+      };
+    };
+    arm();
+  });
+  await skPage.goto(SITE + "#/sessions", { waitUntil: "domcontentloaded" });
+  await skPage.waitForSelector("#fSearch", { timeout: 15000 });
+  await skPage.click("#fSearch");
+  await skPage.keyboard.type("returns", { delay: 40 });
+  await skPage.waitForTimeout(3200); // superseding fetch + the stale slow one both land
+  const sk = await skPage.evaluate(() => ({
+    inputVal: document.getElementById("fSearch")?.value,
+    rows: document.querySelectorAll("tbody tr").length,
+    allMatch: [...document.querySelectorAll("tbody tr")].every((r) => /returns-triage/.test(r.textContent)),
+    hash: location.hash,
+  }));
+  if (sk.inputVal !== "returns" || !sk.rows || !sk.allMatch || !/q=returns/.test(sk.hash))
+    fail("skeleton-phase typing was dropped: " + JSON.stringify(sk));
+  await skPage.close();
+  console.log("✅ skeleton-phase filter liveness: typing during the loading skeleton filters and syncs the URL");
+}
+
 if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors));
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 27 interactive-features drill checks passed.");
+console.log("\nAll 28 interactive-features drill checks passed.");
