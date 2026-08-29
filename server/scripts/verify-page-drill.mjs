@@ -60,6 +60,16 @@ await page.waitForSelector("#drop", { timeout: 10000 });
 await page.waitForSelector("#loadExample", { timeout: 5000 });
 console.log("✅ /verify page renders with drop zone + sample button");
 
+// 1b. The verdict container is a registered live region (present from
+// load, role=status): screen-reader users must HEAR "verifies" /
+// "does not verify" — the verdict is the page's entire purpose.
+const lr = await page.evaluate(() => {
+  const r = document.getElementById("result");
+  return { role: r.getAttribute("role"), live: r.getAttribute("aria-live"), hidden: r.hidden };
+});
+if (lr.role !== "status" || lr.live !== "polite" || lr.hidden) fail("verdict container not an announced live region: " + JSON.stringify(lr));
+console.log("✅ verdict container is a polite status live region, registered from load");
+
 // 2. Try sample -> the sample's pubkey ships on the page's trust
 // anchor list (a deliberate product decision from #44: investors
 // clicking "Try it with a sample" must see the full green TRUSTED
@@ -293,4 +303,4 @@ if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors))
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 12 /verify page drill checks passed.");
+console.log("\nAll 13 /verify page drill checks passed.");
