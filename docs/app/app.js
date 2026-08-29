@@ -2346,7 +2346,7 @@
           message: "receipt.rawBody (UTF-8 bytes)",
           signature: "base64-decode(receipt.rawSignatureB64)",
           publicKey: "hex-decode(publicKey.hex)",
-          command: "node server/scripts/verify-receipt.mjs " + (sess.externalId || sess.id) + ".json",
+          command: "node tools/verify-receipt.mjs " + (sess.externalId || sess.id) + ".json",
           docs: "https://agentvisorai.me/reference/receipts",
         },
       };
@@ -4745,7 +4745,7 @@
     var pages = [
       { g: "Pages", label: "Verify a receipt", desc: "Public offline verifier — green tick, no account", run: function () { window.open("../verify/", "_blank", "noopener"); } },
       { g: "Pages", label: "Watch the pitch", desc: "30 s hero + 130 s full tour, with transcripts", run: function () { window.open("../pitch/", "_blank", "noopener"); } },
-      { g: "Pages", label: "Read the code", desc: "github.com/AgentVisorAI/agentvisor-ai", run: function () { window.open("https://github.com/AgentVisorAI/agentvisor-ai", "_blank", "noopener"); } },
+      { g: "Pages", label: "Read the code", desc: "github.com/AgentVisorAI/agentvisor", run: function () { window.open("https://github.com/AgentVisorAI/agentvisor", "_blank", "noopener"); } },
     ];
     if (state.ds.mode === "mock") {
       // Demo-table reset: judges hand the laptop around; this returns
