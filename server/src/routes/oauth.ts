@@ -328,7 +328,7 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
     // outlook.com / gmail alias mimicking `victim@corp.com` via a
     // misconfigured MSA tenant would then pass the `emailVerified`
     // gate and be upserted onto the victim's existing account
-    // (line 241 `db.user.findUnique({ where: { email } })`) — an
+    // (line 352 `db.user.findUnique({ where: { email } })`) — an
     // account-takeover primitive. If interop with a specific
     // stringly-typed IdP is required, add a per-issuer allowlist
     // that opts THAT `iss` in explicitly.
@@ -439,7 +439,7 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
     }
     // R120 F2 (resolves the R110 F4 deferred item): OAuth login
     // MUST NOT bypass the WebAuthn MFA gate that /login enforces
-    // (auth.ts:326-340). Otherwise the whole point of a passkey
+    // (auth.ts:429-455). Otherwise the whole point of a passkey
     // — "password compromise ≠ account takeover" — is silently
     // invalidated any time a user has a linked OAuth account:
     //   1. User signs up with password + adds a hardware passkey.

@@ -413,7 +413,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       // warn. The "audit + logging" invariant the R77 F4
       // comment claimed was only ever satisfied by the log
       // side; the audit was dead code. Same rationale
-      // /me/delete-account uses (auth.ts:777 "writeAudit into
+      // /me/delete-account uses (auth.ts:963-967 "writeAudit into
       // audit_entries would itself be nuked … SOC-2 evidence
       // for tenant erasure comes from those logs") applies
       // symmetrically here — no orgId to attach to by
@@ -598,7 +598,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     // responses) and sub, every receipt. A plain member could
     // supply their own password and exfil the whole org.
     // Compare the sibling /me/delete-account which correctly
-    // owner-only-gates at auth.ts:538. GDPR data-portability is
+    // owner-only-gates at auth.ts:897-905. GDPR data-portability is
     // an org-level right exercised by the owner; a per-user
     // export would need to filter by actorId on every table
     // (out of scope for this hardening — this endpoint is
