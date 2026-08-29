@@ -46,7 +46,7 @@ import {
   verifyPassword,
   getDummyPasswordHash,
 } from "../lib/auth.js";
-import { writeAudit } from "../lib/audit.js";
+import { writeAudit, resolveActor } from "../lib/audit.js";
 import { perIpCookieOnly } from "../lib/rate-limit.js";
 import { requireSession } from "../lib/session-middleware.js";
 
@@ -325,7 +325,7 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
         {
           orgId: claims.orgId,
           event: "mfa.credential_register_denied",
-          actorId: claims.sub,
+          ...(await resolveActor(claims.sub)),
           note: "invalid_password",
           req,
         },
@@ -421,7 +421,7 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
       {
         orgId: claims.orgId,
         event: "mfa.credential_registered",
-        actorId: claims.sub,
+        ...(await resolveActor(claims.sub)),
         target: body.data.label,
         metadata: { credentialLabel: body.data.label },
         req,
@@ -773,7 +773,7 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
       {
         orgId: claims.orgId,
         event: "mfa.credential_relabeled",
-        actorId: claims.sub,
+        ...(await resolveActor(claims.sub)),
         target: updated.label,
         metadata: {
           credentialId: updated.id,
@@ -835,7 +835,7 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
         {
           orgId: claims.orgId,
           event: "mfa.credential_revoke_denied",
-          actorId: claims.sub,
+          ...(await resolveActor(claims.sub)),
           note: "invalid_password",
           req,
         },
@@ -887,7 +887,7 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
       {
         orgId: claims.orgId,
         event: "mfa.credential_revoked",
-        actorId: claims.sub,
+        ...(await resolveActor(claims.sub)),
         target: cred.label,
         req,
       },

@@ -4,7 +4,8 @@ import { db } from "../db.js";
 import { env } from "../env.js";
 import { requireSession } from "../lib/session-middleware.js";
 import { MEMBER_REDACTED } from "../lib/redaction.js";
-import { writeAudit } from "../lib/audit.js";
+import { writeAudit, resolveActor } from "../lib/audit.js";
+import { perIpCookieOnly } from "../lib/rate-limit.js";
 
 // Opaque cursor encoding for session pagination. Base64(JSON) of the
 // last row's (openedAt, id) so pagination is stable even as new
@@ -448,7 +449,20 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
       limit?: number;
       event?: string;
     };
-  }>("/audit", async (req, reply) => {
+  }>("/audit", {
+    // R147 F2: per-IP rate limit. Prior shape fell to the global
+    // 300/min/IP bucket. R91 F2 comment above already notes audit
+    // is "strictly more portable" for exfil; a stolen owner/admin
+    // cookie could paginate at limit=200 for ~60k rows/min with
+    // no throttle. R137 F1 + R138 F1 audit.viewed emissions
+    // record the drain but don't cap it — the fire-and-forget
+    // breadcrumb IS the audit log the attacker just exfiltrated.
+    // perIpCookieOnly matches the R142 F2 shape used on
+    // /me/export; 30/min covers legitimate console browsing
+    // (limit=50 default × 30/min = 1500 rows/min visible) while
+    // capping the drain rate.
+    config: { rateLimit: perIpCookieOnly(30, 60_000) },
+  }, async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
     // R91 F2: audit log entries expose every owner/admin's email
@@ -553,11 +567,15 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
     // render unaudited (no event filter) while forcing every
     // targeted enumeration into the trail.
     if (query.data.cursor || query.data.event) {
+      // R147 F3: enrich actor email — this is the SELF-referential
+      // "who drained the audit trail" breadcrumb, so owner
+      // attribution matters most here.
+      const viewedActor = await resolveActor(claims.sub);
       writeAudit(
         {
           orgId: claims.orgId,
           event: "audit.viewed",
-          actorId: claims.sub,
+          ...viewedActor,
           target: claims.orgId,
           metadata: {
             paginated: !!query.data.cursor,
@@ -593,6 +611,15 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
   // 10k-row export doesn't spike Node's heap.
   app.get<{ Querystring: { before?: string } }>(
     "/audit.csv",
+    {
+      // R147 F2: /me/export cadence (3/min). CSV is up to 10k
+      // rows per pull — even one hit is a bulk exfil, so aggressive
+      // rate limiting matches the R142 F2 posture. Sibling /audit
+      // (JSON) is more relaxed at 30/min because it's the SPA's
+      // live-render path; the CSV path is exclusively a bulk
+      // download.
+      config: { rateLimit: perIpCookieOnly(3, 60_000) },
+    },
     async (req, reply) => {
       const claims = requireSession(req, reply);
       if (!claims) return;
@@ -662,11 +689,13 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
       // Emit after the member-gate + cursor validation but before
       // reply.raw.setHeader so the audit fires whether the stream
       // succeeds or errors. Same fire-and-forget shape as R136 F1.
+      // R147 F3: enrich actor email — self-referential drain.
+      const exportedActor = await resolveActor(claims.sub);
       writeAudit(
         {
           orgId: claims.orgId,
           event: "audit.exported_csv",
-          actorId: claims.sub,
+          ...exportedActor,
           target: claims.orgId,
           metadata: {
             before: before.toISOString(),
