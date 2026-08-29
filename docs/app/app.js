@@ -2636,7 +2636,10 @@
         '<dl class="kv" style="display:grid;grid-template-columns:140px 1fr;gap:5px 12px;font-size:13px">' +
           '<dt style="color:var(--fg-3)">Fingerprint</dt><dd class="mono">' + copyable(d.keyFingerprint) + "</dd>" +
           '<dt style="color:var(--fg-3)">Public key</dt><dd class="mono" style="word-break:break-all">' + copyable(d.publicKeyHex) + "</dd>" +
-          '<dt style="color:var(--fg-3)">Ingest token</dt><dd class="mono">' + copyable(d.ingestTokenHint) + "</dd>" +
+          // No copy button here: the hint is a redacted placeholder
+          // ("av_live_9HpD…") — copying it pastes garbage. The full
+          // token is only shown once, at create/rotate.
+          '<dt style="color:var(--fg-3)">Ingest token</dt><dd class="mono">' + esc(d.ingestTokenHint) + ' <span style="color:var(--fg-3);font-size:11px">(full token shown once at create/rotate)</span></dd>' +
         "</dl>" +
         '<div style="margin-top: 12px; display:flex; gap:8px">' +
           '<button class="btn" id="depRotate">Rotate token</button>' +
