@@ -3270,13 +3270,39 @@
   // Wire Escape + Tab focus trap for a modal backdrop. Returns nothing;
   // the caller is expected to append the backdrop first and pass its
   // own close() so the same teardown path runs on Escape and on click.
+  // Data-loss guard: a reflexive Escape or a mis-click on the backdrop
+  // used to instantly discard everything typed into a modal form (the
+  // SAML form is 8+ fields). If the modal has unsaved edits, the first
+  // close attempt arms a short window and explains; a second attempt
+  // within it discards for real. Explicit Cancel buttons stay
+  // immediate — clicking Cancel is a deliberate act.
+  function modalDirty(backdrop) {
+    return Array.prototype.some.call(backdrop.querySelectorAll("input, textarea, select"), function (el) {
+      if (el.type === "hidden" || el.readOnly || el.disabled) return false;
+      if (el.type === "checkbox" || el.type === "radio") return el.checked !== el.defaultChecked;
+      if (el.tagName === "SELECT") {
+        var def = -1;
+        for (var i = 0; i < el.options.length; i++) if (el.options[i].defaultSelected) { def = i; break; }
+        return el.selectedIndex !== (def === -1 ? 0 : def);
+      }
+      return (el.value || "") !== (el.defaultValue || "");
+    });
+  }
+  function discardGuard(backdrop) {
+    if (!modalDirty(backdrop)) return false;
+    if (backdrop._discardArmed) return false; // second attempt: really discard
+    backdrop._discardArmed = true;
+    setTimeout(function () { backdrop._discardArmed = false; }, 2000);
+    toast("Unsaved changes — press Escape (or click outside) again to discard");
+    return true;
+  }
   function installModalKeys(backdrop, close) {
     function focusables() {
       return Array.from(backdrop.querySelectorAll('button, [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'))
         .filter(function (el) { return el.offsetParent !== null || el.tagName === "INPUT"; });
     }
     function onKey(e) {
-      if (e.key === "Escape") { e.preventDefault(); close(); return; }
+      if (e.key === "Escape") { e.preventDefault(); if (discardGuard(backdrop)) return; close(); return; }
       if (e.key === "Tab") {
         var els = focusables(); if (!els.length) return;
         var first = els[0], last = els[els.length - 1];
@@ -3284,14 +3310,23 @@
         else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
       }
     }
+    // Backdrop mis-click, same guard. Document capture phase runs
+    // before the modal's own bubble-phase click-to-close handler, so
+    // this can veto it regardless of listener registration order.
+    function onDocClick(e) {
+      if (e.target !== backdrop) return;
+      if (discardGuard(backdrop)) { e.stopPropagation(); e.preventDefault(); }
+    }
     // Close on navigation too. Modals are body-level; a route change
     // re-renders #view underneath them but would otherwise leave the
     // backdrop up, blocking every click on the new page.
     function onNav() { if (close) close(); }
     document.addEventListener("keydown", onKey);
+    document.addEventListener("click", onDocClick, true);
     window.addEventListener("hashchange", onNav);
     return function uninstall() {
       document.removeEventListener("keydown", onKey);
+      document.removeEventListener("click", onDocClick, true);
       window.removeEventListener("hashchange", onNav);
     };
   }
