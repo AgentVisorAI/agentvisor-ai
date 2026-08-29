@@ -353,6 +353,28 @@ async function main(): Promise<void> {
   // pass through untouched.
   app.addHook("onSend", async (req, reply, payload) => {
     reply.header("X-Request-Id", String(req.id));
+    // R166 F1: Cache-Control: private, no-store as global
+    // default. Every API response carries user-scoped data
+    // (session cookie via requireSession, api-key via
+    // authenticate). Fastify doesn't set Cache-Control by
+    // default and @fastify/helmet dropped its Cache-Control
+    // module years ago — responses go out with no header, so
+    // shared caches (corporate transparent proxies, ISP
+    // caches, naive CDN configurations) fall back to
+    // heuristic freshness and MAY store an authenticated
+    // JSON payload. A user hitting /api/v1/auth/me on a
+    // shared coffee-shop proxy can then have their {id,
+    // email, displayName} returned to the next user of the
+    // same proxy — same-URL cache key, no Vary: Cookie
+    // required by the spec. `private, no-store` blocks the
+    // whole class. Skip when a route already set a specific
+    // policy (stream.ts:57 SSE `no-store, no-transform`,
+    // read.ts:775 CSV export `no-store`, auth.ts:673
+    // /me/export `no-store`) — those are stricter or
+    // equivalent, no need to overwrite.
+    if (!reply.getHeader("Cache-Control")) {
+      reply.header("Cache-Control", "private, no-store");
+    }
     if (reply.statusCode < 400) return payload;
     if (typeof payload !== "string") return payload;
     // Only transform JSON bodies — HTML error pages (helmet, static) pass through.
