@@ -1098,7 +1098,7 @@
             onConfirm: function (email) {
               state.ds.discoverSaml(email).then(function (r) {
                 if (!r.ssoConfig) {
-                  toast("No SSO configured for that domain. Ask your admin to add your IdP in Settings → Single sign-on.", true);
+                  toast("No SSO configured for that domain. Ask your admin to add your IdP in Settings → SSO.", true);
                   return;
                 }
                 var relay = (sessionStorage.getItem("av_return_to") || "");
@@ -2413,7 +2413,10 @@
         toast("Verify link copied. Recipient's browser will auto-verify it.");
       }, function () {
         // Fallback: show it in a modal so the user can copy manually.
-        showTokenModal(url, "Share this verify link");
+        showTokenModal(url, "Share this verify link", {
+          subtitle: "Anyone with this link can verify the receipt offline in their browser.",
+          notice: "The link is derived from the receipt id and signature — you can regenerate it any time from the same session detail.",
+        });
       });
     });
 
@@ -2690,7 +2693,12 @@
               confirmLabel: "Rotate token",
               danger: true,
               onConfirm: function () {
-                state.ds.rotateDeploymentToken(id).then(function (r) { showTokenModal(r.ingestToken, "Token rotated"); })
+                state.ds.rotateDeploymentToken(id).then(function (r) {
+                  showTokenModal(r.ingestToken, "Token rotated", {
+                    subtitle: "Paste this token into your daemon's AV_INGEST_TOKEN env var. Store it in your secret manager — this is the only time it's shown.",
+                    notice: "The previous ingest token is invalidated immediately; every daemon using it will fail to connect until you swap the value.",
+                  });
+                })
                   .catch(function (err) { toast(err.message || "Rotation failed", true); });
               },
             });
@@ -2783,7 +2791,12 @@
         body: "The old token stops working immediately.",
         confirmLabel: "Rotate", danger: true,
         onConfirm: function () {
-          state.ds.rotateDeploymentToken(d.id).then(function (r) { showTokenModal(r.ingestToken, "Token rotated"); })
+          state.ds.rotateDeploymentToken(d.id).then(function (r) {
+            showTokenModal(r.ingestToken, "Token rotated", {
+              subtitle: "Paste this token into your daemon's AV_INGEST_TOKEN env var. Store it in your secret manager — this is the only time it's shown.",
+              notice: "The previous ingest token is invalidated immediately; every daemon using it will fail to connect until you swap the value.",
+            });
+          })
             .catch(function (err) { toast(err.message, true); });
         },
       });
@@ -2897,22 +2910,33 @@
       var btn = e.target.querySelector('button[type="submit"]');
       btn.disabled = true;
       state.ds.createDeployment({ name: $("#depName").value.trim(), environment: $("#depEnv").value, region: $("#depRegion").value.trim() || undefined })
-        .then(function (r) { close(); showTokenModal(r.ingestToken, "Deployment created"); })
+        .then(function (r) {
+          close();
+          showTokenModal(r.ingestToken, "Deployment created", {
+            subtitle: "Paste this token into your daemon's AV_INGEST_TOKEN env var. Store it in your secret manager — this is the only time it's shown.",
+            notice: "If you lose the token, rotate to mint a new one from the deployment's detail page; the current value stops being accepted immediately.",
+          });
+        })
         .catch(function (err) { btn.disabled = false; toast(err.message || "Create failed", true); });
     });
     setTimeout(function () { backdrop.querySelector('#depName').focus(); }, 20);
   }
 
-  function showTokenModal(token, title) {
+  function showTokenModal(token, title, opts) {
     if (document.body.classList.contains("locked")) return;
+    opts = opts || {};
+    var subtitle = opts.subtitle ||
+      "Copy this value now — this is the only time you'll see it in the console.";
+    var notice = opts.notice ||
+      "If you lose it, rotate to get a new one; the previous value stops being accepted immediately.";
     var backdrop = h(
       '<div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="tokTitle">' +
         '<div class="modal">' +
           '<h2 id="tokTitle">' + esc(title || "Ingest token") + "</h2>" +
-          '<p class="sub">Point your daemon at this console using the token below. Store it in your secret manager. It won\'t be shown again.</p>' +
+          '<p class="sub">' + esc(subtitle) + '</p>' +
           '<div class="token-display">' + esc(token) + "</div>" +
           '<div class="notice"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M8 1L15 14H1L8 1z"/><path d="M8 6v3M8 11v.5"/></svg>' +
-            '<span>This is the only time you\'ll see the full token. If you lose it, rotate to get a new one.</span></div>' +
+            '<span>' + esc(notice) + '</span></div>' +
           '<div class="actions"><button type="button" class="btn" id="copyTok">Copy</button><button type="button" class="btn accent" data-close>Done</button></div>' +
         "</div>" +
       "</div>"
@@ -3761,7 +3785,10 @@
             if (!name || !name.trim()) return;
             try {
               var res = await state.ds.createApiKey(name.trim());
-              showTokenModal(res.plaintextToken, "API key created");
+              showTokenModal(res.plaintextToken, "API key created", {
+                subtitle: "Store this API key in your CI runner or automation's secret manager. Send it as the Bearer token in the Authorization header.",
+                notice: "If you lose it, delete this key and create a new one — the plaintext value is never stored on the server, only its argon2 hash.",
+              });
               await renderSettingsKeys(root);
             } catch (e) {
               toast(e && e.message ? e.message : "Could not create key");
@@ -4069,7 +4096,10 @@
           // no-ops while body is locked, so the new SP cert was
           // silently never displayed (pre-existing bug).
           close();
-          showTokenModal(r.spCertPem, "New SP certificate");
+          showTokenModal(r.spCertPem, "New SP certificate", {
+            subtitle: "Upload this X.509 certificate to your IdP's SAML metadata before existing pending AuthnRequests time out.",
+            notice: "The previous SP certificate is invalidated immediately — every pending sign-in ceremony against the old cert will fail until the IdP is updated.",
+          });
         }).catch(function (err) { toast(err.message || "Regenerate failed", true); act.disabled = false; });
       }
     });
@@ -4374,7 +4404,10 @@
         try {
           var res = await state.ds.createWebhook({ name: name, url: url, events: events });
           closeWh();
-          showTokenModal(res.secret, "Webhook secret");
+          showTokenModal(res.secret, "Webhook secret", {
+            subtitle: "Configure your receiver to validate every delivery with this HMAC signing secret. Compare against the X-AgentVisor-Signature header.",
+            notice: "If you lose it, rotate to mint a new secret; deliveries signed with the old one will still verify against your receiver until you swap them.",
+          });
           await renderSettingsWebhooks(root);
         } catch (e2) {
           saveBtn.disabled = false;
@@ -4505,7 +4538,16 @@
       if (!current) return;
       if (act === "test") {
         try { await state.ds.testWebhook(id); toast("Test event fired."); }
-        catch (err) { toast(err.message || "Test failed"); }
+        catch (err) {
+          // R227 F2: map the paused-webhook 409 to a helpful nudge
+          // instead of the pre-fix "not_found" alarm.
+          var msg = err && err.message ? err.message : "";
+          if (/webhook_paused/i.test(msg)) {
+            toast("This webhook is paused — resume it before sending a test.");
+          } else {
+            toast(msg || "Test failed");
+          }
+        }
       } else if (act === "toggle") {
         try {
           await state.ds.updateWebhook(id, { isActive: !current.isActive });
@@ -4527,7 +4569,10 @@
           onConfirm: async function () {
             try {
               var res = await state.ds.rotateWebhookSecret(id);
-              showTokenModal(res.secret, "New webhook secret");
+              showTokenModal(res.secret, "New webhook secret", {
+                subtitle: "Update your receiver with this new HMAC signing secret before the next event fires — otherwise verification on your side will fail.",
+                notice: "The previous secret is invalidated immediately. Deliveries in-flight when you rotated may still arrive signed with the old value; retries will use the new one.",
+              });
             } catch (err) { toast(err.message || "Rotate failed"); }
           },
         });

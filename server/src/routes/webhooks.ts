@@ -307,10 +307,19 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
     if (!assertNotMember(claims)) {
       return reply.code(403).send({ error: "forbidden" });
     }
+    // R227 F2: split the lookup so we can distinguish "paused" from
+    // "not found". Prior shape queried `where: { id, orgId, isActive:
+    // true }` and returned 404 for both — SPA users clicking Send
+    // test on a paused row (the exact case where they want to smoke
+    // it before resuming) got an alarming "not_found" toast that
+    // suggested the endpoint had been deleted.
     const ep = await db.webhookEndpoint.findFirst({
-      where: { id: req.params.id, orgId: claims.orgId, isActive: true },
+      where: { id: req.params.id, orgId: claims.orgId },
     });
     if (!ep) return reply.code(404).send({ error: "not_found" });
+    if (!ep.isActive) {
+      return reply.code(409).send({ error: "webhook_paused" });
+    }
     dispatchEvent({
       orgId: claims.orgId,
       event: "test",
