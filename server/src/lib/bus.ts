@@ -137,6 +137,26 @@ class Bus extends EventEmitter {
 
   private async openConnections(): Promise<void> {
     const listener = new PgClient({ connectionString: env.DATABASE_URL });
+    // R233 F1: attach the drain/reconnect handlers IMMEDIATELY, before
+    // `.connect()`. Prior shape wired them at lines 180+ after
+    // connect + LISTEN succeeded, leaving a race window where an
+    // error emitted during connect or on the very first query (pg
+    // 57P01 FATAL if the server is bouncing on your connect) fires
+    // on a Client with no `error` listener — node then crashes on
+    // the uncaught event. E2E round 11's Postgres-chaos scenario
+    // reproduced this by SIGTERM'ing pg mid-connection. Attach the
+    // handlers pre-connect so the first byte of any error path is
+    // always caught. `scheduleReconnect()` is re-entrant-safe.
+    const listenerErr = (err: Error) => {
+      // eslint-disable-next-line no-console
+      console.warn("bus: pg listener error, reconnecting", err.message);
+      this.scheduleReconnect();
+    };
+    const listenerEnd = () => {
+      if (!this.closed) this.scheduleReconnect();
+    };
+    listener.on("error", listenerErr);
+    listener.on("end", listenerEnd);
     await listener.connect();
     // R145 F2: wrap everything after listener.connect() in try/catch
     // so a partial-connect failure (Postgres briefly at
@@ -177,17 +197,10 @@ class Bus extends EventEmitter {
           // be shipped with an explicit version tag, not silently.
         }
       });
-      listener.on("error", (err) => {
-        // eslint-disable-next-line no-console
-        console.warn("bus: pg listener error, reconnecting", err.message);
-        this.scheduleReconnect();
-      });
-      listener.on("end", () => {
-        if (!this.closed) this.scheduleReconnect();
-      });
 
       const publisher = new PgClient({ connectionString: env.DATABASE_URL });
-      await publisher.connect();
+      // R233 F1: same pre-connect error-listener discipline as the
+      // listener above.
       publisher.on("error", (err) => {
         // eslint-disable-next-line no-console
         console.warn("bus: pg publisher error, reconnecting", err.message);
@@ -196,6 +209,7 @@ class Bus extends EventEmitter {
       publisher.on("end", () => {
         if (!this.closed) this.scheduleReconnect();
       });
+      await publisher.connect();
 
       this.pgListener = listener;
       this.pgPublisher = publisher;
@@ -204,6 +218,9 @@ class Bus extends EventEmitter {
       // Drain the already-connected listener socket before rethrowing
       // so the caller can retry cleanly.
       listener.removeAllListeners();
+      // Re-add a passthrough noop so `end()`'s finalizing error (if the
+      // socket is already half-dead) doesn't crash node.
+      listener.on("error", () => {});
       await listener.end().catch(() => void 0);
       throw err;
     }
@@ -227,8 +244,19 @@ class Bus extends EventEmitter {
     this.pgListener = null;
     this.pgPublisher = null;
     // Drain any lingering handlers before we open new sockets.
+    // R233 F1: `removeAllListeners()` also strips the `error` handler
+    // we wired at openConnections(). If the server-side connection is
+    // simultaneously emitting a FATAL error (e.g. PG 57P01
+    // admin_shutdown from a pg-side restart), an unhandled `error`
+    // event on a `pg.Client` with no listeners takes down the whole
+    // node process — the exact crash caught in E2E round 11's
+    // Postgres-chaos scenario. Re-add a passthrough noop handler so
+    // any error that races the drain gets swallowed, then let
+    // scheduleReconnect() spin up fresh sockets on the backoff timer.
     listener?.removeAllListeners();
     publisher?.removeAllListeners();
+    listener?.on("error", () => { /* drained; reconnect in flight */ });
+    publisher?.on("error", () => { /* drained; reconnect in flight */ });
     listener?.end().catch(() => {});
     publisher?.end().catch(() => {});
 
