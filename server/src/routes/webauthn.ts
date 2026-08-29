@@ -533,6 +533,20 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
       await db.webauthnCredential.findFirst({
         where: { userId: "__decoy__" },
       }).catch(() => null);
+      // R144 F2: timing floor to match the real path's
+      // verifyAuthenticationResponse cost. R143 F1 closed the
+      // WIRE oracle; R109 F2 closed the DB-lookup timing oracle
+      // on cred_not_found. But when an attacker replays a real
+      // credentialId (learned from /authenticate/challenge's
+      // allowCredentials), the REAL path executes CBOR-decode +
+      // Ed25519/ECDSA verify (~1-5 ms) while the decoy path
+      // returned immediately after the __decoy__ findFirst.
+      // A proxy-pool statistical timing attack over ~100
+      // samples/email would still leak account existence. Sleep
+      // 8 ms on the decoy branch — coarser than a dummy verify
+      // but avoids the crypto-scaffolding risk and covers the
+      // observed ~1-5 ms real-path variance with margin.
+      await new Promise<void>((resolve) => setTimeout(resolve, 8));
       clearChallengeCookie(reply, AUTH_CHALLENGE_COOKIE);
       return reply.code(400).send({ error: "unknown_credential" });
     }
