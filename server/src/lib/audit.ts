@@ -9,12 +9,13 @@
  * catastrophic.
  *
  * `event` is a stable machine-readable slug:
- *   auth.login, auth.logout, auth.signup
+ *   auth.login, auth.logout, auth.signup, auth.oauth_signin
  *   auth.reset_request, auth.reset_confirm, auth.account_deleted
  *   saml.signin, saml.config_created, saml.config_updated,
  *     saml.config_deleted, saml.keypair_rotated
  *   deployment.create, deployment.delete, deployment.token_rotated
  *   member.invited, member.role_changed
+ *   org.created, org.exported
  *
  * `target` is a human-readable label the log viewer shows.
  * `metadata` carries structured fields for machine consumption.
