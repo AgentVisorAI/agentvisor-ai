@@ -417,7 +417,17 @@
       } catch (e) {}
       return navigate("#/login");
     }
-    if (state.session && publicRoutes.includes(path[0])) return navigate("#/overview");
+    if (state.session && publicRoutes.includes(path[0])) {
+      // An authed user clicking a teammate's invite link used to be
+      // bounced to Overview with the invite silently swallowed — and
+      // the accept page's own hint says "sign in first, then click
+      // the invite link again", which made the bounce a dead end.
+      // Say what happened and where to go.
+      if (path[0] === "accept-invite") {
+        toast("You're already signed in. To accept an invite for a different account, sign out first, then open the link again.", true);
+      }
+      return navigate("#/overview");
+    }
     if (!state.session) {
       announceRoute(path);
       if (path[0] === "signup") return renderSignup();
@@ -1221,7 +1231,7 @@
           '<div class="auth-form-inner">' +
             '<div class="auth-brand"><span class="auth-brand-mark">A</span> AgentVisor AI</div>' +
             '<h1>Join the workspace</h1>' +
-            '<p class="sub">Accept your invite for <b>' + esc(email) + '</b> and set a password.</p>' +
+            '<p class="sub">' + (email ? 'Accept your invite for <b>' + esc(email) + '</b> and set a password.' : 'Accept your invite and set a password.') + '</p>' +
             '<form id="acceptForm">' +
               '<div class="field"><label for="displayName">Your name</label><input id="displayName" type="text" placeholder="First Last" autocomplete="name" /></div>' +
               '<div class="field"><label for="password">Password (min 12)</label><input id="password" type="password" required minlength="12" autocomplete="new-password" /></div>' +
