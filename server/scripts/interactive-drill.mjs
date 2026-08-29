@@ -276,8 +276,20 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
       return out;
     });
     if (bad.length) fail(`unclickable/overflowing controls on ${route}: ${JSON.stringify(bad)}`);
+    // Unsized-inline-SVG blowout: an <svg> with no width/height
+    // renders at the replaced-element default — the OAuth provider
+    // logos on the SSO tab exploded to ~110px and shattered their
+    // pills. Any icon-context svg over 40px is a regression
+    // (sparkline/chart svgs live outside pills/buttons/td and are
+    // exempt by the selector).
+    const fatSvgs = await page.evaluate(() =>
+      [...document.querySelectorAll(".pill svg, td svg, .btn svg, button svg")]
+        .filter((s) => { const r = s.getBoundingClientRect(); return r.width > 40 || r.height > 40; })
+        .map((s) => (s.parentElement.className || "?").toString().slice(0, 24) + " " + Math.round(s.getBoundingClientRect().width) + "px")
+        .slice(0, 4));
+    if (fatSvgs.length) fail(`unsized inline svg blowout on ${route}: ${JSON.stringify(fatSvgs)}`);
   }
-  console.log("✅ table action buttons: all inside their cells and hittable (5 routes)");
+  console.log("✅ table action buttons: all inside their cells and hittable (5 routes); no unsized-svg blowouts");
 }
 
 // ── 9. Corrupted-storage resilience ───────────────────────────────
