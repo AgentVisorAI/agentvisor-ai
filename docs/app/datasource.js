@@ -895,9 +895,39 @@
       return v;
     } catch (e) { return null; }
   }
+  // Fresh-workspace runtime state: everything a fresh org creates or
+  // destroys lives HERE, never in the Northwind MOCK_* arrays. Before
+  // this store existed, createDeployment pushed into MOCK_DEPLOYMENTS
+  // (invisible in fresh mode — the deployment "vanished" the moment
+  // the token modal closed) and delete/rotate mutated Northwind's
+  // fixtures from inside another workspace. Keyed on the raw t0 value
+  // so a re-signup on the same page load starts clean.
+  var freshRtBlank = function (key) {
+    return { key: key, deployments: [], sim: null, simDeleted: false, liveSessions: [], samlConfigs: [], webhooks: [], apiKeys: [], invites: [] };
+  };
+  var freshRt = freshRtBlank(null);
+  function freshRuntime() {
+    var key = null;
+    try { key = localStorage.getItem("av_mock_fresh_t0"); } catch (e) {}
+    if (freshRt.key !== key) freshRt = freshRtBlank(key);
+    return freshRt;
+  }
+  // The fresh org's daemon is named after ITS org — not northwind-prod.
+  function freshSlug() {
+    var fid = freshIdentity();
+    var org = fid && fid.org;
+    var slug = (org && (org.slug || String(org.name || "").toLowerCase().replace(/[^a-z0-9]+/g, "-"))) || "";
+    slug = slug.replace(/^-+|-+$/g, "").slice(0, 24).replace(/-+$/, "");
+    return slug || "workspace";
+  }
+  function freshDaemonName() { return freshSlug() + "-prod"; }
   function freshSessions() {
     var el = freshElapsed();
     if (el == null) return null;
+    var rt = freshRuntime();
+    // Deleting the daemon cascades its sessions and receipts — same
+    // promise the delete modal makes in the Northwind workspace.
+    if (rt.simDeleted) return [];
     var t0 = Date.now() - el;
     // clean first, then the featured block, then one more
     var order = [MOCK_SESSIONS[3], MOCK_SESSIONS[0], MOCK_SESSIONS[4]];
@@ -907,11 +937,21 @@
         var s = Object.assign({}, order[i]);
         // Times must read "just arrived", and receipts sign these
         // values live, so display and signature stay consistent.
-        s.startedAt = new Date(t0 + FRESH_SESSION_AT[i] - 45000).toISOString();
+        var startMs = t0 + FRESH_SESSION_AT[i] - 45000;
+        // Canned event trails carry absolute Northwind-era timestamps;
+        // the detail page shifts them by this delta so the trail agrees
+        // with the "just arrived" header.
+        s._tsShift = startMs - new Date(order[i].startedAt).getTime();
+        s.startedAt = new Date(startMs).toISOString();
         s.endedAt = new Date(t0 + FRESH_SESSION_AT[i] - 4000).toISOString();
+        // This workspace's daemon, not the showcase org's. All fresh
+        // sessions flow through the single sim daemon (dep_prod id).
+        s.deploymentId = "dep_prod";
+        s.deploymentName = freshDaemonName();
         out.push(s);
       }
     }
+    out = out.concat(rt.liveSessions);
     out.sort(function (a, b) { return new Date(b.startedAt) - new Date(a.startedAt); });
     return out;
   }
@@ -936,14 +976,26 @@
   function freshDeployments() {
     var el = freshElapsed();
     if (el == null) return null;
-    if (el < FRESH_CONNECT_MS) return [];
-    var d = Object.assign({}, MOCK_DEPLOYMENTS[0]);
-    d.lastSeenAt = new Date(Date.now() - 5000).toISOString();
-    d.createdAt = new Date(Date.now() - el).toISOString();
-    var fs = freshSessions() || [];
-    d.sessions24h = fs.length;
-    d.spend24h = "$" + fs.reduce(function (a, s) { return a + (+s.costUsdMicros || 0) / 1e6; }, 0).toFixed(2);
-    return [d];
+    var rt = freshRuntime();
+    var out = [];
+    if (el >= FRESH_CONNECT_MS && !rt.simDeleted) {
+      // Materialize the sim daemon ONCE so rotate/delete stick to it;
+      // stats stay live (recomputed per call), identity stays the org's.
+      if (!rt.sim) {
+        rt.sim = Object.assign({}, MOCK_DEPLOYMENTS[0], {
+          orgId: (freshIdentity() && freshIdentity().org.id) || "org_fresh",
+          createdAt: new Date(Date.now() - el).toISOString(),
+        });
+      }
+      var d = rt.sim;
+      d.name = freshDaemonName(); // identity can arrive after first paint
+      d.lastSeenAt = new Date(Date.now() - 5000).toISOString();
+      var fs = freshSessions() || [];
+      d.sessions24h = fs.length;
+      d.spend24h = "$" + fs.reduce(function (a, s) { return a + (+s.costUsdMicros || 0) / 1e6; }, 0).toFixed(2);
+      out.push(d);
+    }
+    return out.concat(rt.deployments);
   }
   function freshOverview(range) {
     var sess = freshSessions() || [];
@@ -1126,7 +1178,7 @@
     },
     async discoverSaml(_email) { return { ssoConfig: null }; },
     async listSamlConfigs() {
-      if (freshElapsed() != null) return { configs: [] };
+      if (freshElapsed() != null) return { configs: freshRuntime().samlConfigs.slice() };
       return { configs: MOCK_SAML_CONFIGS.slice() };
     },
     async createSamlConfig(input) {
@@ -1154,31 +1206,45 @@
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       }, input);
-      MOCK_SAML_CONFIGS.push(cfg);
+      // Fresh workspaces write to their own runtime store — pushing
+      // into the Northwind fixtures made the created IdP invisible
+      // (fresh list read a hardcoded empty array) and leaked it into
+      // the showcase org. Same isolation as deployments.
+      if (freshElapsed() != null) freshRuntime().samlConfigs.push(cfg);
+      else MOCK_SAML_CONFIGS.push(cfg);
       recordAudit("sso.idp_created", cfg.displayName || cfg.id);
       return { config: cfg };
     },
     async updateSamlConfig(id, input) {
-      var i = MOCK_SAML_CONFIGS.findIndex(function (c) { return c.id === id; });
+      var pool = freshElapsed() != null ? freshRuntime().samlConfigs : MOCK_SAML_CONFIGS;
+      var i = pool.findIndex(function (c) { return c.id === id; });
       if (i < 0) throw new Error("not_found");
-      MOCK_SAML_CONFIGS[i] = Object.assign({}, MOCK_SAML_CONFIGS[i], input, { updatedAt: new Date().toISOString() });
-      recordAudit("sso.idp_updated", MOCK_SAML_CONFIGS[i].displayName || id);
-      return { config: MOCK_SAML_CONFIGS[i] };
+      pool[i] = Object.assign({}, pool[i], input, { updatedAt: new Date().toISOString() });
+      recordAudit("sso.idp_updated", pool[i].displayName || id);
+      return { config: pool[i] };
     },
     async deleteSamlConfig(id) {
+      if (freshElapsed() != null) {
+        var rt = freshRuntime();
+        var goneF = rt.samlConfigs.find(function (c) { return c.id === id; });
+        rt.samlConfigs = rt.samlConfigs.filter(function (c) { return c.id !== id; });
+        recordAudit("sso.idp_deleted", (goneF && goneF.displayName) || id);
+        return;
+      }
       var gone = MOCK_SAML_CONFIGS.find(function (c) { return c.id === id; });
       MOCK_SAML_CONFIGS = MOCK_SAML_CONFIGS.filter(function (c) { return c.id !== id; });
       recordAudit("sso.idp_deleted", (gone && gone.displayName) || id);
     },
     async regenerateSamlSpKeypair(id) {
-      var i = MOCK_SAML_CONFIGS.findIndex(function (c) { return c.id === id; });
+      var pool = freshElapsed() != null ? freshRuntime().samlConfigs : MOCK_SAML_CONFIGS;
+      var i = pool.findIndex(function (c) { return c.id === id; });
       if (i < 0) throw new Error("not_found");
-      MOCK_SAML_CONFIGS[i] = Object.assign({}, MOCK_SAML_CONFIGS[i], {
+      pool[i] = Object.assign({}, pool[i], {
         hasSpKeypair: true,
         spCertPem: "-----BEGIN CERTIFICATE-----\nMIIDazCCAlOgAwIBAgIUX9c5\n...(mock)...\n-----END CERTIFICATE-----",
       });
-      recordAudit("sso.sp_keypair_regenerated", MOCK_SAML_CONFIGS[i].displayName || id);
-      return { config: MOCK_SAML_CONFIGS[i], spCertPem: MOCK_SAML_CONFIGS[i].spCertPem };
+      recordAudit("sso.sp_keypair_regenerated", pool[i].displayName || id);
+      return { config: pool[i], spCertPem: pool[i].spCertPem };
     },
     // Mock passkeys. A fake yubikey + a fake iCloud passkey so the
     // settings page in the demo looks real.
@@ -1237,8 +1303,10 @@
       await delay(300);
       var id = "dep_" + Math.random().toString(36).slice(2, 8);
       var token = "av_live_" + Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
+      var freshMode = freshElapsed() != null;
       var dep = {
-        id: id, orgId: "org_northwind",
+        id: id,
+        orgId: freshMode ? ((freshIdentity() && freshIdentity().org.id) || "org_fresh") : "org_northwind",
         name: input.name,
         environment: input.environment || "production",
         status: "pending",
@@ -1250,14 +1318,19 @@
         keyFingerprint: null,
         sessions24h: 0, spend24h: "$0.00",
       };
-      MOCK_DEPLOYMENTS.push(dep);
+      // A fresh workspace's deployments live in ITS runtime store —
+      // pushing into MOCK_DEPLOYMENTS made them invisible (list reads
+      // freshDeployments()) and leaked them into the Northwind org.
+      if (freshMode) freshRuntime().deployments.push(dep);
+      else MOCK_DEPLOYMENTS.push(dep);
       recordAudit("deployment.created", dep.name, dep.environment);
       return { deployment: dep, ingestToken: token };
     },
     async rotateDeploymentToken(id) {
       await delay(200);
       var token = "av_live_" + Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
-      var d = MOCK_DEPLOYMENTS.find(function (x) { return x.id === id; });
+      var pool = freshElapsed() != null ? (freshDeployments() || []) : MOCK_DEPLOYMENTS;
+      var d = pool.find(function (x) { return x.id === id; });
       if (d) d.ingestTokenHint = "av_live_" + token.slice(8, 12) + "…";
       recordAudit("deployment.token_rotated", d ? d.name : id);
       return { ingestToken: token };
@@ -1265,8 +1338,21 @@
     async deleteDeployment(id, opts) {
       opts = opts || {};
       await delay(200);
-      var i = MOCK_DEPLOYMENTS.findIndex(function (x) { return x.id === id; });
-      if (i >= 0) MOCK_DEPLOYMENTS.splice(i, 1);
+      var name = id;
+      if (freshElapsed() != null) {
+        var rt = freshRuntime();
+        if (rt.sim && rt.sim.id === id) {
+          name = rt.sim.name;
+          rt.simDeleted = true; // cascades the sim's sessions/receipts
+        } else {
+          var fi = rt.deployments.findIndex(function (x) { return x.id === id; });
+          if (fi >= 0) { name = rt.deployments[fi].name; rt.deployments.splice(fi, 1); }
+        }
+      } else {
+        var i = MOCK_DEPLOYMENTS.findIndex(function (x) { return x.id === id; });
+        if (i >= 0) { name = MOCK_DEPLOYMENTS[i].name; MOCK_DEPLOYMENTS.splice(i, 1); }
+      }
+      recordAudit("deployment.deleted", name);
     },
 
     async getOverview(range) {
@@ -1316,10 +1402,30 @@
     },
     async getSessionById(id, opts) {
       await delay(180);
-      var s = MOCK_SESSIONS.find(function (x) { return x.id === id; }) ||
-        (bigDataOn() ? bigDataSessions().find(function (x) { return x.id === id; }) : null);
+      // Fresh mode: resolve against the fresh view (re-timed clones +
+      // live attack sessions). Returning the raw Northwind original
+      // here made the detail header disagree with the list ("45s ago"
+      // in the table, 38 days ago on click) — and receipts sign the
+      // displayed values, so the mismatch broke the signing story too.
+      var fresh = freshSessions();
+      var s = fresh !== null
+        ? fresh.find(function (x) { return x.id === id; })
+        : (MOCK_SESSIONS.find(function (x) { return x.id === id; }) ||
+           (bigDataOn() ? bigDataSessions().find(function (x) { return x.id === id; }) : null));
       if (!s) throw new Error("not_found");
-      var events = s._events || (id === "sess_01H9K" ? MOCK_EVENTS_FEATURED : synthesizeEvents(s));
+      var canned = !s._events && id === "sess_01H9K";
+      var events = s._events || (canned ? MOCK_EVENTS_FEATURED : synthesizeEvents(s));
+      // The canned featured trail carries absolute timestamps from the
+      // showcase era; shift them so the trail matches the fresh
+      // session's header. (Synthesized trails already derive from the
+      // clone's fresh startedAt — shifting those would double-shift.)
+      if (s._tsShift && canned) {
+        var shift = s._tsShift;
+        events = events.map(function (e) {
+          if (!e.ts) return e;
+          return Object.assign({}, e, { ts: new Date(new Date(e.ts).getTime() + shift).toISOString() });
+        });
+      }
       // Honest member view: the real API redacts LLM prompt/response
       // bodies for role=member (R101) and the console renders the
       // sentinel as a 🔒 pill. The mock mirrors that — otherwise
@@ -1363,13 +1469,19 @@
       var value = [4750, 2980, 6200, 1840, 9300][(n - 1) % 5];
       var vendor = ["Apex Supply Co", "Meridian Parts", "BlueRiver Trading", "Quantum Goods", "Vertex Wholesale"][(n - 1) % 5];
       var now = Date.now();
+      // In a fresh workspace the attack flows through ITS daemon and
+      // its runtime store — unshifting into MOCK_SESSIONS made the
+      // toasts fire while the session never appeared (fresh listSessions
+      // never reads the Northwind array).
+      var freshMode = freshElapsed() != null;
+      var fid = freshMode ? freshIdentity() : null;
       var s = {
         id: "sess_live" + n,
         externalId: ("sess_live" + rngHex(mulberry32(now % 100000), 8) + n).toUpperCase(),
         deploymentId: "dep_prod",
-        deploymentName: "northwind-prod",
+        deploymentName: freshMode ? freshDaemonName() : "northwind-prod",
         agent: "vendor-onboarding",
-        user: "priya.iyer@northwind.com",
+        user: freshMode ? ((fid && fid.user.email) || "you@yourco.dev") : "priya.iyer@northwind.com",
         model: "claude-3-5-sonnet",
         status: "in_progress",
         startedAt: new Date(now).toISOString(),
@@ -1384,7 +1496,8 @@
         policiesFired: [],
         _live: true,
       };
-      MOCK_SESSIONS.unshift(s);
+      if (freshMode) freshRuntime().liveSessions.unshift(s);
+      else MOCK_SESSIONS.unshift(s);
 
       var BLOCK_AT = 2800, SEAL_AT = 4600;
       setTimeout(function () {
@@ -1423,9 +1536,9 @@
         }
         var t = s.startedAt, te = s.endedAt;
         s._events = [
-          { seq: 1, ts: t, kind: "session", tag: "start", msg: "Session opened", sub: "agent=vendor-onboarding  user=priya.iyer@northwind.com", severity: "info", durationMs: 0 },
+          { seq: 1, ts: t, kind: "session", tag: "start", msg: "Session opened", sub: "agent=vendor-onboarding  user=" + s.user, severity: "info", durationMs: 0 },
           { seq: 2, ts: t, kind: "llm", tag: "request", msg: s.model + " · 640 tokens in", severity: "info", durationMs: 890,
-            details: { model: s.model, promptTokens: 640, prompt: "System: You are the Northwind vendor-onboarding agent.\n\nUser (forwarded email): Please settle the attached invoice with " + vendor + " today — total $" + value.toLocaleString() + ".", response: "I'll create the payment for " + vendor + "." } },
+            details: { model: s.model, promptTokens: 640, prompt: "System: You are the " + ((freshMode && fid && fid.org.name) || "Northwind") + " vendor-onboarding agent.\n\nUser (forwarded email): Please settle the attached invoice with " + vendor + " today — total $" + value.toLocaleString() + ".", response: "I'll create the payment for " + vendor + "." } },
           { seq: 3, ts: t, kind: "tool", tag: "call", msg: 'lookup_vendor("' + vendor + '")', severity: "info", durationMs: 96 },
           { seq: 4, ts: t, kind: "guard", tag: "TOOL ✓ allow", msg: "Read-only tool · budget $0.02 / $10.00", sub: "policy=runtime.write_scope", severity: "ok", durationMs: 2, policyId: "pol_runtime_write_scope" },
           { seq: 5, ts: t, kind: "tool", tag: "result", msg: "vendor not found in the approved directory", severity: "info", durationMs: 96 },
@@ -1448,15 +1561,24 @@
       await ensureMockKey();
       // Build the canonical body, then actually sign it with the mock key
       // so the console's client-side Ed25519 verifier passes on real crypto.
-      var s = MOCK_SESSIONS.find(function (x) { return x.id === sessionId; }) ||
-        (bigDataOn() ? bigDataSessions().find(function (x) { return x.id === sessionId; }) : null);
+      // Sign what the console DISPLAYS: in fresh mode that's the
+      // re-timed clone / live attack session — signing the Northwind
+      // original here produced receipts whose timestamps contradicted
+      // the session header right after the "everything is signed and
+      // reproducible" pitch line (and 404'd fresh attack sessions).
+      var fresh = freshSessions();
+      var s = fresh !== null
+        ? fresh.find(function (x) { return x.id === sessionId; })
+        : (MOCK_SESSIONS.find(function (x) { return x.id === sessionId; }) ||
+           (bigDataOn() ? bigDataSessions().find(function (x) { return x.id === sessionId; }) : null));
       if (!s) throw new Error("not_found");
       var isFeatured = sessionId === "sess_01H9K";
+      var fid = fresh !== null ? freshIdentity() : null;
       var body = {
         schemaVersion: "1.0",
         receiptId: isFeatured ? "rcpt_01H9K7GRPX_finalized" : "rcpt_" + s.externalId + "_finalized",
         sessionId: s.externalId,
-        orgId: "org_northwind",
+        orgId: (fid && fid.org.id) || "org_northwind",
         deploymentId: s.deploymentId,
         startedAt: s.startedAt,
         endedAt: s.endedAt,
@@ -1524,12 +1646,24 @@
 
     async listMembers() {
       await delay(100);
-      if (freshElapsed() != null) return MOCK_MEMBERS.slice(0, 1);
+      // The fresh org's one member is the person who signed up — not
+      // Olivia from the showcase fixtures.
+      if (freshElapsed() != null) {
+        var fid = freshIdentity();
+        return [{
+          id: "usr_you", userId: "usr_you",
+          email: (fid && fid.user.email) || "you@yourco.dev",
+          displayName: (fid && (fid.user.displayName || fid.user.email)) || "You",
+          role: (fid && fid.org && fid.org.role) || "owner",
+          lastActive: new Date().toISOString(),
+        }];
+      }
       return MOCK_MEMBERS.slice();
     },
     async inviteMember(input) {
       await delay(200);
-      MOCK_INVITES.push({
+      var pool = freshElapsed() != null ? freshRuntime().invites : MOCK_INVITES;
+      pool.push({
         id: "inv_" + Math.random().toString(36).slice(2, 8),
         email: input.email,
         role: input.role || "member",
@@ -1538,15 +1672,22 @@
         createdAt: new Date().toISOString(),
       });
       recordAudit("member.invited", input.email, "role: " + (input.role || "member"));
-      return { invite: MOCK_INVITES[MOCK_INVITES.length - 1] };
+      return { invite: pool[pool.length - 1] };
     },
     async listInvites() {
       await delay(80);
-      if (freshElapsed() != null) return { invites: [] };
+      if (freshElapsed() != null) return { invites: freshRuntime().invites.slice() };
       return { invites: MOCK_INVITES.slice() };
     },
     async revokeInvite(id) {
       await delay(120);
+      if (freshElapsed() != null) {
+        var rt = freshRuntime();
+        var invF = rt.invites.find(function (i) { return i.id === id; });
+        rt.invites = rt.invites.filter(function (i) { return i.id !== id; });
+        recordAudit("invite.revoked", invF ? invF.email : id);
+        return;
+      }
       var inv = MOCK_INVITES.find(function (i) { return i.id === id; });
       MOCK_INVITES = MOCK_INVITES.filter(function (i) { return i.id !== id; });
       recordAudit("invite.revoked", inv ? inv.email : id);
@@ -1602,7 +1743,7 @@
     },
     async listApiKeys() {
       await delay(100);
-      if (freshElapsed() != null) return [];
+      if (freshElapsed() != null) return freshRuntime().apiKeys.slice();
       return MOCK_API_KEYS.slice();
     },
     async createApiKey(name) {
@@ -1610,19 +1751,27 @@
       var hint = "av_srv_" + Math.random().toString(36).slice(2, 10) + "…";
       var plaintext = "av_srv_" + Math.random().toString(36).slice(2, 10).padEnd(28, "0");
       var row = { id: "key_" + Math.random().toString(36).slice(2, 8), name: name, createdAt: new Date().toISOString(), lastUsedAt: null, hint: hint };
-      MOCK_API_KEYS.unshift(row);
+      if (freshElapsed() != null) freshRuntime().apiKeys.unshift(row);
+      else MOCK_API_KEYS.unshift(row);
       recordAudit("apikey.created", name);
       return { key: row, plaintextToken: plaintext };
     },
     async revokeApiKey(id) {
       await delay(120);
+      if (freshElapsed() != null) {
+        var rt = freshRuntime();
+        var kf = rt.apiKeys.find(function (r) { return r.id === id; });
+        rt.apiKeys = rt.apiKeys.filter(function (r) { return r.id !== id; });
+        recordAudit("apikey.revoked", kf ? kf.name : id);
+        return;
+      }
       var k = MOCK_API_KEYS.find(function (r) { return r.id === id; });
       MOCK_API_KEYS = MOCK_API_KEYS.filter(function (r) { return r.id !== id; });
       recordAudit("apikey.revoked", k ? k.name : id);
     },
     async listWebhooks() {
       await delay(80);
-      if (freshElapsed() != null) return [];
+      if (freshElapsed() != null) return freshRuntime().webhooks.slice();
       return MOCK_WEBHOOKS.slice();
     },
     async createWebhook(body) {
@@ -1632,26 +1781,42 @@
         name: body.name, url: body.url, events: body.events || [], isActive: true,
         createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
       };
-      MOCK_WEBHOOKS.unshift(row);
+      if (freshElapsed() != null) freshRuntime().webhooks.unshift(row);
+      else MOCK_WEBHOOKS.unshift(row);
       recordAudit("webhook.created", row.name, "events: " + (row.events || []).join(", "));
       return { endpoint: row, secret: "whsec_" + Math.random().toString(36).slice(2, 34) };
     },
     async updateWebhook(id, patch) {
       await delay(120);
-      MOCK_WEBHOOKS = MOCK_WEBHOOKS.map(function (w) { return w.id === id ? Object.assign({}, w, patch, { updatedAt: new Date().toISOString() }) : w; });
-      var w2 = MOCK_WEBHOOKS.find(function (w) { return w.id === id; });
+      var freshW = freshElapsed() != null;
+      if (freshW) {
+        var rt = freshRuntime();
+        rt.webhooks = rt.webhooks.map(function (w) { return w.id === id ? Object.assign({}, w, patch, { updatedAt: new Date().toISOString() }) : w; });
+      } else {
+        MOCK_WEBHOOKS = MOCK_WEBHOOKS.map(function (w) { return w.id === id ? Object.assign({}, w, patch, { updatedAt: new Date().toISOString() }) : w; });
+      }
+      var pool2 = freshW ? freshRuntime().webhooks : MOCK_WEBHOOKS;
+      var w2 = pool2.find(function (w) { return w.id === id; });
       if (patch && "isActive" in patch) recordAudit(patch.isActive ? "webhook.resumed" : "webhook.paused", w2 ? w2.name : id);
       else recordAudit("webhook.updated", w2 ? w2.name : id);
     },
     async deleteWebhook(id) {
       await delay(100);
+      if (freshElapsed() != null) {
+        var rt = freshRuntime();
+        var wdf = rt.webhooks.find(function (w) { return w.id === id; });
+        rt.webhooks = rt.webhooks.filter(function (w) { return w.id !== id; });
+        recordAudit("webhook.deleted", wdf ? wdf.name : id);
+        return;
+      }
       var wd = MOCK_WEBHOOKS.find(function (w) { return w.id === id; });
       MOCK_WEBHOOKS = MOCK_WEBHOOKS.filter(function (w) { return w.id !== id; });
       recordAudit("webhook.deleted", wd ? wd.name : id);
     },
     async testWebhook(id) {
       await delay(90);
-      var wt = MOCK_WEBHOOKS.find(function (w) { return w.id === id; });
+      var poolT = freshElapsed() != null ? freshRuntime().webhooks : MOCK_WEBHOOKS;
+      var wt = poolT.find(function (w) { return w.id === id; });
       // Match the real API's semantics: a paused endpoint refuses the
       // test (the console maps this to a "resume it first" nudge —
       // that branch was dead code against the old always-succeed mock).
@@ -1678,14 +1843,19 @@
     },
     async rotateWebhookSecret(id) {
       await delay(120);
-      var wr = MOCK_WEBHOOKS.find(function (w) { return w.id === id; });
+      var poolR = freshElapsed() != null ? freshRuntime().webhooks : MOCK_WEBHOOKS;
+      var wr = poolR.find(function (w) { return w.id === id; });
       recordAudit("webhook.secret_rotated", wr ? wr.name : id);
       return { secret: "whsec_" + Math.random().toString(36).slice(2, 34) };
     },
     async listWebhookDeliveries(id) {
       await delay(80);
+      var mine = runtimeDeliveries.filter(function (d) { return d.webhookId === id; });
+      // A fresh org's endpoints have only the deliveries THEY produced;
+      // the canned d1–d3 rows belong to the Northwind fixtures.
+      if (freshElapsed() != null) return mine;
       var now = Date.now();
-      return runtimeDeliveries.filter(function (d) { return d.webhookId === id; }).concat([
+      return mine.concat([
         { id: "d1", event: "policy.block", status: "delivered", attempt: 1, responseCode: 200, createdAt: new Date(now - 3 * MIN).toISOString(), deliveredAt: new Date(now - 3 * MIN + 340).toISOString() },
         { id: "d2", event: "policy.block", status: "delivered", attempt: 1, responseCode: 200, createdAt: new Date(now - 47 * MIN).toISOString(), deliveredAt: new Date(now - 47 * MIN + 210).toISOString() },
         { id: "d3", event: "policy.block", status: "delivered", attempt: 2, responseCode: 200, createdAt: new Date(now - 6 * HOUR).toISOString(), deliveredAt: new Date(now - 6 * HOUR + 32_500).toISOString(), errorMessage: "server_error_502 (attempt 1)" },
@@ -1706,11 +1876,15 @@
       var el = freshElapsed();
       if (el != null) {
         var t0 = Date.now() - el;
-        return runtimeAudit.concat([
-          { at: new Date(t0 + FRESH_CONNECT_MS).toISOString(), actor: "system", event: "deployment.connected", target: "northwind-prod", note: "Signing key issued" },
-          { at: new Date(t0 + 2000).toISOString(), actor: "system", event: "policies.defaults_seeded", target: "4 starter policies" },
-          { at: new Date(t0).toISOString(), actor: (mockState.session && mockState.session.user ? mockState.session.user.email : "you"), event: "org.created", target: "Northwind Traders" },
-        ]);
+        var fid = freshIdentity();
+        var entries = [];
+        // The daemon-connected entry appears when the daemon actually
+        // connects — an audit line about the future is a lie. Names
+        // are THIS org's, not the showcase fixtures'.
+        if (el >= FRESH_CONNECT_MS) entries.push({ at: new Date(t0 + FRESH_CONNECT_MS).toISOString(), actor: "system", event: "deployment.connected", target: freshDaemonName(), note: "Signing key issued" });
+        entries.push({ at: new Date(t0 + 2000).toISOString(), actor: "system", event: "policies.defaults_seeded", target: "4 starter policies" });
+        entries.push({ at: new Date(t0).toISOString(), actor: (mockState.session && mockState.session.user ? mockState.session.user.email : "you"), event: "org.created", target: (fid && fid.org.name) || "your workspace" });
+        return runtimeAudit.concat(entries);
       }
       return runtimeAudit.concat(MOCK_AUDIT);
     },

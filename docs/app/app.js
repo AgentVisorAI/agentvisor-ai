@@ -1497,7 +1497,7 @@
     var blockedValue = sessions.reduce(function (a, s) { return a + (parseInt(s.blockedPayoutUsdMicros, 10) || 0) / 1e6; }, 0);
     var steps = [
       { done: true, label: "Create your workspace", sub: "Done — you're in" },
-      { done: hasDep, label: "Connect your first daemon", sub: hasDep ? "northwind-prod is connected" : "Run the install command. This page updates by itself.", href: "#/deployments" },
+      { done: hasDep, label: "Connect your first daemon", sub: hasDep ? "Your daemon is connected and signing" : "Run the install command. This page updates by itself.", href: "#/deployments" },
       { done: hasSess, label: "Sessions stream in", sub: hasSess ? stats.sessions + " session" + (stats.sessions === 1 ? "" : "s") + " recorded so far" : "Waiting for your agent's first run…" },
       { done: hasBlock, label: "First bad order blocked", sub: hasBlock ? "$" + blockedValue.toLocaleString() + " kept — open the session to see why" : "Starter policies are armed and waiting", href: hasBlock ? "#/sessions" : null },
     ];

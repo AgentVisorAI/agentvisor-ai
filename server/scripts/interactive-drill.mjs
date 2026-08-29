@@ -2097,6 +2097,11 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   });
   if (ln.hOv > 0 || ln.menuW > 340 || !ln.menuFits) fail("hostile-length identity broke the chrome: " + JSON.stringify(ln));
   await lnPage.close();
+  // The init script above WROTE fresh-workspace keys into the shared
+  // per-origin storage — scrub them or every later check boots into a
+  // fresh workspace instead of Northwind (the shared-localStorage trap,
+  // third bite).
+  await page.evaluate(() => { localStorage.removeItem("av_mock_fresh_t0"); localStorage.removeItem("av_mock_fresh_identity"); });
   console.log("✅ hostile-length identity: topbar contained, account menu capped at " + ln.menuW + "px");
 }
 
@@ -2193,8 +2198,129 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ keyboard-only tour: Tab to Next, Enter × steps, focus survives every route change, finale CTA reached");
 }
 
+// ── 32. Palette truth after mutations + bfcache eligibility. The ⌘K
+// palette re-fetches sessions/policies/deployments on EVERY open (no
+// cached index) — so an entity created or deleted between opens must
+// appear/disappear. A cached palette would offer ghost links to
+// deleted entities. Also: the app must never register unload /
+// beforeunload handlers (they make every engine skip the bfcache and
+// re-run full boot on Back — slow, and it drops scroll positions).
+{
+  const palPage = await context.newPage();
+  await palPage.goto(SITE + "#/deployments", { waitUntil: "domcontentloaded" });
+  await palPage.waitForSelector("table tbody tr", { timeout: 15000 });
+  const MODK = process.platform === "darwin" ? "Meta+KeyK" : "Control+KeyK";
+  async function palHas(needle) {
+    await palPage.keyboard.press(MODK);
+    await palPage.waitForSelector(".cmdk input", { timeout: 5000 });
+    await palPage.waitForTimeout(500); // dynamic entries land
+    await palPage.type(".cmdk input", needle.slice(0, 12));
+    await palPage.waitForTimeout(200);
+    const hit = await palPage.evaluate(
+      (n) => [...document.querySelectorAll(".cmdk .item")].some((i) => i.textContent.includes(n)), needle);
+    await palPage.keyboard.press("Escape");
+    await palPage.waitForTimeout(250);
+    return hit;
+  }
+  await palPage.click("#addDep, #addDep2");
+  await palPage.waitForSelector("#depName", { timeout: 5000 });
+  await palPage.fill("#depName", "palette-truth-drill");
+  await palPage.click('#depForm button[type="submit"]');
+  await palPage.waitForTimeout(700);
+  await palPage.keyboard.press("Escape"); // token modal (2-step safe)
+  await palPage.waitForTimeout(300);
+  await palPage.keyboard.press("Escape");
+  await palPage.waitForTimeout(300);
+  if (!(await palHas("palette-truth-drill"))) fail("palette missing a deployment created this session");
+  await palPage.evaluate(() => {
+    const r = [...document.querySelectorAll("table tbody tr")].find((r) => r.textContent.includes("palette-truth-drill"));
+    (r.querySelector("a") || r).click();
+  });
+  await palPage.waitForSelector("#depDelete", { timeout: 5000 });
+  await palPage.click("#depDelete");
+  await palPage.waitForTimeout(400);
+  await palPage.evaluate(() => {
+    const d = [...document.querySelectorAll(".modal-backdrop button")].find((b) => /^Delete$/i.test(b.textContent.trim()));
+    d && d.click();
+  });
+  await palPage.waitForTimeout(800);
+  if (await palHas("palette-truth-drill")) fail("palette still lists a DELETED deployment (ghost link)");
+  const unloadHandlers = await palPage.evaluate(() => (window.__lc?.beforeunload || 0) + (window.__lc?.unload || 0));
+  if (unloadHandlers > 0) fail("unload/beforeunload handlers registered (" + unloadHandlers + ") — bfcache killed");
+  await palPage.close();
+  console.log("✅ palette truth: created deployment indexed, deleted one gone; zero unload handlers (bfcache-eligible)");
+}
+
+// ── 33. Fresh-workspace truth: everything a brand-new org sees or
+// creates must belong to THAT org. Before R257: the sim daemon was
+// literally named northwind-prod, audit said "org.created — Northwind
+// Traders" regardless of signup, members listed Olivia from the
+// fixtures, session detail showed showcase-era timestamps under a
+// "45s ago" list row, receipts signed those stale values, and every
+// create (deployment/webhook/invite/API key/IdP) wrote into the
+// NORTHWIND fixtures — invisible in the fresh workspace and leaking
+// into the showcase org.
+{
+  const fPage = await context.newPage();
+  await fPage.goto(SITE, { waitUntil: "domcontentloaded" });
+  await fPage.evaluate(() => {
+    localStorage.clear();
+    localStorage.setItem("av_mock_fresh_t0", String(Date.now() - 60000));
+    localStorage.setItem("av_mock_fresh_identity", JSON.stringify({
+      user: { id: "u_f", email: "founder@acmerobotics.dev", displayName: "Ada Founder", role: "owner" },
+      org: { id: "org_acme", name: "Acme Robotics", slug: "acme-robotics", createdAt: new Date().toISOString(), role: "owner" },
+    }));
+  });
+  await fPage.goto(SITE + "#/deployments", { waitUntil: "domcontentloaded" });
+  await fPage.waitForSelector("table tbody tr", { timeout: 15000 });
+  const deps = await fPage.evaluate(() => [...document.querySelectorAll("table tbody tr")].map((r) => r.textContent).join(" | "));
+  if (!deps.includes("acme-robotics-prod")) fail("fresh sim daemon not named after the org: " + deps.slice(0, 120));
+  if (deps.includes("northwind")) fail("northwind daemon leaked into a fresh workspace");
+  // create → must land in THIS workspace's list
+  await fPage.click("#addDep, #addDep2");
+  await fPage.waitForSelector("#depName", { timeout: 5000 });
+  await fPage.fill("#depName", "acme-edge");
+  await fPage.click('#depForm button[type="submit"]');
+  await fPage.waitForTimeout(700);
+  await fPage.keyboard.press("Escape");
+  await fPage.waitForTimeout(250);
+  await fPage.keyboard.press("Escape");
+  await fPage.waitForTimeout(250);
+  if (!(await fPage.evaluate(() => [...document.querySelectorAll("table tbody tr")].some((r) => r.textContent.includes("acme-edge")))))
+    fail("deployment created in a fresh workspace vanished (wrote into Northwind fixtures?)");
+  // session detail: fresh-era header, no showcase-era "days ago"
+  await fPage.goto(SITE + "#/sessions/sess_01H9K", { waitUntil: "domcontentloaded" });
+  await fPage.waitForSelector(".evt", { timeout: 10000 });
+  const det = await fPage.evaluate(() => document.querySelector("#view").textContent);
+  if (/days? ago|weeks? ago|months? ago/.test(det)) fail("fresh session detail shows showcase-era timestamps");
+  if (det.includes("northwind-prod")) fail("fresh session detail names the showcase daemon");
+  // members: the founder, not the fixtures
+  await fPage.goto(SITE + "#/settings/members", { waitUntil: "domcontentloaded" });
+  await fPage.waitForTimeout(1000);
+  const mem = await fPage.evaluate(() => document.querySelector("#view").textContent);
+  if (!mem.includes("founder@acmerobotics.dev")) fail("fresh members list missing the signup identity");
+  if (mem.includes("olivia.tan@northwind.com")) fail("Northwind members leaked into a fresh workspace");
+  // audit: this org's story
+  await fPage.goto(SITE + "#/settings/audit", { waitUntil: "domcontentloaded" });
+  await fPage.waitForTimeout(1000);
+  const aud = await fPage.evaluate(() => document.querySelector("#view").textContent);
+  if (!aud.includes("Acme Robotics")) fail("fresh audit org.created does not target the signup org");
+  if (aud.includes("Northwind Traders")) fail("fresh audit still says Northwind Traders");
+  if (!aud.includes("acme-robotics-prod")) fail("fresh audit deployment.connected does not target the org daemon");
+  // isolation: none of the above leaked into the showcase fixtures
+  await fPage.evaluate(() => { localStorage.removeItem("av_mock_fresh_t0"); localStorage.removeItem("av_mock_fresh_identity"); });
+  await fPage.goto(SITE + "#/deployments", { waitUntil: "domcontentloaded" });
+  await fPage.reload({ waitUntil: "domcontentloaded" });
+  await fPage.waitForSelector("table tbody tr", { timeout: 10000 });
+  const nw = await fPage.evaluate(() => [...document.querySelectorAll("table tbody tr")].map((r) => r.textContent).join(" | "));
+  if (nw.includes("acme-edge") || nw.includes("acme-robotics-prod")) fail("fresh-workspace activity leaked into the Northwind fixtures: " + nw.slice(0, 120));
+  if (!nw.includes("northwind-prod")) fail("Northwind daemons damaged by fresh-workspace round: " + nw.slice(0, 120));
+  await fPage.close();
+  console.log("✅ fresh-workspace truth: org-named daemon, mutations land locally, founder in members, org audit story, fresh-era detail, Northwind isolated");
+}
+
 if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors));
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 31 interactive-features drill checks passed.");
+console.log("\nAll 33 interactive-features drill checks passed.");
