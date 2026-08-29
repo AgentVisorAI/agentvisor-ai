@@ -1579,7 +1579,18 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await page.waitForTimeout(400);
   const after = await page.evaluate(async () => (await window.dataSource.getRetention()).retention.sessionRetentionDays);
   if (after !== before) fail("out-of-range retention (99999) saved: " + before + "→" + after);
-  console.log("✅ form semantics: type=url validates, Enter submits the webhook form, retention max enforced");
+  // Scroll-wheel accident: wheel over the FOCUSED number input must
+  // not change its value (Chrome default increments it — 90 became 95
+  // from scrolling the page).
+  await page.fill("#retSess", "90");
+  await page.click("#retSess");
+  const rBox = await page.locator("#retSess").boundingBox();
+  await page.mouse.move(rBox.x + rBox.width / 2, rBox.y + rBox.height / 2);
+  for (let i = 0; i < 5; i++) await page.mouse.wheel(0, -120);
+  await page.waitForTimeout(300);
+  const wheeled = await page.inputValue("#retSess");
+  if (wheeled !== "90") fail("scroll wheel changed a focused number input: 90 → " + wheeled);
+  console.log("✅ form semantics: type=url validates, Enter submits the webhook form, retention max enforced, wheel can't nudge focused number inputs");
 }
 
 // ── 28. Skeleton-phase filter liveness: the sessions filter bar paints
