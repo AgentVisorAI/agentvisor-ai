@@ -185,7 +185,9 @@ export async function orgRoutes(app: FastifyInstance): Promise<void> {
     // CIDR blocks (recon: which corp VPN/bastion do admins egress
     // from) and their own detected req.ip (confirms whether their
     // stolen cookie would work from anywhere without alarm). The
-    // sibling PATCH at line 117 already gates on non-member.
+    // sibling PATCH at line 202 gates on owner-only (per R146
+    // F1); this GET stays admin-readable per R93 F3 as R146 F1
+    // explicitly preserved ("GET remains admin-readable").
     if (claims.membershipRole === "member") {
       return reply.code(403).send({ error: "forbidden" });
     }
