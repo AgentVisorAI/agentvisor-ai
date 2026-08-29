@@ -638,7 +638,10 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
         token: z.string().min(16).max(256),
         email: emailSchema,
         password: z.string().min(12).max(1024).optional(),
-        displayName: z.string().max(80).optional(),
+        // R184 F1: reject CRLF/NUL to prevent email header injection
+        // via welcomeMail's displayName interpolation. Same rationale
+        // as orgNameSchema in auth.ts.
+        displayName: z.string().max(80).refine((v) => !/[\r\n\u0000]/.test(v), "must not contain CR/LF/NUL").optional(),
       })
       .safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: "invalid_input" });
