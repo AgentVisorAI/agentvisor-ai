@@ -183,25 +183,31 @@ jobs:
           cp docs/verify/verify.js "$site/verify/"
           cp docs/verify/verify.css "$site/verify/"
           cp docs/verify/sample-receipt.json "$site/verify/"
+          # Pages ships as a plain branch in the public site repo — keep
+          # Jekyll out of the way (files starting with _ etc.).
+          touch "$site/.nojekyll"
           # Publish the assembled directory.
           rm -rf target/doc
           mv "$site" target/doc
-      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
-      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
-        with:
-          path: target/doc
-  deploy:
-    name: Deploy to GitHub Pages
-    needs: build
-    runs-on: ubuntu-latest
-    # R116 F1: only the deploy job needs pages:write + id-token:write
-    # (id-token minting for the deploy-pages OIDC handshake).
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
+      # The monorepo is private and the org is on the free plan, so
+      # GitHub Pages cannot serve from here. The assembled site is
+      # force-pushed (content snapshot, no history) to the PUBLIC
+      # AgentVisorAI/agentvisorai.github.io repo, whose Pages serves
+      # agentvisorai.me. Auth: write-scoped deploy key held as an
+      # Actions secret here; the public repo holds only built
+      # artifacts, never source.
+      - name: Push site to the public Pages repo
+        env:
+          DEPLOY_KEY: ${{ secrets.SITE_DEPLOY_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$DEPLOY_KEY" > "$RUNNER_TEMP/site_key"
+          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/site_key -o StrictHostKeyChecking=accept-new"
+          cd target/doc
+          git init -q -b main
+          git config user.name "agentvisor-deploy"
+          git config user.email "deploy@agentvisorai.me"
+          git add -A
+          git commit -qm "Deploy site from agentvisor-ai@${GITHUB_SHA}"
+          git push -f git@github.com:AgentVisorAI/agentvisorai.github.io.git main
+          rm -f "$RUNNER_TEMP/site_key"

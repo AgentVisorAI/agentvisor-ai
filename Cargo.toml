@@ -20,9 +20,9 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.94"
 license = "Apache-2.0"
-repository = "https://github.com/AgentVisorAI/agentvisor-ai"
-homepage = "https://agentvisorai.github.io/agentvisor-ai/"
-documentation = "https://agentvisorai.github.io/agentvisor-ai/api/"
+repository = "https://github.com/AgentVisorAI/agentvisor"
+homepage = "https://agentvisorai.me/"
+documentation = "https://agentvisorai.me/api/"
 # `keywords` and `categories` are inherited by every workspace crate
 # via `keywords.workspace = true` / `categories.workspace = true`.
 # crates.io caps at 5 keywords / 5 categories.
