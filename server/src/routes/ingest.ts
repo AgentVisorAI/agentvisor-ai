@@ -239,7 +239,6 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
     // unsigned in the list). Same threat model as R92 F2 / R93
     // F4 / R118 F2 (leaked AV_INGEST_TOKEN). First-write-wins
     // matches the sealed-receipt posture across the file.
-    const isSealed = existing?.status === "sealed";
     // R141 F3: refuse pre-sealed CREATE. The R119 F2 update-branch
     // freeze covered rewrites of already-sealed rows, but the
     // create branch (row didn't exist yet) had no such guard. If
@@ -297,50 +296,98 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
         .code(400)
         .send({ error: "cannot_direct_seal_session" });
     }
-    // R144 F1: after refusing s.status === "sealed" above, the
-    // only remaining case where nextStatus differs from s.status
-    // is if `existing?.status === "sealed"` (row is already
-    // sealed and we're being asked to revert it to live/blocked).
-    // Keep the sealed row sealed.
-    const nextStatus = existing?.status === "sealed" ? existing.status : s.status;
-    const session = await db.session.upsert({
+    // R151 F1: atomic sealed-guard via conditional updateMany.
+    // Prior shape branched on `isSealed = existing?.status ===
+    // "sealed"` read from findUnique above, then chose
+    // `upsert.update = isSealed ? {} : {full field set}`. TOCTOU
+    // race with /ingest/receipts's concurrent seal at :~763:
+    // if the receipt handler commits `session.update({status:
+    // "sealed"})` between our findUnique and the upsert, our
+    // JS snapshot showed "live", `isSealed=false`, and Postgres'
+    // ON CONFLICT DO UPDATE has no sealed guard — it blindly
+    // overwrote the just-sealed row back to "live" with the
+    // attacker-supplied agent / workflow / policyVersion /
+    // closedAt fields. Signed receipt.eventCount then mismatched
+    // session.events, the /events guard at line 402 stopped
+    // rejecting further appends, and the SPA/exports rendered
+    // the mutated fields — the same post-seal defacement class
+    // R119 F2 / R141 F3 / R144 F1 closed for the non-concurrent
+    // paths. R144's own header comment named the invariant but
+    // enforced it only against attacker-supplied s.status ===
+    // "sealed"; a race against a legitimate concurrent seal
+    // slipped through. Fix: move the sealed guard onto the DB
+    // WHERE clause. Postgres evaluates `status: { not: "sealed" }`
+    // under the same row lock the UPDATE takes, so no snapshot
+    // can lie about the sealed state.
+    const upd = await db.session.updateMany({
       where: {
-        deploymentId_externalId: {
-          deploymentId: daemon.deploymentId,
-          externalId: s.externalId,
-        },
-      },
-      create: {
         deploymentId: daemon.deploymentId,
-        orgId: daemon.orgId,
         externalId: s.externalId,
+        status: { not: "sealed" },
+      },
+      data: {
         agent: s.agent,
         workflow: s.workflow,
         status: s.status,
         policyVersion: s.policyVersion,
-        openedAt: s.openedAt,
         closedAt: s.closedAt,
       },
-      update: isSealed
-        ? {}
-        : {
-            agent: s.agent,
-            workflow: s.workflow,
-            status: nextStatus,
-            policyVersion: s.policyVersion,
-            closedAt: s.closedAt,
-          },
-      // R123 F2: include `agent` in the returned selection so
-      // the bus.publish below uses the PERSISTED value (which
-      // is the pre-seal canonical agent on a sealed session)
-      // rather than the caller-supplied s.agent. Prior shape
-      // forwarded attacker-controlled s.agent verbatim in the
-      // SSE payload on the isSealed branch — a webhook / CLI
-      // subscriber consuming msg.data.agent broke the R119 F2
-      // "sealed = immutable" invariant even though the DB
-      // stayed canonical.
-      select: { id: true, externalId: true, agent: true },
     });
+    let session: { id: string; externalId: string; agent: string };
+    if (upd.count === 0) {
+      // Two cases collapse here:
+      //   1. Row doesn't exist yet → CREATE branch.
+      //   2. Row exists AND is sealed → R119 F2 freeze; leave
+      //      it untouched via `update: {}`.
+      // Upsert.create handles case 1 atomically; if a concurrent
+      // writer wins the create race the `update: {}` no-op keeps
+      // us safe on case 2 as well.
+      session = await db.session.upsert({
+        where: {
+          deploymentId_externalId: {
+            deploymentId: daemon.deploymentId,
+            externalId: s.externalId,
+          },
+        },
+        create: {
+          deploymentId: daemon.deploymentId,
+          orgId: daemon.orgId,
+          externalId: s.externalId,
+          agent: s.agent,
+          workflow: s.workflow,
+          status: s.status,
+          policyVersion: s.policyVersion,
+          openedAt: s.openedAt,
+          closedAt: s.closedAt,
+        },
+        update: {},
+        // R123 F2: return the PERSISTED agent (which is the
+        // pre-seal canonical value on a sealed row) rather than
+        // the caller-supplied s.agent, so bus.publish below
+        // doesn't forward attacker-controlled agent on the
+        // no-op branch.
+        select: { id: true, externalId: true, agent: true },
+      });
+    } else {
+      const found = await db.session.findUnique({
+        where: {
+          deploymentId_externalId: {
+            deploymentId: daemon.deploymentId,
+            externalId: s.externalId,
+          },
+        },
+        // R123 F2: forward the persisted agent (matches the
+        // no-op branch above).
+        select: { id: true, externalId: true, agent: true },
+      });
+      if (!found) {
+        // updateMany reported 1 row updated but the row is gone
+        // by the time we look it up — a retention purge or a
+        // hard delete raced in between. Treat as no-op.
+        return reply.code(409).send({ error: "session_race" });
+      }
+      session = found;
+    }
     bus.publish({
       type: "session.upsert",
       orgId: daemon.orgId,

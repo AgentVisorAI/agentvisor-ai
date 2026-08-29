@@ -632,7 +632,7 @@ async function scheduleRetry(
 
 let sweeperTimer: NodeJS.Timeout | null = null;
 
-const SWEEPER_INTERVAL_MS = Number(process.env.WEBHOOK_SWEEPER_INTERVAL_MS ?? 15_000);
+const SWEEPER_INTERVAL_MS = env.WEBHOOK_SWEEPER_INTERVAL_MS;
 
 /**
  * Start the retry sweeper. Idempotent — safe to call multiple times

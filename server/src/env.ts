@@ -136,6 +136,29 @@ const Env = z.object({
       (n) => Number.isInteger(n) && n >= 60_000 && n <= 86_400_000,
       "RETENTION_SWEEPER_INTERVAL_MS must be integer ms in [60000, 86400000]",
     ),
+  // R151 F2: webhook retry sweeper interval, in milliseconds.
+  // Same footgun as RETENTION_SWEEPER_INTERVAL_MS above (R99 F3):
+  // prior shape (lib/webhooks.ts:635) did
+  // `Number(process.env.WEBHOOK_SWEEPER_INTERVAL_MS ?? 15_000)`
+  // with no validation — Number("") === 0, Number("15s") === NaN,
+  // Number("15_000") === NaN (underscores rejected), all of which
+  // Node's setInterval clamps to ~1 ms → sweeper hammers Postgres
+  // with the FOR UPDATE SKIP LOCKED claim UPDATE every event-loop
+  // tick. Ops-config typo only (not attacker-triggered) so LOW,
+  // but the retention sibling got the full guard for the same
+  // failure mode. Bounds: 1 s floor (retry latency ceiling for
+  // failed webhook deliveries — anything longer starves customer
+  // endpoints) to 5 min ceiling (safety net so operators don't
+  // silently disable retries by setting it enormous). Default is
+  // 15 s to match the historical constant.
+  WEBHOOK_SWEEPER_INTERVAL_MS: z
+    .string()
+    .default("15000")
+    .transform((v) => Number(v.trim()))
+    .refine(
+      (n) => Number.isInteger(n) && n >= 1_000 && n <= 300_000,
+      "WEBHOOK_SWEEPER_INTERVAL_MS must be integer ms in [1000, 300000]",
+    ),
   ALLOWED_ORIGINS: z
     .string()
     .default("")
