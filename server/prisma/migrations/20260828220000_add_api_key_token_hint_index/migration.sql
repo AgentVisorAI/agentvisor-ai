@@ -1,0 +1,39 @@
+-- R158 F1: index the API-key auth hot path.
+--
+-- session-middleware.ts:40-50 fires
+--   db.apiKey.findMany({ where: { tokenHint: <hint>, revokedAt: null } })
+-- on EVERY request carrying an `Authorization: Bearer av_srv_…`
+-- header (CI runners, dashboards, webhook consumers, cron jobs).
+-- The ApiKey model previously declared only `@@index([orgId])`,
+-- so Postgres seq-scanned `api_keys` per authenticated request.
+--
+-- Impact scales with revoked-but-retained rows: R118 F1's DELETE
+-- flow soft-revokes via `revokedAt` for audit-trail preservation,
+-- so the table never shrinks. At 100k+ rows every programmatic
+-- request pays full-table I/O plus contention with the concurrent
+-- `lastUsedAt` UPDATE at session-middleware.ts:61-63.
+--
+-- `tokenHint` is high-cardinality (base62^8 ≈ 2×10^14), so a
+-- b-tree index is near-perfectly selective — the query drops
+-- from O(N) to O(log N). The composite `(tokenHint, revokedAt)`
+-- would trim the last handful of already-revoked hint collisions
+-- from the candidate set, but a plain `(tokenHint)` index already
+-- narrows to a small candidate list that verifyPassword's argon2
+-- loop clears quickly; the tie-breaker gain doesn't justify the
+-- extra column width in the b-tree.
+--
+-- Sibling of R81 F2 (invites.email seq scan) — same rationale:
+-- an anonymous / cheap-to-trigger hot-path lookup filtering on a
+-- column with no supporting index. Unlike invites (which grows
+-- linearly with self-signup abuse), api_keys grows with legit
+-- operator activity, so the exposure profile is DoS-adjacent
+-- rather than DoS-primary — still worth closing before the table
+-- reaches the seq-scan tipping point in production.
+--
+-- Plain `CREATE INDEX IF NOT EXISTS` (not CONCURRENTLY) matches
+-- the R81 F2 rationale: table is small at index-build time; the
+-- SHARE lock is milliseconds. Switch to CONCURRENTLY inline if
+-- a later ops moment finds the table large — Prisma Migrate does
+-- NOT wrap `.sql` files in an implicit transaction (upstream
+-- prisma/prisma#6491), so CONCURRENTLY runs cleanly.
+CREATE INDEX IF NOT EXISTS "api_keys_tokenHint_idx" ON "api_keys"("tokenHint");
