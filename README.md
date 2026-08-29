@@ -8,7 +8,7 @@
 [![Console + API](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/console-api.yml/badge.svg)](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/console-api.yml)
 [![Deploy](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/deploy.yml/badge.svg)](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/deploy.yml)
 [![Supply chain](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/deny.yml/badge.svg)](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/deny.yml)
-[![Docs](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/pages.yml/badge.svg)](https://agentvisorai.github.io/agentvisor-ai/)
+[![Docs](https://github.com/AgentVisorAI/agentvisor-ai/actions/workflows/pages.yml/badge.svg)](https://agentvisorai.me/)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 **AI agents you can hand to an auditor.**
@@ -29,9 +29,9 @@ client = OpenAI(
 )
 ```
 
-- **[Landing page](https://agentvisorai.github.io/agentvisor-ai/)** — the story, in
+- **[Landing page](https://agentvisorai.me/)** — the story, in
   three concrete examples.
-- **[Console](https://agentvisorai.github.io/agentvisor-ai/app/)** — the
+- **[Console](https://agentvisorai.me/app/)** — the
   product, clickable in your browser: setup, one-line integration, a live
   capped session, the fleet overview, and offline receipt verification.
   Client-side simulation with representative data; nothing leaves the page.
@@ -44,7 +44,7 @@ client = OpenAI(
   **[Conformance status](CONFORMANCE-STATUS.md)** — going deeper.
 - **[Reference docs](docs/reference/)** — configuration, operations,
   OpenAI compatibility, limits, and offline receipt verification.
-- **[API docs](https://agentvisorai.github.io/agentvisor-ai/api/)** — Rust crate
+- **[API docs](https://agentvisorai.me/api/)** — Rust crate
   reference. Skip unless you're embedding AgentVisor AI as a library.
 
 ---
