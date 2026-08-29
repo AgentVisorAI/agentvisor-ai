@@ -1705,7 +1705,39 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await page.waitForTimeout(300);
   const wheeled = await page.inputValue("#retSess");
   if (wheeled !== "90") fail("scroll wheel changed a focused number input: 90 → " + wheeled);
-  console.log("✅ form semantics: type=url validates, Enter submits the webhook form, retention max enforced, wheel can't nudge focused number inputs");
+  // Deployment name pattern: [a-zA-Z0-9\-_]+ must actually reject at
+  // submit (real form → native bubble), same dead-attribute class as
+  // the webhook URL above.
+  await page.goto(SITE + "#/deployments", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("#addDep", { timeout: 15000 });
+  await page.waitForSelector("tbody tr, .empty-hero", { timeout: 10000 });
+  const depRows = await page.evaluate(() => document.querySelectorAll("tbody tr").length);
+  await page.click("#addDep");
+  await page.waitForSelector("#depForm", { timeout: 5000 });
+  await page.fill("#depName", "bad name!!");
+  await page.evaluate(() => { document.querySelector('#depForm button[type="submit"]').click(); });
+  await page.waitForTimeout(400);
+  const depSt = await page.evaluate(() => ({
+    open: !!document.querySelector(".modal-backdrop"),
+    valid: document.getElementById("depName").checkValidity(),
+    rows: document.querySelectorAll("tbody tr").length,
+  }));
+  if (!depSt.open || depSt.valid || depSt.rows !== depRows) fail("invalid deployment name not rejected: " + JSON.stringify(depSt));
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(250);
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(250);
+  // Regex-special characters typed into search fields must filter
+  // LITERALLY (never throw, never match-all): "([*+?" yields the
+  // zero-state, not an exception.
+  await page.goto(SITE + "#/sessions", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("#fSearch", { timeout: 15000 });
+  await page.click("#fSearch");
+  await page.keyboard.type("([*+?", { delay: 15 });
+  await page.waitForTimeout(900);
+  if (!(await page.evaluate(() => document.getElementById("view").innerText.includes("No sessions match"))))
+    fail("regex-special search did not reach the zero-state literally");
+  console.log("✅ form semantics: type=url validates, Enter submits the webhook form, retention max enforced, wheel can't nudge focused number inputs, dep-name pattern rejects, regex chars search literally");
 }
 
 // ── 28. Skeleton-phase filter liveness: the sessions filter bar paints
