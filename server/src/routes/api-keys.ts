@@ -79,7 +79,10 @@ export async function apiKeyRoutes(app: FastifyInstance): Promise<void> {
     }
     const body = z
       .object({
-        name: z.string().min(1).max(80).trim(),
+        // R211 F1: .max().trim().min() ordering — see auth.ts
+        // orgNameSchema. Prior `.min(1).max(80).trim()` accepted
+        // whitespace-only names and stored them as "".
+        name: z.string().max(80).trim().min(1),
         role: roleSchema.default("admin"),
       })
       .safeParse(req.body);

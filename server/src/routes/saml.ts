@@ -119,7 +119,9 @@ function fingerprintPem(pem: string): string {
 // ---------- Zod validation ---------------------------------------------
 
 const createConfigSchema = z.object({
-  displayName: z.string().min(1).max(80).trim(),
+  // R211 F1: .max().trim().min() ordering — see auth.ts
+  // orgNameSchema.
+  displayName: z.string().max(80).trim().min(1),
   ssoUrl: z.string().url().max(2048),
   sloUrl: z.string().url().max(2048).optional().nullable(),
   entityIdIdp: z.string().min(1).max(2048),
