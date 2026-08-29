@@ -935,15 +935,29 @@
     for (var i = 0; i < FRESH_SESSION_AT.length; i++) {
       if (el >= FRESH_SESSION_AT[i] && order[i]) {
         var s = Object.assign({}, order[i]);
-        // Times must read "just arrived", and receipts sign these
-        // values live, so display and signature stay consistent.
-        var startMs = t0 + FRESH_SESSION_AT[i] - 45000;
-        // Canned event trails carry absolute Northwind-era timestamps;
-        // the detail page shifts them by this delta so the trail agrees
-        // with the "just arrived" header.
-        s._tsShift = startMs - new Date(order[i].startedAt).getTime();
+        // Times must read "just arrived", receipts sign these values
+        // live, AND the whole life must fit inside this org's history:
+        // nothing may predate the daemon's key issuance at t0+CONNECT
+        // (the naive t0+AT−45s start put sessions ~25s BEFORE the org
+        // existed — signed into receipts right after the
+        // "tamper-evident" pitch line). Sessions start staggered just
+        // after the daemon connects and seal ~2s before their arrival
+        // tick, so the checklist watches them appear in real time.
+        var endMs = t0 + FRESH_SESSION_AT[i] - 2000;
+        var startMs = Math.max(t0 + FRESH_CONNECT_MS + 800 + i * 1200, endMs - 45000);
+        if (endMs < startMs + 2500) endMs = startMs + 2500;
         s.startedAt = new Date(startMs).toISOString();
-        s.endedAt = new Date(t0 + FRESH_SESSION_AT[i] - 4000).toISOString();
+        s.endedAt = new Date(endMs).toISOString();
+        // Canned event trails carry absolute Northwind-era timestamps
+        // spanning minutes; the detail page re-times them into this
+        // (shorter) fresh window: ts' = start' + (ts − start) × scale.
+        var origStart = new Date(order[i].startedAt).getTime();
+        var origEnd = new Date(order[i].endedAt).getTime();
+        s._retime = {
+          origStart: origStart,
+          freshStart: startMs,
+          scale: (endMs - startMs) / Math.max(1, origEnd - origStart),
+        };
         // This workspace's daemon, not the showcase org's. All fresh
         // sessions flow through the single sim daemon (dep_prod id).
         s.deploymentId = "dep_prod";
@@ -984,7 +998,10 @@
       if (!rt.sim) {
         rt.sim = Object.assign({}, MOCK_DEPLOYMENTS[0], {
           orgId: (freshIdentity() && freshIdentity().org.id) || "org_fresh",
-          createdAt: new Date(Date.now() - el).toISOString(),
+          // The deployment record exists a few seconds after signup
+          // (create → token → install); its key is issued at CONNECT.
+          // Date.now()−el put creation at the org's own birth instant.
+          createdAt: new Date(Date.now() - el + 5000).toISOString(),
         });
       }
       var d = rt.sim;
@@ -1416,14 +1433,16 @@
       var canned = !s._events && id === "sess_01H9K";
       var events = s._events || (canned ? MOCK_EVENTS_FEATURED : synthesizeEvents(s));
       // The canned featured trail carries absolute timestamps from the
-      // showcase era; shift them so the trail matches the fresh
-      // session's header. (Synthesized trails already derive from the
-      // clone's fresh startedAt — shifting those would double-shift.)
-      if (s._tsShift && canned) {
-        var shift = s._tsShift;
+      // showcase era spanning several minutes; re-time it into the
+      // fresh session's (shorter) window so every event sits between
+      // the header's start and end. (Synthesized trails already derive
+      // from the clone's fresh startedAt.)
+      if (s._retime && canned) {
+        var rt_ = s._retime;
         events = events.map(function (e) {
           if (!e.ts) return e;
-          return Object.assign({}, e, { ts: new Date(new Date(e.ts).getTime() + shift).toISOString() });
+          var off = new Date(e.ts).getTime() - rt_.origStart;
+          return Object.assign({}, e, { ts: new Date(rt_.freshStart + Math.max(0, off) * rt_.scale).toISOString() });
         });
       }
       // Honest member view: the real API redacts LLM prompt/response
@@ -1881,12 +1900,16 @@
         var t0 = Date.now() - el;
         var fid = freshIdentity();
         var entries = [];
+        var founder = mockState.session && mockState.session.user ? mockState.session.user.email : "you";
         // The daemon-connected entry appears when the daemon actually
         // connects — an audit line about the future is a lie. Names
-        // are THIS org's, not the showcase fixtures'.
+        // are THIS org's, not the showcase fixtures'. Chronology:
+        // org.created → defaults seeded → deployment registered →
+        // signing key issued (the real ingest slug for that moment).
         if (el >= FRESH_CONNECT_MS) entries.push({ at: new Date(t0 + FRESH_CONNECT_MS).toISOString(), actor: "system", event: "deployment.pubkey_first_set", target: freshDaemonName(), note: "Signing key issued" });
+        if (el >= 5000) entries.push({ at: new Date(t0 + 5000).toISOString(), actor: founder, event: "deployment.create", target: freshDaemonName(), note: "environment: production" });
         entries.push({ at: new Date(t0 + 2000).toISOString(), actor: "system", event: "policies.defaults_seeded", target: "4 starter policies" });
-        entries.push({ at: new Date(t0).toISOString(), actor: (mockState.session && mockState.session.user ? mockState.session.user.email : "you"), event: "org.created", target: (fid && fid.org.name) || "your workspace" });
+        entries.push({ at: new Date(t0).toISOString(), actor: founder, event: "org.created", target: (fid && fid.org.name) || "your workspace" });
         return runtimeAudit.concat(entries);
       }
       return runtimeAudit.concat(MOCK_AUDIT);

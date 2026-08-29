@@ -154,8 +154,11 @@ catalog at the bottom.
     fresh list AND leaks into the showcase org. Identity surfaces
     (sim-daemon name, `org.created` audit target, the members list,
     the attack-sim user) derive from `freshIdentity()`; canned session
-    clones re-time their event trails via `_tsShift` and receipts sign
-    the DISPLAYED fresh values (drill check 33). Showcase-only
+    clones re-time their event trails via `_retime` (proportional
+    squeeze into the fresh window) and receipts sign the DISPLAYED
+    fresh values. Chronology is monotonic: org.created(t0) → defaults
+    seeded → deployment.create → pubkey_first_set → sessions — nothing
+    may predate t0 (drill check 33). Showcase-only
     affordances hide there too: the guided tour (launcher pill,
     palette entry, AND `?tour=1` autostart — it narrates Northwind's
     numbers) and the 30-day-dataset toggle (fresh `listSessions`

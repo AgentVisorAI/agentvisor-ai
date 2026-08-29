@@ -2294,6 +2294,30 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   const det = await fPage.evaluate(() => document.querySelector("#view").textContent);
   if (/days? ago|weeks? ago|months? ago/.test(det)) fail("fresh session detail shows showcase-era timestamps");
   if (det.includes("northwind-prod")) fail("fresh session detail names the showcase daemon");
+  // Chronology: nothing in this org may predate org.created at t0 —
+  // sessions used to start ~25s BEFORE the workspace existed (and
+  // receipts SIGNED those impossible times). The whole story must sit
+  // inside t0‥now and the receipt must sign the displayed window.
+  const chrono = await fPage.evaluate(async () => {
+    const t0 = +localStorage.getItem("av_mock_fresh_t0");
+    const list = (await window.dataSource.listSessions()).sessions;
+    const rec = await window.dataSource.getReceipt("sess_01H9K");
+    const d = await window.dataSource.getSessionById("sess_01H9K");
+    const evts = (d.events || []).map((e) => new Date(e.ts).getTime()).filter(Boolean);
+    return {
+      t0: t0,
+      earliestStart: Math.min(...list.map((s) => new Date(s.startedAt).getTime())),
+      recStart: new Date(rec.startedAt).getTime(),
+      recEnd: new Date(rec.endedAt).getTime(),
+      hdrStart: new Date(d.session.startedAt).getTime(),
+      hdrEnd: new Date(d.session.endedAt).getTime(),
+      evMin: Math.min(...evts),
+      evMax: Math.max(...evts),
+    };
+  });
+  if (chrono.earliestStart < chrono.t0) fail("a fresh session starts BEFORE the org existed (Δ " + (chrono.t0 - chrono.earliestStart) + "ms)");
+  if (chrono.recStart !== chrono.hdrStart || chrono.recEnd !== chrono.hdrEnd) fail("receipt signs a different window than the detail header shows");
+  if (chrono.evMin < chrono.hdrStart - 1500 || chrono.evMax > chrono.hdrEnd + 1500) fail("event trail spills outside the session window: " + JSON.stringify(chrono));
   // members: the founder, not the fixtures
   await fPage.goto(SITE + "#/settings/members", { waitUntil: "domcontentloaded" });
   await fPage.waitForTimeout(1000);
