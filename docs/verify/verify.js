@@ -20,6 +20,34 @@
       return out;
     }
 
+    // R193 F1: enforce identity binding — the receipt.body's
+    // `key_id` field (a 32-hex-char prefix of SHA-256(pubkey))
+    // must derive from the pubkey we're verifying against.
+    // Rust `Receipt::verify_embedded()` at
+    // crates/av-receipts/src/receipt.rs:371-374 refuses
+    // `KeyMismatch` when derived_id != body.key_id. Prior JS
+    // verifier accepted a receipt whose body claimed a
+    // different `key_id` than the pubkey in the bundle
+    // (attribution confusion: attacker with signing key S_a
+    // signs a body claiming `key_id: <victim's_id>`, embeds
+    // their own pubkey P_a, Ed25519 sig verifies, but an
+    // auditor reading body.key_id sees the victim's key
+    // rather than the actual signer). Same class as R190 —
+    // Rust-vs-JS semantic parity gap. v1 backward-compat: if
+    // body.key_id is missing (sample-receipt.json legacy),
+    // skip the check.
+    async function sha256Hex(bytes) {
+      const digest = await crypto.subtle.digest("SHA-256", bytes);
+      return Array.from(new Uint8Array(digest))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+    }
+    async function deriveKeyIdFromPubHex(hex) {
+      const bytes = hex2bytes(hex);
+      const full = await sha256Hex(bytes);
+      return full.slice(0, 32);
+    }
+
     // R190 F1: build the exact byte message the Rust `av-receipts`
     // crate signs. Rust `signing_message(receipt_version, canonical)`
     // (crates/av-receipts/src/receipt.rs:50-64) dispatches on
@@ -116,8 +144,28 @@
       const msg = receiptSigningMessage(r.rawBody);
       const sig = b64ToBytes(r.rawSignatureB64);
       const ok = await crypto.subtle.verify("Ed25519", key, sig, msg);
-      const trustedKey = TRUSTED_RECEIPT_KEYS.has(pub.hex.toLowerCase());
-      return { ok, trustedKey, bundle };
+      // R193 F1: even when Ed25519 sig verifies, refuse the receipt
+      // if body claims a `key_id` that doesn't derive from the
+      // embedded pubkey. Mirrors Rust `verify_embedded()` at
+      // receipt.rs:371-374 which returns `KeyMismatch` in that
+      // exact shape. v1 legacy receipts (sample-receipt.json)
+      // have no body.key_id — skip the check to preserve backward
+      // compat.
+      let keyIdOk = true;
+      if (ok) {
+        try {
+          const parsed = JSON.parse(r.rawBody);
+          if (typeof parsed.key_id === "string" && parsed.key_id.length > 0) {
+            const derived = await deriveKeyIdFromPubHex(pub.hex.toLowerCase());
+            if (derived !== parsed.key_id.toLowerCase()) keyIdOk = false;
+          }
+        } catch {
+          // Body not JSON — leave keyIdOk as true; sig either
+          // verified over structured bytes or it didn't.
+        }
+      }
+      const trustedKey = ok && keyIdOk && TRUSTED_RECEIPT_KEYS.has(pub.hex.toLowerCase());
+      return { ok: ok && keyIdOk, trustedKey, bundle };
     }
 
     // R91 F4: only expose the mutable Set when the ?ci-drill=1
