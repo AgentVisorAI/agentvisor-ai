@@ -1694,6 +1694,23 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
     return { d: after.length - before, ev: after[0].event, actor: after[0].actor };
   });
   if (at.d !== 1 || at.ev !== "webhook.test_fired" || !at.actor.includes("@")) fail("mutation did not land in the audit trail: " + JSON.stringify(at));
+  // Test fires land in the per-endpoint DELIVERY history (the modal
+  // used to show a fixture list that never changed), and a PAUSED
+  // endpoint refuses the test with the "resume it first" nudge (that
+  // console branch was dead code against the old always-succeed mock).
+  const tf = await page.evaluate(async () => {
+    const id = (await window.dataSource.listWebhooks())[0].id;
+    const before = (await window.dataSource.listWebhookDeliveries(id)).length;
+    await window.dataSource.testWebhook(id);
+    const list = await window.dataSource.listWebhookDeliveries(id);
+    let pausedErr = "";
+    await window.dataSource.updateWebhook(id, { isActive: false });
+    try { await window.dataSource.testWebhook(id); } catch (e) { pausedErr = e.message; }
+    await window.dataSource.updateWebhook(id, { isActive: true });
+    return { delta: list.length - before, top: list[0].event, pausedErr };
+  });
+  if (tf.delta !== 1 || tf.top !== "webhook.test_fired") fail("test fire did not land in delivery history: " + JSON.stringify(tf));
+  if (!/webhook_paused/.test(tf.pausedErr)) fail("paused webhook accepted a test fire: " + JSON.stringify(tf));
   const w0 = await page.evaluate(async () => (await window.dataSource.listWebhooks())[0].isActive);
   await page.evaluate(() => { const tr = document.querySelector("tbody tr"); [...tr.querySelectorAll("button")].find((x) => /Pause|Resume/.test(x.textContent)).click(); });
   await page.waitForTimeout(1000);

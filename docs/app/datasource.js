@@ -768,6 +768,8 @@
   // token or fires a test webhook should see their own action land in
   // Settings → Audit log. Kept in memory (Reset demo data clears it).
   var runtimeAudit = [];
+  // Live webhook deliveries (test fires land here; capped at 20).
+  var runtimeDeliveries = [];
   function recordAudit(event, target, note) {
     runtimeAudit.unshift({
       at: new Date().toISOString(),
@@ -1645,6 +1647,28 @@
     async testWebhook(id) {
       await delay(90);
       var wt = MOCK_WEBHOOKS.find(function (w) { return w.id === id; });
+      // Match the real API's semantics: a paused endpoint refuses the
+      // test (the console maps this to a "resume it first" nudge —
+      // that branch was dead code against the old always-succeed mock).
+      if (wt && wt.isActive === false) {
+        var e = new Error("webhook_paused");
+        e.status = 409;
+        throw e;
+      }
+      // The test lands in the per-endpoint delivery history like any
+      // real delivery would (the deliveries modal used to show a
+      // fixture list that never changed after "Test event fired.").
+      runtimeDeliveries.unshift({
+        id: "d_test_" + Math.random().toString(36).slice(2, 8),
+        webhookId: id,
+        event: "webhook.test_fired",
+        status: "delivered",
+        attempt: 1,
+        responseCode: 200,
+        createdAt: new Date().toISOString(),
+        deliveredAt: new Date(Date.now() + 180).toISOString(),
+      });
+      if (runtimeDeliveries.length > 20) runtimeDeliveries.length = 20;
       recordAudit("webhook.test_fired", wt ? wt.name : id);
     },
     async rotateWebhookSecret(id) {
@@ -1656,11 +1680,11 @@
     async listWebhookDeliveries(id) {
       await delay(80);
       var now = Date.now();
-      return [
+      return runtimeDeliveries.filter(function (d) { return d.webhookId === id; }).concat([
         { id: "d1", event: "policy.block", status: "delivered", attempt: 1, responseCode: 200, createdAt: new Date(now - 3 * MIN).toISOString(), deliveredAt: new Date(now - 3 * MIN + 340).toISOString() },
         { id: "d2", event: "policy.block", status: "delivered", attempt: 1, responseCode: 200, createdAt: new Date(now - 47 * MIN).toISOString(), deliveredAt: new Date(now - 47 * MIN + 210).toISOString() },
         { id: "d3", event: "policy.block", status: "delivered", attempt: 2, responseCode: 200, createdAt: new Date(now - 6 * HOUR).toISOString(), deliveredAt: new Date(now - 6 * HOUR + 32_500).toISOString(), errorMessage: "server_error_502 (attempt 1)" },
-      ];
+      ]);
     },
     async getRetention() { await delay(80); return { retention: { sessionRetentionDays: 90, auditRetentionDays: 365 } }; },
     async updateRetention(input) {
