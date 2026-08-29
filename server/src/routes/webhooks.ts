@@ -85,7 +85,10 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
     }
     const body = z
       .object({
-        name: z.string().min(1).max(80).trim(),
+        // R211 F1: .max().trim().min() ordering — see auth.ts
+        // orgNameSchema. Prior `.min(1).max(80).trim()` accepted
+        // "    " (4 chars) → trimmed to "" and stored.
+        name: z.string().max(80).trim().min(1),
         url: urlSchema,
         events: eventsSchema,
       })
@@ -136,7 +139,9 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
     }
     const body = z
       .object({
-        name: z.string().min(1).max(80).trim().optional(),
+        // R211 F1: .max().trim().min() ordering — see auth.ts
+        // orgNameSchema.
+        name: z.string().max(80).trim().min(1).optional(),
         url: urlSchema.optional(),
         events: eventsSchema.optional(),
         isActive: z.boolean().optional(),

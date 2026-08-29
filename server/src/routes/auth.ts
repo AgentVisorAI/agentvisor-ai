@@ -46,11 +46,29 @@ const passwordSchema = z.string().min(12).max(1024);
 // and displayName were only `.trim()`ed (leading/trailing only,
 // not middle). Refuse any control char in [\r\n\u0000].
 const noCrlfNul = (v: string): boolean => !/[\r\n\u0000]/.test(v);
+// R211 F1: chain order matters. `.min(1).max(80).trim()` runs
+// `.trim()` LAST, AFTER the `.min(1)` check on the untrimmed
+// value — so a whitespace-only string like "    " passes
+// (length 4) and the trim step then reduces it to "". Zod's
+// order-of-operations for chained string checks is strictly
+// left-to-right in v3.24.2. Concrete manifestation:
+//   POST /signup { orgName: "    ", … } → org.create({ name: "" })
+//   welcomeMail(user.displayName ?? user.email) with
+//   displayName === "" → email addressed to "" (nullish
+//   coalescing does not coalesce empty strings).
+//   All subsequent audit / email / SPA renders show "" for
+//   the org name with no self-service edit path to fix.
+// Reordering to `.max(80).trim().min(1)` runs trim BEFORE
+// min, so whitespace-only inputs are properly refused as
+// too_small. Sibling emailSchema at :24-29 is unaffected —
+// its final .regex(...) runs after .trim().toLowerCase() and
+// rejects the empty result. Sibling displayName sites without
+// .trim() (members.ts:641 invite-accept) aren't affected.
 const orgNameSchema = z
   .string()
-  .min(1)
   .max(80)
   .trim()
+  .min(1)
   .refine(noCrlfNul, "must not contain CR/LF/NUL");
 
 function orgSlug(name: string, salt: string): string {
@@ -88,7 +106,12 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         email: emailSchema,
         password: passwordSchema,
         // R184 F1: reject CRLF/NUL — see orgNameSchema above.
-        displayName: z.string().min(1).max(80).trim().refine(noCrlfNul, "must not contain CR/LF/NUL").optional(),
+        // R211 F1: reorder `.max(80).trim().min(1)` so trim
+        // runs BEFORE min-1, otherwise whitespace-only names
+        // like "    " pass min-1 on the untrimmed 4-char string
+        // then get trimmed to "" and stored (welcomeMail then
+        // renders "Welcome, " with an empty greeting).
+        displayName: z.string().max(80).trim().min(1).refine(noCrlfNul, "must not contain CR/LF/NUL").optional(),
         orgName: orgNameSchema,
       })
       .safeParse(req.body);
