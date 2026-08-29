@@ -3304,7 +3304,18 @@
     backdrop.querySelector("#inpForm").addEventListener("submit", function (e) {
       e.preventDefault();
       if (handled) return;
-      var v = backdrop.querySelector("#inpVal").value.trim();
+      // R139 F2: do NOT trim password inputs — a user whose
+      // password contains legitimate leading/trailing
+      // whitespace (or whose password manager pastes with a
+      // trailing newline) logs in fine at /login (server does
+      // no trim per auth.ts:29 passwordSchema) but the passkey
+      // enrollment prompt would strip the whitespace and 401
+      // silently. OWASP guidance says don't silently mutate
+      // password input. All other current callers (label
+      // rename, API-key name, deployment name) still get the
+      // trim.
+      var raw = backdrop.querySelector("#inpVal").value;
+      var v = inputType === "password" ? raw : raw.trim();
       if (!v) return;
       var cb = opts.onConfirm;
       close();
