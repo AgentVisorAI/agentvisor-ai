@@ -203,6 +203,33 @@ for (const { name, device } of profiles) {
     console.log("✅ static pages (landing/pitch/verify) fit the phone viewport; video contained");
   }
 
+  // iOS input-zoom guard: any visible input/select/textarea under 16px
+  // makes iOS Safari force-zoom the page on focus (the console lurched
+  // when tapping the session search on the QR path).
+  {
+    // A fresh goto re-runs the suite's signed-out init script, so land
+    // on login, sign in (mock), then hash-navigate to the console.
+    await page.goto(SITE + "?izoom=1#/login", { waitUntil: "domcontentloaded" });
+    await page.waitForSelector("input#email", { timeout: 15000 });
+    await page.locator("input#email").fill("olivia.tan@northwind.com");
+    await page.locator("input#password").fill("d3mo");
+    await page.locator("button[type='submit']").first().click();
+    await page.waitForTimeout(1200);
+    await page.evaluate(() => { location.hash = "#/sessions"; });
+    await page.waitForSelector("#fSearch", { timeout: 15000 });
+    await page.evaluate(() => { location.hash = "#/settings/members"; });
+    await page.waitForTimeout(700);
+    await page.tap("#inviteBtn").catch(() => null);
+    await page.waitForTimeout(500);
+    const small = await page.evaluate(() =>
+      [...document.querySelectorAll("input, select, textarea")]
+        .filter((el) => el.offsetParent !== null && parseFloat(getComputedStyle(el).fontSize) < 16)
+        .map((el) => (el.id || el.type) + "=" + getComputedStyle(el).fontSize).slice(0, 5));
+    if (small.length) fail("inputs under 16px trigger iOS focus-zoom: " + JSON.stringify(small));
+    await page.keyboard.press("Escape");
+    console.log("✅ all visible inputs ≥16px on " + name + " (no iOS focus-zoom)");
+  }
+
   if (jsErrors.length) fail(`${name} JS errors: ${jsErrors.join(" | ")}`);
   console.log("✅ zero JS errors on " + name);
 
