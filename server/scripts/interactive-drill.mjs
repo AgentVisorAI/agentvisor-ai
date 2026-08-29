@@ -896,8 +896,23 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await page.waitForTimeout(400);
   const toasts = await page.evaluate(() => document.querySelectorAll(".toast").length);
   if (toasts > 4) fail("toast flood not capped: " + toasts + " visible");
+  // Unbroken-token containment: a message carrying a 120-char token
+  // (copy-failure echoing av_live_…) once stretched a toast to ~885px,
+  // off the left edge of a phone.
+  const wide = await page.evaluate(() => {
+    const stack = document.querySelector("#toastStack") || document.body;
+    const el = document.createElement("div");
+    el.className = "toast";
+    el.textContent = "av_live_" + "x".repeat(120);
+    stack.appendChild(el);
+    const r = el.getBoundingClientRect();
+    const bad = r.width > Math.min(430, innerWidth) || r.left < -1;
+    el.remove();
+    return bad ? Math.round(r.width) : 0;
+  });
+  if (wide) fail("long-token toast overflows: " + wide + "px wide");
   await page.waitForTimeout(2600); // let them drain before the soak
-  console.log("✅ tactile polish: text-select doesn't navigate, Back restores scroll, toasts cap at 4");
+  console.log("✅ tactile polish: text-select doesn't navigate, Back restores scroll, toasts cap at 4 and contain unbroken tokens");
 }
 
 // ── 17. Filter/sort semantic correctness ───────────────────────────
