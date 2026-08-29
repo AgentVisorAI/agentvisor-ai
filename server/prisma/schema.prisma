@@ -16,23 +16,23 @@ datasource db {
 
 // A person with a login. Owns one or more organizations.
 model User {
-  id           String   @id @default(cuid())
-  email        String   @unique
-  passwordHash String
-  displayName  String?
+  id               String    @id @default(cuid())
+  email            String    @unique
+  passwordHash     String
+  displayName      String?
   // Short-lived password-reset token (argon2-hashed). Both the token and the
   // "issuedAt" timestamp are cleared on successful use or expiry (24h).
-  resetTokenHash String?
-  resetTokenAt   DateTime?
+  resetTokenHash   String?
+  resetTokenAt     DateTime?
   // JWT revocation fence — every session whose iat is before this timestamp
   // is rejected in authenticate(). Bumped on logout and password change so
   // a captured cookie stops working immediately even though the JWT itself
   // is still cryptographically valid until its 7-day exp.
   sessionRevokedAt DateTime?
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
 
-  memberships Membership[]
+  memberships         Membership[]
   webauthnCredentials WebauthnCredential[]
 
   @@map("users")
@@ -48,16 +48,16 @@ model User {
 // USB/NFC/BLE/internal channels the credential supports so re-auth prompts
 // the right UI.
 model WebauthnCredential {
-  id             String   @id @default(cuid())
-  userId         String
-  credentialId   Bytes    @unique
-  publicKey      Bytes
-  counter        BigInt   @default(0)
-  transports     String   @default("") // comma-separated: "usb,nfc,internal"
-  label          String   @default("Passkey")
-  aaguid         String?  // Authenticator model attestation UUID
-  createdAt      DateTime @default(now())
-  lastUsedAt     DateTime?
+  id           String    @id @default(cuid())
+  userId       String
+  credentialId Bytes     @unique
+  publicKey    Bytes
+  counter      BigInt    @default(0)
+  transports   String    @default("") // comma-separated: "usb,nfc,internal"
+  label        String    @default("Passkey")
+  aaguid       String? // Authenticator model attestation UUID
+  createdAt    DateTime  @default(now())
+  lastUsedAt   DateTime?
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -96,14 +96,14 @@ model Org {
   // that would exclude the caller's own current IP.
   ipAllowlist String[] @default([])
 
-  members     Membership[]
-  deployments Deployment[]
-  samlConfigs SamlConfig[]
+  members           Membership[]
+  deployments       Deployment[]
+  samlConfigs       SamlConfig[]
   samlReplayRecords SamlReplayRecord[]
-  auditEntries AuditEntry[]
-  invites Invite[]
-  apiKeys ApiKey[]
-  webhookEndpoints WebhookEndpoint[]
+  auditEntries      AuditEntry[]
+  invites           Invite[]
+  apiKeys           ApiKey[]
+  webhookEndpoints  WebhookEndpoint[]
 
   @@map("orgs")
 }
@@ -118,21 +118,28 @@ model Org {
 // authenticate. createdBy snapshots the operator email so a revoked
 // user's audit trail still shows who created what.
 model ApiKey {
-  id           String   @id @default(cuid())
-  orgId        String
-  name         String   // "CI runner", "Grafana dashboard"
-  tokenHash    String
-  tokenHint    String   // first 8 chars for UI display
-  createdById  String?
+  id             String    @id @default(cuid())
+  orgId          String
+  name           String // "CI runner", "Grafana dashboard"
+  tokenHash      String
+  tokenHint      String // first 8 chars for UI display
+  createdById    String?
   createdByEmail String?
-  role         String   @default("admin") // acts as this role for RBAC
-  lastUsedAt   DateTime?
-  createdAt    DateTime @default(now())
-  revokedAt    DateTime?
+  role           String    @default("admin") // acts as this role for RBAC
+  lastUsedAt     DateTime?
+  createdAt      DateTime  @default(now())
+  revokedAt      DateTime?
 
   org Org @relation(fields: [orgId], references: [id], onDelete: Cascade)
 
   @@index([orgId])
+  // R158 F1: index the API-key auth hot path.
+  // session-middleware.ts:40-50 filters by `tokenHint` on every
+  // Bearer-authenticated request. Without this index the query
+  // seq-scans the whole api_keys table (which grows monotonically
+  // via soft-revoke). See migrations/20260828220000_add_api_key_
+  // token_hint_index/migration.sql for the full rationale.
+  @@index([tokenHint])
   @@map("api_keys")
 }
 
@@ -151,9 +158,9 @@ model AuditEntry {
   event      String
   actorId    String?
   actorEmail String?
-  target     String?  // Free-form: deployment name, member email, config displayName, …
+  target     String? // Free-form: deployment name, member email, config displayName, …
   note       String?
-  metadata   Json?    // Structured details: {oldRole, newRole}, {ip, ua}, {samlConfigId}
+  metadata   Json? // Structured details: {oldRole, newRole}, {ip, ua}, {samlConfigId}
   ip         String?
   userAgent  String?
   at         DateTime @default(now())
@@ -171,17 +178,17 @@ model AuditEntry {
 // invite has a 7-day TTL. Accepted invites keep the row (acceptedAt set)
 // so the audit log can show "accepted N days after sent".
 model Invite {
-  id            String    @id @default(cuid())
-  orgId         String
-  email         String
-  role          String    @default("member") // owner|admin|member
-  tokenHash     String
-  invitedById   String?   // FK-less snapshot — inviter may leave the org
+  id             String    @id @default(cuid())
+  orgId          String
+  email          String
+  role           String    @default("member") // owner|admin|member
+  tokenHash      String
+  invitedById    String? // FK-less snapshot — inviter may leave the org
   invitedByEmail String?
-  expiresAt     DateTime
-  acceptedAt    DateTime?
-  revokedAt     DateTime?
-  createdAt     DateTime  @default(now())
+  expiresAt      DateTime
+  acceptedAt     DateTime?
+  revokedAt      DateTime?
+  createdAt      DateTime  @default(now())
 
   org Org @relation(fields: [orgId], references: [id], onDelete: Cascade)
 
@@ -213,35 +220,35 @@ model Invite {
 //     ssoUrl + x509Cert) back into our settings page.
 //  3. Enable jitEnabled and set allowedDomains so real users land safely.
 model SamlConfig {
-  id                       String    @id @default(cuid())
+  id                       String   @id @default(cuid())
   orgId                    String
-  displayName              String    // "Okta production", "Auth0 corporate", …
+  displayName              String // "Okta production", "Auth0 corporate", …
   // IdP-side config the admin pastes:
-  ssoUrl                   String    // Where we redirect the browser to start authn.
-  sloUrl                   String?   // Optional Single Logout endpoint.
-  entityIdIdp              String    // IdP entity ID / issuer.
-  x509Cert                 String    // IdP signing cert (PEM-encoded, may hold multiple certs during rotation)
-  wantAssertionsSigned     Boolean   @default(true)  // Reject unsigned assertions.
-  wantResponseSigned       Boolean   @default(false) // Some IdPs sign response envelope too.
-  allowEncryptedAssertions Boolean   @default(true)  // Decrypt if IdP encrypted them.
-  signatureAlgorithm       String    @default("sha256")
-  digestAlgorithm          String    @default("sha256")
-  nameIdFormat             String    @default("urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress")
+  ssoUrl                   String // Where we redirect the browser to start authn.
+  sloUrl                   String? // Optional Single Logout endpoint.
+  entityIdIdp              String // IdP entity ID / issuer.
+  x509Cert                 String // IdP signing cert (PEM-encoded, may hold multiple certs during rotation)
+  wantAssertionsSigned     Boolean  @default(true) // Reject unsigned assertions.
+  wantResponseSigned       Boolean  @default(false) // Some IdPs sign response envelope too.
+  allowEncryptedAssertions Boolean  @default(true) // Decrypt if IdP encrypted them.
+  signatureAlgorithm       String   @default("sha256")
+  digestAlgorithm          String   @default("sha256")
+  nameIdFormat             String   @default("urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress")
   // JIT provisioning: on first successful SAML sign-in, create the user
   // + membership if the assertion email is on an allowed domain. Without
   // this, only pre-invited members can sign in via SSO.
-  jitEnabled               Boolean   @default(true)
-  jitDefaultRole           String    @default("member") // "member" | "admin"
+  jitEnabled               Boolean  @default(true)
+  jitDefaultRole           String   @default("member") // "member" | "admin"
   // Comma-separated allowed email domains for JIT. Empty means "all domains
   // this IdP asserts". Recommended to always set (e.g. "acme.com").
-  allowedDomains           String    @default("")
+  allowedDomains           String   @default("")
   // If both are non-null we sign our AuthnRequests. Ops rotate these by
   // regenerating a new keypair and posting the new cert to the IdP.
   spPrivateKeyPem          String?
   spCertPem                String?
-  isActive                 Boolean   @default(true)
-  createdAt                DateTime  @default(now())
-  updatedAt                DateTime  @updatedAt
+  isActive                 Boolean  @default(true)
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
 
   org Org @relation(fields: [orgId], references: [id], onDelete: Cascade)
 
@@ -257,7 +264,7 @@ model SamlConfig {
 model SamlReplayRecord {
   id           String   @id @default(cuid())
   orgId        String
-  assertionId  String   // The IdP-issued Response ID (or Assertion ID)
+  assertionId  String // The IdP-issued Response ID (or Assertion ID)
   notOnOrAfter DateTime // When the assertion legitimately expires.
   createdAt    DateTime @default(now())
 
@@ -270,13 +277,13 @@ model SamlReplayRecord {
 
 // User ↔ Org join with a role.
 model Membership {
-  id     String  @id @default(cuid())
+  id     String @id @default(cuid())
   userId String
   orgId  String
-  role   String  @default("owner") // "owner" | "admin" | "member" (checked in code)
+  role   String @default("owner") // "owner" | "admin" | "member" (checked in code)
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
-  org  Org  @relation(fields: [orgId],  references: [id], onDelete: Cascade)
+  org  Org  @relation(fields: [orgId], references: [id], onDelete: Cascade)
 
   createdAt DateTime @default(now())
 
@@ -289,20 +296,20 @@ model Membership {
 // `ingestToken` to POST events; the org holds `publicKeyHex` so the console
 // can verify receipts offline. Provider secrets never enter this database.
 model Deployment {
-  id             String   @id @default(cuid())
-  orgId          String
-  name           String
-  environment    String   @default("production") // "production" | "staging" | "development"
+  id              String    @id @default(cuid())
+  orgId           String
+  name            String
+  environment     String    @default("production") // "production" | "staging" | "development"
   // Hex-encoded 32-byte Ed25519 verifying key, published by the daemon at
   // startup. Optional until the daemon first checks in.
-  publicKeyHex   String?
+  publicKeyHex    String?
   // Hash of the plaintext ingest token (argon2). Plaintext is shown once at
   // creation and never stored.
   ingestTokenHash String
-  ingestTokenHint String  // first 8 chars for UI display
-  lastIngestAt   DateTime?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  ingestTokenHint String // first 8 chars for UI display
+  lastIngestAt    DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
 
   org      Org       @relation(fields: [orgId], references: [id], onDelete: Cascade)
   sessions Session[]
@@ -314,31 +321,31 @@ model Deployment {
 
 // One conversation as observed by the checkpoint.
 model Session {
-  id             String   @id @default(cuid())
-  deploymentId   String
+  id                     String    @id @default(cuid())
+  deploymentId           String
   // Denormalized from Deployment.orgId. Populated on insert/upsert so
   // org-scoped queries (list, count, aggregate) can use a single index
   // instead of joining via deployments. At 1M+ sessions the join +
   // sort was O(N log N); the compound (orgId, openedAt DESC, id DESC)
   // index below turns cursor pagination into O(log N).
-  orgId          String
-  externalId     String   // the daemon's own session id
-  agent          String   // charter.name
-  workflow       String   @default("signed") // "signed" | "unsigned"
-  status         String   @default("live")   // "live" | "sealed" | "blocked"
-  policyVersion  Int      @default(1)
-  openedAt       DateTime
-  closedAt       DateTime?
+  orgId                  String
+  externalId             String // the daemon's own session id
+  agent                  String // charter.name
+  workflow               String    @default("signed") // "signed" | "unsigned"
+  status                 String    @default("live") // "live" | "sealed" | "blocked"
+  policyVersion          Int       @default(1)
+  openedAt               DateTime
+  closedAt               DateTime?
   // Rollups — the daemon pushes deltas; totals live here.
-  promptTokens   Int      @default(0)
-  completionTokens Int    @default(0)
-  costUsdMicros  BigInt   @default(0)
-  payoutUsdMicros BigInt  @default(0)
-  blockedPayoutUsdMicros BigInt @default(0)
-  toolsAllowed   Int      @default(0)
-  toolsBlocked   Int      @default(0)
-  stopReasonId   Int?
-  stopReason     String?
+  promptTokens           Int       @default(0)
+  completionTokens       Int       @default(0)
+  costUsdMicros          BigInt    @default(0)
+  payoutUsdMicros        BigInt    @default(0)
+  blockedPayoutUsdMicros BigInt    @default(0)
+  toolsAllowed           Int       @default(0)
+  toolsBlocked           Int       @default(0)
+  stopReasonId           Int?
+  stopReason             String?
 
   deployment Deployment @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
   events     Event[]
@@ -356,15 +363,15 @@ model Session {
 
 // One journaled event within a session.
 model Event {
-  id        String   @id @default(cuid())
-  sessionId String
-  seq       Int      // monotonically increasing per session — dedupe key
-  kind      String   // "sys" | "user" | "llm" | "tool" | "block" | "guard" | "audit"
-  tag       String   // short label ("BLOCKED", "TOOL ✓", "LOOP", …)
-  body      String   // HTML-safe rendered body — sanitized on ingest
-  sub       String?  // secondary line
-  occurredAt DateTime
-  journalCount Int   @default(1) // number of journal entries this row represents
+  id           String   @id @default(cuid())
+  sessionId    String
+  seq          Int // monotonically increasing per session — dedupe key
+  kind         String // "sys" | "user" | "llm" | "tool" | "block" | "guard" | "audit"
+  tag          String // short label ("BLOCKED", "TOOL ✓", "LOOP", …)
+  body         String // HTML-safe rendered body — sanitized on ingest
+  sub          String? // secondary line
+  occurredAt   DateTime
+  journalCount Int      @default(1) // number of journal entries this row represents
 
   session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
 
@@ -377,15 +384,15 @@ model Event {
 // by the daemon; `sigB64` is the Ed25519 signature. Verification is
 // performed client-side using `Deployment.publicKeyHex`.
 model Receipt {
-  id            String   @id @default(cuid())
-  sessionId     String   @unique
-  receiptId     String   @unique  // UUIDv7 from the receipt itself
-  body          String              // full canonical JSON
-  sigB64        String              // Ed25519 signature (base64)
-  keyIdHint     String              // first 8 hex chars of key_id, for display
-  eventCount    Int
-  issuedAt      DateTime
-  createdAt     DateTime @default(now())
+  id         String   @id @default(cuid())
+  sessionId  String   @unique
+  receiptId  String   @unique // UUIDv7 from the receipt itself
+  body       String // full canonical JSON
+  sigB64     String // Ed25519 signature (base64)
+  keyIdHint  String // first 8 hex chars of key_id, for display
+  eventCount Int
+  issuedAt   DateTime
+  createdAt  DateTime @default(now())
 
   session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
 
@@ -402,15 +409,15 @@ model Receipt {
 // with the X-AgentVisor-Signature header. A ts-nonce anti-replay
 // mechanism sits on the same headers.
 model WebhookEndpoint {
-  id           String   @id @default(cuid())
-  orgId        String
-  name         String
-  url          String
-  secret       String   // random 32-byte hex, shown once on create
-  events       String[] // subscribed event names; ["*"] means everything
-  isActive     Boolean  @default(true)
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  id        String   @id @default(cuid())
+  orgId     String
+  name      String
+  url       String
+  secret    String // random 32-byte hex, shown once on create
+  events    String[] // subscribed event names; ["*"] means everything
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   org        Org               @relation(fields: [orgId], references: [id], onDelete: Cascade)
   deliveries WebhookDelivery[]
@@ -424,16 +431,16 @@ model WebhookEndpoint {
 // grepping application logs. Bounded retention TTL is enforced by a
 // background sweeper (7 days by default).
 model WebhookDelivery {
-  id           String   @id @default(cuid())
+  id           String    @id @default(cuid())
   endpointId   String
   event        String
-  payload      String   @db.Text
+  payload      String    @db.Text
   responseCode Int?
-  responseBody String?  @db.Text
-  attempt      Int      @default(1)
-  status       String   @default("pending") // pending | delivered | failed | retrying
+  responseBody String?   @db.Text
+  attempt      Int       @default(1)
+  status       String    @default("pending") // pending | delivered | failed | retrying
   errorMessage String?
-  createdAt    DateTime @default(now())
+  createdAt    DateTime  @default(now())
   deliveredAt  DateTime?
   nextRetryAt  DateTime?
 
