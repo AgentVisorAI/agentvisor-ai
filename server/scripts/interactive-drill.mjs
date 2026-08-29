@@ -1616,6 +1616,37 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
     fail("skeleton-phase typing was dropped: " + JSON.stringify(sk));
   await skPage.close();
   console.log("✅ skeleton-phase filter liveness: typing during the loading skeleton filters and syncs the URL");
+  // Same class on the overview: the range group paints with the
+  // skeleton but was wired only after the fetch — a click in that
+  // window silently did nothing, and rapid flips let the slower stale
+  // fetch paint a dashboard that didn't match the active button.
+  const rgPage = await context.newPage();
+  await rgPage.addInitScript(() => {
+    const arm = () => {
+      if (!window.dataSource) return setTimeout(arm, 5);
+      let first = true;
+      const orig = window.dataSource.getOverview.bind(window.dataSource);
+      window.dataSource.getOverview = (...a) => {
+        if (first) { first = false; return new Promise((r) => setTimeout(r, 2000)).then(() => orig(...a)); }
+        return orig(...a);
+      };
+    };
+    arm();
+  });
+  await rgPage.goto(SITE + "#/overview", { waitUntil: "domcontentloaded" });
+  await rgPage.waitForSelector(".range-group button", { timeout: 15000 });
+  await rgPage.click('.range-group button[data-range="7d"]');
+  await rgPage.waitForTimeout(3000); // both fetches land; the stale one must not paint
+  const rg = await rgPage.evaluate(() => ({
+    active: document.querySelector(".range-group button.active")?.getAttribute("data-range"),
+    label: document.querySelector(".page-header")?.innerText || "",
+    hasStats: !!document.querySelector(".stat .value"),
+    hash: location.hash,
+  }));
+  if (rg.active !== "7d" || !/7 days/.test(rg.label) || !rg.hasStats || !/range=7d/.test(rg.hash))
+    fail("skeleton-phase range click dropped or stale fetch clobbered: " + JSON.stringify(rg));
+  await rgPage.close();
+  console.log("✅ skeleton-phase range click lands; stale overview fetch cannot clobber the newer range");
 }
 
 if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors));

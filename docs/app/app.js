@@ -1332,19 +1332,26 @@
    * OVERVIEW. Stats with sparklines + a real chart
    * ============================================================ */
 
+  // Monotonic token, same pattern as _sessionsFetchSeq: rapid range
+  // flips are two overlapping fetches, and the slower STALE one used
+  // to paint a dashboard that didn't match the active range button.
+  var _overviewFetchSeq = 0;
   async function renderOverview(main, quiet) {
     // Range lives in the URL (#/overview?range=7d) like the sessions
     // filters, so a specific dashboard window is shareable.
     var rm = (location.hash.split("?")[1] || "").match(/(?:^|&)range=(1h|24h|7d|30d)/);
     if (rm) state.range = rm[1];
+    var mySeq = ++_overviewFetchSeq;
     var rangeLabel = { "1h": "the last hour", "24h": "the last 24 hours", "7d": "the last 7 days", "30d": "the last 30 days" }[state.range] || "the last 24 hours";
     if (!quiet) main.innerHTML = pageHeader("Overview", "Fleet activity for " + rangeLabel + ".", rangeGroup()) + loadingBlock("stats");
     var stats, sessions;
     try {
       stats = await state.ds.getOverview(state.range);
       var res = await state.ds.listSessions();
+      if (mySeq !== _overviewFetchSeq) return; // superseded by a newer range/render
       sessions = res.sessions.slice(0, 8);
     } catch (e) {
+      if (mySeq !== _overviewFetchSeq) return;
       // A quiet (stream-driven) refresh must never replace a live
       // dashboard with the error card on a transient blip — keep the
       // stale view; the next refresh will catch up.
@@ -1394,7 +1401,6 @@
         sessionsTable(sessions) +
       "</div>";
 
-    installRangeGroup(main);
     installChartHover(main, series);
     var sim = main.querySelector("#simAttack");
     if (sim) sim.addEventListener("click", runAttackDemo);
@@ -1536,15 +1542,18 @@
       return '<button data-range="' + o + '"' + (state.range === o ? ' class="active"' : "") + '>' + o + '</button>';
     }).join("") + '</div>';
   }
-  function installRangeGroup(root) {
-    $$('.range-group button', root).forEach(function (b) {
-      b.addEventListener("click", function () {
-        state.range = b.getAttribute("data-range");
-        try { history.replaceState(null, "", "#/overview" + (state.range === "24h" ? "" : "?range=" + state.range)); } catch (e) {}
-        render();
-      });
-    });
-  }
+  // Delegated (invariant 4): the range group paints with the loading
+  // skeleton, but per-render wiring only landed after the fetch — a
+  // click in that window silently did nothing. Live from first paint;
+  // a skeleton-phase click supersedes the in-flight fetch via
+  // _overviewFetchSeq.
+  document.addEventListener("click", function (e) {
+    var b = e.target.closest && e.target.closest(".range-group button");
+    if (!b) return;
+    state.range = b.getAttribute("data-range");
+    try { history.replaceState(null, "", "#/overview" + (state.range === "24h" ? "" : "?range=" + state.range)); } catch (e2) {}
+    render();
+  });
   function stat(label, value, delta, spark, cls, href) {
     var inner =
       '<div class="head"><div class="label">' + esc(label) + "</div></div>" +
