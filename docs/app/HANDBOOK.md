@@ -146,7 +146,7 @@ catalog at the bottom.
 | Script | Guards |
 |---|---|
 | `interactive-drill.mjs` | 26 checks: tour, attack story, onboarding ages, billing math, reset flows, hit-tests, storage/router fuzz, pagination + deep links, Back/overlays, double-submit, failure paths + catch-up, cross-tab + FOUC, focus rings/traps + reduced motion + shortcut guards, garbage data, filter/sort/chart/audit/detail ground truth, deployment + key lifecycles, member RBAC, leak soak |
-| `live-site-smoke.mjs` | 8 checks incl. link/media crawl, captions, alias stubs, 404 |
+| `live-site-smoke.mjs` | 9 checks incl. link/media crawl, captions, alias stubs, 404, OG/Twitter link previews |
 | `a11y-audit.mjs` | 46 axe scans: 11 routes + 9 modal states × 2 themes, 3 static pages × 2 schemes |
 | `mobile-smoke.mjs` | phone/tablet: tab bar, taps, modals fit + hittable + stacking, static pages |
 | `verify-page-drill.mjs` | 12 checks incl. download→drop→green / tamper→red |
