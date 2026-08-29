@@ -373,49 +373,97 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
     // rank check against the existing row's role. Consumed
     // (acceptedAt) or revoked (revokedAt) rows are inert — safe
     // to refresh regardless of prior rank.
-    const existingInv = await db.invite.findUnique({
-      where: { orgId_email: { orgId: claims.orgId, email: body.data.email } },
-      select: { role: true, acceptedAt: true, revokedAt: true },
-    });
-    if (
-      existingInv &&
-      !existingInv.acceptedAt &&
-      !existingInv.revokedAt &&
-      !canGrantRole(
-        claims.membershipRole,
-        existingInv.role as "owner" | "admin" | "member",
-      )
-    ) {
-      return reply.code(403).send({ error: "cannot_mutate_invite_above_own_rank" });
-    }
-
+    // R153 F1: race the rank check + upsert under Serializable
+    // isolation. R122 F1 landed the rank check as a JS-side
+    // findUnique OUTSIDE any tx, then upserted with an
+    // unguarded UPDATE clause. Two concurrent POST /invites for
+    // the same email — owner O1 minting role="owner" while
+    // admin A1 concurrently mints role="admin" — both read the
+    // null (or same lower-rank) pre-image at snapshot time,
+    // both pass the rank check, and race the upsert. Whichever
+    // tx commits SECOND falls into ON CONFLICT DO UPDATE and
+    // blindly rewrites role / tokenHash / invitedById /
+    // invitedByEmail. If A1 lands second: owner-tier invite
+    // silently DOWNGRADED to admin, O1's already-emailed owner
+    // token argon2-fails at /invites/accept (silent DoS on the
+    // owner's link), invite trail attributes to A1 (audit
+    // laundering), and role is silently downgraded — the exact
+    // harm R122 F1's comment names, delivered via race rather
+    // than sequential ordering. Threat model: admin insider
+    // racing owner onboarding. Same read-then-write race class
+    // R151 F1 / R152 F1 closed for /ingest paths via DB-side
+    // WHERE guards; here the natural shape is the sibling
+    // members.ts PATCH-role Serializable tx at :132-208, which
+    // already catches P2034 as `concurrent_modification_retry`.
     const plaintextToken = randomToken(32);
     const tokenHash = await hashPassword(plaintextToken);
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
-    // Upsert — if there's already a pending invite for this email, refresh
-    // it with a new token instead of erroring. Op-friendly.
-    const inv = await db.invite.upsert({
-      where: { orgId_email: { orgId: claims.orgId, email: body.data.email } },
-      create: {
-        orgId: claims.orgId,
-        email: body.data.email,
-        role: body.data.role,
-        tokenHash,
-        invitedById: inviter.id,
-        invitedByEmail: inviter.email,
-        expiresAt,
-      },
-      update: {
-        tokenHash,
-        role: body.data.role,
-        invitedById: inviter.id,
-        invitedByEmail: inviter.email,
-        expiresAt,
-        acceptedAt: null,
-        revokedAt: null,
-      },
-    });
+    let inv;
+    try {
+      inv = await db.$transaction(
+        async (tx) => {
+          const existingInv = await tx.invite.findUnique({
+            where: { orgId_email: { orgId: claims.orgId, email: body.data.email } },
+            select: { role: true, acceptedAt: true, revokedAt: true },
+          });
+          if (
+            existingInv &&
+            !existingInv.acceptedAt &&
+            !existingInv.revokedAt &&
+            !canGrantRole(
+              claims.membershipRole,
+              existingInv.role as "owner" | "admin" | "member",
+            )
+          ) {
+            throw new Error("rank_guard");
+          }
+          // Upsert — if there's already a pending invite for this
+          // email, refresh it with a new token instead of erroring.
+          // Op-friendly. Serializable isolation makes the pre-read
+          // above + this write atomic against concurrent writers:
+          // a racer who reads the same pre-image aborts with P2034
+          // and the client retries the whole flow.
+          return tx.invite.upsert({
+            where: { orgId_email: { orgId: claims.orgId, email: body.data.email } },
+            create: {
+              orgId: claims.orgId,
+              email: body.data.email,
+              role: body.data.role,
+              tokenHash,
+              invitedById: inviter.id,
+              invitedByEmail: inviter.email,
+              expiresAt,
+            },
+            update: {
+              tokenHash,
+              role: body.data.role,
+              invitedById: inviter.id,
+              invitedByEmail: inviter.email,
+              expiresAt,
+              acceptedAt: null,
+              revokedAt: null,
+            },
+          });
+        },
+        { isolationLevel: "Serializable" },
+      );
+    } catch (e) {
+      if (e instanceof Error && e.message === "rank_guard") {
+        return reply
+          .code(403)
+          .send({ error: "cannot_mutate_invite_above_own_rank" });
+      }
+      if (
+        typeof e === "object" && e !== null &&
+        (e as { code?: string }).code === "P2034"
+      ) {
+        return reply
+          .code(409)
+          .send({ error: "concurrent_modification_retry" });
+      }
+      throw e;
+    }
 
     // Send email — fire-and-forget so a stuck mailer doesn't 30s a request.
     const link = `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/accept-invite?token=${encodeURIComponent(plaintextToken)}&email=${encodeURIComponent(inv.email)}`;
