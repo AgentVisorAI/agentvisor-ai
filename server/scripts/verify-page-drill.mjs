@@ -299,8 +299,32 @@ await uploadJson(JSON.stringify(wrongFormat));
   console.log("✅ console download → /verify/ drop → green; tampered rawBody → red (the auditor path, end-to-end)");
 }
 
+// ── 14. Slow-CDN wiring truth: verify.js arrives late → buttons must be
+// truthfully disabled until handlers attach (a click pre-wiring used to
+// silently do nothing — caught live by the venue-wifi rehearsal).
+{
+  const page = await context.newPage();
+  await page.route("**/verify/verify.js", async (route) => {
+    await new Promise((r) => setTimeout(r, 1500));
+    route.continue();
+  });
+  await page.goto(VERIFY_URL, { waitUntil: "commit" });
+  await page.waitForSelector("#browseBtn", { state: "attached", timeout: 10000 });
+  const pre = await page.evaluate(() => ({
+    browse: document.getElementById("browseBtn").disabled,
+    example: document.getElementById("loadExample").disabled,
+  }));
+  if (!pre.browse || !pre.example) fail("verify buttons enabled before verify.js wired them: " + JSON.stringify(pre));
+  await page.click("#loadExample", { timeout: 10000 }); // auto-waits for enabled
+  await waitVerifyStable(page);
+  const title = await page.locator(".result-title").innerText();
+  if (!/verifies/i.test(title)) fail("post-wire sample click did not verify green: " + title.slice(0, 60));
+  await page.close();
+  console.log("✅ slow-CDN load: buttons ship disabled, enable on wire, click then verifies green");
+}
+
 if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors));
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 13 /verify page drill checks passed.");
+console.log("\nAll 14 /verify page drill checks passed.");
