@@ -352,6 +352,23 @@ async function main(): Promise<void> {
   // ceremony), and the wire stays consistent. Successful 2xx responses
   // pass through untouched.
   app.addHook("onSend", async (req, reply, payload) => {
+    // R169 F1: bail out if the underlying response has already
+    // flushed headers to the client. stream.ts calls
+    // `reply.raw.flushHeaders()` on the SSE handshake so the
+    // client sees `Content-Type: text/event-stream` immediately
+    // — after that point, any `reply.header(...)` call in this
+    // hook resolves to `reply.raw.setHeader(...)` which throws
+    // Node's `ERR_HTTP_HEADERS_SENT` and (depending on Fastify
+    // version) either escalates to a 500 or crashes the
+    // connection mid-stream. The prior shape at :355 ran
+    // `reply.header("X-Request-Id", ...)` unconditionally and
+    // was safe only because Fastify's onSend usually skips
+    // raw-hijacked responses — but R166 F1 added a second
+    // header write and any future addition would compound the
+    // risk. `reply.raw.headersSent` is the Node-level truth
+    // (updated the instant flushHeaders / write / writeHead
+    // fires) and is the only reliable signal.
+    if (reply.raw.headersSent) return payload;
     reply.header("X-Request-Id", String(req.id));
     // R166 F1: Cache-Control: private, no-store as global
     // default. Every API response carries user-scoped data
