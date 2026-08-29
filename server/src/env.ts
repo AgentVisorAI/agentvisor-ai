@@ -195,7 +195,49 @@ const Env = z.object({
     ),
   // Public base URL of the console. Used to build OAuth redirect_uri
   // and password-reset links. e.g. https://agentvisorai.me
-  APP_BASE_URL: z.string().default("http://localhost:8787"),
+  // R175 F1: refuse to boot in production if left at the localhost
+  // default (or on http://). APP_BASE_URL flows into:
+  //   * reset-request emails (auth.ts:1042)
+  //   * invite emails (members.ts:469)
+  //   * SAML EntityID + ACS + SLO + LoginURL + metadata (lib/saml.ts:68)
+  //   * OAuth redirect_uri sent to Google/Microsoft (oauth.ts:187)
+  //   * OAuth error redirects (oauth.ts:167 & many)
+  //   * WebAuthn rpID + expected origins (webauthn.ts:59, :82)
+  //   * SAML redirects (saml.ts:222 & many)
+  // If an operator boots a real deployment without setting
+  // APP_BASE_URL, every one of those flows silently misroutes:
+  // reset/invite links point at localhost:8787 (broken on any
+  // remote machine; on shared or compromised machines, a local
+  // attacker listening on :8787 would intercept the plaintext
+  // token in the URL); OAuth redirect_uri mismatches with the
+  // IdP registration → cascading failure or, if the IdP was
+  // registered against localhost for dev testing, code goes to
+  // localhost; WebAuthn passkeys register against rpID
+  // "localhost" and stop working the moment the operator later
+  // corrects APP_BASE_URL (registered passkeys are pinned to
+  // their rpID). Same failure-fast posture as the mailer guard
+  // at lib/mail.ts:111-117 — misconfiguration should crash at
+  // boot, not on the first reset three weeks later. Dev
+  // (NODE_ENV != production) still defaults to the local URL
+  // so `npm run dev` works out of the box.
+  APP_BASE_URL: z
+    .string()
+    .default("http://localhost:8787")
+    .refine(
+      (v) => {
+        if (process.env.NODE_ENV !== "production") return true;
+        // Production requires an explicit non-default value on
+        // https://. Reject the localhost default and any http://
+        // URL (a real deployment always has TLS; the R105 F2
+        // HTTPS-force hook at index.ts:223 would 400 every
+        // request otherwise, but reset/invite email links are
+        // baked in at send-time and don't go through that hook).
+        if (v === "http://localhost:8787") return false;
+        if (v.startsWith("http://")) return false;
+        return true;
+      },
+      "APP_BASE_URL must be an https:// URL in production; the localhost default is unsafe for reset-links, invite-links, OAuth redirect_uri, and WebAuthn rpID.",
+    ),
   // OIDC providers. All optional — the login page only shows a
   // provider button when the corresponding client-id is set.
   GOOGLE_CLIENT_ID: z.string().optional(),
