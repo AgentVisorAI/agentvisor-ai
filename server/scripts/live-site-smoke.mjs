@@ -182,5 +182,31 @@ console.log("✅ Environment pill present: " + pillText);
   console.log("✅ Alias stubs (/mockup→/pitch, /demo→/app) + branded 404 with escape links");
 }
 
+// 9. Link previews: these URLs get pasted into Slack/WhatsApp/email —
+// every page needs complete OG/Twitter metadata with an absolute
+// og:image that actually resolves, and a working favicon.
+{
+  const origin = new URL(SITE).origin + "/";
+  for (const p of ["", "pitch/", "verify/", "app/"]) {
+    await page.goto(origin + p, { waitUntil: "domcontentloaded" });
+    const m = await page.evaluate(async (orig) => {
+      const g = (sel) => document.querySelector(sel)?.getAttribute("content") || null;
+      const ogImage = g('meta[property="og:image"]');
+      let imgStatus = 0;
+      if (ogImage && /^https?:\/\//.test(ogImage)) {
+        try { imgStatus = (await fetch(ogImage.replace("https://agentvisorai.me/", orig))).status; } catch {}
+      }
+      const iconHref = document.querySelector('link[rel~="icon"]')?.getAttribute("href");
+      let iconStatus = 0;
+      if (iconHref) { try { iconStatus = (await fetch(iconHref)).status; } catch {} }
+      return { title: !!g('meta[property="og:title"]'), desc: !!g('meta[property="og:description"]'), imgAbs: !!ogImage && /^https?:\/\//.test(ogImage), imgStatus, twitter: !!g('meta[name="twitter:card"]'), iconStatus };
+    }, origin);
+    if (!m.title || !m.desc || !m.imgAbs || m.imgStatus !== 200 || !m.twitter || m.iconStatus !== 200) {
+      fail("/" + p + " link-preview metadata broken: " + JSON.stringify(m));
+    }
+  }
+  console.log("✅ Link previews: OG/Twitter tags complete on all 4 pages, og:image + favicon resolve");
+}
+
 await browser.close();
-console.log("\nLive site smoke passed (8 checks against " + SITE + ").");
+console.log("\nLive site smoke passed (9 checks against " + SITE + ").");
