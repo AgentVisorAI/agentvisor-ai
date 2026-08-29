@@ -77,11 +77,15 @@ export async function orgRoutes(app: FastifyInstance): Promise<void> {
       (currentRetention.auditRetentionDays === 0 ||
         body.data.auditRetentionDays < currentRetention.auditRetentionDays);
     if ((narrowingSession || narrowingAudit) && claims.membershipRole !== "owner") {
+      // R146 F2: enrich actor email — auth.step_up_denied
+      // rows benefit from operator attribution just like the
+      // success-path rows.
+      const narrowActor = await resolveActor(claims.sub);
       writeAudit(
         {
           orgId: claims.orgId,
           event: "auth.step_up_denied",
-          actorId: claims.sub,
+          ...narrowActor,
           note: "not_owner",
           metadata: { endpoint: "org.retention.narrow" },
           req,
@@ -136,11 +140,13 @@ export async function orgRoutes(app: FastifyInstance): Promise<void> {
     // expired rows, but by fencing owner-only we keep the primitive
     // consistent with the retention control itself).
     if (claims.membershipRole !== "owner") {
+      // R146 F2: enrich actor email — sweep-now denial too.
+      const sweepDeniedActor = await resolveActor(claims.sub);
       writeAudit(
         {
           orgId: claims.orgId,
           event: "auth.step_up_denied",
-          actorId: claims.sub,
+          ...sweepDeniedActor,
           note: "not_owner",
           metadata: { endpoint: "org.retention.sweep_now" },
           req,
@@ -196,8 +202,33 @@ export async function orgRoutes(app: FastifyInstance): Promise<void> {
   app.patch("/ip-allowlist", async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
-    if (claims.membershipRole === "member") {
-      return reply.code(403).send({ error: "forbidden" });
+    // R146 F1: owner-only for WRITE. Prior shape gated on
+    // non-member so an admin could PATCH the allowlist to
+    // ["<admin-ip>/32"], passing the self-lockout guard (their
+    // own IP matches) — but the owner's next request through
+    // requireSession would hit !ipMatchesAny(req.ip, cidrs) →
+    // 403 forbidden_ip on every console endpoint including
+    // PATCH /ip-allowlist itself. Owner's only recovery is a
+    // DB console. Same "admin uses org-wide primitive to
+    // sabotage recovery" class R145 F1 closed for retention:
+    // R145 F1 shut the "destroy compliance data" leg; this
+    // shuts the "deny owner access" leg. GET remains admin-
+    // readable (per R93 F3 which needed admin visibility).
+    if (claims.membershipRole !== "owner") {
+      // R146 F2: enrich actor email.
+      const ipDeniedActor = await resolveActor(claims.sub);
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "auth.step_up_denied",
+          ...ipDeniedActor,
+          note: "not_owner",
+          metadata: { endpoint: "org.ip_allowlist.write" },
+          req,
+        },
+        req.log,
+      );
+      return reply.code(403).send({ error: "only_owner_can_edit_ip_allowlist" });
     }
     const body = z
       .object({
@@ -235,11 +266,14 @@ export async function orgRoutes(app: FastifyInstance): Promise<void> {
       data: { ipAllowlist: cleaned },
       select: { ipAllowlist: true },
     });
+    // R146 F2: enrich actor email — ip_allowlist changes deserve
+    // owner-identifying attribution.
+    const ipUpdateActor = await resolveActor(claims.sub);
     writeAudit(
       {
         orgId: claims.orgId,
         event: "org.ip_allowlist_updated",
-        actorId: claims.sub,
+        ...ipUpdateActor,
         target: claims.orgId,
         metadata: { cidrs: updated.ipAllowlist, byIp: req.ip },
         req,
