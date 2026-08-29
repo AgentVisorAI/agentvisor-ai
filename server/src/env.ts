@@ -35,6 +35,23 @@ if (!process.env.JWT_SECRET && process.env.NODE_ENV !== "production") {
   process.env.JWT_SECRET = crypto.randomBytes(48).toString("hex");
 }
 
+// R176 F1: snapshot whether NODE_ENV was set BEFORE the Zod schema
+// injects its "development" default. If an operator boots
+// `npm run start` without setting NODE_ENV (bare Docker,
+// systemd unit that forgot Environment=, ad-hoc launch on a
+// self-hosted host — the platform automatons like Vercel/
+// Heroku/Fly.io/K8s Deployment typically set it, but not
+// everyone deploys through those), the whole app silently runs
+// in dev mode: SESSION_COOKIE_SECURE auto-false → cookies over
+// HTTP, HTTPS-force hook disabled at index.ts:223, empty
+// ALLOWED_ORIGINS opens CORS at index.ts:110, dev-stub mailer
+// allowed, and R175 F1's APP_BASE_URL production guard is
+// bypassed. Zod's `.default("development")` fires
+// indistinguishably from an explicit `NODE_ENV=development`
+// export. Capture the boolean now so the runtime can flag it
+// (main() below picks it up after Env parses).
+const NODE_ENV_WAS_UNSET = process.env.NODE_ENV === undefined;
+
 const Env = z.object({
   PORT: z.coerce.number().int().min(1).max(65535).default(8080),
   // Listen on all interfaces via IPv6 wildcard `::`. Modern OS kernels map
@@ -271,3 +288,24 @@ if (!parsed.success) {
 }
 export const env = parsed.data;
 export type Env = z.infer<typeof Env>;
+
+// R176 F1: emit a loud, single-line stderr warning at boot when
+// NODE_ENV was defaulted rather than explicitly set. See the
+// NODE_ENV_WAS_UNSET snapshot above for the full rationale.
+// Uses a leading string that ops log-aggregation rules can
+// alert on (grep-friendly slug) and includes the resolved env
+// so operators immediately see which fail-open branches
+// activated. Warning-only (not fatal) because plenty of dev
+// workflows legitimately omit NODE_ENV, but the presence of
+// this line in a production log stream is a red flag.
+if (NODE_ENV_WAS_UNSET) {
+  // eslint-disable-next-line no-console
+  console.warn(
+    `env_warn_node_env_defaulted: NODE_ENV was not set in the environment; ` +
+      `defaulting to "${env.NODE_ENV}". If this is a production deployment, ` +
+      `set NODE_ENV=production explicitly — otherwise SESSION_COOKIE_SECURE ` +
+      `auto-falses (cookies over HTTP), HTTPS-force is disabled, dev-stub ` +
+      `mailer is allowed, and the R175 APP_BASE_URL production guard is ` +
+      `bypassed.`,
+  );
+}
