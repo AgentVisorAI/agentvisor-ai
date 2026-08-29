@@ -86,10 +86,12 @@ export function parseCidr(cidr: string): ParsedCidr {
   // org.ts:240 explicitly states "Reject any malformed CIDR —
   // never silently drop rows" — this restores that invariant.
   // Number(str.trim()) is strict full-string parse:
-  //   Number("12abc") === NaN, Number("") === 0 (still caught
-  //   by the empty check above), Number(" 24") === 24 (trim
-  //   handles that case). Number.isInteger then rejects
-  //   fractional / NaN / Infinity in one gate.
+  //   Number("12abc") === NaN, Number("") === 0 (caught
+  //   by the explicit empty-prefix check on the next
+  //   statement — DO NOT remove it trusting this comment,
+  //   see R203 F1 rationale below), Number(" 24") === 24
+  //   (trim handles that case). Number.isInteger then
+  //   rejects fractional / NaN / Infinity in one gate.
   const prefix = Number(prefixStr.trim());
   // R203 F1: also reject empty prefix (Number("") === 0, would
   // otherwise accept "1.2.3.4/" as /0 = match-anything — almost
