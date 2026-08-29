@@ -1767,8 +1767,69 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ hostile-length identity: topbar contained, account menu capped at " + ln.menuW + "px");
 }
 
+// ── 30. Theme toggle preserves widget state: toggleTheme used to call
+// render(), wiping typed-but-uncommitted filters, the selected event +
+// drawer, loaded pages, and scroll. Theming is CSS-var-driven — a flip
+// must repaint colors only. Covers the in-tab toggle AND the cross-tab
+// storage follower (which had the same render() reset).
+{
+  const tPage = await context.newPage();
+  await tPage.goto(SITE + "#/sessions/sess_01H9K", { waitUntil: "domcontentloaded" });
+  await tPage.waitForSelector("#evtSearch", { timeout: 15000 });
+  await tPage.click(".evt");
+  await tPage.waitForTimeout(250);
+  await tPage.click("#evtSearch");
+  await tPage.keyboard.type("tool", { delay: 25 });
+  await tPage.waitForTimeout(450);
+  await tPage.evaluate(() => window.scrollTo(0, 300));
+  await tPage.waitForTimeout(150);
+  const pre = await tPage.evaluate(() => ({
+    visible: [...document.querySelectorAll(".evt")].filter((x) => !x.classList.contains("evt-hidden")).length,
+    scrollY: window.scrollY, // may be < 300 if the page is short at this viewport
+  }));
+  await tPage.click(".user-btn");
+  await tPage.waitForSelector('#accountMenu [data-act="theme"]', { timeout: 4000 });
+  await tPage.click('#accountMenu [data-act="theme"]');
+  await tPage.waitForTimeout(450);
+  const post = await tPage.evaluate(() => ({
+    themed: !!document.documentElement.getAttribute("data-theme"),
+    q: document.getElementById("evtSearch")?.value,
+    visible: [...document.querySelectorAll(".evt")].filter((x) => !x.classList.contains("evt-hidden")).length,
+    selected: !!document.querySelector(".evt.selected"),
+    scrollY: window.scrollY,
+  }));
+  const scrollKept = Math.abs(post.scrollY - pre.scrollY) <= 4; // a render() reset would land at 0
+  if (!post.themed || post.q !== "tool" || post.visible !== pre.visible || !post.selected || !scrollKept)
+    fail("theme toggle reset widget state: " + JSON.stringify(post));
+  // menu label reflects the new theme on next open
+  await tPage.click(".user-btn");
+  await tPage.waitForSelector("#accountMenu", { timeout: 4000 });
+  const themeNow = await tPage.evaluate(() => document.documentElement.getAttribute("data-theme"));
+  const label = await tPage.evaluate(() => document.querySelector('#accountMenu [data-act="theme"]').textContent);
+  const expectWord = themeNow === "dark" ? /light/i : /dark/i;
+  if (!expectWord.test(label)) fail("menu label stale after toggle: theme=" + themeNow + " label=" + label);
+  // cross-tab follower keeps the second tab's widget state too
+  const t2 = await context.newPage();
+  await t2.goto(SITE + "#/sessions/sess_01H9K", { waitUntil: "domcontentloaded" });
+  await t2.waitForSelector("#evtSearch", { timeout: 15000 });
+  await t2.click("#evtSearch");
+  await t2.keyboard.type("block", { delay: 25 });
+  await t2.waitForTimeout(400);
+  await tPage.bringToFront();
+  await tPage.click('#accountMenu [data-act="theme"]'); // toggle back (menu still open)
+  await tPage.waitForTimeout(600);
+  const tab2 = await t2.evaluate(() => ({
+    theme: document.documentElement.getAttribute("data-theme"),
+    q: document.getElementById("evtSearch")?.value,
+  }));
+  if (tab2.q !== "block") fail("cross-tab theme follow reset the other tab's widgets: " + JSON.stringify(tab2));
+  await tPage.close();
+  await t2.close();
+  console.log("✅ theme toggle: colors flip, widgets keep state (filter/selection/scroll, both tabs), menu label fresh");
+}
+
 if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors));
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 29 interactive-features drill checks passed.");
+console.log("\nAll 30 interactive-features drill checks passed.");
