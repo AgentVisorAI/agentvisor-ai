@@ -288,8 +288,16 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
         .map((s) => (s.parentElement.className || "?").toString().slice(0, 24) + " " + Math.round(s.getBoundingClientRect().width) + "px")
         .slice(0, 4));
     if (fatSvgs.length) fail(`unsized inline svg blowout on ${route}: ${JSON.stringify(fatSvgs)}`);
+    // Duplicate DOM ids break label/for + getElementById silently on
+    // whichever copy loses; renders must never emit the same id twice.
+    const dupIds = await page.evaluate(() => {
+      const seen = {}, out = [];
+      for (const el of document.querySelectorAll("[id]")) { if (seen[el.id]) out.push(el.id); else seen[el.id] = 1; }
+      return [...new Set(out)];
+    });
+    if (dupIds.length) fail(`duplicate DOM ids on ${route}: ${JSON.stringify(dupIds)}`);
   }
-  console.log("✅ table action buttons: all inside their cells and hittable (5 routes); no unsized-svg blowouts");
+  console.log("✅ table action buttons: all inside their cells and hittable (5 routes); no unsized-svg blowouts; no duplicate DOM ids");
 }
 
 // ── 9. Corrupted-storage resilience ───────────────────────────────
@@ -1507,6 +1515,16 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   if ((await page.evaluate(() => location.hash.split("?")[0].split("/")[2])) !== blockedIds[0]) fail("[ pager did not return");
   const pos = await page.evaluate(() => document.querySelector(".sess-nav-pos")?.textContent);
   if (pos !== "1 / " + blockedIds.length) fail("pager position label wrong: " + pos);
+  // Boundaries: at the first item, prev is disabled and [ is a no-op;
+  // pressing past either end must never error or navigate weirdly.
+  const bounds = await page.evaluate(() => ({
+    prevDisabled: !!document.querySelector("#prevSess")?.disabled,
+    hash: location.hash,
+  }));
+  if (!bounds.prevDisabled) fail("prev not disabled at the first session of the browsed set");
+  await page.keyboard.press("[");
+  await page.waitForTimeout(400);
+  if ((await page.evaluate(() => location.hash)) !== bounds.hash) fail("[ at the first item navigated somewhere");
   // Webhook deliveries view: row click opens the per-endpoint history,
   // rows equal listWebhookDeliveries ground truth, the retry case
   // carries its error note, latency is computed.
