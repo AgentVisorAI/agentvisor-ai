@@ -155,7 +155,11 @@ catalog at the bottom.
     (sim-daemon name, `org.created` audit target, the members list,
     the attack-sim user) derive from `freshIdentity()`; canned session
     clones re-time their event trails via `_tsShift` and receipts sign
-    the DISPLAYED fresh values (drill check 33).
+    the DISPLAYED fresh values (drill check 33). Showcase-only
+    affordances hide there too: the guided tour (launcher pill,
+    palette entry, AND `?tour=1` autostart — it narrates Northwind's
+    numbers) and the 30-day-dataset toggle (fresh `listSessions`
+    ignores the flag; the entry would be a lying no-op).
 
 **Evidence & print**
 22. The printed evidence pack is COMPLETE: `@media print` forces
