@@ -870,7 +870,36 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await page.keyboard.press("s");
   await page.waitForTimeout(500);
   if ((await page.evaluate(() => location.hash)) !== "#/sessions") fail("g-nav dead after modal close");
-  console.log("✅ shortcut guards: g-nav / ? / focus-steal all blocked while a dialog is open, restored after");
+  // Typing shortcut characters INSIDE an input must insert text, never
+  // navigate/page/open sheets ("gs[]/?" into the event filter used to
+  // be the danger case: [ ] pager is live on the detail route).
+  await page.goto(SITE + "#/sessions/sess_01H9K", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("#evtSearch", { timeout: 15000 });
+  await page.click("#evtSearch");
+  await page.keyboard.type("gs[]/?", { delay: 20 });
+  await page.waitForTimeout(400);
+  const typed = await page.evaluate(() => ({
+    hash: location.hash,
+    val: document.getElementById("evtSearch")?.value,
+    sheet: !!document.querySelector(".modal-backdrop"),
+  }));
+  if (typed.hash !== "#/sessions/sess_01H9K" || typed.val !== "gs[]/?" || typed.sheet)
+    fail("shortcut chars typed in an input escaped it: " + JSON.stringify(typed));
+  await page.click("#evtSearch", { clickCount: 3 });
+  await page.keyboard.press("Backspace");
+  await page.keyboard.press("Escape");
+  // The ? sheet documents what actually works — assert the newest
+  // bindings are listed (sheet drift = lying docs).
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("?");
+  await page.waitForSelector(".modal-backdrop", { timeout: 4000 });
+  const sheetTxt = await page.evaluate(() => document.querySelector(".modal-backdrop").innerText);
+  for (const want of ["Open a row in a new tab", "Clear the search", "Previous / next session"]) {
+    if (!sheetTxt.includes(want)) fail("shortcut sheet missing: " + want);
+  }
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(250);
+  console.log("✅ shortcut guards: g-nav / ? / focus-steal all blocked while a dialog is open, restored after; typed shortcut chars stay in inputs; ? sheet documents the current bindings");
   // Focus-trap wrap (installModalKeys implements it; nothing asserted
   // it): Tab from the modal's last focusable wraps to the first,
   // Shift+Tab from the first wraps to the last, focus never escapes.
