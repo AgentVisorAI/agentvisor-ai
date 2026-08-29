@@ -74,18 +74,23 @@
     // Follow a LIVE OS scheme flip (sunset auto-dark etc.) while the
     // app is open — but only when the user never chose explicitly.
     // CSS already tracks prefers-color-scheme when data-theme is
-    // absent; re-render so JS-derived bits (menu label) catch up.
+    // absent; only state.theme needs to catch up (next menu open
+    // reads it). No render() — see toggleTheme.
     try {
       matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function (ev) {
         var s;
         try { s = localStorage.getItem("av_theme"); } catch (e2) {}
         if (s === "light" || s === "dark") return; // explicit choice wins
         state.theme = ev.matches ? "dark" : "light";
-        try { render(); } catch (e2) {}
       });
     } catch (e) { /* older Safari: addListener-only — scheme still applies via CSS */ }
   }
-  function toggleTheme() { applyTheme((state.theme === "dark") ? "light" : "dark"); render(); }
+  // No render() here: theming is entirely CSS-variable-driven off the
+  // data-theme attribute (charts included — zero getComputedStyle
+  // reads), and the account menu rebuilds its label on every open. A
+  // full re-render on toggle RESET live widgets: typed-but-uncommitted
+  // filters, the selected event + drawer, loaded list pages, scroll.
+  function toggleTheme() { applyTheme((state.theme === "dark") ? "light" : "dark"); }
 
   /* ---------- routing ---------- */
 
@@ -185,13 +190,14 @@
       }).catch(function () { /* stay on login */ });
     });
     // Cross-tab theme: follow an explicit toggle made in another tab so
-    // side-by-side windows don't end up half dark, half light.
+    // side-by-side windows don't end up half dark, half light. applyTheme
+    // is enough — a render() here reset live widgets in the OTHER tab
+    // (same class as the in-app toggle; see toggleTheme).
     window.addEventListener("storage", function (e) {
       if (e.key !== "av_theme") return;
       if (e.newValue !== "light" && e.newValue !== "dark") return;
       if (state.theme === e.newValue) return;
       applyTheme(e.newValue);
-      try { render(); } catch (err) { /* pre-boot */ }
     });
   }
 

@@ -116,6 +116,13 @@ catalog at the bottom.
 18. `config.js` applies the saved theme **pre-paint** (strict CSP forbids an
     inline head snippet). The OS-scheme `matchMedia` listener follows live
     flips only when no explicit choice is saved, and never persists.
+    Theme changes must **never call `render()`** — theming is entirely
+    CSS-variable-driven off `data-theme` (charts included; zero
+    `getComputedStyle` reads), the account menu rebuilds its label per
+    open, and a re-render wipes live widget state (typed filters, the
+    selected event + drawer, loaded pages, scroll). All three paths
+    (in-app toggle, OS flip, cross-tab storage follower) are
+    `applyTheme`-only; drill check 30 guards it.
 19. Reduced motion is a **global kill-switch** (0.01 ms durations, not
     `none`). Never go back to enumerating animated elements — the list
     drifted twice.
@@ -164,7 +171,7 @@ catalog at the bottom.
 
 | Script | Guards |
 |---|---|
-| `interactive-drill.mjs` | 29 checks: tour, attack story, onboarding ages, billing math, reset flows, hit-tests, storage/router fuzz, pagination + deep links, Back/overlays, double-submit, failure paths + catch-up, cross-tab + FOUC, focus rings/traps + reduced motion + shortcut guards, garbage data, filter/sort/chart/audit/detail ground truth, deployment + key lifecycles, member RBAC, leak soak, form semantics (native validation + Enter submits), skeleton-phase filter liveness, dirty-modal discard guard |
+| `interactive-drill.mjs` | 30 checks: tour, attack story, onboarding ages, billing math, reset flows, hit-tests + unsized-svg blowouts, storage/router fuzz, pagination + deep links, Back/overlays, double-submit, failure paths + catch-up, cross-tab + FOUC, focus rings/traps + reduced motion + shortcut guards, garbage data, filter/sort/chart/audit/detail ground truth, deployment + key lifecycles, member RBAC, leak soak, form semantics (native validation + Enter submits), skeleton-phase filter liveness, dirty-modal discard guard, theme-toggle state preservation |
 | `live-site-smoke.mjs` | 9 checks incl. link/media crawl, captions, alias stubs, 404, OG/Twitter link previews |
 | `a11y-audit.mjs` | 46 axe scans: 11 routes + 9 modal states × 2 themes, 3 static pages × 2 schemes |
 | `mobile-smoke.mjs` | phone/tablet: tab bar, taps, modals fit + hittable + stacking, static pages |
