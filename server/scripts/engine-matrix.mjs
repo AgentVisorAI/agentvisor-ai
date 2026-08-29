@@ -77,10 +77,56 @@ for (const [name, engine] of Object.entries(engines)) {
     await pg.click('.tabbar a[href="#/sessions"]');
     await pg.waitForTimeout(500);
     if ((await pg.evaluate(() => location.hash)) !== "#/sessions") fails.push("tabbar-nav");
+
+    // ── Newest invariants (post-#225 work): these lean hardest on
+    // engine-specific behavior — position:sticky containing blocks,
+    // wheel event semantics, and capture-phase click vetoes.
+    await pg.setViewportSize({ width: 1280, height: 800 });
+
+    // sticky table headers (overflow:clip vs scroll-container retarget)
+    await pg.evaluate(() => { location.hash = "#/sessions"; });
+    await pg.waitForSelector("thead th", { timeout: 8000 });
+    await pg.evaluate(() => window.scrollTo(0, 1200));
+    await pg.waitForTimeout(300);
+    const stickyOk = await pg.evaluate(() => {
+      if (window.scrollY < 400) return true; // page too short to test here
+      const th = document.querySelector("thead th").getBoundingClientRect();
+      const tb = document.querySelector(".topbar").getBoundingClientRect();
+      return Math.abs(th.top - tb.bottom) <= 2;
+    });
+    if (!stickyOk) fails.push("sticky-th");
+    await pg.evaluate(() => window.scrollTo(0, 0));
+
+    // dirty-modal discard guard (capture-phase Escape veto)
+    await pg.evaluate(() => { location.hash = "#/settings/members"; });
+    await pg.waitForSelector("#inviteBtn", { timeout: 8000 });
+    await pg.click("#inviteBtn");
+    await pg.waitForSelector("#inv_email", { timeout: 5000 });
+    await pg.fill("#inv_email", "dirty@x.dev");
+    await pg.keyboard.press("Escape");
+    await pg.waitForTimeout(300);
+    const guarded = await pg.evaluate(() => !!document.querySelector(".modal-backdrop"));
+    await pg.keyboard.press("Escape");
+    await pg.waitForTimeout(300);
+    const discarded = await pg.evaluate(() => !document.querySelector(".modal-backdrop"));
+    if (!guarded || !discarded) fails.push("dirty-guard");
+
+    // theme toggle preserves widget state (no render)
+    await pg.evaluate(() => { location.hash = "#/sessions/sess_01H9K"; });
+    await pg.waitForSelector("#evtSearch", { timeout: 8000 });
+    await pg.click("#evtSearch");
+    await pg.keyboard.type("tool");
+    await pg.waitForTimeout(500);
+    await pg.click("#userBtn");
+    await pg.waitForSelector('#accountMenu [data-act="theme"]', { timeout: 4000 });
+    await pg.click('#accountMenu [data-act="theme"]');
+    await pg.waitForTimeout(400);
+    const themeKept = await pg.evaluate(() => !!document.documentElement.getAttribute("data-theme") && document.getElementById("evtSearch")?.value === "tool");
+    if (!themeKept) fails.push("theme-state");
   } catch (e) { fails.push("exception: " + String(e).split("\n")[0].slice(0, 80)); }
   const status = fails.length || errs.length ? "❌" : "✅";
   anyFail = anyFail || fails.length > 0 || errs.length > 0;
-  console.log(`${status} ${name}: ${fails.length ? "FAIL " + fails.join(",") : "all 8 features pass"}${errs.length ? " | JS: " + errs[0] : ""}`);
+  console.log(`${status} ${name}: ${fails.length ? "FAIL " + fails.join(",") : "all 11 features pass"}${errs.length ? " | JS: " + errs[0] : ""}`);
   await b.close();
 }
 process.exit(anyFail ? 1 : 0);
