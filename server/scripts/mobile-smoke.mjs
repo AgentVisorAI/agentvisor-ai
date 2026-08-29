@@ -303,8 +303,26 @@ await browser.close();
     return m ? m.right <= innerWidth + 1 && m.left >= -1 : false;
   });
   if (!menu) fail("280px: account menu missing or off-screen");
+  // Tour card: the height GUESS in positionAround undershot on narrow
+  // screens (more wraps → taller card) and hung the actions below the
+  // fold; the real-height re-clamp must keep every step's card inside.
+  const tourPage = await (await b3.newContext({ viewport: { width: 280, height: 653 }, isMobile: true, hasTouch: true })).newPage();
+  await tourPage.goto(SITE + "?tour=1#/overview", { waitUntil: "domcontentloaded" });
+  await tourPage.waitForSelector(".av-tour-card", { timeout: 15000 });
+  for (let i = 0; i < 6; i++) {
+    const st = await tourPage.evaluate(() => {
+      const c = document.querySelector(".av-tour-card")?.getBoundingClientRect();
+      const next = [...document.querySelectorAll(".av-tour-card button")].find((x) => /next|verifier|finish/i.test(x.textContent));
+      return { fits: c && c.right <= innerWidth + 1 && c.left >= -1 && c.bottom <= innerHeight + 1 && c.top >= -1, label: next?.textContent.trim() || "" };
+    });
+    if (!st.fits) fail("tour card overflows the 280px viewport at step " + (i + 1) + ": " + JSON.stringify(st));
+    if (/verifier/i.test(st.label)) break;
+    await tourPage.evaluate(() => [...document.querySelectorAll(".av-tour-card button")].find((x) => /next/i.test(x.textContent))?.click());
+    await tourPage.waitForTimeout(1200);
+  }
+  await tourPage.close();
   await b3.close();
-  console.log("✅ 280px foldable: topbar contains every control; account menu opens on-screen");
+  console.log("✅ 280px foldable: topbar contains every control; account menu opens on-screen; all 6 tour cards fit");
 }
 
 console.log("\nAll mobile viewport smoke checks passed.");

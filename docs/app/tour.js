@@ -188,6 +188,14 @@
     card.style.width = cw + "px";
     card.style.left = left + "px";
     card.style.top = top + "px";
+    // The height guess undershoots on narrow screens (more line wraps
+    // → taller card: 261px real vs 210 guessed at 280px, hanging the
+    // actions below the fold). Re-clamp with the REAL laid-out height.
+    var ch = card.offsetHeight || chGuess;
+    if (top + ch > window.innerHeight - 12) {
+      top = Math.max(12, window.innerHeight - ch - 12);
+      card.style.top = top + "px";
+    }
   }
 
   function waitFor(selector, timeoutMs) {
