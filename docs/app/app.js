@@ -4913,6 +4913,15 @@
    * ============================================================ */
 
   function installKeyboardShortcuts() {
+    // Scroll-wheel accident guard: Chrome increments a focused
+    // <input type=number> on wheel — scrolling the page with the
+    // retention field focused silently changed 90 → 95. Blur-free
+    // fix: swallow wheel over a focused number input (passive:false
+    // required to preventDefault).
+    document.addEventListener("wheel", function (e) {
+      var t = e.target;
+      if (t && t.tagName === "INPUT" && t.type === "number" && document.activeElement === t) e.preventDefault();
+    }, { passive: false });
     document.addEventListener("keydown", function (e) {
       // ⌘K / Ctrl+K
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
