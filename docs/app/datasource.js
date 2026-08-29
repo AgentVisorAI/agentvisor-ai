@@ -1155,16 +1155,20 @@
         updatedAt: new Date().toISOString(),
       }, input);
       MOCK_SAML_CONFIGS.push(cfg);
+      recordAudit("sso.idp_created", cfg.displayName || cfg.id);
       return { config: cfg };
     },
     async updateSamlConfig(id, input) {
       var i = MOCK_SAML_CONFIGS.findIndex(function (c) { return c.id === id; });
       if (i < 0) throw new Error("not_found");
       MOCK_SAML_CONFIGS[i] = Object.assign({}, MOCK_SAML_CONFIGS[i], input, { updatedAt: new Date().toISOString() });
+      recordAudit("sso.idp_updated", MOCK_SAML_CONFIGS[i].displayName || id);
       return { config: MOCK_SAML_CONFIGS[i] };
     },
     async deleteSamlConfig(id) {
+      var gone = MOCK_SAML_CONFIGS.find(function (c) { return c.id === id; });
       MOCK_SAML_CONFIGS = MOCK_SAML_CONFIGS.filter(function (c) { return c.id !== id; });
+      recordAudit("sso.idp_deleted", (gone && gone.displayName) || id);
     },
     async regenerateSamlSpKeypair(id) {
       var i = MOCK_SAML_CONFIGS.findIndex(function (c) { return c.id === id; });
@@ -1173,6 +1177,7 @@
         hasSpKeypair: true,
         spCertPem: "-----BEGIN CERTIFICATE-----\nMIIDazCCAlOgAwIBAgIUX9c5\n...(mock)...\n-----END CERTIFICATE-----",
       });
+      recordAudit("sso.sp_keypair_regenerated", MOCK_SAML_CONFIGS[i].displayName || id);
       return { config: MOCK_SAML_CONFIGS[i], spCertPem: MOCK_SAML_CONFIGS[i].spCertPem };
     },
     // Mock passkeys. A fake yubikey + a fake iCloud passkey so the
