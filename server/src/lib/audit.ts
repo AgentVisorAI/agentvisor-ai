@@ -41,7 +41,13 @@
  *   org.created, org.exported, org.delete.initiated, org.delete.committed,
  *     org.ip_allowlist_updated, org.retention_updated, org.retention_swept
  *   audit.viewed, audit.exported_csv
- *   policy.block
+ *
+ * Note: `policy.block` is NOT an audit slug — it's a webhook
+ * fan-out event dispatched via lib/webhooks.ts dispatchEvent()
+ * from ingest.ts. R146 F3's regen regex picks it up but it's
+ * one of the documented false-positive classes (alongside the
+ * webhook.office.com hostname and the metadata.endpoint values
+ * on auth.step_up_denied rows). Filter when regenerating.
  *
  * `target` is a human-readable label the log viewer shows.
  * `metadata` carries structured fields for machine consumption.

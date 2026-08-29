@@ -174,32 +174,45 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
         select: { id: true, name: true },
       });
       if (!owned) return reply.code(404).send({ error: "not_found" });
-      // R94 F4: refuse to cascade-delete a deployment that still
-      // has sealed receipts unless the caller passes ?force=1.
-      // The schema has ON DELETE CASCADE all the way through
-      // Deployment → Session → Event/Receipt, so a single admin
-      // DELETE (or a phished admin's DELETE, or a compromised-
-      // owner's DELETE) atomically vaporizes every signed receipt
-      // for the deployment plus deployment.publicKeyHex — external
-      // verifier bundles are then unverifiable (no anchor to
-      // pin against), so this is a compliance-story downgrade
-      // sibling of the R93 F4 receipt-overwrite path. Refusing
-      // by default forces the operator to opt in with a
-      // force=1 query flag AND we audit-log the force decision
-      // with the receipt count so the trail shows the intent.
-      // R94 F4 + R95 F2: run the receipt-count check + the delete
-      // inside ONE serializable transaction so a mid-flight
-      // /receipts seal that lands BETWEEN the count and the
-      // delete can't slip through the guard and get vaporized by
-      // the CASCADE. Prior R94 shape ran count() → check → delete
-      // as three independent queries; the race window was
-      // milliseconds but real, and the operator had NO signal in
-      // the audit trail that a receipt had been destroyed
-      // (forceDeletedReceipts: undefined because receiptCount at
-      // check time was 0). Now: recount inside the tx immediately
-      // before the delete, and refuse the whole tx if a fresh
-      // seal landed. The audit metadata is always accurate.
+      // R147 F1: `?force=1` destroys signed receipts and
+      // deployment.publicKeyHex — the anchor external verifier
+      // bundles pin against. Same "admin uses org-wide primitive
+      // to destroy compliance data" class R145 F1 closed for
+      // retention narrowing and R146 F1 closed for
+      // ip_allowlist writes. R94 F4's audit-metadata trail
+      // (forceRequested + forceDeletedReceipts) records the
+      // intent but doesn't stop the action — the operator whose
+      // cookie is stolen doesn't have to be an owner. Gate the
+      // force path on owner-only. Non-force DELETE (empty
+      // deployments, 409 deployment_has_sealed_receipts) stays
+      // admin-writable.
       const force = req.query.force === "1" || req.query.force === "true";
+      if (force && claims.membershipRole !== "owner") {
+        const forceDeniedActor = await resolveActor(claims.sub);
+        writeAudit(
+          {
+            orgId: claims.orgId,
+            event: "auth.step_up_denied",
+            ...forceDeniedActor,
+            note: "not_owner",
+            metadata: {
+              endpoint: "deployment.delete.force",
+              deploymentId: owned.id,
+            },
+            req,
+          },
+          req.log,
+        );
+        return reply
+          .code(403)
+          .send({ error: "only_owner_can_force_delete_receipts" });
+      }
+      // R94 F4 + R95 F2: recount receipts + delete inside ONE
+      // serializable transaction so a mid-flight /receipts seal
+      // that lands BETWEEN the count and the delete can't slip
+      // through the guard and get vaporized by the CASCADE. Audit
+      // metadata (forceRequested + forceDeletedReceipts) is
+      // written after commit so the trail is always accurate.
       let receiptCount = 0;
       try {
         receiptCount = await db.$transaction(async (tx) => {

@@ -24,7 +24,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { db } from "../db.js";
 import { requireSession } from "../lib/session-middleware.js";
-import { writeAudit } from "../lib/audit.js";
+import { writeAudit, resolveActor } from "../lib/audit.js";
 import { dispatchEvent, generateWebhookSecret, validateWebhookUrl } from "../lib/webhooks.js";
 
 const urlSchema = z
@@ -118,7 +118,7 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
       {
         orgId: claims.orgId,
         event: "webhook.created",
-        actorId: claims.sub,
+        ...(await resolveActor(claims.sub)),
         target: ep.name,
         metadata: { endpointId: ep.id, url: ep.url, events: ep.events },
         req,
@@ -169,7 +169,7 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
       {
         orgId: claims.orgId,
         event: "webhook.updated",
-        actorId: claims.sub,
+        ...(await resolveActor(claims.sub)),
         target: updated.name,
         metadata: { endpointId: updated.id, changes: Object.keys(body.data) },
         req,
@@ -194,7 +194,7 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
       {
         orgId: claims.orgId,
         event: "webhook.deleted",
-        actorId: claims.sub,
+        ...(await resolveActor(claims.sub)),
         target: existing.name,
         metadata: { endpointId: existing.id },
         req,
@@ -303,7 +303,7 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
       {
         orgId: claims.orgId,
         event: "webhook.test_fired",
-        actorId: claims.sub,
+        ...(await resolveActor(claims.sub)),
         target: ep.name,
         metadata: { endpointId: ep.id },
         req,
@@ -376,7 +376,7 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
         {
           orgId: claims.orgId,
           event: "webhook.delivery_redelivered",
-          actorId: claims.sub,
+          ...(await resolveActor(claims.sub)),
           target: ep.name,
           metadata: {
             endpointId: ep.id,
@@ -426,7 +426,7 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
         {
           orgId: claims.orgId,
           event: "webhook.secret_rotated",
-          actorId: claims.sub,
+          ...(await resolveActor(claims.sub)),
           target: ep.name,
           metadata: { endpointId: ep.id },
           req,

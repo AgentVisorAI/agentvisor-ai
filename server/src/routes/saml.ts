@@ -23,7 +23,7 @@ import { z } from "zod";
 import { generateKeyPairSync, createHash } from "node:crypto";
 import { db } from "../db.js";
 import { env } from "../env.js";
-import { writeAudit } from "../lib/audit.js";
+import { writeAudit, resolveActor } from "../lib/audit.js";
 import {
   SESSION_COOKIE_OPTS,
   mintSession,
@@ -500,7 +500,7 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
         {
           orgId: claims.orgId,
           event: "auth.saml.slo",
-          actorId: claims.sub,
+          ...(await resolveActor(claims.sub)),
           target: cfg.id,
           metadata: { configId: cfg.id },
           req,
@@ -619,7 +619,7 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
         {
           orgId: claims.orgId,
           event: "saml.config_created",
-          actorId: claims.sub,
+          ...(await resolveActor(claims.sub)),
           target: cfg.displayName,
           metadata: {
             samlConfigId: cfg.id,
@@ -689,7 +689,7 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
         {
           orgId: claims.orgId,
           event: "saml.config_updated",
-          actorId: claims.sub,
+          ...(await resolveActor(claims.sub)),
           target: cfg.displayName,
           metadata: {
             samlConfigId: cfg.id,
@@ -720,7 +720,7 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
         {
           orgId: claims.orgId,
           event: "saml.config_deleted",
-          actorId: claims.sub,
+          ...(await resolveActor(claims.sub)),
           target: existing.displayName,
           metadata: { samlConfigId: existing.id },
           req,
@@ -789,7 +789,7 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
         {
           orgId: claims.orgId,
           event: "saml.keypair_rotated",
-          actorId: claims.sub,
+          ...(await resolveActor(claims.sub)),
           target: existing.displayName,
           metadata: { samlConfigId: existing.id },
           req,
