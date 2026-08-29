@@ -351,6 +351,26 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   }
   await page.waitForFunction(() => document.querySelector(".stat"), { timeout: 10000 });
   console.log("✅ router fuzz: 8 hostile hashes render safely, zero injection, app recovers");
+  // Crash-guard contract: (a) a broken app.js shows the crash card
+  // (throw → immediately; 404 → the 6s watchdog, never a blank page);
+  // (b) a POST-boot stray error must NOT wipe a working console (an
+  // extension throwing mid-demo used to replace the whole UI).
+  const cgPage = await context.newPage();
+  await cgPage.route("**/app/app.js", (r) => r.fulfill({ status: 200, contentType: "text/javascript", body: "throw new Error('drill-simulated corruption');" }));
+  await cgPage.goto(SITE + "#/overview", { waitUntil: "domcontentloaded" });
+  await cgPage.waitForTimeout(1000);
+  const cg = await cgPage.evaluate(() => ({
+    card: document.body.textContent.includes("hit an error"),
+    reload: !![...document.querySelectorAll("button")].find((x) => x.textContent === "Reload"),
+  }));
+  await cgPage.close();
+  if (!cg.card || !cg.reload) fail("crash card missing on boot corruption: " + JSON.stringify(cg));
+  await page.evaluate(() => setTimeout(() => { throw new Error("drill post-boot noise"); }, 0));
+  await page.waitForTimeout(500);
+  const alive = await page.evaluate(() => ({ app: !!document.querySelector(".app-shell"), card: document.body.textContent.includes("hit an error") }));
+  if (!alive.app || alive.card) fail("post-boot error wiped the app: " + JSON.stringify(alive));
+  jsErrors.length = 0; // the deliberate post-boot throw is expected noise
+  console.log("✅ crash guard: boot corruption shows the card; post-boot errors never wipe the console");
 }
 
 // ── 10. Pagination under the big-data mode ─────────────────────────
