@@ -3864,7 +3864,8 @@ impl Finalizer {
             //     while the client's original `/close` is still
             //     `.await`ing on the old Arc.
             // The lifecycle lock is the same one every other
-            // finalize path takes (reconciler.rs:302), so this
+            // finalize path takes (close_session_locked defined
+            // at reconciler.rs:961), so this
             // preserves the "close_session_locked is the single
             // serialization point for finalization tail work"
             // invariant.
@@ -4532,8 +4533,10 @@ async fn remove_outbox(path: &std::path::Path) -> Result<(), FinalizeError> {
                 // is stable. Returning `Err` in this arm made
                 // callers retry the whole operation, and paths that
                 // infer state from outbox presence — see
-                // `recover_signed_journals` around
-                // reconciler.rs:2778-2793 — would then re-emit
+                // `complete_pending_closes` at
+                // reconciler.rs:3844 (drives `replay_unacked_lifecycle_outbox`
+                // for every session whose acked outbox still exists) —
+                // would then re-emit
                 // duplicate lifecycle events off the retry, because
                 // the first pass had ALREADY moved the state
                 // forward. Log the durability warning and return Ok:
@@ -6295,7 +6298,8 @@ mod tests {
 
     /// The pending-close sweep must NOT touch the
     /// empty-unsigned quarantine. That reject path
-    /// (reconciler.rs:442-449) sets `artifact_committed = 1` but
+    /// (reconciler.rs:1121-1130, inside the `Workflow::Unsigned`
+    /// arm of `close_session_locked`) sets `artifact_committed = 1` but
     /// never wrote an ATIF file and never emitted a receipt.
     /// Driving the finalization tail on it would emit a spurious
     /// SESSION_CLOSE bridge event for a session that has no
