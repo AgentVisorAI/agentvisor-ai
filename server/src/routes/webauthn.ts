@@ -486,11 +486,11 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
     // identically to "user doesn't exist" on the timing axis.
     // Prior shape sent decoy allowCredentials but put the real
     // user.id in the challenge cookie, so /authenticate/verify's
-    // dispatch at :520 saw bag.userId != null and skipped the
+    // dispatch at :539 saw bag.userId != null and skipped the
     // decoy branch's 8 ms timing floor + `__decoy__` findFirst
-    // (R144 F2). The real-path findFirst at :584 then returned
+    // (R144 F2). The real-path findFirst at :603 then returned
     // null (client is replaying a decoy id), returned
-    // immediately at :592 with no verify cost. Result: three
+    // immediately at :609-611 with no verify cost. Result: three
     // distinct wall-clock buckets — no user (~8 ms), user
     // exists no creds (~<1 ms), user exists real creds (~1-5
     // ms) — reintroducing the exact account-existence oracle
