@@ -299,6 +299,14 @@
       }
     });
 
+    // The buttons ship disabled in the HTML: on a slow CDN this script
+    // arrives noticeably after first paint, and a click on the not-yet-
+    // wired buttons silently did nothing (the skeleton-phase dead-
+    // button class — caught by the venue-wifi rehearsal in CI). Enable
+    // only now that every handler above is attached.
+    browseBtn.disabled = false;
+    loadExample.disabled = false;
+
     // Shareable receipt URL:
     //     agentvisorai.me/verify/#data=<base64url-encoded-JSON>
     // The console's "Share this receipt" button generates this URL. When

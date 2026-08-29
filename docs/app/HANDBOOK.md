@@ -50,6 +50,10 @@ catalog at the bottom.
 4. Buttons painted during a loading skeleton must be wired through a
    **document-level delegated listener** (`#addPol`, `#addDep`): direct
    wiring after the fetch left dead buttons for the first ~500 ms.
+   The static-page variant: buttons in `/verify/` HTML ship `disabled`
+   and `verify.js` enables them once handlers attach — on a slow CDN the
+   script arrives well after first paint, and a pre-wire click silently
+   did nothing (caught by the venue-wifi rehearsal in CI, run 33224907811).
 
 **Modals & overlays**
 5. The modal contract, all call sites: double-open guard on `body.locked` →
