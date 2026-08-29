@@ -181,3 +181,26 @@ CI: `console-smoke.yml` (22-min timeout; nightly adds engines).
 added to its copy list or they 404 only in production. Live CDN caches for up
 to ~20 min post-deploy; verify with etags or functional probes, not comments
 (assets are terser-minified in the workflow).
+
+## Repo topology (private monorepo, public exports)
+
+This monorepo is **private**. Two public repos are force-pushed
+content snapshots (no history, never edit them directly — the next
+export overwrites everything):
+
+- `AgentVisorAI/agentvisorai.github.io` — the ASSEMBLED site.
+  `pages.yml` builds (rustdoc + terser) and pushes over SSH using the
+  `SITE_DEPLOY_KEY` secret. Its Pages serves `agentvisorai.me`
+  (legacy branch build off `main`, `.nojekyll` in the artifact).
+  The org is on the free plan: Pages cannot serve from a private
+  repo, which is why the site lives in a public artifact repo.
+- `AgentVisorAI/agentvisor` — the public binary tool: the Rust
+  workspace + every compile-time-included path + the offline
+  verifier at `tools/verify-receipt.mjs`. `publish-tool.yml` exports
+  an explicit INCLUDE list (private-by-default) via
+  `TOOL_DEPLOY_KEY`. If a crate gains a new `include_str!` outside
+  the list, the public build breaks — extend the list AND the
+  workflow's `paths:` trigger.
+
+Public site pages must link `github.com/AgentVisorAI/agentvisor`
+(the monorepo 404s for outsiders).

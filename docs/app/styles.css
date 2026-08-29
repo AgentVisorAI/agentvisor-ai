@@ -864,6 +864,15 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
      dot in the Deployments table. */
   white-space: nowrap;
 }
+/* Inline icons inside pills (Google/Microsoft on the SSO tab, webhook
+   event chips, …). An SVG with no width/height attribute renders at
+   the CSS default replaced-element size — the provider logos blew up
+   to ~110px and shattered the pills. Size + align them like text. */
+.pill svg {
+  width: 12px;
+  height: 12px;
+  vertical-align: -2px;
+}
 .pill.ok { background: var(--success-bg); border-color: var(--success-border); color: var(--success); }
 .pill.warn { background: var(--warning-bg); border-color: var(--warning-border); color: var(--warning); }
 .pill.err { background: var(--danger-bg); border-color: var(--danger-border); color: var(--danger); }
