@@ -756,8 +756,12 @@ a.stat.linked:hover .label::after { content: " →"; }
 .chart-svg { width: 100%; height: 180px; display: block; }
 .chart-svg .grid line { stroke: var(--border); stroke-width: 1; stroke-dasharray: 2 3; }
 .chart-svg .axis text { fill: var(--fg-3); font-size: 10px; font-family: inherit; }
-.chart-svg .bar { fill: var(--accent); opacity: 0.85; }
+.chart-svg .bar { fill: var(--accent); opacity: 0.85; transition: opacity 120ms ease; }
 .chart-svg .bar.blocked { fill: var(--danger-solid); opacity: 0.9; }
+/* R202 F1: hovered bar pops so the exact stack under the cursor
+   is visible on dense (60+ bucket) renders where a 2 px bar was
+   otherwise indistinguishable from its neighbours. */
+.chart-svg .bar.hover { opacity: 1; filter: brightness(1.08); }
 .chart-svg .area { fill: var(--accent); fill-opacity: 0.12; stroke: var(--accent); stroke-width: 1.5; }
 .chart-svg .cursor { stroke: var(--fg-3); stroke-width: 1; stroke-dasharray: 2 3; }
 .chart-card { position: relative; }
@@ -771,14 +775,101 @@ a.stat.linked:hover .label::after { content: " →"; }
   pointer-events: none;
   box-shadow: var(--shadow-md);
   z-index: 10;
-  min-width: 140px;
+  min-width: 160px;
 }
-.chart-tip .tip-label { color: var(--canvas); opacity: 0.7; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 4px; }
+/* R202 F1: pointer arrow below the tooltip so the eye connects
+   the label to the bar it describes. Uses a CSS ::after triangle
+   sized to match the tooltip surface. */
+.chart-tip::after {
+  content: "";
+  position: absolute;
+  bottom: -5px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 0;
+  height: 0;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 5px solid var(--fg);
+}
+.chart-tip .tip-label {
+  color: var(--canvas);
+  opacity: 0.7;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
+  /* R202 F1: hold the rate pill on the same line as the bucket
+     label so the tooltip stays compact (2 lines of counts + 1
+     header row) even when both are populated. */
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+/* R202 F1: block-rate pill next to the bucket label. `.quiet`
+   applies when the bucket has zero activity so a hover on empty
+   space returns something readable instead of blank counts. */
+.chart-tip .tip-rate {
+  font-size: 9.5px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.15);
+  color: var(--canvas);
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 500;
+  opacity: 0.9;
+}
+.chart-tip .tip-rate.danger {
+  background: var(--danger-solid);
+  color: #fff;
+  opacity: 1;
+}
+.chart-tip .tip-rate.quiet {
+  background: rgba(255, 255, 255, 0.1);
+  opacity: 0.6;
+}
 .chart-tip .tip-row { display: flex; align-items: center; gap: 6px; padding: 1px 0; }
 .chart-tip .tip-row .d { display: inline-block; width: 6px; height: 6px; border-radius: 2px; }
 .chart-tip .tip-row b { margin-left: auto; font-weight: 600; }
-.chart-tip .tip-row.muted { color: var(--canvas); opacity: 0.7; }
+/* R202 F1: brighten the muted spend row — prior 0.7 opacity on
+   the same low-contrast `var(--canvas)` color made the number
+   unreadable in light-mode. Bumping to 0.85 keeps the visual
+   hierarchy (spend is secondary) while staying WCAG-legible. */
+.chart-tip .tip-row.muted { color: var(--canvas); opacity: 0.85; }
 .chart-svg .hover-strip { cursor: crosshair; }
+
+/* R202 F1: empty-state card that replaces the SVG when every
+   bucket in the window is 0/0. Same visual footprint as the
+   chart (180 px tall inside .chart-card) so the surrounding
+   legend + sub-heading stay aligned instead of collapsing. */
+.chart-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 180px;
+  gap: 6px;
+  color: var(--fg-2);
+  padding: 0 var(--s-4);
+  text-align: center;
+}
+.chart-empty-icon {
+  font-size: 28px;
+  opacity: 0.5;
+  margin-bottom: 2px;
+}
+.chart-empty-title {
+  font-size: var(--t-body);
+  font-weight: 500;
+  color: var(--fg);
+}
+.chart-empty-sub {
+  font-size: var(--t-sec);
+  color: var(--fg-3);
+  max-width: 380px;
+}
 
 /* ============================================================
  * TABLES
