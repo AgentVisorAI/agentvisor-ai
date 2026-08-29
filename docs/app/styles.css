@@ -1574,6 +1574,11 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   box-shadow: var(--shadow-lg);
   z-index: 300;
   animation: toastIn 120ms cubic-bezier(.22,1,.36,1);
+  /* Unbroken tokens/URLs in a message (a copy-failure echoing an
+     av_live_… token) once stretched a toast to ~885px — off the left
+     edge of a phone. Cap and wrap anywhere. */
+  max-width: min(420px, calc(100vw - 24px));
+  overflow-wrap: anywhere;
   display: flex; align-items: center; gap: 8px;
 }
 .toast.err { background: var(--danger-solid); color: var(--solid-fg); }
