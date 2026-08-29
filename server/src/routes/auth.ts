@@ -28,7 +28,30 @@ const emailSchema = z
   .toLowerCase()
   .regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, "Invalid email");
 const passwordSchema = z.string().min(12).max(1024);
-const orgNameSchema = z.string().min(1).max(80).trim();
+// R184 F1: CRLF/NUL rejection on user-controlled strings that flow
+// into email subject/body. inviteMail (mail.ts:202-228) interpolates
+// `orgName`, `inviterEmail`, and `link` into the subject line
+// verbatim; welcomeMail interpolates `displayName` into the HTML
+// body via escHtml. HTML escape closes the phishing-injection vector
+// R99 F1 documented, but a CRLF in orgName would still slip past
+// escHtml into the SMTP `Subject:` header — subject values are
+// header fields, not HTML body, and `\r\n` in a header value
+// injects arbitrary follow-on headers (`Bcc:`, `Reply-To:`,
+// `Content-Type:`) at the mail gateway. Resend / nodemailer / SES
+// typically strip these, but that's out of our control on any
+// swap; defense-in-depth means rejecting the input at Zod time so
+// a mail-library regression can't lift the attack. `\s` in
+// emailSchema already covers this class for the email field
+// (auth.ts:29 uses `[^\s@]+` which excludes CRLF), but orgName
+// and displayName were only `.trim()`ed (leading/trailing only,
+// not middle). Refuse any control char in [\r\n\u0000].
+const noCrlfNul = (v: string): boolean => !/[\r\n\u0000]/.test(v);
+const orgNameSchema = z
+  .string()
+  .min(1)
+  .max(80)
+  .trim()
+  .refine(noCrlfNul, "must not contain CR/LF/NUL");
 
 function orgSlug(name: string, salt: string): string {
   const base = name
@@ -64,7 +87,8 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       .object({
         email: emailSchema,
         password: passwordSchema,
-        displayName: z.string().min(1).max(80).trim().optional(),
+        // R184 F1: reject CRLF/NUL — see orgNameSchema above.
+        displayName: z.string().min(1).max(80).trim().refine(noCrlfNul, "must not contain CR/LF/NUL").optional(),
         orgName: orgNameSchema,
       })
       .safeParse(req.body);
