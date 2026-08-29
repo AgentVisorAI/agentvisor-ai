@@ -68,7 +68,7 @@ try {
     externalId: "sess_e2e_"+rand,
     agent: "e2e-agent",
     workflow: "signed",
-    status: "sealed",
+    status: "live",
     policyVersion: 1,
     openedAt,
     closedAt: new Date().toISOString(),
@@ -83,6 +83,30 @@ try {
     { sessionExternalId:"sess_e2e_"+rand, seq:4, kind:"sys", tag:"end", body:"session sealed", occurredAt: now },
   ]);
   check("ingest events", evRes.status === 200, JSON.stringify(evRes.data));
+
+  // Seal via the sanctioned lifecycle: register the daemon's signing
+  // pubkey, then post a signed receipt. Direct status:"sealed" session
+  // ingests are refused (cannot_direct_seal_session) since the
+  // R141/R144/R151 hardening — a compromised ingest token must not be
+  // able to force-seal a live session and censor the rest of its trail.
+  const { generateKeyPairSync, sign: edSign, createHash } = await import("node:crypto");
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  const pubRaw = publicKey.export({ type: "spki", format: "der" }).subarray(-32);
+  const pkRes = await ingest("/api/v1/ingest/pubkey", { publicKeyHex: pubRaw.toString("hex") });
+  check("ingest pubkey", pkRes.status === 200, JSON.stringify(pkRes.data));
+  const receiptBody = JSON.stringify({ v: 2, session: "sess_e2e_"+rand, eventCount: 4 });
+  const rcptRes = await ingest("/api/v1/ingest/receipts", {
+    sessionExternalId: "sess_e2e_"+rand,
+    receiptId: "rcpt_e2e_"+rand,
+    body: receiptBody,
+    sigB64: edSign(null, Buffer.from(receiptBody), privateKey).toString("base64"),
+    keyIdHex: createHash("sha256").update(pubRaw).digest("hex").slice(0, 32),
+    eventCount: 4,
+    issuedAt: new Date().toISOString(),
+    stopReason: "normal",
+    stopReasonId: 0,
+  });
+  check("ingest receipt seals session", rcptRes.status === 200, JSON.stringify(rcptRes.data));
 
   const ov = await ds.getOverview();
   check("overview sessions=1", ov.sessions === 1, "got="+ov.sessions);
@@ -110,10 +134,16 @@ try {
   const rot = await ds.rotateDeploymentToken(dep.deployment.id);
   check("rotate returns token", !!rot.ingestToken);
 
-  // Delete
-  await ds.deleteDeployment(dep.deployment.id);
+  // Delete: a deployment holding sealed receipts refuses a plain
+  // DELETE (409 deployment_has_sealed_receipts) — assert the guard
+  // fires, then force-delete exactly like the SPA's confirm flow.
+  let refusedCode = "";
+  try { await ds.deleteDeployment(dep.deployment.id); }
+  catch (e) { refusedCode = (e && (e.errorCode || (e.data && (e.data.errorCode || e.data.error)) || e.message)) || ""; }
+  check("plain delete refused (sealed receipts)", /sealed_receipts/.test(refusedCode), refusedCode);
+  await ds.deleteDeployment(dep.deployment.id, { force: true });
   const depsAfter = await ds.listDeployments();
-  check("delete removes", depsAfter.length === 0);
+  check("force delete removes", depsAfter.length === 0);
 
   await ds.logout();
   const s2 = await ds.getSession();
