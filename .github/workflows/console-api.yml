@@ -112,6 +112,13 @@ jobs:
         working-directory: server
         env:
           NODE_ENV: production
+          # R175 F1 fail-fasts production boots left on the localhost
+          # APP_BASE_URL default. CI runs prod mode against 127.0.0.1
+          # but never exercises the link-generation flows (reset/invite
+          # emails, OAuth redirect_uri, WebAuthn rpID), so the real
+          # public origin satisfies the guard without changing what the
+          # smoke/e2e suites hit.
+          APP_BASE_URL: https://agentvisorai.me
           # Prod mode fail-fasts without a mailer (by design — silently
           # swallowing password resets is the wrong failure mode). The
           # SmtpMailer constructs lazily so a dummy URL satisfies boot;
