@@ -289,10 +289,17 @@ pub enum ReceiptError {
     /// `duplicate key `x` in JSON object …` at nesting``.
     #[error("{0}; strict receipt parsers refuse this")]
     DuplicateKey(String),
-    /// A receipt carries a semantically-invalid field
-    /// (currently: `AtifTrajectory.retroactive == false`). Distinct
-    /// from `Serde` and `DuplicateKey` so ops triage can name the
-    /// class.
+    /// A receipt carries a semantically-invalid field.
+    /// Enforced by `verify_semantic_invariants`: supported
+    /// `receipt_version` ∈ {1, 2}, `ai_agent.charter.type_id == 1`
+    /// (OCSF Regular File), non-empty required string fields
+    /// (`receipt_id`, `session_id`, `ai_agent.charter.name`,
+    /// `ai_agent.charter.instance_uid`), 64-hex `chain_head` and
+    /// per-step `trajectory_digest`, `issued_at_iso ==
+    /// iso8601_ms(issued_at)`, stop-reason ↔ stop-reason-id
+    /// cross-wiring, and `AtifTrajectory.retroactive == true`.
+    /// Distinct from `Serde` and `DuplicateKey` so ops triage
+    /// can name the class.
     #[error("semantic invariant violated: {0}")]
     SemanticInvariant(String),
 }
@@ -427,11 +434,17 @@ impl Receipt {
     }
 
     /// Check semantic invariants that the type system
-    /// cannot express. Currently: `AtifTrajectory.retroactive` must
-    /// be `true` (the schema pins it via `const: true`; the Rust
-    /// type is `bool` for auditability). Called from both
-    /// `verify` and `verify_embedded` so no verification path can
-    /// skip it.
+    /// cannot express. Currently enforces: supported
+    /// `receipt_version` ∈ {1, 2}, `ai_agent.charter.type_id == 1`
+    /// (OCSF Regular File), non-empty required string fields
+    /// (`receipt_id`, `session_id`, `ai_agent.charter.name`,
+    /// `ai_agent.charter.instance_uid`), 64-hex `chain_head` and
+    /// per-step `trajectory_digest`, `issued_at_iso ==
+    /// iso8601_ms(issued_at)`, stop-reason ↔ stop-reason-id
+    /// cross-wiring, and `AtifTrajectory.retroactive == true`
+    /// (schema pins it via `const: true`; the Rust type is `bool`
+    /// for auditability). Called from both `verify` and
+    /// `verify_embedded` so no verification path can skip it.
     fn verify_semantic_invariants(&self) -> Result<(), ReceiptError> {
         // Schema parity: `receipt_version` is pinned per-version in the
         // shipped schemas (`const: 1` in receipt-v1, `const: 2` in
