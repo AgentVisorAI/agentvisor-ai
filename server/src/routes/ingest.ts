@@ -88,8 +88,11 @@ const eventPayload = z.object({
   // Prior shape used `z.number().int().min(0)` with NO upper
   // bound — z.number().int() accepts anything up to
   // Number.MAX_SAFE_INTEGER (2^53 - 1 ≈ 9e15). The rollup
-  // update at :599-609 fires:
-  //   tx.session.update({ data: { promptTokens: { increment: dPrompt } } })
+  // updateMany at :679-690 fires:
+  //   tx.session.updateMany({
+  //     where: { id: session.id, status: { not: "sealed" } },
+  //     data: { promptTokens: { increment: dPrompt }, ... },
+  //   })
   // against `Session.promptTokens: Int` (Prisma Int → Postgres
   // int4, max 2^31 - 1 ≈ 2.1e9). A single event with
   // `addPromptTokens: 3_000_000_000` (well within Zod's default
@@ -382,7 +385,7 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
     // Prior shape branched on `isSealed = existing?.status ===
     // "sealed"` read from findUnique above, then chose
     // `upsert.update = isSealed ? {} : {full field set}`. TOCTOU
-    // race with /ingest/receipts's concurrent seal at :~763:
+    // race with /ingest/receipts's concurrent seal at :~1025:
     // if the receipt handler commits `session.update({status:
     // "sealed"})` between our findUnique and the upsert, our
     // JS snapshot showed "live", `isSealed=false`, and Postgres'
@@ -390,7 +393,7 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
     // overwrote the just-sealed row back to "live" with the
     // attacker-supplied agent / workflow / policyVersion /
     // closedAt fields. Signed receipt.eventCount then mismatched
-    // session.events, the /events guard at line 402 stopped
+    // session.events, the /events guard at :531 stopped
     // rejecting further appends, and the SPA/exports rendered
     // the mutated fields — the same post-seal defacement class
     // R119 F2 / R141 F3 / R144 F1 closed for the non-concurrent
@@ -619,12 +622,12 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       // R152 F1: guard the rollup update on the sealed status
       // via a DB-side WHERE clause, mirroring the R151 F1 shape
       // used on POST /ingest/sessions. Prior shape checked
-      // `session.status === "sealed"` at :449 OUTSIDE any
+      // `session.status === "sealed"` at :531 OUTSIDE any
       // transaction, then created event rows + incremented
       // rollup inside a tx that only pinned `{id: session.id}`
       // — no `status` predicate. If /ingest/receipts committed
       // `session.update({ status:"sealed" })` (via its own tx at
-      // :~810) between our findUnique (:434) and the rollup
+      // :~1025) between our findUnique (:516) and the rollup
       // update, event.create rows AND the increment landed on
       // the now-sealed row: signed `receipt.eventCount` /
       // `receipt.body` totals then mismatched
@@ -691,7 +694,7 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
             if (upd.count === 0) {
               // Session was sealed by a concurrent
               // /ingest/receipts between our pre-tx status
-              // check at :449 and this update. Abort the tx
+              // check at :531 and this update. Abort the tx
               // so every event.create above rolls back.
               throw new Error("__session_sealed_mid_tx__");
             }
@@ -1000,16 +1003,17 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       // timeout, container SIGTERM during rolling deploy) or the
       // second call threw, the receipt row would commit but the
       // session would stay status="live" with stopReason=null.
-      // On the daemon's next retry, the byte-exact check at line
-      // ~590 would match the committed receipt → return idempotent
-      // 200 at line 646 WITHOUT re-running session.update, leaving
+      // On the daemon's next retry, the byte-exact check at
+      // :~919 would match the committed receipt → return idempotent
+      // 200 at :994 WITHOUT re-running session.update, leaving
       // the session permanently "live" with a fully-signed receipt.
-      // Downstream: POST /ingest/events (line ~332) only rejects on
-      // status==="sealed" so a "live" session accepts arbitrary
-      // post-seal events, drifting session.promptTokens /
-      // costUsdMicros away from the signed receipt.body's totals —
-      // compliance defect. Same class as R94 F1 (events tx) and
-      // R93 F4 / R118 F2 / R119 F2 (post-seal defacement).
+      // Downstream: POST /ingest/events (:486 handler, sealed
+      // guard :531) only rejects on status==="sealed" so a "live"
+      // session accepts arbitrary post-seal events, drifting
+      // session.promptTokens / costUsdMicros away from the
+      // signed receipt.body's totals — compliance defect. Same
+      // class as R94 F1 (events tx) and R93 F4 / R118 F2 /
+      // R119 F2 (post-seal defacement).
       await db.$transaction(async (tx) => {
         await tx.receipt.create({
           data: {
