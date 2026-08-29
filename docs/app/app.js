@@ -733,6 +733,42 @@
       '</svg>';
   }
 
+  // The activity chart is built at a nominal 720-unit width and CSS-
+  // stretched to fill the card (preserveAspectRatio="none"). That scales
+  // the axis <text> glyphs by containerWidth/720 horizontally while the
+  // vertical scale stays 1:1 — the x/y numbers read compressed on narrow
+  // layouts and smeared on wide ones. Rebuild the SVG at the mounted
+  // pixel width so one viewBox unit equals one CSS pixel and the labels
+  // render undistorted. Returns true when the SVG was replaced (callers
+  // must re-bind hover handlers — outerHTML swaps drop listeners).
+  function fitChartToContainer(root, series) {
+    var svg = root.querySelector(".chart-svg");
+    if (!svg) return false;
+    var w = Math.round(svg.getBoundingClientRect().width);
+    if (!w) return false;
+    var vb = svg.viewBox && svg.viewBox.baseVal;
+    if (vb && Math.abs(vb.width - w) < 1) return false;
+    svg.outerHTML = stackedBarChart(series, { w: w });
+    return true;
+  }
+
+  // One app-lifetime resize listener, installed lazily on the first
+  // overview render — never per-render, because the interactive drill's
+  // leak soak counts listener growth across navigations. The current
+  // overview render stashes its refit closure here; navigating away
+  // leaves a stale closure whose fit no-ops (no .chart-svg in the DOM).
+  var _overviewChartRefit = null;
+  var _chartResizeBound = false;
+  function installChartResizeRefit() {
+    if (_chartResizeBound) return;
+    _chartResizeBound = true;
+    var t = null;
+    window.addEventListener("resize", function () {
+      clearTimeout(t);
+      t = setTimeout(function () { if (_overviewChartRefit) _overviewChartRefit(); }, 150);
+    });
+  }
+
   /* ============================================================
    * SHELL
    * ============================================================ */
@@ -1465,6 +1501,13 @@
         sessionsTable(sessions) +
       "</div>";
 
+    // Fit the chart to the card's real pixel width BEFORE binding hover —
+    // fitting replaces the SVG node, which would orphan earlier bindings.
+    fitChartToContainer(main, series);
+    _overviewChartRefit = function () {
+      if (fitChartToContainer(main, series)) installChartHover(main, series);
+    };
+    installChartResizeRefit();
     installChartHover(main, series);
     var sim = main.querySelector("#simAttack");
     if (sim) sim.addEventListener("click", runAttackDemo);
@@ -1595,8 +1638,14 @@
     var chart = root.querySelector(".chart-svg");
     if (!chart) return;
     var cursor = chart.querySelector("#chartCursor");
+    var card = root.querySelector(".chart-card");
+    // A resize refit swaps the SVG and re-runs this installer — the tip
+    // div lives on .chart-card (which survives the swap), so drop the
+    // previous one instead of accumulating a node per refit.
+    var staleTips = card.querySelectorAll(".chart-tip");
+    for (var st = 0; st < staleTips.length; st++) staleTips[st].remove();
     var tip = h('<div class="chart-tip" style="display:none"></div>');
-    root.querySelector(".chart-card").appendChild(tip);
+    card.appendChild(tip);
     function clearBarHover() {
       // R202 F1: remove `.hover` from any previously-highlighted bar
       // pair so a single hover class travels with the pointer.
@@ -1617,7 +1666,11 @@
       cursor.style.opacity = "1";
       highlightBucket(idx);
       var box = chart.getBoundingClientRect();
-      var relX = (x / 720) * box.width;
+      // Map viewBox x → CSS px via the ACTUAL viewBox width. This was
+      // hardcoded to 720; after fitChartToContainer the viewBox tracks
+      // the card's pixel width, so 720 would misplace the tooltip.
+      var vbW = (chart.viewBox && chart.viewBox.baseVal && chart.viewBox.baseVal.width) || 720;
+      var relX = (x / vbW) * box.width;
       tip.style.display = "block";
       var tipW = 160;
       tip.style.left = Math.min(Math.max(0, relX - tipW / 2), box.width - tipW) + "px";
