@@ -168,6 +168,11 @@ catalog at the bottom.
   slow and the second fast to prove last-write-wins bugs.
 - Zero-match probes are worse than none: ground-truth checks must **fail
   loudly when a probe query matches nothing** (fixture drift tripwire).
+- Probe pages in the SHARED drill context write to the same
+  per-origin localStorage as every other check: a probe that sets
+  `av_mock_signed_out` / fresh-mode keys and closes without cleanup
+  breaks the NEXT check (empty webhooks in fresh mode, login bounces).
+  Always restore the keys before `page.close()` — this bit twice.
 - Suites default `SITE` to **production**. A positional arg passed to a
   script that only reads the env var is silently ignored — an entire
   "local" drill once ran green against the live site while the local
