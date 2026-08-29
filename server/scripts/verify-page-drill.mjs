@@ -323,8 +323,32 @@ await uploadJson(JSON.stringify(wrongFormat));
   console.log("✅ slow-CDN load: buttons ship disabled, enable on wire, click then verifies green");
 }
 
+// ── 15. Text drop: dragging selected receipt *text* (no file) onto the
+// drop zone must verify like a paste — it used to be silently ignored.
+{
+  const page = await context.newPage();
+  await page.goto(VERIFY_URL, { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("#drop", { timeout: 10000 });
+  const dropText = (t) => page.evaluate((text) => {
+    const dt = new DataTransfer();
+    dt.setData("text/plain", text);
+    document.getElementById("drop").dispatchEvent(new DragEvent("drop", { dataTransfer: dt, bubbles: true, cancelable: true }));
+  }, t);
+  const sample = await page.evaluate(() => fetch("sample-receipt.json").then((r) => r.text()));
+  await dropText(sample);
+  await waitVerifyStable(page);
+  let title = await page.locator(".result-title").innerText();
+  if (!/verifies/i.test(title)) fail("dropped receipt text did not verify green: " + title.slice(0, 60));
+  await dropText("this is not json at all");
+  await waitVerifyStable(page);
+  title = await page.locator(".result-title").innerText();
+  if (!/couldn't verify/i.test(title)) fail("garbage text drop did not show the error card: " + title.slice(0, 60));
+  await page.close();
+  console.log("✅ text drop: selected receipt text verifies green; garbage text shows the error card");
+}
+
 if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors));
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 14 /verify page drill checks passed.");
+console.log("\nAll 15 /verify page drill checks passed.");
