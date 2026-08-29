@@ -1318,7 +1318,29 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
     return { ok: view.includes(p.name) && view.includes(String(blocks)) && rows === Math.min(fired.length, 8), fired: fired.length, blocks, rows };
   });
   if (!pd.ok || !pd.fired) fail("policy detail derivation wrong: " + JSON.stringify(pd));
-  console.log("✅ reset flow + auth error branches (401 msg, 429 countdown); member preview redacts + is view-only (tabs, SSO, keypair); policy blocks derived from " + pd.fired + " fired sessions");
+  // Accept-invite edges: (a) an AUTHED user clicking an invite link is
+  // bounced to Overview — that bounce used to swallow the invite
+  // silently while the page's own hint said "sign in first, then click
+  // the link again" (a dead end). It must explain itself. (b) A link
+  // missing its email param must not render "Accept your invite for
+  // <empty>".
+  const aiPage = await context.newPage();
+  await aiPage.goto(SITE + "#/accept-invite?token=drill_tok", { waitUntil: "domcontentloaded" });
+  const aiToast = await aiPage.waitForFunction(() => {
+    const t = document.querySelector(".toast")?.textContent || "";
+    return /already signed in/i.test(t) ? t : null;
+  }, { timeout: 8000 }).then((h) => h.jsonValue()).catch(() => null);
+  if (!aiToast || !/#\/overview/.test(await aiPage.evaluate(() => location.hash)))
+    fail("authed invite click did not bounce-with-explanation: " + JSON.stringify({ aiToast }));
+  await aiPage.evaluate(() => { try { localStorage.setItem("av_mock_signed_out", "1"); } catch (e) {} });
+  await aiPage.reload({ waitUntil: "domcontentloaded" });
+  await aiPage.evaluate(() => { location.hash = "#/accept-invite?token=drill_tok"; });
+  await aiPage.waitForSelector("#acceptForm", { timeout: 8000 });
+  const aiCopy = await aiPage.evaluate(() => document.querySelector(".auth-form .sub")?.textContent.trim() || "");
+  if (/for\s*$|for\s+and/i.test(aiCopy)) fail("email-less invite renders dangling copy: " + JSON.stringify(aiCopy));
+  await aiPage.evaluate(() => { try { localStorage.removeItem("av_mock_signed_out"); } catch (e) {} });
+  await aiPage.close();
+  console.log("✅ reset flow + auth error branches (401 msg, 429 countdown); member preview redacts + is view-only (tabs, SSO, keypair); policy blocks derived from " + pd.fired + " fired sessions; authed invite click explains itself; email-less invite copy clean");
 }
 
 // ── 22. Deployment lifecycle + billing math ────────────────────────
