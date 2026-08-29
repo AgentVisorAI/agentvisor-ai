@@ -187,9 +187,13 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
   // ~299 probes/min at the /authenticate/challenge and
   // /authenticate/verify endpoints (which have no argon2 cost
   // to slow them down). Adding 10/min/IP matches the /login
-  // sibling. Registration endpoints are session-gated so
-  // don't need per-endpoint rate limits (the session cost
-  // already blocks unauthenticated abuse).
+  // sibling. R139 F1: /register/verify grew a password
+  // step-up gate in R138 F2 — now caps at perIp(3, 60_000)
+  // matching /me/export and /me/delete-account (the other
+  // step-up siblings). Prior "registration endpoints are
+  // session-gated so don't need per-endpoint rate limits"
+  // comment was accurate before R138 F2 introduced the
+  // argon2 hit; the second sentence is stale post-R138.
   const perIp = (max: number, windowMs: number) => ({
     max,
     timeWindow: windowMs,
@@ -246,7 +250,19 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
     return reply.send({ options });
   });
 
-  app.post("/register/verify", async (req, reply) => {
+  app.post("/register/verify", {
+    // R139 F1: perIp(3, 60_000) matches /me/export (auth.ts:493)
+    // and /me/delete-account (auth.ts:748) — the other
+    // owner-tier step-up siblings. R138 F2 introduced the
+    // verifyPassword call which is a ~50-120 ms argon2 hit
+    // gated only on the session cookie; without a per-route
+    // cap an attacker sharing the 300/min/IP global bucket
+    // could burn ~5 password guesses/sec against a stolen
+    // cookie with zero failure audit (mfa.credential_registered
+    // fires only on success). Same primitive R86 F3 hardened
+    // for /login. Also amplifies argon2 CPU spend for DoS.
+    config: { rateLimit: perIp(3, 60_000) },
+  }, async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
     // R107 F1: reject api-key sessions — see /register/challenge
