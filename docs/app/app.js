@@ -4953,5 +4953,11 @@
 
   /* ---------- go ---------- */
 
-  boot();
+  boot().then(function () {
+    // Handshake with crash-guard.js: boot completed, so the boot-time
+    // crash card stands down (post-boot errors are logged, not fatal)
+    // and the blank-page watchdog is satisfied. Set only AFTER boot so
+    // an exception mid-boot still shows the card.
+    window.__avBooted = true;
+  });
 })();
