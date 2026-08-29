@@ -66,7 +66,36 @@ function ipv6ToBigInt(ip: string): bigint {
 export function parseCidr(cidr: string): ParsedCidr {
   const [addr, prefixStr] = cidr.split("/");
   if (!addr || prefixStr === undefined) throw new Error("missing_prefix");
-  const prefix = parseInt(prefixStr, 10);
+  // R203 F1: strict integer parse. Prior shape used
+  // `parseInt(prefixStr, 10)` which returns:
+  //   * NaN on "" / "abc" / whitespace-only — every subsequent
+  //     comparison against NaN is false, so the range guards
+  //     below silently pass and `parseCidr` returned a
+  //     ParsedCidr with `prefix: NaN`.
+  //   * A truncated integer on prefixes like "12abc" (parseInt
+  //     stops at the first non-digit), which the range guard
+  //     accepts too.
+  // Downstream `tryParseCidr` folds the throw into null but only
+  // when parseCidr THROWS — a NaN prefix returned quietly. The
+  // ip-allowlist PATCH validator at org.ts:250 uses tryParseCidr
+  // to decide whether the operator's proposed CIDR is legal;
+  // NaN entries slipped past the validator and stored in DB as
+  // silently-dead rules that could never match anyone
+  // (ipInCidr's `BigInt(bits - NaN)` throws, ipMatchesAny's
+  // try/catch swallows, returns false). The block comment at
+  // org.ts:240 explicitly states "Reject any malformed CIDR —
+  // never silently drop rows" — this restores that invariant.
+  // Number(str.trim()) is strict full-string parse:
+  //   Number("12abc") === NaN, Number("") === 0 (still caught
+  //   by the empty check above), Number(" 24") === 24 (trim
+  //   handles that case). Number.isInteger then rejects
+  //   fractional / NaN / Infinity in one gate.
+  const prefix = Number(prefixStr.trim());
+  // R203 F1: also reject empty prefix (Number("") === 0, would
+  // otherwise accept "1.2.3.4/" as /0 = match-anything — almost
+  // certainly not what a fat-fingered operator meant).
+  if (prefixStr.trim().length === 0) throw new Error("bad_prefix");
+  if (!Number.isInteger(prefix)) throw new Error("bad_prefix");
   const version = isIP(addr);
   if (version === 4) {
     if (prefix < 0 || prefix > 32) throw new Error("bad_prefix");
