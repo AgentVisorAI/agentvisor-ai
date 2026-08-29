@@ -647,8 +647,37 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
     async (req, reply) => {
       const claims = requireSession(req, reply);
       if (!claims) return;
-      if (claims.membershipRole === "member") {
-        return reply.code(403).send({ error: "forbidden" });
+      // R148 F1: owner-only. Prior gate let admins PATCH the
+      // config, but the mutation surface here is the same class
+      // of recovery-blocking primitive as DELETE: flipping
+      // `jitEnabled=true → false` freezes SAML-JIT provisioning
+      // (locks new hires out), narrowing `allowedDomains`
+      // ejects domains from JIT, demoting `jitDefaultRole`
+      // downgrades every fresh SAML signup, and swapping
+      // `idpSsoUrl`/`idpCertPem` reroutes AuthnResponses to an
+      // attacker-controlled IdP. Match the sibling /keypair
+      // rotate (:743) and the DELETE gate above. Members are
+      // still blocked; admins are demoted to read-only via
+      // GET /:configId (unchanged).
+      if (claims.membershipRole !== "owner") {
+        const samlPatchDeniedActor = await resolveActor(claims.sub);
+        writeAudit(
+          {
+            orgId: claims.orgId,
+            event: "auth.step_up_denied",
+            ...samlPatchDeniedActor,
+            note: "not_owner",
+            metadata: {
+              endpoint: "saml.config.update",
+              samlConfigId: req.params.configId,
+            },
+            req,
+          },
+          req.log,
+        );
+        return reply
+          .code(403)
+          .send({ error: "only_owner_can_update_saml_config" });
       }
       const body = updateConfigSchema.safeParse(req.body);
       if (!body.success) {
@@ -708,8 +737,34 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
     async (req, reply) => {
       const claims = requireSession(req, reply);
       if (!claims) return;
-      if (claims.membershipRole === "member") {
-        return reply.code(403).send({ error: "forbidden" });
+      // R148 F1: owner-only. Deleting the SAML config is a
+      // recovery-blocking primitive — every user who joined via
+      // SAML-JIT has no local password/passkey (auth.ts /login
+      // routes them through /saml/start), so removing the config
+      // strands them at the login screen with no way back.
+      // Matches the sibling /keypair rotate (already owner-only
+      // at :743) and the "admin sabotages recovery" class closed
+      // by R145 F1 (retention narrow), R146 F1 (ip-allowlist),
+      // R147 F1 (deployment force-delete).
+      if (claims.membershipRole !== "owner") {
+        const samlDeleteDeniedActor = await resolveActor(claims.sub);
+        writeAudit(
+          {
+            orgId: claims.orgId,
+            event: "auth.step_up_denied",
+            ...samlDeleteDeniedActor,
+            note: "not_owner",
+            metadata: {
+              endpoint: "saml.config.delete",
+              samlConfigId: req.params.configId,
+            },
+            req,
+          },
+          req.log,
+        );
+        return reply
+          .code(403)
+          .send({ error: "only_owner_can_delete_saml_config" });
       }
       const existing = await db.samlConfig.findFirst({
         where: { id: req.params.configId, orgId: claims.orgId },

@@ -157,7 +157,16 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
   // Client passes ?cursor=<opaque>&limit=… . On the first call cursor
   // is absent; the response includes `nextCursor` for the next page.
   // When nextCursor is null the client has reached the end.
-  app.get("/sessions", async (req, reply) => {
+  app.get("/sessions", {
+    // R148 F2: cap session enumeration. Same posture as
+    // /audit (perIpCookieOnly 30/min, R147 F2). LIST leaks
+    // deployment inventory, agent names, external ids,
+    // per-session token/cost rollups (member cost redaction
+    // notwithstanding). Bearer-auth API keys skip via the
+    // helper's allowList — programmatic clients already have
+    // full-org read scope and shouldn't be throttled.
+    config: { rateLimit: perIpCookieOnly(30, 60_000) },
+  }, async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
     const query = z
@@ -285,7 +294,19 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
   // SESSION_EVENTS_LIMIT_MAX with a cursor (event seq) for older
   // pages. Sessions with millions of events would otherwise blow up
   // the JSON payload + memory.
-  app.get("/sessions/:id", async (req, reply) => {
+  app.get("/sessions/:id", {
+    // R148 F2: cap per-session event drains. Event.body is
+    // up to 8KB of daemon-forwarded prompt/response payloads
+    // (R101 F2 notes these are strictly more sensitive than
+    // the API-key inventory R90 F2 gated) and eventLimit
+    // defaults to SESSION_EVENTS_LIMIT_MAX (500) with
+    // cursor pagination. Under the global 300/min bucket a
+    // stolen cookie exfils ~20MB/sec of LLM bodies with no
+    // audit breadcrumb per pull. 60/min per cookie covers
+    // legit drawer-open cadence (open, page-through, close)
+    // and caps drain at ~30MB/min. Bearer-auth clients skip.
+    config: { rateLimit: perIpCookieOnly(60, 60_000) },
+  }, async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;
     const params = z.object({ id: z.string() }).safeParse(req.params);
