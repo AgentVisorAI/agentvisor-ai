@@ -1452,7 +1452,28 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   if (conf) await page.click(".modal-backdrop [data-confirm]");
   await page.waitForFunction(() => !document.getElementById("view").textContent.includes("drill-ci-key"), { timeout: 8000 })
     .catch(() => fail("revoked API key still listed"));
-  console.log("✅ onboarding items tick for the right reasons at 4 sim ages; members panel view-only for members; key create→revoke round-trip");
+  // (d) Fresh-workspace relogin truth: signing back in with the SAME
+  // email resumes the created workspace (login() used to wipe the
+  // fresh keys unconditionally — sign-out → sign-in silently dumped
+  // the investor into Northwind, reading as data loss). A different
+  // email gets Northwind and clears the abandoned workspace.
+  const rl = await page.evaluate(async () => {
+    localStorage.setItem("av_mock_fresh_t0", String(Date.now() - 60000));
+    localStorage.setItem("av_mock_fresh_identity", JSON.stringify({ user: { id: "u_rl", email: "founder@relogin.dev", displayName: "Founder" }, org: { id: "org_rl", name: "Relogin Co", slug: "rl", createdAt: new Date().toISOString(), role: "owner" } }));
+    await window.dataSource.logout();
+    const same = await window.dataSource.login({ email: "FOUNDER@relogin.dev", password: "x" });
+    const kept = !!localStorage.getItem("av_mock_fresh_t0");
+    await window.dataSource.logout();
+    const other = await window.dataSource.login({ email: "someone@else.dev", password: "x" });
+    const cleared = !localStorage.getItem("av_mock_fresh_t0");
+    return { sameOrg: same.org.name, kept, otherOrg: other.org.name, cleared };
+  });
+  if (rl.sameOrg !== "Relogin Co" || !rl.kept) fail("same-email relogin lost the fresh workspace: " + JSON.stringify(rl));
+  if (rl.otherOrg === "Relogin Co" || !rl.cleared) fail("different-email login kept the stale fresh workspace: " + JSON.stringify(rl));
+  await page.evaluate(() => { localStorage.removeItem("av_mock_fresh_t0"); localStorage.removeItem("av_mock_fresh_identity"); localStorage.removeItem("av_mock_signed_out"); });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(800);
+  console.log("✅ onboarding items tick for the right reasons at 4 sim ages; members panel view-only for members; key create→revoke round-trip; same-email relogin resumes the fresh workspace (case-insensitive), other emails get Northwind");
 }
 
 // ── 24. Live audit trail, webhook toggle, menu, pager ──────────────
