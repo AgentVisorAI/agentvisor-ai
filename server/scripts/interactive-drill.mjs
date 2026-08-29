@@ -1711,6 +1711,16 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   });
   if (tf.delta !== 1 || tf.top !== "webhook.test_fired") fail("test fire did not land in delivery history: " + JSON.stringify(tf));
   if (!/webhook_paused/.test(tf.pausedErr)) fail("paused webhook accepted a test fire: " + JSON.stringify(tf));
+  // SSO mutations are the most security-sensitive admin surface — they
+  // must land in the audit trail (all four were silent before #256).
+  const ssoAudit = await page.evaluate(async () => {
+    const cfg = (await window.dataSource.listSamlConfigs()).configs[0];
+    await window.dataSource.updateSamlConfig(cfg.id, { displayName: cfg.displayName + " (drill)" });
+    const ev = (await window.dataSource.listAudit())[0]?.event;
+    await window.dataSource.updateSamlConfig(cfg.id, { displayName: cfg.displayName }); // restore
+    return ev;
+  });
+  if (ssoAudit !== "sso.idp_updated") fail("SAML update did not land in the audit trail: " + ssoAudit);
   const w0 = await page.evaluate(async () => (await window.dataSource.listWebhooks())[0].isActive);
   await page.evaluate(() => { const tr = document.querySelector("tbody tr"); [...tr.querySelectorAll("button")].find((x) => /Pause|Resume/.test(x.textContent)).click(); });
   await page.waitForTimeout(1000);
