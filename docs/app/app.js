@@ -2718,7 +2718,8 @@
     return '<div class="empty-hero">' +
       '<div><h2>Connect your first agent</h2>' +
       '<p>Install the AgentVisor daemon on the box that runs your agent. Once it starts, sessions and signed receipts stream directly into this console.</p>' +
-      '<button class="btn accent" id="addDep2">+ New deployment</button></div>' +
+      '<button class="btn accent" id="addDep2">+ New deployment</button> ' +
+      '<button type="button" class="btn" data-copy="curl -fsSL https://get.agentvisorai.me/install.sh | sh\nagentvisord start --token=$AV_INGEST_TOKEN">⧉ Copy install commands</button></div>' +
       '<div class="snippet"><span class="prompt">$</span> <span class="cmd">curl -fsSL https://get.agentvisorai.me/install.sh | sh</span>\n\n<span class="prompt">$</span> <span class="cmd">agentvisord start --token=$AV_INGEST_TOKEN</span></div>' +
       "</div>";
   }
@@ -4048,10 +4049,12 @@
           '<h2>' + esc(cfg.displayName) + '</h2>' +
           '<p class="sub">Give these values to your IdP administrator.</p>' +
           '<dl class="kv" style="grid-template-columns: 200px 1fr; gap: 8px 14px;">' +
-            '<dt>SP Entity ID</dt><dd class="mono" style="font-size:11.5px; word-break:break-all;">' + esc(cfg.spEntityId) + '</dd>' +
-            '<dt>ACS (Reply) URL</dt><dd class="mono" style="font-size:11.5px; word-break:break-all;">' + esc(cfg.spAcsUrl) + '</dd>' +
-            '<dt>SLO URL</dt><dd class="mono" style="font-size:11.5px; word-break:break-all;">' + esc(cfg.spSloUrl) + '</dd>' +
-            '<dt>Metadata URL</dt><dd class="mono" style="font-size:11.5px; word-break:break-all;"><a href="' + esc(cfg.spMetadataUrl) + '" target="_blank">' + esc(cfg.spMetadataUrl) + '</a></dd>' +
+            // The whole point of this modal is copying these values into
+            // Okta/Entra — every URL-ish field gets a copy button.
+            '<dt>SP Entity ID</dt><dd class="mono" style="font-size:11.5px; word-break:break-all;">' + copyable(cfg.spEntityId) + '</dd>' +
+            '<dt>ACS (Reply) URL</dt><dd class="mono" style="font-size:11.5px; word-break:break-all;">' + copyable(cfg.spAcsUrl) + '</dd>' +
+            '<dt>SLO URL</dt><dd class="mono" style="font-size:11.5px; word-break:break-all;">' + copyable(cfg.spSloUrl) + '</dd>' +
+            '<dt>Metadata URL</dt><dd class="mono" style="font-size:11.5px; word-break:break-all;"><span class="copyable"><a href="' + esc(cfg.spMetadataUrl) + '" target="_blank" rel="noopener">' + esc(cfg.spMetadataUrl) + '</a><button type="button" class="copy-btn" data-copy="' + esc(cfg.spMetadataUrl) + '" title="Copy" aria-label="Copy to clipboard">⧉</button></span></dd>' +
             '<dt>IdP cert fingerprint</dt><dd class="mono" style="font-size:11.5px; word-break:break-all;">' + esc(cfg.x509CertFingerprint || "(not parsed)") + '</dd>' +
             '<dt>SP signing keypair</dt><dd>' + (cfg.hasSpKeypair ? '<span class="pill ok">present</span>' : '<span class="pill neutral">none. Using unsigned AuthnRequests</span>') + '</dd>' +
             '<dt>NameID format</dt><dd class="mono" style="font-size:11.5px">' + esc(cfg.nameIdFormat) + '</dd>' +
