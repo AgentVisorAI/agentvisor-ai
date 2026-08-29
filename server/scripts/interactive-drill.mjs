@@ -511,8 +511,17 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   const truncated = await cpPage.evaluate(() =>
     [...document.querySelectorAll("[data-copy]")].map((b) => b.getAttribute("data-copy")).filter((v) => v.includes("…")));
   if (truncated.length) fail("copy button carries a truncated placeholder: " + JSON.stringify(truncated));
+  // SAML details modal: the modal's whole purpose is copying SP values
+  // into the IdP — all four URL-ish fields must carry copy buttons.
+  await cpPage.goto(SITE + "#/settings/sso", { waitUntil: "domcontentloaded" });
+  await cpPage.waitForSelector('button[data-act="details"]', { timeout: 15000 });
+  await cpPage.click('button[data-act="details"]');
+  await cpPage.waitForSelector(".modal-backdrop", { timeout: 5000 });
+  const samlCopies = await cpPage.evaluate(() => document.querySelectorAll(".modal-backdrop .copy-btn").length);
+  if (samlCopies < 4) fail("SAML details modal missing copy buttons: " + samlCopies + "/4");
+  await cpPage.keyboard.press("Escape");
   await cpPage.close();
-  console.log("✅ browser Back sweeps modal + palette overlays; copy gives feedback without clipboard API (" + toastTxt.trim().slice(0, 30) + "); no copy button carries a truncated payload");
+  console.log("✅ browser Back sweeps modal + palette overlays; copy gives feedback without clipboard API (" + toastTxt.trim().slice(0, 30) + "); no copy button carries a truncated payload; SAML SP values copyable");
 }
 
 // ── 12. Double-submit guards ───────────────────────────────────────
