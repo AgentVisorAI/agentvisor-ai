@@ -2307,6 +2307,25 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   if (!aud.includes("Acme Robotics")) fail("fresh audit org.created does not target the signup org");
   if (aud.includes("Northwind Traders")) fail("fresh audit still says Northwind Traders");
   if (!aud.includes("acme-robotics-prod")) fail("fresh audit deployment.connected does not target the org daemon");
+  // Palette affordance truth in fresh mode: the tour narrates the
+  // showcase fixtures (launcher pill already hides — the palette entry
+  // and ?tour=1 autostart escaped the same rule), and the 30-day
+  // dataset toggle is a no-op there (fresh listSessions ignores it).
+  // The attack sim and reset stay — both are fresh-aware.
+  await fPage.keyboard.press(process.platform === "darwin" ? "Meta+KeyK" : "Control+KeyK");
+  await fPage.waitForSelector(".cmdk input", { timeout: 5000 });
+  await fPage.waitForTimeout(500);
+  const palEntries = await fPage.evaluate(() => [...document.querySelectorAll(".cmdk .item")].map((i) => i.textContent).join(" | "));
+  if (/See the full flow/.test(palEntries)) fail("palette offers the Northwind tour inside a fresh workspace");
+  if (/30-day dataset/.test(palEntries)) fail("palette offers the no-op bigdata toggle inside a fresh workspace");
+  if (!/Simulate an agent attack/.test(palEntries)) fail("fresh palette lost the (fresh-aware) attack sim");
+  if (!/Reset demo data/.test(palEntries)) fail("fresh palette lost Reset demo data");
+  await fPage.keyboard.press("Escape");
+  await fPage.waitForTimeout(250);
+  // ?tour=1 must not auto-start the showcase narration in a fresh org
+  await fPage.goto(SITE + "?tour=1#/overview", { waitUntil: "domcontentloaded" });
+  await fPage.waitForTimeout(2500);
+  if (await fPage.$(".av-tour-card")) fail("?tour=1 auto-started the Northwind tour inside a fresh workspace");
   // isolation: none of the above leaked into the showcase fixtures
   await fPage.evaluate(() => { localStorage.removeItem("av_mock_fresh_t0"); localStorage.removeItem("av_mock_fresh_identity"); });
   await fPage.goto(SITE + "#/deployments", { waitUntil: "domcontentloaded" });
@@ -2316,7 +2335,7 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   if (nw.includes("acme-edge") || nw.includes("acme-robotics-prod")) fail("fresh-workspace activity leaked into the Northwind fixtures: " + nw.slice(0, 120));
   if (!nw.includes("northwind-prod")) fail("Northwind daemons damaged by fresh-workspace round: " + nw.slice(0, 120));
   await fPage.close();
-  console.log("✅ fresh-workspace truth: org-named daemon, mutations land locally, founder in members, org audit story, fresh-era detail, Northwind isolated");
+  console.log("✅ fresh-workspace truth: org-named daemon, mutations land locally, founder in members, org audit story, fresh-era detail, showcase-only affordances hidden, Northwind isolated");
 }
 
 if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors));

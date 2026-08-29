@@ -303,7 +303,7 @@
       // refresh was hostile. A fresh visit/tab still auto-starts.
       var autoDone = false;
       try { autoDone = sessionStorage.getItem("av_tour_autostarted") === "1"; } catch (e) {}
-      if (/[?&]tour=1/.test(location.search) && state.i < 0 && !state._autoStarted && !autoDone && !dismissed()) {
+      if (/[?&]tour=1/.test(location.search) && state.i < 0 && !state._autoStarted && !autoDone && !dismissed() && !freshMode()) {
         state._autoStarted = true;
         try { sessionStorage.setItem("av_tour_autostarted", "1"); } catch (e) {}
         setTimeout(start, 600);
