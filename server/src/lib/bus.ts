@@ -29,6 +29,7 @@ import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
 import { Client as PgClient } from "pg";
 import { env } from "../env.js";
+import { pgBusReconnectsTotal } from "./metrics.js";
 
 export type EventPayload =
   | { type: "session.upsert"; orgId: string; deploymentId: string; sessionId: string; externalId: string; agent: string }
@@ -210,6 +211,16 @@ class Bus extends EventEmitter {
 
   private scheduleReconnect(): void {
     if (this.reconnecting || this.closed) return;
+    // R213 F1: increment the previously-dead Prometheus counter.
+    // Counter is declared at lib/metrics.ts:44 with the comment
+    // "useful signal that Neon or whichever managed PG we're on
+    // is bouncing our LISTEN socket" — but nothing ever wired
+    // it up, so every Grafana panel / alert built on
+    // `agentvisor_api_pg_bus_reconnects_total` renders as a
+    // flat zero forever. Counting after the re-entrancy guard
+    // (not before) so this reports SCHEDULED reconnects, one
+    // per socket flap, matching the metric name's intent.
+    pgBusReconnectsTotal.inc();
     this.reconnecting = true;
     const listener = this.pgListener;
     const publisher = this.pgPublisher;
