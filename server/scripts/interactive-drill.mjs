@@ -1640,6 +1640,20 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await skPage.keyboard.press("Escape");
   await skPage.waitForTimeout(200);
   if (await skPage.evaluate(() => document.activeElement?.id === "fSearch")) fail("second Escape did not blur the search field");
+  // Sticky column headers: on a long list the thead must stick flush
+  // under the topbar (overflow-x:hidden on .main or overflow:hidden on
+  // .table-wrap silently retargets sticky to a non-scrolling box).
+  await skPage.evaluate(() => window.scrollTo(0, 2000));
+  await skPage.waitForTimeout(250);
+  const sticky = await skPage.evaluate(() => {
+    const th = document.querySelector("thead th");
+    const tb = document.querySelector(".topbar");
+    if (!th || !tb) return null;
+    const a = th.getBoundingClientRect(), b2 = tb.getBoundingClientRect();
+    return { scrolled: window.scrollY > 500, thTop: Math.round(a.top), tbBottom: Math.round(b2.bottom) };
+  });
+  if (!sticky || !sticky.scrolled || Math.abs(sticky.thTop - sticky.tbBottom) > 2)
+    fail("table header did not stick under the topbar: " + JSON.stringify(sticky));
   await skPage.close();
   console.log("✅ skeleton-phase filter liveness: typing during the loading skeleton filters and syncs the URL");
   // Same class on the overview: the range group paints with the
