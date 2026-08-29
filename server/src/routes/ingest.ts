@@ -67,15 +67,67 @@ const eventPayload = z.object({
   body: z.string().max(8000),
   sub: z.string().max(2000).optional(),
   occurredAt: z.coerce.date(),
-  journalCount: z.number().int().min(0).default(1),
+  // R160 F1: per-field upper bounds on all numeric increments.
+  // Prior shape used `z.number().int().min(0)` with NO upper
+  // bound — z.number().int() accepts anything up to
+  // Number.MAX_SAFE_INTEGER (2^53 - 1 ≈ 9e15). The rollup
+  // update at :599-609 fires:
+  //   tx.session.update({ data: { promptTokens: { increment: dPrompt } } })
+  // against `Session.promptTokens: Int` (Prisma Int → Postgres
+  // int4, max 2^31 - 1 ≈ 2.1e9). A single event with
+  // `addPromptTokens: 3_000_000_000` (well within Zod's default
+  // ceiling) triggers Postgres `numeric_value_out_of_range` on
+  // the UPDATE. The R152 F1 catch handles only the sealed-tx
+  // sentinel; every other error re-throws as 500 → daemon
+  // retries → same error → **session livelock**, the exact
+  // class R95 F1 closed for the tx-timeout case. Threat model:
+  // leaked AV_INGEST_TOKEN or a runaway daemon, same as R119
+  // F2 / R144 F1 / R151 F1 / R152 F1.
+  //
+  // Caps sized so a full 500-event batch fits comfortably
+  // inside int4 for the Int columns and inside 2^53 for the
+  // BigInt-accumulator JS variables (which R152 F1 wraps via
+  // BigInt(dCost) before increment):
+  //   * Tokens (Int in DB): 1_000_000 per event × 500 events =
+  //     5e8 per batch, well below 2^31-1. Realistic LLM events
+  //     carry low-thousands of tokens; even Gemini 1.5 Pro's
+  //     2M-context whole-window prompt is 2× the cap — a legit
+  //     agent hitting this ceiling should raise the bound
+  //     explicitly, not fail-open into livelock.
+  //   * Cost/payout micros (BigInt in DB): 100_000_000_000 per
+  //     event (= $100k per event) is 12× the smoke test's
+  //     $8400 high-value blocked-refund case, covering
+  //     realistic ceiling for expensive tool calls / refund
+  //     blocks without capping legitimate high-cost operations.
+  //     R124 F3's MAX_PER_EVENT_BLOCKED_PAYOUT=1e9 remains the
+  //     SIEM-fanout clamp (fan-out is more DoS-sensitive than
+  //     the DB); this Zod bound is the wider outer envelope for
+  //     what the DB will accept at all. Per-batch: 500 × 1e11 =
+  //     5e13 < 2^53 (9e15) so JS number arithmetic stays
+  //     precise before BigInt().
+  //   * Tools counters (Int in DB): 1_000 per event × 500 =
+  //     5e5, comfortably under int4. Realistic per-event tool
+  //     calls are 0-10.
+  //   * journalCount (Int in DB): capped at 1_000_000 —
+  //     aggregating >1M journal entries into a single row is
+  //     already an extreme edge case.
+  //
+  // Note on the deeper fix: the Int columns
+  // (promptTokens/completionTokens/toolsAllowed/toolsBlocked)
+  // could still overflow int4 across MANY sequential batches
+  // in a very long-running session. Migrating those to BigInt
+  // is the durable fix but is a separate schema-migration
+  // scope. The caps here close the immediate attacker-injected
+  // DoS and the per-batch overflow leg.
+  journalCount: z.number().int().min(0).max(1_000_000).default(1),
   // Delta rollups the daemon reports for this event, if any.
-  addPromptTokens: z.number().int().min(0).default(0),
-  addCompletionTokens: z.number().int().min(0).default(0),
-  addCostUsdMicros: z.number().int().min(0).default(0),
-  addPayoutUsdMicros: z.number().int().min(0).default(0),
-  addBlockedPayoutUsdMicros: z.number().int().min(0).default(0),
-  addToolsAllowed: z.number().int().min(0).default(0),
-  addToolsBlocked: z.number().int().min(0).default(0),
+  addPromptTokens: z.number().int().min(0).max(1_000_000).default(0),
+  addCompletionTokens: z.number().int().min(0).max(1_000_000).default(0),
+  addCostUsdMicros: z.number().int().min(0).max(100_000_000_000).default(0),
+  addPayoutUsdMicros: z.number().int().min(0).max(100_000_000_000).default(0),
+  addBlockedPayoutUsdMicros: z.number().int().min(0).max(100_000_000_000).default(0),
+  addToolsAllowed: z.number().int().min(0).max(1_000).default(0),
+  addToolsBlocked: z.number().int().min(0).max(1_000).default(0),
 });
 
 const receiptPayload = z.object({
