@@ -4,6 +4,7 @@ import { db } from "../db.js";
 import { env } from "../env.js";
 import { requireSession } from "../lib/session-middleware.js";
 import { MEMBER_REDACTED } from "../lib/redaction.js";
+import { writeAudit } from "../lib/audit.js";
 
 // Opaque cursor encoding for session pagination. Base64(JSON) of the
 // last row's (openedAt, id) so pagination is stable even as new
@@ -614,6 +615,30 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
           metadata: true,
         },
       });
+      // R137 F1: /audit.csv itself is not audited — the export
+      // IS the audit log, so a stolen owner cookie can download
+      // 10k rows of mfa.credential_registered, saml.keypair_rotated,
+      // apikey.created, member.role_changed, deployment.token_rotated
+      // and vanish with zero self-referential breadcrumb. Sibling of
+      // R136 F1 (/me/export), stronger because the R91 F2 comment
+      // above explicitly notes "attackers exfil once, keep forever."
+      // Emit after the member-gate + cursor validation but before
+      // reply.raw.setHeader so the audit fires whether the stream
+      // succeeds or errors. Same fire-and-forget shape as R136 F1.
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "audit.exported_csv",
+          actorId: claims.sub,
+          target: claims.orgId,
+          metadata: {
+            before: before.toISOString(),
+            rowCount: rows.length,
+          },
+          req,
+        },
+        req.log,
+      );
       const fname = `agentvisor-audit-${claims.orgId}-${new Date()
         .toISOString()
         .replace(/[:.]/g, "-")}.csv`;
