@@ -469,7 +469,19 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await noClip.waitForTimeout(400);
   await noClip.close();
   if (clipErrs.length) fail("copy without clipboard API threw: " + clipErrs.join("; "));
-  console.log("✅ browser Back sweeps modal + palette overlays; copy gives feedback without clipboard API (" + toastTxt.trim().slice(0, 30) + ")");
+  // Copy-payload truth: no copy affordance may carry a redacted/
+  // truncated placeholder (the ingest-token HINT "av_live_9HpD…" once
+  // had a copy button — pasting it anywhere yields garbage).
+  const cpPage = await context.newPage();
+  await cpPage.goto(SITE + "#/deployments", { waitUntil: "domcontentloaded" });
+  await cpPage.waitForSelector("tr[data-clickable]", { timeout: 15000 });
+  await cpPage.click("tr[data-clickable]");
+  await cpPage.waitForSelector(".copy-btn", { timeout: 10000 });
+  const truncated = await cpPage.evaluate(() =>
+    [...document.querySelectorAll("[data-copy]")].map((b) => b.getAttribute("data-copy")).filter((v) => v.includes("…")));
+  if (truncated.length) fail("copy button carries a truncated placeholder: " + JSON.stringify(truncated));
+  await cpPage.close();
+  console.log("✅ browser Back sweeps modal + palette overlays; copy gives feedback without clipboard API (" + toastTxt.trim().slice(0, 30) + "); no copy button carries a truncated payload");
 }
 
 // ── 12. Double-submit guards ───────────────────────────────────────
