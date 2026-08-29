@@ -2,7 +2,7 @@
   "name": "@agentvisor/api",
   "version": "0.1.0",
   "private": true,
-  "description": "AgentVisor AI hosted API — multi-tenant control plane.",
+  "description": "AgentVisor AI hosted API \u2014 multi-tenant control plane.",
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -55,5 +55,8 @@
   },
   "engines": {
     "node": ">=22.0.0"
+  },
+  "overrides": {
+    "uuid": "^11.1.1"
   }
 }
