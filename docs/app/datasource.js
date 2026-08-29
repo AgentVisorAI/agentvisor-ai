@@ -2036,7 +2036,29 @@
     },
     async listPolicies() { return MOCK_POLICIES.slice(); }, // no backend endpoint yet
     async getPolicy(id) { var p = MOCK_POLICIES.find(function (x) { return x.id === id; }); if (!p) throw new Error("not_found"); return p; },
-    async togglePolicy(id) { return this.getPolicy(id); },
+    // R201 F1: actually flip the enabled flag in MOCK_POLICIES so the
+    // toggle switch produces visible feedback. Prior shape returned
+    // `getPolicy(id)` verbatim without mutating anything, so
+    // togglePolicy was a silent no-op: user clicks the switch, the
+    // aria-busy state flashes, renderPolicies() re-runs, and every
+    // policy returns to its original enabled state. On repeat
+    // clicks the user gets ZERO feedback the action was received —
+    // classic broken-toggle UX. Real backend policies aren't wired
+    // yet (see the file header + the createPolicy comment below),
+    // but the LOCAL mock has to at least maintain internal
+    // consistency or the demo/investor path shows a policies page
+    // whose entire interactivity model is broken. `updatedAt` also
+    // bumps so the "Updated" column reflects the action; audit
+    // entry recorded so the audit log shows the toggle just like
+    // createPolicy already does.
+    async togglePolicy(id) {
+      var p = MOCK_POLICIES.find(function (x) { return x.id === id; });
+      if (!p) throw new Error("not_found");
+      p.enabled = !p.enabled;
+      p.updatedAt = new Date().toISOString();
+      recordAudit(p.enabled ? "policy.enabled" : "policy.disabled", p.name, p.kind + " · " + p.scope);
+      return p;
+    },
     async createPolicy(input) { // no backend endpoint yet — local-only, mirrors the mock
       var p = Object.assign({
         id: "pol_" + Date.now().toString(36),
