@@ -1462,7 +1462,20 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   if (/for\s*$|for\s+and/i.test(aiCopy)) fail("email-less invite renders dangling copy: " + JSON.stringify(aiCopy));
   await aiPage.evaluate(() => { try { localStorage.removeItem("av_mock_signed_out"); } catch (e) {} });
   await aiPage.close();
-  console.log("✅ reset flow + auth error branches (401 msg, 429 countdown); member preview redacts + is view-only (tabs, SSO, keypair); policy blocks derived from " + pd.fired + " fired sessions; authed invite click explains itself; email-less invite copy clean");
+  // ⌘K on the login page: the palette is an in-app tool — it must not
+  // float over the login form for signed-out users (and must come back
+  // after sign-in; the rehearsals cover the authed path).
+  const koPage = await context.newPage();
+  await koPage.addInitScript(() => { try { localStorage.setItem("av_mock_signed_out", "1"); } catch (e) {} });
+  await koPage.goto(SITE + "#/login", { waitUntil: "domcontentloaded" });
+  await koPage.waitForSelector("input#email", { timeout: 15000 });
+  await koPage.keyboard.press(process.platform === "darwin" ? "Meta+k" : "Control+k");
+  await koPage.waitForTimeout(400);
+  const koSt = await koPage.evaluate(() => ({ open: !!document.querySelector(".cmdk-backdrop"), locked: document.body.classList.contains("locked") }));
+  if (koSt.open || koSt.locked) fail("palette opened while signed out: " + JSON.stringify(koSt));
+  await koPage.evaluate(() => { try { localStorage.removeItem("av_mock_signed_out"); } catch (e) {} });
+  await koPage.close();
+  console.log("✅ reset flow + auth error branches (401 msg, 429 countdown); member preview redacts + is view-only (tabs, SSO, keypair); policy blocks derived from " + pd.fired + " fired sessions; authed invite click explains itself; email-less invite copy clean; palette blocked while signed out");
 }
 
 // ── 22. Deployment lifecycle + billing math ────────────────────────
@@ -1617,7 +1630,26 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await page.evaluate(() => { localStorage.removeItem("av_mock_fresh_t0"); localStorage.removeItem("av_mock_fresh_identity"); localStorage.removeItem("av_mock_signed_out"); });
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.waitForTimeout(800);
-  console.log("✅ onboarding items tick for the right reasons at 4 sim ages; members panel view-only for members; key create→revoke round-trip; same-email relogin resumes the fresh workspace (case-insensitive), other emails get Northwind");
+  // Completed-onboarding dismiss lifecycle: 4/4 shows a Dismiss that
+  // persists across reload; incomplete checklists never show it.
+  const obPage = await context.newPage();
+  await obPage.addInitScript(() => {
+    localStorage.setItem("av_mock_fresh_t0", String(Date.now() - 2 * 86400 * 1000));
+    localStorage.setItem("av_mock_fresh_identity", JSON.stringify({ user: { id: "u_ob", email: "ob@x.dev", displayName: "Ob", role: "owner" }, org: { id: "org_ob", name: "Ob Co", slug: "ob", createdAt: new Date().toISOString(), role: "owner" } }));
+  });
+  await obPage.goto(SITE + "#/overview", { waitUntil: "domcontentloaded" });
+  await obPage.waitForSelector("#obDismiss", { timeout: 15000 });
+  await obPage.click("#obDismiss");
+  await obPage.waitForTimeout(300);
+  await obPage.reload({ waitUntil: "domcontentloaded" });
+  await obPage.waitForSelector(".stat", { timeout: 15000 });
+  await obPage.waitForTimeout(500);
+  if (await obPage.evaluate(() => !!document.querySelector(".onboard-card"))) fail("dismissed onboarding card came back after reload");
+  // localStorage is per-origin, shared with the main drill page —
+  // restore Northwind mode before the next checks.
+  await obPage.evaluate(() => { localStorage.removeItem("av_mock_fresh_t0"); localStorage.removeItem("av_mock_fresh_identity"); localStorage.removeItem("av_ob_dismissed"); });
+  await obPage.close();
+  console.log("✅ onboarding items tick for the right reasons at 4 sim ages; members panel view-only for members; key create→revoke round-trip; same-email relogin resumes the fresh workspace (case-insensitive), other emails get Northwind; completed checklist dismissible + stays dismissed");
 }
 
 // ── 24. Live audit trail, webhook toggle, menu, pager ──────────────

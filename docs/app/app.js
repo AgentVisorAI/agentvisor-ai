@@ -1502,6 +1502,11 @@
       { done: hasBlock, label: "First bad order blocked", sub: hasBlock ? "$" + blockedValue.toLocaleString() + " kept — open the session to see why" : "Starter policies are armed and waiting", href: hasBlock ? "#/sessions" : null },
     ];
     var doneCount = steps.filter(function (s) { return s.done; }).length;
+    // Completed onboarding is dismissible — a 4/4 checklist pinned to
+    // the top of the dashboard forever is noise once the story's told.
+    // (Storage write is guarded; a quota failure just means the card
+    // returns next visit.)
+    try { if (doneCount === steps.length && localStorage.getItem("av_ob_dismissed") === "1") return ""; } catch (e) {}
     var rows = steps.map(function (s, i) {
       var inner =
         '<span class="ob-tick' + (s.done ? " done" : "") + '">' + (s.done ? "✓" : i + 1) + "</span>" +
@@ -1515,6 +1520,9 @@
     }).join("");
     return '<div class="onboard-card card" role="region" aria-label="Getting started">' +
       '<div class="ob-head"><h2>Getting started</h2><span class="ob-count">' + doneCount + " of " + steps.length + "</span>" +
+      (doneCount === steps.length
+        ? '<button type="button" class="btn" id="obDismiss" title="Hide this checklist" aria-label="Dismiss the getting-started checklist" style="margin-left:auto;padding:2px 10px">Dismiss</button>'
+        : "") +
       '<div class="ob-bar"><span style="width:' + (doneCount / steps.length) * 100 + '%"></span></div></div>' +
       '<div class="ob-steps">' + rows + "</div>" +
     "</div>";
@@ -1976,6 +1984,14 @@
     else if (t.id === "fBlocked") sessionsFilter.blockedOnly = t.checked;
     else return;
     applySessionsFilterChange();
+  });
+  // Completed-onboarding dismiss (delegated — the card is repainted by
+  // quiet overview refreshes, so per-render wiring would drop off).
+  document.addEventListener("click", function (e) {
+    if (!e.target || e.target.id !== "obDismiss") return;
+    try { localStorage.setItem("av_ob_dismissed", "1"); } catch (e2) {}
+    var card = e.target.closest(".onboard-card");
+    if (card) card.remove();
   });
 
   function sessionsTable(sessions, sortable) {
@@ -4910,6 +4926,10 @@
   var cmdkOpen_ = false;
   async function openCmdK() {
     if (cmdkOpen_) return;
+    // The palette is an in-app tool: navigation entries would just
+    // bounce a signed-out user to /login, and it floated OVER the
+    // login form when ⌘K was pressed there.
+    if (!state.session) return;
     cmdkOpen_ = true;
     document.body.classList.add("locked");
 
