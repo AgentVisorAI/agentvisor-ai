@@ -1020,6 +1020,15 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   cursor: help;
   border: 1px solid var(--border, #ddd);
 }
+/* iOS Safari force-zooms the page when focusing any input whose
+   font-size is under 16px — tapping the session search on the QR path
+   made the whole console lurch. pointer:coarse covers iPads too (the
+   760px breakpoint missed them); mice stay on the compact sizes.
+   !important on purpose: this must beat every per-component input rule
+   (.filter-bar .search input, .modal input, .cmdk input, …). */
+@media (max-width: 760px), (pointer: coarse) {
+  input, select, textarea { font-size: 16px !important; }
+}
 @media (max-width: 760px) {
   .events-head { flex-wrap: wrap; }
   .events-head .evt-filters { margin-left: 0; width: 100%; }
@@ -1285,6 +1294,10 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   animation: fadeIn 100ms ease-out;
 }
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+/* Scroll chaining: hitting the end of an inner scroller must not start
+   scrolling the page behind it — especially under an open modal, where
+   the "background page crept away" effect is disorienting. */
+.modal, .cmdk .list, .sidebar, .event-drawer .payload, .policy-preview, .policy-body, #accountMenu { overscroll-behavior: contain; }
 .modal {
   background: var(--surface);
   border: 1px solid var(--border);
