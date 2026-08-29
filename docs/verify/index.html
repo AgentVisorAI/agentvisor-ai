@@ -64,7 +64,11 @@
       <span style="color: var(--fg-muted)"> — then tamper with one byte and watch it fail</span>
     </div>
 
-    <div class="result" id="result" hidden></div>
+    <!-- Live region: the verdict IS the page's purpose — screen-reader
+         users must hear "verifies" / "does not verify" without hunting.
+         Present (not hidden) from load so the region is registered
+         before its first content change. -->
+    <div class="result" id="result" role="status" aria-live="polite"></div>
 
     <section class="how">
       <h3>How this works</h3>
