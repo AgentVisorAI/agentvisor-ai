@@ -116,6 +116,17 @@
     }
     return new Uint8Array(0);
   }
+  // R193 F1: identity-binding check — see docs/verify/verify.js
+  // for rationale. Mirrors Rust `verify_embedded()` at
+  // crates/av-receipts/src/receipt.rs:371-374.
+  async function _deriveKeyIdFromPubHex(hex) {
+    var bytes = hexToBytes(hex);
+    var digest = await crypto.subtle.digest("SHA-256", bytes);
+    var full = Array.from(new Uint8Array(digest))
+      .map(function (b) { return b.toString(16).padStart(2, "0"); })
+      .join("");
+    return full.slice(0, 32);
+  }
   async function verifyReceiptSignature(publicKeyHex, sigB64, bodyStr) {
     if (!publicKeyHex || !sigB64 || !bodyStr) return { supported: false, ok: false };
     var cacheKey;
@@ -123,8 +134,18 @@
     if (cacheKey && verifyCache.has(cacheKey)) return verifyCache.get(cacheKey);
     try {
       var pub = await crypto.subtle.importKey("raw", hexToBytes(publicKeyHex), { name: "Ed25519" }, false, ["verify"]);
-      var ok = await crypto.subtle.verify("Ed25519", pub, b64ToBytes(sigB64), _receiptSigningMessage(bodyStr));
-      var result = { supported: true, ok: !!ok };
+      var sigOk = await crypto.subtle.verify("Ed25519", pub, b64ToBytes(sigB64), _receiptSigningMessage(bodyStr));
+      var keyIdOk = true;
+      if (sigOk) {
+        try {
+          var parsed = JSON.parse(bodyStr);
+          if (typeof parsed.key_id === "string" && parsed.key_id.length > 0) {
+            var derived = await _deriveKeyIdFromPubHex(publicKeyHex.toLowerCase());
+            if (derived !== parsed.key_id.toLowerCase()) keyIdOk = false;
+          }
+        } catch (e) { /* body not JSON — sig covers structured bytes */ }
+      }
+      var result = { supported: true, ok: !!(sigOk && keyIdOk) };
       if (cacheKey) verifyCache.set(cacheKey, result);
       return result;
     } catch (e) {

@@ -31,7 +31,7 @@
  * insurer, or opposing counsel — no proprietary code required.
  */
 import { readFileSync } from "node:fs";
-import { createPublicKey, verify } from "node:crypto";
+import { createPublicKey, verify, createHash } from "node:crypto";
 
 // R78 HIGH #1: trust anchor pinning. Without this, an attacker who
 // generates their own Ed25519 keypair, signs any `rawBody`, and
@@ -138,8 +138,28 @@ function receiptSigningMessage(rawBody) {
 const msg = receiptSigningMessage(r.rawBody);
 const sig = Buffer.from(r.rawSignatureB64, "base64");
 
-const ok = verify(null, msg, key, sig);
-const trustedKey = TRUSTED_RECEIPT_KEYS.has(pubKeyHex.toLowerCase());
+const sigOk = verify(null, msg, key, sig);
+// R193 F1: enforce identity binding — body.key_id must derive
+// from the pubkey. Mirrors Rust `Receipt::verify_embedded()` at
+// crates/av-receipts/src/receipt.rs:371-374. Legacy v1 receipts
+// (sample-receipt.json) have no body.key_id — skip.
+function deriveKeyIdFromPubHex(hex) {
+  return createHash("sha256").update(Buffer.from(hex, "hex")).digest("hex").slice(0, 32);
+}
+let keyIdOk = true;
+let bodyKeyId = null;
+if (sigOk) {
+  try {
+    const parsed = JSON.parse(r.rawBody);
+    if (typeof parsed.key_id === "string" && parsed.key_id.length > 0) {
+      bodyKeyId = parsed.key_id.toLowerCase();
+      const derived = deriveKeyIdFromPubHex(pubKeyHex.toLowerCase());
+      if (derived !== bodyKeyId) keyIdOk = false;
+    }
+  } catch { /* body not JSON — leave keyIdOk true */ }
+}
+const ok = sigOk && keyIdOk;
+const trustedKey = ok && TRUSTED_RECEIPT_KEYS.has(pubKeyHex.toLowerCase());
 
 console.log("Session:       ", bundle.session?.externalId || bundle.session?.id);
 console.log("Agent:         ", bundle.session?.agent);
