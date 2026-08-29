@@ -183,7 +183,7 @@ catalog at the bottom.
 | `verify-page-drill.mjs` | 12 checks incl. download→drop→green / tamper→red |
 | `receipt-verify-drill.mjs` | download → CLI verifier + tamper matrix |
 | `full-flow-rehearsal.mjs` | ONE continuous session in narrative order: landing CTA → tour → verify finale → attack → receipt → fresh signup → reset. `PROFILE=phone` reruns it as the QR-code path on an iPhone profile; `SLOW=1` adds 300–700ms venue-wifi jitter to every datasource call |
-| `engine-matrix.mjs` | nightly: 8 features × chromium/webkit/firefox |
+| `engine-matrix.mjs` | nightly: 11 features × chromium/webkit/firefox (incl. sticky headers, dirty-guard, theme-state) |
 | `lighthouse-audit.mjs` | budgets, re-measures once on a miss (runner variance ±23) |
 
 CI: `console-smoke.yml` (22-min timeout; nightly adds engines).
