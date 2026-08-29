@@ -37,7 +37,7 @@
 .drop .browse:hover { background: var(--accent-hover); }
 .example-row { margin-top: 1.25rem; text-align: center; font-size: 0.9rem; }
 .example-row .link { color: var(--accent); cursor: pointer; text-decoration: underline; background: none; border: 0; font: inherit; padding: 0; }
-.result { margin-top: 2rem; }
+.result:not(:empty) { margin-top: 2rem; } /* empty live region adds no gap */
 .result-card {
   border-radius: 12px;
   padding: 1.5rem;
