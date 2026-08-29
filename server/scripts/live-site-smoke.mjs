@@ -208,5 +208,34 @@ console.log("✅ Environment pill present: " + pillText);
   console.log("✅ Link previews: OG/Twitter tags complete on all 4 pages, og:image + favicon resolve");
 }
 
+// ── 10. Video playback truth: a corrupt/truncated MP4 still passes a
+// 200-status crawl. Headless Chromium reads container metadata —
+// assert both pitch videos expose their expected durations with no
+// MediaError (pitch ~30s, tour ~130s).
+{
+  const origin = new URL(SITE).origin;
+  const page = await context.newPage();
+  await page.goto(origin + "/pitch/", { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("video", { timeout: 10000 });
+  const vids = await page.evaluate(async () => {
+    const out = [];
+    for (const v of document.querySelectorAll("video")) {
+      v.muted = true;
+      try { v.load(); } catch {}
+      await new Promise((r) => { const done = () => r(); v.addEventListener("loadedmetadata", done, { once: true }); v.addEventListener("error", done, { once: true }); setTimeout(done, 8000); });
+      out.push({ src: (v.currentSrc || "").split("/").pop(), dur: Math.round(v.duration || 0), err: v.error ? v.error.code : null, ready: v.readyState });
+    }
+    return out;
+  });
+  const pitch = vids.find((v) => /pitch/.test(v.src));
+  const tour = vids.find((v) => /tour/.test(v.src));
+  if (!pitch || pitch.err !== null || pitch.ready < 1 || pitch.dur < 25 || pitch.dur > 40)
+    fail("pitch video metadata broken: " + JSON.stringify(pitch));
+  if (!tour || tour.err !== null || tour.ready < 1 || tour.dur < 120 || tour.dur > 140)
+    fail("tour video metadata broken: " + JSON.stringify(tour));
+  await page.close();
+  console.log("✅ video truth: both MP4s decode metadata (pitch " + pitch.dur + "s, tour " + tour.dur + "s), zero MediaErrors");
+}
+
 await browser.close();
-console.log("\nLive site smoke passed (9 checks against " + SITE + ").");
+console.log("\nLive site smoke passed (10 checks against " + SITE + ").");
