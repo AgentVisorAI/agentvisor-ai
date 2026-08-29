@@ -105,7 +105,9 @@
 
 .pitch-cta-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  /* min(280px, 100%): the fixed 280px floor overflowed the page on
+     foldable cover displays (240px content box → 24px page scroll). */
+  grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
   gap: 1rem;
   margin-top: 1rem;
 }
@@ -259,7 +261,7 @@
 
 .pitch-links-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
   gap: 2rem;
 }
 
@@ -370,6 +372,11 @@
 }
 .pitch-qr-title { margin: 0 0 0.15rem; font-weight: 600; }
 .pitch-qr-sub { margin: 0; color: var(--fg-muted); font-size: 0.9rem; }
+/* Foldable cover displays: the QR row (image + text side by side)
+   needs ~292px of content and overflowed the page at 280px — stack it. */
+@media (max-width: 360px) {
+  .pitch-qr { flex-direction: column; align-items: flex-start; }
+}
 
 /* ── Print: the pitch page doubles as a one-page handout. ──────────
    Videos can't print, so they collapse; the QR + short links become
