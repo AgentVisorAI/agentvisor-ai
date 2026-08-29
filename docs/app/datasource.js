@@ -118,7 +118,9 @@
   }
   // R193 F1: identity-binding check — see docs/verify/verify.js
   // for rationale. Mirrors Rust `verify_embedded()` at
-  // crates/av-receipts/src/receipt.rs:371-374.
+  // crates/av-receipts/src/receipt.rs:415-418 (equivalently
+  // `verify()` at :371-374 — both re-derive the key id from the
+  // embedded pubkey and reject on `derived_id != body.key_id`).
   async function _deriveKeyIdFromPubHex(hex) {
     var bytes = hexToBytes(hex);
     var digest = await crypto.subtle.digest("SHA-256", bytes);

@@ -51,9 +51,13 @@ const DELIVERY_TIMEOUT_MS = 5000;
  * dangerous — a compromised operator could otherwise register a
  * webhook that exfiltrates instance-role credentials.
  *
- * In development we allow 127.0.0.1 + link-local so operators can
- * point at their local receiver for testing. The env-driven allowlist
- * is what makes the drill work without disabling the guard entirely.
+ * R185 F1: non-production modes are ALSO default-strict — private-range
+ * / metadata / loopback / link-local destinations are refused unless the
+ * operator explicitly opts in via `ALLOW_INTERNAL_WEBHOOK_TARGETS=true`.
+ * Prior shape fell open when NODE_ENV was unset or "development"/"test",
+ * so an unattended dev-mode deploy was a silent SSRF primitive. The env
+ * opt-in is what makes local-receiver testing possible without disabling
+ * the guard entirely.
  */
 const BLOCKED_HOSTS_ALWAYS = new Set([
   "metadata.google.internal",
