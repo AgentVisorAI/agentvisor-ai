@@ -240,6 +240,27 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
     // F4 / R118 F2 (leaked AV_INGEST_TOKEN). First-write-wins
     // matches the sealed-receipt posture across the file.
     const isSealed = existing?.status === "sealed";
+    // R141 F3: refuse pre-sealed CREATE. The R119 F2 update-branch
+    // freeze covered rewrites of already-sealed rows, but the
+    // create branch (row didn't exist yet) had no such guard. If
+    // retention purges Session rows (sessionRetentionDays elapsed)
+    // but preserves audit rows referencing them, a compromised
+    // ingest-token holder can POST /ingest/sessions with the
+    // historical externalId + status:"sealed" + attacker-chosen
+    // agent/openedAt — Prisma happily inserts. Downstream
+    // /read/sessions/:id then renders a "sealed but no receipt"
+    // row (Receipt was cascade-purged), producing plausible-
+    // deniability defacement of forensic history. Same threat
+    // model as R118 F2 / R119 F2 (leaked AV_INGEST_TOKEN). The
+    // seal transition is by design the receipt row's job
+    // (/ingest/receipts sets status:"sealed" atomically with
+    // the receipt) — an ingest client should never POST a new
+    // session that's already sealed. Refuse cleanly.
+    if (!existing && s.status === "sealed") {
+      return reply
+        .code(400)
+        .send({ error: "cannot_create_prealsealed_session" });
+    }
     const nextStatus =
       existing?.status === "sealed" && s.status !== "sealed" ? existing.status : s.status;
     const session = await db.session.upsert({

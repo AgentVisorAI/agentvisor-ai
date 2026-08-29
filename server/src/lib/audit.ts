@@ -10,7 +10,8 @@
  *
  * `event` is a stable machine-readable slug:
  *   auth.login, auth.logout, auth.signup, auth.oauth_signin
- *   auth.reset_request, auth.reset_confirm, auth.account_deleted
+ *   auth.reset_request, auth.reset_confirm, auth.account_deleted,
+ *     auth.step_up_denied
  *   saml.signin, saml.config_created, saml.config_updated,
  *     saml.config_deleted, saml.keypair_rotated
  *   deployment.create, deployment.delete, deployment.token_rotated
@@ -18,7 +19,7 @@
  *   org.created, org.exported
  *   audit.exported_csv, audit.viewed
  *   mfa.credential_registered, mfa.credential_revoked,
- *     mfa.credential_register_denied
+ *     mfa.credential_register_denied, mfa.credential_revoke_denied
  *
  * `target` is a human-readable label the log viewer shows.
  * `metadata` carries structured fields for machine consumption.

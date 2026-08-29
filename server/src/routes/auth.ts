@@ -764,7 +764,26 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     const user = await db.user.findUnique({ where: { id: claims.sub } });
     if (!user) return reply.code(401).send({ error: "unauthenticated" });
     const ok = await verifyPassword(user.passwordHash, body.data.password);
-    if (!ok) return reply.code(401).send({ error: "invalid_password" });
+    if (!ok) {
+      // R141 F2: step-up failure audit. This branch runs BEFORE
+      // the org cascade so writeAudit still lands in
+      // audit_entries (unlike the success branch, whose audit
+      // gets cascade-nuked and relies on req.log.warn for
+      // external log capture per the R97 F-A comment below).
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "auth.step_up_denied",
+          actorId: claims.sub,
+          actorEmail: user.email,
+          note: "invalid_password",
+          metadata: { endpoint: "me.delete_account" },
+          req,
+        },
+        req.log,
+      );
+      return reply.code(401).send({ error: "invalid_password" });
+    }
 
     // R97 F-A: emit a forensic breadcrumb BEFORE the tx runs. This
     // is the most catastrophic action in the whole codebase — the
@@ -984,6 +1003,35 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       : await getDummyPasswordHash();
     const ok = await verifyPassword(hashForCompare, body.data.token);
     if (!ok || !resetFresh || !user) {
+      // R141 F2: step-up failure audit — only when we have a
+      // real user row to attach the orgId (otherwise there's
+      // nothing to audit against). Preserves the R98 F2 no-
+      // enumeration-oracle posture: an attacker guessing
+      // email+token combinations for accounts that don't exist
+      // triggers no audit, matching the wire-response uniformity.
+      // For legit-email + wrong-token, this is the forensic trail
+      // R135 F1's success-side audit needed for symmetry.
+      if (user) {
+        const firstMembership = await db.membership.findFirst({
+          where: { userId: user.id },
+          orderBy: { createdAt: "asc" },
+          select: { orgId: true },
+        });
+        if (firstMembership) {
+          writeAudit(
+            {
+              orgId: firstMembership.orgId,
+              event: "auth.step_up_denied",
+              actorId: user.id,
+              actorEmail: user.email,
+              note: "invalid_token",
+              metadata: { endpoint: "reset_confirm" },
+              req,
+            },
+            req.log,
+          );
+        }
+      }
       return reply.code(401).send({ error: "invalid_token" });
     }
     const passwordHash = await hashPassword(body.data.newPassword);
