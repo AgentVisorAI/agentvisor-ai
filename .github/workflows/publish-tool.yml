@@ -72,7 +72,8 @@ jobs:
           # Root files.
           for f in Cargo.toml Cargo.lock rust-toolchain.toml deny.toml LICENSE \
                    README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md \
-                   BENCHMARKS.md CONFORMANCE-STATUS.md ARCHITECTURE.md; do
+                   BENCHMARKS.md CONFORMANCE-STATUS.md ARCHITECTURE.md \
+                   EVOLUTION.md; do
             cp "$f" "$out/$f"
           done
           # The offline receipt verifier — the auditor-facing tool.
