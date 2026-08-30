@@ -275,7 +275,7 @@ The attack demo's staged rerenders pass the session id so a viewer
 parked on the detail page sees the panel flip live at seal+300ms
 (the random subscribe tick almost never matches that session id) —
 drill check 2 pins the whole unsealed→sealed transition.
-| `live-site-smoke.mjs` | 10 checks: link/media crawl, captions, alias stubs, 404, OG/Twitter link previews, video-metadata truth (durations + zero MediaErrors) |
+| `live-site-smoke.mjs` | 11 checks: link/media crawl, captions, alias stubs, 404, OG/Twitter link previews, video-metadata truth (durations + zero MediaErrors), install-promise (the exact URL app.js prints serves the real public-repo installer) |
 | `a11y-audit.mjs` | 46 axe scans: 11 routes + 9 modal states × 2 themes, 3 static pages × 2 schemes |
 | `mobile-smoke.mjs` | phone/tablet: tab bar, taps, modals fit + hittable + stacking, static pages |
 | `verify-page-drill.mjs` | 12 checks incl. download→drop→green / tamper→red |
@@ -319,7 +319,18 @@ everything):
 
 Public site pages link `github.com/AgentVisorAI/agentvisor` (the
 curated tool repo) — keep it that way even while the monorepo is
-public; the tool repo is the stable public artifact. deploy.yml's
+public; the tool repo is the stable public artifact. EXTERNAL
+PROMISES (URLs/commands the product tells users to run elsewhere)
+must be guarded: the onboarding install command shipped for weeks
+pointing at get.agentvisorai.me, a host that never existed in DNS —
+the installer now lives at agentvisorai.me/install.sh (same Pages
+artifact, no DNS dependency), installs agentvisord + avctl via
+`cargo install --git` from the public repo, and smoke check 11
+fetches the EXACT URL the deployed app.js prints. Public-consumer
+chain certified manually this round: fresh clone of the public repo
+compiles the daemon (--locked) and its tools/verify-receipt.mjs
+accepts a production-downloaded receipt against the trust anchor —
+re-run that by hand when the export include-list changes. deploy.yml's
 attestation steps gate on `!github.event.repository.private` (the
 attestations API 403s for private repos on this plan) and resume
 automatically on pushes made while public. If the repo ever goes
