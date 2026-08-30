@@ -2799,7 +2799,7 @@
         '<div class="empty-hero" style="margin-bottom: 16px; padding: 16px 20px; grid-template-columns: 1fr 1fr;">' +
           '<div><h2 style="font-size: 15px; margin: 0 0 4px">Connect a new daemon</h2>' +
           '<p style="margin: 0; font-size: 13px">Install <code>agentvisord</code> on your infra with the ingest token, and events start streaming here.</p></div>' +
-          '<div class="snippet"><span class="prompt">$</span> <span class="cmd">curl -fsSL https://agentvisorai.me/install.sh | sh</span>\n<span class="prompt">$</span> <span class="cmd">agentvisord start --token=$AV_INGEST_TOKEN</span></div>' +
+          '<div class="snippet"><span class="prompt">$</span> <span class="cmd">curl -fsSL https://agentvisorai.me/install.sh | sh</span>\n<span class="prompt">$</span> <span class="cmd">avctl setup</span></div>' +
         "</div>" +
         '<div class="card" style="padding:0"><div class="table-wrap"><table>' +
           "<thead><tr><th>Deployment</th><th>Environment</th><th>Status</th><th>Version</th><th>Last seen</th><th class=\"act-2\"><span class=\"sr-only\">Actions</span></th></tr></thead>" +
@@ -2831,7 +2831,7 @@
               onConfirm: function () {
                 state.ds.rotateDeploymentToken(id).then(function (r) {
                   showTokenModal(r.ingestToken, "Token rotated", {
-                    subtitle: "Paste this token into your daemon's AV_INGEST_TOKEN env var. Store it in your secret manager — this is the only time it's shown.",
+                    subtitle: "Store this token in your secret manager — it's shown only once. It links your daemon to this console (the AV_INGEST_TOKEN control-plane hookup ships with the beta; tokens minted now stay valid).",
                     notice: "The previous ingest token is invalidated immediately; every daemon using it will fail to connect until you swap the value.",
                   });
                 })
@@ -2857,8 +2857,8 @@
       '<div><h2>Connect your first agent</h2>' +
       '<p>Install the AgentVisor daemon on the box that runs your agent. Once it starts, sessions and signed receipts stream directly into this console.</p>' +
       '<button class="btn accent" id="addDep2">+ New deployment</button> ' +
-      '<button type="button" class="btn" data-copy="curl -fsSL https://agentvisorai.me/install.sh | sh\nagentvisord start --token=$AV_INGEST_TOKEN">⧉ Copy install commands</button></div>' +
-      '<div class="snippet"><span class="prompt">$</span> <span class="cmd">curl -fsSL https://agentvisorai.me/install.sh | sh</span>\n\n<span class="prompt">$</span> <span class="cmd">agentvisord start --token=$AV_INGEST_TOKEN</span></div>' +
+      '<button type="button" class="btn" data-copy="curl -fsSL https://agentvisorai.me/install.sh | sh\navctl setup">⧉ Copy install commands</button></div>' +
+      '<div class="snippet"><span class="prompt">$</span> <span class="cmd">curl -fsSL https://agentvisorai.me/install.sh | sh</span>\n\n<span class="prompt">$</span> <span class="cmd">avctl setup</span></div>' +
       "</div>";
   }
 
@@ -2930,7 +2930,7 @@
         onConfirm: function () {
           state.ds.rotateDeploymentToken(d.id).then(function (r) {
             showTokenModal(r.ingestToken, "Token rotated", {
-              subtitle: "Paste this token into your daemon's AV_INGEST_TOKEN env var. Store it in your secret manager — this is the only time it's shown.",
+              subtitle: "Store this token in your secret manager — it's shown only once. It links your daemon to this console (the AV_INGEST_TOKEN control-plane hookup ships with the beta; tokens minted now stay valid).",
               notice: "The previous ingest token is invalidated immediately; every daemon using it will fail to connect until you swap the value.",
             });
           })
@@ -3049,7 +3049,7 @@
         .then(function (r) {
           close();
           showTokenModal(r.ingestToken, "Deployment created", {
-            subtitle: "Paste this token into your daemon's AV_INGEST_TOKEN env var. Store it in your secret manager — this is the only time it's shown.",
+            subtitle: "Store this token in your secret manager — it's shown only once. It links your daemon to this console (the AV_INGEST_TOKEN control-plane hookup ships with the beta; tokens minted now stay valid).",
             notice: "If you lose the token, rotate to mint a new one from the deployment's detail page; the current value stops being accepted immediately.",
           });
         })

@@ -875,6 +875,21 @@
       return el;
     } catch (e) { return null; }
   }
+  // The STABLE epoch for all fresh timestamps. Derivations that
+  // recomputed `Date.now() - el` took a SECOND clock read a
+  // millisecond after the first — every fetch re-timed the entire
+  // workspace by its own jitter, so a receipt fetched twice signed
+  // different bytes (drill 33 caught the header/receipt window
+  // straddling a millisecond).
+  function freshT0Ms() {
+    try {
+      var v = localStorage.getItem("av_mock_fresh_t0");
+      if (!v) return null;
+      var t0 = +v;
+      if (!isFinite(t0) || t0 > Date.now()) return null;
+      return t0;
+    } catch (e) { return null; }
+  }
   // The signed-up user's identity (org name, email) — persisted so a
   // reload doesn't revert the workspace to the Northwind demo user
   // while the fresh-workspace story is active.
@@ -928,7 +943,7 @@
     // Deleting the daemon cascades its sessions and receipts — same
     // promise the delete modal makes in the Northwind workspace.
     if (rt.simDeleted) return [];
-    var t0 = Date.now() - el;
+    var t0 = freshT0Ms();
     // clean first, then the featured block, then one more
     var order = [MOCK_SESSIONS[3], MOCK_SESSIONS[0], MOCK_SESSIONS[4]];
     var out = [];
@@ -973,7 +988,7 @@
     var el = freshElapsed();
     if (el == null) return pol;
     var out = Object.assign({}, pol);
-    var t0 = Date.now() - el;
+    var t0 = freshT0Ms();
     out.updatedAt = new Date(t0 + 2000).toISOString();
     var sess = freshSessions() || [];
     var blocked = sess.some(function (s) { return s.toolsBlocked > 0; });
@@ -1000,8 +1015,7 @@
           orgId: (freshIdentity() && freshIdentity().org.id) || "org_fresh",
           // The deployment record exists a few seconds after signup
           // (create → token → install); its key is issued at CONNECT.
-          // Date.now()−el put creation at the org's own birth instant.
-          createdAt: new Date(Date.now() - el + 5000).toISOString(),
+          createdAt: new Date(freshT0Ms() + 5000).toISOString(),
         });
       }
       var d = rt.sim;
@@ -1928,7 +1942,7 @@
       await delay(100);
       var el = freshElapsed();
       if (el != null) {
-        var t0 = Date.now() - el;
+        var t0 = freshT0Ms();
         var fid = freshIdentity();
         var entries = [];
         var founder = mockState.session && mockState.session.user ? mockState.session.user.email : "you";
