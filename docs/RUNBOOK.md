@@ -2,6 +2,12 @@
 
 One page. Grep for the failure, do the fix, move on. Kept short on purpose.
 
+> **Scope note:** sections referencing `api.agentvisorai.me` / Fly.io
+> apply to the hosted API, which launches with the beta (no public
+> instance or DNS today — `docs/STATUS.md` tracks that). The live
+> surfaces before then are the static site + mock-mode console on
+> GitHub Pages; their failure modes are the Pages/CDN sections below.
+
 ## Contact + escalation
 
 - Ops on-call: whoever pushed last (`git log -1 --format='%an %ae' main`)

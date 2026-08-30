@@ -131,6 +131,7 @@ console.log("✅ Environment pill present: " + pillText);
   const origin = new URL(SITE).origin + "/";
   const isLocal = /localhost|127\.0\.0\.1/.test(origin);
   const problems = [];
+  const checkedExternal = new Set();
   for (const p of ["", "pitch/", "verify/"]) {
     await page.goto(origin + p, { waitUntil: "domcontentloaded" });
     await wait(500);
@@ -146,6 +147,20 @@ console.log("✅ Environment pill present: " + pillText);
       }
       if (/^https?:\/\//.test(l.href)) {
         if (l.target === "_blank" && !/noopener/.test(l.rel)) problems.push(`/${p}: _blank without noopener: ${l.href}`);
+        // GitHub links are the one external family the site prints, and
+        // they can silently die: the pitch page's "how the videos were
+        // made" credit 404'd for weeks because it pointed a monorepo
+        // path at the curated export (which excludes server/). HEAD
+        // each unique github.com URL once per run (live runs only —
+        // rate limits are generous for the ~6 links on the site).
+        if (!isLocal && /^https:\/\/github\.com\//.test(l.href) && !checkedExternal.has(l.href)) {
+          checkedExternal.add(l.href);
+          // Node-side fetch: an in-page fetch to github.com dies on
+          // CORS and would mask 404s as network errors.
+          let st = 0;
+          try { st = (await fetch(l.href, { method: "HEAD", redirect: "follow" })).status; } catch { st = 0; }
+          if (st === 404) problems.push(`/${p}: dead GitHub link ${l.href} ('${l.text}')`);
+        }
         continue;
       }
       if (isLocal && /^\.?\/?api\//.test(l.href)) continue;
