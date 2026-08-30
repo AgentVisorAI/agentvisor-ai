@@ -163,7 +163,14 @@ async function recordConsoleScene(browser, sceneName, durationMs, hash, waitFor,
   // ── Phase 1: warm up in an unrecorded context, capture its state ──
   const warmCtx = await browser.newContext({ viewport: { width: 1920, height: 1080 } });
   const warm = await warmCtx.newPage();
-  await warm.addInitScript(() => { try { localStorage.setItem("av_mock_signed_out", "1"); } catch {} });
+  await warm.addInitScript(() => { try {
+    localStorage.setItem("av_mock_signed_out", "1");
+    // Collapse the mock's simulated latency: the recorded context
+    // inherits this via storageState, so scene 2 stops opening on
+    // ~2s of stat-card skeletons under the "$31,840 saved" caption
+    // (the tour pipeline has always set this; the 30s cut never did).
+    localStorage.setItem("av_mock_fastload", "1");
+  } catch {} });
   await warm.goto(SITE + "#/login", { waitUntil: "networkidle" });
   await warm.waitForSelector("input#email", { timeout: 15000 });
   await warm.locator("input#email").fill("olivia.tan@northwind.com");
