@@ -2171,7 +2171,7 @@ pub async fn health(base_url: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::panic, clippy::unwrap_used)]
+    #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
 
@@ -2895,7 +2895,7 @@ mod tests {
         // The mock elides menu items 5-10 behind an ellipsis; the ones it
         // SHOWS must be the real labels at the real positions.
         for index in [1usize, 2, 3, 4, 11, 12, 13] {
-            let label = WIZARD_MENU[index - 1].0;
+            let label = WIZARD_MENU.get(index - 1).expect("menu index in range").0;
             let line = format!("{index}) {label}");
             assert!(
                 html.contains(&line),
