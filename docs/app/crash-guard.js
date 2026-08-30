@@ -39,7 +39,7 @@
       card.appendChild(btn);
       var a = document.createElement("a");
       a.style.cssText = "margin-left:12px;color:#0a5c8b;text-decoration:none";
-      a.href = "mailto:hello@agentvisorai.me?subject=Console%20crash";
+      a.href = "https://github.com/AgentVisorAI/agentvisor-ai/issues/new?title=Console%20crash";
       a.textContent = "Contact support";
       card.appendChild(a);
       host.appendChild(card);
