@@ -1757,8 +1757,19 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   /* Bottom padding clears both the tab bar (56px) and the tour pill. */
   .main { padding: var(--s-4) var(--s-4) 132px; }
   .topbar { overflow: hidden; }
-  .topbar .cmdk-trigger { min-width: 0; }
+  /* R286 (user report: "header on mobile is quite compressed"): the
+     search trigger used to shrink to ~31px with its ⌘K kbd bleeding
+     outside the border, and the avatar squashed to 9px beside a
+     3-character email. The trigger becomes a fixed icon-only button
+     (⌘K is a hardware-keyboard affordance; the magnifier alone reads
+     as search) and nothing in the right cluster may shrink below its
+     content. */
+  .topbar .cmdk-trigger { min-width: 0; flex-shrink: 0; padding: 12px; }
   .topbar .cmdk-trigger span:not(.kbd) { display: none; }
+  .topbar .cmdk-trigger .kbd { display: none; }
+  .topbar .cmdk-trigger svg { width: 16px; height: 16px; }
+  .topbar .theme-btn { flex-shrink: 0; }
+  .topbar .avatar { flex-shrink: 0; }
   /* Keep the Demo/Live pill visible: phones are exactly where the
      demo-table QR code lands, and the pill is the only signal that
      the data is fixtures. Trim its padding instead of hiding it. */
@@ -1783,12 +1794,17 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
    to sign-out/theme) was clipped clean off behind overflow:hidden.
    Logo stands in for the wordmark; the email hides (the avatar initial
    remains); gaps and padding tighten. */
+/* Compact phones (≤480px): the ellipsized email adds nothing next to
+   the avatar initial — hide it (the account menu shows the full email)
+   and let the chip collapse to the avatar. The 340px foldable tier
+   below only has to handle the wordmark after this. */
+@media (max-width: 480px) {
+  .topbar .user-btn span:last-child { display: none; }
+  .topbar .user-btn { max-width: none; padding: 4px; }
+}
 @media (max-width: 340px) {
   .topbar { gap: var(--s-2); padding: 0 var(--s-3); }
   .topbar .brand span { display: none; }
-  .topbar .user-btn span:last-child { display: none; }
-  .topbar .user-btn { max-width: none; }
-  .topbar .cmdk-trigger .kbd { display: none; }
 }
 @media (max-width: 760px) {
   /* Header actions wrap under the title instead of overflowing. */
