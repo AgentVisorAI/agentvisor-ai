@@ -223,5 +223,5 @@ that pass. The tags are load-bearing history — they explain WHY a
 given guard exists so that a future refactor doesn't quietly remove
 it. If you're editing a Round-tagged block, follow the anchor:
 grep for the tag in
-[EVOLUTION.md](../EVOLUTION.md) or in the git log to find the
+[EVOLUTION.md](../../EVOLUTION.md) or in the git log to find the
 incident that motivated it.

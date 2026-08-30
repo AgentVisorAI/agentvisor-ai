@@ -352,4 +352,13 @@ AV_LISTEN port. deploy.yml's
 attestation steps gate on `!github.event.repository.private` (the
 attestations API 403s for private repos on this plan) and resume
 automatically on pushes made while public. If the repo ever goes
-private again, budget Actions minutes FIRST.
+private again, budget Actions minutes FIRST. Markdown cross-reference
+truth (R280): SPOOL-AND-RECOVERY.md linked `../EVOLUTION.md` — one
+directory short from docs/reference/, AND the file was missing from
+the publish-tool export list, so the public auditor-facing repo had a
+dead link. Both fixed; CI's `docs-xref` job now resolves every
+relative markdown link in every tracked .md on every PR (fenced code
+blocks stripped — link syntax inside ``` is example text). When a
+reference doc links a ROOT file, confirm the target is in
+publish-tool.yml's export list too, or the public copy 404s even
+though the monorepo link resolves.
