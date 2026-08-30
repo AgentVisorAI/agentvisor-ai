@@ -195,7 +195,17 @@ async function recordConsoleScene(browser, sceneName, durationMs, hash, waitFor,
   });
   if (cinematicOpts && cinematicOpts.freshOffset != null) {
     await ctx.addInitScript((off) => {
-      try { localStorage.setItem("av_mock_fresh_t0", String(Date.now() - off)); } catch {}
+      try {
+        localStorage.setItem("av_mock_fresh_t0", String(Date.now() - off));
+        // The identity the signup scene persists — without it the
+        // fresh workspace falls back to the anonymous "workspace-prod"
+        // daemon (R257 named fresh daemons after the org's slug) and
+        // the story's org/actor names vanish from chrome + audit.
+        localStorage.setItem("av_mock_fresh_identity", JSON.stringify({
+          user: { id: "usr_olivia", email: "olivia.tan@northwind.com", displayName: "Olivia Tan", role: "owner" },
+          org: { id: "org_fresh_nw", name: "Northwind Traders", slug: "northwind-traders", createdAt: new Date(Date.now() - off).toISOString(), role: "owner" },
+        }));
+      } catch {}
     }, cinematicOpts.freshOffset);
   }
   const page = await ctx.newPage();
@@ -516,8 +526,8 @@ await recordConsoleScene(
       localStorage.setItem("av_mock_fresh_t0", String(Date.now() - 13500));
       window.dispatchEvent(new HashChangeEvent("hashchange"));
     });
-    await page.waitForSelector("text=northwind-prod", { timeout: 6000 });
-    const row = page.locator("text=northwind-prod").first();
+    await page.waitForSelector("text=northwind-traders-prod", { timeout: 6000 });
+    const row = page.locator("text=northwind-traders-prod").first();
     const rb = await row.boundingBox().catch(() => null);
     if (rb) await page.mouse.move(rb.x + rb.width / 2, rb.y + rb.height / 2, { steps: 14 });
     await page.waitForTimeout(600);
