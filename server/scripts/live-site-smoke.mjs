@@ -194,7 +194,27 @@ console.log("✅ Environment pill present: " + pillText);
   const h404 = await page.evaluate(async (u) => (await fetch(u)).text(), origin + "404.html");
   if (!/AgentVisor/i.test(h404) || !h404.includes('href="/pitch/"') || !h404.includes('href="/app/"') || !h404.includes('href="/verify/"'))
     fail("404 page missing brand line or escape links");
-  console.log("✅ Alias stubs (/mockup→/pitch, /demo→/app) + branded 404 with escape links");
+  // Machine surfaces: browsers auto-request /favicon.ico on every
+  // visit (it 404'd since launch); robots.txt states the allow-all
+  // policy; security.txt is an RFC 9116 machine promise — its Expires
+  // must be in the future and its Policy/Acknowledgments URLs must
+  // exist (a stale or dead security.txt reads as an abandoned
+  // project to exactly the people who check such things).
+  for (const [pth, want] of [["favicon.ico", 200], ["robots.txt", 200], [".well-known/security.txt", 200]]) {
+    const st = await page.evaluate(async (u) => (await fetch(u)).status, origin + pth + "?cb=" + Date.now());
+    if (st !== want) fail("machine surface /" + pth + " -> HTTP " + st);
+  }
+  const sec = await page.evaluate(async (u) => (await fetch(u)).text(), origin + ".well-known/security.txt?cb=" + Date.now());
+  const exp = sec.match(/^Expires:\s*(.+)$/m);
+  if (!exp || !(new Date(exp[1]) > new Date())) fail("security.txt Expires missing or in the past: " + (exp && exp[1]));
+  if (!isLocal) {
+    for (const m of sec.matchAll(/^(?:Policy|Acknowledgments|Canonical):\s*(https:\/\/\S+)$/gm)) {
+      let st = 0;
+      try { st = (await fetch(m[1], { method: "HEAD", redirect: "follow" })).status; } catch { st = 0; }
+      if (st === 404) fail("security.txt references a dead URL: " + m[1]);
+    }
+  }
+  console.log("✅ Alias stubs + branded 404 + machine surfaces (favicon, robots, security.txt fresh with live links)");
 }
 
 // 9. Link previews: these URLs get pasted into Slack/WhatsApp/email —

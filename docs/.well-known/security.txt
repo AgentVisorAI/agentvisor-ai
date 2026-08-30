@@ -15,8 +15,8 @@ Acknowledgments: https://github.com/AgentVisorAI/agentvisor-ai/blob/main/SECURIT
 # In-scope surfaces:
 #   • agentvisorai.me and *.agentvisorai.me
 #   • the AgentVisor console SPA at /app
-#   • the hosted API
-#   • the on-device daemon (crates/atif in this repo)
+#   • the hosted API (launches with the beta; in scope from day one)
+#   • the on-device daemon (crates/av-harness + crates/av-atif in this repo)
 #
 # Out of scope: dependency CVEs already tracked upstream, findings that
 # require an already-compromised administrator account, DoS via unbounded
