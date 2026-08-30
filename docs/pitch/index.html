@@ -59,7 +59,9 @@
           The video is served self-hosted so autoplay-muted works
           under any browser policy. Loop keeps it playing while the
           page is on screen; controls stay available for anyone
-          who wants to scrub or unmute.
+          who wants to scrub or unmute. Captions are burned into
+          the footage, so the text track must NOT be `default` —
+          the browser would draw the same lines twice.
         -->
         <div class="pitch-video-wrap">
           <video
@@ -74,7 +76,7 @@
             aria-label="AgentVisor AI. The problem and the fix, 30 seconds"
           >
             <source src="pitch-muted.mp4" type="video/mp4">
-            <track kind="captions" src="pitch.vtt" srclang="en" label="English" default>
+            <track kind="captions" src="pitch.vtt" srclang="en" label="English">
             <p>
               Your browser can’t play this video.
               <a href="pitch.mp4">Download it here</a> (6.6&nbsp;MB, 30&nbsp;seconds).
