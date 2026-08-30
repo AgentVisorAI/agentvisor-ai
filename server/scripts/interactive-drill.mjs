@@ -6,7 +6,7 @@
  *   1. Guided tour: auto-start via /app/?tour=1, all 6 steps land on
  *      their targets, overlay absorbs background clicks (audit D1),
  *      finale offers the verifier CTA.
- *   2. Simulate an attack: full ~5s timeline, stats catch up
+ *   2. Simulate an attack: full ~9s timeline, stats catch up
  *      (prevented losses grows), link toast appears, injected
  *      session page carries the story banner.
  *   3. Story banner on the featured session + Jump to the block
@@ -102,7 +102,7 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
     return v ? parseInt(v.textContent.replace(/[^0-9]/g, ""), 10) : false;
   }, { timeout: 10000 })).jsonValue();
   await page.evaluate(() => document.getElementById("simAttack").click());
-  // Mid-flight (before the ~4.6s seal): the session is in_progress —
+  // Mid-flight (before the ~9s seal): the session is in_progress —
   // the receipt panel must say "no receipt yet" (real API 404s until
   // the daemon posts at seal; a signed receipt whose bytes then CHANGE
   // would contradict the tamper-evidence pitch) and the receipt
