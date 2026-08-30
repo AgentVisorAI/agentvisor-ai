@@ -12,6 +12,11 @@
       var host = document.getElementById("app") || document.body;
       host.textContent = "";
       var card = document.createElement("div");
+      // Screen readers must announce a boot failure without the user
+      // hunting for it; focus lands on the card so keyboard users can
+      // reach Reload immediately.
+      card.setAttribute("role", "alert");
+      card.setAttribute("tabindex", "-1");
       card.style.cssText = "max-width:520px;margin:96px auto;padding:24px 28px;font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#fff;border:1px solid #e0e0e0;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.06)";
       var h = document.createElement("div");
       h.style.cssText = "font-size:15px;font-weight:600;margin-bottom:6px";
@@ -38,6 +43,7 @@
       a.textContent = "Contact support";
       card.appendChild(a);
       host.appendChild(card);
+      try { card.focus(); } catch (e2) {}
     } catch (e) {
       // Truly wedged — fall back to a native alert.
       alert("Console crashed: " + msg + (requestId ? " (request-id " + requestId + ")" : ""));
