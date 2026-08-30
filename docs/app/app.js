@@ -2799,7 +2799,7 @@
         '<div class="empty-hero" style="margin-bottom: 16px; padding: 16px 20px; grid-template-columns: 1fr 1fr;">' +
           '<div><h2 style="font-size: 15px; margin: 0 0 4px">Connect a new daemon</h2>' +
           '<p style="margin: 0; font-size: 13px">Install <code>agentvisord</code> on your infra with the ingest token, and events start streaming here.</p></div>' +
-          '<div class="snippet"><span class="prompt">$</span> <span class="cmd">curl -fsSL https://get.agentvisorai.me/install.sh | sh</span>\n<span class="prompt">$</span> <span class="cmd">agentvisord start --token=$AV_INGEST_TOKEN</span></div>' +
+          '<div class="snippet"><span class="prompt">$</span> <span class="cmd">curl -fsSL https://agentvisorai.me/install.sh | sh</span>\n<span class="prompt">$</span> <span class="cmd">agentvisord start --token=$AV_INGEST_TOKEN</span></div>' +
         "</div>" +
         '<div class="card" style="padding:0"><div class="table-wrap"><table>' +
           "<thead><tr><th>Deployment</th><th>Environment</th><th>Status</th><th>Version</th><th>Last seen</th><th class=\"act-2\"><span class=\"sr-only\">Actions</span></th></tr></thead>" +
@@ -2857,8 +2857,8 @@
       '<div><h2>Connect your first agent</h2>' +
       '<p>Install the AgentVisor daemon on the box that runs your agent. Once it starts, sessions and signed receipts stream directly into this console.</p>' +
       '<button class="btn accent" id="addDep2">+ New deployment</button> ' +
-      '<button type="button" class="btn" data-copy="curl -fsSL https://get.agentvisorai.me/install.sh | sh\nagentvisord start --token=$AV_INGEST_TOKEN">⧉ Copy install commands</button></div>' +
-      '<div class="snippet"><span class="prompt">$</span> <span class="cmd">curl -fsSL https://get.agentvisorai.me/install.sh | sh</span>\n\n<span class="prompt">$</span> <span class="cmd">agentvisord start --token=$AV_INGEST_TOKEN</span></div>' +
+      '<button type="button" class="btn" data-copy="curl -fsSL https://agentvisorai.me/install.sh | sh\nagentvisord start --token=$AV_INGEST_TOKEN">⧉ Copy install commands</button></div>' +
+      '<div class="snippet"><span class="prompt">$</span> <span class="cmd">curl -fsSL https://agentvisorai.me/install.sh | sh</span>\n\n<span class="prompt">$</span> <span class="cmd">agentvisord start --token=$AV_INGEST_TOKEN</span></div>' +
       "</div>";
   }
 
