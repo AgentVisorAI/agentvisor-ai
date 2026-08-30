@@ -281,7 +281,7 @@ The attack demo's staged rerenders pass the session id so a viewer
 parked on the detail page sees the panel flip live at seal+300ms
 (the random subscribe tick almost never matches that session id) —
 drill check 2 pins the whole unsealed→sealed transition.
-| `live-site-smoke.mjs` | 11 checks: link/media crawl, captions, alias stubs, 404, OG/Twitter link previews, video-metadata truth (durations + zero MediaErrors), install-promise (the exact URL app.js prints serves the real public-repo installer) |
+| `live-site-smoke.mjs` | 11 checks: link/media crawl, captions, alias stubs, 404, OG/Twitter link previews, video-metadata truth (durations + zero MediaErrors), install-promise (the exact URL app.js prints serves the real installer; live runs also assert the public README leads with working commands) |
 | `a11y-audit.mjs` | 46 axe scans: 11 routes + 9 modal states × 2 themes, 3 static pages × 2 schemes |
 | `mobile-smoke.mjs` | phone/tablet: tab bar, taps, modals fit + hittable + stacking, static pages |
 | `verify-page-drill.mjs` | 12 checks incl. download→drop→green / tamper→red |
@@ -333,10 +333,22 @@ the installer now lives at agentvisorai.me/install.sh (same Pages
 artifact, no DNS dependency), installs agentvisord + avctl via
 `cargo install --git` from the public repo, and smoke check 11
 fetches the EXACT URL the deployed app.js prints. Public-consumer
-chain certified manually this round: fresh clone of the public repo
-compiles the daemon (--locked) and its tools/verify-receipt.mjs
-accepts a production-downloaded receipt against the trust anchor —
-re-run that by hand when the export include-list changes. deploy.yml's
+chain certified BY EXECUTION (R270–R272): fresh clone compiles; real
+`cargo install --locked --git` produced both binaries; the printed
+`agentvisord start --token` was REFUSED by the fail-closed CLI (fixed
+to `avctl setup`); `avctl setup` exits gracefully on non-TTY EOF;
+`doctor --offline` fails loudly on exactly the unset provider key and
+passes with it; `avctl start` served /health and PROXIED a live
+chat/completions request (upstream's own 401 for a dummy key proves
+the pipe); tools/verify-receipt.mjs accepts a production receipt.
+The public README's `cargo install av-harness av-cli` pointed at
+crates.io entries that were NEVER published — quickstart now leads
+with the installer one-liner + --git form (crates.io note stays for
+the future release). Re-run the chain by hand when the export
+include-list or CLI surface changes. Beware squatters: another
+worktree's daemon on :8484 answered a health probe meant for a
+daemon that had failed to start — always probe on an overridden
+AV_LISTEN port. deploy.yml's
 attestation steps gate on `!github.event.repository.private` (the
 attestations API 403s for private repos on this plan) and resume
 automatically on pushes made while public. If the repo ever goes

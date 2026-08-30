@@ -52,22 +52,30 @@ client = OpenAI(
 ## Easiest start (no config, no exports)
 
 ```bash
-cargo install av-harness av-cli    # installs `agentvisord` + `avctl` binaries
+curl -fsSL https://agentvisorai.me/install.sh | sh    # installs `agentvisord` + `avctl`
+avctl
+```
+
+Or install straight from this repository (same thing the script runs):
+
+```bash
+cargo install --locked --git https://github.com/AgentVisorAI/agentvisor av-harness
+cargo install --locked --git https://github.com/AgentVisorAI/agentvisor av-cli
 avctl
 ```
 
 > `cargo install` builds **default features only**: the embedded
 > bridge, in-memory state, hash embedder and in-memory vector store
 > all work, but `redis`/`kafka`/`nats`/`onnx`/`qdrant`/`otel` are
-> compiled out. To use those backends install with
-> `cargo install av-harness av-cli --features full` (or the specific
-> feature). Both pre-flight tools (`avctl config-validate`,
-> `avctl doctor`) fail loudly when a config selects a backend the
-> build cannot run.
+> compiled out. To use those backends add `--features full` (or the
+> specific feature) to the `av-harness` install line. Both pre-flight
+> tools (`avctl config-validate`, `avctl doctor`) fail loudly when a
+> config selects a backend the build cannot run.
 
-> The two crates land on crates.io from `v0.1.0` onwards; until that
-> release is published, use the `--path` variants shown in
-> [Install from source](#install-from-source) below.
+> Plain `cargo install av-harness av-cli` (crates.io, no `--git`)
+> starts working when the first tagged release is published; until
+> then the registry does not know these crates — use the `--git`
+> lines above or [Install from source](#install-from-source).
 
 Bare `avctl` launches a guided setup: pick your AI provider from a
 numbered list, paste your API key once (typed hidden, stored
@@ -83,7 +91,7 @@ variables, no terminal knowledge beyond typing a number.
 Pick the row that matches your provider, then run two commands.
 
 ```bash
-cargo install av-harness av-cli    # or see "Install from source" below
+curl -fsSL https://agentvisorai.me/install.sh | sh    # or the --git lines above
 ```
 
 ```bash
