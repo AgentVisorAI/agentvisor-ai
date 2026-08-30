@@ -2901,11 +2901,16 @@
       "</div>" +
       // "Now what?" — the first question after creating a deployment.
       // A copyable env block that points a daemon at this workspace.
+      // Honesty rule (R275, same class as the token modals): the
+      // hosted ingest hookup ships with the beta — the daemon reads
+      // these AV_INGEST_* vars then; ingest.agentvisorai.me has no DNS
+      // yet, and "connected within a few seconds" was a promise no
+      // real deployment could keep today.
       '<div class="card" style="margin-bottom:12px">' +
         "<h2>Connect your daemon</h2>" +
-        '<p style="color:var(--fg-2); font-size:var(--t-sec); margin:0 0 10px">Drop these into the daemon\'s environment (or your secret manager) and restart it. It shows up as <b>connected</b> above within a few seconds.</p>' +
+        '<p style="color:var(--fg-2); font-size:var(--t-sec); margin:0 0 10px">Store these with your secrets now — the daemon picks them up when the hosted control-plane link lands with the beta, and this page flips to <b>connected</b>. Tokens you mint today stay valid.</p>' +
         '<pre class="policy-body" style="margin:0 0 10px; user-select:all">' +
-          "AV_INGEST_URL=https://ingest.agentvisorai.me/v1\n" +
+          "AV_INGEST_URL=https://ingest.agentvisorai.me/v1   # live with the beta\n" +
           "AV_DEPLOYMENT=" + esc(d.id) + "\n" +
           "AV_INGEST_TOKEN=" + esc(d.ingestTokenHint || "av_live_…") + "  # full token shown once at create/rotate" +
         "</pre>" +
