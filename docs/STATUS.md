@@ -4,13 +4,24 @@ Real-time SLO tracker. Curated by the on-call.
 
 ## Current status
 
-**All systems operational** — last verified: (edit this line on
-every deploy).
+**Demo surfaces operational · hosted API not yet launched** — last
+verified: 2026-08-30.
 
-- **Console** (`agentvisorai.me/app/`) — nominal
-- **API** (`api.agentvisorai.me`) — nominal
-- **Ingest** (`api.agentvisorai.me/api/v1/ingest`) — nominal
-- **Real-time bus** (SSE) — nominal
+- **Console** (`agentvisorai.me/app/`) — nominal (mock mode: the full
+  product experience against built-in fixtures; nothing leaves the
+  browser)
+- **Site + verifier** (`agentvisorai.me`, `/verify/`) — nominal
+- **Installer + public repo** (`agentvisorai.me/install.sh`,
+  `github.com/AgentVisorAI/agentvisor`) — nominal, exercised nightly
+  by the `public-consumer` workflow
+- **Hosted API** (`api.agentvisorai.me`) — **not launched**. The
+  backend ships in this repo (`server/`, deployable image built by
+  `deploy.yml`) and its full E2E suite runs in CI, but no public
+  instance is up and the DNS record does not exist yet. It goes live
+  with the beta — the SLO table below is the launch template, not a
+  live measurement. Anything here marked "(fill in)" is unmeasured
+  BY DEFINITION until then; treat any claim to the contrary as a bug
+  in this page.
 
 ## Service level objectives
 
@@ -46,13 +57,16 @@ The pitch demo uses a single external prober checking `/healthz` every
 - [UptimeRobot](https://uptimerobot.com) — free 50 monitors, 5 min
   cadence.
 
-Point the monitor at:
+Point the monitor at (once the hosted API launches with the beta —
+the host does not resolve before then):
 
 ```
 https://api.agentvisorai.me/healthz
 ```
 
-Expect a 200 with `{"ok":true,"version":"…"}`.
+Expect a 200 with `{"ok":true,"version":"…"}`. Until launch, monitor
+the live demo surfaces instead: `https://agentvisorai.me/app/` and
+`https://agentvisorai.me/build.txt` (the deploy-convergence marker).
 
 For deeper checks, prod-mode healthchecks should hit `/readyz` too — a
 503 there means the DB (or the LISTEN/NOTIFY bridge) is degraded.
