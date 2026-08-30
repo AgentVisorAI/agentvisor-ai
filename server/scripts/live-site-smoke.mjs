@@ -284,8 +284,39 @@ console.log("✅ Environment pill present: " + pillText);
     fail("pitch video metadata broken: " + JSON.stringify(pitch));
   if (!tour || tour.err !== null || tour.ready < 1 || tour.dur < 120 || tour.dur > 140)
     fail("tour video metadata broken: " + JSON.stringify(tour));
+  // R283: cue-timing truth. Both VTTs kept a stale 30s/130s grid after
+  // the R275 re-shoots (29.1s/127.1s) — final cues ended AFTER the
+  // video. Parse each track's cues in-page and assert: sorted,
+  // non-overlapping, positive, and the last cue ends by the video end.
+  const cueTruth = await page.evaluate(async () => {
+    const out = [];
+    for (const v of document.querySelectorAll("video")) {
+      const trackEl = v.querySelector("track");
+      if (!trackEl) continue;
+      const track = trackEl.track;
+      track.mode = "hidden";
+      await new Promise((r) => {
+        if (track.cues && track.cues.length) return r();
+        trackEl.addEventListener("load", () => r(), { once: true });
+        setTimeout(r, 5000);
+      });
+      const cues = Array.from(track.cues || []).map((c) => [c.startTime, c.endTime]);
+      const problems = [];
+      cues.forEach(([s, e], i) => {
+        if (e <= s) problems.push(`cue${i} end<=start`);
+        if (i && s < cues[i - 1][1] - 0.001) problems.push(`cue${i} overlaps prev`);
+      });
+      if (!cues.length) problems.push("no cues parsed");
+      else if (cues[cues.length - 1][1] > v.duration + 0.05)
+        problems.push(`last cue ends ${cues[cues.length - 1][1]}s > video ${v.duration.toFixed(1)}s`);
+      out.push({ src: (v.currentSrc || "").split("/").pop(), cues: cues.length, problems });
+    }
+    return out;
+  });
+  for (const t of cueTruth)
+    if (t.problems.length) fail("caption cue timing broken for " + t.src + ": " + t.problems.join("; "));
   await page.close();
-  console.log("✅ video truth: both MP4s decode metadata (pitch " + pitch.dur + "s, tour " + tour.dur + "s), zero MediaErrors");
+  console.log("✅ video truth: both MP4s decode metadata (pitch " + pitch.dur + "s, tour " + tour.dur + "s), zero MediaErrors, cue grids fit the footage (" + cueTruth.map((t) => t.cues).join("+") + " cues)");
 }
 
 // ── 11. External promises: the install command the console prints ──
