@@ -199,11 +199,38 @@
       if (state.theme === e.newValue) return;
       applyTheme(e.newValue);
     });
+    // Cross-tab fresh-workspace lifecycle (mock mode): signup sets
+    // av_mock_fresh_t0, reset/relogin removes it. Identity and fixture
+    // data are derived per page-load, so a second tab that misses the
+    // transition keeps the OLD org's name over the NEW org's data —
+    // "Acme Robotics" chrome wrapped around Northwind sessions after a
+    // reset in another tab. Reload to re-derive everything. Latched on
+    // PRESENCE (set ↔ removed), not value: value-only rewrites are
+    // clock refreshes of the same workspace, and a cross-tab re-signup
+    // always removes the old keys first (the removal flips presence).
+    // Writer tabs never receive their own storage events, so no loops;
+    // announceSignIn re-syncs the latch after THIS tab's own auth
+    // transitions (self-writes are invisible to the storage event).
+    syncFreshPresence();
+    window.addEventListener("storage", function (e) {
+      if (e.key !== "av_mock_fresh_t0") return;
+      var now = e.newValue != null;
+      if (now === _freshPresence) return;
+      _freshPresence = now;
+      if (!state.ds || state.ds.mode !== "mock" || !state.session) return;
+      location.reload();
+    });
+  }
+
+  var _freshPresence = false;
+  function syncFreshPresence() {
+    try { _freshPresence = localStorage.getItem("av_mock_fresh_t0") != null; } catch (e) { _freshPresence = false; }
   }
 
   // Written on every successful login/signup so other tabs (parked on
   // the login page after a cross-tab sign-out) can let themselves in.
   function announceSignIn() {
+    syncFreshPresence();
     try { localStorage.setItem("av_signed_in_at", String(Date.now())); } catch (e) {}
   }
 
@@ -1577,14 +1604,21 @@
    * seals, and every stat on screen catches up. Pure fixture theater —
    * the datasource owns the state changes, this owns the pacing. */
   var attackRunning = false;
+  function attackReady() {
+    if (state.ds.mode !== "mock" || typeof state.ds.simulateAttack !== "function") return false;
+    // Fresh workspace: only once the daemon is connected and signing —
+    // a staged session can't exist while the deployments page still
+    // says "run the install command" (and not after the daemon was
+    // deleted). Same gate feeds the palette so surfaces can't disagree.
+    return typeof state.ds.freshDaemonReady !== "function" || state.ds.freshDaemonReady();
+  }
   function attackBtn() {
-    if (state.ds.mode !== "mock" || typeof state.ds.simulateAttack !== "function") return "";
-    try { if (localStorage.getItem("av_mock_fresh_t0")) return ""; } catch (e) {}
+    if (!attackReady()) return "";
     return '<button class="btn" id="simAttack"' + (attackRunning ? " disabled" : "") +
       ' title="Stage a live blocked payment in this demo org">⚡ Simulate an attack</button> ';
   }
   async function runAttackDemo() {
-    if (attackRunning || state.ds.mode !== "mock" || typeof state.ds.simulateAttack !== "function") return;
+    if (attackRunning || !attackReady()) return;
     attackRunning = true;
     var rerender = function () {
       var p = state.route.path[0] || "overview";
@@ -5009,7 +5043,7 @@
       // the same rule.
       var freshNow = freshT0() != null;
       if (window.AVTour && !freshNow) actions.unshift({ g: "Actions", label: "See the full flow", desc: "Guided tour of the money story", run: function () { window.AVTour.start(); } });
-      if (typeof state.ds.simulateAttack === "function") actions.push({ g: "Actions", label: "Simulate an agent attack", desc: "Stage a live blocked payment", run: function () { navigate("#/overview"); setTimeout(runAttackDemo, 250); } });
+      if (typeof state.ds.simulateAttack === "function" && attackReady()) actions.push({ g: "Actions", label: "Simulate an agent attack", desc: "Stage a live blocked payment", run: function () { navigate("#/overview"); setTimeout(runAttackDemo, 250); } });
     }
     actions.push({ g: "Actions", label: "New policy", desc: "Create a spend cap, vendor allowlist, or PII guard", run: function () { navigate("#/policies"); setTimeout(openCreatePolicyModal, 250); } });
     actions.push({ g: "Actions", label: "Keyboard shortcuts", desc: "Everything the keyboard can do", kbd: "?", run: function () { setTimeout(openShortcutSheet, 250); } });

@@ -1672,9 +1672,15 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await obPage.waitForTimeout(500);
   if (await obPage.evaluate(() => !!document.querySelector(".onboard-card"))) fail("dismissed onboarding card came back after reload");
   // localStorage is per-origin, shared with the main drill page —
-  // restore Northwind mode before the next checks.
+  // restore Northwind mode before the next checks. Removing the fresh
+  // key flips presence in the PARKED main page, whose cross-tab
+  // follower reloads it (that's the product behavior under test in
+  // check 33); wait the reload out so the next check's goto isn't
+  // interrupted mid-navigation.
   await obPage.evaluate(() => { localStorage.removeItem("av_mock_fresh_t0"); localStorage.removeItem("av_mock_fresh_identity"); localStorage.removeItem("av_ob_dismissed"); });
   await obPage.close();
+  await page.waitForTimeout(400);
+  await page.waitForSelector(".app-shell", { timeout: 15000 });
   console.log("✅ onboarding items tick for the right reasons at 4 sim ages; members panel view-only for members; key create→revoke round-trip; same-email relogin resumes the fresh workspace (case-insensitive), other emails get Northwind; completed checklist dismissible + stays dismissed");
 }
 
@@ -2346,6 +2352,33 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   if (!/Reset demo data/.test(palEntries)) fail("fresh palette lost Reset demo data");
   await fPage.keyboard.press("Escape");
   await fPage.waitForTimeout(250);
+  // The attack sim's affordance gate (freshDaemonReady): a staged
+  // session can't exist while the deployments page still says "run the
+  // install command" — in the pre-connect window (el < 12s) both the
+  // overview ⚡ button and the palette entry must hide; post-connect
+  // (this workspace, el ≈ 60s) the overview button must be present.
+  await fPage.goto(SITE + "#/overview", { waitUntil: "domcontentloaded" });
+  await fPage.waitForSelector(".onboard-card", { timeout: 15000 });
+  if (!(await fPage.$("#simAttack"))) fail("connected fresh workspace lost the overview ⚡ attack button");
+  const preTab = await context.newPage();
+  await preTab.goto(SITE, { waitUntil: "domcontentloaded" });
+  await preTab.evaluate(() => {
+    localStorage.setItem("av_mock_fresh_t0", String(Date.now() - 2000));
+  });
+  await preTab.goto(SITE + "#/overview", { waitUntil: "domcontentloaded" });
+  await preTab.waitForSelector(".onboard-card", { timeout: 15000 });
+  if (await preTab.$("#simAttack")) fail("pre-connect fresh workspace offers the ⚡ attack button (daemonless session)");
+  await preTab.keyboard.press(process.platform === "darwin" ? "Meta+KeyK" : "Control+KeyK");
+  await preTab.waitForSelector(".cmdk input", { timeout: 5000 });
+  await preTab.waitForTimeout(400);
+  const prePal = await preTab.evaluate(() => [...document.querySelectorAll(".cmdk .item")].map((i) => i.textContent).join(" | "));
+  if (/Simulate an agent attack/.test(prePal)) fail("pre-connect fresh palette offers the attack sim");
+  await preTab.keyboard.press("Escape");
+  // restore the mature-fresh keys the shared storage had before this leg
+  await preTab.evaluate(() => {
+    localStorage.setItem("av_mock_fresh_t0", String(Date.now() - 60000));
+  });
+  await preTab.close();
   // ?tour=1 must not auto-start the showcase narration in a fresh org
   await fPage.goto(SITE + "?tour=1#/overview", { waitUntil: "domcontentloaded" });
   await fPage.waitForTimeout(2500);
@@ -2396,16 +2429,26 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
     return bad;
   });
   if (pools.length) fail("fresh pool round-trips failed: " + pools.join(", "));
-  // isolation: none of the above leaked into the showcase fixtures
-  await fPage.evaluate(() => { localStorage.removeItem("av_mock_fresh_t0"); localStorage.removeItem("av_mock_fresh_identity"); });
+  // Cross-tab lifecycle follower + isolation in one leg: a SECOND tab
+  // clears the fresh keys (the reset path); the parked fPage must
+  // follow the presence flip — reload itself into Northwind — instead
+  // of wearing Acme chrome over showcase data. Then assert none of the
+  // fresh round's activity leaked into the Northwind fixtures.
   await fPage.goto(SITE + "#/deployments", { waitUntil: "domcontentloaded" });
-  await fPage.reload({ waitUntil: "domcontentloaded" });
+  await fPage.waitForTimeout(600);
+  const resetTab = await context.newPage();
+  await resetTab.goto(SITE, { waitUntil: "domcontentloaded" });
+  await resetTab.evaluate(() => { localStorage.removeItem("av_mock_fresh_t0"); localStorage.removeItem("av_mock_fresh_identity"); });
+  await resetTab.close();
+  await fPage.waitForTimeout(1500);
   await fPage.waitForSelector("table tbody tr", { timeout: 10000 });
+  const orgNow = await fPage.evaluate(() => (document.querySelector(".org-switcher") || {}).textContent || "");
+  if (!orgNow.includes("Northwind")) fail("cross-tab reset: stale tab kept the fresh org chrome (" + orgNow.trim().slice(0, 40) + ")");
   const nw = await fPage.evaluate(() => [...document.querySelectorAll("table tbody tr")].map((r) => r.textContent).join(" | "));
   if (nw.includes("acme-edge") || nw.includes("acme-robotics-prod")) fail("fresh-workspace activity leaked into the Northwind fixtures: " + nw.slice(0, 120));
   if (!nw.includes("northwind-prod")) fail("Northwind daemons damaged by fresh-workspace round: " + nw.slice(0, 120));
   await fPage.close();
-  console.log("✅ fresh-workspace truth: org-named daemon, mutations land locally, founder in members, org audit story, fresh-era detail, showcase-only affordances hidden, Northwind isolated");
+  console.log("✅ fresh-workspace truth: org-named daemon, mutations land locally, founder in members, org audit story, fresh-era detail, attack gated on daemon-ready, showcase-only affordances hidden, cross-tab reset follows, Northwind isolated");
 }
 
 if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors));
