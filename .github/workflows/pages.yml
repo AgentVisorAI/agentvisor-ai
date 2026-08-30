@@ -85,6 +85,11 @@ jobs:
           # rustdoc might have written at the root.
           cp docs/index.html "$site/index.html"
           cp docs/style.css "$site/style.css"
+          # The daemon installer the console's onboarding snippets curl
+          # (Deployments empty state + detail). get.agentvisorai.me was
+          # never a real host — the printed command died on DNS the
+          # moment anyone pasted it; this serves from the apex instead.
+          cp docs/install.sh "$site/install.sh"
           cp docs/logo.png "$site/logo.png"
           cp docs/social-preview.png "$site/social-preview.png"
           # Product console — the multi-tenant SaaS app.
