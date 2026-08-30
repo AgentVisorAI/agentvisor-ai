@@ -21,6 +21,22 @@ use std::time::Instant;
 /// recovery to OOM.
 const MAX_ATIF_RECOVERY_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Single HELP text for the `av_lifecycle_outbox_pending` gauge. The
+/// gauge is registered from THREE call sites (pipeline boot-time zero,
+/// the reconciler's early-return leg, and its counting leg); the
+/// registry's first-wins semantics kept whichever text registered
+/// first and logged a "divergent HELP" WARN on every reconcile tick —
+/// permanent log spam in debug runs (R285). One const, zero drift.
+pub(crate) const LIFECYCLE_OUTBOX_PENDING_HELP: &str =
+    "Count of unacked lifecycle outbox files (RECEIPT + SESSION_CLOSE) \
+     sitting in the spool at the last reconciler tick. Steady-state 0 on \
+     a healthy node (each outbox is emitted, published, acked, and \
+     removed within one close). A rising baseline indicates the bridge \
+     is unreachable or slow — outboxes persist across restarts, so \
+     growth is disk-bounded rather than memory-bounded, but a sustained \
+     rise is the earliest signal of a broker outage before its \
+     downstream effects (disk fill, `av_reconcile_errors_total`) fire.";
+
 /// Maximum number of directory entries any single recovery-pass call
 /// is allowed to examine before yielding.
 ///
@@ -3996,20 +4012,7 @@ impl Finalizer {
                 // pending)` alerts don't false-fire on a freshly
                 // booted node with no bridge activity yet.
                 self.metrics
-                    .gauge(
-                        "av_lifecycle_outbox_pending",
-                        "Count of unacked lifecycle outbox files (RECEIPT + \
-                         SESSION_CLOSE) sitting in the spool at the last \
-                         reconciler tick. Steady-state 0 on a healthy node \
-                         (each outbox is emitted, published, acked, and \
-                         removed within one close). A rising baseline \
-                         indicates the bridge is unreachable or slow — \
-                         outboxes persist across restarts, so growth is \
-                         disk-bounded rather than memory-bounded, but a \
-                         sustained rise is the earliest signal of a broker \
-                         outage before its downstream effects (disk fill, \
-                         `av_reconcile_errors_total`) fire.",
-                    )
+                    .gauge("av_lifecycle_outbox_pending", LIFECYCLE_OUTBOX_PENDING_HELP)
                     .set(0);
                 return Ok(());
             }
@@ -4112,20 +4115,7 @@ impl Finalizer {
             }
         }
         self.metrics
-            .gauge(
-                "av_lifecycle_outbox_pending",
-                "Count of unacked lifecycle outbox files (RECEIPT + \
-                 SESSION_CLOSE) sitting in the spool at the last \
-                 reconciler tick. Steady-state 0 on a healthy node \
-                 (each outbox is emitted, published, acked, and \
-                 removed within one close). A rising baseline \
-                 indicates the bridge is unreachable or slow — \
-                 outboxes persist across restarts, so growth is \
-                 disk-bounded rather than memory-bounded, but a \
-                 sustained rise is the earliest signal of a broker \
-                 outage before its downstream effects (disk fill, \
-                 `av_reconcile_errors_total`) fire.",
-            )
+            .gauge("av_lifecycle_outbox_pending", LIFECYCLE_OUTBOX_PENDING_HELP)
             .set(pending_count);
         Ok(())
     }
@@ -4750,7 +4740,7 @@ pub fn spawn_reconciler(
                 metrics
                     .counter(
                         "av_reconciler_panics_total",
-                        "Reconciler tick body panicked; loop supervised via catch_unwind",
+                        crate::pipeline::supervision_help::RECONCILER_PANICS,
                     )
                     .inc();
                 tracing::error!(
