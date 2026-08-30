@@ -186,7 +186,13 @@ catalog at the bottom.
     extension throwing mid-demo must not wipe a working console).
     Storage-denied boot (Safari lockdown: both storages THROW on
     access) works end-to-end — invariant 16's try/catch discipline
-    covers reads too (drill check 34).
+    covers reads too. WebCrypto can be absent ENTIRELY (old corporate
+    webviews): every crypto.subtle call in the mock is wrapped or
+    fallback'd — the one bare inline digest (the receipt's
+    contentHash) used to error-card the whole session detail. The
+    verify head degrades to its honest "?" unsupported state, /verify/
+    names the supported browsers + the CLI alternative, and the crash
+    card is role=alert + focused (drill check 34).
 
 **Evidence & print**
 22. The printed evidence pack is COMPLETE: `@media print` forces
@@ -241,7 +247,7 @@ catalog at the bottom.
 
 | Script | Guards |
 |---|---|
-| `interactive-drill.mjs` | 34 checks: tour, attack story, onboarding ages, billing math, reset flows, hit-tests + unsized-svg blowouts, storage/router fuzz, pagination + deep links, Back/overlays, double-submit, failure paths + catch-up, cross-tab + FOUC, focus rings/traps + reduced motion + shortcut guards, garbage data, filter/sort/chart/audit/detail ground truth, deployment + key lifecycles, member RBAC, leak soak, form semantics (native validation + Enter submits), skeleton-phase filter liveness, dirty-modal discard guard, theme-toggle state preservation, keyboard-only tour, palette mutation-truth + bfcache eligibility (no unload handlers), fresh-workspace truth (org-named daemon, isolated mutations, founder identity, org audit story, showcase-affordance hiding), hostile environment (storage-denied boot, dead-script crash card + Reload recovery) |
+| `interactive-drill.mjs` | 34 checks: tour, attack story, onboarding ages, billing math, reset flows, hit-tests + unsized-svg blowouts, storage/router fuzz, pagination + deep links, Back/overlays, double-submit, failure paths + catch-up, cross-tab + FOUC, focus rings/traps + reduced motion + shortcut guards, garbage data, filter/sort/chart/audit/detail ground truth, deployment + key lifecycles, member RBAC, leak soak, form semantics (native validation + Enter submits), skeleton-phase filter liveness, dirty-modal discard guard, theme-toggle state preservation, keyboard-only tour, palette mutation-truth + bfcache eligibility (no unload handlers), fresh-workspace truth (org-named daemon, isolated mutations, founder identity, org audit story, showcase-affordance hiding), hostile environment (storage-denied boot, dead-script crash card role=alert+focus + Reload recovery, WebCrypto-less detail + honest ? state) |
 
 **Audit-slug parity**: mock `recordAudit` slugs and the `MOCK_AUDIT`
 fixtures mirror the REAL taxonomy in `server/src/lib/audit.ts`

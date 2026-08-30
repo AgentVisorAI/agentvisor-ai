@@ -2512,12 +2512,35 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
     .catch(() => fail("dead datasource.js left a blank page instead of the crash card"));
   const hasReload = await dead.evaluate(() => [...document.querySelectorAll("button")].some((b) => /reload/i.test(b.textContent)));
   if (!hasReload) fail("crash card is missing its Reload button");
+  // The card must announce itself (role=alert) and take focus so
+  // screen-reader and keyboard users aren't stranded on a "blank" page.
+  const cardA11y = await dead.evaluate(() => {
+    const card = document.querySelector("[role=alert]");
+    return { role: !!card, focused: document.activeElement === card };
+  });
+  if (!cardA11y.role || !cardA11y.focused) fail("crash card not announced/focused: " + JSON.stringify(cardA11y));
   await dead.unroute("**/datasource.js*");
   await dead.evaluate(() => { [...document.querySelectorAll("button")].find((b) => /reload/i.test(b.textContent)).click(); });
   await dead.waitForSelector(".app-shell", { timeout: 15000 })
     .catch(() => fail("crash card Reload did not recover after the network came back"));
   await deadCtx.close();
-  console.log("✅ hostile environment: storage-denied boot fully functional; dead datasource → crash card → Reload recovers");
+  // WebCrypto absent entirely (old corporate webviews): the session
+  // detail must still render its evidence trail — the receipt's
+  // inline contentHash digest used to throw and error-card the WHOLE
+  // page — with the verify head in its honest "?" unsupported state.
+  const ncCtx = await browser.newContext();
+  await ncCtx.addInitScript(() => { try { Object.defineProperty(crypto, "subtle", { get: () => undefined }); } catch (e) {} });
+  const nc = await ncCtx.newPage();
+  const ncErrs = [];
+  nc.on("pageerror", (e) => ncErrs.push(String(e).slice(0, 100)));
+  await nc.goto(SITE + "#/sessions/sess_01H9K", { waitUntil: "domcontentloaded" });
+  await nc.waitForSelector(".evt", { timeout: 15000 })
+    .catch(() => fail("WebCrypto-less session detail did not render its trail"));
+  const ncState = await nc.evaluate(() => document.querySelector(".receipt-head")?.getAttribute("data-verify-state"));
+  if (ncState !== "unsupported") fail("WebCrypto-less verify head not in the honest unsupported state: " + ncState);
+  if (ncErrs.length) fail("WebCrypto-less detail threw: " + ncErrs.join(" | "));
+  await ncCtx.close();
+  console.log("✅ hostile environment: storage-denied boot fully functional; dead datasource → announced+focused crash card → Reload recovers; WebCrypto-less detail renders with honest ? state");
 }
 
 

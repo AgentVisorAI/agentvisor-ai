@@ -1626,7 +1626,19 @@
         policiesEnforced: isFeatured
           ? ["procurement.allowed_vendors", "runtime.write_scope", "rate.per_session_usd:10", "runtime.pii_redaction"]
           : ["procurement.allowed_vendors", "runtime.write_scope", "rate.per_session_usd:10"],
-        contentHash: "sha256:" + bytesToHex(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s.externalId + "|" + s.events)))).slice(0, 64),
+        // WebCrypto can be absent entirely (old corporate webviews) —
+        // this inline digest used to throw and take the WHOLE session
+        // detail page down with it ("Something went wrong" instead of
+        // the evidence trail). Fall back to the deterministic rng hash
+        // the attack-seal path already uses; the verify head shows its
+        // honest "?" unsupported state either way.
+        contentHash: await (async function () {
+          try {
+            return "sha256:" + bytesToHex(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s.externalId + "|" + s.events)))).slice(0, 64);
+          } catch (e) {
+            return "sha256:" + rngHex(mulberry32((s.externalId || sessionId).length * 7919), 12) + "…";
+          }
+        }()),
       };
       var rawBody = JSON.stringify(body);
       var sigB64 = await signBodyEd25519(rawBody);
