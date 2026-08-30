@@ -59,7 +59,8 @@ engines.
 
 **tract-nnef 2026-0217 (OOB read on model load) NOT reachable.** We call
 `tract_onnx::onnx().model_for_path(path)` in
-`crates/av-loopdetect/src/onnx_embed.rs:30`, which invokes the ONNX parser
+`crates/av-loopdetect/src/onnx_embed.rs` (`OnnxEmbedder::load`), which invokes the
+ONNX parser
 only. No NNEF code path is reachable. In addition, the production model is
 byte-pinned in the Docker image via `ADD --checksum=sha256:...`, so an
 attacker cannot substitute a hostile model.
