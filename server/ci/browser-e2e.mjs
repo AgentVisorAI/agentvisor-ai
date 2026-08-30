@@ -28,23 +28,44 @@ page.on("console", (m) => {
   if (m.type() !== "error") return;
   const t = m.text();
   // Expected noise: the boot-time /auth/me 401 probe (not signed in
-  // yet) and the DELIBERATE duplicate-name 409 this test triggers.
+  // yet), the DELIBERATE duplicate-name 409 this test triggers, and
+  // the signup 429 while waiting out CI's shared rate-limit budget.
   // Chromium logs a resource-level error line for any 4xx fetch; the
-  // app handles both. Anything else (404 assets, 5xx, JS exceptions)
-  // fails the run.
-  if (t.includes("status of 401") || t.includes("status of 409")) return;
+  // app handles all three. Anything else (404 assets, 5xx, JS
+  // exceptions) fails the run.
+  if (t.includes("status of 401") || t.includes("status of 409") || t.includes("status of 429"))
+    return;
   consoleErrors.push(t.slice(0, 160));
 });
 
-// 1. Signup through the real form.
+// 1. Signup through the real form. CI shares the per-IP signup
+// rate-limit budget (5/min) with smoke.py + e2e.mjs which run just
+// before us — a 429 here is expected scheduling, not a failure. Honor
+// Retry-After exactly like a patient human, capped at two waits.
 const email = `browser-${Date.now()}@apexrobotics.test`;
+let signupStatus = 0;
+page.on("response", (r) => {
+  if (r.url().endsWith("/api/v1/auth/signup")) signupStatus = r.status();
+});
 await page.goto(SPA + "/#/signup", { waitUntil: "networkidle" });
 await page.waitForSelector("#orgName", { timeout: 15000 });
 await page.fill("#orgName", "Browser Truth Org");
 await page.fill("#email", email);
 await page.fill("#password", "correct-horse-battery-staple-9");
-await page.click('button[type="submit"]');
-await page.waitForSelector(".app-shell", { timeout: 15000 });
+for (let attempt = 1; ; attempt++) {
+  signupStatus = 0;
+  await page.click('button[type="submit"]');
+  const shell = await page
+    .waitForSelector(".app-shell", { timeout: 15000 })
+    .catch(() => null);
+  if (shell) break;
+  if (signupStatus === 429 && attempt <= 2) {
+    console.log(`signup rate-limited (attempt ${attempt}) — waiting out the 60s window`);
+    await page.waitForTimeout(61_000);
+    continue;
+  }
+  throw new Error(`signup never reached the shell (last status ${signupStatus})`);
+}
 ok("signup lands in the app shell", true);
 
 // 2. Create a deployment; the ingest token must be revealed once.
