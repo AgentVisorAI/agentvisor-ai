@@ -174,6 +174,19 @@ catalog at the bottom.
     rewrites of the same workspace are ignored) and re-synced via
     announceSignIn after this tab's own auth writes (self-writes fire
     no storage event).
+24. Boot fails LOUDLY when the data layer is missing: app.js throws at
+    top level if `window.dataSource` is undefined (datasource.js
+    aborted by a proxy / 404 mid-deploy), so the crash guard's card
+    takes over. Without it, boot() succeeded, the login render cleared
+    `#app` and died on `state.ds.*` — but `__avBooted` had already
+    pacified the guard AND the empty-`#app` watchdog, leaving a
+    permanent blank page. The guard's three nets: pre-boot
+    window.error → card; unhandledrejection → card; 6s watchdog for
+    scripts that never EXECUTE. Post-boot errors only log (an
+    extension throwing mid-demo must not wipe a working console).
+    Storage-denied boot (Safari lockdown: both storages THROW on
+    access) works end-to-end — invariant 16's try/catch discipline
+    covers reads too (drill check 34).
 
 **Evidence & print**
 22. The printed evidence pack is COMPLETE: `@media print` forces
@@ -228,7 +241,7 @@ catalog at the bottom.
 
 | Script | Guards |
 |---|---|
-| `interactive-drill.mjs` | 33 checks: tour, attack story, onboarding ages, billing math, reset flows, hit-tests + unsized-svg blowouts, storage/router fuzz, pagination + deep links, Back/overlays, double-submit, failure paths + catch-up, cross-tab + FOUC, focus rings/traps + reduced motion + shortcut guards, garbage data, filter/sort/chart/audit/detail ground truth, deployment + key lifecycles, member RBAC, leak soak, form semantics (native validation + Enter submits), skeleton-phase filter liveness, dirty-modal discard guard, theme-toggle state preservation, keyboard-only tour, palette mutation-truth + bfcache eligibility (no unload handlers), fresh-workspace truth (org-named daemon, isolated mutations, founder identity, org audit story, showcase-affordance hiding) |
+| `interactive-drill.mjs` | 34 checks: tour, attack story, onboarding ages, billing math, reset flows, hit-tests + unsized-svg blowouts, storage/router fuzz, pagination + deep links, Back/overlays, double-submit, failure paths + catch-up, cross-tab + FOUC, focus rings/traps + reduced motion + shortcut guards, garbage data, filter/sort/chart/audit/detail ground truth, deployment + key lifecycles, member RBAC, leak soak, form semantics (native validation + Enter submits), skeleton-phase filter liveness, dirty-modal discard guard, theme-toggle state preservation, keyboard-only tour, palette mutation-truth + bfcache eligibility (no unload handlers), fresh-workspace truth (org-named daemon, isolated mutations, founder identity, org audit story, showcase-affordance hiding), hostile environment (storage-denied boot, dead-script crash card + Reload recovery) |
 
 **Audit-slug parity**: mock `recordAudit` slugs and the `MOCK_AUDIT`
 fixtures mirror the REAL taxonomy in `server/src/lib/audit.ts`

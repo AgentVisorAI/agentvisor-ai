@@ -2476,8 +2476,53 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ fresh-workspace truth: org-named daemon, mutations land locally, founder in members, org audit story, fresh-era detail, attack gated on daemon-ready, showcase-only affordances hidden, cross-tab reset follows, Northwind isolated");
 }
 
+// ── 34. Hostile environment: storage denied + dead scripts ─────────
+// (a) Safari-style total storage denial (both storages THROW on
+// access): the console must boot the showcase, navigate, and toggle
+// theme in-memory — every read/write is try/caught by invariant 16.
+// (b) A script that never executes: app.js dead → the crash guard's
+// 6s blank-page watchdog cards it. datasource.js dead is SNEAKIER:
+// app.js boots fine, the login render clears #app then dies on
+// state.ds.* AFTER __avBooted pacified the guard — a permanent blank
+// page. app.js now fails the boot explicitly when the data layer is
+// missing, so the card (with a working Reload) takes over.
+{
+  const denyCtx = await browser.newContext({ viewport: { width: 1380, height: 900 } });
+  await denyCtx.addInitScript(() => {
+    const deny = () => { throw new DOMException("The operation is insecure.", "SecurityError"); };
+    Object.defineProperty(window, "localStorage", { get: deny });
+    Object.defineProperty(window, "sessionStorage", { get: deny });
+  });
+  const dp = await denyCtx.newPage();
+  const denyErrs = [];
+  dp.on("pageerror", (e) => denyErrs.push(String(e).slice(0, 120)));
+  await dp.goto(SITE + "#/overview", { waitUntil: "domcontentloaded" });
+  await dp.waitForSelector(".stat", { timeout: 15000 });
+  if (/console hit an error/i.test(await dp.evaluate(() => document.body.textContent))) fail("storage-denied boot crashed");
+  await dp.click('a[href="#/sessions"]');
+  await dp.waitForSelector("table tbody tr", { timeout: 10000 });
+  if (denyErrs.length) fail("storage-denied boot threw: " + denyErrs.join(" | "));
+  await denyCtx.close();
+
+  const deadCtx = await browser.newContext();
+  const dead = await deadCtx.newPage();
+  await dead.route("**/datasource.js*", (r) => r.abort());
+  await dead.goto(SITE + "#/overview", { waitUntil: "domcontentloaded" }).catch(() => {});
+  await dead.waitForFunction(() => /console hit an error/i.test(document.body.textContent), { timeout: 9000 })
+    .catch(() => fail("dead datasource.js left a blank page instead of the crash card"));
+  const hasReload = await dead.evaluate(() => [...document.querySelectorAll("button")].some((b) => /reload/i.test(b.textContent)));
+  if (!hasReload) fail("crash card is missing its Reload button");
+  await dead.unroute("**/datasource.js*");
+  await dead.evaluate(() => { [...document.querySelectorAll("button")].find((b) => /reload/i.test(b.textContent)).click(); });
+  await dead.waitForSelector(".app-shell", { timeout: 15000 })
+    .catch(() => fail("crash card Reload did not recover after the network came back"));
+  await deadCtx.close();
+  console.log("✅ hostile environment: storage-denied boot fully functional; dead datasource → crash card → Reload recovers");
+}
+
+
 if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors));
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 33 interactive-features drill checks passed.");
+console.log("\nAll 34 interactive-features drill checks passed.");
