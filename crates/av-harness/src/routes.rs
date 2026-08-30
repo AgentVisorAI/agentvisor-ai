@@ -4384,6 +4384,56 @@ mod tests {
         }
     }
 
+    /// R285: OPENAI-COMPATIBILITY.md §Unsupported promises a 404 for
+    /// every listed OpenAI route ("front the harness with a path-based
+    /// router if you need them"). Executed against the real router so
+    /// shipping any shim (a `/v1/models` stub is the classic) forces
+    /// the doc's Unsupported list to shrink in the same commit. Each
+    /// probe carries its distinguishing doc marker — same rationale as
+    /// the route-table test above.
+    #[tokio::test]
+    async fn unsupported_openai_routes_stay_404() {
+        let doc = include_str!("../../../docs/reference/OPENAI-COMPATIBILITY.md");
+        let directory = tempfile::tempdir().unwrap();
+        let (state, _reconciler) = test_state(directory.path()).await;
+        let app = build_router(state);
+        for (route, marker) in [
+            ("/v1/embeddings", "`/v1/embeddings`"),
+            ("/v1/audio/speech", "`/v1/audio/*`"),
+            ("/v1/images/generations", "`/v1/images/*`"),
+            ("/v1/completions", "`/v1/completions`"),
+            ("/v1/models", "`/v1/models`"),
+            ("/v1/files", "`/v1/files`"),
+            ("/v1/moderations", "`/v1/moderations`"),
+            ("/v1/assistants", "`/v1/assistants`"),
+            ("/v1/fine_tuning/jobs", "`/v1/fine_tuning/*`"),
+        ] {
+            assert!(
+                doc.contains(marker),
+                "the Unsupported list lost {marker:?} — if {route} is now \
+                 implemented, update OPENAI-COMPATIBILITY.md; if not, restore it"
+            );
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(route)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{route} no longer 404s — OPENAI-COMPATIBILITY.md's Unsupported \
+                 section promises it does; update the doc with the new behavior"
+            );
+        }
+    }
+
     /// Register item 25 (docs drift) — sub-clause for the product
     /// console at docs/app/. It ships as an offline HTML/JS
     /// simulation of the whole operator flow (setup, sessions,
