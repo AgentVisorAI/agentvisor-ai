@@ -144,6 +144,41 @@ jobs:
         run: python3 server/ci/smoke.py
       - name: Backend E2E (Node fetch through ApiDataSource)
         run: node server/ci/e2e.mjs
+      # R284: browser-truth E2E. The Node E2E can never catch what only
+      # a browser enforces — the meta CSP (connect-src silently blocked
+      # every self-hosted API_BASE until R284), cookie credential flow,
+      # CORS + X-Requested-With, and the error copy a human actually
+      # sees in a toast. Serve a patched console copy (the exact edits
+      # server/README.md tells a self-hoster to make) and drive
+      # signup → deployment → duplicate-409 toast → key reveal → audit
+      # → signout/login in headless Chromium.
+      - name: Prepare self-hosted console copy
+        run: |
+          # Mirror the production topology: the SPA lives at /app/ and
+          # reaches ../logo.png at the site root (a flat copy of
+          # docs/app alone 404s the brand mark + favicon).
+          mkdir -p /tmp/console-root
+          cp -R docs/app /tmp/console-root/app
+          cp docs/logo.png /tmp/console-root/logo.png
+          sed -i 's/window.MOCK_MODE = true;/window.MOCK_MODE = false;/' /tmp/console-root/app/config.js
+          sed -i 's#window.API_BASE = "";#window.API_BASE = "http://127.0.0.1:8985";#' /tmp/console-root/app/config.js
+          sed -i 's#connect-src '\''self'\'' https://api.agentvisorai.me#connect-src '\''self'\'' http://127.0.0.1:8985#' /tmp/console-root/app/index.html
+          grep -q 'MOCK_MODE = false' /tmp/console-root/app/config.js
+          grep -q 'connect-src .self. http://127.0.0.1:8985' /tmp/console-root/app/index.html
+          (cd /tmp/console-root && python3 -m http.server 8787 >/dev/null 2>&1 &)
+          for i in $(seq 1 20); do
+            if curl -sf http://127.0.0.1:8787/app/config.js > /dev/null; then break; fi
+            sleep 0.5
+          done
+      - name: Install Playwright Chromium
+        working-directory: server
+        run: npx playwright install --with-deps chromium
+      - name: Browser E2E (real SPA, real browser, real API)
+        working-directory: server
+        env:
+          SPA_ORIGIN: http://127.0.0.1:8787/app
+          API_BASE: http://127.0.0.1:8985
+        run: node ci/browser-e2e.mjs
       # Load test — validates our "300 rpm per user" claim is actually
       # true, not just documented. autocannon at 100 rps for 15 s against
       # the cheap /healthz endpoint. Asserts p99 < 250 ms and zero

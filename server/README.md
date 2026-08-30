@@ -38,12 +38,25 @@ npm run prisma:migrate:dev
 npm run dev                        # http://localhost:8080
 ```
 
-Point the console at it by editing `docs/app/index.html`:
+Point the console at it by editing `docs/app/config.js`:
 
 ```js
 window.MOCK_MODE = false;
-window.API_BASE = "http://localhost:8080/api/v1";
+window.API_BASE = "http://localhost:8080"; // bare origin — paths already carry /api/v1
 ```
+
+Two footguns (both caught by CI's Browser E2E job, which makes these
+exact edits before driving the SPA in headless Chromium):
+
+- `API_BASE` is the **origin only**. The datasource calls
+  `apiFetch("/api/v1/…")`, so a base that already ends in `/api/v1`
+  doubles the prefix and 404s everything.
+- `docs/app/index.html` ships a strict meta CSP whose `connect-src`
+  allows only `'self'` and `https://api.agentvisorai.me`. Add your API
+  origin there or the browser silently blocks every fetch.
+- Serve the SPA **under `/app/` with `logo.png` one level up** (the
+  production topology). The console references `../logo.png` for the
+  brand mark and favicon; a flat copy of `docs/app` alone 404s both.
 
 ## API surface
 
