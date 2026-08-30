@@ -281,7 +281,7 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
                             metrics_tick
                                 .counter(
                                     "av_atif_retention_errors_total",
-                                    "ATIF retention sweep tick returned an error",
+                                    av_harness::pipeline::supervision_help::ATIF_RETENTION_ERRORS,
                                 )
                                 .inc();
                             tracing::warn!(
@@ -303,7 +303,7 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
                     metrics
                         .counter(
                             "av_atif_retention_panics_total",
-                            "ATIF retention sweep tick panicked; loop supervised via catch_unwind",
+                            av_harness::pipeline::supervision_help::ATIF_RETENTION_PANICS,
                         )
                         .inc();
                     tracing::error!(
@@ -1198,7 +1198,7 @@ fn spawn_bridge_maintenance(
                         metrics
                             .counter(
                                 "av_bridge_maintenance_errors_total",
-                                "Bridge maintenance tick returned an error",
+                                av_harness::pipeline::supervision_help::BRIDGE_MAINTENANCE_ERRORS,
                             )
                             .inc();
                         tracing::warn!(%error, "Bridge maintenance failed");
@@ -1207,7 +1207,7 @@ fn spawn_bridge_maintenance(
                         metrics
                             .counter(
                                 "av_bridge_maintenance_join_errors_total",
-                                "spawn_blocking JoinError from bridge maintenance tick",
+                                av_harness::pipeline::supervision_help::BRIDGE_MAINTENANCE_JOIN_ERRORS,
                             )
                             .inc();
                         tracing::warn!(%error, "Bridge maintenance task failed");
@@ -1225,7 +1225,7 @@ fn spawn_bridge_maintenance(
                 metrics
                     .counter(
                         "av_bridge_maintenance_panics_total",
-                        "Bridge maintenance tick panicked; loop supervised via catch_unwind",
+                        av_harness::pipeline::supervision_help::BRIDGE_MAINTENANCE_PANICS,
                     )
                     .inc();
                 tracing::error!(panic = %msg, "Bridge maintenance tick panicked; continuing");

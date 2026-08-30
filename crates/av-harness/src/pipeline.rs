@@ -18,6 +18,37 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Shared HELP text for the supervised-loop counters that are
+/// registered TWICE: eagerly at boot (this module — so `rate() > 0`
+/// alerts can see the FIRST fire) and lazily at the observation site
+/// (main.rs / reconciler.rs panic arms). The metrics registry is
+/// first-wins on HELP and warns on divergence in debug builds; these
+/// six pairs had drifted into permanent per-tick warn spam (R285).
+/// One const per metric, referenced from both sites.
+pub mod supervision_help {
+    /// HELP for `av_reconciler_panics_total` (boot + panic-arm sites).
+    pub const RECONCILER_PANICS: &str = "Reconciler tick body panicked and was caught; the reconciler \
+         continues on the next tick";
+    /// HELP for `av_bridge_maintenance_panics_total` (boot + panic-arm sites).
+    pub const BRIDGE_MAINTENANCE_PANICS: &str = "Bridge maintenance tick panicked and was caught; the loop \
+         continues on the next interval";
+    /// HELP for `av_bridge_maintenance_errors_total` (boot + error-arm sites).
+    pub const BRIDGE_MAINTENANCE_ERRORS: &str =
+        "Bridge maintenance tick returned an error; the loop continues \
+         on the next interval";
+    /// HELP for `av_bridge_maintenance_join_errors_total` (boot + join-error sites).
+    pub const BRIDGE_MAINTENANCE_JOIN_ERRORS: &str =
+        "Bridge maintenance tick's spawned task failed to join (panic \
+         or cancellation); the loop continues on the next interval";
+    /// HELP for `av_atif_retention_panics_total` (boot + panic-arm sites).
+    pub const ATIF_RETENTION_PANICS: &str = "ATIF retention sweep tick panicked and was caught; the loop \
+         continues on the next hour";
+    /// HELP for `av_atif_retention_errors_total` (boot + error-arm sites).
+    pub const ATIF_RETENTION_ERRORS: &str =
+        "ATIF retention sweep tick returned an error; the loop continues \
+         on the next hour";
+}
+
 pub(crate) const SESSION_HEADER: &str = "x-av-session";
 const WORKFLOW_HEADER: &str = "x-av-workflow";
 pub(crate) const MIDDLEWARE_US_HEADER: &str = "x-av-middleware-us";
@@ -1466,12 +1497,12 @@ impl AppState {
         // stream-close set. `av_jwks_refresh_panics_total` is
         // already eagerly registered at its call site (main.rs
         // beside its interval creation); the five below are the
-        // panic-arm-only stragglers.
-        metrics.counter(
-            "av_reconciler_panics_total",
-            "Reconciler tick body panicked and was caught; the reconciler \
-             continues on the next tick",
-        );
+        // panic-arm-only stragglers. HELP text lives in the
+        // `supervision_help` consts (shared with the observation
+        // sites in main.rs/reconciler.rs) — the registry is
+        // first-wins on HELP and warns on divergence, and these six
+        // pairs drifted apart exactly that way (R285).
+        metrics.counter("av_reconciler_panics_total", supervision_help::RECONCILER_PANICS);
         // `av_worker_shard_panics_total` fires from the OUTER
         // envelope-routing supervisor in worker.rs — NOT from the
         // inner job body (that path uses `av_worker_panics_total`).
@@ -1487,18 +1518,15 @@ impl AppState {
         );
         metrics.counter(
             "av_bridge_maintenance_panics_total",
-            "Bridge maintenance tick panicked and was caught; the loop \
-             continues on the next interval",
+            supervision_help::BRIDGE_MAINTENANCE_PANICS,
         );
         metrics.counter(
             "av_bridge_maintenance_errors_total",
-            "Bridge maintenance tick returned an error; the loop continues \
-             on the next interval",
+            supervision_help::BRIDGE_MAINTENANCE_ERRORS,
         );
         metrics.counter(
             "av_bridge_maintenance_join_errors_total",
-            "Bridge maintenance tick's spawned task failed to join (panic \
-             or cancellation); the loop continues on the next interval",
+            supervision_help::BRIDGE_MAINTENANCE_JOIN_ERRORS,
         );
         // ATIF retention loop: same supervision discipline. A silent
         // panic in the hourly sweep would let the spool grow unbounded
@@ -1507,13 +1535,11 @@ impl AppState {
         // alerts see the FIRST fire.
         metrics.counter(
             "av_atif_retention_panics_total",
-            "ATIF retention sweep tick panicked and was caught; the loop \
-             continues on the next hour",
+            supervision_help::ATIF_RETENTION_PANICS,
         );
         metrics.counter(
             "av_atif_retention_errors_total",
-            "ATIF retention sweep tick returned an error; the loop continues \
-             on the next hour",
+            supervision_help::ATIF_RETENTION_ERRORS,
         );
         // TCP_NODELAY setsockopt failure counter — written from the
         // axum `tap_io` per-accept hook when `set_nodelay(true)` on
@@ -1642,11 +1668,7 @@ impl AppState {
         // `remove_acked_lifecycle_outboxes` tick.
         metrics.gauge(
             "av_lifecycle_outbox_pending",
-            "Count of unacked lifecycle outbox files (RECEIPT + \
-             SESSION_CLOSE) sitting in the spool at the last \
-             reconciler tick. Steady-state 0 on a healthy node; a \
-             rising baseline indicates the bridge is unreachable \
-             or slow.",
+            crate::reconciler::LIFECYCLE_OUTBOX_PENDING_HELP,
         );
         // Reconciler ticks scan the ATIF spool dir, which can be large;
         // finalisation waits for worker drain + broker publish. Wide
@@ -3627,6 +3649,66 @@ mod tests {
         clippy::panic,
         clippy::unwrap_used
     )]
+
+    /// R285: the twice-registered supervised-loop metrics (eager boot
+    /// registration here + lazy observation-site registration in
+    /// main.rs/reconciler.rs) must take their HELP from the shared
+    /// `supervision_help` consts / `LIFECYCLE_OUTBOX_PENDING_HELP`.
+    /// Six counter pairs and the outbox gauge had drifted into
+    /// per-tick "divergent HELP" warn spam; first-wins semantics also
+    /// let a terse boot HELP shadow the rich forensic text alerting
+    /// playbooks key on. A string literal beside any of these names
+    /// reintroduces the drift the consts exist to prevent.
+    #[test]
+    fn twice_registered_metrics_use_shared_help_consts() {
+        let sources = [
+            ("pipeline.rs", include_str!("pipeline.rs")),
+            ("main.rs", include_str!("main.rs")),
+            ("reconciler.rs", include_str!("reconciler.rs")),
+        ];
+        let shared = [
+            ("av_reconciler_panics_total", "RECONCILER_PANICS"),
+            ("av_bridge_maintenance_panics_total", "BRIDGE_MAINTENANCE_PANICS"),
+            ("av_bridge_maintenance_errors_total", "BRIDGE_MAINTENANCE_ERRORS"),
+            (
+                "av_bridge_maintenance_join_errors_total",
+                "BRIDGE_MAINTENANCE_JOIN_ERRORS",
+            ),
+            ("av_atif_retention_panics_total", "ATIF_RETENTION_PANICS"),
+            ("av_atif_retention_errors_total", "ATIF_RETENTION_ERRORS"),
+            ("av_lifecycle_outbox_pending", "LIFECYCLE_OUTBOX_PENDING_HELP"),
+        ];
+        for (file, src) in sources {
+            for (metric, const_name) in shared {
+                let needle = format!("\"{metric}\"");
+                let mut from = 0;
+                while let Some(pos) = src[from..].find(&needle) {
+                    let at = from + pos;
+                    // The ~200 chars after the name must reference the
+                    // shared const (registration site) — doc comments,
+                    // alert examples, and scrape asserts don't register
+                    // and carry no adjacent `.counter(`/`.gauge(` call.
+                    let window = &src[at..(at + 220).min(src.len())];
+                    let registers = src[..at]
+                        .rfind(|c: char| !c.is_whitespace())
+                        .map(|p| {
+                            src[p.saturating_sub(20)..at].contains(".counter(")
+                                || src[p.saturating_sub(20)..at].contains(".gauge(")
+                        })
+                        .unwrap_or(false);
+                    if registers {
+                        assert!(
+                            window.contains(const_name),
+                            "{file}: registration of {metric} does not use \
+                             supervision_help::{const_name} — string-literal HELP \
+                             reintroduces the divergent-HELP drift (R285)"
+                        );
+                    }
+                    from = at + needle.len();
+                }
+            }
+        }
+    }
 
     use super::*;
     use av_bridge::{BusError, PublishAck, StoredEvent};

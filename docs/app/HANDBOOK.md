@@ -406,4 +406,16 @@ signup → deployment token reveal → duplicate-409 human toast → key
 reveal → audit slugs → signout/login, zero unexpected console errors)
 + smoke.py problem+json human-detail assert. Server-side session
 revocation works: a logout invalidates the cookie for ALL saved
-storage states.
+storage states. OPENAI-COMPATIBILITY.md executed R285 (all clean:
+404 sweep, X-AV-Session echo + ephemeral auto-close-with-receipt,
+harness-own errors carry NUMERIC code 413/404, /mcp aliases, close
+kinds, promote returns the bare receipt) — guard
+unsupported_openai_routes_stay_404 EXECUTES the Unsupported list
+against the real router. Twice-registered metrics take HELP from
+shared consts (pipeline supervision_help + reconciler
+LIFECYCLE_OUTBOX_PENDING_HELP): six counter pairs + the outbox gauge
+had drifted into per-tick divergent-HELP warn spam and first-wins
+HELP shadowing; guard twice_registered_metrics_use_shared_help_consts
+(red-tested). Films carry burned-in captions — a `default` VTT track
+doubles every line (PR #284 fixed the pitch page); smoke's video leg
+now fails on ANY defaulted track over burned-in footage.
