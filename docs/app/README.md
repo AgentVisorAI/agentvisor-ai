@@ -38,7 +38,7 @@ live mode):
   `/app/?tour=1` deep link used by the landing-page CTA.
 - **Simulate an attack** (Overview header, also in the palette) — stages a
   live blocked payment: an in-progress purchase session appears, the
-  payment gets blocked ~3 s later, and every stat, chart, and receipt on
+  payment gets blocked ~4.5 s later, and every stat, chart, and receipt on
   screen catches up in real time.
 - **Onboarding checklist** (Overview, fresh workspaces) — after signup a
   four-step "Getting started" card (workspace → daemon → sessions →

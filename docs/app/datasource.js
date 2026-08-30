@@ -1492,9 +1492,9 @@
     },
 
     /* Live-demo aid: stage the blocked-payment story in real time.
-     * Injects an in_progress purchase session; ~3 s later the payment
-     * gets blocked on camera and the session seals with a custom event
-     * trail. Every aggregate (overview stats, charts, policy hit
+     * Injects an in_progress purchase session; ~4.5 s later the payment
+     * gets blocked on camera and the session seals at ~9 s with a custom
+     * event trail. Every aggregate (overview stats, charts, policy hit
      * counts) recomputes from MOCK_SESSIONS, so the whole console
      * reacts. Returns the timeline so the UI can pace its toasts. */
     /* Sync affordance gate: in a fresh workspace the staged attack
@@ -1542,7 +1542,11 @@
       if (freshMode) freshRuntime().liveSessions.unshift(s);
       else MOCK_SESSIONS.unshift(s);
 
-      var BLOCK_AT = 2800, SEAL_AT = 4600;
+      // Pacing: each stage toast needs enough screen time to be read
+      // (~75 chars ≈ 4–5 s) before the next one lands. 2800/4600 put
+      // only ~1.9 s between the BLOCKED line and the receipt toast —
+      // too fast to follow the story at the bottom of the screen.
+      var BLOCK_AT = 4500, SEAL_AT = 9000;
       setTimeout(function () {
         s.toolsBlocked = 1;
         s.events = 9;
