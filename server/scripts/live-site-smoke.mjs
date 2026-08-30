@@ -237,5 +237,34 @@ console.log("✅ Environment pill present: " + pillText);
   console.log("✅ video truth: both MP4s decode metadata (pitch " + pitch.dur + "s, tour " + tour.dur + "s), zero MediaErrors");
 }
 
+// ── 11. External promises: the install command the console prints ──
+// Every fresh onboarding + the deployments pages show
+// `curl -fsSL <url>/install.sh | sh`. That URL must (a) be exactly
+// the one the deployed app.js prints, (b) serve a real POSIX script,
+// (c) install from the PUBLIC repo. get.agentvisorai.me shipped in
+// the snippet for weeks without ever existing in DNS — the first
+// investor to paste it got "Could not resolve host".
+{
+  const origin = new URL(SITE).origin;
+  const appJs = await (await fetch(origin + "/app/app.js?cb=" + Date.now())).text();
+  const m = appJs.match(/curl -fsSL (https?:\/\/[^ ]+\/install\.sh) \| sh/);
+  if (!m) fail("app.js no longer prints the install.sh command (snippet moved?)");
+  const url = m[1];
+  // The printed command is an absolute URL by design (it's copy-pasted
+  // into terminals). Live runs must hit it verbatim; local runs test
+  // the ARTIFACT at the same path on the throwaway server (the real
+  // host would 404 until this very deploy lands).
+  const local = /^(127\.|localhost)/.test(new URL(SITE).hostname);
+  const fetchUrl = local ? origin + new URL(url).pathname : url;
+  const res = await fetch(fetchUrl + "?cb=" + Date.now());
+  if (res.status !== 200) fail("install.sh promise broken: " + fetchUrl + " → " + res.status);
+  const body = await res.text();
+  if (!body.startsWith("#!/bin/sh")) fail("install.sh is not a POSIX script (starts: " + body.slice(0, 30) + ")");
+  if (!/REPO="https:\/\/github\.com\/AgentVisorAI\/agentvisor"/.test(body) || !/cargo install --locked --git "\$REPO"/.test(body))
+    fail("install.sh does not install from the public repo");
+  if (!/agentvisord start --token/.test(body)) fail("install.sh next-steps missing the daemon start line");
+  console.log("✅ install promise: " + url + " serves the real installer (public-repo cargo install + start hint)");
+}
+
 await browser.close();
-console.log("\nLive site smoke passed (10 checks against " + SITE + ").");
+console.log("\nLive site smoke passed (11 checks against " + SITE + ").");
