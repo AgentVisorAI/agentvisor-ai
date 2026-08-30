@@ -88,7 +88,7 @@ Auth: `Authorization: Bearer <ingestToken>` + `X-AV-Deployment: <deployment_id>`
 
 ## Security posture
 
-Full production checklist is in [DEPLOY.md](./DEPLOY.md#security-posture).
+Full production checklist is in [DEPLOY.md](./DEPLOY.md#security-posture-2026-baseline).
 In short:
 
 - Argon2id password hashing.
