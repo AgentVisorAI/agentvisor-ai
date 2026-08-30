@@ -263,7 +263,20 @@ console.log("✅ Environment pill present: " + pillText);
   if (!/REPO="https:\/\/github\.com\/AgentVisorAI\/agentvisor"/.test(body) || !/cargo install --locked --git "\$REPO"/.test(body))
     fail("install.sh does not install from the public repo");
   if (!/avctl setup/.test(body)) fail("install.sh next-steps missing the guided avctl setup line");
-  console.log("✅ install promise: " + url + " serves the real installer (public-repo cargo install + start hint)");
+  // The public repo's README is the same promise surface: its first
+  // printed command was `cargo install av-harness av-cli` — crates
+  // that were NEVER published to crates.io ("does not exist" from the
+  // registry). The quickstart must lead with a command that works
+  // today. Live-only: the public repo has no local artifact, and the
+  // export (publish-tool.yml) lands with the same push being smoked.
+  if (!local) {
+    const readme = await (await fetch("https://raw.githubusercontent.com/AgentVisorAI/agentvisor/main/README.md?cb=" + Date.now())).text();
+    if (!/curl -fsSL https:\/\/agentvisorai\.me\/install\.sh \| sh/.test(readme))
+      fail("public README quickstart lost the installer one-liner");
+    if (!/cargo install --locked --git https:\/\/github\.com\/AgentVisorAI\/agentvisor/.test(readme))
+      fail("public README quickstart lost the working --git install form");
+  }
+  console.log("✅ install promise: " + url + " serves the real installer" + (local ? "" : "; public README leads with working commands"));
 }
 
 await browser.close();
