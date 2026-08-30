@@ -1,4 +1,4 @@
-Contact: mailto:security@agentvisorai.me
+Contact: https://github.com/AgentVisorAI/agentvisor-ai/security/advisories/new
 Expires: 2027-08-25T00:00:00.000Z
 Preferred-Languages: en
 Canonical: https://agentvisorai.me/.well-known/security.txt
@@ -7,9 +7,11 @@ Acknowledgments: https://github.com/AgentVisorAI/agentvisor-ai/blob/main/SECURIT
 
 # AgentVisor AI security disclosure — RFC 9116 (securitytxt.org).
 #
-# We welcome coordinated disclosure. Please email security@agentvisorai.me
-# with a description of the issue, reproduction steps, and any suggested
-# remediation. We aim to acknowledge within 48h and ship a fix within 14
+# We welcome coordinated disclosure. Please open a private security
+# advisory (the Contact URL above) with a description of the issue,
+# reproduction steps, and any suggested remediation. (Email contact
+# lands with the beta's mail domain — the domain has no MX today, so
+# no mailto is listed: a dead mailbox is worse than none.) We aim to acknowledge within 48h and ship a fix within 14
 # days for high/critical severity.
 #
 # In-scope surfaces:
