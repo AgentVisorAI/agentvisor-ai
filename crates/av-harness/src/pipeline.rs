@@ -26,18 +26,24 @@ use std::time::Instant;
 /// six pairs had drifted into permanent per-tick warn spam (R285).
 /// One const per metric, referenced from both sites.
 pub mod supervision_help {
+    /// HELP for `av_reconciler_panics_total` (boot + panic-arm sites).
     pub const RECONCILER_PANICS: &str = "Reconciler tick body panicked and was caught; the reconciler \
          continues on the next tick";
+    /// HELP for `av_bridge_maintenance_panics_total` (boot + panic-arm sites).
     pub const BRIDGE_MAINTENANCE_PANICS: &str = "Bridge maintenance tick panicked and was caught; the loop \
          continues on the next interval";
+    /// HELP for `av_bridge_maintenance_errors_total` (boot + error-arm sites).
     pub const BRIDGE_MAINTENANCE_ERRORS: &str =
         "Bridge maintenance tick returned an error; the loop continues \
          on the next interval";
+    /// HELP for `av_bridge_maintenance_join_errors_total` (boot + join-error sites).
     pub const BRIDGE_MAINTENANCE_JOIN_ERRORS: &str =
         "Bridge maintenance tick's spawned task failed to join (panic \
          or cancellation); the loop continues on the next interval";
+    /// HELP for `av_atif_retention_panics_total` (boot + panic-arm sites).
     pub const ATIF_RETENTION_PANICS: &str = "ATIF retention sweep tick panicked and was caught; the loop \
          continues on the next hour";
+    /// HELP for `av_atif_retention_errors_total` (boot + error-arm sites).
     pub const ATIF_RETENTION_ERRORS: &str =
         "ATIF retention sweep tick returned an error; the loop continues \
          on the next hour";
