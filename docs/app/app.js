@@ -538,10 +538,10 @@
     while (st.children.length >= 4) st.firstChild.remove();
     st.appendChild(t);
   }
-  function toast(msg, err) {
+  function toast(msg, err, ms) {
     var t = h('<div class="toast ' + (err ? "err" : "") + '">' + esc(msg) + "</div>");
     pushToast(t);
-    setTimeout(function () { t.remove(); }, 2600);
+    setTimeout(function () { t.remove(); }, ms || 2600);
   }
   // Toast with an inline action — the Undo pattern for low-stakes
   // destructive operations (cheaper than a confirm dialog, safer than
@@ -1600,9 +1600,12 @@
 
   /* ── Simulated attack (mock mode) ────────────────────────────
    * Stages the blocked-payment story live: an in_progress purchase
-   * session appears, the payment gets blocked ~3 s later, the session
-   * seals, and every stat on screen catches up. Pure fixture theater —
-   * the datasource owns the state changes, this owns the pacing. */
+   * session appears, the payment gets blocked ~4.5 s later, the
+   * session seals at ~9 s, and every stat on screen catches up. Pure
+   * fixture theater — the datasource owns the state changes, this
+   * owns the pacing. Step toasts get explicit longer lifetimes: the
+   * default 2.6 s was shorter than the read time of these lines, so
+   * each step vanished before a viewer finished it. */
   var attackRunning = false;
   function attackReady() {
     if (state.ds.mode !== "mock" || typeof state.ds.simulateAttack !== "function") return false;
@@ -1644,11 +1647,11 @@
     // window on the happy path; catch surfaces a toast so demo
     // presenters see WHY the simulation aborted.
     try {
-      toast("vendor-onboarding picked up an invoice email…");
+      toast("vendor-onboarding picked up an invoice email…", false, 5000);
       var info = await state.ds.simulateAttack();
       setTimeout(function () { rerender(info.id); }, 250);
       setTimeout(function () {
-        toast('create_payment("' + info.vendor + '") — vendor not on the approved list. BLOCKED', true);
+        toast('create_payment("' + info.vendor + '") — vendor not on the approved list. BLOCKED', true, 6000);
         rerender(info.id);
       }, info.blockAtMs + 200);
       // Await the final stage before releasing the flag so the
