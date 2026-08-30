@@ -2877,4 +2877,66 @@ mod tests {
             "loopback probe should still target the address (with zone id stripped): {probed}"
         );
     }
+
+    /// R281: the landing page's mock terminal (docs/index.html #try-it)
+    /// must show the wizard's REAL output. It shipped for months with
+    /// invented prompts ("Pick a provider", "Key stored under …
+    /// (chmod 600)", "Start now?") that the binary never printed. Every
+    /// line the mock shows is pinned two ways: against this file's
+    /// source (so a println! rewording fails here and forces the HTML
+    /// edit in the same commit) and against the HTML (so a landing-page
+    /// rewrite that invents output fails too). Menu entries couple
+    /// straight to WIZARD_MENU.
+    #[test]
+    fn landing_page_mock_terminal_matches_real_wizard_output() {
+        let html = include_str!("../../../docs/index.html");
+        let src = include_str!("setup.rs");
+
+        // The mock elides menu items 5-10 behind an ellipsis; the ones it
+        // SHOWS must be the real labels at the real positions.
+        for index in [1usize, 2, 3, 4, 11, 12, 13] {
+            let label = WIZARD_MENU[index - 1].0;
+            let line = format!("{index}) {label}");
+            assert!(
+                html.contains(&line),
+                "landing mock terminal must show menu entry {line:?} verbatim"
+            );
+        }
+
+        // Verbatim wizard lines (fragments end where the mock's HTML
+        // markup starts). Each must exist in BOTH the source and the HTML.
+        for fragment in [
+            "Welcome to AgentVisor AI! A couple of quick questions and you're done.",
+            "Where do your AI models come from?",
+            "Type a number and press Enter",
+            "All set!",
+            "(private to your user account)",
+            "Start AgentVisor AI now?",
+            "AgentVisor AI is running at ",
+            "Use it from any OpenAI-compatible app:",
+            "API key:  anything (your real key stays on this machine)",
+            "Press Ctrl-C to stop.",
+        ] {
+            assert!(
+                src.contains(fragment),
+                "wizard no longer prints {fragment:?} — update the landing \
+                 page's mock terminal (docs/index.html #try-it) to the new \
+                 wording in this same commit, then update this list"
+            );
+            assert!(
+                html.contains(fragment),
+                "landing mock terminal drifted from the real wizard: \
+                 {fragment:?} missing from docs/index.html"
+            );
+        }
+
+        // The paste prompt is composed with friendly_name(preset).
+        let paste = format!("Paste your {} API key", friendly_name(Preset::Openai));
+        assert!(html.contains(&paste));
+
+        // The mock shows the DEFAULT listen address; both the running
+        // banner's URL and the derived Base URL must carry it.
+        assert!(html.contains("AgentVisor AI is running at http://127.0.0.1:8484"));
+        assert!(html.contains("Base URL: http://127.0.0.1:8484/v1"));
+    }
 }

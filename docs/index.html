@@ -376,6 +376,9 @@ data/bridge/
 <span class="prompt">$</span> cargo install --path crates/av-harness &amp;&amp; cargo install --path crates/av-cli
 <span class="prompt">$</span> avctl
 
+  Welcome to AgentVisor AI! A couple of quick questions and you're done.
+
+  Where do your AI models come from?
   <span class="c">1) OpenAI (GPT models)</span>
   <span class="c">2) Anthropic (Claude)</span>
   <span class="c">3) Google (Gemini)</span>
@@ -384,15 +387,20 @@ data/bridge/
   <span class="c">11) Ollama on this computer (free, no key needed)</span>
   <span class="c">12) LM Studio on this computer (free, no key needed)</span>
   <span class="c">13) Somewhere else (I have a URL)</span>
-  Pick a provider <span class="c">[1]</span>: <span class="in">1</span>
+  Type a number and press Enter <span class="c">[1]</span>: <span class="in">1</span>
 
   Paste your OpenAI API key: <span class="in">&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;</span>
-  Key stored under ~/.agentvisor/keys/ (chmod 600).
 
-  Start now? <span class="c">[Y/n]</span>: <span class="in">y</span>
+  All set!
+  API key:  ~/.agentvisor/keys/openai.key (private to your user account)
 
-  AgentVisor AI is running on http://127.0.0.1:8484
-  Point any OpenAI-compatible SDK at it. Ctrl-C to stop.</code></pre>
+  Start AgentVisor AI now? <span class="c">[Y/n]</span>: <span class="in">y</span>
+
+  &check; AgentVisor AI is running at http://127.0.0.1:8484
+  Use it from any OpenAI-compatible app:
+    Base URL: http://127.0.0.1:8484/v1
+    API key:  anything (your real key stays on this machine)
+  Press Ctrl-C to stop.</code></pre>
         </div>
       </div>
     </section>
