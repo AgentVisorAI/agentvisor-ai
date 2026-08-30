@@ -208,38 +208,64 @@ jobs:
   # a dead link in the public auditor-facing export. Every relative
   # markdown link in tracked .md files must resolve to a real file. Fast
   # (<20s), runs in parallel with `check`, needs nothing but the checkout.
+  # R282: also resolves #fragments — server/README.md pointed at
+  # DEPLOY.md#security-posture after the heading grew "(2026 baseline)".
   docs-xref:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Relative markdown links resolve
+      - name: Relative markdown links and anchors resolve
         run: |
           python3 - <<'PY'
           import os, re, subprocess, sys, urllib.parse
           files = subprocess.run(["git", "ls-files", "*.md"],
                                  capture_output=True, text=True, check=True).stdout.split()
+
+          def strip_fences(text):
+              # Link/heading syntax inside ``` is example text.
+              return re.sub(r"```.*?```", "", text, flags=re.S)
+
+          def heading_slugs(path):
+              # GitHub's anchor algorithm: lowercase, drop everything but
+              # word chars/hyphens/spaces, spaces -> hyphens. Code spans
+              # lose their backticks; link syntax keeps only the text.
+              slugs = set()
+              text = strip_fences(open(path, encoding="utf-8", errors="ignore").read())
+              for m in re.finditer(r"^#{1,6}\s+(.*)$", text, flags=re.M):
+                  h = m.group(1).strip()
+                  h = h.replace("`", "")
+                  h = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", h)
+                  s = re.sub(r"[^\w\- ]", "", h.lower()).strip().replace(" ", "-")
+                  slugs.add(s)
+              return slugs
+
           bad = []
           for f in files:
               base = os.path.dirname(f)
-              txt = open(f, encoding="utf-8", errors="ignore").read()
-              # Strip fenced code blocks: link syntax inside ``` is example text.
-              txt = re.sub(r"```.*?```", "", txt, flags=re.S)
-              for m in re.finditer(r"\]\((?!https?://|#|mailto:)([^)\s]+)", txt):
-                  target = urllib.parse.unquote(m.group(1).split("#", 1)[0])
-                  if not target:
+              txt = strip_fences(open(f, encoding="utf-8", errors="ignore").read())
+              for m in re.finditer(r"\]\((?!https?://|mailto:)([^)\s]+)", txt):
+                  raw = m.group(1)
+                  path_part, _, frag = raw.partition("#")
+                  target = urllib.parse.unquote(path_part)
+                  if not target and not frag:
                       continue
                   # Machine-local absolute paths (the LAUNCH-CHECKLIST bug):
                   # they may resolve on SOME machine, never on all of them.
                   if target.startswith("/"):
-                      bad.append(f"{f}: [..]({m.group(1)}) is an absolute path — use repo-relative")
+                      bad.append(f"{f}: [..]({raw}) is an absolute path — use repo-relative")
                       continue
-                  p = os.path.normpath(os.path.join(base, target))
+                  p = os.path.normpath(os.path.join(base, target)) if target else f
                   if not os.path.exists(p):
-                      bad.append(f"{f}: [..]({m.group(1)}) -> {p} does not exist")
+                      bad.append(f"{f}: [..]({raw}) -> {p} does not exist")
+                      continue
+                  if frag and p.endswith(".md"):
+                      slug = urllib.parse.unquote(frag).lower()
+                      if slug not in heading_slugs(p):
+                          bad.append(f"{f}: [..]({raw}) -> no heading '#{slug}' in {p}")
           if bad:
               print("\n".join(bad))
               sys.exit(1)
-          print(f"{len(files)} markdown files: all relative links resolve")
+          print(f"{len(files)} markdown files: all relative links and anchors resolve")
           PY
