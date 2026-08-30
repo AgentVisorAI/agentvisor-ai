@@ -102,7 +102,32 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
     return v ? parseInt(v.textContent.replace(/[^0-9]/g, ""), 10) : false;
   }, { timeout: 10000 })).jsonValue();
   await page.evaluate(() => document.getElementById("simAttack").click());
-  await page.waitForTimeout(6000);
+  // Mid-flight (before the ~4.6s seal): the session is in_progress —
+  // the receipt panel must say "no receipt yet" (real API 404s until
+  // the daemon posts at seal; a signed receipt whose bytes then CHANGE
+  // would contradict the tamper-evidence pitch) and the receipt
+  // actions must be disabled with the reason.
+  await page.waitForTimeout(900);
+  const midId = await page.evaluate(async () => (await window.dataSource.listSessions()).sessions.find((s) => s.status === "in_progress")?.id);
+  if (!midId) fail("attack session not in_progress mid-flight");
+  await page.evaluate((id) => { location.hash = "#/sessions/" + id; }, midId);
+  await page.waitForSelector("#dlRcpt", { timeout: 10000 });
+  const mid = await page.evaluate(() => ({
+    dl: document.querySelector("#dlRcpt").disabled,
+    share: document.querySelector("#shareRcpt").disabled,
+    copy: document.querySelector("#copyRcpt").disabled,
+    note: /No signed receipt yet/.test(document.querySelector("#view").textContent),
+    verifyHead: !!document.querySelector(".receipt-head"),
+  }));
+  if (!mid.dl || !mid.share || !mid.copy) fail("unsealed session left receipt actions enabled: " + JSON.stringify(mid));
+  if (!mid.note || mid.verifyHead) fail("unsealed session did not show the honest no-receipt state: " + JSON.stringify(mid));
+  // Stay parked through the seal: the rerender at seal+300ms must flip
+  // the panel live — buttons armed, real Ed25519 verify green.
+  await page.waitForFunction(() => !document.querySelector("#dlRcpt").disabled, { timeout: 12000 })
+    .catch(() => fail("receipt actions never armed after the seal (detail page missed the seal refresh)"));
+  await page.waitForFunction(() => /verifie[sd]/i.test(document.querySelector(".receipt-head")?.textContent || ""), { timeout: 8000 })
+    .catch(() => fail("receipt did not verify after the seal"));
+  await page.waitForTimeout(400);
   const link = await page.evaluate(() => {
     const a = document.querySelector("#toastStack .toast a");
     return a ? a.getAttribute("href") : null;
