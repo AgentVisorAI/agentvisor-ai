@@ -162,7 +162,18 @@ catalog at the bottom.
     affordances hide there too: the guided tour (launcher pill,
     palette entry, AND `?tour=1` autostart — it narrates Northwind's
     numbers) and the 30-day-dataset toggle (fresh `listSessions`
-    ignores the flag; the entry would be a lying no-op).
+    ignores the flag; the entry would be a lying no-op). The attack
+    sim gates on `ds.freshDaemonReady()` — hidden until the daemon
+    connects (a staged session can't exist while deployments still
+    says "run the install command") and again after the daemon is
+    deleted; the overview ⚡ button and the palette entry consult the
+    SAME gate so the two surfaces can't disagree. Fresh-key presence
+    flips (signup set / reset removal) propagate cross-tab: a storage
+    follower reloads parked tabs so none wears the old org's chrome
+    over the new org's data — latched on PRESENCE (not value; clock
+    rewrites of the same workspace are ignored) and re-synced via
+    announceSignIn after this tab's own auth writes (self-writes fire
+    no storage event).
 
 **Evidence & print**
 22. The printed evidence pack is COMPLETE: `@media print` forces
@@ -199,6 +210,13 @@ catalog at the bottom.
   30–32 into a fresh workspace; they "passed" there by coincidence
   until the palette check created a deployment and it vanished —
   which turned out to be a REAL fresh-mode bug, not just a leak).
+  Corollary since the cross-tab fresh follower: REMOVING (or first
+  SETTING) `av_mock_fresh_t0` from a probe page fires a presence
+  flip in every parked page of the shared context, which reloads
+  itself mid-whatever-the-next-check-does ("interrupted by another
+  navigation" on the next goto). After a probe restores fresh keys,
+  wait for the parked main page to settle (`waitForSelector
+  .app-shell`); same-presence value rewrites are safe.
 - Suites default `SITE` to **production**. A positional arg passed to a
   script that only reads the env var is silently ignored — an entire
   "local" drill once ran green against the live site while the local
