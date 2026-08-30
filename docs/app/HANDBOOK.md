@@ -392,3 +392,18 @@ labels); pinned in av-harness/tests/operations_doc.rs. Video caption
 grids: both VTTs kept the pre-R275 30s/130s grid — final cues ended
 after the (re-shot) footage; smoke's video-truth leg now parses cue
 timing in-browser (sorted, non-overlapping, last cue ≤ duration).
+API-MODE BROWSER TRUTH (R284): the api-mode console was never driven
+in a real browser until R284 — Node-fetch E2E can't see the meta CSP
+(connect-src allowed ONLY api.agentvisorai.me: every self-hosted
+API_BASE was silently blocked), cookie flow, or toast copy. Server's
+RFC 7807 transform copied machine slugs into `detail` (toasts read
+"deployment_name_in_use") — problemDetail() now maps curated human
+copy + underscores→spaces fallback; errorCode keeps the slug. The SPA
+must be served UNDER /app/ with logo.png one level up (../logo.png
+brand mark + favicon 404 on flat copies). Guards: console-api.yml
+"Browser E2E" job (patched copy = the documented self-host edits;
+signup → deployment token reveal → duplicate-409 human toast → key
+reveal → audit slugs → signout/login, zero unexpected console errors)
++ smoke.py problem+json human-detail assert. Server-side session
+revocation works: a logout invalidates the cookie for ALL saved
+storage states.

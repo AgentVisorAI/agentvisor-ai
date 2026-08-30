@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """End-to-end smoke against a running API server."""
-import json, sys, urllib.request
+import json, os, sys, urllib.request
 
-BASE = "http://127.0.0.1:8985"
+BASE = os.environ.get("API_BASE", "http://127.0.0.1:8985")
 
 def call(method, path, body=None, cookie=None, headers=None):
     hdrs = {}
@@ -54,6 +54,19 @@ if not ok("create deployment", s, 201): fails += 1
 d = json.loads(body)
 dep_id, token = d["deployment"]["id"], d["ingestToken"]
 print(f"      id={dep_id} token={token[:8]}...")
+
+# duplicate deployment name -> RFC 7807 with HUMAN detail (R284: the
+# transform used to copy the machine slug into `detail`, so the SPA
+# toasted raw "deployment_name_in_use" at users; errorCode carries the
+# slug for machines, detail must read like a sentence).
+s, body, _ = call("POST", "/api/v1/deployments", {"name": "prod", "environment": "production"}, cookie=cookie)
+if not ok("duplicate deployment", s, 409): fails += 1
+p = json.loads(body)
+det, code = p.get("detail", ""), p.get("errorCode", "")
+human = det != code and "_" not in det and det.endswith(".")
+mark = "PASS" if (code == "deployment_name_in_use" and human) else "FAIL"
+if mark == "FAIL": fails += 1
+print(f"{mark}  problem+json human detail: {det!r} (errorCode={code})")
 
 # list deployments
 s, body, _ = call("GET", "/api/v1/deployments", cookie=cookie)
