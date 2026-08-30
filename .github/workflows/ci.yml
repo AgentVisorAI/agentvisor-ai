@@ -230,6 +230,11 @@ jobs:
                   target = urllib.parse.unquote(m.group(1).split("#", 1)[0])
                   if not target:
                       continue
+                  # Machine-local absolute paths (the LAUNCH-CHECKLIST bug):
+                  # they may resolve on SOME machine, never on all of them.
+                  if target.startswith("/"):
+                      bad.append(f"{f}: [..]({m.group(1)}) is an absolute path — use repo-relative")
+                      continue
                   p = os.path.normpath(os.path.join(base, target))
                   if not os.path.exists(p):
                       bad.append(f"{f}: [..]({m.group(1)}) -> {p} does not exist")
