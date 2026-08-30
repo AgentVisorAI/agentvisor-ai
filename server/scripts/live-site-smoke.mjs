@@ -132,6 +132,7 @@ console.log("✅ Environment pill present: " + pillText);
   const isLocal = /localhost|127\.0\.0\.1/.test(origin);
   const problems = [];
   const checkedExternal = new Set();
+  const mailtos = [];
   for (const p of ["", "pitch/", "verify/"]) {
     await page.goto(origin + p, { waitUntil: "domcontentloaded" });
     await wait(500);
@@ -140,7 +141,17 @@ console.log("✅ Environment pill present: " + pillText);
     })));
     const ids = await page.evaluate(() => [...document.querySelectorAll("[id]")].map((e) => e.id));
     for (const l of links) {
-      if (!l.href || l.href.startsWith("mailto:")) continue;
+      if (!l.href) continue;
+      if (l.href.startsWith("mailto:")) {
+        // The domain has NO MX records today — any mailto to it is a
+        // dead mailbox (the RFC 9116 contact, the crash card's support
+        // link, and the legal pages all shipped one). Collect them and
+        // verify deliverability after the crawl; the check self-heals
+        // the day MX lands.
+        const m = l.href.match(/^mailto:([^?]+)/);
+        if (m && /@agentvisorai\.me$/i.test(m[1])) mailtos.push(`/${p}: ${m[1]}`);
+        continue;
+      }
       if (l.href.startsWith("#")) {
         if (l.href.length > 1 && !ids.includes(l.href.slice(1))) problems.push(`/${p}: dead anchor ${l.href}`);
         continue;
@@ -182,6 +193,11 @@ console.log("✅ Environment pill present: " + pillText);
     return out;
   });
   for (const m of media) if (!m.tracks || !m.cues) problems.push("pitch video captions missing/unparsed: " + JSON.stringify(m));
+  if (mailtos.length) {
+    let mx = [];
+    try { mx = await (await import("node:dns/promises")).resolveMx("agentvisorai.me"); } catch { mx = []; }
+    if (mx.length === 0) problems.push("dead mailtos (domain has no MX):\n    " + mailtos.join("\n    "));
+  }
   if (problems.length) fail("link/media integrity:\n  " + problems.join("\n  "));
   console.log("✅ Link + media integrity: all internal links resolve, anchors exist, videos have parsed captions");
   // Alias stubs + branded 404: /mockup and /demo are meta-refresh
