@@ -358,7 +358,15 @@ directory short from docs/reference/, AND the file was missing from
 the publish-tool export list, so the public auditor-facing repo had a
 dead link. Both fixed; CI's `docs-xref` job now resolves every
 relative markdown link in every tracked .md on every PR (fenced code
-blocks stripped — link syntax inside ``` is example text). When a
+blocks stripped — link syntax inside ``` is example text), and since
+R282 also resolves #fragments against GitHub-slugged headings
+(server/README.md pointed at DEPLOY.md#security-posture after the
+heading grew "(2026 baseline)"). Never cite file:line in living docs —
+SECURITY-AUDIT.md's onnx_embed.rs:30 rotted to :32; cite the enclosing
+symbol instead, and pin greppable audit-doc claims in
+av-harness/tests/security_audit_doc.rs (wasmtime feature set, named
+containment tests, verify_slice, TODO(compression-marker), lockfile
+states). When a
 reference doc links a ROOT file, confirm the target is in
 publish-tool.yml's export list too, or the public copy 404s even
 though the monorepo link resolves. The promise class extends to CODE
