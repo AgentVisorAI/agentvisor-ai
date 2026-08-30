@@ -5,6 +5,13 @@
 // Set to false and point API_BASE at a deployed backend to run against the
 // real hosted API. See server/README.md for the deploy runbook.
 //
+// SELF-HOSTERS: index.html ships a strict meta CSP whose connect-src
+// allows only 'self' and https://api.agentvisorai.me. If your API_BASE
+// is any other origin, the browser will silently block every fetch —
+// add your API origin to the connect-src list in index.html in the
+// same change that edits this file (CI's "Browser E2E" job makes
+// exactly these two edits; see .github/workflows/console-api.yml).
+//
 // Extracted from index.html so that a strict Content-Security-Policy
 // (`script-src 'self'`) can be enforced without allowing 'unsafe-inline'.
 window.MOCK_MODE = true;
