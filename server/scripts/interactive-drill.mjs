@@ -2543,9 +2543,67 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   console.log("✅ hostile environment: storage-denied boot fully functional; dead datasource → announced+focused crash card → Reload recovers; WebCrypto-less detail renders with honest ? state");
 }
 
+// ── 35. Scripted pitch (/app/pitch/) manual walk + locale hostility ─
+// The self-serve investor path nothing else drills: launch → first
+// request → session run → dashboard → receipt verifies GREEN → tamper
+// flips the verdict → evidence → reset. The next-step ids are wrapper
+// ROWS — click the [data-goto] button inside (the row's midpoint is
+// empty space; a row click silently no-ops). Plus one comma-decimal
+// locale boot (de-DE @ Berlin) asserting the console formats without
+// NaN/Invalid Date.
+{
+  const pitchBase = SITE.replace(/\/app\/?$/, "/") + "app/pitch/";
+  const pp = await context.newPage();
+  const pErrs = [];
+  pp.on("pageerror", (e) => pErrs.push(String(e).slice(0, 120)));
+  await pp.goto(pitchBase, { waitUntil: "domcontentloaded" });
+  await pp.waitForSelector("#btn-launch", { timeout: 15000 });
+  await pp.click("#btn-launch");
+  await pp.waitForSelector("#next-onboard:not([hidden])", { timeout: 20000 });
+  await pp.click("#next-onboard button");
+  await pp.waitForSelector("#btn-first-request", { timeout: 8000 });
+  await pp.click("#btn-first-request");
+  await pp.waitForSelector("#next-integrate:not([hidden])", { timeout: 20000 });
+  await pp.click("#next-integrate button");
+  await pp.waitForSelector("#next-session:not([hidden])", { timeout: 40000 });
+  await pp.click("#next-session button");
+  await pp.waitForTimeout(1200);
+  if (!(await pp.$("#panel-dashboard:not([hidden])"))) fail("pitch walk did not reach the dashboard");
+  await pp.evaluate(() => window.avConsole.goTo("receipt"));
+  await pp.waitForTimeout(600);
+  await pp.click("#btn-verify");
+  await pp.waitForFunction(() => !document.querySelector("#verify-verdict")?.hidden, { timeout: 10000 })
+    .catch(() => fail("pitch receipt verify verdict never appeared"));
+  if (!(await pp.evaluate(() => /valid|verifies|✓/i.test(document.querySelector("#verify-verdict").textContent))))
+    fail("pitch receipt did not verify green");
+  await pp.click("#btn-tamper");
+  await pp.waitForTimeout(1200);
+  if (!(await pp.evaluate(() => /tamper|invalid|breaks|broke|✗|fails/i.test(document.querySelector("#verify-verdict").textContent + document.body.textContent))))
+    fail("pitch tamper did not flip the verdict");
+  await pp.click("#btn-reset");
+  await pp.waitForTimeout(600);
+  if (!(await pp.$("#panel-onboard:not([hidden])"))) fail("pitch reset did not return to onboard");
+  if (pErrs.length) fail("scripted pitch threw: " + pErrs.join(" | "));
+  await pp.close();
+
+  const deCtx = await browser.newContext({ locale: "de-DE", timezoneId: "Europe/Berlin", viewport: { width: 1380, height: 900 } });
+  const dp = await deCtx.newPage();
+  const deErrs = [];
+  dp.on("pageerror", (e) => deErrs.push(String(e).slice(0, 100)));
+  await dp.goto(SITE + "#/overview", { waitUntil: "domcontentloaded" });
+  await dp.waitForSelector(".stat", { timeout: 15000 });
+  await dp.evaluate(() => { location.hash = "#/settings/billing"; });
+  await dp.waitForTimeout(1200);
+  const deTxt = await dp.evaluate(() => document.querySelector("#view").textContent);
+  if (/NaN|Invalid Date|undefined/.test(deTxt)) fail("de-DE locale produced NaN/Invalid Date");
+  if (deErrs.length) fail("de-DE boot threw: " + deErrs.join(" | "));
+  await deCtx.close();
+  console.log("✅ scripted pitch: manual 6-step walk, verify green → tamper red, reset; de-DE locale formats clean");
+}
+
 
 if (jsErrors.length) fail("JS errors during drill: " + JSON.stringify(jsErrors));
 console.log("✅ zero uncaught JS errors");
 
 await browser.close();
-console.log("\nAll 34 interactive-features drill checks passed.");
+console.log("\nAll 35 interactive-features drill checks passed.");
