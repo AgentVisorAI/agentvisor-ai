@@ -12,94 +12,94 @@ Legend: **✅ verified** · **🟢 configured** · **📋 documented**
 
 | # | Item | Status | Reference |
 |---|---|---|---|
-| 1.1 | HTTPS-only in production (fatal boot check) | ✅ | [server/src/index.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/index.ts) |
-| 1.2 | JWT signed with 256-bit secret (auto-generated in dev, fatal in prod without env) | ✅ | [server/src/env.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/env.ts) |
-| 1.3 | JWT tampering rejected (alg=none, wrong secret, expired) | ✅ | [docs/RUNBOOK.md](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/RUNBOOK.md) |
-| 1.4 | HttpOnly + Secure + SameSite=Lax cookie for the session | ✅ | [server/src/routes/auth.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/routes/auth.ts) |
-| 1.5 | Argon2id password hashing (@node-rs/argon2) | ✅ | [server/src/lib/auth.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/lib/auth.ts) |
-| 1.6 | Rate limit on auth endpoints (login 10/min, signup 5/min per IP) | ✅ | [server/src/routes/auth.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/routes/auth.ts) |
-| 1.7 | Ingest endpoints exempt from global rate limit | ✅ | [server/src/index.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/index.ts) |
-| 1.8 | CSRF: Origin allow-list on mutating verbs | ✅ | [server/src/index.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/index.ts) |
-| 1.9 | CSRF: Sec-Fetch-Site defense-in-depth (blocks `cross-site`, passes `same-origin`/`same-site`/`none`) | ✅ | This round — see [server/src/index.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/index.ts) |
-| 1.10 | X-Requested-With required on state-changing routes (SPA sets it) | ✅ | [docs/app/datasource.js](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/app/datasource.js) |
+| 1.1 | HTTPS-only in production (fatal boot check) | ✅ | [server/src/index.ts](server/src/index.ts) |
+| 1.2 | JWT signed with 256-bit secret (auto-generated in dev, fatal in prod without env) | ✅ | [server/src/env.ts](server/src/env.ts) |
+| 1.3 | JWT tampering rejected (alg=none, wrong secret, expired) | ✅ | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
+| 1.4 | HttpOnly + Secure + SameSite=Lax cookie for the session | ✅ | [server/src/routes/auth.ts](server/src/routes/auth.ts) |
+| 1.5 | Argon2id password hashing (@node-rs/argon2) | ✅ | [server/src/lib/auth.ts](server/src/lib/auth.ts) |
+| 1.6 | Rate limit on auth endpoints (login 10/min, signup 5/min per IP) | ✅ | [server/src/routes/auth.ts](server/src/routes/auth.ts) |
+| 1.7 | Ingest endpoints exempt from global rate limit | ✅ | [server/src/index.ts](server/src/index.ts) |
+| 1.8 | CSRF: Origin allow-list on mutating verbs | ✅ | [server/src/index.ts](server/src/index.ts) |
+| 1.9 | CSRF: Sec-Fetch-Site defense-in-depth (blocks `cross-site`, passes `same-origin`/`same-site`/`none`) | ✅ | This round — see [server/src/index.ts](server/src/index.ts) |
+| 1.10 | X-Requested-With required on state-changing routes (SPA sets it) | ✅ | [docs/app/datasource.js](docs/app/datasource.js) |
 | 1.11 | SQL injection resistant (Prisma parameterized, verified with `pg_sleep`, `DROP TABLE`) | ✅ | This round |
-| 1.12 | XSS defense — event drawer uses opt-in isHtml tuple, everything else escaped | ✅ | [docs/app/app.js](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/app/app.js) |
-| 1.13 | Strict CSP: `default-src 'none'; script-src 'self'; script-src-attr 'none'` | ✅ | [docs/_headers](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/_headers) |
-| 1.14 | HSTS + upgrade-insecure-requests | ✅ | [docs/_headers](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/_headers) |
-| 1.15 | Pino logger redacts `authorization`, `cookie`, `password`, `token`, `ingestToken` | ✅ | [server/src/lib/auth.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/lib/auth.ts) |
-| 1.16 | Real Ed25519 receipt verification in the browser (no lies) | ✅ | [docs/app/datasource.js](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/app/datasource.js) |
-| 1.17 | Deployment ingest token rotation flow with one-time-view modal | ✅ | [docs/app/app.js](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/app/app.js) |
-| 1.18 | Role enforcement (owner-only for destructive endpoints) | ✅ | [server/src/routes/auth.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/routes/auth.ts) |
-| 1.19 | Secrets never committed (grep of repo, .env in gitignore) | ✅ | [.gitignore](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/.gitignore) |
-| 1.20 | Trivy scan in CI (blocks on HIGH/CRITICAL) | ✅ | [.github/workflows/deploy.yml](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/.github/workflows/deploy.yml) |
-| 1.21 | SBOM + SLSA attestation attached to every image | ✅ | [.github/workflows/deploy.yml](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/.github/workflows/deploy.yml) |
-| 1.22 | Dependabot with automatic patch-level merges | ✅ | [.github/workflows/dependabot-automerge.yml](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/.github/workflows/dependabot-automerge.yml) |
+| 1.12 | XSS defense — event drawer uses opt-in isHtml tuple, everything else escaped | ✅ | [docs/app/app.js](docs/app/app.js) |
+| 1.13 | Strict CSP: `default-src 'none'; script-src 'self'; script-src-attr 'none'` | ✅ | [docs/_headers](docs/_headers) |
+| 1.14 | HSTS + upgrade-insecure-requests | ✅ | [docs/_headers](docs/_headers) |
+| 1.15 | Pino logger redacts `authorization`, `cookie`, `password`, `token`, `ingestToken` | ✅ | [server/src/lib/auth.ts](server/src/lib/auth.ts) |
+| 1.16 | Real Ed25519 receipt verification in the browser (no lies) | ✅ | [docs/app/datasource.js](docs/app/datasource.js) |
+| 1.17 | Deployment ingest token rotation flow with one-time-view modal | ✅ | [docs/app/app.js](docs/app/app.js) |
+| 1.18 | Role enforcement (owner-only for destructive endpoints) | ✅ | [server/src/routes/auth.ts](server/src/routes/auth.ts) |
+| 1.19 | Secrets never committed (grep of repo, .env in gitignore) | ✅ | [.gitignore](.gitignore) |
+| 1.20 | Trivy scan in CI (blocks on HIGH/CRITICAL) | ✅ | [.github/workflows/deploy.yml](.github/workflows/deploy.yml) |
+| 1.21 | SBOM + SLSA attestation attached to every image | ✅ | [.github/workflows/deploy.yml](.github/workflows/deploy.yml) |
+| 1.22 | Dependabot with automatic patch-level merges | ✅ | [.github/workflows/dependabot-automerge.yml](.github/workflows/dependabot-automerge.yml) |
 
 ## 2. Operations
 
 | # | Item | Status | Reference |
 |---|---|---|---|
-| 2.1 | `/healthz` liveness | ✅ | [server/src/index.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/index.ts) |
-| 2.2 | `/readyz` readiness (DB ping) | ✅ | [server/src/index.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/index.ts) |
-| 2.3 | `/metrics` (Prometheus, IP-allow-list gated) | ✅ | [server/src/lib/metrics.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/lib/metrics.ts) |
-| 2.4 | Request-id echoed on every response (grep-once ops) | ✅ | [server/src/index.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/index.ts) |
-| 2.5 | Problem+json (RFC 7807) normalized on all 4xx/5xx | ✅ | [server/src/index.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/index.ts) |
-| 2.6 | Nightly `pg_dump` backup workflow | ✅ | [.github/workflows/backup.yml](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/.github/workflows/backup.yml) |
-| 2.7 | Backup restore drill run + documented | ✅ | [docs/RUNBOOK.md](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/RUNBOOK.md) |
-| 2.8 | Postgres LISTEN/NOTIFY bus with auto-reconnect | ✅ | [server/src/lib/bus.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/lib/bus.ts) |
-| 2.9 | SSE reconnect with exponential backoff | ✅ | [docs/app/datasource.js](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/app/datasource.js) |
-| 2.10 | Autocannon load-test job in CI (100k row bench) | ✅ | [.github/workflows/console-api.yml](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/.github/workflows/console-api.yml) |
-| 2.11 | Cursor pagination on `/sessions` (O(log N)) | ✅ | [server/src/routes/read.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/routes/read.ts) |
-| 2.12 | Streaming NDJSON export (bounded memory on huge orgs) | ✅ | [server/src/routes/auth.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/routes/auth.ts) |
-| 2.13 | Session.orgId denormalized + compound indexes | ✅ | [server/prisma/schema.prisma](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/prisma/schema.prisma) |
-| 2.14 | Fly.io + Render + Koyeb deploy manifests keyed off `/readyz` | ✅ | [server/fly.toml](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/fly.toml) · [render.yaml](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/render.yaml) |
-| 2.15 | GHCR image push + PR preview comment | ✅ | [.github/workflows/deploy.yml](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/.github/workflows/deploy.yml) |
-| 2.16 | Runbook covers 7 pre-launch drills | ✅ | [docs/RUNBOOK.md](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/RUNBOOK.md) |
+| 2.1 | `/healthz` liveness | ✅ | [server/src/index.ts](server/src/index.ts) |
+| 2.2 | `/readyz` readiness (DB ping) | ✅ | [server/src/index.ts](server/src/index.ts) |
+| 2.3 | `/metrics` (Prometheus, IP-allow-list gated) | ✅ | [server/src/lib/metrics.ts](server/src/lib/metrics.ts) |
+| 2.4 | Request-id echoed on every response (grep-once ops) | ✅ | [server/src/index.ts](server/src/index.ts) |
+| 2.5 | Problem+json (RFC 7807) normalized on all 4xx/5xx | ✅ | [server/src/index.ts](server/src/index.ts) |
+| 2.6 | Nightly `pg_dump` backup workflow | ✅ | [.github/workflows/backup.yml](.github/workflows/backup.yml) |
+| 2.7 | Backup restore drill run + documented | ✅ | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
+| 2.8 | Postgres LISTEN/NOTIFY bus with auto-reconnect | ✅ | [server/src/lib/bus.ts](server/src/lib/bus.ts) |
+| 2.9 | SSE reconnect with exponential backoff | ✅ | [docs/app/datasource.js](docs/app/datasource.js) |
+| 2.10 | Autocannon load-test job in CI (100k row bench) | ✅ | [.github/workflows/console-api.yml](.github/workflows/console-api.yml) |
+| 2.11 | Cursor pagination on `/sessions` (O(log N)) | ✅ | [server/src/routes/read.ts](server/src/routes/read.ts) |
+| 2.12 | Streaming NDJSON export (bounded memory on huge orgs) | ✅ | [server/src/routes/auth.ts](server/src/routes/auth.ts) |
+| 2.13 | Session.orgId denormalized + compound indexes | ✅ | [server/prisma/schema.prisma](server/prisma/schema.prisma) |
+| 2.14 | Fly.io + Render + Koyeb deploy manifests keyed off `/readyz` | ✅ | [server/fly.toml](server/fly.toml) · [render.yaml](render.yaml) |
+| 2.15 | GHCR image push + PR preview comment | ✅ | [.github/workflows/deploy.yml](.github/workflows/deploy.yml) |
+| 2.16 | Runbook covers 7 pre-launch drills | ✅ | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
 
 ## 3. Product
 
 | # | Item | Status | Reference |
 |---|---|---|---|
-| 3.1 | Google SSO (OIDC) | ✅ | [server/src/routes/oauth.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/routes/oauth.ts) |
-| 3.2 | Microsoft SSO (OIDC / Entra multi-tenant) | ✅ | [server/src/routes/oauth.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/routes/oauth.ts) |
-| 3.2b | **SAML 2.0 SSO** (Okta / Auth0 / Entra / any) — full SP with signed AuthnRequests, XML-signature verify, replay guard, JIT, RelayState round-trip, metadata endpoint, SP keypair regen | ✅ | [server/src/routes/saml.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/routes/saml.ts) · [server/src/lib/saml.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/lib/saml.ts) · [server/src/lib/saml-cert.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/lib/saml-cert.ts) |
-| 3.3 | Password reset via mailer with token expiry | ✅ | [server/src/routes/auth.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/routes/auth.ts) |
-| 3.4 | Mailer supports Resend, SMTP, or dev-stub | ✅ | [server/src/lib/mail.ts](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/src/lib/mail.ts) |
-| 3.5 | Ed25519 signed receipts, verified in-browser | ✅ | [docs/app/datasource.js](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/app/datasource.js) |
-| 3.6 | Deployment onboarding: install curl + start daemon snippet | ✅ | [docs/app/app.js](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/app/app.js) |
-| 3.7 | Pitch demo flow (Setup → Connect → Sessions → Overview → Receipts → Data) | ✅ | [docs/app/pitch/index.html](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/app/pitch/index.html) |
-| 3.8 | Session URL deep-linking survives reload | ✅ | [docs/app/app.js](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/app/app.js) |
-| 3.9 | Command palette (⌘K) with async index | ✅ | [docs/app/app.js](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/app/app.js) |
-| 3.10 | Timezone: server UTC, browser renders in local TZ | ✅ | [docs/app/app.js](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/app/app.js) |
-| 3.11 | Long-string table truncation (table-layout fixed + per-cell ellipsis) | ✅ | [docs/app/styles.css](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/app/styles.css) |
-| 3.12 | Rate-limit UX countdown ("Try again in 5s") | ✅ | [docs/app/app.js](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/app/app.js) |
-| 3.13 | JWT expiry triggers graceful re-login (av-session-expired event) | ✅ | [docs/app/datasource.js](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/app/datasource.js) |
-| 3.14 | 404 route renders proper not-found (not generic error) | ✅ | [docs/app/app.js](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/app/app.js) |
-| 3.15 | Empty states on every list surface (sessions, policies, deployments, keys, audit) | ✅ | This round · [docs/app/app.js](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/app/app.js) |
-| 3.16 | Two-line table cells preserved after truncation fix | ✅ | This round · [docs/app/styles.css](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/app/styles.css) |
-| 3.17 | Session persistence across reload and new tabs | ✅ | [docs/RUNBOOK.md](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/RUNBOOK.md) |
-| 3.18 | Zero axe accessibility violations on core surfaces | ✅ | [docs/app/styles.css](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/app/styles.css) |
-| 3.19 | SPA gzip payload ≤ 28KB | ✅ | [.github/workflows/pages.yml](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/.github/workflows/pages.yml) |
+| 3.1 | Google SSO (OIDC) | ✅ | [server/src/routes/oauth.ts](server/src/routes/oauth.ts) |
+| 3.2 | Microsoft SSO (OIDC / Entra multi-tenant) | ✅ | [server/src/routes/oauth.ts](server/src/routes/oauth.ts) |
+| 3.2b | **SAML 2.0 SSO** (Okta / Auth0 / Entra / any) — full SP with signed AuthnRequests, XML-signature verify, replay guard, JIT, RelayState round-trip, metadata endpoint, SP keypair regen | ✅ | [server/src/routes/saml.ts](server/src/routes/saml.ts) · [server/src/lib/saml.ts](server/src/lib/saml.ts) · [server/src/lib/saml-cert.ts](server/src/lib/saml-cert.ts) |
+| 3.3 | Password reset via mailer with token expiry | ✅ | [server/src/routes/auth.ts](server/src/routes/auth.ts) |
+| 3.4 | Mailer supports Resend, SMTP, or dev-stub | ✅ | [server/src/lib/mail.ts](server/src/lib/mail.ts) |
+| 3.5 | Ed25519 signed receipts, verified in-browser | ✅ | [docs/app/datasource.js](docs/app/datasource.js) |
+| 3.6 | Deployment onboarding: install curl + start daemon snippet | ✅ | [docs/app/app.js](docs/app/app.js) |
+| 3.7 | Pitch demo flow (Setup → Connect → Sessions → Overview → Receipts → Data) | ✅ | [docs/app/pitch/index.html](docs/app/pitch/index.html) |
+| 3.8 | Session URL deep-linking survives reload | ✅ | [docs/app/app.js](docs/app/app.js) |
+| 3.9 | Command palette (⌘K) with async index | ✅ | [docs/app/app.js](docs/app/app.js) |
+| 3.10 | Timezone: server UTC, browser renders in local TZ | ✅ | [docs/app/app.js](docs/app/app.js) |
+| 3.11 | Long-string table truncation (table-layout fixed + per-cell ellipsis) | ✅ | [docs/app/styles.css](docs/app/styles.css) |
+| 3.12 | Rate-limit UX countdown ("Try again in 5s") | ✅ | [docs/app/app.js](docs/app/app.js) |
+| 3.13 | JWT expiry triggers graceful re-login (av-session-expired event) | ✅ | [docs/app/datasource.js](docs/app/datasource.js) |
+| 3.14 | 404 route renders proper not-found (not generic error) | ✅ | [docs/app/app.js](docs/app/app.js) |
+| 3.15 | Empty states on every list surface (sessions, policies, deployments, keys, audit) | ✅ | This round · [docs/app/app.js](docs/app/app.js) |
+| 3.16 | Two-line table cells preserved after truncation fix | ✅ | This round · [docs/app/styles.css](docs/app/styles.css) |
+| 3.17 | Session persistence across reload and new tabs | ✅ | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
+| 3.18 | Zero axe accessibility violations on core surfaces | ✅ | [docs/app/styles.css](docs/app/styles.css) |
+| 3.19 | SPA gzip payload ≤ 28KB | ✅ | [.github/workflows/pages.yml](.github/workflows/pages.yml) |
 
 ## 4. Legal & Trust
 
 | # | Item | Status | Reference |
 |---|---|---|---|
-| 4.1 | Terms of Service published | ✅ | [docs/legal/terms.html](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/legal/terms.html) |
-| 4.2 | Privacy Policy published | ✅ | [docs/legal/privacy.html](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/legal/privacy.html) |
-| 4.3 | `/.well-known/security.txt` served | ✅ | [.github/workflows/pages.yml](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/.github/workflows/pages.yml) |
-| 4.4 | Legal linked from footer on public site | 📋 | [docs/app/index.html](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/app/index.html) |
+| 4.1 | Terms of Service published | ✅ | [docs/legal/terms.html](docs/legal/terms.html) |
+| 4.2 | Privacy Policy published | ✅ | [docs/legal/privacy.html](docs/legal/privacy.html) |
+| 4.3 | `/.well-known/security.txt` served | ✅ | [.github/workflows/pages.yml](.github/workflows/pages.yml) |
+| 4.4 | Legal linked from footer on public site | 📋 | [docs/app/index.html](docs/app/index.html) |
 
 ## 5. Documentation
 
 | # | Item | Status | Reference |
 |---|---|---|---|
-| 5.1 | Top-level README explains the product | 📋 | [README.md](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/README.md) |
-| 5.2 | Server DEPLOY guide (Fly, Render, Koyeb, Docker) | 📋 | [server/DEPLOY.md](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/server/DEPLOY.md) |
-| 5.3 | CI/CD reference | 📋 | [CI-CD.md](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/CI-CD.md) |
-| 5.4 | Runbook of pre-launch drills | 📋 | [docs/RUNBOOK.md](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/RUNBOOK.md) |
-| 5.5 | STATUS.md summarizing readiness | 📋 | [docs/STATUS.md](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/docs/STATUS.md) |
-| 5.6 | Launch checklist (this doc) | 📋 | [LAUNCH-CHECKLIST.md](/Users/zacharie/llm_proxy.worktrees/mockup-demo-video-full-flow/LAUNCH-CHECKLIST.md) |
+| 5.1 | Top-level README explains the product | 📋 | [README.md](README.md) |
+| 5.2 | Server DEPLOY guide (Fly, Render, Koyeb, Docker) | 📋 | [server/DEPLOY.md](server/DEPLOY.md) |
+| 5.3 | CI/CD reference | 📋 | [CI-CD.md](CI-CD.md) |
+| 5.4 | Runbook of pre-launch drills | 📋 | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
+| 5.5 | STATUS.md summarizing readiness | 📋 | [docs/STATUS.md](docs/STATUS.md) |
+| 5.6 | Launch checklist (this doc) | 📋 | [LAUNCH-CHECKLIST.md](LAUNCH-CHECKLIST.md) |
 
 ---
 
