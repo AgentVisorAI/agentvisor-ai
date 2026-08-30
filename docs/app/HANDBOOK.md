@@ -384,4 +384,11 @@ text + executed twin, §5a domain-tag/field-count/framing pins, §4
 key_id derivation) and av-cli setup.rs
 landing_page_mock_terminal_matches_real_wizard_output (menu couples to
 WIZARD_MENU; every shown line pinned to BOTH setup.rs source and the
-HTML).
+HTML). OPERATIONS.md executed verbatim R283 — fully TRUE (probe
+writability flip, SIGTERM pre-drain 503 window, whole key-rotation
+runbook incl. SIGHUP-explicitly-ignored + multi-key window, orphan
+quarantine rename + metric, spool-prune, all 26 alert metrics + 7 pass
+labels); pinned in av-harness/tests/operations_doc.rs. Video caption
+grids: both VTTs kept the pre-R275 30s/130s grid — final cues ended
+after the (re-shot) footage; smoke's video-truth leg now parses cue
+timing in-browser (sorted, non-overlapping, last cue ≤ duration).
