@@ -1601,6 +1601,15 @@
         : (MOCK_SESSIONS.find(function (x) { return x.id === sessionId; }) ||
            (bigDataOn() ? bigDataSessions().find(function (x) { return x.id === sessionId; }) : null));
       if (!s) throw new Error("not_found");
+      // Real-API parity: the daemon posts the receipt AT SEAL — the
+      // server 404s for a running session and the console shows "No
+      // signed receipt yet". Signing an in_progress session here meant
+      // the attack demo's mid-flight session showed "✓ verified" on
+      // bytes that then CHANGED at seal — the exact opposite of the
+      // tamper-evidence pitch. Same note string as the api branch.
+      if (s.status === "in_progress") {
+        return { note: "No signed receipt yet. The daemon posts one at session seal.", sessionId: sessionId };
+      }
       var isFeatured = sessionId === "sess_01H9K";
       var fid = fresh !== null ? freshIdentity() : null;
       var body = {
