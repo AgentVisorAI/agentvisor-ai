@@ -8,8 +8,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use av_receipts::{
-    signing_message, CostSummary, Ed25519Signer, Keyring, Receipt, ReceiptBody, ReceiptSubject,
-    Signer, ToolCallSummary, RECEIPT_DOMAIN_TAG_V2,
+    signing_message, CostSummary, Ed25519Signer, Keyring, Receipt, ReceiptBody, ReceiptSubject, Signer,
+    ToolCallSummary, RECEIPT_DOMAIN_TAG_V2,
 };
 
 const DOC: &str = include_str!("../../../docs/reference/VERIFYING-A-RECEIPT.md");
@@ -144,8 +144,15 @@ fn section_5a_protocol_facts_match_the_code() {
     expected.extend_from_slice(&(canon.len() as u64).to_be_bytes());
     expected.extend_from_slice(canon.as_bytes());
     assert_eq!(message, expected, "§5a v2 framing description drifted");
-    assert_eq!(signing_message(1, canon).unwrap(), canon.as_bytes(), "§5a v1 framing");
-    assert!(signing_message(3, canon).is_err(), "§5a: unknown versions refused");
+    assert_eq!(
+        signing_message(1, canon).unwrap(),
+        canon.as_bytes(),
+        "§5a v1 framing"
+    );
+    assert!(
+        signing_message(3, canon).is_err(),
+        "§5a: unknown versions refused"
+    );
 }
 
 /// §4: "the receipt's `key_id` … the first 32 hex characters of the
