@@ -48,11 +48,10 @@ jobs:
     # the old bits.
     if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name != 'workflow_run' }}
     runs-on: ubuntu-latest
-    # 22 min: the nightly/dispatch path additionally installs WebKit +
-    # Firefox and walks the 3-engine matrix (~8 min extra); the 12-min
-    # cap cancelled the first dispatch mid-suite after the matrix had
-    # already passed. Per-deploy runs still finish in ~4 min.
-    timeout-minutes: 22
+    # 30 min: install (~2-4) + suites (~8 on the nightly 3-engine
+    # matrix) + up to 15 of CDN-convergence polling. The old 22-min
+    # cap predates the convergence wait.
+    timeout-minutes: 30
     steps:
       # R106 F2: SHA-pin third-party actions (matches R29 F2 discipline
       # applied elsewhere). Prior console-smoke.yml used mutable
@@ -87,8 +86,40 @@ jobs:
         working-directory: server
         run: npx playwright install --with-deps webkit firefox
 
-      - name: Wait 10s for CDN cache to warm
-        run: sleep 10
+      - name: Wait for the CDN to serve THIS deploy
+        # The Pages CDN takes up to ~10 minutes to converge after a
+        # deploy. Smokes that started inside that window ran the NEW
+        # drill against the OLD payload and false-failed (documented
+        # stale-CDN class — it burned three manual re-dispatches).
+        # pages.yml stamps the deployed commit into /build.txt; on
+        # workflow_run events poll it (cache-busted) until it matches
+        # the Docs run's head_sha — a CDN that never converges inside
+        # 15 minutes is a real deploy problem, fail loudly. Schedule/
+        # dispatch runs aren't racing any particular deploy AND the
+        # tip sha may legitimately never be stamped (pages.yml has a
+        # paths: filter, so non-site commits don't deploy) — those
+        # just assert the marker is reachable.
+        env:
+          EVENT: ${{ github.event_name }}
+          EXPECTED: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          if [ "$EVENT" != "workflow_run" ]; then
+            got="$(curl -fsS "https://agentvisorai.me/build.txt?cb=$RANDOM" || true)"
+            if [ -n "$got" ]; then echo "site alive (build ${got:0:12}…)"; exit 0; fi
+            echo "::error::build.txt unreachable — site down or marker missing"
+            exit 1
+          fi
+          echo "waiting for build.txt == $EXPECTED"
+          for i in $(seq 1 90); do
+            got="$(curl -fsS "https://agentvisorai.me/build.txt?cb=$RANDOM$i" 2>/dev/null || true)"
+            if [ "$got" = "$EXPECTED" ]; then
+              echo "CDN converged after $((i * 10))s"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::CDN never converged to $EXPECTED (last saw: ${got:-nothing}) after 15 minutes"
+          exit 1
 
       - name: Live SPA smoke
         working-directory: server

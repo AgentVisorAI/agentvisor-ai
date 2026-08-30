@@ -188,6 +188,11 @@ jobs:
           # Pages ships as a plain branch in the public site repo — keep
           # Jekyll out of the way (files starting with _ etc.).
           touch "$site/.nojekyll"
+          # Deploy-convergence marker: console-smoke polls this until it
+          # matches the commit it expects, instead of guessing when the
+          # ~10-minute CDN TTL has expired (smokes that fired mid-TTL
+          # ran the NEW drill against the OLD payload and false-failed).
+          printf '%s' "$GITHUB_SHA" > "$site/build.txt"
           # Publish the assembled directory.
           rm -rf target/doc
           mv "$site" target/doc
