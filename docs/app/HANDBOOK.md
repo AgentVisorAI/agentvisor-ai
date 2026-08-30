@@ -242,25 +242,35 @@ added to its copy list or they 404 only in production. Live CDN caches for up
 to ~20 min post-deploy; verify with etags or functional probes, not comments
 (assets are terser-minified in the workflow).
 
-## Repo topology (private monorepo, public exports)
+## Repo topology (public monorepo, public exports)
 
-This monorepo is **private**. Two public repos are force-pushed
-content snapshots (no history, never edit them directly — the next
-export overwrites everything):
+This monorepo is **public again** (flipped back 2026-08-30: the
+private stretch after the R228 restructure billed every Actions
+minute against the org's free pool — 11,689 minutes exhausted it and
+all workflows started refusing with zero-step instant failures;
+public repos get free minutes; a secret scan of tracked content and
+post-privatization history preceded the flip). The deploy pipeline
+still uses two public snapshot repos — do NOT re-point Pages at the
+monorepo; the site-repo pipeline is certified and the domain claim
+lives there. Both snapshots are force-pushed content exports (no
+history, never edit them directly — the next export overwrites
+everything):
 
 - `AgentVisorAI/agentvisorai.github.io` — the ASSEMBLED site.
   `pages.yml` builds (rustdoc + terser) and pushes over SSH using the
   `SITE_DEPLOY_KEY` secret. Its Pages serves `agentvisorai.me`
   (legacy branch build off `main`, `.nojekyll` in the artifact).
-  The org is on the free plan: Pages cannot serve from a private
-  repo, which is why the site lives in a public artifact repo.
 - `AgentVisorAI/agentvisor` — the public binary tool: the Rust
   workspace + every compile-time-included path + the offline
   verifier at `tools/verify-receipt.mjs`. `publish-tool.yml` exports
-  an explicit INCLUDE list (private-by-default) via
-  `TOOL_DEPLOY_KEY`. If a crate gains a new `include_str!` outside
-  the list, the public build breaks — extend the list AND the
-  workflow's `paths:` trigger.
+  an explicit INCLUDE list via `TOOL_DEPLOY_KEY`. If a crate gains a
+  new `include_str!` outside the list, the public build breaks —
+  extend the list AND the workflow's `paths:` trigger.
 
-Public site pages must link `github.com/AgentVisorAI/agentvisor`
-(the monorepo 404s for outsiders).
+Public site pages link `github.com/AgentVisorAI/agentvisor` (the
+curated tool repo) — keep it that way even while the monorepo is
+public; the tool repo is the stable public artifact. deploy.yml's
+attestation steps gate on `!github.event.repository.private` (the
+attestations API 403s for private repos on this plan) and resume
+automatically on pushes made while public. If the repo ever goes
+private again, budget Actions minutes FIRST.
