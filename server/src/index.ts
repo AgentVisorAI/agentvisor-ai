@@ -434,7 +434,7 @@ async function main(): Promise<void> {
       type: "about:blank",
       title: reply.statusCode === 500 ? "Internal Server Error" : "Request Failed",
       status: reply.statusCode,
-      detail: legacy.error,
+      detail: problemDetail(legacy.error),
       instance: req.url,
       errorCode: legacy.error,
       requestId: String(req.id),
@@ -442,7 +442,45 @@ async function main(): Promise<void> {
     return JSON.stringify(problem);
   });
 
-  // RFC 7807 Problem+JSON error envelope. Every non-2xx response goes
+  // RFC 7807 §3.1: `detail` is "a human-readable explanation specific to
+// this occurrence" — but every route writes terse machine slugs
+// (`deployment_name_in_use`), and until R284 the transform copied the
+// slug straight into `detail`, so the SPA's toasts showed raw
+// machine text to humans (`errorCode` already carries the slug for
+// SDKs). Curated copy for the user-facing slugs the console actually
+// renders; everything else gets a readable underscores→spaces
+// fallback. Keys must match the exact slug a route sends.
+const PROBLEM_DETAIL_COPY: Record<string, string> = {
+  unauthenticated: "You need to sign in to do that.",
+  invalid_credentials: "Incorrect email or password.",
+  invalid_password: "Incorrect password.",
+  email_in_use: "That email already has an account.",
+  deployment_name_in_use: "That deployment name is already in use.",
+  forbidden: "You don't have permission to do that.",
+  not_found: "That resource doesn't exist (it may have been deleted).",
+  invalid_input: "Some fields are missing or invalid.",
+  invalid_cursor: "That page reference has expired — reload the list.",
+  cookie_session_required: "This action requires a signed-in browser session.",
+  concurrent_modification_retry: "Someone else changed this at the same time — try again.",
+  cannot_grant_role_above_own: "You can't grant a role higher than your own.",
+  cannot_revoke_role_above_own: "You can't revoke a role higher than your own.",
+  cannot_mutate_target_above_own_rank: "You can't modify a member above your own role.",
+  last_owner: "An organization needs at least one owner.",
+  would_lock_yourself_out: "That change would lock you out of this workspace.",
+  webhook_paused: "This webhook is paused — resume it first.",
+  invalid_token: "That link is invalid or has expired.",
+  unknown_session: "That session doesn't exist.",
+};
+
+function problemDetail(slug: string): string {
+  const curated = PROBLEM_DETAIL_COPY[slug];
+  if (curated) return curated;
+  // Readable fallback: "spool_prune_failed" -> "Spool prune failed."
+  const words = slug.replace(/_/g, " ").trim();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) + "." : slug;
+}
+
+
   // through this handler so clients see one stable shape:
   //
   //   { type, title, status, detail, instance, errorCode, requestId }
