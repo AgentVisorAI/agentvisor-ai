@@ -5421,6 +5421,18 @@
 
   /* ---------- go ---------- */
 
+  // The datasource script is a hard dependency: if it never executed
+  // (network abort, corporate proxy stripping one file, a 404 mid-
+  // deploy) every later render throws on state.ds.* AFTER boot() has
+  // pacified the crash guard — the login page cleared #app, died on
+  // ds.getSSO(), and the guard logged it as post-boot noise: a
+  // permanent blank page the 6s watchdog could no longer see. Fail
+  // the boot EXPLICITLY instead so the guard's card (with Reload)
+  // takes over.
+  if (!state.ds) {
+    throw new Error("The console's data layer failed to load (datasource.js). A deploy may be mid-flight, or your network is blocking scripts.");
+  }
+
   boot().then(function () {
     // Handshake with crash-guard.js: boot completed, so the boot-time
     // crash card stands down (post-boot errors are logged, not fatal)
