@@ -158,7 +158,13 @@ catalog at the bottom.
     squeeze into the fresh window) and receipts sign the DISPLAYED
     fresh values. Chronology is monotonic: org.created(t0) → defaults
     seeded → deployment.create → pubkey_first_set → sessions — nothing
-    may predate t0 (drill check 33). Showcase-only
+    may predate t0, and every derivation reads ONE stable epoch
+    (freshT0Ms(), the raw storage value): recomputing `Date.now()−el`
+    took a second clock read a millisecond later, so each fetch
+    re-timed the workspace by its own jitter and a receipt fetched
+    twice signed different bytes (drill check 33 caught the 1ms
+    straddle once in dozens of runs — clock reads are per-derivation
+    nondeterminism, hoist them). Showcase-only
     affordances hide there too: the guided tour (launcher pill,
     palette entry, AND `?tour=1` autostart — it narrates Northwind's
     numbers) and the 30-day-dataset toggle (fresh `listSessions`

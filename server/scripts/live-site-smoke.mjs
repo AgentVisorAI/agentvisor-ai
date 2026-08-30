@@ -262,7 +262,7 @@ console.log("✅ Environment pill present: " + pillText);
   if (!body.startsWith("#!/bin/sh")) fail("install.sh is not a POSIX script (starts: " + body.slice(0, 30) + ")");
   if (!/REPO="https:\/\/github\.com\/AgentVisorAI\/agentvisor"/.test(body) || !/cargo install --locked --git "\$REPO"/.test(body))
     fail("install.sh does not install from the public repo");
-  if (!/agentvisord start --token/.test(body)) fail("install.sh next-steps missing the daemon start line");
+  if (!/avctl setup/.test(body)) fail("install.sh next-steps missing the guided avctl setup line");
   console.log("✅ install promise: " + url + " serves the real installer (public-repo cargo install + start hint)");
 }
 
