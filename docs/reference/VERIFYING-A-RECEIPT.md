@@ -124,18 +124,21 @@ attackers' subject, not yours.
 The exact JCS + Ed25519 sequence `avctl` runs is:
 
 ```rust
-use av_receipts::Receipt;
-use av_receipts::keys::Keyring;
+use av_receipts::{Keyring, Receipt};
 
 let bytes = std::fs::read("receipt.json")?;
 let receipt: Receipt = serde_json::from_slice(&bytes)?;
 
 let mut ring = Keyring::new();
-ring.add_key_bytes(&hex::decode(trusted_public_key_hex)?)?;
+let key: [u8; 32] = hex::decode(trusted_public_key_hex)?
+    .try_into()
+    .map_err(|_| anyhow::anyhow!("trusted key must be 32 bytes"))?;
+ring.add_key_bytes(&key)?;
 
-// verify returns Ok(()) only if the canonical subject bytes signed
-// by any pinned key match the receipt's signature.
-ring.verify(&receipt)?;
+// verify returns Ok(()) only if the receipt's canonical body bytes
+// verify under ring's key for the receipt's `key_id` — and the
+// embedded public key matches those pinned bytes (anti-substitution).
+receipt.verify(&ring)?;
 ```
 
 The `Keyring::verify` path calls `verify_strict` under the hood and

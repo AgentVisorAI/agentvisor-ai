@@ -361,4 +361,19 @@ relative markdown link in every tracked .md on every PR (fenced code
 blocks stripped — link syntax inside ``` is example text). When a
 reference doc links a ROOT file, confirm the target is in
 publish-tool.yml's export list too, or the public copy 404s even
-though the monorepo link resolves.
+though the monorepo link resolves. The promise class extends to CODE
+SNIPPETS and MOCK TERMINALS (R281): VERIFYING-A-RECEIPT.md's §5 Rust
+snippet NEVER COMPILED (inverted receiver `ring.verify(&receipt)`;
+`Vec<u8>` into `add_key_bytes(&[u8; 32])`), and the landing page's
+#try-it terminal showed prompts the wizard never printed ("Pick a
+provider", "chmod 600", "Start now?"). Both fixed against EXECUTED
+reality (the whole doc ran verbatim: pubkey/banner parity, sha256-stem
+locate, hex+base64+multi-key verify, tamper/relabel/v3/weak-key/
+malformed failures, §5a reimplemented from prose in Python byte-exact
+against a real daemon receipt, event-tail replay, incarnation
+archiving). Guards: av-receipts tests/doc_walkthrough.rs (§5 snippet
+text + executed twin, §5a domain-tag/field-count/framing pins, §4
+key_id derivation) and av-cli setup.rs
+landing_page_mock_terminal_matches_real_wizard_output (menu couples to
+WIZARD_MENU; every shown line pinned to BOTH setup.rs source and the
+HTML).
