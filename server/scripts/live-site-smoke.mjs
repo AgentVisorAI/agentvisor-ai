@@ -315,6 +315,17 @@ console.log("✅ Environment pill present: " + pillText);
   });
   for (const t of cueTruth)
     if (t.problems.length) fail("caption cue timing broken for " + t.src + ": " + t.problems.join("; "));
+  // R285: both films carry BURNED-IN captions (compose.sh drawtext).
+  // A `default` attribute on a <track> makes browsers render the VTT
+  // on top of the burned-ins — every line twice (shipped that way
+  // until PR #284). Tracks must stay opt-in.
+  const defaulted = await page.evaluate(() =>
+    Array.from(document.querySelectorAll("video track[default]")).map(
+      (t) => (t.closest("video")?.currentSrc || "").split("/").pop()
+    )
+  );
+  if (defaulted.length)
+    fail("defaulted caption track over burned-in footage (double captions): " + defaulted.join(", "));
   await page.close();
   console.log("✅ video truth: both MP4s decode metadata (pitch " + pitch.dur + "s, tour " + tour.dur + "s), zero MediaErrors, cue grids fit the footage (" + cueTruth.map((t) => t.cues).join("+") + " cues)");
 }
