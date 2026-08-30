@@ -243,6 +243,19 @@ equivalent yet): `policy.created/updated/enabled/disabled` and
 Never invent a slug — check audit.ts first; the audit chips
 self-generate from the category prefix, so a renamed slug silently
 re-files its rows.
+
+**Receipts exist only at seal**: the real API 404s a running session's
+receipt (the daemon posts it AT seal) and the console renders "No
+signed receipt yet". Mock `getReceipt` mirrors this for
+`status === "in_progress"` with the SAME note string — signing a
+running session showed "✓ verified" on bytes that then CHANGED at
+seal, the exact opposite of the tamper-evidence pitch. The detail
+header's Copy/Share/Download disable (with the reason in `title`)
+while unsealed; Print stays (it truthfully prints the trail + note).
+The attack demo's staged rerenders pass the session id so a viewer
+parked on the detail page sees the panel flip live at seal+300ms
+(the random subscribe tick almost never matches that session id) —
+drill check 2 pins the whole unsealed→sealed transition.
 | `live-site-smoke.mjs` | 10 checks: link/media crawl, captions, alias stubs, 404, OG/Twitter link previews, video-metadata truth (durations + zero MediaErrors) |
 | `a11y-audit.mjs` | 46 axe scans: 11 routes + 9 modal states × 2 themes, 3 static pages × 2 schemes |
 | `mobile-smoke.mjs` | phone/tablet: tab bar, taps, modals fit + hittable + stacking, static pages |
