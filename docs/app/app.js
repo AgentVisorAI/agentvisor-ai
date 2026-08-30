@@ -1620,9 +1620,14 @@
   async function runAttackDemo() {
     if (attackRunning || !attackReady()) return;
     attackRunning = true;
-    var rerender = function () {
+    var rerender = function (id) {
       var p = state.route.path[0] || "overview";
       if (p === "overview" || (p === "sessions" && !state.route.path[1])) render();
+      // Viewing the attack session itself: quiet-refresh it so the
+      // block lands live and the receipt panel + header buttons flip
+      // from "no receipt yet" to signed the moment the seal happens
+      // (the random subscribe tick rarely matches this session id).
+      else if (p === "sessions" && id && state.route.path[1] === id) scheduleSessionDetailRefresh(id);
     };
     // R204 F1: wrap the async body in try/finally so `attackRunning`
     // clears on every exit path — prior shape only cleared inside
@@ -1641,16 +1646,16 @@
     try {
       toast("vendor-onboarding picked up an invoice email…");
       var info = await state.ds.simulateAttack();
-      setTimeout(rerender, 250);
+      setTimeout(function () { rerender(info.id); }, 250);
       setTimeout(function () {
         toast('create_payment("' + info.vendor + '") — vendor not on the approved list. BLOCKED', true);
-        rerender();
+        rerender(info.id);
       }, info.blockAtMs + 200);
       // Await the final stage before releasing the flag so the
       // button stays disabled through the entire animation.
       await new Promise(function (resolve) {
         setTimeout(function () {
-          rerender();
+          rerender(info.id);
           setTimeout(function () {
             var st = document.querySelector(".stat.savings");
             if (st) st.classList.add("av-pulse");
@@ -2273,8 +2278,16 @@
       "</span> ";
     }
 
+    // Receipt-dependent actions are honest about sealing: a running
+    // session has no signed receipt yet (real API 404s; mock mirrors),
+    // so Copy/Share/Download would bundle a placeholder note — disable
+    // them with the reason until the seal lands (the quiet refresh
+    // re-renders and arms them the moment it does). Print stays: the
+    // evidence pack truthfully prints the trail + "no receipt yet".
+    var unsealed = !!(receipt && receipt.note);
+    var rcptDis = unsealed ? ' disabled title="Available when the session seals — the daemon signs the receipt at seal"' : "";
     main.innerHTML =
-      pageHeader("Session " + s.externalId, s.agent + " · " + (s.user || "—") + " · " + (s.model || ""), '<a href="' + esc(backToListUrl("sessions")) + '" class="btn">← All sessions</a> ' + nav + '<button class="btn" id="printPack" title="Print this page as a clean evidence pack — receipt and event trail included">🖨 Print evidence pack</button> <button class="btn" id="copyRcpt">Copy receipt</button> <button class="btn" id="shareRcpt">🔗 Share verify link</button> <button class="btn accent" id="dlRcpt">↓ Download receipt</button>') +
+      pageHeader("Session " + s.externalId, s.agent + " · " + (s.user || "—") + " · " + (s.model || ""), '<a href="' + esc(backToListUrl("sessions")) + '" class="btn">← All sessions</a> ' + nav + '<button class="btn" id="printPack" title="Print this page as a clean evidence pack — receipt and event trail included">🖨 Print evidence pack</button> <button class="btn" id="copyRcpt"' + rcptDis + '>Copy receipt</button> <button class="btn" id="shareRcpt"' + rcptDis + '>🔗 Share verify link</button> <button class="btn accent" id="dlRcpt"' + rcptDis + '>↓ Download receipt</button>') +
       '<div class="session-summary">' +
         cell("Events", s.events, "streamed") +
         cell("Allowed", s.toolsAllowed, "tool calls") +
