@@ -96,6 +96,32 @@ for (const { name, device } of profiles) {
     if (nav.hash !== "#/sessions" || nav.active !== "#/sessions") fail(`${name}: tab navigation broken: ${JSON.stringify(nav)}`);
     console.log("✅ bottom tab bar: 5 tabs, tap navigates, active state follows");
 
+    // R286 (user report): the topbar crushed at phone widths — the
+    // search trigger shrank to ~31px with the ⌘K kbd bleeding outside
+    // and the avatar squashed to 9px. Assert the bar fits, nothing
+    // inside is clipped, the search button keeps a >=40px tap target,
+    // and the avatar keeps its full size.
+    const topbar = await page.evaluate(() => {
+      const bar = document.querySelector(".topbar");
+      const out = { overflow: bar.scrollWidth > bar.clientWidth + 1, clipped: [], search: null, avatar: null };
+      for (const el of bar.querySelectorAll("button, a, span.env-pill")) {
+        if (el.offsetParent === null) continue;
+        if (el.scrollWidth > el.clientWidth + 1)
+          out.clipped.push(el.className.split(" ")[0] || el.tagName);
+      }
+      const s = document.querySelector(".topbar .cmdk-trigger")?.getBoundingClientRect();
+      out.search = s ? { w: Math.round(s.width), h: Math.round(s.height) } : null;
+      const a = document.querySelector(".topbar .avatar")?.getBoundingClientRect();
+      out.avatar = a ? Math.round(a.width) : null;
+      return out;
+    });
+    if (topbar.overflow) fail(`${name}: topbar overflows horizontally`);
+    if (topbar.clipped.length) fail(`${name}: topbar items clipped: ${topbar.clipped.join(", ")}`);
+    if (!topbar.search || topbar.search.w < 40 || topbar.search.h < 40)
+      fail(`${name}: search trigger below 40px tap target: ${JSON.stringify(topbar.search)}`);
+    if (!topbar.avatar || topbar.avatar < 20) fail(`${name}: avatar squashed to ${topbar.avatar}px`);
+    console.log("✅ topbar: fits, nothing clipped, search " + topbar.search.w + "x" + topbar.search.h + ", avatar " + topbar.avatar + "px");
+
     // Tap interactions that keyboard-first desktop testing never
     // exercises: the palette via the topbar search button, and the
     // event drawer via a row tap.

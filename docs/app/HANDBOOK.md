@@ -392,6 +392,15 @@ labels); pinned in av-harness/tests/operations_doc.rs. Video caption
 grids: both VTTs kept the pre-R275 30s/130s grid — final cues ended
 after the (re-shot) footage; smoke's video-truth leg now parses cue
 timing in-browser (sorted, non-overlapping, last cue ≤ duration).
+Mobile topbar (R286, user report "header on mobile is quite
+compressed"): between 341–760px the old rules let flex crush the
+right cluster — search trigger at ~31px with the ⌘K kbd bleeding
+outside its border, avatar squashed to 9px beside a 3-char email. Now:
+icon-only 42px search button (placeholder AND kbd hidden — ⌘K is a
+hardware-keyboard affordance), flex-shrink:0 across the cluster,
+email hidden ≤480px (avatar-only chip; the account menu shows the full
+email). Guard: mobile-smoke topbar leg (fits, nothing clipped, ≥40px
+search tap target, avatar ≥20px).
 API-MODE BROWSER TRUTH (R284): the api-mode console was never driven
 in a real browser until R284 — Node-fetch E2E can't see the meta CSP
 (connect-src allowed ONLY api.agentvisorai.me: every self-hosted
