@@ -1483,6 +1483,16 @@
      * trail. Every aggregate (overview stats, charts, policy hit
      * counts) recomputes from MOCK_SESSIONS, so the whole console
      * reacts. Returns the timeline so the UI can pace its toasts. */
+    /* Sync affordance gate: in a fresh workspace the staged attack
+     * only makes sense once the daemon is connected and signing — a
+     * session can't exist without a daemon (the deployments page still
+     * says "run the install command" during the first seconds). The
+     * overview button and the palette entry both consult this so the
+     * two surfaces can't disagree. Showcase mode is always ready. */
+    freshDaemonReady() {
+      var el = freshElapsed();
+      return el == null || (el >= FRESH_CONNECT_MS && !freshRuntime().simDeleted);
+    },
     async simulateAttack() {
       var n = ++mockState.liveAttackSeq;
       var value = [4750, 2980, 6200, 1840, 9300][(n - 1) % 5];
