@@ -169,6 +169,11 @@ jobs:
           cp docs/mockup/index.html "$site/mockup/"
           cp docs/demo/index.html "$site/demo/"
           cp docs/404.html "$site/404.html"
+          # Machine surfaces: browsers auto-request /favicon.ico on
+          # every visit (404'd since launch); robots.txt makes the
+          # allow-all policy explicit instead of a 404.
+          cp docs/favicon.ico "$site/favicon.ico"
+          cp docs/robots.txt "$site/robots.txt"
           # Custom-domain marker for GitHub Pages. Without a CNAME file in
           # the published artifact, Pages resets the configured custom
           # domain on each deploy.
