@@ -18,7 +18,7 @@
 # For fully reproducible builds, replace the tag with a digest, e.g.
 # `node:22-slim@sha256:<sha>`. Fetch the current digest with:
 #   docker manifest inspect node:22-slim | grep digest | head -1
-FROM node:22-slim AS build
+FROM node:26-slim AS build
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -39,7 +39,7 @@ RUN npm run build
 # of image size for one less pruning-caused footgun is worth it.
 
 # ---------- runtime stage ----------
-FROM node:22-slim AS runtime
+FROM node:26-slim AS runtime
 WORKDIR /app
 ENV NODE_ENV=production \
     NPM_CONFIG_UPDATE_NOTIFIER=false \
