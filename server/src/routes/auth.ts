@@ -952,6 +952,36 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(401).send({ error: "invalid_password" });
     }
 
+    // Owner-only is necessary but not sufficient: the org may have
+    // other members — including co-owners (canGrantRole lets an owner
+    // promote peers, and members.ts's last-owner transactions exist
+    // precisely because multi-owner orgs are expected). One owner's
+    // password must not be able to erase every other member's
+    // deployments, sessions, receipts and audit trail in a single
+    // unilateral call. Require the caller to be the org's sole member:
+    // everyone else must first leave or be removed through the members
+    // flow (which enforces last-owner semantics on the way out). The
+    // count is re-checked inside the transaction below to close the
+    // race with a concurrent invite acceptance.
+    const otherMembers = await db.membership.count({
+      where: { orgId: claims.orgId, NOT: { userId: claims.sub } },
+    });
+    if (otherMembers > 0) {
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "auth.step_up_denied",
+          actorId: claims.sub,
+          actorEmail: user.email,
+          note: "org_has_other_members",
+          metadata: { endpoint: "me.delete_account", otherMembers },
+          req,
+        },
+        req.log,
+      );
+      return reply.code(409).send({ error: "org_has_other_members" });
+    }
+
     // R97 F-A: emit a forensic breadcrumb BEFORE the tx runs. This
     // is the most catastrophic action in the whole codebase — the
     // org row + every child cascades (deployments, sessions,
@@ -991,35 +1021,68 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       "org_delete_initiated",
     );
 
-    await db.$transaction(async (tx) => {
-      // Delete the org first — cascades to deployments, sessions,
-      // events, receipts, receipts, memberships, api keys,
-      // webhooks (+ deliveries), saml configs, saml replay
-      // records, invites, and this org's audit_entries. The
-      // R97 F-A log line above is the durable forensic trace.
-      await tx.org.delete({ where: { id: claims.orgId } });
-      // Then remove the user. Other orgs they belonged to (unlikely
-      // at MVP; multi-org membership not exposed yet) would keep them.
-      const otherMemberships = await tx.membership.count({
-        where: { userId: claims.sub },
+    const ORG_HAS_OTHER_MEMBERS = "org_has_other_members";
+    try {
+      await db.$transaction(async (tx) => {
+        // Race-safe recheck of the pre-transaction guard above: an
+        // invite accepted between the check and this commit must not
+        // be cascaded away by a delete that was authorized when the
+        // caller was still alone.
+        const membersAtCommit = await tx.membership.count({
+          where: { orgId: claims.orgId, NOT: { userId: claims.sub } },
+        });
+        if (membersAtCommit > 0) {
+          throw new Error(ORG_HAS_OTHER_MEMBERS);
+        }
+        // Delete the org first — cascades to deployments, sessions,
+        // events, receipts, receipts, memberships, api keys,
+        // webhooks (+ deliveries), saml configs, saml replay
+        // records, invites, and this org's audit_entries. The
+        // R97 F-A log line above is the durable forensic trace.
+        await tx.org.delete({ where: { id: claims.orgId } });
+        // Then remove the user. Other orgs they belonged to (unlikely
+        // at MVP; multi-org membership not exposed yet) would keep them.
+        const otherMemberships = await tx.membership.count({
+          where: { userId: claims.sub },
+        });
+        if (otherMemberships === 0) {
+          await tx.user.delete({ where: { id: claims.sub } });
+        }
+      }, {
+        // R98 F1: Prisma's default $transaction timeout is 5 s, which
+        // is not survivable for the whole-org cascade tree on any
+        // realistic tenant (a month of steady ingest = 100k+ events,
+        // a handful of deployments). Prior shape tripped P2028 and
+        // rolled back — org survived, user got a 500, but the R97
+        // F-A org_delete_initiated warn line was already durable in
+        // Datadog/Loki. SOC-2 evidence for tenant erasure asserted
+        // a delete that never happened → worse than nothing. Bump
+        // to 60 s (matches R95 F1 shape); maxWait 10 s prevents
+        // queue-storm 429s under contention.
+        timeout: 60_000,
+        maxWait: 10_000,
       });
-      if (otherMemberships === 0) {
-        await tx.user.delete({ where: { id: claims.sub } });
+    } catch (err) {
+      if (err instanceof Error && err.message === ORG_HAS_OTHER_MEMBERS) {
+        // Lost the race with an invite acceptance: the org gained a
+        // member after the pre-transaction guard passed. Same refusal
+        // as the fast path above.
+        writeAudit(
+          {
+            orgId: claims.orgId,
+            event: "auth.step_up_denied",
+            actorId: claims.sub,
+            actorEmail: user.email,
+            note: "org_has_other_members",
+            metadata: { endpoint: "me.delete_account" },
+            req,
+          },
+          req.log,
+        );
+        return reply.code(409).send({ error: "org_has_other_members" });
       }
-    }, {
-      // R98 F1: Prisma's default $transaction timeout is 5 s, which
-      // is not survivable for the whole-org cascade tree on any
-      // realistic tenant (a month of steady ingest = 100k+ events,
-      // a handful of deployments). Prior shape tripped P2028 and
-      // rolled back — org survived, user got a 500, but the R97
-      // F-A org_delete_initiated warn line was already durable in
-      // Datadog/Loki. SOC-2 evidence for tenant erasure asserted
-      // a delete that never happened → worse than nothing. Bump
-      // to 60 s (matches R95 F1 shape); maxWait 10 s prevents
-      // queue-storm 429s under contention.
-      timeout: 60_000,
-      maxWait: 10_000,
-    });
+      throw err;
+    }
 
     req.log.warn(
       {

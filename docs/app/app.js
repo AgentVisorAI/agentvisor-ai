@@ -304,6 +304,7 @@
     }, 700);
   }
   var _sdT;
+  var _sdSeq = 0;
   function scheduleSessionDetailRefresh(id) {
     clearTimeout(_sdT);
     _sdT = setTimeout(async function () {
@@ -314,8 +315,14 @@
       // page with the error card mid-stream. Now a failure just skips
       // this refresh, and success repaints without a skeleton flash.
       try {
+        // Monotonic token (same pattern as _sessionsFetchSeq): the
+        // route check alone can't stop an older in-flight fetch pair
+        // from resolving after a newer one and repainting the detail
+        // page with stale counters.
+        var mySeq = ++_sdSeq;
         var data = await state.ds.getSessionById(id);
         var receipt = await state.ds.getReceipt(id);
+        if (mySeq !== _sdSeq) return;
         if (state.route && state.route.path[0] === "sessions" && state.route.path[1] === id) {
           renderSessionDetail(main, id, { data: data, receipt: receipt });
         }
@@ -328,6 +335,12 @@
     _slT = setTimeout(async function () {
       var main = document.getElementById("view");
       if (!(main && state.route && state.route.path[0] === "sessions" && !state.route.path[1])) return;
+      // The user paged beyond the first page with "Load more": this
+      // refresh only re-fetches page one and would wholesale-replace
+      // sessionsLoaded, snapping the list back to 50 rows and losing
+      // their place on every live event. Leave the paged view alone —
+      // a filter change or navigation re-renders from scratch anyway.
+      if (sessionsLoaded.length > sessionsPageSize) return;
       // Fetch first, repaint on success only: no skeleton flash, and a
       // transient failure skips the refresh instead of nuking the list
       // (renderSessionsBody restores in-flight search keystrokes).
@@ -1252,6 +1265,14 @@
             var left = err.retryAfterSec;
             btn.disabled = true;
             var iv = setInterval(function () {
+              // Route change replaces #view content without a page
+              // reload; stop ticking once the button is detached
+              // instead of writing into a dead subtree for up to a
+              // minute.
+              if (!document.body.contains(btn)) {
+                clearInterval(iv);
+                return;
+              }
               left -= 1;
               if (left <= 0) {
                 clearInterval(iv);

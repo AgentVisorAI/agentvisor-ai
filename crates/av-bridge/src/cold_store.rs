@@ -159,9 +159,14 @@ impl ColdArchive {
         self.commit(topic, &event_uid, event.offset)
     }
 
-    pub(crate) fn stage(&self, topic: &str, event: &StoredEvent, event_uid: &str) -> Result<(), BusError> {
+    /// Records the durable publish intent for `event_uid`. Returns
+    /// `Ok(true)` when a matching intent for this UID already existed —
+    /// i.e. this publish is a retry of an earlier attempt that staged
+    /// (and possibly produced) before completing — and `Ok(false)` for a
+    /// freshly-created intent or a topic with no cold target.
+    pub(crate) fn stage(&self, topic: &str, event: &StoredEvent, event_uid: &str) -> Result<bool, BusError> {
         if !self.targets.contains_key(topic) {
-            return Ok(());
+            return Ok(false);
         }
         let pending = PendingColdEvent {
             topic: topic.to_owned(),
@@ -179,9 +184,10 @@ impl ColdArchive {
         if pending_path.exists() {
             let existing = read_pending(&pending_path, &self.control_key.read())?;
             validate_same_intent(&existing, &pending)?;
-            return Ok(());
+            return Ok(true);
         }
-        persist_pending(&pending_path, &pending, &self.control_key.read())
+        persist_pending(&pending_path, &pending, &self.control_key.read())?;
+        Ok(false)
     }
 
     pub(crate) fn commit(&self, topic: &str, event_uid: &str, offset: u64) -> Result<(), BusError> {

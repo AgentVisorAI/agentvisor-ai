@@ -213,7 +213,11 @@ impl Histogram {
             clippy::cast_sign_loss,
             clippy::cast_precision_loss
         )]
-        let target = ((total as f64) * q.clamp(0.0, 1.0)).ceil() as u64;
+        // Clamp to >= 1: with q = 0.0 the raw target is 0 and `cum >= 0`
+        // holds before any sample is accumulated, which would report the
+        // first bucket bound even when that bucket is empty. p0 must be
+        // the first bucket that actually contains a sample.
+        let target = (((total as f64) * q.clamp(0.0, 1.0)).ceil() as u64).max(1);
         let mut cum = 0u64;
         for (i, b) in self.bounds_us.iter().enumerate() {
             cum += self.buckets.get(i).map_or(0, |x| x.load(Ordering::Relaxed));
