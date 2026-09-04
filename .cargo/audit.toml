@@ -1,0 +1,15 @@
+# cargo-audit policy — kept in lockstep with deny.toml [advisories].
+# cargo-deny (deny.yml workflow) is the CI gate; this file exists so a
+# plain `cargo audit` run by contributors reaches the same verdict
+# instead of re-reporting advisories the project has already dispositioned.
+
+[advisories]
+# Round-44 F5 (see deny.toml for the full analysis): RUSTSEC-2023-0071
+# (Marvin Attack on `rsa` 0.9.x) is UNREACHABLE from our runtime. `rsa`
+# arrives transitively via jsonwebtoken's monolithic `rust_crypto`
+# feature; the JWT validator (crates/av-identity/src/validator.rs)
+# whitelists exactly EdDSA + HS256 and rejects any other `alg` before
+# decode, so the RSA timing side-channel code path never executes. No
+# fixed upstream release exists (RustCrypto/RSA#626). Revisit if
+# jsonwebtoken splits the feature or a fixed `rsa` ships.
+ignore = ["RUSTSEC-2023-0071"]

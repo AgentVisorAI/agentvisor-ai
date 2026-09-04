@@ -281,10 +281,16 @@ exercised against release binaries in CI on every push
   RUSTSEC-2025-0134); brings native SASL SCRAM support.
 - `object_store` 0.12 → 0.14, closing the quick-xml unbounded-allocation
   advisory.
+- `wasmtime` 47.0.3 → 47.0.4, closing RUSTSEC-2026-0269 (filesystem
+  sandbox escape via trailing-slash paths/symlinks, high) and
+  RUSTSEC-2026-0268 (guest-controlled host heap allocation through
+  WASIp3 streams); yanked `chacha20` 0.10.1 replaced with 0.10.2 in
+  both lockfiles.
 - Known accepted advisory: RUSTSEC-2023-0071 (`rsa`, Marvin timing
   side-channel) enters the tree transitively via `jsonwebtoken`; the JWT
   validator accepts only EdDSA and HS256, so the RSA code path is
-  unreachable. Documented in `deny.toml`.
+  unreachable. Documented in `deny.toml` and mirrored in
+  `.cargo/audit.toml` so plain `cargo audit` runs reach the same verdict.
 - CI supply chain: every third-party GitHub Action pinned to a commit
   SHA; Python helper dependencies pinned exactly with their transitive
   closure.
