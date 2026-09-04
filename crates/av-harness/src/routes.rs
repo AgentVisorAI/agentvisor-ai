@@ -4214,20 +4214,30 @@ impl Drop for AbortFinalizingStream {
         // A client disconnect must
         // not seal the whole conversation. Spawn the background close
         // ONLY when this abort left nothing capturable AND no
-        // concurrent stream is in flight — the ephemeral one-shot
-        // case where the session would otherwise linger as an empty
-        // husk until the idle sweeper. In every other case the
-        // session stays OPEN: the truncated turn was recorded above
-        // via response capture, a client retrying with the same
-        // session id keeps working, and the idle sweeper finalizes
-        // if the client never comes back. This was the direct
-        // trigger for the §6.1 recycled-id artifact destruction.
+        // concurrent stream is in flight AND the session is an
+        // ephemeral one-shot (no client X-AV-Session) — the case
+        // where the session would otherwise linger as an empty
+        // husk until the idle sweeper: the client never learned the
+        // generated id, so no future turn can address it. In every
+        // other case the session stays OPEN: the truncated turn was
+        // recorded above via response capture, a client retrying with
+        // the same session id keeps working, and the idle sweeper
+        // finalizes if the client never comes back. This was the
+        // direct trigger for the §6.1 recycled-id artifact
+        // destruction. Without the `ephemeral` gate (mirroring the
+        // completed-arm at the top of this fn), a multi-turn session
+        // whose latest turn aborted before any upstream byte arrived
+        // was force-closed with StopReason::Other; the client's next
+        // turn silently opened a NEW session under the same string id
+        // (get_or_open sees close_complete), fragmenting the audit
+        // chain that OPENAI-COMPATIBILITY.md promises stays continuous
+        // until POST /close or the idle sweeper.
         // NB: our own SessionLease is still held during this body
         // (fields drop after Drop::drop), so `> 1` means "another
         // stream besides ours".
         let nothing_captured = !self.saw_chunk && self.captured_bytes == 0;
         let other_streams = self.session.active_streams_count() > 1;
-        if !is_closed && nothing_captured && !other_streams {
+        if self.ephemeral && !is_closed && nothing_captured && !other_streams {
             let session = Arc::clone(&self.session);
             let finalizer = self.finalizer.clone();
             let session_id = session.id.clone();
@@ -6584,6 +6594,138 @@ mod tests {
             "an errored chunk's never-debited frame deltas must be rolled back \
              from charged_completion_tokens, or the terminal refund credits \
              tokens that were never debited"
+        );
+        provider.abort();
+    }
+
+    /// Builds an `AbortFinalizingStream` in the "aborted before any
+    /// upstream byte" shape: not completed, nothing captured, no pending
+    /// budget. `capture_attempted: true` short-circuits
+    /// `submit_response_capture` in drop so the test needs no worker
+    /// permits — the branch under test is the background auto-close spawn.
+    fn empty_abort_stream(
+        state: &AppState,
+        session: &Arc<crate::session::Session>,
+        identity: av_events::AgentIdentity,
+        ephemeral: bool,
+    ) -> AbortFinalizingStream {
+        AbortFinalizingStream {
+            inner: futures::stream::empty::<Result<Bytes, std::io::Error>>().boxed(),
+            session: Arc::clone(session),
+            identity,
+            response_permit: None,
+            worker: state.worker.clone(),
+            store: Arc::clone(&state.store),
+            budget: state.config.budget.clone(),
+            billed_prompt_tokens: 0,
+            principal_budget: None,
+            provider_adapter: Arc::clone(&state.provider_adapter),
+            finalizer: state.finalizer.clone(),
+            _lease: crate::session::SessionLease::new(Arc::clone(session)),
+            response_marker: None,
+            response_attempt_id: "empty-abort-attempt".into(),
+            response_message: String::new(),
+            response_reasoning: String::new(),
+            response_model: None,
+            response_finish_reason: None,
+            upstream_status: StatusCode::OK,
+            response_cost_usd_micros: 0,
+            response_tool_calls: std::collections::BTreeMap::new(),
+            response_metrics: av_events::EventMetrics::default(),
+            charged_completion_tokens: 0,
+            last_reported_completion_tokens: None,
+            last_reported_prompt_tokens: None,
+            last_reported_cached_tokens: None,
+            last_reported_cost_usd_micros: None,
+            saw_chunk: false,
+            capture_attempted: true,
+            is_sse: true,
+            protocol_buffer: Vec::new(),
+            frame_scratch: Vec::new(),
+            pending_output: std::collections::VecDeque::new(),
+            pending_budget: None,
+            captured_bytes: 0,
+            completed: false,
+            ephemeral,
+        }
+    }
+
+    /// A NON-ephemeral session (client sent `X-AV-Session`) whose turn
+    /// aborts before any upstream byte arrives must stay OPEN.
+    /// OPENAI-COMPATIBILITY.md: multi-turn sessions close only via
+    /// explicit `POST /close` or the idle sweeper. Pre-fix, the
+    /// abort-cleanup spawn at the bottom of `Drop` was missing the
+    /// `ephemeral` gate its completed-arm sibling has, so an ordinary
+    /// network blip on turn N force-closed the whole session with
+    /// `StopReason::Other`; the client's retry with the same string id
+    /// silently opened a NEW session (get_or_open sees close_complete),
+    /// fragmenting the audit chain into disjoint signed records.
+    #[tokio::test]
+    async fn non_ephemeral_empty_abort_leaves_session_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state(directory.path()).await;
+        let identity = av_events::AgentIdentity {
+            version: "1".into(),
+            charter: "c".into(),
+            instance_uid: "i".into(),
+            ttl_remaining_s: None,
+        };
+        let session = state.sessions.get_or_open(
+            "client-managed-multi-turn",
+            crate::session::Workflow::Signed,
+            &identity,
+            &state.config.breaker,
+        );
+        let stream = empty_abort_stream(&state, &session, identity, false);
+        drop(stream);
+        // Give an (erroneously) spawned background close every chance to
+        // run before asserting: yield through the runtime a few times.
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if session.is_closed() {
+                break;
+            }
+        }
+        assert!(
+            !session.is_closed(),
+            "a client-managed (non-ephemeral) session must NOT be auto-closed \
+             when a turn aborts with nothing captured — multi-turn sessions \
+             close only via POST /close or the idle sweeper, otherwise the \
+             client's retry with the same id fragments the audit chain"
+        );
+        provider.abort();
+    }
+
+    /// The intended reaping path still works: an EPHEMERAL one-shot whose
+    /// turn aborts with nothing captured is closed in the background so
+    /// it does not linger as an empty husk until the idle sweeper.
+    #[tokio::test]
+    async fn ephemeral_empty_abort_closes_session_in_background() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, provider) = test_state(directory.path()).await;
+        let identity = av_events::AgentIdentity {
+            version: "1".into(),
+            charter: "c".into(),
+            instance_uid: "i".into(),
+            ttl_remaining_s: None,
+        };
+        let session = state.sessions.get_or_open(
+            "ephemeral-empty-abort",
+            crate::session::Workflow::Signed,
+            &identity,
+            &state.config.breaker,
+        );
+        let stream = empty_abort_stream(&state, &session, identity, true);
+        drop(stream);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !session.is_closed() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            session.is_closed(),
+            "an ephemeral one-shot aborted before any upstream byte must be \
+             closed by the background abort-cleanup spawn, not linger until \
+             the idle sweeper"
         );
         provider.abort();
     }

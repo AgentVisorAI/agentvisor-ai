@@ -2496,8 +2496,15 @@ impl Finalizer {
                 .await
             {
                 Ok(_) => Ok(SignedCandidateOutcome::Recovered),
+                // Sealed-quarantine terminal: close_session_locked already
+                // marked the artifact committed and bumped
+                // av_incomplete_sessions_total. Per the outcome contract
+                // above ("set aside as capture-failed for later
+                // quarantine"), this counts as Recovered — routing it to
+                // the outer Err arm would mislabel a terminal quarantine
+                // as a transient per-session error in logs and metrics.
                 Err(FinalizeError::CaptureIncomplete) => {
-                    Err(FinalizeError::CaptureIncomplete)
+                    Ok(SignedCandidateOutcome::Recovered)
                 }
                 Err(error) => {
                     sessions.remove(&session.id);

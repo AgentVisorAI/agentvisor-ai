@@ -1424,37 +1424,60 @@ impl EmbeddedBroker {
             .ok_or_else(|| BusError::Backend("embedded offset overflow".to_owned()))?;
         if let Some(uid) = event_uid {
             part.seen_event_uids.insert(uid.to_owned(), offset);
-            let mapping = serde_json::to_string(&EventUidOffset {
-                event_uid: uid.to_owned(),
-                offset,
-            })?;
-            // Directory entry for a first-time-created sidecar is only
-            // durable after sync_directory(parent). Sync the parent when
-            // we discover we're creating the file so a subsequent power
-            // loss cannot lose the whole sidecar (which would silently
-            // convert future publish_idempotent calls into duplicate
-            // appends).
-            let sidecar_created = std::fs::symlink_metadata(&part.idempotency_path).is_err();
-            // Same 0o600 + O_NOFOLLOW discipline the segment append
-            // gets — sidecar entries are (event_uid, offset) pairs,
-            // and event_uids are session-derived identifiers.
-            let mut sidecar_options = fs::OpenOptions::new();
-            sidecar_options.create(true).append(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                sidecar_options
-                    .custom_flags(av_core::fsutil::unix_o_nofollow())
-                    .mode(0o600);
-            }
-            let mut idempotency = sidecar_options.open(&part.idempotency_path)?;
-            idempotency.write_all(mapping.as_bytes())?;
-            idempotency.write_all(b"\n")?;
-            idempotency.sync_data()?;
-            if sidecar_created {
-                if let Some(parent) = part.idempotency_path.parent() {
-                    av_core::fsutil::sync_directory(parent)?;
+            // The sidecar is a rebuildable cache: `open()` reconciles it
+            // from the segment itself (`recover_segment_event_uids` —
+            // idempotent publishes are required to embed metadata.uid),
+            // and the in-memory map updated above already serves
+            // same-process retries. The record is durable (fsynced append
+            // above), so a sidecar failure must NOT fail the publish:
+            // reporting an error for an operation whose primary effect
+            // succeeded invites the caller to re-mint the event under a
+            // fresh UID — a genuine duplicate. Log loudly and return the
+            // ack instead.
+            let sidecar_write = (|| -> Result<(), BusError> {
+                let mapping = serde_json::to_string(&EventUidOffset {
+                    event_uid: uid.to_owned(),
+                    offset,
+                })?;
+                // Directory entry for a first-time-created sidecar is only
+                // durable after sync_directory(parent). Sync the parent when
+                // we discover we're creating the file so a subsequent power
+                // loss cannot lose the whole sidecar (which would silently
+                // convert future publish_idempotent calls into duplicate
+                // appends).
+                let sidecar_created = std::fs::symlink_metadata(&part.idempotency_path).is_err();
+                // Same 0o600 + O_NOFOLLOW discipline the segment append
+                // gets — sidecar entries are (event_uid, offset) pairs,
+                // and event_uids are session-derived identifiers.
+                let mut sidecar_options = fs::OpenOptions::new();
+                sidecar_options.create(true).append(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    sidecar_options
+                        .custom_flags(av_core::fsutil::unix_o_nofollow())
+                        .mode(0o600);
                 }
+                let mut idempotency = sidecar_options.open(&part.idempotency_path)?;
+                idempotency.write_all(mapping.as_bytes())?;
+                idempotency.write_all(b"\n")?;
+                idempotency.sync_data()?;
+                if sidecar_created {
+                    if let Some(parent) = part.idempotency_path.parent() {
+                        av_core::fsutil::sync_directory(parent)?;
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = sidecar_write {
+                tracing::warn!(
+                    %error,
+                    topic,
+                    partition,
+                    offset,
+                    "idempotency sidecar append failed; the publish is durable and the \
+                     UID index will be rebuilt from the segment at the next open"
+                );
             }
         }
         Ok(PublishAck {

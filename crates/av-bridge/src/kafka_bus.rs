@@ -323,7 +323,32 @@ impl KafkaBus {
             stored_at,
         };
         if let Some(archive) = &self.cold_archive {
-            archive.stage(topic, &record, &event_uid)?;
+            let already_staged = archive.stage(topic, &record, &event_uid)?;
+            if already_staged {
+                // A prior attempt for this UID staged the intent and may
+                // have produced to the broker before its commit step
+                // failed (ENOSPC persisting the resolved offset, MAC
+                // refusal, crash). rskafka `produce` has no native dedup,
+                // so blindly re-producing would append a second record
+                // for the same logical event — a duplicate in the audit
+                // stream. Consult the partition first, exactly like the
+                // maintenance retry path does.
+                if let Some(existing) = self.find_event_by_uid(topic, key, &event_uid)? {
+                    // The event is durably on the broker; resolving the
+                    // cold intent is best-effort here. On failure the
+                    // durable intent stays queued for the maintenance
+                    // pass — do not fail a publish that succeeded.
+                    if let Err(error) = archive.commit(topic, &event_uid, existing.offset) {
+                        tracing::warn!(
+                            %error,
+                            topic,
+                            event_uid = %event_uid,
+                            "cold intent commit failed after idempotent dedup hit; left for maintenance retry"
+                        );
+                    }
+                    return Ok(existing);
+                }
+            }
         }
         let ack = self.publish_broker_only(topic, key, value, stored_at, &event_uid)?;
         if let Some(archive) = &self.cold_archive {
