@@ -70,6 +70,13 @@ async function policyCounters(
     JOIN sessions s ON s.id = e."sessionId"
     WHERE s."orgId" = ${orgId}
       AND e."policyName" IS NOT NULL
+      -- Bound the aggregation to names that exist as Policy rows:
+      -- ingest deliberately stores unknown names verbatim, so a
+      -- leaked-token daemon posting distinct names per event otherwise
+      -- made EVERY policy read group over unbounded cardinality and
+      -- build a map it then discarded (the console only joins on the
+      -- org's own policy names anyway).
+      AND e."policyName" IN (SELECT p.name FROM policies p WHERE p."orgId" = ${orgId})
       AND e."occurredAt" >= ${new Date(Date.now() - 24 * 3_600_000)}
     GROUP BY 1
   `);

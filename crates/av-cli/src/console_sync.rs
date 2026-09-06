@@ -404,7 +404,16 @@ async fn sync_receipt(
     candidate: ReceiptCandidate,
 ) -> Result<()> {
     if let Some(public_key_hex) = &candidate.public_key_hex {
-        if state.pubkey_hex_synced.as_deref() != Some(public_key_hex) {
+        let version = env!("CARGO_PKG_VERSION");
+        // Re-post when EITHER the key or the binary version changed:
+        // keying this on the pubkey alone meant version reporting
+        // stopped permanently after the first upload — an upgraded
+        // daemon kept displaying its install-time version (or NULL for
+        // installs predating version reporting) in the fleet view
+        // forever.
+        if state.pubkey_hex_synced.as_deref() != Some(public_key_hex)
+            || state.daemon_version_synced.as_deref() != Some(version)
+        {
             let _: serde_json::Value = client
                 .post_json(
                     "pubkey",
@@ -412,11 +421,12 @@ async fn sync_receipt(
                         "publicKeyHex": public_key_hex,
                         // Display metadata for the console's fleet view;
                         // never part of the server's trust decision.
-                        "daemonVersion": env!("CARGO_PKG_VERSION"),
+                        "daemonVersion": version,
                     }),
                 )
                 .await?;
             state.pubkey_hex_synced = Some(public_key_hex.clone());
+            state.daemon_version_synced = Some(version.to_owned());
         }
     }
     let _: serde_json::Value = client.post_json("sessions", &candidate.session).await?;
@@ -545,6 +555,11 @@ fn acknowledged_through(state: &SyncState, session_id: &str, max_seq: u64) -> (b
 struct SyncState {
     sessions: BTreeMap<String, SessionSyncState>,
     pubkey_hex_synced: Option<String>,
+    /// Binary version last reported alongside the pubkey — re-posts the
+    /// (idempotent) pubkey registration after an upgrade so the fleet
+    /// view tracks the running version. Old state files default to
+    /// None → one re-post on first post-upgrade sync.
+    daemon_version_synced: Option<String>,
     /// Destination binding: state is meaningful only against the
     /// console+deployment it was accumulated for. Without this, a rerun
     /// against a different deployment reused watermarks/receipt flags
@@ -1054,22 +1069,48 @@ fn scan_bridge_candidates(
                             }
                             entry.events.push(mapped.event);
                         }
-                        BridgeRecordMapping::OutsideWindow => {
+                        BridgeRecordMapping::FutureSkew => {
                             scan.events_outside_window = scan.events_outside_window.saturating_add(1);
                             // Freeze this cursor (do NOT bank): the record
-                            // stays unread so a later pass with a sane
-                            // clock window can deliver it.
+                            // stays unread so a later pass — once the wall
+                            // clock catches up or NTP corrects — delivers
+                            // it. Future skew is the ONLY retryable
+                            // out-of-window class; permanent classes bank
+                            // below so they cannot wedge the partition.
                             frozen_cursors.insert(cursor_key.clone());
                             eprintln!(
-                                "warning: bridge record at {} offset {} has a timestamp outside \
-                                 the ingest window; cursor frozen before it so it stays retryable \
-                                 (check clock skew between daemon and sync hosts)",
+                                "warning: bridge record at {} offset {} is timestamped beyond \
+                                 the ingest future-skew window; cursor frozen before it so it \
+                                 stays retryable (check clock skew between daemon and sync hosts)",
+                                sanitize_for_terminal(&cursor_key),
+                                stored.offset
+                            );
+                        }
+                        BridgeRecordMapping::AncientOrUndated => {
+                            scan.events_outside_window = scan.events_outside_window.saturating_add(1);
+                            // Permanently un-ingestible (pre-2000 or
+                            // undated): consume it. Freezing here wedged
+                            // the whole partition behind one bad record
+                            // forever — and the unread tail (session
+                            // closes, blocked tool calls) could then be
+                            // sealed out by the receipt gate.
+                            bank(stored.offset);
+                            eprintln!(
+                                "warning: bridge record at {} offset {} has a permanently \
+                                 un-ingestible timestamp; skipped (retained in the bridge log \
+                                 as evidence)",
                                 sanitize_for_terminal(&cursor_key),
                                 stored.offset
                             );
                         }
                         BridgeRecordMapping::Skipped => bank(stored.offset),
                     }
+                }
+                // A frozen cursor's tail can't bank or map — stop paging
+                // this partition instead of re-reading every remaining
+                // page on every pass (watch-mode churn).
+                if frozen_cursors.contains(&cursor_key) {
+                    break;
                 }
                 let next = page
                     .last()
@@ -1134,7 +1175,17 @@ fn bridge_offset_key(topic: &str, partition: u32) -> String {
 
 enum BridgeRecordMapping {
     Mapped(Box<BridgeMappedEvent>),
-    OutsideWindow,
+    /// Timestamp is ahead of the ingest window — a clock-skew condition
+    /// that RESOLVES with time (wall clock catches up or the sync
+    /// host's NTP corrects). The cursor freezes before the record so a
+    /// later pass re-delivers it.
+    FutureSkew,
+    /// Timestamp is permanently un-ingestible (pre-2000, or absent with
+    /// no stored_at): a pure property of the immutable stored record —
+    /// no future pass can ever deliver it. Banked and counted, exactly
+    /// like the pre-freeze behavior, so one bad record cannot
+    /// head-of-line-block its whole partition forever.
+    AncientOrUndated,
     Skipped,
 }
 
@@ -1149,10 +1200,13 @@ fn bridge_record_to_event(
         return BridgeRecordMapping::Skipped;
     };
     let Some((occurred_ms, occurred_at)) = bridge_occurred_at(value, stored.stored_at) else {
-        return BridgeRecordMapping::OutsideWindow;
+        return BridgeRecordMapping::AncientOrUndated;
     };
-    if occurred_ms < INGEST_MIN_OCCURRED_AT_MS || occurred_ms > now_ms.saturating_add(INGEST_FUTURE_SKEW_MS) {
-        return BridgeRecordMapping::OutsideWindow;
+    if occurred_ms < INGEST_MIN_OCCURRED_AT_MS {
+        return BridgeRecordMapping::AncientOrUndated;
+    }
+    if occurred_ms > now_ms.saturating_add(INGEST_FUTURE_SKEW_MS) {
+        return BridgeRecordMapping::FutureSkew;
     }
     let seq = bridge_seq(topic_idx, stored.offset);
     let agent = bounded_nonempty(
@@ -1995,7 +2049,13 @@ fn is_session_sidecar(path: &Path) -> bool {
 }
 
 fn bounded_nonempty(value: &str, max_units: usize, fallback: &str) -> String {
-    let trimmed = value.trim();
+    // JS-compatible trim: the server's zod `.trim().min(1)` uses
+    // ECMAScript whitespace, which includes U+FEFF — Rust's
+    // `char::is_whitespace` does not. A value that survives Rust's trim
+    // but empties under the server's (e.g. a lone BOM in a bridge
+    // payload's policy name) 400'd the WHOLE event batch and stuck the
+    // sync on it forever.
+    let trimmed = value.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}');
     if trimmed.is_empty() {
         fallback.to_owned()
     } else {
