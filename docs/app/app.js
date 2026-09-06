@@ -2239,6 +2239,18 @@
    * ============================================================ */
 
   async function renderSessionDetail(main, id, initial) {
+    // Live-refresh repaints (scheduleSessionDetailRefresh) rebuild this
+    // page's DOM while the operator may be mid-triage: capture the
+    // event-filter widget state from the OUTGOING DOM so the repaint
+    // doesn't silently clear their search text / kind chip (the same
+    // keystroke-preservation discipline renderSessionsBody documents
+    // for #fSearch). Scroll + selection already survive via their own
+    // mechanisms; the filter didn't.
+    var prevEvtSearchEl = document.getElementById("evtSearch");
+    var prevEvtQ = (prevEvtSearchEl && prevEvtSearchEl.value) || "";
+    var prevEvtFocus = !!prevEvtSearchEl && document.activeElement === prevEvtSearchEl;
+    var prevActiveChip = document.querySelector(".evt-filters .evt-chip.active");
+    var prevEvtKind = (prevActiveChip && prevActiveChip.getAttribute("data-kind")) || "";
     main.innerHTML = pageHeader("Session", "", '<a href="' + esc(backToListUrl("sessions")) + '" class="btn">← All sessions</a>') + loadingBlock("stats");
     var data, receipt;
     try {
@@ -2516,6 +2528,26 @@
       applyEvtFilter();
     });
     if (evtSearch) evtSearch.addEventListener("input", applyEvtFilter);
+    // Restore the pre-repaint filter state captured at function entry.
+    // Only for same-session repaints (every `initial` caller: live
+    // refresh + event-page merges) — a fresh route navigation must not
+    // inherit the previous session's filter.
+    if (initial && (prevEvtQ || prevEvtKind)) {
+      if (evtSearch && prevEvtQ) evtSearch.value = prevEvtQ;
+      if (prevEvtKind && filterWrap) {
+        $$(".evt-chip", filterWrap).forEach(function (c) {
+          var isPrev = c.getAttribute("data-kind") === prevEvtKind;
+          c.classList.toggle("active", isPrev);
+          c.setAttribute("aria-pressed", isPrev ? "true" : "false");
+        });
+        activeKind = prevEvtKind;
+      }
+      applyEvtFilter();
+      if (evtSearch && prevEvtFocus) {
+        evtSearch.focus();
+        try { evtSearch.setSelectionRange(prevEvtQ.length, prevEvtQ.length); } catch (e) {}
+      }
+    }
 
     // Story banner "Jump to the block": scroll the BLOCKED row into
     // view and open it in the drawer, so a non-technical visitor gets
