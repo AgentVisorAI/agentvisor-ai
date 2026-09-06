@@ -129,11 +129,14 @@ async fn unsigned_workflow_promote_produces_atif_trajectory_receipt() {
         state.prepare_chat(&h, chat_payload(), None).unwrap();
     }
     let session = state.sessions.get("wf-promote").unwrap();
-    state
+    let close_outcome = state
         .finalizer
         .close_session(session.clone(), StopReason::SessionClosed)
         .await
         .unwrap();
+    let FinalizeOutcome::Atif { path: atif_path } = close_outcome else {
+        panic!("unsigned close must persist an ATIF trajectory");
+    };
     let receipt = state.finalizer.promote(session.clone()).await.unwrap();
     match &receipt.body.subject {
         ReceiptSubject::AtifTrajectory {
@@ -141,7 +144,27 @@ async fn unsigned_workflow_promote_produces_atif_trajectory_receipt() {
             step_count,
             retroactive,
         } => {
-            assert_eq!(trajectory_digest.len(), 64, "digest is a sha256 hex");
+            // Bind the signed assertion to the ARTIFACT, not just its
+            // shape: verify_embedded only authenticates whatever the
+            // subject CLAIMS, so a promotion signing a constant/wrong
+            // digest or a miscounted step count previously passed.
+            let atif_bytes = std::fs::read(&atif_path).unwrap();
+            assert_eq!(
+                trajectory_digest,
+                &av_core::digest::sha256_hex(&atif_bytes),
+                "signed trajectory_digest must hash the persisted ATIF bytes"
+            );
+            let atif: Value = serde_json::from_slice(&atif_bytes).unwrap();
+            let persisted_steps = atif
+                .get("steps")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            assert_eq!(
+                *step_count,
+                u64::try_from(persisted_steps).unwrap(),
+                "signed step_count must match the persisted trajectory"
+            );
             assert!(*retroactive);
             assert!(*step_count >= 1, "promoted trajectory must have >= 1 step");
         }

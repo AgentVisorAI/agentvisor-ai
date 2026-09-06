@@ -171,10 +171,17 @@ fn embedded_pubkey_swap_is_caught_by_key_id_binding() {
     // `key_id` still names the honest signer.
     receipt.body.public_key_b64 =
         base64::engine::general_purpose::STANDARD.encode(Signer::public_key_bytes(&attacker));
-    assert!(
-        receipt.verify(&ring).is_err(),
-        "swapped embedded pubkey went undetected"
-    );
+    // Assert the SPECIFIC error: `verify` checks the key-id binding
+    // BEFORE the signature, so this must be `KeyMismatch`. A bare
+    // is_err() also passed with the binding check deleted (mutating a
+    // signed field breaks the signature anyway), leaving the derived-id
+    // gate unpinned.
+    match receipt.verify(&ring) {
+        Err(av_receipts::ReceiptError::KeyMismatch(_)) => {}
+        other => {
+            panic!("swapped embedded pubkey must fail the KEY-ID BINDING check specifically, got {other:?}")
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +208,49 @@ fn signature_high_bit_mutation_of_s_half_is_refused() {
     assert!(
         mutated.verify(&ring).is_err(),
         "non-canonical S signature was accepted"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6b. The mathematically exact non-canonical variant: S' = S + L verifies
+//     under the SAME equation as S (both reduce to the same scalar), so a
+//     verifier that reduces S modulo L before checking would accept it.
+//     Only the RFC 8032 §5.1.7 canonicality gate (S < L) refuses it. The
+//     high-bit flip in test 6 changes the equation too, so it cannot
+//     isolate this gate.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn signature_s_plus_group_order_is_refused() {
+    let s = signer();
+    let ring = ring(&s);
+    let receipt = Receipt::issue(body("sess-s-plus-l"), &s).unwrap();
+    // The untouched receipt must verify — otherwise the refusal below
+    // proves nothing.
+    receipt.verify(&ring).unwrap();
+    let mut sig_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&receipt.signature_b64)
+        .unwrap();
+    assert_eq!(sig_bytes.len(), 64);
+    // Ed25519 group order L, little-endian (RFC 8032):
+    // 2^252 + 27742317777372353535851937790883648493.
+    const L_LE: [u8; 32] = [
+        0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+    ];
+    // S' = S + L over 256-bit little-endian (S < L < 2^253, no overflow).
+    let mut carry = 0u16;
+    for i in 0..32 {
+        let sum = u16::from(sig_bytes[32 + i]) + u16::from(L_LE[i]) + carry;
+        sig_bytes[32 + i] = (sum & 0xff) as u8;
+        carry = sum >> 8;
+    }
+    assert_eq!(carry, 0, "S + L must fit in 256 bits");
+    let mut mutated = receipt.clone();
+    mutated.signature_b64 = base64::engine::general_purpose::STANDARD.encode(&sig_bytes);
+    assert!(
+        mutated.verify(&ring).is_err(),
+        "S + L (same scalar as S after reduction) was accepted — the S < L canonicality gate is missing"
     );
 }
 
@@ -328,6 +378,15 @@ fn duplicate_json_keys_cannot_smuggle_a_second_session_id() {
         1,
     );
     assert_ne!(injected, serialized, "injection point not found");
+    // The PRODUCTION wire parser (used by avctl receipt-verify and the
+    // reconciler's promote path) must refuse duplicates outright at any
+    // nesting depth — asserting only the layered plain-serde behavior
+    // below let a removal of the strict scanner pass unnoticed (plain
+    // serde last-wins to "honest", which verifies).
+    assert!(
+        Receipt::from_json_slice(injected.as_bytes()).is_err(),
+        "strict wire parser accepted a duplicate session_id — parser-differential smuggling is open"
+    );
     match serde_json::from_str::<Receipt>(&injected) {
         // Preferred: duplicate field refused outright.
         Err(_) => {}

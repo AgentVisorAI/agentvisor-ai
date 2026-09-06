@@ -113,11 +113,12 @@
       //
       // The demo sample receipt bundled with this page
       // (sample-receipt.json). Its keypair was generated once at
-      // build time and the private half was discarded. This anchor
-      // exists so "Try it with a sample" shows the full green
-      // trusted-verify experience investors will see with real
-      // daemon-signed receipts.
-      "9992e71fe6a6e5edc18129becef2ec640f9611a4e12a4b9a311bab943ab19467",
+      // re-signing time and the private half was discarded — unlike
+      // the console demo key below, nobody can mint new signatures
+      // with it. This anchor exists so "Try it with a sample" shows
+      // the full green trusted-verify experience investors will see
+      // with real daemon-signed receipts.
+      "901e153295d578bb9e53301fbcc04dd37f971578f02da771c095b691e1b819bb",
       // The mock console's fixed demo signing key (docs/app/
       // datasource.js). Receipts downloaded from the /app/ demo are
       // signed with it, so dropping one here verifies GREEN-adjacent,

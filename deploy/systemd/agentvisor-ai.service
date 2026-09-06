@@ -69,16 +69,24 @@ ExecStart=/usr/local/bin/agentvisord
 Restart=on-failure
 RestartSec=2
 
-# Round-18 F3: match the docker-compose (120 s stop_grace_period)
-# and k8s (terminationGracePeriodSeconds: 120) shutdown budgets.
+# Round-18 F3 (budget corrected this round): give the daemon room
+# for its FULL worst-case shutdown. The old comment assumed a 30 s
+# HTTP drain, but the drain phase is
+# `max(30, upstream_read_timeout_s + 5)` and the default
+# upstream_read_timeout_s is 60 — the `avctl init` template writes
+# neither key — so the real default budget is
+# 65 s drain + 30 s worker wait_idle + 30 s finalize_sessions
+# + 5 s telemetry flush = 130 s, ABOVE the previous 125 s: a
+# `systemctl restart` SIGKILLed the daemon mid-finalize, dropping
+# receipts and truncating ATIF trajectories — the exact failure
+# the compose (180 s) and k8s (150 s) budgets were raised to avoid.
 # Default systemd DefaultTimeoutStopSec is 90 s on stock installs
-# and can be as low as 30 s under distro overrides — either way
-# below the harness's documented 4-phase shutdown budget
-# (30 s HTTP drain + 30 s worker wait_idle + 30 s finalize_sessions
-# + 5 s telemetry flush). SIGKILL mid-finalize drops receipts and
-# truncates ATIF trajectories; giving the process 120 s + 5 s slack
-# for a clean systemd stop-then-SIGKILL cycle avoids that.
-TimeoutStopSec=125s
+# and can be as low as 30 s under distro overrides — always set
+# this explicitly. 180 s matches the shipped docker-compose budget
+# and covers the default config with 50 s slack; operators raising
+# upstream_read_timeout_s above ~110 s must raise this too (or set
+# shutdown_drain_timeout_s to cap the drain phase).
+TimeoutStopSec=180s
 # Deliver SIGTERM to the process group so any spawned child (rare
 # but possible via wasmtime host functions) gets a chance to run
 # its own cleanup before SIGKILL. Same posture as k8s.

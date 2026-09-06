@@ -3042,6 +3042,36 @@ spec:
         None
     }
 
+    /// deploy/systemd/agentvisor-ai.service + the `avctl init` default
+    /// config shape (which writes neither `upstream_read_timeout_s` nor
+    /// `shutdown_drain_timeout_s`, so the config-derived drain phase is
+    /// max(30, 60+5) = 65 s). The unit shipped 125 s against a 130 s
+    /// worst case for years because its comment assumed a 30 s drain —
+    /// `systemctl restart` SIGKILLed mid-finalize on any deploy whose
+    /// drain actually ran long. Same class as the compose/k8s pins
+    /// above; systemd was the one unmanaged sibling.
+    #[test]
+    fn shipped_systemd_unit_stop_timeout_fits_default_shutdown() {
+        let unit = include_str!("../../../deploy/systemd/agentvisor-ai.service");
+        let stop_timeout = unit
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("TimeoutStopSec="))
+            .and_then(|raw| raw.trim().trim_end_matches('s').parse::<u64>().ok())
+            .expect("unit file must set TimeoutStopSec explicitly");
+        // Default-shaped config: only the keys `avctl init` always writes.
+        let config =
+            HarnessConfig::from_toml("config_version = 1\nupstream_url = \"https://api.openai.com\"")
+                .unwrap();
+        assert_total_shutdown_fits(
+            "deploy/systemd/agentvisor-ai.service / avctl-init defaults",
+            &config,
+            stop_timeout,
+            // systemd has no preStop equivalent; SIGTERM is delivered
+            // immediately at `systemctl stop`.
+            0,
+        );
+    }
+
     /// `tool_upstream_url = ""` used to pass validation while runtime
     /// routing gates tool forwarding on `is_some()` — the empty string
     /// silently enabled the tool-upstream branches and only failed at the

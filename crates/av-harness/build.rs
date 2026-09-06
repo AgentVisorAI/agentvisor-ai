@@ -26,4 +26,35 @@ fn main() {
     // release tarballs / Docker / systemd / k8s as the operator-editable
     // runtime path — keep both in sync during development.
     println!("cargo:rerun-if-changed=policies/payload_limit.wat");
+    // Out-of-crate assets embedded via `include_str!` (mostly by the
+    // config/deploy PIN TESTS). Per the fingerprint-narrowing note
+    // above, once any rerun-if-changed line exists these must be
+    // listed too — otherwise editing e.g. the shipped k8s manifest or
+    // harness.docker.toml did not invalidate the test binary, and the
+    // shutdown-grace / ConfigMap pin tests kept re-asserting against
+    // the PREVIOUSLY embedded copy: exactly the drift they exist to
+    // catch went green. Existence-gated: these workspace files are
+    // absent in `cargo publish` builds (the embedding sites are
+    // test-only), and a rerun-if-changed on a missing path would
+    // force a rebuild on every invocation.
+    for asset in [
+        "../../config/harness.container.toml",
+        "../../config/harness.docker.toml",
+        "../../config/harness.example.toml",
+        "../../config/tool-schemas",
+        "../../deploy/kubernetes/agentvisor-ai.yaml",
+        "../../docker/docker-compose.minimal.yml",
+        "../../docker/docker-compose.yml",
+        "../../docs/app/pitch/console.js",
+        "../../docs/app/pitch/index.html",
+        "../../docs/reference/CONFIGURATION.md",
+        "../../docs/reference/LIMITS.md",
+        "../../docs/reference/OPENAI-COMPATIBILITY.md",
+        "../../docs/reference/OPERATIONS.md",
+        "../../docs/reference/SPOOL-AND-RECOVERY.md",
+    ] {
+        if std::path::Path::new(asset).exists() {
+            println!("cargo:rerun-if-changed={asset}");
+        }
+    }
 }
