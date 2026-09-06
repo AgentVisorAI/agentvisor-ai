@@ -3334,15 +3334,13 @@
         description: built.description, body: built.body,
       }).then(function (p) {
         close();
-        // R232 F3: server-side policy CRUD isn't wired (no
-        // /api/v1/policies route). In live mode the policy is
-        // pushed to the local MOCK_POLICIES store and lost on
-        // reload; be honest about that so operators don't
-        // deploy expecting daemon enforcement. Mock mode
-        // (marketing demo) keeps the "and enforcing" copy.
+        // Server-side policy CRUD persists to the org (POST
+        // /api/v1/policies — R232 F3 resolved); what is NOT wired yet
+        // is daemon-side enforcement sync — the daemon still enforces
+        // its local policy files. Keep that distinction honest.
         var enforcedMsg = state.ds.mode === "mock"
           ? "Policy created and enforcing — the daemon picks it up on its next sync."
-          : "Policy saved in this browser only. Server-side policy CRUD + daemon sync are preview — nothing is persisted or enforced yet.";
+          : "Policy saved to your org. Note: daemons enforce their local policy files — auto-sync from the console is not wired yet.";
         toastLink(enforcedMsg, "#/policies/" + p.id, "View policy →");
         navigate("#/policies/" + p.id);
       }).catch(function (err) {

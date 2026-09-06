@@ -190,6 +190,9 @@ enum Command {
         /// File containing the console ingest token. Overrides AV_CONSOLE_TOKEN and `[console].token_file`.
         #[arg(long)]
         token_file: Option<PathBuf>,
+        /// Embedded Bridge data directory. Overrides AV_CONSOLE_BRIDGE_DIR and `[console].bridge_dir`.
+        #[arg(long)]
+        bridge_dir: Option<PathBuf>,
         /// Keep scanning until Ctrl-C.
         #[arg(long)]
         watch: bool,
@@ -296,6 +299,7 @@ async fn run(cli: Cli) -> Result<()> {
             console_url,
             deployment,
             token_file,
+            bridge_dir,
             watch,
             interval,
             state_file,
@@ -306,6 +310,7 @@ async fn run(cli: Cli) -> Result<()> {
                 console_url,
                 deployment,
                 token_file,
+                bridge_dir,
                 watch,
                 interval,
                 state_file,
