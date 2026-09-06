@@ -181,13 +181,13 @@ enum Command {
         /// ATIF spool directory (`atif_spool_dir` in the harness config).
         #[arg(long, default_value = "spool/atif")]
         spool_dir: PathBuf,
-        /// Hosted console base URL. Overrides AV_CONSOLE_URL and [console].url.
+        /// Hosted console base URL. Overrides AV_CONSOLE_URL and `[console].url`.
         #[arg(long)]
         console_url: Option<String>,
-        /// Console deployment id. Overrides AV_CONSOLE_DEPLOYMENT and [console].deployment.
+        /// Console deployment id. Overrides AV_CONSOLE_DEPLOYMENT and `[console].deployment`.
         #[arg(long)]
         deployment: Option<String>,
-        /// File containing the console ingest token. Overrides AV_CONSOLE_TOKEN and [console].token_file.
+        /// File containing the console ingest token. Overrides AV_CONSOLE_TOKEN and `[console].token_file`.
         #[arg(long)]
         token_file: Option<PathBuf>,
         /// Keep scanning until Ctrl-C.
