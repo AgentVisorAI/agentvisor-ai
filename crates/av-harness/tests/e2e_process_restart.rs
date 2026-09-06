@@ -293,10 +293,12 @@ vector_backend = "memory"
     drop(daemon);
 }
 
-/// A daemon killed BEFORE its response completes must, on restart,
-/// quarantine the interrupted session (its in-flight marker survives
-/// the crash) while still serving fresh sessions — verifying the
-/// quarantine isolates rather than wedges the daemon.
+/// A daemon SIGKILLed inside the boot window (before recovery/serve
+/// has settled — half-written seed install, torn bridge provision,
+/// partial spool mkdir) must not brick the next boot: the restart
+/// serves fresh sessions normally. NB: this deliberately does NOT
+/// exercise a kill mid-REQUEST; the in-flight-marker quarantine path
+/// is covered by the inflight/recovery unit tests.
 #[test]
 fn sigkill_before_first_request_leaves_daemon_restartable() {
     let scratch = tempfile::tempdir().unwrap();

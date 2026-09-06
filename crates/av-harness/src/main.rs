@@ -79,6 +79,22 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
         );
     }
     let manifest = load_manifest(&config)?;
+    // Single-writer status must be established BEFORE `build_bridge`:
+    // its boot path sweeps `bridge_data_dir` of `*.tmp` files (no age
+    // or ownership guard) and `EmbeddedBroker::open` mutates on-disk
+    // state during recovery (torn-tail truncate, sidecar rewrite,
+    // append handles). Acquiring the lock only afterwards (the prior
+    // shape) meant a second daemon started against a live one — a
+    // systemd Restart= overlap, `compose up --scale 2`, a manual
+    // relaunch — would unlink the live daemon's in-flight temp files
+    // and truncate its active segment DURING the failed boot, then
+    // exit cleanly with "another instance holds the spool lock",
+    // having already corrupted the running instance's audit store.
+    // The OS releases the advisory lock on ANY exit including
+    // SIGKILL, so there is no stale-lock recovery to get wrong.
+    // Everything below (bridge sweep/recovery, orphaned-temp sweep,
+    // spool recovery, the reconciler) assumes it is the only writer.
+    let _spool_lock = acquire_spool_lock(std::path::Path::new(&config.atif_spool_dir))?;
     let bridge = build_bridge(&config, &manifest)?;
 
     let sandbox = load_sandbox(&config)?;
@@ -156,13 +172,11 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     .map_err(anyhow::Error::new)?;
     // Two daemons on one spool silently split the audit
     // trail (interleaved journals, racing reconcilers, torn ATIF
-    // artifacts). The README documents single-instance; nothing
-    // enforced it. Hold an exclusive advisory lock on a well-known
-    // spool file for the whole process lifetime — the OS releases it
-    // on ANY exit including SIGKILL, so there is no stale-lock
-    // recovery to get wrong. Everything below (orphaned-temp sweep,
-    // spool recovery, the reconciler) assumes it is the only writer.
-    let _spool_lock = acquire_spool_lock(std::path::Path::new(&config.atif_spool_dir))?;
+    // artifacts). The exclusive advisory spool lock enforcing
+    // single-instance was acquired ABOVE, before `build_bridge`
+    // (see that comment for why the bridge sweep/recovery must not
+    // run unlocked). Everything below (orphaned-temp sweep, spool
+    // recovery, the reconciler) relies on it.
     // Boot-time only (no concurrent writer exists yet): sweep temp
     // files orphaned by a SIGKILL between `create_new` and `rename` —
     // the RAII unlink cannot run across a crash, so crash loops
@@ -464,7 +478,11 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
             let _ = shutdown_started_tx.send(());
         }),
     );
-    tokio::pin!(server);
+    // `Box::pin` (not `tokio::pin!`): the stack pin macro binds the
+    // future to `run()`'s scope, so it cannot be dropped before the
+    // later shutdown phases — the explicit `drop(server)` after the
+    // select is what actually closes the accepting TcpListener.
+    let mut server = Box::pin(server);
     let result = tokio::select! {
         result = &mut server => result.context("serve AgentVisor AI"),
         _ = shutdown_started_rx => {
@@ -472,9 +490,15 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
                 Ok(result) => result.context("serve AgentVisor AI"),
                 Err(_) => {
                     drain_timeouts.inc();
-                    // Explicitly drop the pinned server future here to
-                    // stop the accepting `TcpListener` from taking new
-                    // connections while the later shutdown phases run.
+                    // The listener is closed by the `drop(server)`
+                    // below (the prior comment CLAIMED a drop here that
+                    // never existed — the pinned future lived to the
+                    // end of run(), so the kernel kept completing TCP
+                    // handshakes into a backlog nothing would ever
+                    // read: an LB's connect-probe saw success and kept
+                    // routing traffic at a dead instance for the whole
+                    // worker-drain + finalize window, and every such
+                    // connection died as an RST at process exit).
                     // Detached per-connection tasks that Axum handed
                     // off via `tokio::spawn` still leak — a full fix
                     // requires a broadcast CancellationToken threaded
@@ -488,6 +512,12 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
             }
         }
     };
+    // Consume the serve future NOW, before the later shutdown phases
+    // (worker drain ≤30 s + finalize + OTel flush). On the completed
+    // paths this is a no-op; on the drain-timeout path it closes the
+    // accepting TcpListener so new connects are refused and the LB
+    // fails over immediately instead of feeding a dead backlog.
+    drop(server);
     // R69 F1: Signal reconciler to stop instead of aborting.
     // JoinHandle::abort() cancels only the outer async task; any
     // spawn_blocking closure inside the tick body — write_atomic
