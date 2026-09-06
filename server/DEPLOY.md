@@ -141,11 +141,12 @@ Free tier gives you:
 - Automatic Let's Encrypt certificates
 - Global anycast — one deploy, seven+ regions
 
-To flip the frontend to live mode, edit `docs/app/index.html`:
+To flip the frontend to live mode, append `?live=1` to the console URL
+(sticky via `localStorage`; `?live=0` reverts), or edit `docs/app/config.js`:
 
 ```js
 window.MOCK_MODE = false;
-window.API_BASE = "https://api.agentvisorai.me/api/v1";
+window.API_BASE = "https://api.agentvisorai.me";   // origin only — paths already include /api/v1
 ```
 
 Commit + push → Pages redeploys in ~30 s.
