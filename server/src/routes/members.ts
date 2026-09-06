@@ -744,44 +744,62 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       }
     }
 
-    // R79 MEDIUM (Class B): mark the invite consumed atomically
-    // via `updateMany({ where: { id, acceptedAt: null } })` and
-    // abort on `count === 0`. Prior shape ran the membership
-    // upsert and `invite.update` inside a transaction but the
-    // update's where-clause only matched by `id` — no
-    // `acceptedAt: null` guard. Two concurrent `/invites/accept`
-    // calls with the same token both pass `verifyPassword` (same
-    // hash), both enter the transaction, both flip `acceptedAt`,
-    // both mint session cookies. Combined with a phished/stolen
-    // invite link, both attacker and legitimate invitee end up
-    // with authenticated sessions before the invite is marked
-    // consumed. `updateMany` with the null-guard makes the second
-    // caller's UPDATE affect 0 rows; we detect that and abort
-    // the whole flow.
-    const [_, inviteConsumed] = await db.$transaction([
-      db.membership.upsert({
-        where: { userId_orgId: { userId: user.id, orgId: matched.orgId } },
-        create: {
-          userId: user.id,
-          orgId: matched.orgId,
-          role: matched.role,
-        },
-        update: {}, // Already a member? Fine, just proceed.
-      }),
-      db.invite.updateMany({
-        where: {
-          id: matched.id,
-          acceptedAt: null,
-          revokedAt: null,
-        },
-        data: { acceptedAt: new Date() },
-      }),
-    ]);
-    if (inviteConsumed.count === 0) {
-      // Lost the race with another concurrent /invites/accept.
-      // The other call has already accepted this invite and
-      // minted its own session. Refuse to mint a duplicate.
-      return reply.code(409).send({ error: "invite_already_consumed" });
+    // R79 MEDIUM (Class B), rewritten: consume the invite FIRST
+    // inside an INTERACTIVE transaction, then grant the membership.
+    // Two defects in the prior batch-$transaction shape
+    // ([membership.upsert, invite.updateMany] + post-commit count
+    // check):
+    //   1. A zero-row UPDATE is not an error, so BOTH statements
+    //      committed: the caller received the 409 while their
+    //      membership grant silently persisted. The loser of two
+    //      concurrent accepts kept the membership; worse, a token
+    //      holder whose invite an admin had already REVOKED (or
+    //      that expired) between candidate lookup and the
+    //      transaction still became a member while the API
+    //      reported refusal — an access grant with no audit row.
+    //   2. The consumption predicate matched only {id, unaccepted,
+    //      unrevoked} — not the token hash or expiry — so an owner
+    //      reissuing the invite (fresh tokenHash, downgraded role)
+    //      mid-flight let the OLD token consume the NEW invite and
+    //      grant the stale pre-reissue role.
+    // Now: the updateMany predicate pins the FULL verified snapshot
+    // (tokenHash + expiresAt + unaccepted + unrevoked); a count of 0
+    // throws inside the transaction so the membership upsert never
+    // commits.
+    const INVITE_NOT_CONSUMABLE = "__invite_not_consumable__";
+    try {
+      await db.$transaction(async (tx) => {
+        const consumed = await tx.invite.updateMany({
+          where: {
+            id: matched.id,
+            tokenHash: matched.tokenHash,
+            acceptedAt: null,
+            revokedAt: null,
+            expiresAt: { gt: new Date() },
+          },
+          data: { acceptedAt: new Date() },
+        });
+        if (consumed.count === 0) {
+          throw new Error(INVITE_NOT_CONSUMABLE);
+        }
+        await tx.membership.upsert({
+          where: { userId_orgId: { userId: user!.id, orgId: matched.orgId } },
+          create: {
+            userId: user!.id,
+            orgId: matched.orgId,
+            role: matched.role,
+          },
+          update: {}, // Already a member? Fine, just proceed.
+        });
+      });
+    } catch (err) {
+      if (err instanceof Error && err.message === INVITE_NOT_CONSUMABLE) {
+        // Lost the race with a concurrent accept, an admin revoke, a
+        // reissue (different tokenHash), or expiry. Nothing was
+        // granted — the transaction rolled back.
+        return reply.code(409).send({ error: "invite_already_consumed" });
+      }
+      throw err;
     }
 
     // R121 F1: refuse to mint a session cookie for a pre-existing

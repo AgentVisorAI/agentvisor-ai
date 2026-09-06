@@ -322,20 +322,30 @@ fn stringified_payout_amount_does_not_bypass_the_budget_gate() {
     // Attacker sends a huge amount as a string.
     let raw = tools_call("payout", json!({"amount_usd": "9999999"}));
     let verdict = sandbox.check(&store, "sess", &raw);
-    // Either refused, or the amount charged was 0 (safe interpretation).
-    // Under NO circumstance can the string be interpreted as 9 999 999
-    // that would blow the $10 cap silently while still allowing the call.
-    if let ToolVerdict::Allowed { .. } = verdict {
-        // If allowed, the stored payout must remain within the budget cap.
-        // Read the real budget key: budget:{sha256(session)[..32]}:payout.
-        let digest = av_core::digest::sha256_hex(b"sess");
-        let key = format!("budget:{{{}}}:payout", digest.get(..32).unwrap());
-        let spent = store.get(&key).unwrap_or(0);
-        assert!(
-            spent <= 10 * 1_000_000,
-            "stringified amount slipped past the budget: spent={spent}"
-        );
+    // extract_payout_micros fail-closes on non-numeric amounts ("must
+    // be a number" → stage "budget"), so the ONLY correct verdict is
+    // Blocked. The previous conditional shape ("either refused, or
+    // charged 0") also passed a fail-open implementation that allowed
+    // the call while charging nothing — the raw body is forwarded
+    // verbatim upstream, so an upstream that parses numeric strings
+    // would execute the $9,999,999 payout with zero budget accounting.
+    match verdict {
+        ToolVerdict::Blocked { stage, .. } => {
+            assert_eq!(
+                stage, "budget",
+                "string payout must be refused by the budget gate's number check"
+            );
+        }
+        other => panic!("stringified payout amount must be Blocked, got {other:?}"),
     }
+    // And nothing may have been charged for the refused call.
+    let digest = av_core::digest::sha256_hex(b"sess");
+    let key = format!("budget:{{{}}}:payout", digest.get(..32).unwrap());
+    let spent = store.get(&key).unwrap_or(0);
+    assert_eq!(
+        spent, 0,
+        "a blocked payout must not debit the ledger: spent={spent}"
+    );
 }
 
 // ---------------------------------------------------------------------------
