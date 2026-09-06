@@ -1,56 +1,56 @@
 {
-    "format": "agentvisor.receipt.v1",
-    "exportedAt": "2026-08-27T07:16:04.483Z",
-    "session": {
-        "id": "sess_01H9K",
-        "externalId": "sess_01H9K7GRPX",
-        "agent": "supply-planner",
-        "user": "olivia.tan@northwind.com",
-        "model": "gpt-4o",
-        "events": 42,
-        "toolsAllowed": 18,
-        "toolsBlocked": 1
+  "format": "agentvisor.receipt.v1",
+  "exportedAt": "2026-08-27T07:16:04.483Z",
+  "session": {
+    "id": "sess_01H9K",
+    "externalId": "sess_01H9K7GRPX",
+    "agent": "supply-planner",
+    "user": "olivia.tan@northwind.com",
+    "model": "gpt-4o",
+    "events": 42,
+    "toolsAllowed": 18,
+    "toolsBlocked": 1
+  },
+  "receipt": {
+    "schemaVersion": "1.0",
+    "receiptId": "rcpt_01H9K7GRPX_finalized",
+    "sessionId": "sess_01H9K7GRPX",
+    "orgId": "org_northwind",
+    "deploymentId": "dep_prod",
+    "startedAt": "2026-08-27T07:10:01.774Z",
+    "endedAt": "2026-08-27T07:14:01.774Z",
+    "eventCount": 42,
+    "tools": {
+      "allowed": 18,
+      "blocked": 1
     },
-    "receipt": {
-        "schemaVersion": "1.0",
-        "receiptId": "rcpt_01H9K7GRPX_finalized",
-        "sessionId": "sess_01H9K7GRPX",
-        "orgId": "org_northwind",
-        "deploymentId": "dep_prod",
-        "startedAt": "2026-08-27T07:10:01.774Z",
-        "endedAt": "2026-08-27T07:14:01.774Z",
-        "eventCount": 42,
-        "tools": {
-            "allowed": 18,
-            "blocked": 1
-        },
-        "spend": {
-            "llmUsdMicros": "184000",
-            "blockedActionsUsdMicros": "8400000000"
-        },
-        "policiesEnforced": [
-            "procurement.allowed_vendors",
-            "runtime.write_scope",
-            "rate.per_session_usd:10",
-            "runtime.pii_redaction"
-        ],
-        "contentHash": "sha256:90db551a2a7330b4aeeead934c8fc584da8f70a659e91a489a0fb0b331467baf",
-        "signature": "ed25519:AGeWmRSBGH25myquiPnDODwDZlpLsyYbGfbi9HguXP3NwWQtnzdnsPBICtSNr2iEAJLZ1jmmqNJw8/A3ML3gAA==",
-        "signingKeyFingerprint": "kf_573c8f249012fbb0",
-        "rawBody": "{\"schemaVersion\":\"1.0\",\"receiptId\":\"rcpt_01H9K7GRPX_finalized\",\"sessionId\":\"sess_01H9K7GRPX\",\"orgId\":\"org_northwind\",\"deploymentId\":\"dep_prod\",\"startedAt\":\"2026-08-27T07:10:01.774Z\",\"endedAt\":\"2026-08-27T07:14:01.774Z\",\"eventCount\":42,\"tools\":{\"allowed\":18,\"blocked\":1},\"spend\":{\"llmUsdMicros\":\"184000\",\"blockedActionsUsdMicros\":\"8400000000\"},\"policiesEnforced\":[\"procurement.allowed_vendors\",\"runtime.write_scope\",\"rate.per_session_usd:10\",\"runtime.pii_redaction\"],\"contentHash\":\"sha256:90db551a2a7330b4aeeead934c8fc584da8f70a659e91a489a0fb0b331467baf\"}",
-        "rawSignatureB64": "AGeWmRSBGH25myquiPnDODwDZlpLsyYbGfbi9HguXP3NwWQtnzdnsPBICtSNr2iEAJLZ1jmmqNJw8/A3ML3gAA==",
-        "publicKeyHex": "573c8f249012fbb08b3d79973411bb93141f32719c86ada25306fde5e59e8d57"
+    "spend": {
+      "llmUsdMicros": "184000",
+      "blockedActionsUsdMicros": "8400000000"
     },
-    "publicKey": {
-        "algorithm": "ed25519",
-        "hex": "573c8f249012fbb08b3d79973411bb93141f32719c86ada25306fde5e59e8d57"
-    },
-    "verifyingInstructions": {
-        "algorithm": "Ed25519",
-        "message": "receipt.rawBody (UTF-8 bytes)",
-        "signature": "base64-decode(receipt.rawSignatureB64)",
-        "publicKey": "hex-decode(publicKey.hex)",
-        "command": "node server/scripts/verify-receipt.mjs sess_01H9K7GRPX.json",
-        "docs": "https://agentvisorai.me/reference/receipts"
-    }
+    "policiesEnforced": [
+      "procurement.allowed_vendors",
+      "runtime.write_scope",
+      "rate.per_session_usd:10",
+      "runtime.pii_redaction"
+    ],
+    "contentHash": "sha256:90db551a2a7330b4aeeead934c8fc584da8f70a659e91a489a0fb0b331467baf",
+    "signature": "ed25519:AGeWmRSBGH25myquiPnDODwDZlpLsyYbGfbi9HguXP3NwWQtnzdnsPBICtSNr2iEAJLZ1jmmqNJw8/A3ML3gAA==",
+    "signingKeyFingerprint": "901e153295d578bb",
+    "rawBody": "{\"schemaVersion\":\"1.0\",\"receiptId\":\"rcpt_01H9K7GRPX_finalized\",\"sessionId\":\"sess_01H9K7GRPX\",\"orgId\":\"org_northwind\",\"deploymentId\":\"dep_prod\",\"startedAt\":\"2026-08-27T07:10:01.774Z\",\"endedAt\":\"2026-08-27T07:14:01.774Z\",\"eventCount\":42,\"tools\":{\"allowed\":18,\"blocked\":1},\"spend\":{\"llmUsdMicros\":\"184000\",\"blockedActionsUsdMicros\":\"8400000000\"},\"policiesEnforced\":[\"procurement.allowed_vendors\",\"runtime.write_scope\",\"rate.per_session_usd:10\",\"runtime.pii_redaction\"],\"contentHash\":\"sha256:90db551a2a7330b4aeeead934c8fc584da8f70a659e91a489a0fb0b331467baf\"}",
+    "rawSignatureB64": "onuzKM9rpwFAfU3YcmX4D9dVTu65VszIIlGwDrG4olyhfUenFhO/mBW58Zq6HQ+vKNx0g+vZNAeUlC4JgkIdDA==",
+    "publicKeyHex": "573c8f249012fbb08b3d79973411bb93141f32719c86ada25306fde5e59e8d57"
+  },
+  "publicKey": {
+    "algorithm": "ed25519",
+    "hex": "901e153295d578bb9e53301fbcc04dd37f971578f02da771c095b691e1b819bb"
+  },
+  "verifyingInstructions": {
+    "algorithm": "Ed25519",
+    "message": "receipt.rawBody (UTF-8 bytes)",
+    "signature": "base64-decode(receipt.rawSignatureB64)",
+    "publicKey": "hex-decode(publicKey.hex)",
+    "command": "node server/scripts/verify-receipt.mjs sess_01H9K7GRPX.json",
+    "docs": "https://agentvisorai.me/reference/receipts"
+  }
 }

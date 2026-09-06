@@ -71,8 +71,8 @@ services:
         gid: "65532"
         mode: 0400
       # Round-16 F3: signing seed pinned identically. Populate the
-      # secret at compose-up time via the secrets: block at the
-      # bottom of this file (or `docker secret create`).
+      # file-backed secret before compose-up (see the secrets: block
+      # at the bottom of this file).
       - source: signing_seed
         target: signing_seed
         uid: "65532"
@@ -241,11 +241,27 @@ volumes:
   nats-data:
 
 secrets:
+  # File-backed secrets: the prior `external: true` shape was
+  # SWARM-ONLY — plain `docker compose up` (the mode every other key
+  # in this file targets: build:, container_name:, pids_limit:,
+  # extra_hosts: are all ignored or rejected by `docker stack
+  # deploy`) failed at container creation with "unsupported external
+  # secret identity_hmac", so the daemon service never started while
+  # every backing service came up. `docker compose config` exits 0 on
+  # that shape, which is why the CI config check never noticed.
+  #
+  # The committed files are all-zero PLACEHOLDERS: the daemon's
+  # weak-material refusal rejects them at boot (fail-closed, loud),
+  # forcing the operator to generate real ones:
+  #   openssl rand -hex 32 > docker/secrets/identity_hmac
+  #   openssl rand -out docker/secrets/signing.seed 32
+  #   chmod 0400 docker/secrets/*
+  # File secrets are bind-mounted preserving HOST ownership/mode on
+  # engines that ignore the long-form uid/gid/mode pins above, and
+  # the daemon's owner-only-mode check refuses group/world-readable
+  # key material either way.
   identity_hmac:
-    external: true
+    file: ./secrets/identity_hmac
   # Round-16 F3: the signing seed IS the receipt trust anchor.
-  # Populate as an external Docker secret before running compose:
-  #   `docker secret create signing_seed ./signing.seed`
-  # Or reference a compose-time file with `file: ./signing.seed`.
   signing_seed:
-    external: true
+    file: ./secrets/signing.seed

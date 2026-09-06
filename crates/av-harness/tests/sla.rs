@@ -166,23 +166,30 @@ async fn sla_core_metrics() {
     let mut enqueue = Vec::with_capacity(2_000);
     for _ in 0..2_000 {
         let started = Instant::now();
-        let _ = state.worker.try_submit(WorkerJob {
-            session: Arc::clone(&session),
-            class: EventClass::Session,
-            identity: session.current_identity(),
-            payload: json!({"sla": true}),
-            text: "enqueue".to_owned(),
-            analyze_loop: false,
-            status: StatusId::Success,
-            stop_reason: None,
-            native_stop_reason: None,
-            metrics: EventMetrics::default(),
-            cost_usd_micros: 0,
-            prompt_token_correction: 0,
-            atif: None,
-            response_marker: None,
-            response_attempt: None,
-        });
+        // Must SUCCEED: a swallowed submit meant a regression that
+        // refused jobs instantly (Full/Closed) measured as a superb
+        // enqueue latency. Capacity is 20k, so Full is unreachable in
+        // a correct implementation.
+        state
+            .worker
+            .try_submit(WorkerJob {
+                session: Arc::clone(&session),
+                class: EventClass::Session,
+                identity: session.current_identity(),
+                payload: json!({"sla": true}),
+                text: "enqueue".to_owned(),
+                analyze_loop: false,
+                status: StatusId::Success,
+                stop_reason: None,
+                native_stop_reason: None,
+                metrics: EventMetrics::default(),
+                cost_usd_micros: 0,
+                prompt_token_correction: 0,
+                atif: None,
+                response_marker: None,
+                response_attempt: None,
+            })
+            .expect("enqueue SLA submissions must be accepted (capacity 20k)");
         enqueue.push(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
     }
     let enqueue_p99 = percentile(&mut enqueue, 99);
@@ -233,9 +240,17 @@ async fn sla_core_metrics() {
             .await
             .unwrap();
     }
-    let sign_p99 = metrics
-        .histogram("av_receipt_sign_duration_seconds", "Receipt signing latency")
-        .quantile_us(0.99);
+    let sign_histogram = metrics.histogram("av_receipt_sign_duration_seconds", "Receipt signing latency");
+    // An empty histogram quantiles to 0, so a renamed metric or removed
+    // instrumentation silently PASSED the latency gate. Require the 200
+    // observations the loop above must have produced.
+    assert_eq!(
+        sign_histogram.count(),
+        200,
+        "receipt-sign histogram must carry one observation per close — \
+         instrumentation moved or the metric was renamed"
+    );
+    let sign_p99 = sign_histogram.quantile_us(0.99);
     assert!(sign_p99 < 2_000, "receipt sign p99 {sign_p99}us exceeds 2000us");
 
     let unsigned = Arc::new(Session::new(
