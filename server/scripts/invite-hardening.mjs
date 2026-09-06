@@ -5,6 +5,11 @@
 
 const API = "http://127.0.0.1:4346";
 const SPA_ORIGIN = "http://127.0.0.1:8988";
+// CI names its Postgres container av-pg-r44 with role/db avtest; local
+// runs override via env (same pattern as webhook-drill.mjs).
+const PG_CONTAINER = process.env.PG_CONTAINER ?? "av-pg-r44";
+const PG_USER = process.env.PG_USER ?? "avtest";
+const PG_DB = process.env.PG_DB ?? "avtest";
 
 async function signup(email, orgName) {
   const res = await fetch(`${API}/api/v1/auth/signup`, {
@@ -57,13 +62,13 @@ async function main() {
   const bobInv = await invite(aliceCookie, bobEmail);
   // Force expiresAt into the past.
   const { execSync } = await import("node:child_process");
-  execSync(`docker exec av-pg-r44 psql -U avtest -d avtest -c "UPDATE invites SET \\"expiresAt\\" = NOW() - INTERVAL '1 hour' WHERE id='${bobInv.inviteId}';"`);
+  execSync(`docker exec ${PG_CONTAINER} psql -U ${PG_USER} -d ${PG_DB} -c "UPDATE invites SET \\"expiresAt\\" = NOW() - INTERVAL '1 hour' WHERE id='${bobInv.inviteId}';"`);
   const expiredRes = await accept(bobEmail, bobInv.token);
   const expiredBody = await expiredRes.text();
   results.push({ drill: "expired-invite", status: expiredRes.status, expect: 401, body: expiredBody.slice(0, 80) });
 
   // Restore expiresAt for the next drills.
-  execSync(`docker exec av-pg-r44 psql -U avtest -d avtest -c "UPDATE invites SET \\"expiresAt\\" = NOW() + INTERVAL '1 hour' WHERE id='${bobInv.inviteId}';"`);
+  execSync(`docker exec ${PG_CONTAINER} psql -U ${PG_USER} -d ${PG_DB} -c "UPDATE invites SET \\"expiresAt\\" = NOW() + INTERVAL '1 hour' WHERE id='${bobInv.inviteId}';"`);
 
   // ============ 2. Revoked invite ============
   console.log("[2] Revoked invite");

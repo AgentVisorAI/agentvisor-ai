@@ -110,6 +110,7 @@ async function registerCredential(cookie, auth) {
   const cdReg = auth.clientDataJSON("reg", opts.challenge);
   const body = {
     label: "hard drill",
+    password: "correcthorse42x",
     response: {
       id: b64u.encode(auth.credentialId),
       rawId: b64u.encode(auth.credentialId),
@@ -156,6 +157,7 @@ async function main() {
     },
     body: JSON.stringify({
       label: "no-ch",
+      password: "correcthorse42x",
       response: {
         id: b64u.encode(aliceAuth.credentialId),
         rawId: b64u.encode(aliceAuth.credentialId),
@@ -183,6 +185,7 @@ async function main() {
     headers: { "Content-Type": "application/json", Origin: SPA_ORIGIN, "Sec-Fetch-Site": "same-origin", Cookie: aliceCookie + "; " + reg2Cookie },
     body: JSON.stringify({
       label: "tampered",
+      password: "correcthorse42x",
       response: {
         id: b64u.encode(aliceAuth.credentialId),
         rawId: b64u.encode(aliceAuth.credentialId),
@@ -270,7 +273,11 @@ async function main() {
   const targetId = aliceCreds[0].id;
   const bobRevoke = await fetch(`${API}/api/v1/auth/webauthn/credentials/${targetId}`, {
     method: "DELETE",
-    headers: { Cookie: bobCookie, Origin: SPA_ORIGIN, "Sec-Fetch-Site": "same-origin" },
+    // R140 F2 requires the caller's own password as a step-up on
+    // DELETE; send bob's real password so the request passes the gate
+    // and exercises the ownership fence (the assertion under test).
+    headers: { "Content-Type": "application/json", Cookie: bobCookie, Origin: SPA_ORIGIN, "Sec-Fetch-Site": "same-origin" },
+    body: JSON.stringify({ password: "correcthorse42x" }),
   });
   results.push({ drill: "cred-idor-delete", status: bobRevoke.status, expect: 404 });
   const bobRename = await fetch(`${API}/api/v1/auth/webauthn/credentials/${targetId}`, {
