@@ -2596,6 +2596,20 @@
     // Build the portable verification bundle exactly once. Used by
     // both the Download and Share buttons so the recipient of either
     // gets the same shape as the offline verifier expects.
+    // Version-accurate signed-message description for the exported
+    // bundle's human instructions (mirrors av-receipts
+    // signing_message and verify.js receiptSigningMessage).
+    function receiptMessageInstruction(rcpt) {
+      var version = 1;
+      try {
+        var parsed = JSON.parse(rcpt && rcpt.rawBody || "");
+        if (typeof parsed.receipt_version === "number") version = parsed.receipt_version;
+      } catch (e) {}
+      if (version === 2) {
+        return "utf8('agentvisor-receipt-v2\\0') || u64_be(byteLength(receipt.rawBody)) || receipt.rawBody (UTF-8 bytes)";
+      }
+      return "receipt.rawBody (UTF-8 bytes)";
+    }
     function buildReceiptBundle(sess, rcpt) {
       return {
         format: "agentvisor.receipt.v1",
@@ -2618,7 +2632,13 @@
           : null,
         verifyingInstructions: {
           algorithm: "Ed25519",
-          message: "receipt.rawBody (UTF-8 bytes)",
+          // The signed message depends on the body's receipt_version:
+          // v1 (and bodies without the field) sign the bare rawBody
+          // bytes; v2 — the Rust daemon default — prefixes a domain
+          // tag and a big-endian length. Stating only the v1 shape
+          // here made every auditor's hand-rolled verifier report
+          // "signature invalid" on production v2 receipts.
+          message: receiptMessageInstruction(rcpt),
           signature: "base64-decode(receipt.rawSignatureB64)",
           publicKey: "hex-decode(publicKey.hex)",
           command: "node tools/verify-receipt.mjs " + (sess.externalId || sess.id) + ".json",

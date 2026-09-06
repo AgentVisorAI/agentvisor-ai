@@ -284,7 +284,11 @@ await uploadJson(JSON.stringify(wrongFormat));
   await page.setInputFiles("#fileInput", bundlePath);
   await waitVerifyStable(page);
   let title = await page.locator(".result-title").innerText();
-  if (!/verifies/i.test(title)) fail("downloaded bundle did not verify green on /verify/: " + title.slice(0, 60));
+  // The console bundle is DEMO-key signed: since the 🧪 demo verdict
+  // class landed, the exact expected title is the demo one — still a
+  // successful crypto verify, but never the production "authentic".
+  if (/does not verify/i.test(title)) fail("downloaded bundle rejected on /verify/: " + title.slice(0, 60));
+  if (!/demo receipt/i.test(title)) fail("downloaded demo bundle did not get the demo verdict on /verify/: " + title.slice(0, 60));
   const obj = JSON.parse(await fsp.readFile(bundlePath, "utf8"));
   obj.receipt.rawBody = obj.receipt.rawBody.replace(/[0-9]/, (d) => String((+d + 1) % 10));
   const tamperedPath = pathm.join(dir, "tampered.json");

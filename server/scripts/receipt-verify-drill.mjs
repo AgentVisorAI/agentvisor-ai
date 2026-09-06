@@ -3,7 +3,9 @@
  *
  *   1. Log in, navigate to a session with a receipt.
  *   2. Click "Download receipt" → intercept the browser download.
- *   3. Run verify-receipt.mjs on the downloaded JSON → expect exit 0.
+ *   3. Run verify-receipt.mjs on the downloaded JSON → expect the 🧪
+ *      demo verdict (exit 3): the console session is signed by the
+ *      PUBLIC demo key, which must never earn "authentic" (exit 0).
  *   4. Tamper a byte in the receipt's rawBody → re-run verifier →
  *      expect exit 1 (SIGNATURE DOES NOT VERIFY).
  *   5. Tamper the publicKey.hex → re-run → expect exit 1.
@@ -75,21 +77,27 @@ if (!bundle.receipt?.rawSignatureB64) fail("no signature");
 if (!bundle.publicKey?.hex) fail("no publicKey.hex");
 console.log("✅ Bundle shape correct: format=" + bundle.format + " pubKey=" + bundle.publicKey.hex.slice(0, 12) + "…");
 
-// Verify — expect exit 0. Since TRUSTED_RECEIPT_KEYS is empty
-// (no canonical anchor published yet, R78 HIGH #1), pass
-// `--allow-untrusted-key` to acknowledge that the drill is
-// exercising signature-vs-embedded-pubkey consistency, not
-// trust-anchor authorship. When the anchor list is populated
-// in a future release-hardening round, this flag can be
-// dropped.
+// Verify — the console bundle is signed by the DEMO console key
+// (docs/app/datasource.js fixed keypair), whose private half ships
+// publicly. The verifier's exact expected verdict is therefore the
+// 🧪 demo classification with exit 3 — NOT "authentic" (that would
+// mean anyone holding the shipped key can forge auditor-green
+// receipts) and NOT a tamper failure. Pinning the exact verdict is
+// what catches a regression where the demo key silently earns the
+// trusted-anchor treatment.
 let out;
 try {
-  out = execSync(`node ${VERIFIER} --allow-untrusted-key ${bundlePath}`, { stdio: "pipe" }).toString();
+  out = execSync(`node ${VERIFIER} ${bundlePath}`, { stdio: "pipe" }).toString();
+  fail("verifier exited 0 (authentic) on a DEMO-key bundle — the demo key must never earn the trusted verdict: " + out.slice(0, 400));
 } catch (e) {
-  fail("verifier exited non-zero on legit bundle: " + (e.stdout?.toString() || "") + " " + (e.stderr?.toString() || ""));
+  const output = (e.stdout?.toString() || "") + (e.stderr?.toString() || "");
+  if (e.status !== 3) {
+    fail("verifier exit code on demo bundle: " + e.status + " expected 3 (demo verdict). output: " + output.slice(0, 400));
+  }
+  if (!/DEMO RECEIPT/i.test(output)) fail("verifier didn't print the demo verdict: " + output.slice(0, 400));
+  out = output;
 }
-if (!/SIGNATURE (VERIFIES|IS INTERNALLY CONSISTENT)/i.test(out)) fail("verifier didn't confirm legit bundle: " + out.slice(0, 400));
-console.log("✅ verifier: legit bundle passes internal consistency (trust anchor empty in R78)");
+console.log("✅ verifier: demo-key bundle gets the 🧪 demo verdict (exit 3), not 'authentic'");
 
 // Tamper the rawBody
 const tampered = JSON.parse(JSON.stringify(bundle));

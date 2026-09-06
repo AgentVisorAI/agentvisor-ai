@@ -93,6 +93,23 @@ pub fn compress(payload: &Value, cfg: &CompressionConfig) -> CompressionOutcome 
 
     let mut out = messages.clone();
     let tail_start = out.len().saturating_sub(cfg.keep_tail);
+    // Escalation guard for invariant #4 (idempotence, lib.rs): any
+    // machine-emitted `[pruned:` stub in the INPUT means this payload
+    // is already a compression output (duplicate-collapse and
+    // tool-output stubs included — not only the middle-history
+    // marker the pass-local guard checks). The middle pass's target
+    // is RELATIVE (`tokens_before × (1 − reduction)`), so it must
+    // never engage on such input: run 1 reducing 30 % via dedup
+    // alone left no middle-history marker, and run 2 then recomputed
+    // a fresh 30 % target from the already-reduced baseline and
+    // deleted real history that run 1 had decided to keep —
+    // `compress(compress(x)) != compress(x)`, with each further run
+    // eating deeper until only stubs and the tail remained. Same
+    // spoof-collision reasoning as the pass-local guard: legitimate
+    // user text does not START with the machine stub prefix.
+    let input_already_compressed = messages
+        .iter()
+        .any(|m| msg_content_str(m).is_some_and(|c| c.starts_with("[pruned:")));
 
     let mut changed = false;
     // Normalization must run BEFORE the duplicate-collapse passes:
@@ -112,7 +129,7 @@ pub fn compress(payload: &Value, cfg: &CompressionConfig) -> CompressionOutcome 
         changed |= collapse_duplicate_messages(&mut out, tail_start);
     }
     changed |= stub_stale_tool_outputs(&mut out, tail_start, cfg.tool_output_stub_threshold);
-    if cfg.summarize_middle && tokens_before >= 50_000 {
+    if cfg.summarize_middle && tokens_before >= 50_000 && !input_already_compressed {
         changed |= stub_middle_to_target(
             payload,
             &mut out,
