@@ -163,6 +163,10 @@ async function main() {
   const cdReg = auth.clientDataJSON("reg", regOpts.challenge);
   const registrationBody = {
     label: "Test Passkey",
+    // R138 F2 added a password step-up gate on /register/verify —
+    // enrolling a passkey requires proving the account password, so a
+    // stolen session cookie alone can't mint an attacker key.
+    password: "correcthorse42x",
     response: {
       id: b64u.encode(auth.credentialId),
       rawId: b64u.encode(auth.credentialId),
