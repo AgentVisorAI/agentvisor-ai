@@ -78,8 +78,8 @@ try {
   const now = new Date().toISOString();
   const evRes = await ingest("/api/v1/ingest/events", [
     { sessionExternalId:"sess_e2e_"+rand, seq:1, kind:"sys", tag:"start", body:"session opened", occurredAt: now },
-    { sessionExternalId:"sess_e2e_"+rand, seq:2, kind:"tool", tag:"TOOL ✓ allow", body:"search_inventory()", occurredAt: now, addToolsAllowed: 1, addCostUsdMicros: 45000 },
-    { sessionExternalId:"sess_e2e_"+rand, seq:3, kind:"tool", tag:"TOOL BLOCKED", body:"create_po() vendor not allowlisted", occurredAt: now, addToolsBlocked: 1, addBlockedPayoutUsdMicros: 8400000000 },
+    { sessionExternalId:"sess_e2e_"+rand, seq:2, kind:"tool", tag:"TOOL ✓ allow", body:"search_inventory()", occurredAt: now, addToolsAllowed: 1, addCostUsdMicros: 45000, policyName: "e2e.vendor_allowlist" },
+    { sessionExternalId:"sess_e2e_"+rand, seq:3, kind:"block", tag:"TOOL BLOCKED", body:"create_po() vendor not allowlisted", occurredAt: now, addToolsBlocked: 1, addBlockedPayoutUsdMicros: 8400000000, policyName: "e2e.vendor_allowlist" },
     { sessionExternalId:"sess_e2e_"+rand, seq:4, kind:"sys", tag:"end", body:"session sealed", occurredAt: now },
   ]);
   check("ingest events", evRes.status === 200, JSON.stringify(evRes.data));
@@ -92,8 +92,11 @@ try {
   const { generateKeyPairSync, sign: edSign, createHash } = await import("node:crypto");
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
   const pubRaw = publicKey.export({ type: "spki", format: "der" }).subarray(-32);
-  const pkRes = await ingest("/api/v1/ingest/pubkey", { publicKeyHex: pubRaw.toString("hex") });
+  const pkRes = await ingest("/api/v1/ingest/pubkey", { publicKeyHex: pubRaw.toString("hex"), daemonVersion: "0.1.0-e2e" });
   check("ingest pubkey", pkRes.status === 200, JSON.stringify(pkRes.data));
+  // Daemon version round-trips into the deployments list.
+  const depsAfterPubkey = await ds.listDeployments();
+  check("deployment reports daemon version", depsAfterPubkey[0].version === "0.1.0-e2e", depsAfterPubkey[0].version);
   const receiptBody = JSON.stringify({ v: 2, session: "sess_e2e_"+rand, eventCount: 4 });
   const rcptRes = await ingest("/api/v1/ingest/receipts", {
     sessionExternalId: "sess_e2e_"+rand,
@@ -144,7 +147,9 @@ try {
   check("policy create returns id", !!created.id && created.enabled === true, created.id);
   const pols = await ds.listPolicies();
   check("policy list has 1", pols.length === 1 && pols[0].name === "e2e.vendor_allowlist");
-  check("policy list reports honest zero counters", pols[0].hits24h === 0 && pols[0].blocks24h === 0);
+  // Attribution: the two events above carried policyName matching this
+  // policy — real 24h counters, not fixtures.
+  check("policy counters from attributed events", pols[0].hits24h === 2 && pols[0].blocks24h === 1, `hits=${pols[0].hits24h} blocks=${pols[0].blocks24h}`);
   const toggled = await ds.togglePolicy(created.id);
   check("policy toggle disables", toggled.enabled === false);
   const fetched = await ds.getPolicy(created.id);

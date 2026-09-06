@@ -368,6 +368,9 @@ async fn sync_receipt(
                     "pubkey",
                     &serde_json::json!({
                         "publicKeyHex": public_key_hex,
+                        // Display metadata for the console's fleet view;
+                        // never part of the server's trust decision.
+                        "daemonVersion": env!("CARGO_PKG_VERSION"),
                     }),
                 )
                 .await?;
@@ -1116,6 +1119,15 @@ fn bridge_record_to_event(
             } else {
                 event.add_tools_allowed = 1;
             }
+            // Per-policy attribution when the daemon names the policy in
+            // the OCSF payload. Absent today for the built-in verdict
+            // shapes ({stage, reason}); forward-wired so a policy-aware
+            // daemon build lights the console counters with no CLI change.
+            event.policy_name = payload
+                .get("policy")
+                .or_else(|| payload.get("policy_name"))
+                .and_then(serde_json::Value::as_str)
+                .map(|name| bounded_nonempty(name, MAX_AGENT_UNITS, "policy"));
             event
         }
         "agent.stop_reason" => bridge_ingest_event(
@@ -1174,6 +1186,7 @@ fn bridge_ingest_event(
         tag: bounded_nonempty(tag, MAX_TAG_UNITS, "event"),
         body: bounded_text(&body, MAX_BODY_UNITS),
         sub: sub.map(|value| bounded_text(&value, MAX_SUB_UNITS)),
+        policy_name: None,
         occurred_at,
         journal_count: 1,
         add_prompt_tokens: 0,
@@ -1473,6 +1486,7 @@ fn step_to_event(session_external_id: &str, seq: u64, step: &av_atif::Step) -> I
             &serde_json::to_string(&body_value).unwrap_or_else(|_| "{}".to_owned()),
             MAX_BODY_UNITS,
         ),
+        policy_name: None,
         sub: sub.map(|value| bounded_text(&value, MAX_SUB_UNITS)),
         occurred_at: step
             .timestamp
@@ -1701,6 +1715,11 @@ struct IngestEvent {
     body: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     sub: Option<String>,
+    /// Policy the event fired under, when the OCSF payload attributes
+    /// one (`payload.policy` / `payload.policy_name`). Powers the
+    /// console's per-policy 24h hit/block counters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_name: Option<String>,
     occurred_at: String,
     #[serde(skip_serializing_if = "is_default_u32")]
     journal_count: u32,
@@ -1742,6 +1761,7 @@ impl IngestEvent {
                 MAX_BODY_UNITS,
             ),
             sub: None,
+            policy_name: None,
             occurred_at,
             journal_count: 1,
             add_prompt_tokens: 0,
