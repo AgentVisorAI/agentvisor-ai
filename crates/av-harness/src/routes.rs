@@ -1844,7 +1844,28 @@ pub(crate) async fn unresolved_tool_sessions(
         };
         let mut intent_keys = std::collections::HashSet::new();
         let mut unresolved_sessions = std::collections::HashSet::new();
+        let mut dirents_seen = 0usize;
         for entry in entries {
+            // Dirent cap: every other spool scan bounds its directory
+            // walk (MAX_RECOVERY_DIRENTS_PER_TICK); this one also
+            // accumulates one HashSet key per `*.intent.json` name
+            // BEFORE MAC validation, so a poisoned directory with
+            // millions of planted names meant unbounded memory + CPU
+            // on every recovery tick and every session close. Unlike
+            // the per-tick scans, a TRUNCATED result here is unsafe —
+            // callers use it to prove "no unresolved executions"
+            // before finalizing — so fail closed instead of returning
+            // a partial set: the close refuses, and the operator sees
+            // the poisoned directory instead of a silently incomplete
+            // audit.
+            dirents_seen = dirents_seen.saturating_add(1);
+            if dirents_seen > crate::reconciler::MAX_RECOVERY_DIRENTS_PER_TICK {
+                return Err(format!(
+                    "tool-executions scan aborted: more than {} directory entries; \
+                     the spool directory is poisoned or leaking files",
+                    crate::reconciler::MAX_RECOVERY_DIRENTS_PER_TICK
+                ));
+            }
             let path = entry.map_err(|error| error.to_string())?.path();
             let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
                 continue;
@@ -2024,7 +2045,17 @@ pub(crate) async fn unresolved_tool_sessions(
                 }
             };
         }
+        let mut orphan_dirents = 0usize;
         for entry in std::fs::read_dir(&directory).map_err(|error| error.to_string())? {
+            // Same fail-closed dirent cap as the intent pass above.
+            orphan_dirents = orphan_dirents.saturating_add(1);
+            if orphan_dirents > crate::reconciler::MAX_RECOVERY_DIRENTS_PER_TICK {
+                return Err(format!(
+                    "tool-executions orphan scan aborted: more than {} directory entries; \
+                     the spool directory is poisoned or leaking files",
+                    crate::reconciler::MAX_RECOVERY_DIRENTS_PER_TICK
+                ));
+            }
             let path = entry.map_err(|error| error.to_string())?.path();
             let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
                 continue;

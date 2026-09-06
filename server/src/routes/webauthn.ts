@@ -30,7 +30,7 @@
  * cloned authenticators.
  */
 
-import type { FastifyInstance, FastifyReply } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import {
   generateAuthenticationOptions,
@@ -84,6 +84,16 @@ function acceptedOrigins(): string[] {
 
 // Challenge cookies. Short-lived, HttpOnly. We split by ceremony so a
 // registration cookie can never satisfy an authentication verify.
+//
+// SIGNED + issued-at stamped: `expectedChallenge` is compared against
+// this cookie's contents, so an UNSIGNED cookie made the challenge
+// fully client-controlled — an attacker who captured one assertion
+// (whose clientDataJSON embeds challenge X) could mint their own
+// cookie carrying X and replay the capture indefinitely; `maxAge`
+// only instructs the browser and does nothing against a manually
+// attached header. Signing removes minting; the embedded issued-at,
+// enforced server-side in readChallengeCookie, bounds replay of a
+// captured cookie+assertion pair to CHALLENGE_TTL_S.
 const REG_CHALLENGE_COOKIE = "av_wa_reg_challenge";
 const AUTH_CHALLENGE_COOKIE = "av_wa_auth_challenge";
 const CHALLENGE_TTL_S = 300; // 5 min — plenty for user prompt
@@ -91,15 +101,43 @@ const CHALLENGE_TTL_S = 300; // 5 min — plenty for user prompt
 function setChallengeCookie(
   reply: FastifyReply,
   name: string,
-  value: string,
+  bag: Record<string, unknown>,
 ): void {
-  reply.setCookie(name, value, {
+  reply.setCookie(name, JSON.stringify({ ...bag, iat: Math.floor(Date.now() / 1000) }), {
     ...SESSION_COOKIE_OPTS,
+    signed: true,
     maxAge: CHALLENGE_TTL_S,
     // Ceremony cookies scoped to /api/v1/auth/webauthn so they never
     // ride with unrelated requests.
     path: "/api/v1/auth/webauthn",
   });
+}
+
+/**
+ * Unsign + parse + TTL-check a ceremony cookie. Returns null on any
+ * failure (missing, bad signature, malformed JSON, expired) — callers
+ * treat all of those identically as "no usable challenge".
+ */
+function readChallengeCookie(
+  req: FastifyRequest,
+  name: string,
+): Record<string, unknown> | null {
+  const raw = req.cookies[name];
+  if (!raw) return null;
+  const unsigned = req.unsignCookie(raw);
+  if (!unsigned.valid || unsigned.value === null) return null;
+  let bag: unknown;
+  try {
+    bag = JSON.parse(unsigned.value);
+  } catch {
+    return null;
+  }
+  if (typeof bag !== "object" || bag === null) return null;
+  const iat = (bag as { iat?: unknown }).iat;
+  if (typeof iat !== "number") return null;
+  const age = Math.floor(Date.now() / 1000) - iat;
+  if (age < 0 || age > CHALLENGE_TTL_S) return null;
+  return bag as Record<string, unknown>;
 }
 
 function clearChallengeCookie(reply: FastifyReply, name: string): void {
@@ -247,7 +285,7 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
       // as fallbacks so hardware keys with alternate curves work too.
       supportedAlgorithmIDs: [-7, -8, -257],
     });
-    setChallengeCookie(reply, REG_CHALLENGE_COOKIE, options.challenge);
+    setChallengeCookie(reply, REG_CHALLENGE_COOKIE, { challenge: options.challenge });
     return reply.send({ options });
   });
 
@@ -278,7 +316,8 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
     if (claims.sub.startsWith("apikey:")) {
       return reply.code(400).send({ error: "cookie_session_required" });
     }
-    const cookieChallenge = req.cookies[REG_CHALLENGE_COOKIE];
+    const regBag = readChallengeCookie(req, REG_CHALLENGE_COOKIE);
+    const cookieChallenge = typeof regBag?.challenge === "string" ? regBag.challenge : null;
     if (!cookieChallenge) {
       return reply.code(400).send({ error: "no_challenge_cookie" });
     }
@@ -508,14 +547,10 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
       allowCredentials,
       userVerification: "preferred",
     });
-    setChallengeCookie(
-      reply,
-      AUTH_CHALLENGE_COOKIE,
-      JSON.stringify({
-        challenge: options.challenge,
-        userId: useDecoy ? null : user!.id,
-      }),
-    );
+    setChallengeCookie(reply, AUTH_CHALLENGE_COOKIE, {
+      challenge: options.challenge,
+      userId: useDecoy ? null : user!.id,
+    });
     // Drop `hasCredential` — it explicitly leaked account
     // presence. Clients that gated their UI on it should switch
     // to always calling `/authenticate/verify` and treating any
@@ -528,14 +563,14 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
     // R88 F3: 10/min per IP matches /login.
     config: { rateLimit: perIp(10, 60_000) },
   }, async (req, reply) => {
-    const cookieRaw = req.cookies[AUTH_CHALLENGE_COOKIE];
-    if (!cookieRaw) return reply.code(400).send({ error: "no_challenge_cookie" });
-    let bag: { challenge: string; userId: string | null };
-    try {
-      bag = JSON.parse(cookieRaw);
-    } catch {
-      return reply.code(400).send({ error: "malformed_challenge_cookie" });
+    const authBag = readChallengeCookie(req, AUTH_CHALLENGE_COOKIE);
+    if (!authBag || typeof authBag.challenge !== "string") {
+      return reply.code(400).send({ error: "no_challenge_cookie" });
     }
+    const bag: { challenge: string; userId: string | null } = {
+      challenge: authBag.challenge,
+      userId: typeof authBag.userId === "string" ? authBag.userId : null,
+    };
     if (!bag.userId) {
       // R86 F4 (revised R87 F1): decoy path — the challenge was
       // issued against an unknown email or one with no real
