@@ -347,23 +347,35 @@
     _slT = setTimeout(async function () {
       var main = document.getElementById("view");
       if (!(main && state.route && state.route.path[0] === "sessions" && !state.route.path[1])) return;
-      // The user paged beyond the first page with "Load more": this
-      // refresh only re-fetches page one and would wholesale-replace
-      // sessionsLoaded, snapping the list back to 50 rows and losing
-      // their place on every live event. Leave the paged view alone —
-      // a filter change or navigation re-renders from scratch anyway.
-      if (sessionsLoaded.length > sessionsPageSize) return;
+      // Paged view ("Load more" clicked): refetch ENOUGH pages to cover
+      // what the user has loaded instead of either snapping back to
+      // page one (the original bug — lost their place on every live
+      // event) or skipping entirely (the first fix — which silently
+      // defeated the reconnect/visibilitychange catch-up paths too, so
+      // a paged list had ZERO refresh paths after a disconnect and
+      // never showed sessions ingested during the gap). Capped at 4
+      // pages: beyond ~200 rows the refetch cost outweighs staleness.
+      var wantRows = Math.min(sessionsLoaded.length, sessionsPageSize * 4);
       // Fetch first, repaint on success only: no skeleton flash, and a
       // transient failure skips the refresh instead of nuking the list
       // (renderSessionsBody restores in-flight search keystrokes).
       try {
         var mySeq = ++_sessionsFetchSeq;
         var deps = await state.ds.listDeployments();
-        var firstPage = await state.ds.listSessions(Object.assign({ limit: sessionsPageSize }, sessionsFilter));
-        if (mySeq !== _sessionsFetchSeq) return;
+        var rows = [];
+        var cursor = null;
+        do {
+          var page = await state.ds.listSessions(Object.assign(
+            { limit: sessionsPageSize, cursor: cursor || undefined },
+            sessionsFilter
+          ));
+          if (mySeq !== _sessionsFetchSeq) return;
+          rows = rows.concat(page.sessions);
+          cursor = page.nextCursor;
+        } while (cursor && rows.length < wantRows);
         if (!(state.route && state.route.path[0] === "sessions" && !state.route.path[1])) return;
-        sessionsLoaded = firstPage.sessions;
-        sessionsCursor = firstPage.nextCursor;
+        sessionsLoaded = rows;
+        sessionsCursor = cursor;
         renderSessionsBody(main, deps);
       } catch (e) { console.warn("sessions refresh skipped", e); }
     }, 400);

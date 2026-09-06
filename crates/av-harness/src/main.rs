@@ -1302,6 +1302,35 @@ async fn build_identity(
         if secret.is_empty() {
             anyhow::bail!("identity HMAC secret file {path} is empty");
         }
+        // Weak-material refusal, mirroring the signing-seed check: the
+        // shipped docker-compose stack commits an all-'0' PLACEHOLDER at
+        // docker/secrets/identity_hmac whose entire point is to fail
+        // closed. Without this gate the placeholder loaded as a "valid"
+        // 64-byte HMAC secret whose value is public in the repo — any
+        // attacker could mint accepted HS256 JWTs for the configured
+        // kid. All-identical bytes also covers all-0x00/all-0xFF plants
+        // and catches the classic "echoed the wrong thing into the
+        // file" operator error.
+        // (`first()` + windows-free comparison keeps clippy's
+        // indexing lint satisfied; emptiness was refused above.)
+        let first_byte = secret.first().copied().unwrap_or_default();
+        if secret.iter().all(|byte| *byte == first_byte) {
+            anyhow::bail!(
+                "identity HMAC secret file {path} is a known-weak pattern (every byte identical — \
+                 the committed placeholder or an uninitialized file); generate a real secret: \
+                 openssl rand -hex 32 > <file>"
+            );
+        }
+        if secret.len() < 32 {
+            // RFC 7518 §3.2 requires ≥ 256 bits for HS256. Warn rather
+            // than refuse: short secrets predate this check and refusing
+            // would brick existing deployments on upgrade.
+            tracing::warn!(
+                path,
+                bytes = secret.len(),
+                "identity HMAC secret is shorter than the 32 bytes RFC 7518 requires for HS256"
+            );
+        }
         validator
             .add_key(&config.identity_hmac_kid, KeyMaterial::HmacSecret(secret))
             .context("install identity HMAC key")?;
@@ -2226,6 +2255,35 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    /// The committed docker/secrets placeholder (64 ASCII '0's) — and any
+    /// all-identical-byte file — must be REFUSED, not loaded as a valid
+    /// HMAC secret. Pre-fix, only the signing seed failed closed; the
+    /// HMAC placeholder booted green and its publicly-committed value
+    /// could mint accepted HS256 JWTs for the configured kid.
+    #[tokio::test]
+    async fn hmac_identity_placeholder_secret_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let secret = directory.path().join("identity.secret");
+        std::fs::write(&secret, "0".repeat(64)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let mut config = HarnessConfig::for_tests("http://upstream", "/tmp", "/tmp");
+        config.require_identity = true;
+        config.identity_hmac_secret_file = Some(secret.to_string_lossy().into_owned());
+        let err = build_identity(&config, Arc::new(av_core::metrics::Registry::new()))
+            .await
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(
+            err.contains("known-weak pattern"),
+            "all-identical-byte HMAC secret must be refused at boot, got: {err}"
+        );
     }
 
     #[tokio::test]
