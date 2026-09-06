@@ -107,10 +107,12 @@ await bob.waitForFunction(
 );
 {
   const title = await bob.locator(".result-title").innerText();
-  // "verifies" (trusted anchor) or "internally consistent" both prove
-  // the crypto path works. "does not verify" is the failure state.
+  // "verifies" (trusted anchor), "internally consistent" (unknown
+  // key), or "demo receipt" (console demo key — crypto verifies, but
+  // classified as demo since the private half ships publicly) all
+  // prove the crypto path works. "does not verify" is the failure state.
   if (/does not verify/i.test(title)) fail("Bob's browser rejected legit URL: " + title);
-  if (!/verifies|internally consistent/i.test(title)) fail("unexpected title: " + title);
+  if (!/verifies|internally consistent|demo receipt/i.test(title)) fail("unexpected title: " + title);
   const kvText = await bob.locator(".result-card dl.kv").innerText();
   if (!/Session/.test(kvText)) fail("kv missing session field");
   if (!/agent/i.test(kvText)) fail("kv missing agent");

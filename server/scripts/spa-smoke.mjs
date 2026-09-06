@@ -81,12 +81,35 @@ const staticSrv = createServer(async (req, res) => {
     // Rewrite API base for the SPA to point at our backend.
     if (p.endsWith(".html") || p.endsWith(".js")) {
       let s = data.toString();
-      if (p.endsWith("/app/index.html")) {
-        // Rewrite the built-in mock-mode block to point at our backend.
+      if (p.endsWith("/app/config.js")) {
+        // The mock-mode globals moved from index.html into config.js
+        // (CSP extraction) — the old index.html regex silently
+        // matched nothing, so the drill exercised the FIXTURES, not
+        // the backend it booted. Hard-fail if the substitution
+        // misses so a future layout move cannot regress to theater.
+        const before = s;
         s = s.replace(
-          /window\.MOCK_MODE\s*=\s*true;\s*window\.API_BASE\s*=\s*"";/,
-          `window.MOCK_MODE = false; window.API_BASE = ${JSON.stringify(API_BASE)};`,
+          /window\.MOCK_MODE\s*=\s*true;\s*\nwindow\.API_BASE\s*=\s*"";/,
+          `window.MOCK_MODE = false;\nwindow.API_BASE = ${JSON.stringify(API_BASE)};`,
         );
+        if (s === before) {
+          console.error("FATAL: spa-smoke could not rewrite MOCK_MODE/API_BASE in config.js — layout changed?");
+          process.exit(1);
+        }
+      }
+      if (p.endsWith("/app/index.html")) {
+        // The meta CSP pins connect-src to the hosted API origin; the
+        // local backend would be silently blocked by the browser.
+        // Same rewrite console-api.yml applies.
+        const before = s;
+        s = s.replace(
+          /connect-src 'self' https:\/\/api\.agentvisorai\.me/,
+          `connect-src 'self' ${API_BASE}`,
+        );
+        if (s === before) {
+          console.error("FATAL: spa-smoke could not rewrite the CSP connect-src in index.html — layout changed?");
+          process.exit(1);
+        }
       }
       res.end(s);
     } else {

@@ -64,6 +64,37 @@ fn idempotent_when_normalization_creates_duplicates() {
     );
 }
 
+/// Regression: the middle-history pass's target is RELATIVE
+/// (`tokens_before × (1 − reduction)`), so a run that reached its
+/// target via duplicate-collapse alone left no middle-history marker —
+/// and a SECOND compress of that output recomputed a fresh target from
+/// the already-reduced baseline and pruned real history run 1 had
+/// decided to keep, each further run eating deeper. The
+/// `input_already_compressed` guard skips middle-pruning whenever the
+/// input carries any machine-emitted `[pruned:` stub.
+#[test]
+fn idempotent_when_dedup_alone_met_the_target_on_a_large_history() {
+    // Two large duplicates (dedup saves just under the 30 % default
+    // target) + trailing history big enough to stay above the 50 k
+    // middle-pass floor after run 1.
+    let big = "x".repeat(200_000);
+    let mut messages = vec![
+        json!({"role": "user", "content": big.clone()}),
+        json!({"role": "user", "content": big}),
+    ];
+    for i in 0..8 {
+        messages.push(json!({"role": "user", "content": format!("{} {i}", "y".repeat(30_000))}));
+    }
+    let payload = json!({"model": "m", "messages": messages});
+    let once = compress(&payload, &CompressionConfig::default());
+    assert!(once.changed, "test shape must engage compression");
+    let twice = compress(&once.payload, &CompressionConfig::default());
+    assert_eq!(
+        twice.payload, once.payload,
+        "compress must be idempotent when run 1 met its target without middle-pruning"
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
