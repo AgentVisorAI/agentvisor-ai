@@ -2050,8 +2050,17 @@
     } catch (e) {}
     var text = await res.text();
     // Server errors are now RFC 7807 problem+json. Fall back to legacy
-    // { error } shape gracefully.
-    var data = text ? JSON.parse(text) : {};
+    // { error } shape gracefully. Parse defensively: a proxy/CDN in
+    // front of the API can answer 401/429/502 with an HTML page, and
+    // an unguarded JSON.parse threw a raw SyntaxError BEFORE the
+    // !res.ok handling below — skipping the 401 session-expiry
+    // dispatch and the 429 Retry-After extraction that callers rely
+    // on. Non-JSON bodies now degrade to the status-code fallback.
+    var data = {};
+    if (text) {
+      try { data = JSON.parse(text); }
+      catch (e) { data = {}; }
+    }
     if (!res.ok) {
       var msg = data.detail || data.title || data.error || ("http_" + res.status);
       var err = new Error(msg);
