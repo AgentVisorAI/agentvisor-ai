@@ -35,15 +35,15 @@
       "runtime.pii_redaction"
     ],
     "contentHash": "sha256:90db551a2a7330b4aeeead934c8fc584da8f70a659e91a489a0fb0b331467baf",
-    "signature": "ed25519:AGeWmRSBGH25myquiPnDODwDZlpLsyYbGfbi9HguXP3NwWQtnzdnsPBICtSNr2iEAJLZ1jmmqNJw8/A3ML3gAA==",
-    "signingKeyFingerprint": "901e153295d578bb",
+    "signature": "ed25519:X45MbR9535Bgy3ytTNKt8EKrxFEHJ+QbSUK/RtF5swtzjy6WVMXMi4/TRNU9I9k2PnoERtgzA3I7PV8PBRcSBw==",
+    "signingKeyFingerprint": "f85ae0090441c9dd",
     "rawBody": "{\"schemaVersion\":\"1.0\",\"receiptId\":\"rcpt_01H9K7GRPX_finalized\",\"sessionId\":\"sess_01H9K7GRPX\",\"orgId\":\"org_northwind\",\"deploymentId\":\"dep_prod\",\"startedAt\":\"2026-08-27T07:10:01.774Z\",\"endedAt\":\"2026-08-27T07:14:01.774Z\",\"eventCount\":42,\"tools\":{\"allowed\":18,\"blocked\":1},\"spend\":{\"llmUsdMicros\":\"184000\",\"blockedActionsUsdMicros\":\"8400000000\"},\"policiesEnforced\":[\"procurement.allowed_vendors\",\"runtime.write_scope\",\"rate.per_session_usd:10\",\"runtime.pii_redaction\"],\"contentHash\":\"sha256:90db551a2a7330b4aeeead934c8fc584da8f70a659e91a489a0fb0b331467baf\"}",
-    "rawSignatureB64": "onuzKM9rpwFAfU3YcmX4D9dVTu65VszIIlGwDrG4olyhfUenFhO/mBW58Zq6HQ+vKNx0g+vZNAeUlC4JgkIdDA==",
-    "publicKeyHex": "573c8f249012fbb08b3d79973411bb93141f32719c86ada25306fde5e59e8d57"
+    "rawSignatureB64": "X45MbR9535Bgy3ytTNKt8EKrxFEHJ+QbSUK/RtF5swtzjy6WVMXMi4/TRNU9I9k2PnoERtgzA3I7PV8PBRcSBw==",
+    "publicKeyHex": "f85ae0090441c9ddaaaeec5e8483e28b7a48521d782117a69c0c17dacc2e6d65"
   },
   "publicKey": {
     "algorithm": "ed25519",
-    "hex": "901e153295d578bb9e53301fbcc04dd37f971578f02da771c095b691e1b819bb"
+    "hex": "f85ae0090441c9ddaaaeec5e8483e28b7a48521d782117a69c0c17dacc2e6d65"
   },
   "verifyingInstructions": {
     "algorithm": "Ed25519",
