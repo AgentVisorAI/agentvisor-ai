@@ -19,6 +19,10 @@ import { createServer } from "node:http";
 import { createHmac } from "node:crypto";
 import { execSync } from "node:child_process";
 
+// CI names its Postgres container av-pg-r48; local runs pass PG_CONTAINER
+// (same override webhook-drill.mjs already honors).
+const PG_CONTAINER = process.env.PG_CONTAINER ?? "av-pg-r48";
+
 const BASE = process.env.BASE ?? "http://127.0.0.1:8748";
 const RECV_PORT = 44118;
 const nonce = Math.random().toString(36).slice(2, 6);
@@ -153,7 +157,7 @@ const carol = {};
 {
   // fetch endpoint's secret from DB directly (not exposed via API).
   const secret = execSync(
-    `docker exec av-pg-r48 psql -U av -d avdb -t -A -c "SELECT secret FROM webhook_endpoints WHERE id='${alicEp.id}'"`,
+    `docker exec ${PG_CONTAINER} psql -U av -d avdb -t -A -c "SELECT secret FROM webhook_endpoints WHERE id='${alicEp.id}'"`,
   ).toString().trim();
   capture = [];
   await jsonReq(alice, "POST", "/api/v1/webhooks/" + alicEp.id + "/test");
@@ -180,7 +184,7 @@ const carol = {};
   let finalAttempt = 0;
   for (let i = 0; i < 15; i++) {
     execSync(
-      `docker exec av-pg-r48 psql -U av -d avdb -c "UPDATE webhook_deliveries SET \\"nextRetryAt\\" = NOW() - INTERVAL '1 minute' WHERE status='retrying'"`,
+      `docker exec ${PG_CONTAINER} psql -U av -d avdb -c "UPDATE webhook_deliveries SET \\"nextRetryAt\\" = NOW() - INTERVAL '1 minute' WHERE status='retrying'"`,
       { stdio: "ignore" },
     );
     await wait(900); // sweeper=500ms + 400ms slop for retry
@@ -199,12 +203,12 @@ const carol = {};
 receiverBehavior = { status: 200 };
 {
   const before = execSync(
-    `docker exec av-pg-r48 psql -U av -d avdb -t -A -c "SELECT COUNT(*) FROM webhook_deliveries WHERE \\"endpointId\\"='${alicEp.id}'"`,
+    `docker exec ${PG_CONTAINER} psql -U av -d avdb -t -A -c "SELECT COUNT(*) FROM webhook_deliveries WHERE \\"endpointId\\"='${alicEp.id}'"`,
   ).toString().trim();
   if (before === "0") fail("no deliveries recorded prior to delete");
   await jsonReq(alice, "DELETE", "/api/v1/webhooks/" + alicEp.id);
   const after = execSync(
-    `docker exec av-pg-r48 psql -U av -d avdb -t -A -c "SELECT COUNT(*) FROM webhook_deliveries WHERE \\"endpointId\\"='${alicEp.id}'"`,
+    `docker exec ${PG_CONTAINER} psql -U av -d avdb -t -A -c "SELECT COUNT(*) FROM webhook_deliveries WHERE \\"endpointId\\"='${alicEp.id}'"`,
   ).toString().trim();
   if (after !== "0") fail(`delete cascade: expected 0 rows, got ${after}`);
   console.log(`✅ delete cascade: ${before} deliveries -> 0`);
