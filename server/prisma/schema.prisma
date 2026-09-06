@@ -104,6 +104,7 @@ model Org {
   invites           Invite[]
   apiKeys           ApiKey[]
   webhookEndpoints  WebhookEndpoint[]
+  policies          Policy[]
 
   @@map("orgs")
 }
@@ -397,6 +398,32 @@ model Receipt {
   session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
 
   @@map("receipts")
+}
+
+// Governance policy definitions as authored in the console. The daemon
+// enforces its own local policy files (WASM / schema); these rows are
+// the org's declarative source of truth the console displays and
+// operators edit. Hit/block counters are intentionally NOT stored here:
+// no trustworthy per-policy attribution exists in the ingest stream yet,
+// so the read endpoint reports zeros rather than inventing numbers.
+model Policy {
+  id          String   @id @default(cuid())
+  orgId       String
+  name        String // e.g. "procurement.allowed_vendors"
+  kind        String   @default("guardrail") // allowlist | guardrail | budget | rate | schema | transform
+  scope       String   @default("tool.*") // event scope the policy applies to
+  enabled     Boolean  @default(true)
+  description String   @default("")
+  body        String   @default("") @db.Text // policy source text as authored
+  updatedBy   String   @default("") // email of the last editor, for display
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  org Org @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, name])
+  @@index([orgId])
+  @@map("policies")
 }
 
 // An outbound webhook subscription. Operators wire AgentVisor into their

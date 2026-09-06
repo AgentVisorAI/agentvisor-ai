@@ -89,6 +89,22 @@ exercised against release binaries in CI on every push
 
 ### Added
 
+- **Hosted console: server-side policies.** New `/api/v1/policies` CRUD
+  (org-scoped, owner/admin writes, cross-tenant fenced, audited as
+  `policy.create/enabled/disabled/update/delete`); the console's
+  Policies surface now persists to the org in live mode instead of a
+  browser-local mock store. Hit/block counters render as honest zeros
+  until the ingest stream carries per-policy attribution.
+- **`avctl console-sync --bridge-dir`.** Signed-workflow sessions leave
+  no ATIF trajectory, so they previously synced with zero events; the
+  bridge pass replays the embedded Bridge's OCSF topics
+  (session/tool_call/stop_reason/compression/identity) into console
+  events with deterministic offset-derived sequence numbers, ordered
+  before the receipt pass so sealing cannot orphan the evidence.
+- **`avctl setup` console step.** Guided setup can now store the
+  console ingest token (owner-only, `~/.agentvisor/keys/`) and write
+  `~/.agentvisor/console.toml`, then points at `avctl console-sync
+  --watch` — matching what the console's onboarding card promises.
 - **`avctl console-sync`.** Uploads locally-spooled session evidence
   (ATIF trajectories, signed receipts, the signer public key) to the
   hosted console's ingest API — the daemon→console bridge the console's
