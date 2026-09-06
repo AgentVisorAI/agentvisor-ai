@@ -1645,7 +1645,7 @@ fn step_to_event(session_external_id: &str, seq: u64, step: &av_atif::Step) -> I
             &serde_json::to_string(&body_value).unwrap_or_else(|_| "{}".to_owned()),
             MAX_BODY_UNITS,
         ),
-        policy_name: None,
+        policy_name: policy_from_step(step),
         sub: sub.map(|value| bounded_text(&value, MAX_SUB_UNITS)),
         occurred_at: step
             .timestamp
@@ -1704,6 +1704,34 @@ fn first_tool_name(step: &av_atif::Step) -> Option<String> {
         .as_ref()
         .and_then(|calls| calls.first())
         .map(|call| bounded_text(&call.function_name, MAX_TAG_UNITS))
+}
+
+/// Extract a named-policy attribution from an ATIF step. The harness
+/// embeds its tool-authorization payload (the same JSON that reaches
+/// the OCSF `agent.tool_call` event, including `"policy"` for named
+/// policy-chain denials) as observation-result content — either as a
+/// JSON object or as a serialized JSON string. Absent or unnamed gates
+/// (parse/schema/budget) yield `None`; attribution must never invent a
+/// policy the operator can't find in the console inventory.
+fn policy_from_step(step: &av_atif::Step) -> Option<String> {
+    let results = &step.observation.as_ref()?.results;
+    for result in results {
+        let Some(content) = result.content.as_ref() else {
+            continue;
+        };
+        let payload: Option<serde_json::Value> = match content {
+            serde_json::Value::String(text) => serde_json::from_str(text).ok(),
+            other => Some(other.clone()),
+        };
+        if let Some(name) = payload
+            .as_ref()
+            .and_then(|value| value.get("policy"))
+            .and_then(serde_json::Value::as_str)
+        {
+            return Some(bounded_nonempty(name, MAX_AGENT_UNITS, "policy"));
+        }
+    }
+    None
 }
 
 fn contains_block_signal(step: &av_atif::Step) -> bool {

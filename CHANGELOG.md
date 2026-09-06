@@ -89,6 +89,14 @@ exercised against release binaries in CI on every push
 
 ### Added
 
+- **Daemon-side policy attribution.** `ToolVerdict::Blocked` now carries
+  the name of the policy engine that denied (`stage: "policy"` chain
+  denials and the built-in `workflow.signed_required` consequential-tool
+  gate; parse/schema/budget gates deliberately stay unattributed), and
+  the OCSF `agent.tool_call` payload publishes it as `"policy"`.
+  `console-sync` extracts the attribution from both evidence paths —
+  bridge topics and ATIF observation content — so real daemon
+  enforcement lights the console's per-policy counters end-to-end.
 - **Per-policy attribution + daemon version reporting.** Ingest events
   accept an optional `policyName`; `/api/v1/policies` aggregates real
   24h hit/block counters from attributed events (org-fenced through

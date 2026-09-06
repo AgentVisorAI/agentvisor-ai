@@ -2736,6 +2736,10 @@ impl AppState {
                 ToolVerdict::Blocked {
                     tool: request.tool.clone(),
                     stage: "policy",
+                    // Built-in workflow gate, named so console-side
+                    // attribution has a stable handle an operator can
+                    // create a matching policy row for.
+                    policy: Some("workflow.signed_required".to_owned()),
                     reason: reason.clone(),
                     response: av_sandbox::rpc::authorization_error(request.id.as_ref(), &reason),
                     elapsed_us: 0,
@@ -2772,6 +2776,7 @@ impl AppState {
             ToolVerdict::Blocked {
                 tool,
                 stage,
+                policy,
                 reason,
                 elapsed_us,
                 ..
@@ -2781,6 +2786,10 @@ impl AppState {
                     "tool": tool,
                     "allowed": false,
                     "stage": stage,
+                    // Present only for named policy-chain denials —
+                    // consumed by console-sync as the per-policy
+                    // attribution (`payload.policy` → ingest policyName).
+                    "policy": policy,
                     "reason": reason,
                     "decision_us": elapsed_us,
                 }),
