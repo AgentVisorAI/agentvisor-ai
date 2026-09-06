@@ -254,8 +254,11 @@ secrets:
   # weak-material refusal rejects them at boot (fail-closed, loud),
   # forcing the operator to generate real ones:
   #   openssl rand -hex 32 > docker/secrets/identity_hmac
-  #   openssl rand -out docker/secrets/signing.seed 32
+  #   openssl rand -hex 32 > docker/secrets/signing.seed
   #   chmod 0400 docker/secrets/*
+  # (Both files are read as text: the signing seed MUST be 64 hex
+  # chars — the loader hex-decodes it — and the HMAC secret is used
+  # verbatim, so hex text works for both and survives editors.)
   # File secrets are bind-mounted preserving HOST ownership/mode on
   # engines that ignore the long-form uid/gid/mode pins above, and
   # the daemon's owner-only-mode check refuses group/world-readable
