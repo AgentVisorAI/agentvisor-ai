@@ -342,11 +342,20 @@
     }, 400);
   }
   var _slT;
+  // In-flight "Load more" guard: the live-tick refresh below shares the
+  // sessions fetch-seq with the Load-more click handler, so a refresh
+  // firing inside the click's fetch window bumped the seq (silently
+  // aborting the user's click) and repainted page-one depth — the
+  // interactive drill's triple-click check caught exactly this race
+  // against the demo stream's 6–14 s ticks. While a Load-more is in
+  // flight the refresh defers; the next stream event retriggers it.
+  var _loadMoreInFlight = false;
   function scheduleSessionsListRefresh() {
     clearTimeout(_slT);
     _slT = setTimeout(async function () {
       var main = document.getElementById("view");
       if (!(main && state.route && state.route.path[0] === "sessions" && !state.route.path[1])) return;
+      if (_loadMoreInFlight) return;
       // Paged view ("Load more" clicked): refetch ENOUGH pages to cover
       // what the user has loaded instead of either snapping back to
       // page one (the original bug — lost their place on every live
@@ -2003,6 +2012,7 @@
       lm.addEventListener("click", async function () {
         lm.disabled = true;
         lm.textContent = "Loading…";
+        _loadMoreInFlight = true;
         var mySeq = _sessionsFetchSeq; // abandon if a filter change lands mid-fetch
         try {
           var page = await state.ds.listSessions(Object.assign({ limit: sessionsPageSize, cursor: sessionsCursor }, sessionsFilter));
@@ -2015,6 +2025,8 @@
           toast(err.message || "Failed to load", true);
           lm.disabled = false;
           lm.textContent = "Load more";
+        } finally {
+          _loadMoreInFlight = false;
         }
       });
     }
@@ -3361,27 +3373,38 @@
 
   async function renderPolicies(main) {
     rememberListUrl("policies");
-    main.innerHTML = pageHeader("Policies", "Rules the daemon enforces before any tool call or LLM egress.", '<button class="btn accent" id="addPol">+ New policy</button>') + loadingBlock("table");
+    // Same client-side role gate as SETTINGS_TABS (R90 F3): the API
+    // refuses member-role writes with 403, so members must not see
+    // write affordances that silently snap back.
+    var polRole = (state.session && state.session.org && state.session.org.role) || "member";
+    var polCanWrite = polRole !== "member";
+    var addPolBtn = polCanWrite ? '<button class="btn accent" id="addPol">+ New policy</button>' : "";
+    main.innerHTML = pageHeader("Policies", "Rules the daemon enforces before any tool call or LLM egress.", addPolBtn) + loadingBlock("table");
     var pols;
     try { pols = await state.ds.listPolicies(); } catch (e) { return renderError(main, e); }
     if (!pols.length) {
-      main.innerHTML = pageHeader("Policies", "0 policies · none enabled", '<button class="btn accent" id="addPol">+ New policy</button>') +
-        emptyState("No policies yet", "Write your first policy to start blocking risky prompts, tool calls, or PII egress. The daemon evaluates policies before any request reaches your model.", "+ Write a policy", null, "addPolCta");
+      main.innerHTML = pageHeader("Policies", "0 policies · none enabled", addPolBtn) +
+        (polCanWrite
+          ? emptyState("No policies yet", "Write your first policy to start blocking risky prompts, tool calls, or PII egress. The daemon evaluates policies before any request reaches your model.", "+ Write a policy", null, "addPolCta")
+          : emptyState("No policies yet", "An owner or admin can write policies that block risky prompts, tool calls, or PII egress before any request reaches your model.", null, null, null));
       // #addPol / #addPolCta are handled by the delegated listener above.
       return;
     }
     var rows = pols.map(function (p) {
       var switchCls = p.enabled ? "on" : "";
+      var switchCell = polCanWrite
+        ? '<button class="switch ' + switchCls + '" data-id="' + esc(p.id) + '" aria-label="Toggle policy ' + esc(p.name) + '" role="switch" aria-checked="' + (p.enabled ? "true" : "false") + '"></button>'
+        : '<span class="pill ' + (p.enabled ? "ok" : "neutral") + '">' + (p.enabled ? "on" : "off") + "</span>";
       return '<tr data-clickable data-id="' + esc(p.id) + '" data-nav="#/policies/" tabindex="0">' +
         '<td class="policy-row"><div class="name">' + esc(p.name) + '</div><div class="kind">' + esc(p.kind) + " · " + esc(p.scope) + "</div></td>" +
         '<td title="' + esc(p.description) + '">' + esc(p.description) + "</td>" +
         '<td class="num tabular">' + esc(p.hits24h) + "</td>" +
         '<td class="num tabular">' + (p.blocks24h > 0 ? '<span style="color: var(--danger-solid); font-weight:500">' + esc(p.blocks24h) + "</span>" : esc(p.blocks24h)) + "</td>" +
         '<td style="color:var(--fg-2)">' + timeAgoCell(p.updatedAt) + "</td>" +
-        '<td><button class="switch ' + switchCls + '" data-id="' + esc(p.id) + '" aria-label="Toggle policy ' + esc(p.name) + '" role="switch" aria-checked="' + (p.enabled ? "true" : "false") + '"></button></td>' +
+        "<td>" + switchCell + "</td>" +
         "</tr>";
     }).join("");
-    main.innerHTML = pageHeader("Policies", pols.length + " policies · " + pols.filter(function (p) { return p.enabled; }).length + " enabled", '<button class="btn accent" id="addPol">+ New policy</button>') +
+    main.innerHTML = pageHeader("Policies", pols.length + " policies · " + pols.filter(function (p) { return p.enabled; }).length + " enabled", addPolBtn) +
       '<div class="card" style="padding:0"><div class="table-wrap"><table>' +
         "<thead><tr><th>Policy</th><th>Description</th><th class=\"num\">Hits 24h</th><th class=\"num\">Blocks</th><th>Updated</th><th class=\"act-1\"><span class=\"sr-only\">Actions</span></th></tr></thead>" +
         "<tbody>" + rows + "</tbody></table></div></div>";
@@ -3394,7 +3417,13 @@
         // responses could interleave with the re-render out of order.
         if (sw.getAttribute("aria-busy") === "true") return;
         sw.setAttribute("aria-busy", "true");
-        state.ds.togglePolicy(sw.getAttribute("data-id")).then(function () { renderPolicies(main); }, function () { sw.removeAttribute("aria-busy"); });
+        state.ds.togglePolicy(sw.getAttribute("data-id")).then(function () { renderPolicies(main); }, function (err) {
+          sw.removeAttribute("aria-busy");
+          // Surface the failure (403 for members racing a role change,
+          // network errors): the silent snap-back looked like a broken
+          // switch.
+          toast((err && err.message) || "Could not toggle policy", true);
+        });
         return;
       }
       var tr = e.target.closest("tr[data-id]");
@@ -3414,15 +3443,21 @@
       var resp = await state.ds.listSessions({ limit: 100 });
       fired = (resp.sessions || []).filter(function (s) { return (s.policiesFired || []).indexOf(id) >= 0; });
     } catch (e) { /* the policy page still renders without the list */ }
-    var switchCls = p.enabled ? "on" : "";
     // Keep the headline consistent with the evidence below it: when we
     // have the fired-session list, derive the block count from it
     // instead of the fixture's static number.
     var blocks24 = fired.length
       ? fired.reduce(function (a, s) { return a + (s.toolsBlocked || 0); }, 0)
       : p.blocks24h;
+    var switchCls = p.enabled ? "on" : "";
+    // Members get a read-only pill instead of a switch the API would
+    // 403 (same gate as the list page + SETTINGS_TABS R90 F3).
+    var polDetailRole = (state.session && state.session.org && state.session.org.role) || "member";
+    var headerSwitch = polDetailRole !== "member"
+      ? ' <button class="switch ' + switchCls + '" id="polSwitch" title="Toggle enabled" aria-label="Toggle policy enabled" role="switch" aria-checked="' + (p.enabled ? "true" : "false") + '"></button>'
+      : "";
     main.innerHTML =
-      pageHeader(p.name, p.kind + " · " + p.scope, '<a href="' + esc(backToListUrl("policies")) + '" class="btn">← All policies</a> <button class="switch ' + switchCls + '" id="polSwitch" title="Toggle enabled" aria-label="Toggle policy enabled" role="switch" aria-checked="' + (p.enabled ? "true" : "false") + '"></button>') +
+      pageHeader(p.name, p.kind + " · " + p.scope, '<a href="' + esc(backToListUrl("policies")) + '" class="btn">← All policies</a>' + headerSwitch) +
       '<div class="dep-summary">' +
         depCell("Status", p.enabled ? '<span class="pill ok status-dot">enabled</span>' : '<span class="pill neutral">disabled</span>', false, true) +
         depCell("Hits (24h)", p.hits24h.toLocaleString()) +
@@ -3445,7 +3480,10 @@
       var sw = e.currentTarget;
       if (sw.getAttribute("aria-busy") === "true") return;
       sw.setAttribute("aria-busy", "true");
-      state.ds.togglePolicy(id).then(function () { renderPolicyDetail(main, id); }, function () { sw.removeAttribute("aria-busy"); });
+      state.ds.togglePolicy(id).then(function () { renderPolicyDetail(main, id); }, function (err) {
+        sw.removeAttribute("aria-busy");
+        toast((err && err.message) || "Could not toggle policy", true);
+      });
     });
   }
   function syntaxPolicy(src) {
