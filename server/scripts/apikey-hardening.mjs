@@ -24,6 +24,10 @@
 
 import { execSync } from "node:child_process";
 
+// CI names its Postgres container av-pg-r45; local runs pass PG_CONTAINER
+// (same override webhook-drill.mjs already honors).
+const PG_CONTAINER = process.env.PG_CONTAINER ?? "av-pg-r45";
+
 const BASE = process.env.BASE ?? "http://127.0.0.1:8745";
 
 async function jsonReq(state, method, path, body) {
@@ -152,7 +156,7 @@ let carolState = {};
     "FROM api_keys LIMIT 1;",
   ].join(" ");
   execSync(
-    `docker exec -e PGPASSWORD=av av-pg-r45 psql -U av -d avdb -c "${sql.replace(/"/g, '\\"')}"`,
+    `docker exec -e PGPASSWORD=av ${PG_CONTAINER} psql -U av -d avdb -c "${sql.replace(/"/g, '\\"')}"`,
     { stdio: "ignore" },
   );
   const r = await fetch(BASE + "/api/v1/sessions", {

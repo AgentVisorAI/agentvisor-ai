@@ -81,7 +81,10 @@ const alice = {};
   const r = await jr(alice, "PATCH", "/api/v1/org/ip-allowlist", { cidrs: ["not.a.cidr/blah"] });
   if (r.status !== 400) fail(`bad cidr ${r.status}, expected 400`);
   const j = await r.json();
-  if (!/invalid_cidr/i.test(String(j.detail || j.errorCode))) fail(`error: ${JSON.stringify(j)}`);
+  // R285: problem+json humanizes `detail` ("Invalid cidr.") while the
+  // machine-readable token lives in `errorCode` — test both fields, not
+  // detail-with-errorCode-fallback (detail is always truthy now).
+  if (!/invalid_cidr/i.test(`${j.detail} ${j.errorCode}`)) fail(`error: ${JSON.stringify(j)}`);
   console.log("✅ malformed CIDR rejected");
 }
 

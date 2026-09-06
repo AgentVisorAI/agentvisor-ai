@@ -159,7 +159,10 @@ async function main() {
   });
   const r1 = await postToAcs(cfg.spAcsUrl, expiredResp);
   const b1 = await r1.text();
-  results.push({ drill: "expired-assertion", status: r1.status, expect: 400, body: b1.slice(0, 100) });
+  // R122 F2: ACS errors are browser-UX redirects (302 to
+  // /app/#/login?err=<slug>), not bare 4xx JSON — /acs is always a
+  // top-level IdP form post. Assert the redirect carries the slug.
+  results.push({ drill: "expired-assertion", status: r1.status, expect: 302, body: (r1.headers.get("location") ?? b1).slice(0, 100), ok: r1.status === 302 && /err=saml_assertion/.test(r1.headers.get("location") ?? "") });
 
   // ============ 2. Wrong audience ============
   console.log("\n[2] Wrong audience");
@@ -173,7 +176,7 @@ async function main() {
   });
   const r2 = await postToAcs(cfg.spAcsUrl, wrongAudResp);
   const b2 = await r2.text();
-  results.push({ drill: "wrong-audience", status: r2.status, expect: 400, body: b2.slice(0, 100) });
+  results.push({ drill: "wrong-audience", status: r2.status, expect: 302, body: (r2.headers.get("location") ?? b2).slice(0, 100), ok: r2.status === 302 && /err=saml_assertion/.test(r2.headers.get("location") ?? "") });
 
   // ============ 3. Wrong signing cert ============
   console.log("\n[3] Assertion signed by different key");
@@ -188,18 +191,40 @@ async function main() {
   });
   const r3 = await postToAcs(cfg.spAcsUrl, attackerResp);
   const b3 = await r3.text();
-  results.push({ drill: "wrong-signing-cert", status: r3.status, expect: 400, body: b3.slice(0, 100) });
+  results.push({ drill: "wrong-signing-cert", status: r3.status, expect: 302, body: (r3.headers.get("location") ?? b3).slice(0, 100), ok: r3.status === 302 && /err=saml_assertion/.test(r3.headers.get("location") ?? "") });
 
   // ============ 4. Member can't CRUD ============
   console.log("\n[4] Member cannot CRUD SAML configs");
-  // Set up a member user by inserting directly via DB - too complex. Use the /me/members flow instead? We don't have one.
-  // Skip: forge a JWT with role=member and try.
-  const memberJwt = await forgeMemberJwt(ownerCookie);
-  const memberCookie = `av_session=${memberJwt}`;
+  // Round-33 hardened the membership fence: the role claim inside the
+  // JWT is re-resolved against the memberships table on every request,
+  // so the old forged-JWT approach now (correctly) yields 401. Create a
+  // REAL member through the invite flow instead — the same path the
+  // product uses (acceptUrlDev is surfaced in dev builds).
+  const memberEmail = `member-${Date.now()}@hardening.example`;
+  const invRes = await fetch(`${API}/api/v1/members/invites`, {
+    method: "POST",
+    headers: { Cookie: ownerCookie, Origin: SPA_ORIGIN, "Sec-Fetch-Site": "same-origin", "Content-Type": "application/json" },
+    body: JSON.stringify({ email: memberEmail, role: "member" }),
+  });
+  const inv = await invRes.json();
+  const acceptToken = /token=([^&]+)/.exec(inv.invite?.acceptUrlDev ?? "")?.[1];
+  if (!acceptToken) throw new Error(`no dev accept URL on invite: ${JSON.stringify(inv).slice(0, 120)}`);
+  const acceptRes = await fetch(`${API}/api/v1/members/invites/accept`, {
+    method: "POST",
+    headers: { Origin: SPA_ORIGIN, "Sec-Fetch-Site": "same-origin", "Content-Type": "application/json" },
+    body: JSON.stringify({ email: memberEmail, token: decodeURIComponent(acceptToken), password: "correcthorse42x-member", displayName: "Drill Member" }),
+  });
+  const memberCookie = /av_session=([^;]+)/.exec(acceptRes.headers.get("set-cookie") ?? "")
+    ? `av_session=${/av_session=([^;]+)/.exec(acceptRes.headers.get("set-cookie") ?? "")[1]}`
+    : null;
+  if (!memberCookie) throw new Error(`invite accept minted no session: ${acceptRes.status} ${(await acceptRes.text()).slice(0, 120)}`);
   const memberListReq = await fetch(`${API}/api/v1/auth/saml`, {
     headers: { Cookie: memberCookie, Origin: SPA_ORIGIN, "Sec-Fetch-Site": "same-origin" },
   });
-  results.push({ drill: "member-list-ok", status: memberListReq.status, expect: 200 });
+  // R108 F1 made the SAML list owner/admin-only (ssoUrl, cert
+  // fingerprints, JIT config are recon material — same class as the
+  // R89/R90 list gates). A member must get 403, not the config list.
+  results.push({ drill: "member-list-403", status: memberListReq.status, expect: 403 });
 
   const memberCreateReq = await fetch(`${API}/api/v1/auth/saml`, {
     method: "POST",
@@ -241,13 +266,15 @@ async function main() {
   });
   const r5 = await postToAcs(cfg.spAcsUrl, jitOffResp);
   const b5 = await r5.text();
-  results.push({ drill: "jit-disabled", status: r5.status, expect: 403, body: b5.slice(0, 100) });
+  results.push({ drill: "jit-disabled", status: r5.status, expect: 302, body: (r5.headers.get("location") ?? b5).slice(0, 100), ok: r5.status === 302 && /err=saml/.test(r5.headers.get("location") ?? "") });
 
   // Print
   console.log("\n============ RESULTS ============");
   let allPass = true;
   for (const r of results) {
-    const ok = r.status === r.expect;
+    // Rows that carry their own verdict (redirect-slug assertions)
+    // use it; plain rows compare status to expect.
+    const ok = r.ok !== undefined ? r.ok : r.status === r.expect;
     if (!ok) allPass = false;
     console.log(`${ok ? "✅" : "❌"} ${r.drill}: got ${r.status}, expected ${r.expect}${r.body ? " — " + r.body : ""}`);
   }
@@ -255,29 +282,6 @@ async function main() {
   console.log("\n✅  All SAML hardening drills PASSED");
 }
 
-async function forgeMemberJwt(_ownerCookie) {
-  // Look up the org id via /me, then mint a JWT with role=member. We do
-  // NOT insert a real member row — the check we care about is "role in
-  // the JWT gets rejected by the CRUD handlers regardless".
-  const meRes = await fetch(`${API}/api/v1/auth/me`, {
-    headers: { Cookie: _ownerCookie, Origin: SPA_ORIGIN },
-  });
-  const me = await meRes.json();
-  const orgId = me.org.id;
-  const userId = me.user.id;
-  const { SignJWT } = await import("jose");
-  const secret = new TextEncoder().encode(
-    "thisisatestsecret_atleast32bytes_long_ok!",
-  );
-  const now = Math.floor(Date.now() / 1000);
-  return await new SignJWT({ sub: userId, orgId, membershipRole: "member" })
-    .setProtectedHeader({ alg: "HS256", typ: "JWT" })
-    .setIssuer("agentvisor-ai")
-    .setAudience("agentvisor-console")
-    .setIssuedAt()
-    .setExpirationTime(now + 3600)
-    .sign(secret);
-}
 
 main().catch((err) => {
   console.error("❌", err);
