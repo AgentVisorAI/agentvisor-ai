@@ -120,9 +120,20 @@
       "9992e71fe6a6e5edc18129becef2ec640f9611a4e12a4b9a311bab943ab19467",
       // The mock console's fixed demo signing key (docs/app/
       // datasource.js). Receipts downloaded from the /app/ demo are
-      // signed with it, so dropping one here verifies GREEN, the same
-      // end-to-end flow the pitch video shows. The private half is
-      // intentionally public; it signs only fake demo data.
+      // signed with it, so dropping one here verifies GREEN-adjacent,
+      // the same end-to-end flow the pitch video shows. The private
+      // half is intentionally public; it signs only fake demo data —
+      // which is exactly why it must NOT share the full "authentic"
+      // verdict with production anchors: anyone can sign an arbitrary
+      // body with the published key. DEMO_RECEIPT_KEYS below renders
+      // a distinct demo verdict instead.
+      "573c8f249012fbb08b3d79973411bb93141f32719c86ada25306fde5e59e8d57",
+    ]);
+    // Anchors whose PRIVATE half is public by design (demo/mock
+    // keys). A signature from one of these proves the receipt came
+    // from the demo tooling — or from anyone who copied the shipped
+    // key — so the UI must never call it "authentic".
+    const DEMO_RECEIPT_KEYS = new Set([
       "573c8f249012fbb08b3d79973411bb93141f32719c86ada25306fde5e59e8d57",
     ]);
 
@@ -193,7 +204,8 @@
         }
       }
       const trustedKey = ok && keyIdOk && pubkeyOk && TRUSTED_RECEIPT_KEYS.has(pub.hex.toLowerCase());
-      return { ok: ok && keyIdOk && pubkeyOk, trustedKey, bundle };
+      const demoKey = trustedKey && DEMO_RECEIPT_KEYS.has(pub.hex.toLowerCase());
+      return { ok: ok && keyIdOk && pubkeyOk, trustedKey, demoKey, bundle };
     }
 
     // R91 F4: only expose the mutable Set when the ?ci-drill=1
@@ -267,16 +279,21 @@
       // generating their own keypair) from "signature verifies AND
       // pubkey is in the trust anchor list" (actually attesting
       // AgentVisor authorship).
-      const trusted = state.ok && state.trustedKey;
+      const demo = state.ok && state.trustedKey && state.demoKey;
+      const trusted = state.ok && state.trustedKey && !state.demoKey;
       const internallyConsistent = state.ok && !state.trustedKey;
-      const cls = trusted ? "ok" : (internallyConsistent ? "pending" : "bad");
+      const cls = trusted ? "ok" : (demo || internallyConsistent ? "pending" : "bad");
       const titleText = trusted
         ? "✅  Signature verifies against a trusted key"
+        : demo
+        ? "🧪  Demo receipt — signed by the public demo key"
         : internallyConsistent
         ? "⚠️  Signature is internally consistent. Trust anchor NOT verified"
         : "❌  Signature does not verify";
       const subText = trusted
         ? "This receipt is authentic. It was signed by a key on the AgentVisor trust anchor list, and every byte of the payload matches the signature."
+        : demo
+        ? "The signature verifies against the demo console's signing key. That key's PRIVATE half ships publicly with the demo, so anyone can sign anything with it — this proves the demo flow end-to-end, but it is NOT a production attestation."
         : internallyConsistent
         ? "The bundle's signature matches its embedded public key, but that public key is NOT in the trust anchor list this verifier ships with. An attacker can generate a keypair, sign anything, and embed the pubkey, so this alone does NOT attest AgentVisor authorship. Compare the public key against a canonical AgentVisor deployment record before trusting the payload."
         : "The signature does not match the payload. Either the receipt was modified after signing, or the public key doesn't correspond to the signing key.";
@@ -362,9 +379,9 @@
       try { bundle = JSON.parse(text); }
       catch (e) { render({ kind: "err", message: "Not valid JSON: " + e.message }); return; }
       try {
-        const { ok, trustedKey, bundle: b } = await verifyBundle(bundle);
+        const { ok, trustedKey, demoKey, bundle: b } = await verifyBundle(bundle);
         if (ok && !tamper) lastGood = text;
-        render({ kind: "result", ok, trustedKey, bundle: b, tamper: tamper || null });
+        render({ kind: "result", ok, trustedKey, demoKey, bundle: b, tamper: tamper || null });
       } catch (e) {
         render({ kind: "err", message: e.message });
       }

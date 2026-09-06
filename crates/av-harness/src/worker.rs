@@ -2363,6 +2363,18 @@ pub(crate) async fn persist_broker_ack(
     .map_err(|error| error.to_string())?
 }
 
+/// Byte cap for the per-session broker-ack journal read at recovery.
+/// The journal is append-only with NO write-side cap: one sealed ack
+/// line per published event (~0.3–0.6 KiB), so a long multi-turn
+/// session accumulates acks linearly. `MAX_CONTROL_BYTES` (1 MiB,
+/// ~2–3k acks) was silently too small: `read_capped` refuses oversize
+/// files outright, so the first restart after a session crossed the
+/// cap made EVERY `read_broker_ack` for it fail and recovery skip the
+/// session forever — its artifact could never be produced. 16 MiB
+/// (matching the `MAX_RECEIPT_BYTES` class) clears ~30–50k acks while
+/// still bounding a hostile plant.
+const MAX_ACK_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
+
 pub(crate) async fn read_broker_ack(
     directory: &std::path::Path,
     session_id: &str,
@@ -2371,12 +2383,12 @@ pub(crate) async fn read_broker_ack(
 ) -> Result<Option<PublishAck>, String> {
     // New layout first: scan the per-session ack journal. Recovery-only
     // path, so the linear scan per lookup is acceptable (the journal is
-    // capped at MAX_CONTROL_BYTES ≈ 5k acks).
+    // capped at MAX_ACK_JOURNAL_BYTES, see above).
     {
         let path = ack_journal_path(directory, session_id);
         let bytes = match tokio::task::spawn_blocking({
             let path = path.clone();
-            move || av_core::fsutil::read_capped(&path, av_core::fsutil::MAX_CONTROL_BYTES)
+            move || av_core::fsutil::read_capped(&path, MAX_ACK_JOURNAL_BYTES)
         })
         .await
         .map_err(|error| error.to_string())?
