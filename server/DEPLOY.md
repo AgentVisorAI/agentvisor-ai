@@ -214,6 +214,17 @@ All four consume the same `server/Dockerfile`. Environment variables
 follow the same names (`DATABASE_URL`, `JWT_SECRET`, `ALLOWED_ORIGINS`).
 There is no platform-specific code inside the container.
 
+**Proxy hop depth — verify per provider.** `TRUSTED_PROXY_HOP_COUNT`
+must equal the number of proxy layers between the client and the app
+or per-IP rate limits, IP allowlists, and audit IPs silently key on a
+rotating edge IP instead of the client (drill-verified 2026-09-06:
+with the wrong value, 14 rapid wrong-password logins produced zero
+429s). Measured values: **Render = 3** (Cloudflare edge → Render
+router → internal hop), Fly/Cloud Run/Heroku bare = 1, anything
+behind your own CF + LB = 2. To verify a deployment: make a failed
+login, then check the IP recorded in the audit log matches your real
+public IP — and confirm an 11th rapid login attempt returns 429.
+
 ### Alternative backend: self-hosted VPS
 
 `docker compose up -d` on any Linux box with Docker installed. The

@@ -1,5 +1,6 @@
 //! `avctl` operations for keys, receipts, ATIF, Bridge, sessions, and load.
 
+mod console_sync;
 mod setup;
 
 use anyhow::{Context, Result};
@@ -175,6 +176,33 @@ enum Command {
         #[arg(long)]
         structural_only: bool,
     },
+    /// Upload locally-spooled AgentVisor session evidence to the hosted console.
+    ConsoleSync {
+        /// ATIF spool directory (`atif_spool_dir` in the harness config).
+        #[arg(long, default_value = "spool/atif")]
+        spool_dir: PathBuf,
+        /// Hosted console base URL. Overrides AV_CONSOLE_URL and [console].url.
+        #[arg(long)]
+        console_url: Option<String>,
+        /// Console deployment id. Overrides AV_CONSOLE_DEPLOYMENT and [console].deployment.
+        #[arg(long)]
+        deployment: Option<String>,
+        /// File containing the console ingest token. Overrides AV_CONSOLE_TOKEN and [console].token_file.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        /// Keep scanning until Ctrl-C.
+        #[arg(long)]
+        watch: bool,
+        /// Watch polling interval in seconds.
+        #[arg(long, default_value_t = 30)]
+        interval: u64,
+        /// JSON state file recording synced event sequences and receipts.
+        #[arg(long)]
+        state_file: Option<PathBuf>,
+        /// Print what would be uploaded without contacting the console or updating state.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Generate concurrent OpenAI-compatible chat traffic and report latency.
     Loadgen {
         /// Harness base URL.
@@ -263,6 +291,28 @@ async fn run(cli: Cli) -> Result<()> {
             path,
             structural_only,
         } => config_validate(&path, structural_only),
+        Command::ConsoleSync {
+            spool_dir,
+            console_url,
+            deployment,
+            token_file,
+            watch,
+            interval,
+            state_file,
+            dry_run,
+        } => {
+            console_sync::run(console_sync::ConsoleSyncArgs {
+                spool_dir,
+                console_url,
+                deployment,
+                token_file,
+                watch,
+                interval,
+                state_file,
+                dry_run,
+            })
+            .await
+        }
         Command::Loadgen {
             url,
             connections,
