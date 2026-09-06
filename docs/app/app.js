@@ -1801,13 +1801,10 @@
     });
   }
   function rangeGroup() {
-    // R232 F2: the server /overview endpoint doesn't accept `range` yet
-    // (read.ts:44-56 zod is {deploymentId, limit} only). Rendering the
-    // 1h/24h/7d/30d buttons in live mode produces a ghost filter — the
-    // click flips the pill but every response is the same aggregate.
-    // Mock mode honors range via bucketSessions() so keep the group
-    // for the marketing demo.
-    if (state.ds.mode !== "mock") return "";
+    // R232 F2 (resolved): the server /overview endpoint accepts
+    // `range` (1h/24h/7d/30d buckets) and ApiDataSource.getOverview
+    // forwards it, so the picker is live in BOTH modes — the old
+    // mock-only gate would hide a working control from operators.
     var opts = ["1h", "24h", "7d", "30d"];
     return '<div class="range-group">' + opts.map(function (o) {
       return '<button data-range="' + o + '"' + (state.range === o ? ' class="active"' : "") + '>' + o + '</button>';
