@@ -89,12 +89,22 @@ exercised against release binaries in CI on every push
 
 ### Added
 
+- **Per-policy attribution + daemon version reporting.** Ingest events
+  accept an optional `policyName`; `/api/v1/policies` aggregates real
+  24h hit/block counters from attributed events (org-fenced through
+  `sessions.orgId`, 24h-windowed, unmatched names ignored) instead of
+  rendering zeros. `/ingest/pubkey` accepts an optional `daemonVersion`
+  (display metadata only — never part of the trust-anchor decision;
+  a refused key rotation still records the version) shown in the
+  console's deployments fleet view; `console-sync` reports its crate
+  version and forwards `payload.policy`/`policy_name` attributions
+  from bridge tool-call events.
 - **Hosted console: server-side policies.** New `/api/v1/policies` CRUD
   (org-scoped, owner/admin writes, cross-tenant fenced, audited as
   `policy.create/enabled/disabled/update/delete`); the console's
   Policies surface now persists to the org in live mode instead of a
-  browser-local mock store. Hit/block counters render as honest zeros
-  until the ingest stream carries per-policy attribution.
+  browser-local mock store. Hit/block counters come from per-policy
+  attribution (see the entry above).
 - **`avctl console-sync --bridge-dir`.** Signed-workflow sessions leave
   no ATIF trajectory, so they previously synced with zero events; the
   bridge pass replays the embedded Bridge's OCSF topics

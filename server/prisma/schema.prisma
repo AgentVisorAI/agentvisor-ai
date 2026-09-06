@@ -304,6 +304,9 @@ model Deployment {
   // Hex-encoded 32-byte Ed25519 verifying key, published by the daemon at
   // startup. Optional until the daemon first checks in.
   publicKeyHex    String?
+  // Daemon build version as self-reported on /ingest/pubkey. Display
+  // metadata only — never trust material. Optional until first check-in.
+  daemonVersion   String?
   // Hash of the plaintext ingest token (argon2). Plaintext is shown once at
   // creation and never stored.
   ingestTokenHash String
@@ -371,6 +374,10 @@ model Event {
   tag          String // short label ("BLOCKED", "TOOL ✓", "LOOP", …)
   body         String // HTML-safe rendered body — sanitized on ingest
   sub          String? // secondary line
+  // Name of the policy this event fired under, when the daemon
+  // attributes one (block verdicts, allowlist hits). Powers the real
+  // per-policy 24h hit/block counters on /api/v1/policies.
+  policyName   String?
   occurredAt   DateTime
   journalCount Int      @default(1) // number of journal entries this row represents
 
@@ -378,6 +385,7 @@ model Event {
 
   @@unique([sessionId, seq])
   @@index([sessionId, occurredAt])
+  @@index([policyName, occurredAt])
   @@map("events")
 }
 
@@ -403,9 +411,9 @@ model Receipt {
 // Governance policy definitions as authored in the console. The daemon
 // enforces its own local policy files (WASM / schema); these rows are
 // the org's declarative source of truth the console displays and
-// operators edit. Hit/block counters are intentionally NOT stored here:
-// no trustworthy per-policy attribution exists in the ingest stream yet,
-// so the read endpoint reports zeros rather than inventing numbers.
+// operators edit. Hit/block counters are NOT stored here — the read
+// endpoint aggregates them from ingest events that carry a policyName
+// attribution (Event.policyName), scoped through sessions.orgId.
 model Policy {
   id          String   @id @default(cuid())
   orgId       String

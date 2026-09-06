@@ -25,6 +25,11 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
         name: true,
         environment: true,
         publicKeyHex: true,
+        // Daemon build version: operationally useful for owner/admin
+        // ("which fleet member is behind"), but a patch-level
+        // disclosure to a hostile member — same recon posture as
+        // ingestTokenHint/lastIngestAt below.
+        daemonVersion: !isMember,
         // R92 F2: `ingestTokenHint` is the first 8 chars of the
         // plaintext ingest token — 48 bits of the auth material.
         // R90 F2's rationale for hiding API-key hints from members
