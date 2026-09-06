@@ -242,6 +242,12 @@
         // Meta messages control the pill's connection state.
         if (msg.type === "stream.open" || msg.type === "hello") {
           setLiveState("live");
+          // `hello` also marks a (re)connect boundary: the server has
+          // no event-id replay, so anything ingested while this tab
+          // was disconnected is silently missing. Refresh whatever is
+          // on screen — same catch-up path as the visibilitychange
+          // handler; fetch-first, so a failure just skips.
+          refreshCurrentView();
           return;
         }
         if (msg.type === "stream.closed") {
@@ -283,6 +289,12 @@
     if (!path || !path[0]) return;
     if (path[0] === "overview") scheduleOverviewRefresh();
     else if (path[0] === "sessions" && path[1] && msg.type === "events.appended" && msg.data.sessionId === path[1]) {
+      scheduleSessionDetailRefresh(path[1]);
+    } else if (path[0] === "sessions" && path[1] && msg.type === "receipt.finalized" && msg.data && msg.data.sessionId === path[1]) {
+      // The open session just sealed: without this the detail page
+      // kept showing "No signed receipt yet" (and disabled export)
+      // until a manual reload — receipt.finalized previously only
+      // refreshed the overview and the list.
       scheduleSessionDetailRefresh(path[1]);
     } else if (path[0] === "sessions" && !path[1] && (msg.type === "session.upsert" || msg.type === "events.appended")) {
       // A new session or a batch of events came in. Refresh the list

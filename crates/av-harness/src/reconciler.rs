@@ -3328,10 +3328,17 @@ impl Finalizer {
                 let Some(key) = name.strip_suffix(crate::spool::TOOL_INTENT_SUFFIX) else {
                     continue;
                 };
-                let intent_bytes = match std::fs::read(&path) {
-                    Ok(bytes) => bytes,
-                    Err(_) => continue,
-                };
+                // Bounded read: same policy as the recovery scans in
+                // routes.rs — an attacker-planted multi-GB
+                // `*.intent.json` would otherwise be fully allocated
+                // here before MAC verification. Oversize/unreadable
+                // intents are skipped (they cannot name this session
+                // authentically anyway).
+                let intent_bytes =
+                    match av_core::fsutil::read_capped(&path, av_core::fsutil::MAX_CONTROL_BYTES) {
+                        Ok(bytes) => bytes,
+                        Err(_) => continue,
+                    };
                 let intent_session_id = crate::journal::open::<serde_json::Value>(
                     &control_key,
                     &format!("{}:{key}", crate::journal::TOOL_INTENT_DOMAIN),
