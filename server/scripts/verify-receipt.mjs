@@ -48,6 +48,16 @@ const TRUSTED_RECEIPT_KEYS = new Set([
   "573c8f249012fbb08b3d79973411bb93141f32719c86ada25306fde5e59e8d57",
 ]);
 
+// Keys whose PRIVATE half is public by design (the demo console ships
+// its signing key in docs/app/datasource.js so the mock flow works
+// offline). A signature from one of these proves only that the bundle
+// came from the demo tooling — or from anyone who copied the shipped
+// key — so it must NEVER earn the "authentic" verdict. Keep in sync
+// with docs/verify/verify.js DEMO_RECEIPT_KEYS.
+const DEMO_RECEIPT_KEYS = new Set([
+  "573c8f249012fbb08b3d79973411bb93141f32719c86ada25306fde5e59e8d57",
+]);
+
 const argv = process.argv.slice(2);
 let allowUntrusted = false;
 const files = [];
@@ -172,7 +182,8 @@ if (sigOk) {
   } catch { /* body not JSON — leave keyIdOk + pubkeyOk true */ }
 }
 const ok = sigOk && keyIdOk && pubkeyOk;
-const trustedKey = ok && TRUSTED_RECEIPT_KEYS.has(pubKeyHex.toLowerCase());
+const demoKey = ok && DEMO_RECEIPT_KEYS.has(pubKeyHex.toLowerCase());
+const trustedKey = ok && !demoKey && TRUSTED_RECEIPT_KEYS.has(pubKeyHex.toLowerCase());
 
 console.log("Session:       ", bundle.session?.externalId || bundle.session?.id);
 console.log("Agent:         ", bundle.session?.agent);
@@ -192,6 +203,17 @@ if (!ok) {
 if (trustedKey) {
   console.log("✅ SIGNATURE VERIFIES against a TRUSTED key — this session record is authentic.");
   process.exit(0);
+}
+
+if (demoKey) {
+  console.log(
+    "🧪 DEMO RECEIPT — signed by the public demo key. That key's PRIVATE half ships with the\n" +
+    "   demo console, so anyone can sign anything with it. This proves the demo flow end-to-end\n" +
+    "   but is NOT a production attestation.",
+  );
+  // Distinct from both "authentic" (0) and "tampered" (1): scripts
+  // must be able to require the production verdict.
+  process.exit(3);
 }
 
 if (allowUntrusted) {
