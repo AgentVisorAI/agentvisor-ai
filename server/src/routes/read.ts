@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { Prisma } from "@prisma/client";
 import { z } from "zod";
 import { db } from "../db.js";
 import { env } from "../env.js";
@@ -30,6 +31,28 @@ const OVERVIEW_LIMIT_MAX = 100;
 const SESSIONS_LIST_LIMIT_MAX = 100;
 const SESSION_EVENTS_LIMIT_MAX = 500;
 
+// Time-series bucket specs for /overview?range=…. Buckets aggregate the
+// same per-session rollup columns the mock console charts (toolsAllowed,
+// toolsBlocked, costUsdMicros, blockedPayoutUsdMicros) grouped on
+// date_trunc of openedAt, so live mode and mock mode read identically.
+// All timestamps are UTC; the SPA renders labels in the browser's TZ
+// (established policy — see LAUNCH-CHECKLIST 3.10).
+const SERIES_SPECS = {
+  "1h": { unit: "minute", bucketMs: 60_000, count: 60 },
+  "24h": { unit: "hour", bucketMs: 3_600_000, count: 24 },
+  "7d": { unit: "day", bucketMs: 86_400_000, count: 7 },
+  "30d": { unit: "day", bucketMs: 86_400_000, count: 30 },
+} as const;
+type SeriesRange = keyof typeof SERIES_SPECS;
+// date_trunc's unit argument cannot be a bind parameter inside
+// Prisma.sql, so it is interpolated from this fixed allow-list only —
+// never from user input.
+const TRUNC_SQL: Record<string, Prisma.Sql> = {
+  minute: Prisma.sql`'minute'`,
+  hour: Prisma.sql`'hour'`,
+  day: Prisma.sql`'day'`,
+};
+
 export async function readRoutes(app: FastifyInstance): Promise<void> {
   // Fleet overview: aggregate stats over the ENTIRE org (not just the
   // sliced window) + a recent-sessions preview for the dashboard.
@@ -49,6 +72,9 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
         // the last uncapped .optional() field on this endpoint
         // and its /sessions sibling.
         deploymentId: z.string().max(64).optional(),
+        // Chart range. Same options the console's range picker offers;
+        // anything else is rejected by the enum, not defaulted.
+        range: z.enum(["1h", "24h", "7d", "30d"]).default("24h"),
         limit: z.coerce.number().int().min(1).max(OVERVIEW_LIMIT_MAX).default(50),
       })
       .safeParse(req.query);
@@ -110,6 +136,44 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
 
     const byStatus: Record<string, number> = {};
     for (const g of countByStatus) byStatus[g.status] = g._count._all;
+
+    // Bucketed time series for the activity chart. Grouping happens in
+    // Postgres (date_trunc + SUM over the compound (orgId, openedAt)
+    // index path) so the payload stays a fixed `count` rows regardless
+    // of fleet size. Empty buckets are zero-filled here — the SPA
+    // renders a fixed-width bar chart and must not have to guess gaps.
+    const spec = SERIES_SPECS[query.data.range as SeriesRange];
+    const nowMs = Date.now();
+    const windowStart = new Date(
+      Math.floor(nowMs / spec.bucketMs) * spec.bucketMs - (spec.count - 1) * spec.bucketMs,
+    );
+    const rows = await db.$queryRaw<
+      Array<{ bucket: Date; allowed: bigint; blocked: bigint; cost: bigint; blockedpayout: bigint }>
+    >(Prisma.sql`
+      SELECT date_trunc(${TRUNC_SQL[spec.unit]}, "openedAt") AS bucket,
+             COALESCE(SUM("toolsAllowed"), 0)::bigint            AS allowed,
+             COALESCE(SUM("toolsBlocked"), 0)::bigint            AS blocked,
+             COALESCE(SUM("costUsdMicros"), 0)::bigint           AS cost,
+             COALESCE(SUM("blockedPayoutUsdMicros"), 0)::bigint  AS blockedpayout
+      FROM sessions
+      WHERE "orgId" = ${claims.orgId}
+        AND "openedAt" >= ${windowStart}
+        ${query.data.deploymentId ? Prisma.sql`AND "deploymentId" = ${query.data.deploymentId}` : Prisma.empty}
+      GROUP BY 1
+    `);
+    const byBucket = new Map<number, (typeof rows)[number]>();
+    for (const r of rows) byBucket.set(r.bucket.getTime(), r);
+    const series = Array.from({ length: spec.count }, (_, i) => {
+      const t = windowStart.getTime() + i * spec.bucketMs;
+      const r = byBucket.get(t);
+      return {
+        t: new Date(t).toISOString(),
+        allowed: r ? Number(r.allowed) : 0,
+        blocked: r ? Number(r.blocked) : 0,
+        costUsdMicros: r ? r.cost.toString() : "0",
+        blockedPayoutUsdMicros: r ? r.blockedpayout.toString() : "0",
+      };
+    });
     const stats = {
       sessions: sums._count._all,
       live: byStatus["live"] ?? 0,
@@ -146,6 +210,12 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
           ? "0"
           : stats.blockedPayoutUsdMicros.toString(),
       },
+      // Same member redaction as the aggregates above: tool-call counts
+      // are workaday operational data, the money dimensions are not.
+      series: series.map((b) =>
+        isMember ? { ...b, costUsdMicros: "0", blockedPayoutUsdMicros: "0" } : b,
+      ),
+      range: query.data.range,
     });
   });
 

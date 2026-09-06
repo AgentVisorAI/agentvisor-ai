@@ -26,6 +26,17 @@
 
   var NOW = Date.now();
   var HOUR = 3600000;
+
+  // Shared bucket specs for the overview chart. Used by the mock
+  // fixture bucketing below AND by ApiDataSource.getOverview to label
+  // the server's UTC bucket timestamps in the browser's local TZ, so
+  // both modes chart identically.
+  var BUCKET_SPECS = {
+    "1h":  { bucketMs: 60000, count: 60, fmt: function (d) { return d.getHours().toString().padStart(2, "0") + ":" + d.getMinutes().toString().padStart(2, "0"); } },
+    "24h": { bucketMs: HOUR, count: 24, fmt: function (d) { return d.getHours().toString().padStart(2, "0") + ":00"; } },
+    "7d":  { bucketMs: 24 * HOUR, count: 7, fmt: function (d) { return ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][d.getDay()]; } },
+    "30d": { bucketMs: 24 * HOUR, count: 30, fmt: function (d) { return (d.getMonth() + 1) + "/" + d.getDate(); } },
+  };
   var MIN = 60000;
   function iso(delta) { return new Date(NOW - delta).toISOString(); }
   function isoMinsAgo(m) { return iso(m * MIN); }
@@ -591,12 +602,7 @@
 
   function bucketSessions(range) {
     // Range → bucket count / span. All are sensible for the fixture size.
-    var spec = {
-      "1h":  { bucketMs: 60000, count: 60, fmt: function (d) { return d.getHours().toString().padStart(2, "0") + ":" + d.getMinutes().toString().padStart(2, "0"); } },
-      "24h": { bucketMs: HOUR, count: 24, fmt: function (d) { return d.getHours().toString().padStart(2, "0") + ":00"; } },
-      "7d":  { bucketMs: 24 * HOUR, count: 7, fmt: function (d) { return ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][d.getDay()]; } },
-      "30d": { bucketMs: 24 * HOUR, count: 30, fmt: function (d) { return (d.getMonth() + 1) + "/" + d.getDate(); } },
-    }[range] || { bucketMs: HOUR, count: 24, fmt: function (d) { return d.getHours() + ":00"; } };
+    var spec = BUCKET_SPECS[range] || BUCKET_SPECS["24h"];
 
     // Anchor buckets to the wall clock, not the module-load NOW —
     // sessions injected after page load (simulateAttack) must land in
@@ -2247,15 +2253,30 @@
     },
 
     async getOverview(range) {
-      var r = await apiFetch("/api/v1/overview");
+      var r = await apiFetch("/api/v1/overview?range=" + encodeURIComponent(range || "24h"));
       var stats = r.stats || {};
       var sessions = r.sessions || [];
       var llmCents = parseInt(stats.costUsdMicros || "0", 10) / 1e6;
       var blockedDollars = parseInt(stats.blockedPayoutUsdMicros || "0", 10) / 1e6;
       var deps = {};
       sessions.forEach(function (s) { if (s.deployment) deps[s.deployment.id] = s.deployment; });
+      // Map the server's UTC buckets onto the mock series shape so
+      // renderOverview charts both modes through one code path. Labels
+      // are formatted here, in the browser's local timezone (3.10).
+      var spec = BUCKET_SPECS[r.range] || BUCKET_SPECS["24h"];
+      var series = (r.series || []).map(function (b) {
+        var d = new Date(b.t);
+        return {
+          t: b.t,
+          label: spec.fmt(d),
+          allowed: b.allowed || 0,
+          blocked: b.blocked || 0,
+          spendUsd: parseInt(b.costUsdMicros || "0", 10) / 1e6,
+          blockedValueUsd: parseInt(b.blockedPayoutUsdMicros || "0", 10) / 1e6,
+        };
+      });
       return {
-        period: "last_24h",
+        period: "last_" + (r.range || "24h"),
         sessions: stats.sessions || sessions.length,
         events: 0,
         toolsAllowed: stats.toolsAllowed || 0,
@@ -2264,7 +2285,7 @@
         blockedSpendUsd: blockedDollars.toFixed(0),
         deployments: Object.keys(deps).length,
         deploymentsHealthy: Object.keys(deps).length,
-        series: null,
+        series: series.length ? series : null,
       };
     },
     async listSessions(params) {

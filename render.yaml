@@ -55,6 +55,11 @@ services:
         value: AgentVisor AI <no-reply@agentvisorai.me>
       - key: MICROSOFT_TENANT
         value: common
+      # Render fronts apps with Cloudflare edge + its own router: 3
+      # proxy hops. Wrong depth silently breaks per-IP rate limits,
+      # IP allowlists, and audit IPs (see server/DEPLOY.md).
+      - key: TRUSTED_PROXY_HOP_COUNT
+        value: "3"
       # Mailer — pick ONE. Production refuses to boot without one.
       # Set via the dashboard as a sync:false secret.
       - key: RESEND_API_KEY
