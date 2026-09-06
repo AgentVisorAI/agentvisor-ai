@@ -89,6 +89,21 @@ exercised against release binaries in CI on every push
 
 ### Added
 
+- **`avctl console-sync`.** Uploads locally-spooled session evidence
+  (ATIF trajectories, signed receipts, the signer public key) to the
+  hosted console's ingest API — the daemon→console bridge the console's
+  onboarding flow describes. Incremental and idempotent via a local
+  state file plus the server's per-`(session, seq)` dedupe; `--watch`
+  mode for continuous sync; per-session errors don't abort the run;
+  the ingest token is file- or env-sourced and never logged. See
+  `docs/reference/OPERATIONS.md`.
+- **Hosted console: real overview time series.** `GET /api/v1/overview`
+  now returns zero-filled activity buckets (`?range=1h|24h|7d|30d`)
+  aggregated in Postgres, and the console charts them in live mode —
+  previously live mode showed a structurally empty "hourly buckets not
+  wired yet" chart. Money dimensions in the series follow the existing
+  member-role redaction.
+
 - **Provider adapters.** New `provider` config key selects the upstream
   wire dialect: `"openai"` (the default; also fits vLLM, LiteLLM, Groq,
   Together, DeepSeek, OpenRouter, Ollama, LM Studio, llama.cpp, xAI,

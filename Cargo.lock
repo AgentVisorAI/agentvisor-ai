@@ -262,6 +262,7 @@ dependencies = [
  "av-events",
  "av-harness",
  "av-receipts",
+ "axum",
  "base64 0.23.1",
  "clap",
  "futures",
@@ -272,6 +273,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "toml",
  "zeroize",
 ]
 
