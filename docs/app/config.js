@@ -17,6 +17,21 @@
 window.MOCK_MODE = true;
 window.API_BASE = "";
 
+// Live-mode override: `?live=1` flips this page to the hosted API at
+// https://api.agentvisorai.me (already permitted by the CSP connect-src
+// above) and remembers the choice in localStorage; `?live=0` reverts to
+// the mock fixtures. The default stays MOCK_MODE=true so the public
+// demo keeps its fully populated Northwind workspace.
+try {
+  var __live = new URLSearchParams(location.search).get("live");
+  if (__live === "1") localStorage.setItem("av_live_mode", "1");
+  else if (__live === "0") localStorage.removeItem("av_live_mode");
+  if (localStorage.getItem("av_live_mode") === "1") {
+    window.MOCK_MODE = false;
+    window.API_BASE = "https://api.agentvisorai.me";
+  }
+} catch (e) {}
+
 // Apply the SAVED theme before first paint. Without this, a user who
 // explicitly chose the theme opposite their OS scheme got a full-page
 // flash on every load (CSS defaults follow prefers-color-scheme; the

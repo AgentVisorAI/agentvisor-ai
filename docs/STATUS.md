@@ -4,24 +4,28 @@ Real-time SLO tracker. Curated by the on-call.
 
 ## Current status
 
-**Demo surfaces operational · hosted API not yet launched** — last
-verified: 2026-08-30.
+**Demo surfaces operational · hosted API live (demo-scale)** — last
+verified: 2026-09-06.
 
-- **Console** (`agentvisorai.me/app/`) — nominal (mock mode: the full
-  product experience against built-in fixtures; nothing leaves the
-  browser)
+- **Console** (`agentvisorai.me/app/`) — nominal (mock mode by
+  default: the full product experience against built-in fixtures;
+  nothing leaves the browser. Append `?live=1` to run the same page
+  against the hosted API; `?live=0` reverts)
 - **Site + verifier** (`agentvisorai.me`, `/verify/`) — nominal
 - **Installer + public repo** (`agentvisorai.me/install.sh`,
   `github.com/AgentVisorAI/agentvisor`) — nominal, exercised nightly
   by the `public-consumer` workflow
-- **Hosted API** (`api.agentvisorai.me`) — **not launched**. The
-  backend ships in this repo (`server/`, deployable image built by
-  `deploy.yml`) and its full E2E suite runs in CI, but no public
-  instance is up and the DNS record does not exist yet. It goes live
-  with the beta — the SLO table below is the launch template, not a
-  live measurement. Anything here marked "(fill in)" is unmeasured
-  BY DEFINITION until then; treat any claim to the contrary as a bug
-  in this page.
+- **Hosted API** (`api.agentvisorai.me`) — **live** as of 2026-09-06
+  on the free-tier stack from `server/DEPLOY.md`: Render web service
+  (Ohio, Docker image from `server/Dockerfile`) + Neon Postgres
+  (us-east-2, direct/unpooled URL so the LISTEN/NOTIFY bus works) +
+  Resend mailer (no verified domain yet — delivery restricted to the
+  operator address until DNS records are added). A `keepalive.yml`
+  cron pings `/healthz` every 10 min to avoid free-tier spin-down.
+  The SLO table below still shows the launch template — "(fill in)"
+  values stay unmeasured until an uptime monitor is pointed at the
+  live instance; treat any claim to the contrary as a bug in this
+  page.
 
 ## Service level objectives
 

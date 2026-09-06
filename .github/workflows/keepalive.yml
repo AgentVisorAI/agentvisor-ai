@@ -1,0 +1,23 @@
+# Keeps the free-tier Render instance warm. Render's free plan spins
+# a service down after ~15 minutes without traffic and cold-starts take
+# 30-60 s — unacceptable mid-demo. A scheduled ping (GitHub-cron
+# granularity is best-effort ~5-15 min) keeps the machine alive within
+# the free plan's 750 instance-hours/month (a single always-on
+# instance uses ~744).
+name: API keepalive
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Ping /healthz
+        run: |
+          curl -fsS -m 30 --retry 2 https://api.agentvisorai.me/healthz

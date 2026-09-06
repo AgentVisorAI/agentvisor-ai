@@ -47,12 +47,15 @@ live mode):
 
 ### Live mode
 
-Set:
+Append `?live=1` to the console URL (persists in `localStorage`;
+`?live=0` reverts to mock), or set statically in `config.js`:
 
 ```js
 window.MOCK_MODE = false;
-window.API_BASE = "https://api.agentvisorai.me/api/v1";
+window.API_BASE = "https://api.agentvisorai.me";
 ```
+
+(The origin only — request paths already include `/api/v1`.)
 
 …and the same UI now talks to the real hosted backend defined in [`../../server/`](../../server/).
 Signup / login create real users and orgs. Deployments mint real ingest
