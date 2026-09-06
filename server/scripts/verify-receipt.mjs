@@ -50,7 +50,7 @@ const TRUSTED_RECEIPT_KEYS = new Set([
   // Keep in sync with docs/verify/verify.js TRUSTED_RECEIPT_KEYS.
   // Sample receipt signing key (docs/verify/sample-receipt.json).
   // Generated once at re-signing time; private half discarded.
-  "901e153295d578bb9e53301fbcc04dd37f971578f02da771c095b691e1b819bb",
+  "f85ae0090441c9ddaaaeec5e8483e28b7a48521d782117a69c0c17dacc2e6d65",
   // Demo console signing key (docs/app/datasource.js fixed keypair).
   "573c8f249012fbb08b3d79973411bb93141f32719c86ada25306fde5e59e8d57",
 ]);
