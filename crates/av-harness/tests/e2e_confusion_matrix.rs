@@ -466,8 +466,16 @@ fn scenarios() -> Vec<Scenario> {
             let state = build_state(sandbox, budget);
             let headers = signed_headers("scn-tool-tp-percap");
             let raw = tools_call("db_write", json!({"row": 1}));
-            // First call: should pass.
-            let _ = state.intercept_tool(&headers, &raw);
+            // First call must be ALLOWED — swallowing its verdict let an
+            // off-by-one cap (blocking from the first call) masquerade
+            // as this scenario's true positive.
+            match state.intercept_tool(&headers, &raw) {
+                Ok(v) => assert!(
+                    matches!(observed_from_verdict(&v), Observed::Allowed),
+                    "first db_write call must pass the per-tool cap of 1"
+                ),
+                Err(error) => panic!("first db_write call must not error: {error:?}"),
+            }
             // Second call: should trip the per-tool cap of 1.
             match state.intercept_tool(&headers, &raw) {
                 Ok(v) => observed_from_verdict(&v),

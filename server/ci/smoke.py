@@ -149,8 +149,15 @@ s, sig, sc2 = call("POST", "/api/v1/auth/signup", {
 if not ok("second signup", s, 201): fails += 1
 cookie2 = sc2.split(";")[0] if sc2 else None
 s, body, _ = call("GET", "/api/v1/overview", cookie=cookie2)
-if not ok("tenant isolation: fresh org empty", s, 200): fails += 1
-print(f"      second org sessions={json.loads(body)['stats']['sessions']}")
+if not ok("tenant isolation: fresh org overview 200", s, 200): fails += 1
+# The whole point of this check is the COUNT: a tenant-isolation
+# regression that served org 1's populated overview to org 2 with a
+# 200 previously PASSED (the leaked session count was only printed).
+second_org_sessions = json.loads(body)["stats"]["sessions"]
+print(f"      second org sessions={second_org_sessions}")
+if second_org_sessions != 0:
+    print(f"  FAIL tenant isolation: fresh org sees {second_org_sessions} sessions (expected 0)")
+    fails += 1
 
 # rotate token
 s, body, _ = call("POST", f"/api/v1/deployments/{dep_id}/rotate-token", None, cookie=cookie)

@@ -348,9 +348,14 @@ pub fn init(
                 .with_context(|| format!("remove pre-existing symlink at {}", output.display()))?;
         }
     }
-    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent).with_context(|| format!("create directory {}", parent.display()))?;
-    }
+    // No pre-mkdir here: `write_atomic` runs
+    // `create_dir_all_synced` on the parent itself. A preliminary
+    // bare `create_dir_all` (the prior shape) created the ancestors
+    // FIRST — unsynced and at the ambient umask — so the synced
+    // helper's is_dir() fast path skipped both the fsync of the new
+    // dirents (power loss could drop the whole just-written config)
+    // and the 0o700 mode pinning this capability-sensitive file's
+    // directory is supposed to get.
     // `std::fs::write` after the symlink check above was
     // a TOCTOU — an attacker replanting the symlink in the
     // check→write window redirected the TOML into the target (and
