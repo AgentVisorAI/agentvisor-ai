@@ -63,6 +63,13 @@ pub enum ToolVerdict {
         tool: String,
         /// Which gate blocked: `parse` | `schema` | `policy` | `budget`.
         stage: &'static str,
+        /// Name of the policy engine that denied, when the block came
+        /// from the named policy chain (`stage: "policy"`). Parse,
+        /// schema, and budget gates are configured limits rather than
+        /// named policies, so they stay `None` — the console's
+        /// per-policy attribution must never invent a policy that the
+        /// operator can't find in their policy inventory.
+        policy: Option<String>,
         /// Human/machine-readable reason.
         reason: String,
         /// Ready-to-send JSON-RPC authorization error.
@@ -166,6 +173,7 @@ impl Sandbox {
                 return ToolVerdict::Blocked {
                     tool: "<unparsed>".into(),
                     stage,
+                    policy: None,
                     reason,
                     response: crate::rpc::protocol_error(id.as_ref(), &e),
                     elapsed_us: elapsed(started),
@@ -187,6 +195,7 @@ impl Sandbox {
                 return ToolVerdict::Blocked {
                     tool: req.tool.clone(),
                     stage: "schema",
+                    policy: None,
                     reason: reason.clone(),
                     response: authorization_error(req.id.as_ref(), &reason),
                     elapsed_us: elapsed(started),
@@ -197,6 +206,7 @@ impl Sandbox {
             return ToolVerdict::Blocked {
                 tool: req.tool.clone(),
                 stage: "schema",
+                policy: None,
                 reason: reason.clone(),
                 response: authorization_error(req.id.as_ref(), &reason),
                 elapsed_us: elapsed(started),
@@ -210,6 +220,7 @@ impl Sandbox {
                 return ToolVerdict::Blocked {
                     tool: req.tool.clone(),
                     stage: "policy",
+                    policy: Some(policy.name().to_owned()),
                     reason: reason.clone(),
                     response: authorization_error(req.id.as_ref(), &reason),
                     elapsed_us: elapsed(started),
@@ -224,6 +235,7 @@ impl Sandbox {
                 return ToolVerdict::Blocked {
                     tool: req.tool.clone(),
                     stage: "budget",
+                    policy: None,
                     reason: reason.clone(),
                     response: authorization_error(req.id.as_ref(), &reason),
                     elapsed_us: elapsed(started),
@@ -246,6 +258,7 @@ impl Sandbox {
                     return ToolVerdict::Blocked {
                         tool: req.tool.clone(),
                         stage: "budget",
+                        policy: None,
                         reason: reason.clone(),
                         response: authorization_error(req.id.as_ref(), &reason),
                         elapsed_us: elapsed(started),
@@ -256,6 +269,7 @@ impl Sandbox {
                     return ToolVerdict::Blocked {
                         tool: req.tool.clone(),
                         stage: "budget",
+                        policy: None,
                         reason: reason.clone(),
                         response: authorization_error(req.id.as_ref(), &reason),
                         elapsed_us: elapsed(started),
@@ -280,6 +294,7 @@ impl Sandbox {
                     return ToolVerdict::Blocked {
                         tool: req.tool.clone(),
                         stage: "budget",
+                        policy: None,
                         reason: reason.clone(),
                         response: authorization_error(req.id.as_ref(), &reason),
                         elapsed_us: elapsed(started),
@@ -291,6 +306,7 @@ impl Sandbox {
                     return ToolVerdict::Blocked {
                         tool: req.tool.clone(),
                         stage: "budget",
+                        policy: None,
                         reason: reason.clone(),
                         response: authorization_error(req.id.as_ref(), &reason),
                         elapsed_us: elapsed(started),
@@ -314,6 +330,7 @@ impl Sandbox {
                 ToolVerdict::Blocked {
                     tool: req.tool.clone(),
                     stage: "budget",
+                    policy: None,
                     reason: reason.clone(),
                     response: authorization_error(req.id.as_ref(), &reason),
                     elapsed_us: elapsed(started),
@@ -325,6 +342,7 @@ impl Sandbox {
                 ToolVerdict::Blocked {
                     tool: req.tool.clone(),
                     stage: "budget",
+                    policy: None,
                     reason: reason.clone(),
                     response: authorization_error(req.id.as_ref(), &reason),
                     elapsed_us: elapsed(started),
@@ -483,9 +501,31 @@ mod tests {
         let store = InMemoryStore::new();
         let v = sandbox().check(&store, "s", &raw_call("rm_rf", json!({})));
         match v {
-            ToolVerdict::Blocked { stage, reason, .. } => {
+            ToolVerdict::Blocked {
+                stage,
+                policy,
+                reason,
+                ..
+            } => {
                 assert_eq!(stage, "policy");
                 assert!(reason.contains("deny-listed"), "{reason}");
+                // Named-policy denials carry the engine name so the
+                // console can attribute the block to a policy row.
+                assert_eq!(policy.as_deref(), Some("deny_tools"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_policy_gates_carry_no_policy_attribution() {
+        let store = InMemoryStore::new();
+        // Parse gate: invalid JSON-RPC.
+        let parse = sandbox().check(&store, "s", b"not json");
+        match parse {
+            ToolVerdict::Blocked { stage, policy, .. } => {
+                assert_eq!(stage, "parse");
+                assert!(policy.is_none(), "parse gate must not invent a policy name");
             }
             other => panic!("{other:?}"),
         }
