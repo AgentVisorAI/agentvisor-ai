@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -15,12 +15,25 @@ const MAX_SUB_UNITS: usize = 2_000;
 const MAX_BATCH_EVENTS: usize = 500;
 const MAX_SEQ: u64 = 100_000_000;
 const FALLBACK_OCCURRED_AT: &str = "2000-01-01T00:00:00Z";
+const INGEST_MIN_OCCURRED_AT_MS: u64 = 946_684_800_000;
+const INGEST_FUTURE_SKEW_MS: u64 = 5 * 60 * 1_000;
+const BRIDGE_SEQ_STRIDE: u64 = 1_000_000;
+const BRIDGE_FETCH_PAGE: usize = 1_024;
+const BRIDGE_TOPICS: [&str; 6] = [
+    "agent.session",
+    "agent.tool_call",
+    "agent.stop_reason",
+    "agent.compression",
+    "agent.identity",
+    "agent.receipt",
+];
 
 pub(super) struct ConsoleSyncArgs {
     pub(super) spool_dir: PathBuf,
     pub(super) console_url: Option<String>,
     pub(super) deployment: Option<String>,
     pub(super) token_file: Option<PathBuf>,
+    pub(super) bridge_dir: Option<PathBuf>,
     pub(super) watch: bool,
     pub(super) interval: u64,
     pub(super) state_file: Option<PathBuf>,
@@ -75,6 +88,14 @@ async fn run_once(config: &ResolvedSyncConfig, dry_run: bool) -> Result<SyncSumm
     state.deployment = Some(config.deployment.clone());
     let trajectories = scan_trajectories(&config.spool_dir);
     let receipts = scan_receipts(&config.spool_dir);
+    let atif_session_ids: BTreeSet<String> = trajectories
+        .iter()
+        .map(|candidate| candidate.session.external_id.clone())
+        .collect();
+    let bridge_candidates = match config.bridge_dir.as_ref() {
+        Some(bridge_dir) => scan_bridge_candidates(bridge_dir, &state, &atif_session_ids),
+        None => BridgeScan::default(),
+    };
 
     if dry_run {
         let event_count: usize = trajectories.iter().map(|candidate| candidate.events.len()).sum();
@@ -84,8 +105,12 @@ async fn run_once(config: &ResolvedSyncConfig, dry_run: bool) -> Result<SyncSumm
                 "dryRun": true,
                 "spoolDir": config.spool_dir.display().to_string(),
                 "stateFile": config.state_file.display().to_string(),
+                "bridgeDir": config.bridge_dir.as_ref().map(|path| path.display().to_string()),
                 "sessions": trajectories.len(),
                 "events": event_count,
+                "bridgeSessions": bridge_candidates.candidates.len(),
+                "bridgeEvents": bridge_candidates.candidates.iter().map(|candidate| candidate.events.len()).sum::<usize>(),
+                "bridgeEventsOutsideWindow": bridge_candidates.events_outside_window,
                 "receipts": receipts.len(),
             })
         );
@@ -96,6 +121,8 @@ async fn run_once(config: &ResolvedSyncConfig, dry_run: bool) -> Result<SyncSumm
     let mut summary = SyncSummary {
         sessions_seen: trajectories.len(),
         receipts_seen: receipts.len(),
+        bridge_sessions_seen: bridge_candidates.candidates.len(),
+        bridge_events_outside_window: bridge_candidates.events_outside_window,
         ..SyncSummary::default()
     };
     // Also save when the destination binding was just added to a
@@ -109,7 +136,8 @@ async fn run_once(config: &ResolvedSyncConfig, dry_run: bool) -> Result<SyncSumm
     // transient event-upload failure followed by a successful receipt
     // post permanently locked the missing events out.
     let mut failed_sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let pending_max_seq: std::collections::HashMap<String, u64> = trajectories
+    let bridge_max_seen_offsets = bridge_candidates.max_seen_offsets.clone();
+    let mut pending_max_seq: std::collections::HashMap<String, u64> = trajectories
         .iter()
         .filter_map(|candidate| {
             candidate
@@ -120,6 +148,16 @@ async fn run_once(config: &ResolvedSyncConfig, dry_run: bool) -> Result<SyncSumm
                 .map(|max_seq| (candidate.session.external_id.clone(), max_seq))
         })
         .collect();
+    let mut bridge_pending_max_seq: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for candidate in &bridge_candidates.candidates {
+        if let Some(max_seq) = candidate.events.iter().map(|event| event.seq).max() {
+            bridge_pending_max_seq.insert(candidate.session.external_id.clone(), max_seq);
+            pending_max_seq
+                .entry(candidate.session.external_id.clone())
+                .and_modify(|existing| *existing = (*existing).max(max_seq))
+                .or_insert(max_seq);
+        }
+    }
 
     for candidate in trajectories {
         summary.attempted += 1;
@@ -135,6 +173,32 @@ async fn run_once(config: &ResolvedSyncConfig, dry_run: bool) -> Result<SyncSumm
                 eprintln!("warning: skipped session sync: {error:#}");
             }
         }
+    }
+
+    let mut bridge_failed = false;
+    let mut bridge_incomplete = false;
+    for candidate in bridge_candidates.candidates {
+        summary.attempted += 1;
+        let session_id = candidate.session.external_id.clone();
+        match sync_bridge_candidate(&client, &mut state, candidate).await {
+            Ok(did_change) => {
+                summary.succeeded += 1;
+                changed |= did_change;
+                if let Some(max_seq) = bridge_pending_max_seq.get(&session_id) {
+                    let (acknowledged, _, _) = acknowledged_through(&state, &session_id, *max_seq);
+                    bridge_incomplete |= !acknowledged;
+                }
+            }
+            Err(error) => {
+                summary.failed += 1;
+                bridge_failed = true;
+                failed_sessions.insert(session_id);
+                eprintln!("warning: skipped bridge session sync: {error:#}");
+            }
+        }
+    }
+    if !bridge_failed && !bridge_incomplete {
+        changed |= update_bridge_offsets(&mut state, &bridge_max_seen_offsets);
     }
 
     for candidate in receipts {
@@ -156,17 +220,20 @@ async fn run_once(config: &ResolvedSyncConfig, dry_run: bool) -> Result<SyncSumm
             continue;
         }
         if let Some(max_seq) = pending_max_seq.get(&candidate.session_external_id) {
-            let synced_through = state
-                .sessions
-                .get(&candidate.session_external_id)
-                .map(|session| session.last_synced_seq)
-                .unwrap_or(0);
-            if synced_through < *max_seq {
+            let (acknowledged, synced_through, synced_any) =
+                acknowledged_through(&state, &candidate.session_external_id, *max_seq);
+            if !acknowledged {
                 summary.receipts_skipped += 1;
+                let synced_label = if synced_any {
+                    synced_through.to_string()
+                } else {
+                    "nothing".to_owned()
+                };
                 eprintln!(
-                    "warning: deferring receipt for {} — events through seq {max_seq} are not \
-                     yet acknowledged (synced through {synced_through})",
-                    sanitize_for_terminal(&candidate.session_external_id)
+                    "warning: deferring receipt for {} — events through seq {max_seq} are not yet \
+                     acknowledged (synced through {})",
+                    sanitize_for_terminal(&candidate.session_external_id),
+                    synced_label,
                 );
                 continue;
             }
@@ -196,6 +263,8 @@ async fn run_once(config: &ResolvedSyncConfig, dry_run: bool) -> Result<SyncSumm
             "succeeded": summary.succeeded,
             "failed": summary.failed,
             "receiptsSkipped": summary.receipts_skipped,
+            "bridgeSessionsSeen": summary.bridge_sessions_seen,
+            "bridgeEventsOutsideWindow": summary.bridge_events_outside_window,
         })
     );
     if summary.attempted > 0 && summary.succeeded == 0 && summary.failed > 0 {
@@ -208,6 +277,8 @@ async fn run_once(config: &ResolvedSyncConfig, dry_run: bool) -> Result<SyncSumm
 struct SyncSummary {
     sessions_seen: usize,
     receipts_seen: usize,
+    bridge_sessions_seen: usize,
+    bridge_events_outside_window: usize,
     attempted: usize,
     succeeded: usize,
     failed: usize,
@@ -224,6 +295,8 @@ async fn sync_trajectory(
         .sessions
         .entry(candidate.session.external_id.clone())
         .or_default();
+    let newly_marked_atif = !session_state.atif_synced;
+    session_state.atif_synced = true;
     let last_synced = session_state.last_synced_seq;
     let synced_any = session_state.synced_any;
     let mut events: Vec<IngestEvent> = candidate
@@ -237,10 +310,10 @@ async fn sync_trajectory(
     events.sort_by_key(|event| event.seq);
     events.dedup_by_key(|event| event.seq);
     if events.is_empty() {
-        return Ok(false);
+        return Ok(newly_marked_atif);
     }
 
-    let mut changed = false;
+    let mut changed = newly_marked_atif;
     for batch in event_batches(&events) {
         let response: EventBatchResponse = client.post_json("events", &batch).await?;
         if response
@@ -311,6 +384,102 @@ async fn sync_receipt(
     Ok(())
 }
 
+async fn sync_bridge_candidate(
+    client: &ConsoleClient,
+    state: &mut SyncState,
+    candidate: BridgeSessionCandidate,
+) -> Result<bool> {
+    let _: serde_json::Value = client.post_json("sessions", &candidate.session).await?;
+    let (last_synced, synced_any) = state
+        .sessions
+        .get(&candidate.session.external_id)
+        .map_or((0, false), |session| {
+            (session.last_synced_seq, session.synced_any)
+        });
+    let mut events: Vec<IngestEvent> = candidate
+        .events
+        .into_iter()
+        // `synced_any` distinguishes a fresh session (nothing
+        // acknowledged — include the seq-0 `open` event) from a
+        // watermark that genuinely sits at 0.
+        .filter(|event| event.seq > last_synced || (!synced_any && event.seq == 0))
+        .collect();
+    events.sort_by_key(|event| event.seq);
+    events.dedup_by_key(|event| event.seq);
+    if events.is_empty() {
+        return Ok(false);
+    }
+
+    let mut changed = false;
+    for batch in event_batches(&events) {
+        let response: EventBatchResponse = client.post_json("events", &batch).await?;
+        if response
+            .rejected_sealed
+            .as_ref()
+            .is_some_and(|sealed| sealed.iter().any(|id| id == &candidate.session.external_id))
+        {
+            eprintln!(
+                "warning: console rejected sealed bridge session {}; leaving state unchanged",
+                sanitize_for_terminal(&candidate.session.external_id)
+            );
+            // Sealed for every remaining batch too — stop instead of
+            // letting a later batch advance the watermark past events
+            // this one never delivered.
+            break;
+        }
+        if response.dropped_future.unwrap_or(0) > 0 || response.dropped_ancient.unwrap_or(0) > 0 {
+            eprintln!(
+                "warning: console dropped timestamp-skewed bridge events for {}; leaving that batch retryable",
+                sanitize_for_terminal(&candidate.session.external_id)
+            );
+            // MUST stop here: continuing let the NEXT batch's success
+            // bump last_synced_seq past the dropped events, excluding
+            // them from every future pass — permanently missing
+            // evidence with only a one-line warning.
+            break;
+        }
+        if let Some(max_seq) = batch.iter().map(|event| event.seq).max() {
+            let session_state = state
+                .sessions
+                .entry(candidate.session.external_id.clone())
+                .or_default();
+            session_state.last_synced_seq = session_state.last_synced_seq.max(max_seq);
+            session_state.synced_any = true;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+fn update_bridge_offsets(state: &mut SyncState, offsets: &BTreeMap<String, u64>) -> bool {
+    let mut changed = false;
+    for (key, offset) in offsets {
+        let entry = state.bridge_topic_offsets.entry(key.clone()).or_insert(0);
+        if *entry < *offset {
+            *entry = *offset;
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn acknowledged_through(state: &SyncState, session_id: &str, max_seq: u64) -> (bool, u64, bool) {
+    let synced_through = state
+        .sessions
+        .get(session_id)
+        .map(|session| session.last_synced_seq)
+        .unwrap_or(0);
+    let synced_any = state
+        .sessions
+        .get(session_id)
+        .is_some_and(|session| session.synced_any);
+    (
+        synced_any && synced_through >= max_seq,
+        synced_through,
+        synced_any,
+    )
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct SyncState {
@@ -322,6 +491,7 @@ struct SyncState {
     /// and silently delivered incomplete evidence to the new target.
     console_url: Option<String>,
     deployment: Option<String>,
+    bridge_topic_offsets: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -333,7 +503,9 @@ struct SessionSyncState {
     /// up to seq 0": the generated `open` event carries seq 0, and the
     /// `seq > last_synced_seq` filter with the default watermark of 0
     /// silently discarded it forever on every fresh session.
+    #[serde(alias = "events_synced")]
     synced_any: bool,
+    atif_synced: bool,
 }
 
 /// The state file grows with one entry per session and is never pruned;
@@ -363,6 +535,7 @@ impl SyncState {
 #[derive(Debug)]
 struct ResolvedSyncConfig {
     spool_dir: PathBuf,
+    bridge_dir: Option<PathBuf>,
     state_file: PathBuf,
     console_url: String,
     deployment: String,
@@ -382,6 +555,11 @@ impl ResolvedSyncConfig {
             .clone()
             .or_else(|| std::env::var("AV_CONSOLE_DEPLOYMENT").ok())
             .or(file_config.deployment);
+        let bridge_dir = args
+            .bridge_dir
+            .clone()
+            .or_else(|| std::env::var_os("AV_CONSOLE_BRIDGE_DIR").map(PathBuf::from))
+            .or(file_config.bridge_dir);
         let env_token = std::env::var("AV_CONSOLE_TOKEN")
             .ok()
             .map(|value| value.trim().to_owned())
@@ -431,6 +609,7 @@ impl ResolvedSyncConfig {
             .unwrap_or_else(|| args.spool_dir.join(".console-sync-state.json"));
         Ok(Self {
             spool_dir: args.spool_dir.clone(),
+            bridge_dir,
             state_file,
             console_url,
             deployment,
@@ -444,17 +623,58 @@ struct ConsoleFileConfig {
     url: Option<String>,
     deployment: Option<String>,
     token_file: Option<PathBuf>,
+    bridge_dir: Option<PathBuf>,
 }
 
 fn read_console_file_config() -> Result<ConsoleFileConfig> {
+    let mut config = read_user_console_file_config()?;
     let source = av_harness::config::resolve_config_source().map_err(anyhow::Error::msg)?;
     let av_harness::config::ConfigSource::File(path) = source else {
-        return Ok(ConsoleFileConfig::default());
+        return Ok(config);
     };
     let text = av_core::fsutil::read_capped_string(&path, av_core::fsutil::MAX_CONTROL_BYTES)
         .with_context(|| format!("read config {}", path.display()))?;
     let value: toml::Value =
         toml::from_str(&text).with_context(|| format!("parse config {}", path.display()))?;
+    let Some(console) = value.get("console").and_then(toml::Value::as_table) else {
+        return Ok(config);
+    };
+    config.url = console
+        .get("url")
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
+        .or(config.url);
+    config.deployment = console
+        .get("deployment")
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
+        .or(config.deployment);
+    config.token_file = console
+        .get("token_file")
+        .and_then(toml::Value::as_str)
+        .map(PathBuf::from)
+        .or(config.token_file);
+    config.bridge_dir = console
+        .get("bridge_dir")
+        .and_then(toml::Value::as_str)
+        .map(PathBuf::from)
+        .or(config.bridge_dir);
+    Ok(config)
+}
+
+fn read_user_console_file_config() -> Result<ConsoleFileConfig> {
+    let Some(path) = user_console_config_path() else {
+        return Ok(ConsoleFileConfig::default());
+    };
+    let text = match av_core::fsutil::read_capped_string(&path, av_core::fsutil::MAX_CONTROL_BYTES) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ConsoleFileConfig::default());
+        }
+        Err(error) => return Err(error).with_context(|| format!("read console config {}", path.display())),
+    };
+    let value: toml::Value =
+        toml::from_str(&text).with_context(|| format!("parse console config {}", path.display()))?;
     let Some(console) = value.get("console").and_then(toml::Value::as_table) else {
         return Ok(ConsoleFileConfig::default());
     };
@@ -471,7 +691,16 @@ fn read_console_file_config() -> Result<ConsoleFileConfig> {
             .get("token_file")
             .and_then(toml::Value::as_str)
             .map(PathBuf::from),
+        bridge_dir: console
+            .get("bridge_dir")
+            .and_then(toml::Value::as_str)
+            .map(PathBuf::from),
     })
+}
+
+fn user_console_config_path() -> Option<PathBuf> {
+    #[allow(deprecated)]
+    std::env::home_dir().map(|home| home.join(".agentvisor").join("console.toml"))
 }
 
 struct ConsoleClient {
@@ -595,6 +824,528 @@ fn scan_trajectories(spool_dir: &Path) -> Vec<TrajectoryCandidate> {
         }
     }
     out
+}
+
+#[derive(Default)]
+struct BridgeScan {
+    candidates: Vec<BridgeSessionCandidate>,
+    events_outside_window: usize,
+    max_seen_offsets: BTreeMap<String, u64>,
+}
+
+#[derive(Debug)]
+struct BridgeSessionCandidate {
+    session: SessionUpsert,
+    events: Vec<IngestEvent>,
+}
+
+struct BridgeSessionAccumulator {
+    external_id: String,
+    agent: String,
+    workflow: Workflow,
+    opened_at: Option<String>,
+    closed_at: Option<String>,
+    first_at: Option<String>,
+    events: Vec<IngestEvent>,
+}
+
+struct BridgeMappedEvent {
+    session_external_id: String,
+    agent: String,
+    workflow: Option<Workflow>,
+    opened_at: Option<String>,
+    closed_at: Option<String>,
+    event: IngestEvent,
+}
+
+fn scan_bridge_candidates(
+    bridge_dir: &Path,
+    state: &SyncState,
+    atif_session_ids: &BTreeSet<String>,
+) -> BridgeScan {
+    let partitions = match bridge_topic_partitions(bridge_dir) {
+        Ok(partitions) => partitions,
+        Err(error) => {
+            eprintln!(
+                "warning: cannot read bridge manifest under {}: {error:#}",
+                bridge_dir.display()
+            );
+            return BridgeScan::default();
+        }
+    };
+    let mut scan = BridgeScan::default();
+    let mut sessions: BTreeMap<String, BridgeSessionAccumulator> = BTreeMap::new();
+    let now_ms = av_core::time::now_ms();
+
+    for (topic_idx, topic) in BRIDGE_TOPICS.iter().enumerate() {
+        let Some(partition_count) = partitions.get(*topic).copied() else {
+            continue;
+        };
+        for partition in 0..partition_count {
+            let cursor_key = bridge_offset_key(topic, partition);
+            let mut cursor = state
+                .bridge_topic_offsets
+                .get(&cursor_key)
+                .and_then(|offset| offset.checked_add(1))
+                .unwrap_or(0);
+            loop {
+                let page = match av_bridge::EmbeddedBroker::fetch_read_only(
+                    bridge_dir,
+                    topic,
+                    partition,
+                    cursor,
+                    BRIDGE_FETCH_PAGE,
+                ) {
+                    Ok(page) => page,
+                    Err(error) => {
+                        eprintln!(
+                            "warning: cannot read bridge topic {} partition {}: {error}",
+                            sanitize_for_terminal(topic),
+                            partition
+                        );
+                        break;
+                    }
+                };
+                if page.is_empty() {
+                    break;
+                }
+                for stored in &page {
+                    scan.max_seen_offsets
+                        .entry(cursor_key.clone())
+                        .and_modify(|offset| *offset = (*offset).max(stored.offset))
+                        .or_insert(stored.offset);
+                    if *topic == "agent.receipt" {
+                        continue;
+                    }
+                    let Some(session_id) = bridge_session_id(&stored.value) else {
+                        continue;
+                    };
+                    if atif_session_ids.contains(&session_id)
+                        || state
+                            .sessions
+                            .get(&session_id)
+                            .is_some_and(|session| session.atif_synced)
+                    {
+                        continue;
+                    }
+                    match bridge_record_to_event(topic_idx, topic, stored, now_ms) {
+                        BridgeRecordMapping::Mapped(mapped) => {
+                            let entry =
+                                sessions
+                                    .entry(mapped.session_external_id.clone())
+                                    .or_insert_with(|| BridgeSessionAccumulator {
+                                        external_id: mapped.session_external_id.clone(),
+                                        agent: mapped.agent.clone(),
+                                        workflow: mapped.workflow.unwrap_or(Workflow::Signed),
+                                        opened_at: None,
+                                        closed_at: None,
+                                        first_at: None,
+                                        events: Vec::new(),
+                                    });
+                            entry.agent = mapped.agent;
+                            if let Some(workflow) = mapped.workflow {
+                                entry.workflow = workflow;
+                            }
+                            if let Some(opened_at) = mapped.opened_at {
+                                entry.opened_at = Some(opened_at);
+                            }
+                            if let Some(closed_at) = mapped.closed_at {
+                                entry.closed_at = Some(closed_at);
+                            }
+                            if entry.first_at.is_none() {
+                                entry.first_at = Some(mapped.event.occurred_at.clone());
+                            }
+                            entry.events.push(mapped.event);
+                        }
+                        BridgeRecordMapping::OutsideWindow => {
+                            scan.events_outside_window = scan.events_outside_window.saturating_add(1);
+                        }
+                        BridgeRecordMapping::Skipped => {}
+                    }
+                }
+                let next = page
+                    .last()
+                    .and_then(|event| event.offset.checked_add(1))
+                    .unwrap_or(cursor);
+                if next <= cursor {
+                    break;
+                }
+                cursor = next;
+            }
+        }
+    }
+
+    scan.candidates = sessions
+        .into_values()
+        .filter_map(|mut session| {
+            session.events.sort_by_key(|event| event.seq);
+            session.events.dedup_by_key(|event| event.seq);
+            if session.events.is_empty() {
+                return None;
+            }
+            let opened_at = session
+                .opened_at
+                .clone()
+                .or_else(|| session.first_at.clone())
+                .unwrap_or_else(|| FALLBACK_OCCURRED_AT.to_owned());
+            Some(BridgeSessionCandidate {
+                session: SessionUpsert {
+                    external_id: session.external_id,
+                    agent: bounded_nonempty(&session.agent, MAX_AGENT_UNITS, "agent"),
+                    workflow: session.workflow,
+                    status: SessionStatus::Live,
+                    policy_version: 1,
+                    opened_at,
+                    closed_at: session.closed_at,
+                },
+                events: session.events,
+            })
+        })
+        .collect();
+    scan
+}
+
+fn bridge_topic_partitions(bridge_dir: &Path) -> Result<BTreeMap<String, u32>> {
+    let manifest_yaml = av_core::fsutil::read_capped_string(
+        &bridge_dir.join("manifest.yaml"),
+        av_core::fsutil::MAX_CONTROL_BYTES,
+    )?;
+    let manifest = av_bridge::BridgeManifest::from_yaml(&manifest_yaml).map_err(anyhow::Error::new)?;
+    let wanted: BTreeSet<&str> = BRIDGE_TOPICS.iter().copied().collect();
+    Ok(manifest
+        .topics
+        .iter()
+        .filter(|topic| wanted.contains(topic.name.as_str()))
+        .map(|topic| (topic.name.clone(), topic.partitions))
+        .collect())
+}
+
+fn bridge_offset_key(topic: &str, partition: u32) -> String {
+    format!("{topic}/p{partition}")
+}
+
+enum BridgeRecordMapping {
+    Mapped(Box<BridgeMappedEvent>),
+    OutsideWindow,
+    Skipped,
+}
+
+fn bridge_record_to_event(
+    topic_idx: usize,
+    topic: &str,
+    stored: &av_bridge::StoredEvent,
+    now_ms: u64,
+) -> BridgeRecordMapping {
+    let value = &stored.value;
+    let Some(session_external_id) = bridge_session_id(value) else {
+        return BridgeRecordMapping::Skipped;
+    };
+    let Some((occurred_ms, occurred_at)) = bridge_occurred_at(value, stored.stored_at) else {
+        return BridgeRecordMapping::OutsideWindow;
+    };
+    if occurred_ms < INGEST_MIN_OCCURRED_AT_MS || occurred_ms > now_ms.saturating_add(INGEST_FUTURE_SKEW_MS) {
+        return BridgeRecordMapping::OutsideWindow;
+    }
+    let seq = bridge_seq(topic_idx, stored.offset);
+    let agent = bounded_nonempty(
+        value
+            .pointer("/ai_agent/charter/name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("agent"),
+        MAX_AGENT_UNITS,
+        "agent",
+    );
+    let payload = value.get("payload").unwrap_or(&serde_json::Value::Null);
+    let body = bridge_body(topic, value);
+    let mut workflow = payload
+        .get("workflow")
+        .and_then(serde_json::Value::as_str)
+        .and_then(workflow_from_str);
+    let mut opened_at = None;
+    let mut closed_at = None;
+
+    let mut event = match topic {
+        "agent.session" => {
+            let action = payload
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("session");
+            if action == "opened" {
+                opened_at = Some(occurred_at.clone());
+            } else if action == "closed" {
+                closed_at = Some(occurred_at.clone());
+            }
+            if workflow.is_none() && action == "closed" {
+                workflow = Some(Workflow::Signed);
+            }
+            bridge_ingest_event(
+                &session_external_id,
+                seq,
+                EventKind::Sys,
+                if action == "opened" {
+                    "open"
+                } else if action == "closed" {
+                    "close"
+                } else {
+                    "session"
+                },
+                None,
+                body,
+                occurred_at.clone(),
+            )
+        }
+        "agent.tool_call" => {
+            let blocked = bridge_tool_blocked(value);
+            let tag = bridge_tool_tag(payload);
+            let mut event = bridge_ingest_event(
+                &session_external_id,
+                seq,
+                if blocked {
+                    EventKind::Block
+                } else {
+                    EventKind::Tool
+                },
+                &tag,
+                Some(tag.clone()),
+                body,
+                occurred_at.clone(),
+            );
+            if blocked {
+                event.add_tools_blocked = 1;
+                event.add_blocked_payout_usd_micros = extract_payout_micros(payload);
+            } else {
+                event.add_tools_allowed = 1;
+            }
+            event
+        }
+        "agent.stop_reason" => bridge_ingest_event(
+            &session_external_id,
+            seq,
+            EventKind::Guard,
+            bridge_stop_reason_tag(value).as_str(),
+            None,
+            body,
+            occurred_at.clone(),
+        ),
+        "agent.compression" => bridge_ingest_event(
+            &session_external_id,
+            seq,
+            EventKind::Audit,
+            "compression",
+            None,
+            body,
+            occurred_at.clone(),
+        ),
+        "agent.identity" => bridge_ingest_event(
+            &session_external_id,
+            seq,
+            EventKind::Audit,
+            "identity",
+            None,
+            body,
+            occurred_at.clone(),
+        ),
+        _ => return BridgeRecordMapping::Skipped,
+    };
+    apply_bridge_metrics(value, &mut event);
+    BridgeRecordMapping::Mapped(Box::new(BridgeMappedEvent {
+        session_external_id,
+        agent,
+        workflow,
+        opened_at,
+        closed_at,
+        event,
+    }))
+}
+
+fn bridge_ingest_event(
+    session_external_id: &str,
+    seq: u64,
+    kind: EventKind,
+    tag: &str,
+    sub: Option<String>,
+    body: String,
+    occurred_at: String,
+) -> IngestEvent {
+    IngestEvent {
+        session_external_id: bounded_nonempty(session_external_id, MAX_EXTERNAL_ID_UNITS, "unknown-session"),
+        seq,
+        kind,
+        tag: bounded_nonempty(tag, MAX_TAG_UNITS, "event"),
+        body: bounded_text(&body, MAX_BODY_UNITS),
+        sub: sub.map(|value| bounded_text(&value, MAX_SUB_UNITS)),
+        occurred_at,
+        journal_count: 1,
+        add_prompt_tokens: 0,
+        add_completion_tokens: 0,
+        add_cost_usd_micros: 0,
+        add_payout_usd_micros: 0,
+        add_blocked_payout_usd_micros: 0,
+        add_tools_allowed: 0,
+        add_tools_blocked: 0,
+    }
+}
+
+fn bridge_session_id(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("session_uid")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            value
+                .pointer("/payload/session_id")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            value
+                .pointer("/payload/session_uid")
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(|value| bounded_nonempty(value, MAX_EXTERNAL_ID_UNITS, "unknown-session"))
+}
+
+fn bridge_occurred_at(value: &serde_json::Value, stored_at: u64) -> Option<(u64, String)> {
+    let ms = value
+        .get("time")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| (stored_at > 0).then_some(stored_at))?;
+    let iso = value
+        .get("time_iso")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| av_core::time::iso8601_ms(ms));
+    Some((ms, iso))
+}
+
+fn bridge_seq(topic_idx: usize, offset: u64) -> u64 {
+    let base = u64::try_from(topic_idx)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(BRIDGE_SEQ_STRIDE);
+    base.saturating_add(offset).min(MAX_SEQ)
+}
+
+fn workflow_from_str(value: &str) -> Option<Workflow> {
+    match value {
+        "signed" => Some(Workflow::Signed),
+        "unsigned" => Some(Workflow::Unsigned),
+        _ => None,
+    }
+}
+
+fn bridge_body(topic: &str, value: &serde_json::Value) -> String {
+    let mut body = serde_json::json!({
+        "topic": topic,
+        "metadataUid": value.pointer("/metadata/uid"),
+        "payload": value.get("payload"),
+        "metrics": value.get("metrics"),
+        "stopReasonId": value.get("stop_reason_id"),
+        "stopReason": value.get("stop_reason"),
+    });
+    if topic == "agent.compression" {
+        if let Some(pruned) = value
+            .pointer("/metrics/pruned_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                value
+                    .pointer("/payload/pruned_tokens")
+                    .and_then(serde_json::Value::as_u64)
+            })
+        {
+            if let Some(object) = body.as_object_mut() {
+                object.insert("prunedTokens".to_owned(), serde_json::json!(pruned));
+            }
+        }
+    }
+    serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_owned())
+}
+
+fn bridge_tool_blocked(value: &serde_json::Value) -> bool {
+    let payload = value.get("payload").unwrap_or(&serde_json::Value::Null);
+    if payload.get("allowed").and_then(serde_json::Value::as_bool) == Some(false) {
+        return true;
+    }
+    if value.get("status_id").and_then(serde_json::Value::as_u64) == Some(2) {
+        return true;
+    }
+    for key in ["verdict", "status", "decision", "outcome"] {
+        if payload
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| {
+                let text = text.to_ascii_lowercase();
+                text.contains("block") || text.contains("deny") || text.contains("fail")
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn bridge_tool_tag(payload: &serde_json::Value) -> String {
+    for pointer in ["/tool", "/tool_name", "/name", "/function/name", "/function_name"] {
+        if let Some(value) = payload.pointer(pointer).and_then(serde_json::Value::as_str) {
+            return bounded_nonempty(value, MAX_TAG_UNITS, "tool");
+        }
+    }
+    "tool".to_owned()
+}
+
+fn bridge_stop_reason_tag(value: &serde_json::Value) -> String {
+    value
+        .get("stop_reason")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            value
+                .pointer("/payload/reason")
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(|value| bounded_nonempty(value, MAX_TAG_UNITS, "stop_reason"))
+        .unwrap_or_else(|| "stop_reason".to_owned())
+}
+
+fn apply_bridge_metrics(value: &serde_json::Value, event: &mut IngestEvent) {
+    if let Some(metrics) = value.get("metrics") {
+        event.add_prompt_tokens = cap_u64_to_u32(
+            metrics
+                .get("prompt_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            1_000_000,
+        );
+        event.add_completion_tokens = cap_u64_to_u32(
+            metrics
+                .get("completion_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            1_000_000,
+        );
+    }
+    event.add_cost_usd_micros = value
+        .pointer("/payload/cost_usd_micros")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| value.get("cost_usd_micros").and_then(serde_json::Value::as_u64))
+        .unwrap_or(0)
+        .min(100_000_000_000);
+}
+
+fn extract_payout_micros(value: &serde_json::Value) -> u64 {
+    for pointer in [
+        "/payout_usd_micros",
+        "/payoutUsdMicros",
+        "/payout_micros",
+        "/payout/micros",
+        "/payout/usd_micros",
+    ] {
+        if let Some(micros) = value.pointer(pointer).and_then(serde_json::Value::as_u64) {
+            return micros.min(100_000_000_000);
+        }
+    }
+    for pointer in ["/payout_usd", "/amount_usd", "/payout/usd", "/payout/amount_usd"] {
+        if let Some(usd) = value.pointer(pointer).and_then(serde_json::Value::as_f64) {
+            return cost_usd_to_micros(usd);
+        }
+    }
+    0
 }
 
 fn read_trajectory_candidate(path: &Path) -> Result<TrajectoryCandidate> {
@@ -927,7 +1678,7 @@ struct SessionUpsert {
     closed_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Workflow {
     Signed,
@@ -1012,6 +1763,8 @@ enum EventKind {
     Llm,
     Tool,
     Block,
+    Guard,
+    Audit,
 }
 
 fn is_default_u32(value: &u32) -> bool {
@@ -1218,15 +1971,190 @@ mod tests {
                 last_synced_seq: 42,
                 receipt_synced: true,
                 synced_any: true,
+                atif_synced: true,
             },
         );
         state.pubkey_hex_synced = Some("ab".repeat(32));
+        state.console_url = Some("https://console.example".to_owned());
+        state.deployment = Some("dep-1".to_owned());
+        state
+            .bridge_topic_offsets
+            .insert("agent.session/p0".to_owned(), 7);
         state.save(&path).unwrap();
         let restored = SyncState::load(&path).unwrap();
         let session = restored.sessions.get("s1").unwrap();
         assert_eq!(session.last_synced_seq, 42);
+        assert!(session.synced_any);
         assert!(session.receipt_synced);
+        assert!(session.atif_synced);
         assert_eq!(restored.pubkey_hex_synced, Some("ab".repeat(32)));
+        assert_eq!(restored.console_url.as_deref(), Some("https://console.example"));
+        assert_eq!(restored.deployment.as_deref(), Some("dep-1"));
+        assert_eq!(restored.bridge_topic_offsets.get("agent.session/p0"), Some(&7));
+    }
+
+    #[test]
+    fn bridge_seq_is_deterministic_and_capped() {
+        assert_eq!(bridge_seq(1, 7), 1_000_007);
+        assert_eq!(bridge_seq(1, 7), bridge_seq(1, 7));
+        assert_eq!(bridge_seq(200, 1), MAX_SEQ);
+    }
+
+    #[test]
+    fn bridge_ocsf_tool_and_session_events_map_to_ingest_shape() {
+        let tool = stored_bridge_event(
+            "agent.tool_call",
+            7,
+            json!({
+                "metadata": {"uid": "evt-tool", "sequence": 3},
+                "class_name": "agent.tool_call",
+                "time": 1767225600000u64,
+                "time_iso": "2026-01-01T00:00:00.000Z",
+                "status_id": 2,
+                "session_uid": "signed-s",
+                "ai_agent": {
+                    "version": "1.0.0",
+                    "charter": {"name": "signed-agent", "type_id": 1},
+                    "instance_uid": "inst-1"
+                },
+                "payload": {
+                    "tool": "deploy-production",
+                    "allowed": false,
+                    "stage": "policy",
+                    "reason": "denied by policy",
+                    "payout_usd_micros": 8400
+                }
+            }),
+        );
+        let BridgeRecordMapping::Mapped(mapped) =
+            bridge_record_to_event(1, "agent.tool_call", &tool, 1_800_000_000_000)
+        else {
+            panic!("tool event should map");
+        };
+        assert_eq!(mapped.session_external_id, "signed-s");
+        assert_eq!(mapped.agent, "signed-agent");
+        assert_eq!(mapped.event.seq, 1_000_007);
+        assert_eq!(mapped.event.kind, EventKind::Block);
+        assert_eq!(mapped.event.tag, "deploy-production");
+        assert_eq!(mapped.event.add_tools_blocked, 1);
+        assert_eq!(mapped.event.add_tools_allowed, 0);
+        assert_eq!(mapped.event.add_blocked_payout_usd_micros, 8400);
+
+        let opened = stored_bridge_event(
+            "agent.session",
+            0,
+            json!({
+                "metadata": {"uid": "evt-open", "sequence": 0},
+                "class_name": "agent.session",
+                "time": 1767225600000u64,
+                "time_iso": "2026-01-01T00:00:00.000Z",
+                "status_id": 1,
+                "session_uid": "signed-s",
+                "ai_agent": {
+                    "version": "1.0.0",
+                    "charter": {"name": "signed-agent", "type_id": 1},
+                    "instance_uid": "inst-1"
+                },
+                "payload": {"action": "opened", "workflow": "signed"}
+            }),
+        );
+        let BridgeRecordMapping::Mapped(mapped) =
+            bridge_record_to_event(0, "agent.session", &opened, 1_800_000_000_000)
+        else {
+            panic!("session event should map");
+        };
+        assert_eq!(mapped.workflow, Some(Workflow::Signed));
+        assert_eq!(mapped.opened_at.as_deref(), Some("2026-01-01T00:00:00.000Z"));
+        assert_eq!(mapped.event.kind, EventKind::Sys);
+        assert_eq!(mapped.event.tag, "open");
+    }
+
+    #[test]
+    fn bridge_scan_skips_atif_synced_sessions_and_tracks_offsets() {
+        let dir = test_tempdir("bridge-dedupe");
+        write_bridge_manifest(dir.path());
+        append_bridge_event(
+            dir.path(),
+            "agent.session",
+            stored_bridge_event(
+                "agent.session",
+                0,
+                json!({
+                    "metadata": {"uid": "evt-unsigned", "sequence": 0},
+                    "class_name": "agent.session",
+                    "time": 1767225600000u64,
+                    "time_iso": "2026-01-01T00:00:00.000Z",
+                    "status_id": 1,
+                    "session_uid": "unsigned-s",
+                    "ai_agent": {
+                        "version": "1.0.0",
+                        "charter": {"name": "unsigned-agent", "type_id": 1},
+                        "instance_uid": "inst-u"
+                    },
+                    "payload": {"action": "opened", "workflow": "unsigned"}
+                }),
+            ),
+        );
+        append_bridge_event(
+            dir.path(),
+            "agent.session",
+            stored_bridge_event(
+                "agent.session",
+                2,
+                json!({
+                    "metadata": {"uid": "evt-old-unsigned", "sequence": 0},
+                    "class_name": "agent.session",
+                    "time": 1767225600000u64,
+                    "time_iso": "2026-01-01T00:00:00.000Z",
+                    "status_id": 1,
+                    "session_uid": "old-unsigned",
+                    "ai_agent": {
+                        "version": "1.0.0",
+                        "charter": {"name": "old-unsigned-agent", "type_id": 1},
+                        "instance_uid": "inst-ou"
+                    },
+                    "payload": {"action": "opened", "workflow": "unsigned"}
+                }),
+            ),
+        );
+        append_bridge_event(
+            dir.path(),
+            "agent.session",
+            stored_bridge_event(
+                "agent.session",
+                1,
+                json!({
+                    "metadata": {"uid": "evt-signed", "sequence": 0},
+                    "class_name": "agent.session",
+                    "time": 1767225600000u64,
+                    "time_iso": "2026-01-01T00:00:00.000Z",
+                    "status_id": 1,
+                    "session_uid": "signed-s",
+                    "ai_agent": {
+                        "version": "1.0.0",
+                        "charter": {"name": "signed-agent", "type_id": 1},
+                        "instance_uid": "inst-s"
+                    },
+                    "payload": {"action": "opened", "workflow": "signed"}
+                }),
+            ),
+        );
+
+        let mut state = SyncState::default();
+        state.sessions.insert(
+            "old-unsigned".to_owned(),
+            SessionSyncState {
+                last_synced_seq: 0,
+                receipt_synced: false,
+                synced_any: true,
+                atif_synced: true,
+            },
+        );
+        let atif_ids = BTreeSet::from(["unsigned-s".to_owned()]);
+        let scan = scan_bridge_candidates(dir.path(), &state, &atif_ids);
+        assert_eq!(scan.candidates.len(), 1);
+        assert_eq!(scan.candidates[0].session.external_id, "signed-s");
+        assert_eq!(scan.max_seen_offsets.get("agent.session/p0"), Some(&2));
     }
 
     #[test]
@@ -1295,6 +2223,7 @@ mod tests {
             console_url: Some(base_url),
             deployment: Some("dep-1".to_owned()),
             token_file: Some(token_path),
+            bridge_dir: None,
             watch: false,
             interval: 30,
             state_file: Some(dir.path().join("state.json")),
@@ -1383,6 +2312,45 @@ mod tests {
             "signature_b64": base64::engine::general_purpose::STANDARD.encode([7u8; 64])
         });
         std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    }
+
+    fn write_bridge_manifest(path: &Path) {
+        let topics = BRIDGE_TOPICS
+            .iter()
+            .map(|topic| format!("  - name: {topic}\n    partitions: 1\n    retention: {{hot_hours: 24}}\n"))
+            .collect::<String>();
+        std::fs::write(
+            path.join("manifest.yaml"),
+            format!("manifest_version: 1\nname: test-bridge\ntopics:\n{topics}"),
+        )
+        .unwrap();
+    }
+
+    fn stored_bridge_event(_topic: &str, offset: u64, value: Value) -> av_bridge::StoredEvent {
+        av_bridge::StoredEvent {
+            partition: 0,
+            offset,
+            key: value
+                .pointer("/ai_agent/instance_uid")
+                .and_then(Value::as_str)
+                .unwrap_or("inst")
+                .to_owned(),
+            value,
+            stored_at: 1_767_225_600_000,
+        }
+    }
+
+    fn append_bridge_event(path: &Path, topic: &str, event: av_bridge::StoredEvent) {
+        let topic_dir = path.join("topics").join(topic);
+        std::fs::create_dir_all(&topic_dir).unwrap();
+        let segment = topic_dir.join("p0.jsonl");
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(segment)
+            .unwrap();
+        writeln!(file, "{}", serde_json::to_string(&event).unwrap()).unwrap();
     }
 
     async fn start_mock_console(seen: Arc<Mutex<Vec<String>>>) -> (String, oneshot::Sender<()>) {

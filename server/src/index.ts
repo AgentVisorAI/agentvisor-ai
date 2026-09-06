@@ -22,6 +22,7 @@ import { ingestRoutes } from "./routes/ingest.js";
 import { memberRoutes } from "./routes/members.js";
 import { oauthRoutes } from "./routes/oauth.js";
 import { orgRoutes } from "./routes/org.js";
+import { policyRoutes } from "./routes/policies.js";
 import { readRoutes } from "./routes/read.js";
 import { samlRoutes } from "./routes/saml.js";
 import { streamRoutes } from "./routes/stream.js";
@@ -731,6 +732,9 @@ function problemDetail(slug: string): string {
   });
   await app.register(async (r) => r.register(orgRoutes), {
     prefix: "/api/v1/org",
+  });
+  await app.register(async (r) => r.register(policyRoutes), {
+    prefix: "/api/v1/policies",
   });
   await app.register(async (r) => r.register(deploymentRoutes), {
     prefix: "/api/v1/deployments",
