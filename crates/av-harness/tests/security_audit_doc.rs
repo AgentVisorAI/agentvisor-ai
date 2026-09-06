@@ -66,9 +66,17 @@ fn audit_cited_regression_tests_exist() {
 /// The constant-time comparison the audit's one real fix introduced.
 #[test]
 fn cold_store_mac_still_verified_constant_time() {
+    // Strip comment lines first: the file's own comments mention
+    // `verify_slice` several times, so a plain contains() kept passing
+    // after the actual call was swapped for ordinary equality.
+    let code_only: String = COLD_STORE
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        COLD_STORE.contains("verify_slice"),
-        "cold_store.rs no longer uses hmac::Mac::verify_slice — the CWE-208 \
+        code_only.contains(".verify_slice("),
+        "cold_store.rs no longer CALLS hmac::Mac::verify_slice — the CWE-208 \
          fix in SECURITY-AUDIT.md claims constant-time MAC comparison"
     );
 }

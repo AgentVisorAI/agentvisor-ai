@@ -26,6 +26,12 @@
  *       the attacker generated their own Ed25519 keypair, signed
  *       arbitrary contents, and embedded their pubkey. The signature
  *       math checks out; the AUTHORSHIP claim does not.
+ *   3 — signature verifies but the signer is the PUBLIC DEMO key
+ *       (its private half ships with the demo console, so anyone can
+ *       sign anything with it). Proves the demo flow end-to-end; is
+ *       never a production attestation. Takes precedence over
+ *       --allow-untrusted-key: scripts must not be able to launder
+ *       a demo signature into exit 0.
  *
  * You can safely email this file + a receipt JSON to an auditor,
  * insurer, or opposing counsel — no proprietary code required.
@@ -42,8 +48,9 @@ import { createPublicKey, verify, createHash } from "node:crypto";
 // Empty list defaults to REQUIRING `--allow-untrusted-key`.
 const TRUSTED_RECEIPT_KEYS = new Set([
   // Keep in sync with docs/verify/verify.js TRUSTED_RECEIPT_KEYS.
-  // Sample/shared receipts signing key (legacy demo exports).
-  "9992e71fe6a6e5edc18129becef2ec640f9611a4e12a4b9a311bab943ab19467",
+  // Sample receipt signing key (docs/verify/sample-receipt.json).
+  // Generated once at re-signing time; private half discarded.
+  "901e153295d578bb9e53301fbcc04dd37f971578f02da771c095b691e1b819bb",
   // Demo console signing key (docs/app/datasource.js fixed keypair).
   "573c8f249012fbb08b3d79973411bb93141f32719c86ada25306fde5e59e8d57",
 ]);
