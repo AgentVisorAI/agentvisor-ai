@@ -55,6 +55,24 @@ pub(super) async fn run(args: ConsoleSyncArgs) -> Result<()> {
 
 async fn run_once(config: &ResolvedSyncConfig, dry_run: bool) -> Result<SyncSummary> {
     let mut state = SyncState::load(&config.state_file)?;
+    // Refuse a destination switch under an existing state file: the
+    // watermarks/receipt flags in it describe what THAT console already
+    // has, not the new one.
+    if let (Some(stored_url), Some(stored_dep)) = (state.console_url.as_deref(), state.deployment.as_deref())
+    {
+        if stored_url != config.console_url || stored_dep != config.deployment {
+            anyhow::bail!(
+                "state file {} was accumulated for {stored_url} / deployment {stored_dep}; \
+                 refusing to reuse it against {} / {} — pass a fresh --state-file per destination",
+                config.state_file.display(),
+                config.console_url,
+                config.deployment,
+            );
+        }
+    }
+    let binding_added = state.console_url.is_none() || state.deployment.is_none();
+    state.console_url = Some(config.console_url.clone());
+    state.deployment = Some(config.deployment.clone());
     let trajectories = scan_trajectories(&config.spool_dir);
     let receipts = scan_receipts(&config.spool_dir);
 
@@ -80,10 +98,32 @@ async fn run_once(config: &ResolvedSyncConfig, dry_run: bool) -> Result<SyncSumm
         receipts_seen: receipts.len(),
         ..SyncSummary::default()
     };
-    let mut changed = false;
+    // Also save when the destination binding was just added to a
+    // pre-existing (or fresh) state file.
+    let mut changed = binding_added;
+
+    // Receipt gate bookkeeping: sealing a session is IRREVERSIBLE on
+    // the console (events for sealed sessions are refused), so a
+    // receipt must only be posted once every event this pass could see
+    // for that session has been acknowledged. Without this, a
+    // transient event-upload failure followed by a successful receipt
+    // post permanently locked the missing events out.
+    let mut failed_sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let pending_max_seq: std::collections::HashMap<String, u64> = trajectories
+        .iter()
+        .filter_map(|candidate| {
+            candidate
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .max()
+                .map(|max_seq| (candidate.session.external_id.clone(), max_seq))
+        })
+        .collect();
 
     for candidate in trajectories {
         summary.attempted += 1;
+        let session_id = candidate.session.external_id.clone();
         match sync_trajectory(&client, &mut state, candidate).await {
             Ok(did_change) => {
                 summary.succeeded += 1;
@@ -91,6 +131,7 @@ async fn run_once(config: &ResolvedSyncConfig, dry_run: bool) -> Result<SyncSumm
             }
             Err(error) => {
                 summary.failed += 1;
+                failed_sessions.insert(session_id);
                 eprintln!("warning: skipped session sync: {error:#}");
             }
         }
@@ -104,6 +145,31 @@ async fn run_once(config: &ResolvedSyncConfig, dry_run: bool) -> Result<SyncSumm
         {
             summary.receipts_skipped += 1;
             continue;
+        }
+        if failed_sessions.contains(&candidate.session_external_id) {
+            summary.receipts_skipped += 1;
+            eprintln!(
+                "warning: deferring receipt for {} — its event sync failed this pass and \
+                 sealing would lock the missing events out permanently",
+                sanitize_for_terminal(&candidate.session_external_id)
+            );
+            continue;
+        }
+        if let Some(max_seq) = pending_max_seq.get(&candidate.session_external_id) {
+            let synced_through = state
+                .sessions
+                .get(&candidate.session_external_id)
+                .map(|session| session.last_synced_seq)
+                .unwrap_or(0);
+            if synced_through < *max_seq {
+                summary.receipts_skipped += 1;
+                eprintln!(
+                    "warning: deferring receipt for {} — events through seq {max_seq} are not \
+                     yet acknowledged (synced through {synced_through})",
+                    sanitize_for_terminal(&candidate.session_external_id)
+                );
+                continue;
+            }
         }
         summary.attempted += 1;
         match sync_receipt(&client, &mut state, candidate).await {
@@ -159,10 +225,14 @@ async fn sync_trajectory(
         .entry(candidate.session.external_id.clone())
         .or_default();
     let last_synced = session_state.last_synced_seq;
+    let synced_any = session_state.synced_any;
     let mut events: Vec<IngestEvent> = candidate
         .events
         .into_iter()
-        .filter(|event| event.seq > last_synced)
+        // `synced_any` distinguishes a fresh session (nothing
+        // acknowledged — include the seq-0 `open` event) from a
+        // watermark that genuinely sits at 0.
+        .filter(|event| event.seq > last_synced || (!synced_any && event.seq == 0))
         .collect();
     events.sort_by_key(|event| event.seq);
     events.dedup_by_key(|event| event.seq);
@@ -182,14 +252,21 @@ async fn sync_trajectory(
                 "warning: console rejected sealed session {}; leaving state unchanged",
                 sanitize_for_terminal(&candidate.session.external_id)
             );
-            continue;
+            // Sealed for every remaining batch too — stop instead of
+            // letting a later batch advance the watermark past events
+            // this one never delivered.
+            break;
         }
         if response.dropped_future.unwrap_or(0) > 0 || response.dropped_ancient.unwrap_or(0) > 0 {
             eprintln!(
                 "warning: console dropped timestamp-skewed events for {}; leaving that batch retryable",
                 sanitize_for_terminal(&candidate.session.external_id)
             );
-            continue;
+            // MUST stop here: continuing let the NEXT batch's success
+            // bump last_synced_seq past the dropped events, excluding
+            // them from every future pass — permanently missing
+            // evidence with only a one-line warning.
+            break;
         }
         if response.inserted > 0 || !batch.is_empty() {
             if let Some(max_seq) = batch.iter().map(|event| event.seq).max() {
@@ -198,6 +275,7 @@ async fn sync_trajectory(
                     .entry(candidate.session.external_id.clone())
                     .or_default();
                 session_state.last_synced_seq = session_state.last_synced_seq.max(max_seq);
+                session_state.synced_any = true;
                 changed = true;
             }
         }
@@ -238,6 +316,12 @@ async fn sync_receipt(
 struct SyncState {
     sessions: BTreeMap<String, SessionSyncState>,
     pubkey_hex_synced: Option<String>,
+    /// Destination binding: state is meaningful only against the
+    /// console+deployment it was accumulated for. Without this, a rerun
+    /// against a different deployment reused watermarks/receipt flags
+    /// and silently delivered incomplete evidence to the new target.
+    console_url: Option<String>,
+    deployment: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -245,11 +329,23 @@ struct SyncState {
 struct SessionSyncState {
     last_synced_seq: u64,
     receipt_synced: bool,
+    /// Distinguishes "never acknowledged anything" from "acknowledged
+    /// up to seq 0": the generated `open` event carries seq 0, and the
+    /// `seq > last_synced_seq` filter with the default watermark of 0
+    /// silently discarded it forever on every fresh session.
+    synced_any: bool,
 }
+
+/// The state file grows with one entry per session and is never pruned;
+/// reading it back through the generic 1 MiB control-file cap meant the
+/// writer eventually produced a file its own reader refused — watch mode
+/// then failed every pass before scanning anything. 16 MiB ≈ hundreds of
+/// thousands of sessions while still bounding a hostile plant.
+const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
 
 impl SyncState {
     fn load(path: &Path) -> Result<Self> {
-        match av_core::fsutil::read_capped(path, av_core::fsutil::MAX_CONTROL_BYTES) {
+        match av_core::fsutil::read_capped(path, MAX_STATE_BYTES) {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .with_context(|| format!("parse console-sync state {}", path.display())),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -392,7 +488,16 @@ impl ConsoleClient {
             base.push_str(INGEST_PREFIX);
         }
         Ok(Self {
-            client: reqwest::Client::builder().build().context("build HTTP client")?,
+            // Deadlines are load-bearing in --watch mode: with no
+            // request timeout, one server that accepts a connection and
+            // never completes a response wedged the sync loop forever
+            // (Ctrl-C only ran between passes) and blocked the
+            // end-of-pass state save.
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(120))
+                .build()
+                .context("build HTTP client")?,
             ingest_base: base,
             deployment: config.deployment.clone(),
             token: config.token.clone(),
@@ -427,7 +532,9 @@ impl ConsoleClient {
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|value| value.to_str().ok())
                     .and_then(|value| value.parse::<u64>().ok())
-                    .map(Duration::from_secs)
+                    // Clamp: a hostile/misconfigured server must not be
+                    // able to park the sync for hours with one header.
+                    .map(|seconds| Duration::from_secs(seconds.min(300)))
                     .unwrap_or(backoff);
                 tokio::time::sleep(retry_after).await;
                 backoff = (backoff * 2).min(Duration::from_secs(30));
@@ -472,7 +579,10 @@ fn scan_trajectories(spool_dir: &Path) -> Vec<TrajectoryCandidate> {
         }
     };
     for path in entries {
-        if !is_primary_json(&path) || is_session_sidecar(&path) || !path.with_extension("atif-auth").exists()
+        if !is_primary_json(&path)
+            || is_symlink(&path)
+            || is_session_sidecar(&path)
+            || !path.with_extension("atif-auth").exists()
         {
             continue;
         }
@@ -731,7 +841,7 @@ fn scan_receipts(spool_dir: &Path) -> Vec<ReceiptCandidate> {
         }
     };
     for path in entries {
-        if !is_primary_json(&path) {
+        if !is_primary_json(&path) || is_symlink(&path) {
             continue;
         }
         match read_receipt_candidate(&path) {
@@ -939,11 +1049,45 @@ struct ReceiptIngestPayload {
     stop_reason: Option<String>,
 }
 
+/// Cap batches by BOTH event count and serialized size: field caps are
+/// UTF-16-unit based, so 500 CJK-heavy events serialize to ~12 MB of
+/// UTF-8 JSON — far past the server's 4 MiB body limit, and the 413
+/// reply made the same oversized batch rebuild forever. 3 MiB leaves
+/// room for JSON escaping + envelope overhead.
+const MAX_BATCH_BYTES: usize = 3 * 1024 * 1024;
+
 fn event_batches(events: &[IngestEvent]) -> Vec<Vec<IngestEvent>> {
-    events
-        .chunks(MAX_BATCH_EVENTS)
-        .map(<[IngestEvent]>::to_vec)
-        .collect()
+    let mut batches = Vec::new();
+    let mut current: Vec<IngestEvent> = Vec::new();
+    let mut current_bytes = 0usize;
+    for event in events {
+        let event_bytes = serde_json::to_string(event).map(|s| s.len()).unwrap_or(0);
+        let would_overflow = !current.is_empty()
+            && (current.len() >= MAX_BATCH_EVENTS
+                || current_bytes.saturating_add(event_bytes) > MAX_BATCH_BYTES);
+        if would_overflow {
+            batches.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes = current_bytes.saturating_add(event_bytes);
+        current.push(event.clone());
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+/// Symlink refusal for spool scans: the daemon writes only regular
+/// files here; a planted symlink would otherwise let `read_capped`
+/// (which follows links) exfiltrate an arbitrary readable file into the
+/// console upload. Same O_NOFOLLOW-equivalent posture as the harness's
+/// own spool readers. Unreadable metadata counts as a symlink
+/// (fail-closed — the read would fail anyway).
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(true)
 }
 
 fn sorted_dir_entries(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
@@ -1073,6 +1217,7 @@ mod tests {
             SessionSyncState {
                 last_synced_seq: 42,
                 receipt_synced: true,
+                synced_any: true,
             },
         );
         state.pubkey_hex_synced = Some("ab".repeat(32));
