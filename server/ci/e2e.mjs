@@ -144,7 +144,15 @@ try {
   check("policy create returns id", !!created.id && created.enabled === true, created.id);
   const pols = await ds.listPolicies();
   check("policy list has 1", pols.length === 1 && pols[0].name === "e2e.vendor_allowlist");
-  check("policy list reports honest zero counters", pols[0].hits24h === 0 && pols[0].blocks24h === 0);
+  // Wire-shape contract, not a value assertion: hits24h/blocks24h are
+  // (currently) hardcoded zeros server-side, so asserting their VALUE
+  // was a tautology that could never fail. What CAN regress is the
+  // fields disappearing from the wire (renderPolicyDetail calls
+  // .toLocaleString() on them — undefined crashes the page).
+  check(
+    "policy wire shape carries numeric hit counters",
+    typeof pols[0].hits24h === "number" && typeof pols[0].blocks24h === "number",
+  );
   const toggled = await ds.togglePolicy(created.id);
   check("policy toggle disables", toggled.enabled === false);
   const fetched = await ds.getPolicy(created.id);
