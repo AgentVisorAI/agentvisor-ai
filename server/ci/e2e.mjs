@@ -139,6 +139,20 @@ try {
   const blocked = detail.events.find(e=>e.severity==="err");
   check("detail marks blocked event", !!blocked, blocked?.msg);
 
+  // Policies — full CRUD through the real API (was mock-only).
+  const created = await ds.createPolicy({ name: "e2e.vendor_allowlist", kind: "allowlist", scope: "tool.create_po", description: "e2e", body: "effect = block" });
+  check("policy create returns id", !!created.id && created.enabled === true, created.id);
+  const pols = await ds.listPolicies();
+  check("policy list has 1", pols.length === 1 && pols[0].name === "e2e.vendor_allowlist");
+  check("policy list reports honest zero counters", pols[0].hits24h === 0 && pols[0].blocks24h === 0);
+  const toggled = await ds.togglePolicy(created.id);
+  check("policy toggle disables", toggled.enabled === false);
+  const fetched = await ds.getPolicy(created.id);
+  check("policy get reflects toggle", fetched.enabled === false && fetched.body === "effect = block");
+  let dupCode = "";
+  try { await ds.createPolicy({ name: "e2e.vendor_allowlist" }); } catch (e) { dupCode = e.errorCode || e.message; }
+  check("policy duplicate name 409", dupCode === "policy_name_in_use", dupCode);
+
   // Rotate
   const rot = await ds.rotateDeploymentToken(dep.deployment.id);
   check("rotate returns token", !!rot.ingestToken);

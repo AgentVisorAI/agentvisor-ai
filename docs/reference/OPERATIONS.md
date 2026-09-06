@@ -135,34 +135,64 @@ does the same work each tick without duplicating events.
 console ingest API. It reads ATIF trajectories from `atif_spool_dir`
 (default `spool/atif`), skips archived collision artifacts, posts one
 session upsert plus ordered event batches of at most 500 events, then
-uploads receipts from `receipts/`. Receipt uploads first register the
-receipt's embedded public key with `/api/v1/ingest/pubkey` when present.
+uploads signed receipts from `receipts/`. When `--bridge-dir` is set it
+also tails the embedded Bridge topic logs after the ATIF pass so signed
+workflow sessions (which have receipts but no ATIF trajectory) publish
+their durable OCSF events.
 
 ```
 avctl console-sync --spool-dir /var/lib/agentvisor/spool/atif \
+  --bridge-dir /var/lib/agentvisor/data/bridge \
   --console-url https://console.example.com \
   --deployment dep_123 \
   --token-file /run/secrets/av-console-token
 ```
 
 Configuration precedence is CLI flags, then `AV_CONSOLE_URL`,
-`AV_CONSOLE_DEPLOYMENT`, `AV_CONSOLE_TOKEN`, then an optional
-`[console]` section in the effective `agentvisor.toml`:
+`AV_CONSOLE_DEPLOYMENT`, `AV_CONSOLE_TOKEN`,
+`AV_CONSOLE_BRIDGE_DIR`, then an optional `~/.agentvisor/console.toml`
+file (or legacy `[console]` table in the effective `agentvisor.toml`):
 
 ```toml
 [console]
 url = "https://console.example.com"
 deployment = "dep_123"
 token_file = "/run/secrets/av-console-token"
+bridge_dir = "/var/lib/agentvisor/data/bridge"
 ```
 
 The token is never printed; token files are read with trailing
 whitespace trimmed. Replays are idempotent: the state file
 (`--state-file`, default `.console-sync-state.json` inside the spool)
 records each session's last synced event sequence and whether its
-receipt was accepted, while the server also deduplicates events by
-sequence. Use `--dry-run` to count what would be sent, or
-`--watch --interval 30` to poll until Ctrl-C.
+receipt was accepted, plus the last synced Bridge offset per
+topic/partition. The state file is bound to the console URL and
+deployment that produced it; use a separate `--state-file` when syncing
+to a different destination. ATIF-synced session ids are recorded so
+Bridge events for unsigned sessions are not duplicated. Receipts are
+posted only after all events visible in the current pass for that
+session (ATIF or Bridge) are acknowledged, because sealing rejects later
+event uploads. Use `--dry-run` to count what would be sent, or `--watch
+--interval 30` to poll until Ctrl-C.
+
+Bridge OCSF topics map to ingest events as follows:
+
+| Bridge topic | Ingest kind | Notes |
+| --- | --- | --- |
+| `agent.session` | `sys` | `opened` sets `openedAt`; `closed` carries `workflow`. |
+| `agent.tool_call` | `tool` / `block` | Allowed calls increment `addToolsAllowed`; blocked/denied calls increment `addToolsBlocked` and blocked payout micros when present. |
+| `agent.stop_reason` | `guard` | Stop reason tag/body preserve the OCSF reason. |
+| `agent.compression` | `audit` | Body includes metrics including pruned token count when present. |
+| `agent.identity` | `audit` | Identity validation evidence. |
+| `agent.receipt` | skipped | Receipts are uploaded separately from the receipt spool. |
+
+`avctl setup` can create the console config for you. At the end of the
+guided setup, answer yes to "Connect to the hosted console?", accept or
+enter the console URL, paste the deployment id and ingest token, then run:
+
+```sh
+avctl console-sync --watch
+```
 
 ### Releasing a quarantined session id
 
