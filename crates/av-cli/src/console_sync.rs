@@ -68,24 +68,6 @@ pub(super) async fn run(args: ConsoleSyncArgs) -> Result<()> {
 
 async fn run_once(config: &ResolvedSyncConfig, dry_run: bool) -> Result<SyncSummary> {
     let mut state = SyncState::load(&config.state_file)?;
-    // Refuse a destination switch under an existing state file: the
-    // watermarks/receipt flags in it describe what THAT console already
-    // has, not the new one.
-    if let (Some(stored_url), Some(stored_dep)) = (state.console_url.as_deref(), state.deployment.as_deref())
-    {
-        if stored_url != config.console_url || stored_dep != config.deployment {
-            anyhow::bail!(
-                "state file {} was accumulated for {stored_url} / deployment {stored_dep}; \
-                 refusing to reuse it against {} / {} — pass a fresh --state-file per destination",
-                config.state_file.display(),
-                config.console_url,
-                config.deployment,
-            );
-        }
-    }
-    let binding_added = state.console_url.is_none() || state.deployment.is_none();
-    state.console_url = Some(config.console_url.clone());
-    state.deployment = Some(config.deployment.clone());
     let trajectories = scan_trajectories(&config.spool_dir);
     let receipts = scan_receipts(&config.spool_dir);
     let atif_session_ids: BTreeSet<String> = trajectories
@@ -116,6 +98,35 @@ async fn run_once(config: &ResolvedSyncConfig, dry_run: bool) -> Result<SyncSumm
         );
         return Ok(SyncSummary::default());
     }
+
+    // Refuse a destination switch under an existing state file: the
+    // watermarks/receipt flags in it describe what THAT console already
+    // has, not the new one. This runs AFTER the dry-run branch —
+    // `resolve()` deliberately allows a missing URL/deployment in
+    // dry-run mode, and comparing the empty config against a bound
+    // state file broke `--dry-run` in any spool that had ever really
+    // synced. URLs compare trailing-slash-normalized: the same console
+    // spelled `https://c.example` vs `https://c.example/` (arg vs env
+    // vs config-file convention) is one destination, and a spurious
+    // bail here sends the operator to a fresh state file — a full
+    // re-upload whose sealed sessions then defer their receipts
+    // forever.
+    let config_url = config.console_url.trim_end_matches('/');
+    if let (Some(stored_url), Some(stored_dep)) = (state.console_url.as_deref(), state.deployment.as_deref())
+    {
+        if stored_url.trim_end_matches('/') != config_url || stored_dep != config.deployment {
+            anyhow::bail!(
+                "state file {} was accumulated for {stored_url} / deployment {stored_dep}; \
+                 refusing to reuse it against {} / {} — pass a fresh --state-file per destination",
+                config.state_file.display(),
+                config.console_url,
+                config.deployment,
+            );
+        }
+    }
+    let binding_added = state.console_url.is_none() || state.deployment.is_none();
+    state.console_url = Some(config_url.to_owned());
+    state.deployment = Some(config.deployment.clone());
 
     let client = ConsoleClient::new(config)?;
     let mut summary = SyncSummary {
@@ -184,9 +195,18 @@ async fn run_once(config: &ResolvedSyncConfig, dry_run: bool) -> Result<SyncSumm
             Ok(did_change) => {
                 summary.succeeded += 1;
                 changed |= did_change;
-                if let Some(max_seq) = bridge_pending_max_seq.get(&session_id) {
-                    let (acknowledged, _, _) = acknowledged_through(&state, &session_id, *max_seq);
-                    bridge_incomplete |= !acknowledged;
+                // A console-sealed session's remaining bridge records are
+                // terminally unconsumable — banking their offsets is
+                // correct and must not hold the global advance hostage.
+                let sealed = state
+                    .sessions
+                    .get(&session_id)
+                    .is_some_and(|session| session.receipt_synced);
+                if !sealed {
+                    if let Some(max_seq) = bridge_pending_max_seq.get(&session_id) {
+                        let (acknowledged, _, _) = acknowledged_through(&state, &session_id, *max_seq);
+                        bridge_incomplete |= !acknowledged;
+                    }
                 }
             }
             Err(error) => {
@@ -290,6 +310,17 @@ async fn sync_trajectory(
     state: &mut SyncState,
     candidate: TrajectoryCandidate,
 ) -> Result<bool> {
+    // Console-side seal is terminal: nothing more can be sent for this
+    // session (events are refused, the receipt row is immutable). Skip
+    // BEFORE the session upsert so a sealed historical session costs
+    // zero round trips per pass.
+    if state
+        .sessions
+        .get(&candidate.session.external_id)
+        .is_some_and(|session| session.receipt_synced)
+    {
+        return Ok(false);
+    }
     let _: serde_json::Value = client.post_json("sessions", &candidate.session).await?;
     let session_state = state
         .sessions
@@ -322,12 +353,23 @@ async fn sync_trajectory(
             .is_some_and(|sealed| sealed.iter().any(|id| id == &candidate.session.external_id))
         {
             eprintln!(
-                "warning: console rejected sealed session {}; leaving state unchanged",
+                "warning: console already sealed session {}; marking it done locally",
                 sanitize_for_terminal(&candidate.session.external_id)
             );
-            // Sealed for every remaining batch too — stop instead of
-            // letting a later batch advance the watermark past events
-            // this one never delivered.
+            // Sealed is TERMINAL on the console — no event for this
+            // session can ever insert again. Record that instead of
+            // "leaving state unchanged": a state file that lagged the
+            // seal (fresh state against a populated console, or the
+            // pre-`synced_any` upgrade path) otherwise re-posted the
+            // same refused batch on every pass forever. Also stop
+            // instead of letting a later batch advance the watermark.
+            let session_state = state
+                .sessions
+                .entry(candidate.session.external_id.clone())
+                .or_default();
+            session_state.receipt_synced = true;
+            session_state.synced_any = true;
+            changed = true;
             break;
         }
         if response.dropped_future.unwrap_or(0) > 0 || response.dropped_ancient.unwrap_or(0) > 0 {
@@ -392,21 +434,29 @@ async fn sync_bridge_candidate(
     state: &mut SyncState,
     candidate: BridgeSessionCandidate,
 ) -> Result<bool> {
-    let _: serde_json::Value = client.post_json("sessions", &candidate.session).await?;
-    let (last_synced, synced_any) = state
+    // Console-side seal is terminal — mirror the ATIF path's skip so a
+    // post-seal bridge record can't make this session churn (and, via
+    // the global bridge_incomplete flag, wedge offset progress for
+    // every other topic/partition forever).
+    if state
         .sessions
         .get(&candidate.session.external_id)
-        .map_or((0, false), |session| {
-            (session.last_synced_seq, session.synced_any)
-        });
-    let mut events: Vec<IngestEvent> = candidate
-        .events
-        .into_iter()
-        // `synced_any` distinguishes a fresh session (nothing
-        // acknowledged — include the seq-0 `open` event) from a
-        // watermark that genuinely sits at 0.
-        .filter(|event| event.seq > last_synced || (!synced_any && event.seq == 0))
-        .collect();
+        .is_some_and(|session| session.receipt_synced)
+    {
+        return Ok(false);
+    }
+    let _: serde_json::Value = client.post_json("sessions", &candidate.session).await?;
+    let mut events: Vec<IngestEvent> = candidate.events;
+    // NO seq-watermark filter here, unlike the ATIF path: bridge seqs
+    // are `topic_idx × 1e6 + offset` — NOT chronological — so one
+    // high-base event (e.g. agent.compression at 3e6) raised the
+    // session watermark above every later low-base event (a session
+    // close at seq 1, tool calls at 1e6+x) and silently discarded them
+    // while the offset cursor advanced past their records: permanently
+    // missing evidence, then sealed by the receipt gate. The
+    // per-(topic,partition) OFFSET cursor is the bridge watermark;
+    // re-posts inside an unadvanced window are deduped server-side by
+    // (sessionId, seq).
     events.sort_by_key(|event| event.seq);
     events.dedup_by_key(|event| event.seq);
     if events.is_empty() {
@@ -422,12 +472,19 @@ async fn sync_bridge_candidate(
             .is_some_and(|sealed| sealed.iter().any(|id| id == &candidate.session.external_id))
         {
             eprintln!(
-                "warning: console rejected sealed bridge session {}; leaving state unchanged",
+                "warning: console already sealed bridge session {}; marking it done locally",
                 sanitize_for_terminal(&candidate.session.external_id)
             );
-            // Sealed for every remaining batch too — stop instead of
-            // letting a later batch advance the watermark past events
-            // this one never delivered.
+            // Terminal on the console — record it (mirrors the ATIF
+            // path) so this session stops being rebuilt and stops
+            // holding the global offset advance hostage.
+            let session_state = state
+                .sessions
+                .entry(candidate.session.external_id.clone())
+                .or_default();
+            session_state.receipt_synced = true;
+            session_state.synced_any = true;
+            changed = true;
             break;
         }
         if response.dropped_future.unwrap_or(0) > 0 || response.dropped_ancient.unwrap_or(0) > 0 {
@@ -521,8 +578,24 @@ const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
 impl SyncState {
     fn load(path: &Path) -> Result<Self> {
         match av_core::fsutil::read_capped(path, MAX_STATE_BYTES) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .with_context(|| format!("parse console-sync state {}", path.display())),
+            Ok(bytes) => {
+                let mut state: Self = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("parse console-sync state {}", path.display()))?;
+                // Upgrade migration for pre-`synced_any` state files
+                // (serde default = false): any session with prior
+                // acknowledgements HAS synced — without this, every
+                // already-sealed historical session re-included its
+                // seq-0 open event on each pass, the server's sealed
+                // guard rejected the batch before its seq-dedupe could
+                // no-op it, and watch mode burned two HTTP round trips
+                // + a warning per sealed session per interval forever.
+                for session in state.sessions.values_mut() {
+                    if session.last_synced_seq > 0 || session.receipt_synced {
+                        session.synced_any = true;
+                    }
+                }
+                Ok(state)
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(error) => Err(error).with_context(|| format!("read console-sync state {}", path.display())),
         }
@@ -877,6 +950,9 @@ fn scan_bridge_candidates(
         }
     };
     let mut scan = BridgeScan::default();
+    // Cursors halted at a clock-skewed record this pass (see the
+    // OutsideWindow arm): no offset past the freeze point is banked.
+    let mut frozen_cursors: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut sessions: BTreeMap<String, BridgeSessionAccumulator> = BTreeMap::new();
     let now_ms = av_core::time::now_ms();
 
@@ -913,14 +989,30 @@ fn scan_bridge_candidates(
                     break;
                 }
                 for stored in &page {
-                    scan.max_seen_offsets
-                        .entry(cursor_key.clone())
-                        .and_modify(|offset| *offset = (*offset).max(stored.offset))
-                        .or_insert(stored.offset);
+                    // Offset banking is deferred until we know the record
+                    // is consumable: for clock-skewed records (see the
+                    // OutsideWindow arm) the cursor must FREEZE before
+                    // them so a corrected clock re-delivers — banking
+                    // unconditionally consumed them permanently with only
+                    // a counter bump. Once a cursor is frozen, nothing
+                    // later in that (topic, partition) banks either
+                    // (banking a later mapped offset would skip the
+                    // frozen record on the next pass).
+                    if frozen_cursors.contains(&cursor_key) {
+                        continue;
+                    }
+                    let mut bank = |offset: u64| {
+                        scan.max_seen_offsets
+                            .entry(cursor_key.clone())
+                            .and_modify(|current| *current = (*current).max(offset))
+                            .or_insert(offset);
+                    };
                     if *topic == "agent.receipt" {
+                        bank(stored.offset);
                         continue;
                     }
                     let Some(session_id) = bridge_session_id(&stored.value) else {
+                        bank(stored.offset);
                         continue;
                     };
                     if atif_session_ids.contains(&session_id)
@@ -929,10 +1021,12 @@ fn scan_bridge_candidates(
                             .get(&session_id)
                             .is_some_and(|session| session.atif_synced)
                     {
+                        bank(stored.offset);
                         continue;
                     }
                     match bridge_record_to_event(topic_idx, topic, stored, now_ms) {
                         BridgeRecordMapping::Mapped(mapped) => {
+                            bank(stored.offset);
                             let entry =
                                 sessions
                                     .entry(mapped.session_external_id.clone())
@@ -962,8 +1056,19 @@ fn scan_bridge_candidates(
                         }
                         BridgeRecordMapping::OutsideWindow => {
                             scan.events_outside_window = scan.events_outside_window.saturating_add(1);
+                            // Freeze this cursor (do NOT bank): the record
+                            // stays unread so a later pass with a sane
+                            // clock window can deliver it.
+                            frozen_cursors.insert(cursor_key.clone());
+                            eprintln!(
+                                "warning: bridge record at {} offset {} has a timestamp outside \
+                                 the ingest window; cursor frozen before it so it stays retryable \
+                                 (check clock skew between daemon and sync hosts)",
+                                sanitize_for_terminal(&cursor_key),
+                                stored.offset
+                            );
                         }
-                        BridgeRecordMapping::Skipped => {}
+                        BridgeRecordMapping::Skipped => bank(stored.offset),
                     }
                 }
                 let next = page
