@@ -115,6 +115,15 @@ try {
   check("overview blockedSpendUsd>0", parseFloat(ov.blockedSpendUsd) > 0, "$"+ov.blockedSpendUsd);
   check("overview llmSpendUsd", parseFloat(ov.llmSpendUsd) > 0, "$"+ov.llmSpendUsd);
   check("overview deployments=1", ov.deployments === 1);
+  // R-series: /overview now returns real bucketed series in live mode
+  // (was `series: null` — "hourly buckets not wired yet").
+  check("overview series has 24 hourly buckets", Array.isArray(ov.series) && ov.series.length === 24, "len="+(ov.series||[]).length);
+  const serAllowed = (ov.series||[]).reduce((a,b)=>a+b.allowed, 0);
+  const serBlocked = (ov.series||[]).reduce((a,b)=>a+b.blocked, 0);
+  check("overview series sums match aggregates", serAllowed === ov.toolsAllowed && serBlocked === ov.toolsBlocked, `allowed=${serAllowed} blocked=${serBlocked}`);
+  check("overview series buckets labeled", (ov.series||[]).every(b => typeof b.label === "string" && b.label.length > 0));
+  const ov7 = await ds.getOverview("7d");
+  check("overview range=7d has 7 daily buckets", Array.isArray(ov7.series) && ov7.series.length === 7, "len="+(ov7.series||[]).length);
 
   const list = await ds.listSessions();
   check("listSessions has 1", list.sessions.length === 1);

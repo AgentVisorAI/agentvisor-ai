@@ -129,6 +129,41 @@ The reconciler runs every `reconcile_tick_s` seconds and handles:
 Recovery is idempotent — a killed-then-restarted-then-killed pod
 does the same work each tick without duplicating events.
 
+## Console sync
+
+`avctl console-sync` uploads durable local spool evidence to the hosted
+console ingest API. It reads ATIF trajectories from `atif_spool_dir`
+(default `spool/atif`), skips archived collision artifacts, posts one
+session upsert plus ordered event batches of at most 500 events, then
+uploads receipts from `receipts/`. Receipt uploads first register the
+receipt's embedded public key with `/api/v1/ingest/pubkey` when present.
+
+```
+avctl console-sync --spool-dir /var/lib/agentvisor/spool/atif \
+  --console-url https://console.example.com \
+  --deployment dep_123 \
+  --token-file /run/secrets/av-console-token
+```
+
+Configuration precedence is CLI flags, then `AV_CONSOLE_URL`,
+`AV_CONSOLE_DEPLOYMENT`, `AV_CONSOLE_TOKEN`, then an optional
+`[console]` section in the effective `agentvisor.toml`:
+
+```toml
+[console]
+url = "https://console.example.com"
+deployment = "dep_123"
+token_file = "/run/secrets/av-console-token"
+```
+
+The token is never printed; token files are read with trailing
+whitespace trimmed. Replays are idempotent: the state file
+(`--state-file`, default `.console-sync-state.json` inside the spool)
+records each session's last synced event sequence and whether its
+receipt was accepted, while the server also deduplicates events by
+sequence. Use `--dry-run` to count what would be sent, or
+`--watch --interval 30` to poll until Ctrl-C.
+
 ### Releasing a quarantined session id
 
 A SIGKILL / OOMKill / node loss mid-request leaves a sealed marker

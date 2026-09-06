@@ -1513,7 +1513,7 @@
       ? Math.round((stats.toolsBlocked / (stats.toolsAllowed + stats.toolsBlocked)) * 100) : 0;
 
     main.innerHTML =
-      pageHeader("Overview", "Fleet activity" + (state.ds.mode === "mock" ? " for " + rangeLabel : "") + ".", attackBtn() + rangeGroup()) +
+      pageHeader("Overview", "Fleet activity for " + rangeLabel + ".", attackBtn() + rangeGroup()) +
       onboardingCard(stats, sessions) +
       '<div class="stats">' +
         stat("Sessions", stats.sessions, stats.deployments + " deployment" + (stats.deployments === 1 ? "" : "s"), sparkline(series.map(function (b) { return b.allowed + b.blocked; }))) +
@@ -1531,19 +1531,13 @@
           // "no activity" when the whole window is quiet so the
           // empty-state chart below reads consistently.
           '<span class="sub">' +
-            (state.ds.mode === "mock"
-              ? esc(rangeLabel) + ' · ' + { "1h": "1-minute", "24h": "hourly", "7d": "daily", "30d": "daily" }[state.range] + ' buckets' +
-                ((stats.toolsAllowed + stats.toolsBlocked) > 0
-                  ? ' · <b>' + pctBlocked + '% blocked</b>'
-                  : ' · <span style="color: var(--fg-3)">no activity</span>')
-              // R232 F1: server /overview returns aggregates only —
-              // no hourly buckets yet — so the chart below reads
-              // structurally empty in live mode regardless of actual
-              // fleet activity. Say so instead of implying idle
-              // fleet.
-              : (stats.toolsAllowed + stats.toolsBlocked) > 0
-                ? '<b>' + pctBlocked + '% blocked</b> · time-series preview'
-                : '<span style="color: var(--fg-3)">time-series preview — hourly buckets not wired yet</span>') +
+            // R232 F1 (resolved): /overview now returns real bucketed
+            // series in live mode too, so both modes share one copy
+            // path. The granularity text tracks the range picker.
+            (esc(rangeLabel) + ' · ' + { "1h": "1-minute", "24h": "hourly", "7d": "daily", "30d": "daily" }[state.range] + ' buckets' +
+              ((stats.toolsAllowed + stats.toolsBlocked) > 0
+                ? ' · <b>' + pctBlocked + '% blocked</b>'
+                : ' · <span style="color: var(--fg-3)">no activity</span>')) +
           '</span>' +
           '<div class="legend">' +
             '<span><span class="dot" style="background: var(--accent)"></span> Allowed</span>' +
