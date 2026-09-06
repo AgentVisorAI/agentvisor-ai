@@ -1,6 +1,6 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
-import { createHash } from "node:crypto";
+import { createHash, createPublicKey, verify as cryptoVerify } from "node:crypto";
 import { db } from "../db.js";
 import { verifyPassword } from "../lib/auth.js";
 import { bus } from "../lib/bus.js";
@@ -149,6 +149,72 @@ const eventPayload = z.object({
   addToolsAllowed: z.number().int().min(0).max(1_000).default(0),
   addToolsBlocked: z.number().int().min(0).max(1_000).default(0),
 });
+
+// ── Server-side Ed25519 receipt verification ────────────────────────────────
+//
+// Mirrors the byte framing of the Rust `av-receipts` crate
+// (crates/av-receipts/src/receipt.rs `signing_message`) and the JS
+// verifier (docs/verify/verify.js `receiptSigningMessage`):
+//   * v1 → bare canonical body bytes
+//   * v2 → b"agentvisor-receipt-v2\0" || u64_be(body.len) || body
+// Without this check, the key-id comparison alone gated storage: any
+// holder of a leaked ingest token could POST a receipt whose sigB64 is
+// random bytes; first-write-wins then permanently sealed the session
+// against the LEGITIMATE receipt, and every downstream verifier
+// (console, /verify page, avctl) reported an invalid compliance
+// artifact for a session the customer trusted.
+const RECEIPT_DOMAIN_TAG_V2 = Buffer.from("agentvisor-receipt-v2\0", "utf8");
+
+function receiptSigningMessage(rawBody: string): Buffer {
+  const canonical = Buffer.from(rawBody, "utf8");
+  let receiptVersion = 1;
+  try {
+    const parsed: unknown = JSON.parse(rawBody);
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      typeof (parsed as { receipt_version?: unknown }).receipt_version === "number"
+    ) {
+      receiptVersion = (parsed as { receipt_version: number }).receipt_version;
+    }
+  } catch {
+    // Not JSON — treat as v1; the signature check will fail, which is
+    // the correct verdict for garbage.
+  }
+  if (receiptVersion === 1) return canonical;
+  if (receiptVersion === 2) {
+    const len = Buffer.alloc(8);
+    len.writeBigUInt64BE(BigInt(canonical.length), 0);
+    return Buffer.concat([RECEIPT_DOMAIN_TAG_V2, len, canonical]);
+  }
+  // Unknown version — fail closed with an empty message that can never
+  // verify, rather than guessing a future framing.
+  return Buffer.alloc(0);
+}
+
+/** SPKI DER prefix for a raw 32-byte Ed25519 public key. */
+const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
+
+function verifyReceiptSignature(
+  publicKeyHex: string,
+  sigB64: string,
+  rawBody: string,
+): boolean {
+  try {
+    const rawKey = Buffer.from(publicKeyHex, "hex");
+    if (rawKey.length !== 32) return false;
+    const sig = Buffer.from(sigB64, "base64");
+    if (sig.length !== 64) return false;
+    const key = createPublicKey({
+      key: Buffer.concat([ED25519_SPKI_PREFIX, rawKey]),
+      format: "der",
+      type: "spki",
+    });
+    return cryptoVerify(null, receiptSigningMessage(rawBody), key, sig);
+  } catch {
+    return false;
+  }
+}
 
 const receiptPayload = z.object({
   sessionExternalId: z.string().min(1).max(128),
@@ -728,6 +794,36 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
           // body (inserted counter, bus.publish, policy.block
           // dispatch — none of those effects landed).
           sealedMidTx = true;
+        } else if (
+          err instanceof Error &&
+          (err.message.includes("22003") ||
+            err.message.includes("out of range for type integer"))
+        ) {
+          // Postgres numeric_value_out_of_range: a cumulative int4
+          // counter (promptTokens/completionTokens/toolsAllowed/
+          // toolsBlocked) crossed 2^31-1. Only reachable by a
+          // hostile/runaway daemon spamming per-event maxima
+          // (~2.1B tokens on ONE session); a 500 here made the
+          // daemon retry the identical batch forever — permanent
+          // livelock + log spam. 422 is terminal: the daemon drops
+          // the batch and the operator sees the audit line.
+          req.log.warn(
+            { sessionExternalId: externalId, deploymentId: daemon.deploymentId },
+            "ingest_counter_overflow_batch_refused",
+          );
+          writeAudit(
+            {
+              orgId: daemon.orgId,
+              event: "deployment.ingest_counter_overflow",
+              actorId: `daemon:${daemon.deploymentId}`,
+              actorEmail: `daemon@${daemon.deploymentId}`,
+              target: externalId,
+              metadata: { deploymentId: daemon.deploymentId, sessionExternalId: externalId },
+              req,
+            },
+            req.log,
+          );
+          return reply.code(422).send({ error: "counter_overflow" });
         } else {
           throw err;
         }
@@ -873,6 +969,41 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
         req.log,
       );
       return reply.code(400).send({ error: "key_id_mismatch" });
+    }
+    // Verify the Ed25519 signature against the deployment's pinned
+    // pubkey BEFORE any DB write. The key-id check above only proves
+    // the daemon CLAIMED the right key; without verifying sigB64 over
+    // body, a leaked-ingest-token holder could seal the session with
+    // garbage bytes and first-write-wins would then refuse the
+    // legitimate receipt forever (see the R93 F4 comment below for
+    // why sealed receipts are immutable). Same framing as the JS
+    // verifier and `avctl receipt-verify`.
+    if (!verifyReceiptSignature(dep.publicKeyHex, r.sigB64, r.body)) {
+      req.log.warn(
+        {
+          deploymentId: daemon.deploymentId,
+          sessionExternalId: r.sessionExternalId,
+          receiptId: r.receiptId,
+        },
+        "ingest_receipt_signature_invalid",
+      );
+      writeAudit(
+        {
+          orgId: daemon.orgId,
+          event: "deployment.receipt_signature_invalid",
+          actorId: `daemon:${daemon.deploymentId}`,
+          actorEmail: `daemon@${daemon.deploymentId}`,
+          target: r.sessionExternalId,
+          metadata: {
+            deploymentId: daemon.deploymentId,
+            sessionExternalId: r.sessionExternalId,
+            receiptId: r.receiptId,
+          },
+          req,
+        },
+        req.log,
+      );
+      return reply.code(400).send({ error: "signature_invalid" });
     }
     const session = await db.session.findUnique({
       where: {

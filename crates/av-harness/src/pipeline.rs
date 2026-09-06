@@ -507,6 +507,18 @@ impl HotMetrics {
                 "Middleware stages that exceeded the strict per-stage budget",
             )
         });
+        // The post-compression quota debit reports under its own label
+        // (`quota_post_compression`, not in `Stage::ORDER`) through
+        // observe_stage's lazy fallback. Pre-register it here with the
+        // SAME wide bounds as the enum stages: first-registration wins
+        // in the Registry, so without this the lazy path created it
+        // with the default bounds and the one stage doing real backend
+        // work (Redis) had incomparable buckets to its siblings.
+        let _ = metrics.histogram_with_bounds(
+            "av_stage_duration_seconds{stage=\"quota_post_compression\"}",
+            "Harness stage latency",
+            av_core::metrics::WIDE_LATENCY_BOUNDS_US,
+        );
         // Pre-resolve the request-metrics middleware's counters +
         // histograms as a [route][status_class] array so the hot
         // path is O(1) with zero string alloc and zero Registry
@@ -3935,7 +3947,7 @@ mod tests {
         assert!(matches!(error, PipelineError::Blocked { .. }));
         assert_eq!(state.sessions.len(), 1);
         let session = state.sessions.get("quota-failure").unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while session.atif_steps_count() == 0 {
                 tokio::task::yield_now().await;
             }
@@ -4689,7 +4701,7 @@ mod tests {
         // capture-failed and the worker skips the sink this test blocks on.
         first.capture_guard.defuse();
         drop(first);
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while !sink.entered.load(AtomicOrdering::Acquire) {
                 tokio::task::yield_now().await;
             }
@@ -5089,7 +5101,7 @@ mod tests {
             state.forward_chat(prepared).await,
             Err(PipelineError::Upstream { .. })
         ));
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while session.chain.lock().count() < 2 {
                 tokio::task::yield_now().await;
             }

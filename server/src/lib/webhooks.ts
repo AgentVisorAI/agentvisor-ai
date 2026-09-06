@@ -392,6 +392,55 @@ export function dispatchEvent(opts: DispatchOpts): void {
   })();
 }
 
+/**
+ * Read at most `maxBytes` of a fetch Response body, then cancel the
+ * rest of the stream. Never throws — an abort/reset mid-body returns
+ * whatever was collected. Used instead of `res.text()`, which buffers
+ * the ENTIRE body and only resolves at end-of-stream: a hostile
+ * endpoint could stream gigabytes (memory) or trickle bytes forever
+ * (socket + delivery-loop stall) after a fast 200 header.
+ */
+async function readBodyCapped(
+  res: {
+    body: {
+      getReader(): {
+        read(): Promise<{ done: boolean; value?: Uint8Array }>;
+        cancel(): Promise<unknown>;
+      };
+    } | null;
+  },
+  maxBytes: number,
+): Promise<string> {
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total < maxBytes) {
+      const { done, value } = (await reader.read()) as {
+        done: boolean;
+        value?: Uint8Array;
+      };
+      if (done) break;
+      if (value) {
+        chunks.push(value);
+        total += value.byteLength;
+      }
+    }
+  } catch {
+    // Partial body is fine — it's only used for the operator-facing
+    // delivery log excerpt.
+  } finally {
+    // Cancel whatever the endpoint is still trying to send; ignore
+    // failures (stream may already be closed/errored).
+    await reader.cancel().catch(() => undefined);
+  }
+  const joined = Buffer.concat(
+    chunks.map((c) => Buffer.from(c.buffer, c.byteOffset, c.byteLength)),
+  );
+  return joined.subarray(0, maxBytes).toString("utf8");
+}
+
 async function deliverOne(
   endpointId: string,
   url: string,
@@ -470,12 +519,19 @@ async function deliverOne(
     return;
   }
   const hostname = parsedUrl.hostname.toLowerCase();
+  // Same enforcement contract as creation-time validateWebhookUrl and
+  // the env flag's own doc ("block internal IPs in ALL modes,
+  // including dev"): delivery-time re-checks previously gated on
+  // NODE_ENV === "production" only, so a dev/staging deployment with
+  // the default strict setting could pass creation with a public DNS
+  // answer and then be rebound to 127.0.0.1/RFC1918 at delivery.
+  const enforceSsrf = env.NODE_ENV === "production" || !env.ALLOW_INTERNAL_WEBHOOK_TARGETS;
   let pinnedAddr: { address: string; family: 4 | 6 } | null = null;
   if (isIP(hostname)) {
     // Literal IP — validateWebhookUrl already blocked private
     // and metadata IPs in `production`. Re-check here for
     // defence-in-depth and skip the DNS lookup.
-    if (env.NODE_ENV === "production" && isBlockedIp(hostname)) {
+    if (enforceSsrf && isBlockedIp(hostname)) {
       clearTimeout(timer);
       await db.webhookDelivery.update({
         where: { id: deliveryId },
@@ -508,8 +564,10 @@ async function deliverOne(
       if (addrs.length === 0) {
         throw new Error("unresolvable");
       }
-      // In production, every returned address must be public.
-      if (env.NODE_ENV === "production") {
+      // Every returned address must be public whenever SSRF
+      // enforcement is on (production, or any mode without the
+      // explicit internal-targets opt-in).
+      if (enforceSsrf) {
         for (const a of addrs) {
           if (isBlockedIp(a.address)) {
             throw new Error(`resolves_to_private_ip:${a.address}`);
@@ -579,9 +637,15 @@ async function deliverOne(
       signal: controller.signal,
       dispatcher,
     });
-    clearTimeout(timer);
     const responseCode = res.status;
-    const respText = await res.text().catch(() => "");
+    // Body read runs with the abort timer still armed: a compromised
+    // endpoint returning headers then trickling (or streaming
+    // multi-GB) otherwise held the socket + buffered unboundedly —
+    // res.text() only resolves at end-of-stream. The capped reader
+    // stops at 2 KiB and cancels the rest; the timer bounds total
+    // wall time.
+    const respText = await readBodyCapped(res, 2048);
+    clearTimeout(timer);
     const truncated = respText.length > 2000 ? respText.slice(0, 2000) + "…" : respText;
     if (responseCode >= 200 && responseCode < 300) {
       await db.webhookDelivery.update({
