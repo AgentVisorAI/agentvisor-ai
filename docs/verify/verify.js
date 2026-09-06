@@ -138,7 +138,52 @@
       "573c8f249012fbb08b3d79973411bb93141f32719c86ada25306fde5e59e8d57",
     ]);
 
+    // Raw daemon receipts: the file agentvisord writes under
+    // spool/atif/receipts/ is {receipt fields…, public_key_b64,
+    // signature_b64} — NOT the console-export bundle envelope. The page
+    // copy ("drop an AgentVisor receipt JSON") and `avctl
+    // receipt-verify` both promise raw files work, so adapt them to
+    // the bundle shape verifyBundle expects. The signed message is the
+    // RFC 8785 (JCS) canonicalization of the receipt WITHOUT
+    // signature_b64 — same construction console-sync uses when
+    // uploading (av_receipts::canonicalize over Receipt.body).
+    function jcsCanonicalize(value) {
+      // Minimal JCS for the receipt value domain: JSON.stringify
+      // already emits shortest-form numbers for the integers/floats a
+      // receipt carries; JCS then only requires lexicographically
+      // sorted object keys and no whitespace.
+      if (value === null || typeof value !== "object") return JSON.stringify(value);
+      if (Array.isArray(value)) return "[" + value.map(jcsCanonicalize).join(",") + "]";
+      const keys = Object.keys(value).sort();
+      return "{" + keys.map((k) => JSON.stringify(k) + ":" + jcsCanonicalize(value[k])).join(",") + "}";
+    }
+    function bytesToHex(bytes) {
+      return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+    }
+    function looksLikeRawReceipt(parsed) {
+      return (
+        parsed && typeof parsed === "object" && !parsed.format &&
+        typeof parsed.signature_b64 === "string" &&
+        typeof parsed.public_key_b64 === "string" &&
+        typeof parsed.receipt_id === "string"
+      );
+    }
+    function rawReceiptToBundle(parsed) {
+      const body = {};
+      for (const k of Object.keys(parsed)) {
+        if (k === "signature_b64") continue;
+        body[k] = parsed[k];
+      }
+      const pubHex = bytesToHex(b64ToBytes(parsed.public_key_b64));
+      return {
+        format: "agentvisor.receipt.v1",
+        receipt: { rawBody: jcsCanonicalize(body), rawSignatureB64: parsed.signature_b64 },
+        publicKey: { hex: pubHex },
+      };
+    }
+
     async function verifyBundle(bundle) {
+      if (looksLikeRawReceipt(bundle)) bundle = rawReceiptToBundle(bundle);
       if (bundle.format !== "agentvisor.receipt.v1") {
         throw new Error("Unrecognized bundle format: " + bundle.format);
       }
@@ -260,10 +305,17 @@
       // green tick would let a tampered bundle show forged numbers.
       let signed = {};
       try { signed = JSON.parse(r.rawBody || "{}"); } catch { signed = {}; }
-      const displaySession = signed.sessionExternalId || signed.sessionId || s.externalId || s.id || "—";
-      const displayAgent = signed.agent || s.agent || "—";
-      const displayEvents = signed.eventCount ?? r.eventCount ?? "—";
-      const displayReceiptId = signed.receiptId || r.receiptId || "—";
+      // Display fields: console-export bodies use camelCase
+      // (sessionExternalId/agent/eventCount/receiptId); raw daemon
+      // receipt bodies use the Rust wire shape (session_id,
+      // ai_agent.charter.name, subject.event_count/step_count,
+      // receipt_id). Accept both so raw spool files render real
+      // metadata instead of dashes.
+      const rawSubject = signed.subject || {};
+      const displaySession = signed.sessionExternalId || signed.sessionId || signed.session_id || s.externalId || s.id || "—";
+      const displayAgent = signed.agent || (signed.ai_agent && signed.ai_agent.charter && signed.ai_agent.charter.name) || s.agent || "—";
+      const displayEvents = signed.eventCount ?? rawSubject.event_count ?? rawSubject.step_count ?? r.eventCount ?? "—";
+      const displayReceiptId = signed.receiptId || signed.receipt_id || r.receiptId || "—";
       // Surface envelope/signed-body drift so edited convenience copies
       // are called out even though the signature itself still verifies.
       const drift = [];
@@ -344,6 +396,10 @@
       if (!lastGood) return;
       let bundle;
       try { bundle = JSON.parse(lastGood); } catch { return; }
+      // Raw daemon receipts don't carry the bundle envelope — convert
+      // first so the byte flip lands in the actual signed body and the
+      // re-verify exercises the same path as the original verify.
+      if (looksLikeRawReceipt(bundle)) bundle = rawReceiptToBundle(bundle);
       const r = bundle.receipt || {};
       const body = r.rawBody || "";
       if (!body) return;
