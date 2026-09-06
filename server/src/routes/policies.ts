@@ -5,10 +5,10 @@
  * Enforcement itself happens in the daemon (local WASM / schema policy
  * files); this API is the org-visible source of truth for what SHOULD
  * be enforced, who last touched it, and whether it is enabled. The
- * hits24h/blocks24h columns the SPA renders are returned as zeros: no
- * trustworthy per-policy attribution exists in the ingest stream yet,
- * and inventing numbers on a compliance surface is worse than an
- * honest zero.
+ * hits24h/blocks24h columns the SPA renders are aggregated from ingest
+ * events carrying a policyName attribution (see policyCounters below);
+ * policies with no attributed events in the window report zero rather
+ * than an invented number.
  *
  * Endpoints:
  *   GET    /api/v1/policies       list (all roles — members need read)
@@ -19,6 +19,7 @@
  */
 
 import type { FastifyInstance } from "fastify";
+import { Prisma } from "@prisma/client";
 import { z } from "zod";
 import { db } from "../db.js";
 import { writeAudit, resolveActor } from "../lib/audit.js";
@@ -50,10 +51,42 @@ const policySelect = {
   updatedAt: true,
 } as const;
 
-// The SPA charts hits/blocks columns; zeros are the honest value until
-// the ingest stream carries per-policy attribution (see model comment).
-function toWire(p: Record<string, unknown>) {
-  return { ...p, hits24h: 0, blocks24h: 0 };
+// Per-policy 24h counters, aggregated from ingest events that carry a
+// policyName attribution (events.policyName ← eventPayload.policyName).
+// Scoped through sessions.orgId so one org can never observe another's
+// hit volume; the (policyName, occurredAt) index keeps this a range
+// scan. Names with no matching Policy row are simply not returned —
+// the console joins on the org's own policy names.
+async function policyCounters(
+  orgId: string,
+): Promise<Map<string, { hits: number; blocks: number }>> {
+  const rows = await db.$queryRaw<
+    Array<{ policyname: string; hits: bigint; blocks: bigint }>
+  >(Prisma.sql`
+    SELECT e."policyName"                                   AS policyname,
+           COUNT(*)::bigint                                 AS hits,
+           COUNT(*) FILTER (WHERE e.kind = 'block')::bigint AS blocks
+    FROM events e
+    JOIN sessions s ON s.id = e."sessionId"
+    WHERE s."orgId" = ${orgId}
+      AND e."policyName" IS NOT NULL
+      AND e."occurredAt" >= ${new Date(Date.now() - 24 * 3_600_000)}
+    GROUP BY 1
+  `);
+  const map = new Map<string, { hits: number; blocks: number }>();
+  for (const r of rows)
+    map.set(r.policyname, { hits: Number(r.hits), blocks: Number(r.blocks) });
+  return map;
+}
+
+// Counters come from the attribution aggregate when present; zero when
+// the org's daemons haven't attributed any events in the window.
+function toWire(
+  p: { name: string } & Record<string, unknown>,
+  counters?: Map<string, { hits: number; blocks: number }>,
+) {
+  const c = counters?.get(p.name);
+  return { ...p, hits24h: c?.hits ?? 0, blocks24h: c?.blocks ?? 0 };
 }
 
 export async function policyRoutes(app: FastifyInstance): Promise<void> {
@@ -65,7 +98,8 @@ export async function policyRoutes(app: FastifyInstance): Promise<void> {
       orderBy: [{ enabled: "desc" }, { updatedAt: "desc" }],
       select: policySelect,
     });
-    return reply.send({ policies: rows.map(toWire) });
+    const counters = await policyCounters(claims.orgId);
+    return reply.send({ policies: rows.map((p) => toWire(p, counters)) });
   });
 
   app.get("/:id", async (req, reply) => {
@@ -80,7 +114,8 @@ export async function policyRoutes(app: FastifyInstance): Promise<void> {
       select: policySelect,
     });
     if (!row) return reply.code(404).send({ error: "not_found" });
-    return reply.send({ policy: toWire(row) });
+    const counters = await policyCounters(claims.orgId);
+    return reply.send({ policy: toWire(row, counters) });
   });
 
   app.post("/", async (req, reply) => {

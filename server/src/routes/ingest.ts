@@ -83,6 +83,12 @@ const eventPayload = z.object({
   tag: z.string().min(1).max(32),
   body: z.string().max(8000),
   sub: z.string().max(2000).optional(),
+  // Which policy this event fired under, when the daemon attributes
+  // one (block verdicts, allowlist hits). Free-form name matched
+  // against Policy.name for the console's per-policy 24h counters —
+  // unknown names are stored as-is so counters appear as soon as the
+  // operator creates the matching policy row.
+  policyName: z.string().trim().min(1).max(80).optional(),
   occurredAt: z.coerce.date(),
   // R160 F1: per-field upper bounds on all numeric increments.
   // Prior shape used `z.number().int().min(0)` with NO upper
@@ -243,6 +249,14 @@ const receiptPayload = z.object({
 
 const publicKeyPayload = z.object({
   publicKeyHex: z.string().regex(/^[0-9a-f]{64}$/),
+  // Self-reported daemon build version. Display metadata only — it is
+  // NEVER part of the trust decision below, so it updates on every
+  // check-in even when the anchor logic refuses a key change.
+  daemonVersion: z
+    .string()
+    .max(40)
+    .regex(/^[0-9A-Za-z][0-9A-Za-z.+_-]*$/)
+    .optional(),
 });
 
 export async function ingestRoutes(app: FastifyInstance): Promise<void> {
@@ -251,6 +265,17 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
     if (!daemon) return;
     const body = publicKeyPayload.safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: "invalid_input" });
+    // Version is informational — record it best-effort on every
+    // authenticated check-in, independent of the trust-anchor outcome
+    // (same posture as the lastIngestAt touch in authenticateDaemon).
+    if (body.data.daemonVersion) {
+      db.deployment
+        .update({
+          where: { id: daemon.deploymentId },
+          data: { daemonVersion: body.data.daemonVersion },
+        })
+        .catch(() => void 0);
+    }
     // R91 F3: silent trust-anchor rotation is the exact class the
     // R78 pinning + R79 verifier hardening tried to close, and
     // this endpoint was silently ROTATING the anchor without any
@@ -644,6 +669,7 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
         tag: e.tag,
         body: e.body,
         sub: e.sub,
+        policyName: e.policyName,
         occurredAt: e.occurredAt,
         journalCount: e.journalCount,
       }));

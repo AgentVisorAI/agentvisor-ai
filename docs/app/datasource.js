@@ -2223,7 +2223,7 @@
           name: d.name,
           environment: d.environment || "production",
           status: d.lastIngestAt && (Date.now() - new Date(d.lastIngestAt).getTime() < 5 * 60 * 1000) ? "connected" : "pending",
-          version: d.version || null,
+          version: d.daemonVersion || null,
           lastSeenAt: d.lastIngestAt || null,
           createdAt: d.createdAt,
           ingestTokenHint: d.ingestTokenHint ? "av_live_" + d.ingestTokenHint.slice(0, 4) + "…" : "—",
