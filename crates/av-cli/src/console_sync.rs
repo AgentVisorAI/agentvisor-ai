@@ -1279,14 +1279,21 @@ fn bridge_record_to_event(
                 event.add_tools_allowed = 1;
             }
             // Per-policy attribution when the daemon names the policy in
-            // the OCSF payload. Absent today for the built-in verdict
-            // shapes ({stage, reason}); forward-wired so a policy-aware
-            // daemon build lights the console counters with no CLI change.
+            // the OCSF payload. `bounded_text` (not the fallback-carrying
+            // bounded_nonempty): an empty/whitespace name must yield NO
+            // attribution rather than inventing a literal "policy" row
+            // the operator can't find in their inventory.
             event.policy_name = payload
                 .get("policy")
                 .or_else(|| payload.get("policy_name"))
                 .and_then(serde_json::Value::as_str)
-                .map(|name| bounded_nonempty(name, MAX_AGENT_UNITS, "policy"));
+                .map(|name| {
+                    bounded_text(
+                        name.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}'),
+                        MAX_AGENT_UNITS,
+                    )
+                })
+                .filter(|name| !name.is_empty());
             event
         }
         "agent.stop_reason" => bridge_ingest_event(
@@ -1723,12 +1730,32 @@ fn policy_from_step(step: &av_atif::Step) -> Option<String> {
             serde_json::Value::String(text) => serde_json::from_str(text).ok(),
             other => Some(other.clone()),
         };
-        if let Some(name) = payload
-            .as_ref()
-            .and_then(|value| value.get("policy"))
-            .and_then(serde_json::Value::as_str)
-        {
-            return Some(bounded_nonempty(name, MAX_AGENT_UNITS, "policy"));
+        let Some(payload) = payload.as_ref() else {
+            continue;
+        };
+        // Only the harness's tool-AUTHORIZATION payload may attribute:
+        // it always carries `stage` + `allowed`. Without this shape
+        // check, an ALLOWED call's observation — the tool's own
+        // response body, attacker-influenced JSON — could smuggle a
+        // top-level "policy" key and inflate arbitrary per-policy hit
+        // counters through the ATIF path.
+        if payload.get("stage").is_none() || payload.get("allowed").is_none() {
+            continue;
+        }
+        if let Some(name) = payload.get("policy").and_then(serde_json::Value::as_str) {
+            // Empty/whitespace names yield None — NOT a fallback
+            // string: bounded_nonempty's "policy" fallback would
+            // invent an attribution the operator can't find in their
+            // inventory, the exact thing this function's contract
+            // forbids.
+            let bounded = bounded_text(
+                name.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}'),
+                MAX_AGENT_UNITS,
+            );
+            if bounded.is_empty() {
+                continue;
+            }
+            return Some(bounded);
         }
     }
     None
