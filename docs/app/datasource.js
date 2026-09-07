@@ -2407,15 +2407,24 @@
         var r = await apiFetch("/api/v1/receipts/" + sessionId);
         var rec = r.receipt || r;
         var body; try { body = JSON.parse(rec.body); } catch (e) { body = { raw: rec.body }; }
+        // Two body dialects reach this page: the legacy console shape
+        // ({tools:{allowed,blocked}, contentHash, startedAt}) and the
+        // real daemon ReceiptBody v2 ({tool_calls:{total,allowed,blocked},
+        // subject:{chain_head}, issued_at_iso}). Mapping only the legacy
+        // names rendered every daemon receipt as "0 allowed · 0 blocked"
+        // with a blank content hash.
+        var tools = body.tools ||
+          (body.tool_calls ? { allowed: body.tool_calls.allowed || 0, blocked: body.tool_calls.blocked || 0 } : null);
         return {
-          schemaVersion: body.schemaVersion || "1.0",
+          schemaVersion: body.schemaVersion || (body.receipt_version ? "v" + body.receipt_version : "1.0"),
           receiptId: rec.receiptId, sessionId: sessionId,
           deploymentId: rec.session && rec.session.deploymentId,
-          startedAt: body.startedAt, endedAt: body.endedAt,
+          startedAt: body.startedAt, endedAt: body.endedAt || body.issued_at_iso,
           eventCount: rec.eventCount,
-          tools: body.tools || {}, spend: body.spend || {},
+          tools: tools, spend: body.spend || {},
           policiesEnforced: body.policiesEnforced || [],
-          contentHash: body.contentHash, signature: rec.sigB64,
+          contentHash: body.contentHash || (body.subject && body.subject.chain_head) || null,
+          signature: rec.sigB64,
           signingKeyFingerprint: rec.keyIdHint,
           // Everything the client needs to independently verify. No blind
           // trust in a server-side "verified" flag.
