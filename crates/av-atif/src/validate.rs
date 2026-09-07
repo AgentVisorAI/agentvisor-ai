@@ -1469,24 +1469,49 @@ fn validate_step(
                 // path said "invalid", diverging the two verdicts on
                 // the same file.
                 if let Mode::Strict = mode {
-                    for numeric_array_field in ["logprobs", "completion_token_ids", "prompt_token_ids"] {
-                        if let Some(v) = m.get(numeric_array_field) {
+                    // `logprobs` is `Vec<f64>` in the typed model: any JSON
+                    // number is acceptable.
+                    if let Some(v) = m.get("logprobs") {
+                        match v.as_array() {
+                            Some(items) => {
+                                for (index, item) in items.iter().enumerate() {
+                                    if !item.is_number() {
+                                        issue!(
+                                            issues,
+                                            format!("{mpath}.logprobs[{index}]"),
+                                            "must be a number"
+                                        );
+                                    }
+                                }
+                            }
+                            None => {
+                                issue!(issues, format!("{mpath}.logprobs"), "must be an array of numbers")
+                            }
+                        }
+                    }
+                    // The token-id arrays are `Vec<u64>` in the typed model
+                    // and `integer, minimum: 0` in the schema — `is_number`
+                    // alone admitted negative/fractional elements here that
+                    // the typed deserialize path rejects, re-opening the
+                    // verdict split this block exists to close.
+                    for token_id_field in ["completion_token_ids", "prompt_token_ids"] {
+                        if let Some(v) = m.get(token_id_field) {
                             match v.as_array() {
                                 Some(items) => {
                                     for (index, item) in items.iter().enumerate() {
-                                        if !item.is_number() {
+                                        if !item.is_u64() {
                                             issue!(
                                                 issues,
-                                                format!("{mpath}.{numeric_array_field}[{index}]"),
-                                                "must be a number"
+                                                format!("{mpath}.{token_id_field}[{index}]"),
+                                                "must be a non-negative integer"
                                             );
                                         }
                                     }
                                 }
                                 None => issue!(
                                     issues,
-                                    format!("{mpath}.{numeric_array_field}"),
-                                    "must be an array of numbers"
+                                    format!("{mpath}.{token_id_field}"),
+                                    "must be an array of non-negative integers"
                                 ),
                             }
                         }
@@ -1675,6 +1700,75 @@ mod tests {
                 .iter()
                 .any(|issue| issue.path.ends_with(".timestamp")),
             "strict must refuse naive timestamps"
+        );
+    }
+
+    /// Regression: strict mode used a bare `is_number` check for the
+    /// token-id arrays, so `[-5]` or `[2.5]` passed validation while
+    /// the typed model (`Vec<u64>`) and the shipped schema
+    /// (`integer, minimum: 0`) both reject them — the exact
+    /// CLI-vs-typed-path verdict split this block exists to close.
+    #[test]
+    fn strict_token_id_arrays_reject_non_u64_elements() {
+        let doc = |field: &str, items: Value| {
+            serde_json::json!({
+                "schema_version": "ATIF-v1.7",
+                "session_id": "s",
+                "agent": {"name": "a", "version": "1"},
+                "steps": [{
+                    "step_id": 1,
+                    "source": "agent",
+                    "message": "hi",
+                    "llm_call_count": 1,
+                    "metrics": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                        field: items,
+                    },
+                }],
+            })
+        };
+        for field in ["completion_token_ids", "prompt_token_ids"] {
+            // Valid: non-negative integers — strict verdict and typed
+            // deserialize must both accept.
+            let good = doc(field, serde_json::json!([0, 1, 42]));
+            assert!(
+                validate_value(&good, Mode::Strict).is_empty(),
+                "{field}: u64 elements must pass strict validation"
+            );
+            assert!(
+                serde_json::from_value::<crate::model::Trajectory>(good).is_ok(),
+                "{field}: u64 elements must deserialize"
+            );
+            // Invalid: negative and fractional elements — the typed
+            // model refuses, so strict must too.
+            for bad_items in [serde_json::json!([1, -5]), serde_json::json!([1, 2.5])] {
+                let bad = doc(field, bad_items.clone());
+                assert!(
+                    validate_value(&bad, Mode::Strict).iter().any(|issue| {
+                        issue.path.contains(field) && issue.message.contains("non-negative integer")
+                    }),
+                    "{field}: strict must flag {bad_items} as non-u64"
+                );
+                assert!(
+                    serde_json::from_value::<crate::model::Trajectory>(bad).is_err(),
+                    "{field}: typed model must refuse {bad_items} (verdict agreement)"
+                );
+            }
+        }
+        // `logprobs` stays `Vec<f64>`: negative/fractional numbers are
+        // legitimate there and must NOT be flagged.
+        let logprobs = doc("logprobs", serde_json::json!([-0.25, 1.5]));
+        assert!(
+            validate_value(&logprobs, Mode::Strict).is_empty(),
+            "logprobs must keep accepting arbitrary finite numbers"
+        );
+        assert!(
+            validate_value(&doc("logprobs", serde_json::json!(["x"])), Mode::Strict)
+                .iter()
+                .any(|issue| issue.path.contains("logprobs") && issue.message.contains("number")),
+            "logprobs must still flag non-numbers"
         );
     }
 

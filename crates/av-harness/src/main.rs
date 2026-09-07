@@ -1485,10 +1485,12 @@ async fn refresh_jwks(client: &reqwest::Client, url: &str, validator: &IdentityV
             anyhow::Error::new(error.without_url()).context(format!("JWKS endpoint returned status {status}"))
         })?;
     // Fast reject: if Content-Length is present and already exceeds the
-    // cap, refuse without allocating anything for the body.
+    // cap, refuse without allocating anything for the body. The message
+    // must contain "exceeded" — classify_jwks_error keys the "oversize"
+    // category on that substring.
     if let Some(len) = response.content_length() {
         if len > MAX_JWKS_BYTES as u64 {
-            anyhow::bail!("JWKS declared Content-Length {len} bytes; cap is {MAX_JWKS_BYTES}");
+            anyhow::bail!("JWKS declared Content-Length {len} bytes exceeded the {MAX_JWKS_BYTES} byte cap");
         }
     }
     use futures::StreamExt as _;
@@ -2516,8 +2518,15 @@ mod tests {
             "refresh_jwks error must not contain the host:port either. Got: {text}"
         );
         // classify_jwks_error must return a stable non-identifying
-        // category — same URL-free posture on the log-side.
+        // category — same URL-free posture on the log-side. The
+        // Content-Length fast-reject must land in the "oversize"
+        // bucket (it used to fall through to "other" because its bail
+        // message lacked the "exceeded" keyword the classifier keys on).
         let category = classify_jwks_error(&err);
+        assert_eq!(
+            category, "oversize",
+            "Content-Length cap rejection must classify as oversize"
+        );
         assert!(
             !category.contains("://") && !category.contains(&addr.to_string()),
             "classify_jwks_error must be URL-free. Got: {category}"
@@ -2670,6 +2679,11 @@ mod tests {
         assert!(
             text.contains("exceeded"),
             "expected streamed-body cap error, got: {text}"
+        );
+        assert_eq!(
+            classify_jwks_error(&err),
+            "oversize",
+            "streamed-body cap rejection must classify as oversize"
         );
         server.abort();
     }

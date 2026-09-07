@@ -95,6 +95,49 @@ fn idempotent_when_dedup_alone_met_the_target_on_a_large_history() {
     );
 }
 
+/// Regression: the `input_already_compressed` guard used to scan the
+/// WHOLE messages array — including the never-touched tail — so a tail
+/// message whose content merely starts with `[pruned:` (user pasting a
+/// stub example, or hostile content) permanently disabled the middle
+/// pass for the conversation. Machine stubs only ever live before
+/// `tail_start`, so the scan must stop there.
+#[test]
+fn pruned_prefixed_tail_message_does_not_disable_the_middle_pass() {
+    // 40 unique large middle messages (~2 000 approx tokens each ⇒
+    // ~80 k total, above the 50 k middle-pass floor). Unique content
+    // and non-JSON text keep every other pass idle, so only the
+    // middle-history pass can effect a change.
+    let mut messages: Vec<Value> = (0..40)
+        .map(|i| json!({"role": "user", "content": format!("segment {i} {}", "x".repeat(8_000))}))
+        .collect();
+    // Default keep_tail is 8: seven fillers plus a tail message that
+    // starts with the machine stub prefix but is genuine user content.
+    for i in 0..7 {
+        messages.push(json!({"role": "user", "content": format!("tail filler {i}")}));
+    }
+    messages.push(json!({
+        "role": "user",
+        "content": "[pruned: 999 tokens, sha256:deadbeef, reason: middle history] — example stub I pasted from the docs"
+    }));
+    let payload = json!({"model": "m", "messages": messages});
+    let once = compress(&payload, &CompressionConfig::default());
+    assert!(
+        once.changed && once.tokens_after < once.tokens_before,
+        "a [pruned:-prefixed TAIL message must not disable the middle pass \
+         (before: {}, after: {}, changed: {})",
+        once.tokens_before,
+        once.tokens_after,
+        once.changed
+    );
+    // The genuine machine stubs emitted by run 1 sit before the tail,
+    // so run 2's guard must still hold the idempotence invariant.
+    let twice = compress(&once.payload, &CompressionConfig::default());
+    assert_eq!(
+        twice.payload, once.payload,
+        "compress must stay idempotent when the tail quotes the stub prefix"
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
