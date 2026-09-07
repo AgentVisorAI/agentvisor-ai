@@ -162,6 +162,25 @@ try {
   const rot = await ds.rotateDeploymentToken(dep.deployment.id);
   check("rotate returns token", !!rot.ingestToken);
 
+  // Edit metadata: rename + environment flip; ID stays; guards
+  const edited = await ds.updateDeployment(dep.deployment.id, { name: "e2e-prod-renamed", environment: "development" });
+  check("deployment edit", edited && edited.name === "e2e-prod-renamed" && edited.environment === "development" && edited.id === dep.deployment.id);
+  let emptyPatch = "";
+  try { await ds.updateDeployment(dep.deployment.id, {}); } catch (e) { emptyPatch = e.errorCode || e.message; }
+  check("deployment empty patch 400", emptyPatch === "invalid_input", emptyPatch);
+  let badEnv = "";
+  try { await ds.updateDeployment(dep.deployment.id, { environment: "qa" }); } catch (e) { badEnv = e.errorCode || e.message; }
+  check("deployment bad env 400", badEnv === "invalid_input", badEnv);
+  let ghostDep = "";
+  try { await ds.updateDeployment("cmnope0000000000000000000", { name: "x" }); } catch (e) { ghostDep = e.errorCode || e.message; }
+  check("deployment ghost 404", ghostDep === "not_found", ghostDep);
+
+  // Sign out other devices: caller's cookie is re-minted and survives
+  const lo = await ds.logoutOtherDevices();
+  check("logout-all ok", lo && lo.ok === true);
+  const meAfterLo = await ds.getSession();
+  check("session survives logout-all", meAfterLo && meAfterLo.user.email === email, meAfterLo?.user?.email);
+
   // Delete: a deployment holding sealed receipts refuses a plain
   // DELETE (409 deployment_has_sealed_receipts) — assert the guard
   // fires, then force-delete exactly like the SPA's confirm flow.

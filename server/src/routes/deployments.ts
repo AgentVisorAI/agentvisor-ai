@@ -168,6 +168,64 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
     return reply.send({ ingestToken: plaintextToken });
   });
 
+  // Edit deployment metadata — name and environment only. Both are
+  // labels: the ingest token, signing key anchor, and every sealed
+  // receipt reference the deployment ID, so a rename can't orphan or
+  // re-attribute anything already issued. Member role is read-only on
+  // deployments (same gate as create/rotate/delete).
+  app.patch<{ Params: { id: string } }>("/:id", async (req, reply) => {
+    const claims = requireSession(req, reply);
+    if (!claims) return;
+    if (claims.membershipRole === "member") {
+      return reply.code(403).send({ error: "forbidden" });
+    }
+    const body = z
+      .object({
+        name: z.string().max(80).trim().min(1).optional(),
+        environment: envSchema.optional(),
+      })
+      .refine((v) => v.name !== undefined || v.environment !== undefined, "empty patch")
+      .safeParse(req.body);
+    if (!body.success) return reply.code(400).send({ error: "invalid_input" });
+    const owned = await db.deployment.findFirst({
+      where: { id: req.params.id, orgId: claims.orgId },
+    });
+    // Uniform 404 — no existence oracle for foreign deployment ids.
+    if (!owned) return reply.code(404).send({ error: "not_found" });
+    const updated = await db.deployment.update({
+      where: { id: owned.id },
+      data: {
+        ...(body.data.name !== undefined ? { name: body.data.name } : {}),
+        ...(body.data.environment !== undefined ? { environment: body.data.environment } : {}),
+      },
+    });
+    if (updated.name !== owned.name || updated.environment !== owned.environment) {
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "deployment.updated",
+          ...(await resolveActor(claims.sub)),
+          target: updated.name,
+          metadata: {
+            deploymentId: updated.id,
+            previousName: owned.name,
+            previousEnvironment: owned.environment,
+            environment: updated.environment,
+          },
+          req,
+        },
+        req.log,
+      );
+    }
+    return reply.send({
+      deployment: {
+        id: updated.id,
+        name: updated.name,
+        environment: updated.environment,
+      },
+    });
+  });
+
   app.delete<{ Params: { id: string }; Querystring: { force?: string } }>(
     "/:id",
     async (req, reply) => {

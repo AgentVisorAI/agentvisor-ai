@@ -966,6 +966,44 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     });
   });
 
+  // Sign out other devices. The sessionRevokedAt fence (bumped on
+  // logout / password change / reset / passkey revoke) was never
+  // user-reachable on its own — the only ways to fence a possibly-
+  // leaked cookie were to rotate the password or revoke a passkey,
+  // both heavier than "I left myself signed in on a conference
+  // machine". Bump the fence, then re-mint THIS session's cookie in
+  // the same response (same shape as /change-password) so "other
+  // devices" is exactly the semantics. API keys are untouched — this
+  // is about browser cookies, not automation credentials.
+  app.post("/logout-all", async (req, reply) => {
+    const claims = requireSession(req, reply);
+    if (!claims) return;
+    if (claims.sub.startsWith("apikey:")) {
+      return reply.code(403).send({ error: "cookie_session_required" });
+    }
+    const user = await db.user.update({
+      where: { id: claims.sub },
+      data: { sessionRevokedAt: new Date() },
+    });
+    const token = await mintSession({
+      sub: claims.sub,
+      orgId: claims.orgId,
+      membershipRole: claims.membershipRole,
+    });
+    reply.setCookie(env.SESSION_COOKIE_NAME, token, SESSION_COOKIE_OPTS);
+    writeAudit(
+      {
+        orgId: claims.orgId,
+        event: "auth.logout_all",
+        actorId: user.id,
+        actorEmail: user.email,
+        req,
+      },
+      req.log,
+    );
+    return reply.send({ ok: true });
+  });
+
   // GDPR data export. Returns everything the org has stored:
   // deployments, sessions, events, receipts, memberships, users.
   // Password hashes and reset tokens are excluded — the export is meant
