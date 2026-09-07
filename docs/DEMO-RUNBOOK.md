@@ -80,12 +80,24 @@ H='-H Content-Type:application/json -H X-Requested-With:fetch -H Origin:https://
 curl -s -c /tmp/prod.jar $H -X POST $B/auth/login \
   -d '{"email":"debug6667@proton.me","password":"<vault>"}'
 curl -s -b /tmp/prod.jar $H -X DELETE \
-  "$B/deployments/$(awk '{print $2}' /tmp/demo-dep.txt)?force=1"
+  "$B/deployments/$(awk '{print $2}' /tmp/demo-dep.txt)?force=1" -d '{}'
+# (the -d '{}' matters: $H sets Content-Type: application/json and
+#  Fastify 400s a bodyless JSON request — dress-rehearsal finding 9/7)
 R=$(curl -s -b /tmp/prod.jar $H -X POST $B/deployments \
   -d '{"name":"demo-day-live","environment":"production"}')
 echo "$R" | python3 -c 'import json,sys; d=json.load(sys.stdin); \
   open("/tmp/demo-token","w").write(d["ingestToken"]); \
   print("dep", d["deployment"]["id"])' | tee /tmp/demo-dep.txt
+
+# Optional: purge rehearsal residue older than a day (orphaned
+# recovery-adopted sessions from drills sync with agent
+# "agentvisor-ai-harness" and would render as stalled pills). Restores
+# 90d after.
+curl -s -b /tmp/prod.jar $H -X PATCH $B/org/retention \
+  -d '{"sessionRetentionDays":1,"auditRetentionDays":365}' >/dev/null
+curl -s -b /tmp/prod.jar $H -X POST $B/org/retention/sweep-now -d '{}'
+curl -s -b /tmp/prod.jar $H -X PATCH $B/org/retention \
+  -d '{"sessionRetentionDays":90,"auditRetentionDays":365}' >/dev/null
 chmod 600 /tmp/demo-token
 rm -f /tmp/demo-state.json     # sync state must reset with the deployment
 ```
