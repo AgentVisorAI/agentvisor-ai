@@ -48,7 +48,7 @@ import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 
 const API = process.env.API_BASE || "http://127.0.0.1:4477";
-const IDP_PORT = 4478;
+const IDP_PORT = Number(process.env.IDP_PORT || 4478);
 const ISSUER = `http://127.0.0.1:${IDP_PORT}`;
 const CLIENT_ID = "av-console";
 const CLIENT_SECRET = "drill-secret-123";
@@ -82,6 +82,11 @@ const scenario = {
   includeEmail: true,
   name: "Drill User",
   wrongNonce: false,
+  wrongAud: false,   // aud for a different client
+  wrongKey: false,   // signed by a key NOT in the JWKS
+  algNone: false,    // unsigned token, alg "none"
+  expiredToken: false, // exp in the past
+  wrongIss: false,   // issuer of a different IdP
 };
 
 // code → { challenge, nonce, redirectUri }
@@ -92,6 +97,19 @@ function b64url(buf) {
 }
 
 function signIdToken(claims) {
+  if (scenario.algNone) {
+    // Classic JWT downgrade: header claims "none", empty signature.
+    const header = b64url(JSON.stringify({ alg: "none", typ: "JWT" }));
+    return `${header}.${b64url(JSON.stringify(claims))}.`;
+  }
+  if (scenario.wrongKey) {
+    // Valid RS256 signature — from a key the JWKS has never published.
+    const rogue = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey;
+    const header = b64url(JSON.stringify({ alg: "RS256", kid: KID, typ: "JWT" }));
+    const payload = b64url(JSON.stringify(claims));
+    const sig = crypto.sign("RSA-SHA256", Buffer.from(`${header}.${payload}`), rogue);
+    return `${header}.${payload}.${b64url(sig)}`;
+  }
   const header = b64url(JSON.stringify({ alg: "RS256", kid: KID, typ: "JWT" }));
   const payload = b64url(JSON.stringify(claims));
   const sig = crypto.sign("RSA-SHA256", Buffer.from(`${header}.${payload}`), privateKey);
@@ -170,11 +188,11 @@ const idp = http.createServer((req, res) => {
       codes.delete(p.get("code"));
       const now = Math.floor(Date.now() / 1000);
       const claims = {
-        iss: ISSUER,
+        iss: scenario.wrongIss ? "http://evil-idp.example" : ISSUER,
         sub: `sub-${crypto.createHash("sha256").update(scenario.email).digest("hex").slice(0, 16)}`,
-        aud: CLIENT_ID,
-        iat: now,
-        exp: now + 300,
+        aud: scenario.wrongAud ? "some-other-client" : CLIENT_ID,
+        iat: scenario.expiredToken ? now - 900 : now,
+        exp: scenario.expiredToken ? now - 600 : now + 300,
         nonce: scenario.wrongNonce ? "forged-nonce-value" : grant.nonce,
         email_verified: scenario.emailVerified,
         name: scenario.name,
@@ -347,6 +365,23 @@ async function main() {
   check("no session minted", !flowNonce.sessionCookie);
   scenario.wrongNonce = false;
 
+  console.log("[10b] forged id_tokens: library guarantees, negatively probed");
+  // Round-68 lesson (SAML issuer pin was a no-op on the login path):
+  // never trust a config knob — post the attack and watch it bounce.
+  for (const [flag, label] of [
+    ["wrongAud", "aud of another client"],
+    ["wrongKey", "RS256 by a key not in JWKS"],
+    ["algNone", "alg:none downgrade"],
+    ["expiredToken", "expired id_token"],
+    ["wrongIss", "issuer of another IdP"],
+  ]) {
+    scenario[flag] = true;
+    const f = await runFlow();
+    check(`${label} → oauth_exchange_failed`, errSlugFrom(f.finalLocation) === "oauth_exchange_failed", f);
+    check(`${label}: no session minted`, !f.sessionCookie);
+    scenario[flag] = false;
+  }
+
   console.log("[11] provider routing edges");
   const gStart = await fetch(`${API}/api/v1/auth/oauth/google/start`, { redirect: "manual" });
   check("google unconfigured → not_configured", errSlugFrom(gStart.headers.get("location")) === "oauth_provider_not_configured");
@@ -358,6 +393,11 @@ async function main() {
   console.log("[12] MFA gate: passkey holder refused OAuth bypass");
   if (!PG_CONTAINER) {
     console.log("  SKIP (set PG_CONTAINER to run — needs a seeded WebAuthn credential row)");
+  } else if (!me1.body?.user?.id) {
+    // Happens when earlier flows were eaten by the /start 30/min/IP
+    // bucket (e.g. two drill runs inside one minute) — fail loudly
+    // instead of TypeError-ing.
+    check("leg 12 preconditions (rate-limited earlier legs?)", false, me1);
   } else {
     const uid = me1.body.user.id;
     const seedSql = `INSERT INTO "webauthn_credentials" ("id","userId","credentialId","publicKey","counter","transports","label") VALUES ('drill-mfa-cred','${uid}',decode('ZHJpbGwtY3JlZA==','base64'),decode('ZHJpbGwtcGs=','base64'),0,'usb','drill seed')`;

@@ -154,6 +154,23 @@ a { color: var(--accent); text-decoration: none; }
 /* Links inside flowing text must be distinguishable without color
    alone (axe link-in-text-block, WCAG 1.4.1) — underline them. */
 .link-inline { text-decoration: underline; text-underline-offset: 2px; }
+/* Settings key/value grids. Fixed 140px label column + unwrappable
+   values (emails, org ids, key fingerprints) overflowed the card on
+   narrow phones — grid children need min-width:0 and long tokens need
+   a break opportunity; below 420px the label column shrinks. */
+.kv-grid { display: grid; grid-template-columns: 140px 1fr; gap: 5px 12px; font-size: 13px; }
+.kv-grid dt { color: var(--fg-3); }
+.kv-grid dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+@media (max-width: 420px) {
+  .kv-grid { grid-template-columns: 100px 1fr; }
+}
+/* Data-retention form grid: the 200px label column pushed the
+   input+days row past the card edge at phone widths — stack instead. */
+.ret-grid { display: grid; grid-template-columns: 200px 1fr; gap: 12px 16px; font-size: 13px; align-items: center; }
+@media (max-width: 480px) {
+  .ret-grid { grid-template-columns: 1fr; gap: 4px 0; }
+  .ret-grid > div { margin-bottom: 8px; }
+}
 a:hover { text-decoration: underline; }
 button { font-family: inherit; font-size: inherit; cursor: pointer; }
 
