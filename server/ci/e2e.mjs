@@ -23,7 +23,10 @@ globalThis.fetch = async (url, opts={}) => {
 };
 
 const src = readFileSync(datasourcePath, "utf8");
-globalThis.window = { MOCK_MODE: false, API_BASE: "http://127.0.0.1:8985" };
+// API_BASE override lets the suite run against any port — the default
+// stays the CI convention. (Shared dev machines: 8985 can be taken.)
+const API_BASE = process.env.API_BASE ?? "http://127.0.0.1:8985";
+globalThis.window = { MOCK_MODE: false, API_BASE };
 new Function(src)();
 const ds = globalThis.window.dataSource;
 
@@ -52,7 +55,7 @@ try {
   // Ingest session
   const openedAt = new Date().toISOString();
   const ingest = async (path, body) => {
-    const r = await origFetch(`http://127.0.0.1:8985${path}`, {
+    const r = await origFetch(`${API_BASE}${path}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -320,6 +323,17 @@ try {
   check("reset-mfa wrong password 401", wrongPwMfa === "invalid_password", wrongPwMfa);
   const mem = await ds.listMembers();
   check("members carry mfaEnrolled flag", mem.length === 1 && mem[0].mfaEnrolled === false, JSON.stringify(mem[0] && mem[0].mfaEnrolled));
+
+  // Webhook deliveries pagination contract: { deliveries, nextCursor }.
+  // (Endpoint creation needs ALLOW_INTERNAL_WEBHOOK_TARGETS=true on the
+  // server under test — CI sets it; the SSRF guard rejects loopback
+  // targets otherwise.)
+  const wep = await ds.createWebhook({ name: "e2e-hook", url: "http://127.0.0.1:9994/e2e", events: ["*"] });
+  const wepId = (wep.endpoint || wep).id;
+  check("webhook created", !!wepId);
+  const whd = await ds.listWebhookDeliveries(wepId);
+  check("deliveries page shape", Array.isArray(whd.deliveries) && whd.nextCursor === null, JSON.stringify({ arr: Array.isArray(whd.deliveries), cur: whd.nextCursor }));
+  await ds.deleteWebhook ? await ds.deleteWebhook(wepId) : null;
 
   // Audit pagination contract: {entries, nextCursor}; cursor walk
   // yields non-overlapping pages. The suite has generated well over 4

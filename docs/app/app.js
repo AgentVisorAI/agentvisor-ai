@@ -5769,8 +5769,12 @@
         if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
       });
       setTimeout(function () { var c = backdrop.querySelector("[data-close]"); if (c) c.focus(); }, 20);
-      var list = [];
-      try { list = await state.ds.listWebhookDeliveries(id); }
+      var list = [], whdCursor = null;
+      try {
+        var whdRes = await state.ds.listWebhookDeliveries(id);
+        list = Array.isArray(whdRes) ? whdRes : (whdRes.deliveries || []);
+        whdCursor = Array.isArray(whdRes) ? null : (whdRes.nextCursor || null);
+      }
       catch (err) {
         var bodyEl = backdrop.querySelector("#whdBody");
         if (bodyEl) bodyEl.innerHTML = '<p class="sub">Could not load deliveries (' + esc(err.message || "network") + ').</p>';
@@ -5778,22 +5782,47 @@
       }
       var bodyEl2 = backdrop.querySelector("#whdBody");
       if (!bodyEl2) return; // closed while loading
+      var whdRows = function (rows) {
+        return rows.map(function (d) {
+          var ms = d.deliveredAt ? (new Date(d.deliveredAt) - new Date(d.createdAt)) : null;
+          return '<tr>' +
+            '<td class="mono" style="font-size:11.5px">' + esc(d.event) + (d.errorMessage ? '<div class="id" title="' + esc(d.errorMessage) + '">' + esc(d.errorMessage) + '</div>' : '') + '</td>' +
+            '<td>' + (d.status === "delivered" ? '<span class="pill ok">delivered</span>' : '<span class="pill neutral">' + esc(d.status) + '</span>') + '</td>' +
+            '<td class="num">' + esc(d.attempt) + '</td>' +
+            '<td class="num">' + esc(d.responseCode || "—") + '</td>' +
+            '<td class="num">' + (ms != null ? (ms >= 1000 ? (ms / 1000).toFixed(1) + " s" : ms + " ms") : "—") + '</td>' +
+            '<td>' + timeAgoCell(d.createdAt) + '</td>' +
+          '</tr>';
+        }).join('');
+      };
       bodyEl2.innerHTML = list.length
         ? '<div class="table-wrap"><table>' +
             '<thead><tr><th>Event</th><th>Status</th><th class="num">Attempts</th><th class="num">HTTP</th><th class="num">Latency</th><th>When</th></tr></thead>' +
-            '<tbody>' + list.map(function (d) {
-              var ms = d.deliveredAt ? (new Date(d.deliveredAt) - new Date(d.createdAt)) : null;
-              return '<tr>' +
-                '<td class="mono" style="font-size:11.5px">' + esc(d.event) + (d.errorMessage ? '<div class="id" title="' + esc(d.errorMessage) + '">' + esc(d.errorMessage) + '</div>' : '') + '</td>' +
-                '<td>' + (d.status === "delivered" ? '<span class="pill ok">delivered</span>' : '<span class="pill neutral">' + esc(d.status) + '</span>') + '</td>' +
-                '<td class="num">' + esc(d.attempt) + '</td>' +
-                '<td class="num">' + esc(d.responseCode || "—") + '</td>' +
-                '<td class="num">' + (ms != null ? (ms >= 1000 ? (ms / 1000).toFixed(1) + " s" : ms + " ms") : "—") + '</td>' +
-                '<td>' + timeAgoCell(d.createdAt) + '</td>' +
-              '</tr>';
-            }).join('') + '</tbody>' +
-          '</table></div>'
+            '<tbody id="whdRows">' + whdRows(list) + '</tbody>' +
+          '</table></div>' +
+          '<div id="whdFooter" style="padding:10px 0 0;' + (whdCursor ? "" : " display:none") + '">' +
+            '<button class="btn" id="whdMoreBtn">Load older deliveries</button>' +
+          '</div>'
         : '<p class="sub">No deliveries yet — fire a test event to see one here.</p>';
+      var whdMore = backdrop.querySelector("#whdMoreBtn");
+      if (whdMore) whdMore.addEventListener("click", async function () {
+        if (!whdCursor || whdMore.disabled) return;
+        whdMore.disabled = true;
+        whdMore.textContent = "Loading…";
+        try {
+          var pageRes = await state.ds.listWebhookDeliveries(id, { cursor: whdCursor });
+          var older = (pageRes && pageRes.deliveries) || [];
+          whdCursor = (pageRes && pageRes.nextCursor) || null;
+          var tb = backdrop.querySelector("#whdRows");
+          if (tb) tb.insertAdjacentHTML("beforeend", whdRows(older));
+          var foot = backdrop.querySelector("#whdFooter");
+          if (foot) foot.style.display = whdCursor ? "" : "none";
+        } catch (e3) {
+          toast((e3 && e3.message) || "Could not load older deliveries", true);
+        }
+        whdMore.textContent = "Load older deliveries";
+        whdMore.disabled = false;
+      });
     }
 
     root.addEventListener("keydown", function (e) {
