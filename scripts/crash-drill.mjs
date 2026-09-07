@@ -211,16 +211,18 @@ const main = async () => {
     let stats = {};
     try { stats = JSON.parse(syncOut.trim().split("\n").pop()); } catch { /* shape drift */ }
     beat(stats.failed === 0 && (stats.succeeded ?? 0) > 0, "C: console-sync ingests with zero failures", syncOut.trim().split("\n").pop());
-    // D: pre-crash evidence in the console. KNOWN GAP (issue filed):
-    // bridge publishes ride a bounded worker queue, so an event that
-    // hadn't flushed when SIGKILL landed (here: the BLOCKED call, the
-    // most forensically valuable frame) never reaches the bridge, and
-    // recovery crash-seals the session WITHOUT finalizing it — no
-    // receipt is minted and the ATIF-spooled truth (which DOES hold the
-    // blocked frame durably) is never replayed toward the console.
-    // Verified 90s post-restart: still no receipt. Until the recovery
-    // finalizer replays ATIF into bridge+receipt, this leg WARNS
-    // instead of failing so the drill stays green on known behavior.
+    // D: pre-crash evidence visibility. KNOWN GAP — see issue #356
+    // (incl. the correction comment): recovery QUARANTINES crash-
+    // interrupted sessions deliberately (capture may be incomplete —
+    // effects that ran but weren't journaled; attesting that would be
+    // worse than attesting nothing), so no receipt is ever minted and
+    // the MAC'd spool can't be synced by avctl (journal_key-
+    // authenticated — spool reads are not console-trustable). The
+    // console therefore shows the crashed session's PRE-CRASH bridge
+    // flushes only (here: allowed calls, NOT the blocked one) with no
+    // quarantine marker — actively misleading. The ask in #356 is a
+    // synced `quarantined_crash_evidence` session status. This leg
+    // WARNS until that lands, then flips fatal.
     const jar = process.env.COOKIE_JAR;
     if (jar) {
       const cookie = readFileSync(jar, "utf8").split("\n").filter((l) => l.includes("av_session")).map((l) => "av_session=" + l.trim().split(/\s+/).pop()).pop() ?? "";
