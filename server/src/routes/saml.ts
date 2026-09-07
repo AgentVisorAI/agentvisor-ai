@@ -393,6 +393,19 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
         membership = provisioned.membership;
       }
 
+      // Existing users signing in through the org's configured IdP get
+      // the same mailbox-control proof JIT-created users get at birth —
+      // the IdP asserted this exact address. Without this backfill, a
+      // password-era account that later moved to SAML stayed
+      // "unverified" forever and the OAuth pre-hijack gate refused it,
+      // even though its mailbox is proven on every SSO sign-in.
+      if (user && !user.emailVerifiedAt) {
+        await db.user.update({
+          where: { id: user.id },
+          data: { emailVerifiedAt: new Date() },
+        });
+      }
+
       // Everything lines up. Mint an av_session JWT.
       const token = await mintSession({
         sub: user!.id,
