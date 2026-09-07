@@ -222,8 +222,9 @@ fn wasmtime_policy_memory_grow_past_cap_is_stopped() {
 
 // ---------------------------------------------------------------------------
 // 7. wasmtime containment: hostile module (attack: policy exports the wrong
-// functions or missing memory). Wasmtime instantiate errors or missing
-// export lookup errors must produce Deny, not panic.
+// functions or missing memory). Since the ABI is validated at load,
+// `from_bytes` must reject the module outright — fail closed before the
+// policy is ever installed, and without panicking.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -234,9 +235,13 @@ fn wasmtime_policy_missing_required_exports_is_denied_cleanly() {
           (memory (export "memory") 1)
           (func (export "alloc") (param i32) (result i32) i32.const 0))
     "#;
-    let policy = WasmPolicy::from_bytes("bad-shape", wat.as_bytes()).unwrap();
-    let decision = policy.evaluate("t", &json!({}));
-    assert!(matches!(decision, PolicyDecision::Deny { .. }));
+    let err = WasmPolicy::from_bytes("bad-shape", wat.as_bytes())
+        .err()
+        .expect("a policy missing the required ABI must be rejected at load");
+    assert!(
+        err.contains("evaluate"),
+        "load error should name the missing export: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------
