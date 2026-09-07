@@ -50,7 +50,7 @@
     "lighthouse": "^13.4.1",
     "playwright": "^1.62.1",
     "tsx": "^4.19.3",
-    "typescript": "^5.7.3"
+    "typescript": "^7.0.2"
   },
   "engines": {
     "node": ">=22.0.0"
