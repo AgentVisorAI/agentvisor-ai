@@ -1271,6 +1271,14 @@
             return;
           }
         }
+        // Shape guard: never install a session without a user — a
+        // malformed/drifted response must fail the login visibly, not
+        // crash renderShell three frames later.
+        if (!s || !s.user) {
+          btn.disabled = false;
+          errEl.innerHTML = '<div class="auth-err">Sign-in failed — unexpected server response. Try again.</div>';
+          return;
+        }
         state.session = s;
         state.authedAt = Date.now();
         announceSignIn();
@@ -3581,7 +3589,7 @@
         '<dl class="kv" style="display:grid;grid-template-columns:140px 1fr;gap:5px 12px;font-size:13px">' +
           "<dt style=\"color:var(--fg-3)\">Name</dt><dd>" + esc(state.session.org.name) + "</dd>" +
           "<dt style=\"color:var(--fg-3)\">Org ID</dt><dd class=\"mono\">" + esc(state.session.org.id) + "</dd>" +
-          "<dt style=\"color:var(--fg-3)\">Created</dt><dd>" + esc(new Date(state.session.org.createdAt).toLocaleDateString()) + "</dd>" +
+          "<dt style=\"color:var(--fg-3)\">Created</dt><dd>" + esc(state.session.org.createdAt ? new Date(state.session.org.createdAt).toLocaleDateString() : "—") + "</dd>" +
         "</dl>" +
       "</div>" +
       '<div class="card" id="retentionCard">' +

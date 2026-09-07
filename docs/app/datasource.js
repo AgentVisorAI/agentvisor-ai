@@ -2130,6 +2130,12 @@
     },
     async login(input) {
       var r = await apiFetch("/api/v1/auth/login", { method: "POST", body: { email: input.email, password: input.password } });
+      // R85 F3 made /login answer 200 {mfaRequired:true} uniformly for
+      // passkey-enrolled accounts AND wrong credentials (no oracle).
+      // This flag must survive the mapping — dropping it turned every
+      // MFA login (and every wrong password) into a phantom
+      // {user: undefined} session that crashed the shell.
+      if (r && r.mfaRequired) return { mfaRequired: true, email: input.email };
       return { user: r.user, org: r.org };
     },
     async loginWithProvider(provider) {
