@@ -756,6 +756,7 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
         slug: membership.org.slug,
         name: membership.org.name,
         role: membership.role,
+        createdAt: membership.org.createdAt,
       },
     });
   });
