@@ -355,24 +355,39 @@ mod tests {
         let no_evaluate = r#"(module
             (memory (export "memory") 1)
             (func (export "alloc") (param i32) (result i32) (i32.const 2048)))"#;
-        let err = WasmPolicy::from_bytes("no-evaluate", no_evaluate.as_bytes()).err().expect("load should fail");
-        assert!(err.contains("evaluate"), "error should name the missing export: {err}");
+        let err = WasmPolicy::from_bytes("no-evaluate", no_evaluate.as_bytes())
+            .err()
+            .expect("load should fail");
+        assert!(
+            err.contains("evaluate"),
+            "error should name the missing export: {err}"
+        );
 
         // No exported memory.
         let no_memory = r#"(module
             (memory 1)
             (func (export "alloc") (param i32) (result i32) (i32.const 2048))
             (func (export "evaluate") (param i32 i32) (result i32) (i32.const 0)))"#;
-        let err = WasmPolicy::from_bytes("no-memory", no_memory.as_bytes()).err().expect("load should fail");
-        assert!(err.contains("memory"), "error should name the missing memory: {err}");
+        let err = WasmPolicy::from_bytes("no-memory", no_memory.as_bytes())
+            .err()
+            .expect("load should fail");
+        assert!(
+            err.contains("memory"),
+            "error should name the missing memory: {err}"
+        );
 
         // Wrong `evaluate` arity.
         let bad_arity = r#"(module
             (memory (export "memory") 1)
             (func (export "alloc") (param i32) (result i32) (i32.const 2048))
             (func (export "evaluate") (param i32) (result i32) (i32.const 0)))"#;
-        let err = WasmPolicy::from_bytes("bad-arity", bad_arity.as_bytes()).err().expect("load should fail");
-        assert!(err.contains("evaluate"), "error should name the bad-arity export: {err}");
+        let err = WasmPolicy::from_bytes("bad-arity", bad_arity.as_bytes())
+            .err()
+            .expect("load should fail");
+        assert!(
+            err.contains("evaluate"),
+            "error should name the bad-arity export: {err}"
+        );
 
         // The full correct ABI still loads.
         let ok = r#"(module
