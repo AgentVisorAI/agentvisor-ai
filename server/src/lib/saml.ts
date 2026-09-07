@@ -331,6 +331,27 @@ export async function consumeSamlResponse(
   }
   if (!profile) return { ok: false, error: "no_profile" };
 
+  // Enforce the Issuer pin on the LOGIN path. node-saml's `idpIssuer`
+  // option (buildAdapter pins it to cfg.entityIdIdp) is only checked by
+  // the library for LogoutRequest/LogoutResponse messages — on the ACS
+  // path it merely copies the assertion's Issuer into profile.issuer
+  // (node-saml 5.1.0, saml.js verifyIssuer call sites). Without this
+  // check, ANY assertion signed by the configured cert is accepted
+  // regardless of who issued it — a cert reused across tenants/apps
+  // (routine with shared IdP appliances and wildcard signing certs)
+  // would let one tenant's assertions log into another's org. The
+  // profile.issuer value comes from the XMLDSig-validated assertion,
+  // so this comparison is bound to what the signature actually covers.
+  // Fail closed on a missing Issuer too.
+  const assertedIssuer = profile["issuer"];
+  if (typeof assertedIssuer !== "string" || assertedIssuer !== cfg.entityIdIdp) {
+    return {
+      ok: false,
+      error: "issuer_mismatch",
+      detail: `expected ${cfg.entityIdIdp}, got ${typeof assertedIssuer === "string" ? assertedIssuer.slice(0, 200) : String(assertedIssuer)}`,
+    };
+  }
+
   // Extract fields we actually need. IdPs emit attributes under a
   // grab-bag of names; support the standard ones and a few common
   // aliases (Okta, Auth0, Entra).
