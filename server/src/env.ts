@@ -304,6 +304,29 @@ const Env = z.object({
   MICROSOFT_CLIENT_SECRET: z.string().optional(),
   // Microsoft tenant id or 'common' (both work / school and personal).
   MICROSOFT_TENANT: z.string().default("common"),
+  // Generic OIDC provider (Keycloak / Okta / Auth0 / Authentik / any
+  // spec-compliant issuer). Shares the exact Google/Microsoft code path
+  // in routes/oauth.ts: discovery, PKCE S256, signed state cookie,
+  // nonce, email_verified===true gate, JIT user+org, MFA-gate refusal.
+  // The issuer URL is the OIDC discovery base (openid-client appends
+  // /.well-known/openid-configuration). http:// issuers are allowed
+  // outside production only (local IdPs / drills); production requires
+  // https:// like every other public-URL env var here.
+  OIDC_ISSUER_URL: z
+    .string()
+    .optional()
+    .refine(
+      (v) => {
+        if (!v) return true;
+        if (process.env.NODE_ENV !== "production") return true;
+        return v.startsWith("https://");
+      },
+      "OIDC_ISSUER_URL must be an https:// URL in production.",
+    ),
+  OIDC_CLIENT_ID: z.string().optional(),
+  OIDC_CLIENT_SECRET: z.string().optional(),
+  // Label for the login-page button: "Continue with <name>".
+  OIDC_DISPLAY_NAME: z.string().max(40).default("SSO"),
   // Mailer. Priority: RESEND_API_KEY > SMTP_URL > dev-only stub. In
   // production the app refuses to boot if neither is set (checked in
   // main() so misconfigured deployments crash immediately, not on the

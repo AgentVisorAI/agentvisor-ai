@@ -88,7 +88,7 @@ All routes are prefixed `/api/v1`.
 | `POST` | `/auth/webauthn/register/challenge` + `/verify` | Passkey enrollment (verify requires the account password) |
 | `POST` | `/auth/webauthn/authenticate/challenge` + `/verify` | Passkey MFA step at login; requires the single-use `av_mfa_gate` cookie `/auth/login` sets on its `mfaRequired` response (passkey possession alone cannot sign in) |
 | `GET`/`PATCH`/`DELETE` | `/auth/webauthn/credentials[/:id]` | List / rename / revoke (revoke = break-glass: fences sessions, revokes keys) |
-| `GET`  | `/auth/oauth/providers`, `/auth/oauth/:provider/start` + `/callback` | Google / Microsoft sign-in when configured |
+| `GET`  | `/auth/oauth/providers`, `/auth/oauth/:provider/start` + `/callback` | Google / Microsoft / generic-OIDC sign-in when configured |
 | — | `/auth/saml/*` | SAML 2.0 SP: config CRUD, `/:configId/metadata.xml`, `/login`, `/acs`, `/slo`, `/keypair`, `/discover` |
 
 ### Org & members
