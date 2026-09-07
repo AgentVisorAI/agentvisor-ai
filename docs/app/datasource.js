@@ -2145,9 +2145,9 @@
         if (el >= 5000) entries.push({ at: new Date(t0 + 5000).toISOString(), actor: founder, event: "deployment.create", target: freshDaemonName(), note: "environment: production" });
         entries.push({ at: new Date(t0 + 2000).toISOString(), actor: "system", event: "policies.defaults_seeded", target: "4 starter policies" });
         entries.push({ at: new Date(t0).toISOString(), actor: founder, event: "org.created", target: (fid && fid.org.name) || "your workspace" });
-        return runtimeAudit.concat(entries);
+        return { entries: runtimeAudit.concat(entries), nextCursor: null };
       }
-      return runtimeAudit.concat(MOCK_AUDIT);
+      return { entries: runtimeAudit.concat(MOCK_AUDIT), nextCursor: null };
     },
     subscribe(callback) {
       // The demo needs to feel alive. Every 6-14 seconds we synthesize a new
@@ -2813,9 +2813,10 @@
       link.remove();
     },
     async listAudit(opts) {
-      // Real audit log. The SPA maps our normalized shape into the
-      // audit table. If the server returns 4xx/5xx we fall through to
-      // an empty array so the settings page doesn't crash.
+      // Real audit log with cursor pagination. Returns
+      // { entries, nextCursor } — nextCursor null at the end of
+      // history. On 4xx/5xx fall through to an empty page so the
+      // settings tab doesn't crash.
       opts = opts || {};
       var q = [];
       if (opts.cursor) q.push("cursor=" + encodeURIComponent(opts.cursor));
@@ -2824,11 +2825,14 @@
       var qs = q.length ? ("?" + q.join("&")) : "";
       try {
         var res = await apiFetch("/api/v1/audit" + qs);
-        return (res.entries || []).map(function (e) {
-          return { at: e.at, actor: e.actor, event: e.event, target: e.target, note: e.note };
-        });
+        return {
+          entries: (res.entries || []).map(function (e) {
+            return { at: e.at, actor: e.actor, event: e.event, target: e.target, note: e.note };
+          }),
+          nextCursor: res.nextCursor || null,
+        };
       } catch (e) {
-        return [];
+        return { entries: [], nextCursor: null };
       }
     },
     subscribe(callback) {
