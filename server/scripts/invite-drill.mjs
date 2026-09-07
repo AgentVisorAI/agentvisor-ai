@@ -10,7 +10,7 @@
 
 import { execSync } from "node:child_process";
 
-const API = "http://127.0.0.1:4345";
+const API = process.env.API_BASE || "http://127.0.0.1:4345";
 const SPA_ORIGIN = "http://127.0.0.1:8988";
 
 async function signup(email, orgName) {

@@ -3,7 +3,7 @@
  * the /members and /members/invites routes.
  */
 
-const API = "http://127.0.0.1:4346";
+const API = process.env.API_BASE || "http://127.0.0.1:4346";
 const SPA_ORIGIN = "http://127.0.0.1:8988";
 // CI names its Postgres container av-pg-r44 with role/db avtest; local
 // runs override via env (same pattern as webhook-drill.mjs).

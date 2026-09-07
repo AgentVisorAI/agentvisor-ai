@@ -1,0 +1,71 @@
+name: API drills
+
+# The full DB-backed drill battery: 14 attack/behavior drills that boot
+# a fresh API per drill (apikey ×2, invite ×2, ip-allowlist, retention,
+# saml ×2, webauthn ×2, webhook ×3, oidc). These previously ran only on
+# developer machines — regressions in the negative paths (forged SAML
+# assertions, forged id_tokens, foreign cursors, …) were invisible to
+# CI. ~10 min, so scoped to server/** changes + main.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "server/**"
+      - ".github/workflows/api-drills.yml"
+  pull_request:
+    paths:
+      - "server/**"
+      - ".github/workflows/api-drills.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: api-drills-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  drills:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16-alpine
+        # Fixed name so drills can `docker exec av-pg-drills psql …`
+        options: >-
+          --name av-pg-drills
+          --health-cmd "pg_isready -U av"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+        env:
+          POSTGRES_USER: av
+          POSTGRES_PASSWORD: av
+          POSTGRES_DB: avdb
+        ports:
+          - 5433:5432
+    env:
+      DATABASE_URL: postgresql://av:av@localhost:5433/avdb
+      PG_CONTAINER: av-pg-drills
+      PG_USER: av
+      PG_DB: avdb
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - name: Install
+        working-directory: server
+        run: npm ci
+      - name: Prisma generate + migrate
+        working-directory: server
+        run: |
+          npx prisma generate
+          npx prisma migrate deploy
+      - name: Run drill battery
+        working-directory: server
+        run: bash scripts/run-drill-battery.sh
+      - name: Server logs on failure
+        if: failure()
+        run: tail -40 /tmp/drill-*.log || true
