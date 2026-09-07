@@ -731,6 +731,24 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     // tooling, SOC-2 audit ingesters) rejected the download.
     // Same class R110 F1 closed at /audit.csv; correct hijack
     // pattern matches stream.ts.
+    //
+    // CORS: raw-socket streaming bypasses @fastify/cors (it decorates
+    // the REPLY, and nothing here flushes reply headers), so the 200
+    // arrived with no Access-Control-Allow-Origin — the console's
+    // cross-origin fetch() (Pages origin → api subdomain) failed
+    // AFTER the password step-up succeeded. Mirror the plugin's
+    // allowlist + dev-fallback logic exactly like stream.ts:35-54.
+    const xOrigin = req.headers.origin;
+    const xAllowByAllowlist =
+      typeof xOrigin === "string" && env.ALLOWED_ORIGINS.includes(xOrigin);
+    const xAllowByDevFallback = typeof xOrigin === "string" &&
+      env.ALLOWED_ORIGINS.length === 0 &&
+      env.NODE_ENV !== "production";
+    if (xAllowByAllowlist || xAllowByDevFallback) {
+      reply.raw.setHeader("Access-Control-Allow-Origin", xOrigin!);
+      reply.raw.setHeader("Access-Control-Allow-Credentials", "true");
+      reply.raw.setHeader("Vary", "Origin");
+    }
     reply.raw.setHeader("Content-Type", "application/x-ndjson");
     reply.raw.setHeader(
       "Content-Disposition",

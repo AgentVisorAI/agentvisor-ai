@@ -3606,8 +3606,21 @@
           "<dt style=\"color:var(--fg-3)\">Email</dt><dd>" + esc(state.session.user.email) + "</dd>" +
           "<dt style=\"color:var(--fg-3)\">User ID</dt><dd class=\"mono\">" + esc(state.session.user.id) + "</dd>" +
         "</dl>" +
-        '<div style="margin-top:12px"><button class="btn danger" id="signOut">Sign out</button></div>' +
+        '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">' +
+          (state.session.org.role === "owner" ? '<button class="btn" id="exportMyData" title="Download everything this workspace stores about you and your org as NDJSON">↓ Download my data</button>' : "") +
+          '<button class="btn danger" id="signOut">Sign out</button>' +
+        '</div>' +
       "</div>" +
+      (state.session.org.role !== "member" && state.ds.getIpAllowlist ?
+        '<div class="card" id="ipAllowCard"><h2>Network access</h2>' +
+          '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 12px">Restrict console and API access to trusted networks. One CIDR per line (a bare IP means just that address). Leave empty to allow any network.</p>' +
+          loadingBlock("table") +
+        "</div>" : "") +
+      (state.session.org.role === "owner" ?
+        '<div class="card" id="dangerCard" style="border-color:color-mix(in srgb, var(--danger, #e5484d) 45%, transparent)"><h2>Danger zone</h2>' +
+          '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 12px">Permanently delete this organization and your account — every deployment, session, event, signed receipt, webhook, and audit entry is erased. Only possible when you are the sole member.</p>' +
+          '<button class="btn danger" id="deleteAccountBtn">Delete organization &amp; account</button>' +
+        "</div>" : "") +
       (state.ds.mode === "mock" ?
         '<div class="card"><h2>Demo mode</h2><p style="color: var(--fg-2); margin: 0 0 8px; font-size: var(--t-sec)">This console is running against built-in fixtures. To connect to a real backend, set <code>window.MOCK_MODE = false</code> in <code>docs/app/index.html</code>.</p></div>' : "");
     var so = $("#signOut", root);
@@ -3678,6 +3691,152 @@
         card.innerHTML = '<h2>Data retention</h2><p style="color:var(--fg-2);font-size:var(--t-sec)">Could not load (' + esc(e.message || "network") + ').</p>';
       }
     }
+
+    // Network access (IP allowlist). GET is admin-readable; PATCH is
+    // owner-only (R146 F1) — mirror that split in the editor.
+    var ipCard = $("#ipAllowCard", root);
+    if (ipCard) {
+      try {
+        var ipRes = await state.ds.getIpAllowlist();
+        var isOwner = state.session.org.role === "owner";
+        ipCard.innerHTML =
+          '<h2>Network access</h2>' +
+          '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 12px">Restrict console and API access to trusted networks. One CIDR per line (a bare IP means just that address). Leave empty to allow any network.</p>' +
+          '<textarea id="ipCidrs" rows="4" spellcheck="false" style="width:100%;max-width:420px;font-family:var(--mono, monospace);font-size:12.5px" placeholder="203.0.113.0/24&#10;198.51.100.7"' + (isOwner ? "" : " disabled") + ">" + esc((ipRes.cidrs || []).join("\n")) + "</textarea>" +
+          '<p style="margin:8px 0 0;color:var(--fg-3);font-size:12px">Your current IP: <span class="mono">' + esc(ipRes.yourIp || "—") + '</span>. A non-empty list must include it — the console refuses to lock you out.</p>' +
+          (isOwner
+            ? '<div style="margin-top:12px"><button class="btn accent" id="ipSave">Save allowlist</button></div>'
+            : '<p style="margin-top:10px;color:var(--fg-3);font-size:12px">Only owners can change the allowlist.</p>');
+        if (isOwner) {
+          $("#ipSave", ipCard).addEventListener("click", async function (e) {
+            var btn = e.currentTarget;
+            if (btn.disabled) return;
+            var lines = $("#ipCidrs", ipCard).value.split("\n").map(function (s) { return s.trim(); }).filter(Boolean);
+            btn.disabled = true;
+            try {
+              var saved = await state.ds.updateIpAllowlist(lines);
+              $("#ipCidrs", ipCard).value = (saved.cidrs || []).join("\n");
+              toast(saved.cidrs && saved.cidrs.length ? "Allowlist saved — " + saved.cidrs.length + " network" + (saved.cidrs.length === 1 ? "" : "s") + " trusted" : "Allowlist cleared — any network can connect");
+            } catch (e2) {
+              var msg = e2.message || "Save failed";
+              if (e2.errorCode === "invalid_cidr" || (e2.data && e2.data.cidr)) msg = "Not a valid IP or CIDR: " + ((e2.data && e2.data.cidr) || "");
+              else if (msg === "would_lock_yourself_out" || e2.errorCode === "would_lock_yourself_out") msg = "Refused: that list doesn't include your current IP (" + ((e2.data && e2.data.yourIp) || "?") + ") — you'd lock yourself out.";
+              toast(msg, true);
+            }
+            btn.disabled = false;
+          });
+        }
+      } catch (e) {
+        ipCard.innerHTML = '<h2>Network access</h2><p style="color:var(--fg-2);font-size:var(--t-sec)">Could not load (' + esc(e.message || "network") + ').</p>';
+      }
+    }
+
+    // Download my data — owner-only NDJSON export with password step-up.
+    var exBtn = $("#exportMyData", root);
+    if (exBtn) exBtn.addEventListener("click", function () {
+      stepUpModal({
+        title: "Download my data",
+        body: "Everything this workspace stores about you and your org, as NDJSON. Confirm your password to continue.",
+        confirmLabel: "Download",
+        onConfirm: async function (password, fail) {
+          try {
+            var blob = await state.ds.exportMyData(password);
+            var a = document.createElement("a");
+            a.href = URL.createObjectURL(blob);
+            a.download = "agentvisor-export-" + new Date().toISOString().slice(0, 10) + ".jsonl";
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(function () { URL.revokeObjectURL(a.href); }, 4000);
+            toast("Export downloaded");
+          } catch (e2) {
+            fail(e2.status === 401 ? "Wrong password." : (e2.message || "Export failed"));
+          }
+        },
+      });
+    });
+
+    // Danger zone — delete org + account (sole member only).
+    var delBtn = $("#deleteAccountBtn", root);
+    if (delBtn) delBtn.addEventListener("click", function () {
+      stepUpModal({
+        title: "Delete organization & account?",
+        body: "This erases the org and EVERYTHING in it — deployments, sessions, events, signed receipts, webhooks, audit log — plus your account. Receipt bundles you exported stop verifying against this console. This cannot be undone.",
+        confirmLabel: "Delete forever",
+        danger: true,
+        typeToConfirm: "DELETE MY ACCOUNT",
+        onConfirm: async function (password, fail) {
+          try {
+            await state.ds.deleteMyAccount(password);
+            try { localStorage.setItem("av_signed_out_at", String(Date.now())); } catch (e3) {}
+            state.session = null;
+            toast("Organization deleted. Goodbye.");
+            navigate("#/login");
+          } catch (e2) {
+            var msg = e2.message || "Delete failed";
+            if (e2.status === 401 || e2.errorCode === "invalid_password") msg = "Wrong password.";
+            else if (e2.errorCode === "org_has_other_members" || msg === "org_has_other_members") msg = "The org still has other members. Remove them first — one owner can't erase everyone's data unilaterally.";
+            fail(msg);
+          }
+        },
+      });
+    });
+  }
+
+  // Step-up modal: password + optional type-to-confirm phrase, used by
+  // the irreversible account actions. onConfirm(password, fail) — call
+  // fail(msg) to surface an inline error and keep the modal open.
+  function stepUpModal(opts) {
+    if (document.body.classList.contains("locked")) return;
+    var backdrop = h(
+      '<div class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal' + (opts.danger ? " confirm-danger" : "") + '">' +
+        "<h2>" + esc(opts.title) + "</h2>" +
+        '<p class="sub">' + esc(opts.body) + "</p>" +
+        '<form id="stepUpForm">' +
+          (opts.typeToConfirm ? '<div class="field"><label for="su_phrase">Type <span class="mono">' + esc(opts.typeToConfirm) + "</span> to confirm</label><input id=\"su_phrase\" type=\"text\" autocomplete=\"off\" spellcheck=\"false\"></div>" : "") +
+          '<div class="field"><label for="su_pw">Your password</label><input id="su_pw" type="password" autocomplete="current-password" required></div>' +
+          '<p id="su_err" style="display:none;color:var(--danger, #e5484d);font-size:12.5px;margin:0 0 8px"></p>' +
+          '<div class="actions"><button type="button" class="btn" data-close>Cancel</button><button type="submit" class="btn ' + (opts.danger ? "danger" : "accent") + '">' + esc(opts.confirmLabel || "Confirm") + "</button></div>" +
+        "</form>" +
+      "</div></div>"
+    );
+    document.body.appendChild(backdrop);
+    document.body.classList.add("locked");
+    var previouslyFocused = document.activeElement;
+    var uninstall;
+    var handled = false;
+    function close() { if (handled) return; handled = true; backdrop.remove(); document.body.classList.remove("locked"); if (uninstall) uninstall(); if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {} }
+    uninstall = installModalKeys(backdrop, close);
+    backdrop.addEventListener("click", function (e) {
+      if (handled) return;
+      if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
+    });
+    backdrop.querySelector("#stepUpForm").addEventListener("submit", async function (e) {
+      e.preventDefault();
+      if (handled) return;
+      var errEl = backdrop.querySelector("#su_err");
+      errEl.style.display = "none";
+      if (opts.typeToConfirm) {
+        var typed = backdrop.querySelector("#su_phrase").value;
+        if (typed !== opts.typeToConfirm) {
+          errEl.textContent = "Type the exact phrase to confirm.";
+          errEl.style.display = "block";
+          return;
+        }
+      }
+      var pw = backdrop.querySelector("#su_pw").value;
+      var btn = e.target.querySelector('button[type="submit"]');
+      btn.disabled = true;
+      var failed = false;
+      await opts.onConfirm(pw, function (msg) {
+        failed = true;
+        errEl.textContent = msg;
+        errEl.style.display = "block";
+      });
+      if (!handled) {
+        if (failed) btn.disabled = false;
+        else close();
+      }
+    });
+    setTimeout(function () { backdrop.querySelector(opts.typeToConfirm ? "#su_phrase" : "#su_pw").focus(); }, 20);
   }
   // Wire Escape + Tab focus trap for a modal backdrop. Returns nothing;
   // the caller is expected to append the backdrop first and pass its
