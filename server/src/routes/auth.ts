@@ -732,6 +732,13 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         // overwrite the NEW password.
         resetTokenHash: null,
         resetTokenAt: null,
+        // Same for a pending email change: it was authorized with the
+        // OLD password. If that password was compromised, the pending
+        // row is the attacker's — their confirm link must not survive
+        // the credential rotation and flip the login address afterward.
+        pendingEmail: null,
+        pendingEmailTokenHash: null,
+        pendingEmailAt: null,
       },
     });
     // Survive our own fence: fresh iat lands in the same-or-later
@@ -1788,6 +1795,16 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
           resetTokenHash: null,
           resetTokenAt: null,
           sessionRevokedAt: new Date(),
+          // Void any pending email change: it was authorized with the
+          // password this reset is break-glassing away. Without this, an
+          // attacker who knew the old password requests a change to
+          // THEIR mailbox (victim's inbox stays silent — the verify mail
+          // goes to the attacker), the victim resets the password
+          // believing the account is recovered, and the attacker's 24h
+          // confirm link still rotates the login address afterward.
+          pendingEmail: null,
+          pendingEmailTokenHash: null,
+          pendingEmailAt: null,
         },
       }),
       db.apiKey.updateMany({

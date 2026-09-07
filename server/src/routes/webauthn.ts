@@ -931,7 +931,16 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
       db.webauthnCredential.delete({ where: { id: cred.id } }),
       db.user.update({
         where: { id: claims.sub },
-        data: { sessionRevokedAt: new Date() },
+        data: {
+          sessionRevokedAt: new Date(),
+          // R124 F1's own rationale: this deletion signals possession
+          // compromise. A pending email change requested under the
+          // compromised state must die with it — same posture as
+          // reset-confirm and the admin MFA reset.
+          pendingEmail: null,
+          pendingEmailTokenHash: null,
+          pendingEmailAt: null,
+        },
       }),
       db.apiKey.updateMany({
         where: { createdById: claims.sub, revokedAt: null },

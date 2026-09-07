@@ -159,7 +159,15 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       db.webauthnCredential.deleteMany({ where: { userId: target.userId } }),
       db.user.update({
         where: { id: target.userId },
-        data: { sessionRevokedAt: new Date() },
+        data: {
+          sessionRevokedAt: new Date(),
+          // Same break-glass posture as reset-confirm: if the wiped
+          // credential was an attacker's enrollment, a pending email
+          // change they requested must not outlive the cleanup.
+          pendingEmail: null,
+          pendingEmailTokenHash: null,
+          pendingEmailAt: null,
+        },
       }),
       db.apiKey.updateMany({
         where: { createdById: target.userId, revokedAt: null },
