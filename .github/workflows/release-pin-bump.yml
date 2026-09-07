@@ -2,9 +2,12 @@ name: Release pin bump
 
 # Round-91 dress-rehearsal lesson: v0.1.0-rc.2 shipped and the
 # installer kept handing out rc.1 for an hour — the install.sh pin is
-# a manual step nobody remembers. This workflow opens the bump PR
+# a manual step nobody remembers. This workflow lands the bump on main
 # automatically whenever a release is published (and is dispatchable
-# for testing / catch-up).
+# for testing / catch-up). It commits directly (org policy forbids
+# Actions-created PRs); because GITHUB_TOKEN pushes don't trigger
+# other workflows (anti-recursion), it then dispatches the Pages
+# deploy explicitly so the live installer actually serves the bump.
 
 on:
   release:
@@ -17,7 +20,7 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
+  actions: write
 
 jobs:
   bump:
@@ -49,21 +52,31 @@ jobs:
           sh -n docs/install.sh
           echo "changed=true" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-      - name: Open PR
+      - name: Commit bump to main
         if: steps.bump.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.bump.outputs.version }}
         run: |
           set -eu
-          BRANCH="bot/install-pin-$VERSION"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$BRANCH"
           git add docs/install.sh
           git commit -m "install.sh: pin v$VERSION (automated release bump)"
-          git push -f origin "$BRANCH"
-          gh pr create --head "$BRANCH" \
-            --title "install.sh: pin v$VERSION (automated release bump)" \
-            --body "Opened automatically by release-pin-bump on release publish. The installer's default AV_VERSION now matches the freshly published release; the release assets were checksum-published by release.yml before this fired." \
-            || echo "PR already open"
+          # Race guard: main may have moved since checkout — rebase and retry.
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              echo "pushed on attempt $attempt"
+              exit 0
+            fi
+            git fetch origin main
+            git rebase origin/main
+          done
+          echo "::error::could not push the pin bump after 3 attempts"
+          exit 1
+      - name: Deploy the installer (Pages)
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # GITHUB_TOKEN pushes never trigger pages.yml on their own.
+          gh workflow run pages.yml --ref main
