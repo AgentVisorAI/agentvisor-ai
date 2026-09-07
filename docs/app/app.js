@@ -1136,6 +1136,22 @@
     if (document.getElementById("accountMenu")) return closeAccountMenu();
     var user = state.session.user, org = state.session.org;
     var canPreview = !rolePreview && org && org.role !== "member";
+    // Multi-org: the sidebar org-switcher is display:none on narrow
+    // viewports, which left phone users with no path to their other
+    // workspaces. The account menu is reachable at every width, so
+    // mirror the switcher here (same data, same switchWorkspace call).
+    var orgItems = "";
+    if ((state.session.memberships || []).length > 1) {
+      orgItems = '<div class="am-sep"></div>' +
+        '<div class="am-head"><div class="am-sub">Switch workspace</div></div>' +
+        (state.session.memberships || []).map(function (m) {
+          var isCurrent = m.orgId === org.id;
+          return '<button role="menuitem" data-org-switch="' + esc(m.orgId) + '"' + (isCurrent ? " disabled" : "") + ">" +
+            '<span class="avatar" aria-hidden="true">' + esc(initials(m.name)) + "</span>" +
+            "<span>" + esc(m.name) + '</span><span class="am-sub" style="margin-left:auto">' + esc(m.role) + (isCurrent ? " ✓" : "") + "</span>" +
+          "</button>";
+        }).join("");
+    }
     var menu = h(
       '<div id="accountMenu" role="menu" aria-label="Account">' +
         '<div class="am-head">' +
@@ -1146,6 +1162,7 @@
         '<button role="menuitem" data-act="theme">Switch to ' + (state.theme === "dark" ? "light" : "dark") + " theme</button>" +
         (canPreview ? '<button role="menuitem" data-act="preview">👁 Preview as member</button>' : "") +
         (rolePreview ? '<button role="menuitem" data-act="exitPreview">Exit member preview</button>' : "") +
+        orgItems +
         '<div class="am-sep"></div>' +
         '<button role="menuitem" data-act="signout" class="am-danger">Sign out…</button>' +
       "</div>"
@@ -1158,6 +1175,13 @@
     menu.style.top = (r.bottom + 6) + "px";
     menu.style.right = Math.max(8, window.innerWidth - r.right) + "px";
     menu.addEventListener("click", function (e) {
+      var orgIt = e.target.closest("[data-org-switch]");
+      if (orgIt && !orgIt.disabled) {
+        var orgId = orgIt.getAttribute("data-org-switch");
+        closeAccountMenu();
+        switchWorkspace(orgId);
+        return;
+      }
       var it = e.target.closest("[data-act]");
       if (!it) return;
       var act = it.getAttribute("data-act");
@@ -6285,6 +6309,19 @@
     if (rolePreview) actions.push({ g: "Actions", label: "Exit member preview", desc: "Back to your own role", run: exitRolePreview });
     else if (state.session && state.session.org && state.session.org.role !== "member")
       actions.push({ g: "Actions", label: "Preview as member", desc: "See the console the way a member does", run: enterRolePreview });
+    // Multi-org: one palette action per other workspace (the sidebar
+    // switcher is hidden on narrow viewports; ⌘K works everywhere).
+    if (state.session && (state.session.memberships || []).length > 1) {
+      (state.session.memberships || []).forEach(function (m) {
+        if (m.orgId === state.session.org.id) return;
+        actions.push({
+          g: "Actions",
+          label: "Switch to " + m.name,
+          desc: "Open the " + m.name + " workspace as " + m.role,
+          run: function () { switchWorkspace(m.orgId); },
+        });
+      });
+    }
     // Sibling pages: the verifier and the pitch live outside the SPA,
     // so open them as real navigations instead of hash routes.
     var pages = [
