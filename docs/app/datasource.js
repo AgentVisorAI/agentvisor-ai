@@ -2051,6 +2051,25 @@
       recordAudit("org.renamed", "", nm);
       return { id: (mockState.session && mockState.session.org.id) || "org_demo", slug: "northwind", name: nm };
     },
+    async logoutOtherDevices() {
+      await delay(150);
+      recordAudit("auth.logout_all", "", "");
+      return { ok: true };
+    },
+    async updateDeployment(id, input) {
+      await delay(150);
+      var fud = freshDeployments();
+      var pool = fud !== null ? fud : MOCK_DEPLOYMENTS;
+      for (var udi = 0; udi < pool.length; udi++) {
+        if (pool[udi].id === id) {
+          if (input && input.name) pool[udi].name = String(input.name).slice(0, 80);
+          if (input && input.environment) pool[udi].environment = input.environment;
+          recordAudit("deployment.updated", "", pool[udi].name);
+          return { id: pool[udi].id, name: pool[udi].name, environment: pool[udi].environment };
+        }
+      }
+      var eud = new Error("not_found"); eud.status = 404; eud.errorCode = "not_found"; throw eud;
+    },
     async exportMyData(password) {
       await delay(200);
       if (!password) { var e1 = new Error("password_required"); e1.status = 400; throw e1; }
@@ -2273,6 +2292,13 @@
     async renameOrg(name) {
       var r = await apiFetch("/api/v1/org", { method: "PATCH", body: { name: name } });
       return r.org;
+    },
+    async logoutOtherDevices() {
+      return apiFetch("/api/v1/auth/logout-all", { method: "POST", body: {} });
+    },
+    async updateDeployment(id, input) {
+      var r = await apiFetch("/api/v1/deployments/" + encodeURIComponent(id), { method: "PATCH", body: input });
+      return r.deployment;
     },
     async signup(input) {
       var r = await apiFetch("/api/v1/auth/signup", { method: "POST", body: { email: input.email, password: input.password, orgName: input.orgName || (input.email.split("@")[0] + "'s org") } });

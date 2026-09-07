@@ -21,6 +21,7 @@
  * ternaries — e.g. members.ts:310 `event: sub === userId ? "member.left" : "member.removed"`
  * — so the R146 F3 regen catches them.):
  *   auth.login, auth.login_denied, auth.logout, auth.logout.apikey_noop,
+ *     auth.logout_all,
  *     auth.signup, auth.oauth_signin, auth.oauth_refused_mfa_required,
  *     auth.password_ok_mfa_required, auth.password_changed,
  *     auth.email_change_requested, auth.email_changed,
@@ -32,6 +33,7 @@
  *     mfa.credential_register_denied, mfa.credential_revoke_denied,
  *     mfa.credential_relabeled, mfa.credentials_admin_reset
  *   deployment.create, deployment.delete, deployment.delete_conflict,
+ *     deployment.updated,
  *     deployment.token_rotated, deployment.direct_seal_refused,
  *     deployment.pubkey_first_set, deployment.pubkey_rotation_refused,
  *     deployment.receipt_overwrite_refused, deployment.receipt_key_id_mismatch
