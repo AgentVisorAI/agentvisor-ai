@@ -227,7 +227,9 @@ async function main() {
   // logout messages, so consumeSamlResponse enforces the pin itself —
   // this leg would have minted a session before that check landed.
   console.log("\n[3b] Valid signature but Issuer of another tenant");
+  const irt_wrongIssuerResp = await spInitiate(cfg.id);
   const wrongIssuerResp = await craftSignedResponse({
+    inResponseTo: irt_wrongIssuerResp,
     privateKey: idp.privateKey, // RIGHT key —
     certBody: idp.certBody,
     audience: cfg.spEntityId,
