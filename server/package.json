@@ -38,7 +38,7 @@
     "resend": "^6.24.0",
     "undici": "^8.10.0",
     "xml-crypto": "^6.1.2",
-    "zod": "^3.24.2"
+    "zod": "^4.5.4"
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.13.0",
