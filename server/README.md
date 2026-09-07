@@ -69,7 +69,7 @@ All routes are prefixed `/api/v1`.
 | `POST` | `/auth/signup` | `{ email, password, orgName, displayName? }` — creates user + owner org, sets `av_session` cookie |
 | `POST` | `/auth/login` | `{ email, password }`; answers `{ mfaRequired: true }` uniformly for passkey-enrolled accounts **and** bad credentials (no oracle) |
 | `POST` | `/auth/logout` | Clears the cookie and fences prior JWTs |
-| `POST` | `/auth/logout-all` | Fences every session, re-mints the caller's cookie — "sign out other devices" |
+| `POST` | `/auth/logout-all` | `{ password }` step-up; fences every session, re-mints the caller's cookie — "sign out other devices" |
 | `GET`  | `/auth/me` | `{ user (incl. pendingEmail), org, memberships[] }` for the active session |
 | `POST` | `/auth/switch-org` | `{ orgId }` — re-mints the cookie bound to another membership |
 | `POST` | `/auth/change-password` | `{ currentPassword, newPassword }` — fences other sessions, keeps API keys |
@@ -86,7 +86,7 @@ All routes are prefixed `/api/v1`.
 | Method | Path | Notes |
 |---|---|---|
 | `POST` | `/auth/webauthn/register/challenge` + `/verify` | Passkey enrollment (verify requires the account password) |
-| `POST` | `/auth/webauthn/authenticate/challenge` + `/verify` | Passkey MFA step at login |
+| `POST` | `/auth/webauthn/authenticate/challenge` + `/verify` | Passkey MFA step at login; requires the single-use `av_mfa_gate` cookie `/auth/login` sets on its `mfaRequired` response (passkey possession alone cannot sign in) |
 | `GET`/`PATCH`/`DELETE` | `/auth/webauthn/credentials[/:id]` | List / rename / revoke (revoke = break-glass: fences sessions, revokes keys) |
 | `GET`  | `/auth/oauth/providers`, `/auth/oauth/:provider/start` + `/callback` | Google / Microsoft sign-in when configured |
 | — | `/auth/saml/*` | SAML 2.0 SP: config CRUD, `/:configId/metadata.xml`, `/login`, `/acs`, `/slo`, `/keypair`, `/discover` |
