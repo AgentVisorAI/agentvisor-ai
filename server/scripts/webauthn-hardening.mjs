@@ -7,7 +7,7 @@
 import { createHash, generateKeyPairSync, sign as cryptoSign } from "node:crypto";
 import * as cbor2 from "cbor2";
 
-const API = "http://127.0.0.1:4344";
+const API = process.env.API_BASE || "http://127.0.0.1:4344";
 const SPA_ORIGIN = "http://127.0.0.1:8988";
 const ORIGIN = SPA_ORIGIN;
 
