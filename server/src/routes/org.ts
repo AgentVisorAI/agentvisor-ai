@@ -19,6 +19,50 @@ import { sweepRetentionForOrg } from "../lib/retention.js";
 import { ipMatchesAny, tryParseCidr } from "../lib/cidr.js";
 
 export async function orgRoutes(app: FastifyInstance): Promise<void> {
+  // Rename the workspace. Owner-only: the name is the org's public
+  // identity — it appears in invite email SUBJECTS (mail.ts inviteMail),
+  // the console chrome, and exports. The slug stays stable on purpose:
+  // it's a join-key ingredient, and receipts/exports reference the org
+  // id, so a rebrand must not invalidate anything already issued.
+  // Same CRLF/NUL posture as signup's orgNameSchema (R184 F1): a CR/LF
+  // smuggled into the name would otherwise inject SMTP headers via the
+  // invite subject line.
+  app.patch("/", async (req, reply) => {
+    const claims = requireSession(req, reply);
+    if (!claims) return;
+    if (claims.membershipRole !== "owner") {
+      return reply.code(403).send({ error: "forbidden" });
+    }
+    const body = z
+      .object({
+        name: z.string().max(80).trim().min(1)
+          .refine((v) => !/[\r\n\u0000]/.test(v), "must not contain CR/LF/NUL"),
+      })
+      .safeParse(req.body);
+    if (!body.success) return reply.code(400).send({ error: "invalid_name" });
+    const prev = await db.org.findUnique({ where: { id: claims.orgId } });
+    if (!prev) return reply.code(404).send({ error: "not_found" });
+    if (prev.name === body.data.name) {
+      return reply.send({ org: { id: prev.id, slug: prev.slug, name: prev.name } });
+    }
+    const updated = await db.org.update({
+      where: { id: claims.orgId },
+      data: { name: body.data.name },
+    });
+    writeAudit(
+      {
+        orgId: claims.orgId,
+        event: "org.renamed",
+        ...(await resolveActor(claims.sub)),
+        target: updated.name,
+        metadata: { previousName: prev.name },
+        req,
+      },
+      req.log,
+    );
+    return reply.send({ org: { id: updated.id, slug: updated.slug, name: updated.name } });
+  });
+
   app.get("/retention", async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;

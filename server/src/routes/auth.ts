@@ -935,6 +935,37 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     return reply.send({ ok: true });
   });
 
+  // Profile edits — currently just the display name, which was only
+  // settable at signup (and not at all for invite-accepted or SSO-JIT
+  // users, whose displayName is null forever). No step-up: it's
+  // cosmetic, org-visible metadata, same trust tier as an org rename.
+  // Empty string clears it (falls back to email everywhere it renders).
+  app.patch("/me/profile", async (req, reply) => {
+    const claims = requireSession(req, reply);
+    if (!claims) return;
+    if (claims.sub.startsWith("apikey:")) {
+      return reply.code(403).send({ error: "cookie_session_required" });
+    }
+    const body = z
+      .object({
+        // Same CRLF/NUL posture as signup (R184 F1): displayName is
+        // interpolated into welcomeMail HTML (escaped) but header-class
+        // injection must die at the Zod boundary, not in the template.
+        displayName: z.string().max(80).trim()
+          .refine(noCrlfNul, "must not contain CR/LF/NUL"),
+      })
+      .safeParse(req.body);
+    if (!body.success) return reply.code(400).send({ error: "invalid_name" });
+    const displayName = body.data.displayName === "" ? null : body.data.displayName;
+    const updated = await db.user.update({
+      where: { id: claims.sub },
+      data: { displayName },
+    });
+    return reply.send({
+      user: { id: updated.id, email: updated.email, displayName: updated.displayName },
+    });
+  });
+
   // GDPR data export. Returns everything the org has stored:
   // deployments, sessions, events, receipts, memberships, users.
   // Password hashes and reset tokens are excluded — the export is meant
