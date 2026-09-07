@@ -276,6 +276,26 @@ const Env = z.object({
       },
       "APP_BASE_URL must be an https:// URL in production; the localhost default is unsafe for reset-links, invite-links, OAuth redirect_uri, and WebAuthn rpID.",
     ),
+  // Public base URL of THIS API when it lives on a different origin
+  // than the console (Pages at agentvisorai.me, API at
+  // api.agentvisorai.me). Flows into every URL that must be served by
+  // the API itself: SAML SP entityId / ACS / metadata / login and the
+  // OAuth redirect_uri. Those were previously built from APP_BASE_URL,
+  // which on a split-origin deploy is the STATIC console host — the
+  // console handed IdP admins ACS/metadata URLs that 404 on Pages, and
+  // OAuth providers a redirect_uri no server listens on. Empty default
+  // falls back to APP_BASE_URL so same-origin/dev deploys need nothing.
+  API_PUBLIC_URL: z
+    .string()
+    .default("")
+    .refine(
+      (v) => {
+        if (v === "") return true;
+        if (process.env.NODE_ENV !== "production") return true;
+        return !v.startsWith("http://");
+      },
+      "API_PUBLIC_URL must be an https:// URL in production (or unset to fall back to APP_BASE_URL).",
+    ),
   // OIDC providers. All optional — the login page only shows a
   // provider button when the corresponding client-id is set.
   GOOGLE_CLIENT_ID: z.string().optional(),
@@ -329,4 +349,11 @@ if (NODE_ENV_WAS_UNSET) {
       `mailer is allowed, and the R175 APP_BASE_URL production guard is ` +
       `bypassed.`,
   );
+}
+
+// Base URL for links the API must serve itself (SAML SP endpoints,
+// OAuth redirect_uri). Falls back to APP_BASE_URL for same-origin
+// deploys where the SPA and API share a host.
+export function apiPublicBase(): string {
+  return (env.API_PUBLIC_URL || env.APP_BASE_URL).replace(/\/$/, "");
 }

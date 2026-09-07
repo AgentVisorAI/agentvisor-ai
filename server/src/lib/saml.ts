@@ -30,7 +30,7 @@
 import { SAML } from "@node-saml/node-saml";
 import type { SamlConfig } from "@prisma/client";
 import { db } from "../db.js";
-import { env } from "../env.js";
+import { env, apiPublicBase } from "../env.js";
 
 /** What we ultimately care about from a validated SAML assertion. */
 export interface SamlSuccess {
@@ -65,7 +65,7 @@ export function spUrls(cfg: SamlConfig): {
   loginUrl: string;
   metadataUrl: string;
 } {
-  const base = env.APP_BASE_URL.replace(/\/$/, "");
+  const base = apiPublicBase();
   return {
     entityId: `${base}/api/v1/auth/saml/${cfg.id}`,
     acsUrl: `${base}/api/v1/auth/saml/${cfg.id}/acs`,

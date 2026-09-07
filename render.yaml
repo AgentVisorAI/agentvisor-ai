@@ -51,6 +51,12 @@ services:
         generateValue: true
       - key: APP_BASE_URL
         value: https://agentvisorai.me
+      - key: API_PUBLIC_URL
+        # The API's own public origin. SAML SP endpoints (entityId /
+        # ACS / metadata / login) and the OAuth redirect_uri are built
+        # from this — without it they'd point at the static Pages host
+        # above, which 404s every IdP round-trip.
+        value: https://api.agentvisorai.me
       - key: EMAIL_FROM
         # MUST be a Resend-verified domain sender or Resend rejects
         # every send at request time (the API still 202s — check logs
