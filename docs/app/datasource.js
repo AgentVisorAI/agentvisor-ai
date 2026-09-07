@@ -2160,8 +2160,12 @@
   var ApiDataSource = {
     mode: "api",
     async getSession() {
-      try { var r = await apiFetch("/api/v1/auth/me"); return { user: r.user, org: r.org }; }
+      try { var r = await apiFetch("/api/v1/auth/me"); return { user: r.user, org: r.org, memberships: r.memberships || [] }; }
       catch (e) { if (e.status === 401) return null; throw e; }
+    },
+    async switchOrg(orgId) {
+      var r = await apiFetch("/api/v1/auth/switch-org", { method: "POST", body: { orgId: orgId } });
+      return { user: r.user, org: r.org };
     },
     async signup(input) {
       var r = await apiFetch("/api/v1/auth/signup", { method: "POST", body: { email: input.email, password: input.password, orgName: input.orgName || (input.email.split("@")[0] + "'s org") } });
