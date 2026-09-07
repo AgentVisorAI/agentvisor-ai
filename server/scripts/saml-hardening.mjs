@@ -193,6 +193,27 @@ async function main() {
   const b3 = await r3.text();
   results.push({ drill: "wrong-signing-cert", status: r3.status, expect: 302, body: (r3.headers.get("location") ?? b3).slice(0, 100), ok: r3.status === 302 && /err=saml_assertion/.test(r3.headers.get("location") ?? "") });
 
+  // ============ 3b. Right cert, wrong Issuer ============
+  // The cross-tenant hole: a signing cert reused across tenants/apps
+  // (shared IdP appliances, wildcard certs) must NOT admit assertions
+  // issued for someone else. node-saml's idpIssuer option only guards
+  // logout messages, so consumeSamlResponse enforces the pin itself —
+  // this leg would have minted a session before that check landed.
+  console.log("\n[3b] Valid signature but Issuer of another tenant");
+  const wrongIssuerResp = await craftSignedResponse({
+    privateKey: idp.privateKey, // RIGHT key —
+    certBody: idp.certBody,
+    audience: cfg.spEntityId,
+    acs: cfg.spAcsUrl,
+    idpIssuer: "https://other-tenant.example/entity", // — wrong Issuer
+    email: "crosstenant@hardening.example",
+  });
+  const r3b = await postToAcs(cfg.spAcsUrl, wrongIssuerResp);
+  const b3b = await r3b.text();
+  const loc3b = r3b.headers.get("location") ?? "";
+  const cookie3b = (r3b.headers.getSetCookie?.() ?? []).some((c) => c.startsWith("av_session="));
+  results.push({ drill: "issuer-mismatch", status: r3b.status, expect: 302, body: (loc3b || b3b).slice(0, 100), ok: r3b.status === 302 && /err=saml_assertion_issuer_mismatch/.test(loc3b) && !cookie3b });
+
   // ============ 4. Member can't CRUD ============
   console.log("\n[4] Member cannot CRUD SAML configs");
   // Round-33 hardened the membership fence: the role claim inside the
