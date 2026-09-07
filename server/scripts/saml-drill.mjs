@@ -16,7 +16,7 @@ import { execSync } from "node:child_process";
 import { generateKeyPairSync, createSign, randomBytes } from "node:crypto";
 import { promises as fs } from "node:fs";
 
-const API = "http://127.0.0.1:4340";
+const API = process.env.API_BASE || "http://127.0.0.1:4340";
 const SPA_ORIGIN = "http://127.0.0.1:8988";
 
 async function main() {

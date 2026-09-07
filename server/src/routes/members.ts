@@ -949,6 +949,18 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
           },
           update: {}, // Already a member? Fine, just proceed.
         });
+        // The invite token was mailed to this address and presented
+        // back — mailbox control is proven for EXISTING users too, not
+        // just the freshly-created row above (whose create clause sets
+        // it). Without this, a password-era account that accepted an
+        // invite stayed "unverified" and the OAuth pre-hijack gate
+        // refused SSO for it forever.
+        if (!grantee.emailVerifiedAt) {
+          await tx.user.update({
+            where: { id: grantee.id },
+            data: { emailVerifiedAt: new Date() },
+          });
+        }
         return grantee;
       });
     } catch (err) {

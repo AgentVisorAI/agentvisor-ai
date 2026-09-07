@@ -7,7 +7,7 @@ import { execSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { promises as fs } from "node:fs";
 
-const API = "http://127.0.0.1:4341";
+const API = process.env.API_BASE || "http://127.0.0.1:4341";
 const SPA_ORIGIN = "http://127.0.0.1:8988";
 
 async function signup(email, orgName) {
@@ -71,6 +71,7 @@ async function craftSignedResponse({
   // null crafts an UNSOLICITED response — refused at the outer gate,
   // which the dedicated probe asserts.
   inResponseTo = null,
+  skipSignature = false, // post the assertion with NO ds:Signature at all
 }) {
   const responseId = "_" + randomBytes(16).toString("hex");
   const assertionId = "_" + randomBytes(16).toString("hex");
@@ -95,6 +96,10 @@ async function craftSignedResponse({
 </saml:Assertion>`.trim();
 
   const { SignedXml } = await import("xml-crypto");
+  let signedAssertion;
+  if (skipSignature) {
+    signedAssertion = assertionXml;
+  } else {
   const sig = new SignedXml({
     privateKey,
     signatureAlgorithm: "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
@@ -110,7 +115,8 @@ async function craftSignedResponse({
     digestAlgorithm: "http://www.w3.org/2001/04/xmlenc#sha256",
   });
   sig.computeSignature(assertionXml, { location: { reference: "//*[local-name(.)='Issuer']", action: "after" } });
-  const signedAssertion = sig.getSignedXml();
+  signedAssertion = sig.getSignedXml();
+  }
 
   const responseXml = `<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="${responseId}"${inResponseTo ? ` InResponseTo="${inResponseTo}"` : ""} Version="2.0" IssueInstant="${now.toISOString()}" Destination="${acs}">
   <saml:Issuer>${idpIssuer}</saml:Issuer>
@@ -242,6 +248,28 @@ async function main() {
   const loc3b = r3b.headers.get("location") ?? "";
   const cookie3b = (r3b.headers.getSetCookie?.() ?? []).some((c) => c.startsWith("av_session="));
   results.push({ drill: "issuer-mismatch", status: r3b.status, expect: 302, body: (loc3b || b3b).slice(0, 100), ok: r3b.status === 302 && /err=saml_assertion_issuer_mismatch/.test(loc3b) && !cookie3b });
+
+  // ============ 3c. Unsigned assertion ============
+  // wantAssertionsSigned: true is another library KNOB — post an
+  // assertion carrying no ds:Signature at all and prove the knob is a
+  // GUARANTEE (same probe philosophy as 3b).
+  console.log("\n[3c] Assertion with no signature at all");
+  const irt_unsigned = await spInitiate(cfg.id);
+  const unsignedResp = await craftSignedResponse({
+    inResponseTo: irt_unsigned,
+    privateKey: idp.privateKey,
+    certBody: idp.certBody,
+    audience: cfg.spEntityId,
+    acs: cfg.spAcsUrl,
+    idpIssuer: "https://real-idp.example/entity",
+    email: "unsigned@hardening.example",
+    skipSignature: true,
+  });
+  const r3c = await postToAcs(cfg.spAcsUrl, unsignedResp);
+  const b3c = await r3c.text();
+  const loc3c = r3c.headers.get("location") ?? "";
+  const cookie3c = (r3c.headers.getSetCookie?.() ?? []).some((c) => c.startsWith("av_session="));
+  results.push({ drill: "unsigned-assertion", status: r3c.status, expect: 302, body: (loc3c || b3c).slice(0, 100), ok: r3c.status === 302 && /err=saml_assertion/.test(loc3c) && !cookie3c });
 
   // ============ 4. Member can't CRUD ============
   console.log("\n[4] Member cannot CRUD SAML configs");
