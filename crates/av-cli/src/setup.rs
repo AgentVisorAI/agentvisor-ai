@@ -2009,7 +2009,19 @@ async fn probe_endpoint_any(endpoint: &str) -> Result<()> {
                         })?;
                 }
                 #[cfg(not(unix))]
-                let _ = metadata;
+                {
+                    let _ = metadata;
+                    // The runtime's Redis client can only open a Unix
+                    // domain socket on Unix; on any other platform this
+                    // endpoint fails at runtime no matter what sits at
+                    // the path. Existence alone was a false "reachable"
+                    // verdict — the exact class this probe's comment
+                    // above promises to catch.
+                    anyhow::bail!(
+                        "unix socket {path}: unix-socket endpoints are not supported on this platform; use a TCP endpoint (redis://host:port)"
+                    );
+                }
+                #[cfg(unix)]
                 return Ok(());
             }
             Err(error) => anyhow::bail!("unix socket {path}: {error}"),
