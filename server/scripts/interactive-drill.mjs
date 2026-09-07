@@ -1118,6 +1118,9 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   const m = Object.fromEntries(all.map((s) => [s.id, s]));
   await goF("?range=720&sort=cost.asc");
   const seq = (await page.evaluate(() => [...document.querySelectorAll("tr[data-clickable]")].map((r) => r.getAttribute("data-id")))).map((id) => m[id]?.cost);
+  // Guard the vacuous-truth hole: .every() on an empty array is true,
+  // so a sort that broke the query into returning 0 rows sailed green.
+  if (seq.length < 2) fail("sort=cost.asc rendered " + seq.length + " rows — sort query broken or fixture changed");
   if (!seq.every((v, i) => i === 0 || seq[i - 1] <= v)) fail("sort cost.asc not monotone");
   // Filter-race: a slow stale query must never paint over a newer one,
   // and keystrokes typed while a fetch is in flight must survive (the
@@ -1658,8 +1661,13 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
     const tr = [...document.querySelectorAll("tbody tr")].find((r) => r.textContent.includes("drill-ci-key"));
     (tr.querySelector("button[data-act='revoke']") || tr.querySelector(".btn.danger")).click();
   });
+  // Destructive action must confirm: a missing confirm modal means the
+  // SPA regressed to revoke-without-confirmation — fail loud instead of
+  // silently skipping the click (the old .catch(null) + if(conf) shape
+  // let that regression ride green as long as the key stayed put).
   const conf = await page.waitForSelector(".modal-backdrop [data-confirm]", { timeout: 5000 }).catch(() => null);
-  if (conf) await page.click(".modal-backdrop [data-confirm]");
+  if (!conf) fail("API key revoke did not ask for confirmation");
+  await page.click(".modal-backdrop [data-confirm]");
   await page.waitForFunction(() => !document.getElementById("view").textContent.includes("drill-ci-key"), { timeout: 8000 })
     .catch(() => fail("revoked API key still listed"));
   // (d) Fresh-workspace relogin truth: signing back in with the SAME
@@ -1911,7 +1919,13 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   // (b) Enter in the URL field submits the form (no Save click)
   await page.fill("#whUrl", "https://example.dev/form-truth-hook");
   await page.press("#whUrl", "Enter");
-  await page.waitForSelector(".modal-backdrop .mono, .modal-backdrop code", { timeout: 5000 }).catch(() => null);
+  // The secret modal is the whole point of webhook creation (the
+  // secret is shown once); app.js showTokenModal renders it as
+  // `.token-display` inside the backdrop. The old shape waited on
+  // `.mono, code` — selectors that never existed — and swallowed the
+  // timeout, so this leg never actually verified the modal.
+  await page.waitForSelector(".modal-backdrop .token-display", { timeout: 5000 })
+    .catch(() => fail("webhook created but the secret modal never appeared"));
   await page.waitForFunction((n) => document.querySelectorAll("tbody tr").length === n + 1, rowsBefore, { timeout: 5000 })
     .catch(() => fail("Enter in the webhook URL field did not submit the form"));
   await page.keyboard.press("Escape"); // dismiss the secret modal
