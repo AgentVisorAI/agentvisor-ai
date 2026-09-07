@@ -106,9 +106,17 @@ pub fn compress(payload: &Value, cfg: &CompressionConfig) -> CompressionOutcome 
     // `compress(compress(x)) != compress(x)`, with each further run
     // eating deeper until only stubs and the tail remained. Same
     // spoof-collision reasoning as the pass-local guard: legitimate
-    // user text does not START with the machine stub prefix.
+    // user text does not START with the machine stub prefix. And like
+    // the pass-local guard, the scan is bounded to the pre-tail range:
+    // no pass ever writes a stub at or past `tail_start` (invariant
+    // #2), so a TAIL message that merely starts with the marker text
+    // is user content, not a machine stub — scanning it here would
+    // let one such message permanently disable the middle pass for
+    // the whole conversation.
     let input_already_compressed = messages
-        .iter()
+        .get(..tail_start)
+        .into_iter()
+        .flatten()
         .any(|m| msg_content_str(m).is_some_and(|c| c.starts_with("[pruned:")));
 
     let mut changed = false;
