@@ -1960,6 +1960,45 @@
       recordAudit("org.retention_updated", "", "sessions " + input.sessionRetentionDays + "d · audit " + input.auditRetentionDays + "d");
     },
     async retentionSweepNow() { await delay(120); return { result: { sessionsPurged: 0, auditPurged: 0, webhookDeliveriesPurged: 0 } }; },
+    async getIpAllowlist() {
+      await delay(80);
+      return { cidrs: mockState.ipAllowlist || [], yourIp: "203.0.113.7" };
+    },
+    async updateIpAllowlist(cidrs) {
+      await delay(100);
+      // Mirror the server's bare-IP sugar + reject junk so demo users
+      // see the same validation the real API enforces.
+      var cleaned = [];
+      for (var i = 0; i < cidrs.length; i++) {
+        var t = String(cidrs[i]).trim();
+        if (!t) continue;
+        var withPrefix = t.indexOf("/") >= 0 ? t : (t.indexOf(":") >= 0 ? t + "/128" : t + "/32");
+        var m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/.exec(withPrefix);
+        var v6 = /^[0-9a-fA-F:]+\/\d{1,3}$/.test(withPrefix) && withPrefix.indexOf(":") >= 0;
+        var v4ok = m && +m[1] < 256 && +m[2] < 256 && +m[3] < 256 && +m[4] < 256 && +m[5] <= 32;
+        if (!v4ok && !v6) { var err = new Error("invalid_cidr"); err.data = { cidr: cidrs[i] }; err.errorCode = "invalid_cidr"; throw err; }
+        cleaned.push(withPrefix);
+      }
+      mockState.ipAllowlist = cleaned;
+      recordAudit("org.ip_allowlist_updated", "", cleaned.length ? cleaned.join(", ") : "cleared");
+      return { cidrs: cleaned };
+    },
+    async exportMyData(password) {
+      await delay(200);
+      if (!password) { var e1 = new Error("password_required"); e1.status = 400; throw e1; }
+      var lines = [
+        JSON.stringify({ type: "header", format: "agentvisor.export.v1", generatedAt: new Date().toISOString(), note: "demo fixture export" }),
+        JSON.stringify({ type: "user", email: (mockState.session && mockState.session.user.email) || "demo@northwind.com" }),
+        JSON.stringify({ type: "org", name: (mockState.session && mockState.session.org.name) || "Northwind Traders" }),
+      ];
+      return new Blob([lines.join("\n") + "\n"], { type: "application/x-ndjson" });
+    },
+    async deleteMyAccount(password) {
+      await delay(200);
+      if (!password) { var e2 = new Error("invalid_password"); e2.status = 401; throw e2; }
+      // Demo mode: pretend the cascade ran; the caller signs out.
+      return { ok: true };
+    },
     // No downloadAuditCsv here on purpose: without it the console
     // builds the CSV client-side from the loaded entries, which works
     // offline and respects the active filter (the old no-op silently
@@ -2514,6 +2553,39 @@
     },
     async retentionSweepNow() {
       return apiFetch("/api/v1/org/retention/sweep-now", { method: "POST" });
+    },
+    async getIpAllowlist() {
+      return apiFetch("/api/v1/org/ip-allowlist");
+    },
+    async updateIpAllowlist(cidrs) {
+      return apiFetch("/api/v1/org/ip-allowlist", { method: "PATCH", body: { cidrs: cidrs } });
+    },
+    async exportMyData(password) {
+      // Streams NDJSON with a Content-Disposition filename. POST (the
+      // password step-up rides the body) so this can't be a plain <a>
+      // navigation like the audit CSV — fetch it and hand the caller a
+      // Blob to download.
+      var res = await fetch(apiUrl("/api/v1/auth/me/export"), {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json", "X-Requested-With": "fetch" },
+        body: JSON.stringify({ password: password }),
+      });
+      if (!res.ok) {
+        var data = {};
+        try { data = await res.json(); } catch (e) {}
+        var err = new Error(data.detail || data.error || ("http_" + res.status));
+        err.status = res.status;
+        err.errorCode = data.errorCode || data.error;
+        throw err;
+      }
+      return res.blob();
+    },
+    async deleteMyAccount(password) {
+      return apiFetch("/api/v1/auth/me/delete-account", {
+        method: "POST",
+        body: { password: password, confirm: "DELETE MY ACCOUNT" },
+      });
     },
     downloadAuditCsv: function () {
       // Redirect to the CSV endpoint. Cookies auto-attach (SameSite=Lax
