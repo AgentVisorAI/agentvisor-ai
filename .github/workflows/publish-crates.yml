@@ -61,43 +61,20 @@ jobs:
             exit 1
           fi
 
-      # Dry-run package in strict topological order — every crate MUST
-      # `cargo package` cleanly (manifest completeness, packaged file
-      # list, out-of-crate path detection) before any real upload. If a
-      # leaf fails here, later crates would fail on the actual publish
-      # after upstream crates are already live (irreversible on
-      # crates.io — you can only yank, not re-upload the same version).
-      #
-      # Round-6 (hunt2 ops F5): `--no-verify` is REQUIRED here. The
-      # verification build resolves `{ path, version }` dependencies
-      # from crates.io, and during a version bump the new sibling
-      # versions are not published yet — so every crate except av-core
-      # would fail dry-run verification on precisely the releases this
-      # gate exists to protect. The real `cargo publish` loop below
-      # still runs a full verification build per crate, at a point
-      # where its dependencies ARE live in the index.
-      - name: Dry-run package (topological order)
-        run: |
-          set -euo pipefail
-          crates=(
-            av-core
-            av-events
-            av-compress
-            av-loopdetect
-            av-state
-            av-atif
-            av-receipts
-            av-bridge
-            av-identity
-            av-sandbox
-            av-harness
-            av-cli
-          )
-          for crate in "${crates[@]}"; do
-            echo "::group::dry-run package $crate"
-            cargo package -p "$crate" --allow-dirty --no-verify
-            echo "::endgroup::"
-          done
+      # Dry-run the whole workspace before any real upload. `cargo
+      # publish --workspace --dry-run` (native since cargo 1.90, and the
+      # toolchain above pins 1.97.1) topologically orders the crates and
+      # runs each verification build against the LOCAL copies of
+      # yet-unpublished siblings — exactly the semantics a fresh release
+      # needs. The previous hand-rolled per-crate loop used
+      # `cargo package --no-verify`, but even --no-verify resolves
+      # `{ path, version }` dependencies against the crates.io INDEX, so
+      # every crate except av-core failed the gate on precisely the
+      # releases it existed to protect (reproduced locally: "no matching
+      # package named `av-core` found"). The gate could never pass
+      # before the first real publish.
+      - name: Dry-run publish (whole workspace)
+        run: cargo publish --workspace --dry-run --allow-dirty
 
       # workflow_dispatch with dry_run=true stops here — the manual
       # trigger's purpose is to smoke-test the workflow itself before
@@ -115,12 +92,12 @@ jobs:
             echo "Skipping upload — dry-run only."
           fi
 
-      # Publish in topological order. Each `cargo publish` waits for the
-      # new version to appear in the index (via crates.io's server-side
-      # confirmation) before returning, so the next crate's dependency
-      # resolution can find its upstream. Rate-limit friendly: crates.io
-      # currently allows ~10 new versions per minute per token, well
-      # under our 12-crate cadence.
+      # Publish the whole workspace. `cargo publish --workspace` handles
+      # topological ordering AND waits for each crate to land in the
+      # index before publishing its dependents — the two things the old
+      # hand-rolled loop did manually. Rate-limit friendly: crates.io
+      # allows ~10 new versions/min/token, and the built-in index wait
+      # paces the 12-crate cadence naturally.
       - name: Publish
         if: steps.gate.outputs.publish == 'true'
         env:
@@ -131,26 +108,11 @@ jobs:
             echo "::error::CARGO_REGISTRY_TOKEN secret is not set. Add it under Settings → Secrets → Actions."
             exit 1
           fi
-          crates=(
-            av-core
-            av-events
-            av-compress
-            av-loopdetect
-            av-state
-            av-atif
-            av-receipts
-            av-bridge
-            av-identity
-            av-sandbox
-            av-harness
-            av-cli
-          )
-          for crate in "${crates[@]}"; do
-            echo "::group::publish $crate"
-            # --allow-dirty because the workflow runs against the tag
-            # tree which cargo considers "dirty" versus its own
-            # packaged tree diff — nothing is actually modified in the
-            # working copy.
-            cargo publish -p "$crate" --allow-dirty
-            echo "::endgroup::"
-          done
+          # --allow-dirty because the workflow runs against the tag
+          # tree which cargo considers "dirty" versus its own
+          # packaged tree diff — nothing is actually modified in the
+          # working copy. --no-verify: the dry-run gate above already
+          # ran every verification build; rebuilding all 12 crates a
+          # second time only adds ~20 min between "first crate live"
+          # and "last crate live" (a broken half-published window).
+          cargo publish --workspace --allow-dirty --no-verify
