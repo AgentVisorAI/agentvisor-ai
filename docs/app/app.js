@@ -950,7 +950,7 @@
     // drops. Rendering both a mode chip AND a stream chip in live mode
     // duplicated the word "Live" next to itself.
     var statusChip = state.ds.mode === "mock"
-      ? '<span class="env-pill" title="Console is showing built-in demo data. Set MOCK_MODE=false to talk to a live backend.">Demo</span>'
+      ? '<span class="env-pill" title="Console is showing built-in demo data. Add ?live=1 to the URL to talk to the hosted backend.">Demo</span>'
       : '<span class="env-pill live-pulse" title="Streaming events from the daemon"><span class="live-label">Live</span></span>';
 
     app.innerHTML = "";
@@ -3978,7 +3978,7 @@
               '<button class="btn danger" id="deleteAccountBtn">Delete organization &amp; account</button>') +
         "</div>" : "") +
       (state.ds.mode === "mock" ?
-        '<div class="card"><h2>Demo mode</h2><p style="color: var(--fg-2); margin: 0 0 8px; font-size: var(--t-sec)">This console is running against built-in fixtures. To connect to a real backend, set <code>window.MOCK_MODE = false</code> in <code>docs/app/index.html</code>.</p></div>' : "");
+        '<div class="card"><h2>Demo mode</h2><p style="color: var(--fg-2); margin: 0 0 8px; font-size: var(--t-sec)">This console is running against built-in fixtures. To use the real backend, open this page with <code>?live=1</code> in the URL (it sticks until you visit with <code>?live=0</code>) — or <a href="?live=1#/signup">switch to live mode and create a workspace</a>.</p></div>' : "");
     var so = $("#signOut", root);
     if (so) so.addEventListener("click", signOut);
 
@@ -5772,8 +5772,12 @@
         if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
       });
       setTimeout(function () { var c = backdrop.querySelector("[data-close]"); if (c) c.focus(); }, 20);
-      var list = [];
-      try { list = await state.ds.listWebhookDeliveries(id); }
+      var list = [], whdCursor = null;
+      try {
+        var whdRes = await state.ds.listWebhookDeliveries(id);
+        list = Array.isArray(whdRes) ? whdRes : (whdRes.deliveries || []);
+        whdCursor = Array.isArray(whdRes) ? null : (whdRes.nextCursor || null);
+      }
       catch (err) {
         var bodyEl = backdrop.querySelector("#whdBody");
         if (bodyEl) bodyEl.innerHTML = '<p class="sub">Could not load deliveries (' + esc(err.message || "network") + ').</p>';
@@ -5781,22 +5785,47 @@
       }
       var bodyEl2 = backdrop.querySelector("#whdBody");
       if (!bodyEl2) return; // closed while loading
+      var whdRows = function (rows) {
+        return rows.map(function (d) {
+          var ms = d.deliveredAt ? (new Date(d.deliveredAt) - new Date(d.createdAt)) : null;
+          return '<tr>' +
+            '<td class="mono" style="font-size:11.5px">' + esc(d.event) + (d.errorMessage ? '<div class="id" title="' + esc(d.errorMessage) + '">' + esc(d.errorMessage) + '</div>' : '') + '</td>' +
+            '<td>' + (d.status === "delivered" ? '<span class="pill ok">delivered</span>' : '<span class="pill neutral">' + esc(d.status) + '</span>') + '</td>' +
+            '<td class="num">' + esc(d.attempt) + '</td>' +
+            '<td class="num">' + esc(d.responseCode || "—") + '</td>' +
+            '<td class="num">' + (ms != null ? (ms >= 1000 ? (ms / 1000).toFixed(1) + " s" : ms + " ms") : "—") + '</td>' +
+            '<td>' + timeAgoCell(d.createdAt) + '</td>' +
+          '</tr>';
+        }).join('');
+      };
       bodyEl2.innerHTML = list.length
         ? '<div class="table-wrap"><table>' +
             '<thead><tr><th>Event</th><th>Status</th><th class="num">Attempts</th><th class="num">HTTP</th><th class="num">Latency</th><th>When</th></tr></thead>' +
-            '<tbody>' + list.map(function (d) {
-              var ms = d.deliveredAt ? (new Date(d.deliveredAt) - new Date(d.createdAt)) : null;
-              return '<tr>' +
-                '<td class="mono" style="font-size:11.5px">' + esc(d.event) + (d.errorMessage ? '<div class="id" title="' + esc(d.errorMessage) + '">' + esc(d.errorMessage) + '</div>' : '') + '</td>' +
-                '<td>' + (d.status === "delivered" ? '<span class="pill ok">delivered</span>' : '<span class="pill neutral">' + esc(d.status) + '</span>') + '</td>' +
-                '<td class="num">' + esc(d.attempt) + '</td>' +
-                '<td class="num">' + esc(d.responseCode || "—") + '</td>' +
-                '<td class="num">' + (ms != null ? (ms >= 1000 ? (ms / 1000).toFixed(1) + " s" : ms + " ms") : "—") + '</td>' +
-                '<td>' + timeAgoCell(d.createdAt) + '</td>' +
-              '</tr>';
-            }).join('') + '</tbody>' +
-          '</table></div>'
+            '<tbody id="whdRows">' + whdRows(list) + '</tbody>' +
+          '</table></div>' +
+          '<div id="whdFooter" style="padding:10px 0 0;' + (whdCursor ? "" : " display:none") + '">' +
+            '<button class="btn" id="whdMoreBtn">Load older deliveries</button>' +
+          '</div>'
         : '<p class="sub">No deliveries yet — fire a test event to see one here.</p>';
+      var whdMore = backdrop.querySelector("#whdMoreBtn");
+      if (whdMore) whdMore.addEventListener("click", async function () {
+        if (!whdCursor || whdMore.disabled) return;
+        whdMore.disabled = true;
+        whdMore.textContent = "Loading…";
+        try {
+          var pageRes = await state.ds.listWebhookDeliveries(id, { cursor: whdCursor });
+          var older = (pageRes && pageRes.deliveries) || [];
+          whdCursor = (pageRes && pageRes.nextCursor) || null;
+          var tb = backdrop.querySelector("#whdRows");
+          if (tb) tb.insertAdjacentHTML("beforeend", whdRows(older));
+          var foot = backdrop.querySelector("#whdFooter");
+          if (foot) foot.style.display = whdCursor ? "" : "none";
+        } catch (e3) {
+          toast((e3 && e3.message) || "Could not load older deliveries", true);
+        }
+        whdMore.textContent = "Load older deliveries";
+        whdMore.disabled = false;
+      });
     }
 
     root.addEventListener("keydown", function (e) {
@@ -5951,8 +5980,14 @@
       } catch (e) {}
     }
     root.innerHTML = '<div class="card">' + loadingBlock("table") + "</div>";
-    var audit;
-    try { audit = await state.ds.listAudit(); }
+    var audit, auditCursor = null;
+    try {
+      var auditRes = await state.ds.listAudit();
+      // { entries, nextCursor } from both datasources; tolerate a bare
+      // array from any stale cached bundle.
+      audit = Array.isArray(auditRes) ? auditRes : (auditRes.entries || []);
+      auditCursor = Array.isArray(auditRes) ? null : (auditRes.nextCursor || null);
+    }
     catch (e) { root.innerHTML = '<div class="card empty"><h3>Could not load the audit log</h3><p>' + esc(e.message || "Try again in a moment.") + '</p></div>'; return; }
     if (!audit.length) {
       root.innerHTML =
@@ -5966,14 +6001,19 @@
 
     // Category chips from event prefixes actually present (policy.*,
     // member.*, auth.* …) — same interaction model as the event-stream
-    // triage chips on session detail.
-    var catCounts = {};
-    audit.forEach(function (a) { var c = a.event.split(".")[0]; catCounts[c] = (catCounts[c] || 0) + 1; });
-    var cats = Object.keys(catCounts).sort();
-    var chips = '<button class="evt-chip active" data-cat="" aria-pressed="true">All <span class="n">' + audit.length + "</span></button>" +
-      cats.map(function (c) {
-        return '<button class="evt-chip" data-cat="' + esc(c) + '" aria-pressed="false">' + esc(c) + ' <span class="n">' + catCounts[c] + "</span></button>";
-      }).join("");
+    // triage chips on session detail. Wrapped in #auditChips so "Load
+    // older" can rebuild counts without nuking the search input.
+    var chipsHtml = function () {
+      var catCounts = {};
+      audit.forEach(function (a) { var c = a.event.split(".")[0]; catCounts[c] = (catCounts[c] || 0) + 1; });
+      var cats = Object.keys(catCounts).sort();
+      return '<button class="evt-chip' + (activeCat === "" ? " active" : "") + '" data-cat="" aria-pressed="' + (activeCat === "" ? "true" : "false") + '">All <span class="n">' + audit.length + "</span></button>" +
+        cats.map(function (c) {
+          var on = activeCat === c;
+          return '<button class="evt-chip' + (on ? " active" : "") + '" data-cat="' + esc(c) + '" aria-pressed="' + (on ? "true" : "false") + '">' + esc(c) + ' <span class="n">' + catCounts[c] + "</span></button>";
+        }).join("");
+    };
+    var activeCat = "";
 
     var rowsHtml = function (list) {
       return list.map(function (a) {
@@ -5990,7 +6030,7 @@
         '<div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:8px; flex-wrap:wrap">' +
           '<h2 style="margin:0; font-size:var(--t-section); font-weight:600">Audit log</h2>' +
           '<span style="color:var(--fg-3); font-size:var(--t-sec)" id="auditCount" role="status" aria-live="polite">' + audit.length + " events</span>" +
-          '<div class="evt-filters" style="margin-left:auto">' + chips +
+          '<div class="evt-filters" style="margin-left:auto"><span id="auditChips">' + chipsHtml() + '</span>' +
             '<input id="auditSearch" type="search" placeholder="Filter by actor, event, target…" aria-label="Filter audit entries" style="width:180px" />' +
           "</div>" +
           '<button class="btn" id="auditExportBtn" title="Download the entries shown below as CSV">↓ Export CSV</button>' +
@@ -5999,10 +6039,11 @@
           "<thead><tr><th>When</th><th>Event</th><th>Actor</th><th>Target</th><th>Note</th></tr></thead>" +
           '<tbody id="auditBody">' + rowsHtml(audit) + "</tbody>" +
         "</table></div>" +
-        '<div class="empty-mini" id="auditNone" style="padding:16px; display:none">No entries match — clear the filter to see all ' + audit.length + ".</div>" +
+        '<div class="empty-mini" id="auditNone" style="padding:16px; display:none">No entries match — clear the filter.</div>' +
+        '<div id="auditFooter" style="padding:12px 16px; border-top:1px solid var(--border);' + (auditCursor ? "" : " display:none") + '">' +
+          '<button class="btn" id="auditMoreBtn" title="Fetch the next page of history (bulk pulls are themselves audited)">Load older entries</button>' +
+        "</div>" +
       "</div>";
-
-    var activeCat = "";
     var search = $("#auditSearch", root);
     function filtered() {
       var q = ((search && search.value) || "").trim().toLowerCase();
@@ -6030,6 +6071,34 @@
       });
       activeCat = chip.getAttribute("data-cat");
       apply();
+    });
+
+    // Load older pages: the /audit endpoint caps a page at 200 rows and
+    // the console used to show only the newest page — history past it
+    // was reachable exclusively via the CSV export. Append pages via
+    // nextCursor; filters and chips recount across everything loaded.
+    var moreBtn = $("#auditMoreBtn", root);
+    if (moreBtn) moreBtn.addEventListener("click", async function () {
+      if (!auditCursor || moreBtn.disabled) return;
+      moreBtn.disabled = true;
+      moreBtn.textContent = "Loading…";
+      try {
+        var page = await state.ds.listAudit({ cursor: auditCursor });
+        var older = (page && page.entries) || [];
+        Array.prototype.push.apply(audit, older);
+        auditCursor = (page && page.nextCursor) || null;
+        var chipsEl = $("#auditChips", root);
+        if (chipsEl) chipsEl.innerHTML = chipsHtml();
+        apply();
+        $("#auditFooter", root).style.display = auditCursor ? "" : "none";
+        moreBtn.textContent = "Load older entries";
+        moreBtn.disabled = false;
+        if (!older.length && !auditCursor) toast("You've reached the start of the audit history");
+      } catch (e2) {
+        moreBtn.textContent = "Load older entries";
+        moreBtn.disabled = false;
+        toast((e2 && e2.message) || "Could not load older entries", true);
+      }
     });
 
     var exp = $("#auditExportBtn", root);

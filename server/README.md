@@ -67,37 +67,73 @@ All routes are prefixed `/api/v1`.
 | Method | Path | Notes |
 |---|---|---|
 | `POST` | `/auth/signup` | `{ email, password, orgName, displayName? }` — creates user + owner org, sets `av_session` cookie |
-| `POST` | `/auth/login` | `{ email, password }` |
-| `POST` | `/auth/logout` | Clears the cookie |
-| `GET`  | `/auth/me` | Returns `{ user, org }` for the active session |
+| `POST` | `/auth/login` | `{ email, password }`; answers `{ mfaRequired: true }` uniformly for passkey-enrolled accounts **and** bad credentials (no oracle) |
+| `POST` | `/auth/logout` | Clears the cookie and fences prior JWTs |
+| `POST` | `/auth/logout-all` | Fences every session, re-mints the caller's cookie — "sign out other devices" |
+| `GET`  | `/auth/me` | `{ user (incl. pendingEmail), org, memberships[] }` for the active session |
+| `POST` | `/auth/switch-org` | `{ orgId }` — re-mints the cookie bound to another membership |
+| `POST` | `/auth/change-password` | `{ currentPassword, newPassword }` — fences other sessions, keeps API keys |
+| `POST` | `/auth/change-email` | `{ newEmail, password }` — uniform 202; confirm link goes to the new mailbox |
+| `POST` | `/auth/change-email/confirm` | `{ email, token }` — anonymous; rotates the address, fences all sessions |
+| `POST` | `/auth/change-email/cancel` | Clears the pending change |
+| `PATCH`| `/auth/me/profile` | `{ displayName }` — empty clears |
+| `POST` | `/auth/me/export` | Password step-up; streams the whole org as NDJSON (owner only) |
+| `POST` | `/auth/me/delete-account` | Password + type-phrase; deletes org (+ account unless other memberships remain — response carries `accountDeleted`) |
+| `POST` | `/auth/reset-request` / `/auth/reset-confirm` | Email reset flow; confirm revokes sessions **and** API keys (break-glass) |
 
-### Deployments (authed user)
+### MFA / SSO
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET`  | `/deployments` | List deployments in the caller's org |
-| `POST` | `/deployments` | `{ name, environment? }` — returns `{ deployment, ingestToken }`; token is shown **once** |
-| `POST` | `/deployments/:id/rotate-token` | Rotate |
-| `DELETE` | `/deployments/:id` | Delete |
+| `POST` | `/auth/webauthn/register/challenge` + `/verify` | Passkey enrollment (verify requires the account password) |
+| `POST` | `/auth/webauthn/authenticate/challenge` + `/verify` | Passkey MFA step at login |
+| `GET`/`PATCH`/`DELETE` | `/auth/webauthn/credentials[/:id]` | List / rename / revoke (revoke = break-glass: fences sessions, revokes keys) |
+| `GET`  | `/auth/oauth/providers`, `/auth/oauth/:provider/start` + `/callback` | Google / Microsoft sign-in when configured |
+| — | `/auth/saml/*` | SAML 2.0 SP: config CRUD, `/:configId/metadata.xml`, `/login`, `/acs`, `/slo`, `/keypair`, `/discover` |
+
+### Org & members
+
+| Method | Path | Notes |
+|---|---|---|
+| `PATCH`| `/org` | Rename the workspace (owner; slug/id stable) |
+| `GET`/`PATCH` | `/org/retention` (+ `POST /org/retention/sweep-now`) | Retention windows + manual sweep |
+| `GET`/`PATCH` | `/org/ip-allowlist` | CIDR allowlist (refuses to lock the caller out) |
+| `GET`  | `/members` | Members incl. `mfaEnrolled` flag |
+| `PATCH`/`DELETE` | `/members/:userId` | Role change / remove (rank guards, last-owner guard; self-DELETE = leave) |
+| `POST` | `/members/:userId/reset-mfa` | Admin break-glass for a lost passkey (own-password step-up) |
+| `POST`/`GET`/`DELETE` | `/members/invites[/:id]` | Invite CRUD; re-POST the same email = resend (fresh token, old link dies) |
+| `POST` | `/members/invites/accept` | Anonymous accept (`{ token, email, password? }`) |
+
+### Deployments, keys, policies, webhooks
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET`/`POST` | `/deployments` | Token returned **once** on create |
+| `PATCH`/`DELETE` | `/deployments/:id` (+ `POST /:id/rotate-token`) | Rename/env edit (labels only), delete (409 if sealed receipts unless forced), rotate |
+| `GET`/`POST`/`PATCH`/`DELETE` | `/keys[/:id]` | API keys: list / mint (shown once) / rename / revoke — rank-guarded |
+| `GET`/`POST`/`PATCH`/`DELETE` | `/policies[/:id]` | Policy CRUD (name/description/body/enabled) |
+| `GET`/`POST`/`PATCH`/`DELETE` | `/webhooks[/:id]` (+ `POST /:id/test`, `GET /:id/deliveries`) | Endpoints (SSRF-guarded), HMAC-signed deliveries with retries, cursor-paginated delivery log |
 
 ### Ingest (daemon → API)
 
-Auth: `Authorization: Bearer <ingestToken>` + `X-AV-Deployment: <deployment_id>`.
+Auth: `Authorization: Bearer <ingest_token>` + `X-AV-Deployment: <deployment_id>`.
 
 | Method | Path | Notes |
 |---|---|---|
-| `POST` | `/ingest/pubkey` | `{ publicKeyHex }` — one-shot on first startup |
+| `POST` | `/ingest/pubkey` | `{ publicKeyHex }` — anchored on first set; rotation refused |
 | `POST` | `/ingest/sessions` | Upsert a session (idempotent on `externalId`) |
 | `POST` | `/ingest/events` | Array of events, deduped on `(session, seq)` |
-| `POST` | `/ingest/receipts` | Signed receipt at seal |
+| `POST` | `/ingest/receipts` | Signed receipt at seal (key-id must match the anchor) |
 
 ### Read (authed user)
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET`  | `/overview` | Fleet stats + recent sessions |
-| `GET`  | `/sessions/:id` | Session + events + receipt |
+| `GET`  | `/overview` | Fleet stats + time-series + recent sessions |
+| `GET`  | `/sessions` (+ `/sessions/:id`) | Cursor-paginated list; detail with cursor-paginated events + receipt |
 | `GET`  | `/receipts/:sessionId` | Raw receipt + deployment public key for offline verify |
+| `GET`  | `/audit` (+ `/audit.csv`) | Cursor-paginated audit trail; CSV streams up to 10k rows |
+| `GET`  | `/stream` | SSE: session/event/receipt updates, multi-instance via PG LISTEN/NOTIFY |
 
 ## Security posture
 

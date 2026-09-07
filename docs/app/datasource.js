@@ -2002,13 +2002,13 @@
       var mine = runtimeDeliveries.filter(function (d) { return d.webhookId === id; });
       // A fresh org's endpoints have only the deliveries THEY produced;
       // the canned d1–d3 rows belong to the Northwind fixtures.
-      if (freshElapsed() != null) return mine;
+      if (freshElapsed() != null) return { deliveries: mine, nextCursor: null };
       var now = Date.now();
-      return mine.concat([
+      return { deliveries: mine.concat([
         { id: "d1", event: "policy.block", status: "delivered", attempt: 1, responseCode: 200, createdAt: new Date(now - 3 * MIN).toISOString(), deliveredAt: new Date(now - 3 * MIN + 340).toISOString() },
         { id: "d2", event: "policy.block", status: "delivered", attempt: 1, responseCode: 200, createdAt: new Date(now - 47 * MIN).toISOString(), deliveredAt: new Date(now - 47 * MIN + 210).toISOString() },
         { id: "d3", event: "policy.block", status: "delivered", attempt: 2, responseCode: 200, createdAt: new Date(now - 6 * HOUR).toISOString(), deliveredAt: new Date(now - 6 * HOUR + 32_500).toISOString(), errorMessage: "server_error_502 (attempt 1)" },
-      ]);
+      ]), nextCursor: null };
     },
     async getRetention() { await delay(80); return { retention: { sessionRetentionDays: 90, auditRetentionDays: 365 } }; },
     async updateRetention(input) {
@@ -2146,9 +2146,9 @@
         if (el >= 5000) entries.push({ at: new Date(t0 + 5000).toISOString(), actor: founder, event: "deployment.create", target: freshDaemonName(), note: "environment: production" });
         entries.push({ at: new Date(t0 + 2000).toISOString(), actor: "system", event: "policies.defaults_seeded", target: "4 starter policies" });
         entries.push({ at: new Date(t0).toISOString(), actor: founder, event: "org.created", target: (fid && fid.org.name) || "your workspace" });
-        return runtimeAudit.concat(entries);
+        return { entries: runtimeAudit.concat(entries), nextCursor: null };
       }
-      return runtimeAudit.concat(MOCK_AUDIT);
+      return { entries: runtimeAudit.concat(MOCK_AUDIT), nextCursor: null };
     },
     subscribe(callback) {
       // The demo needs to feel alive. Every 6-14 seconds we synthesize a new
@@ -2750,11 +2750,18 @@
       // copy-to-clipboard modal }.
       return apiFetch("/api/v1/webhooks/" + encodeURIComponent(id) + "/rotate-secret", { method: "POST" });
     },
-    async listWebhookDeliveries(id) {
+    async listWebhookDeliveries(id, opts) {
+      opts = opts || {};
+      var q = [];
+      if (opts.cursor) q.push("cursor=" + encodeURIComponent(opts.cursor));
+      if (opts.limit) q.push("limit=" + encodeURIComponent(opts.limit));
+      var qs = q.length ? ("?" + q.join("&")) : "";
       try {
-        var res = await apiFetch("/api/v1/webhooks/" + encodeURIComponent(id) + "/deliveries");
-        return res.deliveries || [];
-      } catch (e) { return []; }
+        var res = await apiFetch("/api/v1/webhooks/" + encodeURIComponent(id) + "/deliveries" + qs);
+        return { deliveries: res.deliveries || [], nextCursor: res.nextCursor || null };
+      } catch (e) {
+        throw e;
+      }
     },
     async getRetention() {
       return apiFetch("/api/v1/org/retention");
@@ -2814,9 +2821,10 @@
       link.remove();
     },
     async listAudit(opts) {
-      // Real audit log. The SPA maps our normalized shape into the
-      // audit table. If the server returns 4xx/5xx we fall through to
-      // an empty array so the settings page doesn't crash.
+      // Real audit log with cursor pagination. Returns
+      // { entries, nextCursor } — nextCursor null at the end of
+      // history. On 4xx/5xx fall through to an empty page so the
+      // settings tab doesn't crash.
       opts = opts || {};
       var q = [];
       if (opts.cursor) q.push("cursor=" + encodeURIComponent(opts.cursor));
@@ -2825,11 +2833,14 @@
       var qs = q.length ? ("?" + q.join("&")) : "";
       try {
         var res = await apiFetch("/api/v1/audit" + qs);
-        return (res.entries || []).map(function (e) {
-          return { at: e.at, actor: e.actor, event: e.event, target: e.target, note: e.note };
-        });
+        return {
+          entries: (res.entries || []).map(function (e) {
+            return { at: e.at, actor: e.actor, event: e.event, target: e.target, note: e.note };
+          }),
+          nextCursor: res.nextCursor || null,
+        };
       } catch (e) {
-        return [];
+        return { entries: [], nextCursor: null };
       }
     },
     subscribe(callback) {
