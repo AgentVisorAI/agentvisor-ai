@@ -4418,7 +4418,7 @@
             : '<span style="margin-left:auto; color:var(--fg-3); font-size:var(--t-sec)">Ask an owner or admin to manage members</span>') +
         "</div>" +
         '<div class="table-wrap"><table>' +
-          '<thead><tr><th>Person</th><th>Role</th><th>Last active</th><th class="act-1"><span class="sr-only">Actions</span></th></tr></thead>' +
+          '<thead><tr><th>Person</th><th>Role</th><th>Last active</th><th class="act-3"><span class="sr-only">Actions</span></th></tr></thead>' +
           '<tbody>' + memberRows + '</tbody>' +
         '</table></div>' +
       '</div>';
@@ -4777,7 +4777,7 @@
 
     var mfaRows = passkeys.length
       ? '<div class="table-wrap"><table>' +
-          '<thead><tr><th>Passkey</th><th>Transport</th><th>Last used</th><th>Registered</th><th class="act-1"><span class="sr-only">Actions</span></th></tr></thead>' +
+          '<thead><tr><th>Passkey</th><th>Transport</th><th>Last used</th><th>Registered</th><th class="act-2"><span class="sr-only">Actions</span></th></tr></thead>' +
           '<tbody>' + passkeys.map(function (p) {
             return '<tr data-pk="' + esc(p.id) + '">' +
               '<td><div style="font-weight:500">' + esc(p.label) + '</div><div class="id">' + esc((p.aaguid || 'aaguid unknown').slice(0, 24)) + '</div></td>' +
