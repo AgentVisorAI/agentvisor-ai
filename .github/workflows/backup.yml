@@ -16,8 +16,17 @@
 #
 # Configuration
 #   Requires a repository secret `BACKUP_DATABASE_URL` pointing at a
-#   read-only replica or the primary. If the secret isn't set the job
-#   is a no-op (fork-friendly).
+#   read-only replica or the primary, AND `BACKUP_PASSPHRASE` to
+#   encrypt the dump (gpg AES-256) before upload. If neither is set
+#   the job is a no-op (fork-friendly). If the database URL is set
+#   without a passphrase the job FAILS: this repository is public,
+#   and artifacts on public repos are downloadable by any GitHub
+#   user — uploading a plaintext production dump (password hashes,
+#   API keys, webhook secrets, PII) would publish the database.
+#
+# Restore
+#   gpg --decrypt agentvisor-<ts>.dump.gpg > agentvisor-<ts>.dump
+#   pg_restore --no-owner --dbname "$TARGET_URL" agentvisor-<ts>.dump
 name: Nightly PG backup
 
 on:
@@ -37,10 +46,18 @@ jobs:
     steps:
       - name: Guard on BACKUP_DATABASE_URL
         id: guard
+        env:
+          BACKUP_DATABASE_URL: ${{ secrets.BACKUP_DATABASE_URL }}
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
         run: |
-          if [ -z "${{ secrets.BACKUP_DATABASE_URL }}" ]; then
+          if [ -z "$BACKUP_DATABASE_URL" ]; then
             echo "BACKUP_DATABASE_URL not set; skipping." >&2
             echo "run=false" >> "$GITHUB_OUTPUT"
+          elif [ -z "$BACKUP_PASSPHRASE" ]; then
+            echo "::error::BACKUP_DATABASE_URL is set but BACKUP_PASSPHRASE is not." >&2
+            echo "::error::This repo is PUBLIC — artifacts are downloadable by any GitHub user." >&2
+            echo "::error::Refusing to upload a plaintext production dump. Set BACKUP_PASSPHRASE." >&2
+            exit 1
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
@@ -56,10 +73,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends postgresql-client-16
 
-      - name: pg_dump (custom format, compressed)
+      - name: pg_dump (custom format, compressed, encrypted)
         if: steps.guard.outputs.run == 'true'
         env:
           DATABASE_URL: ${{ secrets.BACKUP_DATABASE_URL }}
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
         run: |
           ts=$(date -u +%Y%m%d-%H%M)
           out="agentvisor-${ts}.dump"
@@ -70,9 +88,16 @@ jobs:
             --no-privileges \
             --file "$out" \
             "$DATABASE_URL"
+          # Encrypt before upload: artifacts on this PUBLIC repo are
+          # downloadable by any GitHub user, so the plaintext dump
+          # must never leave the runner. gpg ships on ubuntu runners.
+          gpg --batch --symmetric --cipher-algo AES256 \
+            --pinentry-mode loopback --passphrase "$BACKUP_PASSPHRASE" \
+            --output "$out.gpg" "$out"
+          rm -f "$out"
           # Show size + a short manifest so the artifact is greppable.
-          ls -lh "$out"
-          echo "BACKUP_FILE=$out" >> "$GITHUB_ENV"
+          ls -lh "$out.gpg"
+          echo "BACKUP_FILE=$out.gpg" >> "$GITHUB_ENV"
 
       - name: Upload backup artifact (30-day retention)
         if: steps.guard.outputs.run == 'true'
