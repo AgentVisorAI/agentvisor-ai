@@ -172,6 +172,27 @@ you can ignore this email — nothing has changed on your account.
   return { subject: "Reset your AgentVisor AI password", text, html };
 }
 
+export function adminMfaResetMail(adminEmail: string): Pick<MailInput, "subject" | "text" | "html"> {
+  const adminEsc = escHtml(adminEmail);
+  const text = `A workspace administrator (${adminEmail}) reset the passkeys on your AgentVisor AI account.
+
+All your passkeys were removed, every signed-in session was signed
+out, and API tokens you created were revoked. You can sign in with
+your password alone, then enroll a new passkey under Settings > SSO.
+
+If you did NOT ask for this, treat your account as at risk: reset your
+password from the sign-in page ("Forgot password") and contact your
+workspace owner.
+`;
+  const html = `<div style="font:15px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#222;max-width:520px">
+  <h2 style="margin:0 0 12px;font-size:20px">Your passkeys were reset</h2>
+  <p>A workspace administrator (<strong>${adminEsc}</strong>) reset the passkeys on your AgentVisor AI account.</p>
+  <p>All your passkeys were removed, every signed-in session was signed out, and API tokens you created were revoked. You can sign in with your password alone, then enroll a new passkey under <em>Settings &gt; SSO</em>.</p>
+  <p><strong>If you did not ask for this</strong>, treat your account as at risk: reset your password from the sign-in page (&ldquo;Forgot password&rdquo;) and contact your workspace owner.</p>
+</div>`;
+  return { subject: "Your AgentVisor AI passkeys were reset by an administrator", text, html };
+}
+
 export function passwordChangedMail(): Pick<MailInput, "subject" | "text" | "html"> {
   const text = `Your AgentVisor AI password was just changed.
 

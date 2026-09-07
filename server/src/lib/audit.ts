@@ -29,7 +29,7 @@
  *     saml.config_deleted, saml.keypair_rotated
  *   mfa.authenticate, mfa.credential_registered, mfa.credential_revoked,
  *     mfa.credential_register_denied, mfa.credential_revoke_denied,
- *     mfa.credential_relabeled
+ *     mfa.credential_relabeled, mfa.credentials_admin_reset
  *   deployment.create, deployment.delete, deployment.delete_conflict,
  *     deployment.token_rotated, deployment.direct_seal_refused,
  *     deployment.pubkey_first_set, deployment.pubkey_rotation_refused,

@@ -205,9 +205,9 @@
   };
 
   var MOCK_MEMBERS = [
-    { id: "usr_olivia", userId: "usr_olivia", email: "olivia.tan@northwind.com", displayName: "Olivia Tan", role: "owner", lastActive: iso(2 * MIN) },
-    { id: "usr_raj", userId: "usr_raj", email: "raj.patel@northwind.com", displayName: "Raj Patel", role: "admin", lastActive: iso(18 * MIN) },
-    { id: "usr_sam", userId: "usr_sam", email: "sam.lee@northwind.com", displayName: "Sam Lee", role: "member", lastActive: iso(4 * HOUR) },
+    { id: "usr_olivia", userId: "usr_olivia", email: "olivia.tan@northwind.com", displayName: "Olivia Tan", role: "owner", lastActive: iso(2 * MIN), mfaEnrolled: true },
+    { id: "usr_raj", userId: "usr_raj", email: "raj.patel@northwind.com", displayName: "Raj Patel", role: "admin", lastActive: iso(18 * MIN), mfaEnrolled: true },
+    { id: "usr_sam", userId: "usr_sam", email: "sam.lee@northwind.com", displayName: "Sam Lee", role: "member", lastActive: iso(4 * HOUR), mfaEnrolled: true },
     { id: "usr_priya", userId: "usr_priya", email: "priya.iyer@northwind.com", displayName: "Priya Iyer", role: "member", lastActive: iso(2 * 24 * HOUR) },
     { id: "usr_marc", userId: "usr_marc", email: "marc.dubois@northwind.com", displayName: "Marc Dubois", role: "member", lastActive: iso(6 * 24 * HOUR) },
   ];
@@ -1312,6 +1312,13 @@
       // doesn't verify it (no auth in mock mode).
       MOCK_PASSKEYS = MOCK_PASSKEYS.filter(function (p) { return p.id !== id; });
     },
+    async webauthnRelabel(id, label) {
+      var lbl = (label || "").trim();
+      if (!lbl) { var erl = new Error("invalid_input"); erl.status = 400; erl.errorCode = "invalid_input"; throw erl; }
+      for (var rli = 0; rli < MOCK_PASSKEYS.length; rli++) if (MOCK_PASSKEYS[rli].id === id) MOCK_PASSKEYS[rli].label = lbl.slice(0, 80);
+      recordAudit("mfa.credential_relabeled", "", lbl);
+      return { credential: { id: id, label: lbl.slice(0, 80) } };
+    },
     async webauthnAuthStart() { return { options: { challenge: "mock" } }; },
     async webauthnAuthFinish() { throw new Error("mock_no_real_authenticator"); },
     async logout() {
@@ -1749,6 +1756,17 @@
         }];
       }
       return MOCK_MEMBERS.slice();
+    },
+    async resetMemberMfa(userId, password) {
+      await delay(200);
+      if (!password) { var erm = new Error("invalid_password"); erm.status = 401; erm.errorCode = "invalid_password"; throw erm; }
+      var tgt = null;
+      for (var rmi = 0; rmi < MOCK_MEMBERS.length; rmi++) if (MOCK_MEMBERS[rmi].userId === userId) tgt = MOCK_MEMBERS[rmi];
+      if (!tgt) { var erm2 = new Error("not_found"); erm2.status = 404; erm2.errorCode = "not_found"; throw erm2; }
+      if (!tgt.mfaEnrolled) { var erm3 = new Error("no_mfa_enrolled"); erm3.status = 400; erm3.errorCode = "no_mfa_enrolled"; throw erm3; }
+      tgt.mfaEnrolled = false;
+      recordAudit("mfa.credentials_admin_reset", "", tgt.email);
+      return { ok: true, credentialsRemoved: 1 };
     },
     async inviteMember(input) {
       await delay(200);
@@ -2288,6 +2306,12 @@
         body: { password: password },
       });
     },
+    async webauthnRelabel(id, label) {
+      return apiFetch("/api/v1/auth/webauthn/credentials/" + encodeURIComponent(id), {
+        method: "PATCH",
+        body: { label: label },
+      });
+    },
     async webauthnAuthStart(email) {
       return apiFetch("/api/v1/auth/webauthn/authenticate/challenge", { method: "POST", body: { email: email } });
     },
@@ -2506,9 +2530,15 @@
       try {
         var r = await apiFetch("/api/v1/members");
         return (r.members || []).map(function (m) {
-          return { userId: m.userId, email: m.email, displayName: m.displayName, role: m.role, lastActive: m.joinedAt };
+          return { userId: m.userId, email: m.email, displayName: m.displayName, role: m.role, lastActive: m.joinedAt, mfaEnrolled: !!m.mfaEnrolled };
         });
       } catch (e) { return []; }
+    },
+    async resetMemberMfa(userId, password) {
+      return apiFetch("/api/v1/members/" + encodeURIComponent(userId) + "/reset-mfa", {
+        method: "POST",
+        body: { password: password },
+      });
     },
     async inviteMember(input) {
       return apiFetch("/api/v1/members/invites", { method: "POST", body: input });
