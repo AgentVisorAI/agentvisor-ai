@@ -5186,6 +5186,24 @@
       { g: "Navigate", label: "Deployments", desc: "Daemons & tokens", kbd: "G D", href: "#/deployments", icon: iconServer() },
       { g: "Navigate", label: "Settings", desc: "Org, members, keys, audit", kbd: "G ,", href: "#/settings", icon: iconGear() },
     ];
+    // Settings subsections: "webhooks" or "members" typed into the
+    // palette previously hit "No matches" — the tabs are real routes
+    // (#/settings/<tab>) but had no palette entries. Same role gate as
+    // SETTINGS_TABS (R90 F3): members never see owner/admin-only tabs.
+    var cmdkRole = (state.session && state.session.org && state.session.org.role) || "member";
+    var tabDescs = {
+      general: "Org profile, data retention, danger zone",
+      members: "Invite teammates, roles, remove members",
+      keys: "API keys for the ingest and read APIs",
+      sso: "Single sign-on with Google or GitHub",
+      webhooks: "Endpoints, signing secrets, deliveries",
+      audit: "Who did what, when — exportable",
+      billing: "Plan, usage, invoices",
+    };
+    SETTINGS_TABS.forEach(function (t) {
+      if (t.ownerAdminOnly && cmdkRole === "member") return;
+      routes.push({ g: "Navigate", label: "Settings › " + t.label, desc: tabDescs[t.id] || "", href: "#/settings/" + t.id, icon: iconGear() });
+    });
     var actions = [
       { g: "Actions", label: "Toggle theme", desc: "Switch light / dark", run: function () { toggleTheme(); } },
       { g: "Actions", label: "New deployment", desc: "Register an agentvisord daemon", run: function () { navigate("#/deployments"); setTimeout(openCreateDeploymentModal, 100); } },
