@@ -3111,7 +3111,7 @@
           '<div class="snippet"><span class="prompt">$</span> <span class="cmd">curl -fsSL https://agentvisorai.me/install.sh | sh</span>\n<span class="prompt">$</span> <span class="cmd">avctl setup</span></div>' +
         "</div>" +
         '<div class="card" style="padding:0"><div class="table-wrap"><table>' +
-          "<thead><tr><th>Deployment</th><th>Environment</th><th>Status</th><th>Version</th><th>Last seen</th><th class=\"act-2\"><span class=\"sr-only\">Actions</span></th></tr></thead>" +
+          "<thead><tr><th>Deployment</th><th>Environment</th><th>Status</th><th>Version</th><th>Last seen</th><th class=\"act-3\"><span class=\"sr-only\">Actions</span></th></tr></thead>" +
           "<tbody>" + rows + "</tbody></table></div></div>";
     }
     main.innerHTML = pageHeader("Deployments", "Each daemon streams events and signed receipts to this console.", actions) + body;
