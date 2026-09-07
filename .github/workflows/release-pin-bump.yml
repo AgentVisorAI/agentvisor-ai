@@ -5,7 +5,9 @@ name: Release pin bump
 # a manual step nobody remembers. This workflow lands the bump on main
 # automatically whenever a release is published (and is dispatchable
 # for testing / catch-up). It commits directly (org policy forbids
-# Actions-created PRs); Pages then redeploys the installer on its own.
+# Actions-created PRs); because GITHUB_TOKEN pushes don't trigger
+# other workflows (anti-recursion), it then dispatches the Pages
+# deploy explicitly so the live installer actually serves the bump.
 
 on:
   release:
@@ -18,6 +20,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   bump:
@@ -70,3 +73,10 @@ jobs:
           done
           echo "::error::could not push the pin bump after 3 attempts"
           exit 1
+      - name: Deploy the installer (Pages)
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # GITHUB_TOKEN pushes never trigger pages.yml on their own.
+          gh workflow run pages.yml --ref main
