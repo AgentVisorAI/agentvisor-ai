@@ -1136,6 +1136,22 @@
     if (document.getElementById("accountMenu")) return closeAccountMenu();
     var user = state.session.user, org = state.session.org;
     var canPreview = !rolePreview && org && org.role !== "member";
+    // Multi-org: the sidebar org-switcher is display:none on narrow
+    // viewports, which left phone users with no path to their other
+    // workspaces. The account menu is reachable at every width, so
+    // mirror the switcher here (same data, same switchWorkspace call).
+    var orgItems = "";
+    if ((state.session.memberships || []).length > 1) {
+      orgItems = '<div class="am-sep"></div>' +
+        '<div class="am-head"><div class="am-sub">Switch workspace</div></div>' +
+        (state.session.memberships || []).map(function (m) {
+          var isCurrent = m.orgId === org.id;
+          return '<button role="menuitem" data-org-switch="' + esc(m.orgId) + '"' + (isCurrent ? " disabled" : "") + ">" +
+            '<span class="avatar" aria-hidden="true">' + esc(initials(m.name)) + "</span>" +
+            "<span>" + esc(m.name) + '</span><span class="am-sub" style="margin-left:auto">' + esc(m.role) + (isCurrent ? " ✓" : "") + "</span>" +
+          "</button>";
+        }).join("");
+    }
     var menu = h(
       '<div id="accountMenu" role="menu" aria-label="Account">' +
         '<div class="am-head">' +
@@ -1146,6 +1162,7 @@
         '<button role="menuitem" data-act="theme">Switch to ' + (state.theme === "dark" ? "light" : "dark") + " theme</button>" +
         (canPreview ? '<button role="menuitem" data-act="preview">👁 Preview as member</button>' : "") +
         (rolePreview ? '<button role="menuitem" data-act="exitPreview">Exit member preview</button>' : "") +
+        orgItems +
         '<div class="am-sep"></div>' +
         '<button role="menuitem" data-act="signout" class="am-danger">Sign out…</button>' +
       "</div>"
@@ -1158,6 +1175,13 @@
     menu.style.top = (r.bottom + 6) + "px";
     menu.style.right = Math.max(8, window.innerWidth - r.right) + "px";
     menu.addEventListener("click", function (e) {
+      var orgIt = e.target.closest("[data-org-switch]");
+      if (orgIt && !orgIt.disabled) {
+        var orgId = orgIt.getAttribute("data-org-switch");
+        closeAccountMenu();
+        switchWorkspace(orgId);
+        return;
+      }
       var it = e.target.closest("[data-act]");
       if (!it) return;
       var act = it.getAttribute("data-act");
@@ -1276,6 +1300,10 @@
     var ssoButtons = "";
     if (byId.google)    ssoButtons += '<button type="button" data-sso="google">' + iconGoogle() + '<span>Continue with Google</span></button>';
     if (byId.microsoft) ssoButtons += '<button type="button" data-sso="microsoft">' + iconMicrosoft() + '<span>Continue with Microsoft</span></button>';
+    // Generic OIDC issuer (Keycloak / Okta / Auth0 / Authentik). The
+    // label comes from the server's OIDC_DISPLAY_NAME env — operator
+    // input, so esc() it like everything else user-controlled.
+    if (byId.oidc)      ssoButtons += '<button type="button" data-sso="oidc">' + iconKey() + '<span>Continue with ' + esc(byId.oidc.displayName || "SSO") + '</span></button>';
     // SAML/Okta = enterprise path. We're honest about not shipping it
     // yet: click routes to a contact-sales mailto. Still visible so the
     // login page communicates the roadmap without pretending.
@@ -3978,7 +4006,7 @@
               '<button class="btn danger" id="deleteAccountBtn">Delete organization &amp; account</button>') +
         "</div>" : "") +
       (state.ds.mode === "mock" ?
-        '<div class="card"><h2>Demo mode</h2><p style="color: var(--fg-2); margin: 0 0 8px; font-size: var(--t-sec)">This console is running against built-in fixtures. To use the real backend, open this page with <code>?live=1</code> in the URL (it sticks until you visit with <code>?live=0</code>) — or <a href="?live=1#/signup" style="text-decoration:underline">switch to live mode and create a workspace</a>.</p></div>' : "");
+        '<div class="card"><h2>Demo mode</h2><p style="color: var(--fg-2); margin: 0 0 8px; font-size: var(--t-sec)">This console is running against built-in fixtures. To use the real backend, open this page with <code>?live=1</code> in the URL (it sticks until you visit with <code>?live=0</code>) — or <a class="link-inline" href="?live=1#/signup">switch to live mode and create a workspace</a>.</p></div>' : "");
     var so = $("#signOut", root);
     if (so) so.addEventListener("click", signOut);
 
@@ -5044,13 +5072,26 @@
     catch (e) { root.innerHTML = '<div class="card empty"><h3>Could not load SSO</h3><p>' + esc(e.message || "Try again in a moment.") + '</p></div>'; return; }
     var configs = res.configs || [];
 
+    // Show live configured/not state per provider (from /providers)
+    // rather than a static pair of pills that may be lies. The generic
+    // OIDC issuer appears under its operator-set display name.
+    var oauthProviders = [];
+    try { oauthProviders = ((await state.ds.getSSO()) || {}).providers || []; } catch (e) { oauthProviders = []; }
+    var oauthById = {};
+    oauthProviders.forEach(function (p) { oauthById[p.id] = p; });
+    function providerPill(id, icon, label) {
+      var on = !!oauthById[id];
+      return '<span class="pill ' + (on ? "ok" : "neutral") + '">' + icon +
+        '<span style="margin-left:6px">' + esc(label) + (on ? " ✓" : "") + '</span></span>';
+    }
     var oauthCard =
       '<div class="card">' +
         '<h2>Social sign-in (OAuth)</h2>' +
-        '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 var(--s-4)">Anyone with a Google Workspace or Microsoft Entra account at your domain can sign in. Configured server-side via provider env vars.</p>' +
+        '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 var(--s-4)">Sign-in with an OIDC identity provider — Google Workspace, Microsoft Entra, or any spec-compliant issuer (Keycloak, Okta, Auth0…). Configured server-side via provider env vars; a checkmark means the button is live on the login page.</p>' +
         '<div style="display:flex; gap:8px; flex-wrap:wrap">' +
-          '<span class="pill neutral">' + iconGoogle() + '<span style="margin-left:6px">Google Workspace</span></span>' +
-          '<span class="pill neutral">' + iconMicrosoft() + '<span style="margin-left:6px">Microsoft Entra</span></span>' +
+          providerPill("google", iconGoogle(), "Google Workspace") +
+          providerPill("microsoft", iconMicrosoft(), "Microsoft Entra") +
+          providerPill("oidc", iconKey(), (oauthById.oidc && oauthById.oidc.displayName) || "Generic OIDC") +
         "</div>" +
       "</div>";
 
@@ -6268,6 +6309,19 @@
     if (rolePreview) actions.push({ g: "Actions", label: "Exit member preview", desc: "Back to your own role", run: exitRolePreview });
     else if (state.session && state.session.org && state.session.org.role !== "member")
       actions.push({ g: "Actions", label: "Preview as member", desc: "See the console the way a member does", run: enterRolePreview });
+    // Multi-org: one palette action per other workspace (the sidebar
+    // switcher is hidden on narrow viewports; ⌘K works everywhere).
+    if (state.session && (state.session.memberships || []).length > 1) {
+      (state.session.memberships || []).forEach(function (m) {
+        if (m.orgId === state.session.org.id) return;
+        actions.push({
+          g: "Actions",
+          label: "Switch to " + m.name,
+          desc: "Open the " + m.name + " workspace as " + m.role,
+          run: function () { switchWorkspace(m.orgId); },
+        });
+      });
+    }
     // Sibling pages: the verifier and the pitch live outside the SPA,
     // so open them as real navigations instead of hash routes.
     var pages = [

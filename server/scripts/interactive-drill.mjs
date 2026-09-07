@@ -1721,7 +1721,6 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await page.goto(SITE + "#/settings/webhooks", { waitUntil: "domcontentloaded" });
   await page.waitForSelector("#whAdd", { timeout: 15000 });
   const at = await page.evaluate(async () => {
-    // #339 pagination shape: { entries, nextCursor }.
     const before = (await window.dataSource.listAudit()).entries.length;
     await window.dataSource.testWebhook((await window.dataSource.listWebhooks())[0].id);
     const after = (await window.dataSource.listAudit()).entries;
@@ -1734,7 +1733,6 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   // console branch was dead code against the old always-succeed mock).
   const tf = await page.evaluate(async () => {
     const id = (await window.dataSource.listWebhooks())[0].id;
-    // #340 pagination shape: { deliveries, nextCursor }.
     const before = (await window.dataSource.listWebhookDeliveries(id)).deliveries.length;
     await window.dataSource.testWebhook(id);
     const list = (await window.dataSource.listWebhookDeliveries(id)).deliveries;
@@ -1818,7 +1816,6 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await page.click("tbody tr[data-id] td:nth-child(2)");
   await page.waitForSelector("#whdBody table", { timeout: 8000 });
   const del = await page.evaluate(async () => {
-    // #340 pagination shape: { deliveries, nextCursor }.
     const gt = (await window.dataSource.listWebhookDeliveries(document.querySelector("tbody tr[data-id]").getAttribute("data-id"))).deliveries;
     const rows = [...document.querySelectorAll("#whdBody tbody tr")];
     return {

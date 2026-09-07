@@ -151,6 +151,9 @@ html, body {
 body.locked { overflow: hidden; }
 
 a { color: var(--accent); text-decoration: none; }
+/* Links inside flowing text must be distinguishable without color
+   alone (axe link-in-text-block, WCAG 1.4.1) — underline them. */
+.link-inline { text-decoration: underline; text-underline-offset: 2px; }
 a:hover { text-decoration: underline; }
 button { font-family: inherit; font-size: inherit; cursor: pointer; }
 
