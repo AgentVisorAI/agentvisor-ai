@@ -14,7 +14,14 @@ const port = 44120;
 const mime = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".json": "application/json", ".svg": "image/svg+xml", ".png": "image/png" };
 const srv = createServer(async (req, res) => {
   let p = decodeURIComponent(new URL(req.url, "http://x").pathname);
-  if (p === "/" || p === "/app" || p === "/app/") p = "/app/index.html";
+  // Mirror GitHub Pages semantics: `/` is the real landing page and
+  // ANY directory path serves its index.html (the old shape only
+  // special-cased /app/, so /pitch/, /verify/, and the /mockup/ +
+  // /demo/ alias stubs 404'd here while passing on the live site —
+  // the pre-push smoke couldn't validate what Pages actually serves).
+  if (p === "/") p = "/index.html";
+  else if (p.endsWith("/")) p = p + "index.html";
+  else if (!extname(p)) p = p + "/index.html";
   try {
     const data = await readFile(DOCS_ROOT + p);
     res.setHeader("content-type", mime[extname(p)] || "application/octet-stream");
