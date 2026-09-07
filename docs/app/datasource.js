@@ -2516,10 +2516,15 @@
       return apiFetch("/api/v1/org/retention/sweep-now", { method: "POST" });
     },
     downloadAuditCsv: function () {
-      // Redirect to the CSV endpoint. Cookies auto-attach, browser
-      // saves the response using the Content-Disposition filename.
+      // Redirect to the CSV endpoint. Cookies auto-attach (SameSite=Lax
+      // cookies ride top-level GET navigations, so this works from the
+      // Pages origin too), browser saves the response using the
+      // Content-Disposition filename. Must be an absolute API_BASE URL:
+      // a relative "/api/v1/audit.csv" resolved against the CONSOLE
+      // origin (github pages), which has no API — the click navigated
+      // the SPA to a Pages 404 instead of downloading.
       var link = document.createElement("a");
-      link.href = "/api/v1/audit.csv";
+      link.href = apiUrl("/api/v1/audit.csv");
       link.rel = "noopener";
       document.body.appendChild(link);
       link.click();
