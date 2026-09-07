@@ -173,6 +173,33 @@ try {
   const depsAfter = await ds.listDeployments();
   check("force delete removes", depsAfter.length === 0);
 
+  // Change password: step-up denials, weak/unchanged rejects, then the
+  // real rotation — and prove the response re-mints THIS session's
+  // cookie (subsequent authed call works despite the revocation fence).
+  let cpWrong = "";
+  try { await ds.changePassword({ currentPassword: "not-my-password", newPassword: "an-entirely-new-pw-1" }); }
+  catch (e) { cpWrong = e.errorCode || e.message; }
+  check("change-password wrong current 401", cpWrong === "invalid_password", cpWrong);
+  let cpWeak = "";
+  try { await ds.changePassword({ currentPassword: "correcthorse", newPassword: "short" }); }
+  catch (e) { cpWeak = e.errorCode || e.message; }
+  check("change-password weak new 400", cpWeak === "weak_password", cpWeak);
+  let cpSame = "";
+  try { await ds.changePassword({ currentPassword: "correcthorse", newPassword: "correcthorse" }); }
+  catch (e) { cpSame = e.errorCode || e.message; }
+  check("change-password unchanged 400", cpSame === "password_unchanged", cpSame);
+  const cpOk = await ds.changePassword({ currentPassword: "correcthorse", newPassword: "rotated-e2e-pw-2026" });
+  check("change-password succeeds", cpOk && cpOk.ok === true);
+  const meAfterCp = await ds.getSession();
+  check("session survives own rotation", meAfterCp && meAfterCp.user.email === email, meAfterCp?.user?.email);
+  await ds.logout();
+  // Wrong-credential logins answer 200 {mfaRequired:true} uniformly
+  // (R85 F3 anti-oracle) — the OLD password must now take that path.
+  const oldPwLogin = await ds.login({ email, password: "correcthorse" });
+  check("old password refused after change", oldPwLogin && oldPwLogin.mfaRequired === true && !oldPwLogin.user, JSON.stringify(oldPwLogin));
+  const reLogin = await ds.login({ email, password: "rotated-e2e-pw-2026" });
+  check("new password logs in", reLogin && reLogin.user && reLogin.user.email === email);
+
   await ds.logout();
   const s2 = await ds.getSession();
   check("logout clears session", s2 === null);
