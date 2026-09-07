@@ -232,6 +232,20 @@
   function announceSignIn() {
     syncFreshPresence();
     try { localStorage.setItem("av_signed_in_at", String(Date.now())); } catch (e) {}
+    // Login/passkey/OAuth responses carry {user, org} but not the
+    // memberships list — only GET /me does. Hydrate in the background
+    // so multi-org users get the workspace switcher without a reload;
+    // single-org users see no change (chip stays a static div).
+    if (state.ds.getSession) {
+      state.ds.getSession().then(function (full) {
+        if (full && full.user && state.session && state.session.user &&
+            full.user.id === state.session.user.id &&
+            (full.memberships || []).length > 1) {
+          state.session = full;
+          render();
+        }
+      }).catch(function () {});
+    }
   }
 
   var liveUnsub = null;
@@ -495,9 +509,34 @@
       // bounced to Overview with the invite silently swallowed — and
       // the accept page's own hint says "sign in first, then click
       // the invite link again", which made the bounce a dead end.
-      // Say what happened and where to go.
       if (path[0] === "accept-invite") {
-        toast("You're already signed in. To accept an invite for a different account, sign out first, then open the link again.", true);
+        var invQs = new URLSearchParams(location.hash.split("?")[1] || "");
+        var invToken = invQs.get("token") || "";
+        var invEmail = (invQs.get("email") || "").toLowerCase();
+        var myEmail = (state.session.user.email || "").toLowerCase();
+        if (invToken && invEmail && invEmail === myEmail) {
+          // The invite is for THIS signed-in account. The accept
+          // endpoint grants the membership without needing a password
+          // for existing users (it refuses only the cookie MINT — and
+          // we already have a session). Join, hydrate memberships so
+          // the workspace switcher appears, and switch straight into
+          // the new org — that's unambiguously why they clicked.
+          state.ds.acceptInvite({ token: invToken, email: invQs.get("email") }).then(function (r) {
+            var orgId = r && r.org && r.org.id;
+            var orgName = (r && r.org && r.org.name) || "the new workspace";
+            toast("You joined " + orgName);
+            if (orgId && state.ds.switchOrg) return switchWorkspace(orgId);
+            navigate("#/overview");
+          }).catch(function (err) {
+            var msg = err && err.errorCode === "invalid_or_expired_invite"
+              ? "That invite link is invalid or has expired. Ask for a fresh one."
+              : ((err && err.message) || "Could not accept the invite.");
+            toast(msg, true);
+            navigate("#/overview");
+          });
+          return;
+        }
+        toast("You're signed in as " + state.session.user.email + ", but this invite is for a different address. Sign out first, then open the link again.", true);
       }
       return navigate("#/overview");
     }
@@ -933,11 +972,17 @@
           "</button>" +
         "</header>" +
         '<nav class="sidebar" aria-label="Primary navigation">' +
-          '<div class="org-switcher">' +
-            '<span class="avatar">' + esc(initials(org.name)) + "</span>" +
-            "<span>" + esc(org.name) + "</span>" +
-            '<span class="env">Production</span>' +
-          "</div>" +
+          (((state.session.memberships || []).length > 1)
+            ? '<button class="org-switcher" id="orgSwitcher" aria-haspopup="menu" aria-expanded="false" title="Switch workspace">' +
+                '<span class="avatar">' + esc(initials(org.name)) + "</span>" +
+                "<span>" + esc(org.name) + "</span>" +
+                '<span class="env">' + esc((state.session.memberships || []).length + " orgs") + "</span>" +
+              "</button>"
+            : '<div class="org-switcher">' +
+                '<span class="avatar">' + esc(initials(org.name)) + "</span>" +
+                "<span>" + esc(org.name) + "</span>" +
+                '<span class="env">Production</span>' +
+              "</div>") +
           navLink("overview", current, "Overview", iconChart(), "G O") +
           navLink("sessions", current, "Sessions", iconActivity(), "G S") +
           navLink("policies", current, "Policies", iconShield(), "G P") +
@@ -961,8 +1006,75 @@
     $("#cmdkOpen").addEventListener("click", openCmdK);
     $("#themeBtn").addEventListener("click", toggleTheme);
     $("#userBtn").addEventListener("click", toggleAccountMenu);
+    var osw = $("#orgSwitcher");
+    if (osw) osw.addEventListener("click", toggleOrgMenu);
     var xp = $("#exitPreview");
     if (xp) xp.addEventListener("click", exitRolePreview);
+  }
+
+  /* ── Org switcher. Multi-org users (consultants, agencies) previously
+   *    had no path to their non-oldest memberships: login always bound
+   *    the oldest org. The sidebar chip becomes a menu when /me reports
+   *    more than one membership; picking another org re-mints the
+   *    session cookie server-side (POST /auth/switch-org) and reboots
+   *    the console into that workspace. Same dropdown mechanics as the
+   *    account menu (Escape / click-outside / navigation close it). ── */
+  function closeOrgMenu() {
+    var m = document.getElementById("orgMenu");
+    if (m) m.remove();
+    var btn = document.getElementById("orgSwitcher");
+    if (btn) btn.setAttribute("aria-expanded", "false");
+    document.removeEventListener("click", orgMenuOutside, true);
+  }
+  function orgMenuOutside(e) {
+    var m = document.getElementById("orgMenu");
+    if (m && !m.contains(e.target) && !e.target.closest("#orgSwitcher")) closeOrgMenu();
+  }
+  function toggleOrgMenu() {
+    if (document.getElementById("orgMenu")) return closeOrgMenu();
+    closeAccountMenu();
+    var current = state.session.org;
+    var items = (state.session.memberships || []).map(function (m) {
+      var isCurrent = m.orgId === current.id;
+      return '<button role="menuitem" data-org="' + esc(m.orgId) + '"' + (isCurrent ? ' disabled' : "") + ">" +
+        '<span class="avatar" aria-hidden="true">' + esc(initials(m.name)) + "</span>" +
+        "<span>" + esc(m.name) + '</span><span class="am-sub" style="margin-left:auto">' + esc(m.role) + (isCurrent ? " ✓" : "") + "</span>" +
+      "</button>";
+    }).join("");
+    var menu = h('<div id="orgMenu" role="menu" aria-label="Switch workspace">' +
+      '<div class="am-head"><div style="font-weight:600">Switch workspace</div></div>' + items + "</div>");
+    document.body.appendChild(menu);
+    var btn = document.getElementById("orgSwitcher");
+    btn.setAttribute("aria-expanded", "true");
+    var r = btn.getBoundingClientRect();
+    menu.style.position = "fixed";
+    menu.style.top = (r.bottom + 6) + "px";
+    menu.style.left = r.left + "px";
+    menu.style.zIndex = 60;
+    menu.addEventListener("click", function (e) {
+      var it = e.target.closest("[data-org]");
+      if (!it || it.disabled) return;
+      var orgId = it.getAttribute("data-org");
+      closeOrgMenu();
+      switchWorkspace(orgId);
+    });
+    document.addEventListener("click", orgMenuOutside, true);
+  }
+  async function switchWorkspace(orgId) {
+    if (!state.ds.switchOrg) return;
+    try {
+      await state.ds.switchOrg(orgId);
+      // Re-fetch /me so memberships + role reflect the new binding.
+      var s = await state.ds.getSession();
+      if (!s || !s.user) throw new Error("session refresh failed");
+      state.session = s;
+      rolePreview = null;
+      toast("Switched to " + s.org.name);
+      navigate("#/overview");
+      render();
+    } catch (e) {
+      toast(e.message || "Could not switch workspace", true);
+    }
   }
 
   /* ── Account menu. The avatar used to be a straight shortcut to the
@@ -3607,6 +3719,7 @@
           "<dt style=\"color:var(--fg-3)\">User ID</dt><dd class=\"mono\">" + esc(state.session.user.id) + "</dd>" +
         "</dl>" +
         '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">' +
+          '<button class="btn" id="changePasswordBtn" title="Rotate your password. Other sessions are signed out; API tokens keep working">Change password…</button>' +
           (state.session.org.role === "owner" ? '<button class="btn" id="exportMyData" title="Download everything this workspace stores about you and your org as NDJSON">↓ Download my data</button>' : "") +
           '<button class="btn danger" id="signOut">Sign out</button>' +
         '</div>' +
@@ -3731,6 +3844,14 @@
       }
     }
 
+    // Change password — self-service rotation with current-password
+    // step-up. Other sessions are fenced server-side; this one gets a
+    // re-minted cookie in the same response, so no sign-out here.
+    var cpBtn = $("#changePasswordBtn", root);
+    if (cpBtn) cpBtn.addEventListener("click", function () {
+      changePasswordModal();
+    });
+
     // Download my data — owner-only NDJSON export with password step-up.
     var exBtn = $("#exportMyData", root);
     if (exBtn) exBtn.addEventListener("click", function () {
@@ -3779,6 +3900,71 @@
         },
       });
     });
+  }
+
+  // Change-password modal: current + new + confirm. Client pre-checks
+  // (length, match) catch typos before a network round-trip; the server
+  // re-validates everything. Mirrors stepUpModal's shell (focus trap,
+  // discard guard, inline error) but needs three fields, so it's its
+  // own builder rather than a stepUpModal contortion.
+  function changePasswordModal() {
+    if (document.body.classList.contains("locked")) return;
+    var backdrop = h(
+      '<div class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal">' +
+        "<h2>Change password</h2>" +
+        '<p class="sub">Pick a new password of at least 12 characters. Every other signed-in session is signed out; your API ingest tokens keep working.</p>' +
+        '<form id="cpForm">' +
+          '<div class="field"><label for="cp_cur">Current password</label><input id="cp_cur" type="password" autocomplete="current-password" required></div>' +
+          '<div class="field"><label for="cp_new">New password</label><input id="cp_new" type="password" autocomplete="new-password" minlength="12" required></div>' +
+          '<div class="field"><label for="cp_new2">Confirm new password</label><input id="cp_new2" type="password" autocomplete="new-password" required></div>' +
+          '<p id="cp_err" style="display:none;color:var(--danger, #e5484d);font-size:12.5px;margin:0 0 8px"></p>' +
+          '<div class="actions"><button type="button" class="btn" data-close>Cancel</button><button type="submit" class="btn accent">Change password</button></div>' +
+        "</form>" +
+      "</div></div>"
+    );
+    document.body.appendChild(backdrop);
+    document.body.classList.add("locked");
+    var previouslyFocused = document.activeElement;
+    var uninstall;
+    var handled = false;
+    function close() { if (handled) return; handled = true; backdrop.remove(); document.body.classList.remove("locked"); if (uninstall) uninstall(); if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {} }
+    uninstall = installModalKeys(backdrop, close);
+    backdrop.addEventListener("click", function (e) {
+      if (handled) return;
+      if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
+    });
+    function showErr(msg) {
+      var errEl = backdrop.querySelector("#cp_err");
+      errEl.textContent = msg;
+      errEl.style.display = "block";
+    }
+    backdrop.querySelector("#cpForm").addEventListener("submit", async function (e) {
+      e.preventDefault();
+      if (handled) return;
+      backdrop.querySelector("#cp_err").style.display = "none";
+      var cur = backdrop.querySelector("#cp_cur").value;
+      var nw = backdrop.querySelector("#cp_new").value;
+      var nw2 = backdrop.querySelector("#cp_new2").value;
+      if (nw.length < 12) { showErr("New password must be at least 12 characters."); return; }
+      if (nw !== nw2) { showErr("New passwords don't match."); return; }
+      if (nw === cur) { showErr("That's already your password — pick a different one."); return; }
+      var btn = e.target.querySelector('button[type="submit"]');
+      btn.disabled = true;
+      try {
+        await state.ds.changePassword({ currentPassword: cur, newPassword: nw });
+        close();
+        toast("Password changed — other sessions were signed out");
+      } catch (e2) {
+        btn.disabled = false;
+        var msg = e2.message || "Change failed";
+        if (e2.status === 401 || e2.errorCode === "invalid_password") msg = "Wrong current password.";
+        else if (e2.errorCode === "weak_password" || msg === "weak_password") msg = "New password must be at least 12 characters.";
+        else if (e2.errorCode === "password_unchanged" || msg === "password_unchanged") msg = "That's already your password — pick a different one.";
+        else if (e2.status === 429) msg = e2.friendlyMessage || "Too many attempts. Try again shortly.";
+        showErr(msg);
+      }
+    });
+    setTimeout(function () { backdrop.querySelector("#cp_cur").focus(); }, 20);
   }
 
   // Step-up modal: password + optional type-to-confirm phrase, used by
@@ -5366,6 +5552,7 @@
     var actions = [
       { g: "Actions", label: "Toggle theme", desc: "Switch light / dark", run: function () { toggleTheme(); } },
       { g: "Actions", label: "New deployment", desc: "Register an agentvisord daemon", run: function () { navigate("#/deployments"); setTimeout(openCreateDeploymentModal, 100); } },
+      { g: "Actions", label: "Change password", desc: "Rotate your password; other sessions sign out", run: function () { navigate("#/settings/general"); setTimeout(changePasswordModal, 250); } },
       { g: "Actions", label: "Sign out", desc: "Leave this workspace", run: signOut },
     ];
     if (state.ds.mode === "mock") {

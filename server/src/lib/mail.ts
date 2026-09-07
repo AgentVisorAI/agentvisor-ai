@@ -172,6 +172,24 @@ you can ignore this email — nothing has changed on your account.
   return { subject: "Reset your AgentVisor AI password", text, html };
 }
 
+export function passwordChangedMail(): Pick<MailInput, "subject" | "text" | "html"> {
+  const text = `Your AgentVisor AI password was just changed.
+
+If this was you, no action is needed — every other signed-in session
+was signed out, and your API ingest tokens keep working.
+
+If this was NOT you, someone else knows your password. Reset it
+immediately from the sign-in page ("Forgot password") — a reset signs
+out every session and revokes your API tokens.
+`;
+  const html = `<div style="font:15px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#222;max-width:520px">
+  <h2 style="margin:0 0 12px;font-size:20px">Your password was changed</h2>
+  <p>If this was you, no action is needed — every other signed-in session was signed out, and your API ingest tokens keep working.</p>
+  <p><strong>If this was not you</strong>, someone else knows your password. Reset it immediately from the sign-in page (&ldquo;Forgot password&rdquo;) — a reset signs out every session and revokes your API tokens.</p>
+</div>`;
+  return { subject: "Your AgentVisor AI password was changed", text, html };
+}
+
 export function welcomeMail(displayName: string): Pick<MailInput, "subject" | "text" | "html"> {
   const name = displayName || "there";
   const nameEsc = escHtml(name);

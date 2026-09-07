@@ -1983,6 +1983,14 @@
       recordAudit("org.ip_allowlist_updated", "", cleaned.length ? cleaned.join(", ") : "cleared");
       return { cidrs: cleaned };
     },
+    async changePassword(input) {
+      await delay(200);
+      if (!input || !input.currentPassword) { var ecp0 = new Error("invalid_password"); ecp0.status = 401; ecp0.errorCode = "invalid_password"; throw ecp0; }
+      if (!input.newPassword || input.newPassword.length < 12) { var ecp1 = new Error("weak_password"); ecp1.status = 400; ecp1.errorCode = "weak_password"; throw ecp1; }
+      if (input.newPassword === input.currentPassword) { var ecp2 = new Error("password_unchanged"); ecp2.status = 400; ecp2.errorCode = "password_unchanged"; throw ecp2; }
+      recordAudit("auth.password_changed", "", "");
+      return { ok: true };
+    },
     async exportMyData(password) {
       await delay(200);
       if (!password) { var e1 = new Error("password_required"); e1.status = 400; throw e1; }
@@ -2146,7 +2154,26 @@
       // user cleanly to /login with a friendly notice. The 'me' probe
       // during boot handles its own 401 (returns null) so we skip that
       // path here to avoid a redirect loop.
-      if (res.status === 401 && !path.endsWith("/auth/me")) {
+      // The 'me' probe during boot handles its own 401 (returns null) so
+      // we skip that path to avoid a redirect loop. Beyond that, gate on
+      // the error SLUG, not the path: a 401 only means "your cookie
+      // died" when the session middleware says `unauthenticated` (its
+      // single exit — session-middleware.ts requireSession). Every
+      // other 401 carries a body-credential slug — invalid_password
+      // from the step-up endpoints (export / delete-account / passkey
+      // register / change-password), invalid_token from reset-confirm,
+      // invalid_or_expired_invite from invite replays — and tearing
+      // down a healthy session for a typo'd password in a modal was a
+      // real sign-out bug. Unknown/absent slugs (proxy/CDN HTML 401s
+      // parse to {}) still dispatch: fail toward re-auth.
+      var bodyCredential401 = data && (
+        data.error === "invalid_password" ||
+        data.error === "invalid_token" ||
+        data.error === "invalid_or_expired_invite" ||
+        data.errorCode === "invalid_password" ||
+        data.errorCode === "invalid_token" ||
+        data.errorCode === "invalid_or_expired_invite");
+      if (res.status === 401 && !path.endsWith("/auth/me") && !bodyCredential401) {
         // Signal the app; app.js listens for this and navigates.
         try {
           window.dispatchEvent(new CustomEvent("av-session-expired", { detail: { errorCode: err.errorCode } }));
@@ -2160,8 +2187,15 @@
   var ApiDataSource = {
     mode: "api",
     async getSession() {
-      try { var r = await apiFetch("/api/v1/auth/me"); return { user: r.user, org: r.org }; }
+      try { var r = await apiFetch("/api/v1/auth/me"); return { user: r.user, org: r.org, memberships: r.memberships || [] }; }
       catch (e) { if (e.status === 401) return null; throw e; }
+    },
+    async switchOrg(orgId) {
+      var r = await apiFetch("/api/v1/auth/switch-org", { method: "POST", body: { orgId: orgId } });
+      return { user: r.user, org: r.org };
+    },
+    async changePassword(input) {
+      return apiFetch("/api/v1/auth/change-password", { method: "POST", body: { currentPassword: input.currentPassword, newPassword: input.newPassword } });
     },
     async signup(input) {
       var r = await apiFetch("/api/v1/auth/signup", { method: "POST", body: { email: input.email, password: input.password, orgName: input.orgName || (input.email.split("@")[0] + "'s org") } });
