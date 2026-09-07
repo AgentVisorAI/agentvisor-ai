@@ -24,7 +24,7 @@ import * as oidc from "openid-client";
 import { z } from "zod";
 import crypto from "node:crypto";
 import { db } from "../db.js";
-import { env } from "../env.js";
+import { env, apiPublicBase } from "../env.js";
 import {
   SESSION_COOKIE_OPTS,
   hashPassword,
@@ -184,7 +184,7 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
     const state = oidc.randomState();
     const nonce = oidc.randomNonce();
 
-    const redirectUri = `${env.APP_BASE_URL.replace(/\/$/, "")}/api/v1/auth/oauth/${p.id}/callback`;
+    const redirectUri = `${apiPublicBase()}/api/v1/auth/oauth/${p.id}/callback`;
     const authUrl = oidc.buildAuthorizationUrl(cfg, {
       redirect_uri: redirectUri,
       scope: p.scope,
@@ -287,7 +287,10 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
     // /start endpoint's redirect_uri contract is anchored to
     // (line 140), so the IdP's `redirect_uri` check requires
     // this exact host anyway — no external-header dependency.
-    const base = env.APP_BASE_URL.replace(/\/$/, "");
+    // API_PUBLIC_URL-aware: the callback URL the token exchange
+    // validates must match the redirect_uri from /start, which is
+    // the API's own origin on split-origin deploys.
+    const base = apiPublicBase();
     const currentUrl = new URL(req.url, base);
 
     let tokens;
