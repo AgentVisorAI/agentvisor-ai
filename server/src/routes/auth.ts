@@ -267,7 +267,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     })();
     return reply.code(201).send({
       user: { id: user.id, email: user.email, displayName: user.displayName },
-      org: { id: org.id, slug: org.slug, name: org.name, role: "owner" },
+      org: { id: org.id, slug: org.slug, name: org.name, role: "owner", createdAt: org.createdAt },
     });
   });
 
@@ -481,6 +481,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         slug: membership.org.slug,
         name: membership.org.name,
         role: membership.role,
+        createdAt: membership.org.createdAt,
       },
     });
   });
@@ -570,6 +571,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         slug: active.org.slug,
         name: active.org.name,
         role: active.role,
+        createdAt: active.org.createdAt,
       },
     });
   });
