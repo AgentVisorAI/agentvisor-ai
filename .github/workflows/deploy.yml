@@ -119,7 +119,7 @@ jobs:
       # PRs get :pr-<num>-sha-XXX. OCI labels include a link back to
       # source revision + license per opencontainers/image-spec.
       - id: meta
-        uses: docker/metadata-action@8e1d5461f02b7886d3c1a774bfbd873650445aa2 # v5.8.0
+        uses: docker/metadata-action@c1e51972afc2121e065aed6d45c65596fe445f3f # v5.8.0
         with:
           images: ghcr.io/${{ steps.owner.outputs.lc }}/agentvisor-api
           tags: |
@@ -159,7 +159,7 @@ jobs:
       # consumers to reason about what's actually in the image without
       # having to run the container.
       - name: Generate SPDX SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.20.7
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ghcr.io/${{ steps.owner.outputs.lc }}/agentvisor-api@${{ steps.push.outputs.digest }}
           format: spdx-json
