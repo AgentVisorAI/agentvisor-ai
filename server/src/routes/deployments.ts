@@ -192,13 +192,27 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
     });
     // Uniform 404 — no existence oracle for foreign deployment ids.
     if (!owned) return reply.code(404).send({ error: "not_found" });
-    const updated = await db.deployment.update({
-      where: { id: owned.id },
-      data: {
-        ...(body.data.name !== undefined ? { name: body.data.name } : {}),
-        ...(body.data.environment !== undefined ? { environment: body.data.environment } : {}),
-      },
-    });
+    let updated;
+    try {
+      updated = await db.deployment.update({
+        where: { id: owned.id },
+        data: {
+          ...(body.data.name !== undefined ? { name: body.data.name } : {}),
+          ...(body.data.environment !== undefined ? { environment: body.data.environment } : {}),
+        },
+      });
+    } catch (err) {
+      // Same (orgId, name) unique constraint the create path maps to
+      // 409 — renaming onto an existing name surfaced as a sanitized
+      // 500 while create said `deployment_name_in_use`.
+      if (
+        typeof err === "object" && err !== null &&
+        (err as { code?: string }).code === "P2002"
+      ) {
+        return reply.code(409).send({ error: "deployment_name_in_use" });
+      }
+      throw err;
+    }
     if (updated.name !== owned.name || updated.environment !== owned.environment) {
       writeAudit(
         {

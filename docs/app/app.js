@@ -4153,19 +4153,22 @@
 
     // Sign out other devices — the fence primitive, self-service. This
     // session gets a re-minted cookie in the same response, so only
-    // OTHER browsers die.
+    // OTHER browsers die. Password step-up: a STOLEN cookie must not be
+    // able to evict the real owner everywhere and keep the only
+    // surviving session (same gate as export / delete / passkey ops).
     var loBtn = $("#logoutOthersBtn", root);
     if (loBtn) loBtn.addEventListener("click", function () {
-      confirmModal({
+      stepUpModal({
         title: "Sign out other devices?",
-        body: "Every other browser and device signed in to this account is signed out immediately. This session stays. API ingest tokens keep working.",
+        body: "Every other browser and device signed in to this account is signed out immediately. This session stays. API ingest tokens keep working. Confirm your password to continue.",
         confirmLabel: "Sign out others",
-        onConfirm: function () {
-          state.ds.logoutOtherDevices().then(function () {
+        onConfirm: async function (password, fail) {
+          try {
+            await state.ds.logoutOtherDevices(password);
             toast("Other sessions were signed out — this one stays");
-          }).catch(function (err) {
-            toast(err.message || "Could not sign out other sessions", true);
-          });
+          } catch (err) {
+            fail(err.status === 401 ? "Wrong password." : (err.message || "Could not sign out other sessions"));
+          }
         },
       });
     });

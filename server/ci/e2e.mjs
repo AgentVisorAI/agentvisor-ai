@@ -207,9 +207,24 @@ try {
   let ghostDep = "";
   try { await ds.updateDeployment("cmnope0000000000000000000", { name: "x" }); } catch (e) { ghostDep = e.errorCode || e.message; }
   check("deployment ghost 404", ghostDep === "not_found", ghostDep);
+  // Renaming onto an existing same-org name maps the unique-constraint
+  // hit to the same 409 the create path uses (was a sanitized 500).
+  const depB = await ds.createDeployment({ name: "e2e-daemon-b", environment: "staging" });
+  let renameClash = "";
+  try { await ds.updateDeployment(depB.deployment.id, { name: "e2e-prod-renamed" }); } catch (e) { renameClash = e.errorCode || e.message; }
+  check("deployment rename clash 409", renameClash === "deployment_name_in_use", renameClash);
+  await ds.deleteDeployment(depB.deployment.id, { force: true }).catch(() => {});
 
-  // Sign out other devices: caller's cookie is re-minted and survives
-  const lo = await ds.logoutOtherDevices();
+  // Sign out other devices: password step-up gates it (a stolen cookie
+  // alone must not evict the owner everywhere), then the caller's
+  // cookie is re-minted and survives.
+  let loNoPw = "";
+  try { await ds.logoutOtherDevices(""); } catch (e) { loNoPw = e.errorCode || e.message; }
+  check("logout-all requires password", loNoPw === "password_required", loNoPw);
+  let loBadPw = "";
+  try { await ds.logoutOtherDevices("wrong-password-123"); } catch (e) { loBadPw = e.errorCode || e.message; }
+  check("logout-all wrong password 401", loBadPw === "invalid_password", loBadPw);
+  const lo = await ds.logoutOtherDevices("correcthorse");
   check("logout-all ok", lo && lo.ok === true);
   const meAfterLo = await ds.getSession();
   check("session survives logout-all", meAfterLo && meAfterLo.user.email === email, meAfterLo?.user?.email);

@@ -2089,8 +2089,9 @@
       recordAudit("org.renamed", "", nm);
       return { id: (mockState.session && mockState.session.org.id) || "org_demo", slug: "northwind", name: nm };
     },
-    async logoutOtherDevices() {
+    async logoutOtherDevices(password) {
       await delay(150);
+      if (!password) { var e = new Error("Password required"); e.status = 400; throw e; }
       recordAudit("auth.logout_all", "", "");
       return { ok: true };
     },
@@ -2331,8 +2332,8 @@
       var r = await apiFetch("/api/v1/org", { method: "PATCH", body: { name: name } });
       return r.org;
     },
-    async logoutOtherDevices() {
-      return apiFetch("/api/v1/auth/logout-all", { method: "POST", body: {} });
+    async logoutOtherDevices(password) {
+      return apiFetch("/api/v1/auth/logout-all", { method: "POST", body: { password: password } });
     },
     async updateDeployment(id, input) {
       var r = await apiFetch("/api/v1/deployments/" + encodeURIComponent(id), { method: "PATCH", body: input });

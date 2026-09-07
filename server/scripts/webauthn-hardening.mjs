@@ -95,6 +95,22 @@ async function signup(email) {
   return { cookie };
 }
 
+// Password-verified MFA gate for the login ceremony: /login with the
+// correct password answers {mfaRequired:true} + the single-use
+// av_mfa_gate cookie the ceremony endpoints require (a challenge
+// without it gets decoy credentials, a verify without it refuses the
+// mint). One gate per ceremony.
+async function mfaGate(email) {
+  const res = await fetch(`${API}/api/v1/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: SPA_ORIGIN, "Sec-Fetch-Site": "same-origin" },
+    body: JSON.stringify({ email, password: "correcthorse42x" }),
+  });
+  const gate = /(av_mfa_gate=[^;]+)/.exec(res.headers.get("set-cookie") ?? "")?.[1];
+  if (!gate) throw new Error("no av_mfa_gate cookie from /login");
+  return gate;
+}
+
 async function registerCredential(cookie, auth) {
   const ch = await fetch(`${API}/api/v1/auth/webauthn/register/challenge`, {
     method: "POST",
@@ -206,11 +222,15 @@ async function main() {
   console.log("[3] Wrong signer");
   const email3 = `h1-${Date.now()}@wa-hard.example`;
   // Use alice's account so the credential lookup succeeds; sign with an
-  // unrelated keypair.
+  // unrelated keypair. Each probe carries a fresh password-verified MFA
+  // gate (single-use) so it exercises the check under test, not the
+  // gate refusal.
+  const aliceEmail = (await (await fetch(`${API}/api/v1/auth/me`, { headers: { Cookie: aliceCookie, Origin: SPA_ORIGIN } })).json()).user.email;
+  const gate3 = await mfaGate(aliceEmail);
   const start3 = await fetch(`${API}/api/v1/auth/webauthn/authenticate/challenge`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Origin: SPA_ORIGIN, "Sec-Fetch-Site": "same-origin" },
-    body: JSON.stringify({ email: (await (await fetch(`${API}/api/v1/auth/me`, { headers: { Cookie: aliceCookie, Origin: SPA_ORIGIN } })).json()).user.email }),
+    headers: { "Content-Type": "application/json", Origin: SPA_ORIGIN, "Sec-Fetch-Site": "same-origin", Cookie: gate3 },
+    body: JSON.stringify({ email: aliceEmail }),
   });
   const authCookie3 = /(av_wa_auth_challenge=[^;]+)/.exec(start3.headers.get("set-cookie") ?? "")?.[1];
   const opts3 = (await start3.json()).options;
@@ -223,7 +243,7 @@ async function main() {
   });
   const wrongSigner = await fetch(`${API}/api/v1/auth/webauthn/authenticate/verify`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Origin: SPA_ORIGIN, "Sec-Fetch-Site": "same-origin", Cookie: authCookie3 },
+    headers: { "Content-Type": "application/json", Origin: SPA_ORIGIN, "Sec-Fetch-Site": "same-origin", Cookie: `${authCookie3}; ${gate3}` },
     body: JSON.stringify({ response: badAssertion }),
   });
   results.push({ drill: "wrong-signer", status: wrongSigner.status, expect: 400 });
@@ -231,36 +251,62 @@ async function main() {
   // ============ 4. Counter regression -> clone_detected ============
   console.log("[4] Counter regression");
   // First successful auth with signCount = 5
+  const gate4a = await mfaGate(aliceEmail);
   const start4a = await fetch(`${API}/api/v1/auth/webauthn/authenticate/challenge`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Origin: SPA_ORIGIN, "Sec-Fetch-Site": "same-origin" },
-    body: JSON.stringify({ email: (await (await fetch(`${API}/api/v1/auth/me`, { headers: { Cookie: aliceCookie, Origin: SPA_ORIGIN } })).json()).user.email }),
+    headers: { "Content-Type": "application/json", Origin: SPA_ORIGIN, "Sec-Fetch-Site": "same-origin", Cookie: gate4a },
+    body: JSON.stringify({ email: aliceEmail }),
   });
   const authCookie4a = /(av_wa_auth_challenge=[^;]+)/.exec(start4a.headers.get("set-cookie") ?? "")?.[1];
   const opts4a = (await start4a.json()).options;
   const goodAssertion = await aliceAuth.assertion({ challenge: opts4a.challenge, signCount: 5 });
   const ok4 = await fetch(`${API}/api/v1/auth/webauthn/authenticate/verify`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Origin: SPA_ORIGIN, "Sec-Fetch-Site": "same-origin", Cookie: authCookie4a },
+    headers: { "Content-Type": "application/json", Origin: SPA_ORIGIN, "Sec-Fetch-Site": "same-origin", Cookie: `${authCookie4a}; ${gate4a}` },
     body: JSON.stringify({ response: goodAssertion }),
   });
   console.log("  baseline auth (sc=5):", ok4.status);
   // Now try with sc = 3 (regression)
+  const gate4b = await mfaGate(aliceEmail);
   const start4b = await fetch(`${API}/api/v1/auth/webauthn/authenticate/challenge`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Origin: SPA_ORIGIN, "Sec-Fetch-Site": "same-origin" },
-    body: JSON.stringify({ email: (await (await fetch(`${API}/api/v1/auth/me`, { headers: { Cookie: aliceCookie, Origin: SPA_ORIGIN } })).json()).user.email }),
+    headers: { "Content-Type": "application/json", Origin: SPA_ORIGIN, "Sec-Fetch-Site": "same-origin", Cookie: gate4b },
+    body: JSON.stringify({ email: aliceEmail }),
   });
   const authCookie4b = /(av_wa_auth_challenge=[^;]+)/.exec(start4b.headers.get("set-cookie") ?? "")?.[1];
   const opts4b = (await start4b.json()).options;
   const regressed = await aliceAuth.assertion({ challenge: opts4b.challenge, signCount: 3 });
   const clone = await fetch(`${API}/api/v1/auth/webauthn/authenticate/verify`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Origin: SPA_ORIGIN, "Sec-Fetch-Site": "same-origin", Cookie: authCookie4b },
+    headers: { "Content-Type": "application/json", Origin: SPA_ORIGIN, "Sec-Fetch-Site": "same-origin", Cookie: `${authCookie4b}; ${gate4b}` },
     body: JSON.stringify({ response: regressed }),
   });
   const cloneBody = await clone.text();
   results.push({ drill: "clone-detected", status: clone.status, expect: 400, body: cloneBody.slice(0, 100) });
+
+  // ============ 4c. Possession-only login refused ============
+  // A registered authenticator WITHOUT a fresh password check must not
+  // complete login: the ungated challenge serves decoy credentials and
+  // the ungated verify refuses the mint — the "stolen or cloned
+  // security key alone = account takeover" bypass the MFA gate closed.
+  console.log("[4c] Possession-only (no password gate)");
+  const startNg = await fetch(`${API}/api/v1/auth/webauthn/authenticate/challenge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: SPA_ORIGIN, "Sec-Fetch-Site": "same-origin" },
+    body: JSON.stringify({ email: aliceEmail }),
+  });
+  const authCookieNg = /(av_wa_auth_challenge=[^;]+)/.exec(startNg.headers.get("set-cookie") ?? "")?.[1];
+  const optsNg = (await startNg.json()).options;
+  const ngAssertion = await aliceAuth.assertion({ challenge: optsNg.challenge, signCount: 9 });
+  const noGate = await fetch(`${API}/api/v1/auth/webauthn/authenticate/verify`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: SPA_ORIGIN, "Sec-Fetch-Site": "same-origin", Cookie: authCookieNg },
+    body: JSON.stringify({ response: ngAssertion }),
+  });
+  if ((noGate.headers.get("set-cookie") ?? "").includes("av_session=")) {
+    throw new Error("possession-only ceremony minted a session — MFA gate bypassed!");
+  }
+  results.push({ drill: "possession-only-refused", status: noGate.status, expect: 400 });
 
   // ============ 5. CRUD IDOR ============
   console.log("[5] CRUD IDOR");

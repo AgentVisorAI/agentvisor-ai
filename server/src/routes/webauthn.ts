@@ -47,6 +47,7 @@ import {
   getDummyPasswordHash,
 } from "../lib/auth.js";
 import { writeAudit, resolveActor } from "../lib/audit.js";
+import { mfaGateAuthorizes, clearMfaGateCookie } from "../lib/mfa-gate.js";
 import { perIpCookieOnly } from "../lib/rate-limit.js";
 import { requireSession } from "../lib/session-middleware.js";
 
@@ -536,7 +537,18 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
     // R76/R86/R87/R143/R144 spent five rounds closing.
     // Fix: use decoy path (bag.userId=null) whenever
     // realCreds.length === 0, whether or not the user exists.
-    const useDecoy = realCreds.length === 0;
+    //
+    // MFA-gate binding: a REAL challenge is issued only when the
+    // caller proves a fresh password check for THIS user (the gate
+    // cookie /login sets on every mfaRequired response — real MAC on
+    // verified passwords, decoy bytes otherwise; see lib/mfa-gate.ts).
+    // Without it, possession of a registered authenticator alone
+    // completed login, silently downgrading "password AND passkey" to
+    // "passkey alone" (and uv is not required, so no PIN/biometric
+    // backstop). Missing/expired/mismatched gates take the SAME decoy
+    // path as unknown emails — no new wire, timing, or cookie-shape
+    // oracle: mfaGateAuthorizes is a constant-time MAC check either way.
+    const useDecoy = realCreds.length === 0 || !mfaGateAuthorizes(req, user!.id);
     const allowCredentials = useDecoy
       ? await deriveDecoyCredentials(body.data.email)
       : realCreds.map((c) => ({
@@ -713,15 +725,47 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: "unknown_credential" });
     }
 
-    // Bump the counter + last-used.
-    await db.webauthnCredential.update({
-      where: { id: cred.id },
+    // MFA-gate re-check (defense in depth over the challenge-side
+    // gate): a valid signature with a REAL challenge cookie still must
+    // not mint a session unless the caller holds the fresh
+    // password-verified gate for THIS credential's user. Runs BEFORE
+    // the counter bump so an ungated possession-only attempt mutates
+    // nothing. Same uniform wire shape as every other failure leg.
+    if (!mfaGateAuthorizes(req, cred.userId)) {
+      req.log.warn(
+        { credId: cred.id, userId: cred.userId },
+        "webauthn_auth_without_password_gate",
+      );
+      clearChallengeCookie(reply, AUTH_CHALLENGE_COOKIE);
+      return reply.code(400).send({ error: "unknown_credential" });
+    }
+
+    // Bump the counter + last-used. Guard against a concurrent
+    // ceremony's interleaved bump: an unconditional update could
+    // overwrite counter 102 back to 101 (two valid ceremonies racing),
+    // and the next honest login would then trip clone detection — or a
+    // real clone's regression could be masked. Compare-and-set on the
+    // exact counter we validated against; losing the race fails closed
+    // with the uniform wire shape.
+    const bumped = await db.webauthnCredential.updateMany({
+      where: { id: cred.id, counter: cred.counter },
       data: {
         counter: newCounter,
         lastUsedAt: new Date(),
       },
     });
+    if (bumped.count === 0) {
+      req.log.warn(
+        { credId: cred.id, storedCounter: String(cred.counter) },
+        "webauthn_counter_cas_lost_race",
+      );
+      clearChallengeCookie(reply, AUTH_CHALLENGE_COOKIE);
+      return reply.code(400).send({ error: "unknown_credential" });
+    }
     clearChallengeCookie(reply, AUTH_CHALLENGE_COOKIE);
+    // The gate is single-use: one password check authorizes one
+    // ceremony. A second ceremony needs a fresh /login.
+    clearMfaGateCookie(reply);
 
     // Mint the session — same shape as password login.
     const user = await db.user.findUnique({

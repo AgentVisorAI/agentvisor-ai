@@ -220,6 +220,10 @@ async function main() {
     // With MFA required, we should NOT have gotten a session cookie yet.
     throw new Error("session cookie leaked despite MFA gate!");
   }
+  // The password-verified login sets the MFA gate cookie; the ceremony
+  // endpoints refuse (decoy) without it — carry it like a browser would.
+  const mfaGateCookie = /(av_mfa_gate=[^;]+)/.exec(gated.headers.get("set-cookie") ?? "")?.[1];
+  if (!mfaGateCookie) throw new Error("no av_mfa_gate cookie on the mfaRequired response");
 
   // ---------- Authentication ceremony ----------
   console.log("[5/5] passkey authenticate");
@@ -229,6 +233,7 @@ async function main() {
       "Content-Type": "application/json",
       Origin: SPA_ORIGIN,
       "Sec-Fetch-Site": "same-origin",
+      Cookie: mfaGateCookie,
     },
     body: JSON.stringify({ email }),
   });
@@ -242,7 +247,7 @@ async function main() {
       "Content-Type": "application/json",
       Origin: SPA_ORIGIN,
       "Sec-Fetch-Site": "same-origin",
-      Cookie: authCookie,
+      Cookie: `${authCookie}; ${mfaGateCookie}`,
     },
     body: JSON.stringify({ response: assertion }),
   });

@@ -11,6 +11,7 @@ import {
   verifyPassword,
 } from "../lib/auth.js";
 import { writeAudit } from "../lib/audit.js";
+import { setMfaGateCookie } from "../lib/mfa-gate.js";
 import { authEventsTotal } from "../lib/metrics.js";
 import { perIpCookieOnly } from "../lib/rate-limit.js";
 import { getMailer, emailChangeVerifyMail, emailChangedNoticeMail, passwordChangedMail, passwordResetMail, welcomeMail } from "../lib/mail.js";
@@ -347,7 +348,16 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     // account still see 401 (this branch); users typing a wrong
     // password on an MFA account will be routed into the
     // WebAuthn ceremony, which fails at /authenticate/verify.
-    const mfaGateResponse = () => reply.send({ mfaRequired: true });
+    // The gate cookie must be set on EVERY mfaRequired response —
+    // real MAC on verified passwords, decoy bytes otherwise — so its
+    // presence can't reopen the password-validity oracle this uniform
+    // shape exists to close (see lib/mfa-gate.ts). The ceremony
+    // endpoints treat a decoy/absent gate exactly like an unknown
+    // email: decoy credentials, uniform failure.
+    const mfaGateResponse = (verifiedUserId: string | null = null) => {
+      setMfaGateCookie(reply, verifiedUserId);
+      return reply.send({ mfaRequired: true });
+    };
     if (!user || !ok) {
       // Uniform shape whether email exists or not — closes the
       // "does this account exist" oracle for callers who
@@ -452,7 +462,9 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         },
         req.log,
       );
-      return mfaGateResponse();
+      // Password verified: the gate carries a real MAC so the
+      // ceremony endpoints will issue a real challenge for THIS user.
+      return mfaGateResponse(user.id);
     }
 
     const token = await mintSession({
@@ -989,6 +1001,36 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     if (!claims) return;
     if (claims.sub.startsWith("apikey:")) {
       return reply.code(403).send({ error: "cookie_session_required" });
+    }
+    // Step-up: revoking every other session is a recovery action a
+    // STOLEN cookie must not be able to perform — without this gate a
+    // cookie thief could evict the victim from all their browsers and
+    // re-mint themselves the only surviving session. Same fresh
+    // password check as the sibling destructive endpoints
+    // (change-password, /me/export, /me/delete-account, passkey
+    // enroll/revoke); SSO-provisioned users set a password via
+    // /reset-request first, exactly as for those siblings.
+    const body = z.object({ password: z.string().min(1).max(1024) }).safeParse(req.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: "password_required" });
+    }
+    const account = await db.user.findUnique({ where: { id: claims.sub } });
+    if (!account) return reply.code(401).send({ error: "unauthenticated" });
+    const ok = await verifyPassword(account.passwordHash, body.data.password);
+    if (!ok) {
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "auth.step_up_denied",
+          actorId: claims.sub,
+          actorEmail: account.email,
+          note: "invalid_password",
+          metadata: { endpoint: "auth.logout_all" },
+          req,
+        },
+        req.log,
+      );
+      return reply.code(401).send({ error: "invalid_password" });
     }
     const user = await db.user.update({
       where: { id: claims.sub },
