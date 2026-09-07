@@ -268,6 +268,23 @@ async function me(sessionCookie) {
   return { status: r.status, body: r.status === 200 ? await r.json() : null };
 }
 
+// writeAudit is fire-and-forget server-side; poll briefly so a read
+// issued right after the audited action doesn't race the insert.
+async function auditEvents(sessionCookie, limit, wantedEvent) {
+  let events = [];
+  let entries = [];
+  for (let i = 0; i < 20; i++) {
+    const audit = await fetch(`${API}/api/v1/audit?limit=${limit}`, {
+      headers: { cookie: sessionCookie },
+    }).then((r) => r.json());
+    entries = audit.entries || audit.items || [];
+    events = entries.map((e) => e.event);
+    if (events.includes(wantedEvent)) break;
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  return { events, entries };
+}
+
 /* ---------------- main ---------------- */
 
 async function main() {
@@ -314,11 +331,14 @@ async function main() {
   check("JIT user is owner", me1.body?.org?.role === "owner", me1.body?.org);
 
   console.log("[4] audit trail");
-  const audit = await fetch(`${API}/api/v1/audit?limit=50`, { headers: { cookie: flow1.sessionCookie } }).then((r) => r.json());
-  const events = (audit.entries || audit.items || []).map((e) => e.event);
+  const { events, entries: auditEntries } = await auditEvents(
+    flow1.sessionCookie,
+    50,
+    "auth.oauth_signin",
+  );
   check("org.created audited", events.includes("org.created"), events);
   check("auth.oauth_signin audited", events.includes("auth.oauth_signin"), events);
-  const signinRow = (audit.entries || audit.items || []).find((e) => e.event === "auth.oauth_signin");
+  const signinRow = auditEntries.find((e) => e.event === "auth.oauth_signin");
   check("audit provider metadata = oidc", signinRow?.metadata?.provider === "oidc", signinRow);
 
   console.log("[5] repeat login: no duplicate JIT");
@@ -406,8 +426,11 @@ async function main() {
       const flowMfa = await runFlow();
       check("passkey user → mfa_required_use_password_login", errSlugFrom(flowMfa.finalLocation) === "mfa_required_use_password_login", flowMfa);
       check("no session minted", !flowMfa.sessionCookie);
-      const auditMfa = await fetch(`${API}/api/v1/audit?limit=20`, { headers: { cookie: flow1.sessionCookie } }).then((r) => r.json());
-      const evs = (auditMfa.entries || auditMfa.items || []).map((e) => e.event);
+      const { events: evs } = await auditEvents(
+        flow1.sessionCookie,
+        20,
+        "auth.oauth_refused_mfa_required",
+      );
       check("refusal audited", evs.includes("auth.oauth_refused_mfa_required"), evs);
     } finally {
       execFileSync("docker", ["exec", PG_CONTAINER, "psql", "-U", PG_USER, "-d", PG_DB, "-c", `DELETE FROM "webauthn_credentials" WHERE "id"='drill-mfa-cred'`], { stdio: "pipe" });

@@ -107,11 +107,20 @@ async function main() {
   console.log("[6/6] bob /me: role=" + me.org.role);
   if (me.org.role !== "admin") throw new Error("wrong role");
 
-  // Alice's audit trail includes member.invited + member.invite_accepted
-  const audit = await fetch(`${API}/api/v1/audit?limit=10`, {
-    headers: { Cookie: aliceCookie, Origin: SPA_ORIGIN },
-  }).then((r) => r.json());
-  const events = audit.entries.map((e) => e.event);
+  // Alice's audit trail includes member.invited + member.invite_accepted.
+  // writeAudit is fire-and-forget (void db.auditEntry.create), so the
+  // accept's audit row may still be in flight when we read — poll
+  // briefly instead of asserting on the first snapshot (raced in CI:
+  // slower service-container Postgres lost to the immediate read).
+  let events = [];
+  for (let i = 0; i < 20; i++) {
+    const audit = await fetch(`${API}/api/v1/audit?limit=10`, {
+      headers: { Cookie: aliceCookie, Origin: SPA_ORIGIN },
+    }).then((r) => r.json());
+    events = audit.entries.map((e) => e.event);
+    if (events.includes("member.invited") && events.includes("member.invite_accepted")) break;
+    await new Promise((r) => setTimeout(r, 150));
+  }
   console.log("     audit events:", events.join(", "));
   if (!events.includes("member.invited") || !events.includes("member.invite_accepted")) {
     throw new Error("audit missing events");

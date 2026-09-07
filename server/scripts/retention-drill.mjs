@@ -163,10 +163,17 @@ console.log(`Setup: alice=${aliceOrg} bob=${bobOrg}`);
 }
 
 // 7. Audit trail entries
+// writeAudit is fire-and-forget server-side — poll briefly so this
+// read doesn't race the sweep's in-flight audit inserts.
 {
-  const r = await jr(alice, "GET", "/api/v1/audit?limit=200");
-  const j = await r.json();
-  const events = j.entries.map((e) => e.event);
+  let events = [];
+  for (let i = 0; i < 20; i++) {
+    const r = await jr(alice, "GET", "/api/v1/audit?limit=200");
+    const j = await r.json();
+    events = j.entries.map((e) => e.event);
+    if (events.includes("org.retention_updated") && events.includes("org.retention_swept")) break;
+    await new Promise((r) => setTimeout(r, 150));
+  }
   if (!events.includes("org.retention_updated")) fail(`retention_updated missing: ${events}`);
   if (!events.includes("org.retention_swept")) fail(`retention_swept missing: ${events}`);
   console.log("✅ audit trail contains retention_updated + retention_swept");

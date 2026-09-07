@@ -152,14 +152,21 @@ let plaintext, keyId, hint;
 }
 
 // 8. Audit trail
+// writeAudit is fire-and-forget server-side — poll briefly so this
+// read doesn't race the revoke's in-flight audit insert.
 {
-  const r = await jsonReq("GET", "/api/v1/audit?limit=20");
-  if (r.status !== 200) {
-    console.log("❌ audit failed:", r.status, await r.text());
-    process.exit(1);
+  let events = [];
+  for (let i = 0; i < 20; i++) {
+    const r = await jsonReq("GET", "/api/v1/audit?limit=20");
+    if (r.status !== 200) {
+      console.log("❌ audit failed:", r.status, await r.text());
+      process.exit(1);
+    }
+    const j = await r.json();
+    events = j.entries.map((e) => e.event);
+    if (events.includes("apikey.created") && events.includes("apikey.revoked")) break;
+    await new Promise((r) => setTimeout(r, 150));
   }
-  const j = await r.json();
-  const events = j.entries.map((e) => e.event);
   if (!events.includes("apikey.created")) {
     console.log("❌ apikey.created missing:", events);
     process.exit(1);

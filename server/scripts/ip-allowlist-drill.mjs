@@ -151,10 +151,17 @@ const alice = {};
 }
 
 // 9. Audit trail
+// writeAudit is fire-and-forget server-side — poll briefly so this
+// read doesn't race the PATCH's in-flight audit insert.
 {
-  const r = await jr(alice, "GET", "/api/v1/audit?limit=50");
-  const j = await r.json();
-  const events = j.entries.map((e) => e.event);
+  let events = [];
+  for (let i = 0; i < 20; i++) {
+    const r = await jr(alice, "GET", "/api/v1/audit?limit=50");
+    const j = await r.json();
+    events = j.entries.map((e) => e.event);
+    if (events.includes("org.ip_allowlist_updated")) break;
+    await new Promise((r) => setTimeout(r, 150));
+  }
   if (!events.includes("org.ip_allowlist_updated")) fail(`audit missing: ${events.slice(0,10)}`);
   console.log("✅ audit trail contains org.ip_allowlist_updated");
 }
