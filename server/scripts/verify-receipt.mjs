@@ -3,8 +3,9 @@
  * Standalone AgentVisor receipt verifier.
  *
  * Reads a receipt bundle exported from the console (Download receipt
- * button on the session detail page) and verifies the Ed25519
- * signature against the embedded public key.
+ * button on the session detail page) OR a raw daemon receipt file
+ * (spool/atif/receipts/*.json as written by agentvisord) and verifies
+ * the Ed25519 signature against the embedded public key.
  *
  * Requires only Node 16+. No AgentVisor dependency, no network
  * call — everything the verifier needs is inside the JSON file
@@ -90,6 +91,47 @@ try {
 } catch (e) {
   console.error("Could not read/parse:", files[0], "-", e.message);
   process.exit(2);
+}
+
+// Raw daemon receipts: the file agentvisord writes under
+// spool/atif/receipts/ is {receipt fields…, public_key_b64,
+// signature_b64} — NOT the console-export bundle envelope. The
+// /verify page (docs/verify/verify.js) and `avctl receipt-verify`
+// both accept raw files, and the page's no-WebCrypto fallback copy
+// points here — so adapt raw receipts to the bundle shape the rest
+// of this script expects. The signed message is the RFC 8785 (JCS)
+// canonicalization of the receipt WITHOUT signature_b64 (same
+// construction as av_receipts::canonicalize over Receipt.body).
+// Keep in sync with docs/verify/verify.js rawReceiptToBundle.
+function jcsCanonicalize(value) {
+  // Minimal JCS for the receipt value domain: JSON.stringify already
+  // emits shortest-form numbers for the integers/floats a receipt
+  // carries; JCS then only requires lexicographically sorted object
+  // keys (UTF-16 code-unit order — JS default sort) and no whitespace.
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return "[" + value.map(jcsCanonicalize).join(",") + "]";
+  const keys = Object.keys(value).sort();
+  return "{" + keys.map((k) => JSON.stringify(k) + ":" + jcsCanonicalize(value[k])).join(",") + "}";
+}
+function looksLikeRawReceipt(parsed) {
+  return (
+    parsed && typeof parsed === "object" && !parsed.format &&
+    typeof parsed.signature_b64 === "string" &&
+    typeof parsed.public_key_b64 === "string" &&
+    typeof parsed.receipt_id === "string"
+  );
+}
+if (looksLikeRawReceipt(bundle)) {
+  const body = {};
+  for (const k of Object.keys(bundle)) {
+    if (k === "signature_b64") continue;
+    body[k] = bundle[k];
+  }
+  bundle = {
+    format: "agentvisor.receipt.v1",
+    receipt: { rawBody: jcsCanonicalize(body), rawSignatureB64: bundle.signature_b64 },
+    publicKey: { hex: Buffer.from(bundle.public_key_b64, "base64").toString("hex") },
+  };
 }
 
 if (bundle.format !== "agentvisor.receipt.v1") {
@@ -192,10 +234,18 @@ const ok = sigOk && keyIdOk && pubkeyOk;
 const demoKey = ok && DEMO_RECEIPT_KEYS.has(pubKeyHex.toLowerCase());
 const trustedKey = ok && !demoKey && TRUSTED_RECEIPT_KEYS.has(pubKeyHex.toLowerCase());
 
-console.log("Session:       ", bundle.session?.externalId || bundle.session?.id);
-console.log("Agent:         ", bundle.session?.agent);
-console.log("Events sealed: ", r.eventCount);
-console.log("Receipt ID:    ", r.receiptId);
+// Metadata rows: console-export bundles carry a session envelope +
+// camelCase receipt fields; raw daemon receipt bodies use the Rust
+// wire shape (session_id, ai_agent.charter.name,
+// subject.event_count/step_count, receipt_id). Accept both — same
+// dual-shape display docs/verify/verify.js uses.
+let signedBody = {};
+try { signedBody = JSON.parse(r.rawBody || "{}"); } catch { signedBody = {}; }
+const rawSubject = signedBody.subject || {};
+console.log("Session:       ", bundle.session?.externalId || bundle.session?.id || signedBody.session_id || "—");
+console.log("Agent:         ", bundle.session?.agent || signedBody.ai_agent?.charter?.name || "—");
+console.log("Events sealed: ", r.eventCount ?? rawSubject.event_count ?? rawSubject.step_count ?? "—");
+console.log("Receipt ID:    ", r.receiptId || signedBody.receipt_id || "—");
 console.log("Public key:    ", pubKeyHex);
 console.log("Trusted key:   ", trustedKey ? "yes" : "NO (not on the trust anchor list)");
 console.log("Message bytes: ", msg.length);

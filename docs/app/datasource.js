@@ -1039,21 +1039,37 @@
     var deps = freshDeployments() || [];
     var series = bucketSessions(range || "24h");
     series.forEach(function (b) { b.allowed = 0; b.blocked = 0; b.spendUsd = 0; b.blockedValueUsd = 0; });
-    var last = series[series.length - 1];
+    // Bucket each fresh session by its startedAt age — same math as
+    // bucketSessions — instead of lumping everything into the last
+    // bucket (which mislocated staggered sessions on the 1h chart).
+    // Anchor on the series' own last-bucket timestamp so a second
+    // clock read can't straddle a bucket boundary.
+    var spec = BUCKET_SPECS[range || "24h"] || BUCKET_SPECS["24h"];
+    var anchor = new Date(series[series.length - 1].t).getTime();
+    var totals = { allowed: 0, blocked: 0, spendUsd: 0, blockedValueUsd: 0 };
     sess.forEach(function (s) {
-      last.allowed += s.toolsAllowed;
-      last.blocked += s.toolsBlocked;
-      last.spendUsd += (+s.costUsdMicros || 0) / 1e6;
-      last.blockedValueUsd += (+s.blockedPayoutUsdMicros || 0) / 1e6;
+      var age = anchor - new Date(s.startedAt).getTime();
+      var idx = series.length - 1 - Math.floor(Math.max(0, age) / spec.bucketMs);
+      if (!isFinite(idx) || idx > series.length - 1) idx = series.length - 1;
+      totals.allowed += s.toolsAllowed;
+      totals.blocked += s.toolsBlocked;
+      totals.spendUsd += (+s.costUsdMicros || 0) / 1e6;
+      totals.blockedValueUsd += (+s.blockedPayoutUsdMicros || 0) / 1e6;
+      if (idx < 0) return; // older than the window — KPIs only
+      var b = series[idx];
+      b.allowed += s.toolsAllowed;
+      b.blocked += s.toolsBlocked;
+      b.spendUsd += (+s.costUsdMicros || 0) / 1e6;
+      b.blockedValueUsd += (+s.blockedPayoutUsdMicros || 0) / 1e6;
     });
     return {
       period: range || "24h",
       sessions: sess.length,
       events: sess.reduce(function (a, s) { return a + s.events; }, 0),
-      toolsAllowed: last.allowed,
-      toolsBlocked: last.blocked,
-      llmSpendUsd: last.spendUsd.toFixed(2),
-      blockedSpendUsd: last.blockedValueUsd.toFixed(0),
+      toolsAllowed: totals.allowed,
+      toolsBlocked: totals.blocked,
+      llmSpendUsd: totals.spendUsd.toFixed(2),
+      blockedSpendUsd: totals.blockedValueUsd.toFixed(0),
       deployments: deps.length,
       deploymentsHealthy: deps.filter(function (d) { return d.status === "connected"; }).length,
       series: series,
