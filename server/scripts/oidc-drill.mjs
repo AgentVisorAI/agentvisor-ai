@@ -54,6 +54,8 @@ const CLIENT_ID = "av-console";
 const CLIENT_SECRET = "drill-secret-123";
 const APP_BASE = "http://127.0.0.1:8988";
 const PG_CONTAINER = process.env.PG_CONTAINER || "";
+const PG_USER = process.env.PG_USER || "agentvisor";
+const PG_DB = process.env.PG_DB || "agentvisor";
 
 let passed = 0;
 let failed = 0;
@@ -359,7 +361,7 @@ async function main() {
   } else {
     const uid = me1.body.user.id;
     const seedSql = `INSERT INTO "webauthn_credentials" ("id","userId","credentialId","publicKey","counter","transports","label") VALUES ('drill-mfa-cred','${uid}',decode('ZHJpbGwtY3JlZA==','base64'),decode('ZHJpbGwtcGs=','base64'),0,'usb','drill seed')`;
-    execFileSync("docker", ["exec", PG_CONTAINER, "psql", "-U", "agentvisor", "-d", "agentvisor", "-c", seedSql], { stdio: "pipe" });
+    execFileSync("docker", ["exec", PG_CONTAINER, "psql", "-U", PG_USER, "-d", PG_DB, "-c", seedSql], { stdio: "pipe" });
     try {
       const flowMfa = await runFlow();
       check("passkey user → mfa_required_use_password_login", errSlugFrom(flowMfa.finalLocation) === "mfa_required_use_password_login", flowMfa);
@@ -368,7 +370,7 @@ async function main() {
       const evs = (auditMfa.entries || auditMfa.items || []).map((e) => e.event);
       check("refusal audited", evs.includes("auth.oauth_refused_mfa_required"), evs);
     } finally {
-      execFileSync("docker", ["exec", PG_CONTAINER, "psql", "-U", "agentvisor", "-d", "agentvisor", "-c", `DELETE FROM "webauthn_credentials" WHERE "id"='drill-mfa-cred'`], { stdio: "pipe" });
+      execFileSync("docker", ["exec", PG_CONTAINER, "psql", "-U", PG_USER, "-d", PG_DB, "-c", `DELETE FROM "webauthn_credentials" WHERE "id"='drill-mfa-cred'`], { stdio: "pipe" });
     }
   }
 
@@ -378,7 +380,7 @@ async function main() {
     // needs password step-up, so sweep the drill rows directly.
     for (const email of ["jit.user@oidc-drill.example", "capped.name@oidc-drill.example"]) {
       execFileSync("docker", [
-        "exec", PG_CONTAINER, "psql", "-U", "agentvisor", "-d", "agentvisor", "-c",
+        "exec", PG_CONTAINER, "psql", "-U", PG_USER, "-d", PG_DB, "-c",
         `DELETE FROM "orgs" WHERE "id" IN (SELECT m."orgId" FROM "memberships" m JOIN "users" u ON u."id"=m."userId" WHERE u."email"='${email}'); DELETE FROM "users" WHERE "email"='${email}'`,
       ], { stdio: "pipe" });
     }
