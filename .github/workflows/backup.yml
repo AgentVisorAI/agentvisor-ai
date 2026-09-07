@@ -24,9 +24,24 @@
 #   user — uploading a plaintext production dump (password hashes,
 #   API keys, webhook secrets, PII) would publish the database.
 #
-# Restore
-#   gpg --decrypt agentvisor-<ts>.dump.gpg > agentvisor-<ts>.dump
+# Restore  (drilled end-to-end 2026-09-07 against a live prod dump)
+#   gpg --batch --passphrase-file <vaulted-passphrase> \
+#       --decrypt agentvisor-<ts>.dump.gpg > agentvisor-<ts>.dump
 #   pg_restore --no-owner --dbname "$TARGET_URL" agentvisor-<ts>.dump
+#
+#   Two gotchas that WILL bite during a real incident:
+#   - The passphrase is a WRITE-ONLY GitHub secret. If it is not also
+#     stored in a vault a human can read, every artifact is ciphertext
+#     forever (this happened: all dumps 2026-09-06→07 are unrecoverable
+#     after the original passphrase was lost with a session; rotated
+#     2026-09-07, current passphrase vaulted off-GitHub).
+#   - pg_dump 18 emits archive format 1.16 — pg_restore < 18 refuses it
+#     ("unsupported version (1.16) in file header"). Restore with a
+#     matching client, e.g.:
+#       docker run --rm -v "$PWD:/w" postgres:18-alpine \
+#         pg_restore --no-owner --dbname "$TARGET_URL" /w/<dump>
+#     (one ignorable error against older SERVERS: SET transaction_timeout
+#     is unknown before PG 17 — pg_restore reports "errors ignored: 1".)
 name: Nightly PG backup
 
 on:
