@@ -2114,9 +2114,17 @@ fn seed_path_for(source: Option<&av_harness::config::ConfigSource>) -> PathBuf {
 /// truncated or textbook-wrong seed pass, and the operator only
 /// discovers the problem when `avctl start` fails.
 fn check_signing_seed_content(path: &Path) -> std::result::Result<(), String> {
-    let contents =
-        std::fs::read_to_string(path).map_err(|error| format!("read {}: {error}", path.display()))?;
-    let decoded = hex::decode(contents.trim()).map_err(|error| format!("decode as hex: {error}"))?;
+    // Capped + zeroizing read: `read_to_string` was the one seed read
+    // outside the discipline `read_signer`/pubkey use — a planted
+    // multi-GiB "seed" OOM'd doctor before any content check, and the
+    // seed bytes lingered unzeroized in the dropped String.
+    let contents = zeroize::Zeroizing::new(
+        av_core::fsutil::read_capped_string(path, av_core::fsutil::MAX_CONTROL_BYTES)
+            .map_err(|error| format!("read {}: {error}", path.display()))?,
+    );
+    let decoded = zeroize::Zeroizing::new(
+        hex::decode(contents.trim()).map_err(|error| format!("decode as hex: {error}"))?,
+    );
     if decoded.len() != 32 {
         return Err(format!("must be exactly 32 bytes, got {}", decoded.len()));
     }

@@ -179,6 +179,54 @@ pub struct KafkaBus {
     partition_clients: HashMap<(String, u32), Arc<rskafka::client::partition::PartitionClient>>,
     topics: HashMap<String, u32>,
     validators: HashMap<String, jsonschema::Validator>,
+    /// Process-local idempotency memory for caller-supplied event UIDs —
+    /// the Kafka analogue of the embedded broker's `seen_event_uids`.
+    /// `publish_idempotent`'s contract is "same UID → original ack", but
+    /// rskafka `produce` has no native dedupe and the cold-outbox
+    /// staging check only fires when a prior attempt CRASHED mid-publish
+    /// (intent still staged); after a clean success a retried same-UID
+    /// call appended a duplicate record — the embedded and Kafka
+    /// backends disagreed on the trait's core promise. Bounded FIFO so
+    /// an unbounded UID stream can't grow memory (dedup across restarts
+    /// is still covered by the staged-intent + `find_event_by_uid`
+    /// recovery path).
+    recent_uids: parking_lot::Mutex<RecentUids>,
+}
+
+/// Bounded FIFO of `topic\0uid → (partition, offset)` (see
+/// `KafkaBus::recent_uids`).
+struct RecentUids {
+    map: HashMap<String, (u32, u64)>,
+    order: std::collections::VecDeque<String>,
+}
+
+/// 64Ki UIDs ≈ a few MB worst case: covers hours of same-process retry
+/// windows while staying trivially bounded.
+const RECENT_UIDS_CAP: usize = 65_536;
+
+impl RecentUids {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn get(&self, topic: &str, uid: &str) -> Option<(u32, u64)> {
+        self.map.get(&format!("{topic}\0{uid}")).copied()
+    }
+
+    fn insert(&mut self, topic: &str, uid: &str, partition: u32, offset: u64) {
+        let key = format!("{topic}\0{uid}");
+        if self.map.insert(key.clone(), (partition, offset)).is_none() {
+            self.order.push_back(key);
+            while self.order.len() > RECENT_UIDS_CAP {
+                if let Some(evicted) = self.order.pop_front() {
+                    self.map.remove(&evicted);
+                }
+            }
+        }
+    }
 }
 
 impl KafkaBus {
@@ -285,6 +333,7 @@ impl KafkaBus {
             partition_clients,
             topics,
             validators,
+            recent_uids: parking_lot::Mutex::new(RecentUids::new()),
         })
     }
 
@@ -313,6 +362,19 @@ impl KafkaBus {
             .get(topic)
             .ok_or_else(|| BusError::UnknownTopic(topic.to_owned()))?;
         let partition = partition_for(key, partitions);
+        // Idempotency fast path for caller-supplied UIDs: after a clean
+        // success the cold intent is gone, so without this a same-UID
+        // retry re-produced a duplicate record (see `recent_uids` docs).
+        let caller_uid = event_uid.is_some();
+        if let Some(uid) = event_uid {
+            if let Some((cached_partition, offset)) = self.recent_uids.lock().get(topic, uid) {
+                return Ok(PublishAck {
+                    topic: topic.to_owned(),
+                    partition: cached_partition,
+                    offset,
+                });
+            }
+        }
         let event_uid = event_uid.map_or_else(av_core::new_event_uid, str::to_owned);
         let stored_at = av_core::time::now_ms();
         let record = StoredEvent {
@@ -353,6 +415,11 @@ impl KafkaBus {
         let ack = self.publish_broker_only(topic, key, value, stored_at, &event_uid)?;
         if let Some(archive) = &self.cold_archive {
             archive.commit(topic, &event_uid, ack.offset)?;
+        }
+        if caller_uid {
+            self.recent_uids
+                .lock()
+                .insert(topic, &event_uid, ack.partition, ack.offset);
         }
         Ok(ack)
     }

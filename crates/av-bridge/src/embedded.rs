@@ -562,12 +562,17 @@ impl EmbeddedBroker {
                     continue;
                 }
                 let outcome: Result<u64, BusError> = (|| {
-                    let (kept, expired) = split_by_time(&part.path, cutoff)?;
-                    if expired.is_empty() {
+                    // Streaming pass 1: bail with zero allocation when
+                    // nothing expired (the common hourly case). Offsets are
+                    // kept for the post-rename idempotency-map prune.
+                    let expired_offsets = expired_offsets(&part.path, cutoff)?;
+                    if expired_offsets.is_empty() {
                         return Ok(0);
                     }
-                    let expired_count = expired.len() as u64;
+                    let expired_count = expired_offsets.len() as u64;
                     // Cold export first (never destroy before the copy lands).
+                    // Streaming pass 2: export each expired line as it is
+                    // read — no whole-segment buffering.
                     if let Some(cold) = &t.retention.cold_uri {
                         if cold.contains("://") {
                             #[cfg(feature = "cold-store")]
@@ -575,10 +580,13 @@ impl EmbeddedBroker {
                                 let archive = self.cold_archive.as_ref().ok_or_else(|| {
                                     BusError::Backend(format!("cold archive for {:?} is unavailable", t.name))
                                 })?;
-                                for line in &expired {
-                                    let event: StoredEvent = serde_json::from_str(line)?;
-                                    archive.put(&t.name, &event)?;
-                                }
+                                for_each_segment_line(&part.path, cutoff, |line, is_expired| {
+                                    if is_expired {
+                                        let event: StoredEvent = serde_json::from_str(line)?;
+                                        archive.put(&t.name, &event)?;
+                                    }
+                                    Ok(())
+                                })?;
                             }
                             #[cfg(not(feature = "cold-store"))]
                             return Err(BusError::Backend(format!(
@@ -595,10 +603,13 @@ impl EmbeddedBroker {
                             // below destroys the only other copy, so the cold
                             // subtree's dirents must be durable before it runs.
                             av_core::fsutil::create_dir_all_synced(&cold_dir)?;
-                            for line in &expired {
-                                let event: StoredEvent = serde_json::from_str(line)?;
-                                write_cold_event_once(&cold_dir, &event)?;
-                            }
+                            for_each_segment_line(&part.path, cutoff, |line, is_expired| {
+                                if is_expired {
+                                    let event: StoredEvent = serde_json::from_str(line)?;
+                                    write_cold_event_once(&cold_dir, &event)?;
+                                }
+                                Ok(())
+                            })?;
                             av_core::fsutil::sync_directory(&cold_dir)?;
                         }
                     }
@@ -632,9 +643,19 @@ impl EmbeddedBroker {
                             tmp_options.mode(0o600);
                         }
                         let mut f = tmp_options.open(&tmp)?;
-                        for line in &kept {
-                            f.write_all(line.as_bytes())?;
-                            f.write_all(b"\n")?;
+                        // Streaming pass 3: kept lines flow straight to the
+                        // tmp segment.
+                        {
+                            use std::io::Write as _;
+                            let mut writer = std::io::BufWriter::new(&mut f);
+                            for_each_segment_line(&part.path, cutoff, |line, is_expired| {
+                                if !is_expired {
+                                    writer.write_all(line.as_bytes())?;
+                                    writer.write_all(b"\n")?;
+                                }
+                                Ok(())
+                            })?;
+                            writer.flush()?;
                         }
                         f.sync_all()?;
                     }
@@ -661,22 +682,17 @@ impl EmbeddedBroker {
                         // no longer exists, and the caller's follow-up `fetch(offset)`
                         // silently returns the wrong event or nothing.
                         //
-                        // Expired lines are parseable
-                        // BY CONSTRUCTION (`split_by_time` never expires an
-                        // unparseable line), so we can remove exactly the
-                        // expired offsets. The previous survivors+[min,max]
-                        // range heuristic was unsound at both edges: a
-                        // wall-clock regression could expire a MIDDLE-offset
-                        // record whose UID then survived pruning (stale ack →
-                        // wrong-record fetch), and a trailing unparseable
-                        // kept line's offset fell OUTSIDE the range so its
-                        // UID was dropped (duplicate re-append on the next
+                        // Expired offsets were collected in streaming pass 1
+                        // (only parseable lines expire, so the set covers
+                        // exactly the removed records). The previous
+                        // survivors+[min,max] range heuristic was unsound at
+                        // both edges: a wall-clock regression could expire a
+                        // MIDDLE-offset record whose UID then survived
+                        // pruning (stale ack → wrong-record fetch), and a
+                        // trailing unparseable kept line's offset fell
+                        // OUTSIDE the range so its UID was dropped
+                        // (duplicate re-append on the next
                         // publish_idempotent).
-                        let expired_offsets: std::collections::HashSet<u64> = expired
-                            .iter()
-                            .filter_map(|line| serde_json::from_str::<StoredEvent>(line).ok())
-                            .map(|event| event.offset)
-                            .collect();
                         let before = part.seen_event_uids.len();
                         part.seen_event_uids
                             .retain(|_, offset| !expired_offsets.contains(offset));
@@ -1290,28 +1306,71 @@ fn persist_high_water(path: &Path, next_offset: u64) -> Result<(), BusError> {
 }
 
 /// Partition a segment's lines into (kept, expired) by `stored_at < cutoff`.
-fn split_by_time(path: &Path, cutoff_ms: u64) -> Result<(Vec<String>, Vec<String>), BusError> {
-    let mut kept = Vec::new();
-    let mut expired = Vec::new();
+/// Stream every line of a segment through `visit(line, is_expired)`,
+/// with per-line buffers bounded at 16 MiB (the segment line cap used by
+/// the read paths). Replaces the old `split_by_time`, which buffered the
+/// ENTIRE segment into two `Vec<String>`s on every hourly retention pass
+/// — even when nothing had expired — so a large hot partition (or one
+/// hostile giant line, unbounded under `BufRead::lines`) could OOM the
+/// maintenance task. Lines that fail to parse as `StoredEvent` are
+/// treated as unexpired, exactly like the old shape. A line at the cap
+/// with no newline is refused as corrupt (the partition lock is held, so
+/// there is no in-flight append to race).
+fn for_each_segment_line(
+    path: &Path,
+    cutoff_ms: u64,
+    mut visit: impl FnMut(&str, bool) -> Result<(), BusError>,
+) -> Result<(), BusError> {
+    const MAX_SEGMENT_LINE_BYTES: u64 = 16 * 1024 * 1024;
     if !path.exists() {
-        return Ok((kept, expired));
+        return Ok(());
     }
-    let reader = BufReader::new(fs::File::open(path)?);
-    for line in reader.lines() {
-        let line = line?;
+    let mut reader = BufReader::new(fs::File::open(path)?);
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        buf.clear();
+        let read = {
+            use std::io::BufRead as _;
+            use std::io::Read as _;
+            let mut limited = (&mut reader).take(MAX_SEGMENT_LINE_BYTES);
+            limited.read_until(b'\n', &mut buf)?
+        };
+        if read == 0 {
+            return Ok(());
+        }
+        if buf.last() != Some(&b'\n') && read as u64 >= MAX_SEGMENT_LINE_BYTES {
+            return Err(BusError::Backend(format!(
+                "segment line exceeds the {MAX_SEGMENT_LINE_BYTES}-byte cap in {}",
+                path.display()
+            )));
+        }
+        let line = std::str::from_utf8(&buf)
+            .map_err(|error| BusError::Backend(format!("segment line is not UTF-8: {error}")))?
+            .trim_end_matches('\n');
         if line.is_empty() {
             continue;
         }
-        let is_expired = serde_json::from_str::<StoredEvent>(&line)
+        let is_expired = serde_json::from_str::<StoredEvent>(line)
             .map(|e| e.stored_at < cutoff_ms)
             .unwrap_or(false);
-        if is_expired {
-            expired.push(line);
-        } else {
-            kept.push(line);
-        }
+        visit(line, is_expired)?;
     }
-    Ok((kept, expired))
+}
+
+/// Streaming pass 1 of retention: collect the OFFSETS of expired
+/// records (for the idempotency-map prune) without buffering lines —
+/// 8 bytes per expired record instead of the whole segment.
+fn expired_offsets(path: &Path, cutoff_ms: u64) -> Result<std::collections::HashSet<u64>, BusError> {
+    let mut offsets = std::collections::HashSet::new();
+    for_each_segment_line(path, cutoff_ms, |line, is_expired| {
+        if is_expired {
+            if let Ok(event) = serde_json::from_str::<StoredEvent>(line) {
+                offsets.insert(event.offset);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(offsets)
 }
 
 impl EmbeddedBroker {
