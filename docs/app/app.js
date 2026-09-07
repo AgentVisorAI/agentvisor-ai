@@ -950,7 +950,7 @@
     // drops. Rendering both a mode chip AND a stream chip in live mode
     // duplicated the word "Live" next to itself.
     var statusChip = state.ds.mode === "mock"
-      ? '<span class="env-pill" title="Console is showing built-in demo data. Set MOCK_MODE=false to talk to a live backend.">Demo</span>'
+      ? '<span class="env-pill" title="Console is showing built-in demo data. Add ?live=1 to the URL to talk to the hosted backend.">Demo</span>'
       : '<span class="env-pill live-pulse" title="Streaming events from the daemon"><span class="live-label">Live</span></span>';
 
     app.innerHTML = "";
@@ -3978,7 +3978,7 @@
               '<button class="btn danger" id="deleteAccountBtn">Delete organization &amp; account</button>') +
         "</div>" : "") +
       (state.ds.mode === "mock" ?
-        '<div class="card"><h2>Demo mode</h2><p style="color: var(--fg-2); margin: 0 0 8px; font-size: var(--t-sec)">This console is running against built-in fixtures. To connect to a real backend, set <code>window.MOCK_MODE = false</code> in <code>docs/app/index.html</code>.</p></div>' : "");
+        '<div class="card"><h2>Demo mode</h2><p style="color: var(--fg-2); margin: 0 0 8px; font-size: var(--t-sec)">This console is running against built-in fixtures. To use the real backend, open this page with <code>?live=1</code> in the URL (it sticks until you visit with <code>?live=0</code>) — or <a href="?live=1#/signup">switch to live mode and create a workspace</a>.</p></div>' : "");
     var so = $("#signOut", root);
     if (so) so.addEventListener("click", signOut);
 

@@ -289,6 +289,20 @@ try {
   const meCancelled = await ds.getSession();
   check("pendingEmail cleared after cancel", meCancelled.user.pendingEmail == null, String(meCancelled.user.pendingEmail));
 
+  // Break-glass voiding: a pending email change must not survive a
+  // password change (it was authorized with the OLD password). The
+  // change-email (3/min) and change-password (5/min) buckets are both
+  // full at this point in the run — drain them first.
+  await new Promise(r => setTimeout(r, 61_000));
+  await ds.requestEmailChange({ newEmail: `void-${rand}@test.dev`, password: "rotated-e2e-pw-2026" });
+  const mePend = await ds.getSession();
+  check("pending set before rotation", mePend.user.pendingEmail === `void-${rand}@test.dev`);
+  await ds.changePassword({ currentPassword: "rotated-e2e-pw-2026", newPassword: "rotated-e2e-pw-2027" });
+  const meVoided = await ds.getSession();
+  check("pending voided by password change", meVoided.user.pendingEmail == null, String(meVoided.user.pendingEmail));
+  // put the password back so downstream checks keep working
+  await ds.changePassword({ currentPassword: "rotated-e2e-pw-2027", newPassword: "rotated-e2e-pw-2026" });
+
   // Admin MFA reset guards (the full lifecycle needs a WebAuthn
   // authenticator — browser drills cover it; here we pin the API's
   // guard rails, which need no credential).
