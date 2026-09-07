@@ -2374,6 +2374,21 @@
 
   function sessionsTable(sessions, sortable) {
     if (sessions.length === 0) return emptyState("No sessions yet", "Sessions from your daemons will appear here.");
+    var STALL_MS = 30 * 60 * 1000;
+    function statusPill(s) {
+      if (s.status === "completed") return '<span class="pill ok" title="Sealed — the daemon signed the receipt">sealed</span>';
+      if (s.status !== "in_progress") return '<span class="pill neutral">' + esc(s.status || "—") + '</span>';
+      var started = new Date(s.startedAt).getTime();
+      // A "live" session that has not sealed after 30 minutes is not
+      // healthy — the daemon crashed mid-session (its evidence is
+      // quarantined on the host), the process was killed before close,
+      // or the client never closed. Rendering it as silently live
+      // implied a completeness the console cannot vouch for (#356).
+      if (isFinite(started) && Date.now() - started > STALL_MS) {
+        return '<span class="pill warn" title="Open for over 30 minutes with no seal — the daemon may have crashed mid-session (evidence stays quarantined on the host) or the client never closed. Counts below may be incomplete.">stalled · unsealed</span>';
+      }
+      return '<span class="pill neutral" title="Session is open — events still arriving">live</span>';
+    }
     var rows = sessions.map(function (s) {
       var blocks = s.toolsBlocked > 0
         ? '<span class="pill err">' + s.toolsBlocked + " blocked</span>"
@@ -2386,6 +2401,7 @@
         "<td>" + blocks + "</td>" +
         '<td class="num tabular">' + usdMicros(s.costUsdMicros) + "</td>" +
         '<td style="color: var(--fg-2)">' + timeAgoCell(s.startedAt) + "</td>" +
+        "<td>" + statusPill(s) + "</td>" +
       "</tr>";
     }).join("");
     // Sortable headers only on the sessions list (the overview's
@@ -2402,7 +2418,7 @@
     }
     return '<div class="table-wrap"><table>' +
       "<thead><tr>" + th("Session") + th("Actor") + th("Events", "events", true) + th("Allowed", "allowed", true) +
-        th("Blocked", "blocked") + th("LLM cost", "cost", true) + th("Started", "started") + "</tr></thead>" +
+        th("Blocked", "blocked") + th("LLM cost", "cost", true) + th("Started", "started") + th("Status") + "</tr></thead>" +
       "<tbody>" + rows + "</tbody></table></div>";
   }
 
