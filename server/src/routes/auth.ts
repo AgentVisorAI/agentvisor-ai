@@ -944,6 +944,75 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     return reply.send({ ok: true });
   });
 
+  // Profile edits — currently just the display name, which was only
+  // settable at signup (and not at all for invite-accepted or SSO-JIT
+  // users, whose displayName is null forever). No step-up: it's
+  // cosmetic, org-visible metadata, same trust tier as an org rename.
+  // Empty string clears it (falls back to email everywhere it renders).
+  app.patch("/me/profile", async (req, reply) => {
+    const claims = requireSession(req, reply);
+    if (!claims) return;
+    if (claims.sub.startsWith("apikey:")) {
+      return reply.code(403).send({ error: "cookie_session_required" });
+    }
+    const body = z
+      .object({
+        // Same CRLF/NUL posture as signup (R184 F1): displayName is
+        // interpolated into welcomeMail HTML (escaped) but header-class
+        // injection must die at the Zod boundary, not in the template.
+        displayName: z.string().max(80).trim()
+          .refine(noCrlfNul, "must not contain CR/LF/NUL"),
+      })
+      .safeParse(req.body);
+    if (!body.success) return reply.code(400).send({ error: "invalid_name" });
+    const displayName = body.data.displayName === "" ? null : body.data.displayName;
+    const updated = await db.user.update({
+      where: { id: claims.sub },
+      data: { displayName },
+    });
+    return reply.send({
+      user: { id: updated.id, email: updated.email, displayName: updated.displayName },
+    });
+  });
+
+  // Sign out other devices. The sessionRevokedAt fence (bumped on
+  // logout / password change / reset / passkey revoke) was never
+  // user-reachable on its own — the only ways to fence a possibly-
+  // leaked cookie were to rotate the password or revoke a passkey,
+  // both heavier than "I left myself signed in on a conference
+  // machine". Bump the fence, then re-mint THIS session's cookie in
+  // the same response (same shape as /change-password) so "other
+  // devices" is exactly the semantics. API keys are untouched — this
+  // is about browser cookies, not automation credentials.
+  app.post("/logout-all", async (req, reply) => {
+    const claims = requireSession(req, reply);
+    if (!claims) return;
+    if (claims.sub.startsWith("apikey:")) {
+      return reply.code(403).send({ error: "cookie_session_required" });
+    }
+    const user = await db.user.update({
+      where: { id: claims.sub },
+      data: { sessionRevokedAt: new Date() },
+    });
+    const token = await mintSession({
+      sub: claims.sub,
+      orgId: claims.orgId,
+      membershipRole: claims.membershipRole,
+    });
+    reply.setCookie(env.SESSION_COOKIE_NAME, token, SESSION_COOKIE_OPTS);
+    writeAudit(
+      {
+        orgId: claims.orgId,
+        event: "auth.logout_all",
+        actorId: user.id,
+        actorEmail: user.email,
+        req,
+      },
+      req.log,
+    );
+    return reply.send({ ok: true });
+  });
+
   // GDPR data export. Returns everything the org has stored:
   // deployments, sessions, events, receipts, memberships, users.
   // Password hashes and reset tokens are excluded — the export is meant

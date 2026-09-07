@@ -162,6 +162,25 @@ try {
   const rot = await ds.rotateDeploymentToken(dep.deployment.id);
   check("rotate returns token", !!rot.ingestToken);
 
+  // Edit metadata: rename + environment flip; ID stays; guards
+  const edited = await ds.updateDeployment(dep.deployment.id, { name: "e2e-prod-renamed", environment: "development" });
+  check("deployment edit", edited && edited.name === "e2e-prod-renamed" && edited.environment === "development" && edited.id === dep.deployment.id);
+  let emptyPatch = "";
+  try { await ds.updateDeployment(dep.deployment.id, {}); } catch (e) { emptyPatch = e.errorCode || e.message; }
+  check("deployment empty patch 400", emptyPatch === "invalid_input", emptyPatch);
+  let badEnv = "";
+  try { await ds.updateDeployment(dep.deployment.id, { environment: "qa" }); } catch (e) { badEnv = e.errorCode || e.message; }
+  check("deployment bad env 400", badEnv === "invalid_input", badEnv);
+  let ghostDep = "";
+  try { await ds.updateDeployment("cmnope0000000000000000000", { name: "x" }); } catch (e) { ghostDep = e.errorCode || e.message; }
+  check("deployment ghost 404", ghostDep === "not_found", ghostDep);
+
+  // Sign out other devices: caller's cookie is re-minted and survives
+  const lo = await ds.logoutOtherDevices();
+  check("logout-all ok", lo && lo.ok === true);
+  const meAfterLo = await ds.getSession();
+  check("session survives logout-all", meAfterLo && meAfterLo.user.email === email, meAfterLo?.user?.email);
+
   // Delete: a deployment holding sealed receipts refuses a plain
   // DELETE (409 deployment_has_sealed_receipts) — assert the guard
   // fires, then force-delete exactly like the SPA's confirm flow.
@@ -199,6 +218,20 @@ try {
   check("old password refused after change", oldPwLogin && oldPwLogin.mfaRequired === true && !oldPwLogin.user, JSON.stringify(oldPwLogin));
   const reLogin = await ds.login({ email, password: "rotated-e2e-pw-2026" });
   check("new password logs in", reLogin && reLogin.user && reLogin.user.email === email);
+
+  // Org rename + profile edits
+  const renamed = await ds.renameOrg("E2E Renamed Co");
+  check("org rename", renamed && renamed.name === "E2E Renamed Co");
+  const meRenamed = await ds.getSession();
+  check("rename reflected on /me", meRenamed.org.name === "E2E Renamed Co", meRenamed.org.name);
+  check("slug stable across rename", meRenamed.org.slug && /e2e-co/.test(meRenamed.org.slug), meRenamed.org.slug);
+  let badName = "";
+  try { await ds.renameOrg("x".repeat(81)); } catch (e) { badName = e.errorCode || e.message; }
+  check("rename 81 chars rejected", badName === "invalid_name", badName);
+  const prof = await ds.updateProfile({ displayName: "E2E Tester" });
+  check("displayName set", prof && prof.displayName === "E2E Tester");
+  const profClear = await ds.updateProfile({ displayName: "" });
+  check("displayName cleared", profClear && profClear.displayName === null, String(profClear && profClear.displayName));
 
   // Email change guards (full round-trip needs a mailbox — covered by
   // browser/curl drills; here we pin the API contract).

@@ -3098,6 +3098,7 @@
           '<td class="mono">' + esc(d.version || "—") + "</td>" +
           '<td style="color: var(--fg-2)">' + timeAgoCell(d.lastSeenAt) + "</td>" +
           '<td>' +
+            '<button class="btn" data-action="edit" title="Rename or change environment — the ID, token, and receipts stay put">Edit</button> ' +
             '<button class="btn" data-action="rotate">Rotate</button> ' +
             '<button class="btn danger" data-action="delete">Delete</button>' +
           "</td>" +
@@ -3130,7 +3131,11 @@
         var btn = e.target.closest("button[data-action]");
         if (btn) {
           e.stopPropagation();
-          if (btn.getAttribute("data-action") === "rotate") {
+          if (btn.getAttribute("data-action") === "edit") {
+            var depRow = null;
+            for (var edi = 0; edi < deps.length; edi++) if (deps[edi].id === id) depRow = deps[edi];
+            editDeploymentModal(depRow || { id: id, name: "", environment: "production" }, function () { renderDeployments(main); });
+          } else if (btn.getAttribute("data-action") === "rotate") {
             confirmModal({
               title: "Rotate ingest token?",
               body: "The old token stops working immediately. Any daemon using it will fail to connect until you paste the new one.",
@@ -3266,6 +3271,65 @@
   // 409. Extract the flow into one place so future callers can't
   // regress the pattern; both the DETAIL page ($#depDelete) and
   // the LIST row-action button now call this.
+  // Edit a deployment's label fields. Name + environment are pure
+  // metadata — the modal says so, because operators are (rightly)
+  // nervous about touching anything near a signing key.
+  function editDeploymentModal(dep, onSuccess) {
+    if (document.body.classList.contains("locked")) return;
+    var envs = ["production", "staging", "development"];
+    var backdrop = h(
+      '<div class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal">' +
+        "<h2>Edit deployment</h2>" +
+        '<p class="sub">Name and environment are labels. The deployment ID, ingest token, signing key, and sealed receipts are untouched.</p>' +
+        '<form id="edForm">' +
+          '<div class="field"><label for="ed_name">Name</label><input id="ed_name" type="text" required maxlength="80" value="' + esc(dep.name || "") + '"></div>' +
+          '<div class="field"><label for="ed_env">Environment</label><select id="ed_env">' +
+            envs.map(function (v) { return '<option value="' + v + '"' + (dep.environment === v ? " selected" : "") + '>' + v + '</option>'; }).join("") +
+          '</select></div>' +
+          '<p id="ed_err" style="display:none;color:var(--danger, #e5484d);font-size:12.5px;margin:0 0 8px"></p>' +
+          '<div class="actions"><button type="button" class="btn" data-close>Cancel</button><button type="submit" class="btn accent">Save</button></div>' +
+        "</form>" +
+      "</div></div>"
+    );
+    document.body.appendChild(backdrop);
+    document.body.classList.add("locked");
+    var previouslyFocused = document.activeElement;
+    var uninstall;
+    var handled = false;
+    function close() { if (handled) return; handled = true; backdrop.remove(); document.body.classList.remove("locked"); if (uninstall) uninstall(); if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {} }
+    uninstall = installModalKeys(backdrop, close);
+    backdrop.addEventListener("click", function (e) {
+      if (handled) return;
+      if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
+    });
+    backdrop.querySelector("#edForm").addEventListener("submit", async function (e) {
+      e.preventDefault();
+      if (handled) return;
+      var errEl = backdrop.querySelector("#ed_err");
+      errEl.style.display = "none";
+      var name = backdrop.querySelector("#ed_name").value.trim();
+      var envSel = backdrop.querySelector("#ed_env").value;
+      if (!name) { errEl.textContent = "Name can't be empty."; errEl.style.display = "block"; return; }
+      var btn = e.target.querySelector('button[type="submit"]');
+      btn.disabled = true;
+      try {
+        var updated = await state.ds.updateDeployment(dep.id, { name: name, environment: envSel });
+        close();
+        toast('Saved — "' + ((updated && updated.name) || name) + '" (' + ((updated && updated.environment) || envSel) + ")");
+        if (onSuccess) onSuccess();
+      } catch (e2) {
+        btn.disabled = false;
+        var msg = e2.message || "Save failed";
+        if (e2.status === 403) msg = "Members can't edit deployments — ask an owner or admin.";
+        else if (e2.status === 404 || e2.errorCode === "not_found") msg = "That deployment no longer exists.";
+        else if (e2.errorCode === "invalid_input" || msg === "invalid_input") msg = "Name must be 1-80 characters.";
+        errEl.textContent = msg;
+        errEl.style.display = "block";
+      }
+    });
+    setTimeout(function () { backdrop.querySelector("#ed_name").focus(); }, 20);
+  }
+
   function openDeleteDeploymentModal(depId, onSuccess) {
     confirmModal({
       title: "Delete deployment?",
@@ -3782,9 +3846,11 @@
 
   async function renderSettingsGeneral(root) {
     root.innerHTML =
-      '<div class="card"><h2>Organization</h2>' +
+      '<div class="card"><h2 style="display:flex;align-items:baseline;gap:8px">Organization' +
+        (state.session.org.role === "owner" && state.ds.renameOrg ? '<button class="btn" id="renameOrgBtn" style="margin-left:auto;padding:2px 10px;font-size:12px" title="Rename the workspace. The org ID and everything issued under it stay valid">Rename…</button>' : '') +
+      '</h2>' +
         '<dl class="kv" style="display:grid;grid-template-columns:140px 1fr;gap:5px 12px;font-size:13px">' +
-          "<dt style=\"color:var(--fg-3)\">Name</dt><dd>" + esc(state.session.org.name) + "</dd>" +
+          "<dt style=\"color:var(--fg-3)\">Name</dt><dd id=\"orgNameVal\">" + esc(state.session.org.name) + "</dd>" +
           "<dt style=\"color:var(--fg-3)\">Org ID</dt><dd class=\"mono\">" + esc(state.session.org.id) + "</dd>" +
           "<dt style=\"color:var(--fg-3)\">Created</dt><dd>" + esc(state.session.org.createdAt ? new Date(state.session.org.createdAt).toLocaleDateString() : "—") + "</dd>" +
         "</dl>" +
@@ -3799,11 +3865,14 @@
           "<dt style=\"color:var(--fg-3)\">Email</dt><dd>" + esc(state.session.user.email) +
             (state.session.user.pendingEmail ? ' <span class="pill neutral" id="pendingEmailPill" title="Waiting for the confirmation link sent to the new address">change pending: ' + esc(state.session.user.pendingEmail) + '</span> <button class="btn" id="cancelEmailChange" style="padding:1px 8px;font-size:12px">Cancel</button>' : '') +
           "</dd>" +
+          "<dt style=\"color:var(--fg-3)\">Name</dt><dd>" + esc(state.session.user.displayName || "—") +
+            ' <button class="btn" id="editNameBtn" style="padding:1px 8px;font-size:12px" title="Shown to teammates instead of your email">Edit</button></dd>' +
           "<dt style=\"color:var(--fg-3)\">User ID</dt><dd class=\"mono\">" + esc(state.session.user.id) + "</dd>" +
         "</dl>" +
         '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">' +
           '<button class="btn" id="changeEmailBtn" title="Move the account to a new sign-in address; the new mailbox must confirm">Change email…</button>' +
           '<button class="btn" id="changePasswordBtn" title="Rotate your password. Other sessions are signed out; API tokens keep working">Change password…</button>' +
+          '<button class="btn" id="logoutOthersBtn" title="Sign out every other browser and device. This one stays signed in; API tokens keep working">Sign out other devices</button>' +
           (state.session.org.role === "owner" ? '<button class="btn" id="exportMyData" title="Download everything this workspace stores about you and your org as NDJSON">↓ Download my data</button>' : "") +
           '<button class="btn danger" id="signOut">Sign out</button>' +
         '</div>' +
@@ -3927,6 +3996,89 @@
         ipCard.innerHTML = '<h2>Network access</h2><p style="color:var(--fg-2);font-size:var(--t-sec)">Could not load (' + esc(e.message || "network") + ').</p>';
       }
     }
+
+    // Rename workspace (owner-only). Updates the chrome (org chip /
+    // switcher) in place — the slug and org id are stable by design.
+    var roBtn = $("#renameOrgBtn", root);
+    if (roBtn) roBtn.addEventListener("click", function () {
+      openInputModal({
+        title: "Rename workspace",
+        sub: "The new name shows up in the console, invite emails, and exports. The org ID and everything already issued stay valid.",
+        label: "Workspace name",
+        placeholder: state.session.org.name,
+        confirmLabel: "Rename",
+        onConfirm: function (name) {
+          var nm = (name || "").trim();
+          if (!nm) { toast("Name can't be empty", true); return; }
+          if (nm.length > 80) { toast("Keep it under 80 characters", true); return; }
+          state.ds.renameOrg(nm).then(function (org) {
+            state.session.org.name = (org && org.name) || nm;
+            // The switcher menu lists memberships by name — patch the
+            // active org's entry so the menu doesn't show the old name
+            // until the next /me hydration.
+            (state.session.memberships || []).forEach(function (m) {
+              if (m.orgId === state.session.org.id || (m.org && m.org.id === state.session.org.id)) {
+                if (m.org) m.org.name = state.session.org.name;
+                if (m.orgName) m.orgName = state.session.org.name;
+                if (m.name) m.name = state.session.org.name;
+              }
+            });
+            toast('Workspace renamed to "' + state.session.org.name + '"');
+            render();
+          }).catch(function (err) {
+            var msg = err.message || "Rename failed";
+            if (err.errorCode === "invalid_name" || msg === "invalid_name") msg = "That name won't work — 1-80 characters, no control characters.";
+            else if (err.status === 403) msg = "Only an owner can rename the workspace.";
+            toast(msg, true);
+          });
+        },
+      });
+    });
+
+    // Display name (any role — it's the caller's own profile).
+    var enBtn = $("#editNameBtn", root);
+    if (enBtn) enBtn.addEventListener("click", function () {
+      openInputModal({
+        title: "Your name",
+        sub: "Shown to teammates in the members list and audit trail instead of your email. Leave empty to clear it.",
+        label: "Display name",
+        placeholder: state.session.user.displayName || "First Last",
+        confirmLabel: "Save",
+        allowEmpty: true,
+        onConfirm: function (name) {
+          var nm = (name || "").trim();
+          if (nm.length > 80) { toast("Keep it under 80 characters", true); return; }
+          state.ds.updateProfile({ displayName: nm }).then(function (user) {
+            state.session.user.displayName = (user && user.displayName) || null;
+            toast(nm ? 'Saved — you\'ll appear as "' + nm + '"' : "Display name cleared");
+            render();
+          }).catch(function (err) {
+            var msg = err.message || "Save failed";
+            if (err.errorCode === "invalid_name" || msg === "invalid_name") msg = "That name won't work — up to 80 characters, no control characters.";
+            toast(msg, true);
+          });
+        },
+      });
+    });
+
+    // Sign out other devices — the fence primitive, self-service. This
+    // session gets a re-minted cookie in the same response, so only
+    // OTHER browsers die.
+    var loBtn = $("#logoutOthersBtn", root);
+    if (loBtn) loBtn.addEventListener("click", function () {
+      confirmModal({
+        title: "Sign out other devices?",
+        body: "Every other browser and device signed in to this account is signed out immediately. This session stays. API ingest tokens keep working.",
+        confirmLabel: "Sign out others",
+        onConfirm: function () {
+          state.ds.logoutOtherDevices().then(function () {
+            toast("Other sessions were signed out — this one stays");
+          }).catch(function (err) {
+            toast(err.message || "Could not sign out other sessions", true);
+          });
+        },
+      });
+    });
 
     // Change email — two-phase: password step-up here, then a confirm
     // link lands in the NEW mailbox. Nothing changes until it's clicked.
@@ -4283,7 +4435,7 @@
         (opts.sub ? '<p class="sub">' + esc(opts.sub) + "</p>" : "") +
         '<form id="inpForm">' +
           '<div class="field"><label for="inpVal">' + esc(opts.label || "Value") + "</label>" +
-          '<input id="inpVal" type="' + esc(inputType) + '" required placeholder="' + esc(opts.placeholder || "") + '" autocomplete="' + esc(autoComplete) + '" /></div>' +
+          '<input id="inpVal" type="' + esc(inputType) + '"' + (opts.allowEmpty ? "" : " required") + ' placeholder="' + esc(opts.placeholder || "") + '" autocomplete="' + esc(autoComplete) + '" /></div>' +
           '<div class="actions">' +
             '<button type="button" class="btn" data-close>Cancel</button>' +
             '<button class="btn accent" type="submit">' + esc(opts.confirmLabel || "Save") + "</button>" +
@@ -4323,7 +4475,9 @@
       // trim.
       var raw = backdrop.querySelector("#inpVal").value;
       var v = inputType === "password" ? raw : raw.trim();
-      if (!v) return;
+      // allowEmpty callers (display-name clear) accept "" as a
+      // deliberate value; everyone else keeps the silent-noop guard.
+      if (!v && !opts.allowEmpty) return;
       var cb = opts.onConfirm;
       close();
       if (cb) cb(v);
