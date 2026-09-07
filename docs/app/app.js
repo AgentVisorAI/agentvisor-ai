@@ -3884,8 +3884,11 @@
         "</div>" : "") +
       (state.session.org.role === "owner" ?
         '<div class="card" id="dangerCard" style="border-color:color-mix(in srgb, var(--danger, #e5484d) 45%, transparent)"><h2>Danger zone</h2>' +
-          '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 12px">Permanently delete this organization and your account — every deployment, session, event, signed receipt, webhook, and audit entry is erased. Only possible when you are the sole member.</p>' +
-          '<button class="btn danger" id="deleteAccountBtn">Delete organization &amp; account</button>' +
+          ((state.session.memberships || []).length > 1
+            ? '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 12px">Permanently delete this workspace — every deployment, session, event, signed receipt, webhook, and audit entry is erased. Your account stays: you belong to other workspaces and will land in the next one. Only possible when you are the sole member here.</p>' +
+              '<button class="btn danger" id="deleteAccountBtn">Delete this workspace</button>'
+            : '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 12px">Permanently delete this organization and your account — every deployment, session, event, signed receipt, webhook, and audit entry is erased. Only possible when you are the sole member.</p>' +
+              '<button class="btn danger" id="deleteAccountBtn">Delete organization &amp; account</button>') +
         "</div>" : "") +
       (state.ds.mode === "mock" ?
         '<div class="card"><h2>Demo mode</h2><p style="color: var(--fg-2); margin: 0 0 8px; font-size: var(--t-sec)">This console is running against built-in fixtures. To connect to a real backend, set <code>window.MOCK_MODE = false</code> in <code>docs/app/index.html</code>.</p></div>' : "");
@@ -4130,18 +4133,39 @@
       });
     });
 
-    // Danger zone — delete org + account (sole member only).
+    // Danger zone — delete org (+ account only when this was the last
+    // workspace; a multi-org owner keeps their account and lands in the
+    // next workspace, per the server's accountDeleted flag).
     var delBtn = $("#deleteAccountBtn", root);
     if (delBtn) delBtn.addEventListener("click", function () {
+      var multiOrg = (state.session.memberships || []).length > 1;
       stepUpModal({
-        title: "Delete organization & account?",
-        body: "This erases the org and EVERYTHING in it — deployments, sessions, events, signed receipts, webhooks, audit log — plus your account. Receipt bundles you exported stop verifying against this console. This cannot be undone.",
+        title: multiOrg ? "Delete this workspace?" : "Delete organization & account?",
+        body: multiOrg
+          ? "This erases the workspace and EVERYTHING in it — deployments, sessions, events, signed receipts, webhooks, audit log. Receipt bundles exported from it stop verifying. Your account survives (you belong to other workspaces). This cannot be undone."
+          : "This erases the org and EVERYTHING in it — deployments, sessions, events, signed receipts, webhooks, audit log — plus your account. Receipt bundles you exported stop verifying against this console. This cannot be undone.",
         confirmLabel: "Delete forever",
         danger: true,
-        typeToConfirm: "DELETE MY ACCOUNT",
+        typeToConfirm: multiOrg ? "DELETE THIS WORKSPACE" : "DELETE MY ACCOUNT",
         onConfirm: async function (password, fail) {
           try {
-            await state.ds.deleteMyAccount(password);
+            var r = await state.ds.deleteMyAccount(password);
+            if (r && r.accountDeleted === false && r.org) {
+              // Account survives — the server already minted a cookie
+              // for the oldest remaining workspace. Rebind in place.
+              var deletedName = state.session.org.name;
+              var deletedId = state.session.org.id;
+              state.session.org = r.org;
+              state.session.memberships = (state.session.memberships || []).filter(function (m) {
+                return (m.orgId || (m.org && m.org.id)) !== deletedId;
+              });
+              toast('Workspace "' + deletedName + '" deleted — you\'re now in ' + r.org.name);
+              // Re-hydrate memberships from /me so the switcher is right.
+              announceSignIn();
+              navigate("#/overview");
+              render();
+              return;
+            }
             try { localStorage.setItem("av_signed_out_at", String(Date.now())); } catch (e3) {}
             state.session = null;
             toast("Organization deleted. Goodbye.");

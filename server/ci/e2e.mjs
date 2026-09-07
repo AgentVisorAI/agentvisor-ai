@@ -300,6 +300,14 @@ try {
   const s2 = await ds.getSession();
   check("logout clears session", s2 === null);
 
+  // Danger zone: single-org owner delete removes org AND account
+  // (accountDeleted flag). Doubles as suite cleanup.
+  await ds.login({ email, password: "rotated-e2e-pw-2026" });
+  const del = await ds.deleteMyAccount("rotated-e2e-pw-2026");
+  check("delete-account accountDeleted flag", del && del.ok === true && del.accountDeleted === true, JSON.stringify(del));
+  const s3 = await ds.getSession();
+  check("session gone after delete", s3 === null);
+
   let ok=0, fail=0;
   results.forEach(r => { if (r.ok){ok++;console.log("PASS",r.n,r.x||"");} else {fail++;console.log("FAIL",r.n,r.x||"");} });
   console.log(`\n${ok}/${ok+fail} e2e checks passed`);

@@ -2098,7 +2098,7 @@
       await delay(200);
       if (!password) { var e2 = new Error("invalid_password"); e2.status = 401; throw e2; }
       // Demo mode: pretend the cascade ran; the caller signs out.
-      return { ok: true };
+      return { ok: true, accountDeleted: true };
     },
     // No downloadAuditCsv here on purpose: without it the console
     // builds the CSV client-side from the loaded entries, which works

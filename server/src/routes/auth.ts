@@ -1479,8 +1479,9 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     );
 
     const ORG_HAS_OTHER_MEMBERS = "org_has_other_members";
+    let accountDeleted = true;
     try {
-      await db.$transaction(async (tx) => {
+      accountDeleted = await db.$transaction(async (tx) => {
         // Race-safe recheck of the pre-transaction guard above: an
         // invite accepted between the check and this commit must not
         // be cascaded away by a delete that was authorized when the
@@ -1497,14 +1498,18 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         // records, invites, and this org's audit_entries. The
         // R97 F-A log line above is the durable forensic trace.
         await tx.org.delete({ where: { id: claims.orgId } });
-        // Then remove the user. Other orgs they belonged to (unlikely
-        // at MVP; multi-org membership not exposed yet) would keep them.
+        // Then remove the user — unless they belong to other orgs
+        // (multi-org membership is a first-class flow since the
+        // workspace switcher landed): deleting ONE workspace must
+        // not erase the person from every other org they're in.
         const otherMemberships = await tx.membership.count({
           where: { userId: claims.sub },
         });
         if (otherMemberships === 0) {
           await tx.user.delete({ where: { id: claims.sub } });
+          return true;
         }
+        return false;
       }, {
         // R98 F1: Prisma's default $transaction timeout is 5 s, which
         // is not survivable for the whole-org cascade tree on any
@@ -1552,7 +1557,37 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     );
 
     clearSessionCookie(reply);
-    return reply.send({ ok: true });
+    if (!accountDeleted) {
+      // Multi-org caller: the account survives. Land them in their
+      // oldest remaining workspace with a fresh cookie (same
+      // oldest-first rule login uses) instead of a dead-org sign-out —
+      // "delete workspace A" should not feel like "delete me".
+      const next = await db.membership.findFirst({
+        where: { userId: claims.sub },
+        orderBy: { createdAt: "asc" },
+        include: { org: true },
+      });
+      if (next) {
+        const token = await mintSession({
+          sub: claims.sub,
+          orgId: next.orgId,
+          membershipRole: next.role as "owner" | "admin" | "member",
+        });
+        reply.setCookie(env.SESSION_COOKIE_NAME, token, SESSION_COOKIE_OPTS);
+        return reply.send({
+          ok: true,
+          accountDeleted: false,
+          org: {
+            id: next.org.id,
+            slug: next.org.slug,
+            name: next.org.name,
+            role: next.role,
+            createdAt: next.org.createdAt,
+          },
+        });
+      }
+    }
+    return reply.send({ ok: true, accountDeleted });
   });
 
   // Password reset — two-step flow. The first endpoint always returns 202,
