@@ -24,6 +24,13 @@ model User {
   // "issuedAt" timestamp are cleared on successful use or expiry (24h).
   resetTokenHash   String?
   resetTokenAt     DateTime?
+  // Pending email change: the NEW address awaiting verification, plus the
+  // argon2-hashed token mailed to it. Cleared on confirm/cancel/overwrite;
+  // stale requests expire after 24h (checked at confirm time, same TTL
+  // discipline as the reset token above).
+  pendingEmail          String?
+  pendingEmailTokenHash String?
+  pendingEmailAt        DateTime?
   // JWT revocation fence — every session whose iat is before this timestamp
   // is rejected in authenticate(). Bumped on logout and password change so
   // a captured cookie stops working immediately even though the JWT itself

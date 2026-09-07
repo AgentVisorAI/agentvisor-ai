@@ -200,6 +200,29 @@ try {
   const reLogin = await ds.login({ email, password: "rotated-e2e-pw-2026" });
   check("new password logs in", reLogin && reLogin.user && reLogin.user.email === email);
 
+  // Email change guards (full round-trip needs a mailbox — covered by
+  // browser/curl drills; here we pin the API contract).
+  let ceWrong = "";
+  try { await ds.requestEmailChange({ newEmail: "other@test.dev", password: "not-my-password" }); }
+  catch (e) { ceWrong = e.errorCode || e.message; }
+  check("change-email wrong password 401", ceWrong === "invalid_password", ceWrong);
+  let ceSame = "";
+  try { await ds.requestEmailChange({ newEmail: email, password: "rotated-e2e-pw-2026" }); }
+  catch (e) { ceSame = e.errorCode || e.message; }
+  check("change-email same address 400", ceSame === "same_as_current", ceSame);
+  const ceReq = await ds.requestEmailChange({ newEmail: `new-${rand}@test.dev`, password: "rotated-e2e-pw-2026" });
+  check("change-email request 202", ceReq && ceReq.ok === true && ceReq.pendingEmail === `new-${rand}@test.dev`);
+  const mePending = await ds.getSession();
+  check("pendingEmail on /me", mePending.user.pendingEmail === `new-${rand}@test.dev`, mePending.user.pendingEmail);
+  let ceBadTok = "";
+  try { await ds.confirmEmailChange({ email, token: "AAAAAAAAAAAAAAAAAAAAAAAA" }); }
+  catch (e) { ceBadTok = e.errorCode || e.message; }
+  check("change-email bad token 401", ceBadTok === "invalid_token", ceBadTok);
+  const ceCancel = await ds.cancelEmailChange();
+  check("change-email cancel", ceCancel && ceCancel.ok === true);
+  const meCancelled = await ds.getSession();
+  check("pendingEmail cleared after cancel", meCancelled.user.pendingEmail == null, String(meCancelled.user.pendingEmail));
+
   // Admin MFA reset guards (the full lifecycle needs a WebAuthn
   // authenticator — browser drills cover it; here we pin the API's
   // guard rails, which need no credential).

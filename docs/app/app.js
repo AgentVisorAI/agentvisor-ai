@@ -233,14 +233,15 @@
     syncFreshPresence();
     try { localStorage.setItem("av_signed_in_at", String(Date.now())); } catch (e) {}
     // Login/passkey/OAuth responses carry {user, org} but not the
-    // memberships list — only GET /me does. Hydrate in the background
-    // so multi-org users get the workspace switcher without a reload;
-    // single-org users see no change (chip stays a static div).
+    // memberships list or account-level extras like pendingEmail — only
+    // GET /me does. Hydrate in the background so multi-org users get
+    // the workspace switcher and the Settings Account card shows a
+    // pending email change without a reload.
     if (state.ds.getSession) {
       state.ds.getSession().then(function (full) {
         if (full && full.user && state.session && state.session.user &&
             full.user.id === state.session.user.id &&
-            (full.memberships || []).length > 1) {
+            ((full.memberships || []).length > 1 || full.user.pendingEmail)) {
           state.session = full;
           render();
         }
@@ -434,7 +435,7 @@
     var names = {
       overview: "Overview", sessions: "Sessions", policies: "Policies",
       deployments: "Deployments", settings: "Settings", login: "Sign in",
-      signup: "Create account", reset: "Reset password", "accept-invite": "Accept invite",
+      signup: "Create account", reset: "Reset password", "accept-invite": "Accept invite", "confirm-email": "Confirm email",
     };
     var base = names[path[0]] || "Console";
     if (path[0] === "sessions" && path[1]) base = "Session " + path[1];
@@ -493,7 +494,7 @@
     _scrollPrevHash = _hashNow;
     state.route = parseHash();
     var path = state.route.path;
-    var publicRoutes = ["login", "signup", "reset", "accept-invite"];
+    var publicRoutes = ["login", "signup", "reset", "accept-invite", "confirm-email"];
     if (!state.session && !publicRoutes.includes(path[0])) {
       // Remember where the user was trying to go so we can restore
       // after login. A deep-link from a Slack notification / email
@@ -505,6 +506,14 @@
       return navigate("#/login");
     }
     if (state.session && publicRoutes.includes(path[0])) {
+      // The email-change confirm endpoint is anonymous and, on
+      // success, fences every session (including this one) — so a
+      // signed-in user clicking the link from their new mailbox gets
+      // the confirm + a purposeful sign-out in one flow instead of a
+      // bounce to Overview followed by a surprise session-expiry.
+      if (path[0] === "confirm-email") {
+        return renderConfirmEmail();
+      }
       // An authed user clicking a teammate's invite link used to be
       // bounced to Overview with the invite silently swallowed — and
       // the accept page's own hint says "sign in first, then click
@@ -545,6 +554,7 @@
       if (path[0] === "signup") return renderSignup();
       if (path[0] === "reset") return renderReset();
       if (path[0] === "accept-invite") return renderAcceptInvite();
+      if (path[0] === "confirm-email") return renderConfirmEmail();
       return renderLogin();
     }
 
@@ -1529,6 +1539,68 @@
         btn.disabled = false;
         $("#acceptErr").innerHTML = '<div class="auth-err">' + esc(err.message || "Accept failed") + '</div>';
       });
+    });
+  }
+
+  // One-click landing page for the email-change verification link
+  // (#/confirm-email?token=…&email=<old address>). Runs the confirm on
+  // load — the token in the URL is the proof, there's nothing to type.
+  // On success every session is fenced server-side, so if this browser
+  // was signed in we purposefully sign it out into a clean login.
+  function renderConfirmEmail() {
+    var qs = new URLSearchParams(location.hash.split("?")[1] || "");
+    var token = qs.get("token") || "";
+    var email = qs.get("email") || "";
+    app.innerHTML = "";
+    app.appendChild(h(
+      '<div class="auth-shell">' +
+        '<section class="auth-form">' +
+          '<div class="auth-form-inner">' +
+            '<div class="auth-brand"><span class="auth-brand-mark">A</span> AgentVisor AI</div>' +
+            '<h1>Confirm your new email</h1>' +
+            '<div id="ceStatus"><p class="sub">Verifying the link…</p></div>' +
+            '<div class="auth-alt"><a href="#/login">← Back to sign in</a></div>' +
+          "</div>" +
+        "</section>" +
+        '<aside class="auth-panel"><div class="panel-inner">' +
+          '<h2>One link, both proofs.</h2>' +
+          '<p>Changing the sign-in address needs the account password and control of the new mailbox. This link is the mailbox half — it expires after 24 hours and works once.</p>' +
+        "</div></aside>" +
+      "</div>"
+    ));
+    var status = $("#ceStatus");
+    if (!token || !email) {
+      status.innerHTML = '<div class="auth-err">This link is incomplete — open the exact URL from the confirmation email.</div>';
+      return;
+    }
+    state.ds.confirmEmailChange({ email: email, token: token }).then(function (r) {
+      var newEmail = (r && r.email) || "your new address";
+      if (state.session) {
+        // Fence already killed this cookie server-side; make the local
+        // state match on purpose instead of via a surprise 401.
+        stopLiveStream();
+        state.session = null;
+        try { localStorage.setItem("av_signed_out_at", String(Date.now())); } catch (e) {}
+      }
+      status.innerHTML =
+        '<div class="mock-badge" style="margin-top:0; text-align:left; padding: 10px 12px;">' +
+          'Email updated to <strong>' + esc(newEmail) + '</strong>. Every signed-in session was signed out — sign in with the new address.' +
+        '</div>' +
+        '<button class="primary" style="margin-top:12px" id="ceGoLogin">Sign in</button>';
+      var go = $("#ceGoLogin");
+      if (go) go.addEventListener("click", function () { navigate("#/login"); });
+    }).catch(function (err) {
+      var msg;
+      if (err && (err.errorCode === "invalid_token" || err.message === "invalid_token")) {
+        msg = "This link is invalid, already used, or expired (links last 24 hours). Request the change again from Settings.";
+      } else if (err && (err.errorCode === "email_in_use" || err.message === "email_in_use")) {
+        msg = "That address now belongs to another account. Request the change again with a different address.";
+      } else if (err && err.status === 429) {
+        msg = err.friendlyMessage || "Too many attempts. Try again shortly.";
+      } else {
+        msg = (err && err.message) || "Could not confirm the change.";
+      }
+      status.innerHTML = '<div class="auth-err">' + esc(msg) + "</div>";
     });
   }
 
@@ -3724,10 +3796,13 @@
       "</div>" +
       '<div class="card"><h2>Account</h2>' +
         '<dl class="kv" style="display:grid;grid-template-columns:140px 1fr;gap:5px 12px;font-size:13px">' +
-          "<dt style=\"color:var(--fg-3)\">Email</dt><dd>" + esc(state.session.user.email) + "</dd>" +
+          "<dt style=\"color:var(--fg-3)\">Email</dt><dd>" + esc(state.session.user.email) +
+            (state.session.user.pendingEmail ? ' <span class="pill neutral" id="pendingEmailPill" title="Waiting for the confirmation link sent to the new address">change pending: ' + esc(state.session.user.pendingEmail) + '</span> <button class="btn" id="cancelEmailChange" style="padding:1px 8px;font-size:12px">Cancel</button>' : '') +
+          "</dd>" +
           "<dt style=\"color:var(--fg-3)\">User ID</dt><dd class=\"mono\">" + esc(state.session.user.id) + "</dd>" +
         "</dl>" +
         '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">' +
+          '<button class="btn" id="changeEmailBtn" title="Move the account to a new sign-in address; the new mailbox must confirm">Change email…</button>' +
           '<button class="btn" id="changePasswordBtn" title="Rotate your password. Other sessions are signed out; API tokens keep working">Change password…</button>' +
           (state.session.org.role === "owner" ? '<button class="btn" id="exportMyData" title="Download everything this workspace stores about you and your org as NDJSON">↓ Download my data</button>' : "") +
           '<button class="btn danger" id="signOut">Sign out</button>' +
@@ -3853,6 +3928,25 @@
       }
     }
 
+    // Change email — two-phase: password step-up here, then a confirm
+    // link lands in the NEW mailbox. Nothing changes until it's clicked.
+    var ceBtn = $("#changeEmailBtn", root);
+    if (ceBtn) ceBtn.addEventListener("click", function () {
+      changeEmailModal(root);
+    });
+    var ceCancel = $("#cancelEmailChange", root);
+    if (ceCancel) ceCancel.addEventListener("click", function () {
+      ceCancel.disabled = true;
+      state.ds.cancelEmailChange().then(function () {
+        if (state.session && state.session.user) state.session.user.pendingEmail = null;
+        toast("Email change cancelled");
+        renderSettingsGeneral(root);
+      }).catch(function (err) {
+        ceCancel.disabled = false;
+        toast(err.message || "Cancel failed", true);
+      });
+    });
+
     // Change password — self-service rotation with current-password
     // step-up. Other sessions are fenced server-side; this one gets a
     // re-minted cookie in the same response, so no sign-out here.
@@ -3909,6 +4003,77 @@
         },
       });
     });
+  }
+
+  // Change-email modal: new address + current password. The server
+  // answers a uniform 202 whether or not the address is taken; the
+  // real gate is the confirmation link mailed to the new address.
+  function changeEmailModal(settingsRoot) {
+    if (document.body.classList.contains("locked")) return;
+    var backdrop = h(
+      '<div class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal">' +
+        "<h2>Change email</h2>" +
+        '<p class="sub">We\'ll send a confirmation link to the new address. Nothing changes until it\'s clicked; after confirming, you\'ll sign in with the new address.</p>' +
+        '<form id="ceForm">' +
+          '<div class="field"><label for="ce_new">New email</label><input id="ce_new" type="email" autocomplete="email" placeholder="you@company.com" required></div>' +
+          '<div class="field"><label for="ce_pw">Your password</label><input id="ce_pw" type="password" autocomplete="current-password" required></div>' +
+          '<p id="ce_err" style="display:none;color:var(--danger, #e5484d);font-size:12.5px;margin:0 0 8px"></p>' +
+          '<div class="actions"><button type="button" class="btn" data-close>Cancel</button><button type="submit" class="btn accent">Send confirmation</button></div>' +
+        "</form>" +
+      "</div></div>"
+    );
+    document.body.appendChild(backdrop);
+    document.body.classList.add("locked");
+    var previouslyFocused = document.activeElement;
+    var uninstall;
+    var handled = false;
+    function close() { if (handled) return; handled = true; backdrop.remove(); document.body.classList.remove("locked"); if (uninstall) uninstall(); if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {} }
+    uninstall = installModalKeys(backdrop, close);
+    backdrop.addEventListener("click", function (e) {
+      if (handled) return;
+      if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
+    });
+    function showErr(msg) {
+      var errEl = backdrop.querySelector("#ce_err");
+      errEl.textContent = msg;
+      errEl.style.display = "block";
+    }
+    backdrop.querySelector("#ceForm").addEventListener("submit", async function (e) {
+      e.preventDefault();
+      if (handled) return;
+      backdrop.querySelector("#ce_err").style.display = "none";
+      var newEmail = backdrop.querySelector("#ce_new").value.trim().toLowerCase();
+      var pw = backdrop.querySelector("#ce_pw").value;
+      if (state.session && newEmail === (state.session.user.email || "").toLowerCase()) {
+        showErr("That's already your address.");
+        return;
+      }
+      var btn = e.target.querySelector('button[type="submit"]');
+      btn.disabled = true;
+      try {
+        var r = await state.ds.requestEmailChange({ newEmail: newEmail, password: pw });
+        if (state.session && state.session.user) state.session.user.pendingEmail = newEmail;
+        close();
+        if (state.ds.mode === "mock" && r && r.mockToken) {
+          toast("Demo: confirmation 'sent'. Opening the confirm link…");
+          setTimeout(function () {
+            navigate("#/confirm-email?token=" + encodeURIComponent(r.mockToken) + "&email=" + encodeURIComponent(state.session.user.email));
+          }, 600);
+        } else {
+          toast("Confirmation sent to " + newEmail + " — the change happens when that link is clicked");
+        }
+        if (settingsRoot) renderSettingsGeneral(settingsRoot);
+      } catch (e2) {
+        btn.disabled = false;
+        var msg = e2.message || "Request failed";
+        if (e2.status === 401 || e2.errorCode === "invalid_password") msg = "Wrong password.";
+        else if (e2.errorCode === "same_as_current" || msg === "same_as_current") msg = "That's already your address.";
+        else if (e2.errorCode === "invalid_input" || msg === "invalid_input") msg = "That doesn't look like a valid email address.";
+        else if (e2.status === 429) msg = e2.friendlyMessage || "Too many attempts. Try again shortly.";
+        showErr(msg);
+      }
+    });
+    setTimeout(function () { backdrop.querySelector("#ce_new").focus(); }, 20);
   }
 
   // Change-password modal: current + new + confirm. Client pre-checks
