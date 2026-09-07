@@ -3229,7 +3229,7 @@
       "</div>" +
       '<div class="card" style="margin-bottom:12px">' +
         "<h2>Signing key</h2>" +
-        '<dl class="kv" style="display:grid;grid-template-columns:140px 1fr;gap:5px 12px;font-size:13px">' +
+        '<dl class="kv kv-grid">' +
           '<dt style="color:var(--fg-3)">Fingerprint</dt><dd class="mono">' + copyable(d.keyFingerprint) + "</dd>" +
           '<dt style="color:var(--fg-3)">Public key</dt><dd class="mono" style="word-break:break-all">' + copyable(d.publicKeyHex) + "</dd>" +
           // No copy button here: the hint is a redacted placeholder
@@ -3966,7 +3966,7 @@
       '<div class="card"><h2 style="display:flex;align-items:baseline;gap:8px">Organization' +
         (state.session.org.role === "owner" && state.ds.renameOrg ? '<button class="btn" id="renameOrgBtn" style="margin-left:auto;padding:2px 10px;font-size:12px" title="Rename the workspace. The org ID and everything issued under it stay valid">Rename…</button>' : '') +
       '</h2>' +
-        '<dl class="kv" style="display:grid;grid-template-columns:140px 1fr;gap:5px 12px;font-size:13px">' +
+        '<dl class="kv kv-grid">' +
           "<dt style=\"color:var(--fg-3)\">Name</dt><dd id=\"orgNameVal\">" + esc(state.session.org.name) + "</dd>" +
           "<dt style=\"color:var(--fg-3)\">Org ID</dt><dd class=\"mono\">" + esc(state.session.org.id) + "</dd>" +
           "<dt style=\"color:var(--fg-3)\">Created</dt><dd>" + esc(state.session.org.createdAt ? new Date(state.session.org.createdAt).toLocaleDateString() : "—") + "</dd>" +
@@ -3978,7 +3978,7 @@
         loadingBlock("table") +
       "</div>" +
       '<div class="card"><h2>Account</h2>' +
-        '<dl class="kv" style="display:grid;grid-template-columns:140px 1fr;gap:5px 12px;font-size:13px">' +
+        '<dl class="kv kv-grid">' +
           "<dt style=\"color:var(--fg-3)\">Email</dt><dd>" + esc(state.session.user.email) +
             (state.session.user.pendingEmail ? ' <span class="pill neutral" id="pendingEmailPill" title="Waiting for the confirmation link sent to the new address">change pending: ' + esc(state.session.user.pendingEmail) + '</span> <button class="btn" id="cancelEmailChange" style="padding:1px 8px;font-size:12px">Cancel</button>' : '') +
           "</dd>" +
@@ -4022,7 +4022,7 @@
         card.innerHTML =
           '<h2>Data retention</h2>' +
           '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 12px">Sessions, events, receipts, and audit log entries older than the window are automatically purged. Set to 0 to keep everything forever.</p>' +
-          '<div style="display:grid;grid-template-columns:200px 1fr;gap:12px 16px;font-size:13px;align-items:center">' +
+          '<div class="ret-grid">' +
             '<label for="retSess">Sessions + events</label>' +
             '<div style="display:flex;gap:8px;align-items:center">' +
               '<input id="retSess" type="number" min="0" max="3650" value="' + esc(r.sessionRetentionDays) + '" style="width:100px"' + (editable ? '' : ' disabled') + '>' +

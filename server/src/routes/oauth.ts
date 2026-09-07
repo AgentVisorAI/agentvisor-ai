@@ -109,6 +109,18 @@ async function getConfig(p: ProviderCfg): Promise<oidc.Configuration> {
       ? { execute: [oidc.allowInsecureRequests] }
       : undefined,
   );
+  // Code-flow ID tokens arrive over the direct token-endpoint channel,
+  // so openid-client skips JWS signature validation by default (the
+  // OIDC Core 3.1.3.7 TLS-channel-trust shortcut — probed and confirmed
+  // by oidc-drill leg 10b: an id_token signed by a key NOT in the JWKS
+  // was accepted while aud/nonce/exp/iss/alg:none forgeries were all
+  // refused via claims validation). The library ships the opt-in for
+  // full signature validation against the issuer JWKS; turn it on.
+  // Defense-in-depth: a compromised/malicious token-endpoint response
+  // (DNS/proxy tampering inside the TLS boundary, or a misconfigured
+  // multi-tenant issuer fronting several signing keys) must also hold
+  // a key the issuer actually publishes.
+  oidc.enableNonRepudiationChecks(cfg);
   configCache.set(p.id, cfg);
   return cfg;
 }
