@@ -1383,7 +1383,16 @@
             return;
           } catch (err) {
             btn.disabled = false;
-            errEl.innerHTML = '<div class="auth-err">' + esc(err.message || "Passkey step failed") + "</div>";
+            // Raw WebAuthn DOMExceptions read like stack traces ("The
+            // operation either timed out or was not allowed. See:
+            // https://www.w3.org/TR/…") — map to human sentences. A
+            // cancelled/timed-out ceremony additionally deserves a
+            // "try again" nudge since the password already verified.
+            var pkMsg = friendlyPasskeyError(err);
+            if (err && (err.name === "NotAllowedError" || /timed out or was not allowed/i.test(err.message || ""))) {
+              pkMsg = "Passkey step was cancelled or timed out. Press Sign in to try again.";
+            }
+            errEl.innerHTML = '<div class="auth-err">' + esc(pkMsg) + "</div>";
             return;
           }
         }
@@ -4221,10 +4230,15 @@
           '</select>';
       }
       return '<tr data-user="' + esc(m.userId || m.id) + '">' +
-        '<td><div class="actor"><span class="av">' + esc(initials(m.displayName || m.email)) + '</span><div><div style="font-weight:500">' + esc(m.displayName || m.email) + '</div><div class="id">' + esc(m.email) + '</div></div></div></td>' +
+        '<td><div class="actor"><span class="av">' + esc(initials(m.displayName || m.email)) + '</span><div><div style="font-weight:500">' + esc(m.displayName || m.email) +
+          (m.mfaEnrolled ? ' <span class="pill neutral" title="This account requires a passkey on every sign-in">2FA</span>' : '') +
+          '</div><div class="id">' + esc(m.email) + '</div></div></div></td>' +
         '<td>' + selector + '</td>' +
         '<td style="color:var(--fg-2)">' + timeAgoCell(m.lastActive) + '</td>' +
-        '<td>' + (canManage ? '<button class="btn danger" data-act="remove">Remove</button>' : '') + '</td>' +
+        '<td style="white-space:nowrap">' +
+          (canManage && !isSelf && m.mfaEnrolled ? '<button class="btn" data-act="reset-mfa" title="Remove all their passkeys so they can sign in with password alone — for lost or destroyed authenticators">Reset MFA</button> ' : '') +
+          (canManage ? '<button class="btn danger" data-act="remove">Remove</button>' : '') +
+        '</td>' +
       '</tr>';
     }).join("");
 
@@ -4297,6 +4311,46 @@
       });
     });
     tables[0].addEventListener("click", function (e) {
+      var mfaBtn = e.target.closest("[data-act='reset-mfa']");
+      if (mfaBtn) {
+        var mfaTr = e.target.closest("tr[data-user]");
+        var mfaUid = mfaTr.getAttribute("data-user");
+        var mfaEmail = (mfaTr.querySelector(".id") || {}).textContent || "this member";
+        // Break-glass recovery for a LOST passkey: without this the
+        // member is locked out forever (password reset deliberately
+        // doesn't clear MFA). Same posture as self-revoke: their
+        // sessions are fenced and their API keys revoked, because the
+        // credential being wiped could be an attacker's enrollment.
+        confirmModal({
+          title: "Reset their MFA?",
+          body: "All passkeys on " + mfaEmail + "'s account are removed so they can sign in with their password alone. They'll be signed out everywhere and API keys they created will be revoked. They'll get an email about it. Do this only when they've lost their authenticator.",
+          confirmLabel: "Reset MFA",
+          danger: true,
+          onConfirm: function () {
+            stepUpModal({
+              title: "Confirm your password",
+              body: "Removing another member's MFA is a break-glass action. Confirm your own password to continue.",
+              confirmLabel: "Reset their MFA",
+              danger: true,
+              onConfirm: async function (password, fail) {
+                try {
+                  var r = await state.ds.resetMemberMfa(mfaUid, password);
+                  toast("MFA reset — " + ((r && r.credentialsRemoved) || 0) + " passkey" + (r && r.credentialsRemoved === 1 ? "" : "s") + " removed. They can sign in with their password.");
+                  renderSettingsMembers(root);
+                } catch (err) {
+                  var msg = err.message || "Reset failed";
+                  if (err.status === 401 || err.errorCode === "invalid_password") msg = "Wrong password.";
+                  else if (err.errorCode === "no_mfa_enrolled" || msg === "no_mfa_enrolled") msg = "They no longer have any passkeys enrolled.";
+                  else if (err.errorCode === "cannot_mutate_target_above_own_rank" || msg === "cannot_mutate_target_above_own_rank") msg = "You can't reset MFA for someone above your own rank.";
+                  else if (err.status === 429) msg = err.friendlyMessage || "Too many attempts. Try again shortly.";
+                  fail(msg);
+                }
+              },
+            });
+          },
+        });
+        return;
+      }
       var btn = e.target.closest("[data-act='remove']");
       if (!btn) return;
       var tr = e.target.closest("tr[data-user]");
@@ -4565,7 +4619,7 @@
               '<td>' + (p.transports || []).map(function (t) { return '<span class="pill neutral">' + esc(t) + '</span>'; }).join(' ') + '</td>' +
               '<td style="color: var(--fg-2)">' + (p.lastUsedAt ? timeAgoCell(p.lastUsedAt) : "never") + '</td>' +
               '<td style="color: var(--fg-2)">' + timeAgoCell(p.createdAt) + '</td>' +
-              '<td><button class="btn danger" data-pk-act="revoke">Revoke</button></td>' +
+              '<td><button class="btn" data-pk-act="rename">Rename</button> <button class="btn danger" data-pk-act="revoke">Revoke</button></td>' +
             '</tr>';
           }).join('') + '</tbody>' +
         '</table></div>'
@@ -4598,6 +4652,27 @@
         var tr = e.target.closest("tr[data-pk]");
         if (!tr) return;
         var pkId = tr.getAttribute("data-pk");
+        if (btn.getAttribute("data-pk-act") === "rename") {
+          // Relabel is metadata-only (no step-up): the server audits
+          // mfa.credential_relabeled with the previous label so a
+          // passkey-confusion rename is reconstructable.
+          openInputModal({
+            title: "Rename passkey",
+            label: "New name",
+            placeholder: tr.querySelector("td div") ? tr.querySelector("td div").textContent : "",
+            confirmLabel: "Rename",
+            onConfirm: function (label) {
+              if (!label || !label.trim()) { toast("Name can't be empty", true); return; }
+              state.ds.webauthnRelabel(pkId, label.trim()).then(function (r) {
+                toast('Renamed to "' + ((r && r.credential && r.credential.label) || label.trim()) + '"');
+                renderSettingsSSO(root);
+              }).catch(function (err) {
+                toast(err.errorCode === "invalid_input" ? "Name can't be empty" : (err.message || "Rename failed"), true);
+              });
+            },
+          });
+          return;
+        }
         confirmModal({
           title: "Revoke passkey?",
           // R125 F1: R124 F1 turned DELETE /credentials/:id into a
@@ -4819,16 +4894,64 @@
                 clientExtensionResults: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {},
                 authenticatorAttachment: cred.authenticatorAttachment || null,
               };
-              await state.ds.webauthnRegisterFinish(response, label, password);
-              toast("Passkey added");
-              if (rootAfterAdd) renderSettingsSSO(rootAfterAdd);
+              // The finish call may fail on the PASSWORD alone (401
+              // invalid_password) while the WebAuthn ceremony already
+              // succeeded — and the server keeps the challenge cookie
+              // on that branch (webauthn.ts step-up check runs before
+              // verifyRegistrationResponse, which is what clears it).
+              // Don't throw the user's completed touch-the-key ceremony
+              // away over a typo: re-prompt for the password and retry
+              // the SAME finish payload.
+              var finishWithRetry = async function (pw) {
+                try {
+                  await state.ds.webauthnRegisterFinish(response, label, pw);
+                  toast("Passkey added");
+                  if (rootAfterAdd) renderSettingsSSO(rootAfterAdd);
+                } catch (err) {
+                  if (err.status === 401 || err.errorCode === "invalid_password") {
+                    openInputModal({
+                      title: "Wrong password",
+                      sub: "Your passkey is ready — we just need the correct account password to save it.",
+                      label: "Account password",
+                      type: "password",
+                      placeholder: "",
+                      confirmLabel: "Save passkey",
+                      onConfirm: finishWithRetry,
+                    });
+                    return;
+                  }
+                  toast(friendlyPasskeyError(err), true);
+                }
+              };
+              await finishWithRetry(password);
             } catch (err) {
-              toast(err.message || "Passkey registration failed", true);
+              toast(friendlyPasskeyError(err), true);
             }
           },
         });
       },
     });
+  }
+
+  // Map WebAuthn ceremony + server slugs to human sentences. The raw
+  // DOMException messages ("The operation either timed out or was not
+  // allowed…") and wire slugs (invalid_password) read like stack
+  // traces in a toast.
+  function friendlyPasskeyError(err) {
+    var m = (err && err.message) || "";
+    if (err && (err.name === "NotAllowedError" || /timed out or was not allowed/i.test(m))) {
+      return "Passkey step was cancelled or timed out. Nothing was added.";
+    }
+    if (err && (err.name === "InvalidStateError" || /already registered/i.test(m))) {
+      return "That authenticator is already registered on this account.";
+    }
+    if (err && (err.name === "SecurityError")) {
+      return "This site's domain can't use passkeys (WebAuthn needs a real hostname, not an IP).";
+    }
+    if (m === "invalid_password" || (err && err.errorCode === "invalid_password")) return "Wrong password.";
+    if (m === "no_challenge_cookie") return "The enrollment expired — start again.";
+    if (m === "verify_failed" || m === "not_verified") return "The authenticator's response didn't verify — try again.";
+    return m || "Passkey registration failed";
   }
 
   async function runPasskeyLogin(email) {

@@ -28,6 +28,7 @@ import { env } from "../env.js";
 import {
   SESSION_COOKIE_OPTS,
   canGrantRole,
+  getDummyPasswordHash,
   hashPassword,
   mintSession,
   randomToken,
@@ -35,7 +36,8 @@ import {
 } from "../lib/auth.js";
 import { writeAudit, resolveActor } from "../lib/audit.js";
 import { dispatchEvent } from "../lib/webhooks.js";
-import { getMailer, inviteMail } from "../lib/mail.js";
+import { getMailer, inviteMail, adminMfaResetMail } from "../lib/mail.js";
+import { perIpCookieOnly } from "../lib/rate-limit.js";
 import { requireSession } from "../lib/session-middleware.js";
 
 const roleSchema = z.enum(["owner", "admin", "member"]);
@@ -60,6 +62,14 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       include: { user: true },
       orderBy: { createdAt: "asc" },
     });
+    // Per-member MFA flag so the console can offer "Reset MFA" only
+    // where it means something. One groupBy, not N queries.
+    const counts = await db.webauthnCredential.groupBy({
+      by: ["userId"],
+      where: { userId: { in: rows.map((m) => m.userId) } },
+      _count: { userId: true },
+    });
+    const mfaByUser = new Set(counts.map((c) => c.userId));
     return reply.send({
       members: rows.map((m) => ({
         userId: m.userId,
@@ -67,8 +77,118 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
         displayName: m.user.displayName,
         role: m.role,
         joinedAt: m.createdAt,
+        mfaEnrolled: mfaByUser.has(m.userId),
       })),
     });
+  });
+
+  // Break-glass MFA recovery. A lost/destroyed passkey is a PERMANENT
+  // lockout without this: password reset deliberately does not clear
+  // MFA (that would gut it — mailbox compromise ⇒ MFA bypass), and
+  // the self-service revoke in Settings requires being signed IN,
+  // which the locked-out user can't do. Every serious IdP ships an
+  // admin-side reset for exactly this reason. Threat posture:
+  //   - owner/admin only, and never above the caller's own rank
+  //     (admin can't strip an owner's MFA as a takeover step),
+  //   - never self (the signed-in self-service path in Settings › SSO
+  //     has its own password gate; allowing self here would just be a
+  //     second, differently-shaped copy of it),
+  //   - caller's OWN password as step-up (a stolen admin cookie must
+  //     not be able to soften a victim account for ATO),
+  //   - break-glass transaction on the TARGET mirrors the self-revoke
+  //     leg (webauthn.ts DELETE): wipe credentials + fence all their
+  //     sessions + revoke API keys they created — the credential being
+  //     reset may be an attacker's enrollment, so everything minted
+  //     under it is suspect,
+  //   - the target is emailed (can't-unsee notice) — if they did NOT
+  //     ask for this reset, their recovery path is a password reset.
+  app.post<{ Params: { userId: string } }>("/:userId/reset-mfa", {
+    config: { rateLimit: perIpCookieOnly(3, 60_000) },
+  }, async (req, reply) => {
+    const claims = requireSession(req, reply);
+    if (!claims) return;
+    if (claims.sub.startsWith("apikey:")) {
+      return reply.code(403).send({ error: "cookie_session_required" });
+    }
+    if (claims.membershipRole === "member") {
+      return reply.code(403).send({ error: "forbidden" });
+    }
+    if (claims.sub === req.params.userId) {
+      return reply.code(400).send({ error: "use_self_service_revoke" });
+    }
+    const body = z
+      .object({ password: z.string().min(1).max(1024) })
+      .safeParse(req.body);
+    if (!body.success) return reply.code(400).send({ error: "invalid_input" });
+    // Uniform argon2 verify against a dummy hash on the no-user branch
+    // — same anti-oracle shape as every step-up sibling.
+    const stepUpUser = await db.user.findUnique({ where: { id: claims.sub } });
+    const stepUpHash = stepUpUser?.passwordHash ?? (await getDummyPasswordHash());
+    const stepUpOk = await verifyPassword(stepUpHash, body.data.password);
+    if (!stepUpUser || !stepUpOk) {
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "auth.step_up_denied",
+          actorId: claims.sub,
+          ...(stepUpUser ? { actorEmail: stepUpUser.email } : {}),
+          note: "invalid_password",
+          metadata: { endpoint: "members.reset_mfa" },
+          req,
+        },
+        req.log,
+      );
+      return reply.code(401).send({ error: "invalid_password" });
+    }
+    const target = await db.membership.findFirst({
+      where: { userId: req.params.userId, orgId: claims.orgId },
+      include: { user: true },
+    });
+    // Uniform 404: no oracle for user ids outside the org.
+    if (!target) return reply.code(404).send({ error: "not_found" });
+    if (!canGrantRole(claims.membershipRole, target.role as "owner" | "admin" | "member")) {
+      return reply.code(403).send({ error: "cannot_mutate_target_above_own_rank" });
+    }
+    const credCount = await db.webauthnCredential.count({
+      where: { userId: target.userId },
+    });
+    if (credCount === 0) {
+      return reply.code(400).send({ error: "no_mfa_enrolled" });
+    }
+    await db.$transaction([
+      db.webauthnCredential.deleteMany({ where: { userId: target.userId } }),
+      db.user.update({
+        where: { id: target.userId },
+        data: { sessionRevokedAt: new Date() },
+      }),
+      db.apiKey.updateMany({
+        where: { createdById: target.userId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      }),
+    ]);
+    writeAudit(
+      {
+        orgId: claims.orgId,
+        event: "mfa.credentials_admin_reset",
+        ...(await resolveActor(claims.sub)),
+        target: target.user.email,
+        metadata: { targetUserId: target.userId, credentialsRemoved: credCount },
+        req,
+      },
+      req.log,
+    );
+    void (async () => {
+      try {
+        const mail = getMailer(req.log);
+        await mail.send({
+          to: target.user.email,
+          ...adminMfaResetMail(stepUpUser.email),
+        });
+      } catch (e) {
+        req.log.warn({ err: e }, "admin mfa reset mail send failed");
+      }
+    })();
+    return reply.send({ ok: true, credentialsRemoved: credCount });
   });
 
   app.patch<{ Params: { userId: string } }>("/:userId", async (req, reply) => {

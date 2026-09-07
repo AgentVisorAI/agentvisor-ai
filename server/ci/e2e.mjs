@@ -200,6 +200,24 @@ try {
   const reLogin = await ds.login({ email, password: "rotated-e2e-pw-2026" });
   check("new password logs in", reLogin && reLogin.user && reLogin.user.email === email);
 
+  // Admin MFA reset guards (the full lifecycle needs a WebAuthn
+  // authenticator — browser drills cover it; here we pin the API's
+  // guard rails, which need no credential).
+  let selfMfa = "";
+  try { await ds.resetMemberMfa(me.user.id, "rotated-e2e-pw-2026"); }
+  catch (e) { selfMfa = e.errorCode || e.message; }
+  check("reset-mfa self refused", selfMfa === "use_self_service_revoke", selfMfa);
+  let ghostMfa = "";
+  try { await ds.resetMemberMfa("cmnonexistent000000000000", "rotated-e2e-pw-2026"); }
+  catch (e) { ghostMfa = e.errorCode || e.message; }
+  check("reset-mfa unknown target 404", ghostMfa === "not_found", ghostMfa);
+  let wrongPwMfa = "";
+  try { await ds.resetMemberMfa("cmnonexistent000000000000", "not-my-password"); }
+  catch (e) { wrongPwMfa = e.errorCode || e.message; }
+  check("reset-mfa wrong password 401", wrongPwMfa === "invalid_password", wrongPwMfa);
+  const mem = await ds.listMembers();
+  check("members carry mfaEnrolled flag", mem.length === 1 && mem[0].mfaEnrolled === false, JSON.stringify(mem[0] && mem[0].mfaEnrolled));
+
   await ds.logout();
   const s2 = await ds.getSession();
   check("logout clears session", s2 === null);
