@@ -13,7 +13,7 @@ import {
 import { writeAudit } from "../lib/audit.js";
 import { authEventsTotal } from "../lib/metrics.js";
 import { perIpCookieOnly } from "../lib/rate-limit.js";
-import { getMailer, passwordResetMail, welcomeMail } from "../lib/mail.js";
+import { getMailer, passwordChangedMail, passwordResetMail, welcomeMail } from "../lib/mail.js";
 import {
   clearSessionCookie,
   requireSession,
@@ -646,6 +646,116 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         createdAt: membership.org.createdAt,
       },
     });
+  });
+
+  // Signed-in password change. Until now the ONLY way to rotate a
+  // password was the anonymous forgot-password email round-trip —
+  // which auto-revokes every av_srv_ API key (reset-confirm treats
+  // itself as break-glass, R123 F3) and fences ALL cookies including
+  // the one you're holding. A routine hygiene rotation shouldn't
+  // nuke production ingest tokens or sign you out of your own
+  // browser. This endpoint:
+  //   - requires the CURRENT password (step-up; stolen-cookie can't
+  //     lock the victim out or set an attacker password),
+  //   - fences every OTHER session via sessionRevokedAt, then
+  //     re-mints THIS session's cookie in the same response so the
+  //     caller survives its own fence (same mint+setCookie shape as
+  //     /switch-org above; the fresh iat is >= the fence second, see
+  //     session-middleware.ts R210 F1 comparison),
+  //   - leaves API keys alone (deliberate contrast with
+  //     /reset-confirm: reset implies possible mailbox/browser
+  //     compromise; a self-service change with the old password
+  //     supplied does not),
+  //   - sends a can't-unsee notification mail to the account address
+  //     (fire-and-forget, same detached shape as /reset-request).
+  app.post("/change-password", {
+    // Same shape as the sibling step-up endpoints (/me/export,
+    // /me/delete-account): cookie-only bucket so an api-key holder
+    // on a shared egress IP can't burn the owner's budget. 5/min
+    // bounds argon2 grinding against a stolen cookie.
+    config: { rateLimit: perIpCookieOnly(5, 60_000) },
+  }, async (req, reply) => {
+    const claims = requireSession(req, reply);
+    if (!claims) return;
+    // av_srv_ tokens authenticate as sub="apikey:<id>" — there is no
+    // user password behind them and a leaked key must never be able
+    // to probe or rotate its creator's credential.
+    if (claims.sub.startsWith("apikey:")) {
+      return reply.code(403).send({ error: "cookie_session_required" });
+    }
+    const body = z
+      .object({
+        currentPassword: z.string().min(1).max(1024),
+        newPassword: passwordSchema,
+      })
+      .safeParse(req.body);
+    if (!body.success) {
+      // Distinguish "new password too weak" for the UI without
+      // leaking anything sensitive — both inputs are the caller's own.
+      return reply.code(400).send({ error: "weak_password" });
+    }
+    const user = await db.user.findUnique({ where: { id: claims.sub } });
+    if (!user) return reply.code(401).send({ error: "unauthenticated" });
+    const ok = await verifyPassword(user.passwordHash, body.data.currentPassword);
+    if (!ok) {
+      // Same forensic slug as the /me/export and /me/delete-account
+      // step-up denials: an owner auditing "who probed passwords
+      // against a stolen cookie at 03:12" greps one event.
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "auth.step_up_denied",
+          actorId: claims.sub,
+          actorEmail: user.email,
+          note: "invalid_password",
+          metadata: { endpoint: "auth.change_password" },
+          req,
+        },
+        req.log,
+      );
+      return reply.code(401).send({ error: "invalid_password" });
+    }
+    if (body.data.newPassword === body.data.currentPassword) {
+      // AFTER the verify so this branch can't be used as a free
+      // "is X my password" oracle cheaper than the audited 401 path.
+      return reply.code(400).send({ error: "password_unchanged" });
+    }
+    const passwordHash = await hashPassword(body.data.newPassword);
+    await db.user.update({
+      where: { id: user.id },
+      data: { passwordHash, sessionRevokedAt: new Date() },
+    });
+    // Survive our own fence: fresh iat lands in the same-or-later
+    // second, and the R210 F1 floor comparison admits it.
+    const token = await mintSession({
+      sub: claims.sub,
+      orgId: claims.orgId,
+      membershipRole: claims.membershipRole,
+    });
+    reply.setCookie(env.SESSION_COOKIE_NAME, token, SESSION_COOKIE_OPTS);
+    writeAudit(
+      {
+        orgId: claims.orgId,
+        event: "auth.password_changed",
+        actorId: user.id,
+        actorEmail: user.email,
+        req,
+      },
+      req.log,
+    );
+    // Notification the account holder can't miss: if this change
+    // wasn't them, the reset link in the mail is their recovery
+    // path (reset-confirm revokes everything, including whatever
+    // the attacker holds). Detached like /reset-request's send.
+    void (async () => {
+      try {
+        const mail = getMailer(req.log);
+        await mail.send({ to: user.email, ...passwordChangedMail() });
+      } catch (e) {
+        req.log.warn({ err: e }, "password-changed mail send failed");
+      }
+    })();
+    return reply.send({ ok: true });
   });
 
   // GDPR data export. Returns everything the org has stored:

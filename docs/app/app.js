@@ -3719,6 +3719,7 @@
           "<dt style=\"color:var(--fg-3)\">User ID</dt><dd class=\"mono\">" + esc(state.session.user.id) + "</dd>" +
         "</dl>" +
         '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">' +
+          '<button class="btn" id="changePasswordBtn" title="Rotate your password. Other sessions are signed out; API tokens keep working">Change password…</button>' +
           (state.session.org.role === "owner" ? '<button class="btn" id="exportMyData" title="Download everything this workspace stores about you and your org as NDJSON">↓ Download my data</button>' : "") +
           '<button class="btn danger" id="signOut">Sign out</button>' +
         '</div>' +
@@ -3843,6 +3844,14 @@
       }
     }
 
+    // Change password — self-service rotation with current-password
+    // step-up. Other sessions are fenced server-side; this one gets a
+    // re-minted cookie in the same response, so no sign-out here.
+    var cpBtn = $("#changePasswordBtn", root);
+    if (cpBtn) cpBtn.addEventListener("click", function () {
+      changePasswordModal();
+    });
+
     // Download my data — owner-only NDJSON export with password step-up.
     var exBtn = $("#exportMyData", root);
     if (exBtn) exBtn.addEventListener("click", function () {
@@ -3891,6 +3900,71 @@
         },
       });
     });
+  }
+
+  // Change-password modal: current + new + confirm. Client pre-checks
+  // (length, match) catch typos before a network round-trip; the server
+  // re-validates everything. Mirrors stepUpModal's shell (focus trap,
+  // discard guard, inline error) but needs three fields, so it's its
+  // own builder rather than a stepUpModal contortion.
+  function changePasswordModal() {
+    if (document.body.classList.contains("locked")) return;
+    var backdrop = h(
+      '<div class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal">' +
+        "<h2>Change password</h2>" +
+        '<p class="sub">Pick a new password of at least 12 characters. Every other signed-in session is signed out; your API ingest tokens keep working.</p>' +
+        '<form id="cpForm">' +
+          '<div class="field"><label for="cp_cur">Current password</label><input id="cp_cur" type="password" autocomplete="current-password" required></div>' +
+          '<div class="field"><label for="cp_new">New password</label><input id="cp_new" type="password" autocomplete="new-password" minlength="12" required></div>' +
+          '<div class="field"><label for="cp_new2">Confirm new password</label><input id="cp_new2" type="password" autocomplete="new-password" required></div>' +
+          '<p id="cp_err" style="display:none;color:var(--danger, #e5484d);font-size:12.5px;margin:0 0 8px"></p>' +
+          '<div class="actions"><button type="button" class="btn" data-close>Cancel</button><button type="submit" class="btn accent">Change password</button></div>' +
+        "</form>" +
+      "</div></div>"
+    );
+    document.body.appendChild(backdrop);
+    document.body.classList.add("locked");
+    var previouslyFocused = document.activeElement;
+    var uninstall;
+    var handled = false;
+    function close() { if (handled) return; handled = true; backdrop.remove(); document.body.classList.remove("locked"); if (uninstall) uninstall(); if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {} }
+    uninstall = installModalKeys(backdrop, close);
+    backdrop.addEventListener("click", function (e) {
+      if (handled) return;
+      if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
+    });
+    function showErr(msg) {
+      var errEl = backdrop.querySelector("#cp_err");
+      errEl.textContent = msg;
+      errEl.style.display = "block";
+    }
+    backdrop.querySelector("#cpForm").addEventListener("submit", async function (e) {
+      e.preventDefault();
+      if (handled) return;
+      backdrop.querySelector("#cp_err").style.display = "none";
+      var cur = backdrop.querySelector("#cp_cur").value;
+      var nw = backdrop.querySelector("#cp_new").value;
+      var nw2 = backdrop.querySelector("#cp_new2").value;
+      if (nw.length < 12) { showErr("New password must be at least 12 characters."); return; }
+      if (nw !== nw2) { showErr("New passwords don't match."); return; }
+      if (nw === cur) { showErr("That's already your password — pick a different one."); return; }
+      var btn = e.target.querySelector('button[type="submit"]');
+      btn.disabled = true;
+      try {
+        await state.ds.changePassword({ currentPassword: cur, newPassword: nw });
+        close();
+        toast("Password changed — other sessions were signed out");
+      } catch (e2) {
+        btn.disabled = false;
+        var msg = e2.message || "Change failed";
+        if (e2.status === 401 || e2.errorCode === "invalid_password") msg = "Wrong current password.";
+        else if (e2.errorCode === "weak_password" || msg === "weak_password") msg = "New password must be at least 12 characters.";
+        else if (e2.errorCode === "password_unchanged" || msg === "password_unchanged") msg = "That's already your password — pick a different one.";
+        else if (e2.status === 429) msg = e2.friendlyMessage || "Too many attempts. Try again shortly.";
+        showErr(msg);
+      }
+    });
+    setTimeout(function () { backdrop.querySelector("#cp_cur").focus(); }, 20);
   }
 
   // Step-up modal: password + optional type-to-confirm phrase, used by
@@ -5478,6 +5552,7 @@
     var actions = [
       { g: "Actions", label: "Toggle theme", desc: "Switch light / dark", run: function () { toggleTheme(); } },
       { g: "Actions", label: "New deployment", desc: "Register an agentvisord daemon", run: function () { navigate("#/deployments"); setTimeout(openCreateDeploymentModal, 100); } },
+      { g: "Actions", label: "Change password", desc: "Rotate your password; other sessions sign out", run: function () { navigate("#/settings/general"); setTimeout(changePasswordModal, 250); } },
       { g: "Actions", label: "Sign out", desc: "Leave this workspace", run: signOut },
     ];
     if (state.ds.mode === "mock") {
