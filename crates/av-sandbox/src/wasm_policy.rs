@@ -74,6 +74,45 @@ impl WasmPolicy {
         config.epoch_interruption(true);
         let engine = Engine::new(&config).map_err(|e| e.to_string())?;
         let module = Module::new(&engine, bytes).map_err(|e| e.to_string())?;
+        // Validate the ABI statically at LOAD time. `run()` re-checks at
+        // instantiation, but that check only fires on the first tool
+        // call — a policy missing `evaluate` (typo'd export name, wrong
+        // build target) booted fine and then silently denied every tool
+        // call as "failed closed: missing evaluate". Correct posture,
+        // terrible operability: the operator sees a deny-storm instead
+        // of a boot refusal naming the broken file. Fail fast like the
+        // empty-wasm_policy_paths boot guard in main.rs.
+        let mut has_memory = false;
+        let mut alloc_ok = false;
+        let mut evaluate_ok = false;
+        for export in module.exports() {
+            match (export.name(), export.ty()) {
+                ("memory", wasmtime::ExternType::Memory(_)) => has_memory = true,
+                ("alloc", wasmtime::ExternType::Func(f)) => {
+                    alloc_ok = f.params().len() == 1 && f.results().len() == 1;
+                }
+                ("evaluate", wasmtime::ExternType::Func(f)) => {
+                    evaluate_ok = f.params().len() == 2 && f.results().len() == 1;
+                }
+                _ => {}
+            }
+        }
+        if !has_memory || !alloc_ok || !evaluate_ok {
+            let mut missing = Vec::new();
+            if !has_memory {
+                missing.push("`memory` (exported linear memory)");
+            }
+            if !alloc_ok {
+                missing.push("`alloc(len: i32) -> i32`");
+            }
+            if !evaluate_ok {
+                missing.push("`evaluate(ptr: i32, len: i32) -> i32`");
+            }
+            return Err(format!(
+                "policy does not export the required ABI: missing {} — see crates/av-sandbox/src/wasm_policy.rs for the policy-author contract",
+                missing.join(", ")
+            ));
+        }
         let epoch_stop = Arc::new(AtomicBool::new(false));
         let ticker_stop = Arc::clone(&epoch_stop);
         let ticker_engine = engine.clone();
@@ -294,14 +333,53 @@ mod tests {
 
     #[test]
     fn missing_exports_fail_closed() {
-        let p = WasmPolicy::from_bytes("empty", b"(module)").unwrap();
-        assert!(matches!(p.evaluate("t", &json!({})), PolicyDecision::Deny { .. }));
+        // Load-time ABI validation now refuses an export-less module
+        // outright (see missing_abi_exports_rejected_at_load). The
+        // fail-closed guarantee this test used to pin still holds for
+        // modules that PASS load validation but misbehave at run time —
+        // covered by the trap/fuel tests below.
+        assert!(WasmPolicy::from_bytes("empty", b"(module)").is_err());
     }
 
     #[test]
     fn invalid_wasm_rejected_at_load() {
         assert!(WasmPolicy::from_bytes("garbage", b"\x00asm garbage").is_err());
         assert!(WasmPolicy::from_bytes("not wat", b"(module (broken").is_err());
+    }
+
+    #[test]
+    fn missing_abi_exports_rejected_at_load() {
+        // Compiles fine but exports no `evaluate` — previously booted and
+        // then denied every tool call at runtime; now refused at load with
+        // the missing export named.
+        let no_evaluate = r#"(module
+            (memory (export "memory") 1)
+            (func (export "alloc") (param i32) (result i32) (i32.const 2048)))"#;
+        let err = WasmPolicy::from_bytes("no-evaluate", no_evaluate.as_bytes()).err().expect("load should fail");
+        assert!(err.contains("evaluate"), "error should name the missing export: {err}");
+
+        // No exported memory.
+        let no_memory = r#"(module
+            (memory 1)
+            (func (export "alloc") (param i32) (result i32) (i32.const 2048))
+            (func (export "evaluate") (param i32 i32) (result i32) (i32.const 0)))"#;
+        let err = WasmPolicy::from_bytes("no-memory", no_memory.as_bytes()).err().expect("load should fail");
+        assert!(err.contains("memory"), "error should name the missing memory: {err}");
+
+        // Wrong `evaluate` arity.
+        let bad_arity = r#"(module
+            (memory (export "memory") 1)
+            (func (export "alloc") (param i32) (result i32) (i32.const 2048))
+            (func (export "evaluate") (param i32) (result i32) (i32.const 0)))"#;
+        let err = WasmPolicy::from_bytes("bad-arity", bad_arity.as_bytes()).err().expect("load should fail");
+        assert!(err.contains("evaluate"), "error should name the bad-arity export: {err}");
+
+        // The full correct ABI still loads.
+        let ok = r#"(module
+            (memory (export "memory") 1)
+            (func (export "alloc") (param i32) (result i32) (i32.const 2048))
+            (func (export "evaluate") (param i32 i32) (result i32) (i32.const 0)))"#;
+        assert!(WasmPolicy::from_bytes("ok", ok.as_bytes()).is_ok());
     }
 
     /// Adversarial: a policy module that tries to grow linear memory past the
