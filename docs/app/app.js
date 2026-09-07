@@ -4594,7 +4594,7 @@
             '<span style="margin-left:8px; color:var(--fg-3); font-size:var(--t-sec)">' + invites.length + '</span>' +
           '</div>' +
           '<div class="table-wrap"><table>' +
-            '<thead><tr><th>Email</th><th>Role</th><th>Expires</th><th class="act-1"><span class="sr-only">Actions</span></th></tr></thead>' +
+            '<thead><tr><th>Email</th><th>Role</th><th>Expires</th><th class="act-2"><span class="sr-only">Actions</span></th></tr></thead>' +
             '<tbody>' + inviteRows + '</tbody>' +
           '</table></div>' +
         '</div>')
@@ -4867,7 +4867,7 @@
           '<button class="btn accent" id="createKeyBtn" style="margin-left:auto">+ Create key</button>' +
         "</div>" +
         '<div class="table-wrap"><table>' +
-          "<thead><tr><th>Name</th><th>Prefix</th><th>Last used</th><th>Created</th><th class=\"act-1\"><span class=\"sr-only\">Actions</span></th></tr></thead>" +
+          "<thead><tr><th>Name</th><th>Prefix</th><th>Last used</th><th>Created</th><th class=\"act-2\"><span class=\"sr-only\">Actions</span></th></tr></thead>" +
           "<tbody>" + rows + "</tbody>" +
         "</table></div>" +
       "</div>";
