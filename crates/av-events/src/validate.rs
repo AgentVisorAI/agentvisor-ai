@@ -25,6 +25,19 @@ pub enum ValidationError {
     /// A required string field was empty.
     #[error("required field `{0}` is empty")]
     EmptyField(&'static str),
+    /// A string field exceeds the shipped schema's maxLength — the
+    /// event would pass Rust validation but fail the broker's schema
+    /// gate at publish (which fail-closes the session), splitting the
+    /// two validators' verdicts.
+    #[error("field `{field}` is {len} chars; schema maxLength is {max}")]
+    FieldTooLong {
+        /// Field path.
+        field: &'static str,
+        /// Observed length in chars.
+        len: usize,
+        /// Schema maxLength.
+        max: usize,
+    },
     /// `unmapped` carries inbound-tolerance fields
     /// that re-serialize to the top level, but the shipped schema
     /// declares `additionalProperties: false` — such an event passes the
@@ -183,6 +196,24 @@ pub fn validate_event(ev: &OcsfEvent) -> Result<(), Vec<ValidationError>> {
     }
     if ev.session_uid.is_empty() {
         errors.push(ValidationError::EmptyField("session_uid"));
+    }
+    // Schema parity: ocsf-agent-event.schema.json pins maxLength 128 on
+    // session_uid and ai_agent.instance_uid (matching
+    // av_core::SessionId/InstanceUid). Longer values pass here but fail
+    // every schema-based verifier and the broker's publish gate.
+    if ev.session_uid.chars().count() > 128 {
+        errors.push(ValidationError::FieldTooLong {
+            field: "session_uid",
+            len: ev.session_uid.chars().count(),
+            max: 128,
+        });
+    }
+    if ev.ai_agent.instance_uid.chars().count() > 128 {
+        errors.push(ValidationError::FieldTooLong {
+            field: "ai_agent.instance_uid",
+            len: ev.ai_agent.instance_uid.chars().count(),
+            max: 128,
+        });
     }
     if ev.ai_agent.version.is_empty() {
         errors.push(ValidationError::EmptyField("ai_agent.version"));
@@ -552,6 +583,41 @@ mod tests {
                 .any(|e| matches!(e, ValidationError::TimeBeyondSchemaRange(_))),
             "5-digit-year instants must be refused"
         );
+    }
+
+    #[test]
+    fn oversize_uids_fail_schema_parity() {
+        // Schema pins maxLength 128 on session_uid and
+        // ai_agent.instance_uid; the Rust validator must agree or the
+        // broker's schema gate refuses events this validator passed.
+        let mut ev = valid_event();
+        ev.session_uid = "s".repeat(129);
+        assert!(
+            validate_event(&ev).unwrap_err().iter().any(|e| matches!(
+                e,
+                ValidationError::FieldTooLong {
+                    field: "session_uid",
+                    ..
+                }
+            )),
+            "129-char session_uid must be refused"
+        );
+        let mut ev = valid_event();
+        ev.ai_agent.instance_uid = "i".repeat(129);
+        assert!(
+            validate_event(&ev).unwrap_err().iter().any(|e| matches!(
+                e,
+                ValidationError::FieldTooLong {
+                    field: "ai_agent.instance_uid",
+                    ..
+                }
+            )),
+            "129-char instance_uid must be refused"
+        );
+        let mut ev = valid_event();
+        ev.session_uid = "s".repeat(128);
+        ev.ai_agent.instance_uid = "i".repeat(128);
+        assert!(validate_event(&ev).is_ok(), "exactly-128-char uids must pass");
     }
 
     #[test]

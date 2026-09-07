@@ -3219,6 +3219,30 @@ impl AbortFinalizingStream {
                     "reason": "stream ended without a finish_reason chunk",
                 }),
             )
+        } else if self.response_message.is_empty()
+            && self.response_reasoning.is_empty()
+            && tool_calls.is_empty()
+        {
+            // Non-SSE 200 whose body carried NO finish_reason and NO
+            // content — e.g. a bare `{"choices":[]}` (or `{}`-shaped)
+            // body from a broken shim. Every compliant non-streaming
+            // completion carries choices[0].finish_reason, so this is
+            // not attestable as a clean success: previously it recorded
+            // StatusId::Success with no stop reason, making an
+            // empty-response failure indistinguishable from a real
+            // completion in the signed audit trail (the SSE sibling
+            // branch above closed the same hole for streams).
+            (
+                av_events::EventClass::StopReason,
+                av_events::StatusId::Unknown,
+                Some(av_events::StopReason::Other),
+                json!({
+                    "direction": "upstream_response",
+                    "http_status": self.upstream_status.as_u16(),
+                    "truncated": true,
+                    "reason": "response carried no choices, content, or finish_reason",
+                }),
+            )
         } else {
             (
                 av_events::EventClass::Session,
