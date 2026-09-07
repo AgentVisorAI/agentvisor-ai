@@ -2146,7 +2146,16 @@
       // user cleanly to /login with a friendly notice. The 'me' probe
       // during boot handles its own 401 (returns null) so we skip that
       // path here to avoid a redirect loop.
-      if (res.status === 401 && !path.endsWith("/auth/me")) {
+      // The 'me' probe during boot handles its own 401 (returns null) so
+      // we skip that path to avoid a redirect loop. Anonymous endpoints
+      // whose 401 means "bad credential in the BODY", not "your cookie
+      // died", must be exempt too: replaying a consumed/expired invite
+      // link while signed in returned invalid_or_expired_invite (401)
+      // and this dispatch tore down a perfectly healthy session.
+      var anonAuth401 = path.endsWith("/auth/me") ||
+        path.indexOf("/invites/accept") >= 0 ||
+        path.indexOf("/auth/reset") >= 0;
+      if (res.status === 401 && !anonAuth401) {
         // Signal the app; app.js listens for this and navigates.
         try {
           window.dispatchEvent(new CustomEvent("av-session-expired", { detail: { errorCode: err.errorCode } }));
