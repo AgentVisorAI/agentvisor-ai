@@ -68,14 +68,27 @@ install_prebuilt() {
     note "actual:   $actual"
     exit 1
   fi
-  tar -xzf "$tmp/pkg.tar.gz" -C "$tmp"
+  # NOTE: this function runs as an `if` condition, which suspends
+  # `set -e` for its whole body (POSIX). Every step below must guard
+  # its own failure explicitly, or a failed tar/install would fall
+  # through to the success message and exit 0 with nothing installed.
+  tar -xzf "$tmp/pkg.tar.gz" -C "$tmp" || {
+    note "archive extraction failed"
+    return 1
+  }
   # Default into ~/.cargo/bin when it exists (already on PATH for every
   # Rust user and the CI consumer); otherwise ~/.local/bin.
   if [ -n "${AV_INSTALL_DIR:-}" ]; then dest="$AV_INSTALL_DIR"
   elif [ -d "$HOME/.cargo/bin" ]; then dest="$HOME/.cargo/bin"
   else dest="$HOME/.local/bin"; fi
-  mkdir -p "$dest"
-  install -m 0755 "$tmp/$stage/agentvisord" "$tmp/$stage/avctl" "$dest/"
+  mkdir -p "$dest" || {
+    note "cannot create $dest"
+    return 1
+  }
+  install -m 0755 "$tmp/$stage/agentvisord" "$tmp/$stage/avctl" "$dest/" || {
+    note "copying binaries into $dest failed"
+    return 1
+  }
   say "Installed to $dest (checksum verified)."
   case ":$PATH:" in
     *":$dest:"*) ;;
