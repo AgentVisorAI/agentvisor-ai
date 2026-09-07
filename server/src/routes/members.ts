@@ -738,38 +738,15 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
     // they just set) and cannot have prior passkeys by
     // construction.
     const isPreexistingUser = user !== null;
+    let newUserPasswordHash: string | null = null;
     if (!user) {
       if (!body.data.password) {
         return reply.code(400).send({ error: "password_required_for_new_user" });
       }
-      const passwordHash = await hashPassword(body.data.password);
-      // R80 F5: two concurrent `/invites/accept` for the same
-      // NEW email both saw `findUnique === null`, both called
-      // `db.user.create`. One won the `email` unique constraint;
-      // the other threw uncaught P2002 → 500 to the losing
-      // caller. Same pattern the auth.ts signup handler
-      // explicitly handles. On P2002, re-query the winner and
-      // proceed — the invite `updateMany` null-guard below still
-      // prevents double session-mint.
-      try {
-        user = await db.user.create({
-          data: {
-            email: matched.email,
-            passwordHash,
-            displayName: body.data.displayName ?? null,
-          },
-        });
-      } catch (err) {
-        if (
-          typeof err === "object" && err !== null &&
-          (err as { code?: string }).code === "P2002"
-        ) {
-          user = await db.user.findUnique({ where: { email: matched.email } });
-          if (!user) throw err; // Should not happen; re-throw for observability.
-        } else {
-          throw err;
-        }
-      }
+      // Hash outside the transaction (argon2 is deliberately slow;
+      // holding a tx open across it would pin a connection and widen
+      // every race window below).
+      newUserPasswordHash = await hashPassword(body.data.password);
     }
 
     // R79 MEDIUM (Class B), rewritten: consume the invite FIRST
@@ -792,11 +769,22 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
     //      grant the stale pre-reissue role.
     // Now: the updateMany predicate pins the FULL verified snapshot
     // (tokenHash + expiresAt + unaccepted + unrevoked); a count of 0
-    // throws inside the transaction so the membership upsert never
-    // commits.
+    // throws inside the transaction so nothing else commits.
+    //
+    // New-user creation ALSO lives inside the transaction, AFTER the
+    // consume: the prior shape created the User row first, so a
+    // consume failure (revoked/expired mid-flight) returned 409 while
+    // leaving an orphan zero-membership account behind — an email
+    // that could no longer sign up ("email exists") NOR sign in
+    // (zero-membership logins are refused), stuck until someone
+    // re-invited it. `upsert` (not `create` + P2002 catch) because a
+    // unique-violation error inside a Postgres transaction aborts the
+    // whole tx — the old catch-and-requery pattern cannot work here;
+    // ON CONFLICT returns the concurrent winner's row exactly like
+    // the R80 F5 requery used to.
     const INVITE_NOT_CONSUMABLE = "__invite_not_consumable__";
     try {
-      await db.$transaction(async (tx) => {
+      user = await db.$transaction(async (tx) => {
         const consumed = await tx.invite.updateMany({
           where: {
             id: matched.id,
@@ -810,21 +798,34 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
         if (consumed.count === 0) {
           throw new Error(INVITE_NOT_CONSUMABLE);
         }
+        const grantee =
+          user ??
+          (await tx.user.upsert({
+            where: { email: matched.email },
+            create: {
+              email: matched.email,
+              passwordHash: newUserPasswordHash!,
+              displayName: body.data.displayName ?? null,
+            },
+            update: {},
+          }));
         await tx.membership.upsert({
-          where: { userId_orgId: { userId: user!.id, orgId: matched.orgId } },
+          where: { userId_orgId: { userId: grantee.id, orgId: matched.orgId } },
           create: {
-            userId: user!.id,
+            userId: grantee.id,
             orgId: matched.orgId,
             role: matched.role,
           },
           update: {}, // Already a member? Fine, just proceed.
         });
+        return grantee;
       });
     } catch (err) {
       if (err instanceof Error && err.message === INVITE_NOT_CONSUMABLE) {
         // Lost the race with a concurrent accept, an admin revoke, a
         // reissue (different tokenHash), or expiry. Nothing was
-        // granted — the transaction rolled back.
+        // granted — the transaction rolled back (including any
+        // would-be new User row).
         return reply.code(409).send({ error: "invite_already_consumed" });
       }
       throw err;

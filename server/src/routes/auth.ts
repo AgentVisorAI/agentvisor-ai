@@ -723,7 +723,16 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     const passwordHash = await hashPassword(body.data.newPassword);
     await db.user.update({
       where: { id: user.id },
-      data: { passwordHash, sessionRevokedAt: new Date() },
+      data: {
+        passwordHash,
+        sessionRevokedAt: new Date(),
+        // Any outstanding reset link predates this change and must die
+        // with the old credential (reset-confirm nulls these too) — an
+        // unexpired link captured before the change could otherwise
+        // overwrite the NEW password.
+        resetTokenHash: null,
+        resetTokenAt: null,
+      },
     });
     // Survive our own fence: fresh iat lands in the same-or-later
     // second, and the R210 F1 floor comparison admits it.

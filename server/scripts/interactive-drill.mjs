@@ -1501,7 +1501,9 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await aiPage.goto(SITE + "#/accept-invite?token=drill_tok", { waitUntil: "domcontentloaded" });
   const aiToast = await aiPage.waitForFunction(() => {
     const t = document.querySelector(".toast")?.textContent || "";
-    return /already signed in/i.test(t) ? t : null;
+    // #329 copy: "You're signed in as <email>, but this invite is for a
+    // different address." (pre-#329: "You're already signed in.")
+    return /signed in as|already signed in/i.test(t) ? t : null;
   }, { timeout: 8000 }).then((h) => h.jsonValue()).catch(() => null);
   if (!aiToast || !/#\/overview/.test(await aiPage.evaluate(() => location.hash)))
     fail("authed invite click did not bounce-with-explanation: " + JSON.stringify({ aiToast }));
