@@ -131,9 +131,18 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
     try {
       updated = await db.$transaction(
         async (tx) => {
-          const stillOwner =
-            (await tx.membership.findUnique({ where: { id: existing.id } }))?.role ===
-            "owner";
+          // R84 F1 recheck under the serializable tx: the rank gate
+          // above ran on a snapshot read OUTSIDE the transaction, so a
+          // target promoted (e.g. member→owner by a concurrent owner
+          // PATCH) between that read and this tx would be mutated by an
+          // admin whose rank no longer covers them. Re-read and
+          // re-apply the same gate on the current role.
+          const current = await tx.membership.findUnique({ where: { id: existing.id } });
+          if (!current) throw new Error("not_found");
+          if (!canGrantRole(claims.membershipRole, current.role as "owner" | "admin" | "member")) {
+            throw new Error("target_rank_changed");
+          }
+          const stillOwner = current.role === "owner";
           if (stillOwner && body.data.role !== "owner") {
             const ownerCount = await tx.membership.count({
               where: { orgId: claims.orgId, role: "owner" },
@@ -197,6 +206,12 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       if (e instanceof Error && e.message === "last_owner") {
         return reply.code(400).send({ error: "last_owner" });
       }
+      if (e instanceof Error && e.message === "not_found") {
+        return reply.code(404).send({ error: "not_found" });
+      }
+      if (e instanceof Error && e.message === "target_rank_changed") {
+        return reply.code(403).send({ error: "cannot_mutate_target_above_own_rank" });
+      }
       // Serializable isolation aborts with P2034 (write conflict);
       // client retries the whole flow safely.
       if (
@@ -258,6 +273,16 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
             where: { id: existing.id },
           });
           if (!current) throw new Error("not_found");
+          // R84 F1 recheck under the tx (same rationale as the PATCH
+          // path): the rank gate above ran on a pre-transaction
+          // snapshot; re-apply it on the current role so a target
+          // promoted concurrently cannot be removed by a lower rank.
+          if (
+            claims.sub !== req.params.userId &&
+            !canGrantRole(claims.membershipRole, current.role as "owner" | "admin" | "member")
+          ) {
+            throw new Error("target_rank_changed");
+          }
           if (current.role === "owner") {
             const ownerCount = await tx.membership.count({
               where: { orgId: claims.orgId, role: "owner" },
@@ -295,6 +320,9 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
       }
       if (e instanceof Error && e.message === "not_found") {
         return reply.code(404).send({ error: "not_found" });
+      }
+      if (e instanceof Error && e.message === "target_rank_changed") {
+        return reply.code(403).send({ error: "cannot_mutate_target_above_own_rank" });
       }
       if (
         typeof e === "object" && e !== null &&

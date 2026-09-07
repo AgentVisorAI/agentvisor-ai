@@ -601,17 +601,28 @@ async function deliverOne(
   const dispatcher = new Agent({
     connect: {
       // Pin DNS: any lookup for the target hostname returns the
-      // pre-vetted IP. Any OTHER hostname (shouldn't happen —
-      // fetch is scoped to `url` only, and undici doesn't
-      // follow redirects by default under fetch()) throws so a
-      // regression can't silently re-open the TOCTOU.
+      // pre-vetted IP. Any OTHER hostname throws so a regression
+      // can't silently re-open the TOCTOU. undici ≥8 invokes this
+      // with `{ all: true }` and expects the addresses-array
+      // callback shape (Node's dns.lookup `all` contract); the
+      // legacy 3-arg `(err, address, family)` shape here used to
+      // hard-fail every DNS-hostname delivery with "Invalid IP
+      // address: undefined", so honor `opts.all` explicitly.
       lookup: (
         h: string,
-        _opts: unknown,
-        cb: (err: NodeJS.ErrnoException | null, address: string, family: number) => void,
+        opts: { all?: boolean },
+        cb: (
+          err: NodeJS.ErrnoException | null,
+          address: string | { address: string; family: number }[],
+          family?: number,
+        ) => void,
       ): void => {
         if (h.toLowerCase() === hostname && pinnedAddr) {
-          cb(null, pinnedAddr.address, pinnedAddr.family);
+          if (opts?.all) {
+            cb(null, [{ address: pinnedAddr.address, family: pinnedAddr.family }]);
+          } else {
+            cb(null, pinnedAddr.address, pinnedAddr.family);
+          }
         } else {
           cb(
             Object.assign(
@@ -640,6 +651,13 @@ async function deliverOne(
       body,
       signal: controller.signal,
       dispatcher,
+      // Never follow redirects: WHATWG fetch defaults to
+      // `redirect: "follow"`, and a 30x from a "public" webhook
+      // endpoint to an IP-literal target (169.254.169.254, RFC 1918,
+      // localhost) would connect WITHOUT consulting the pinned
+      // `lookup` above — a full SSRF-check bypass. A webhook
+      // receiver must answer 2xx at its registered URL.
+      redirect: "manual",
     });
     const responseCode = res.status;
     // Body read runs with the abort timer still armed: a compromised
@@ -658,6 +676,24 @@ async function deliverOne(
           status: "delivered",
           responseCode,
           responseBody: truncated,
+          deliveredAt: new Date(),
+        },
+      });
+      return;
+    }
+    // 3xx = give up: redirects are refused outright (see
+    // `redirect: "manual"` above — following one would bypass the
+    // SSRF pinning), and retrying a redirecting endpoint would just
+    // redirect again. Surface it as its own error class so the
+    // operator sees "fix your endpoint URL", not a retried 5xx.
+    if (responseCode >= 300 && responseCode < 400) {
+      await db.webhookDelivery.update({
+        where: { id: deliveryId },
+        data: {
+          status: "failed",
+          responseCode,
+          responseBody: truncated,
+          errorMessage: "redirect_refused_" + responseCode,
           deliveredAt: new Date(),
         },
       });
