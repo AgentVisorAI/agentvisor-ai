@@ -171,6 +171,23 @@ sign up in production:
 `EMAIL_FROM` defaults to `AgentVisor AI <no-reply@agentvisorai.me>`;
 override per environment.
 
+**Split origins** (SPA on Pages, API elsewhere): set `API_PUBLIC_URL`
+to the API's own public origin (e.g. `https://api.agentvisorai.me`).
+SAML SP URLs (entityId / ACS / metadata) and OAuth redirect URIs are
+built from it; without it they fall back to `APP_BASE_URL` — the SPA
+origin — and every IdP round-trip 404s (found the hard way; see the
+`API_PUBLIC_URL` commit trail).
+
+**Background sweepers**: `RETENTION_SWEEPER_INTERVAL_MS` (default 1h)
+and `WEBHOOK_SWEEPER_INTERVAL_MS` (default 15s, floor 1s) control the
+retention purge and webhook retry cadence. Multi-instance safe — the
+webhook sweeper claims rows with `FOR UPDATE SKIP LOCKED`.
+
+**Webhook SSRF guard**: endpoint targets resolving to loopback,
+RFC1918, link-local, or cloud-metadata addresses are refused. For
+local development against a receiver on your own machine set
+`ALLOW_INTERNAL_WEBHOOK_TARGETS=true` (never in production).
+
 **OIDC login** (Google + Microsoft):
 
 - **Google**: [Google Cloud → APIs & Services → OAuth 2.0 Client IDs](https://console.cloud.google.com/apis/credentials).
