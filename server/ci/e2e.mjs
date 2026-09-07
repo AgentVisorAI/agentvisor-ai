@@ -340,10 +340,13 @@ try {
   check("members carry mfaEnrolled flag", mem.length === 1 && mem[0].mfaEnrolled === false, JSON.stringify(mem[0] && mem[0].mfaEnrolled));
 
   // Webhook deliveries pagination contract: { deliveries, nextCursor }.
-  // (Endpoint creation needs ALLOW_INTERNAL_WEBHOOK_TARGETS=true on the
-  // server under test — CI sets it; the SSRF guard rejects loopback
-  // targets otherwise.)
-  const wep = await ds.createWebhook({ name: "e2e-hook", url: "http://127.0.0.1:9994/e2e", events: ["*"] });
+  // Target is a TEST-NET-3 literal (RFC 5737, never routable): CI runs
+  // the API in NODE_ENV=production, where the SSRF guard blocks
+  // loopback/private targets UNCONDITIONALLY (ALLOW_INTERNAL_WEBHOOK_
+  // TARGETS is deliberately ignored in prod), so 127.0.0.1 can never
+  // pass creation. The test only asserts the empty-page shape — no
+  // delivery has to succeed, and the endpoint is deleted right after.
+  const wep = await ds.createWebhook({ name: "e2e-hook", url: "http://203.0.113.9/e2e", events: ["*"] });
   const wepId = (wep.endpoint || wep).id;
   check("webhook created", !!wepId);
   const whd = await ds.listWebhookDeliveries(wepId);
