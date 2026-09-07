@@ -232,6 +232,20 @@
   function announceSignIn() {
     syncFreshPresence();
     try { localStorage.setItem("av_signed_in_at", String(Date.now())); } catch (e) {}
+    // Login/passkey/OAuth responses carry {user, org} but not the
+    // memberships list — only GET /me does. Hydrate in the background
+    // so multi-org users get the workspace switcher without a reload;
+    // single-org users see no change (chip stays a static div).
+    if (state.ds.getSession) {
+      state.ds.getSession().then(function (full) {
+        if (full && full.user && state.session && state.session.user &&
+            full.user.id === state.session.user.id &&
+            (full.memberships || []).length > 1) {
+          state.session = full;
+          render();
+        }
+      }).catch(function () {});
+    }
   }
 
   var liveUnsub = null;
@@ -933,11 +947,17 @@
           "</button>" +
         "</header>" +
         '<nav class="sidebar" aria-label="Primary navigation">' +
-          '<div class="org-switcher">' +
-            '<span class="avatar">' + esc(initials(org.name)) + "</span>" +
-            "<span>" + esc(org.name) + "</span>" +
-            '<span class="env">Production</span>' +
-          "</div>" +
+          (((state.session.memberships || []).length > 1)
+            ? '<button class="org-switcher" id="orgSwitcher" aria-haspopup="menu" aria-expanded="false" title="Switch workspace">' +
+                '<span class="avatar">' + esc(initials(org.name)) + "</span>" +
+                "<span>" + esc(org.name) + "</span>" +
+                '<span class="env">' + esc((state.session.memberships || []).length + " orgs") + "</span>" +
+              "</button>"
+            : '<div class="org-switcher">' +
+                '<span class="avatar">' + esc(initials(org.name)) + "</span>" +
+                "<span>" + esc(org.name) + "</span>" +
+                '<span class="env">Production</span>' +
+              "</div>") +
           navLink("overview", current, "Overview", iconChart(), "G O") +
           navLink("sessions", current, "Sessions", iconActivity(), "G S") +
           navLink("policies", current, "Policies", iconShield(), "G P") +
@@ -961,8 +981,75 @@
     $("#cmdkOpen").addEventListener("click", openCmdK);
     $("#themeBtn").addEventListener("click", toggleTheme);
     $("#userBtn").addEventListener("click", toggleAccountMenu);
+    var osw = $("#orgSwitcher");
+    if (osw) osw.addEventListener("click", toggleOrgMenu);
     var xp = $("#exitPreview");
     if (xp) xp.addEventListener("click", exitRolePreview);
+  }
+
+  /* ── Org switcher. Multi-org users (consultants, agencies) previously
+   *    had no path to their non-oldest memberships: login always bound
+   *    the oldest org. The sidebar chip becomes a menu when /me reports
+   *    more than one membership; picking another org re-mints the
+   *    session cookie server-side (POST /auth/switch-org) and reboots
+   *    the console into that workspace. Same dropdown mechanics as the
+   *    account menu (Escape / click-outside / navigation close it). ── */
+  function closeOrgMenu() {
+    var m = document.getElementById("orgMenu");
+    if (m) m.remove();
+    var btn = document.getElementById("orgSwitcher");
+    if (btn) btn.setAttribute("aria-expanded", "false");
+    document.removeEventListener("click", orgMenuOutside, true);
+  }
+  function orgMenuOutside(e) {
+    var m = document.getElementById("orgMenu");
+    if (m && !m.contains(e.target) && !e.target.closest("#orgSwitcher")) closeOrgMenu();
+  }
+  function toggleOrgMenu() {
+    if (document.getElementById("orgMenu")) return closeOrgMenu();
+    closeAccountMenu();
+    var current = state.session.org;
+    var items = (state.session.memberships || []).map(function (m) {
+      var isCurrent = m.orgId === current.id;
+      return '<button role="menuitem" data-org="' + esc(m.orgId) + '"' + (isCurrent ? ' disabled' : "") + ">" +
+        '<span class="avatar" aria-hidden="true">' + esc(initials(m.name)) + "</span>" +
+        "<span>" + esc(m.name) + '</span><span class="am-sub" style="margin-left:auto">' + esc(m.role) + (isCurrent ? " ✓" : "") + "</span>" +
+      "</button>";
+    }).join("");
+    var menu = h('<div id="orgMenu" role="menu" aria-label="Switch workspace">' +
+      '<div class="am-head"><div style="font-weight:600">Switch workspace</div></div>' + items + "</div>");
+    document.body.appendChild(menu);
+    var btn = document.getElementById("orgSwitcher");
+    btn.setAttribute("aria-expanded", "true");
+    var r = btn.getBoundingClientRect();
+    menu.style.position = "fixed";
+    menu.style.top = (r.bottom + 6) + "px";
+    menu.style.left = r.left + "px";
+    menu.style.zIndex = 60;
+    menu.addEventListener("click", function (e) {
+      var it = e.target.closest("[data-org]");
+      if (!it || it.disabled) return;
+      var orgId = it.getAttribute("data-org");
+      closeOrgMenu();
+      switchWorkspace(orgId);
+    });
+    document.addEventListener("click", orgMenuOutside, true);
+  }
+  async function switchWorkspace(orgId) {
+    if (!state.ds.switchOrg) return;
+    try {
+      await state.ds.switchOrg(orgId);
+      // Re-fetch /me so memberships + role reflect the new binding.
+      var s = await state.ds.getSession();
+      if (!s || !s.user) throw new Error("session refresh failed");
+      state.session = s;
+      rolePreview = null;
+      toast("Switched to " + s.org.name);
+      navigate("#/overview");
+      render();
+    } catch (e) {
+      toast(e.message || "Could not switch workspace", true);
+    }
   }
 
   /* ── Account menu. The avatar used to be a straight shortcut to the

@@ -573,6 +573,78 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         role: active.role,
         createdAt: active.org.createdAt,
       },
+      // Every workspace this user belongs to, oldest first (the same
+      // order login's oldest-membership binding uses). Single-org
+      // users get a one-element array and the console hides the
+      // switcher. Names/roles only — nothing here an org-fenced
+      // member couldn't already see about their own memberships.
+      memberships: [...user.memberships]
+        .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+        .map((m) => ({
+          orgId: m.orgId,
+          name: m.org.name,
+          slug: m.org.slug,
+          role: m.role,
+        })),
+    });
+  });
+
+  // Re-bind the session to another org the user already belongs to.
+  // Multi-org users (a consultant in two client workspaces, an agency
+  // operator) previously had NO path to their non-oldest memberships:
+  // login always bound the oldest membership and the console offered
+  // no switch. Mints a fresh cookie exactly like login (same claims
+  // shape, same TTL); the sessionRevokedAt fence applies to the new
+  // iat, and all org fencing continues to flow from the JWT's orgId.
+  // No password step-up: the caller is already authenticated as this
+  // user, and the target membership was granted through the invite
+  // flow's own controls.
+  app.post("/switch-org", async (req, reply) => {
+    const claims = requireSession(req, reply);
+    if (!claims) return;
+    const body = z.object({ orgId: z.string().min(1).max(64) }).safeParse(req.body);
+    if (!body.success) return reply.code(400).send({ error: "invalid_input" });
+    if (body.data.orgId === claims.orgId) {
+      return reply.code(400).send({ error: "already_active_org" });
+    }
+    const membership = await db.membership.findFirst({
+      where: { userId: claims.sub, orgId: body.data.orgId },
+      include: { org: true, user: true },
+    });
+    // Uniform 404 whether the org doesn't exist or the caller simply
+    // isn't a member — no existence oracle for org ids.
+    if (!membership) return reply.code(404).send({ error: "not_found" });
+    const token = await mintSession({
+      sub: claims.sub,
+      orgId: membership.orgId,
+      membershipRole: membership.role as "owner" | "admin" | "member",
+    });
+    reply.setCookie(env.SESSION_COOKIE_NAME, token, SESSION_COOKIE_OPTS);
+    writeAudit(
+      {
+        orgId: membership.orgId,
+        event: "auth.org_switched",
+        actorId: claims.sub,
+        actorEmail: membership.user.email,
+        target: membership.org.name,
+        metadata: { fromOrgId: claims.orgId },
+        req,
+      },
+      req.log,
+    );
+    return reply.send({
+      user: {
+        id: membership.user.id,
+        email: membership.user.email,
+        displayName: membership.user.displayName,
+      },
+      org: {
+        id: membership.org.id,
+        slug: membership.org.slug,
+        name: membership.org.name,
+        role: membership.role,
+        createdAt: membership.org.createdAt,
+      },
     });
   });
 

@@ -580,6 +580,9 @@ code, pre, .mono {
   padding: var(--s-4) 10px var(--s-1);
   font-weight: 600;
 }
+/* When the chip is a real <button> (multi-org switcher) reset the
+   button chrome so it renders identically to the static div. */
+button.org-switcher { font: inherit; text-align: left; border: 0; cursor: pointer; }
 .sidebar .org-switcher {
   padding: 8px 10px;
   border-radius: var(--r);
@@ -1397,7 +1400,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 /* Scroll chaining: hitting the end of an inner scroller must not start
    scrolling the page behind it — especially under an open modal, where
    the "background page crept away" effect is disorienting. */
-.modal, .cmdk .list, .sidebar, .event-drawer .payload, .policy-preview, .policy-body, #accountMenu { overscroll-behavior: contain; }
+.modal, .cmdk .list, .sidebar, .event-drawer .payload, .policy-preview, .policy-body, #accountMenu, #orgMenu { overscroll-behavior: contain; }
 .modal {
   background: var(--surface);
   border: 1px solid var(--border);
@@ -2150,7 +2153,7 @@ a.ob-step:hover { border-color: var(--accent); }
 .print-only { display: none; }
 
 /* Account menu (topbar avatar dropdown). */
-#accountMenu {
+#accountMenu, #orgMenu {
   position: fixed;
   min-width: 240px;
   /* Cap: the menu is sized by its content, and a long signup email
@@ -2164,19 +2167,19 @@ a.ob-step:hover { border-color: var(--accent); }
   z-index: 500;
   animation: modalIn 120ms cubic-bezier(.22,1,.36,1);
 }
-#accountMenu .am-head { padding: 8px 10px 10px; border-bottom: 1px solid var(--border); margin-bottom: 6px; font-size: var(--t-sec); }
-#accountMenu .am-head, #accountMenu .am-head .am-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#accountMenu .am-head .am-sub { color: var(--fg-3); font-size: 11.5px; margin-top: 2px; }
-#accountMenu [role=menuitem] {
+#accountMenu .am-head, #orgMenu .am-head { padding: 8px 10px 10px; border-bottom: 1px solid var(--border); margin-bottom: 6px; font-size: var(--t-sec); }
+#accountMenu .am-head, #accountMenu .am-head .am-sub, #orgMenu .am-head, #orgMenu .am-head .am-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#accountMenu .am-head .am-sub, #orgMenu .am-head .am-sub { color: var(--fg-3); font-size: 11.5px; margin-top: 2px; }
+#accountMenu [role=menuitem], #orgMenu [role=menuitem] {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
   width: 100%; text-align: left;
   background: none; border: 0; cursor: pointer;
   padding: 8px 10px; border-radius: var(--r-sm);
   font: inherit; font-size: var(--t-sec); color: var(--fg);
 }
-#accountMenu [role=menuitem]:hover, #accountMenu [role=menuitem]:focus-visible { background: var(--surface-hover); }
-#accountMenu .am-danger { color: var(--danger); }
-#accountMenu .am-sep { border-top: 1px solid var(--border); margin: 6px 0; }
+#accountMenu [role=menuitem]:hover, #accountMenu [role=menuitem]:focus-visible, #orgMenu [role=menuitem]:hover, #orgMenu [role=menuitem]:focus-visible { background: var(--surface-hover); }
+#accountMenu .am-danger, #orgMenu .am-danger { color: var(--danger); }
+#accountMenu .am-sep, #orgMenu .am-sep { border-top: 1px solid var(--border); margin: 6px 0; }
 @media (prefers-reduced-motion: reduce) { #accountMenu { animation: none; } }
 
 /* Bottom tab bar — phone-width primary navigation (hidden on desktop,
