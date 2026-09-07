@@ -1259,6 +1259,10 @@
           errEl.innerHTML = '<div class="auth-hint" style="color: var(--fg-2); padding: 8px 12px;">Touch your passkey…</div>';
           try {
             var full = await runPasskeyLogin(s.email || email);
+            // Same shape guard as the password path below: the verify
+            // endpoint's response must carry a user or the login fails
+            // visibly instead of installing a phantom session.
+            if (!full || !full.user) throw new Error("Sign-in failed — unexpected server response. Try again.");
             state.session = full;
             state.authedAt = Date.now();
             announceSignIn();
