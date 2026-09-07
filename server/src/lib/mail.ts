@@ -172,6 +172,64 @@ you can ignore this email — nothing has changed on your account.
   return { subject: "Reset your AgentVisor AI password", text, html };
 }
 
+export function emailChangeVerifyMail(link: string, oldEmail: string): Pick<MailInput, "subject" | "text" | "html"> {
+  const text = `Confirm this address for your AgentVisor AI account (${oldEmail}):
+
+${link}
+
+This link expires in 24 hours. After confirming, you'll sign in with
+this address instead. If you didn't ask to change the account email,
+ignore this message — nothing changes without this link.
+`;
+  const linkEsc = escHtml(link);
+  const html = `<div style="font:15px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#222;max-width:520px">
+  <h2 style="margin:0 0 12px;font-size:20px">Confirm your new email</h2>
+  <p>The AgentVisor AI account <strong>${escHtml(oldEmail)}</strong> asked to use this address instead.</p>
+  <p><a href="${linkEsc}" style="display:inline-block;background:#0a5c8b;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:500">Confirm this address</a></p>
+  <p style="font-size:13px;color:#666">Or copy this URL into your browser:<br><code style="word-break:break-all">${linkEsc}</code></p>
+  <p style="font-size:13px;color:#666">This link expires in 24 hours. If you didn't ask for this, ignore it — nothing changes without this link.</p>
+</div>`;
+  return { subject: "Confirm your new AgentVisor AI email address", text, html };
+}
+
+export function emailChangedNoticeMail(newEmail: string): Pick<MailInput, "subject" | "text" | "html"> {
+  const text = `The email on your AgentVisor AI account was just changed to ${newEmail}.
+
+Every signed-in session was signed out; sign in with the new address.
+
+If this was NOT you, someone with your password changed your login
+address. This address no longer signs in, so contact your workspace
+owner or support@agentvisorai.me right away.
+`;
+  const html = `<div style="font:15px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#222;max-width:520px">
+  <h2 style="margin:0 0 12px;font-size:20px">Your account email was changed</h2>
+  <p>The email on your AgentVisor AI account is now <strong>${escHtml(newEmail)}</strong>. Every signed-in session was signed out; sign in with the new address.</p>
+  <p><strong>If this was not you</strong>, someone with your password changed your login address. Contact your workspace owner or <a href="mailto:support@agentvisorai.me">support@agentvisorai.me</a> right away.</p>
+</div>`;
+  return { subject: "Your AgentVisor AI account email was changed", text, html };
+}
+
+export function adminMfaResetMail(adminEmail: string): Pick<MailInput, "subject" | "text" | "html"> {
+  const adminEsc = escHtml(adminEmail);
+  const text = `A workspace administrator (${adminEmail}) reset the passkeys on your AgentVisor AI account.
+
+All your passkeys were removed, every signed-in session was signed
+out, and API tokens you created were revoked. You can sign in with
+your password alone, then enroll a new passkey under Settings > SSO.
+
+If you did NOT ask for this, treat your account as at risk: reset your
+password from the sign-in page ("Forgot password") and contact your
+workspace owner.
+`;
+  const html = `<div style="font:15px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#222;max-width:520px">
+  <h2 style="margin:0 0 12px;font-size:20px">Your passkeys were reset</h2>
+  <p>A workspace administrator (<strong>${adminEsc}</strong>) reset the passkeys on your AgentVisor AI account.</p>
+  <p>All your passkeys were removed, every signed-in session was signed out, and API tokens you created were revoked. You can sign in with your password alone, then enroll a new passkey under <em>Settings &gt; SSO</em>.</p>
+  <p><strong>If you did not ask for this</strong>, treat your account as at risk: reset your password from the sign-in page (&ldquo;Forgot password&rdquo;) and contact your workspace owner.</p>
+</div>`;
+  return { subject: "Your AgentVisor AI passkeys were reset by an administrator", text, html };
+}
+
 export function passwordChangedMail(): Pick<MailInput, "subject" | "text" | "html"> {
   const text = `Your AgentVisor AI password was just changed.
 

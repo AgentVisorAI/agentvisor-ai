@@ -200,6 +200,47 @@ try {
   const reLogin = await ds.login({ email, password: "rotated-e2e-pw-2026" });
   check("new password logs in", reLogin && reLogin.user && reLogin.user.email === email);
 
+  // Email change guards (full round-trip needs a mailbox — covered by
+  // browser/curl drills; here we pin the API contract).
+  let ceWrong = "";
+  try { await ds.requestEmailChange({ newEmail: "other@test.dev", password: "not-my-password" }); }
+  catch (e) { ceWrong = e.errorCode || e.message; }
+  check("change-email wrong password 401", ceWrong === "invalid_password", ceWrong);
+  let ceSame = "";
+  try { await ds.requestEmailChange({ newEmail: email, password: "rotated-e2e-pw-2026" }); }
+  catch (e) { ceSame = e.errorCode || e.message; }
+  check("change-email same address 400", ceSame === "same_as_current", ceSame);
+  const ceReq = await ds.requestEmailChange({ newEmail: `new-${rand}@test.dev`, password: "rotated-e2e-pw-2026" });
+  check("change-email request 202", ceReq && ceReq.ok === true && ceReq.pendingEmail === `new-${rand}@test.dev`);
+  const mePending = await ds.getSession();
+  check("pendingEmail on /me", mePending.user.pendingEmail === `new-${rand}@test.dev`, mePending.user.pendingEmail);
+  let ceBadTok = "";
+  try { await ds.confirmEmailChange({ email, token: "AAAAAAAAAAAAAAAAAAAAAAAA" }); }
+  catch (e) { ceBadTok = e.errorCode || e.message; }
+  check("change-email bad token 401", ceBadTok === "invalid_token", ceBadTok);
+  const ceCancel = await ds.cancelEmailChange();
+  check("change-email cancel", ceCancel && ceCancel.ok === true);
+  const meCancelled = await ds.getSession();
+  check("pendingEmail cleared after cancel", meCancelled.user.pendingEmail == null, String(meCancelled.user.pendingEmail));
+
+  // Admin MFA reset guards (the full lifecycle needs a WebAuthn
+  // authenticator — browser drills cover it; here we pin the API's
+  // guard rails, which need no credential).
+  let selfMfa = "";
+  try { await ds.resetMemberMfa(me.user.id, "rotated-e2e-pw-2026"); }
+  catch (e) { selfMfa = e.errorCode || e.message; }
+  check("reset-mfa self refused", selfMfa === "use_self_service_revoke", selfMfa);
+  let ghostMfa = "";
+  try { await ds.resetMemberMfa("cmnonexistent000000000000", "rotated-e2e-pw-2026"); }
+  catch (e) { ghostMfa = e.errorCode || e.message; }
+  check("reset-mfa unknown target 404", ghostMfa === "not_found", ghostMfa);
+  let wrongPwMfa = "";
+  try { await ds.resetMemberMfa("cmnonexistent000000000000", "not-my-password"); }
+  catch (e) { wrongPwMfa = e.errorCode || e.message; }
+  check("reset-mfa wrong password 401", wrongPwMfa === "invalid_password", wrongPwMfa);
+  const mem = await ds.listMembers();
+  check("members carry mfaEnrolled flag", mem.length === 1 && mem[0].mfaEnrolled === false, JSON.stringify(mem[0] && mem[0].mfaEnrolled));
+
   await ds.logout();
   const s2 = await ds.getSession();
   check("logout clears session", s2 === null);

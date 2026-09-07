@@ -13,7 +13,7 @@ import {
 import { writeAudit } from "../lib/audit.js";
 import { authEventsTotal } from "../lib/metrics.js";
 import { perIpCookieOnly } from "../lib/rate-limit.js";
-import { getMailer, passwordChangedMail, passwordResetMail, welcomeMail } from "../lib/mail.js";
+import { getMailer, emailChangeVerifyMail, emailChangedNoticeMail, passwordChangedMail, passwordResetMail, welcomeMail } from "../lib/mail.js";
 import {
   clearSessionCookie,
   requireSession,
@@ -565,7 +565,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(403).send({ error: "membership_revoked" });
     }
     return reply.send({
-      user: { id: user.id, email: user.email, displayName: user.displayName },
+      user: { id: user.id, email: user.email, displayName: user.displayName, pendingEmail: user.pendingEmail },
       org: {
         id: active.org.id,
         slug: active.org.slug,
@@ -764,6 +764,183 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         req.log.warn({ err: e }, "password-changed mail send failed");
       }
     })();
+    return reply.send({ ok: true });
+  });
+
+  // Email change, two-phase. Proof of BOTH factors is required: the
+  // account password (step-up on the request) and control of the NEW
+  // mailbox (the verify token is mailed there, never shown on the
+  // wire). The wire answer is a uniform 202 whether or not the new
+  // address is already registered — takenness is only revealed at
+  // confirm time, to someone who holds the account password AND the
+  // token from the new mailbox, i.e. nothing they couldn't learn by
+  // trying to sign up. Design constraint worth naming: OAuth/SAML JIT
+  // is email-KEYED (no provider-linkage column), so a user who signs
+  // in via SSO after changing their address here will be provisioned
+  // as a fresh user under the IdP's address. Password login follows
+  // the new address immediately.
+  const emailChangeTtlMs = 24 * 60 * 60 * 1000;
+  app.post("/change-email", {
+    config: { rateLimit: perIpCookieOnly(3, 60_000) },
+  }, async (req, reply) => {
+    const claims = requireSession(req, reply);
+    if (!claims) return;
+    if (claims.sub.startsWith("apikey:")) {
+      return reply.code(403).send({ error: "cookie_session_required" });
+    }
+    const body = z
+      .object({ newEmail: emailSchema, password: z.string().min(1).max(1024) })
+      .safeParse(req.body);
+    if (!body.success) return reply.code(400).send({ error: "invalid_input" });
+    const user = await db.user.findUnique({ where: { id: claims.sub } });
+    if (!user) return reply.code(401).send({ error: "unauthenticated" });
+    const ok = await verifyPassword(user.passwordHash, body.data.password);
+    if (!ok) {
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "auth.step_up_denied",
+          actorId: claims.sub,
+          actorEmail: user.email,
+          note: "invalid_password",
+          metadata: { endpoint: "auth.change_email" },
+          req,
+        },
+        req.log,
+      );
+      return reply.code(401).send({ error: "invalid_password" });
+    }
+    if (body.data.newEmail === user.email) {
+      // After the verify so this can't probe the password for free.
+      return reply.code(400).send({ error: "same_as_current" });
+    }
+    const plaintextToken = randomToken(32);
+    const pendingEmailTokenHash = await hashPassword(plaintextToken);
+    await db.user.update({
+      where: { id: user.id },
+      data: {
+        pendingEmail: body.data.newEmail,
+        pendingEmailTokenHash,
+        pendingEmailAt: new Date(),
+      },
+    });
+    writeAudit(
+      {
+        orgId: claims.orgId,
+        event: "auth.email_change_requested",
+        actorId: user.id,
+        actorEmail: user.email,
+        target: body.data.newEmail,
+        req,
+      },
+      req.log,
+    );
+    // Detached send, uniform wall-clock (same shape as /reset-request).
+    // If the new address already belongs to an account we store the
+    // pending row anyway (confirm will refuse with email_in_use) but
+    // skip the mail — the legitimate owner of that address shouldn't
+    // get "verify this change" spam they never asked for.
+    const newEmail = body.data.newEmail;
+    const oldEmail = user.email;
+    void (async () => {
+      try {
+        const taken = await db.user.findUnique({ where: { email: newEmail } });
+        if (taken) return;
+        const link = `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/confirm-email?token=${encodeURIComponent(plaintextToken)}&email=${encodeURIComponent(oldEmail)}`;
+        const mail = getMailer(req.log);
+        await mail.send({ to: newEmail, ...emailChangeVerifyMail(link, oldEmail) });
+      } catch (e) {
+        req.log.warn({ err: e }, "email-change verify mail send failed");
+      }
+    })();
+    return reply.code(202).send({ ok: true, pendingEmail: newEmail });
+  });
+
+  app.post("/change-email/confirm", {
+    // Anonymous (the link may be opened on any device). Same posture
+    // as /reset-confirm: 10/min per IP, uniform argon2 verify against
+    // a dummy hash on every failure leg, single invalid_token exit.
+    config: { rateLimit: perIp(10, 60_000) },
+  }, async (req, reply) => {
+    const body = z
+      .object({ email: emailSchema, token: z.string().min(16).max(256) })
+      .safeParse(req.body);
+    if (!body.success) return reply.code(400).send({ error: "invalid_token" });
+    const user = await db.user.findUnique({ where: { email: body.data.email } });
+    const fresh =
+      !!(user?.pendingEmail &&
+        user.pendingEmailTokenHash &&
+        user.pendingEmailAt &&
+        Date.now() - user.pendingEmailAt.getTime() <= emailChangeTtlMs);
+    const hashForCompare = fresh
+      ? (user!.pendingEmailTokenHash as string)
+      : await getDummyPasswordHash();
+    const ok = await verifyPassword(hashForCompare, body.data.token);
+    if (!ok || !fresh || !user) {
+      return reply.code(401).send({ error: "invalid_token" });
+    }
+    const newEmail = user.pendingEmail as string;
+    // Uniqueness is enforced HERE, not at request time — revealing
+    // takenness to someone holding both the password-gated pending row
+    // and the new-mailbox token leaks nothing signup wouldn't.
+    const taken = await db.user.findUnique({ where: { email: newEmail } });
+    if (taken) {
+      return reply.code(409).send({ error: "email_in_use" });
+    }
+    await db.user.update({
+      where: { id: user.id },
+      data: {
+        email: newEmail,
+        pendingEmail: null,
+        pendingEmailTokenHash: null,
+        pendingEmailAt: null,
+        // Fence every session: the login identifier just rotated and
+        // the confirm may have happened on an untrusted device. The
+        // user signs back in with the new address.
+        sessionRevokedAt: new Date(),
+      },
+    });
+    const firstMembership = await db.membership.findFirst({
+      where: { userId: user.id },
+      orderBy: { createdAt: "asc" },
+      select: { orgId: true },
+    });
+    if (firstMembership) {
+      writeAudit(
+        {
+          orgId: firstMembership.orgId,
+          event: "auth.email_changed",
+          actorId: user.id,
+          actorEmail: newEmail,
+          target: newEmail,
+          metadata: { previousEmail: body.data.email },
+          req,
+        },
+        req.log,
+      );
+    }
+    const oldEmail = body.data.email;
+    void (async () => {
+      try {
+        const mail = getMailer(req.log);
+        await mail.send({ to: oldEmail, ...emailChangedNoticeMail(newEmail) });
+      } catch (e) {
+        req.log.warn({ err: e }, "email-changed notice mail send failed");
+      }
+    })();
+    return reply.send({ ok: true, email: newEmail });
+  });
+
+  app.post("/change-email/cancel", async (req, reply) => {
+    const claims = requireSession(req, reply);
+    if (!claims) return;
+    if (claims.sub.startsWith("apikey:")) {
+      return reply.code(403).send({ error: "cookie_session_required" });
+    }
+    await db.user.update({
+      where: { id: claims.sub },
+      data: { pendingEmail: null, pendingEmailTokenHash: null, pendingEmailAt: null },
+    });
     return reply.send({ ok: true });
   });
 

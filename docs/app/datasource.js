@@ -205,9 +205,9 @@
   };
 
   var MOCK_MEMBERS = [
-    { id: "usr_olivia", userId: "usr_olivia", email: "olivia.tan@northwind.com", displayName: "Olivia Tan", role: "owner", lastActive: iso(2 * MIN) },
-    { id: "usr_raj", userId: "usr_raj", email: "raj.patel@northwind.com", displayName: "Raj Patel", role: "admin", lastActive: iso(18 * MIN) },
-    { id: "usr_sam", userId: "usr_sam", email: "sam.lee@northwind.com", displayName: "Sam Lee", role: "member", lastActive: iso(4 * HOUR) },
+    { id: "usr_olivia", userId: "usr_olivia", email: "olivia.tan@northwind.com", displayName: "Olivia Tan", role: "owner", lastActive: iso(2 * MIN), mfaEnrolled: true },
+    { id: "usr_raj", userId: "usr_raj", email: "raj.patel@northwind.com", displayName: "Raj Patel", role: "admin", lastActive: iso(18 * MIN), mfaEnrolled: true },
+    { id: "usr_sam", userId: "usr_sam", email: "sam.lee@northwind.com", displayName: "Sam Lee", role: "member", lastActive: iso(4 * HOUR), mfaEnrolled: true },
     { id: "usr_priya", userId: "usr_priya", email: "priya.iyer@northwind.com", displayName: "Priya Iyer", role: "member", lastActive: iso(2 * 24 * HOUR) },
     { id: "usr_marc", userId: "usr_marc", email: "marc.dubois@northwind.com", displayName: "Marc Dubois", role: "member", lastActive: iso(6 * 24 * HOUR) },
   ];
@@ -1312,6 +1312,13 @@
       // doesn't verify it (no auth in mock mode).
       MOCK_PASSKEYS = MOCK_PASSKEYS.filter(function (p) { return p.id !== id; });
     },
+    async webauthnRelabel(id, label) {
+      var lbl = (label || "").trim();
+      if (!lbl) { var erl = new Error("invalid_input"); erl.status = 400; erl.errorCode = "invalid_input"; throw erl; }
+      for (var rli = 0; rli < MOCK_PASSKEYS.length; rli++) if (MOCK_PASSKEYS[rli].id === id) MOCK_PASSKEYS[rli].label = lbl.slice(0, 80);
+      recordAudit("mfa.credential_relabeled", "", lbl);
+      return { credential: { id: id, label: lbl.slice(0, 80) } };
+    },
     async webauthnAuthStart() { return { options: { challenge: "mock" } }; },
     async webauthnAuthFinish() { throw new Error("mock_no_real_authenticator"); },
     async logout() {
@@ -1750,6 +1757,17 @@
       }
       return MOCK_MEMBERS.slice();
     },
+    async resetMemberMfa(userId, password) {
+      await delay(200);
+      if (!password) { var erm = new Error("invalid_password"); erm.status = 401; erm.errorCode = "invalid_password"; throw erm; }
+      var tgt = null;
+      for (var rmi = 0; rmi < MOCK_MEMBERS.length; rmi++) if (MOCK_MEMBERS[rmi].userId === userId) tgt = MOCK_MEMBERS[rmi];
+      if (!tgt) { var erm2 = new Error("not_found"); erm2.status = 404; erm2.errorCode = "not_found"; throw erm2; }
+      if (!tgt.mfaEnrolled) { var erm3 = new Error("no_mfa_enrolled"); erm3.status = 400; erm3.errorCode = "no_mfa_enrolled"; throw erm3; }
+      tgt.mfaEnrolled = false;
+      recordAudit("mfa.credentials_admin_reset", "", tgt.email);
+      return { ok: true, credentialsRemoved: 1 };
+    },
     async inviteMember(input) {
       await delay(200);
       var pool = freshElapsed() != null ? freshRuntime().invites : MOCK_INVITES;
@@ -1991,6 +2009,33 @@
       recordAudit("auth.password_changed", "", "");
       return { ok: true };
     },
+    async requestEmailChange(input) {
+      await delay(200);
+      if (!input || !input.password) { var ece0 = new Error("invalid_password"); ece0.status = 401; ece0.errorCode = "invalid_password"; throw ece0; }
+      var cur = (mockState.session && mockState.session.user.email) || "demo@northwind.com";
+      if (!input.newEmail || input.newEmail === cur) { var ece1 = new Error("same_as_current"); ece1.status = 400; ece1.errorCode = "same_as_current"; throw ece1; }
+      mockState.pendingEmail = input.newEmail;
+      recordAudit("auth.email_change_requested", "", input.newEmail);
+      // Demo parity with the reset flow: surface the token inline since
+      // there's no mailbox in mock mode.
+      return { ok: true, pendingEmail: input.newEmail, mockToken: "demo-email-token" };
+    },
+    async confirmEmailChange(input) {
+      await delay(200);
+      if (!input || input.token !== "demo-email-token" || !mockState.pendingEmail) {
+        var ece2 = new Error("invalid_token"); ece2.status = 401; ece2.errorCode = "invalid_token"; throw ece2;
+      }
+      var newEmail = mockState.pendingEmail;
+      mockState.pendingEmail = null;
+      if (mockState.session) mockState.session.user.email = newEmail;
+      recordAudit("auth.email_changed", "", newEmail);
+      return { ok: true, email: newEmail };
+    },
+    async cancelEmailChange() {
+      await delay(100);
+      mockState.pendingEmail = null;
+      return { ok: true };
+    },
     async exportMyData(password) {
       await delay(200);
       if (!password) { var e1 = new Error("password_required"); e1.status = 400; throw e1; }
@@ -2197,6 +2242,15 @@
     async changePassword(input) {
       return apiFetch("/api/v1/auth/change-password", { method: "POST", body: { currentPassword: input.currentPassword, newPassword: input.newPassword } });
     },
+    async requestEmailChange(input) {
+      return apiFetch("/api/v1/auth/change-email", { method: "POST", body: { newEmail: input.newEmail, password: input.password } });
+    },
+    async confirmEmailChange(input) {
+      return apiFetch("/api/v1/auth/change-email/confirm", { method: "POST", body: { email: input.email, token: input.token } });
+    },
+    async cancelEmailChange() {
+      return apiFetch("/api/v1/auth/change-email/cancel", { method: "POST", body: {} });
+    },
     async signup(input) {
       var r = await apiFetch("/api/v1/auth/signup", { method: "POST", body: { email: input.email, password: input.password, orgName: input.orgName || (input.email.split("@")[0] + "'s org") } });
       return { user: r.user, org: r.org };
@@ -2286,6 +2340,12 @@
       return apiFetch("/api/v1/auth/webauthn/credentials/" + encodeURIComponent(id), {
         method: "DELETE",
         body: { password: password },
+      });
+    },
+    async webauthnRelabel(id, label) {
+      return apiFetch("/api/v1/auth/webauthn/credentials/" + encodeURIComponent(id), {
+        method: "PATCH",
+        body: { label: label },
       });
     },
     async webauthnAuthStart(email) {
@@ -2506,9 +2566,15 @@
       try {
         var r = await apiFetch("/api/v1/members");
         return (r.members || []).map(function (m) {
-          return { userId: m.userId, email: m.email, displayName: m.displayName, role: m.role, lastActive: m.joinedAt };
+          return { userId: m.userId, email: m.email, displayName: m.displayName, role: m.role, lastActive: m.joinedAt, mfaEnrolled: !!m.mfaEnrolled };
         });
       } catch (e) { return []; }
+    },
+    async resetMemberMfa(userId, password) {
+      return apiFetch("/api/v1/members/" + encodeURIComponent(userId) + "/reset-mfa", {
+        method: "POST",
+        body: { password: password },
+      });
     },
     async inviteMember(input) {
       return apiFetch("/api/v1/members/invites", { method: "POST", body: input });
