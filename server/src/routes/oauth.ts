@@ -34,7 +34,7 @@ import {
 import { writeAudit } from "../lib/audit.js";
 
 interface ProviderCfg {
-  id: "google" | "microsoft";
+  id: "google" | "microsoft" | "oidc";
   displayName: string;
   discoveryUrl: string;
   clientId: string;
@@ -67,6 +67,24 @@ function providerConfigs(): ProviderCfg[] {
       scope: "openid email profile",
     });
   }
+  // Generic OIDC issuer (Keycloak / Okta / Auth0 / Authentik / …).
+  // Identical contract to the branded providers: discovery, PKCE,
+  // nonce, email_verified===true. The email_verified gate matters
+  // MORE here than for Google — a self-hosted IdP is exactly the
+  // "attacker running their own IdP" the R135 comment warns about,
+  // so the operator wiring one in is trusting that issuer's email
+  // claims; the gate still refuses issuers that don't even claim
+  // verification.
+  if (env.OIDC_ISSUER_URL && env.OIDC_CLIENT_ID && env.OIDC_CLIENT_SECRET) {
+    out.push({
+      id: "oidc",
+      displayName: env.OIDC_DISPLAY_NAME,
+      discoveryUrl: env.OIDC_ISSUER_URL,
+      clientId: env.OIDC_CLIENT_ID,
+      clientSecret: env.OIDC_CLIENT_SECRET,
+      scope: "openid email profile",
+    });
+  }
   return out;
 }
 
@@ -82,6 +100,14 @@ async function getConfig(p: ProviderCfg): Promise<oidc.Configuration> {
     p.clientId,
     undefined,
     oidc.ClientSecretPost(p.clientSecret),
+    // http:// issuers are refused by openid-client unless explicitly
+    // allowed. Only the generic OIDC provider can carry one, and only
+    // outside production (env.ts refine) — local IdPs and the
+    // oidc-drill mock. Google/Microsoft discovery URLs are https
+    // constants so this branch never fires for them.
+    p.discoveryUrl.startsWith("http://") && env.NODE_ENV !== "production"
+      ? { execute: [oidc.allowInsecureRequests] }
+      : undefined,
   );
   configCache.set(p.id, cfg);
   return cfg;
@@ -167,7 +193,7 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
         `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/login?err=${encodeURIComponent(slug)}`,
       );
     const params = z
-      .object({ provider: z.enum(["google", "microsoft"]) })
+      .object({ provider: z.enum(["google", "microsoft", "oidc"]) })
       .safeParse(req.params);
     if (!params.success) {
       return errRedirect("oauth_provider_not_found");
@@ -233,7 +259,7 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
         `${env.APP_BASE_URL.replace(/\/$/, "")}/app/#/login?err=${encodeURIComponent(slug)}`,
       );
     const params = z
-      .object({ provider: z.enum(["google", "microsoft"]) })
+      .object({ provider: z.enum(["google", "microsoft", "oidc"]) })
       .safeParse(req.params);
     if (!params.success) {
       return errRedirect("oauth_provider_not_found");

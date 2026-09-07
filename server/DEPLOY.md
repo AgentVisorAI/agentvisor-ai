@@ -188,7 +188,7 @@ RFC1918, link-local, or cloud-metadata addresses are refused. For
 local development against a receiver on your own machine set
 `ALLOW_INTERNAL_WEBHOOK_TARGETS=true` (never in production).
 
-**OIDC login** (Google + Microsoft):
+**OIDC login** (Google + Microsoft + any generic issuer):
 
 - **Google**: [Google Cloud → APIs & Services → OAuth 2.0 Client IDs](https://console.cloud.google.com/apis/credentials).
   Create a Web application client. Add authorized redirect URI:
@@ -200,13 +200,26 @@ local development against a receiver on your own machine set
   Under *Certificates & secrets* create a client secret. Set
   `MICROSOFT_TENANT=common` for multi-tenant + personal, or a specific
   tenant id for enterprise single-tenant.
+- **Generic OIDC** (Keycloak / Okta / Auth0 / Authentik / any
+  spec-compliant issuer): set `OIDC_ISSUER_URL` to the issuer base (the
+  server discovers `<issuer>/.well-known/openid-configuration`),
+  `OIDC_CLIENT_ID` + `OIDC_CLIENT_SECRET` from the client you register
+  there, and optionally `OIDC_DISPLAY_NAME` (login button reads
+  "Continue with <name>", default "SSO"). Register redirect URI
+  `https://api.agentvisorai.me/api/v1/auth/oauth/oidc/callback` and
+  auth method `client_secret_post`. Same rules as the branded
+  providers: PKCE S256, nonce, and `email_verified: true` required in
+  the id_token — issuers that don't verify emails are refused.
+  `OIDC_ISSUER_URL` must be https:// in production.
 
-Set the four secrets:
+Set the secrets:
 
 ```bash
 fly secrets set \
   GOOGLE_CLIENT_ID="…" GOOGLE_CLIENT_SECRET="…" \
-  MICROSOFT_CLIENT_ID="…" MICROSOFT_CLIENT_SECRET="…"
+  MICROSOFT_CLIENT_ID="…" MICROSOFT_CLIENT_SECRET="…" \
+  OIDC_ISSUER_URL="https://sso.example.com/realms/acme" \
+  OIDC_CLIENT_ID="…" OIDC_CLIENT_SECRET="…" OIDC_DISPLAY_NAME="Acme SSO"
 ```
 
 The login page automatically shows/hides each button based on which

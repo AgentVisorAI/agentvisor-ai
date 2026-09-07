@@ -1276,6 +1276,10 @@
     var ssoButtons = "";
     if (byId.google)    ssoButtons += '<button type="button" data-sso="google">' + iconGoogle() + '<span>Continue with Google</span></button>';
     if (byId.microsoft) ssoButtons += '<button type="button" data-sso="microsoft">' + iconMicrosoft() + '<span>Continue with Microsoft</span></button>';
+    // Generic OIDC issuer (Keycloak / Okta / Auth0 / Authentik). The
+    // label comes from the server's OIDC_DISPLAY_NAME env — operator
+    // input, so esc() it like everything else user-controlled.
+    if (byId.oidc)      ssoButtons += '<button type="button" data-sso="oidc">' + iconKey() + '<span>Continue with ' + esc(byId.oidc.displayName || "SSO") + '</span></button>';
     // SAML/Okta = enterprise path. We're honest about not shipping it
     // yet: click routes to a contact-sales mailto. Still visible so the
     // login page communicates the roadmap without pretending.
@@ -5044,13 +5048,26 @@
     catch (e) { root.innerHTML = '<div class="card empty"><h3>Could not load SSO</h3><p>' + esc(e.message || "Try again in a moment.") + '</p></div>'; return; }
     var configs = res.configs || [];
 
+    // Show live configured/not state per provider (from /providers)
+    // rather than a static pair of pills that may be lies. The generic
+    // OIDC issuer appears under its operator-set display name.
+    var oauthProviders = [];
+    try { oauthProviders = ((await state.ds.getSSO()) || {}).providers || []; } catch (e) { oauthProviders = []; }
+    var oauthById = {};
+    oauthProviders.forEach(function (p) { oauthById[p.id] = p; });
+    function providerPill(id, icon, label) {
+      var on = !!oauthById[id];
+      return '<span class="pill ' + (on ? "ok" : "neutral") + '">' + icon +
+        '<span style="margin-left:6px">' + esc(label) + (on ? " ✓" : "") + '</span></span>';
+    }
     var oauthCard =
       '<div class="card">' +
         '<h2>Social sign-in (OAuth)</h2>' +
-        '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 var(--s-4)">Anyone with a Google Workspace or Microsoft Entra account at your domain can sign in. Configured server-side via provider env vars.</p>' +
+        '<p style="color: var(--fg-2); font-size: var(--t-sec); margin: 0 0 var(--s-4)">Sign-in with an OIDC identity provider — Google Workspace, Microsoft Entra, or any spec-compliant issuer (Keycloak, Okta, Auth0…). Configured server-side via provider env vars; a checkmark means the button is live on the login page.</p>' +
         '<div style="display:flex; gap:8px; flex-wrap:wrap">' +
-          '<span class="pill neutral">' + iconGoogle() + '<span style="margin-left:6px">Google Workspace</span></span>' +
-          '<span class="pill neutral">' + iconMicrosoft() + '<span style="margin-left:6px">Microsoft Entra</span></span>' +
+          providerPill("google", iconGoogle(), "Google Workspace") +
+          providerPill("microsoft", iconMicrosoft(), "Microsoft Entra") +
+          providerPill("oidc", iconKey(), (oauthById.oidc && oauthById.oidc.displayName) || "Generic OIDC") +
         "</div>" +
       "</div>";
 
