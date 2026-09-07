@@ -52,6 +52,12 @@ services:
       - key: APP_BASE_URL
         value: https://agentvisorai.me
       - key: EMAIL_FROM
+        # MUST be a Resend-verified domain sender or Resend rejects
+        # every send at request time (the API still 202s — check logs
+        # for resend_send_failed). Until the domain is verified in
+        # Resend, use their sandbox sender, which only delivers to the
+        # Resend account owner's own address:
+        #   AgentVisor AI <onboarding@resend.dev>
         value: AgentVisor AI <no-reply@agentvisorai.me>
       - key: MICROSOFT_TENANT
         value: common
