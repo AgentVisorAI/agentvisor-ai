@@ -215,10 +215,8 @@ code, pre, .mono {
 .auth-brand-mark {
   width: 26px; height: 26px;
   border-radius: 6px;
-  background: linear-gradient(135deg, var(--accent), var(--accent-hover));
-  display: grid; place-items: center;
-  color: var(--accent-fg); font-weight: 700; font-size: 13px;
-  letter-spacing: -0.02em;
+  object-fit: contain;
+  display: block;
 }
 .auth-form h1 { font-size: 24px; margin: 0 0 var(--s-1); font-weight: 600; letter-spacing: -0.01em; }
 .auth-form .sub { color: var(--fg-2); margin: 0 0 var(--s-6); font-size: var(--t-body); }

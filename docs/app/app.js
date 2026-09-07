@@ -1286,7 +1286,7 @@
       '<div class="auth-shell">' +
         '<section class="auth-form">' +
           '<div class="auth-form-inner">' +
-            '<div class="auth-brand"><span class="auth-brand-mark">A</span> AgentVisor AI</div>' +
+            '<div class="auth-brand"><img class="auth-brand-mark" src="../logo.png" alt="" width="26" height="26" /> AgentVisor AI</div>' +
             '<h1>' + (isSignup ? "Create your workspace" : "Sign in") + '</h1>' +
             '<p class="sub">' + (isSignup ? "Governance for every AI agent in your fleet." : "Access your agent control plane.") + '</p>' +
             noteHtml +
@@ -1489,7 +1489,7 @@
       '<div class="auth-shell">' +
         '<section class="auth-form">' +
           '<div class="auth-form-inner">' +
-            '<div class="auth-brand"><span class="auth-brand-mark">A</span> AgentVisor AI</div>' +
+            '<div class="auth-brand"><img class="auth-brand-mark" src="../logo.png" alt="" width="26" height="26" /> AgentVisor AI</div>' +
             '<h1>Join the workspace</h1>' +
             '<p class="sub">' + (email ? 'Accept your invite for <b>' + esc(email) + '</b> and set a password.' : 'Accept your invite and set a password.') + '</p>' +
             '<form id="acceptForm">' +
@@ -1556,7 +1556,7 @@
       '<div class="auth-shell">' +
         '<section class="auth-form">' +
           '<div class="auth-form-inner">' +
-            '<div class="auth-brand"><span class="auth-brand-mark">A</span> AgentVisor AI</div>' +
+            '<div class="auth-brand"><img class="auth-brand-mark" src="../logo.png" alt="" width="26" height="26" /> AgentVisor AI</div>' +
             '<h1>Confirm your new email</h1>' +
             '<div id="ceStatus"><p class="sub">Verifying the link…</p></div>' +
             '<div class="auth-alt"><a href="#/login">← Back to sign in</a></div>' +
@@ -1619,7 +1619,7 @@
       '<div class="auth-shell">' +
         '<section class="auth-form">' +
           '<div class="auth-form-inner">' +
-            '<div class="auth-brand"><span class="auth-brand-mark">A</span> AgentVisor AI</div>' +
+            '<div class="auth-brand"><img class="auth-brand-mark" src="../logo.png" alt="" width="26" height="26" /> AgentVisor AI</div>' +
             (stage === "request"
               ? '<h1>Reset your password</h1>' +
                 '<p class="sub">We\'ll email you a link to pick a new one.</p>' +
