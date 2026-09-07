@@ -27,6 +27,46 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Round 93: the installer must work on ANY os. Real runners cover
+  # linux x64/arm64 + macOS arm64/x64; containers cover old-glibc
+  # distros and musl (where rc.2's gnu binaries died silently).
+  installer-matrix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: curl | sh from the live site, then smoke
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://agentvisorai.me/install.sh?cb=$RANDOM" -o /tmp/install.sh
+          AV_INSTALL_DIR="$HOME/av-bin" sh /tmp/install.sh
+          "$HOME/av-bin/agentvisord" --version
+          "$HOME/av-bin/avctl" --version
+
+  installer-containers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:22.04", "debian:12", "alpine:3.20"]
+    container: ${{ matrix.image }}
+    steps:
+      - name: Install curl
+        run: |
+          if command -v apt-get >/dev/null; then apt-get update -q && apt-get install -y -q curl ca-certificates; fi
+          if command -v apk >/dev/null; then apk add -q curl; fi
+      - name: curl | sh from the live site, then smoke
+        run: |
+          set -eu
+          curl -fsSL "https://agentvisorai.me/install.sh?cb=$RANDOM" -o /tmp/install.sh
+          AV_INSTALL_DIR=/opt/av sh /tmp/install.sh
+          /opt/av/agentvisord --version
+          /opt/av/avctl --version
+
   outsider-chain:
     runs-on: ubuntu-latest
     timeout-minutes: 45
