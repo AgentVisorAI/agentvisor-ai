@@ -84,7 +84,11 @@ jobs:
         run: |
           ts=$(date -u +%Y%m%d-%H%M)
           out="agentvisor-${ts}.dump"
-          pg_dump \
+          # The runner PREINSTALLS postgresql-client-16 and Debian's
+          # pg_wrapper keeps /usr/bin/pg_dump pointing at it even after
+          # client-18 lands — the previous fix installed 18 but still
+          # executed 16.15. Call the versioned binary directly.
+          /usr/lib/postgresql/18/bin/pg_dump \
             --format=custom \
             --compress=9 \
             --no-owner \
