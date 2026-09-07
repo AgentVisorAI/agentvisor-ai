@@ -1,0 +1,69 @@
+name: Release pin bump
+
+# Round-91 dress-rehearsal lesson: v0.1.0-rc.2 shipped and the
+# installer kept handing out rc.1 for an hour — the install.sh pin is
+# a manual step nobody remembers. This workflow opens the bump PR
+# automatically whenever a release is published (and is dispatchable
+# for testing / catch-up).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to pin (e.g. v0.1.0-rc.2)"
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Bump docs/install.sh pin
+        id: bump
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -eu
+          VERSION="${TAG#v}"
+          CURRENT=$(sed -n 's/^AV_VERSION="\${AV_VERSION:-\(.*\)}"$/\1/p' docs/install.sh)
+          echo "current pin: $CURRENT → release: $VERSION"
+          if [ -z "$CURRENT" ]; then
+            echo "::error::could not parse the AV_VERSION pin out of docs/install.sh — pattern drifted"
+            exit 1
+          fi
+          if [ "$CURRENT" = "$VERSION" ]; then
+            echo "pin already current; nothing to do"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          sed -i "s/${CURRENT//./\\.}/$VERSION/g" docs/install.sh
+          sh -n docs/install.sh
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Open PR
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          set -eu
+          BRANCH="bot/install-pin-$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add docs/install.sh
+          git commit -m "install.sh: pin v$VERSION (automated release bump)"
+          git push -f origin "$BRANCH"
+          gh pr create --head "$BRANCH" \
+            --title "install.sh: pin v$VERSION (automated release bump)" \
+            --body "Opened automatically by release-pin-bump on release publish. The installer's default AV_VERSION now matches the freshly published release; the release assets were checksum-published by release.yml before this fired." \
+            || echo "PR already open"
