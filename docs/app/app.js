@@ -509,9 +509,34 @@
       // bounced to Overview with the invite silently swallowed — and
       // the accept page's own hint says "sign in first, then click
       // the invite link again", which made the bounce a dead end.
-      // Say what happened and where to go.
       if (path[0] === "accept-invite") {
-        toast("You're already signed in. To accept an invite for a different account, sign out first, then open the link again.", true);
+        var invQs = new URLSearchParams(location.hash.split("?")[1] || "");
+        var invToken = invQs.get("token") || "";
+        var invEmail = (invQs.get("email") || "").toLowerCase();
+        var myEmail = (state.session.user.email || "").toLowerCase();
+        if (invToken && invEmail && invEmail === myEmail) {
+          // The invite is for THIS signed-in account. The accept
+          // endpoint grants the membership without needing a password
+          // for existing users (it refuses only the cookie MINT — and
+          // we already have a session). Join, hydrate memberships so
+          // the workspace switcher appears, and switch straight into
+          // the new org — that's unambiguously why they clicked.
+          state.ds.acceptInvite({ token: invToken, email: invQs.get("email") }).then(function (r) {
+            var orgId = r && r.org && r.org.id;
+            var orgName = (r && r.org && r.org.name) || "the new workspace";
+            toast("You joined " + orgName);
+            if (orgId && state.ds.switchOrg) return switchWorkspace(orgId);
+            navigate("#/overview");
+          }).catch(function (err) {
+            var msg = err && err.errorCode === "invalid_or_expired_invite"
+              ? "That invite link is invalid or has expired. Ask for a fresh one."
+              : ((err && err.message) || "Could not accept the invite.");
+            toast(msg, true);
+            navigate("#/overview");
+          });
+          return;
+        }
+        toast("You're signed in as " + state.session.user.email + ", but this invite is for a different address. Sign out first, then open the link again.", true);
       }
       return navigate("#/overview");
     }
