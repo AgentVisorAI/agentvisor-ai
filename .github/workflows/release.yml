@@ -106,9 +106,12 @@ jobs:
     runs-on: ubuntu-latest
     # R115 F3: only the publish job needs contents:write to call
     # `gh release create`. Every other job runs with the
-    # workflow-root contents:read scope.
+    # workflow-root contents:read scope. actions:write lets it chain
+    # release-pin-bump (GITHUB_TOKEN-created releases don't emit
+    # workflow-triggering events — anti-recursion).
     permissions:
       contents: write
+      actions: write
     steps:
       # Round-29 F2: pin every third-party action by commit SHA.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -157,3 +160,12 @@ jobs:
             --notes-file notes.md \
             $prerelease_flag \
             dist/*.tar.gz dist/*.tar.gz.sha256 dist/SHA256SUMS
+      - name: Chain the installer pin bump
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The release above was created with GITHUB_TOKEN, so its
+          # `release: published` event never fires other workflows.
+          # Dispatch the pin bump explicitly to keep the chain alive:
+          # release → install.sh pin → Pages deploy of the installer.
+          gh workflow run release-pin-bump.yml --ref main -f tag="${GITHUB_REF_NAME}"
