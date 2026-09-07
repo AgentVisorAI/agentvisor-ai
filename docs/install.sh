@@ -2,12 +2,15 @@
 # AgentVisor AI — daemon installer.
 #
 # What this does, in order:
-#   1. Detects your platform. For Linux x86_64 and macOS (arm64/x86_64)
+#   1. Detects your platform. For Linux (x86_64/aarch64, any libc —
+#      the Linux binaries are static musl) and macOS (arm64/x86_64)
 #      it downloads the prebuilt release binaries from GitHub, verifies
-#      the SHA-256 checksum, and installs `agentvisord` + `avctl`.
+#      the SHA-256 checksum, installs `agentvisord` + `avctl`, and
+#      smoke-runs them to prove they execute on YOUR system.
 #   2. Anywhere else — or with AV_INSTALL_SOURCE=1 — it cargo-installs
 #      both from source, exactly as before:
 #        https://github.com/AgentVisorAI/agentvisor
+#      (Windows: use WSL; the static Linux binaries run there.)
 #   3. Prints the one guided next step (`avctl setup`).
 #
 # Environment overrides:
@@ -36,7 +39,12 @@ if [ "${AV_INSTALL_SOURCE:-}" != "1" ]; then
   os="$(uname -s 2>/dev/null || echo unknown)"
   arch="$(uname -m 2>/dev/null || echo unknown)"
   case "$os/$arch" in
-    Linux/x86_64)          target="x86_64-unknown-linux-gnu" ;;
+    # Static musl builds: run on every Linux regardless of glibc age
+    # or libc flavor (round-93 find: gnu builds needed glibc ≥2.38 and
+    # died silently on Ubuntu 22.04 / Debian 12 / Alpine).
+    Linux/x86_64)          target="x86_64-unknown-linux-musl" ;;
+    Linux/aarch64)         target="aarch64-unknown-linux-musl" ;;
+    Linux/arm64)           target="aarch64-unknown-linux-musl" ;;
     Darwin/arm64)          target="aarch64-apple-darwin" ;;
     Darwin/x86_64)         target="x86_64-apple-darwin" ;;
     *)                     target="" ;;
@@ -89,7 +97,16 @@ install_prebuilt() {
     note "copying binaries into $dest failed"
     return 1
   }
-  say "Installed to $dest (checksum verified)."
+  # Smoke-run what we just installed. A checksum only proves the bytes
+  # arrived intact — not that they execute HERE (round-93 find: glibc
+  # mismatches passed every check, then died at first run). On failure,
+  # remove the dead binaries and fall back to the source build.
+  if ! "$dest/avctl" --version >/dev/null 2>&1 || ! "$dest/agentvisord" --version >/dev/null 2>&1; then
+    note "installed binaries do not run on this system (libc mismatch?)"
+    rm -f "$dest/avctl" "$dest/agentvisord"
+    return 1
+  fi
+  say "Installed to $dest (checksum verified, binaries smoke-tested)."
   case ":$PATH:" in
     *":$dest:"*) ;;
     *) note "add it to your PATH:  export PATH=\"$dest:\$PATH\"" ;;

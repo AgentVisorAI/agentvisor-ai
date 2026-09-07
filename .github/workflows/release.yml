@@ -31,6 +31,14 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          # Round-93 find: gnu binaries built on ubuntu-latest need
+          # glibc ≥2.38 — dead on Ubuntu 22.04 / Debian 12 / Alpine.
+          # The workspace is openssl-free (rustls/ring), so static musl
+          # builds run on EVERY Linux; the installer prefers these.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
           - os: macos-14
             target: aarch64-apple-darwin
           - os: macos-15-intel
@@ -49,12 +57,21 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends musl-tools
       - name: Build binaries
         # Default features only: no live backends, no ONNX, no cross-compile
         # tooling required. Users who need kafka/nats/redis/onnx/qdrant/otel
         # can build from source with `--features full`.
         env:
           CARGO_PROFILE_RELEASE_STRIP: symbols
+          # cc/ring need the musl wrapper for the musl targets (native
+          # arch on both runners, so plain musl-gcc works for each).
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
         run: |
           cargo build --release --target ${{ matrix.target }} \
             -p av-harness --bin agentvisord \
