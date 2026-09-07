@@ -577,6 +577,21 @@ impl IdentityValidator {
         // principals hold the identity signing key. Any of them can
         // construct a valid JWT with hostile-length claims.
         const MAX_IDENTITY_STRING_CHARS: usize = 256;
+        // instance_uid has a TIGHTER cap than the other identity
+        // strings: it flows verbatim into `ai_agent.instance_uid` on
+        // every OCSF event and signed receipt, and the shipped schemas
+        // (ocsf-agent-event, receipt-v2) pin it at maxLength 128 —
+        // matching `av_core::InstanceUid::parse`. A 129–256-char uid
+        // admitted here would build events/receipts that Rust-side
+        // validation accepts but every external schema verifier (and
+        // the console ingest) refuses — the split-verdict class.
+        const MAX_INSTANCE_UID_CHARS: usize = 128;
+        if claims.instance_uid.chars().count() > MAX_INSTANCE_UID_CHARS {
+            return Err(IdentityError::FieldTooLong {
+                field: "instance_uid",
+                max: MAX_INSTANCE_UID_CHARS,
+            });
+        }
         for (name, value) in [
             ("instance_uid", claims.instance_uid.as_str()),
             ("charter", claims.charter.as_str()),

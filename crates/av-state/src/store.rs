@@ -350,15 +350,26 @@ impl StateStore for InMemoryStore {
             }
             let amount = i64::try_from(spend.amount).map_err(|_| StateError::Overflow(spend.key.clone()))?;
             let limit = i64::try_from(spend.limit).map_err(|_| StateError::Overflow(spend.key.clone()))?;
-            let cell = self.cell(&spend.key);
-            let current = cell.load(Ordering::Acquire);
+            // Validation phase must NOT materialize cells (`self.cell`
+            // inserts a fresh 0). A refused batch would otherwise leave
+            // permanent zero counters for every key validated before the
+            // refusal — principal/tool ledger keys are attacker-chosen
+            // and never session-cleaned, so that's unbounded memory
+            // growth (the same class `refund`'s no-resurrect rule closed).
+            // Redis validates GET-only; match it: read existing cells,
+            // treat missing as 0, and create only in the commit phase.
+            let current = self
+                .counters
+                .get(&spend.key)
+                .map(|cell| cell.load(Ordering::Acquire))
+                .unwrap_or(0);
             let next = current
                 .checked_add(amount)
                 .ok_or_else(|| StateError::Overflow(spend.key.clone()))?;
             if next > limit {
                 return Ok(TrySpendOutcome::Refused { index });
             }
-            prepared.push((cell, amount, limit, next));
+            prepared.push((&spend.key, amount, limit, next));
         }
         // R66 F3: compute post-commit min-headroom under the SAME
         // transaction_lock that commits the spends. A subsequent
@@ -366,7 +377,11 @@ impl StateStore for InMemoryStore {
         // remove_prefix/spend/refund; this value is the exact
         // headroom at the instant of commit.
         let mut min_remaining: u64 = u64::MAX;
-        for (cell, amount, limit, next) in prepared {
+        for (key, amount, limit, next) in prepared {
+            // Every mutator holds `transaction_lock`, so the value read
+            // during validation is still current: fetch_add lands
+            // exactly on `next` (a fresh cell starts at 0 == `current`).
+            let cell = self.cell(key);
             cell.fetch_add(amount, Ordering::AcqRel);
             let remaining = u64::try_from(limit - next).unwrap_or(0);
             min_remaining = min_remaining.min(remaining);
@@ -625,6 +640,58 @@ mod tests {
         let total: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
         assert!(total <= limit, "over-spend: {total} > {limit}");
         assert_eq!(s.get("cap").unwrap(), total);
+    }
+
+    /// A refused batch must not leave zero-valued cells behind for the
+    /// keys validated before the refusal: principal/tool ledger keys
+    /// are attacker-chosen and never session-cleaned, so materialized
+    /// zeros are unbounded memory growth (Redis validates GET-only and
+    /// has no such residue). The counters map must stay untouched.
+    #[test]
+    fn try_spend_many_refusal_leaves_no_zero_cells() {
+        let s = InMemoryStore::new();
+        let outcome = s
+            .try_spend_many(&[
+                Spend {
+                    key: "session-budget".to_owned(),
+                    amount: 10,
+                    limit: 100,
+                },
+                Spend {
+                    key: "principal:attacker-chosen".to_owned(),
+                    amount: 60,
+                    limit: 50, // refused here
+                },
+            ])
+            .unwrap();
+        assert!(
+            matches!(outcome, TrySpendOutcome::Refused { index: 1 }),
+            "got {outcome:?}"
+        );
+        assert_eq!(
+            s.counters.len(),
+            0,
+            "refused batch materialized cells: {:?}",
+            s.counters.iter().map(|e| e.key().clone()).collect::<Vec<_>>()
+        );
+        // And a committed batch still lands both cells with values.
+        let outcome = s
+            .try_spend_many(&[
+                Spend {
+                    key: "session-budget".to_owned(),
+                    amount: 10,
+                    limit: 100,
+                },
+                Spend {
+                    key: "principal:attacker-chosen".to_owned(),
+                    amount: 40,
+                    limit: 50,
+                },
+            ])
+            .unwrap();
+        assert!(matches!(outcome, TrySpendOutcome::Committed { .. }));
+        assert_eq!(s.get("session-budget").unwrap(), 10);
+        assert_eq!(s.get("principal:attacker-chosen").unwrap(), 40);
     }
 
     /// Vicious double-spend bug: `try_spend_many` used to

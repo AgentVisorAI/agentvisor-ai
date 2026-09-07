@@ -354,6 +354,37 @@ fn identity_string_caps_bound_every_field_that_flows_to_receipts() {
     }
 }
 
+/// `instance_uid` carries a TIGHTER cap than the 256-char identity
+/// strings: the shipped event and receipt schemas pin
+/// `ai_agent.instance_uid` at maxLength 128 (as does
+/// `av_core::InstanceUid::parse`). A 129–256-char uid admitted at
+/// identity validation would mint OCSF events and signed receipts that
+/// in-tree validation accepts but every schema-based verifier refuses.
+#[test]
+fn instance_uid_is_capped_at_the_schema_maximum_128() {
+    let keys = ed25519_keys("k1");
+    let v = validator(&keys);
+    let mut c = claims(&[], 600, None);
+    c.instance_uid = "u".repeat(129);
+    let outcome = v.validate(&mint(&keys, &c));
+    assert!(
+        matches!(
+            &outcome,
+            Err(IdentityError::FieldTooLong {
+                field: "instance_uid",
+                max: 128
+            })
+        ),
+        "129-char instance_uid must be refused at the schema cap; got {outcome:?}"
+    );
+    let mut c = claims(&[], 600, None);
+    c.instance_uid = "u".repeat(128);
+    assert!(
+        v.validate(&mint(&keys, &c)).is_ok(),
+        "exactly-128-char instance_uid must pass"
+    );
+}
+
 /// Scopes[] length and per-scope length must both be bounded. An
 /// unbounded scope list amplifies delegation-verification cost per
 /// request (the parent-covers-child check is per-element), and an

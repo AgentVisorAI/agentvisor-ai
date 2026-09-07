@@ -1253,6 +1253,33 @@ impl HarnessConfig {
                 self.upstream_auth_header
             ));
         }
+        for entry in &self.allowed_hosts {
+            // The Host check strips the request's :port before comparing,
+            // so an entry carrying a port (`"localhost:8484"`), empty, or
+            // padded with whitespace can NEVER match — every request 403s
+            // and the operator learns it in production, not at boot.
+            // (IPv6 literals are fine: the comparison strips brackets on
+            // both sides; a port after the bracket is still refused.)
+            let unbracketed = entry.trim_start_matches('[').trim_end_matches(']');
+            let has_port = entry.rsplit_once(':').is_some_and(|(head, port)| {
+                !head.is_empty()
+                    && !port.is_empty()
+                    && port.chars().all(|c| c.is_ascii_digit())
+                    && !entry.ends_with(']')
+            });
+            if entry.trim().is_empty() {
+                errors.push("allowed_hosts contains an empty entry".into());
+            } else if entry != entry.trim() {
+                errors.push(format!(
+                    "allowed_hosts entry {entry:?} has leading/trailing whitespace and would never match a Host header"
+                ));
+            } else if has_port && unbracketed.parse::<std::net::Ipv6Addr>().is_err() {
+                errors.push(format!(
+                    "allowed_hosts entry {entry:?} includes a port; the Host check compares \
+                     hostnames with the port stripped, so this entry would never match — drop the port"
+                ));
+            }
+        }
         if self
             .upstream_auth_scheme
             .bytes()
@@ -1804,6 +1831,43 @@ mod tests {
 
     /// Validation must surface EVERY violation in one
     /// run, not one per `avctl config-validate` round-trip.
+    /// `allowed_hosts` entries that can never match the port-stripped
+    /// request Host (ports, whitespace, empties) must be refused at
+    /// boot — the alternative is every request 403ing in production
+    /// with no hint that the config entry shape is wrong.
+    #[test]
+    fn validate_refuses_unmatchable_allowed_hosts_entries() {
+        for (entry, needle) in [
+            ("localhost:8484", "includes a port"),
+            ("[::1]:8484", "includes a port"),
+            (" localhost", "whitespace"),
+            ("", "empty"),
+        ] {
+            let mut cfg = HarnessConfig::from_toml(r#"upstream_url = "https://api.openai.com""#).unwrap();
+            cfg.allowed_hosts = vec![entry.to_owned()];
+            let error = cfg.validate().unwrap_err();
+            assert!(
+                error.contains(needle),
+                "entry {entry:?}: expected {needle:?} in: {error}"
+            );
+        }
+        // Legitimate shapes still pass: hostname, IPv4, bare and
+        // bracketed IPv6 (bare IPv6 has colons but is not host:port).
+        for entry in [
+            "localhost",
+            "127.0.0.1",
+            "::1",
+            "2001:db8::1",
+            "[::1]",
+            "agentvisor.internal",
+        ] {
+            let mut cfg = HarnessConfig::from_toml(r#"upstream_url = "https://api.openai.com""#).unwrap();
+            cfg.allowed_hosts = vec![entry.to_owned()];
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("entry {entry:?} must pass: {e}"));
+        }
+    }
+
     #[test]
     fn validate_reports_all_errors_at_once() {
         let mut cfg = HarnessConfig::from_toml(r#"upstream_url = "https://api.openai.com""#).unwrap();
