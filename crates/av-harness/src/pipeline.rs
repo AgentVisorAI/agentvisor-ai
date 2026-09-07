@@ -4378,9 +4378,14 @@ mod tests {
             "{}tokens",
             av_state::ActionBudget::session_prefix("budget-cleanup")
         );
+        // Intermittent CI-only failure (2× as of 2026-09-07, never in
+        // 40+ local runs): print the observed state so the next
+        // occurrence is diagnosable instead of a bare assert.
+        let observed = store.get(&tokens_key);
         assert!(
-            store.get(&tokens_key).unwrap() > 0,
-            "precondition: admission must have spent from the token budget",
+            observed.unwrap_or(0) > 0,
+            "precondition: admission must have spent from the token budget \
+             (key {tokens_key:?}, observed {observed:?})",
         );
         let session = state.sessions.get("budget-cleanup").unwrap();
         session.wait_for_worker_jobs().await;
