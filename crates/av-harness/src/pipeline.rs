@@ -4383,7 +4383,7 @@ mod tests {
         // occurrence is diagnosable instead of a bare assert.
         let observed = store.get(&tokens_key);
         assert!(
-            observed.unwrap_or(0) > 0,
+            observed.as_ref().copied().unwrap_or(0) > 0,
             "precondition: admission must have spent from the token budget \
              (key {tokens_key:?}, observed {observed:?})",
         );
