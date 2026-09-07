@@ -1717,6 +1717,30 @@
       if (p) { p.enabled = !p.enabled; recordAudit(p.enabled ? "policy.enabled" : "policy.disabled", p.name); }
       return p;
     },
+    async updatePolicy(id, fields) {
+      await delay(150);
+      var p = MOCK_POLICIES.find(function (x) { return x.id === id; });
+      if (!p) { var epu = new Error("not_found"); epu.status = 404; epu.errorCode = "not_found"; throw epu; }
+      if (fields && fields.name !== undefined) {
+        var nm = String(fields.name).trim();
+        if (!nm || nm.length > 80) { var epu2 = new Error("invalid_input"); epu2.status = 400; epu2.errorCode = "invalid_input"; throw epu2; }
+        if (MOCK_POLICIES.some(function (x) { return x.id !== id && x.name === nm; })) { var epu3 = new Error("policy_name_in_use"); epu3.status = 409; epu3.errorCode = "policy_name_in_use"; throw epu3; }
+        p.name = nm;
+      }
+      if (fields && fields.description !== undefined) p.description = String(fields.description).slice(0, 500);
+      if (fields && fields.body !== undefined) p.body = String(fields.body).slice(0, 16384);
+      p.updatedAt = new Date().toISOString();
+      recordAudit("policy.update", p.name);
+      return p;
+    },
+    async deletePolicy(id) {
+      await delay(150);
+      var idx = MOCK_POLICIES.findIndex(function (x) { return x.id === id; });
+      if (idx < 0) { var epd = new Error("not_found"); epd.status = 404; epd.errorCode = "not_found"; throw epd; }
+      recordAudit("policy.delete", MOCK_POLICIES[idx].name);
+      MOCK_POLICIES.splice(idx, 1);
+      return { ok: true };
+    },
     async createPolicy(input) {
       await delay(300);
       var base = "pol_" + (input.name || "custom").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 40);
@@ -2611,6 +2635,16 @@
         body: { enabled: !cur.policy.enabled },
       });
       return r.policy;
+    },
+    async updatePolicy(id, fields) {
+      var r = await apiFetch("/api/v1/policies/" + encodeURIComponent(id), {
+        method: "PATCH",
+        body: fields,
+      });
+      return r.policy;
+    },
+    async deletePolicy(id) {
+      return apiFetch("/api/v1/policies/" + encodeURIComponent(id), { method: "DELETE" });
     },
     async createPolicy(input) {
       var r = await apiFetch("/api/v1/policies", {

@@ -3752,7 +3752,9 @@
     // 403 (same gate as the list page + SETTINGS_TABS R90 F3).
     var polDetailRole = (state.session && state.session.org && state.session.org.role) || "member";
     var headerSwitch = polDetailRole !== "member"
-      ? ' <button class="switch ' + switchCls + '" id="polSwitch" title="Toggle enabled" aria-label="Toggle policy enabled" role="switch" aria-checked="' + (p.enabled ? "true" : "false") + '"></button>'
+      ? ' <button class="btn" id="polEditBtn" title="Edit the name, description, or rule body">Edit</button>' +
+        ' <button class="btn danger" id="polDeleteBtn" title="Delete this policy — its hit history goes with it">Delete</button>' +
+        ' <button class="switch ' + switchCls + '" id="polSwitch" title="Toggle enabled" aria-label="Toggle policy enabled" role="switch" aria-checked="' + (p.enabled ? "true" : "false") + '"></button>'
       : "";
     main.innerHTML =
       pageHeader(p.name, p.kind + " · " + p.scope, '<a href="' + esc(backToListUrl("policies")) + '" class="btn">← All policies</a>' + headerSwitch) +
@@ -3783,6 +3785,91 @@
         toast((err && err.message) || "Could not toggle policy", true);
       });
     });
+    on("#polEditBtn", "click", function () {
+      openEditPolicyModal(p, function () { renderPolicyDetail(main, id); });
+    });
+    on("#polDeleteBtn", "click", function () {
+      confirmModal({
+        title: "Delete this policy?",
+        body: 'The rule "' + p.name + '" stops being distributed to daemons on their next sync, and its hit history disappears with it. Prefer the toggle if you just want it off for a while.',
+        confirmLabel: "Delete policy",
+        danger: true,
+        onConfirm: function () {
+          state.ds.deletePolicy(id).then(function () {
+            toast('Policy "' + p.name + '" deleted');
+            navigate("#/policies");
+          }).catch(function (err) {
+            toast((err && err.message) || "Delete failed", true);
+          });
+        },
+      });
+    });
+  }
+
+  // Edit an existing policy in place — the create modal is template-
+  // driven (it writes the rule for you), but editing needs the raw
+  // fields: a typo'd vendor name or a threshold change shouldn't cost
+  // a delete + recreate (which would orphan the hit counters and the
+  // sessions-fired history that hang off the policy id).
+  function openEditPolicyModal(p, onSaved) {
+    if (document.body.classList.contains("locked")) return;
+    var backdrop = h(
+      '<div class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal modal-wide">' +
+        "<h2>Edit policy</h2>" +
+        '<p class="sub">Changes apply on the daemon\'s next policy sync. The policy ID and its hit history stay put.</p>' +
+        '<form id="peForm">' +
+          '<div class="field"><label for="pe_name">Name</label><input id="pe_name" type="text" required maxlength="80" value="' + esc(p.name) + '"></div>' +
+          '<div class="field"><label for="pe_desc">Description</label><input id="pe_desc" type="text" maxlength="500" value="' + esc(p.description || "") + '"></div>' +
+          '<div class="field"><label for="pe_body">Definition</label><textarea id="pe_body" rows="8" spellcheck="false" style="font-family:var(--mono, ui-monospace, monospace);font-size:12.5px" maxlength="16384">' + esc(p.body || "") + '</textarea></div>' +
+          '<p id="pe_err" style="display:none;color:var(--danger, #e5484d);font-size:12.5px;margin:0 0 8px"></p>' +
+          '<div class="actions"><button type="button" class="btn" data-close>Cancel</button><button type="submit" class="btn accent">Save changes</button></div>' +
+        "</form>" +
+      "</div></div>"
+    );
+    document.body.appendChild(backdrop);
+    document.body.classList.add("locked");
+    var previouslyFocused = document.activeElement;
+    var uninstall;
+    var handled = false;
+    function close() { if (handled) return; handled = true; backdrop.remove(); document.body.classList.remove("locked"); if (uninstall) uninstall(); if (previouslyFocused && previouslyFocused.focus) try { previouslyFocused.focus(); } catch (e) {} }
+    uninstall = installModalKeys(backdrop, close);
+    backdrop.addEventListener("click", function (e) {
+      if (handled) return;
+      if (e.target === backdrop || e.target.hasAttribute("data-close")) close();
+    });
+    backdrop.querySelector("#peForm").addEventListener("submit", async function (e) {
+      e.preventDefault();
+      if (handled) return;
+      var errEl = backdrop.querySelector("#pe_err");
+      errEl.style.display = "none";
+      var fields = {};
+      var name = backdrop.querySelector("#pe_name").value.trim();
+      var desc = backdrop.querySelector("#pe_desc").value;
+      var bodyText = backdrop.querySelector("#pe_body").value;
+      if (!name) { errEl.textContent = "Name can't be empty."; errEl.style.display = "block"; return; }
+      if (!bodyText.trim()) { errEl.textContent = "The definition can't be empty — disable the policy instead if you want it off."; errEl.style.display = "block"; return; }
+      if (name !== p.name) fields.name = name;
+      if (desc !== (p.description || "")) fields.description = desc;
+      if (bodyText !== (p.body || "")) fields.body = bodyText;
+      if (!Object.keys(fields).length) { close(); toast("No changes"); return; }
+      var btn = e.target.querySelector('button[type="submit"]');
+      btn.disabled = true;
+      try {
+        await state.ds.updatePolicy(p.id, fields);
+        close();
+        toast("Policy updated — daemons pick it up on their next sync");
+        if (onSaved) onSaved();
+      } catch (e2) {
+        btn.disabled = false;
+        var msg = e2.message || "Save failed";
+        if (e2.errorCode === "policy_name_in_use" || msg === "policy_name_in_use") msg = "Another policy already has that name.";
+        else if (e2.status === 403) msg = "Members can't edit policies — ask an owner or admin.";
+        else if (e2.errorCode === "invalid_input" || msg === "invalid_input") msg = "Name must be 1-80 characters; definition up to 16 KB.";
+        errEl.textContent = msg;
+        errEl.style.display = "block";
+      }
+    });
+    setTimeout(function () { backdrop.querySelector("#pe_name").focus(); }, 20);
   }
   function syntaxPolicy(src) {
     return esc(src)

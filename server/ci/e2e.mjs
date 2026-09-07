@@ -158,6 +158,17 @@ try {
   try { await ds.createPolicy({ name: "e2e.vendor_allowlist" }); } catch (e) { dupCode = e.errorCode || e.message; }
   check("policy duplicate name 409", dupCode === "policy_name_in_use", dupCode);
 
+  // Full-field edit + delete (completes policy CRUD through the ds)
+  const polEdited = await ds.updatePolicy(created.id, { name: "e2e.vendor_allowlist.v2", description: "edited", body: "effect = block\nreason = \"e2e\"" });
+  check("policy edit fields", polEdited.name === "e2e.vendor_allowlist.v2" && polEdited.description === "edited" && /reason/.test(polEdited.body));
+  const secondPol = await ds.createPolicy({ name: "e2e.other" });
+  let dupEdit = "";
+  try { await ds.updatePolicy(created.id, { name: "e2e.other" }); } catch (e) { dupEdit = e.errorCode || e.message; }
+  check("policy edit dup name 409", dupEdit === "policy_name_in_use", dupEdit);
+  await ds.deletePolicy(secondPol.id);
+  const polsAfterDel = await ds.listPolicies();
+  check("policy delete removes", !polsAfterDel.some(x => x.id === secondPol.id));
+
   // Rotate
   const rot = await ds.rotateDeploymentToken(dep.deployment.id);
   check("rotate returns token", !!rot.ingestToken);
