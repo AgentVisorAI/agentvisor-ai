@@ -267,9 +267,14 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
     if (!body.success) return reply.code(400).send({ error: "invalid_input" });
     // Version is informational — record it best-effort on every
     // authenticated check-in, independent of the trust-anchor outcome
-    // (same posture as the lastIngestAt touch in authenticateDaemon).
+    // (errors are swallowed like the lastIngestAt touch in
+    // authenticateDaemon). Unlike that unobserved heartbeat, the write
+    // IS awaited: a daemon that checks in and immediately appears in
+    // the deployments list must show its version, and the previous
+    // fire-and-forget form let the route return 200 before the row
+    // committed (flaky "deployment reports daemon version" e2e).
     if (body.data.daemonVersion) {
-      db.deployment
+      await db.deployment
         .update({
           where: { id: daemon.deploymentId },
           data: { daemonVersion: body.data.daemonVersion },
