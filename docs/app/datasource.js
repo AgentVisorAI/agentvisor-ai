@@ -2002,13 +2002,13 @@
       var mine = runtimeDeliveries.filter(function (d) { return d.webhookId === id; });
       // A fresh org's endpoints have only the deliveries THEY produced;
       // the canned d1–d3 rows belong to the Northwind fixtures.
-      if (freshElapsed() != null) return mine;
+      if (freshElapsed() != null) return { deliveries: mine, nextCursor: null };
       var now = Date.now();
-      return mine.concat([
+      return { deliveries: mine.concat([
         { id: "d1", event: "policy.block", status: "delivered", attempt: 1, responseCode: 200, createdAt: new Date(now - 3 * MIN).toISOString(), deliveredAt: new Date(now - 3 * MIN + 340).toISOString() },
         { id: "d2", event: "policy.block", status: "delivered", attempt: 1, responseCode: 200, createdAt: new Date(now - 47 * MIN).toISOString(), deliveredAt: new Date(now - 47 * MIN + 210).toISOString() },
         { id: "d3", event: "policy.block", status: "delivered", attempt: 2, responseCode: 200, createdAt: new Date(now - 6 * HOUR).toISOString(), deliveredAt: new Date(now - 6 * HOUR + 32_500).toISOString(), errorMessage: "server_error_502 (attempt 1)" },
-      ]);
+      ]), nextCursor: null };
     },
     async getRetention() { await delay(80); return { retention: { sessionRetentionDays: 90, auditRetentionDays: 365 } }; },
     async updateRetention(input) {
@@ -2749,11 +2749,18 @@
       // copy-to-clipboard modal }.
       return apiFetch("/api/v1/webhooks/" + encodeURIComponent(id) + "/rotate-secret", { method: "POST" });
     },
-    async listWebhookDeliveries(id) {
+    async listWebhookDeliveries(id, opts) {
+      opts = opts || {};
+      var q = [];
+      if (opts.cursor) q.push("cursor=" + encodeURIComponent(opts.cursor));
+      if (opts.limit) q.push("limit=" + encodeURIComponent(opts.limit));
+      var qs = q.length ? ("?" + q.join("&")) : "";
       try {
-        var res = await apiFetch("/api/v1/webhooks/" + encodeURIComponent(id) + "/deliveries");
-        return res.deliveries || [];
-      } catch (e) { return []; }
+        var res = await apiFetch("/api/v1/webhooks/" + encodeURIComponent(id) + "/deliveries" + qs);
+        return { deliveries: res.deliveries || [], nextCursor: res.nextCursor || null };
+      } catch (e) {
+        throw e;
+      }
     },
     async getRetention() {
       return apiFetch("/api/v1/org/retention");
