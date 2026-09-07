@@ -189,6 +189,54 @@ export async function apiKeyRoutes(app: FastifyInstance): Promise<void> {
     });
   });
 
+  // Rename a key. Name is a label — the token, role, and hint are
+  // immutable (role changes would be a privilege edit and belong to
+  // revoke+re-mint). Same rank guard as DELETE: an admin must not be
+  // able to touch an owner-scoped key's row at all, rename included
+  // (renaming the owner's CI key to something innocuous is a decent
+  // way to get it revoked by mistake later).
+  app.patch<{ Params: { id: string } }>("/:id", async (req, reply) => {
+    const claims = requireSession(req, reply);
+    if (!claims) return;
+    if (claims.membershipRole === "member") {
+      return reply.code(403).send({ error: "forbidden" });
+    }
+    const body = z
+      .object({ name: z.string().max(80).trim().min(1) })
+      .safeParse(req.body);
+    if (!body.success) return reply.code(400).send({ error: "invalid_input" });
+    const existing = await db.apiKey.findFirst({
+      where: { id: req.params.id, orgId: claims.orgId, revokedAt: null },
+    });
+    if (!existing) return reply.code(404).send({ error: "not_found" });
+    if (
+      !canGrantRole(
+        claims.membershipRole,
+        existing.role as SessionClaims["membershipRole"],
+      )
+    ) {
+      return reply.code(403).send({ error: "cannot_mutate_role_above_own" });
+    }
+    const updated = await db.apiKey.update({
+      where: { id: existing.id },
+      data: { name: body.data.name },
+    });
+    if (updated.name !== existing.name) {
+      writeAudit(
+        {
+          orgId: claims.orgId,
+          event: "apikey.renamed",
+          ...(await resolveActor(claims.sub)),
+          target: updated.name,
+          metadata: { apiKeyId: updated.id, previousName: existing.name },
+          req,
+        },
+        req.log,
+      );
+    }
+    return reply.send({ key: { id: updated.id, name: updated.name, role: updated.role } });
+  });
+
   app.delete<{ Params: { id: string } }>("/:id", async (req, reply) => {
     const claims = requireSession(req, reply);
     if (!claims) return;

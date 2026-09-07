@@ -39,7 +39,7 @@
  *     deployment.receipt_overwrite_refused, deployment.receipt_key_id_mismatch
  *   member.invited, member.invite_accepted, member.invite_accepted_requires_login,
  *     member.invite_revoked, member.role_changed, member.left, member.removed
- *   apikey.created, apikey.revoked
+ *   apikey.created, apikey.renamed, apikey.revoked
  *   webhook.created, webhook.updated, webhook.deleted, webhook.test_fired,
  *     webhook.secret_rotated, webhook.delivery_redelivered
  *   org.created, org.exported, org.delete.initiated, org.delete.committed,

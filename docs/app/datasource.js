@@ -1864,6 +1864,20 @@
       recordAudit("apikey.created", name);
       return { key: row, plaintextToken: plaintext };
     },
+    async renameApiKey(id, name) {
+      await delay(120);
+      var nm = (name || "").trim().slice(0, 80);
+      if (!nm) { var ekr = new Error("invalid_input"); ekr.status = 400; ekr.errorCode = "invalid_input"; throw ekr; }
+      var kpool = freshElapsed() != null ? freshRuntime().apiKeys : MOCK_API_KEYS;
+      for (var kri = 0; kri < kpool.length; kri++) {
+        if (kpool[kri].id === id) {
+          kpool[kri].name = nm;
+          recordAudit("apikey.renamed", "", nm);
+          return { id: id, name: nm };
+        }
+      }
+      var ekr2 = new Error("not_found"); ekr2.status = 404; ekr2.errorCode = "not_found"; throw ekr2;
+    },
     async revokeApiKey(id) {
       await delay(120);
       if (freshElapsed() != null) {
@@ -2671,6 +2685,10 @@
     },
     async revokeApiKey(id) {
       return apiFetch("/api/v1/keys/" + encodeURIComponent(id), { method: "DELETE" });
+    },
+    async renameApiKey(id, name) {
+      var r = await apiFetch("/api/v1/keys/" + encodeURIComponent(id), { method: "PATCH", body: { name: name } });
+      return r.key;
     },
     async listWebhooks() {
       try {
