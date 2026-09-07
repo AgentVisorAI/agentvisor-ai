@@ -513,6 +513,7 @@ async function deliverOne(
         status: "failed",
         responseCode: 0,
         responseBody: "invalid webhook URL",
+        errorMessage: "invalid_webhook_url",
         deliveredAt: new Date(),
       },
     });
@@ -539,6 +540,7 @@ async function deliverOne(
           status: "failed",
           responseCode: 0,
           responseBody: "SSRF re-check failed at delivery time: private_ip_blocked",
+          errorMessage: "ssrf_private_ip_blocked",
           deliveredAt: new Date(),
         },
       });
@@ -552,6 +554,7 @@ async function deliverOne(
           status: "failed",
           responseCode: 0,
           responseBody: "SSRF re-check failed at delivery time: blocked_metadata_ip",
+          errorMessage: "ssrf_blocked_metadata_ip",
           deliveredAt: new Date(),
         },
       });
@@ -587,6 +590,7 @@ async function deliverOne(
           status: "failed",
           responseCode: 0,
           responseBody: `SSRF re-check failed at delivery time: ${reason}`,
+          errorMessage: "ssrf_recheck_failed",
           deliveredAt: new Date(),
         },
       });
