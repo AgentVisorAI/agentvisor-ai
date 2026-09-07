@@ -238,6 +238,18 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
         where: { id: req.params.id, orgId: claims.orgId },
       });
       if (!ep) return reply.code(404).send({ error: "not_found" });
+      // Scope-bind the cursor anchor to THIS endpoint (same rationale
+      // as read.ts sessions/audit): Prisma positions on the cursor
+      // row's sort keys regardless of the where-clause, so a delivery
+      // id from another endpoint/org mis-anchors the page instead of
+      // 400ing like every other stale cursor.
+      if (q.data.cursor) {
+        const anchor = await db.webhookDelivery.findFirst({
+          where: { id: q.data.cursor, endpointId: ep.id },
+          select: { id: true },
+        });
+        if (!anchor) return reply.code(400).send({ error: "invalid_cursor" });
+      }
       // R130 F1: same cursor guard as R129 F3. Stale cursor
       // (retention purged, sweeper deleted the row, forged
       // input) → Prisma P2016/P2032 → uncaught 500 through

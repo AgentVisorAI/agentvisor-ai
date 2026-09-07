@@ -3978,7 +3978,7 @@
               '<button class="btn danger" id="deleteAccountBtn">Delete organization &amp; account</button>') +
         "</div>" : "") +
       (state.ds.mode === "mock" ?
-        '<div class="card"><h2>Demo mode</h2><p style="color: var(--fg-2); margin: 0 0 8px; font-size: var(--t-sec)">This console is running against built-in fixtures. To use the real backend, open this page with <code>?live=1</code> in the URL (it sticks until you visit with <code>?live=0</code>) — or <a href="?live=1#/signup">switch to live mode and create a workspace</a>.</p></div>' : "");
+        '<div class="card"><h2>Demo mode</h2><p style="color: var(--fg-2); margin: 0 0 8px; font-size: var(--t-sec)">This console is running against built-in fixtures. To use the real backend, open this page with <code>?live=1</code> in the URL (it sticks until you visit with <code>?live=0</code>) — or <a href="?live=1#/signup" style="text-decoration:underline">switch to live mode and create a workspace</a>.</p></div>' : "");
     var so = $("#signOut", root);
     if (so) so.addEventListener("click", signOut);
 

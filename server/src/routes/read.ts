@@ -282,6 +282,18 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
     if (query.data.cursor && !cursor) {
       return reply.code(400).send({ error: "invalid_cursor" });
     }
+    // Scope-bind the anchor: Prisma positions on the cursor row's sort
+    // keys regardless of the where-clause, so a cursor id from another
+    // org (or one that stopped matching the filter) silently anchors
+    // the page in the wrong place — skipped or empty pages instead of
+    // the 400 a stale cursor already gets.
+    if (cursor) {
+      const anchor = await db.session.findFirst({
+        where: { id: cursor.id, orgId: claims.orgId },
+        select: { id: true },
+      });
+      if (!anchor) return reply.code(400).send({ error: "invalid_cursor" });
+    }
 
     const where: Record<string, unknown> = query.data.deploymentId
       ? { orgId: claims.orgId, deploymentId: query.data.deploymentId }
@@ -390,7 +402,7 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
     if (!params.success) return reply.code(400).send({ error: "invalid_id" });
     const query = z
       .object({
-        eventCursor: z.coerce.number().int().optional(),
+        eventCursor: z.coerce.number().int().min(0).max(2_147_483_647).optional(),
         eventLimit: z.coerce.number().int().min(1).max(SESSION_EVENTS_LIMIT_MAX).default(SESSION_EVENTS_LIMIT_MAX),
       })
       .safeParse(req.query);
@@ -597,6 +609,16 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
       } catch {
         return reply.code(400).send({ error: "invalid_cursor" });
       }
+    }
+    // Scope-bind the anchor to this org (same rationale as the
+    // sessions endpoint above): a foreign cursor id must 400, not
+    // silently mis-anchor the page.
+    if (cursorPart) {
+      const anchor = await db.auditEntry.findFirst({
+        where: { id: cursorPart.id, orgId: claims.orgId },
+        select: { id: true },
+      });
+      if (!anchor) return reply.code(400).send({ error: "invalid_cursor" });
     }
     // R129 F3: wrap findMany so a forged cursor pointing at a
     // non-existent id maps to 400 invalid_cursor instead of

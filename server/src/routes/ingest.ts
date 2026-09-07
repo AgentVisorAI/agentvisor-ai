@@ -1036,6 +1036,68 @@ export async function ingestRoutes(app: FastifyInstance): Promise<void> {
       );
       return reply.code(400).send({ error: "signature_invalid" });
     }
+    // Bind the SIGNED body's identity claims to the top-level fields
+    // that become queryable columns. The signature only proves the
+    // bytes are an authentic receipt — not that they belong to THIS
+    // row: a token holder could file session A's validly-signed
+    // receipt under sessionExternalId=B with arbitrary receiptId/
+    // eventCount, and the console would render 'verified' evidence
+    // whose body contradicts the row it hangs on. Enforced for fields
+    // PRESENT in the body: every real receipt (receipt-v2 schema)
+    // carries receipt_id + session_id, so a genuine receipt can never
+    // be re-homed; bodies without them (nothing to bind) still seal —
+    // an attacker who can sign fieldless blobs holds the daemon key
+    // and needs no re-homing trick.
+    let signedBody: {
+      receipt_id?: unknown;
+      session_id?: unknown;
+      subject?: { kind?: unknown; event_count?: unknown };
+    };
+    try {
+      signedBody = JSON.parse(r.body) as typeof signedBody;
+    } catch {
+      return reply.code(400).send({ error: "receipt_body_not_json" });
+    }
+    const bodyEventCount =
+      signedBody.subject && signedBody.subject.kind === "event_chain"
+        ? signedBody.subject.event_count
+        : undefined;
+    if (
+      (signedBody.receipt_id !== undefined && signedBody.receipt_id !== r.receiptId) ||
+      (signedBody.session_id !== undefined && signedBody.session_id !== r.sessionExternalId) ||
+      (bodyEventCount !== undefined && bodyEventCount !== r.eventCount)
+    ) {
+      req.log.warn(
+        {
+          deploymentId: daemon.deploymentId,
+          sessionExternalId: r.sessionExternalId,
+          receiptId: r.receiptId,
+          bodyReceiptId: signedBody.receipt_id,
+          bodySessionId: signedBody.session_id,
+          bodyEventCount,
+        },
+        "ingest_receipt_body_binding_mismatch",
+      );
+      writeAudit(
+        {
+          orgId: daemon.orgId,
+          event: "deployment.receipt_body_binding_mismatch",
+          actorId: `daemon:${daemon.deploymentId}`,
+          actorEmail: `daemon@${daemon.deploymentId}`,
+          target: r.sessionExternalId,
+          metadata: {
+            deploymentId: daemon.deploymentId,
+            sessionExternalId: r.sessionExternalId,
+            receiptId: r.receiptId,
+            bodySessionId: typeof signedBody.session_id === "string" ? signedBody.session_id : null,
+            bodyReceiptId: typeof signedBody.receipt_id === "string" ? signedBody.receipt_id : null,
+          },
+          req,
+        },
+        req.log,
+      );
+      return reply.code(400).send({ error: "receipt_body_binding_mismatch" });
+    }
     const session = await db.session.findUnique({
       where: {
         deploymentId_externalId: {

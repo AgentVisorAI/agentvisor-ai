@@ -205,6 +205,12 @@ function buildAdapter(cfg: SamlConfig): SAML {
     logoutUrl: cfg.sloUrl ?? undefined,
     // IdP-side crypto.
     idpCert: cfg.x509Cert,
+    // Pin the Issuer: without it, ANY assertion signed by the
+    // configured cert is accepted regardless of who issued it — a cert
+    // reused across tenants/apps (routine with shared IdP appliances
+    // and wildcard signing certs) would let one tenant's assertions
+    // log into another's org.
+    idpIssuer: cfg.entityIdIdp,
     wantAssertionsSigned: cfg.wantAssertionsSigned,
     wantAuthnResponseSigned: cfg.wantResponseSigned,
     signatureAlgorithm: sig as "sha256" | "sha512",

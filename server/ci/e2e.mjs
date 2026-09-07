@@ -114,6 +114,22 @@ try {
   });
   check("ingest receipt seals session", rcptRes.status === 200, JSON.stringify(rcptRes.data));
 
+  // A validly-signed body whose INTERNAL claims name another session /
+  // receipt id must not be filed under this row (re-homing forgery).
+  const alienBody = JSON.stringify({ v: 2, receipt_id: "rcpt_alien", session_id: "sess_alien" });
+  const bindRes = await ingest("/api/v1/ingest/receipts", {
+    sessionExternalId: "sess_e2e_"+rand,
+    receiptId: "rcpt_e2e_"+rand,
+    body: alienBody,
+    sigB64: edSign(null, Buffer.from(alienBody), privateKey).toString("base64"),
+    keyIdHex: createHash("sha256").update(pubRaw).digest("hex").slice(0, 32),
+    eventCount: 4,
+    issuedAt: new Date().toISOString(),
+    stopReason: "normal",
+    stopReasonId: 0,
+  });
+  check("receipt body binding refused", bindRes.status === 400 && /receipt_body_binding_mismatch/.test(bindRes.data), JSON.stringify(bindRes.data));
+
   const ov = await ds.getOverview();
   check("overview sessions=1", ov.sessions === 1, "got="+ov.sessions);
   check("overview toolsAllowed=1", ov.toolsAllowed === 1);
