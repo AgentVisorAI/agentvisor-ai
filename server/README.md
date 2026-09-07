@@ -135,6 +135,32 @@ Auth: `Authorization: Bearer <ingest_token>` + `X-AV-Deployment: <deployment_id>
 | `GET`  | `/audit` (+ `/audit.csv`) | Cursor-paginated audit trail; CSV streams up to 10k rows |
 | `GET`  | `/stream` | SSE: session/event/receipt updates, multi-instance via PG LISTEN/NOTIFY |
 
+## Testing
+
+Four layers, all runnable locally and (except the browser drills'
+prod target) wired into CI:
+
+- **`ci/e2e.mjs`** — 93-check API contract suite. Boot the server,
+  then `API_BASE=http://127.0.0.1:<port> node ci/e2e.mjs`. Runs in the
+  Console + API workflow.
+- **`scripts/run-drill-battery.sh`** — the 14 DB-backed attack drills
+  (apikey ×2, invite ×2, ip-allowlist, retention, saml ×2, webauthn ×2,
+  webhook ×3, oidc). Boots a fresh server per drill on uncontested
+  604xx ports. Needs a Postgres the drills can `docker exec psql` into:
+  `PG_CONTAINER=<container> PG_USER=av PG_DB=avdb bash scripts/run-drill-battery.sh [drill…]`.
+  Runs in CI on every `server/**` change (api-drills workflow).
+- **Browser drills** (`scripts/a11y-audit.mjs`, `interactive-drill.mjs`,
+  `mobile-smoke.mjs`, `engine-matrix.mjs`, …) — Playwright suites the
+  console-smoke workflow runs against the deployed console after every
+  Pages deploy. Point `SITE=` at any served copy for local runs.
+- **Daemon drills** (repo root `scripts/`) — `demo-agent.mjs` (offline
+  storyline, exit 0 = 10 beats), `crash-drill.mjs` (SIGKILL durability
+  + quarantine semantics; sync leg needs `CONSOLE_URL`/`DEPLOYMENT_ID`/
+  `TOKEN_FILE`). Probe gotcha: `/mcp` tool executions are
+  idempotency-keyed by (session, JSON-RPC id, tool, args) — reuse an id
+  and you get the cached outcome, not a re-execution; use unique ids
+  unless you are testing replay.
+
 ## Security posture
 
 Full production checklist is in [DEPLOY.md](./DEPLOY.md#security-posture-2026-baseline).
