@@ -62,7 +62,8 @@ jobs:
       - name: curl | sh from the live site, then smoke
         run: |
           set -eu
-          curl -fsSL "https://agentvisorai.me/install.sh?cb=$RANDOM" -o /tmp/install.sh
+          # $$ not $RANDOM: this step runs under dash on debian/ubuntu.
+          curl -fsSL "https://agentvisorai.me/install.sh?cb=$$" -o /tmp/install.sh
           AV_INSTALL_DIR=/opt/av sh /tmp/install.sh
           /opt/av/agentvisord --version
           /opt/av/avctl --version
