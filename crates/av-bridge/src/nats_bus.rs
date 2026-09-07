@@ -456,8 +456,15 @@ impl EventBus for NatsBus {
         offset: u64,
         max: usize,
     ) -> Result<Vec<StoredEvent>, BusError> {
-        if !self.topics.contains_key(topic) {
+        let Some(&partitions) = self.topics.get(topic) else {
             return Err(BusError::UnknownTopic(topic.to_owned()));
+        };
+        // Same contract as the embedded broker: an out-of-range
+        // partition is a caller bug and must error, not silently read
+        // an empty non-existent subject forever (a mis-partitioned
+        // reader would see "no data" instead of its own mistake).
+        if partition >= partitions {
+            return Err(BusError::Backend(format!("partition {partition} out of range")));
         }
         // Contract: "read up to `max` events". `max_messages(0)` has
         // server-defined semantics and the loop below checks the cap only

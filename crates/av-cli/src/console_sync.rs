@@ -1761,11 +1761,43 @@ fn policy_from_step(step: &av_atif::Step) -> Option<String> {
     None
 }
 
+/// Structured block detection for an ATIF step: read the harness
+/// tool-authorization payload embedded in observation-result content —
+/// the same shape `policy_from_step` keys on (`stage` + `allowed`; the
+/// harness's Blocked payload always carries both, see
+/// `pipeline.rs`'s ToolVerdict::Blocked arm). The previous shape
+/// grepped the whole serialized step for "blocked"/"forbidden"/
+/// "policy", so ANY step whose message, tool arguments, or model
+/// output merely mentioned those words was counted as a policy block —
+/// and an attacker-influenced tool response could inflate blocked
+/// counters through the ATIF import path at will (the exact smuggling
+/// class `policy_from_step`'s shape gate exists to stop).
 fn contains_block_signal(step: &av_atif::Step) -> bool {
-    let text = serde_json::to_string(step)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    text.contains("blocked") || text.contains("forbidden") || text.contains("policy")
+    let Some(observation) = step.observation.as_ref() else {
+        return false;
+    };
+    for result in &observation.results {
+        let Some(content) = result.content.as_ref() else {
+            continue;
+        };
+        let payload: Option<serde_json::Value> = match content {
+            serde_json::Value::String(text) => serde_json::from_str(text).ok(),
+            other => Some(other.clone()),
+        };
+        let Some(payload) = payload else {
+            continue;
+        };
+        // Only the authorization payload may classify: it always
+        // carries `stage` on denials. `allowed: false` alone (from a
+        // tool's own response body) must not count.
+        if payload.get("stage").is_none() {
+            continue;
+        }
+        if payload.get("allowed").and_then(serde_json::Value::as_bool) == Some(false) {
+            return true;
+        }
+    }
+    false
 }
 
 fn policy_version_from_extra(extra: Option<&serde_json::Value>) -> u32 {
@@ -2178,6 +2210,68 @@ mod tests {
         assert_eq!(truncated.chars().count(), 4_000);
         assert_eq!(truncated.encode_utf16().count(), MAX_BODY_UNITS);
         assert!(truncated.ends_with('😀'));
+    }
+
+    /// Block classification of an ATIF step must key on the structured
+    /// tool-authorization payload (`stage` + `allowed: false`), never on
+    /// keyword sniffing: a step that merely MENTIONS "policy"/"blocked"
+    /// in its message, arguments, or tool output is not a policy block,
+    /// and a hostile tool response echoing `allowed: false` without the
+    /// authorization shape must not inflate blocked counters.
+    #[test]
+    fn atif_step_block_classification_is_structural_not_keyword() {
+        let step = |message: &str, observation: Option<av_atif::Observation>| av_atif::Step {
+            step_id: 1,
+            timestamp: None,
+            source: av_atif::Source::Agent,
+            message: Value::String(message.to_owned()),
+            reasoning_effort: None,
+            reasoning_content: None,
+            model_name: None,
+            tool_calls: None,
+            observation,
+            metrics: None,
+            is_copied_context: None,
+            llm_call_count: None,
+            extra: None,
+        };
+        let auth_observation = |content: Value| {
+            Some(av_atif::Observation {
+                results: vec![av_atif::ObservationResult {
+                    source_call_id: None,
+                    content: Some(content),
+                    subagent_trajectory_ref: None,
+                    extra: None,
+                }],
+            })
+        };
+        // Mentioning the keywords is not a block.
+        let (kind, tag, _) = classify_step(&step("our policy forbids this; blocked?", None));
+        assert_eq!(
+            kind,
+            EventKind::Llm,
+            "keyword mention misclassified as block: {tag}"
+        );
+        // A denial payload embedded as a JSON string (the harness shape) is.
+        let denied = json!({"tool": "db_write", "allowed": false, "stage": "policy", "reason": "denied"});
+        let (kind, tag, _) = classify_step(&step(
+            "MCP tool authorization decision",
+            auth_observation(Value::String(denied.to_string())),
+        ));
+        assert_eq!(kind, EventKind::Block);
+        assert_eq!(tag, "policy_block");
+        // The same payload as a bare JSON object also classifies.
+        let (kind, _, _) = classify_step(&step("decision", auth_observation(denied)));
+        assert_eq!(kind, EventKind::Block);
+        // `allowed: false` WITHOUT the authorization shape (a tool's own
+        // response body) stays a tool step, not a block.
+        let echoed = json!({"allowed": false, "note": "tool output echoing the field"});
+        let (kind, _, _) = classify_step(&step("tool result", auth_observation(echoed)));
+        assert_eq!(kind, EventKind::Tool);
+        // An allowed authorization payload is a tool step.
+        let allowed = json!({"tool": "db_read", "allowed": true, "stage": "policy"});
+        let (kind, _, _) = classify_step(&step("ok", auth_observation(Value::String(allowed.to_string()))));
+        assert_eq!(kind, EventKind::Tool);
     }
 
     #[test]

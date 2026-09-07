@@ -579,6 +579,26 @@ impl Receipt {
                 self.body.stop_reason, self.body.stop_reason_id, expected_caption
             )));
         }
+        // Tool-accounting invariant: classified outcomes can never
+        // exceed observed calls. The issuer maintains this by
+        // construction and journal recovery hard-fails on its violation
+        // (`RecoveredTotals::validate_tool_accounting`), but
+        // verification never checked it — a keyholding issuer could
+        // sign `total: 1, allowed: 1_000_000` and every offline
+        // verifier would attest arithmetic the pipeline itself refuses
+        // to recover. Same cross-field class as issued_at/issued_at_iso
+        // above (the JSON Schema cannot express cross-field sums).
+        let classified = self
+            .body
+            .tool_calls
+            .allowed
+            .checked_add(self.body.tool_calls.blocked);
+        if classified.is_none_or(|classified| classified > self.body.tool_calls.total) {
+            return Err(ReceiptError::SemanticInvariant(format!(
+                "tool_calls allowed ({}) + blocked ({}) exceeds total ({})",
+                self.body.tool_calls.allowed, self.body.tool_calls.blocked, self.body.tool_calls.total
+            )));
+        }
         Ok(())
     }
 }
@@ -1504,6 +1524,58 @@ mod tests {
             matches!(receipt.verify_embedded(), Err(ReceiptError::SemanticInvariant(_))),
             "embedded verify must refuse an unknown receipt_version"
         );
+    }
+
+    /// Tool accounting must be arithmetically possible: `allowed +
+    /// blocked` can never exceed `total` (journal recovery refuses to
+    /// recover such totals, and the issuer maintains it by
+    /// construction). A keyholder-signed receipt violating it must fail
+    /// verification rather than attest impossible statistics — including
+    /// the u64-overflow corner where `allowed + blocked` wraps.
+    #[test]
+    fn impossible_tool_accounting_is_refused() {
+        let signer = Ed25519Signer::generate();
+        let mut ring = Keyring::new();
+        ring.add_key_bytes(&signer.public_key_bytes()).unwrap();
+        for (total, allowed, blocked) in [
+            (1u64, 1_000_000u64, 0u64),
+            (0, 0, 1),
+            (5, 3, 3),
+            // JCS caps every integer at 2^53-1, so the u64 checked_add
+            // overflow arm is unreachable through an issuable receipt;
+            // the largest issuable sum is still refused.
+            (0, (1 << 53) - 1, (1 << 53) - 1),
+        ] {
+            let mut b = body();
+            b.tool_calls = ToolCallSummary {
+                total,
+                allowed,
+                blocked,
+            };
+            let receipt = Receipt::issue(b, &signer).unwrap();
+            assert!(
+                matches!(
+                    receipt.verify(&ring),
+                    Err(ReceiptError::SemanticInvariant(ref msg)) if msg.contains("tool_calls")
+                ),
+                "signed receipt with impossible tool accounting ({total}/{allowed}/{blocked}) verified"
+            );
+            assert!(
+                matches!(receipt.verify_embedded(), Err(ReceiptError::SemanticInvariant(_))),
+                "embedded verify accepted impossible tool accounting ({total}/{allowed}/{blocked})"
+            );
+        }
+        // Boundary: exactly-classified and under-classified totals verify.
+        for (total, allowed, blocked) in [(2u64, 1u64, 1u64), (3, 1, 1)] {
+            let mut b = body();
+            b.tool_calls = ToolCallSummary {
+                total,
+                allowed,
+                blocked,
+            };
+            let receipt = Receipt::issue(b, &signer).unwrap();
+            receipt.verify(&ring).unwrap();
+        }
     }
 
     /// Stress: for every wall-clock instant sampled during issuance, the

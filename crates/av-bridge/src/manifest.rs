@@ -314,9 +314,16 @@ impl BridgeManifest {
                 // as the deployment-name check above.
                 refuse_yaml_marker_chars("schema_ref", reference)?;
                 // Schema parity: bridge-manifest.schema.json pins
-                // maxLength 4096 on schema_ref and cold_uri — a longer
-                // value passing here while external schema validation
-                // refuses it would split the two verification paths.
+                // minLength 1 and maxLength 4096 on schema_ref and
+                // cold_uri — a value passing here while external schema
+                // validation refuses it would split the two verification
+                // paths.
+                if reference.is_empty() {
+                    return Err(ManifestError::Invalid(format!(
+                        "topic {:?} schema_ref is empty (schema requires minLength 1); omit the field instead",
+                        t.name
+                    )));
+                }
                 if reference.len() > MAX_REFERENCE_BYTES {
                     return Err(ManifestError::Invalid(format!(
                         "schema_ref exceeds the schema maxLength of {MAX_REFERENCE_BYTES} bytes ({})",
@@ -334,6 +341,18 @@ impl BridgeManifest {
             }
             if let Some(uri) = &t.retention.cold_uri {
                 refuse_yaml_marker_chars("cold_uri", uri)?;
+                // Schema parity (minLength 1) AND retention safety: an
+                // empty cold_uri reaches retention enforcement as
+                // `Path::new("")`, exporting the cold archive relative
+                // to the process CWD before the hot records are deleted
+                // — evidence lands wherever the daemon happened to be
+                // started. Refuse it up front.
+                if uri.is_empty() {
+                    return Err(ManifestError::Invalid(format!(
+                        "topic {:?} cold_uri is empty (schema requires minLength 1); omit the field to disable cold export",
+                        t.name
+                    )));
+                }
                 if uri.len() > MAX_REFERENCE_BYTES {
                     return Err(ManifestError::Invalid(format!(
                         "cold_uri exceeds the schema maxLength of {MAX_REFERENCE_BYTES} bytes ({})",
@@ -665,6 +684,29 @@ topics:
         let mut m = BridgeManifest::default_for("t");
         m.topics[0].retention.cold_uri = Some("s3://bucket/../elsewhere".to_owned());
         m.validate().unwrap();
+    }
+
+    /// Schema parity: bridge-manifest.schema.json pins `minLength: 1` on
+    /// both `cold_uri` and `schema_ref`. An empty `cold_uri` additionally
+    /// reaches retention enforcement as `Path::new("")` — the cold
+    /// archive would be exported relative to the process CWD before the
+    /// hot records are deleted.
+    #[test]
+    fn validate_refuses_empty_cold_uri_and_schema_ref() {
+        let mut m = BridgeManifest::default_for("t");
+        m.topics[0].retention.cold_uri = Some(String::new());
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(err, ManifestError::Invalid(ref msg) if msg.contains("cold_uri") && msg.contains("empty")),
+            "empty cold_uri must be refused, got {err:?}"
+        );
+        let mut m = BridgeManifest::default_for("t");
+        m.topics[0].schema_ref = Some(String::new());
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(err, ManifestError::Invalid(ref msg) if msg.contains("schema_ref") && msg.contains("empty")),
+            "empty schema_ref must be refused, got {err:?}"
+        );
     }
 
     /// A manifest that passes validate() must round-trip through
