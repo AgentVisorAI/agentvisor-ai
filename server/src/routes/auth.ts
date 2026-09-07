@@ -913,6 +913,9 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         pendingEmail: null,
         pendingEmailTokenHash: null,
         pendingEmailAt: null,
+        // The confirm token was mailed to the NEW address — mailbox
+        // control of the (now current) email is proven.
+        emailVerifiedAt: new Date(),
         // Fence every session: the login identifier just rotated and
         // the confirm may have happened on an untrusted device. The
         // user signs back in with the new address.
@@ -1847,6 +1850,10 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
           pendingEmail: null,
           pendingEmailTokenHash: null,
           pendingEmailAt: null,
+          // The reset link was mailed to `email` — completing it proves
+          // mailbox control (unlocks OAuth linking for accounts that
+          // signed up by password before verification existed).
+          emailVerifiedAt: new Date(),
         },
       }),
       db.apiKey.updateMany({

@@ -86,7 +86,22 @@ async function main() {
   const { config } = await create.json();
   console.log("[1/6] created config", config.id, "with ACS", config.spAcsUrl);
 
-  // 4. Craft the SAMLResponse XML.
+  // 4. SP-initiated prelude: the ACS now refuses unsolicited responses
+  // (validateInResponseTo=always — login-CSRF fix), so a real
+  // AuthnRequest must be issued first and its ID echoed back as
+  // InResponseTo, exactly like a live IdP would.
+  const loginRes = await fetch(`${API}/api/v1/auth/saml/${config.id}/login`, { redirect: "manual" });
+  if (loginRes.status !== 302) throw new Error("SP-initiated login start failed: " + loginRes.status);
+  const idpRedirect = new URL(loginRes.headers.get("location"));
+  const samlRequestB64 = idpRedirect.searchParams.get("SAMLRequest");
+  if (!samlRequestB64) throw new Error("no SAMLRequest in IdP redirect");
+  const { inflateRawSync } = await import("node:zlib");
+  const authnRequestXml = inflateRawSync(Buffer.from(samlRequestB64, "base64")).toString("utf8");
+  const inResponseTo = /ID="([^"]+)"/.exec(authnRequestXml)?.[1];
+  if (!inResponseTo) throw new Error("could not extract AuthnRequest ID");
+  console.log("[1.5/6] SP-initiated AuthnRequest", inResponseTo);
+
+  // 5. Craft the SAMLResponse XML.
   const userEmail = "alice@saml-drill.example";
   const now = new Date();
   const notBefore = new Date(now.getTime() - 60_000).toISOString();
@@ -106,7 +121,7 @@ async function main() {
   <saml:Subject>
     <saml:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress">${userEmail}</saml:NameID>
     <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
-      <saml:SubjectConfirmationData NotOnOrAfter="${notOnOrAfter}" Recipient="${acs}"/>
+      <saml:SubjectConfirmationData NotOnOrAfter="${notOnOrAfter}" Recipient="${acs}" InResponseTo="${inResponseTo}"/>
     </saml:SubjectConfirmation>
   </saml:Subject>
   <saml:Conditions NotBefore="${notBefore}" NotOnOrAfter="${notOnOrAfter}">
@@ -145,7 +160,7 @@ async function main() {
   const signedAssertion = sig.getSignedXml();
 
   const responseXml =
-`<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="${responseId}" Version="2.0" IssueInstant="${now.toISOString()}" Destination="${acs}">
+`<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="${responseId}" InResponseTo="${inResponseTo}" Version="2.0" IssueInstant="${now.toISOString()}" Destination="${acs}">
   <saml:Issuer>${idpIssuer}</saml:Issuer>
   <samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></samlp:Status>
   ${signedAssertion}
@@ -200,12 +215,15 @@ async function main() {
   const replayLocation = replay.headers.get("location") || "";
   console.log("[6/6] replay:", replay.status, replayLocation.slice(0, 160));
   // Replay guard behavior: browsers hitting ACS are redirected to
-  // /app/#/login?err=saml_assertion_replay_detected (302 with the slug
-  // in the Location header). Non-browser probes get the same envelope
-  // — the guard hangs off consumeSamlResponse() → errRedirect(). Prior
-  // drill shape looked for the slug in replayBody, but redirect
-  // responses have empty bodies; the slug lives in the Location URL.
-  if (replay.status !== 302 || !replayLocation.includes("saml_assertion_replay_detected")) {
+  // /app/#/login?err=<slug> (302; redirect bodies are empty so the slug
+  // lives in the Location URL). Two guards can fire, both correct:
+  // the InResponseTo request-id was CONSUMED by the first login, so the
+  // replay usually dies in node-saml validation
+  // (saml_assertion_signature_or_conditions_failed) before the
+  // replay-record table (saml_assertion_replay_detected) even runs —
+  // that table remains the durable cross-restart backstop.
+  const replaySlugOk = /saml_assertion_(replay_detected|signature_or_conditions_failed)/.test(replayLocation);
+  if (replay.status !== 302 || !replaySlugOk) {
     throw new Error(`replay guard did not fire: status=${replay.status} location=${replayLocation}`);
   }
 

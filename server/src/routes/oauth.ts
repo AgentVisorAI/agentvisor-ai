@@ -417,6 +417,9 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
           data: {
             email,
             displayName,
+            // The provider asserted (and we required) email_verified —
+            // this account has proven mailbox control from birth.
+            emailVerifiedAt: new Date(),
             // R86 F3: use a real argon2 hash of random bytes so
             // that verifyPassword timing matches password-set
             // users. Prior shape stored `oidc:${provider}:${hex}`
@@ -457,6 +460,41 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
         req.log,
       );
       user = created.user;
+    }
+
+    // Pre-hijack gate: OAuth links by email, and /signup never verifies
+    // the mailbox — an attacker who pre-registered this address by
+    // password would capture the victim's later SSO sign-in (the
+    // victim lands inside the attacker's account/org, and the attacker
+    // keeps password + recovery control). Only link into accounts that
+    // have PROVEN mailbox control: SSO-JIT/invite-provisioned rows and
+    // any account that completed reset-confirm or change-email confirm
+    // (both mail a token to the address). Same refusal UX as the MFA
+    // gate below — sign in with the password, prove the mailbox via
+    // reset if needed.
+    if (!user.emailVerifiedAt) {
+      // Audit only with a real org FK (same shape as auth.login_denied:
+      // a bogus orgId would P2003 and be swallowed by audit.ts).
+      const auditOrg = user.memberships[0]?.orgId;
+      if (auditOrg) {
+        writeAudit(
+          {
+            orgId: auditOrg,
+            event: "auth.oauth_refused_email_unverified",
+            actorId: user.id,
+            actorEmail: user.email,
+            target: user.email,
+            metadata: { provider: params.data.provider },
+            req,
+          },
+          req.log,
+        );
+      }
+      req.log.warn(
+        { userId: user.id, provider: params.data.provider },
+        "oauth_refused_email_unverified",
+      );
+      return errRedirect("oauth_email_unverified_use_password_login");
     }
 
     const membership = user.memberships[0];

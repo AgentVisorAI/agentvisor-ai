@@ -374,11 +374,40 @@ async function main() {
     }
   }
 
+  console.log("[13] pre-hijack gate: unverified password account refuses OIDC link");
+  {
+    // An attacker pre-registers the victim's address by password
+    // (signup never verifies the mailbox). The victim's later SSO
+    // sign-in must NOT be linked into that account.
+    const victim = "prehijack.victim@oidc-drill.example";
+    const su = await fetch(`${API}/api/v1/auth/signup`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: APP_BASE, "Sec-Fetch-Site": "same-origin" },
+      body: JSON.stringify({ email: victim, password: "attacker-chosen-pw-1", orgName: "Attacker Org" }),
+    });
+    check("pre-hijack: attacker signup 201", su.status === 201, su.status);
+    scenario.email = victim;
+    const flowHijack = await runFlow();
+    check("unverified account → oauth_email_unverified_use_password_login", errSlugFrom(flowHijack.finalLocation) === "oauth_email_unverified_use_password_login", flowHijack);
+    check("no session minted for the hijack", !flowHijack.sessionCookie);
+    if (PG_CONTAINER) {
+      // Positive path: once the mailbox is proven (reset-confirm /
+      // change-email confirm set emailVerifiedAt), the link works.
+      execFileSync("docker", ["exec", PG_CONTAINER, "psql", "-U", PG_USER, "-d", PG_DB, "-c",
+        `UPDATE "users" SET "emailVerifiedAt"=NOW() WHERE "email"='${victim}'`], { stdio: "pipe" });
+      const flowVerified = await runFlow();
+      check("verified account links via OIDC", !!flowVerified.sessionCookie, flowVerified.finalLocation);
+    } else {
+      console.log("  SKIP positive path (set PG_CONTAINER to flip emailVerifiedAt)");
+    }
+    scenario.email = "jit.user@oidc-drill.example";
+  }
+
   console.log("[cleanup] delete drill users");
   if (PG_CONTAINER) {
     // OAuth-JIT users have random passwords — the danger-zone flow
     // needs password step-up, so sweep the drill rows directly.
-    for (const email of ["jit.user@oidc-drill.example", "capped.name@oidc-drill.example"]) {
+    for (const email of ["jit.user@oidc-drill.example", "capped.name@oidc-drill.example", "prehijack.victim@oidc-drill.example"]) {
       execFileSync("docker", [
         "exec", PG_CONTAINER, "psql", "-U", PG_USER, "-d", PG_DB, "-c",
         `DELETE FROM "orgs" WHERE "id" IN (SELECT m."orgId" FROM "memberships" m JOIN "users" u ON u."id"=m."userId" WHERE u."email"='${email}'); DELETE FROM "users" WHERE "email"='${email}'`,

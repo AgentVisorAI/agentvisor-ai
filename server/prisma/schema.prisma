@@ -31,6 +31,16 @@ model User {
   pendingEmail          String?
   pendingEmailTokenHash String?
   pendingEmailAt        DateTime?
+  // Set when the account has PROVEN control of `email`: SSO-JIT
+  // creation (provider/IdP asserted it), invite acceptance (the token
+  // was mailed there), reset-confirm or change-email confirm (links
+  // mailed there). Password signup alone does NOT set it — /signup
+  // never verifies the mailbox, so OAuth/OIDC login refuses to
+  // auto-link into an unverified password account (pre-hijack: an
+  // attacker who pre-registers victim@corp.com would otherwise capture
+  // the victim's later "Sign in with Google"). Backfilled for accounts
+  // predating the column (grandfathered).
+  emailVerifiedAt       DateTime?
   // JWT revocation fence — every session whose iat is before this timestamp
   // is rejected in authenticate(). Bumped on logout and password change so
   // a captured cookie stops working immediately even though the JWT itself

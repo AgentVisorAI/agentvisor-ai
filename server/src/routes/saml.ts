@@ -361,6 +361,9 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
           const u = await tx.user.create({
                 data: {
                   email: result.email,
+                  // The org's configured IdP asserted this address —
+                  // mailbox control is proven at creation.
+                  emailVerifiedAt: new Date(),
                   // A JIT user has no password. Login endpoint uses the
                   // dummy hash on lookup miss so this doesn't create a
                   // timing side channel — but the row still needs a

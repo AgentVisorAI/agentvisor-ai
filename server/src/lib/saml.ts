@@ -27,7 +27,7 @@
  *     path without touching the network.
  */
 
-import { SAML } from "@node-saml/node-saml";
+import { SAML, ValidateInResponseTo } from "@node-saml/node-saml";
 import type { SamlConfig } from "@prisma/client";
 import { db } from "../db.js";
 import { env, apiPublicBase } from "../env.js";
@@ -176,6 +176,44 @@ export function isSha1Legacy(cfg: SamlConfig): boolean {
 }
 
 /** Construct the @node-saml/node-saml adapter from our stored config. */
+/// AuthnRequest-ID cache shared by EVERY adapter instance (buildAdapter
+/// constructs a fresh SAML object per request, so an instance-local
+/// cache would forget the request id between /login and the ACS POST).
+/// node-saml saves the id on getAuthorizeUrlAsync, checks + consumes it
+/// on validatePostResponseAsync. TTL covers the 5-minute clock-skew
+/// window plus ceremony time; the sweep runs inline on every save so no
+/// timer is needed.
+const REQUEST_ID_TTL_MS = 10 * 60_000;
+const requestIdStore = new Map<string, { value: string; createdAt: number }>();
+function sweepRequestIds(): void {
+  const cutoff = Date.now() - REQUEST_ID_TTL_MS;
+  for (const [key, item] of requestIdStore) {
+    if (item.createdAt < cutoff) requestIdStore.delete(key);
+  }
+}
+const sharedRequestIdCache = {
+  async saveAsync(key: string, value: string): Promise<{ value: string; createdAt: number } | null> {
+    sweepRequestIds();
+    if (requestIdStore.has(key)) return null;
+    const item = { value, createdAt: Date.now() };
+    requestIdStore.set(key, item);
+    return item;
+  },
+  async getAsync(key: string): Promise<string | null> {
+    const item = requestIdStore.get(key);
+    if (!item) return null;
+    if (item.createdAt < Date.now() - REQUEST_ID_TTL_MS) {
+      requestIdStore.delete(key);
+      return null;
+    }
+    return item.value;
+  },
+  async removeAsync(key: string | null): Promise<string | null> {
+    if (key === null) return null;
+    return requestIdStore.delete(key) ? key : null;
+  },
+};
+
 function buildAdapter(cfg: SamlConfig): SAML {
   const urls = spUrls(cfg);
   // R88 F5: reject pre-R88 rows still storing "sha1" — the
@@ -203,6 +241,18 @@ function buildAdapter(cfg: SamlConfig): SAML {
     callbackUrl: urls.acsUrl,
     entryPoint: cfg.ssoUrl,
     logoutUrl: cfg.sloUrl ?? undefined,
+    // Unsolicited-response refusal (login CSRF): every consumed
+    // Response must carry an InResponseTo matching an AuthnRequest WE
+    // issued (saved into the shared cache by getAuthorizeUrlAsync,
+    // consumed once at validation). Without this an attacker could
+    // push a victim's browser through the ATTACKER's IdP and log the
+    // victim into the attacker's workspace (session fixation), and
+    // IdP-initiated responses from anywhere were accepted. In-memory
+    // cache: same single-process posture as the rate-limit buckets;
+    // multi-instance deploys need sticky routing on /auth/saml/*.
+    validateInResponseTo: ValidateInResponseTo.always,
+    requestIdExpirationPeriodMs: REQUEST_ID_TTL_MS,
+    cacheProvider: sharedRequestIdCache,
     // IdP-side crypto.
     idpCert: cfg.x509Cert,
     // Pin the Issuer: without it, ANY assertion signed by the

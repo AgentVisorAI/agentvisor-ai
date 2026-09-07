@@ -67,6 +67,10 @@ async function craftSignedResponse({
   email,
   notBefore = new Date(Date.now() - 60_000),
   notOnOrAfter = new Date(Date.now() + 300_000),
+  // Echo of a real AuthnRequest ID (validateInResponseTo=always).
+  // null crafts an UNSOLICITED response — refused at the outer gate,
+  // which the dedicated probe asserts.
+  inResponseTo = null,
 }) {
   const responseId = "_" + randomBytes(16).toString("hex");
   const assertionId = "_" + randomBytes(16).toString("hex");
@@ -76,7 +80,7 @@ async function craftSignedResponse({
   <saml:Subject>
     <saml:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress">${email}</saml:NameID>
     <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
-      <saml:SubjectConfirmationData NotOnOrAfter="${notOnOrAfter.toISOString()}" Recipient="${acs}"/>
+      <saml:SubjectConfirmationData NotOnOrAfter="${notOnOrAfter.toISOString()}" Recipient="${acs}"${inResponseTo ? ` InResponseTo="${inResponseTo}"` : ""}/>
     </saml:SubjectConfirmation>
   </saml:Subject>
   <saml:Conditions NotBefore="${notBefore.toISOString()}" NotOnOrAfter="${notOnOrAfter.toISOString()}">
@@ -108,7 +112,7 @@ async function craftSignedResponse({
   sig.computeSignature(assertionXml, { location: { reference: "//*[local-name(.)='Issuer']", action: "after" } });
   const signedAssertion = sig.getSignedXml();
 
-  const responseXml = `<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="${responseId}" Version="2.0" IssueInstant="${now.toISOString()}" Destination="${acs}">
+  const responseXml = `<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="${responseId}"${inResponseTo ? ` InResponseTo="${inResponseTo}"` : ""} Version="2.0" IssueInstant="${now.toISOString()}" Destination="${acs}">
   <saml:Issuer>${idpIssuer}</saml:Issuer>
   <samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></samlp:Status>
   ${signedAssertion}
@@ -123,6 +127,23 @@ async function postToAcs(acsUrl, samlResponse) {
     body: new URLSearchParams({ SAMLResponse: samlResponse }).toString(),
     redirect: "manual",
   });
+}
+
+
+// SP-initiated prelude: issue a real AuthnRequest via /login and pull
+// its ID out of the deflated SAMLRequest, exactly like a live IdP
+// would. Each crafted probe needs a FRESH id (they are single-use).
+async function spInitiate(configId) {
+  const res = await fetch(`${API}/api/v1/auth/saml/${configId}/login`, { redirect: "manual" });
+  if (res.status !== 302) throw new Error("sp login start " + res.status);
+  const url = new URL(res.headers.get("location"));
+  const req = url.searchParams.get("SAMLRequest");
+  if (!req) throw new Error("no SAMLRequest in redirect");
+  const { inflateRawSync } = await import("node:zlib");
+  const xml = inflateRawSync(Buffer.from(req, "base64")).toString("utf8");
+  const id = /ID="([^"]+)"/.exec(xml)?.[1];
+  if (!id) throw new Error("no AuthnRequest ID");
+  return id;
 }
 
 async function main() {
@@ -147,7 +168,9 @@ async function main() {
 
   // ============ 1. Expired assertion ============
   console.log("\n[1] Expired assertion (NotOnOrAfter in past)");
+  const irt_expiredResp = await spInitiate(cfg.id);
   const expiredResp = await craftSignedResponse({
+    inResponseTo: irt_expiredResp,
     privateKey: idp.privateKey,
     certBody: idp.certBody,
     audience: cfg.spEntityId,
@@ -166,7 +189,9 @@ async function main() {
 
   // ============ 2. Wrong audience ============
   console.log("\n[2] Wrong audience");
+  const irt_wrongAudResp = await spInitiate(cfg.id);
   const wrongAudResp = await craftSignedResponse({
+    inResponseTo: irt_wrongAudResp,
     privateKey: idp.privateKey,
     certBody: idp.certBody,
     audience: "https://not-us.example/entity",
@@ -181,7 +206,9 @@ async function main() {
   // ============ 3. Wrong signing cert ============
   console.log("\n[3] Assertion signed by different key");
   const attacker = await generateIdpKeys("attacker-idp");
+  const irt_attackerResp = await spInitiate(cfg.id);
   const attackerResp = await craftSignedResponse({
+    inResponseTo: irt_attackerResp,
     privateKey: attacker.privateKey, // Wrong key!
     certBody: attacker.certBody,
     audience: cfg.spEntityId,
@@ -256,7 +283,9 @@ async function main() {
     },
     body: JSON.stringify({ jitEnabled: false }),
   });
+  const irt_jitOffResp = await spInitiate(cfg.id);
   const jitOffResp = await craftSignedResponse({
+    inResponseTo: irt_jitOffResp,
     privateKey: idp.privateKey,
     certBody: idp.certBody,
     audience: cfg.spEntityId,
@@ -267,6 +296,29 @@ async function main() {
   const r5 = await postToAcs(cfg.spAcsUrl, jitOffResp);
   const b5 = await r5.text();
   results.push({ drill: "jit-disabled", status: r5.status, expect: 302, body: (r5.headers.get("location") ?? b5).slice(0, 100), ok: r5.status === 302 && /err=saml/.test(r5.headers.get("location") ?? "") });
+
+  // ============ Unsolicited response refused (login CSRF gate) ============
+  // Since validateInResponseTo=always, a response that answers NO
+  // AuthnRequest of ours must be refused regardless of its signature —
+  // this is also the gate every crafted probe above now hits first,
+  // which is correct defense-in-depth: hostile responses die at the
+  // outermost check.
+  console.log("[5b] Unsolicited (IdP-initiated) response refused");
+  const unsolicited = await craftSignedResponse({
+    privateKey: idp.privateKey,
+    certBody: idp.certBody,
+    audience: cfg.spEntityId,
+    acs: cfg.spAcsUrl,
+    idpIssuer: "https://real-idp.example/entity",
+    email: "unsolicited@saml-hard.example",
+  });
+  const rUn = await fetch(cfg.spAcsUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ SAMLResponse: unsolicited, RelayState: "" }).toString(),
+    redirect: "manual",
+  });
+  results.push({ drill: "unsolicited-refused", status: rUn.status, expect: 302, ok: rUn.status === 302 && /err=saml_assertion/.test(rUn.headers.get("location") ?? "") && !(rUn.headers.get("set-cookie") ?? "").includes("av_session=") });
 
   // Print
   console.log("\n============ RESULTS ============");

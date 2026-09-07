@@ -1253,6 +1253,8 @@
     var noteHtml = "";
     if (errCode === "mfa_required_use_password_login") {
       noteHtml = '<div class="auth-note">This account has a passkey enrolled. Sign in with your password so we can complete the WebAuthn step — SSO alone can\'t satisfy MFA.</div>';
+    } else if (errCode === "oauth_email_unverified_use_password_login") {
+      noteHtml = '<div class="auth-note">This account hasn\'t confirmed its email address yet, so single sign-on can\'t be linked to it. Sign in with your password — or use "Forgot password" to confirm the mailbox — and SSO will work afterwards.</div>';
     } else if (errCode.indexOf("oauth_") === 0) {
       // R122 F2: OAuth callback error paths now redirect here
       // instead of dead-ending in a raw-JSON tab. Slug map:

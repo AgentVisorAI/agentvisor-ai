@@ -934,6 +934,9 @@ export async function memberRoutes(app: FastifyInstance): Promise<void> {
               email: matched.email,
               passwordHash: newUserPasswordHash!,
               displayName: body.data.displayName ?? null,
+              // The invite token was mailed to this address — accepting
+              // it proves mailbox control.
+              emailVerifiedAt: new Date(),
             },
             update: {},
           }));
