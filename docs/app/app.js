@@ -4584,7 +4584,7 @@
         '<td style="color:var(--fg-2)">expires ' + esc(timeUntil(i.expiresAt)) + '</td>' +
         // Revoking an invite is admin-gated on the API — same rule as
         // Remove above; members see the pending list without controls.
-        '<td>' + (canManage ? '<button class="btn danger" data-act="revoke">Revoke</button>' : '') + '</td>' +
+        '<td>' + (canManage ? '<button class="btn" data-act="resend" title="Mint a fresh link and email it again — the old link stops working">Resend</button> <button class="btn danger" data-act="revoke">Revoke</button>' : '') + '</td>' +
       '</tr>';
     }).join('');
     var invitesCard = invites.length
@@ -4715,6 +4715,30 @@
       });
     });
     if (tables[1]) tables[1].addEventListener("click", function (e) {
+      var rsBtn = e.target.closest("[data-act='resend']");
+      if (rsBtn) {
+        if (rsBtn.disabled) return;
+        rsBtn.disabled = true;
+        var rsTr = e.target.closest("tr[data-invite]");
+        var rsInv = invites.filter(function (x) { return x.id === rsTr.getAttribute("data-invite"); })[0];
+        if (!rsInv) { rsBtn.disabled = false; return; }
+        // POST /invites upserts: same email re-invited mints a fresh
+        // token + 7-day expiry and re-sends the email; the old link
+        // argon2-fails from then on. The accept page's own error copy
+        // says "ask your teammate to resend the invite" — this is that
+        // button.
+        state.ds.inviteMember({ email: rsInv.email, role: rsInv.role }).then(function () {
+          toast("Invite re-sent to " + rsInv.email + " — the previous link no longer works");
+          renderSettingsMembers(root);
+        }).catch(function (err) {
+          rsBtn.disabled = false;
+          var msg = err.message || "Resend failed";
+          if (err.errorCode === "cannot_mutate_invite_above_own_rank" || msg === "cannot_mutate_invite_above_own_rank") msg = "You can't reissue an invite minted above your own role.";
+          else if (err.errorCode === "already_a_member" || msg === "already_a_member") msg = "They already joined — no invite needed.";
+          toast(msg, true);
+        });
+        return;
+      }
       var btn = e.target.closest("[data-act='revoke']");
       if (!btn) return;
       if (btn.disabled) return;
@@ -4830,7 +4854,9 @@
         '<td class="mono">' + esc(k.hint) + "</td>" +
         '<td style="color:var(--fg-2)">' + timeAgoCell(k.lastUsedAt) + "</td>" +
         '<td style="color:var(--fg-2)">' + timeAgoCell(k.createdAt) + "</td>" +
-        '<td><button class="btn danger" data-act="revoke">Revoke</button></td>' +
+        '<td>' +
+          '<button class="btn" data-act="rename">Rename</button> ' +
+          '<button class="btn danger" data-act="revoke">Revoke</button></td>' +
       "</tr>";
     }).join("");
     root.innerHTML =
@@ -4846,6 +4872,34 @@
         "</table></div>" +
       "</div>";
     attachCreate($("#createKeyBtn", root));
+    $$("tr[data-id] button[data-act='rename']", root).forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var tr = btn.closest("tr");
+        var id = tr && tr.getAttribute("data-id");
+        var curName = tr ? (tr.querySelector("td div") || {}).textContent : "";
+        if (!id) return;
+        openInputModal({
+          title: "Rename API key",
+          sub: "The token itself doesn't change — only the label you see in this list and the audit trail.",
+          label: "New name",
+          placeholder: curName || "",
+          confirmLabel: "Rename",
+          onConfirm: function (name) {
+            var nm = (name || "").trim();
+            if (!nm) { toast("Name can't be empty", true); return; }
+            state.ds.renameApiKey(id, nm).then(function (k) {
+              toast('Renamed to "' + ((k && k.name) || nm) + '"');
+              renderSettingsKeys(root);
+            }).catch(function (err) {
+              var msg = err.message || "Rename failed";
+              if (err.errorCode === "cannot_mutate_role_above_own" || msg === "cannot_mutate_role_above_own") msg = "You can't rename a key scoped above your own role.";
+              else if (err.errorCode === "invalid_input" || msg === "invalid_input") msg = "Name must be 1-80 characters.";
+              toast(msg, true);
+            });
+          },
+        });
+      });
+    });
     $$("tr[data-id] button[data-act='revoke']", root).forEach(function (btn) {
       btn.addEventListener("click", function () {
         var tr = btn.closest("tr");

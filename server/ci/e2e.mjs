@@ -162,6 +162,28 @@ try {
   const rot = await ds.rotateDeploymentToken(dep.deployment.id);
   check("rotate returns token", !!rot.ingestToken);
 
+  // API key rename
+  const k1 = await ds.createApiKey("e2e-key");
+  check("create key", !!k1.key.id);
+  const kRenamed = await ds.renameApiKey(k1.key.id, "e2e-key-renamed");
+  check("key rename", kRenamed && kRenamed.name === "e2e-key-renamed");
+  let kBlank = "";
+  try { await ds.renameApiKey(k1.key.id, "   "); } catch (e) { kBlank = e.errorCode || e.message; }
+  check("key rename blank 400", kBlank === "invalid_input", kBlank);
+  let kGhost = "";
+  try { await ds.renameApiKey("cmnope000000000000000", "x"); } catch (e) { kGhost = e.errorCode || e.message; }
+  check("key rename ghost 404", kGhost === "not_found", kGhost);
+  await ds.revokeApiKey(k1.key.id);
+
+  // Invite resend = upsert: same email re-invited answers 201 again
+  const inv1 = await ds.inviteMember({ email: `resend-${rand}@test.dev`, role: "member" });
+  check("invite created", !!inv1);
+  const inv2 = await ds.inviteMember({ email: `resend-${rand}@test.dev`, role: "member" });
+  check("invite resend (upsert) ok", !!inv2);
+  const pend = (await ds.listInvites()).invites || [];
+  check("resend keeps ONE pending row", pend.filter(i => i.email === `resend-${rand}@test.dev`).length === 1);
+  await ds.revokeInvite(pend.find(i => i.email === `resend-${rand}@test.dev`).id);
+
   // Edit metadata: rename + environment flip; ID stays; guards
   const edited = await ds.updateDeployment(dep.deployment.id, { name: "e2e-prod-renamed", environment: "development" });
   check("deployment edit", edited && edited.name === "e2e-prod-renamed" && edited.environment === "development" && edited.id === dep.deployment.id);
