@@ -9,6 +9,10 @@
  *   4. Tamper a byte in the receipt's rawBody → re-run verifier →
  *      expect exit 1 (SIGNATURE DOES NOT VERIFY).
  *   5. Tamper the publicKey.hex → re-run → expect exit 1.
+ *   6. Build a raw daemon receipt (spool/atif/receipts shape:
+ *      flattened body + signature_b64, v2 domain-tag framing) →
+ *      expect exit 2 (untrusted anchor) with real metadata, and
+ *      exit 1 after tampering the signed body.
  *
  * Proves the whole "any auditor can verify offline with no
  * AgentVisor dependency" pitch is real, end-to-end.
@@ -187,10 +191,72 @@ if (/^✅ SIGNATURE VERIFIES against a TRUSTED key/im.test(forgedAcked)) fail("f
 if (!/INTERNALLY CONSISTENT/i.test(forgedAcked)) fail("forged-ack didn't say INTERNALLY CONSISTENT: " + forgedAcked.slice(0, 400));
 console.log("✅ fresh-keypair forgery WITH --allow-untrusted-key -> INTERNALLY CONSISTENT (exit 0, not TRUSTED)");
 
+// Raw daemon receipt (spool/atif/receipts/*.json shape): the file
+// agentvisord writes is the flattened ReceiptBody + signature_b64 —
+// no bundle envelope. verify-receipt.mjs adapts it (same as the
+// /verify page): JCS(body minus signature_b64) is the signed
+// message, pubkey comes from body.public_key_b64. Assert the
+// adapter path end-to-end: untrusted-anchor verdict (exit 2) with
+// real metadata rendered, and tamper -> exit 1.
+function jcs(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return "[" + value.map(jcs).join(",") + "]";
+  return "{" + Object.keys(value).sort().map((k) => JSON.stringify(k) + ":" + jcs(value[k])).join(",") + "}";
+}
+const rawKeys = generateKeyPairSync("ed25519");
+const rawSpki = rawKeys.publicKey.export({ format: "der", type: "spki" });
+const rawPub = rawSpki.slice(-32);
+const { createHash } = await import("node:crypto");
+const rawBodyObj = {
+  receipt_version: 2,
+  receipt_id: "0192aaaa-bbbb-7ccc-8ddd-eeeeffff0000",
+  session_id: "sess-raw-drill",
+  issued_at: 1757200000123,
+  issued_at_iso: "2025-09-06T23:06:40.123Z",
+  ai_agent: { version: "1.0.0", charter: { name: "drill-agent", type_id: 1 }, instance_uid: "inst-1" },
+  subject: { kind: "event_chain", chain_head: "ab".repeat(32), event_count: 7 },
+  tool_calls: { total: 3, allowed: 3, blocked: 0 },
+  cost: { prompt_tokens: 10, completion_tokens: 5, cached_tokens: 0, cost_usd_micros: 42 },
+  stop_reason_id: 1,
+  stop_reason: "stop",
+  key_id: createHash("sha256").update(rawPub).digest("hex").slice(0, 32),
+  public_key_b64: rawPub.toString("base64"),
+};
+const rawCanon = Buffer.from(jcs(rawBodyObj), "utf8");
+const rawLen = Buffer.alloc(8);
+rawLen.writeBigUInt64BE(BigInt(rawCanon.length), 0);
+const rawMsg = Buffer.concat([Buffer.from("agentvisor-receipt-v2\0", "utf8"), rawLen, rawCanon]);
+const rawSig = sign(null, rawMsg, rawKeys.privateKey);
+const rawReceipt = { ...rawBodyObj, signature_b64: rawSig.toString("base64") };
+const rawPath = bundlePath.replace(".json", "-raw.json");
+writeFileSync(rawPath, JSON.stringify(rawReceipt, null, 2));
+try {
+  execSync(`node ${VERIFIER} ${rawPath}`, { stdio: "pipe" });
+  fail("raw daemon receipt (fresh keypair) exited 0 — trust anchor gate is broken for raw receipts!");
+} catch (e) {
+  const output = (e.stdout?.toString() || "") + (e.stderr?.toString() || "");
+  if (e.status !== 2) fail("raw-receipt exit code: " + e.status + " expected 2 (untrusted). output: " + output.slice(0, 400));
+  if (/Unrecognized format/i.test(output)) fail("raw daemon receipt still rejected as unrecognized format: " + output.slice(0, 400));
+  if (!/sess-raw-drill/.test(output)) fail("raw-receipt metadata: session_id not rendered: " + output.slice(0, 400));
+  if (!/drill-agent/.test(output)) fail("raw-receipt metadata: charter name not rendered: " + output.slice(0, 400));
+}
+console.log("✅ raw daemon receipt (spool shape) -> adapter path verifies, untrusted verdict (exit 2), metadata rendered");
+
+const rawTampered = { ...rawReceipt, session_id: "sess-raw-TAMPERED" };
+const rawTamperedPath = bundlePath.replace(".json", "-raw-tampered.json");
+writeFileSync(rawTamperedPath, JSON.stringify(rawTampered, null, 2));
+try {
+  execSync(`node ${VERIFIER} ${rawTamperedPath}`, { stdio: "pipe" });
+  fail("tampered raw daemon receipt exited 0!");
+} catch (e) {
+  if (e.status !== 1) fail("tampered raw-receipt exit code: " + e.status + " expected 1");
+}
+console.log("✅ tampered raw daemon receipt -> SIGNATURE DOES NOT VERIFY (exit 1)");
+
 // Cleanup
-for (const p of [bundlePath, tamperedPath, tamperedKeyPath, forgedPath]) {
+for (const p of [bundlePath, tamperedPath, tamperedKeyPath, forgedPath, rawPath, rawTamperedPath]) {
   try { unlinkSync(p); } catch {}
 }
 
 await browser.close();
-console.log("\nReceipt download + offline verification round-trip: 6/6 checks passed.");
+console.log("\nReceipt download + offline verification round-trip: 8/8 checks passed.");

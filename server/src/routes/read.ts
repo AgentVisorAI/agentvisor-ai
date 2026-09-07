@@ -147,6 +147,12 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
     const windowStart = new Date(
       Math.floor(nowMs / spec.bucketMs) * spec.bucketMs - (spec.count - 1) * spec.bucketMs,
     );
+    // Exclusive upper bound (end of the current bucket). `openedAt` is
+    // client-supplied (z.coerce.date in ingest), so a skewed or hostile
+    // daemon can insert future-dated rows — without this bound the scan
+    // aggregates them into buckets the series builder then discards,
+    // unbounded I/O for rows that can never render.
+    const windowEnd = new Date(windowStart.getTime() + spec.count * spec.bucketMs);
     const rows = await db.$queryRaw<
       Array<{ bucket: Date; allowed: bigint; blocked: bigint; cost: bigint; blockedpayout: bigint }>
     >(Prisma.sql`
@@ -158,6 +164,7 @@ export async function readRoutes(app: FastifyInstance): Promise<void> {
       FROM sessions
       WHERE "orgId" = ${claims.orgId}
         AND "openedAt" >= ${windowStart}
+        AND "openedAt" < ${windowEnd}
         ${query.data.deploymentId ? Prisma.sql`AND "deploymentId" = ${query.data.deploymentId}` : Prisma.empty}
       GROUP BY 1
     `);
