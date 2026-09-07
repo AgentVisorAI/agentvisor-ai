@@ -23,6 +23,7 @@
  *   auth.login, auth.login_denied, auth.logout, auth.logout.apikey_noop,
  *     auth.signup, auth.oauth_signin, auth.oauth_refused_mfa_required,
  *     auth.password_ok_mfa_required, auth.password_changed,
+ *     auth.email_change_requested, auth.email_changed,
  *     auth.reset_request, auth.reset_confirm,
  *     auth.saml.slo, auth.step_up_denied
  *   saml.signin, saml.config_created, saml.config_updated,

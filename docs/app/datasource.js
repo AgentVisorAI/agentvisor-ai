@@ -2009,6 +2009,33 @@
       recordAudit("auth.password_changed", "", "");
       return { ok: true };
     },
+    async requestEmailChange(input) {
+      await delay(200);
+      if (!input || !input.password) { var ece0 = new Error("invalid_password"); ece0.status = 401; ece0.errorCode = "invalid_password"; throw ece0; }
+      var cur = (mockState.session && mockState.session.user.email) || "demo@northwind.com";
+      if (!input.newEmail || input.newEmail === cur) { var ece1 = new Error("same_as_current"); ece1.status = 400; ece1.errorCode = "same_as_current"; throw ece1; }
+      mockState.pendingEmail = input.newEmail;
+      recordAudit("auth.email_change_requested", "", input.newEmail);
+      // Demo parity with the reset flow: surface the token inline since
+      // there's no mailbox in mock mode.
+      return { ok: true, pendingEmail: input.newEmail, mockToken: "demo-email-token" };
+    },
+    async confirmEmailChange(input) {
+      await delay(200);
+      if (!input || input.token !== "demo-email-token" || !mockState.pendingEmail) {
+        var ece2 = new Error("invalid_token"); ece2.status = 401; ece2.errorCode = "invalid_token"; throw ece2;
+      }
+      var newEmail = mockState.pendingEmail;
+      mockState.pendingEmail = null;
+      if (mockState.session) mockState.session.user.email = newEmail;
+      recordAudit("auth.email_changed", "", newEmail);
+      return { ok: true, email: newEmail };
+    },
+    async cancelEmailChange() {
+      await delay(100);
+      mockState.pendingEmail = null;
+      return { ok: true };
+    },
     async exportMyData(password) {
       await delay(200);
       if (!password) { var e1 = new Error("password_required"); e1.status = 400; throw e1; }
@@ -2214,6 +2241,15 @@
     },
     async changePassword(input) {
       return apiFetch("/api/v1/auth/change-password", { method: "POST", body: { currentPassword: input.currentPassword, newPassword: input.newPassword } });
+    },
+    async requestEmailChange(input) {
+      return apiFetch("/api/v1/auth/change-email", { method: "POST", body: { newEmail: input.newEmail, password: input.password } });
+    },
+    async confirmEmailChange(input) {
+      return apiFetch("/api/v1/auth/change-email/confirm", { method: "POST", body: { email: input.email, token: input.token } });
+    },
+    async cancelEmailChange() {
+      return apiFetch("/api/v1/auth/change-email/cancel", { method: "POST", body: {} });
     },
     async signup(input) {
       var r = await apiFetch("/api/v1/auth/signup", { method: "POST", body: { email: input.email, password: input.password, orgName: input.orgName || (input.email.split("@")[0] + "'s org") } });
