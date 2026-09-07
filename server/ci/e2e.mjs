@@ -321,6 +321,14 @@ try {
   const mem = await ds.listMembers();
   check("members carry mfaEnrolled flag", mem.length === 1 && mem[0].mfaEnrolled === false, JSON.stringify(mem[0] && mem[0].mfaEnrolled));
 
+  // Audit pagination contract: {entries, nextCursor}; cursor walk
+  // yields non-overlapping pages. The suite has generated well over 4
+  // audit rows by now, so limit=2 guarantees a cursor.
+  const aud1 = await ds.listAudit({ limit: 2 });
+  check("audit page shape", Array.isArray(aud1.entries) && aud1.entries.length === 2 && !!aud1.nextCursor, JSON.stringify({ n: aud1.entries?.length, c: !!aud1.nextCursor }));
+  const aud2 = await ds.listAudit({ limit: 2, cursor: aud1.nextCursor });
+  check("audit cursor walk distinct", aud2.entries.length > 0 && aud2.entries[0].at !== aud1.entries[0].at);
+
   await ds.logout();
   const s2 = await ds.getSession();
   check("logout clears session", s2 === null);
