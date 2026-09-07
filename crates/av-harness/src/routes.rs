@@ -641,10 +641,9 @@ async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, bod
         response: upstream,
         billed_prompt_tokens,
         lease,
-        response_permit,
-        capture_guard,
+        mut capture_guard,
     } = forwarded;
-    let Some(response_permit) = response_permit else {
+    let Some(response_permit) = capture_guard.take_permit() else {
         // Defensive: `prepare_chat` always reserves a permit. Even so,
         // retire the durable marker and the journalled attempt through
         // the plain worker queue before failing — returning directly
@@ -2213,37 +2212,54 @@ impl ToolExecution {
     }
 
     fn load_sync(&self) -> Result<ToolExecutionState, String> {
-        if !self.intent_path.exists() {
+        // Read directly instead of `exists()` + `read()`: a concurrent
+        // `release_unexecuted()` (client abandoned the call) or close-time
+        // cleanup can unlink between the two, turning a retryable
+        // Missing/Pending state into an opaque "No such file" lifecycle
+        // error for the caller.
+        let intent_bytes = match std::fs::read(&self.intent_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.to_string()),
+        };
+        let Some(intent_bytes) = intent_bytes else {
             if self.outcome_path.exists() || self.audited_path.exists() {
                 return Err("tool outcome exists without an authenticated intent".to_owned());
             }
             return Ok(ToolExecutionState::Missing);
-        }
+        };
         let intent: ToolIntent = crate::journal::open(
             &self.control_key,
             &format!("{}:{}", crate::journal::TOOL_INTENT_DOMAIN, self.key),
             0,
-            &std::fs::read(&self.intent_path).map_err(|error| error.to_string())?,
+            &intent_bytes,
         )?;
         if intent != self.intent() {
             return Err(TOOL_REQUEST_MISMATCH.to_owned());
         }
-        if self.outcome_path.exists() {
+        let outcome_bytes = match std::fs::read(&self.outcome_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.to_string()),
+        };
+        if let Some(outcome_bytes) = outcome_bytes {
             let outcome: ToolOutcome = crate::journal::open(
                 &self.control_key,
                 &format!("{}:{}", crate::journal::TOOL_OUTCOME_DOMAIN, self.key),
                 0,
-                &std::fs::read(&self.outcome_path).map_err(|error| error.to_string())?,
+                &outcome_bytes,
             )?;
-            return if self.audited_path.exists()
-                && crate::journal::open::<serde_json::Value>(
+            let audited = match std::fs::read(&self.audited_path) {
+                Ok(bytes) => crate::journal::open::<serde_json::Value>(
                     &self.control_key,
                     &format!("{}:{}", crate::journal::TOOL_AUDITED_DOMAIN, self.key),
                     0,
-                    &std::fs::read(&self.audited_path).map_err(|error| error.to_string())?,
+                    &bytes,
                 )
-                .is_ok()
-            {
+                .is_ok(),
+                Err(_) => false,
+            };
+            return if audited {
                 Ok(ToolExecutionState::Completed(outcome))
             } else {
                 Ok(ToolExecutionState::Unaudited(outcome))

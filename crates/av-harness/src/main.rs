@@ -598,9 +598,16 @@ async fn run(config_override: Option<PathBuf>) -> Result<()> {
     };
     #[cfg(not(feature = "otel"))]
     let flush_telemetry = || Ok(());
-    let open_sessions = state.sessions.open_sessions();
+    let shutdown_sessions = Arc::clone(&state.sessions);
     let shutdown_finalizer = state.finalizer.clone();
     let finalize_sessions = async move {
+        // Snapshot open sessions HERE — this future runs only after
+        // `finish_shutdown` has awaited `worker_drain` (MCP-inflight
+        // drain + worker wait_idle). Snapshotting before the drain
+        // (the previous shape) missed any session a still-draining
+        // detached mcp_call body created or re-opened after the
+        // snapshot, silently deferring it to restart-time recovery.
+        let open_sessions = shutdown_sessions.open_sessions();
         let mut failures = Vec::new();
         // Bound each per-session close so a stuck session (a leaked
         // SessionLease from an axum-cancelled handler, a worker permit

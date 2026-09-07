@@ -780,7 +780,6 @@ pub struct PreparedRequest {
     // unsigned). AbortFinalizingStream preserves the same invariant by
     // convention (its Drop runs before `_lease` drops).
     capture_guard: ResponseCaptureGuard,
-    response_permit: Option<ResponsePermit>,
     lease: SessionLease,
     /// Client `Authorization` header captured for passthrough mode only.
     client_authorization: Option<HeaderValue>,
@@ -802,9 +801,9 @@ pub struct ForwardedResponse {
     pub(crate) billed_prompt_tokens: u64,
     // Same ordering invariant as `PreparedRequest`: guard drops before
     // lease so its terminal job registers `pending_jobs` before the
-    // close barrier sees the streams drained.
+    // close barrier sees the streams drained. The reserved response
+    // slot travels inside the guard until routes.rs takes it.
     pub(crate) capture_guard: ResponseCaptureGuard,
-    pub(crate) response_permit: Option<ResponsePermit>,
     pub(crate) lease: SessionLease,
 }
 
@@ -827,6 +826,14 @@ pub(crate) struct ResponseCaptureGuard {
     identity: AgentIdentity,
     marker: Option<String>,
     attempt_id: String,
+    /// The response-capture slot reserved at admission. Owned by the
+    /// guard so the cancellation path (Drop) submits its terminal
+    /// record through the RESERVED slot, exactly like every explicit
+    /// failure path — a saturated worker queue must not be able to
+    /// poison an admitted session whose slot was pre-paid
+    /// (`mark_capture_failed` quarantines the id permanently).
+    /// Explicit paths `take_permit()` when they assume ownership.
+    permit: Option<ResponsePermit>,
     armed: bool,
 }
 
@@ -836,6 +843,7 @@ impl ResponseCaptureGuard {
         session: Arc<Session>,
         identity: AgentIdentity,
         attempt_id: String,
+        permit: Option<ResponsePermit>,
     ) -> Self {
         Self {
             worker,
@@ -843,8 +851,17 @@ impl ResponseCaptureGuard {
             identity,
             marker: None,
             attempt_id,
+            permit,
             armed: true,
         }
+    }
+
+    /// Hand the reserved response slot to an explicit owner (the
+    /// SSE/buffered relay, or a failure path that submits its own
+    /// terminal record). The guard's Drop falls back to the plain
+    /// worker queue once the permit is taken.
+    pub(crate) fn take_permit(&mut self) -> Option<ResponsePermit> {
+        self.permit.take()
     }
 
     /// Record the durable in-flight marker so a later drop retires it.
@@ -883,10 +900,17 @@ impl Drop for ResponseCaptureGuard {
             self.marker.take(),
             std::mem::take(&mut self.attempt_id),
         );
-        // Same fallback as every explicit refusal path: if the queue is
-        // full, fail the session closed rather than dropping the capture
-        // silently.
-        if self.worker.try_submit(job).is_err() {
+        // Submit through the reserved response slot when the guard
+        // still owns it (cancellation before an explicit owner took
+        // over) so worker saturation cannot fail this submission; fall
+        // back to the plain queue otherwise. Same fallback as every
+        // explicit refusal path: if the submission fails, fail the
+        // session closed rather than dropping the capture silently.
+        let submitted = match self.permit.take() {
+            Some(permit) => permit.submit(&self.worker, job),
+            None => self.worker.try_submit(job),
+        };
+        if submitted.is_err() {
             self.session.mark_capture_failed();
         }
     }
@@ -2237,6 +2261,7 @@ impl AppState {
             Arc::clone(&session),
             identity.clone(),
             response_attempt_id,
+            Some(response_permit),
         );
         drop(admission);
 
@@ -2259,7 +2284,6 @@ impl AppState {
             middleware_us: elapsed_us(total_started),
             admission_debit,
             lease,
-            response_permit: Some(response_permit),
             capture_guard,
             client_authorization,
             upstream_passthrough_headers,
@@ -2389,7 +2413,7 @@ impl AppState {
         // itself, so a hypothetical double abandon — or the guard's own
         // Drop — cannot double-refund).
         prepared.admission_debit.refund_now();
-        let Some(permit) = prepared.response_permit.take() else {
+        let Some(permit) = prepared.capture_guard.take_permit() else {
             // Defensive: no permit means the guard's Drop is the only
             // resolver left. Leave it armed so the terminal record lands
             // through the plain worker queue on drop.
@@ -2499,8 +2523,7 @@ impl AppState {
             identity,
             payload,
             lease,
-            response_permit,
-            capture_guard,
+            mut capture_guard,
             client_authorization,
             upstream_passthrough_headers,
             mut admission_debit,
@@ -2561,7 +2584,6 @@ impl AppState {
                     response,
                     billed_prompt_tokens: debited_tokens,
                     lease,
-                    response_permit,
                     capture_guard,
                 })
             }
@@ -2630,7 +2652,7 @@ impl AppState {
                     PipelineError::upstream(client_reason.to_owned())
                 };
                 let persisted_reason = format!("upstream_{client_reason}");
-                if let Some(permit) = response_permit {
+                if let Some(permit) = capture_guard.take_permit() {
                     let (response_marker, response_attempt_id) = capture_guard.disarm();
                     let capture_session = Arc::clone(&session);
                     let mut job =

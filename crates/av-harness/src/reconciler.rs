@@ -605,6 +605,16 @@ struct LifecycleOutbox {
     key: String,
     value: serde_json::Value,
     ack: Option<av_bridge::PublishAck>,
+    /// Per-incarnation scope (`Session::session_scope`) recorded at
+    /// emit time. `key` (the partition key) carries the instance_uid,
+    /// which is RUNNING-INSTANCE scoped: the same agent instance
+    /// recycling a session id reuses it, so an acked leftover outbox
+    /// from incarnation 1 would dedup — and silently swallow —
+    /// incarnation 2's authoritative lifecycle event. `None` on
+    /// legacy records (written before this field existed): treated as
+    /// same-incarnation to avoid false invalidation across upgrades.
+    #[serde(default)]
+    session_scope: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -3232,15 +3242,33 @@ impl Finalizer {
                 let Some(key) = name.strip_suffix(crate::spool::TOOL_INTENT_SUFFIX) else {
                     continue;
                 };
-                let intent_bytes = match std::fs::read(&path) {
-                    Ok(bytes) => bytes,
-                    // Concurrent removal or a torn intent already
-                    // quarantined by the recovery scan: skip and
-                    // continue rather than aborting the cleanup pass
-                    // over unrelated files.
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(FinalizeError::atif_source(error)),
-                };
+                let intent_bytes =
+                    match av_core::fsutil::read_capped(&path, av_core::fsutil::MAX_CONTROL_BYTES) {
+                        Ok(bytes) => bytes,
+                        // Concurrent removal or a torn intent already
+                        // quarantined by the recovery scan: skip and
+                        // continue rather than aborting the cleanup pass
+                        // over unrelated files.
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        // Oversize or non-regular file (`read_capped`, same
+                        // bound as the recovery scan): a real MAC-sealed
+                        // intent is tiny, so this is a plant or corruption.
+                        // Skip it — an uncapped `std::fs::read` here let one
+                        // planted multi-GiB `.intent.json` stall or OOM
+                        // every close of every session.
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::InvalidData
+                                || error.kind() == std::io::ErrorKind::InvalidInput =>
+                        {
+                            tracing::warn!(
+                                file = %av_core::fsutil::basename(&path),
+                                %error,
+                                "skipping oversize or non-regular tool-intent file during close cleanup"
+                            );
+                            continue;
+                        }
+                        Err(error) => return Err(FinalizeError::atif_source(error)),
+                    };
                 let intent_session_id = crate::journal::open::<serde_json::Value>(
                     &control_key,
                     &format!("{}:{key}", crate::journal::TOOL_INTENT_DOMAIN),
@@ -3696,7 +3724,19 @@ impl Finalizer {
             // not close-complete — during a recycled-id window that
             // means the leftover survives GC until the fresh close
             // hits this branch.
-            if outbox.key != current_instance_uid {
+            //
+            // `instance_uid` alone cannot catch the SAME agent
+            // instance recycling a session id (same uid, new
+            // incarnation) — compare the per-incarnation
+            // `session_scope` too when the record carries one.
+            // Legacy records (`session_scope: None`) predate the
+            // field and are treated as same-incarnation.
+            let stale_incarnation = outbox.key != current_instance_uid
+                || outbox
+                    .session_scope
+                    .as_ref()
+                    .is_some_and(|scope| scope != &session.session_scope);
+            if stale_incarnation {
                 remove_outbox(&path).await?;
                 // Fresh emit: fall through by returning to the outer
                 // async block via a boolean sentinel. Rust's `if let`
@@ -3750,6 +3790,7 @@ impl Finalizer {
                 key: current_instance_uid.clone(),
                 value: serde_json::to_value(event).map_err(FinalizeError::bridge_source)?,
                 ack: None,
+                session_scope: Some(session.session_scope.clone()),
             };
             persist_outbox(&path, &fresh, &self.journal_key).await?;
             session.advance_seq_past(event_seq);
@@ -4246,7 +4287,20 @@ fn archive_conflicting_atif(
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned)
             }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        // Primary missing: the happy path (nothing to archive), EXCEPT
+        // when a previous archive or quarantine crashed between moving
+        // the primary and moving its siblings. A stale `.atif-auth`
+        // (sealed over the OLD bytes) left at the primary name
+        // permanently fails `ensure_atif_provenance` for every finalize
+        // of the recycled id, and a stale digest-bound `.close-complete`
+        // / `.promote` marker misbinds against the NEW artifact —
+        // nothing else ever removes them (the provenance-quarantine
+        // sweep in `recover_atif_trajectories` documents exactly this
+        // hole). Archive the orphaned siblings before declaring the
+        // name free.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return archive_orphaned_atif_siblings(path, session_id);
+        }
         // Unreadable existing file: treat conservatively as evidence
         // from a prior incarnation and archive it.
         Err(_) => None,
@@ -4333,6 +4387,47 @@ fn archive_conflicting_atif(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+/// Crash-window repair for `archive_conflicting_atif`: the primary
+/// `.json` is gone but digest-bound siblings from the previous
+/// incarnation may remain at the primary name (archive/quarantine
+/// renames the primary first and can crash before the siblings move).
+/// Left in place they poison the recycled session id: a stale
+/// `.atif-auth` fails `ensure_atif_provenance` against the NEW bytes on
+/// every finalize, and stale `.close-complete` / `.promote` markers are
+/// digest-bound to bytes that no longer exist. Move them aside with the
+/// same extension discipline as the main archive path (extensions must
+/// stay outside the `.json` recovery scan and the `.promote` retry
+/// scan).
+fn archive_orphaned_atif_siblings(path: &std::path::Path, session_id: &str) -> std::io::Result<()> {
+    let mut moved: Vec<String> = Vec::new();
+    for (sibling, archived_ext) in [
+        (path.with_extension("atif-auth"), "orphaned-atif-auth"),
+        (path.with_extension("close-complete"), "orphaned-close-complete"),
+        (path.with_extension("promote"), "orphaned-promote"),
+    ] {
+        if !sibling.exists() {
+            continue;
+        }
+        // Unique per rescue so repeated crash loops never collide, and
+        // the resulting `extension()` (`orphaned-*`) matches no scan.
+        let archived = path.with_extension(format!("{archived_ext}-{}", av_core::new_event_uid()));
+        match std::fs::rename(&sibling, &archived) {
+            Ok(()) => moved.push(av_core::fsutil::basename(&sibling).to_owned()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if !moved.is_empty() {
+        tracing::warn!(
+            session = %session_id,
+            orphans = ?moved,
+            "archived orphaned ATIF siblings left by a crashed archive/quarantine; \
+             the recycled session id can now seal fresh provenance",
+        );
+    }
+    Ok(())
 }
 
 /// Receipt paths are keyed by `sha256(session_id)`, and `get_or_open`
@@ -5288,6 +5383,7 @@ mod tests {
             kind: crate::journal::RECEIPT_OUTBOX_KIND.to_owned(),
             topic: av_events::EventClass::Receipt.topic().to_owned(),
             key: session.identity.instance_uid.clone(),
+            session_scope: Some(session.session_scope.clone()),
             value,
             ack: Some(av_bridge::PublishAck {
                 topic: av_events::EventClass::Receipt.topic().to_owned(),
@@ -5899,6 +5995,74 @@ mod tests {
         assert_eq!(preserved, 1, "corrupt bytes must be archived, not destroyed");
     }
 
+    /// Crash window inside `archive_conflicting_atif` /
+    /// the provenance-quarantine sweep: the primary `.json` moved but the
+    /// process died before its digest-bound siblings did. On the next
+    /// close of the recycled id the primary name is free, but a stale
+    /// `.atif-auth` (sealed over the OLD bytes) would fail
+    /// `ensure_atif_provenance` for every finalize of the NEW artifact —
+    /// and nothing else ever removes it. The missing-primary branch must
+    /// archive the orphans instead of declaring the name clean.
+    #[test]
+    fn archive_conflicting_atif_rescues_orphaned_siblings_of_a_missing_primary() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("abc123.json");
+        let sidecar = path.with_extension("atif-auth");
+        let close_marker = path.with_extension("close-complete");
+        let promote_marker = path.with_extension("promote");
+        std::fs::write(&sidecar, b"sealed-old").unwrap();
+        std::fs::write(&close_marker, b"sealed-close").unwrap();
+        std::fs::write(&promote_marker, b"sealed-promote").unwrap();
+        // Primary missing + orphaned siblings: all three move aside.
+        archive_conflicting_atif(&path, Some("traj-2"), "s").unwrap();
+        assert!(
+            !sidecar.exists(),
+            "orphaned sidecar must be archived so the recycled id can seal fresh provenance"
+        );
+        assert!(
+            !close_marker.exists(),
+            "orphaned close-complete marker must be archived"
+        );
+        assert!(
+            !promote_marker.exists(),
+            "orphaned promotion marker must be archived"
+        );
+        let names: Vec<String> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+            .collect();
+        for marker in [
+            "orphaned-atif-auth",
+            "orphaned-close-complete",
+            "orphaned-promote",
+        ] {
+            assert_eq!(
+                names.iter().filter(|n| n.contains(marker)).count(),
+                1,
+                "expected exactly one archived {marker} orphan, got {names:?}"
+            );
+        }
+        for name in &names {
+            let extension = std::path::Path::new(name)
+                .extension()
+                .and_then(std::ffi::OsStr::to_str);
+            assert_ne!(
+                extension,
+                Some("json"),
+                "orphan archive re-enters the recovery scan: {name}"
+            );
+            assert_ne!(
+                extension,
+                Some("promote"),
+                "orphan archive re-enters the promote scan: {name}"
+            );
+        }
+        // Bare missing primary with no siblings stays a no-op.
+        let clean = directory.path().join("def456.json");
+        archive_conflicting_atif(&clean, Some("traj-1"), "s").unwrap();
+    }
+
     /// An acked RECEIPT outbox is the dedup
     /// anchor for promotion retries — `emit_bridge_event` re-reads it to
     /// reuse the already-published event's uid. The acked-outbox GC used to
@@ -5918,6 +6082,7 @@ mod tests {
             kind: crate::journal::RECEIPT_OUTBOX_KIND.to_owned(),
             topic: topic.to_owned(),
             key: "instance-1".to_owned(),
+            session_scope: None,
             value: serde_json::json!({
                 "metadata": { "sequence": 0, "uid": av_core::new_event_uid() },
                 "topic": topic,
@@ -6003,6 +6168,7 @@ mod tests {
             kind: crate::journal::RECEIPT_OUTBOX_KIND.to_owned(),
             topic: topic.to_owned(),
             key: "instance-old".to_owned(),
+            session_scope: None,
             value: serde_json::json!({
                 "metadata": { "sequence": 0, "uid": av_core::new_event_uid() },
                 "topic": topic,
@@ -6075,6 +6241,106 @@ mod tests {
             "persisted outbox key must reflect the fresh incarnation's instance_uid; \
              stale key would let the next tick's `remove_acked_lifecycle_outboxes` see \
              it as a valid ack and never re-publish"
+        );
+    }
+
+    /// Same-instance recycled id: `outbox.key` (instance_uid) is
+    /// running-INSTANCE scoped, so when the SAME agent instance
+    /// recycles a session id, the stale acked outbox passes the key
+    /// check and (pre-fix) `ack.is_some()` silently swallowed the new
+    /// incarnation's lifecycle event. The per-incarnation
+    /// `session_scope` recorded in the outbox must catch this: stale
+    /// scope → remove + fresh emit + publish.
+    #[tokio::test]
+    async fn same_instance_recycled_session_id_re_emits_lifecycle_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let concrete_bus = Arc::new(FailFirstReceiptBus {
+            fail: std::sync::atomic::AtomicBool::new(false),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+        });
+        let bus_probe = Arc::clone(&concrete_bus);
+        let bus: Arc<dyn EventBus> = concrete_bus;
+        let finalizer = Finalizer::with_bridge(
+            Arc::new(Ed25519Signer::from_seed(&[7; 32])),
+            directory.path().to_path_buf(),
+            Arc::new(Registry::new()),
+            bus,
+        );
+        let session_id = "same-instance-recycled";
+        let identity = AgentIdentity {
+            version: "1".to_owned(),
+            charter: "test".into(),
+            instance_uid: "instance-stable".to_owned(),
+            ttl_remaining_s: Some(600),
+        };
+        let topic = av_events::EventClass::Receipt.topic();
+        // Incarnation 1's acked outbox: same session id, SAME
+        // instance_uid, but a session_scope no live session has.
+        let stale = LifecycleOutbox {
+            schema_version: LIFECYCLE_OUTBOX_SCHEMA_V1,
+            session_id: session_id.to_owned(),
+            kind: crate::journal::RECEIPT_OUTBOX_KIND.to_owned(),
+            topic: topic.to_owned(),
+            key: "instance-stable".to_owned(),
+            session_scope: Some(format!("{session_id}#previous-incarnation")),
+            value: serde_json::json!({
+                "metadata": { "sequence": 0, "uid": av_core::new_event_uid() },
+                "topic": topic,
+            }),
+            ack: Some(av_bridge::PublishAck {
+                topic: topic.to_owned(),
+                partition: 0,
+                offset: 1,
+            }),
+        };
+        let outbox_path = finalizer.lifecycle_outbox_path(session_id, crate::journal::RECEIPT_OUTBOX_KIND);
+        std::fs::create_dir_all(outbox_path.parent().unwrap()).unwrap();
+        let sealed = crate::journal::seal(
+            &finalizer.journal_key,
+            crate::journal::LIFECYCLE_OUTBOX_DOMAIN,
+            0,
+            &stale,
+        )
+        .unwrap();
+        std::fs::write(&outbox_path, sealed).unwrap();
+
+        // Incarnation 2: same id, same instance_uid, fresh session_scope.
+        let session = Arc::new(Session::new(
+            session_id.to_owned(),
+            Workflow::Signed,
+            identity,
+            Default::default(),
+        ));
+        finalizer
+            .emit_bridge_event(
+                &session,
+                av_events::EventClass::Receipt,
+                serde_json::json!({
+                    "receipt_id": "01936000-0000-7000-8000-000000000002",
+                    "chain_head": "0000",
+                }),
+                crate::journal::RECEIPT_OUTBOX_KIND,
+            )
+            .await
+            .expect("same-instance recycled emit succeeds");
+        let attempts = bus_probe.attempts.lock();
+        assert!(
+            attempts.iter().any(|(t, _)| t == topic),
+            "a stale acked outbox from the SAME instance_uid must not swallow the new \
+             incarnation's lifecycle event; got attempts: {attempts:?}"
+        );
+        let bytes = std::fs::read(&outbox_path).unwrap();
+        let outbox: LifecycleOutbox = crate::journal::open(
+            &finalizer.journal_key,
+            crate::journal::LIFECYCLE_OUTBOX_DOMAIN,
+            0,
+            &bytes,
+        )
+        .unwrap();
+        assert_eq!(
+            outbox.session_scope.as_deref(),
+            Some(session.session_scope.as_str()),
+            "persisted outbox must carry the fresh incarnation's session_scope"
         );
     }
 
@@ -8434,6 +8700,7 @@ mod tests {
                 kind: crate::journal::RECEIPT_OUTBOX_KIND.to_owned(),
                 topic: topic.to_owned(),
                 key: format!("instance-{i}"),
+                session_scope: None,
                 value: serde_json::json!({
                     "metadata": { "sequence": 0, "uid": av_core::new_event_uid() },
                     "topic": topic,
