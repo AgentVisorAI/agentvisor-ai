@@ -41,7 +41,7 @@
  *   webhook.created, webhook.updated, webhook.deleted, webhook.test_fired,
  *     webhook.secret_rotated, webhook.delivery_redelivered
  *   org.created, org.exported, org.delete.initiated, org.delete.committed,
- *     org.ip_allowlist_updated, org.retention_updated, org.retention_swept
+ *     org.ip_allowlist_updated, org.renamed, org.retention_updated, org.retention_swept
  *   audit.viewed, audit.exported_csv
  *
  * Note: `policy.block` is NOT an audit slug — it's a webhook

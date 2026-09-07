@@ -200,6 +200,20 @@ try {
   const reLogin = await ds.login({ email, password: "rotated-e2e-pw-2026" });
   check("new password logs in", reLogin && reLogin.user && reLogin.user.email === email);
 
+  // Org rename + profile edits
+  const renamed = await ds.renameOrg("E2E Renamed Co");
+  check("org rename", renamed && renamed.name === "E2E Renamed Co");
+  const meRenamed = await ds.getSession();
+  check("rename reflected on /me", meRenamed.org.name === "E2E Renamed Co", meRenamed.org.name);
+  check("slug stable across rename", meRenamed.org.slug && /e2e-co/.test(meRenamed.org.slug), meRenamed.org.slug);
+  let badName = "";
+  try { await ds.renameOrg("x".repeat(81)); } catch (e) { badName = e.errorCode || e.message; }
+  check("rename 81 chars rejected", badName === "invalid_name", badName);
+  const prof = await ds.updateProfile({ displayName: "E2E Tester" });
+  check("displayName set", prof && prof.displayName === "E2E Tester");
+  const profClear = await ds.updateProfile({ displayName: "" });
+  check("displayName cleared", profClear && profClear.displayName === null, String(profClear && profClear.displayName));
+
   // Email change guards (full round-trip needs a mailbox — covered by
   // browser/curl drills; here we pin the API contract).
   let ceWrong = "";

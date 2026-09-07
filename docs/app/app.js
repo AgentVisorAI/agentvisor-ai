@@ -3782,9 +3782,11 @@
 
   async function renderSettingsGeneral(root) {
     root.innerHTML =
-      '<div class="card"><h2>Organization</h2>' +
+      '<div class="card"><h2 style="display:flex;align-items:baseline;gap:8px">Organization' +
+        (state.session.org.role === "owner" && state.ds.renameOrg ? '<button class="btn" id="renameOrgBtn" style="margin-left:auto;padding:2px 10px;font-size:12px" title="Rename the workspace. The org ID and everything issued under it stay valid">Rename…</button>' : '') +
+      '</h2>' +
         '<dl class="kv" style="display:grid;grid-template-columns:140px 1fr;gap:5px 12px;font-size:13px">' +
-          "<dt style=\"color:var(--fg-3)\">Name</dt><dd>" + esc(state.session.org.name) + "</dd>" +
+          "<dt style=\"color:var(--fg-3)\">Name</dt><dd id=\"orgNameVal\">" + esc(state.session.org.name) + "</dd>" +
           "<dt style=\"color:var(--fg-3)\">Org ID</dt><dd class=\"mono\">" + esc(state.session.org.id) + "</dd>" +
           "<dt style=\"color:var(--fg-3)\">Created</dt><dd>" + esc(state.session.org.createdAt ? new Date(state.session.org.createdAt).toLocaleDateString() : "—") + "</dd>" +
         "</dl>" +
@@ -3799,6 +3801,8 @@
           "<dt style=\"color:var(--fg-3)\">Email</dt><dd>" + esc(state.session.user.email) +
             (state.session.user.pendingEmail ? ' <span class="pill neutral" id="pendingEmailPill" title="Waiting for the confirmation link sent to the new address">change pending: ' + esc(state.session.user.pendingEmail) + '</span> <button class="btn" id="cancelEmailChange" style="padding:1px 8px;font-size:12px">Cancel</button>' : '') +
           "</dd>" +
+          "<dt style=\"color:var(--fg-3)\">Name</dt><dd>" + esc(state.session.user.displayName || "—") +
+            ' <button class="btn" id="editNameBtn" style="padding:1px 8px;font-size:12px" title="Shown to teammates instead of your email">Edit</button></dd>' +
           "<dt style=\"color:var(--fg-3)\">User ID</dt><dd class=\"mono\">" + esc(state.session.user.id) + "</dd>" +
         "</dl>" +
         '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">' +
@@ -3927,6 +3931,70 @@
         ipCard.innerHTML = '<h2>Network access</h2><p style="color:var(--fg-2);font-size:var(--t-sec)">Could not load (' + esc(e.message || "network") + ').</p>';
       }
     }
+
+    // Rename workspace (owner-only). Updates the chrome (org chip /
+    // switcher) in place — the slug and org id are stable by design.
+    var roBtn = $("#renameOrgBtn", root);
+    if (roBtn) roBtn.addEventListener("click", function () {
+      openInputModal({
+        title: "Rename workspace",
+        sub: "The new name shows up in the console, invite emails, and exports. The org ID and everything already issued stay valid.",
+        label: "Workspace name",
+        placeholder: state.session.org.name,
+        confirmLabel: "Rename",
+        onConfirm: function (name) {
+          var nm = (name || "").trim();
+          if (!nm) { toast("Name can't be empty", true); return; }
+          if (nm.length > 80) { toast("Keep it under 80 characters", true); return; }
+          state.ds.renameOrg(nm).then(function (org) {
+            state.session.org.name = (org && org.name) || nm;
+            // The switcher menu lists memberships by name — patch the
+            // active org's entry so the menu doesn't show the old name
+            // until the next /me hydration.
+            (state.session.memberships || []).forEach(function (m) {
+              if (m.orgId === state.session.org.id || (m.org && m.org.id === state.session.org.id)) {
+                if (m.org) m.org.name = state.session.org.name;
+                if (m.orgName) m.orgName = state.session.org.name;
+                if (m.name) m.name = state.session.org.name;
+              }
+            });
+            toast('Workspace renamed to "' + state.session.org.name + '"');
+            render();
+          }).catch(function (err) {
+            var msg = err.message || "Rename failed";
+            if (err.errorCode === "invalid_name" || msg === "invalid_name") msg = "That name won't work — 1-80 characters, no control characters.";
+            else if (err.status === 403) msg = "Only an owner can rename the workspace.";
+            toast(msg, true);
+          });
+        },
+      });
+    });
+
+    // Display name (any role — it's the caller's own profile).
+    var enBtn = $("#editNameBtn", root);
+    if (enBtn) enBtn.addEventListener("click", function () {
+      openInputModal({
+        title: "Your name",
+        sub: "Shown to teammates in the members list and audit trail instead of your email. Leave empty to clear it.",
+        label: "Display name",
+        placeholder: state.session.user.displayName || "First Last",
+        confirmLabel: "Save",
+        allowEmpty: true,
+        onConfirm: function (name) {
+          var nm = (name || "").trim();
+          if (nm.length > 80) { toast("Keep it under 80 characters", true); return; }
+          state.ds.updateProfile({ displayName: nm }).then(function (user) {
+            state.session.user.displayName = (user && user.displayName) || null;
+            toast(nm ? 'Saved — you\'ll appear as "' + nm + '"' : "Display name cleared");
+            render();
+          }).catch(function (err) {
+            var msg = err.message || "Save failed";
+            if (err.errorCode === "invalid_name" || msg === "invalid_name") msg = "That name won't work — up to 80 characters, no control characters.";
+            toast(msg, true);
+          });
+        },
+      });
+    });
 
     // Change email — two-phase: password step-up here, then a confirm
     // link lands in the NEW mailbox. Nothing changes until it's clicked.
@@ -4283,7 +4351,7 @@
         (opts.sub ? '<p class="sub">' + esc(opts.sub) + "</p>" : "") +
         '<form id="inpForm">' +
           '<div class="field"><label for="inpVal">' + esc(opts.label || "Value") + "</label>" +
-          '<input id="inpVal" type="' + esc(inputType) + '" required placeholder="' + esc(opts.placeholder || "") + '" autocomplete="' + esc(autoComplete) + '" /></div>' +
+          '<input id="inpVal" type="' + esc(inputType) + '"' + (opts.allowEmpty ? "" : " required") + ' placeholder="' + esc(opts.placeholder || "") + '" autocomplete="' + esc(autoComplete) + '" /></div>' +
           '<div class="actions">' +
             '<button type="button" class="btn" data-close>Cancel</button>' +
             '<button class="btn accent" type="submit">' + esc(opts.confirmLabel || "Save") + "</button>" +
@@ -4323,7 +4391,9 @@
       // trim.
       var raw = backdrop.querySelector("#inpVal").value;
       var v = inputType === "password" ? raw : raw.trim();
-      if (!v) return;
+      // allowEmpty callers (display-name clear) accept "" as a
+      // deliberate value; everyone else keeps the silent-noop guard.
+      if (!v && !opts.allowEmpty) return;
       var cb = opts.onConfirm;
       close();
       if (cb) cb(v);

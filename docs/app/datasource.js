@@ -2036,6 +2036,21 @@
       mockState.pendingEmail = null;
       return { ok: true };
     },
+    async updateProfile(input) {
+      await delay(150);
+      var dn = (input && input.displayName || "").trim();
+      if (dn.length > 80) { var epn = new Error("invalid_name"); epn.status = 400; epn.errorCode = "invalid_name"; throw epn; }
+      if (mockState.session) mockState.session.user.displayName = dn || null;
+      return { id: (mockState.session && mockState.session.user.id) || "usr_you", email: (mockState.session && mockState.session.user.email) || "demo@northwind.com", displayName: dn || null };
+    },
+    async renameOrg(name) {
+      await delay(150);
+      var nm = (name || "").trim();
+      if (!nm || nm.length > 80) { var eon = new Error("invalid_name"); eon.status = 400; eon.errorCode = "invalid_name"; throw eon; }
+      if (mockState.session) mockState.session.org.name = nm;
+      recordAudit("org.renamed", "", nm);
+      return { id: (mockState.session && mockState.session.org.id) || "org_demo", slug: "northwind", name: nm };
+    },
     async exportMyData(password) {
       await delay(200);
       if (!password) { var e1 = new Error("password_required"); e1.status = 400; throw e1; }
@@ -2250,6 +2265,14 @@
     },
     async cancelEmailChange() {
       return apiFetch("/api/v1/auth/change-email/cancel", { method: "POST", body: {} });
+    },
+    async updateProfile(input) {
+      var r = await apiFetch("/api/v1/auth/me/profile", { method: "PATCH", body: { displayName: input.displayName } });
+      return r.user;
+    },
+    async renameOrg(name) {
+      var r = await apiFetch("/api/v1/org", { method: "PATCH", body: { name: name } });
+      return r.org;
     },
     async signup(input) {
       var r = await apiFetch("/api/v1/auth/signup", { method: "POST", body: { email: input.email, password: input.password, orgName: input.orgName || (input.email.split("@")[0] + "'s org") } });
