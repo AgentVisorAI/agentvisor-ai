@@ -52,6 +52,13 @@ if [ "${AV_INSTALL_SOURCE:-}" != "1" ]; then
 fi
 
 install_prebuilt() {
+  # tar is the one tool we can't inline (AL2023/openSUSE minimal
+  # containers ship without it). Say so precisely instead of letting
+  # the fallback imply a Rust toolchain is the fix.
+  if ! command -v tar >/dev/null 2>&1; then
+    note "'tar' is missing — install it (e.g. dnf/zypper/apt install tar) and re-run."
+    return 1
+  fi
   stage="agentvisor-ai-${AV_VERSION}-${target}"
   url="${RELEASE_REPO}/releases/download/v${AV_VERSION}/${stage}.tar.gz"
   tmp="$(mktemp -d)"
