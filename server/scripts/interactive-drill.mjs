@@ -1285,7 +1285,7 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await page.goto(SITE + "#/settings/audit", { waitUntil: "domcontentloaded" });
   await page.waitForSelector("#auditBody tr", { timeout: 15000 });
   const a = await page.evaluate(async () => {
-    const gt = await window.dataSource.listAudit();
+    const gt = (await window.dataSource.listAudit()).entries;
     const problems = [];
     if (document.querySelectorAll("#auditBody tr").length !== gt.length) problems.push("row count wrong");
     const cc = {}; gt.forEach((x) => { const c = x.event.split(".")[0]; cc[c] = (cc[c] || 0) + 1; });
@@ -1721,9 +1721,9 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await page.goto(SITE + "#/settings/webhooks", { waitUntil: "domcontentloaded" });
   await page.waitForSelector("#whAdd", { timeout: 15000 });
   const at = await page.evaluate(async () => {
-    const before = (await window.dataSource.listAudit()).length;
+    const before = (await window.dataSource.listAudit()).entries.length;
     await window.dataSource.testWebhook((await window.dataSource.listWebhooks())[0].id);
-    const after = await window.dataSource.listAudit();
+    const after = (await window.dataSource.listAudit()).entries;
     return { d: after.length - before, ev: after[0].event, actor: after[0].actor };
   });
   if (at.d !== 1 || at.ev !== "webhook.test_fired" || !at.actor.includes("@")) fail("mutation did not land in the audit trail: " + JSON.stringify(at));
@@ -1733,9 +1733,9 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   // console branch was dead code against the old always-succeed mock).
   const tf = await page.evaluate(async () => {
     const id = (await window.dataSource.listWebhooks())[0].id;
-    const before = (await window.dataSource.listWebhookDeliveries(id)).length;
+    const before = (await window.dataSource.listWebhookDeliveries(id)).deliveries.length;
     await window.dataSource.testWebhook(id);
-    const list = await window.dataSource.listWebhookDeliveries(id);
+    const list = (await window.dataSource.listWebhookDeliveries(id)).deliveries;
     let pausedErr = "";
     await window.dataSource.updateWebhook(id, { isActive: false });
     try { await window.dataSource.testWebhook(id); } catch (e) { pausedErr = e.message; }
@@ -1749,7 +1749,7 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   const ssoAudit = await page.evaluate(async () => {
     const cfg = (await window.dataSource.listSamlConfigs()).configs[0];
     await window.dataSource.updateSamlConfig(cfg.id, { displayName: cfg.displayName + " (drill)" });
-    const ev = (await window.dataSource.listAudit())[0]?.event;
+    const ev = (await window.dataSource.listAudit()).entries[0]?.event;
     await window.dataSource.updateSamlConfig(cfg.id, { displayName: cfg.displayName }); // restore
     return ev;
   });
@@ -1816,7 +1816,7 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
   await page.click("tbody tr[data-id] td:nth-child(2)");
   await page.waitForSelector("#whdBody table", { timeout: 8000 });
   const del = await page.evaluate(async () => {
-    const gt = await window.dataSource.listWebhookDeliveries(document.querySelector("tbody tr[data-id]").getAttribute("data-id"));
+    const gt = (await window.dataSource.listWebhookDeliveries(document.querySelector("tbody tr[data-id]").getAttribute("data-id"))).deliveries;
     const rows = [...document.querySelectorAll("#whdBody tbody tr")];
     return {
       ok: rows.length === gt.length &&
@@ -2423,18 +2423,18 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
     await ds.updateSamlConfig(created.config.id, { displayName: "Acme Okta v2" });
     t("saml update", (await ds.listSamlConfigs()).configs[0].displayName === "Acme Okta v2");
     t("saml regen cert", !!(await ds.regenerateSamlSpKeypair(created.config.id)).spCertPem);
-    let aud = await ds.listAudit();
+    let aud = (await ds.listAudit()).entries;
     t("saml slugs", ["saml.config_created", "saml.config_updated", "saml.keypair_rotated"].every((s) => aud.some((a) => a.event === s)));
     await ds.deleteSamlConfig(created.config.id);
     t("saml delete", (await ds.listSamlConfigs()).configs.length === 0);
     const wh = await ds.createWebhook({ name: "acme-hook", url: "https://h.acme.dev", events: ["policy.block"] });
     await ds.testWebhook(wh.endpoint.id);
-    const dels = await ds.listWebhookDeliveries(wh.endpoint.id);
+    const dels = (await ds.listWebhookDeliveries(wh.endpoint.id)).deliveries;
     t("webhook test-fire delivery (runtime only)", dels.length === 1 && dels[0].event === "webhook.test_fired");
     await ds.updateWebhook(wh.endpoint.id, { isActive: false });
     let pausedErr = ""; try { await ds.testWebhook(wh.endpoint.id); } catch (e) { pausedErr = e.message; }
     t("paused refuses test", pausedErr === "webhook_paused");
-    aud = await ds.listAudit();
+    aud = (await ds.listAudit()).entries;
     t("pause audited as webhook.updated+note", aud.some((a) => a.event === "webhook.updated" && a.note === "paused"));
     await ds.deleteWebhook(wh.endpoint.id);
     t("webhook delete", (await ds.listWebhooks()).length === 0);
@@ -2445,14 +2445,14 @@ await page.waitForSelector(".av-tour-card", { timeout: 15000 });
     const inv = await ds.inviteMember({ email: "cto@acme.dev", role: "admin" });
     t("invite create", (await ds.listInvites()).invites.length === 1);
     await ds.revokeInvite(inv.invite.id);
-    t("invite revoke", (await ds.listInvites()).invites.length === 0 && (await ds.listAudit()).some((a) => a.event === "member.invite_revoked"));
+    t("invite revoke", (await ds.listInvites()).invites.length === 0 && (await ds.listAudit()).entries.some((a) => a.event === "member.invite_revoked"));
     const deps = await ds.listDeployments();
     const simId = deps[0].id;
     const rot = await ds.rotateDeploymentToken(simId);
     t("sim rotate sticks", (await ds.listDeployments())[0].ingestTokenHint.includes(rot.ingestToken.slice(8, 12)));
     await ds.deleteDeployment(simId);
     const remaining = await ds.listDeployments();
-    t("sim delete cascades", remaining.every((d) => d.id !== simId) && (await ds.listSessions()).sessions.length === 0 && (await ds.listAudit()).some((a) => a.event === "deployment.delete"));
+    t("sim delete cascades", remaining.every((d) => d.id !== simId) && (await ds.listSessions()).sessions.length === 0 && (await ds.listAudit()).entries.some((a) => a.event === "deployment.delete"));
     return bad;
   });
   if (pools.length) fail("fresh pool round-trips failed: " + pools.join(", "));
