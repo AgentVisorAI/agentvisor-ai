@@ -161,7 +161,8 @@ const shutdown = (code) => {
     say(`${c.d}  daemon   http://127.0.0.1:${DAEMON_PORT}`);
     say(`  config   ${configPath}`);
     say(`  spool    ${workDir}/spool/atif`);
-    say(`  next     avctl console-sync --spool-dir ${workDir}/spool/atif --console-url https://api.agentvisorai.me --deployment <id> --token-file <f>${c.x}`);
+    say(`  next     avctl console-sync --spool-dir ${workDir}/spool/atif --bridge-dir ${workDir}/data/bridge --console-url https://api.agentvisorai.me --deployment <id> --token-file <f>`);
+    say(`${c.d}  (keep --bridge-dir: a receipt-only sync seals the session on the console FIRST, and sealed sessions refuse events forever)${c.x}`);
     process.exit(code);
   }
 };
