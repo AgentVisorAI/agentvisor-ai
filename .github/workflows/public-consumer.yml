@@ -68,6 +68,22 @@ jobs:
           /opt/av/agentvisord --version
           /opt/av/avctl --version
 
+  # Round 95: the cargo fallback is the path every platform WITHOUT a
+  # prebuilt target hits (riscv64/ppc64le/s390x/armv7/386 …). It builds
+  # from the PUBLIC export, which can rot independently of this repo.
+  installer-source-fallback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - name: AV_INSTALL_SOURCE=1 curl | sh, then smoke
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://agentvisorai.me/install.sh?cb=$RANDOM" -o /tmp/install.sh
+          AV_INSTALL_SOURCE=1 sh /tmp/install.sh
+          "$HOME/.cargo/bin/agentvisord" --version
+          "$HOME/.cargo/bin/avctl" --version
+
   outsider-chain:
     runs-on: ubuntu-latest
     timeout-minutes: 45
