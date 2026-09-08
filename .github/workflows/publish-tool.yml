@@ -37,6 +37,7 @@ on:
       - "BENCHMARKS.md"
       - "ARCHITECTURE.md"
       - "CONFORMANCE-STATUS.md"
+      - "EVOLUTION.md"
       - "LICENSE"
       - "assets/**"
       - "scripts/**"

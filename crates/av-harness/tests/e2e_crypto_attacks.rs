@@ -128,7 +128,7 @@ fn signature_field_rejects_url_safe_base64_and_embedded_whitespace() {
     let ring = ring(&s);
     let receipt = Receipt::issue(body("sess-b64"), &s).unwrap();
     // Replace any '+' with '-' and '/' with '_' — URL-safe alphabet.
-    let urlsafe: String = receipt
+    let mut urlsafe: String = receipt
         .signature_b64
         .chars()
         .map(|c| match c {
@@ -137,14 +137,21 @@ fn signature_field_rejects_url_safe_base64_and_embedded_whitespace() {
             other => other,
         })
         .collect();
-    if urlsafe != receipt.signature_b64 {
-        let mut mutated = receipt.clone();
-        mutated.signature_b64 = urlsafe;
-        assert!(
-            mutated.verify(&ring).is_err(),
-            "URL-safe base64 in signature_b64 was accepted"
-        );
+    if urlsafe == receipt.signature_b64 {
+        // Ed25519 is deterministic per (seed, body): if THIS signature
+        // happens to contain no '+' or '/', the mutation above is a
+        // no-op and the alphabet check would silently skip on every
+        // run (seed-dependent vacuity). Force one URL-safe-only char —
+        // '-' is outside the STANDARD alphabet, so strict decode must
+        // refuse it regardless of the original bytes.
+        urlsafe.replace_range(0..1, "-");
     }
+    let mut mutated = receipt.clone();
+    mutated.signature_b64 = urlsafe;
+    assert!(
+        mutated.verify(&ring).is_err(),
+        "URL-safe base64 in signature_b64 was accepted"
+    );
     // Whitespace injection anywhere in the payload must fail STANDARD decode.
     let mut wsp = receipt.clone();
     let mid = wsp.signature_b64.len() / 2;

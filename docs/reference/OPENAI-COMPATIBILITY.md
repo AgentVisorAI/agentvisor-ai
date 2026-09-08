@@ -75,7 +75,8 @@ which does not change with the upstream dialect.
 | --- | --- | --- |
 | `POST` | `/v1/chat/completions` | Full request/response, streaming SSE and non-streaming JSON. |
 
-Every other route on the harness (`/promote`, `/close`, `/health`,
+Every other route on the harness (`/v1/sessions/{id}/promote`,
+`/v1/sessions/{id}/close`, `/health`,
 `/livez`, `/readyz`, `/metrics`, `/dashboard/*`) is AgentVisor AI
 territory and is documented separately. Only the chat route is
 "OpenAI-compatible" in the strict sense.
@@ -241,7 +242,7 @@ one audit event.
 
 For long-lived multi-turn agent conversations, set the same
 `X-AV-Session` on every request and either explicitly
-`POST /close` when done or rely on the idle-close sweeper
+`POST /v1/sessions/{id}/close` when done or rely on the idle-close sweeper
 (`session_idle_close_s`).
 
 ## Unsupported OpenAI features
