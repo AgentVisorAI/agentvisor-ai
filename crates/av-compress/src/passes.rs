@@ -1356,3 +1356,74 @@ mod ratio_tests {
         assert_eq!(zero.pruning_ratio_millis(), 0, "0/0 guard");
     }
 }
+
+#[cfg(test)]
+mod engage_threshold_tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+
+    use super::*;
+    use serde_json::json;
+
+    /// Round-19 mutation finding: the engage gate's `<` at compress()'s
+    /// entry was unpinned — `tokens_before < min_tokens_to_engage`
+    /// mutating to `<=` survived, i.e. nothing pinned WHERE the
+    /// threshold bites. The gate is a stability contract: payloads at
+    /// or above the threshold must engage the pass, smaller ones must
+    /// come back byte-identical (changed=false). Measure the payload's
+    /// own token count via a probe outcome, then pin both sides of the
+    /// exact boundary.
+    #[test]
+    fn engage_threshold_boundary_is_exact() {
+        let messages: Vec<_> = (0..40)
+            .map(|i| {
+                // Long identical bodies (i not interpolated) so
+                // collapse_duplicates has real work — the probe must
+                // CHANGE the payload for the boundary to be testable.
+                let _ = i;
+                let body = "repeat this exact filler sentence with enough length that duplicate collapsing meaningfully prunes tokens from the payload ".repeat(10);
+                json!({"role": "user", "content": body})
+            })
+            .collect();
+        let payload = json!({"model": "m", "messages": messages});
+        // Probe with an always-engaged config to learn tokens_before —
+        // and REQUIRE the pass to visibly change this payload, so
+        // "engaged" and "skipped" are distinguishable below.
+        let mut cfg = CompressionConfig {
+            min_tokens_to_engage: 0,
+            ..CompressionConfig::default()
+        };
+        let probe = compress(&payload, &cfg);
+        let measured = probe.tokens_before;
+        assert!(measured > 0, "probe payload must have measurable tokens");
+        assert!(
+            probe.changed,
+            "probe payload must be compressible or the boundary is untestable"
+        );
+
+        // At exactly the threshold: the `<` gate does NOT skip — the
+        // pass engages and (per the probe) changes the payload.
+        cfg.min_tokens_to_engage = measured;
+        let at = compress(&payload, &cfg);
+        assert_eq!(
+            at.tokens_before, measured,
+            "token measurement must be deterministic"
+        );
+        assert!(
+            at.changed,
+            "payload exactly at min_tokens_to_engage must engage the pass"
+        );
+
+        // One above the threshold: the gate MUST skip untouched.
+        cfg.min_tokens_to_engage = measured + 1;
+        let below = compress(&payload, &cfg);
+        assert!(!below.changed, "below-threshold payload must be untouched");
+        assert_eq!(
+            below.payload, payload,
+            "below-threshold payload must be byte-identical"
+        );
+        assert_eq!(
+            below.tokens_after, below.tokens_before,
+            "skip must report tokens_after == tokens_before"
+        );
+    }
+}

@@ -718,3 +718,48 @@ fn scope_covered_by(scope: &str, parent_scopes: &[String]) -> bool {
                 .is_some_and(|prefix| scope.starts_with(&format!("{prefix}:")))
     })
 }
+
+#[cfg(test)]
+mod key_material_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::KeyMaterial;
+
+    /// Round-19 mutation finding: the hand-written Debug impl exists
+    /// solely so key material can never leak into logs/error chains
+    /// ("never print secrets"), but nothing pinned it — replacing the
+    /// whole impl with a no-op survived the suite, and so would a
+    /// future `#[derive(Debug)]` refactor that prints the secret bytes
+    /// verbatim into any `{:?}` log site. Pin the redaction contract.
+    #[test]
+    fn debug_never_prints_key_material() {
+        const SECRET_PEM: &str = "-----BEGIN PUBLIC KEY-----abc123secretbytes";
+        const SECRET_HMAC: &[u8] = b"hmac-shared-secret-0123456789abcdef";
+        let cases = [
+            (
+                format!("{:?}", KeyMaterial::Ed25519Pem(SECRET_PEM.to_owned())),
+                "Ed25519Pem",
+            ),
+            (
+                format!("{:?}", KeyMaterial::Ed25519Jwk(SECRET_PEM.to_owned())),
+                "Ed25519Jwk",
+            ),
+            (
+                format!("{:?}", KeyMaterial::HmacSecret(SECRET_HMAC.to_vec())),
+                "HmacSecret",
+            ),
+        ];
+        for (rendered, variant) in cases {
+            assert!(
+                rendered.contains(variant),
+                "Debug must still name the variant for diagnosability: {rendered}"
+            );
+            assert!(
+                !rendered.contains("secret")
+                    && !rendered.contains("abc123")
+                    && !rendered.contains("0123456789"),
+                "Debug leaked key material: {rendered}"
+            );
+        }
+    }
+}
