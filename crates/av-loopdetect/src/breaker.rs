@@ -654,4 +654,73 @@ mod similarity_path_tests {
             );
         }
     }
+
+    /// Round-120 language parity: the anti-rambling breaker must work
+    /// for agents that don't speak English. The char-n-gram embedder is
+    /// whitespace-independent by design — paraphrased rambling in
+    /// Japanese (no word boundaries) and Arabic must build a streak and
+    /// trip exactly like English, and genuinely progressing CJK content
+    /// must NOT trip. Guards against a future "smarter" tokenizer
+    /// (e.g. split_whitespace) silently disabling the breaker for the
+    /// half of the world that doesn't delimit words with spaces.
+    #[test]
+    fn paraphrased_rambling_trips_language_independently() {
+        let e = crate::embed::HashEmbedder::default();
+        let mk = || {
+            SessionLoopState::new(BreakerConfig {
+                min_tokens: 1000,
+                ..BreakerConfig::default()
+            })
+        };
+        // Near-paraphrases: same core sentence, small tail variations —
+        // the realistic rambling shape (counters/qualifiers change,
+        // content doesn't).
+        let cases: [&[&str]; 3] = [
+            &[
+                "I should check the inventory database again for pending orders",
+                "I should check the inventory database again for the pending orders",
+                "I should check the inventory database once again for pending orders",
+                "I really should check the inventory database again for pending orders",
+            ],
+            &[
+                "在庫データベースをもう一度確認して保留中の注文を調べる必要があります",
+                "在庫データベースをもう一度確認して保留中の注文を調べる必要がありますね",
+                "在庫データベースを再度確認して保留中の注文を調べる必要があります",
+                "在庫データベースをもう一度確認して、保留中の注文を調べる必要があります",
+            ],
+            &[
+                "يجب أن أتحقق من قاعدة بيانات المخزون مرة أخرى بحثاً عن الطلبات المعلقة",
+                "يجب أن أتحقق من قاعدة بيانات المخزون مرة أخرى بحثا عن الطلبات المعلقة",
+                "يجب أن أتحقق من قاعدة بيانات المخزون مجدداً بحثاً عن الطلبات المعلقة",
+                "يجب أن أتحقق من قاعدة بيانات المخزون مرة أخرى عن الطلبات المعلقة",
+            ],
+        ];
+        for (i, steps) in cases.iter().enumerate() {
+            let s = mk();
+            let mut tripped = false;
+            for step in *steps {
+                if matches!(
+                    s.observe(&e, step, 400),
+                    BreakerVerdict::Tripped { .. }
+                ) {
+                    tripped = true;
+                    break;
+                }
+            }
+            assert!(tripped, "case {i}: paraphrased rambling must trip in every language");
+        }
+        // Control: genuinely progressing Japanese content must stay open.
+        let s = mk();
+        for step in [
+            "在庫データベースを確認しています",
+            "注文番号一二三四の在庫はゼロでした",
+            "コントソ社に八十四ドルの発注書を作成します",
+            "発注が完了しました。担当者に通知します",
+        ] {
+            assert!(
+                !matches!(s.observe(&e, step, 400), BreakerVerdict::Tripped { .. }),
+                "progressing Japanese content must not trip"
+            );
+        }
+    }
 }
