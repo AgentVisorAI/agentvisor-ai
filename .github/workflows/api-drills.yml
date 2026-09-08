@@ -41,6 +41,10 @@ jobs:
           POSTGRES_USER: av
           POSTGRES_PASSWORD: av
           POSTGRES_DB: avdb
+          # Round-114 TZ guard (drills half of #383): non-UTC database
+          # so naive-vs-timestamptz casts regress loudly in the battery.
+          TZ: America/New_York
+          PGTZ: America/New_York
         ports:
           - 5433:5432
     env:
@@ -48,6 +52,9 @@ jobs:
       PG_CONTAINER: av-pg-drills
       PG_USER: av
       PG_DB: avdb
+      # Round-114: drills run in a fractional-offset zone (+12:45) so
+      # daemon/CLI clock handling is exercised off-UTC nightly too.
+      TZ: Pacific/Chatham
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

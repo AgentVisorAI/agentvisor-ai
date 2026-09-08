@@ -1572,11 +1572,47 @@ pub async fn doctor(offline: bool) -> Result<()> {
                 .build()
                 .context("build probe client")?;
             match client.get(&url).send().await {
-                Ok(response) => checks.push(Check::Pass(format!(
-                    "upstream: {} reachable (HTTP {})",
-                    redact_userinfo(&url),
-                    response.status().as_u16()
-                ))),
+                Ok(response) => {
+                    checks.push(Check::Pass(format!(
+                        "upstream: {} reachable (HTTP {})",
+                        redact_userinfo(&url),
+                        response.status().as_u16()
+                    )));
+                    // Round-114: the response's Date header is a free
+                    // clock-skew oracle. A host clock off by more than
+                    // ~15min silently breaks NHI identity tokens
+                    // (TTL ≤900s → every honest client rejected) and
+                    // freezes console-sync bridge records behind the
+                    // future-skew window; both were only diagnosable
+                    // AFTER failures (rounds 106-107). Warn up front.
+                    if let Some(date) = response
+                        .headers()
+                        .get(reqwest::header::DATE)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| httpdate::parse_http_date(s).ok())
+                    {
+                        let now = std::time::SystemTime::now();
+                        let (skew, direction) = match now.duration_since(date) {
+                            Ok(d) => (d, "ahead of"),
+                            Err(e) => (e.duration(), "behind"),
+                        };
+                        // 120s tolerance: HTTP Date has 1s resolution,
+                        // plus network latency and upstream clock error.
+                        if skew > Duration::from_secs(120) {
+                            checks.push(Check::Warn(format!(
+                                "clock: this host is ~{}s {} the upstream's clock — check NTP; \
+                                 identity tokens and console-sync stall once skew passes ~15min",
+                                skew.as_secs(),
+                                direction
+                            )));
+                        } else {
+                            checks.push(Check::Pass(format!(
+                                "clock: within {}s of upstream",
+                                skew.as_secs()
+                            )));
+                        }
+                    }
+                }
                 Err(error) => {
                     // Redact userinfo here too — this failure
                     // line used to leak what the success line redacted.

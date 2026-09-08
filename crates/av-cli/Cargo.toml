@@ -46,6 +46,11 @@ tokio = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 reqwest = { workspace = true }
+# Round-114: parse the upstream probe's Date header (RFC 7231
+# IMF-fixdate) so `avctl doctor` can flag host clock skew BEFORE it
+# breaks identity tokens (TTL ≤900s) and console-sync windows.
+# Already in-tree transitively via hyper.
+httpdate = "1"
 hex = { workspace = true }
 base64 = { workspace = true }
 zeroize = { workspace = true }
