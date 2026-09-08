@@ -333,10 +333,12 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
         // domains (defense against a misconfigured IdP asserting a
         // random email).
         const at = result.email.lastIndexOf("@");
-        const domain = at >= 0 ? result.email.slice(at + 1).toLowerCase() : "";
+        // Round-109: NFC both sides (see lib/saml.ts findConfigForEmail).
+        const domain =
+          at >= 0 ? result.email.slice(at + 1).toLowerCase().normalize("NFC") : "";
         const domains = cfg.allowedDomains
           .split(",")
-          .map((d) => d.trim().toLowerCase())
+          .map((d) => d.trim().toLowerCase().normalize("NFC"))
           .filter(Boolean);
         // R76 HIGH #1 (companion): refuse an empty allowlist.
         // Prior shape returned `ok` when `domains.length === 0`,
