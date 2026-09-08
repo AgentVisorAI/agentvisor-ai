@@ -239,6 +239,25 @@ async fn run_once(config: &ResolvedSyncConfig, dry_run: bool) -> Result<SyncSumm
             );
             continue;
         }
+        // Round 106: records frozen behind a FutureSkew cursor are
+        // pending evidence the seq-acknowledgement gate below cannot
+        // see (they never became pending events this pass). Sealing
+        // now would lock them out permanently — e.g. a clock-fixed
+        // host syncing a +6h spool sealed a session as CLEAN whose
+        // signed receipt attests blocked:1.
+        if bridge_candidates
+            .frozen_sessions
+            .contains(&candidate.session_external_id)
+        {
+            summary.receipts_skipped += 1;
+            eprintln!(
+                "warning: deferring receipt for {} — bridge records for it are frozen behind \
+                 the future-skew window; sealing now would lock that evidence out permanently \
+                 (retry after the wall clock passes the skewed timestamps)",
+                sanitize_for_terminal(&candidate.session_external_id)
+            );
+            continue;
+        }
         if let Some(max_seq) = pending_max_seq.get(&candidate.session_external_id) {
             let (acknowledged, synced_through, synced_any) =
                 acknowledged_through(&state, &candidate.session_external_id, *max_seq);
@@ -921,6 +940,13 @@ fn scan_trajectories(spool_dir: &Path) -> Vec<TrajectoryCandidate> {
 struct BridgeScan {
     candidates: Vec<BridgeSessionCandidate>,
     events_outside_window: usize,
+    /// Sessions with bridge records withheld behind a FutureSkew cursor
+    /// freeze (round 106). The receipt gate must treat these exactly
+    /// like unacknowledged pending events: sealing while a blocked-call
+    /// record sits frozen locks it out forever (sealed sessions refuse
+    /// events) and the console would show a CLEAN session whose signed
+    /// receipt attests blocked>0 — silent evidence loss.
+    frozen_sessions: std::collections::HashSet<String>,
     max_seen_offsets: BTreeMap<String, u64>,
 }
 
@@ -1071,6 +1097,9 @@ fn scan_bridge_candidates(
                         }
                         BridgeRecordMapping::FutureSkew => {
                             scan.events_outside_window = scan.events_outside_window.saturating_add(1);
+                            if let Some(sid) = bridge_session_id(&stored.value) {
+                                scan.frozen_sessions.insert(sid);
+                            }
                             // Freeze this cursor (do NOT bank): the record
                             // stays unread so a later pass — once the wall
                             // clock catches up or NTP corrects — delivers
