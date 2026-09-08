@@ -349,7 +349,7 @@ export async function consumeSamlResponse(
     return {
       ok: false,
       error: "issuer_mismatch",
-      detail: `expected ${cfg.entityIdIdp}, got ${typeof assertedIssuer === "string" ? assertedIssuer.slice(0, 200) : String(assertedIssuer)}`,
+      detail: `expected ${cfg.entityIdIdp}, got ${typeof assertedIssuer === "string" ? truncateWellFormed(assertedIssuer, 200) : String(assertedIssuer)}`,
     };
   }
 

@@ -11,6 +11,7 @@ import {
   verifyPassword,
 } from "../lib/auth.js";
 import { writeAudit } from "../lib/audit.js";
+import { truncateWellFormed } from "../lib/strings.js";
 import { setMfaGateCookie } from "../lib/mfa-gate.js";
 import { authEventsTotal } from "../lib/metrics.js";
 import { perIpCookieOnly } from "../lib/rate-limit.js";
@@ -1528,7 +1529,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         actorEmail: user.email,
         ip: req.ip,
         userAgent: typeof req.headers["user-agent"] === "string"
-          ? req.headers["user-agent"].slice(0, 200)
+          ? truncateWellFormed(req.headers["user-agent"], 200)
           : undefined,
         at: new Date().toISOString(),
       },

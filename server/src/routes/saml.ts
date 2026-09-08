@@ -29,6 +29,7 @@ import {
   mintSession,
 } from "../lib/auth.js";
 import { requireSession } from "../lib/session-middleware.js";
+import { truncateWellFormed } from "../lib/strings.js";
 import {
   buildLoginUrl,
   consumeSamlResponse,
@@ -234,7 +235,7 @@ export async function samlRoutes(app: FastifyInstance): Promise<void> {
       return errRedirect("saml_config_uses_sha1_reject");
     }
     const relayState = typeof req.query.RelayState === "string"
-      ? req.query.RelayState.slice(0, 1024)
+      ? truncateWellFormed(req.query.RelayState, 1024)
       : null;
     const url = await buildLoginUrl(cfg, relayState);
     return reply.redirect(url);

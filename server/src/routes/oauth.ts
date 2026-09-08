@@ -376,7 +376,7 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
     // that opts THAT `iss` in explicitly.
     const emailVerified = claims?.email_verified === true;
     const displayName = typeof claims?.name === "string"
-      ? claims.name.slice(0, 200)
+      ? truncateWellFormed(claims.name, 200)
       : null;
 
     if (!email) {
@@ -422,7 +422,7 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
       const created = await db.$transaction(async (tx) => {
         const newOrg = await tx.org.create({
           data: {
-            name: (domain.split(".")[0] || "Personal").slice(0, 63),
+            name: truncateWellFormed(domain.split(".")[0] || "Personal", 63),
             slug: orgSlug(domain),
           },
         });
