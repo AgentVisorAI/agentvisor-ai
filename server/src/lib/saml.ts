@@ -507,14 +507,17 @@ export async function findConfigForEmail(email: string): Promise<
 > {
   const at = email.lastIndexOf("@");
   if (at < 0) return null;
-  const domain = email.slice(at + 1).toLowerCase();
+  // Round-109: NFC both sides — emails are NFC at entry (#381), but
+  // stored allowedDomains may carry legacy/admin-pasted NFD bytes;
+  // visually identical domains must match.
+  const domain = email.slice(at + 1).toLowerCase().normalize("NFC");
   const configs = await db.samlConfig.findMany({
     where: { isActive: true },
   });
   for (const c of configs) {
     const domains = c.allowedDomains
       .split(",")
-      .map((d) => d.trim().toLowerCase())
+      .map((d) => d.trim().toLowerCase().normalize("NFC"))
       .filter(Boolean);
     if (domains.length === 0) continue;
     if (domains.includes(domain)) return c;
