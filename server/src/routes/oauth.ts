@@ -358,7 +358,7 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
     // `domain.split(".")[0]` slug feed at RFC 1035's 63-char
     // label max so a 1 MB email doesn't produce a 1 MB org.name.
     const email = typeof claims?.email === "string"
-      ? claims.email.toLowerCase().slice(0, 320)
+      ? claims.email.toLowerCase().normalize("NFC").slice(0, 320)
       : null;
     // R76 MEDIUM #5 (landed R77): only accept the JSON boolean
     // `true` for `email_verified`. Prior shape accepted the string

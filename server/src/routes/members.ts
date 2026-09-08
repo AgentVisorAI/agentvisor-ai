@@ -47,7 +47,9 @@ const emailSchema = z
   .trim()
   .min(3)
   .max(320)
-  .regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, "must be a valid email");
+  .regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, "must be a valid email")
+  // Round-108: NFC canonicalization — see auth.ts emailSchema.
+  .transform((v) => v.normalize("NFC"));
 
 export async function memberRoutes(app: FastifyInstance): Promise<void> {
   // -------------------------------------------------------------------
