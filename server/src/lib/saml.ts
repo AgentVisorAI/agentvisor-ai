@@ -467,7 +467,7 @@ export async function consumeSamlResponse(
     // is 320; console password signup already enforces
     // displayName max(80), so 200 here gives IdP-asserted
     // legitimate names some slack while still bounded.
-    email: email.toLowerCase().trim().slice(0, 320),
+    email: email.toLowerCase().trim().normalize("NFC").slice(0, 320),
     displayName: typeof displayName === "string"
       ? displayName.slice(0, 200)
       : null,

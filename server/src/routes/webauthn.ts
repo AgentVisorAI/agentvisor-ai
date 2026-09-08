@@ -481,7 +481,16 @@ export async function webauthnRoutes(app: FastifyInstance): Promise<void> {
     config: { rateLimit: perIp(10, 60_000) },
   }, async (req, reply) => {
     const body = z
-      .object({ email: z.string().min(3).max(320).toLowerCase().trim() })
+      .object({
+        email: z
+          .string()
+          .min(3)
+          .max(320)
+          .toLowerCase()
+          .trim()
+          // Round-108: NFC canonicalization — see auth.ts emailSchema.
+          .transform((v) => v.normalize("NFC")),
+      })
       .safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: "invalid_input" });
     const user = await db.user.findUnique({

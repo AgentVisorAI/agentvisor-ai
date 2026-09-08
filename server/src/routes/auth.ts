@@ -27,8 +27,13 @@ const emailSchema = z
   .string()
   .max(320)
   .trim()
+  // Round-108: canonicalize to NFC. macOS input paths often emit
+  // decomposed (NFD) accents while Linux/browsers emit NFC — the
+  // byte-distinct forms of one visually-identical address created
+  // two accounts and made cross-machine logins fail "wrong password".
   .toLowerCase()
-  .regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, "Invalid email");
+  .regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, "Invalid email")
+  .transform((v) => v.normalize("NFC"));
 const passwordSchema = z.string().min(12).max(1024);
 // R184 F1: CRLF/NUL rejection on user-controlled strings that flow
 // into email subject/body. inviteMail (mail.ts:202-228) interpolates
