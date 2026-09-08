@@ -1785,11 +1785,111 @@ mod tests {
             "2025-01-15T10:30:00.Z",
             "2025-01-15T10:30:00ZZ",
             "2025-01-15T10:30:00+5:30",
+            // Round-20 mutation findings: the offset arm's bounds were
+            // unpinned (`&&` → `||` mutants at is_iso8601's offset
+            // check survived) — nothing refused an offset hour above
+            // 14, offset minutes above 59, or a malformed separator.
+            "2025-01-15T10:30:00+15:00",
+            "2025-01-15T10:30:00-15:00",
+            "2025-01-15T10:30:00+14:60",
+            "2025-01-15T10:30:00+1400",
+            "2025-01-15T10:30:00+14:00Z",
             "not-a-date",
         ] {
             assert!(!is_iso8601(ts, true), "should reject {ts}");
             assert!(!is_iso8601(ts, false), "should reject {ts}");
         }
+        // Boundary acceptance: ±14:00 is the real-world maximum offset.
+        for ts in [
+            "2025-01-15T10:30:00+14:00",
+            "2025-01-15T10:30:00-14:00",
+            "2025-01-15T10:30:00+13:59",
+        ] {
+            assert!(is_iso8601(ts, true), "should accept {ts}");
+        }
+    }
+
+    /// Round-20 mutation findings: the version-gate comparisons
+    /// (`ver < (1, N)` → "field requires ATIF-v1.N+") and the
+    /// tool_calls fan-out cap were unpinned — `<`/`>` mutants at each
+    /// gate survived, so a refactor could silently stop enforcing the
+    /// spec's compatibility matrix (accepting v1.6-gated fields in a
+    /// v1.2 doc, or unbounded tool_calls maps). Table-driven pin: each
+    /// entry is a minimal doc valid EXCEPT for the one gated defect,
+    /// asserted to produce an issue naming the right path — plus the
+    /// boundary version where the same doc must validate clean.
+    #[test]
+    fn version_gates_and_caps_refuse_exactly_at_their_boundaries() {
+        let doc = |version: &str, step_extras: serde_json::Value| {
+            let mut step = serde_json::json!({
+                "step_id": 1,
+                "source": "agent",
+                "message": "hi",
+            });
+            if let (Some(obj), Some(extras)) = (step.as_object_mut(), step_extras.as_object()) {
+                for (k, v) in extras {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            serde_json::json!({
+                "schema_version": format!("ATIF-v{version}"),
+                "session_id": "s",
+                "agent": {"name": "a", "version": "1"},
+                "steps": [step],
+            })
+        };
+        let has_issue = |v: &Value, needle: &str| {
+            validate_value(v, Mode::Strict)
+                .iter()
+                .any(|i| i.path.contains(needle) || i.message.contains(needle))
+        };
+
+        // metrics.completion_token_ids requires v1.3+.
+        let m = serde_json::json!({"metrics": {"prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0, "completion_token_ids": [1]}});
+        assert!(
+            has_issue(&doc("1.2", m.clone()), "completion_token_ids"),
+            "v1.2 must refuse completion_token_ids"
+        );
+        assert!(
+            !has_issue(&doc("1.3", m), "completion_token_ids"),
+            "v1.3 must accept completion_token_ids"
+        );
+
+        // metrics.prompt_token_ids requires v1.4+.
+        let m = serde_json::json!({"metrics": {"prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0, "prompt_token_ids": [1]}});
+        assert!(
+            has_issue(&doc("1.3", m.clone()), "prompt_token_ids"),
+            "v1.3 must refuse prompt_token_ids"
+        );
+        assert!(
+            !has_issue(&doc("1.4", m), "prompt_token_ids"),
+            "v1.4 must accept prompt_token_ids"
+        );
+
+        // observation.results[].content: content-part ARRAYS require
+        // v1.6+; wrong TYPES are refused everywhere.
+        let tc = |content: serde_json::Value| serde_json::json!({"observation": {"results": [{"content": content}]}});
+        assert!(
+            has_issue(
+                &doc("1.5", tc(serde_json::json!([{"type": "text", "text": "x"}]))),
+                "content-part arrays require"
+            ),
+            "v1.5 must refuse content-part arrays"
+        );
+        assert!(
+            !has_issue(
+                &doc("1.6", tc(serde_json::json!([{"type": "text", "text": "x"}]))),
+                "content-part"
+            ),
+            "v1.6 must accept content-part arrays"
+        );
+        assert!(
+            has_issue(
+                &doc("1.7", tc(serde_json::json!(42))),
+                "must be a string or content-part array"
+            ),
+            "numeric content must be refused at any version"
+        );
     }
 
     #[test]
