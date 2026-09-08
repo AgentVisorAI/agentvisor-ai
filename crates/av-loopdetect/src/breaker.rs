@@ -699,15 +699,15 @@ mod similarity_path_tests {
             let s = mk();
             let mut tripped = false;
             for step in *steps {
-                if matches!(
-                    s.observe(&e, step, 400),
-                    BreakerVerdict::Tripped { .. }
-                ) {
+                if matches!(s.observe(&e, step, 400), BreakerVerdict::Tripped { .. }) {
                     tripped = true;
                     break;
                 }
             }
-            assert!(tripped, "case {i}: paraphrased rambling must trip in every language");
+            assert!(
+                tripped,
+                "case {i}: paraphrased rambling must trip in every language"
+            );
         }
         // Control: genuinely progressing Japanese content must stay open.
         let s = mk();
