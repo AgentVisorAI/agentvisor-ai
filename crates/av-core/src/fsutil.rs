@@ -43,10 +43,7 @@ pub const fn unix_o_nofollow() -> i32 {
     {
         0x20000
     }
-    #[cfg(all(
-        target_os = "linux",
-        any(target_arch = "powerpc", target_arch = "powerpc64")
-    ))]
+    #[cfg(all(target_os = "linux", any(target_arch = "powerpc", target_arch = "powerpc64")))]
     {
         0x8000
     }
