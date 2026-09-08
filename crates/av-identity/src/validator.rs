@@ -72,6 +72,27 @@ pub enum IdentityError {
         /// Validator wall clock.
         now: u64,
     },
+    /// Token expired — with enough context to tell a stale token from a
+    /// skewed validator clock. Round-106/107 drills: a +6h host rejects
+    /// every honest client with a bare "ExpiredSignature", sending the
+    /// operator hunting client TTLs instead of their own NTP. An
+    /// "expiry" further in the past than the maximum issuable TTL can
+    /// only mean the validating host's clock is ahead.
+    #[error(
+        "token expired: exp {exp}, validator now {now} ({past_s}s past expiry{hint})",
+        past_s = now.saturating_sub(*exp),
+        hint = if now.saturating_sub(*exp) > MAX_TTL_SECS {
+            " — longer than the maximum token TTL; this host's clock is likely ahead (check NTP)"
+        } else {
+            ""
+        }
+    )]
+    Expired {
+        /// Expiry claim (signature-verified before extraction).
+        exp: u64,
+        /// Validator wall clock.
+        now: u64,
+    },
     /// Required identity field empty.
     #[error("empty identity field {0}")]
     EmptyField(&'static str),
@@ -536,7 +557,30 @@ impl IdentityValidator {
         validation.validate_nbf = true;
 
         let data = jsonwebtoken::decode::<NhiClaims>(token, &decoding_key, &validation)
-            .map_err(|e| IdentityError::Verification(e.to_string()))?;
+            .map_err(|e| {
+                // Round-107: on expiry, re-decode with the SAME key and
+                // audience but exp validation off — signature integrity
+                // still enforced — purely to recover exp for the error.
+                // The token is still rejected either way; this only
+                // upgrades diagnosability (skewed-host vs stale-token).
+                if matches!(
+                    e.kind(),
+                    jsonwebtoken::errors::ErrorKind::ExpiredSignature
+                ) {
+                    let mut relaxed = validation.clone();
+                    relaxed.validate_exp = false;
+                    if let Ok(peek) =
+                        jsonwebtoken::decode::<NhiClaims>(token, &decoding_key, &relaxed)
+                    {
+                        let now_s = av_core::time::now_ms() / av_core::units::MS_PER_SEC;
+                        return IdentityError::Expired {
+                            exp: peek.claims.exp,
+                            now: now_s,
+                        };
+                    }
+                }
+                IdentityError::Verification(e.to_string())
+            })?;
         let claims = data.claims;
 
         if claims.exp <= claims.iat {

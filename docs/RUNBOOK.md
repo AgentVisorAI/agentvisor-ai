@@ -193,7 +193,12 @@ response the customer pastes into a ticket is directly greppable.
 **Signal:** customer reports sessions stuck `live` with no timeline, and
 `avctl console-sync` printing
 `warning: console dropped timestamp-skewed events … leaving that batch retryable`
-plus `receiptsSkipped` > 0 in the summary line.
+plus `receiptsSkipped` > 0 in the summary line. With
+`require_identity = true` the same skew locks out every honest client
+(all 401) — the daemon log then says which way the clock is off:
+`issued-at timestamp … is in the future` (host behind) or
+`…s past expiry — longer than the maximum token TTL; this host's
+clock is likely ahead (check NTP)` (host ahead).
 
 **What's happening (verified end-to-end, round 106, +6h faketime):** the
 console clamps session `openedAt`/`closedAt` to `now+5min`, refuses

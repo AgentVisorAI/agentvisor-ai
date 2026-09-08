@@ -114,7 +114,29 @@ fn expired_token_rejected() {
     c.iat = now_s() - 800;
     c.exp = now_s() - 200; // expired beyond the 30s leeway
     let token = mint(&keys, &c);
-    assert!(matches!(v.validate(&token), Err(IdentityError::Verification(_))));
+    // Round-107: expiry now surfaces exp/now so operators can tell a
+    // stale token from a skewed validator clock. A 200s-past expiry is
+    // within the issuable TTL, so no clock-skew hint.
+    let err = v.validate(&token).unwrap_err();
+    assert!(matches!(err, IdentityError::Expired { .. }), "got {err:?}");
+    assert!(!err.to_string().contains("clock is likely ahead"), "{err}");
+}
+
+#[test]
+fn expired_beyond_ttl_hints_clock_skew() {
+    // A token "expired" longer ago than the maximum issuable TTL can
+    // only mean the validating host's clock is ahead (round-106/107
+    // faketime drills: a +6h host rejected every honest client with a
+    // bare ExpiredSignature and no lead toward NTP).
+    let keys = ed25519_keys("k1");
+    let v = validator(&keys);
+    let mut c = claims(&[], 600, None);
+    c.iat = now_s() - 22_000; // ~6h ago, as a +6h-skewed host would see an honest token
+    c.exp = c.iat + 600;
+    let token = mint(&keys, &c);
+    let err = v.validate(&token).unwrap_err();
+    assert!(matches!(err, IdentityError::Expired { .. }), "got {err:?}");
+    assert!(err.to_string().contains("clock is likely ahead"), "{err}");
 }
 
 #[test]
