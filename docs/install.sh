@@ -10,7 +10,10 @@
 #   2. Anywhere else — or with AV_INSTALL_SOURCE=1 — it cargo-installs
 #      both from source, exactly as before:
 #        https://github.com/AgentVisorAI/agentvisor
-#      (Windows: use WSL; the static Linux binaries run there.)
+#      (Windows: use WSL; the static Linux binaries run there.
+#       32-bit hosts (armv7l/i686): the source build works — the
+#       policy sandbox falls back to wasmtime's portable interpreter
+#       on targets without native JIT. Expect a long compile on a Pi.)
 #   3. Prints the one guided next step (`avctl setup`).
 #
 # Environment overrides:
