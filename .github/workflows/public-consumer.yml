@@ -105,6 +105,18 @@ jobs:
           agentvisord --version
           avctl --version
 
+      - name: The setup wizard the installer prints (piped, headless)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/wizard && cd /tmp/wizard
+          # Answers: preset 1 (OpenAI) → dummy key → no console → don't start.
+          printf '1\nsk-outsider-dummy-key-123\nn\nn\n' | avctl setup
+          test -f "$HOME/.agentvisor/agentvisor.toml"
+          # Key stays out of the config and lands 0600 in keys/.
+          ! grep -q sk-outsider-dummy "$HOME/.agentvisor/agentvisor.toml"
+          [ "$(stat -c %a "$HOME/.agentvisor/keys/openai.key")" = "600" ]
+          avctl config-validate "$HOME/.agentvisor/agentvisor.toml"
+
       - name: The quickstart the README prints (init → doctor → start → proxy)
         env:
           OPENAI_API_KEY: sk-public-consumer-dummy
