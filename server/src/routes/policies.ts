@@ -77,7 +77,12 @@ async function policyCounters(
       -- build a map it then discarded (the console only joins on the
       -- org's own policy names anyway).
       AND e."policyName" IN (SELECT p.name FROM policies p WHERE p."orgId" = ${orgId})
-      AND e."occurredAt" >= ${new Date(Date.now() - 24 * 3_600_000)}
+      -- Round-104 TZ fix (sibling of read.ts /overview + the webhooks
+      -- sweeper, missed by the first pass): occurredAt is naive-UTC
+      -- while the bound JS Date arrives as timestamptz — on a non-UTC
+      -- database the 24 h counter window shifts by the DB's UTC
+      -- offset. Pin the param to naive UTC like the other two sites.
+      AND e."occurredAt" >= (${new Date(Date.now() - 24 * 3_600_000)}::timestamptz AT TIME ZONE 'UTC')
     GROUP BY 1
   `);
   const map = new Map<string, { hits: number; blocks: number }>();
