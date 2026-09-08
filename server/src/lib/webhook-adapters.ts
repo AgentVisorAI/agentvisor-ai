@@ -15,6 +15,8 @@
  * createdAt } and produce a Buffer / string. Keep them pure so unit
  * tests are trivial.
  */
+import { truncateWellFormed } from "./strings.js";
+
 export type Adapter = "slack" | "teams" | "discord" | "raw";
 
 export function pickAdapter(url: string): Adapter {
@@ -48,7 +50,7 @@ function label(event: string): string {
 /** Truncate deep field values so a huge blob doesn't blow up the card. */
 function shortValue(v: unknown): string {
   const s = typeof v === "string" ? v : JSON.stringify(v);
-  return s.length > 240 ? s.slice(0, 240) + "…" : s;
+  return s.length > 240 ? truncateWellFormed(s, 240) + "…" : s;
 }
 
 // R125 F3: escape platform-specific control characters before
