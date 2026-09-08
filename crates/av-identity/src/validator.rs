@@ -556,31 +556,25 @@ impl IdentityValidator {
         validation.leeway = self.leeway_secs;
         validation.validate_nbf = true;
 
-        let data = jsonwebtoken::decode::<NhiClaims>(token, &decoding_key, &validation)
-            .map_err(|e| {
-                // Round-107: on expiry, re-decode with the SAME key and
-                // audience but exp validation off — signature integrity
-                // still enforced — purely to recover exp for the error.
-                // The token is still rejected either way; this only
-                // upgrades diagnosability (skewed-host vs stale-token).
-                if matches!(
-                    e.kind(),
-                    jsonwebtoken::errors::ErrorKind::ExpiredSignature
-                ) {
-                    let mut relaxed = validation.clone();
-                    relaxed.validate_exp = false;
-                    if let Ok(peek) =
-                        jsonwebtoken::decode::<NhiClaims>(token, &decoding_key, &relaxed)
-                    {
-                        let now_s = av_core::time::now_ms() / av_core::units::MS_PER_SEC;
-                        return IdentityError::Expired {
-                            exp: peek.claims.exp,
-                            now: now_s,
-                        };
-                    }
+        let data = jsonwebtoken::decode::<NhiClaims>(token, &decoding_key, &validation).map_err(|e| {
+            // Round-107: on expiry, re-decode with the SAME key and
+            // audience but exp validation off — signature integrity
+            // still enforced — purely to recover exp for the error.
+            // The token is still rejected either way; this only
+            // upgrades diagnosability (skewed-host vs stale-token).
+            if matches!(e.kind(), jsonwebtoken::errors::ErrorKind::ExpiredSignature) {
+                let mut relaxed = validation.clone();
+                relaxed.validate_exp = false;
+                if let Ok(peek) = jsonwebtoken::decode::<NhiClaims>(token, &decoding_key, &relaxed) {
+                    let now_s = av_core::time::now_ms() / av_core::units::MS_PER_SEC;
+                    return IdentityError::Expired {
+                        exp: peek.claims.exp,
+                        now: now_s,
+                    };
                 }
-                IdentityError::Verification(e.to_string())
-            })?;
+            }
+            IdentityError::Verification(e.to_string())
+        })?;
         let claims = data.claims;
 
         if claims.exp <= claims.iat {
