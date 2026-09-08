@@ -578,7 +578,13 @@
   /* ---------- utilities ---------- */
 
   function h(html) { var t = document.createElement("template"); t.innerHTML = html.trim(); return t.content.firstChild; }
-  function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
+  // Round-124: also strip bidi control characters (RLO/LRO/RLI…,
+  // U+061C, LRM/RLM, BOM). They are invisible, have no legitimate
+  // display purpose in an evidence console, and a leaked-token daemon
+  // could otherwise make identifiers render REVERSED (Trojan-Source
+  // display spoofing) in the audit trail. ZWJ/ZWNJ are deliberately
+  // kept so emoji sequences in org/display names still render.
+  function esc(s) { return String(s == null ? "" : s).replace(/[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, "").replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
   // Array.from splits by code point, not UTF-16 unit — .slice(0,1) on
   // an emoji-leading name ("🚀 Rocket Corp") rendered a broken "�".
   function initials(name) { return (Array.from(String(name || "?").trim())[0] || "?").toUpperCase(); }

@@ -5,7 +5,10 @@
     const loadExample = document.getElementById("loadExample");
 
     function esc(s) {
-      return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+      // Round-124: strip bidi controls before display — an attacker-
+      // crafted receipt field must not render reversed next to a green
+      // tick (Trojan-Source display spoofing). Mirrors app.js esc().
+      return String(s).replace(/[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
     }
 
     function hex2bytes(hex) {

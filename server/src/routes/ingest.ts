@@ -50,12 +50,31 @@ async function authenticateDaemon(
 
 // ── Payload schemas ─────────────────────────────────────────────────────────
 
+// Round-124 (R15 hunt): refuse control (Cc) and format (Cf) characters
+// in IDENTIFIER fields. Cf includes the bidi controls (U+202A-202E,
+// U+2066-2069, U+061C) behind Trojan-Source-style display spoofing —
+// an attacker with a leaked ingest token (the R119/R124/R125 threat
+// model) could otherwise mint sessions/events whose agent or tag
+// renders REVERSED or with invisible characters in the console and
+// the audit CSV, spoofing the very evidence trail this product sells.
+// Free-content fields (body, sub) are deliberately exempt: daemons
+// capture model output verbatim there and the SPA HTML-escapes them;
+// identifiers have no legitimate use for invisible characters. Same
+// refusal family as auth.ts noCrlfNul (R211).
+const noControlOrFormatChars = (v: string): boolean => !/[\p{Cc}\p{Cf}]/u.test(v);
+const identifier = (max: number) =>
+  z
+    .string()
+    .min(1)
+    .max(max)
+    .refine(noControlOrFormatChars, "must not contain control or format characters");
+
 const sessionUpsert = z.object({
-  externalId: z.string().min(1).max(128),
+  externalId: identifier(128),
   // Round-123: NFC like every other identity-ish string (#381 pattern)
   // so server-side session search matches regardless of the daemon
   // host's composition form.
-  agent: z.string().min(1).max(80).transform((v) => v.normalize("NFC")),
+  agent: identifier(80).transform((v) => v.normalize("NFC")),
   workflow: z.enum(["signed", "unsigned"]).default("signed"),
   status: z.enum(["live", "sealed", "blocked"]).default("live"),
   // R161 F1: cap at 1M policy versions. Prior shape was
@@ -73,7 +92,7 @@ const sessionUpsert = z.object({
 });
 
 const eventPayload = z.object({
-  sessionExternalId: z.string().min(1).max(128),
+  sessionExternalId: identifier(128),
   // R161 F1: cap seq at 100M. Prior shape was unbounded —
   // Event.seq is Postgres int4 and every batch's WHERE seq: {gt}
   // /IN clauses and rollup writes flow through it. 100M is
@@ -83,7 +102,7 @@ const eventPayload = z.object({
   // livelock class R160 F1 closed for the rollup fields.
   seq: z.number().int().min(0).max(100_000_000),
   kind: z.enum(["sys", "user", "llm", "tool", "block", "guard", "audit"]),
-  tag: z.string().min(1).max(32),
+  tag: identifier(32),
   body: z.string().max(8000),
   sub: z.string().max(2000).optional(),
   // Which policy this event fired under, when the daemon attributes
@@ -91,7 +110,13 @@ const eventPayload = z.object({
   // against Policy.name for the console's per-policy 24h counters —
   // unknown names are stored as-is so counters appear as soon as the
   // operator creates the matching policy row.
-  policyName: z.string().trim().min(1).max(80).optional(),
+  policyName: z
+    .string()
+    .trim()
+    .min(1)
+    .max(80)
+    .refine(noControlOrFormatChars, "must not contain control or format characters")
+    .optional(),
   occurredAt: z.coerce.date(),
   // R160 F1: per-field upper bounds on all numeric increments.
   // Prior shape used `z.number().int().min(0)` with NO upper
@@ -226,8 +251,8 @@ function verifyReceiptSignature(
 }
 
 const receiptPayload = z.object({
-  sessionExternalId: z.string().min(1).max(128),
-  receiptId: z.string().min(1).max(128),
+  sessionExternalId: identifier(128),
+  receiptId: identifier(128),
   body: z.string().min(1).max(65_536),
   sigB64: z.string().min(1).max(4096),
   keyIdHex: z.string().min(1).max(128),

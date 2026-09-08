@@ -118,6 +118,16 @@ try {
   });
   check("ingest session", sessionRes.status === 200, JSON.stringify(sessionRes.data));
 
+  // Round-124: identifier fields refuse control/format characters —
+  // a leaked-token daemon must not be able to mint evidence whose
+  // agent renders REVERSED (U+202E Trojan-Source display spoofing).
+  const bidiRes = await ingest("/api/v1/ingest/sessions", {
+    externalId: "sess_bidi_"+rand,
+    agent: "evil-\u202Etnega",
+    workflow: "signed", status: "live", policyVersion: 1, openedAt,
+  });
+  check("bidi control char in agent refused", bidiRes.status === 400 && /invalid_input|control or format/.test(bidiRes.data), bidiRes.status + " " + String(bidiRes.data).slice(0, 80));
+
   const now = new Date().toISOString();
   const evRes = await ingest("/api/v1/ingest/events", [
     { sessionExternalId:"sess_e2e_"+rand, seq:1, kind:"sys", tag:"start", body:"session opened", occurredAt: now },
