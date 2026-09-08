@@ -157,3 +157,32 @@ jobs:
           cd /tmp/pub
           docker compose -f docker/docker-compose.minimal.yml config -q
           docker compose -f docker/docker-compose.minimal.yml build
+
+      - name: The image must RUN, not just build (boot → gate → SIGTERM drain)
+        run: |
+          set -euo pipefail
+          # Round-102/103: agentvisord is PID 1 in this image (no init
+          # shim) — prove SIGTERM lands, the drain finishes fast, and
+          # the shutdown finalizer seals the still-open session.
+          docker run -d --name avd -p 127.0.0.1:8484:8484 agentvisor-ai:local
+          for i in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:8484/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8484/health | grep -q '"status":"ok"'
+          # $60 payout: schema caps amount_usd at 50 → blocked at the
+          # gate, no upstream needed. Session left UNCLOSED on purpose.
+          BODY=$(curl -sS -X POST http://127.0.0.1:8484/mcp \
+            -H "Content-Type: application/json" -H "x-av-session: ci-sigterm" \
+            -d '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"payout","arguments":{"amount_usd":60,"recipient":"acme"}}}')
+          echo "$BODY" | grep -q '"error"' || { echo "gate did not block: $BODY"; exit 1; }
+          T0=$(date +%s)
+          docker stop -t 180 avd
+          ELAPSED=$(( $(date +%s) - T0 ))
+          echo "docker stop took ${ELAPSED}s"
+          [ "$ELAPSED" -lt 60 ] || { echo "drain exceeded 60s — SIGTERM not honored?"; exit 1; }
+          [ "$(docker inspect avd --format '{{.State.ExitCode}}')" = "0" ]
+          docker cp avd:/app/spool/atif/receipts /tmp/receipts
+          ls /tmp/receipts/*.json
+          grep -q '"blocked":1' /tmp/receipts/*.json
+          docker rm avd
